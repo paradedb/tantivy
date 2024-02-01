@@ -1,3 +1,6 @@
+use crate::query::fuzzy_query::DfaWrapper;
+use crate::query::score_combiner::SumCombiner;
+
 use std::any::{Any, TypeId};
 use std::io;
 use std::sync::Arc;
@@ -6,8 +9,6 @@ use tantivy_fst::Automaton;
 
 use super::phrase_prefix_query::prefix_end;
 use crate::index::SegmentReader;
-use crate::query::fuzzy_query::DfaWrapper;
-use crate::query::score_combiner::SumCombiner;
 use crate::query::{ConstScorer, Explanation, Scorer, Union, Weight};
 use crate::schema::{Field, IndexRecordOption};
 use crate::termdict::{TermDictionary, TermWithStateStreamer};
