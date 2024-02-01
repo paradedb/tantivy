@@ -70,6 +70,7 @@ impl AggregationLimits {
         }
     }
 
+    #[allow(unused_doc_comments)]
     /// Create a new ResourceLimitGuard, that will release the memory when dropped.
     pub fn new_guard(&self) -> ResourceLimitGuard {
         ResourceLimitGuard {
