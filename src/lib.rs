@@ -303,6 +303,9 @@ pub mod merge_policy {
 /// At most, a segment can contain 2^31 documents.
 pub type DocId = u32;
 
+/// A Postgres ctid, for identifying physical rows in ParadeDB.
+pub type Ctid = u64;
+
 /// A u64 assigned to every operation incrementally
 ///
 /// All operations modifying the index receives an monotonic Opstamp.

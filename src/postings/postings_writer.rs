@@ -13,7 +13,7 @@ use crate::postings::{
 };
 use crate::schema::{Field, Schema, Term, Type};
 use crate::tokenizer::{Token, TokenStream, MAX_TOKEN_LEN};
-use crate::DocId;
+use crate::{Ctid, DocId};
 
 const POSITION_GAP: u32 = 1;
 
@@ -114,7 +114,7 @@ pub(crate) trait PostingsWriter: Send + Sync {
     /// * term - the term
     /// * ctx - Contains a term hashmap and a memory arena to store all necessary posting list
     ///   information.
-    fn subscribe(&mut self, doc: DocId, pos: u32, term: &Term, ctx: &mut IndexingContext);
+    fn subscribe(&mut self, doc: (DocId, Ctid), pos: u32, term: &Term, ctx: &mut IndexingContext);
 
     /// Serializes the postings on disk.
     /// The actual serialization format is handled by the `PostingsSerializer`.
@@ -130,7 +130,7 @@ pub(crate) trait PostingsWriter: Send + Sync {
     /// Tokenize a text and subscribe all of its token.
     fn index_text(
         &mut self,
-        doc_id: DocId,
+        doc_id: (DocId, Ctid),
         token_stream: &mut dyn TokenStream,
         term_buffer: &mut Term,
         ctx: &mut IndexingContext,
@@ -203,22 +203,28 @@ impl<Rec: Recorder> SpecializedPostingsWriter<Rec> {
 
 impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
     #[inline]
-    fn subscribe(&mut self, doc: DocId, position: u32, term: &Term, ctx: &mut IndexingContext) {
+    fn subscribe(
+        &mut self,
+        doc: (DocId, Ctid),
+        position: u32,
+        term: &Term,
+        ctx: &mut IndexingContext,
+    ) {
         debug_assert!(term.serialized_term().len() >= 4);
         self.total_num_tokens += 1;
         let (term_index, arena) = (&mut ctx.term_index, &mut ctx.arena);
         term_index.mutate_or_create(term.serialized_term(), |opt_recorder: Option<Rec>| {
             if let Some(mut recorder) = opt_recorder {
                 let current_doc = recorder.current_doc();
-                if current_doc != doc {
+                if current_doc != doc.0 {
                     recorder.close_doc(arena);
-                    recorder.new_doc(doc, arena);
+                    recorder.new_doc(doc.0, arena);
                 }
                 recorder.record_position(position, arena);
                 recorder
             } else {
                 let mut recorder = Rec::default();
-                recorder.new_doc(doc, arena);
+                recorder.new_doc(doc.0, arena);
                 recorder.record_position(position, arena);
                 recorder
             }

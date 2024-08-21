@@ -9,7 +9,7 @@ use crate::postings::recorder::{BufferLender, DocIdRecorder, Recorder};
 use crate::postings::{FieldSerializer, IndexingContext, IndexingPosition, PostingsWriter};
 use crate::schema::{Field, Type, JSON_END_OF_PATH};
 use crate::tokenizer::TokenStream;
-use crate::{DocId, Term};
+use crate::{Ctid, DocId, Term};
 
 /// The `JsonPostingsWriter` is odd in that it relies on a hidden contract:
 ///
@@ -31,7 +31,7 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
     #[inline]
     fn subscribe(
         &mut self,
-        doc: crate::DocId,
+        doc: (crate::DocId, Ctid),
         pos: u32,
         term: &crate::Term,
         ctx: &mut IndexingContext,
@@ -41,7 +41,7 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
 
     fn index_text(
         &mut self,
-        doc_id: DocId,
+        doc_id: (DocId, Ctid),
         token_stream: &mut dyn TokenStream,
         term_buffer: &mut Term,
         ctx: &mut IndexingContext,

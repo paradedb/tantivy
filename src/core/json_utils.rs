@@ -10,7 +10,7 @@ use crate::schema::{Field, Type, DATE_TIME_PRECISION_INDEXED};
 use crate::time::format_description::well_known::Rfc3339;
 use crate::time::{OffsetDateTime, UtcOffset};
 use crate::tokenizer::TextAnalyzer;
-use crate::{DateTime, DocId, Term};
+use crate::{Ctid, DateTime, DocId, Term};
 
 /// This object is a map storing the last position for a given path for the current document
 /// being indexed.
@@ -72,7 +72,7 @@ pub fn json_path_sep_to_dot(path: &mut str) {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn index_json_values<'a, V: Value<'a>>(
-    doc: DocId,
+    doc: (DocId, Ctid),
     json_visitors: impl Iterator<Item = crate::Result<V::ObjectIter>>,
     text_analyzer: &mut TextAnalyzer,
     expand_dots_enabled: bool,
@@ -102,7 +102,7 @@ pub(crate) fn index_json_values<'a, V: Value<'a>>(
 
 #[allow(clippy::too_many_arguments)]
 fn index_json_object<'a, V: Value<'a>>(
-    doc: DocId,
+    doc: (DocId, Ctid),
     json_visitor: V::ObjectIter,
     text_analyzer: &mut TextAnalyzer,
     term_buffer: &mut Term,
@@ -129,7 +129,7 @@ fn index_json_object<'a, V: Value<'a>>(
 
 #[allow(clippy::too_many_arguments)]
 fn index_json_value<'a, V: Value<'a>>(
-    doc: DocId,
+    doc: (DocId, Ctid),
     json_value: V,
     text_analyzer: &mut TextAnalyzer,
     term_buffer: &mut Term,

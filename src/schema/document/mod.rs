@@ -173,6 +173,7 @@ pub use self::owned_value::OwnedValue;
 pub(crate) use self::se::BinaryDocumentSerializer;
 pub use self::value::{ReferenceValue, ReferenceValueLeaf, Value};
 use super::*;
+use crate::Ctid;
 
 /// The core trait representing a document within the index.
 pub trait Document: Send + Sync + 'static {
@@ -242,6 +243,16 @@ pub trait Document: Send + Sync + 'static {
     fn to_json(&self, schema: &Schema) -> String {
         serde_json::to_string(&self.to_named_doc(schema))
             .expect("doc encoding failed. This is a bug")
+    }
+
+    /// Return the first value in the Document field entries as a Ctid.
+    fn ctid(&self) -> Ctid {
+        self.iter_fields_and_values()
+            .next()
+            .expect("first field in the tantivy document must be ctid... no fields found")
+            .1
+            .as_u64()
+            .expect("first field in the tantivy document must be ctid... first field not a u64")
     }
 }
 
