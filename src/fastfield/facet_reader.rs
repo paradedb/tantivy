@@ -62,7 +62,8 @@ impl FacetReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::schema::{Facet, FacetOptions, SchemaBuilder, Value, STORED};
+    use crate::schema::document::Value;
+    use crate::schema::{Facet, FacetOptions, SchemaBuilder, STORED};
     use crate::{DocAddress, Index, IndexWriter, TantivyDocument};
 
     #[test]
@@ -88,9 +89,7 @@ mod tests {
         let doc = searcher
             .doc::<TantivyDocument>(DocAddress::new(0u32, 0u32))
             .unwrap();
-        let value = doc
-            .get_first(facet_field)
-            .and_then(|v| v.as_value().as_facet());
+        let value = doc.get_first(facet_field).and_then(|v| v.as_facet());
         assert_eq!(value, None);
     }
 
@@ -147,11 +146,8 @@ mod tests {
         facet_ords.extend(facet_reader.facet_ords(0u32));
         assert_eq!(&facet_ords, &[0u64]);
         let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0u32, 0u32))?;
-        let value: Option<Facet> = doc
-            .get_first(facet_field)
-            .and_then(|v| v.as_facet())
-            .map(|facet| Facet::from_encoded_string(facet.to_string()));
-        assert_eq!(value, Facet::from_text("/a/b").ok());
+        let value: Option<&Facet> = doc.get_first(facet_field).and_then(|v| v.as_facet());
+        assert_eq!(value, Facet::from_text("/a/b").ok().as_ref());
         Ok(())
     }
 

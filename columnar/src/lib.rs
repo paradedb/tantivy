@@ -48,7 +48,7 @@ pub use column_values::{
 };
 pub use columnar::{
     merge_columnar, ColumnType, ColumnarReader, ColumnarWriter, HasAssociatedColumnType,
-    MergeRowOrder, ShuffleMergeOrder, StackMergeOrder, Version, CURRENT_VERSION,
+    MergeRowOrder, ShuffleMergeOrder, StackMergeOrder,
 };
 use sstable::VoidSSTable;
 pub use value::{NumericalType, NumericalValue};
@@ -131,6 +131,3 @@ impl Cardinality {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod compat_tests;

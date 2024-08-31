@@ -5,7 +5,6 @@ mod reader;
 mod writer;
 
 pub use column_type::{ColumnType, HasAssociatedColumnType};
-pub use format_version::{Version, CURRENT_VERSION};
 #[cfg(test)]
 pub(crate) use merge::ColumnTypeCategory;
 pub use merge::{merge_columnar, MergeRowOrder, ShuffleMergeOrder, StackMergeOrder};

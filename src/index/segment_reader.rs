@@ -318,14 +318,14 @@ impl SegmentReader {
                         if create_canonical {
                             // Without expand dots enabled dots need to be escaped.
                             let escaped_json_path = json_path.replace('.', "\\.");
-                            let full_path = format!("{field_name}.{escaped_json_path}");
+                            let full_path = format!("{}.{}", field_name, escaped_json_path);
                             let full_path_unescaped = format!("{}.{}", field_name, &json_path);
                             map_to_canonical.insert(full_path_unescaped, full_path.to_string());
                             full_path
                         } else {
                             // With expand dots enabled, we can use '.' instead of '\u{1}'.
                             json_path_sep_to_dot(&mut json_path);
-                            format!("{field_name}.{json_path}")
+                            format!("{}.{}", field_name, json_path)
                         }
                     };
                     indexed_fields.extend(
@@ -406,7 +406,7 @@ impl SegmentReader {
     }
 
     /// Returns an iterator that will iterate over the alive document ids
-    pub fn doc_ids_alive(&self) -> Box<dyn Iterator<Item = DocId> + Send + '_> {
+    pub fn doc_ids_alive(&self) -> Box<dyn Iterator<Item = DocId> + '_> {
         if let Some(alive_bitset) = &self.alive_bitset_opt {
             Box::new(alive_bitset.iter_alive())
         } else {

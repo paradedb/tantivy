@@ -127,7 +127,6 @@ impl Scorer for TermScorer {
 mod tests {
     use proptest::prelude::*;
 
-    use crate::index::SegmentId;
     use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
     use crate::merge_policy::NoMergePolicy;
     use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
@@ -135,7 +134,8 @@ mod tests {
     use crate::query::{Bm25Weight, EnableScoring, Scorer, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, TEXT};
     use crate::{
-        assert_nearly_equals, DocId, DocSet, Index, IndexWriter, Score, Searcher, Term, TERMINATED,
+        assert_nearly_equals, DocId, DocSet, Index, IndexWriter, Score, Searcher, SegmentId, Term,
+        TERMINATED,
     };
 
     #[test]

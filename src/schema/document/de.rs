@@ -873,7 +873,7 @@ mod tests {
         );
 
         let facet = Facet::from_text("/hello/world").unwrap();
-        let result = serialize_value(ReferenceValueLeaf::Facet(facet.encoded_str()).into());
+        let result = serialize_value(ReferenceValueLeaf::Facet(&facet).into());
         let value = deserialize_value(result);
         assert_eq!(value, crate::schema::OwnedValue::Facet(facet));
 
@@ -881,8 +881,7 @@ mod tests {
             text: "hello, world".to_string(),
             tokens: vec![Token::default(), Token::default()],
         };
-        let result =
-            serialize_value(ReferenceValueLeaf::PreTokStr(pre_tok_str.clone().into()).into());
+        let result = serialize_value(ReferenceValueLeaf::PreTokStr(&pre_tok_str).into());
         let value = deserialize_value(result);
         assert_eq!(value, crate::schema::OwnedValue::PreTokStr(pre_tok_str));
     }
@@ -961,19 +960,13 @@ mod tests {
             "my-third-key".to_string(),
             crate::schema::OwnedValue::F64(123.0),
         );
-        assert_eq!(
-            value,
-            crate::schema::OwnedValue::Object(expected_object.into_iter().collect())
-        );
+        assert_eq!(value, crate::schema::OwnedValue::Object(expected_object));
 
         let object = serde_json::Map::new();
         let result = serialize_value(ReferenceValue::Object(JsonObjectIter(object.iter())));
         let value = deserialize_value(result);
         let expected_object = BTreeMap::new();
-        assert_eq!(
-            value,
-            crate::schema::OwnedValue::Object(expected_object.into_iter().collect())
-        );
+        assert_eq!(value, crate::schema::OwnedValue::Object(expected_object));
 
         let mut object = serde_json::Map::new();
         object.insert("my-first-key".into(), serde_json::Value::Null);
@@ -985,10 +978,7 @@ mod tests {
         expected_object.insert("my-first-key".to_string(), crate::schema::OwnedValue::Null);
         expected_object.insert("my-second-key".to_string(), crate::schema::OwnedValue::Null);
         expected_object.insert("my-third-key".to_string(), crate::schema::OwnedValue::Null);
-        assert_eq!(
-            value,
-            crate::schema::OwnedValue::Object(expected_object.into_iter().collect())
-        );
+        assert_eq!(value, crate::schema::OwnedValue::Object(expected_object));
     }
 
     #[test]
@@ -1065,10 +1055,7 @@ mod tests {
                 .collect(),
             ),
         );
-        assert_eq!(
-            value,
-            crate::schema::OwnedValue::Object(expected_object.into_iter().collect())
-        );
+        assert_eq!(value, crate::schema::OwnedValue::Object(expected_object));
 
         // Some more extreme nesting that might behave weirdly
         let mut object = serde_json::Map::new();
@@ -1090,9 +1077,6 @@ mod tests {
                 OwnedValue::Array(vec![OwnedValue::Null]),
             ])]),
         );
-        assert_eq!(
-            value,
-            OwnedValue::Object(expected_object.into_iter().collect())
-        );
+        assert_eq!(value, OwnedValue::Object(expected_object));
     }
 }

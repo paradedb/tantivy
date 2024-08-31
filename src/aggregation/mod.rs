@@ -44,14 +44,11 @@
 //! - [Metric](metric)
 //!     - [Average](metric::AverageAggregation)
 //!     - [Stats](metric::StatsAggregation)
-//!     - [ExtendedStats](metric::ExtendedStatsAggregation)
 //!     - [Min](metric::MinAggregation)
 //!     - [Max](metric::MaxAggregation)
 //!     - [Sum](metric::SumAggregation)
 //!     - [Count](metric::CountAggregation)
 //!     - [Percentiles](metric::PercentilesAggregationReq)
-//!     - [Cardinality](metric::CardinalityAggregationReq)
-//!     - [TopHits](metric::TopHitsAggregationReq)
 //!
 //! # Example
 //! Compute the average metric, by building [`agg_req::Aggregations`], which is built from an
@@ -146,6 +143,8 @@ use std::fmt::Display;
 #[cfg(test)]
 mod agg_tests;
 
+mod agg_bench;
+
 use core::fmt;
 
 pub use agg_limits::AggregationLimits;
@@ -166,14 +165,15 @@ pub(crate) fn invalid_agg_request(message: String) -> crate::TantivyError {
 }
 
 fn parse_str_into_f64<E: de::Error>(value: &str) -> Result<f64, E> {
-    let parsed = value
-        .parse::<f64>()
-        .map_err(|_err| de::Error::custom(format!("Failed to parse f64 from string: {value:?}")))?;
+    let parsed = value.parse::<f64>().map_err(|_err| {
+        de::Error::custom(format!("Failed to parse f64 from string: {:?}", value))
+    })?;
 
     // Check if the parsed value is NaN or infinity
     if parsed.is_nan() || parsed.is_infinite() {
         Err(de::Error::custom(format!(
-            "Value is not a valid f64 (NaN or Infinity): {value:?}"
+            "Value is not a valid f64 (NaN or Infinity): {:?}",
+            value
         )))
     } else {
         Ok(parsed)
@@ -341,16 +341,10 @@ pub type SerializedKey = String;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialOrd)]
 /// The key to identify a bucket.
-///
-/// The order is important, with serde untagged, that we try to deserialize into i64 first.
 #[serde(untagged)]
 pub enum Key {
     /// String key
     Str(String),
-    /// `i64` key
-    I64(i64),
-    /// `u64` key
-    U64(u64),
     /// `f64` key
     F64(f64),
 }
@@ -361,8 +355,6 @@ impl std::hash::Hash for Key {
         match self {
             Key::Str(text) => text.hash(state),
             Key::F64(val) => val.to_bits().hash(state),
-            Key::U64(val) => val.hash(state),
-            Key::I64(val) => val.hash(state),
         }
     }
 }
@@ -382,8 +374,6 @@ impl Display for Key {
         match self {
             Key::Str(val) => f.write_str(val),
             Key::F64(val) => f.write_str(&val.to_string()),
-            Key::U64(val) => f.write_str(&val.to_string()),
-            Key::I64(val) => f.write_str(&val.to_string()),
         }
     }
 }

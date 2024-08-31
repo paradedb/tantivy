@@ -5,7 +5,6 @@ mod bm25;
 mod boolean_query;
 mod boost_query;
 mod const_score_query;
-mod disjunction;
 mod disjunction_max_query;
 mod empty_query;
 mod exclude;
@@ -54,10 +53,12 @@ pub use self::phrase_prefix_query::PhrasePrefixQuery;
 pub use self::phrase_query::PhraseQuery;
 pub use self::query::{EnableScoring, Query, QueryClone};
 pub use self::query_parser::{QueryParser, QueryParserError};
-pub use self::range_query::*;
+pub use self::range_query::{FastFieldRangeWeight, IPFastFieldRangeWeight, RangeQuery};
 pub use self::regex_query::RegexQuery;
 pub use self::reqopt_scorer::RequiredOptionalScorer;
-pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner};
+pub use self::score_combiner::{
+    DisjunctionMaxCombiner, ScoreCombiner, SumCombiner, SumWithCoordsCombiner,
+};
 pub use self::scorer::Scorer;
 pub use self::set_query::TermSetQuery;
 pub use self::term_query::TermQuery;

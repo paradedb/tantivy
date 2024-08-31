@@ -25,7 +25,6 @@ where W: Write
 
     /// Attempts to serialize a given document and write the output
     /// to the writer.
-    #[inline]
     pub(crate) fn serialize_doc<D>(&mut self, doc: &D) -> io::Result<()>
     where D: Document {
         let stored_field_values = || {
@@ -58,8 +57,9 @@ where W: Write
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!(
-                    "Unexpected number of entries written to serializer, expected \
-                     {num_field_values} entries, got {actual_length} entries",
+                    "Unexpected number of entries written to serializer, expected {} entries, got \
+                     {} entries",
+                    num_field_values, actual_length,
                 ),
             ));
         }
@@ -121,7 +121,7 @@ where W: Write
                 ReferenceValueLeaf::Facet(val) => {
                     self.write_type_code(type_codes::HIERARCHICAL_FACET_CODE)?;
 
-                    Cow::Borrowed(val).serialize(self.writer)
+                    val.serialize(self.writer)
                 }
                 ReferenceValueLeaf::Bytes(val) => {
                     self.write_type_code(type_codes::BYTES_CODE)?;
@@ -428,7 +428,7 @@ mod tests {
         );
 
         let facet = Facet::from_text("/hello/world").unwrap();
-        let result = serialize_value(ReferenceValueLeaf::Facet(facet.encoded_str()).into());
+        let result = serialize_value(ReferenceValueLeaf::Facet(&facet).into());
         let expected = binary_repr!(
             type_codes::HIERARCHICAL_FACET_CODE => Facet::from_text("/hello/world").unwrap(),
         );
@@ -441,8 +441,7 @@ mod tests {
             text: "hello, world".to_string(),
             tokens: vec![Token::default(), Token::default()],
         };
-        let result =
-            serialize_value(ReferenceValueLeaf::PreTokStr(pre_tok_str.clone().into()).into());
+        let result = serialize_value(ReferenceValueLeaf::PreTokStr(&pre_tok_str).into());
         let expected = binary_repr!(
             type_codes::EXT_CODE, type_codes::TOK_STR_EXT_CODE => pre_tok_str,
         );
@@ -679,7 +678,6 @@ mod tests {
         );
     }
 
-    #[inline]
     fn serialize_doc<D: Document>(doc: &D, schema: &Schema) -> Vec<u8> {
         let mut writer = Vec::new();
 

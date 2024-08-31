@@ -1,10 +1,9 @@
 use std::fmt::Debug;
-use std::io;
 use std::net::Ipv6Addr;
 
 use columnar::column_values::CompactSpaceU64Accessor;
 use columnar::{
-    ColumnType, Dictionary, MonotonicallyMappableToU128, MonotonicallyMappableToU64, NumericalValue,
+    BytesColumn, ColumnType, MonotonicallyMappableToU128, MonotonicallyMappableToU64, StrColumn,
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -21,7 +20,7 @@ use crate::aggregation::intermediate_agg_result::{
 use crate::aggregation::segment_agg_result::{
     build_segment_agg_collector, SegmentAggregationCollector,
 };
-use crate::aggregation::{format_date, Key};
+use crate::aggregation::{f64_from_fastfield_u64, format_date, Key};
 use crate::error::DataCorruption;
 use crate::TantivyError;
 
@@ -325,11 +324,9 @@ impl SegmentAggregationCollector for SegmentTermCollector {
         }
 
         let mem_delta = self.get_memory_consumption() - mem_pre;
-        if mem_delta > 0 {
-            bucket_agg_accessor
-                .limits
-                .add_memory_consumed(mem_delta as u64)?;
-        }
+        bucket_agg_accessor
+            .limits
+            .add_memory_consumed(mem_delta as u64)?;
 
         Ok(())
     }
@@ -358,7 +355,8 @@ impl SegmentTermCollector {
     ) -> crate::Result<Self> {
         if field_type == ColumnType::Bytes {
             return Err(TantivyError::InvalidArgument(format!(
-                "terms aggregation is not supported for column type {field_type:?}"
+                "terms aggregation is not supported for column type {:?}",
+                field_type
             )));
         }
         let term_buckets = TermBuckets::default();
@@ -467,72 +465,49 @@ impl SegmentTermCollector {
             };
 
         if self.column_type == ColumnType::Str {
-            let fallback_dict = Dictionary::empty();
             let term_dict = agg_with_accessor
                 .str_dict_column
                 .as_ref()
-                .map(|el| el.dictionary())
-                .unwrap_or_else(|| &fallback_dict);
-            let mut buffer = Vec::new();
-
-            // special case for missing key
-            if let Some(index) = entries.iter().position(|value| value.0 == u64::MAX) {
-                let entry = entries[index];
-                let intermediate_entry = into_intermediate_bucket_entry(entry.0, entry.1)?;
-                let missing_key = self
-                    .req
-                    .missing
-                    .as_ref()
-                    .expect("Found placeholder term_id but `missing` is None");
-                match missing_key {
-                    Key::Str(missing) => {
-                        buffer.clear();
-                        buffer.extend_from_slice(missing.as_bytes());
-                        dict.insert(
-                            IntermediateKey::Str(
-                                String::from_utf8(buffer.to_vec())
-                                    .expect("could not convert to String"),
-                            ),
-                            intermediate_entry,
-                        );
+                .cloned()
+                .unwrap_or_else(|| {
+                    StrColumn::wrap(BytesColumn::empty(agg_with_accessor.accessor.num_docs()))
+                });
+            let mut buffer = String::new();
+            for (term_id, doc_count) in entries {
+                let intermediate_entry = into_intermediate_bucket_entry(term_id, doc_count)?;
+                // Special case for missing key
+                if term_id == u64::MAX {
+                    let missing_key = self
+                        .req
+                        .missing
+                        .as_ref()
+                        .expect("Found placeholder term_id but `missing` is None");
+                    match missing_key {
+                        Key::Str(missing) => {
+                            buffer.clear();
+                            buffer.push_str(missing);
+                            dict.insert(
+                                IntermediateKey::Str(buffer.to_string()),
+                                intermediate_entry,
+                            );
+                        }
+                        Key::F64(val) => {
+                            buffer.push_str(&val.to_string());
+                            dict.insert(IntermediateKey::F64(*val), intermediate_entry);
+                        }
                     }
-                    Key::F64(val) => {
-                        dict.insert(IntermediateKey::F64(*val), intermediate_entry);
+                } else {
+                    if !term_dict.ord_to_str(term_id, &mut buffer)? {
+                        return Err(TantivyError::InternalError(format!(
+                            "Couldn't find term_id {term_id} in dict"
+                        )));
                     }
-                    Key::U64(val) => {
-                        dict.insert(IntermediateKey::U64(*val), intermediate_entry);
-                    }
-                    Key::I64(val) => {
-                        dict.insert(IntermediateKey::I64(*val), intermediate_entry);
-                    }
+                    dict.insert(IntermediateKey::Str(buffer.to_string()), intermediate_entry);
                 }
-
-                entries.swap_remove(index);
             }
-
-            // Sort by term ord
-            entries.sort_unstable_by_key(|bucket| bucket.0);
-            let mut idx = 0;
-            term_dict.sorted_ords_to_term_cb(
-                entries.iter().map(|(term_id, _)| *term_id),
-                |term| {
-                    let entry = entries[idx];
-                    let intermediate_entry = into_intermediate_bucket_entry(entry.0, entry.1)
-                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-                    dict.insert(
-                        IntermediateKey::Str(
-                            String::from_utf8(term.to_vec()).expect("could not convert to String"),
-                        ),
-                        intermediate_entry,
-                    );
-                    idx += 1;
-                    Ok(())
-                },
-            )?;
-
             if self.req.min_doc_count == 0 {
                 // TODO: Handle rev streaming for descending sorting by keys
-                let mut stream = term_dict.stream()?;
+                let mut stream = term_dict.dictionary().stream()?;
                 let empty_sub_aggregation = IntermediateAggregationResults::empty_from_req(
                     agg_with_accessor.agg.sub_aggregation(),
                 );
@@ -591,26 +566,8 @@ impl SegmentTermCollector {
         } else {
             for (val, doc_count) in entries {
                 let intermediate_entry = into_intermediate_bucket_entry(val, doc_count)?;
-                if self.column_type == ColumnType::U64 {
-                    dict.insert(IntermediateKey::U64(val), intermediate_entry);
-                } else if self.column_type == ColumnType::I64 {
-                    dict.insert(IntermediateKey::I64(i64::from_u64(val)), intermediate_entry);
-                } else {
-                    let val = f64::from_u64(val);
-                    let val: NumericalValue = val.into();
-
-                    match val.normalize() {
-                        NumericalValue::U64(val) => {
-                            dict.insert(IntermediateKey::U64(val), intermediate_entry);
-                        }
-                        NumericalValue::I64(val) => {
-                            dict.insert(IntermediateKey::I64(val), intermediate_entry);
-                        }
-                        NumericalValue::F64(val) => {
-                            dict.insert(IntermediateKey::F64(val), intermediate_entry);
-                        }
-                    }
-                };
+                let val = f64_from_fastfield_u64(val, &self.column_type);
+                dict.insert(IntermediateKey::F64(val), intermediate_entry);
             }
         };
 
@@ -1739,54 +1696,6 @@ mod tests {
         assert_eq!(res["my_ids"]["buckets"][0]["key"], 1337.0);
         assert_eq!(res["my_ids"]["buckets"][0]["doc_count"], 2);
         assert_eq!(res["my_ids"]["buckets"][1]["key"], 1.0);
-        assert_eq!(res["my_ids"]["buckets"][1]["doc_count"], 1);
-        assert_eq!(res["my_ids"]["buckets"][2]["key"], serde_json::Value::Null);
-
-        Ok(())
-    }
-
-    #[test]
-    fn terms_aggregation_u64_value() -> crate::Result<()> {
-        // Make sure that large u64 are not truncated
-        let mut schema_builder = Schema::builder();
-        let id_field = schema_builder.add_u64_field("id", FAST);
-        let index = Index::create_in_ram(schema_builder.build());
-        {
-            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
-            index_writer.set_merge_policy(Box::new(NoMergePolicy));
-            index_writer.add_document(doc!(
-                id_field => 9_223_372_036_854_775_807u64,
-            ))?;
-            index_writer.add_document(doc!(
-                id_field => 1_769_070_189_829_214_202u64,
-            ))?;
-            index_writer.add_document(doc!(
-                id_field => 1_769_070_189_829_214_202u64,
-            ))?;
-            index_writer.commit()?;
-        }
-
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_ids": {
-                "terms": {
-                    "field": "id"
-                },
-            }
-        }))
-        .unwrap();
-
-        let res = exec_request_with_query(agg_req, &index, None)?;
-
-        // id field
-        assert_eq!(
-            res["my_ids"]["buckets"][0]["key"],
-            1_769_070_189_829_214_202u64
-        );
-        assert_eq!(res["my_ids"]["buckets"][0]["doc_count"], 2);
-        assert_eq!(
-            res["my_ids"]["buckets"][1]["key"],
-            9_223_372_036_854_775_807u64
-        );
         assert_eq!(res["my_ids"]["buckets"][1]["doc_count"], 1);
         assert_eq!(res["my_ids"]["buckets"][2]["key"], serde_json::Value::Null);
 

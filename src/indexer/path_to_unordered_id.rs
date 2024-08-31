@@ -38,8 +38,7 @@ impl PathToUnorderedId {
     #[cold]
     fn insert_new_path(&mut self, path: &str) -> u32 {
         let next_id = self.map.len() as u32;
-        let new_path = path.to_string();
-        self.map.insert(new_path, next_id);
+        self.map.insert(path.to_string(), next_id);
         next_id
     }
 
