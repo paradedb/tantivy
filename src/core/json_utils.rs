@@ -1,12 +1,10 @@
-use columnar::MonotonicallyMappableToU64;
+use common::json_path_writer::{JSON_END_OF_PATH, JSON_PATH_SEGMENT_SEP};
 use common::{replace_in_place, JsonPathWriter};
 use rustc_hash::FxHashMap;
 
-use crate::fastfield::FastValue;
 use crate::postings::{IndexingContext, IndexingPosition, PostingsWriter};
 use crate::schema::document::{ReferenceValue, ReferenceValueLeaf, Value};
-use crate::schema::term::JSON_PATH_SEGMENT_SEP;
-use crate::schema::{Field, Type, DATE_TIME_PRECISION_INDEXED};
+use crate::schema::{Type, DATE_TIME_PRECISION_INDEXED};
 use crate::time::format_description::well_known::Rfc3339;
 use crate::time::{OffsetDateTime, UtcOffset};
 use crate::tokenizer::TextAnalyzer;
@@ -33,7 +31,7 @@ use crate::{DateTime, DocId, Term};
 /// position 1.
 /// As a result, with lemmatization, "The Smiths" will match our object.
 ///
-/// Worse, if a same term is appears in the second object, a non increasing value would be pushed
+/// Worse, if a same term appears in the second object, a non increasing value would be pushed
 /// to the position recorder probably provoking a panic.
 ///
 /// This problem is solved for regular multivalued object by offsetting the position
@@ -52,13 +50,16 @@ use crate::{DateTime, DocId, Term};
 /// We can therefore afford working with a map that is not imperfect. It is fine if several
 /// path map to the same index position as long as the probability is relatively low.
 #[derive(Default)]
-struct IndexingPositionsPerPath {
+pub(crate) struct IndexingPositionsPerPath {
     positions_per_path: FxHashMap<u32, IndexingPosition>,
 }
 
 impl IndexingPositionsPerPath {
     fn get_position_from_id(&mut self, id: u32) -> &mut IndexingPosition {
         self.positions_per_path.entry(id).or_default()
+    }
+    pub fn clear(&mut self) {
+        self.positions_per_path.clear();
     }
 }
 
@@ -68,36 +69,6 @@ pub fn json_path_sep_to_dot(path: &mut str) {
     unsafe {
         replace_in_place(JSON_PATH_SEGMENT_SEP, b'.', path.as_bytes_mut());
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn index_json_values<'a, V: Value<'a>>(
-    doc: DocId,
-    json_visitors: impl Iterator<Item = crate::Result<V::ObjectIter>>,
-    text_analyzer: &mut TextAnalyzer,
-    expand_dots_enabled: bool,
-    term_buffer: &mut Term,
-    postings_writer: &mut dyn PostingsWriter,
-    json_path_writer: &mut JsonPathWriter,
-    ctx: &mut IndexingContext,
-) -> crate::Result<()> {
-    json_path_writer.clear();
-    json_path_writer.set_expand_dots(expand_dots_enabled);
-    let mut positions_per_path: IndexingPositionsPerPath = Default::default();
-    for json_visitor_res in json_visitors {
-        let json_visitor = json_visitor_res?;
-        index_json_object::<V>(
-            doc,
-            json_visitor,
-            text_analyzer,
-            term_buffer,
-            json_path_writer,
-            postings_writer,
-            ctx,
-            &mut positions_per_path,
-        );
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -112,6 +83,9 @@ fn index_json_object<'a, V: Value<'a>>(
     positions_per_path: &mut IndexingPositionsPerPath,
 ) {
     for (json_path_segment, json_value_visitor) in json_visitor {
+        if json_path_segment.as_bytes().contains(&JSON_END_OF_PATH) {
+            continue;
+        }
         json_path_writer.push(json_path_segment);
         index_json_value(
             doc,
@@ -128,7 +102,7 @@ fn index_json_object<'a, V: Value<'a>>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn index_json_value<'a, V: Value<'a>>(
+pub(crate) fn index_json_value<'a, V: Value<'a>>(
     doc: DocId,
     json_value: V,
     text_analyzer: &mut TextAnalyzer,
@@ -168,12 +142,18 @@ fn index_json_value<'a, V: Value<'a>>(
                 );
             }
             ReferenceValueLeaf::U64(val) => {
+                // try to parse to i64, since when querying we will apply the same logic and prefer
+                // i64 values
                 set_path_id(
                     term_buffer,
                     ctx.path_to_unordered_id
                         .get_or_allocate_unordered_id(json_path_writer.as_str()),
                 );
-                term_buffer.append_type_and_fast_value(val);
+                if let Ok(i64_val) = val.try_into() {
+                    term_buffer.append_type_and_fast_value::<i64>(i64_val);
+                } else {
+                    term_buffer.append_type_and_fast_value(val);
+                }
                 postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
             }
             ReferenceValueLeaf::I64(val) => {
@@ -209,6 +189,7 @@ fn index_json_value<'a, V: Value<'a>>(
                     ctx.path_to_unordered_id
                         .get_or_allocate_unordered_id(json_path_writer.as_str()),
                 );
+                let val = val.truncate(DATE_TIME_PRECISION_INDEXED);
                 term_buffer.append_type_and_fast_value(val);
                 postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
             }
@@ -256,70 +237,48 @@ fn index_json_value<'a, V: Value<'a>>(
     }
 }
 
-// Tries to infer a JSON type from a string.
-pub fn convert_to_fast_value_and_get_term(
-    json_term_writer: &mut JsonTermWriter,
+/// Tries to infer a JSON type from a string and append it to the term.
+///
+/// The term must be json + JSON path.
+pub fn convert_to_fast_value_and_append_to_json_term(
+    mut term: Term,
     phrase: &str,
+    truncate_date_for_search: bool,
 ) -> Option<Term> {
+    assert_eq!(
+        term.value()
+            .as_json_value_bytes()
+            .expect("expecting a Term with a json type and json path")
+            .as_serialized()
+            .len(),
+        0,
+        "JSON value bytes should be empty"
+    );
     if let Ok(dt) = OffsetDateTime::parse(phrase, &Rfc3339) {
-        let dt_utc = dt.to_offset(UtcOffset::UTC);
-        return Some(set_fastvalue_and_get_term(
-            json_term_writer,
-            DateTime::from_utc(dt_utc),
-        ));
+        let mut dt = DateTime::from_utc(dt.to_offset(UtcOffset::UTC));
+        if truncate_date_for_search {
+            dt = dt.truncate(DATE_TIME_PRECISION_INDEXED);
+        }
+        term.append_type_and_fast_value(dt);
+        return Some(term);
     }
     if let Ok(i64_val) = str::parse::<i64>(phrase) {
-        return Some(set_fastvalue_and_get_term(json_term_writer, i64_val));
+        term.append_type_and_fast_value(i64_val);
+        return Some(term);
     }
     if let Ok(u64_val) = str::parse::<u64>(phrase) {
-        return Some(set_fastvalue_and_get_term(json_term_writer, u64_val));
+        term.append_type_and_fast_value(u64_val);
+        return Some(term);
     }
     if let Ok(f64_val) = str::parse::<f64>(phrase) {
-        return Some(set_fastvalue_and_get_term(json_term_writer, f64_val));
+        term.append_type_and_fast_value(f64_val);
+        return Some(term);
     }
     if let Ok(bool_val) = str::parse::<bool>(phrase) {
-        return Some(set_fastvalue_and_get_term(json_term_writer, bool_val));
+        term.append_type_and_fast_value(bool_val);
+        return Some(term);
     }
     None
-}
-// helper function to generate a Term from a json fastvalue
-pub(crate) fn set_fastvalue_and_get_term<T: FastValue>(
-    json_term_writer: &mut JsonTermWriter,
-    value: T,
-) -> Term {
-    json_term_writer.set_fast_value(value);
-    json_term_writer.term().clone()
-}
-
-// helper function to generate a list of terms with their positions from a textual json value
-pub(crate) fn set_string_and_get_terms(
-    json_term_writer: &mut JsonTermWriter,
-    value: &str,
-    text_analyzer: &mut TextAnalyzer,
-) -> Vec<(usize, Term)> {
-    let mut positions_and_terms = Vec::<(usize, Term)>::new();
-    json_term_writer.close_path_and_set_type(Type::Str);
-    let term_num_bytes = json_term_writer.term_buffer.len_bytes();
-    let mut token_stream = text_analyzer.token_stream(value);
-    token_stream.process(&mut |token| {
-        json_term_writer
-            .term_buffer
-            .truncate_value_bytes(term_num_bytes);
-        json_term_writer
-            .term_buffer
-            .append_bytes(token.text.as_bytes());
-        positions_and_terms.push((token.position, json_term_writer.term().clone()));
-    });
-    positions_and_terms
-}
-
-/// Writes a value of a JSON field to a `Term`.
-/// The Term format is as follows:
-/// `[JSON_TYPE][JSON_PATH][JSON_END_OF_PATH][VALUE_BYTES]`
-pub struct JsonTermWriter<'a> {
-    term_buffer: &'a mut Term,
-    path_stack: Vec<usize>,
-    expand_dots_enabled: bool,
 }
 
 /// Splits a json path supplied to the query parser in such a way that
@@ -377,158 +336,48 @@ pub(crate) fn encode_column_name(
     path.into()
 }
 
-impl<'a> JsonTermWriter<'a> {
-    pub fn from_field_and_json_path(
-        field: Field,
-        json_path: &str,
-        expand_dots_enabled: bool,
-        term_buffer: &'a mut Term,
-    ) -> Self {
-        term_buffer.set_field_and_type(field, Type::Json);
-        let mut json_term_writer = Self::wrap(term_buffer, expand_dots_enabled);
-        for segment in split_json_path(json_path) {
-            json_term_writer.push_path_segment(&segment);
-        }
-        json_term_writer
-    }
-
-    pub fn wrap(term_buffer: &'a mut Term, expand_dots_enabled: bool) -> Self {
-        term_buffer.clear_with_type(Type::Json);
-        let mut path_stack = Vec::with_capacity(10);
-        path_stack.push(0);
-        Self {
-            term_buffer,
-            path_stack,
-            expand_dots_enabled,
-        }
-    }
-
-    fn trim_to_end_of_path(&mut self) {
-        let end_of_path = *self.path_stack.last().unwrap();
-        self.term_buffer.truncate_value_bytes(end_of_path);
-    }
-
-    pub fn close_path_and_set_type(&mut self, typ: Type) {
-        self.trim_to_end_of_path();
-        self.term_buffer.set_json_path_end();
-        self.term_buffer.append_bytes(&[typ.to_code()]);
-    }
-
-    // TODO: Remove this function and use JsonPathWriter instead.
-    pub fn push_path_segment(&mut self, segment: &str) {
-        // the path stack should never be empty.
-        self.trim_to_end_of_path();
-
-        if self.path_stack.len() > 1 {
-            self.term_buffer.set_json_path_separator();
-        }
-        let appended_segment = self.term_buffer.append_bytes(segment.as_bytes());
-        if self.expand_dots_enabled {
-            // We need to replace `.` by JSON_PATH_SEGMENT_SEP.
-            replace_in_place(b'.', JSON_PATH_SEGMENT_SEP, appended_segment);
-        }
-        self.term_buffer.add_json_path_separator();
-        self.path_stack.push(self.term_buffer.len_bytes());
-    }
-
-    pub fn pop_path_segment(&mut self) {
-        self.path_stack.pop();
-        assert!(!self.path_stack.is_empty());
-        self.trim_to_end_of_path();
-    }
-
-    /// Returns the json path of the term being currently built.
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> &[u8] {
-        let end_of_path = self.path_stack.last().cloned().unwrap_or(1);
-        &self.term().serialized_value_bytes()[..end_of_path - 1]
-    }
-
-    pub(crate) fn set_fast_value<T: FastValue>(&mut self, val: T) {
-        self.close_path_and_set_type(T::to_type());
-        let value = if T::to_type() == Type::Date {
-            DateTime::from_u64(val.to_u64())
-                .truncate(DATE_TIME_PRECISION_INDEXED)
-                .to_u64()
-        } else {
-            val.to_u64()
-        };
-        self.term_buffer
-            .append_bytes(value.to_be_bytes().as_slice());
-    }
-
-    pub fn set_str(&mut self, text: &str) {
-        self.close_path_and_set_type(Type::Str);
-        self.term_buffer.append_bytes(text.as_bytes());
-    }
-
-    pub fn term(&self) -> &Term {
-        self.term_buffer
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{split_json_path, JsonTermWriter};
-    use crate::schema::{Field, Type};
+    use super::split_json_path;
+    use crate::schema::Field;
     use crate::Term;
 
     #[test]
     fn test_json_writer() {
         let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("attributes");
-        json_writer.push_path_segment("color");
-        json_writer.set_str("red");
+
+        let mut term = Term::from_field_json_path(field, "attributes.color", false);
+        term.append_type_and_str("red");
         assert_eq!(
-            format!("{:?}", json_writer.term()),
+            format!("{term:?}"),
             "Term(field=1, type=Json, path=attributes.color, type=Str, \"red\")"
         );
-        json_writer.set_str("blue");
+
+        let mut term = Term::from_field_json_path(field, "attributes.dimensions.width", false);
+        term.append_type_and_fast_value(400i64);
         assert_eq!(
-            format!("{:?}", json_writer.term()),
-            "Term(field=1, type=Json, path=attributes.color, type=Str, \"blue\")"
-        );
-        json_writer.pop_path_segment();
-        json_writer.push_path_segment("dimensions");
-        json_writer.push_path_segment("width");
-        json_writer.set_fast_value(400i64);
-        assert_eq!(
-            format!("{:?}", json_writer.term()),
+            format!("{term:?}"),
             "Term(field=1, type=Json, path=attributes.dimensions.width, type=I64, 400)"
-        );
-        json_writer.pop_path_segment();
-        json_writer.push_path_segment("height");
-        json_writer.set_fast_value(300i64);
-        assert_eq!(
-            format!("{:?}", json_writer.term()),
-            "Term(field=1, type=Json, path=attributes.dimensions.height, type=I64, 300)"
         );
     }
 
     #[test]
     fn test_string_term() {
         let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("color");
-        json_writer.set_str("red");
-        assert_eq!(
-            json_writer.term().serialized_term(),
-            b"\x00\x00\x00\x01jcolor\x00sred"
-        )
+        let mut term = Term::from_field_json_path(field, "color", false);
+        term.append_type_and_str("red");
+
+        assert_eq!(term.serialized_term(), b"\x00\x00\x00\x01jcolor\x00sred")
     }
 
     #[test]
     fn test_i64_term() {
         let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("color");
-        json_writer.set_fast_value(-4i64);
+        let mut term = Term::from_field_json_path(field, "color", false);
+        term.append_type_and_fast_value(-4i64);
+
         assert_eq!(
-            json_writer.term().serialized_term(),
+            term.serialized_term(),
             b"\x00\x00\x00\x01jcolor\x00i\x7f\xff\xff\xff\xff\xff\xff\xfc"
         )
     }
@@ -536,12 +385,11 @@ mod tests {
     #[test]
     fn test_u64_term() {
         let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("color");
-        json_writer.set_fast_value(4u64);
+        let mut term = Term::from_field_json_path(field, "color", false);
+        term.append_type_and_fast_value(4u64);
+
         assert_eq!(
-            json_writer.term().serialized_term(),
+            term.serialized_term(),
             b"\x00\x00\x00\x01jcolor\x00u\x00\x00\x00\x00\x00\x00\x00\x04"
         )
     }
@@ -549,12 +397,10 @@ mod tests {
     #[test]
     fn test_f64_term() {
         let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("color");
-        json_writer.set_fast_value(4.0f64);
+        let mut term = Term::from_field_json_path(field, "color", false);
+        term.append_type_and_fast_value(4.0f64);
         assert_eq!(
-            json_writer.term().serialized_term(),
+            term.serialized_term(),
             b"\x00\x00\x00\x01jcolor\x00f\xc0\x10\x00\x00\x00\x00\x00\x00"
         )
     }
@@ -562,88 +408,12 @@ mod tests {
     #[test]
     fn test_bool_term() {
         let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("color");
-        json_writer.set_fast_value(true);
+        let mut term = Term::from_field_json_path(field, "color", false);
+        term.append_type_and_fast_value(true);
         assert_eq!(
-            json_writer.term().serialized_term(),
+            term.serialized_term(),
             b"\x00\x00\x00\x01jcolor\x00o\x00\x00\x00\x00\x00\x00\x00\x01"
         )
-    }
-
-    #[test]
-    fn test_push_after_set_path_segment() {
-        let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("attribute");
-        json_writer.set_str("something");
-        json_writer.push_path_segment("color");
-        json_writer.set_str("red");
-        assert_eq!(
-            json_writer.term().serialized_term(),
-            b"\x00\x00\x00\x01jattribute\x01color\x00sred"
-        )
-    }
-
-    #[test]
-    fn test_pop_segment() {
-        let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("color");
-        json_writer.push_path_segment("hue");
-        json_writer.pop_path_segment();
-        json_writer.set_str("red");
-        assert_eq!(
-            json_writer.term().serialized_term(),
-            b"\x00\x00\x00\x01jcolor\x00sred"
-        )
-    }
-
-    #[test]
-    fn test_json_writer_path() {
-        let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("color");
-        assert_eq!(json_writer.path(), b"color");
-        json_writer.push_path_segment("hue");
-        assert_eq!(json_writer.path(), b"color\x01hue");
-        json_writer.set_str("pink");
-        assert_eq!(json_writer.path(), b"color\x01hue");
-    }
-
-    #[test]
-    fn test_json_path_expand_dots_disabled() {
-        let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, false);
-        json_writer.push_path_segment("color.hue");
-        assert_eq!(json_writer.path(), b"color.hue");
-    }
-
-    #[test]
-    fn test_json_path_expand_dots_enabled() {
-        let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, true);
-        json_writer.push_path_segment("color.hue");
-        assert_eq!(json_writer.path(), b"color\x01hue");
-    }
-
-    #[test]
-    fn test_json_path_expand_dots_enabled_pop_segment() {
-        let field = Field::from_field_id(1);
-        let mut term = Term::with_type_and_field(Type::Json, field);
-        let mut json_writer = JsonTermWriter::wrap(&mut term, true);
-        json_writer.push_path_segment("hello");
-        assert_eq!(json_writer.path(), b"hello");
-        json_writer.push_path_segment("color.hue");
-        assert_eq!(json_writer.path(), b"hello\x01color\x01hue");
-        json_writer.pop_path_segment();
-        assert_eq!(json_writer.path(), b"hello");
     }
 
     #[test]

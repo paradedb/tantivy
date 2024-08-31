@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::iter::once;
 
 use nom::branch::alt;
@@ -19,7 +20,7 @@ use crate::Occur;
 // Note: '-' char is only forbidden at the beginning of a field name, would be clearer to add it to
 // special characters.
 const SPECIAL_CHARS: &[char] = &[
-    '+', '^', '`', ':', '{', '}', '"', '[', ']', '(', ')', '!', '\\', '*', ' ',
+    '+', '^', '`', ':', '{', '}', '"', '\'', '[', ']', '(', ')', '!', '\\', '*', ' ',
 ];
 
 /// consume a field name followed by colon. Return the field name with escape sequence
@@ -41,36 +42,92 @@ fn field_name(inp: &str) -> IResult<&str, String> {
     )(inp)
 }
 
+const ESCAPE_IN_WORD: &[char] = &['^', '`', ':', '{', '}', '"', '\'', '[', ']', '(', ')', '\\'];
+
+fn interpret_escape(source: &str) -> String {
+    let mut res = String::with_capacity(source.len());
+    let mut in_escape = false;
+    let require_escape = |c: char| c.is_whitespace() || ESCAPE_IN_WORD.contains(&c) || c == '-';
+
+    for c in source.chars() {
+        if in_escape {
+            if !require_escape(c) {
+                // we re-add the escape sequence
+                res.push('\\');
+            }
+            res.push(c);
+            in_escape = false;
+        } else if c == '\\' {
+            in_escape = true;
+        } else {
+            res.push(c);
+        }
+    }
+    res
+}
+
 /// Consume a word outside of any context.
 // TODO should support escape sequences
-fn word(inp: &str) -> IResult<&str, &str> {
+fn word(inp: &str) -> IResult<&str, Cow<str>> {
     map_res(
         recognize(tuple((
-            satisfy(|c| {
-                !c.is_whitespace()
-                    && !['-', '^', '`', ':', '{', '}', '"', '[', ']', '(', ')'].contains(&c)
-            }),
-            many0(satisfy(|c: char| {
-                !c.is_whitespace() && ![':', '^', '{', '}', '"', '[', ']', '(', ')'].contains(&c)
-            })),
+            alt((
+                preceded(char('\\'), anychar),
+                satisfy(|c| !c.is_whitespace() && !ESCAPE_IN_WORD.contains(&c) && c != '-'),
+            )),
+            many0(alt((
+                preceded(char('\\'), anychar),
+                satisfy(|c: char| !c.is_whitespace() && !ESCAPE_IN_WORD.contains(&c)),
+            ))),
         ))),
         |s| match s {
             "OR" | "AND" | "NOT" | "IN" => Err(Error::new(inp, ErrorKind::Tag)),
-            _ => Ok(s),
+            s if s.contains('\\') => Ok(Cow::Owned(interpret_escape(s))),
+            s => Ok(Cow::Borrowed(s)),
         },
     )(inp)
 }
 
-fn word_infallible(delimiter: &str) -> impl Fn(&str) -> JResult<&str, Option<&str>> + '_ {
-    |inp| {
-        opt_i_err(
-            preceded(
-                multispace0,
-                recognize(many1(satisfy(|c| {
-                    !c.is_whitespace() && !delimiter.contains(c)
-                }))),
+fn word_infallible(
+    delimiter: &str,
+    emit_error: bool,
+) -> impl Fn(&str) -> JResult<&str, Option<Cow<str>>> + '_ {
+    // emit error is set when receiving an unescaped `:` should emit an error
+
+    move |inp| {
+        map(
+            opt_i_err(
+                preceded(
+                    multispace0,
+                    recognize(many1(alt((
+                        preceded(char::<&str, _>('\\'), anychar),
+                        satisfy(|c| !c.is_whitespace() && !delimiter.contains(c)),
+                    )))),
+                ),
+                "expected word",
             ),
-            "expected word",
+            |(opt_s, mut errors)| match opt_s {
+                Some(s) => {
+                    if emit_error
+                        && (s
+                            .as_bytes()
+                            .windows(2)
+                            .any(|window| window[0] != b'\\' && window[1] == b':')
+                            || s.starts_with(':'))
+                    {
+                        errors.push(LenientErrorInternal {
+                            pos: inp.len(),
+                            message: "parsed possible invalid field as term".to_string(),
+                        });
+                    }
+                    if s.contains('\\') {
+                        (Some(Cow::Owned(interpret_escape(s))), errors)
+                    } else {
+                        (Some(Cow::Borrowed(s)), errors)
+                    }
+                }
+                None => (None, errors),
+            },
         )(inp)
     }
 }
@@ -159,7 +216,7 @@ fn simple_term_infallible(
                 (value((), char('\'')), simple_quotes),
             ),
             // numbers are parsed with words in this case, as we allow string starting with a -
-            map(word_infallible(delimiter), |(text, errors)| {
+            map(word_infallible(delimiter, true), |(text, errors)| {
                 (text.map(|text| (Delimiter::None, text.to_string())), errors)
             }),
         )(inp)
@@ -218,27 +275,14 @@ fn term_or_phrase_infallible(inp: &str) -> JResult<&str, Option<UserInputLeaf>> 
 }
 
 fn term_group(inp: &str) -> IResult<&str, UserInputAst> {
-    let occur_symbol = alt((
-        value(Occur::MustNot, char('-')),
-        value(Occur::Must, char('+')),
-    ));
-
     map(
         tuple((
             terminated(field_name, multispace0),
-            delimited(
-                tuple((char('('), multispace0)),
-                separated_list0(multispace1, tuple((opt(occur_symbol), term_or_phrase))),
-                char(')'),
-            ),
+            delimited(tuple((char('('), multispace0)), ast, char(')')),
         )),
-        |(field_name, terms)| {
-            UserInputAst::Clause(
-                terms
-                    .into_iter()
-                    .map(|(occur, leaf)| (occur, leaf.set_field(Some(field_name.clone())).into()))
-                    .collect(),
-            )
+        |(field_name, mut ast)| {
+            ast.set_default_field(field_name);
+            ast
         },
     )(inp)
 }
@@ -258,46 +302,18 @@ fn term_group_precond(inp: &str) -> IResult<&str, (), ()> {
 }
 
 fn term_group_infallible(inp: &str) -> JResult<&str, UserInputAst> {
-    let (mut inp, (field_name, _, _, _)) =
+    let (inp, (field_name, _, _, _)) =
         tuple((field_name, multispace0, char('('), multispace0))(inp).expect("precondition failed");
 
-    let mut terms = Vec::new();
-    let mut errs = Vec::new();
-
-    let mut first_round = true;
-    loop {
-        let mut space_error = if first_round {
-            first_round = false;
-            Vec::new()
-        } else {
-            let (rest, (_, err)) = space1_infallible(inp)?;
-            inp = rest;
-            err
-        };
-        if inp.is_empty() {
-            errs.push(LenientErrorInternal {
-                pos: inp.len(),
-                message: "missing )".to_string(),
-            });
-            break Ok((inp, (UserInputAst::Clause(terms), errs)));
-        }
-        if let Some(inp) = inp.strip_prefix(')') {
-            break Ok((inp, (UserInputAst::Clause(terms), errs)));
-        }
-        // only append missing space error if we did not reach the end of group
-        errs.append(&mut space_error);
-
-        // here we do the assumption term_or_phrase_infallible always consume something if the
-        // first byte is not `)` or ' '. If it did not, we would end up looping.
-
-        let (rest, ((occur, leaf), mut err)) =
-            tuple_infallible((occur_symbol, term_or_phrase_infallible))(inp)?;
-        errs.append(&mut err);
-        if let Some(leaf) = leaf {
-            terms.push((occur, leaf.set_field(Some(field_name.clone())).into()));
-        }
-        inp = rest;
-    }
+    let res = delimited_infallible(
+        nothing,
+        map(ast_infallible, |(mut ast, errors)| {
+            ast.set_default_field(field_name.to_string());
+            (ast, errors)
+        }),
+        opt_i_err(char(')'), "expected ')'"),
+    )(inp);
+    res
 }
 
 fn exists(inp: &str) -> IResult<&str, UserInputLeaf> {
@@ -363,15 +379,6 @@ fn literal_no_group_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>>
         |((field_name, _, leaf), mut errors)| {
             (
                 leaf.map(|leaf| {
-                    if matches!(&leaf, UserInputLeaf::Literal(literal)
-                            if literal.phrase.contains(':') && literal.delimiter == Delimiter::None)
-                        && field_name.is_none()
-                    {
-                        errors.push(LenientErrorInternal {
-                            pos: inp.len(),
-                            message: "parsed possible invalid field as term".to_string(),
-                        });
-                    }
                     if matches!(&leaf, UserInputLeaf::Literal(literal)
                             if literal.phrase == "NOT" && literal.delimiter == Delimiter::None)
                         && field_name.is_none()
@@ -490,20 +497,20 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
         tuple_infallible((
             opt_i(anychar),
             space0_infallible,
-            word_infallible("]}"),
+            word_infallible("]}", false),
             space1_infallible,
             opt_i_err(
                 terminated(tag("TO"), alt((value((), multispace1), value((), eof)))),
                 "missing keyword TO",
             ),
-            word_infallible("]}"),
+            word_infallible("]}", false),
             opt_i_err(one_of("]}"), "missing range delimiter"),
         )),
         |(
             (lower_bound_kind, _multispace0, lower, _multispace1, to, upper, upper_bound_kind),
             errs,
         )| {
-            let lower_bound = match (lower_bound_kind, lower) {
+            let lower_bound = match (lower_bound_kind, lower.as_deref()) {
                 (_, Some("*")) => UserInputBound::Unbounded,
                 (_, None) => UserInputBound::Unbounded,
                 // if it is some, TO was actually the bound (i.e. [TO TO something])
@@ -512,7 +519,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 (Some('{'), Some(bound)) => UserInputBound::Exclusive(bound.to_string()),
                 _ => unreachable!("precondition failed, range did not start with [ or {{"),
             };
-            let upper_bound = match (upper_bound_kind, upper) {
+            let upper_bound = match (upper_bound_kind, upper.as_deref()) {
                 (_, Some("*")) => UserInputBound::Unbounded,
                 (_, None) => UserInputBound::Unbounded,
                 (Some(']'), Some(bound)) => UserInputBound::Inclusive(bound.to_string()),
@@ -529,7 +536,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
             (
                 (
                     value((), tag(">=")),
-                    map(word_infallible(""), |(bound, err)| {
+                    map(word_infallible("", false), |(bound, err)| {
                         (
                             (
                                 bound
@@ -543,7 +550,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag("<=")),
-                    map(word_infallible(""), |(bound, err)| {
+                    map(word_infallible("", false), |(bound, err)| {
                         (
                             (
                                 UserInputBound::Unbounded,
@@ -557,7 +564,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag(">")),
-                    map(word_infallible(""), |(bound, err)| {
+                    map(word_infallible("", false), |(bound, err)| {
                         (
                             (
                                 bound
@@ -571,7 +578,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag("<")),
-                    map(word_infallible(""), |(bound, err)| {
+                    map(word_infallible("", false), |(bound, err)| {
                         (
                             (
                                 UserInputBound::Unbounded,
@@ -1198,6 +1205,12 @@ mod test {
         test_parse_query_to_ast_helper("weight: <= 70", "\"weight\":{\"*\" TO \"70\"]");
 
         test_parse_query_to_ast_helper("weight: <= 70.5", "\"weight\":{\"*\" TO \"70.5\"]");
+
+        test_parse_query_to_ast_helper(">a", "{\"a\" TO \"*\"}");
+        test_parse_query_to_ast_helper(">=a", "[\"a\" TO \"*\"}");
+        test_parse_query_to_ast_helper("<a", "{\"*\" TO \"a\"}");
+        test_parse_query_to_ast_helper("<=a", "{\"*\" TO \"a\"]");
+        test_parse_query_to_ast_helper("<=bsd", "{\"*\" TO \"bsd\"]");
     }
 
     #[test]
@@ -1468,8 +1481,18 @@ mod test {
 
     #[test]
     fn test_parse_query_term_group() {
-        test_parse_query_to_ast_helper(r#"field:(abc)"#, r#"(*"field":abc)"#);
+        test_parse_query_to_ast_helper(r#"field:(abc)"#, r#""field":abc"#);
         test_parse_query_to_ast_helper(r#"field:(+a -"b c")"#, r#"(+"field":a -"field":"b c")"#);
+        test_parse_query_to_ast_helper(r#"field:(a AND "b c")"#, r#"(+"field":a +"field":"b c")"#);
+        test_parse_query_to_ast_helper(r#"field:(a OR "b c")"#, r#"(?"field":a ?"field":"b c")"#);
+        test_parse_query_to_ast_helper(
+            r#"field:(a OR (b AND c))"#,
+            r#"(?"field":a ?(+"field":b +"field":c))"#,
+        );
+        test_parse_query_to_ast_helper(
+            r#"field:(a [b TO c])"#,
+            r#"(*"field":a *"field":["b" TO "c"])"#,
+        );
 
         test_is_parse_err(r#"field:(+a -"b c""#, r#"(+"field":a -"field":"b c")"#);
     }
@@ -1621,5 +1644,21 @@ mod test {
             r#"myfield:'hello\"happy\'tax'"#,
             r#""myfield":'hello"happy'tax'"#,
         );
+        // we don't process escape sequence for chars which don't require it
+        test_parse_query_to_ast_helper(r#"abc\*"#, r#"abc\*"#);
+    }
+
+    #[test]
+    fn test_queries_with_colons() {
+        test_parse_query_to_ast_helper(r#""abc:def""#, r#""abc:def""#);
+        test_parse_query_to_ast_helper(r#"'abc:def'"#, r#"'abc:def'"#);
+        test_parse_query_to_ast_helper(r#"abc\:def"#, r#"abc:def"#);
+        test_parse_query_to_ast_helper(r#""abc\:def""#, r#""abc:def""#);
+        test_parse_query_to_ast_helper(r#"'abc\:def'"#, r#"'abc:def'"#);
+    }
+
+    #[test]
+    fn test_invalid_field() {
+        test_is_parse_err(r#"!bc:def"#, "!bc:def");
     }
 }

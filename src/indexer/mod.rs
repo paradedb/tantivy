@@ -13,10 +13,10 @@ mod flat_map_with_buffer;
 pub(crate) mod index_writer;
 pub(crate) mod index_writer_status;
 mod log_merge_policy;
+mod merge_index_test;
 mod merge_operation;
 pub(crate) mod merge_policy;
 pub(crate) mod merger;
-mod merger_sorted_index_test;
 pub(crate) mod operation;
 pub(crate) mod prepared_commit;
 mod segment_entry;
@@ -145,24 +145,44 @@ mod tests_mmap {
         }
     }
     #[test]
-    fn test_json_field_null_byte() {
-        // Test when field name contains a zero byte, which has special meaning in tantivy.
-        // As a workaround, we convert the zero byte to the ASCII character '0'.
-        // https://github.com/quickwit-oss/tantivy/issues/2340
-        // https://github.com/quickwit-oss/tantivy/issues/2193
-        let field_name_in = "\u{0000}";
-        let field_name_out = "0";
-        test_json_field_name(field_name_in, field_name_out);
+    fn test_json_field_null_byte_is_ignored() {
+        let mut schema_builder = Schema::builder();
+        let options = JsonObjectOptions::from(TEXT | FAST).set_expand_dots_enabled();
+        let field = schema_builder.add_json_field("json", options);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(doc!(field=>json!({"key": "test1", "invalidkey\u{0000}": "test2"})))
+            .unwrap();
+        index_writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let inv_indexer = segment_reader.inverted_index(field).unwrap();
+        let term_dict = inv_indexer.terms();
+        assert_eq!(term_dict.num_terms(), 1);
+        let mut term_bytes = Vec::new();
+        term_dict.ord_to_term(0, &mut term_bytes).unwrap();
+        assert_eq!(term_bytes, b"key\0stest1");
     }
+
     #[test]
     fn test_json_field_1byte() {
-        // Test when field name contains a 1 byte, which has special meaning in tantivy.
+        // Test when field name contains a '1' byte, which has special meaning in tantivy.
+        // The 1 byte can be addressed as '1' byte or '.'.
         let field_name_in = "\u{0001}";
         let field_name_out = "\u{0001}";
         test_json_field_name(field_name_in, field_name_out);
 
-        // Test when field name contains a 1 byte, which has special meaning in tantivy.
+        // Test when field name contains a '1' byte, which has special meaning in tantivy.
         let field_name_in = "\u{0001}";
+        let field_name_out = ".";
+        test_json_field_name(field_name_in, field_name_out);
+    }
+    #[test]
+    fn test_json_field_dot() {
+        // Test when field name contains a '.'
+        let field_name_in = ".";
         let field_name_out = ".";
         test_json_field_name(field_name_in, field_name_out);
     }
@@ -174,7 +194,7 @@ mod tests_mmap {
         let index = Index::create_in_ram(schema_builder.build());
         let mut index_writer = index.writer_for_tests().unwrap();
         index_writer
-            .add_document(doc!(field=>json!({format!("{field_name_in}"): "test1"})))
+            .add_document(doc!(field=>json!({format!("{field_name_in}"): "test1", format!("num{field_name_in}"): 10})))
             .unwrap();
         index_writer
             .add_document(doc!(field=>json!({format!("a{field_name_in}"): "test2"})))
@@ -205,10 +225,10 @@ mod tests_mmap {
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
         let parse_query = QueryParser::for_index(&index, Vec::new());
-        let test_query = |field_name: &str| {
-            let query = parse_query.parse_query(field_name).unwrap();
+        let test_query = |query_str: &str| {
+            let query = parse_query.parse_query(query_str).unwrap();
             let num_docs = searcher.search(&query, &Count).unwrap();
-            assert_eq!(num_docs, 1);
+            assert_eq!(num_docs, 1, "{query_str}");
         };
         test_query(format!("json.{field_name_out}:test1").as_str());
         test_query(format!("json.a{field_name_out}:test2").as_str());
@@ -252,6 +272,64 @@ mod tests_mmap {
             "test6",
         );
         test_agg(format!("json.{field_name_out}a").as_str(), "test7");
+
+        // `.` is stored as `\u{0001}` internally in tantivy
+        let field_name_out_internal = if field_name_out == "." {
+            "\u{0001}"
+        } else {
+            field_name_out
+        };
+
+        let mut fields = reader.searcher().segment_readers()[0]
+            .inverted_index(field)
+            .unwrap()
+            .list_encoded_fields()
+            .unwrap();
+        assert_eq!(fields.len(), 8);
+        fields.sort();
+        let mut expected_fields = vec![
+            (format!("a{field_name_out_internal}"), Type::Str),
+            (format!("a{field_name_out_internal}a"), Type::Str),
+            (
+                format!("a{field_name_out_internal}a{field_name_out_internal}"),
+                Type::Str,
+            ),
+            (
+                format!("a{field_name_out_internal}\u{1}ab{field_name_out_internal}"),
+                Type::Str,
+            ),
+            (
+                format!("a{field_name_out_internal}\u{1}a{field_name_out_internal}"),
+                Type::Str,
+            ),
+            (format!("{field_name_out_internal}a"), Type::Str),
+            (field_name_out_internal.to_string(), Type::Str),
+            (format!("num{field_name_out_internal}"), Type::I64),
+        ];
+        expected_fields.sort();
+        assert_eq!(fields, expected_fields);
+        // Check columnar reader
+        let mut columns = reader.searcher().segment_readers()[0]
+            .fast_fields()
+            .columnar()
+            .list_columns()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        let mut expected_columns = vec![
+            format!("json\u{1}{field_name_out_internal}"),
+            format!("json\u{1}{field_name_out_internal}a"),
+            format!("json\u{1}a{field_name_out_internal}"),
+            format!("json\u{1}a{field_name_out_internal}a"),
+            format!("json\u{1}a{field_name_out_internal}a{field_name_out_internal}"),
+            format!("json\u{1}a{field_name_out_internal}\u{1}ab{field_name_out_internal}"),
+            format!("json\u{1}a{field_name_out_internal}\u{1}a{field_name_out_internal}"),
+            format!("json\u{1}num{field_name_out_internal}"),
+        ];
+        columns.sort();
+        expected_columns.sort();
+        assert_eq!(columns, expected_columns);
     }
 
     #[test]
@@ -524,10 +602,10 @@ mod tests_mmap {
         let query_parser = QueryParser::for_index(&index, vec![]);
         // Test if field name can be queried
         for (indexed_field, val) in fields_and_vals.iter() {
-            let query_str = &format!("{}:{}", indexed_field, val);
+            let query_str = &format!("{indexed_field}:{val}");
             let query = query_parser.parse_query(query_str).unwrap();
             let count_docs = searcher.search(&*query, &TopDocs::with_limit(2)).unwrap();
-            assert!(!count_docs.is_empty(), "{}:{}", indexed_field, val);
+            assert!(!count_docs.is_empty(), "{indexed_field}:{val}");
         }
         // Test if field name can be used for aggregation
         for (field_name, val) in fields_and_vals.iter() {

@@ -1,14 +1,13 @@
 use std::io;
 
 use columnar::{ColumnarWriter, NumericalValue};
-use common::JsonPathWriter;
+use common::{DateTimePrecision, JsonPathWriter};
 use tokenizer_api::Token;
 
-use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::schema::document::{Document, ReferenceValue, ReferenceValueLeaf, Value};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema, Type};
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::{DateTimePrecision, DocId, TantivyError};
+use crate::{DocId, TantivyError};
 
 /// Only index JSON down to a depth of 20.
 /// This is mostly to guard us from a stack overflow triggered by malicious input.
@@ -106,16 +105,6 @@ impl FastFieldsWriter {
         self.columnar_writer.mem_usage()
     }
 
-    pub(crate) fn sort_order(
-        &self,
-        sort_field: &str,
-        num_docs: DocId,
-        reversed: bool,
-    ) -> Vec<DocId> {
-        self.columnar_writer
-            .sort_order(sort_field, num_docs, reversed)
-    }
-
     /// Indexes all of the fastfields of a new document.
     pub fn add_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
         let doc_id = self.num_docs;
@@ -183,8 +172,7 @@ impl FastFieldsWriter {
                         .record_datetime(doc_id, field_name, truncated_datetime);
                 }
                 ReferenceValueLeaf::Facet(val) => {
-                    self.columnar_writer
-                        .record_str(doc_id, field_name, val.encoded_str());
+                    self.columnar_writer.record_str(doc_id, field_name, val);
                 }
                 ReferenceValueLeaf::Bytes(val) => {
                     self.columnar_writer.record_bytes(doc_id, field_name, val);
@@ -234,16 +222,9 @@ impl FastFieldsWriter {
 
     /// Serializes all of the `FastFieldWriter`s by pushing them in
     /// order to the fast field serializer.
-    pub fn serialize(
-        mut self,
-        wrt: &mut dyn io::Write,
-        doc_id_map_opt: Option<&DocIdMapping>,
-    ) -> io::Result<()> {
+    pub fn serialize(mut self, wrt: &mut dyn io::Write) -> io::Result<()> {
         let num_docs = self.num_docs;
-        let old_to_new_row_ids =
-            doc_id_map_opt.map(|doc_id_mapping| doc_id_mapping.old_to_new_ids());
-        self.columnar_writer
-            .serialize(num_docs, old_to_new_row_ids, wrt)?;
+        self.columnar_writer.serialize(num_docs, wrt)?;
         Ok(())
     }
 }
@@ -393,7 +374,7 @@ mod tests {
         }
         let mut buffer = Vec::new();
         columnar_writer
-            .serialize(json_docs.len() as DocId, None, &mut buffer)
+            .serialize(json_docs.len() as DocId, &mut buffer)
             .unwrap();
         ColumnarReader::open(buffer).unwrap()
     }

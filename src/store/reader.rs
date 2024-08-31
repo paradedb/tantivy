@@ -14,10 +14,12 @@ use super::Decompressor;
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
-use crate::schema::document::{BinaryDocumentDeserializer, Document, DocumentDeserialize};
+use crate::schema::document::{BinaryDocumentDeserializer, DocumentDeserialize};
 use crate::space_usage::StoreSpaceUsage;
 use crate::store::index::Checkpoint;
 use crate::DocId;
+#[cfg(feature = "quickwit")]
+use crate::Executor;
 
 pub(crate) const DOCSTORE_CACHE_CAPACITY: usize = 100;
 
@@ -235,7 +237,7 @@ impl StoreReader {
     /// Iterator over all Documents in their order as they are stored in the doc store.
     /// Use this, if you want to extract all Documents from the doc store.
     /// The `alive_bitset` has to be forwarded from the `SegmentReader` or the results may be wrong.
-    pub fn iter<'a: 'b, 'b, D: Document + DocumentDeserialize>(
+    pub fn iter<'a: 'b, 'b, D: DocumentDeserialize>(
         &'b self,
         alive_bitset: Option<&'a AliveBitSet>,
     ) -> impl Iterator<Item = crate::Result<D>> + 'b {
@@ -341,7 +343,11 @@ impl StoreReader {
     /// In most cases use [`get_async`](Self::get_async)
     ///
     /// Loads and decompresses a block asynchronously.
-    async fn read_block_async(&self, checkpoint: &Checkpoint) -> io::Result<Block> {
+    async fn read_block_async(
+        &self,
+        checkpoint: &Checkpoint,
+        executor: &Executor,
+    ) -> io::Result<Block> {
         let cache_key = checkpoint.byte_range.start;
         if let Some(block) = self.cache.get_from_cache(checkpoint.byte_range.start) {
             return Ok(block);
@@ -353,8 +359,12 @@ impl StoreReader {
             .read_bytes_async()
             .await?;
 
-        let decompressed_block =
-            OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
+        let decompressor = self.decompressor;
+        let maybe_decompressed_block = executor
+            .spawn_blocking(move || decompressor.decompress(compressed_block.as_ref()))
+            .await
+            .expect("decompression panicked");
+        let decompressed_block = OwnedBytes::new(maybe_decompressed_block?);
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
@@ -363,15 +373,23 @@ impl StoreReader {
     }
 
     /// Reads raw bytes of a given document asynchronously.
-    pub async fn get_document_bytes_async(&self, doc_id: DocId) -> crate::Result<OwnedBytes> {
+    pub async fn get_document_bytes_async(
+        &self,
+        doc_id: DocId,
+        executor: &Executor,
+    ) -> crate::Result<OwnedBytes> {
         let checkpoint = self.block_checkpoint(doc_id)?;
-        let block = self.read_block_async(&checkpoint).await?;
+        let block = self.read_block_async(&checkpoint, executor).await?;
         Self::get_document_bytes_from_block(block, doc_id, &checkpoint)
     }
 
     /// Fetches a document asynchronously. Async version of [`get`](Self::get).
-    pub async fn get_async<D: DocumentDeserialize>(&self, doc_id: DocId) -> crate::Result<D> {
-        let mut doc_bytes = self.get_document_bytes_async(doc_id).await?;
+    pub async fn get_async<D: DocumentDeserialize>(
+        &self,
+        doc_id: DocId,
+        executor: &Executor,
+    ) -> crate::Result<D> {
+        let mut doc_bytes = self.get_document_bytes_async(doc_id, executor).await?;
 
         let deserializer = BinaryDocumentDeserializer::from_reader(&mut doc_bytes)
             .map_err(crate::TantivyError::from)?;
@@ -385,8 +403,7 @@ mod tests {
 
     use super::*;
     use crate::directory::RamDirectory;
-    use crate::schema::document::Value;
-    use crate::schema::{Field, TantivyDocument};
+    use crate::schema::{Field, TantivyDocument, Value};
     use crate::store::tests::write_lorem_ipsum_store;
     use crate::store::Compressor;
     use crate::Directory;
@@ -394,7 +411,7 @@ mod tests {
     const BLOCK_SIZE: usize = 16_384;
 
     fn get_text_field<'a>(doc: &'a TantivyDocument, field: &'a Field) -> Option<&'a str> {
-        doc.get_first(*field).and_then(|f| f.as_str())
+        doc.get_first(*field).and_then(|f| f.as_value().as_str())
     }
 
     #[test]

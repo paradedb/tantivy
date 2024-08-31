@@ -3,7 +3,6 @@ use std::net::Ipv6Addr;
 
 use common::DateTime;
 
-use crate::schema::Facet;
 use crate::tokenizer::PreTokenizedString;
 
 /// A single field value.
@@ -19,16 +18,7 @@ pub trait Value<'a>: Send + Sync + Debug {
     fn as_value(&self) -> ReferenceValue<'a, Self>;
 
     #[inline]
-    /// Returns if the value is `null` or not.
-    fn is_null(&self) -> bool {
-        matches!(
-            self.as_value(),
-            ReferenceValue::Leaf(ReferenceValueLeaf::Null)
-        )
-    }
-
-    #[inline]
-    /// If the Value is a String, returns the associated str. Returns None otherwise.
+    /// If the Value is a leaf, returns the associated leaf. Returns None otherwise.
     fn as_leaf(&self) -> Option<ReferenceValueLeaf<'a>> {
         if let ReferenceValue::Leaf(val) = self.as_value() {
             Some(val)
@@ -82,8 +72,9 @@ pub trait Value<'a>: Send + Sync + Debug {
     #[inline]
     /// If the Value is a pre-tokenized string, returns the associated string. Returns None
     /// otherwise.
-    fn as_pre_tokenized_text(&self) -> Option<&'a PreTokenizedString> {
-        self.as_leaf().and_then(|leaf| leaf.as_pre_tokenized_text())
+    fn as_pre_tokenized_text(&self) -> Option<Box<PreTokenizedString>> {
+        self.as_leaf()
+            .and_then(|leaf| leaf.into_pre_tokenized_text())
     }
 
     #[inline]
@@ -94,7 +85,7 @@ pub trait Value<'a>: Send + Sync + Debug {
 
     #[inline]
     /// If the Value is a facet, returns the associated facet. Returns None otherwise.
-    fn as_facet(&self) -> Option<&'a Facet> {
+    fn as_facet(&self) -> Option<&'a str> {
         self.as_leaf().and_then(|leaf| leaf.as_facet())
     }
 
@@ -117,22 +108,10 @@ pub trait Value<'a>: Send + Sync + Debug {
             None
         }
     }
-
-    #[inline]
-    /// Returns true if the Value is an array.
-    fn is_array(&self) -> bool {
-        matches!(self.as_value(), ReferenceValue::Object(_))
-    }
-
-    #[inline]
-    /// Returns true if the Value is an object.
-    fn is_object(&self) -> bool {
-        matches!(self.as_value(), ReferenceValue::Object(_))
-    }
 }
 
 /// A enum representing a leaf value for tantivy to index.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ReferenceValueLeaf<'a> {
     /// A null value.
     Null,
@@ -146,8 +125,9 @@ pub enum ReferenceValueLeaf<'a> {
     F64(f64),
     /// Date/time with nanoseconds precision
     Date(DateTime),
-    /// Facet
-    Facet(&'a Facet),
+    /// Facet string needs to match the format of
+    /// [Facet::encoded_str](crate::schema::Facet::encoded_str).
+    Facet(&'a str),
     /// Arbitrarily sized byte array
     Bytes(&'a [u8]),
     /// IpV6 Address. Internally there is no IpV4, it needs to be converted to `Ipv6Addr`.
@@ -155,7 +135,70 @@ pub enum ReferenceValueLeaf<'a> {
     /// Bool value
     Bool(bool),
     /// Pre-tokenized str type,
-    PreTokStr(&'a PreTokenizedString),
+    PreTokStr(Box<PreTokenizedString>),
+}
+
+impl From<u64> for ReferenceValueLeaf<'_> {
+    #[inline]
+    fn from(value: u64) -> Self {
+        ReferenceValueLeaf::U64(value)
+    }
+}
+
+impl From<i64> for ReferenceValueLeaf<'_> {
+    #[inline]
+    fn from(value: i64) -> Self {
+        ReferenceValueLeaf::I64(value)
+    }
+}
+
+impl From<f64> for ReferenceValueLeaf<'_> {
+    #[inline]
+    fn from(value: f64) -> Self {
+        ReferenceValueLeaf::F64(value)
+    }
+}
+
+impl From<bool> for ReferenceValueLeaf<'_> {
+    #[inline]
+    fn from(value: bool) -> Self {
+        ReferenceValueLeaf::Bool(value)
+    }
+}
+
+impl<'a> From<&'a str> for ReferenceValueLeaf<'a> {
+    #[inline]
+    fn from(value: &'a str) -> Self {
+        ReferenceValueLeaf::Str(value)
+    }
+}
+
+impl<'a> From<&'a [u8]> for ReferenceValueLeaf<'a> {
+    #[inline]
+    fn from(value: &'a [u8]) -> Self {
+        ReferenceValueLeaf::Bytes(value)
+    }
+}
+
+impl From<DateTime> for ReferenceValueLeaf<'_> {
+    #[inline]
+    fn from(value: DateTime) -> Self {
+        ReferenceValueLeaf::Date(value)
+    }
+}
+
+impl From<Ipv6Addr> for ReferenceValueLeaf<'_> {
+    #[inline]
+    fn from(value: Ipv6Addr) -> Self {
+        ReferenceValueLeaf::IpAddr(value)
+    }
+}
+
+impl From<PreTokenizedString> for ReferenceValueLeaf<'_> {
+    #[inline]
+    fn from(val: PreTokenizedString) -> Self {
+        ReferenceValueLeaf::PreTokStr(Box::new(val))
+    }
 }
 
 impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<'a, T> {
@@ -259,9 +302,9 @@ impl<'a> ReferenceValueLeaf<'a> {
     }
 
     #[inline]
-    /// If the Value is a pre-tokenized string, returns the associated string. Returns None
-    /// otherwise.
-    pub fn as_pre_tokenized_text(&self) -> Option<&'a PreTokenizedString> {
+    /// If the Value is a pre-tokenized string, consumes it and returns the string.
+    /// Returns None otherwise.
+    pub fn into_pre_tokenized_text(self) -> Option<Box<PreTokenizedString>> {
         if let Self::PreTokStr(val) = self {
             Some(val)
         } else {
@@ -281,7 +324,7 @@ impl<'a> ReferenceValueLeaf<'a> {
 
     #[inline]
     /// If the Value is a facet, returns the associated facet. Returns None otherwise.
-    pub fn as_facet(&self) -> Option<&'a Facet> {
+    pub fn as_facet(&self) -> Option<&'a str> {
         if let Self::Facet(val) = self {
             Some(val)
         } else {
@@ -315,6 +358,16 @@ where V: Value<'a>
     #[inline]
     /// If the Value is a leaf, returns the associated leaf. Returns None otherwise.
     pub fn as_leaf(&self) -> Option<&ReferenceValueLeaf<'a>> {
+        if let Self::Leaf(val) = self {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    /// If the Value is a leaf, consume it and return the leaf. Returns None otherwise.
+    pub fn into_leaf(self) -> Option<ReferenceValueLeaf<'a>> {
         if let Self::Leaf(val) = self {
             Some(val)
         } else {
@@ -365,10 +418,11 @@ where V: Value<'a>
     }
 
     #[inline]
-    /// If the Value is a pre-tokenized string, returns the associated string. Returns None
-    /// otherwise.
-    pub fn as_pre_tokenized_text(&self) -> Option<&'a PreTokenizedString> {
-        self.as_leaf().and_then(|leaf| leaf.as_pre_tokenized_text())
+    /// If the Value is a pre-tokenized string, consumes it and returns the string.
+    /// Returns None otherwise.
+    pub fn into_pre_tokenized_text(self) -> Option<Box<PreTokenizedString>> {
+        self.into_leaf()
+            .and_then(|leaf| leaf.into_pre_tokenized_text())
     }
 
     #[inline]
@@ -379,7 +433,7 @@ where V: Value<'a>
 
     #[inline]
     /// If the Value is a facet, returns the associated facet. Returns None otherwise.
-    pub fn as_facet(&self) -> Option<&'a Facet> {
+    pub fn as_facet(&self) -> Option<&'a str> {
         self.as_leaf().and_then(|leaf| leaf.as_facet())
     }
 

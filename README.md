@@ -18,7 +18,7 @@ Tantivy is, in fact, strongly inspired by Lucene's design.
 
 ## Benchmark
 
-The following [benchmark](https://tantivy-search.github.io/bench/) breakdowns
+The following [benchmark](https://tantivy-search.github.io/bench/) breaks down the
 performance for different types of queries/collections.
 
 Your mileage WILL vary depending on the nature of queries and their load.
@@ -101,7 +101,8 @@ cargo test
 ## Companies Using Tantivy
 
 <p align="left">
-<img align="center" src="doc/assets/images/etsy.png" alt="Etsy" height="25" width="auto" />&nbsp;
+<img align="center" src="doc/assets/images/etsy.png" alt="Etsy" height="25" width="auto" /> &nbsp;
+<img align="center" src="doc/assets/images/paradedb.png" alt="ParadeDB" height="25" width="auto" /> &nbsp;
 <img align="center" src="doc/assets/images/Nuclia.png#gh-light-mode-only" alt="Nuclia" height="25" width="auto" /> &nbsp;
 <img align="center" src="doc/assets/images/humanfirst.png#gh-light-mode-only" alt="Humanfirst.ai" height="30" width="auto" />
 <img align="center" src="doc/assets/images/element.io.svg#gh-light-mode-only" alt="Element.io" height="25" width="auto" />

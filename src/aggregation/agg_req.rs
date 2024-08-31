@@ -34,8 +34,9 @@ use super::bucket::{
     DateHistogramAggregationReq, HistogramAggregation, RangeAggregation, TermsAggregation,
 };
 use super::metric::{
-    AverageAggregation, CountAggregation, MaxAggregation, MinAggregation,
-    PercentilesAggregationReq, StatsAggregation, SumAggregation, TopHitsAggregation,
+    AverageAggregation, CardinalityAggregationReq, CountAggregation, ExtendedStatsAggregation,
+    MaxAggregation, MinAggregation, PercentilesAggregationReq, StatsAggregation, SumAggregation,
+    TopHitsAggregationReq,
 };
 
 /// The top-level aggregation request structure, which contains [`Aggregation`] and their user
@@ -146,6 +147,11 @@ pub enum AggregationVariants {
     /// extracted values.
     #[serde(rename = "stats")]
     Stats(StatsAggregation),
+    /// Computes a collection of estended statistics (`min`, `max`, `sum`, `count`, `avg`,
+    /// `sum_of_squares`, `variance`, `variance_sampling`, `std_deviation`,
+    /// `std_deviation_sampling`) over the  extracted values.
+    #[serde(rename = "extended_stats")]
+    ExtendedStats(ExtendedStatsAggregation),
     /// Computes the sum of the extracted values.
     #[serde(rename = "sum")]
     Sum(SumAggregation),
@@ -154,7 +160,10 @@ pub enum AggregationVariants {
     Percentiles(PercentilesAggregationReq),
     /// Finds the top k values matching some order
     #[serde(rename = "top_hits")]
-    TopHits(TopHitsAggregation),
+    TopHits(TopHitsAggregationReq),
+    /// Computes an estimate of the number of unique values
+    #[serde(rename = "cardinality")]
+    Cardinality(CardinalityAggregationReq),
 }
 
 impl AggregationVariants {
@@ -170,9 +179,11 @@ impl AggregationVariants {
             AggregationVariants::Max(max) => vec![max.field_name()],
             AggregationVariants::Min(min) => vec![min.field_name()],
             AggregationVariants::Stats(stats) => vec![stats.field_name()],
+            AggregationVariants::ExtendedStats(extended_stats) => vec![extended_stats.field_name()],
             AggregationVariants::Sum(sum) => vec![sum.field_name()],
             AggregationVariants::Percentiles(per) => vec![per.field_name()],
             AggregationVariants::TopHits(top_hits) => top_hits.field_names(),
+            AggregationVariants::Cardinality(per) => vec![per.field_name()],
         }
     }
 
@@ -194,6 +205,12 @@ impl AggregationVariants {
     pub(crate) fn as_term(&self) -> Option<&TermsAggregation> {
         match &self {
             AggregationVariants::Terms(terms) => Some(terms),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_top_hits(&self) -> Option<&TopHitsAggregationReq> {
+        match &self {
+            AggregationVariants::TopHits(top_hits) => Some(top_hits),
             _ => None,
         }
     }

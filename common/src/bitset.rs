@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::{fmt, io, u64};
+use std::{fmt, io};
 
 use ownedbytes::OwnedBytes;
 
@@ -694,45 +694,5 @@ mod tests {
         for el in 0u32..1000u32 {
             assert!(!bitset.contains(el));
         }
-    }
-}
-
-#[cfg(all(test, feature = "unstable"))]
-mod bench {
-
-    use test;
-
-    use super::{BitSet, TinySet};
-
-    #[bench]
-    fn bench_tinyset_pop(b: &mut test::Bencher) {
-        b.iter(|| {
-            let mut tinyset = TinySet::singleton(test::black_box(31u32));
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-        });
-    }
-
-    #[bench]
-    fn bench_tinyset_sum(b: &mut test::Bencher) {
-        let tiny_set = TinySet::empty().insert(10u32).insert(14u32).insert(21u32);
-        b.iter(|| {
-            assert_eq!(test::black_box(tiny_set).into_iter().sum::<u32>(), 45u32);
-        });
-    }
-
-    #[bench]
-    fn bench_tinyarr_sum(b: &mut test::Bencher) {
-        let v = [10u32, 14u32, 21u32];
-        b.iter(|| test::black_box(v).iter().cloned().sum::<u32>());
-    }
-
-    #[bench]
-    fn bench_bitset_initialize(b: &mut test::Bencher) {
-        b.iter(|| BitSet::with_max_value(1_000_000));
     }
 }

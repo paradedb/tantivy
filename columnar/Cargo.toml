@@ -9,7 +9,7 @@ description = "column oriented storage for tantivy"
 categories = ["database-implementations", "data-structures", "compression"]
 
 [dependencies]
-itertools = "0.12.0"
+itertools = "0.13.0"
 fastdivide = "0.4.0"
 
 stacker = { version= "0.3", path = "../stacker", package="tantivy-stacker"}
@@ -23,6 +23,16 @@ downcast-rs = "1.2.0"
 proptest = "1"
 more-asserts = "0.3.1"
 rand = "0.8"
+binggan = "0.8.1"
+
+[[bench]]
+name = "bench_merge"
+harness = false
+
+[[bench]]
+name = "bench_access"
+harness = false
+
 
 [features]
 unstable = []

@@ -3,7 +3,7 @@ use std::fmt;
 #[cfg(feature = "mmap")]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::thread::available_parallelism;
 
 use super::segment::Segment;
 use super::segment_reader::merge_field_meta_data;
@@ -232,23 +232,7 @@ impl IndexBuilder {
     }
 
     fn validate(&self) -> crate::Result<()> {
-        if let Some(schema) = self.schema.as_ref() {
-            if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref() {
-                let schema_field = schema.get_field(&sort_by_field.field).map_err(|_| {
-                    TantivyError::InvalidArgument(format!(
-                        "Field to sort index {} not found in schema",
-                        sort_by_field.field
-                    ))
-                })?;
-                let entry = schema.get_field_entry(schema_field);
-                if !entry.is_fast() {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "Field {} is no fast field. Field needs to be a single value fast field \
-                         to be used to sort an index",
-                        sort_by_field.field
-                    )));
-                }
-            }
+        if let Some(_schema) = self.schema.as_ref() {
             Ok(())
         } else {
             Err(TantivyError::InvalidArgument(
@@ -284,7 +268,7 @@ pub struct Index {
     directory: ManagedDirectory,
     schema: Schema,
     settings: IndexSettings,
-    executor: Arc<Executor>,
+    executor: Executor,
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
@@ -309,29 +293,25 @@ impl Index {
     ///
     /// By default the executor is single thread, and simply runs in the calling thread.
     pub fn search_executor(&self) -> &Executor {
-        self.executor.as_ref()
+        &self.executor
     }
 
     /// Replace the default single thread search executor pool
     /// by a thread pool with a given number of threads.
     pub fn set_multithread_executor(&mut self, num_threads: usize) -> crate::Result<()> {
-        self.executor = Arc::new(Executor::multi_thread(num_threads, "tantivy-search-")?);
+        self.executor = Executor::multi_thread(num_threads, "tantivy-search-")?;
         Ok(())
     }
 
     /// Custom thread pool by a outer thread pool.
-    pub fn set_shared_multithread_executor(
-        &mut self,
-        shared_thread_pool: Arc<Executor>,
-    ) -> crate::Result<()> {
-        self.executor = shared_thread_pool.clone();
-        Ok(())
+    pub fn set_executor(&mut self, executor: Executor) {
+        self.executor = executor;
     }
 
     /// Replace the default single thread search executor pool
     /// by a thread pool with as many threads as there are CPUs on the system.
     pub fn set_default_multithread_executor(&mut self) -> crate::Result<()> {
-        let default_num_threads = num_cpus::get();
+        let default_num_threads = available_parallelism()?.get();
         self.set_multithread_executor(default_num_threads)
     }
 
@@ -409,7 +389,7 @@ impl Index {
             schema,
             tokenizers: TokenizerManager::default(),
             fast_field_tokenizers: TokenizerManager::default(),
-            executor: Arc::new(Executor::single_thread()),
+            executor: Executor::single_thread(),
             inventory,
         }
     }
@@ -612,7 +592,7 @@ impl Index {
         &self,
         memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter<D>> {
-        let mut num_threads = std::cmp::min(num_cpus::get(), MAX_NUM_THREAD);
+        let mut num_threads = std::cmp::min(available_parallelism()?.get(), MAX_NUM_THREAD);
         let memory_budget_num_bytes_per_thread = memory_budget_in_bytes / num_threads;
         if memory_budget_num_bytes_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
             num_threads = (memory_budget_in_bytes / MEMORY_BUDGET_NUM_BYTES_MIN).max(1);

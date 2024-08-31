@@ -1,13 +1,13 @@
 use std::io;
 
+use common::json_path_writer::JSON_END_OF_PATH;
 use stacker::Addr;
 
-use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::indexer::path_to_unordered_id::OrderedPathId;
 use crate::postings::postings_writer::SpecializedPostingsWriter;
 use crate::postings::recorder::{BufferLender, DocIdRecorder, Recorder};
 use crate::postings::{FieldSerializer, IndexingContext, IndexingPosition, PostingsWriter};
-use crate::schema::{Field, Type, JSON_END_OF_PATH};
+use crate::schema::{Field, Type};
 use crate::tokenizer::TokenStream;
 use crate::{DocId, Term};
 
@@ -59,9 +59,8 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
     /// The actual serialization format is handled by the `PostingsSerializer`.
     fn serialize(
         &self,
-        term_addrs: &[(Field, OrderedPathId, &[u8], Addr)],
+        ordered_term_addrs: &[(Field, OrderedPathId, &[u8], Addr)],
         ordered_id_to_path: &[&str],
-        doc_id_map: Option<&DocIdMapping>,
         ctx: &IndexingContext,
         serializer: &mut FieldSerializer,
     ) -> io::Result<()> {
@@ -70,7 +69,7 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
         term_buffer.clear_with_field_and_type(Type::Json, Field::from_field_id(0));
         let mut prev_term_id = u32::MAX;
         let mut term_path_len = 0; // this will be set in the first iteration
-        for (_field, path_id, term, addr) in term_addrs {
+        for (_field, path_id, term, addr) in ordered_term_addrs {
             if prev_term_id != path_id.path_id() {
                 term_buffer.truncate_value_bytes(0);
                 term_buffer.append_path(ordered_id_to_path[path_id.path_id() as usize].as_bytes());
@@ -86,7 +85,6 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
                     SpecializedPostingsWriter::<Rec>::serialize_one_term(
                         term_buffer.serialized_value_bytes(),
                         *addr,
-                        doc_id_map,
                         &mut buffer_lender,
                         ctx,
                         serializer,
@@ -95,7 +93,6 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
                     SpecializedPostingsWriter::<DocIdRecorder>::serialize_one_term(
                         term_buffer.serialized_value_bytes(),
                         *addr,
-                        doc_id_map,
                         &mut buffer_lender,
                         ctx,
                         serializer,

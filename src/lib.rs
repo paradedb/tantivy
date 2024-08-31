@@ -216,28 +216,17 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 pub use self::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
-#[deprecated(
-    since = "0.22.0",
-    note = "Will be removed in tantivy 0.23. Use export from snippet module instead"
-)]
-pub use self::snippet::{Snippet, SnippetGenerator};
 #[doc(hidden)]
 pub use crate::core::json_utils;
 pub use crate::core::{Executor, Searcher, SearcherGeneration};
 pub use crate::directory::Directory;
 #[allow(deprecated)] // Remove with index sorting
 pub use crate::index::{
-    Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
-    Segment, SegmentComponent, SegmentId, SegmentMeta, SegmentReader,
+    Index, IndexBuilder, IndexMeta, IndexSettings, InvertedIndexReader, Order, Segment,
+    SegmentMeta, SegmentReader,
 };
-#[deprecated(
-    since = "0.22.0",
-    note = "Will be removed in tantivy 0.23. Use export from indexer module instead"
-)]
-pub use crate::indexer::PreparedCommit;
 pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
-pub use crate::postings::Postings;
-pub use crate::schema::{DateOptions, DateTimePrecision, Document, TantivyDocument, Term};
+pub use crate::schema::{Document, TantivyDocument, Term};
 
 /// Index format version.
 const INDEX_FORMAT_VERSION: u32 = 6;
@@ -255,7 +244,7 @@ pub struct Version {
 
 impl fmt::Debug for Version {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.to_string())
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -266,9 +255,10 @@ static VERSION: Lazy<Version> = Lazy::new(|| Version {
     index_format_version: INDEX_FORMAT_VERSION,
 });
 
-impl ToString for Version {
-    fn to_string(&self) -> String {
-        format!(
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
             "tantivy v{}.{}.{}, index_format v{}",
             self.major, self.minor, self.patch, self.index_format_version
         )
@@ -391,9 +381,10 @@ pub mod tests {
     use crate::docset::{DocSet, TERMINATED};
     use crate::index::SegmentReader;
     use crate::merge_policy::NoMergePolicy;
+    use crate::postings::Postings;
     use crate::query::BooleanQuery;
     use crate::schema::*;
-    use crate::{DateTime, DocAddress, Index, IndexWriter, Postings, ReloadPolicy};
+    use crate::{DateTime, DocAddress, Index, IndexWriter, ReloadPolicy};
 
     pub fn fixed_size_test<O: BinarySerializable + FixedSize + Default>() {
         let mut buffer = Vec::new();
@@ -406,16 +397,20 @@ pub mod tests {
     #[macro_export]
     macro_rules! assert_nearly_equals {
         ($left:expr, $right:expr) => {{
-            match (&$left, &$right) {
-                (left_val, right_val) => {
+            assert_nearly_equals!($left, $right, 0.0005);
+        }};
+        ($left:expr, $right:expr, $epsilon:expr) => {{
+            match (&$left, &$right, &$epsilon) {
+                (left_val, right_val, epsilon_val) => {
                     let diff = (left_val - right_val).abs();
-                    let add = left_val.abs() + right_val.abs();
-                    if diff > 0.0005 * add {
+
+                    if diff > *epsilon_val {
                         panic!(
-                            r#"assertion failed: `(left ~= right)`
-  left: `{:?}`,
- right: `{:?}`"#,
-                            &*left_val, &*right_val
+                            r#"assertion failed: `abs(left-right)>epsilon`
+    left: `{:?}`,
+    right: `{:?}`,
+    epsilon: `{:?}`"#,
+                            &*left_val, &*right_val, &*epsilon_val
                         )
                     }
                 }
@@ -445,7 +440,6 @@ pub mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "lz4"))]
     fn test_version_string() {
         use regex::Regex;
         let regex_ptn = Regex::new(
@@ -945,7 +939,7 @@ pub mod tests {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json", STORED | TEXT);
         let schema = schema_builder.build();
-        let json_val: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+        let json_val: serde_json::Value = serde_json::from_str(
             r#"{
             "signed": 2,
             "float": 2.0,
@@ -1035,13 +1029,16 @@ pub mod tests {
                             text_field => "some other value",
                             other_text_field => "short");
         assert_eq!(document.len(), 3);
-        let values: Vec<&OwnedValue> = document.get_all(text_field).collect();
+        let values: Vec<OwnedValue> = document.get_all(text_field).map(OwnedValue::from).collect();
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0].as_str(), Some("tantivy"));
-        assert_eq!(values[1].as_str(), Some("some other value"));
-        let values: Vec<&OwnedValue> = document.get_all(other_text_field).collect();
+        assert_eq!(values[0].as_ref().as_str(), Some("tantivy"));
+        assert_eq!(values[1].as_ref().as_str(), Some("some other value"));
+        let values: Vec<OwnedValue> = document
+            .get_all(other_text_field)
+            .map(OwnedValue::from)
+            .collect();
         assert_eq!(values.len(), 1);
-        assert_eq!(values[0].as_str(), Some("short"));
+        assert_eq!(values[0].as_ref().as_str(), Some("short"));
     }
 
     #[test]
@@ -1108,9 +1105,9 @@ pub mod tests {
     #[test]
     fn test_update_via_delete_insert() -> crate::Result<()> {
         use crate::collector::Count;
+        use crate::index::SegmentId;
         use crate::indexer::NoMergePolicy;
         use crate::query::AllQuery;
-        use crate::SegmentId;
 
         const DOC_COUNT: u64 = 2u64;
 
