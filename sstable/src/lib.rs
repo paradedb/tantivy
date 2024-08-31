@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::ops::Range;
+use std::usize;
 
 use merge::ValueMerger;
 

@@ -114,6 +114,7 @@ pub(crate) mod term;
 
 mod field_entry;
 mod field_type;
+mod field_value;
 
 mod bytes_options;
 mod date_time_options;
@@ -137,6 +138,7 @@ pub use self::facet_options::FacetOptions;
 pub use self::field::Field;
 pub use self::field_entry::FieldEntry;
 pub use self::field_type::{FieldType, Type};
+pub use self::field_value::FieldValue;
 pub use self::flags::{COERCE, FAST, INDEXED, STORED};
 pub use self::index_record_option::IndexRecordOption;
 pub use self::ip_options::{IntoIpv6Addr, IpAddrOptions};
@@ -144,7 +146,7 @@ pub use self::json_object_options::JsonObjectOptions;
 pub use self::named_field_document::NamedFieldDocument;
 pub use self::numeric_options::NumericOptions;
 pub use self::schema::{Schema, SchemaBuilder};
-pub use self::term::{Term, ValueBytes};
+pub use self::term::{Term, ValueBytes, JSON_END_OF_PATH};
 pub use self::text_options::{TextFieldIndexing, TextOptions, STRING, TEXT};
 
 /// Validator for a potential `field_name`.

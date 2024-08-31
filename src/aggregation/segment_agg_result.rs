@@ -11,15 +11,12 @@ use super::agg_req_with_accessor::{AggregationWithAccessor, AggregationsWithAcce
 use super::bucket::{SegmentHistogramCollector, SegmentRangeCollector, SegmentTermCollector};
 use super::intermediate_agg_result::IntermediateAggregationResults;
 use super::metric::{
-    AverageAggregation, CountAggregation, ExtendedStatsAggregation, MaxAggregation, MinAggregation,
+    AverageAggregation, CountAggregation, MaxAggregation, MinAggregation,
     SegmentPercentilesCollector, SegmentStatsCollector, SegmentStatsType, StatsAggregation,
     SumAggregation,
 };
 use crate::aggregation::bucket::TermMissingAgg;
-use crate::aggregation::metric::{
-    CardinalityAggregationReq, SegmentCardinalityCollector, SegmentExtendedStatsCollector,
-    TopHitsSegmentCollector,
-};
+use crate::aggregation::metric::TopHitsSegmentCollector;
 
 pub(crate) trait SegmentAggregationCollector: CollectorClone + Debug {
     fn add_intermediate_aggregation_result(
@@ -151,9 +148,6 @@ pub(crate) fn build_single_agg_segment_collector(
             accessor_idx,
             *missing,
         ))),
-        ExtendedStats(ExtendedStatsAggregation { missing, sigma, .. }) => Ok(Box::new(
-            SegmentExtendedStatsCollector::from_req(req.field_type, *sigma, accessor_idx, *missing),
-        )),
         Sum(SumAggregation { missing, .. }) => Ok(Box::new(SegmentStatsCollector::from_req(
             req.field_type,
             SegmentStatsType::Sum,
@@ -172,9 +166,6 @@ pub(crate) fn build_single_agg_segment_collector(
             accessor_idx,
             req.segment_ordinal,
         ))),
-        Cardinality(CardinalityAggregationReq { missing, .. }) => Ok(Box::new(
-            SegmentCardinalityCollector::from_req(req.field_type, accessor_idx, missing),
-        )),
     }
 }
 

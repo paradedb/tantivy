@@ -6,7 +6,7 @@ use sstable::{Dictionary, RangeSSTable};
 
 use crate::columnar::{format_version, ColumnType};
 use crate::dynamic_column::DynamicColumnHandle;
-use crate::{RowId, Version};
+use crate::RowId;
 
 fn io_invalid_data(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
@@ -19,7 +19,6 @@ pub struct ColumnarReader {
     column_dictionary: Dictionary<RangeSSTable>,
     column_data: FileSlice,
     num_rows: RowId,
-    format_version: Version,
 }
 
 impl fmt::Debug for ColumnarReader {
@@ -54,7 +53,6 @@ impl fmt::Debug for ColumnarReader {
 fn read_all_columns_in_stream(
     mut stream: sstable::Streamer<'_, RangeSSTable>,
     column_data: &FileSlice,
-    format_version: Version,
 ) -> io::Result<Vec<DynamicColumnHandle>> {
     let mut results = Vec::new();
     while stream.advance() {
@@ -69,7 +67,6 @@ fn read_all_columns_in_stream(
         let dynamic_column_handle = DynamicColumnHandle {
             file_slice,
             column_type,
-            format_version,
         };
         results.push(dynamic_column_handle);
     }
@@ -91,7 +88,7 @@ impl ColumnarReader {
         let num_rows = u32::deserialize(&mut &footer_bytes[8..12])?;
         let version_footer_bytes: [u8; format_version::VERSION_FOOTER_NUM_BYTES] =
             footer_bytes[12..].try_into().unwrap();
-        let format_version = format_version::parse_footer(version_footer_bytes)?;
+        let _version = format_version::parse_footer(version_footer_bytes)?;
         let (column_data, sstable) =
             file_slice_without_sstable_len.split_from_end(sstable_len as usize);
         let column_dictionary = Dictionary::open(sstable)?;
@@ -99,7 +96,6 @@ impl ColumnarReader {
             column_dictionary,
             column_data,
             num_rows,
-            format_version,
         })
     }
 
@@ -130,7 +126,6 @@ impl ColumnarReader {
                 let column_handle = DynamicColumnHandle {
                     file_slice,
                     column_type,
-                    format_version: self.format_version,
                 };
                 Some((column_name, column_handle))
             } else {
@@ -172,7 +167,7 @@ impl ColumnarReader {
             .stream_for_column_range(column_name)
             .into_stream_async()
             .await?;
-        read_all_columns_in_stream(stream, &self.column_data, self.format_version)
+        read_all_columns_in_stream(stream, &self.column_data)
     }
 
     /// Get all columns for the given column name.
@@ -181,7 +176,7 @@ impl ColumnarReader {
     /// different types.
     pub fn read_columns(&self, column_name: &str) -> io::Result<Vec<DynamicColumnHandle>> {
         let stream = self.stream_for_column_range(column_name).into_stream()?;
-        read_all_columns_in_stream(stream, &self.column_data, self.format_version)
+        read_all_columns_in_stream(stream, &self.column_data)
     }
 
     /// Return the number of columns in the columnar.
@@ -200,7 +195,7 @@ mod tests {
         columnar_writer.record_column_type("col1", ColumnType::Str, false);
         columnar_writer.record_column_type("col2", ColumnType::U64, false);
         let mut buffer = Vec::new();
-        columnar_writer.serialize(1, &mut buffer).unwrap();
+        columnar_writer.serialize(1, None, &mut buffer).unwrap();
         let columnar = ColumnarReader::open(buffer).unwrap();
         let columns = columnar.list_columns().unwrap();
         assert_eq!(columns.len(), 2);
@@ -216,7 +211,7 @@ mod tests {
         columnar_writer.record_column_type("count", ColumnType::U64, false);
         columnar_writer.record_numerical(1, "count", 1u64);
         let mut buffer = Vec::new();
-        columnar_writer.serialize(2, &mut buffer).unwrap();
+        columnar_writer.serialize(2, None, &mut buffer).unwrap();
         let columnar = ColumnarReader::open(buffer).unwrap();
         let columns = columnar.list_columns().unwrap();
         assert_eq!(columns.len(), 1);

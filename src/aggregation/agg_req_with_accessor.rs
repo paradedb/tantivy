@@ -11,14 +11,13 @@ use super::bucket::{
     DateHistogramAggregationReq, HistogramAggregation, RangeAggregation, TermsAggregation,
 };
 use super::metric::{
-    AverageAggregation, CardinalityAggregationReq, CountAggregation, ExtendedStatsAggregation,
-    MaxAggregation, MinAggregation, StatsAggregation, SumAggregation,
+    AverageAggregation, CountAggregation, MaxAggregation, MinAggregation, StatsAggregation,
+    SumAggregation,
 };
 use super::segment_agg_result::AggregationLimits;
 use super::VecWithNames;
 use crate::aggregation::{f64_to_fastfield_u64, Key};
-use crate::index::SegmentReader;
-use crate::SegmentOrdinal;
+use crate::{SegmentOrdinal, SegmentReader};
 
 #[derive(Default)]
 pub(crate) struct AggregationsWithAccessor {
@@ -162,11 +161,6 @@ impl AggregationWithAccessor {
                 field: ref field_name,
                 ref missing,
                 ..
-            })
-            | Cardinality(CardinalityAggregationReq {
-                field: ref field_name,
-                ref missing,
-                ..
             }) => {
                 let str_dict_column = reader.fast_fields().str(field_name)?;
                 let allowed_column_types = [
@@ -186,8 +180,6 @@ impl AggregationWithAccessor {
                     .map(|missing| match missing {
                         Key::Str(_) => ColumnType::Str,
                         Key::F64(_) => ColumnType::F64,
-                        Key::I64(_) => ColumnType::I64,
-                        Key::U64(_) => ColumnType::U64,
                     })
                     .unwrap_or(ColumnType::U64);
                 let column_and_types = get_all_ff_reader_or_empty(
@@ -234,16 +226,13 @@ impl AggregationWithAccessor {
                         missing.clone()
                     };
 
-                    let missing_value_for_accessor =
-                        if let Some(missing) = missing_value_term_agg.as_ref() {
-                            get_missing_val_as_u64_lenient(
-                                column_type,
-                                missing,
-                                agg.agg.get_fast_field_names()[0],
-                            )?
-                        } else {
-                            None
-                        };
+                    let missing_value_for_accessor = if let Some(missing) =
+                        missing_value_term_agg.as_ref()
+                    {
+                        get_missing_val(column_type, missing, agg.agg.get_fast_field_names()[0])?
+                    } else {
+                        None
+                    };
 
                     let agg = AggregationWithAccessor {
                         segment_ordinal,
@@ -283,10 +272,6 @@ impl AggregationWithAccessor {
                 ..
             })
             | Stats(StatsAggregation {
-                field: ref field_name,
-                ..
-            })
-            | ExtendedStats(ExtendedStatsAggregation {
                 field: ref field_name,
                 ..
             })
@@ -335,14 +320,7 @@ impl AggregationWithAccessor {
     }
 }
 
-/// Get the missing value as internal u64 representation
-///
-/// For terms we use u64::MAX as sentinel value
-/// For numerical data we convert the value into the representation
-/// we would get from the fast field, when we open it as u64_lenient_for_type.
-///
-/// That way we can use it the same way as if it would come from the fastfield.
-fn get_missing_val_as_u64_lenient(
+fn get_missing_val(
     column_type: ColumnType,
     missing: &Key,
     field_name: &str,
@@ -351,22 +329,13 @@ fn get_missing_val_as_u64_lenient(
         Key::Str(_) if column_type == ColumnType::Str => Some(u64::MAX),
         // Allow fallback to number on text fields
         Key::F64(_) if column_type == ColumnType::Str => Some(u64::MAX),
-        Key::U64(_) if column_type == ColumnType::Str => Some(u64::MAX),
-        Key::I64(_) if column_type == ColumnType::Str => Some(u64::MAX),
         Key::F64(val) if column_type.numerical_type().is_some() => {
             f64_to_fastfield_u64(*val, &column_type)
         }
-        // NOTE: We may loose precision of the passed missing value by casting i64 and u64 to f64.
-        Key::I64(val) if column_type.numerical_type().is_some() => {
-            f64_to_fastfield_u64(*val as f64, &column_type)
-        }
-        Key::U64(val) if column_type.numerical_type().is_some() => {
-            f64_to_fastfield_u64(*val as f64, &column_type)
-        }
         _ => {
             return Err(crate::TantivyError::InvalidArgument(format!(
-                "Missing value {missing:?} for field {field_name} is not supported for column \
-                 type {column_type:?}"
+                "Missing value {:?} for field {} is not supported for column type {:?}",
+                missing, field_name, column_type
             )));
         }
     };
@@ -433,7 +402,7 @@ fn get_dynamic_columns(
         .iter()
         .map(|h| h.open())
         .collect::<io::Result<_>>()?;
-    assert!(!ff_fields.is_empty(), "field {field_name} not found");
+    assert!(!ff_fields.is_empty(), "field {} not found", field_name);
     Ok(cols)
 }
 

@@ -8,12 +8,11 @@ use std::net::Ipv6Addr;
 
 use column_operation::ColumnOperation;
 pub(crate) use column_writers::CompatibleNumericalTypes;
-use common::json_path_writer::JSON_END_OF_PATH;
 use common::CountingWriter;
 pub(crate) use serializer::ColumnarSerializer;
 use stacker::{Addr, ArenaHashMap, MemoryArena};
 
-use crate::column_index::{SerializableColumnIndex, SerializableOptionalIndex};
+use crate::column_index::SerializableColumnIndex;
 use crate::column_values::{MonotonicallyMappableToU128, MonotonicallyMappableToU64};
 use crate::columnar::column_type::ColumnType;
 use crate::columnar::writer::column_writers::{
@@ -44,7 +43,7 @@ struct SpareBuffers {
 /// columnar_writer.record_str(1u32 /* doc id */, "product_name", "Apple");
 /// columnar_writer.record_numerical(0u32 /* doc id */, "price", 10.5f64); //< uh oh we ended up mixing integer and floats.
 /// let mut wrt: Vec<u8> =  Vec::new();
-/// columnar_writer.serialize(2u32, &mut wrt).unwrap();
+/// columnar_writer.serialize(2u32, None, &mut wrt).unwrap();
 /// ```
 #[derive(Default)]
 pub struct ColumnarWriter {
@@ -58,6 +57,22 @@ pub struct ColumnarWriter {
     // Dictionaries used to store dictionary-encoded values.
     dictionaries: Vec<DictionaryBuilder>,
     buffers: SpareBuffers,
+}
+
+#[inline]
+fn mutate_or_create_column<V, TMutator>(
+    arena_hash_map: &mut ArenaHashMap,
+    column_name: &str,
+    updater: TMutator,
+) where
+    V: Copy + 'static,
+    TMutator: FnMut(Option<V>) -> V,
+{
+    assert!(
+        !column_name.as_bytes().contains(&0u8),
+        "key may not contain the 0 byte"
+    );
+    arena_hash_map.mutate_or_create(column_name.as_bytes(), updater);
 }
 
 impl ColumnarWriter {
@@ -74,6 +89,63 @@ impl ColumnarWriter {
                 .iter()
                 .map(|dict| dict.mem_usage())
                 .sum::<usize>()
+    }
+
+    /// Returns the list of doc ids from 0..num_docs sorted by the `sort_field`
+    /// column.
+    ///
+    /// If the column is multivalued, use the first value for scoring.
+    /// If no value is associated to a specific row, the document is assigned
+    /// the lowest possible score.
+    ///
+    /// The sort applied is stable.
+    pub fn sort_order(&self, sort_field: &str, num_docs: RowId, reversed: bool) -> Vec<u32> {
+        let Some(numerical_col_writer) = self
+            .numerical_field_hash_map
+            .get::<NumericalColumnWriter>(sort_field.as_bytes())
+            .or_else(|| {
+                self.datetime_field_hash_map
+                    .get::<NumericalColumnWriter>(sort_field.as_bytes())
+            })
+        else {
+            return Vec::new();
+        };
+        let mut symbols_buffer = Vec::new();
+        let mut values = Vec::new();
+        let mut start_doc_check_fill = 0;
+        let mut current_doc_opt: Option<RowId> = None;
+        // Assumption: NewDoc will never call the same doc twice and is strictly increasing between
+        // calls
+        for op in numerical_col_writer.operation_iterator(&self.arena, None, &mut symbols_buffer) {
+            match op {
+                ColumnOperation::NewDoc(doc) => {
+                    current_doc_opt = Some(doc);
+                }
+                ColumnOperation::Value(numerical_value) => {
+                    if let Some(current_doc) = current_doc_opt {
+                        // Fill up with 0.0 since last doc
+                        values.extend((start_doc_check_fill..current_doc).map(|doc| (0.0, doc)));
+                        start_doc_check_fill = current_doc + 1;
+                        // handle multi values
+                        current_doc_opt = None;
+
+                        let score: f32 = f64::coerce(numerical_value) as f32;
+                        values.push((score, current_doc));
+                    }
+                }
+            }
+        }
+        for doc in values.len() as u32..num_docs {
+            values.push((0.0f32, doc));
+        }
+        values.sort_by(|(left_score, _), (right_score, _)| {
+            if reversed {
+                right_score.total_cmp(left_score)
+            } else {
+                left_score.total_cmp(right_score)
+            }
+        });
+        values.into_iter().map(|(_score, doc)| doc).collect()
     }
 
     /// Records a column type. This is useful to bypass the coercion process,
@@ -103,8 +175,9 @@ impl ColumnarWriter {
                     },
                     &mut self.dictionaries,
                 );
-                hash_map.mutate_or_create(
-                    column_name.as_bytes(),
+                mutate_or_create_column(
+                    hash_map,
+                    column_name,
                     |column_opt: Option<StrOrBytesColumnWriter>| {
                         let mut column_writer = if let Some(column_writer) = column_opt {
                             column_writer
@@ -119,21 +192,24 @@ impl ColumnarWriter {
                 );
             }
             ColumnType::Bool => {
-                self.bool_field_hash_map.mutate_or_create(
-                    column_name.as_bytes(),
+                mutate_or_create_column(
+                    &mut self.bool_field_hash_map,
+                    column_name,
                     |column_opt: Option<ColumnWriter>| column_opt.unwrap_or_default(),
                 );
             }
             ColumnType::DateTime => {
-                self.datetime_field_hash_map.mutate_or_create(
-                    column_name.as_bytes(),
+                mutate_or_create_column(
+                    &mut self.datetime_field_hash_map,
+                    column_name,
                     |column_opt: Option<ColumnWriter>| column_opt.unwrap_or_default(),
                 );
             }
             ColumnType::I64 | ColumnType::F64 | ColumnType::U64 => {
                 let numerical_type = column_type.numerical_type().unwrap();
-                self.numerical_field_hash_map.mutate_or_create(
-                    column_name.as_bytes(),
+                mutate_or_create_column(
+                    &mut self.numerical_field_hash_map,
+                    column_name,
                     |column_opt: Option<NumericalColumnWriter>| {
                         let mut column: NumericalColumnWriter = column_opt.unwrap_or_default();
                         column.force_numerical_type(numerical_type);
@@ -141,8 +217,9 @@ impl ColumnarWriter {
                     },
                 );
             }
-            ColumnType::IpAddr => self.ip_addr_field_hash_map.mutate_or_create(
-                column_name.as_bytes(),
+            ColumnType::IpAddr => mutate_or_create_column(
+                &mut self.ip_addr_field_hash_map,
+                column_name,
                 |column_opt: Option<ColumnWriter>| column_opt.unwrap_or_default(),
             ),
         }
@@ -155,8 +232,9 @@ impl ColumnarWriter {
         numerical_value: T,
     ) {
         let (hash_map, arena) = (&mut self.numerical_field_hash_map, &mut self.arena);
-        hash_map.mutate_or_create(
-            column_name.as_bytes(),
+        mutate_or_create_column(
+            hash_map,
+            column_name,
             |column_opt: Option<NumericalColumnWriter>| {
                 let mut column: NumericalColumnWriter = column_opt.unwrap_or_default();
                 column.record_numerical_value(doc, numerical_value.into(), arena);
@@ -166,6 +244,10 @@ impl ColumnarWriter {
     }
 
     pub fn record_ip_addr(&mut self, doc: RowId, column_name: &str, ip_addr: Ipv6Addr) {
+        assert!(
+            !column_name.as_bytes().contains(&0u8),
+            "key may not contain the 0 byte"
+        );
         let (hash_map, arena) = (&mut self.ip_addr_field_hash_map, &mut self.arena);
         hash_map.mutate_or_create(
             column_name.as_bytes(),
@@ -179,30 +261,24 @@ impl ColumnarWriter {
 
     pub fn record_bool(&mut self, doc: RowId, column_name: &str, val: bool) {
         let (hash_map, arena) = (&mut self.bool_field_hash_map, &mut self.arena);
-        hash_map.mutate_or_create(
-            column_name.as_bytes(),
-            |column_opt: Option<ColumnWriter>| {
-                let mut column: ColumnWriter = column_opt.unwrap_or_default();
-                column.record(doc, val, arena);
-                column
-            },
-        );
+        mutate_or_create_column(hash_map, column_name, |column_opt: Option<ColumnWriter>| {
+            let mut column: ColumnWriter = column_opt.unwrap_or_default();
+            column.record(doc, val, arena);
+            column
+        });
     }
 
     pub fn record_datetime(&mut self, doc: RowId, column_name: &str, datetime: common::DateTime) {
         let (hash_map, arena) = (&mut self.datetime_field_hash_map, &mut self.arena);
-        hash_map.mutate_or_create(
-            column_name.as_bytes(),
-            |column_opt: Option<ColumnWriter>| {
-                let mut column: ColumnWriter = column_opt.unwrap_or_default();
-                column.record(
-                    doc,
-                    NumericalValue::I64(datetime.into_timestamp_nanos()),
-                    arena,
-                );
-                column
-            },
-        );
+        mutate_or_create_column(hash_map, column_name, |column_opt: Option<ColumnWriter>| {
+            let mut column: ColumnWriter = column_opt.unwrap_or_default();
+            column.record(
+                doc,
+                NumericalValue::I64(datetime.into_timestamp_nanos()),
+                arena,
+            );
+            column
+        });
     }
 
     pub fn record_str(&mut self, doc: RowId, column_name: &str, value: &str) {
@@ -227,6 +303,10 @@ impl ColumnarWriter {
     }
 
     pub fn record_bytes(&mut self, doc: RowId, column_name: &str, value: &[u8]) {
+        assert!(
+            !column_name.as_bytes().contains(&0u8),
+            "key may not contain the 0 byte"
+        );
         let (hash_map, arena, dictionaries) = (
             &mut self.bytes_field_hash_map,
             &mut self.arena,
@@ -246,9 +326,13 @@ impl ColumnarWriter {
             },
         );
     }
-    pub fn serialize(&mut self, num_docs: RowId, wrt: &mut dyn io::Write) -> io::Result<()> {
+    pub fn serialize(
+        &mut self,
+        num_docs: RowId,
+        old_to_new_row_ids: Option<&[RowId]>,
+        wrt: &mut dyn io::Write,
+    ) -> io::Result<()> {
         let mut serializer = ColumnarSerializer::new(wrt);
-
         let mut columns: Vec<(&[u8], ColumnType, Addr)> = self
             .numerical_field_hash_map
             .iter()
@@ -262,7 +346,7 @@ impl ColumnarWriter {
         columns.extend(
             self.bytes_field_hash_map
                 .iter()
-                .map(|(column_name, addr)| (column_name, ColumnType::Bytes, addr)),
+                .map(|(term, addr)| (term, ColumnType::Bytes, addr)),
         );
         columns.extend(
             self.str_field_hash_map
@@ -289,12 +373,6 @@ impl ColumnarWriter {
         let (arena, buffers, dictionaries) = (&self.arena, &mut self.buffers, &self.dictionaries);
         let mut symbol_byte_buffer: Vec<u8> = Vec::new();
         for (column_name, column_type, addr) in columns {
-            if column_name.contains(&JSON_END_OF_PATH) {
-                // Tantivy uses b'0' as a separator for nested fields in JSON.
-                // Column names with a b'0' are not simply ignored by the columnar (and the inverted
-                // index).
-                continue;
-            }
             match column_type {
                 ColumnType::Bool => {
                     let column_writer: ColumnWriter = self.bool_field_hash_map.read(addr);
@@ -304,7 +382,11 @@ impl ColumnarWriter {
                     serialize_bool_column(
                         cardinality,
                         num_docs,
-                        column_writer.operation_iterator(arena, &mut symbol_byte_buffer),
+                        column_writer.operation_iterator(
+                            arena,
+                            old_to_new_row_ids,
+                            &mut symbol_byte_buffer,
+                        ),
                         buffers,
                         &mut column_serializer,
                     )?;
@@ -318,7 +400,11 @@ impl ColumnarWriter {
                     serialize_ip_addr_column(
                         cardinality,
                         num_docs,
-                        column_writer.operation_iterator(arena, &mut symbol_byte_buffer),
+                        column_writer.operation_iterator(
+                            arena,
+                            old_to_new_row_ids,
+                            &mut symbol_byte_buffer,
+                        ),
                         buffers,
                         &mut column_serializer,
                     )?;
@@ -343,8 +429,11 @@ impl ColumnarWriter {
                         num_docs,
                         str_or_bytes_column_writer.sort_values_within_row,
                         dictionary_builder,
-                        str_or_bytes_column_writer
-                            .operation_iterator(arena, &mut symbol_byte_buffer),
+                        str_or_bytes_column_writer.operation_iterator(
+                            arena,
+                            old_to_new_row_ids,
+                            &mut symbol_byte_buffer,
+                        ),
                         buffers,
                         &self.arena,
                         &mut column_serializer,
@@ -362,7 +451,11 @@ impl ColumnarWriter {
                         cardinality,
                         num_docs,
                         numerical_type,
-                        numerical_column_writer.operation_iterator(arena, &mut symbol_byte_buffer),
+                        numerical_column_writer.operation_iterator(
+                            arena,
+                            old_to_new_row_ids,
+                            &mut symbol_byte_buffer,
+                        ),
                         buffers,
                         &mut column_serializer,
                     )?;
@@ -377,7 +470,11 @@ impl ColumnarWriter {
                         cardinality,
                         num_docs,
                         NumericalType::I64,
-                        column_writer.operation_iterator(arena, &mut symbol_byte_buffer),
+                        column_writer.operation_iterator(
+                            arena,
+                            old_to_new_row_ids,
+                            &mut symbol_byte_buffer,
+                        ),
                         buffers,
                         &mut column_serializer,
                     )?;
@@ -562,16 +659,16 @@ fn send_to_serialize_column_mappable_to_u128<
             let optional_index_builder = value_index_builders.borrow_optional_index_builder();
             consume_operation_iterator(op_iterator, optional_index_builder, values);
             let optional_index = optional_index_builder.finish(num_rows);
-            SerializableColumnIndex::Optional(SerializableOptionalIndex {
+            SerializableColumnIndex::Optional {
                 num_rows,
                 non_null_row_ids: Box::new(optional_index),
-            })
+            }
         }
         Cardinality::Multivalued => {
             let multivalued_index_builder = value_index_builders.borrow_multivalued_index_builder();
             consume_operation_iterator(op_iterator, multivalued_index_builder, values);
-            let serializable_multivalued_index = multivalued_index_builder.finish(num_rows);
-            SerializableColumnIndex::Multivalued(serializable_multivalued_index)
+            let multivalued_index = multivalued_index_builder.finish(num_rows);
+            SerializableColumnIndex::Multivalued(Box::new(multivalued_index))
         }
     };
     crate::column::serialize_column_mappable_to_u128(
@@ -580,6 +677,15 @@ fn send_to_serialize_column_mappable_to_u128<
         &mut wrt,
     )?;
     Ok(())
+}
+
+fn sort_values_within_row_in_place(multivalued_index: &[RowId], values: &mut [u64]) {
+    let mut start_index: usize = 0;
+    for end_index in multivalued_index.iter().copied() {
+        let end_index = end_index as usize;
+        values[start_index..end_index].sort_unstable();
+        start_index = end_index;
+    }
 }
 
 fn send_to_serialize_column_mappable_to_u64(
@@ -605,22 +711,19 @@ fn send_to_serialize_column_mappable_to_u64(
             let optional_index_builder = value_index_builders.borrow_optional_index_builder();
             consume_operation_iterator(op_iterator, optional_index_builder, values);
             let optional_index = optional_index_builder.finish(num_rows);
-            SerializableColumnIndex::Optional(SerializableOptionalIndex {
+            SerializableColumnIndex::Optional {
                 non_null_row_ids: Box::new(optional_index),
                 num_rows,
-            })
+            }
         }
         Cardinality::Multivalued => {
             let multivalued_index_builder = value_index_builders.borrow_multivalued_index_builder();
             consume_operation_iterator(op_iterator, multivalued_index_builder, values);
-            let serializable_multivalued_index = multivalued_index_builder.finish(num_rows);
+            let multivalued_index = multivalued_index_builder.finish(num_rows);
             if sort_values_within_row {
-                sort_values_within_row_in_place(
-                    serializable_multivalued_index.start_offsets.boxed_iter(),
-                    values,
-                );
+                sort_values_within_row_in_place(multivalued_index, values);
             }
-            SerializableColumnIndex::Multivalued(serializable_multivalued_index)
+            SerializableColumnIndex::Multivalued(Box::new(multivalued_index))
         }
     };
     crate::column::serialize_column_mappable_to_u64(
@@ -629,18 +732,6 @@ fn send_to_serialize_column_mappable_to_u64(
         &mut wrt,
     )?;
     Ok(())
-}
-
-fn sort_values_within_row_in_place(
-    multivalued_index: impl Iterator<Item = RowId>,
-    values: &mut [u64],
-) {
-    let mut start_index: usize = 0;
-    for end_index in multivalued_index {
-        let end_index = end_index as usize;
-        values[start_index..end_index].sort_unstable();
-        start_index = end_index;
-    }
 }
 
 fn coerce_numerical_symbol<T>(
@@ -690,7 +781,7 @@ mod tests {
         assert_eq!(column_writer.get_cardinality(3), Cardinality::Full);
         let mut buffer = Vec::new();
         let symbols: Vec<ColumnOperation<NumericalValue>> = column_writer
-            .operation_iterator(&arena, &mut buffer)
+            .operation_iterator(&arena, None, &mut buffer)
             .collect();
         assert_eq!(symbols.len(), 6);
         assert!(matches!(symbols[0], ColumnOperation::NewDoc(0u32)));
@@ -719,7 +810,7 @@ mod tests {
         assert_eq!(column_writer.get_cardinality(3), Cardinality::Optional);
         let mut buffer = Vec::new();
         let symbols: Vec<ColumnOperation<NumericalValue>> = column_writer
-            .operation_iterator(&arena, &mut buffer)
+            .operation_iterator(&arena, None, &mut buffer)
             .collect();
         assert_eq!(symbols.len(), 4);
         assert!(matches!(symbols[0], ColumnOperation::NewDoc(1u32)));
@@ -742,7 +833,7 @@ mod tests {
         assert_eq!(column_writer.get_cardinality(2), Cardinality::Optional);
         let mut buffer = Vec::new();
         let symbols: Vec<ColumnOperation<NumericalValue>> = column_writer
-            .operation_iterator(&arena, &mut buffer)
+            .operation_iterator(&arena, None, &mut buffer)
             .collect();
         assert_eq!(symbols.len(), 2);
         assert!(matches!(symbols[0], ColumnOperation::NewDoc(0u32)));
@@ -761,7 +852,7 @@ mod tests {
         assert_eq!(column_writer.get_cardinality(1), Cardinality::Multivalued);
         let mut buffer = Vec::new();
         let symbols: Vec<ColumnOperation<NumericalValue>> = column_writer
-            .operation_iterator(&arena, &mut buffer)
+            .operation_iterator(&arena, None, &mut buffer)
             .collect();
         assert_eq!(symbols.len(), 3);
         assert!(matches!(symbols[0], ColumnOperation::NewDoc(0u32)));

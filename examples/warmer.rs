@@ -3,11 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, Weak};
 
 use tantivy::collector::TopDocs;
-use tantivy::index::SegmentId;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Schema, FAST, TEXT};
 use tantivy::{
-    doc, DocAddress, DocId, Index, IndexWriter, Opstamp, Searcher, SearcherGeneration,
+    doc, DocAddress, DocId, Index, IndexWriter, Opstamp, Searcher, SearcherGeneration, SegmentId,
     SegmentReader, Warmer,
 };
 

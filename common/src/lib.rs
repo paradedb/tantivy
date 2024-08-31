@@ -5,12 +5,11 @@ use std::ops::Deref;
 pub use byteorder::LittleEndian as Endianness;
 
 mod bitset;
-pub mod bounds;
 mod byte_count;
 mod datetime;
 pub mod file_slice;
 mod group_by;
-pub mod json_path_writer;
+mod json_path_writer;
 mod serialize;
 mod vint;
 mod writer;

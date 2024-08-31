@@ -2,16 +2,22 @@ use std::hash::{Hash, Hasher};
 use std::net::Ipv6Addr;
 use std::{fmt, str};
 
-use columnar::MonotonicallyMappableToU128;
-use common::json_path_writer::{JSON_END_OF_PATH, JSON_PATH_SEGMENT_SEP_STR};
-use common::JsonPathWriter;
+use columnar::{MonotonicallyMappableToU128, MonotonicallyMappableToU64};
 
 use super::date_time_options::DATE_TIME_PRECISION_INDEXED;
-use super::{Field, Schema};
+use super::Field;
 use crate::fastfield::FastValue;
-use crate::json_utils::split_json_path;
 use crate::schema::{Facet, Type};
 use crate::DateTime;
+
+/// Separates the different segments of a json path.
+pub const JSON_PATH_SEGMENT_SEP: u8 = 1u8;
+pub const JSON_PATH_SEGMENT_SEP_STR: &str =
+    unsafe { std::str::from_utf8_unchecked(&[JSON_PATH_SEGMENT_SEP]) };
+
+/// Separates the json path and the value in
+/// a JSON term binary representation.
+pub const JSON_END_OF_PATH: u8 = 0u8;
 
 /// Term represents the value that the token can take.
 /// It's a serialized representation over different types.
@@ -35,51 +41,6 @@ impl Term {
         Term(data)
     }
 
-    /// Creates a term from a json path.
-    ///
-    /// The json path can address a nested value in a JSON object.
-    /// e.g. `{"k8s": {"node": {"id": 5}}}` can be addressed via `k8s.node.id`.
-    ///
-    /// In case there are dots in the field name, and the `expand_dots_enabled` parameter is not
-    /// set they need to be escaped with a backslash.
-    /// e.g. `{"k8s.node": {"id": 5}}` can be addressed via `k8s\.node.id`.
-    pub fn from_field_json_path(field: Field, json_path: &str, expand_dots_enabled: bool) -> Term {
-        let paths = split_json_path(json_path);
-        let mut json_path = JsonPathWriter::with_expand_dots(expand_dots_enabled);
-        for path in paths {
-            json_path.push(&path);
-        }
-        json_path.set_end();
-        let mut term = Term::with_type_and_field(Type::Json, field);
-
-        term.append_bytes(json_path.as_str().as_bytes());
-
-        term
-    }
-
-    /// Gets the full path of the field name + optional json path.
-    pub fn get_full_path(&self, schema: &Schema) -> String {
-        let field = self.field();
-        let mut field = schema.get_field_name(field).to_string();
-        if let Some(json_path) = self.get_json_path() {
-            field.push('.');
-            field.push_str(&json_path);
-        };
-        field
-    }
-
-    /// Gets the json path if the type is JSON
-    pub fn get_json_path(&self) -> Option<String> {
-        let value = self.value();
-        if let Some((json_path, _)) = value.as_json() {
-            Some(unsafe {
-                std::str::from_utf8_unchecked(&json_path[..json_path.len() - 1]).to_string()
-            })
-        } else {
-            None
-        }
-    }
-
     pub(crate) fn with_type_and_field(typ: Type, field: Field) -> Term {
         let mut term = Self::with_capacity(8);
         term.set_field_and_type(field, typ);
@@ -93,7 +54,7 @@ impl Term {
         term
     }
 
-    pub(crate) fn from_fast_value<T: FastValue>(field: Field, val: &T) -> Term {
+    fn from_fast_value<T: FastValue>(field: Field, val: &T) -> Term {
         let mut term = Self::with_type_and_field(T::to_type(), field);
         term.set_u64(val.to_u64());
         term
@@ -141,20 +102,8 @@ impl Term {
         Term::from_fast_value(field, &val)
     }
 
-    /// Builds a term given a field, and a `DateTime` value.
-    ///
-    /// The contained value may not match the value, due do the truncation used
-    /// for indexed data [super::DATE_TIME_PRECISION_INDEXED].
-    /// To create a term used for search use `from_field_date_for_search`.
+    /// Builds a term given a field, and a `DateTime` value
     pub fn from_field_date(field: Field, val: DateTime) -> Term {
-        Term::from_fast_value(field, &val)
-    }
-
-    /// Builds a term given a field, and a `DateTime` value to be used in searching the inverted
-    /// index.
-    /// It truncates the `DateTime` to the precision used in the index
-    /// ([super::DATE_TIME_PRECISION_INDEXED]).
-    pub fn from_field_date_for_search(field: Field, val: DateTime) -> Term {
         Term::from_fast_value(field, &val.truncate(DATE_TIME_PRECISION_INDEXED))
     }
 
@@ -220,23 +169,16 @@ impl Term {
         self.set_bytes(val.to_u64().to_be_bytes().as_ref());
     }
 
-    /// Append a type marker + fast value to a term.
-    /// This is used in JSON type to append a fast value after the path.
-    ///
-    /// It will not clear existing bytes.
-    pub fn append_type_and_fast_value<T: FastValue>(&mut self, val: T) {
+    pub(crate) fn append_type_and_fast_value<T: FastValue>(&mut self, val: T) {
         self.0.push(T::to_type().to_code());
-        let value = val.to_u64();
+        let value = if T::to_type() == Type::Date {
+            DateTime::from_u64(val.to_u64())
+                .truncate(DATE_TIME_PRECISION_INDEXED)
+                .to_u64()
+        } else {
+            val.to_u64()
+        };
         self.0.extend(value.to_be_bytes().as_ref());
-    }
-
-    /// Append a string type marker + string to a term.
-    /// This is used in JSON type to append a str after the path.
-    ///
-    /// It will not clear existing bytes.
-    pub fn append_type_and_str(&mut self, val: &str) {
-        self.0.push(Type::Str.to_code());
-        self.0.extend(val.as_bytes().as_ref());
     }
 
     /// Sets a `Ipv6Addr` value in the term.
@@ -248,6 +190,11 @@ impl Term {
     pub fn set_bytes(&mut self, bytes: &[u8]) {
         self.truncate_value_bytes(0);
         self.0.extend(bytes);
+    }
+
+    /// Set the texts only, keeping the field untouched.
+    pub fn set_text(&mut self, text: &str) {
+        self.set_bytes(text.as_bytes());
     }
 
     /// Truncates the value bytes of the term. Value and field type stays the same.
@@ -278,9 +225,34 @@ impl Term {
     #[inline]
     pub fn append_path(&mut self, bytes: &[u8]) -> &mut [u8] {
         let len_before = self.0.len();
-        assert!(!bytes.contains(&JSON_END_OF_PATH));
-        self.0.extend_from_slice(bytes);
+        if bytes.contains(&0u8) {
+            self.0
+                .extend(bytes.iter().map(|&b| if b == 0 { b'0' } else { b }));
+        } else {
+            self.0.extend_from_slice(bytes);
+        }
         &mut self.0[len_before..]
+    }
+
+    /// Appends a JSON_PATH_SEGMENT_SEP to the term.
+    /// Only used for JSON type.
+    #[inline]
+    pub fn add_json_path_separator(&mut self) {
+        self.0.push(JSON_PATH_SEGMENT_SEP);
+    }
+    /// Sets the current end to JSON_END_OF_PATH.
+    /// Only used for JSON type.
+    #[inline]
+    pub fn set_json_path_end(&mut self) {
+        let buffer_len = self.0.len();
+        self.0[buffer_len - 1] = JSON_END_OF_PATH;
+    }
+    /// Sets the current end to JSON_PATH_SEGMENT_SEP.
+    /// Only used for JSON type.
+    #[inline]
+    pub fn set_json_path_separator(&mut self) {
+        let buffer_len = self.0.len();
+        self.0[buffer_len - 1] = JSON_PATH_SEGMENT_SEP;
     }
 }
 
@@ -353,11 +325,6 @@ where B: AsRef<[u8]>
         ValueBytes(data)
     }
 
-    /// Wraps a object holding Vec<u8>
-    pub fn to_owned(&self) -> ValueBytes<Vec<u8>> {
-        ValueBytes(self.0.as_ref().to_vec())
-    }
-
     fn typ_code(&self) -> u8 {
         self.0.as_ref()[0]
     }
@@ -379,7 +346,7 @@ where B: AsRef<[u8]>
         if self.typ() != T::to_type() {
             return None;
         }
-        let value_bytes = self.raw_value_bytes_payload();
+        let value_bytes = self.value_bytes();
         let value_u64 = u64::from_be_bytes(value_bytes.try_into().ok()?);
         Some(T::from_u64(value_u64))
     }
@@ -424,7 +391,7 @@ where B: AsRef<[u8]>
         if self.typ() != Type::Str {
             return None;
         }
-        str::from_utf8(self.raw_value_bytes_payload()).ok()
+        str::from_utf8(self.value_bytes()).ok()
     }
 
     /// Returns the facet associated with the term.
@@ -435,7 +402,7 @@ where B: AsRef<[u8]>
         if self.typ() != Type::Facet {
             return None;
         }
-        let facet_encode_str = str::from_utf8(self.raw_value_bytes_payload()).ok()?;
+        let facet_encode_str = str::from_utf8(self.value_bytes()).ok()?;
         Some(Facet::from_encoded_string(facet_encode_str.to_string()))
     }
 
@@ -446,7 +413,7 @@ where B: AsRef<[u8]>
         if self.typ() != Type::Bytes {
             return None;
         }
-        Some(self.raw_value_bytes_payload())
+        Some(self.value_bytes())
     }
 
     /// Returns a `Ipv6Addr` value from the term.
@@ -454,7 +421,7 @@ where B: AsRef<[u8]>
         if self.typ() != Type::IpAddr {
             return None;
         }
-        let ip_u128 = u128::from_be_bytes(self.raw_value_bytes_payload().try_into().ok()?);
+        let ip_u128 = u128::from_be_bytes(self.value_bytes().try_into().ok()?);
         Some(Ipv6Addr::from_u128(ip_u128))
     }
 
@@ -475,7 +442,7 @@ where B: AsRef<[u8]>
         if self.typ() != Type::Json {
             return None;
         }
-        let bytes = self.raw_value_bytes_payload();
+        let bytes = self.value_bytes();
 
         let pos = bytes.iter().cloned().position(|b| b == JSON_END_OF_PATH)?;
         // split at pos + 1, so that json_path_bytes includes the JSON_END_OF_PATH byte.
@@ -490,23 +457,14 @@ where B: AsRef<[u8]>
         if self.typ() != Type::Json {
             return None;
         }
-        let bytes = self.raw_value_bytes_payload();
+        let bytes = self.value_bytes();
         let pos = bytes.iter().cloned().position(|b| b == JSON_END_OF_PATH)?;
         Some(ValueBytes::wrap(&bytes[pos + 1..]))
     }
 
-    /// Returns the raw value of ValueBytes payload, without the type tag.
-    pub(crate) fn raw_value_bytes_payload(&self) -> &[u8] {
+    /// Returns the serialized value of ValueBytes without the type.
+    fn value_bytes(&self) -> &[u8] {
         &self.0.as_ref()[1..]
-    }
-
-    /// Returns the serialized value of ValueBytes payload, without the type tag.
-    pub(crate) fn value_bytes_payload(&self) -> Vec<u8> {
-        if let Some(value_bytes) = self.as_json_value_bytes() {
-            value_bytes.raw_value_bytes_payload().to_vec()
-        } else {
-            self.raw_value_bytes_payload().to_vec()
-        }
     }
 
     /// Returns the serialized representation of Term.

@@ -174,18 +174,16 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
     }
 
     fn size_hint(&self) -> u32 {
-        self.column.num_docs()
+        0 // heuristic possible by checking number of hits when fetching a block
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Bound;
-
     use crate::collector::Count;
     use crate::directory::RamDirectory;
     use crate::query::RangeQuery;
-    use crate::{schema, IndexBuilder, TantivyDocument, Term};
+    use crate::{schema, IndexBuilder, TantivyDocument};
 
     #[test]
     fn range_query_fast_optional_field_minimum() {
@@ -220,9 +218,10 @@ mod tests {
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
 
-        let query = RangeQuery::new(
-            Bound::Included(Term::from_field_u64(score_field, 70)),
-            Bound::Unbounded,
+        let query = RangeQuery::new_u64_bounds(
+            "score".to_string(),
+            std::ops::Bound::Included(70),
+            std::ops::Bound::Unbounded,
         );
 
         let count = searcher.search(&query, &Count).unwrap();

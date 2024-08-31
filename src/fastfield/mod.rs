@@ -80,7 +80,7 @@ mod tests {
     use std::path::Path;
 
     use columnar::StrColumn;
-    use common::{ByteCount, DateTimePrecision, HasLen, TerminatingWrite};
+    use common::{ByteCount, HasLen, TerminatingWrite};
     use once_cell::sync::Lazy;
     use rand::prelude::SliceRandom;
     use rand::rngs::StdRng;
@@ -88,15 +88,14 @@ mod tests {
 
     use super::*;
     use crate::directory::{Directory, RamDirectory, WritePtr};
-    use crate::index::SegmentId;
     use crate::merge_policy::NoMergePolicy;
     use crate::schema::{
-        DateOptions, Facet, FacetOptions, Field, JsonObjectOptions, Schema, SchemaBuilder,
-        TantivyDocument, TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
+        Facet, FacetOptions, Field, JsonObjectOptions, Schema, SchemaBuilder, TantivyDocument,
+        TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
     };
     use crate::time::OffsetDateTime;
     use crate::tokenizer::{LowerCaser, RawTokenizer, TextAnalyzer, TokenizerManager};
-    use crate::{Index, IndexWriter, SegmentReader};
+    use crate::{DateOptions, DateTimePrecision, Index, IndexWriter, SegmentId, SegmentReader};
 
     pub static SCHEMA: Lazy<Schema> = Lazy::new(|| {
         let mut schema_builder = Schema::builder();
@@ -127,7 +126,7 @@ mod tests {
             fast_field_writers
                 .add_document(&doc!(*FIELD=>2u64))
                 .unwrap();
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
@@ -178,7 +177,7 @@ mod tests {
             fast_field_writers
                 .add_document(&doc!(*FIELD=>215u64))
                 .unwrap();
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
@@ -211,7 +210,7 @@ mod tests {
                     .add_document(&doc!(*FIELD=>100_000u64))
                     .unwrap();
             }
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
@@ -243,7 +242,7 @@ mod tests {
                     .add_document(&doc!(*FIELD=>5_000_000_000_000_000_000u64 + doc_id))
                     .unwrap();
             }
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
@@ -276,7 +275,7 @@ mod tests {
                 doc.add_i64(i64_field, i);
                 fast_field_writers.add_document(&doc).unwrap();
             }
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
@@ -315,7 +314,7 @@ mod tests {
             let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
             let doc = TantivyDocument::default();
             fast_field_writers.add_document(&doc).unwrap();
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
 
@@ -348,7 +347,7 @@ mod tests {
             let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
             let doc = TantivyDocument::default();
             fast_field_writers.add_document(&doc).unwrap();
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
 
@@ -385,7 +384,7 @@ mod tests {
             for &x in &permutation {
                 fast_field_writers.add_document(&doc!(*FIELD=>x)).unwrap();
             }
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
@@ -770,7 +769,7 @@ mod tests {
             fast_field_writers
                 .add_document(&doc!(field=>false))
                 .unwrap();
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
@@ -802,7 +801,7 @@ mod tests {
                     .add_document(&doc!(field=>false))
                     .unwrap();
             }
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
@@ -827,7 +826,7 @@ mod tests {
             let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
             let doc = TantivyDocument::default();
             fast_field_writers.add_document(&doc).unwrap();
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
@@ -855,7 +854,7 @@ mod tests {
             for doc in docs {
                 fast_field_writers.add_document(doc).unwrap();
             }
-            fast_field_writers.serialize(&mut write).unwrap();
+            fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         Ok(directory)

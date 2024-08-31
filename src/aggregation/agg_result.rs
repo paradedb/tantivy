@@ -8,9 +8,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::bucket::GetDocCount;
-use super::metric::{
-    ExtendedStats, PercentilesMetricResult, SingleMetricResult, Stats, TopHitsMetricResult,
-};
+use super::metric::{PercentilesMetricResult, SingleMetricResult, Stats, TopHitsMetricResult};
 use super::{AggregationError, Key};
 use crate::TantivyError;
 
@@ -90,16 +88,12 @@ pub enum MetricResult {
     Min(SingleMetricResult),
     /// Stats metric result.
     Stats(Stats),
-    /// ExtendedStats metric result.
-    ExtendedStats(Box<ExtendedStats>),
     /// Sum metric result.
     Sum(SingleMetricResult),
     /// Percentiles metric result.
     Percentiles(PercentilesMetricResult),
     /// Top hits metric result
     TopHits(TopHitsMetricResult),
-    /// Cardinality metric result
-    Cardinality(SingleMetricResult),
 }
 
 impl MetricResult {
@@ -110,7 +104,6 @@ impl MetricResult {
             MetricResult::Max(max) => Ok(max.value),
             MetricResult::Min(min) => Ok(min.value),
             MetricResult::Stats(stats) => stats.get_value(agg_property),
-            MetricResult::ExtendedStats(extended_stats) => extended_stats.get_value(agg_property),
             MetricResult::Sum(sum) => Ok(sum.value),
             MetricResult::Percentiles(_) => Err(TantivyError::AggregationError(
                 AggregationError::InvalidRequest("percentiles can't be used to order".to_string()),
@@ -118,7 +111,6 @@ impl MetricResult {
             MetricResult::TopHits(_) => Err(TantivyError::AggregationError(
                 AggregationError::InvalidRequest("top_hits can't be used to order".to_string()),
             )),
-            MetricResult::Cardinality(card) => Ok(card.value),
         }
     }
 }
