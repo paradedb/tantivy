@@ -67,6 +67,7 @@ sketches-ddsketch = { version = "0.3.0", features = ["use_serde"] }
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 futures-util = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
+pgrx = "0.12.6"
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
