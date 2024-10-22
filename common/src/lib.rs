@@ -144,6 +144,15 @@ pub(crate) mod test {
         assert_eq!(u64_to_f64(f64_to_u64(val)), val);
     }
 
+<<<<<<< HEAD
+=======
+    pub(crate) fn fixed_size_test<O: BinarySerializable + FixedSize + Default>() {
+        let mut buffer = Vec::new();
+        O::default().serialize(&mut buffer).unwrap();
+        assert_eq!(buffer.len(), O::SIZE_IN_BYTES);
+    }
+
+>>>>>>> 2d22e4d07 (clippy (#2527))
     proptest! {
         #[test]
         fn test_f64_converter_monotonicity_proptest((left, right) in (proptest::num::f64::NORMAL, proptest::num::f64::NORMAL)) {
