@@ -140,7 +140,7 @@ where
     }
 
     /// Return the next `(key, value)` pair.
-    #[allow(clippy::should_implement_trait)]
+    #[expect(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(&[u8], &TermInfo)> {
         if self.advance() {
             Some((self.key(), self.value()))
