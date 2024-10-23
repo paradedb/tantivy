@@ -12,7 +12,7 @@ use crate::core::{Executor, META_FILEPATH};
 use crate::directory::error::OpenReadError;
 #[cfg(feature = "mmap")]
 use crate::directory::MmapDirectory;
-use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
+use crate::directory::{Directory, DirectoryLock, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
 use crate::error::{DataCorruption, TantivyError};
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
 use crate::indexer::index_writer::{MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN};
@@ -545,20 +545,7 @@ impl Index {
         num_threads: usize,
         overall_memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter<D>> {
-        let directory_lock = self
-            .directory
-            .acquire_lock(&INDEX_WRITER_LOCK)
-            .map_err(|err| {
-                TantivyError::LockFailure(
-                    err,
-                    Some(
-                        "Failed to acquire index lock. If you are using a regular directory, this \
-                         means there is already an `IndexWriter` working on this `Directory`, in \
-                         this process or in a different process."
-                            .to_string(),
-                    ),
-                )
-            })?;
+        let directory_lock = DirectoryLock::from(Box::new(&INDEX_WRITER_LOCK));
         let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
         IndexWriter::new(
             self,
@@ -666,7 +653,7 @@ impl Index {
 
     /// Returns the set of corrupted files
     pub fn validate_checksum(&self) -> crate::Result<HashSet<PathBuf>> {
-        let managed_files = self.directory.list_managed_files();
+        let managed_files = self.directory.get_managed_paths()?;
         let active_segments_files: HashSet<PathBuf> = self
             .searchable_segment_metas()?
             .iter()

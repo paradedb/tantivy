@@ -11,7 +11,7 @@ use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteEr
 use crate::directory::footer::{Footer, FooterProxy};
 use crate::directory::{
     DirectoryLock, FileHandle, FileSlice, GarbageCollectionResult, Lock, WatchCallback,
-    WatchHandle, WritePtr, META_LOCK,
+    WatchHandle, WritePtr, META_LOCK, MANAGED_LOCK
 };
 use crate::error::DataCorruption;
 use crate::Directory;
@@ -109,6 +109,9 @@ impl ManagedDirectory {
     ) -> crate::Result<GarbageCollectionResult> {
         let mut files_to_delete = vec![];
 
+        // We're about to do an atomic write to managed.json, lock it down
+        self.acquire_lock(&MANAGED_LOCK)?;
+
         // It is crucial to get the living files after acquiring the
         // read lock of meta information. That way, we
         // avoid the following scenario.
@@ -202,6 +205,10 @@ impl ManagedDirectory {
         if !is_managed(filepath) {
             return Ok(());
         }
+
+        // We're about to do an atomic write to managed.json, lock it down
+        self.acquire_lock(&MANAGED_LOCK).expect("must be able to acquire lock for managed.json");
+
         let mut managed_paths = self.get_managed_paths().expect("reading managed files should not fail");
         let has_changed = managed_paths.insert(filepath.to_owned());
         if !has_changed {
@@ -242,6 +249,7 @@ impl ManagedDirectory {
 
     /// List all managed files
     pub fn list_managed_files(&self) -> HashSet<PathBuf> {
+        self.acquire_lock(&MANAGED_LOCK).expect("must be able to acquire lock for managed.json");
         self.get_managed_paths().expect("reading managed files should not fail")
     }
 }
