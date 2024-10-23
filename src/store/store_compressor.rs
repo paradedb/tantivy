@@ -231,7 +231,7 @@ fn harvest_thread_result(join_handle_opt: Option<JoinHandle<io::Result<()>>>) ->
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Thread already joined."))?;
     join_handle
         .join()
-        .map_err(|_err| io::Error::new(io::ErrorKind::Other, "Compressing thread panicked."))?
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, "Error"))?
 }
 
 #[cfg(test)]
