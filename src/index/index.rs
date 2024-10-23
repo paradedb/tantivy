@@ -36,17 +36,14 @@ fn load_metas(
             "Meta file does not contain valid utf8 file.".to_string(),
         )
     })?;
-    let meta = IndexMeta::deserialize(&meta_string, inventory)
+    IndexMeta::deserialize(&meta_string, inventory)
         .map_err(|e| {
             DataCorruption::new(
                 META_FILEPATH.to_path_buf(),
                 format!("Meta file cannot be deserialized. {e:?}. Content: {meta_string:?}"),
             )
         })
-        .map_err(From::from);
-
-    pgrx::info!("Meta data loaded from {:?}: {:?}", META_FILEPATH, meta);
-    meta
+        .map_err(From::from)
 }
 
 /// Save the index meta file.

@@ -610,7 +610,8 @@ impl<D: Document> IndexWriter<D> {
         //
         // This will move uncommitted segments to the state of
         // committed segments.
-
+        info!("Preparing commit");
+        
         // this will drop the current document channel
         // and recreate a new one.
         self.recreate_document_channel();
