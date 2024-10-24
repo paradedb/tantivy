@@ -1,6 +1,7 @@
+use crate::postings::TermInfo;
 use crate::query::fuzzy_query::DfaWrapper;
 use crate::query::score_combiner::SumCombiner;
-use crate::query::Union;
+
 use std::any::{Any, TypeId};
 use std::io;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use tantivy_fst::Automaton;
 
 use super::phrase_prefix_query::prefix_end;
 use crate::index::SegmentReader;
-use crate::query::{BitSetDocSet, ConstScorer, Explanation, Scorer, Weight};
+use crate::query::{BufferedUnionScorer, ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
 use crate::termdict::{TermDictionary, TermWithStateStreamer};
 use crate::{DocId, Score, TantivyError};
