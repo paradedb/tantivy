@@ -2,12 +2,9 @@
 mod test {
     use maplit::hashmap;
     use tantivy::collector::TopDocs;
-    use tantivy::doc;
     use tantivy::query::FuzzyTermQuery;
-    use tantivy::schema::Schema;
-    use tantivy::schema::{STORED, TEXT};
-    use tantivy::Index;
-    use tantivy::Term;
+    use tantivy::schema::{Schema, STORED, TEXT};
+    use tantivy::{doc, Index, Term};
 
     #[test]
     pub fn test_fuzzy_term() {
