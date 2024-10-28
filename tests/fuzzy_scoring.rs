@@ -3,8 +3,8 @@ mod test {
     use maplit::hashmap;
     use tantivy::collector::TopDocs;
     use tantivy::query::FuzzyTermQuery;
-    use tantivy::schema::{Schema, STORED, TEXT};
-    use tantivy::{doc, Index, Term};
+    use tantivy::schema::{Schema, Value, STORED, TEXT};
+    use tantivy::{doc, Index, TantivyDocument, Term};
 
     #[test]
     pub fn test_fuzzy_term() {
@@ -100,8 +100,8 @@ mod test {
 
             // Print out the scores and documents retrieved by the search.
             for (score, adr) in &top_docs {
-                let doc = searcher.doc(*adr).expect("document");
-                println!("{score}, {:?}", doc.field_values().first().unwrap().value);
+                let doc: TantivyDocument = searcher.doc(*adr).expect("document");
+                println!("{score}, {:?}", doc.field_values().next().unwrap().1);
             }
 
             // Assert that 17 documents match the fuzzy query criteria.
@@ -111,14 +111,8 @@ mod test {
 
             // Check the scores of the returned documents against the expected scores.
             for (score, adr) in &top_docs {
-                let doc = searcher.doc(*adr).expect("document");
-                let doc_text = doc
-                    .field_values()
-                    .first()
-                    .unwrap()
-                    .value()
-                    .as_text()
-                    .unwrap();
+                let doc: TantivyDocument = searcher.doc(*adr).expect("document");
+                let doc_text = doc.field_values().next().unwrap().1.as_str().unwrap();
 
                 // Ensure the retrieved score for each document is close to the expected score.
                 assert!(
