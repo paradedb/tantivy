@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -225,6 +226,22 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// `OnCommitWithDelay` `ReloadPolicy`. Not implementing watch in a `Directory` only prevents
     /// the `OnCommitWithDelay` `ReloadPolicy` to work properly.
     fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle>;
+
+    /// Allows the directory to list managed files, overriding the ManagedDirectory's default
+    /// list_managed_files
+    fn list_managed_files(&self) -> crate::Result<HashSet<PathBuf>> {
+        Err(crate::TantivyError::InternalError(
+            "list_managed_files not implemented".to_string(),
+        ))
+    }
+
+    /// Allows the directory to register a file as managed, overriding the ManagedDirectory's
+    /// default register_file_as_managed
+    fn register_files_as_managed(&self, files: Vec<PathBuf>, overwrite: bool) -> crate::Result<()> {
+        Err(crate::TantivyError::InternalError(
+            "register_files_as_managed not implemented".to_string(),
+        ))
+    }
 }
 
 /// DirectoryClone
