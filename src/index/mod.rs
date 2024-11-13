@@ -13,8 +13,10 @@ mod segment_reader;
 
 pub(crate) use self::index::{builtin_plugins, list_segment_files};
 pub use self::index::{Index, IndexBuilder};
-pub(crate) use self::index_meta::SegmentMetaInventory;
-pub use self::index_meta::{IndexMeta, IndexSettings, IndexSortByField, Order, SegmentMeta};
+pub use self::index_meta::{
+    IndexMeta, IndexSettings, IndexSortByField, InnerSegmentMeta, Order, SegmentMeta,
+    SegmentMetaInventory,
+};
 pub use self::inverted_index_plugin::{InvertedIndexPlugin, InvertedIndexPluginWriter};
 pub use self::inverted_index_reader::InvertedIndexReader;
 pub use self::segment::Segment;
