@@ -199,7 +199,6 @@ impl ManagedDirectory {
                 .directory
                 .register_files_as_managed(managed_paths_write.clone().into_iter().collect(), true)
             {
-                eprintln!("registering 2");
                 save_managed_paths(self.directory.as_mut(), &managed_paths_write)?;
             }
         }
@@ -235,7 +234,6 @@ impl ManagedDirectory {
         if let Err(crate::TantivyError::InternalError(_)) =
             self.directory.register_files_as_managed(vec![filepath.to_owned()], false)
         {
-            eprintln!("registering 1");
             let mut managed_paths = self
                 .list_managed_files()
                 .expect("reading managed files should not fail");
