@@ -218,7 +218,7 @@ use serde::{Deserialize, Serialize};
 pub use self::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 #[doc(hidden)]
 pub use crate::core::json_utils;
-pub use crate::core::{Executor, Searcher, SearcherGeneration};
+pub use crate::core::{Executor, Searcher, SearcherGeneration, MANAGED_FILEPATH, META_FILEPATH};
 pub use crate::directory::Directory;
 #[allow(deprecated)] // Remove with index sorting
 pub use crate::index::{

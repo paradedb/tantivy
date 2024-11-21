@@ -10,7 +10,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use super::segment_manager::SegmentManager;
 use crate::core::META_FILEPATH;
-use crate::directory::{Directory, DirectoryClone, GarbageCollectionResult};
+use crate::directory::{Directory, DirectoryClone, GarbageCollectionResult, META_LOCK};
 use crate::fastfield::AliveBitSet;
 use crate::index::{Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta};
 use crate::indexer::delete_queue::DeleteCursor;
@@ -379,6 +379,7 @@ impl SegmentUpdater {
         if self.is_alive() {
             let index = &self.index;
             let directory = index.directory();
+            let _lock = directory.acquire_lock(&META_LOCK)?;
             let mut commited_segment_metas = self.segment_manager.committed_segment_metas();
 
             // We sort segment_readers by number of documents.
@@ -421,7 +422,9 @@ impl SegmentUpdater {
     fn list_files(&self) -> HashSet<PathBuf> {
         let mut files: HashSet<PathBuf> = self
             .index
-            .list_all_segment_metas()
+            .load_metas()
+            .expect("Failed to load index meta")
+            .segments
             .into_iter()
             .flat_map(|segment_meta| segment_meta.list_files())
             .collect();
