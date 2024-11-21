@@ -231,8 +231,9 @@ impl ManagedDirectory {
             .acquire_lock(&MANAGED_LOCK)
             .expect("must be able to acquire lock for managed.json");
 
-        if let Err(crate::TantivyError::InternalError(_)) =
-            self.directory.register_files_as_managed(vec![filepath.to_owned()], false)
+        if let Err(crate::TantivyError::InternalError(_)) = self
+            .directory
+            .register_files_as_managed(vec![filepath.to_owned()], false)
         {
             let mut managed_paths = self
                 .list_managed_files()
@@ -293,8 +294,6 @@ impl Directory for ManagedDirectory {
     }
 
     fn open_write(&self, path: &Path) -> result::Result<WritePtr, OpenWriteError> {
-        self.register_file_as_managed(path)
-            .map_err(|io_error| OpenWriteError::wrap_io_error(io_error, path.to_path_buf()))?;
         Ok(io::BufWriter::new(Box::new(FooterProxy::new(
             self.directory
                 .open_write(path)?
@@ -305,7 +304,6 @@ impl Directory for ManagedDirectory {
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-        self.register_file_as_managed(path)?;
         self.directory.atomic_write(path, data)
     }
 

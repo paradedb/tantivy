@@ -194,7 +194,9 @@ impl InnerIndexReader {
     /// as we are opening our index.
     fn open_segment_readers(index: &Index) -> crate::Result<Vec<SegmentReader>> {
         // Prevents segment files from getting deleted while we are in the process of opening them
-        let _meta_lock = index.directory().acquire_lock(&META_LOCK)?;
+        // @rebasedming: meta_lock has been moved to save_metas, which calls open_segment_readers
+        // This lock would deadlock if it was still here
+        // let _meta_lock = index.directory().acquire_lock(&META_LOCK)?;
         let searchable_segments = index.searchable_segments()?;
         let segment_readers = searchable_segments
             .iter()
