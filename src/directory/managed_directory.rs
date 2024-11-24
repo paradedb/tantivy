@@ -116,7 +116,9 @@ impl ManagedDirectory {
         let mut files_to_delete = vec![];
 
         // We're about to do an atomic write to managed.json, lock it down
-        let _lock = self.acquire_lock(&MANAGED_LOCK)?;
+        let _managed_lock = self.acquire_lock(&MANAGED_LOCK)?;
+        let _meta_lock = self.acquire_lock(&META_LOCK)?;
+
         let managed_paths = match self.directory.list_managed_files() {
             Ok(managed_paths) => managed_paths,
             Err(crate::TantivyError::InternalError(_)) => {
@@ -136,26 +138,10 @@ impl ManagedDirectory {
         // even though it is a living file.
         //
         // releasing the lock as .delete() will use it too.
-        {
-            // The point of this second "file" lock is to enforce the following scenario
-            // 1) process B tries to load a new set of searcher.
-            // The list of segments is loaded
-            // 2) writer change meta.json (for instance after a merge or a commit)
-            // 3) gc kicks in.
-            // 4) gc removes a file that was useful for process B, before process B opened it.
-            match self.acquire_lock(&META_LOCK) {
-                Ok(_meta_lock) => {
-                    let living_files = get_living_files();
-                    for managed_path in &managed_paths {
-                        if !living_files.contains(managed_path) {
-                            files_to_delete.push(managed_path.clone());
-                        }
-                    }
-                }
-                Err(err) => {
-                    error!("Failed to acquire lock for GC");
-                    return Err(crate::TantivyError::from(err));
-                }
+        let living_files = get_living_files();
+        for managed_path in &managed_paths {
+            if !living_files.contains(managed_path) {
+                files_to_delete.push(managed_path.clone());
             }
         }
 
