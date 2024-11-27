@@ -8,6 +8,8 @@ use std::{fmt, io, thread};
 use crate::directory::directory_lock::Lock;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use crate::directory::{FileHandle, FileSlice, WatchCallback, WatchHandle, WritePtr};
+use crate::index::SegmentMetaInventory;
+use crate::IndexMeta;
 
 /// Retry the logic of acquiring locks is pretty simple.
 /// We just retry `n` times after a given `duratio`, both
@@ -240,6 +242,20 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     fn register_files_as_managed(&self, files: Vec<PathBuf>, overwrite: bool) -> crate::Result<()> {
         Err(crate::TantivyError::InternalError(
             "register_files_as_managed not implemented".to_string(),
+        ))
+    }
+
+    /// Allows the directory to save IndexMeta, overriding the SegmentUpdater's default save_meta
+    fn save_metas(&self, meta: &IndexMeta) -> crate::Result<()> {
+        Err(crate::TantivyError::InternalError(
+            "save_meta not implemented".to_string(),
+        ))
+    }
+
+    /// Allows the directory to load IndexMeta, overriding the SegmentUpdater's default load_meta
+    fn load_metas(&self, inventory: &SegmentMetaInventory) -> crate::Result<IndexMeta> {
+        Err(crate::TantivyError::InternalError(
+            "load_metas not implemented".to_string(),
         ))
     }
 }

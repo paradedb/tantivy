@@ -14,7 +14,8 @@ use crate::directory::{
     WatchHandle, WritePtr, MANAGED_LOCK, META_LOCK,
 };
 use crate::error::DataCorruption;
-use crate::Directory;
+use crate::index::SegmentMetaInventory;
+use crate::{Directory, IndexMeta};
 
 /// Returns true if the file is "managed".
 /// Non-managed file are not subject to garbage collection.
@@ -316,6 +317,14 @@ impl Directory for ManagedDirectory {
     fn sync_directory(&self) -> io::Result<()> {
         self.directory.sync_directory()?;
         Ok(())
+    }
+
+    fn save_metas(&self, metas: &IndexMeta) -> crate::Result<()> {
+        self.directory.save_metas(metas)
+    }
+
+    fn load_metas(&self, inventory: &SegmentMetaInventory) -> crate::Result<IndexMeta> {
+        self.directory.load_metas(inventory)
     }
 }
 
