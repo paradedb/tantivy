@@ -196,28 +196,42 @@ struct NestedDocumentScorer {
 
 impl DocSet for NestedDocumentScorer {
     fn advance(&mut self) -> DocId {
-        if !self.initialized {
-            println!("\n=== Initializing NestedDocumentScorer ===");
-            self.initialized = true;
-            self.current_parent = self.find_next_parent(0);
-            if self.current_parent == TERMINATED {
-                self.has_more = false;
-                return TERMINATED;
-            }
-            return self.collect_matches();
-        }
-
+        // If we are out of docs, just return TERMINATED.
         if !self.has_more {
             return TERMINATED;
         }
 
-        self.current_parent = self.find_next_parent(self.current_parent + 1);
-        if self.current_parent == TERMINATED {
-            self.has_more = false;
-            return TERMINATED;
+        // If this is the first time we advance, initialize the child scorer.
+        if !self.initialized {
+            // Advance the child scorer once to position it properly.
+            self.child_scorer.advance();
+            self.initialized = true;
         }
 
-        self.collect_matches()
+        // Keep looping until we find a parent with children or run out of parents.
+        loop {
+            let start = if self.current_parent == TERMINATED {
+                // Start from doc 0 if we haven't found any parent yet.
+                0
+            } else {
+                self.current_parent + 1
+            };
+
+            // Find the next parent
+            self.current_parent = self.find_next_parent(start);
+            if self.current_parent == TERMINATED {
+                self.has_more = false;
+                return TERMINATED;
+            }
+
+            // Collect matches for this parent
+            let doc_id = self.collect_matches();
+            if doc_id != TERMINATED {
+                // We found a parent with children
+                return doc_id;
+            }
+            // If no children were found, try the next parent
+        }
     }
 
     fn doc(&self) -> DocId {
@@ -234,39 +248,41 @@ impl DocSet for NestedDocumentScorer {
 }
 
 impl NestedDocumentScorer {
+    fn find_next_parent(&self, from: DocId) -> DocId {
+        println!(">>> Looking for next parent starting from {}", from);
+        let mut current = from;
+        while current < self.parent_docs.max_value() {
+            if self.parent_docs.contains(current) {
+                println!(">>> Found next parent: {}", current);
+                return current;
+            }
+            current += 1;
+        }
+        println!(">>> No more parents found after {}", from);
+        TERMINATED
+    }
+
     fn collect_matches(&mut self) -> DocId {
         println!(
             "\n>>> Collecting matches for parent: {}",
             self.current_parent
         );
 
-        // Initialize child scorer if not already initialized
-        let mut child_doc = if !self.initialized {
-            println!(">>> First time initialization of child scorer");
-            let doc = self.child_scorer.advance();
-            println!(">>> Initial child doc: {}", doc);
-            self.initialized = true;
-            doc
-        } else {
-            let doc = self.child_scorer.doc();
-            println!(">>> Using existing child doc: {}", doc);
-            doc
-        };
-
-        println!(">>> Current child doc: {}", child_doc);
+        let mut child_doc = self.child_scorer.doc();
+        println!(">>> Using current child doc: {}", child_doc);
         println!(">>> Current parent: {}", self.current_parent);
         println!(">>> Has more: {}", self.has_more);
 
         let mut child_scores = Vec::new();
 
-        // Find all valid children for this parent
+        // Gather all valid children for this parent
         while child_doc != TERMINATED && child_doc < self.current_parent {
             println!(
                 ">>> Examining child doc {} for parent {}",
                 child_doc, self.current_parent
             );
 
-            // Check if this is a valid child
+            // Check if there is another parent in between child and this parent
             let mut is_valid = true;
             for doc_id in (child_doc + 1)..self.current_parent {
                 if self.parent_docs.contains(doc_id) {
@@ -297,7 +313,15 @@ impl NestedDocumentScorer {
             println!(">>> Advanced child scorer to: {}", child_doc);
         }
 
-        if !child_scores.is_empty() {
+        if child_scores.is_empty() {
+            println!(
+                ">>> No valid children for parent {}, skipping this parent",
+                self.current_parent
+            );
+            // Return TERMINATED to indicate no matches for this parent
+            // and let `advance()` try the next one.
+            TERMINATED
+        } else {
             println!(
                 ">>> Found {} valid children for parent {}",
                 child_scores.len(),
@@ -314,12 +338,12 @@ impl NestedDocumentScorer {
                     avg
                 }
                 ScoreMode::Max => {
-                    let max = child_scores.iter().cloned().fold(f32::MIN, f32::max);
+                    let max = child_scores.iter().copied().fold(f32::MIN, f32::max);
                     println!(">>> Max score for parent {}: {}", self.current_parent, max);
                     max
                 }
                 ScoreMode::Total => {
-                    let sum = child_scores.iter().sum();
+                    let sum: Score = child_scores.iter().sum();
                     println!(
                         ">>> Total score for parent {}: {}",
                         self.current_parent, sum
@@ -333,65 +357,7 @@ impl NestedDocumentScorer {
                 self.current_parent, self.current_score
             );
             self.current_parent
-        } else {
-            println!(
-                ">>> No valid children for parent {}, advancing",
-                self.current_parent
-            );
-            // No children found, try next parent
-            self.advance()
         }
-    }
-
-    fn advance(&mut self) -> DocId {
-        if !self.initialized {
-            println!(">>> Initial advance - not yet initialized");
-            self.initialized = true;
-            self.current_parent = self.find_next_parent(0);
-
-            if self.current_parent == TERMINATED {
-                println!(">>> No initial parent found, terminating");
-                self.has_more = false;
-                return TERMINATED;
-            }
-
-            println!(">>> Found initial parent: {}", self.current_parent);
-            return self.collect_matches();
-        }
-
-        if !self.has_more {
-            println!(">>> No more documents to process");
-            return TERMINATED;
-        }
-
-        println!(
-            ">>> Advancing from parent {} to next parent",
-            self.current_parent
-        );
-        self.current_parent = self.find_next_parent(self.current_parent + 1);
-
-        if self.current_parent == TERMINATED {
-            println!(">>> No more parents found, terminating");
-            self.has_more = false;
-            return TERMINATED;
-        }
-
-        println!(">>> Found next parent: {}", self.current_parent);
-        self.collect_matches()
-    }
-
-    fn find_next_parent(&self, from: DocId) -> DocId {
-        println!(">>> Looking for next parent starting from {}", from);
-        let mut current = from;
-        while current < self.parent_docs.max_value() {
-            if self.parent_docs.contains(current) {
-                println!(">>> Found next parent: {}", current);
-                return current;
-            }
-            current += 1;
-        }
-        println!(">>> No more parents found after {}", from);
-        TERMINATED
     }
 }
 
@@ -407,8 +373,7 @@ mod tests {
     use crate::collector::TopDocs;
     use crate::query::{BooleanQuery, Occur, RangeQuery, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, INDEXED, STORED, STRING};
-    use crate::Term;
-    use crate::{Index, Result};
+    use crate::{Index, Result, Term};
     use std::ops::Bound;
 
     #[test]
@@ -432,38 +397,15 @@ mod tests {
 
         println!("Created index and writer");
 
-        // Add documents in the correct order: children before parents
-        writer.add_document(doc!(
-            skill => "java",
-            year => 2006u64,
-        ))?;
-
-        writer.add_document(doc!(
-            skill => "python",
-            year => 2010u64,
-        ))?;
-
-        writer.add_document(doc!(
-            name => "Lisa",
-            country => "United Kingdom",
-            doc_type => "resume",
-        ))?;
-
-        writer.add_document(doc!(
-            skill => "ruby",
-            year => 2005u64,
-        ))?;
-
-        writer.add_document(doc!(
-            skill => "java",
-            year => 2007u64,
-        ))?;
-
-        writer.add_document(doc!(
-            name => "Frank",
-            country => "United States",
-            doc_type => "resume",
-        ))?;
+        // Add documents using add_documents in a single batch
+        writer.add_documents(vec![
+            doc!(skill => "java",   year => 2006u64),
+            doc!(skill => "python", year => 2010u64),
+            doc!(name => "Lisa", country => "United Kingdom", doc_type => "resume"),
+            doc!(skill => "ruby",  year => 2005u64),
+            doc!(skill => "java",  year => 2007u64),
+            doc!(name => "Frank", country => "United States", doc_type => "resume"),
+        ])?;
 
         println!("Added all documents");
         writer.commit()?;
