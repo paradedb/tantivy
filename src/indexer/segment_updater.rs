@@ -711,7 +711,7 @@ mod tests {
     use crate::indexer::segment_updater::merge_filtered_segments;
     use crate::query::QueryParser;
     use crate::schema::*;
-    use crate::{Directory, DocAddress, Index, Segment};
+    use crate::{Ctid, Directory, DocAddress, Index, Segment};
 
     #[test]
     fn test_delete_during_merge() -> crate::Result<()> {
@@ -1053,7 +1053,7 @@ mod tests {
                 let query = QueryParser::for_index(&index, vec![text_field])
                     .parse_query(term)
                     .unwrap();
-                let top_docs: Vec<(f32, DocAddress)> =
+                let top_docs: Vec<(f32, DocAddress, Ctid)> =
                     searcher.search(&query, &TopDocs::with_limit(3)).unwrap();
 
                 top_docs.iter().map(|el| el.1.doc_id).collect::<Vec<_>>()

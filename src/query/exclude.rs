@@ -1,6 +1,6 @@
 use crate::docset::{DocSet, TERMINATED};
 use crate::query::Scorer;
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score};
 
 #[inline]
 fn is_within<TDocSetExclude: DocSet>(docset: &mut TDocSetExclude, doc: DocId) -> bool {
@@ -84,7 +84,7 @@ where
     TScorer: Scorer,
     TDocSetExclude: DocSet + 'static,
 {
-    fn score(&mut self) -> Score {
+    fn score(&mut self) -> (Score, Ctid) {
         self.underlying_docset.score()
     }
 }

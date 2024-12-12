@@ -1,7 +1,7 @@
 use crate::docset::{DocSet, TERMINATED};
 use crate::query::term_query::TermScorer;
 use crate::query::{EmptyScorer, Scorer};
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score};
 
 /// Returns the intersection scorer.
 ///
@@ -45,8 +45,8 @@ pub fn intersect_scorers(mut scorers: Vec<Box<dyn Scorer>>) -> Box<dyn Scorer> {
 
 /// Creates a `DocSet` that iterate through the intersection of two or more `DocSet`s.
 pub struct Intersection<TDocSet: DocSet, TOtherDocSet: DocSet = Box<dyn Scorer>> {
-    left: TDocSet,
-    right: TDocSet,
+    pub(crate) left: TDocSet,
+    pub(crate) right: TDocSet,
     others: Vec<TOtherDocSet>,
 }
 
@@ -150,10 +150,21 @@ where
     TScorer: Scorer,
     TOtherScorer: Scorer,
 {
-    fn score(&mut self) -> Score {
-        self.left.score()
-            + self.right.score()
-            + self.others.iter_mut().map(Scorer::score).sum::<Score>()
+    fn score(&mut self) -> (Score, Ctid) {
+        let (left_score, left_ctid) = self.left.score();
+        let (right_score, right_ctid) = self.right.score();
+        debug_assert!(left_ctid == right_ctid);
+        (
+            left_score
+                + right_score
+                + self
+                    .others
+                    .iter_mut()
+                    .map(Scorer::score)
+                    .map(|(score, _)| score)
+                    .sum::<Score>(),
+            left_ctid,
+        )
     }
 }
 

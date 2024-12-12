@@ -4,7 +4,7 @@ use crate::postings::Postings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::phrase_query::{intersection_count, PhraseScorer};
 use crate::query::Scorer;
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score};
 
 enum PhraseKind<TPostings: Postings> {
     SinglePrefix {
@@ -78,13 +78,17 @@ impl<TPostings: Postings> DocSet for PhraseKind<TPostings> {
 }
 
 impl<TPostings: Postings> Scorer for PhraseKind<TPostings> {
-    fn score(&mut self) -> Score {
+    fn score(&mut self) -> (Score, Ctid) {
         match self {
-            PhraseKind::SinglePrefix { positions, .. } => {
+            PhraseKind::SinglePrefix {
+                positions,
+                postings,
+                ..
+            } => {
                 if positions.is_empty() {
-                    0.0
+                    (0.0, postings.ctid())
                 } else {
-                    1.0
+                    (1.0, postings.ctid())
                 }
             }
             PhraseKind::MultiPrefix(postings) => postings.score(),
@@ -200,7 +204,7 @@ impl<TPostings: Postings> DocSet for PhrasePrefixScorer<TPostings> {
 }
 
 impl<TPostings: Postings> Scorer for PhrasePrefixScorer<TPostings> {
-    fn score(&mut self) -> Score {
+    fn score(&mut self) -> (Score, Ctid) {
         // TODO modify score??
         self.phrase_scorer.score()
     }

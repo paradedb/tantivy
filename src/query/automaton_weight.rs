@@ -175,10 +175,10 @@ mod tests {
         let searcher = reader.searcher();
         let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
         assert_eq!(scorer.doc(), 0u32);
-        assert_eq!(scorer.score(), 1.0);
+        assert_eq!(scorer.score().0, 1.0);
         assert_eq!(scorer.advance(), 2u32);
         assert_eq!(scorer.doc(), 2u32);
-        assert_eq!(scorer.score(), 1.0);
+        assert_eq!(scorer.score().0, 1.0);
         assert_eq!(scorer.advance(), TERMINATED);
         Ok(())
     }
@@ -192,7 +192,7 @@ mod tests {
         let searcher = reader.searcher();
         let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.32)?;
         assert_eq!(scorer.doc(), 0u32);
-        assert_eq!(scorer.score(), 1.32);
+        assert_eq!(scorer.score().0, 1.32);
         Ok(())
     }
 }

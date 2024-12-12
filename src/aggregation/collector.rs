@@ -9,7 +9,7 @@ use super::segment_agg_result::{
 use crate::aggregation::agg_req_with_accessor::get_aggs_with_segment_accessor_and_validate;
 use crate::collector::{Collector, SegmentCollector};
 use crate::index::SegmentReader;
-use crate::{DocId, SegmentOrdinal, TantivyError};
+use crate::{Ctid, DocId, SegmentOrdinal, TantivyError};
 
 /// The default max bucket count, before the aggregation fails.
 pub const DEFAULT_BUCKET_LIMIT: u32 = 65000;
@@ -165,7 +165,7 @@ impl SegmentCollector for AggregationSegmentCollector {
     type Fruit = crate::Result<IntermediateAggregationResults>;
 
     #[inline]
-    fn collect(&mut self, doc: DocId, _score: crate::Score) {
+    fn collect(&mut self, doc: DocId, _score: crate::Score, _ctid: Ctid) {
         if self.error.is_some() {
             return;
         }
@@ -180,7 +180,7 @@ impl SegmentCollector for AggregationSegmentCollector {
     /// The query pushes the documents to the collector via this method.
     ///
     /// Only valid for Collectors that ignore docs
-    fn collect_block(&mut self, docs: &[DocId]) {
+    fn collect_block(&mut self, docs: &[DocId], _ctids: &[Ctid]) {
         if self.error.is_some() {
             return;
         }

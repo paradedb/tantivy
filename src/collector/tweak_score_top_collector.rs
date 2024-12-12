@@ -1,6 +1,6 @@
 use crate::collector::top_collector::{TopCollector, TopSegmentCollector};
 use crate::collector::{Collector, SegmentCollector};
-use crate::{DocAddress, DocId, Result, Score, SegmentReader};
+use crate::{Ctid, DocAddress, DocId, Result, Score, SegmentReader};
 
 pub(crate) struct TweakedScoreTopCollector<TScoreTweaker, TScore = Score> {
     score_tweaker: TScoreTweaker,
@@ -8,7 +8,8 @@ pub(crate) struct TweakedScoreTopCollector<TScoreTweaker, TScore = Score> {
 }
 
 impl<TScoreTweaker, TScore> TweakedScoreTopCollector<TScoreTweaker, TScore>
-where TScore: Clone + PartialOrd
+where
+    TScore: Clone + PartialOrd,
 {
     pub fn new(
         score_tweaker: TScoreTweaker,
@@ -50,7 +51,7 @@ where
     TScoreTweaker: ScoreTweaker<TScore> + Send + Sync,
     TScore: 'static + PartialOrd + Clone + Send + Sync,
 {
-    type Fruit = Vec<(TScore, DocAddress)>;
+    type Fruit = Vec<(TScore, DocAddress, Ctid)>;
 
     type Child = TopTweakedScoreSegmentCollector<TScoreTweaker::Child, TScore>;
 
@@ -91,14 +92,14 @@ where
     TScore: 'static + PartialOrd + Clone + Send + Sync,
     TSegmentScoreTweaker: 'static + ScoreSegmentTweaker<TScore>,
 {
-    type Fruit = Vec<(TScore, DocAddress)>;
+    type Fruit = Vec<(TScore, DocAddress, Ctid)>;
 
-    fn collect(&mut self, doc: DocId, score: Score) {
+    fn collect(&mut self, doc: DocId, score: Score, ctid: Ctid) {
         let score = self.segment_scorer.score(doc, score);
-        self.segment_collector.collect(doc, score);
+        self.segment_collector.collect(doc, score, ctid);
     }
 
-    fn harvest(self) -> Vec<(TScore, DocAddress)> {
+    fn harvest(self) -> Vec<(TScore, DocAddress, Ctid)> {
         self.segment_collector.harvest()
     }
 }
@@ -116,7 +117,8 @@ where
 }
 
 impl<F, TScore> ScoreSegmentTweaker<TScore> for F
-where F: 'static + FnMut(DocId, Score) -> TScore
+where
+    F: 'static + FnMut(DocId, Score) -> TScore,
 {
     fn score(&mut self, doc: DocId, score: Score) -> TScore {
         (self)(doc, score)

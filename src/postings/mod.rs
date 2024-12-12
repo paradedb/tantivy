@@ -52,7 +52,7 @@ pub mod tests {
         Field, IndexRecordOption, Schema, Term, TextFieldIndexing, TextOptions, INDEXED, TEXT,
     };
     use crate::tokenizer::{SimpleTokenizer, MAX_TOKEN_LEN};
-    use crate::{DocId, HasLen, IndexWriter, Score, INVALID_CTID};
+    use crate::{Ctid, DocId, HasLen, IndexWriter, Score, INVALID_CTID};
 
     #[test]
     pub fn test_position_write() -> crate::Result<()> {
@@ -528,7 +528,7 @@ pub mod tests {
     }
 
     impl<TScorer: Scorer> Scorer for UnoptimizedDocSet<TScorer> {
-        fn score(&mut self) -> Score {
+        fn score(&mut self) -> (Score, Ctid) {
             self.0.score()
         }
     }

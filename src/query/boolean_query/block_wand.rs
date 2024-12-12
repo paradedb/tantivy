@@ -2,7 +2,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::query::term_query::TermScorer;
 use crate::query::Scorer;
-use crate::{DocId, DocSet, Score, TERMINATED};
+use crate::{Ctid, DocId, DocSet, Score, TERMINATED};
 
 /// Takes a term_scorers sorted by their current doc() and a threshold and returns
 /// Returns (pivot_len, pivot_ord) defined as follows:
@@ -148,7 +148,7 @@ fn advance_all_scorers_on_pivot(term_scorers: &mut Vec<TermScorerWithMaxScore>, 
 pub fn block_wand(
     mut scorers: Vec<TermScorer>,
     mut threshold: Score,
-    callback: &mut dyn FnMut(u32, Score) -> Score,
+    callback: &mut dyn FnMut(DocId, Score, Ctid) -> Score,
 ) {
     let mut scorers: Vec<TermScorerWithMaxScore> = scorers
         .iter_mut()
@@ -200,11 +200,12 @@ pub fn block_wand(
         // At this point, all scorers are positioned on the doc.
         let score = scorers[..pivot_len]
             .iter_mut()
-            .map(|scorer| scorer.score())
+            .map(|scorer| scorer.score().0)
             .sum();
+        let ctid = scorers[0].ctid();
 
         if score > threshold {
-            threshold = callback(pivot_doc, score);
+            threshold = callback(pivot_doc, score, ctid);
         }
         // let's advance all of the scorers that are currently positioned on the pivot.
         advance_all_scorers_on_pivot(&mut scorers, pivot_len);
@@ -222,7 +223,7 @@ pub fn block_wand(
 pub fn block_wand_single_scorer(
     mut scorer: TermScorer,
     mut threshold: Score,
-    callback: &mut dyn FnMut(u32, Score) -> Score,
+    callback: &mut dyn FnMut(u32, Score, Ctid) -> Score,
 ) {
     let mut doc = scorer.doc();
     loop {
@@ -242,9 +243,9 @@ pub fn block_wand_single_scorer(
             break;
         }
         loop {
-            let score = scorer.score();
+            let (score, ctid) = scorer.score();
             if score > threshold {
-                threshold = callback(doc, score);
+                threshold = callback(doc, score, ctid);
             }
             debug_assert!(doc <= scorer.last_doc_in_block());
             if doc == scorer.last_doc_in_block() {
@@ -309,7 +310,7 @@ mod tests {
     use crate::query::score_combiner::SumCombiner;
     use crate::query::term_query::TermScorer;
     use crate::query::{Bm25Weight, Scorer, Union};
-    use crate::{DocId, DocSet, Score, TERMINATED};
+    use crate::{Ctid, DocId, DocSet, Score, TERMINATED};
 
     struct Float(Score);
 
@@ -340,12 +341,12 @@ mod tests {
     fn compute_checkpoints_for_each_pruning(
         mut term_scorers: Vec<TermScorer>,
         n: usize,
-    ) -> Vec<(DocId, Score)> {
+    ) -> Vec<(DocId, Score, Ctid)> {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(n);
-        let mut checkpoints: Vec<(DocId, Score)> = Vec::new();
+        let mut checkpoints: Vec<(DocId, Score, Ctid)> = Vec::new();
         let mut limit: Score = 0.0;
 
-        let callback = &mut |doc, score| {
+        let callback = &mut |doc, score, ctid| {
             heap.push(Float(score));
             if heap.len() > n {
                 heap.pop().unwrap();
@@ -354,7 +355,7 @@ mod tests {
                 limit = heap.peek().unwrap().0;
             }
             if !nearly_equals(score, limit) {
-                checkpoints.push((doc, score));
+                checkpoints.push((doc, score, ctid));
             }
             limit
         };
@@ -368,9 +369,12 @@ mod tests {
         checkpoints
     }
 
-    fn compute_checkpoints_manual(term_scorers: Vec<TermScorer>, n: usize) -> Vec<(DocId, Score)> {
+    fn compute_checkpoints_manual(
+        term_scorers: Vec<TermScorer>,
+        n: usize,
+    ) -> Vec<(DocId, Score, Ctid)> {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(n);
-        let mut checkpoints: Vec<(DocId, Score)> = Vec::new();
+        let mut checkpoints: Vec<(DocId, Score, Ctid)> = Vec::new();
         let mut scorer = Union::build(term_scorers, SumCombiner::default);
 
         let mut limit = Score::MIN;
@@ -379,7 +383,7 @@ mod tests {
                 break;
             }
             let doc = scorer.doc();
-            let score = scorer.score();
+            let (score, ctid) = scorer.score();
             if score > limit {
                 heap.push(Float(score));
                 if heap.len() > n {
@@ -389,7 +393,7 @@ mod tests {
                     limit = heap.peek().unwrap().0;
                 }
                 if !nearly_equals(score, limit) {
-                    checkpoints.push((doc, score));
+                    checkpoints.push((doc, score, ctid));
                 }
             }
             scorer.advance();
@@ -481,11 +485,13 @@ mod tests {
                 compute_checkpoints_for_each_pruning(term_scorers.clone(), top_k);
             let checkpoints_manual = compute_checkpoints_manual(term_scorers.clone(), top_k);
             assert_eq!(checkpoints_for_each_pruning.len(), checkpoints_manual.len());
-            for (&(left_doc, left_score), &(right_doc, right_score)) in checkpoints_for_each_pruning
-                .iter()
-                .zip(checkpoints_manual.iter())
+            for (&(left_doc, left_score, left_ctid), &(right_doc, right_score, right_ctid)) in
+                checkpoints_for_each_pruning
+                    .iter()
+                    .zip(checkpoints_manual.iter())
             {
                 assert_eq!(left_doc, right_doc);
+                assert_eq!(left_ctid, right_ctid);
                 assert!(nearly_equals(left_score, right_score));
             }
         }

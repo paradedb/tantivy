@@ -93,16 +93,17 @@ fn compute_deleted_bitset(
 
         // A delete operation should only affect
         // document that were inserted before it.
-        delete_op
-            .target
-            .for_each_no_score(segment_reader, &mut |docs_matching_delete_query| {
+        delete_op.target.for_each_no_score(
+            segment_reader,
+            &mut |docs_matching_delete_query, _ctids| {
                 for doc_matching_delete_query in docs_matching_delete_query.iter().cloned() {
                     if doc_opstamps.is_deleted(doc_matching_delete_query, delete_op.opstamp) {
                         alive_bitset.remove(doc_matching_delete_query);
                         might_have_changed = true;
                     }
                 }
-            })?;
+            },
+        )?;
         delete_cursor.advance();
     }
     Ok(might_have_changed)
@@ -855,8 +856,8 @@ mod tests {
     };
     use crate::store::DOCSTORE_CACHE_CAPACITY;
     use crate::{
-        DateTime, DocAddress, Index, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument,
-        Term,
+        Ctid, DateTime, DocAddress, Index, IndexSettings, IndexWriter, ReloadPolicy,
+        TantivyDocument, Term,
     };
 
     const LOREM: &str = "Doc Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
@@ -2032,7 +2033,7 @@ mod tests {
             let query = QueryParser::for_index(&index, vec![field])
                 .parse_query(term)
                 .unwrap();
-            let top_docs: Vec<(f32, DocAddress)> =
+            let top_docs: Vec<(f32, DocAddress, Ctid)> =
                 searcher.search(&query, &TopDocs::with_limit(1000)).unwrap();
 
             top_docs.iter().map(|el| el.1).collect::<Vec<_>>()
@@ -2467,7 +2468,7 @@ mod tests {
             Term::from_field_u64(id_field, existing_id),
             IndexRecordOption::Basic,
         );
-        let top_docs: Vec<(f32, DocAddress)> =
+        let top_docs: Vec<(f32, DocAddress, Ctid)> =
             searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
 
         assert_eq!(top_docs.len(), 1); // Was failing
@@ -2509,7 +2510,7 @@ mod tests {
             Term::from_field_i64(id_field, 10i64),
             IndexRecordOption::Basic,
         );
-        let top_docs: Vec<(f32, DocAddress)> =
+        let top_docs: Vec<(f32, DocAddress, Ctid)> =
             searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
 
         assert_eq!(top_docs.len(), 1); // Fails
@@ -2518,7 +2519,7 @@ mod tests {
             Term::from_field_i64(id_field, 30i64),
             IndexRecordOption::Basic,
         );
-        let top_docs: Vec<(f32, DocAddress)> =
+        let top_docs: Vec<(f32, DocAddress, Ctid)> =
             searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
 
         assert_eq!(top_docs.len(), 1); // Fails

@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
-use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
+use crate::{Ctid, DocId, DocSet, Score, SegmentReader, TantivyError, Term, INVALID_CTID};
 
 /// `ConstScoreQuery` is a wrapper over a query to provide a constant score.
 /// It can avoid unnecessary score computation on the wrapped query.
@@ -133,8 +133,9 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
 }
 
 impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
-    fn score(&mut self) -> Score {
-        self.score
+    fn score(&mut self) -> (Score, Ctid) {
+        todo!("ConstScorer::score():  how do we get the ctid here?");
+        (self.score, INVALID_CTID)
     }
 }
 

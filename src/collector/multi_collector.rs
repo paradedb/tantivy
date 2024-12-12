@@ -3,7 +3,7 @@ use std::ops::Deref;
 
 use super::{Collector, SegmentCollector};
 use crate::collector::Fruit;
-use crate::{DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::{Ctid, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 /// MultiFruit keeps Fruits from every nested Collector
 pub struct MultiFruit {
@@ -53,13 +53,13 @@ impl SegmentCollector for Box<dyn BoxableSegmentCollector> {
     type Fruit = Box<dyn Fruit>;
 
     #[inline]
-    fn collect(&mut self, doc: u32, score: Score) {
-        self.as_mut().collect(doc, score);
+    fn collect(&mut self, doc: u32, score: Score, ctid: Ctid) {
+        self.as_mut().collect(doc, score, ctid);
     }
 
     #[inline]
-    fn collect_block(&mut self, docs: &[DocId]) {
-        self.as_mut().collect_block(docs);
+    fn collect_block(&mut self, docs: &[DocId], ctids: &[Ctid]) {
+        self.as_mut().collect_block(docs, ctids);
     }
 
     fn harvest(self) -> Box<dyn Fruit> {
@@ -68,10 +68,10 @@ impl SegmentCollector for Box<dyn BoxableSegmentCollector> {
 }
 
 pub trait BoxableSegmentCollector {
-    fn collect(&mut self, doc: u32, score: Score);
-    fn collect_block(&mut self, docs: &[DocId]) {
-        for &doc in docs {
-            self.collect(doc, 0.0);
+    fn collect(&mut self, doc: u32, score: Score, ctid: Ctid);
+    fn collect_block(&mut self, docs: &[DocId], ctids: &[Ctid]) {
+        for (doc, ctid) in docs.iter().zip(ctids) {
+            self.collect(*doc, 0.0, *ctid);
         }
     }
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit>;
@@ -83,12 +83,12 @@ impl<TSegmentCollector: SegmentCollector> BoxableSegmentCollector
     for SegmentCollectorWrapper<TSegmentCollector>
 {
     #[inline]
-    fn collect(&mut self, doc: u32, score: Score) {
-        self.0.collect(doc, score);
+    fn collect(&mut self, doc: u32, score: Score, ctid: Ctid) {
+        self.0.collect(doc, score, ctid);
     }
     #[inline]
-    fn collect_block(&mut self, docs: &[DocId]) {
-        self.0.collect_block(docs);
+    fn collect_block(&mut self, docs: &[DocId], ctids: &[Ctid]) {
+        self.0.collect_block(docs, ctids);
     }
 
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit> {
@@ -244,9 +244,9 @@ pub struct MultiCollectorChild {
 impl SegmentCollector for MultiCollectorChild {
     type Fruit = MultiFruit;
 
-    fn collect(&mut self, doc: DocId, score: Score) {
+    fn collect(&mut self, doc: DocId, score: Score, ctid: Ctid) {
         for child in &mut self.children {
-            child.collect(doc, score);
+            child.collect(doc, score, ctid);
         }
     }
 

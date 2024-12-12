@@ -1,6 +1,6 @@
 use crate::collector::top_collector::{TopCollector, TopSegmentCollector};
 use crate::collector::{Collector, SegmentCollector};
-use crate::{DocAddress, DocId, Score, SegmentReader};
+use crate::{Ctid, DocAddress, DocId, Score, SegmentReader};
 
 pub(crate) struct CustomScoreTopCollector<TCustomScorer, TScore = Score> {
     custom_scorer: TCustomScorer,
@@ -8,7 +8,8 @@ pub(crate) struct CustomScoreTopCollector<TCustomScorer, TScore = Score> {
 }
 
 impl<TCustomScorer, TScore> CustomScoreTopCollector<TCustomScorer, TScore>
-where TScore: Clone + PartialOrd
+where
+    TScore: Clone + PartialOrd,
 {
     pub(crate) fn new(
         custom_scorer: TCustomScorer,
@@ -48,7 +49,7 @@ where
     TCustomScorer: CustomScorer<TScore> + Send + Sync,
     TScore: 'static + PartialOrd + Clone + Send + Sync,
 {
-    type Fruit = Vec<(TScore, DocAddress)>;
+    type Fruit = Vec<(TScore, DocAddress, Ctid)>;
 
     type Child = CustomScoreTopSegmentCollector<TCustomScorer::Child, TScore>;
 
@@ -88,14 +89,14 @@ where
     TScore: 'static + PartialOrd + Clone + Send + Sync,
     T: 'static + CustomSegmentScorer<TScore>,
 {
-    type Fruit = Vec<(TScore, DocAddress)>;
+    type Fruit = Vec<(TScore, DocAddress, Ctid)>;
 
-    fn collect(&mut self, doc: DocId, _score: Score) {
+    fn collect(&mut self, doc: DocId, _score: Score, ctid: Ctid) {
         let score = self.segment_scorer.score(doc);
-        self.segment_collector.collect(doc, score);
+        self.segment_collector.collect(doc, score, ctid);
     }
 
-    fn harvest(self) -> Vec<(TScore, DocAddress)> {
+    fn harvest(self) -> Vec<(TScore, DocAddress, Ctid)> {
         self.segment_collector.harvest()
     }
 }
@@ -113,7 +114,8 @@ where
 }
 
 impl<F, TScore> CustomSegmentScorer<TScore> for F
-where F: 'static + FnMut(DocId) -> TScore
+where
+    F: 'static + FnMut(DocId) -> TScore,
 {
     fn score(&mut self, doc: DocId) -> TScore {
         (self)(doc)

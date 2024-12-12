@@ -445,7 +445,7 @@ mod tests {
     use crate::time::OffsetDateTime;
     use crate::tokenizer::{PreTokenizedString, Token};
     use crate::{
-        DateTime, Directory, DocAddress, DocSet, Index, IndexWriter, TantivyDocument, Term,
+        Ctid, DateTime, Directory, DocAddress, DocSet, Index, IndexWriter, TantivyDocument, Term,
         TERMINATED,
     };
 
@@ -521,7 +521,7 @@ mod tests {
 
         let query_parser = QueryParser::for_index(&index, vec![json_field]);
         let text_query = query_parser.parse_query("my_field:a").unwrap();
-        let score_docs: Vec<(_, DocAddress)> = index
+        let score_docs: Vec<(_, DocAddress, Ctid)> = index
             .reader()
             .unwrap()
             .searcher()
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(score_docs.len(), 1);
 
         let text_query = query_parser.parse_query("my_field:b").unwrap();
-        let score_docs: Vec<(_, DocAddress)> = index
+        let score_docs: Vec<(_, DocAddress, Ctid)> = index
             .reader()
             .unwrap()
             .searcher()
@@ -563,7 +563,7 @@ mod tests {
         let search_and_expect = |query| {
             let query_parser = QueryParser::for_index(&index, vec![json_field]);
             let text_query = query_parser.parse_query(query).unwrap();
-            let score_docs: Vec<(_, DocAddress)> = index
+            let score_docs: Vec<(_, DocAddress, Ctid)> = index
                 .reader()
                 .unwrap()
                 .searcher()

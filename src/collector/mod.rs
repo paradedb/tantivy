@@ -56,7 +56,7 @@
 //! #     let searcher = reader.searcher();
 //! #     let query_parser = QueryParser::for_index(&index, vec![title]);
 //! #     let query = query_parser.parse_query("diary")?;
-//! let (doc_count, top_docs): (usize, Vec<(Score, DocAddress)>) =
+//! let (doc_count, top_docs): (usize, Vec<(Score, DocAddress, Ctid)>) =
 //! searcher.search(&query, &(Count, TopDocs::with_limit(2)))?;
 //! #     Ok(())
 //! # }
@@ -83,7 +83,7 @@
 
 use downcast_rs::impl_downcast;
 
-use crate::{DocId, Score, SegmentOrdinal, SegmentReader};
+use crate::{Ctid, DocId, Score, SegmentOrdinal, SegmentReader, INVALID_CTID};
 
 mod count_collector;
 pub use self::count_collector::Count;
@@ -174,29 +174,29 @@ pub trait Collector: Sync + Send {
 
         match (reader.alive_bitset(), self.requires_scoring()) {
             (Some(alive_bitset), true) => {
-                weight.for_each(reader, &mut |doc, score| {
+                weight.for_each(reader, &mut |doc, score, ctid| {
                     if alive_bitset.is_alive(doc) {
-                        segment_collector.collect(doc, score);
+                        segment_collector.collect(doc, score, ctid);
                     }
                 })?;
             }
             (Some(alive_bitset), false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
-                    for doc in docs.iter().cloned() {
-                        if alive_bitset.is_alive(doc) {
-                            segment_collector.collect(doc, 0.0);
+                weight.for_each_no_score(reader, &mut |docs, ctids| {
+                    for (doc, ctid) in docs.iter().zip(ctids) {
+                        if alive_bitset.is_alive(*doc) {
+                            segment_collector.collect(*doc, 0.0, *ctid);
                         }
                     }
                 })?;
             }
             (None, true) => {
-                weight.for_each(reader, &mut |doc, score| {
-                    segment_collector.collect(doc, score);
+                weight.for_each(reader, &mut |doc, score, ctid| {
+                    segment_collector.collect(doc, score, ctid);
                 })?;
             }
             (None, false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
-                    segment_collector.collect_block(docs);
+                weight.for_each_no_score(reader, &mut |docs, ctids| {
+                    segment_collector.collect_block(docs, ctids);
                 })?;
             }
         }
@@ -208,9 +208,9 @@ pub trait Collector: Sync + Send {
 impl<TSegmentCollector: SegmentCollector> SegmentCollector for Option<TSegmentCollector> {
     type Fruit = Option<TSegmentCollector::Fruit>;
 
-    fn collect(&mut self, doc: DocId, score: Score) {
+    fn collect(&mut self, doc: DocId, score: Score, ctid: Ctid) {
         if let Some(segment_collector) = self {
-            segment_collector.collect(doc, score);
+            segment_collector.collect(doc, score, ctid);
         }
     }
 
@@ -271,16 +271,16 @@ pub trait SegmentCollector: 'static {
     type Fruit: Fruit;
 
     /// The query pushes the scored document to the collector via this method.
-    fn collect(&mut self, doc: DocId, score: Score);
+    fn collect(&mut self, doc: DocId, score: Score, ctid: Ctid);
 
     /// The query pushes the scored document to the collector via this method.
     /// This method is used when the collector does not require scoring.
     ///
     /// See [`COLLECT_BLOCK_BUFFER_LEN`](crate::COLLECT_BLOCK_BUFFER_LEN) for the
     /// buffer size passed to the collector.
-    fn collect_block(&mut self, docs: &[DocId]) {
-        for doc in docs {
-            self.collect(*doc, 0.0);
+    fn collect_block(&mut self, docs: &[DocId], ctids: &[Ctid]) {
+        for (doc, ctid) in docs.iter().zip(ctids) {
+            self.collect(*doc, 0.0, *ctid);
         }
     }
 
@@ -337,9 +337,9 @@ where
 {
     type Fruit = (Left::Fruit, Right::Fruit);
 
-    fn collect(&mut self, doc: DocId, score: Score) {
-        self.0.collect(doc, score);
-        self.1.collect(doc, score);
+    fn collect(&mut self, doc: DocId, score: Score, ctid: Ctid) {
+        self.0.collect(doc, score, ctid);
+        self.1.collect(doc, score, ctid);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -401,10 +401,10 @@ where
 {
     type Fruit = (One::Fruit, Two::Fruit, Three::Fruit);
 
-    fn collect(&mut self, doc: DocId, score: Score) {
-        self.0.collect(doc, score);
-        self.1.collect(doc, score);
-        self.2.collect(doc, score);
+    fn collect(&mut self, doc: DocId, score: Score, ctid: Ctid) {
+        self.0.collect(doc, score, ctid);
+        self.1.collect(doc, score, ctid);
+        self.2.collect(doc, score, ctid);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -475,11 +475,11 @@ where
 {
     type Fruit = (One::Fruit, Two::Fruit, Three::Fruit, Four::Fruit);
 
-    fn collect(&mut self, doc: DocId, score: Score) {
-        self.0.collect(doc, score);
-        self.1.collect(doc, score);
-        self.2.collect(doc, score);
-        self.3.collect(doc, score);
+    fn collect(&mut self, doc: DocId, score: Score, ctid: Ctid) {
+        self.0.collect(doc, score, ctid);
+        self.1.collect(doc, score, ctid);
+        self.2.collect(doc, score, ctid);
+        self.3.collect(doc, score, ctid);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {

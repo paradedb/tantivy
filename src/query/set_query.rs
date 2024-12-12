@@ -155,7 +155,7 @@ mod tests {
             let term_set_query = TermSetQuery::new(terms);
             let top_docs = searcher.search(&term_set_query, &TopDocs::with_limit(2))?;
             assert_eq!(top_docs.len(), 1, "Expected 1 document");
-            let (score, _) = top_docs[0];
+            let (score, _, _) = top_docs[0];
             assert_nearly_equals!(1.0, score);
         }
 
@@ -178,7 +178,7 @@ mod tests {
             let term_set_query = TermSetQuery::new(terms);
             let top_docs = searcher.search(&term_set_query, &TopDocs::with_limit(2))?;
             assert_eq!(top_docs.len(), 2, "Expected 2 documents");
-            for (score, _) in top_docs {
+            for (score, _, _) in top_docs {
                 assert_nearly_equals!(1.0, score);
             }
         }
@@ -195,7 +195,7 @@ mod tests {
             let top_docs = searcher.search(&term_set_query, &TopDocs::with_limit(3))?;
 
             assert_eq!(top_docs.len(), 2, "Expected 2 document");
-            for (score, _) in top_docs {
+            for (score, _, _) in top_docs {
                 assert_nearly_equals!(1.0, score);
             }
         }

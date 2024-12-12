@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::{Collector, SegmentCollector};
-use crate::{DocAddress, DocId, Score};
+use crate::{Ctid, DocAddress, DocId, Score};
 
 /// Collectors that returns the set of DocAddress that matches the query.
 ///
@@ -50,7 +50,7 @@ pub struct DocSetChildCollector {
 impl SegmentCollector for DocSetChildCollector {
     type Fruit = (u32, HashSet<DocId>);
 
-    fn collect(&mut self, doc: crate::DocId, _score: Score) {
+    fn collect(&mut self, doc: crate::DocId, _score: Score, _ctid: Ctid) {
         self.docs.insert(doc);
     }
 

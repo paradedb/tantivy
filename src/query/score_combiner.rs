@@ -1,5 +1,5 @@
 use crate::query::Scorer;
-use crate::Score;
+use crate::{Ctid, Score};
 
 /// The `ScoreCombiner` trait defines how to compute
 /// an overall score given a list of scores.
@@ -8,7 +8,8 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
     ///
     /// The `ScoreCombiner` may decide to call `.scorer.score()`
     /// or not.
-    fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer);
+    #[must_use]
+    fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer) -> Ctid;
 
     /// Clears the score combiner state back to its initial state.
     fn clear(&mut self);
@@ -25,7 +26,9 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
 pub struct DoNothingCombiner;
 
 impl ScoreCombiner for DoNothingCombiner {
-    fn update<TScorer: Scorer>(&mut self, _scorer: &mut TScorer) {}
+    fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer) -> Ctid {
+        scorer.score().1
+    }
 
     fn clear(&mut self) {}
 
@@ -41,8 +44,10 @@ pub struct SumCombiner {
 }
 
 impl ScoreCombiner for SumCombiner {
-    fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer) {
-        self.score += scorer.score();
+    fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer) -> Ctid {
+        let (score, ctid) = scorer.score();
+        self.score += score;
+        ctid
     }
 
     fn clear(&mut self) {
@@ -75,10 +80,11 @@ impl DisjunctionMaxCombiner {
 }
 
 impl ScoreCombiner for DisjunctionMaxCombiner {
-    fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer) {
-        let score = scorer.score();
+    fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer) -> Ctid {
+        let (score, ctid) = scorer.score();
         self.max = Score::max(score, self.max);
         self.sum += score;
+        ctid
     }
 
     fn clear(&mut self) {

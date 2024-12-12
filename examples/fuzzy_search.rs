@@ -150,7 +150,7 @@ fn main() -> tantivy::Result<()> {
             .unwrap();
         assert_eq!(count, 3);
         assert_eq!(top_docs.len(), 3);
-        for (score, doc_address) in top_docs {
+        for (score, doc_address, _ctid) in top_docs {
             // Note that the score is not lower for the fuzzy hit.
             // There's an issue open for that: https://github.com/quickwit-oss/tantivy/issues/563
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;

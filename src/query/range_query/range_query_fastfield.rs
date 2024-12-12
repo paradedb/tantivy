@@ -228,7 +228,7 @@ impl Weight for FastFieldRangeWeight {
                 "Document #({doc}) does not match"
             )));
         }
-        let explanation = Explanation::new("Const", scorer.score());
+        let explanation = Explanation::new("Const", scorer.score().0);
 
         Ok(explanation)
     }

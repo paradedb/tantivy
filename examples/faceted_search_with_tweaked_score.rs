@@ -89,7 +89,7 @@ fn main() -> tantivy::Result<()> {
 
         let titles: Vec<String> = top_docs
             .iter()
-            .map(|(_, doc_id)| {
+            .map(|(_, doc_id, _ctid)| {
                 searcher
                     .doc::<TantivyDocument>(*doc_id)
                     .unwrap()

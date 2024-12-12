@@ -3,7 +3,7 @@ use std::fmt;
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::fastfield::AliveBitSet;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
-use crate::{DocId, DocSet, Score, SegmentReader, Term};
+use crate::{Ctid, DocId, DocSet, Score, SegmentReader, Term};
 
 /// `BoostQuery` is a wrapper over a query used to boost its score.
 ///
@@ -127,8 +127,9 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
 }
 
 impl<S: Scorer> Scorer for BoostScorer<S> {
-    fn score(&mut self) -> Score {
-        self.underlying.score() * self.boost
+    fn score(&mut self) -> (Score, Ctid) {
+        let (score, ctid) = self.underlying.score();
+        (score * self.boost, ctid)
     }
 }
 

@@ -3,7 +3,7 @@ use common::TinySet;
 use crate::docset::{DocSet, TERMINATED};
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::Scorer;
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score};
 
 const HORIZON_NUM_TINYBITSETS: usize = 64;
 const HORIZON: u32 = 64u32 * HORIZON_NUM_TINYBITSETS as u32;
@@ -14,7 +14,9 @@ const HORIZON: u32 = 64u32 * HORIZON_NUM_TINYBITSETS as u32;
 //
 // Also, it does not "yield" any elements.
 fn unordered_drain_filter<T, P>(v: &mut Vec<T>, mut predicate: P)
-where P: FnMut(&mut T) -> bool {
+where
+    P: FnMut(&mut T) -> bool,
+{
     let mut i = 0;
     while i < v.len() {
         if predicate(&mut v[i]) {
@@ -33,7 +35,7 @@ pub struct Union<TScorer, TScoreCombiner = DoNothingCombiner> {
     cursor: usize,
     offset: DocId,
     doc: DocId,
-    score: Score,
+    score: (Score, Ctid),
 }
 
 fn refill<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
@@ -66,10 +68,11 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Union<TScorer, TScoreCombin
         docsets: Vec<TScorer>,
         score_combiner_fn: impl FnOnce() -> TScoreCombiner,
     ) -> Union<TScorer, TScoreCombiner> {
-        let non_empty_docsets: Vec<TScorer> = docsets
+        let mut non_empty_docsets: Vec<TScorer> = docsets
             .into_iter()
             .filter(|docset| docset.doc() != TERMINATED)
             .collect();
+        let ctid = non_empty_docsets[0].score().1;
         let mut union = Union {
             docsets: non_empty_docsets,
             bitsets: Box::new([TinySet::empty(); HORIZON_NUM_TINYBITSETS]),
@@ -77,7 +80,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Union<TScorer, TScoreCombin
             cursor: HORIZON_NUM_TINYBITSETS,
             offset: 0,
             doc: 0,
-            score: 0.0,
+            score: (0.0, ctid),
         };
         if union.refill() {
             union.advance();
@@ -110,7 +113,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Union<TScorer, TScoreCombin
                 let delta = val + (self.cursor as u32) * 64;
                 self.doc = self.offset + delta;
                 let score_combiner = &mut self.scores[delta as usize];
-                self.score = score_combiner.score();
+                self.score = (score_combiner.score(), self.score.1);
                 score_combiner.clear();
                 return true;
             } else {
@@ -235,7 +238,7 @@ where
     TScoreCombiner: ScoreCombiner,
     TScorer: Scorer,
 {
-    fn score(&mut self) -> Score {
+    fn score(&mut self) -> (Score, Ctid) {
         self.score
     }
 }

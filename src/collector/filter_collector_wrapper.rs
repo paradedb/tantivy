@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 use columnar::{BytesColumn, Column, DynamicColumn, HasAssociatedColumnType};
 
 use crate::collector::{Collector, SegmentCollector};
-use crate::{DocId, Score, SegmentReader};
+use crate::{Ctid, DocId, Score, SegmentReader};
 
 /// The `FilterCollector` filters docs using a fast field value and a predicate.
 ///
@@ -67,7 +67,8 @@ use crate::{DocId, Score, SegmentReader};
 /// [`FastValue`][crate::fastfield::FastValue] trait, e.g. `u64` but not `&[u8]`.
 /// To filter based on a bytes fast field, use a [`BytesFilterCollector`] instead.
 pub struct FilterCollector<TCollector, TPredicate, TPredicateValue>
-where TPredicate: 'static + Clone
+where
+    TPredicate: 'static + Clone,
 {
     field: String,
     collector: TCollector,
@@ -170,9 +171,9 @@ where
 {
     type Fruit = TSegmentCollector::Fruit;
 
-    fn collect(&mut self, doc: u32, score: Score) {
+    fn collect(&mut self, doc: u32, score: Score, ctid: Ctid) {
         if self.accept_document(doc) {
-            self.segment_collector.collect(doc, score);
+            self.segment_collector.collect(doc, score, ctid);
         }
     }
 
@@ -226,7 +227,8 @@ where
 /// # }
 /// ```
 pub struct BytesFilterCollector<TCollector, TPredicate>
-where TPredicate: 'static + Clone
+where
+    TPredicate: 'static + Clone,
 {
     field: String,
     collector: TCollector,
@@ -289,7 +291,8 @@ where
 }
 
 pub struct BytesFilterSegmentCollector<TSegmentCollector, TPredicate>
-where TPredicate: 'static
+where
+    TPredicate: 'static,
 {
     column_opt: Option<BytesColumn>,
     segment_collector: TSegmentCollector,
@@ -327,9 +330,9 @@ where
 {
     type Fruit = TSegmentCollector::Fruit;
 
-    fn collect(&mut self, doc: u32, score: Score) {
+    fn collect(&mut self, doc: u32, score: Score, ctid: Ctid) {
         if self.accept_document(doc) {
-            self.segment_collector.collect(doc, score);
+            self.segment_collector.collect(doc, score, ctid);
         }
     }
 
