@@ -450,9 +450,15 @@ impl IndexMerger {
                             positions_buffer.clear();
                             0u32
                         };
+                        let ctid = segment_postings.ctid();
 
                         let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                        field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
+                        field_serializer.write_doc(
+                            remapped_doc_id,
+                            term_freq,
+                            ctid,
+                            delta_positions,
+                        );
                     }
 
                     doc = segment_postings.advance();

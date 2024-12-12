@@ -1,8 +1,3 @@
-use std::cmp::Ordering;
-use std::io::{self, Write};
-
-use common::{BinarySerializable, CountingWriter, VInt};
-
 use super::TermInfo;
 use crate::directory::{CompositeWrite, WritePtr};
 use crate::fieldnorm::FieldNormReader;
@@ -13,7 +8,11 @@ use crate::postings::skip::SkipSerializer;
 use crate::query::Bm25Weight;
 use crate::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use crate::termdict::TermDictionaryBuilder;
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score, INVALID_BLOCK_NUMBER, INVALID_OFFSET_NUMBER};
+use byteorder::{LittleEndian, WriteBytesExt};
+use common::{BinarySerializable, CountingWriter, VInt};
+use std::cmp::Ordering;
+use std::io::{self, Write};
 
 /// `InvertedIndexSerializer` is in charge of serializing
 /// postings on disk, in the
@@ -196,9 +195,15 @@ impl<'a> FieldSerializer<'a> {
     ///
     /// Term frequencies and positions may be ignored by the serializer depending
     /// on the configuration of the field in the `Schema`.
-    pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32, position_deltas: &[u32]) {
+    pub fn write_doc(
+        &mut self,
+        doc_id: DocId,
+        term_freq: u32,
+        ctid: Ctid,
+        position_deltas: &[u32],
+    ) {
         self.current_term_info.doc_freq += 1;
-        self.postings_serializer.write_doc(doc_id, term_freq);
+        self.postings_serializer.write_doc(doc_id, term_freq, ctid);
         if let Some(ref mut positions_serializer) = self.positions_serializer_opt.as_mut() {
             assert_eq!(term_freq as usize, position_deltas.len());
             positions_serializer.write_positions_delta(position_deltas);
@@ -246,6 +251,7 @@ impl<'a> FieldSerializer<'a> {
 struct Block {
     doc_ids: [DocId; COMPRESSION_BLOCK_SIZE],
     term_freqs: [u32; COMPRESSION_BLOCK_SIZE],
+    ctids: [Ctid; COMPRESSION_BLOCK_SIZE],
     len: usize,
 }
 
@@ -254,6 +260,7 @@ impl Block {
         Block {
             doc_ids: [0u32; COMPRESSION_BLOCK_SIZE],
             term_freqs: [0u32; COMPRESSION_BLOCK_SIZE],
+            ctids: [(INVALID_BLOCK_NUMBER, INVALID_OFFSET_NUMBER); COMPRESSION_BLOCK_SIZE],
             len: 0,
         }
     }
@@ -266,14 +273,26 @@ impl Block {
         &self.term_freqs[..self.len]
     }
 
+    fn ctid_block_numbers(&self) -> Vec<u32> {
+        self.ctids[..self.len].iter().map(|ctid| ctid.0).collect()
+    }
+
+    fn ctid_offset_numbers(&self) -> Vec</* u16 as */ u32> {
+        self.ctids[..self.len]
+            .iter()
+            .map(|ctid| ctid.1 as u32)
+            .collect()
+    }
+
     fn clear(&mut self) {
         self.len = 0;
     }
 
-    fn append_doc(&mut self, doc: DocId, term_freq: u32) {
+    fn append_doc(&mut self, doc: DocId, term_freq: u32, ctid: Ctid) {
         let len = self.len;
         self.doc_ids[len] = doc;
         self.term_freqs[len] = term_freq;
+        self.ctids[len] = ctid;
         self.len = len + 1;
     }
 
@@ -297,6 +316,8 @@ pub struct PostingsSerializer<W: Write> {
 
     block_encoder: BlockEncoder,
     block: Box<Block>,
+
+    ctid_encoders: (BlockEncoder, BlockEncoder),
 
     postings_write: Vec<u8>,
     skip_write: SkipSerializer,
@@ -322,6 +343,8 @@ impl<W: Write> PostingsSerializer<W> {
 
             block_encoder: BlockEncoder::new(),
             block: Box::new(Block::new()),
+
+            ctid_encoders: (BlockEncoder::new(), BlockEncoder::new()),
 
             postings_write: Vec::new(),
             skip_write: SkipSerializer::new(),
@@ -363,17 +386,47 @@ impl<W: Write> PostingsSerializer<W> {
     }
 
     fn write_block(&mut self) {
-        {
+        let num_bits = {
             // encode the doc ids
             let (num_bits, block_encoded): (u8, &[u8]) = self
                 .block_encoder
                 .compress_block_sorted(self.block.doc_ids(), self.last_doc_id_encoded);
             self.last_doc_id_encoded = self.block.last_doc();
-            self.skip_write
-                .write_doc(self.last_doc_id_encoded, num_bits);
             // last el block 0, offset block 1,
             self.postings_write.extend(block_encoded);
-        }
+            num_bits
+        };
+
+        let (blockno_num_bits, offno_num_bits) = {
+            let blockno_num_bits = {
+                // encode the ctid block numbers
+                let (num_bits, block_encoded): (u8, &[u8]) = self
+                    .ctid_encoders
+                    .0
+                    .compress_block_unsorted(&self.block.ctid_block_numbers(), false);
+                self.postings_write.extend(block_encoded);
+                num_bits
+            };
+
+            let offno_num_bits = {
+                // encode the ctid offset numbers
+                let (num_bits, block_encoded): (u8, &[u8]) = self
+                    .ctid_encoders
+                    .1
+                    .compress_block_unsorted(&self.block.ctid_offset_numbers(), false);
+                self.postings_write.extend(block_encoded);
+                num_bits
+            };
+            (blockno_num_bits, offno_num_bits)
+        };
+
+        self.skip_write.write_doc(
+            self.last_doc_id_encoded,
+            num_bits,
+            blockno_num_bits,
+            offno_num_bits,
+        );
+
         if self.term_has_freq {
             let (num_bits, block_encoded): (u8, &[u8]) = self
                 .block_encoder
@@ -415,8 +468,8 @@ impl<W: Write> PostingsSerializer<W> {
         self.block.clear();
     }
 
-    pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32) {
-        self.block.append_doc(doc_id, term_freq);
+    pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32, ctid: Ctid) {
+        self.block.append_doc(doc_id, term_freq, ctid);
         if self.block.is_full() {
             self.write_block();
         }
@@ -440,6 +493,26 @@ impl<W: Write> PostingsSerializer<W> {
                     .compress_vint_sorted(self.block.doc_ids(), self.last_doc_id_encoded);
                 self.postings_write.write_all(block_encoded)?;
             }
+
+            {
+                {
+                    // write lefover block numbers
+                    let block_encoded = self
+                        .ctid_encoders
+                        .0
+                        .compress_vint_unsorted(&self.block.ctid_block_numbers());
+                    self.postings_write.write_all(block_encoded)?;
+                }
+                {
+                    // write lefover block numbers
+                    let block_encoded = self
+                        .ctid_encoders
+                        .1
+                        .compress_vint_unsorted(&self.block.ctid_offset_numbers());
+                    self.postings_write.write_all(block_encoded)?;
+                }
+            }
+
             // ... Idem for term frequencies
             if self.term_has_freq {
                 let block_encoded = self

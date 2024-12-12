@@ -8,7 +8,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, INDEXED, STRING, TEXT};
 use crate::tokenizer::TokenizerManager;
 use crate::{
     Directory, DocSet, Index, IndexBuilder, IndexReader, IndexSettings, IndexWriter, ReloadPolicy,
-    TantivyDocument, Term,
+    TantivyDocument, Term, INVALID_CTID,
 };
 
 #[test]
@@ -287,7 +287,7 @@ fn test_single_segment_index_writer() -> crate::Result<()> {
         .single_segment_index_writer(directory, 15_000_000)?;
     for _ in 0..10 {
         let doc = doc!(text_field=>"hello");
-        single_segment_index_writer.add_document(doc)?;
+        single_segment_index_writer.add_document(doc, INVALID_CTID)?;
     }
     let index = single_segment_index_writer.finalize()?;
     let searcher = index.reader()?.searcher();
@@ -462,7 +462,8 @@ fn test_non_text_json_term_freq_bitpacked() {
     assert_eq!(postings.doc(), 0);
     assert_eq!(postings.term_freq(), 1u32);
     for i in 1..num_docs {
-        assert_eq!(postings.advance(), i);
+        let doc_id = postings.advance();
+        assert_eq!(doc_id, i);
         assert_eq!(postings.term_freq(), 1u32);
     }
 }

@@ -1,6 +1,6 @@
-use std::io;
-
+use byteorder::{LittleEndian, ReadBytesExt};
 use common::VInt;
+use std::io;
 
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
@@ -8,7 +8,7 @@ use crate::postings::compression::{BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_
 use crate::postings::{BlockInfo, FreqReadingOption, SkipReader};
 use crate::query::Bm25Weight;
 use crate::schema::IndexRecordOption;
-use crate::{DocId, Score, TERMINATED};
+use crate::{Ctid, DocId, Score, INVALID_BLOCK_NUMBER, INVALID_OFFSET_NUMBER, TERMINATED};
 
 fn max_score<I: Iterator<Item = Score>>(mut it: I) -> Option<Score> {
     it.next().map(|first| it.fold(first, Score::max))
@@ -26,6 +26,7 @@ pub struct BlockSegmentPostings {
     pub(crate) doc_decoder: BlockDecoder,
     block_loaded: bool,
     freq_decoder: BlockDecoder,
+    ctid_decoders: (BlockDecoder, BlockDecoder),
     freq_reading_option: FreqReadingOption,
     block_max_score_cache: Option<Score>,
     doc_freq: u32,
@@ -35,15 +36,35 @@ pub struct BlockSegmentPostings {
 
 fn decode_bitpacked_block(
     doc_decoder: &mut BlockDecoder,
+    ctid_decoders: &mut (BlockDecoder, BlockDecoder),
     freq_decoder_opt: Option<&mut BlockDecoder>,
     data: &[u8],
     doc_offset: DocId,
     doc_num_bits: u8,
+    ctid_blockno_num_bits: u8,
+    ctid_offno_num_bits: u8,
     tf_num_bits: u8,
     strict_delta: bool,
 ) {
-    let num_consumed_bytes =
+    let mut num_consumed_bytes =
         doc_decoder.uncompress_block_sorted(data, doc_offset, doc_num_bits, strict_delta);
+
+    {
+        num_consumed_bytes += ctid_decoders.0.uncompress_block_unsorted(
+            &data[num_consumed_bytes..],
+            ctid_blockno_num_bits,
+            false,
+        );
+    }
+
+    {
+        num_consumed_bytes += ctid_decoders.1.uncompress_block_unsorted(
+            &data[num_consumed_bytes..],
+            ctid_offno_num_bits,
+            false,
+        );
+    }
+
     if let Some(freq_decoder) = freq_decoder_opt {
         freq_decoder.uncompress_block_unsorted(
             &data[num_consumed_bytes..],
@@ -55,13 +76,31 @@ fn decode_bitpacked_block(
 
 fn decode_vint_block(
     doc_decoder: &mut BlockDecoder,
+    ctid_decoders: &mut (BlockDecoder, BlockDecoder),
     freq_decoder_opt: Option<&mut BlockDecoder>,
     data: &[u8],
     doc_offset: DocId,
     num_vint_docs: usize,
 ) {
-    let num_consumed_bytes =
+    let mut num_consumed_bytes =
         doc_decoder.uncompress_vint_sorted(data, doc_offset, num_vint_docs, TERMINATED);
+
+    {
+        num_consumed_bytes += ctid_decoders.0.uncompress_vint_unsorted(
+            &data[num_consumed_bytes..],
+            num_vint_docs,
+            TERMINATED,
+        );
+    }
+
+    {
+        num_consumed_bytes += ctid_decoders.1.uncompress_vint_unsorted(
+            &data[num_consumed_bytes..],
+            num_vint_docs,
+            TERMINATED,
+        );
+    }
+
     if let Some(freq_decoder) = freq_decoder_opt {
         // if it's a json term with freq, containing less than 256 docs, we can reach here thinking
         // we have a freq, despite not really having one.
@@ -129,6 +168,10 @@ impl BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: false,
             freq_decoder: BlockDecoder::with_val(1),
+            ctid_decoders: (
+                BlockDecoder::with_val(INVALID_BLOCK_NUMBER),
+                BlockDecoder::with_val(INVALID_OFFSET_NUMBER as u32),
+            ),
             freq_reading_option,
             block_max_score_cache: None,
             doc_freq,
@@ -162,6 +205,8 @@ impl BlockSegmentPostings {
         // If it is actually loaded, we can compute block max manually.
         if self.block_is_loaded() {
             let docs = self.doc_decoder.output_array().iter().cloned();
+            let _blocknos = self.ctid_decoders.0.output_array().iter().cloned();
+            let _offsetnos = self.ctid_decoders.1.output_array().iter().cloned();
             let freqs = self.freq_decoder.output_array().iter().cloned();
             let bm25_scores = docs.zip(freqs).map(|(doc, term_freq)| {
                 let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
@@ -260,6 +305,19 @@ impl BlockSegmentPostings {
         self.freq_decoder.output(idx)
     }
 
+    #[inline]
+    pub fn ctid(&self, idx: usize) -> Ctid {
+        debug_assert!(self.block_is_loaded());
+        (
+            self.ctid_decoders.0.output(idx),
+            self.ctid_decoders
+                .1
+                .output(idx)
+                .try_into()
+                .expect("Ctid OffsetNumber should not exceed u16::MAX"),
+        )
+    }
+
     /// Returns the length of the current block.
     ///
     /// All blocks have a length of `NUM_DOCS_PER_BLOCK`,
@@ -311,10 +369,13 @@ impl BlockSegmentPostings {
                 doc_num_bits,
                 strict_delta_encoded,
                 tf_num_bits,
+                ctid_blockno_num_bits,
+                ctid_offno_num_bits,
                 ..
             } => {
                 decode_bitpacked_block(
                     &mut self.doc_decoder,
+                    &mut self.ctid_decoders,
                     if let FreqReadingOption::ReadFreq = self.freq_reading_option {
                         Some(&mut self.freq_decoder)
                     } else {
@@ -323,6 +384,8 @@ impl BlockSegmentPostings {
                     &self.data.as_slice()[offset..],
                     self.skip_reader.last_doc_in_previous_block,
                     doc_num_bits,
+                    ctid_blockno_num_bits,
+                    ctid_offno_num_bits,
                     tf_num_bits,
                     strict_delta_encoded,
                 );
@@ -337,6 +400,7 @@ impl BlockSegmentPostings {
                 };
                 decode_vint_block(
                     &mut self.doc_decoder,
+                    &mut self.ctid_decoders,
                     if let FreqReadingOption::ReadFreq = self.freq_reading_option {
                         Some(&mut self.freq_decoder)
                     } else {
@@ -365,6 +429,10 @@ impl BlockSegmentPostings {
             doc_decoder: BlockDecoder::with_val(TERMINATED),
             block_loaded: true,
             freq_decoder: BlockDecoder::with_val(1),
+            ctid_decoders: (
+                BlockDecoder::with_val(INVALID_BLOCK_NUMBER),
+                BlockDecoder::with_val(INVALID_OFFSET_NUMBER as u32),
+            ),
             freq_reading_option: FreqReadingOption::NoFreq,
             block_max_score_cache: None,
             doc_freq: 0,

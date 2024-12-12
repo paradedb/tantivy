@@ -12,7 +12,7 @@ use crate::postings::{
 };
 use crate::schema::{Field, Schema, Term, Type};
 use crate::tokenizer::{Token, TokenStream, MAX_TOKEN_LEN};
-use crate::DocId;
+use crate::{Ctid, DocId};
 
 const POSITION_GAP: u32 = 1;
 
@@ -111,7 +111,14 @@ pub(crate) trait PostingsWriter: Send + Sync {
     /// * term - the term
     /// * ctx - Contains a term hashmap and a memory arena to store all necessary posting list
     ///   information.
-    fn subscribe(&mut self, doc: DocId, pos: u32, term: &Term, ctx: &mut IndexingContext);
+    fn subscribe(
+        &mut self,
+        doc: DocId,
+        ctid: Ctid,
+        pos: u32,
+        term: &Term,
+        ctx: &mut IndexingContext,
+    );
 
     /// Serializes the postings on disk.
     /// The actual serialization format is handled by the `PostingsSerializer`.
@@ -127,6 +134,7 @@ pub(crate) trait PostingsWriter: Send + Sync {
     fn index_text(
         &mut self,
         doc_id: DocId,
+        ctid: Ctid,
         token_stream: &mut dyn TokenStream,
         term_buffer: &mut Term,
         ctx: &mut IndexingContext,
@@ -150,7 +158,7 @@ pub(crate) trait PostingsWriter: Send + Sync {
             term_buffer.append_bytes(token.text.as_bytes());
             let start_position = indexing_position.end_position + token.position as u32;
             end_position = end_position.max(start_position + token.position_length as u32);
-            self.subscribe(doc_id, start_position, term_buffer, ctx);
+            self.subscribe(doc_id, ctid, start_position, term_buffer, ctx);
             num_tokens += 1;
         });
 
@@ -198,7 +206,14 @@ impl<Rec: Recorder> SpecializedPostingsWriter<Rec> {
 
 impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
     #[inline]
-    fn subscribe(&mut self, doc: DocId, position: u32, term: &Term, ctx: &mut IndexingContext) {
+    fn subscribe(
+        &mut self,
+        doc: DocId,
+        ctid: Ctid,
+        position: u32,
+        term: &Term,
+        ctx: &mut IndexingContext,
+    ) {
         debug_assert!(term.serialized_term().len() >= 4);
         self.total_num_tokens += 1;
         let (term_index, arena) = (&mut ctx.term_index, &mut ctx.arena);
@@ -207,13 +222,13 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
                 let current_doc = recorder.current_doc();
                 if current_doc != doc {
                     recorder.close_doc(arena);
-                    recorder.new_doc(doc, arena);
+                    recorder.new_doc(doc, ctid, arena);
                 }
                 recorder.record_position(position, arena);
                 recorder
             } else {
                 let mut recorder = Rec::default();
-                recorder.new_doc(doc, arena);
+                recorder.new_doc(doc, ctid, arena);
                 recorder.record_position(position, arena);
                 recorder
             }

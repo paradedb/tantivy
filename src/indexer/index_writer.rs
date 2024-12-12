@@ -22,7 +22,7 @@ use crate::indexer::{MergePolicy, SegmentEntry, SegmentWriter};
 use crate::query::{EnableScoring, Query, TermQuery};
 use crate::schema::document::Document;
 use crate::schema::{IndexRecordOption, TantivyDocument, Term};
-use crate::{FutureResult, Opstamp};
+use crate::{Ctid, FutureResult, Opstamp, INVALID_CTID};
 
 // Size of the margin for the `memory_arena`. A segment is closed when the remaining memory
 // in the `memory_arena` goes below MARGIN_IN_BYTES.
@@ -710,7 +710,28 @@ impl<D: Document> IndexWriter<D> {
     /// document queue.
     pub fn add_document(&self, document: D) -> crate::Result<Opstamp> {
         let opstamp = self.stamper.stamp();
-        self.send_add_documents_batch(smallvec![AddOperation { opstamp, document }])?;
+        self.send_add_documents_batch(smallvec![AddOperation {
+            opstamp,
+            document,
+            ctid: INVALID_CTID
+        }])?;
+        Ok(opstamp)
+    }
+
+    /// Adds a document.
+    ///
+    /// If the indexing pipeline is full, this call may block.
+    ///
+    /// The opstamp is an increasing `u64` that can
+    /// be used by the client to align commits with its own
+    /// document queue.
+    pub fn add_document_with_ctid(&self, document: D, ctid: Ctid) -> crate::Result<Opstamp> {
+        let opstamp = self.stamper.stamp();
+        self.send_add_documents_batch(smallvec![AddOperation {
+            opstamp,
+            document,
+            ctid
+        }])?;
         Ok(opstamp)
     }
 
@@ -770,7 +791,20 @@ impl<D: Document> IndexWriter<D> {
                     self.delete_queue.push(delete_operation);
                 }
                 UserOperation::Add(document) => {
-                    let add_operation = AddOperation { opstamp, document };
+                    let add_operation = AddOperation {
+                        opstamp,
+                        document,
+                        ctid: INVALID_CTID,
+                    };
+                    adds.push(add_operation);
+                }
+
+                UserOperation::AddWithCtid(document, ctid) => {
+                    let add_operation = AddOperation {
+                        opstamp,
+                        document,
+                        ctid,
+                    };
                     adds.push(add_operation);
                 }
             }
