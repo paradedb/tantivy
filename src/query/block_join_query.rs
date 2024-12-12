@@ -92,12 +92,15 @@ impl Query for BlockJoinQuery {
             .weight(EnableScoring::enabled_from_searcher(searcher))?
             .scorer(reader, 1.0)?;
         
-        // Seek to the requested document
-        let doc = scorer.seek(doc_address.doc_id);
-        let score = if doc == doc_address.doc_id {
+        let mut current_doc = scorer.doc();
+        while current_doc != TERMINATED && current_doc < doc_address.doc_id {
+            current_doc = scorer.advance();
+        }
+        
+        let score = if current_doc == doc_address.doc_id {
             scorer.score()
         } else {
-            1.0 // Default score if document is found
+            0.0
         };
         
         let mut explanation = Explanation::new("BlockJoinQuery", score);
@@ -325,45 +328,40 @@ impl BlockJoinScorer {
     }
 
     fn collect_matches(&mut self) -> DocId {
-        println!(
-            "BlockJoinScorer::collect_matches() - Starting collection for parent {}",
-            self.current_parent
-        );
         let parent_id = self.current_parent;
+        if parent_id == TERMINATED {
+            return TERMINATED;
+        }
+
         let mut child_doc = self.child_scorer.doc();
         let mut child_scores = Vec::new();
+        let next_parent = self.find_next_parent(parent_id + 1);
 
-        // Find all children before this parent
-        while child_doc != TERMINATED && child_doc < parent_id {
-            // Only collect scores for children that belong to this parent
-            // (i.e., no other parent document between the child and current parent)
-            let mut belongs_to_parent = true;
-            for doc_id in (child_doc + 1)..parent_id {
-                if self.parent_docs.contains(doc_id) {
-                    belongs_to_parent = false;
-                    break;
-                }
+        // Collect all children between current parent and next parent
+        while child_doc != TERMINATED && (next_parent == TERMINATED || child_doc < next_parent) {
+            if child_doc > parent_id {
+                child_doc = self.child_scorer.advance();
+                continue;
             }
-
-            if belongs_to_parent {
-                child_scores.push(self.child_scorer.score());
-            }
-
+            child_scores.push(self.child_scorer.score());
             child_doc = self.child_scorer.advance();
         }
 
-        // Update score and return parent doc ID if we found matching children
-        if !child_scores.is_empty() {
-            self.current_score = match self.score_mode {
+        // Update score and return parent doc ID
+        self.current_score = if child_scores.is_empty() {
+            match self.score_mode {
+                ScoreMode::None => 1.0,
+                _ => 0.0,
+            }
+        } else {
+            match self.score_mode {
                 ScoreMode::Avg => child_scores.iter().sum::<Score>() / child_scores.len() as Score,
                 ScoreMode::Max => child_scores.iter().cloned().fold(f32::MIN, f32::max),
                 ScoreMode::Total => child_scores.iter().sum(),
-                ScoreMode::None => 1.0, // Give a default score of 1.0 instead of 0.0
-            };
-            parent_id
-        } else {
-            TERMINATED
-        }
+                ScoreMode::None => 1.0,
+            }
+        };
+        parent_id
     }
 }
 
