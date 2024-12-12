@@ -87,12 +87,21 @@ impl Query for BlockJoinQuery {
     }
 
     fn explain(&self, searcher: &Searcher, doc_address: DocAddress) -> Result<Explanation> {
-        let mut explanation = Explanation::new("BlockJoinQuery", 0.0);
         let reader = searcher.segment_reader(doc_address.segment_ord);
         let mut scorer = self
             .weight(EnableScoring::enabled_from_searcher(searcher))?
             .scorer(reader, 1.0)?;
-        explanation.add_detail(Explanation::new("score", scorer.score()));
+        
+        // Seek to the requested document
+        let doc = scorer.seek(doc_address.doc_id);
+        let score = if doc == doc_address.doc_id {
+            scorer.score()
+        } else {
+            1.0 // Default score if document is found
+        };
+        
+        let mut explanation = Explanation::new("BlockJoinQuery", score);
+        explanation.add_detail(Explanation::new("score", score));
         Ok(explanation)
     }
 
