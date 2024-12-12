@@ -2,7 +2,7 @@ use common::read_u32_vint;
 use stacker::{ExpUnrolledLinkedList, MemoryArena};
 
 use crate::postings::FieldSerializer;
-use crate::DocId;
+use crate::{Ctid, DocId, INVALID_CTID};
 
 const POSITION_END: u32 = 0;
 
@@ -60,7 +60,7 @@ pub(crate) trait Recorder: Copy + Default + Send + Sync + 'static {
     fn current_doc(&self) -> u32;
     /// Starts recording information about a new document
     /// This method shall only be called if the term is within the document.
-    fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena);
+    fn new_doc(&mut self, doc: DocId, ctid: Ctid, arena: &mut MemoryArena);
     /// Record the position of a term. For each document,
     /// this method will be called `term_freq` times.
     fn record_position(&mut self, position: u32, arena: &mut MemoryArena);
@@ -98,10 +98,12 @@ impl Recorder for DocIdRecorder {
     }
 
     #[inline]
-    fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena) {
+    fn new_doc(&mut self, doc: DocId, ctid: Ctid, arena: &mut MemoryArena) {
         let delta = doc - self.current_doc;
         self.current_doc = doc;
         self.stack.writer(arena).write_u32_vint(delta);
+        self.stack.writer(arena).write_u32_vint(ctid.0);
+        self.stack.writer(arena).write_u32_vint(ctid.1 as u32);
     }
 
     #[inline]
@@ -119,9 +121,25 @@ impl Recorder for DocIdRecorder {
         let buffer = buffer_lender.lend_u8();
         // TODO avoid reading twice.
         self.stack.read_to_end(arena, buffer);
-        let iter = get_sum_reader(VInt32Reader::new(&buffer[..]));
-        for doc_id in iter {
-            serializer.write_doc(doc_id, 0u32, &[][..]);
+
+        let mut iter = VInt32Reader::new(&buffer[..]);
+        let mut prev_doc = 0;
+        while let Some(doc_id) = iter.next() {
+            let doc_id = doc_id + prev_doc;
+            let blockno = iter.next().unwrap();
+            let offno = iter.next().unwrap();
+            prev_doc = doc_id;
+            serializer.write_doc(
+                doc_id,
+                0u32,
+                (
+                    blockno,
+                    offno
+                        .try_into()
+                        .expect("Ctid OffsetNumber should not exceed u16::MAX"),
+                ),
+                &[][..],
+            );
         }
     }
 
@@ -159,11 +177,13 @@ impl Recorder for TermFrequencyRecorder {
     }
 
     #[inline]
-    fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena) {
+    fn new_doc(&mut self, doc: DocId, ctid: Ctid, arena: &mut MemoryArena) {
         let delta = doc - self.current_doc;
         self.term_doc_freq += 1;
         self.current_doc = doc;
         self.stack.writer(arena).write_u32_vint(delta);
+        self.stack.writer(arena).write_u32_vint(ctid.0);
+        self.stack.writer(arena).write_u32_vint(ctid.1 as u32);
     }
 
     #[inline]
@@ -190,9 +210,21 @@ impl Recorder for TermFrequencyRecorder {
         let mut prev_doc = 0;
         while let Some(delta_doc_id) = u32_it.next() {
             let doc_id = prev_doc + delta_doc_id;
+            let blockno = u32_it.next().unwrap();
+            let offno = u32_it.next().unwrap();
             prev_doc = doc_id;
             let term_freq = u32_it.next().unwrap_or(self.current_tf);
-            serializer.write_doc(doc_id, term_freq, &[][..]);
+            serializer.write_doc(
+                doc_id,
+                term_freq,
+                (
+                    blockno,
+                    offno
+                        .try_into()
+                        .expect("Ctid OffsetNumber should not exceed u16::MAX"),
+                ),
+                &[][..],
+            );
         }
     }
 
@@ -216,11 +248,13 @@ impl Recorder for TfAndPositionRecorder {
     }
 
     #[inline]
-    fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena) {
+    fn new_doc(&mut self, doc: DocId, ctid: Ctid, arena: &mut MemoryArena) {
         let delta = doc - self.current_doc;
         self.current_doc = doc;
         self.term_doc_freq += 1u32;
         self.stack.writer(arena).write_u32_vint(delta);
+        self.stack.writer(arena).write_u32_vint(ctid.0);
+        self.stack.writer(arena).write_u32_vint(ctid.1 as u32);
     }
 
     #[inline]
@@ -246,6 +280,8 @@ impl Recorder for TfAndPositionRecorder {
         let mut u32_it = VInt32Reader::new(&buffer_u8[..]);
         let mut prev_doc = 0;
         while let Some(delta_doc_id) = u32_it.next() {
+            let blockno = u32_it.next().unwrap();
+            let offno = u32_it.next().unwrap();
             let doc_id = prev_doc + delta_doc_id;
             prev_doc = doc_id;
             let mut prev_position_plus_one = 1u32;
@@ -262,7 +298,17 @@ impl Recorder for TfAndPositionRecorder {
                     }
                 }
             }
-            serializer.write_doc(doc_id, buffer_positions.len() as u32, buffer_positions);
+            serializer.write_doc(
+                doc_id,
+                buffer_positions.len() as u32,
+                (
+                    blockno,
+                    offno
+                        .try_into()
+                        .expect("Ctid OffsetNumber should not exceed u16::MAX"),
+                ),
+                buffer_positions,
+            );
         }
     }
 

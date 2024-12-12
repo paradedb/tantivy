@@ -16,7 +16,7 @@ use crate::postings::{
 use crate::schema::document::{Document, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, Term, DATE_TIME_PRECISION_INDEXED};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
-use crate::{DocId, Opstamp, TantivyError};
+use crate::{Ctid, DocId, Opstamp, TantivyError};
 
 /// Computes the initial size of the hash table.
 ///
@@ -143,7 +143,7 @@ impl SegmentWriter {
             + self.segment_serializer.mem_usage()
     }
 
-    fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
+    fn index_document<D: Document>(&mut self, doc: &D, ctid: Ctid) -> crate::Result<()> {
         let doc_id = self.max_doc;
 
         // TODO: Can this be optimised a bit?
@@ -183,6 +183,7 @@ impl SegmentWriter {
                         let mut indexing_position = IndexingPosition::default();
                         postings_writer.index_text(
                             doc_id,
+                            ctid,
                             &mut facet_tokenizer,
                             term_buffer,
                             ctx,
@@ -208,6 +209,7 @@ impl SegmentWriter {
                         assert!(term_buffer.is_empty());
                         postings_writer.index_text(
                             doc_id,
+                            ctid,
                             &mut *token_stream,
                             term_buffer,
                             ctx,
@@ -227,7 +229,7 @@ impl SegmentWriter {
                         num_vals += 1;
                         let u64_val = value.as_u64().ok_or_else(make_schema_error)?;
                         term_buffer.set_u64(u64_val);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
+                        postings_writer.subscribe(doc_id, ctid, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
@@ -242,7 +244,7 @@ impl SegmentWriter {
                         let date_val = value.as_datetime().ok_or_else(make_schema_error)?;
                         term_buffer
                             .set_u64(date_val.truncate(DATE_TIME_PRECISION_INDEXED).to_u64());
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
+                        postings_writer.subscribe(doc_id, ctid, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
@@ -256,7 +258,7 @@ impl SegmentWriter {
                         num_vals += 1;
                         let i64_val = value.as_i64().ok_or_else(make_schema_error)?;
                         term_buffer.set_i64(i64_val);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
+                        postings_writer.subscribe(doc_id, ctid, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
@@ -269,7 +271,7 @@ impl SegmentWriter {
                         num_vals += 1;
                         let f64_val = value.as_f64().ok_or_else(make_schema_error)?;
                         term_buffer.set_f64(f64_val);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
+                        postings_writer.subscribe(doc_id, ctid, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
@@ -282,7 +284,7 @@ impl SegmentWriter {
                         num_vals += 1;
                         let bool_val = value.as_bool().ok_or_else(make_schema_error)?;
                         term_buffer.set_bool(bool_val);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
+                        postings_writer.subscribe(doc_id, ctid, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
@@ -295,7 +297,7 @@ impl SegmentWriter {
                         num_vals += 1;
                         let bytes = value.as_bytes().ok_or_else(make_schema_error)?;
                         term_buffer.set_bytes(bytes);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
+                        postings_writer.subscribe(doc_id, ctid, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
@@ -313,6 +315,7 @@ impl SegmentWriter {
 
                         index_json_value(
                             doc_id,
+                            ctid,
                             json_value,
                             text_analyzer,
                             term_buffer,
@@ -331,7 +334,7 @@ impl SegmentWriter {
                         num_vals += 1;
                         let ip_addr = value.as_ip_addr().ok_or_else(make_schema_error)?;
                         term_buffer.set_ip_addr(ip_addr);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
+                        postings_writer.subscribe(doc_id, ctid, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
@@ -349,10 +352,14 @@ impl SegmentWriter {
         &mut self,
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {
-        let AddOperation { document, opstamp } = add_operation;
+        let AddOperation {
+            document,
+            opstamp,
+            ctid,
+        } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
-        self.index_document(&document)?;
+        self.index_document(&document, ctid)?;
         let doc_writer = self.segment_serializer.get_store_writer();
         doc_writer.store(&document, &self.schema)?;
         self.max_doc += 1;
@@ -751,7 +758,7 @@ mod tests {
             term_info,
             TermInfo {
                 doc_freq: 1,
-                postings_range: 2..4,
+                postings_range: 8..16,
                 positions_range: 2..5
             }
         );
@@ -790,7 +797,7 @@ mod tests {
             term_info,
             TermInfo {
                 doc_freq: 1,
-                postings_range: 0..1,
+                postings_range: 0..7,
                 positions_range: 0..0
             }
         );

@@ -4,7 +4,7 @@ use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
 use crate::schema::document::Document;
-use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument};
+use crate::{Ctid, Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument};
 
 #[doc(hidden)]
 pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
@@ -30,11 +30,14 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         self.segment_writer.mem_usage()
     }
 
-    pub fn add_document(&mut self, document: D) -> crate::Result<()> {
+    pub fn add_document(&mut self, document: D, ctid: Ctid) -> crate::Result<()> {
         let opstamp = self.opstamp;
         self.opstamp += 1;
-        self.segment_writer
-            .add_document(AddOperation { opstamp, document })
+        self.segment_writer.add_document(AddOperation {
+            opstamp,
+            document,
+            ctid,
+        })
     }
 
     pub fn finalize(self) -> crate::Result<Index> {

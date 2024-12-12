@@ -8,7 +8,7 @@ use crate::schema::{Type, DATE_TIME_PRECISION_INDEXED};
 use crate::time::format_description::well_known::Rfc3339;
 use crate::time::{OffsetDateTime, UtcOffset};
 use crate::tokenizer::TextAnalyzer;
-use crate::{DateTime, DocId, Term};
+use crate::{Ctid, DateTime, DocId, Term};
 
 /// This object is a map storing the last position for a given path for the current document
 /// being indexed.
@@ -74,6 +74,7 @@ pub fn json_path_sep_to_dot(path: &mut str) {
 #[allow(clippy::too_many_arguments)]
 fn index_json_object<'a, V: Value<'a>>(
     doc: DocId,
+    ctid: Ctid,
     json_visitor: V::ObjectIter,
     text_analyzer: &mut TextAnalyzer,
     term_buffer: &mut Term,
@@ -89,6 +90,7 @@ fn index_json_object<'a, V: Value<'a>>(
         json_path_writer.push(json_path_segment);
         index_json_value(
             doc,
+            ctid,
             json_value_visitor,
             text_analyzer,
             term_buffer,
@@ -104,6 +106,7 @@ fn index_json_object<'a, V: Value<'a>>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn index_json_value<'a, V: Value<'a>>(
     doc: DocId,
+    ctid: Ctid,
     json_value: V,
     text_analyzer: &mut TextAnalyzer,
     term_buffer: &mut Term,
@@ -135,6 +138,7 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
                 let indexing_position = positions_per_path.get_position_from_id(unordered_id);
                 postings_writer.index_text(
                     doc,
+                    ctid,
                     &mut *token_stream,
                     term_buffer,
                     ctx,
@@ -154,7 +158,7 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
                 } else {
                     term_buffer.append_type_and_fast_value(val);
                 }
-                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+                postings_writer.subscribe(doc, ctid, 0u32, term_buffer, ctx);
             }
             ReferenceValueLeaf::I64(val) => {
                 set_path_id(
@@ -163,7 +167,7 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
                         .get_or_allocate_unordered_id(json_path_writer.as_str()),
                 );
                 term_buffer.append_type_and_fast_value(val);
-                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+                postings_writer.subscribe(doc, ctid, 0u32, term_buffer, ctx);
             }
             ReferenceValueLeaf::F64(val) => {
                 set_path_id(
@@ -172,7 +176,7 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
                         .get_or_allocate_unordered_id(json_path_writer.as_str()),
                 );
                 term_buffer.append_type_and_fast_value(val);
-                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+                postings_writer.subscribe(doc, ctid, 0u32, term_buffer, ctx);
             }
             ReferenceValueLeaf::Bool(val) => {
                 set_path_id(
@@ -181,7 +185,7 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
                         .get_or_allocate_unordered_id(json_path_writer.as_str()),
                 );
                 term_buffer.append_type_and_fast_value(val);
-                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+                postings_writer.subscribe(doc, ctid, 0u32, term_buffer, ctx);
             }
             ReferenceValueLeaf::Date(val) => {
                 set_path_id(
@@ -191,7 +195,7 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
                 );
                 let val = val.truncate(DATE_TIME_PRECISION_INDEXED);
                 term_buffer.append_type_and_fast_value(val);
-                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+                postings_writer.subscribe(doc, ctid, 0u32, term_buffer, ctx);
             }
             ReferenceValueLeaf::PreTokStr(_) => {
                 unimplemented!(
@@ -212,6 +216,7 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
             for val in elements {
                 index_json_value(
                     doc,
+                    ctid,
                     val,
                     text_analyzer,
                     term_buffer,
@@ -225,6 +230,7 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
         ReferenceValue::Object(object) => {
             index_json_object::<V>(
                 doc,
+                ctid,
                 object,
                 text_analyzer,
                 term_buffer,
