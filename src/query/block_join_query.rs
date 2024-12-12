@@ -72,8 +72,11 @@ impl fmt::Debug for BlockJoinQuery {
 
 impl Query for BlockJoinQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> Result<Box<dyn Weight>> {
-        let child_weight = self.child_query.weight(enable_scoring)?;
+        println!("BlockJoinQuery::weight() - Creating weights");
+        let child_weight = self.child_query.weight(enable_scoring.clone())?;
+        println!("BlockJoinQuery::weight() - Created child weight");
         let parents_weight = self.parents_filter.weight(enable_scoring)?;
+        println!("BlockJoinQuery::weight() - Created parent weight");
 
         Ok(Box::new(BlockJoinWeight {
             child_weight,
@@ -109,25 +112,41 @@ struct BlockJoinWeight {
 
 impl Weight for BlockJoinWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
+        println!("BlockJoinWeight::scorer() - Creating scorer with boost {}", boost);
+        
         // Create parents bitset
-        let mut parents_bitset = BitSet::with_max_value(reader.max_doc());
+        let max_doc = reader.max_doc();
+        println!("BlockJoinWeight::scorer() - Max doc value: {}", max_doc);
+        let mut parents_bitset = BitSet::with_max_value(max_doc);
+        
+        println!("BlockJoinWeight::scorer() - Creating parent scorer");
         let mut parents_scorer = self.parents_weight.scorer(reader, boost)?;
+        println!("BlockJoinWeight::scorer() - Parent scorer created");
 
         // Collect all parent documents
         let mut found_parent = false;
+        let mut parent_count = 0;
         while parents_scorer.doc() != TERMINATED {
             let parent_doc = parents_scorer.doc();
+            println!("BlockJoinWeight::scorer() - Found parent doc: {}", parent_doc);
             parents_bitset.insert(parent_doc);
             found_parent = true;
+            parent_count += 1;
             parents_scorer.advance();
         }
+        println!("BlockJoinWeight::scorer() - Found {} parent documents", parent_count);
 
         // If no parents in this segment, return empty scorer
         if !found_parent {
+            println!("BlockJoinWeight::scorer() - No parents found, returning empty scorer");
             return Ok(Box::new(EmptyScorer));
         }
 
+        println!("BlockJoinWeight::scorer() - Creating child scorer");
         let child_scorer = self.child_weight.scorer(reader, boost)?;
+        println!("BlockJoinWeight::scorer() - Child scorer created");
+        
+        println!("BlockJoinWeight::scorer() - Creating BlockJoinScorer");
         Ok(Box::new(BlockJoinScorer {
             child_scorer,
             parent_docs: parents_bitset,
@@ -188,32 +207,44 @@ struct BlockJoinScorer {
 
 impl DocSet for BlockJoinScorer {
     fn advance(&mut self) -> DocId {
+        println!("BlockJoinScorer::advance() - Starting advance");
+        
         if !self.has_more {
+            println!("BlockJoinScorer::advance() - No more documents available");
             return TERMINATED;
         }
 
         if !self.initialized {
+            println!("BlockJoinScorer::advance() - Initializing child scorer");
             self.child_scorer.advance();
             self.initialized = true;
+            println!("BlockJoinScorer::advance() - Child scorer initialized");
         }
 
         loop {
             let start = if self.current_parent == TERMINATED {
+                println!("BlockJoinScorer::advance() - Starting from beginning");
                 0
             } else {
+                println!("BlockJoinScorer::advance() - Starting from parent {} + 1", self.current_parent);
                 self.current_parent + 1
             };
 
             self.current_parent = self.find_next_parent(start);
+            println!("BlockJoinScorer::advance() - Found next parent: {:?}", self.current_parent);
+            
             if self.current_parent == TERMINATED {
+                println!("BlockJoinScorer::advance() - No more parents found");
                 self.has_more = false;
                 return TERMINATED;
             }
 
             let doc_id = self.collect_matches();
+            println!("BlockJoinScorer::advance() - Collected matches, doc_id: {:?}", doc_id);
             if doc_id != TERMINATED {
                 return doc_id;
             }
+            println!("BlockJoinScorer::advance() - No matches found for current parent, continuing...");
         }
     }
 
@@ -232,26 +263,37 @@ impl DocSet for BlockJoinScorer {
 
 impl BlockJoinScorer {
     fn find_next_parent(&self, from: DocId) -> DocId {
+        println!("BlockJoinScorer::find_next_parent() - Starting from {}", from);
         let mut current = from;
-        while current < self.parent_docs.max_value() {
+        let max_value = self.parent_docs.max_value();
+        println!("BlockJoinScorer::find_next_parent() - Max value: {}", max_value);
+        
+        while current < max_value {
             if self.parent_docs.contains(current) {
+                println!("BlockJoinScorer::find_next_parent() - Found parent at {}", current);
                 return current;
             }
             current += 1;
         }
+        println!("BlockJoinScorer::find_next_parent() - No more parents found");
         TERMINATED
     }
 
     fn collect_matches(&mut self) -> DocId {
+        println!("BlockJoinScorer::collect_matches() - Starting collection for parent {}", self.current_parent);
         let parent_id = self.current_parent;
         let mut child_doc = self.child_scorer.doc();
+        println!("BlockJoinScorer::collect_matches() - Initial child doc: {:?}", child_doc);
         let mut child_scores = Vec::new();
 
         while child_doc != TERMINATED && child_doc < parent_id {
+            println!("BlockJoinScorer::collect_matches() - Processing child doc {} for parent {}", child_doc, parent_id);
+            
             // Check if there's another parent in between:
             let mut is_valid = true;
             for doc_id in (child_doc + 1)..parent_id {
                 if self.parent_docs.contains(doc_id) {
+                    println!("BlockJoinScorer::collect_matches() - Found intervening parent at {}", doc_id);
                     is_valid = false;
                     break;
                 }
@@ -259,21 +301,39 @@ impl BlockJoinScorer {
 
             if is_valid {
                 let score = self.child_scorer.score();
+                println!("BlockJoinScorer::collect_matches() - Valid child found with score {}", score);
                 child_scores.push(score);
             }
 
             child_doc = self.child_scorer.advance();
+            println!("BlockJoinScorer::collect_matches() - Advanced to next child: {:?}", child_doc);
         }
 
         if child_scores.is_empty() {
-            // no children matched this parent
+            println!("BlockJoinScorer::collect_matches() - No matching children found for parent {}", parent_id);
             TERMINATED
         } else {
+            println!("BlockJoinScorer::collect_matches() - Found {} matching children", child_scores.len());
             self.current_score = match self.score_mode {
-                ScoreMode::Avg => child_scores.iter().sum::<Score>() / child_scores.len() as Score,
-                ScoreMode::Max => child_scores.iter().cloned().fold(f32::MIN, f32::max),
-                ScoreMode::Total => child_scores.iter().sum(),
-                ScoreMode::None => 0.0,
+                ScoreMode::Avg => {
+                    let avg = child_scores.iter().sum::<Score>() / child_scores.len() as Score;
+                    println!("BlockJoinScorer::collect_matches() - Calculated average score: {}", avg);
+                    avg
+                },
+                ScoreMode::Max => {
+                    let max = child_scores.iter().cloned().fold(f32::MIN, f32::max);
+                    println!("BlockJoinScorer::collect_matches() - Calculated max score: {}", max);
+                    max
+                },
+                ScoreMode::Total => {
+                    let total = child_scores.iter().sum();
+                    println!("BlockJoinScorer::collect_matches() - Calculated total score: {}", total);
+                    total
+                },
+                ScoreMode::None => {
+                    println!("BlockJoinScorer::collect_matches() - Using no scoring mode");
+                    0.0
+                },
             };
             parent_id
         }
