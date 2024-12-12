@@ -322,89 +322,38 @@ impl BlockJoinScorer {
         );
         let parent_id = self.current_parent;
         let mut child_doc = self.child_scorer.doc();
-        println!(
-            "BlockJoinScorer::collect_matches() - Initial child doc: {:?}",
-            child_doc
-        );
         let mut child_scores = Vec::new();
 
+        // Find all children before this parent
         while child_doc != TERMINATED && child_doc < parent_id {
-            println!(
-                "BlockJoinScorer::collect_matches() - Processing child doc {} for parent {}",
-                child_doc, parent_id
-            );
-
-            // Check if there's another parent in between:
-            let mut is_valid = true;
+            // Only collect scores for children that belong to this parent
+            // (i.e., no other parent document between the child and current parent)
+            let mut belongs_to_parent = true;
             for doc_id in (child_doc + 1)..parent_id {
                 if self.parent_docs.contains(doc_id) {
-                    println!(
-                        "BlockJoinScorer::collect_matches() - Found intervening parent at {}",
-                        doc_id
-                    );
-                    is_valid = false;
+                    belongs_to_parent = false;
                     break;
                 }
             }
 
-            if is_valid {
-                let score = self.child_scorer.score();
-                println!(
-                    "BlockJoinScorer::collect_matches() - Valid child found with score {}",
-                    score
-                );
-                child_scores.push(score);
+            if belongs_to_parent {
+                child_scores.push(self.child_scorer.score());
             }
 
             child_doc = self.child_scorer.advance();
-            println!(
-                "BlockJoinScorer::collect_matches() - Advanced to next child: {:?}",
-                child_doc
-            );
         }
 
-        if child_scores.is_empty() {
-            println!(
-                "BlockJoinScorer::collect_matches() - No matching children found for parent {}",
-                parent_id
-            );
-            TERMINATED
-        } else {
-            println!(
-                "BlockJoinScorer::collect_matches() - Found {} matching children",
-                child_scores.len()
-            );
+        // Update score and return parent doc ID if we found matching children
+        if !child_scores.is_empty() {
             self.current_score = match self.score_mode {
-                ScoreMode::Avg => {
-                    let avg = child_scores.iter().sum::<Score>() / child_scores.len() as Score;
-                    println!(
-                        "BlockJoinScorer::collect_matches() - Calculated average score: {}",
-                        avg
-                    );
-                    avg
-                }
-                ScoreMode::Max => {
-                    let max = child_scores.iter().cloned().fold(f32::MIN, f32::max);
-                    println!(
-                        "BlockJoinScorer::collect_matches() - Calculated max score: {}",
-                        max
-                    );
-                    max
-                }
-                ScoreMode::Total => {
-                    let total = child_scores.iter().sum();
-                    println!(
-                        "BlockJoinScorer::collect_matches() - Calculated total score: {}",
-                        total
-                    );
-                    total
-                }
-                ScoreMode::None => {
-                    println!("BlockJoinScorer::collect_matches() - Using no scoring mode");
-                    0.0
-                }
+                ScoreMode::Avg => child_scores.iter().sum::<Score>() / child_scores.len() as Score,
+                ScoreMode::Max => child_scores.iter().cloned().fold(f32::MIN, f32::max),
+                ScoreMode::Total => child_scores.iter().sum(),
+                ScoreMode::None => 1.0, // Give a default score of 1.0 instead of 0.0
             };
             parent_id
+        } else {
+            TERMINATED
         }
     }
 }
