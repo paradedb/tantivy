@@ -1,3 +1,4 @@
+#![allow(unused)]
 use crate::core::searcher::Searcher;
 use crate::query::{EnableScoring, Explanation, Query, QueryClone, Scorer, Weight};
 use crate::schema::Term;
@@ -112,13 +113,16 @@ struct BlockJoinWeight {
 
 impl Weight for BlockJoinWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
-        println!("BlockJoinWeight::scorer() - Creating scorer with boost {}", boost);
-        
+        println!(
+            "BlockJoinWeight::scorer() - Creating scorer with boost {}",
+            boost
+        );
+
         // Create parents bitset
         let max_doc = reader.max_doc();
         println!("BlockJoinWeight::scorer() - Max doc value: {}", max_doc);
         let mut parents_bitset = BitSet::with_max_value(max_doc);
-        
+
         println!("BlockJoinWeight::scorer() - Creating parent scorer");
         let mut parents_scorer = self.parents_weight.scorer(reader, boost)?;
         println!("BlockJoinWeight::scorer() - Parent scorer created");
@@ -128,13 +132,19 @@ impl Weight for BlockJoinWeight {
         let mut parent_count = 0;
         while parents_scorer.doc() != TERMINATED {
             let parent_doc = parents_scorer.doc();
-            println!("BlockJoinWeight::scorer() - Found parent doc: {}", parent_doc);
+            println!(
+                "BlockJoinWeight::scorer() - Found parent doc: {}",
+                parent_doc
+            );
             parents_bitset.insert(parent_doc);
             found_parent = true;
             parent_count += 1;
             parents_scorer.advance();
         }
-        println!("BlockJoinWeight::scorer() - Found {} parent documents", parent_count);
+        println!(
+            "BlockJoinWeight::scorer() - Found {} parent documents",
+            parent_count
+        );
 
         // If no parents in this segment, return empty scorer
         if !found_parent {
@@ -145,7 +155,7 @@ impl Weight for BlockJoinWeight {
         println!("BlockJoinWeight::scorer() - Creating child scorer");
         let child_scorer = self.child_weight.scorer(reader, boost)?;
         println!("BlockJoinWeight::scorer() - Child scorer created");
-        
+
         println!("BlockJoinWeight::scorer() - Creating BlockJoinScorer");
         Ok(Box::new(BlockJoinScorer {
             child_scorer,
@@ -208,7 +218,7 @@ struct BlockJoinScorer {
 impl DocSet for BlockJoinScorer {
     fn advance(&mut self) -> DocId {
         println!("BlockJoinScorer::advance() - Starting advance");
-        
+
         if !self.has_more {
             println!("BlockJoinScorer::advance() - No more documents available");
             return TERMINATED;
@@ -226,13 +236,19 @@ impl DocSet for BlockJoinScorer {
                 println!("BlockJoinScorer::advance() - Starting from beginning");
                 0
             } else {
-                println!("BlockJoinScorer::advance() - Starting from parent {} + 1", self.current_parent);
+                println!(
+                    "BlockJoinScorer::advance() - Starting from parent {} + 1",
+                    self.current_parent
+                );
                 self.current_parent + 1
             };
 
             self.current_parent = self.find_next_parent(start);
-            println!("BlockJoinScorer::advance() - Found next parent: {:?}", self.current_parent);
-            
+            println!(
+                "BlockJoinScorer::advance() - Found next parent: {:?}",
+                self.current_parent
+            );
+
             if self.current_parent == TERMINATED {
                 println!("BlockJoinScorer::advance() - No more parents found");
                 self.has_more = false;
@@ -240,11 +256,16 @@ impl DocSet for BlockJoinScorer {
             }
 
             let doc_id = self.collect_matches();
-            println!("BlockJoinScorer::advance() - Collected matches, doc_id: {:?}", doc_id);
+            println!(
+                "BlockJoinScorer::advance() - Collected matches, doc_id: {:?}",
+                doc_id
+            );
             if doc_id != TERMINATED {
                 return doc_id;
             }
-            println!("BlockJoinScorer::advance() - No matches found for current parent, continuing...");
+            println!(
+                "BlockJoinScorer::advance() - No matches found for current parent, continuing..."
+            );
         }
     }
 
@@ -263,14 +284,23 @@ impl DocSet for BlockJoinScorer {
 
 impl BlockJoinScorer {
     fn find_next_parent(&self, from: DocId) -> DocId {
-        println!("BlockJoinScorer::find_next_parent() - Starting from {}", from);
+        println!(
+            "BlockJoinScorer::find_next_parent() - Starting from {}",
+            from
+        );
         let mut current = from;
         let max_value = self.parent_docs.max_value();
-        println!("BlockJoinScorer::find_next_parent() - Max value: {}", max_value);
-        
+        println!(
+            "BlockJoinScorer::find_next_parent() - Max value: {}",
+            max_value
+        );
+
         while current < max_value {
             if self.parent_docs.contains(current) {
-                println!("BlockJoinScorer::find_next_parent() - Found parent at {}", current);
+                println!(
+                    "BlockJoinScorer::find_next_parent() - Found parent at {}",
+                    current
+                );
                 return current;
             }
             current += 1;
@@ -280,20 +310,32 @@ impl BlockJoinScorer {
     }
 
     fn collect_matches(&mut self) -> DocId {
-        println!("BlockJoinScorer::collect_matches() - Starting collection for parent {}", self.current_parent);
+        println!(
+            "BlockJoinScorer::collect_matches() - Starting collection for parent {}",
+            self.current_parent
+        );
         let parent_id = self.current_parent;
         let mut child_doc = self.child_scorer.doc();
-        println!("BlockJoinScorer::collect_matches() - Initial child doc: {:?}", child_doc);
+        println!(
+            "BlockJoinScorer::collect_matches() - Initial child doc: {:?}",
+            child_doc
+        );
         let mut child_scores = Vec::new();
 
         while child_doc != TERMINATED && child_doc < parent_id {
-            println!("BlockJoinScorer::collect_matches() - Processing child doc {} for parent {}", child_doc, parent_id);
-            
+            println!(
+                "BlockJoinScorer::collect_matches() - Processing child doc {} for parent {}",
+                child_doc, parent_id
+            );
+
             // Check if there's another parent in between:
             let mut is_valid = true;
             for doc_id in (child_doc + 1)..parent_id {
                 if self.parent_docs.contains(doc_id) {
-                    println!("BlockJoinScorer::collect_matches() - Found intervening parent at {}", doc_id);
+                    println!(
+                        "BlockJoinScorer::collect_matches() - Found intervening parent at {}",
+                        doc_id
+                    );
                     is_valid = false;
                     break;
                 }
@@ -301,39 +343,60 @@ impl BlockJoinScorer {
 
             if is_valid {
                 let score = self.child_scorer.score();
-                println!("BlockJoinScorer::collect_matches() - Valid child found with score {}", score);
+                println!(
+                    "BlockJoinScorer::collect_matches() - Valid child found with score {}",
+                    score
+                );
                 child_scores.push(score);
             }
 
             child_doc = self.child_scorer.advance();
-            println!("BlockJoinScorer::collect_matches() - Advanced to next child: {:?}", child_doc);
+            println!(
+                "BlockJoinScorer::collect_matches() - Advanced to next child: {:?}",
+                child_doc
+            );
         }
 
         if child_scores.is_empty() {
-            println!("BlockJoinScorer::collect_matches() - No matching children found for parent {}", parent_id);
+            println!(
+                "BlockJoinScorer::collect_matches() - No matching children found for parent {}",
+                parent_id
+            );
             TERMINATED
         } else {
-            println!("BlockJoinScorer::collect_matches() - Found {} matching children", child_scores.len());
+            println!(
+                "BlockJoinScorer::collect_matches() - Found {} matching children",
+                child_scores.len()
+            );
             self.current_score = match self.score_mode {
                 ScoreMode::Avg => {
                     let avg = child_scores.iter().sum::<Score>() / child_scores.len() as Score;
-                    println!("BlockJoinScorer::collect_matches() - Calculated average score: {}", avg);
+                    println!(
+                        "BlockJoinScorer::collect_matches() - Calculated average score: {}",
+                        avg
+                    );
                     avg
-                },
+                }
                 ScoreMode::Max => {
                     let max = child_scores.iter().cloned().fold(f32::MIN, f32::max);
-                    println!("BlockJoinScorer::collect_matches() - Calculated max score: {}", max);
+                    println!(
+                        "BlockJoinScorer::collect_matches() - Calculated max score: {}",
+                        max
+                    );
                     max
-                },
+                }
                 ScoreMode::Total => {
                     let total = child_scores.iter().sum();
-                    println!("BlockJoinScorer::collect_matches() - Calculated total score: {}", total);
+                    println!(
+                        "BlockJoinScorer::collect_matches() - Calculated total score: {}",
+                        total
+                    );
                     total
-                },
+                }
                 ScoreMode::None => {
                     println!("BlockJoinScorer::collect_matches() - Using no scoring mode");
                     0.0
-                },
+                }
             };
             parent_id
         }
@@ -420,6 +483,29 @@ mod tests {
     use crate::schema::*;
     use crate::{DocAddress, DocId, Index, IndexWriter, Score};
 
+    /// Adds multiple documents as a block.
+    ///
+    /// This method allows adding multiple documents together as a single block.
+    /// This is important for nested documents, where child documents need to be
+    /// added before their parent document, and they need to be stored together
+    /// in the same block.
+    ///
+    /// The opstamp returned is the opstamp of the last document added.
+    /// This is here for reference, it is a method on IndexWriter.
+    // pub fn add_documents(&self, documents: Vec<D>) -> crate::Result<Opstamp> {
+    //     let count = documents.len() as u64;
+    //     if count == 0 {
+    //         return Ok(self.stamper.stamp());
+    //     }
+    //     let (batch_opstamp, stamps) = self.get_batch_opstamps(count);
+    //     let mut adds = AddBatch::default();
+    //     for (document, opstamp) in documents.into_iter().zip(stamps) {
+    //         adds.push(AddOperation { opstamp, document });
+    //     }
+    //     self.send_add_documents_batch(adds)?;
+    //     Ok(batch_opstamp)
+    // }
+
     fn create_test_index() -> crate::Result<(Index, Field, Field, Field, Field)> {
         let mut schema_builder = Schema::builder();
         let name_field = schema_builder.add_text_field("name", STRING | STORED);
@@ -433,34 +519,38 @@ mod tests {
             let mut index_writer: IndexWriter = index.writer_for_tests()?;
 
             // First resume block
-            index_writer.add_document(doc!(
-                skill_field => "java",
-                doc_type_field => "job"
-            ))?;
-            index_writer.add_document(doc!(
-                skill_field => "python",
-                doc_type_field => "job"
-            ))?;
-            index_writer.add_document(doc!(
-                name_field => "Lisa",
-                country_field => "United Kingdom",
-                doc_type_field => "resume"
-            ))?;
+            index_writer.add_documents(vec![
+                doc!(
+                    skill_field => "java",
+                    doc_type_field => "job"
+                ),
+                doc!(
+                    skill_field => "python",
+                    doc_type_field => "job"
+                ),
+                doc!(
+                    name_field => "Lisa",
+                    country_field => "United Kingdom",
+                    doc_type_field => "resume"
+                ),
+            ])?;
 
             // Second resume block
-            index_writer.add_document(doc!(
-                skill_field => "ruby",
-                doc_type_field => "job"
-            ))?;
-            index_writer.add_document(doc!(
-                skill_field => "java",
-                doc_type_field => "job"
-            ))?;
-            index_writer.add_document(doc!(
-                name_field => "Frank",
-                country_field => "United States",
-                doc_type_field => "resume"
-            ))?;
+            index_writer.add_documents(vec![
+                doc!(
+                    skill_field => "ruby",
+                    doc_type_field => "job"
+                ),
+                doc!(
+                    skill_field => "java",
+                    doc_type_field => "job"
+                ),
+                doc!(
+                    name_field => "Frank",
+                    country_field => "United States",
+                    doc_type_field => "resume"
+                ),
+            ])?;
 
             index_writer.commit()?;
         }
@@ -471,141 +561,6 @@ mod tests {
             skill_field,
             doc_type_field,
         ))
-    }
-
-    #[derive(Debug)]
-    struct BlockJoinQuery {
-        parent_query: Box<dyn Query>,
-        child_query: Box<dyn Query>,
-        doc_type_field: Field,
-        parent_doc_type: String,
-    }
-
-    impl BlockJoinQuery {
-        fn new<Q1: Query + 'static, Q2: Query + 'static>(
-            parent_query: Q1,
-            child_query: Q2,
-            doc_type_field: Field,
-            parent_doc_type: &str,
-        ) -> Self {
-            BlockJoinQuery {
-                parent_query: Box::new(parent_query),
-                child_query: Box::new(child_query),
-                doc_type_field,
-                parent_doc_type: parent_doc_type.to_string(),
-            }
-        }
-    }
-
-    // Implement QueryClone manually instead of deriving Clone
-    impl QueryClone for BlockJoinQuery {
-        fn box_clone(&self) -> Box<dyn Query> {
-            Box::new(BlockJoinQuery {
-                parent_query: self.parent_query.box_clone(),
-                child_query: self.child_query.box_clone(),
-                doc_type_field: self.doc_type_field,
-                parent_doc_type: self.parent_doc_type.clone(),
-            })
-        }
-    }
-
-    impl Query for BlockJoinQuery {
-        fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-            let parent_weight = self.parent_query.weight(enable_scoring.clone())?;
-            let child_weight = self.child_query.weight(enable_scoring)?;
-
-            Ok(Box::new(BlockJoinWeight {
-                parent_weight,
-                child_weight,
-                doc_type_field: self.doc_type_field,
-                parent_doc_type: self.parent_doc_type.clone(),
-            }))
-        }
-
-        fn explain(
-            &self,
-            searcher: &Searcher,
-            doc_address: DocAddress,
-        ) -> crate::Result<Explanation> {
-            let weight = self.weight(EnableScoring::enabled_from_searcher(searcher))?;
-            weight.explain(
-                &searcher.segment_reader(doc_address.segment_ord),
-                doc_address.doc_id,
-            )
-        }
-    }
-
-    struct BlockJoinWeight {
-        parent_weight: Box<dyn Weight>,
-        child_weight: Box<dyn Weight>,
-        doc_type_field: Field,
-        parent_doc_type: String,
-    }
-
-    impl Weight for BlockJoinWeight {
-        fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
-            let parent_scorer = self.parent_weight.scorer(reader, boost)?;
-            let child_scorer = self.child_weight.scorer(reader, boost)?;
-
-            Ok(Box::new(BlockJoinScorer {
-                parent_scorer,
-                child_scorer,
-                current_doc: 0,
-                score: 0.0,
-            }))
-        }
-
-        fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
-            let mut scorer = self.scorer(reader, 1.0)?;
-
-            if scorer.seek(doc) != doc {
-                return Ok(Explanation::new("No match", 0.0));
-            }
-
-            Ok(Explanation::new("Block join score", scorer.score()))
-        }
-    }
-
-    struct BlockJoinScorer {
-        parent_scorer: Box<dyn Scorer>,
-        child_scorer: Box<dyn Scorer>,
-        current_doc: DocId,
-        score: Score,
-    }
-
-    impl DocSet for BlockJoinScorer {
-        fn advance(&mut self) -> DocId {
-            let parent_doc = self.parent_scorer.advance();
-            if parent_doc == TERMINATED {
-                return TERMINATED;
-            }
-
-            // Find child docs between current and next parent
-            let mut found_child = false;
-            while self.child_scorer.doc() < parent_doc {
-                found_child = true;
-                if self.child_scorer.advance() == TERMINATED {
-                    break;
-                }
-            }
-
-            self.current_doc = if found_child { parent_doc } else { TERMINATED };
-            self.current_doc
-        }
-
-        fn doc(&self) -> DocId {
-            self.current_doc
-        }
-
-        fn size_hint(&self) -> u32 {
-            self.parent_scorer.size_hint()
-        }
-    }
-
-    impl Scorer for BlockJoinScorer {
-        fn score(&mut self) -> Score {
-            self.score
-        }
     }
 
     #[test]
@@ -624,8 +579,11 @@ mod tests {
             IndexRecordOption::Basic,
         );
 
-        let block_join_query =
-            BlockJoinQuery::new(parent_query, child_query, doc_type_field, "resume");
+        let block_join_query = BlockJoinQuery::new(
+            Box::new(parent_query),
+            Box::new(child_query),
+            ScoreMode::Avg,
+        );
 
         let top_docs = searcher.search(&block_join_query, &TopDocs::with_limit(1))?;
         assert_eq!(top_docs.len(), 1);
@@ -652,8 +610,11 @@ mod tests {
             IndexRecordOption::Basic,
         );
 
-        let block_join_query =
-            BlockJoinQuery::new(parent_query, child_query, doc_type_field, "resume");
+        let block_join_query = BlockJoinQuery::new(
+            Box::new(parent_query),
+            Box::new(child_query),
+            ScoreMode::Avg,
+        );
 
         let top_docs = searcher.search(&block_join_query, &TopDocs::with_limit(1))?;
         assert_eq!(top_docs.len(), 0);
@@ -677,8 +638,11 @@ mod tests {
             IndexRecordOption::WithFreqs,
         );
 
-        let block_join_query =
-            BlockJoinQuery::new(parent_query, child_query, doc_type_field, "resume");
+        let block_join_query = BlockJoinQuery::new(
+            Box::new(parent_query),
+            Box::new(child_query),
+            ScoreMode::Avg,
+        );
 
         let top_docs = searcher.search(&block_join_query, &TopDocs::with_limit(1))?;
         assert_eq!(top_docs.len(), 1);
@@ -691,7 +655,8 @@ mod tests {
 
     #[test]
     pub fn test_explain_block_join() -> crate::Result<()> {
-        let (index, _name_field, country_field, skill_field, doc_type_field) = create_test_index()?;
+        let (index, _name_field, country_field, skill_field, _doc_type_field) =
+            create_test_index()?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
@@ -705,8 +670,11 @@ mod tests {
             IndexRecordOption::Basic,
         );
 
-        let block_join_query =
-            BlockJoinQuery::new(parent_query, child_query, doc_type_field, "resume");
+        let block_join_query = BlockJoinQuery::new(
+            Box::new(parent_query),
+            Box::new(child_query),
+            ScoreMode::Avg,
+        );
 
         let explanation = block_join_query.explain(&searcher, DocAddress::new(0, 2))?;
         assert!(explanation.value() > 0.0);
