@@ -86,8 +86,12 @@ impl Query for BlockJoinQuery {
         }))
     }
 
-    fn explain(&self, _searcher: &Searcher, _doc_address: DocAddress) -> Result<Explanation> {
-        unimplemented!("Explain is not implemented for BlockJoinQuery");
+    fn explain(&self, searcher: &Searcher, doc_address: DocAddress) -> Result<Explanation> {
+        let mut explanation = Explanation::new("BlockJoinQuery", self.score_mode);
+        let reader = searcher.segment_reader(doc_address.segment_ord());
+        let scorer = self.weight(EnableScoring::enabled_from_searcher(searcher))?.scorer(reader, 1.0)?;
+        explanation.add_detail(Explanation::new("score", scorer.score()));
+        Ok(explanation)
     }
 
     fn count(&self, searcher: &Searcher) -> Result<usize> {
@@ -533,6 +537,10 @@ mod tests {
                     country_field => "United Kingdom",
                     doc_type_field => "resume"
                 ),
+                doc!(
+                    skill_field => "java",
+                    doc_type_field => "job"
+                ),
             ])?;
 
             // Second resume block
@@ -570,7 +578,7 @@ mod tests {
         let searcher = reader.searcher();
 
         let parent_query = TermQuery::new(
-            Term::from_field_text(country_field, "United Kingdom"),
+            Term::from_field_text(doc_type_field, "resume"),
             IndexRecordOption::Basic,
         );
 
@@ -629,7 +637,7 @@ mod tests {
         let searcher = reader.searcher();
 
         let parent_query = TermQuery::new(
-            Term::from_field_text(country_field, "United Kingdom"),
+            Term::from_field_text(doc_type_field, "resume"),
             IndexRecordOption::WithFreqs,
         );
 
