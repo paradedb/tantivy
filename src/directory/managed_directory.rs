@@ -42,6 +42,7 @@ pub struct ManagedDirectory {
     directory: Box<dyn Directory>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct MetaInformation {
     managed_paths: HashSet<PathBuf>,

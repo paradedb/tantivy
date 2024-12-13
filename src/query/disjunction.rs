@@ -135,7 +135,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
                     self.score_combiner.clear();
                 }
                 current_num_matches += 1;
-                self.score_combiner.update(&mut candidate.scorer);
+                let _ = self.score_combiner.update(&mut candidate.scorer);
                 candidate.advance();
                 self.chains.push(candidate);
             }

@@ -152,6 +152,7 @@ impl Recorder for DocIdRecorder {
     }
 }
 
+#[allow(dead_code)]
 /// Takes an Iterator of delta encoded elements and returns an iterator
 /// that yields the sum of the elements.
 fn get_sum_reader(iter: impl Iterator<Item = u32>) -> impl Iterator<Item = u32> {

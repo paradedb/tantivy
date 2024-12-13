@@ -3,7 +3,7 @@ use crate::index::SegmentReader;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
-use crate::{Ctid, DocId, Score, INVALID_CTID};
+use crate::{Ctid, DocId, Score};
 
 /// Query that matches all of the documents.
 ///
@@ -61,7 +61,7 @@ impl DocSet for AllScorer {
     fn fill_buffer(
         &mut self,
         buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
-        ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+        _ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
     ) -> usize {
         if self.doc() == TERMINATED {
             return 0;
@@ -98,7 +98,7 @@ impl DocSet for AllScorer {
 impl Scorer for AllScorer {
     fn score(&mut self) -> (Score, Ctid) {
         todo!("AllScorer::score():  this needs to be backed by actual postings so we can get the ctid");
-        (1.0, INVALID_CTID)
+        // (1.0, INVALID_CTID)
     }
 }
 

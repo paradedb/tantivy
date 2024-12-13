@@ -54,7 +54,7 @@ fn refill<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
             // add this document
             let delta = doc - min_doc;
             bitsets[(delta / 64) as usize].insert_mut(delta % 64u32);
-            score_combiner[delta as usize].update(scorer);
+            let _ = score_combiner[delta as usize].update(scorer);
             if scorer.advance() == TERMINATED {
                 // remove the docset, it has been entirely consumed.
                 return true;
