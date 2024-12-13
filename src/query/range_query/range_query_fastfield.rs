@@ -13,8 +13,7 @@ use common::bounds::{BoundsRange, TransformBound};
 
 use super::fast_field_range_doc_set::RangeDocSet;
 use crate::query::{
-    AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, InvertedIndexRangeWeight,
-    Query, Scorer, Weight,
+    AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer, Weight,
 };
 use crate::schema::{Type, ValueBytes};
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
@@ -35,13 +34,6 @@ impl FastFieldRangeQuery {
 
 impl Query for FastFieldRangeQuery {
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        // let weight = InvertedIndexRangeWeight::new(
-        //     field,
-        //     &self.bounds.lower_bound,
-        //     &self.bounds.upper_bound,
-        //     None,
-        // );
-
         Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
     }
 }
@@ -1590,7 +1582,6 @@ pub mod ip_range_tests {
 
 #[cfg(all(test, feature = "unstable"))]
 mod bench {
-
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use test::Bencher;
@@ -1798,7 +1789,6 @@ mod bench {
 
 #[cfg(all(test, feature = "unstable"))]
 mod bench_ip {
-
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use test::Bencher;

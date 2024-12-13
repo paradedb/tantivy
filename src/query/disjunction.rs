@@ -88,7 +88,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Disjunction<TScorer, TScore
         );
         let chains = docsets
             .into_iter()
-            .map(|mut doc| ScorerWrapper::new(doc))
+            .map(|doc| ScorerWrapper::new(doc))
             .collect();
         let mut disjunction = Self {
             chains,

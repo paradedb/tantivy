@@ -148,7 +148,6 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
         self.loaded_docs.current().unwrap_or(TERMINATED)
     }
 
-    #[cfg(test)]
     fn ctid(&self) -> Ctid {
         // only used for testing
         INVALID_CTID

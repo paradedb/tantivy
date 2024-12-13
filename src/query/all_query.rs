@@ -62,6 +62,7 @@ pub struct AllScorer {
 
 impl AllScorer {
     /// Creates a new AllScorer with `max_doc` docs.
+    #[allow(unused)]
     pub fn new(max_doc: DocId) -> AllScorer {
         AllScorer { doc: 0u32, max_doc }
     }
@@ -92,12 +93,14 @@ impl DocSet for AllScorer {
             for (buffer_val, ctid_val) in buffer.iter_mut().zip(ctid_buffer.iter_mut()) {
                 *buffer_val = self.doc();
                 *ctid_val = INVALID_CTID;
-                
+
                 self.doc += 1;
             }
             num_items
         } else {
-            for (i, (buffer_val, ctid_val)) in buffer.iter_mut().zip(ctid_buffer.iter_mut()).enumerate() {
+            for (i, (buffer_val, ctid_val)) in
+                buffer.iter_mut().zip(ctid_buffer.iter_mut()).enumerate()
+            {
                 *buffer_val = self.doc();
                 *ctid_val = INVALID_CTID;
                 if self.advance() == TERMINATED {
@@ -129,67 +132,6 @@ impl Scorer for AllScorer {
             (1.0, INVALID_CTID)
         } else {
             unreachable!("AllScorer is not directly supported anymore and should not be called")
-        }
-    }
-}
-
-pub mod postings_all_scorer {
-    use crate::fastfield::AliveBitSet;
-    use crate::postings::SegmentPostings;
-    use crate::query::Scorer;
-    use crate::{Ctid, DocId, DocSet, Score, COLLECT_BLOCK_BUFFER_LEN};
-
-    pub struct AllScorer {
-        postings: SegmentPostings,
-    }
-
-    impl AllScorer {
-        pub fn new(postings: SegmentPostings) -> AllScorer {
-            Self { postings }
-        }
-    }
-
-    impl DocSet for AllScorer {
-        fn advance(&mut self) -> DocId {
-            self.postings.advance()
-        }
-
-        fn seek(&mut self, target: DocId) -> DocId {
-            self.postings.seek(target)
-        }
-
-        fn fill_buffer(
-            &mut self,
-            buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
-            ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
-        ) -> usize {
-            self.postings.fill_buffer(buffer, ctid_buffer)
-        }
-
-        fn doc(&self) -> DocId {
-            self.postings.doc()
-        }
-
-        fn ctid(&self) -> Ctid {
-            self.postings.ctid()
-        }
-
-        fn size_hint(&self) -> u32 {
-            self.postings.size_hint()
-        }
-
-        fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
-            self.postings.count(alive_bitset)
-        }
-
-        fn count_including_deleted(&mut self) -> u32 {
-            self.postings.count_including_deleted()
-        }
-    }
-
-    impl Scorer for AllScorer {
-        fn score(&mut self) -> (Score, Ctid) {
-            (1.0, self.postings.ctid())
         }
     }
 }
