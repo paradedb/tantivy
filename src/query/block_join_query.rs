@@ -232,56 +232,29 @@ struct BlockJoinScorer {
 
 impl DocSet for BlockJoinScorer {
     fn advance(&mut self) -> DocId {
-        println!("BlockJoinScorer::advance() - Starting advance");
-
         if !self.has_more {
-            println!("BlockJoinScorer::advance() - No more documents available");
             return TERMINATED;
         }
 
         if !self.initialized {
-            println!("BlockJoinScorer::advance() - Initializing child scorer");
             self.child_scorer.advance();
             self.initialized = true;
-            println!("BlockJoinScorer::advance() - Child scorer initialized");
         }
 
-        loop {
-            let start = if self.current_parent == TERMINATED {
-                println!("BlockJoinScorer::advance() - Starting from beginning");
-                0
-            } else {
-                println!(
-                    "BlockJoinScorer::advance() - Starting from parent {} + 1",
-                    self.current_parent
-                );
-                self.current_parent + 1
-            };
+        let start = if self.current_parent == TERMINATED {
+            0
+        } else {
+            self.current_parent + 1
+        };
 
-            self.current_parent = self.find_next_parent(start);
-            println!(
-                "BlockJoinScorer::advance() - Found next parent: {:?}",
-                self.current_parent
-            );
+        self.current_parent = self.find_next_parent(start);
 
-            if self.current_parent == TERMINATED {
-                println!("BlockJoinScorer::advance() - No more parents found");
-                self.has_more = false;
-                return TERMINATED;
-            }
-
-            let doc_id = self.collect_matches();
-            println!(
-                "BlockJoinScorer::advance() - Collected matches, doc_id: {:?}",
-                doc_id
-            );
-            if doc_id != TERMINATED {
-                return doc_id;
-            }
-            println!(
-                "BlockJoinScorer::advance() - No matches found for current parent, continuing..."
-            );
+        if self.current_parent == TERMINATED {
+            self.has_more = false;
+            return TERMINATED;
         }
+
+        self.collect_matches()
     }
 
     fn doc(&self) -> DocId {
@@ -334,13 +307,14 @@ impl BlockJoinScorer {
         let mut child_scores = Vec::new();
         let next_parent = self.find_next_parent(parent_id + 1);
 
-        // Collect all child docs up to the next parent (or end)
+        // Collect all child docs between current parent and next parent
         while child_doc != TERMINATED && (next_parent == TERMINATED || child_doc < next_parent) {
-            if child_doc < parent_id {
-                // Child doc belongs to current parent block
+            if child_doc > parent_id {
+                break;
+            }
+            if !self.parent_docs.contains(child_doc) {
                 child_scores.push(self.child_scorer.score());
             }
-
             child_doc = self.child_scorer.advance();
         }
 
@@ -353,7 +327,7 @@ impl BlockJoinScorer {
         } else {
             match self.score_mode {
                 ScoreMode::Avg => child_scores.iter().sum::<Score>() / child_scores.len() as Score,
-                ScoreMode::Max => child_scores.iter().cloned().fold(f32::MIN, f32::max),
+                ScoreMode::Max => child_scores.iter().cloned().fold(0.0, f32::max),
                 ScoreMode::Total => child_scores.iter().sum(),
                 ScoreMode::None => 1.0,
             }
