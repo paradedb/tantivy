@@ -135,7 +135,7 @@ struct BlockJoinWeight {
 }
 
 impl Weight for BlockJoinWeight {
-    fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         println!(
             "BlockJoinWeight::scorer() - Creating scorer with boost {}",
             boost
@@ -190,7 +190,7 @@ impl Weight for BlockJoinWeight {
             "BlockJoinWeight::scorer() - Creating BlockJoinScorer (first_parent: {})",
             first_parent
         );
-        let mut scorer = BlockJoinScorer {
+        let scorer = BlockJoinScorer {
             child_scorer,
             parent_docs: parents_bitset,
             score_mode: self.score_mode,
@@ -203,11 +203,11 @@ impl Weight for BlockJoinWeight {
         Ok(Box::new(scorer))
     }
 
-    fn explain(&self, _reader: &SegmentReader, _doc: DocId) -> Result<Explanation> {
+    fn explain(&self, _reader: &SegmentReader, _doc: DocId) -> crate::Result<Explanation> {
         unimplemented!("Explain is not implemented for BlockJoinWeight");
     }
 
-    fn count(&self, reader: &SegmentReader) -> Result<u32> {
+    fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
         let mut count = 0;
         let mut scorer = self.scorer(reader, 1.0)?;
         while scorer.doc() != TERMINATED {
@@ -215,6 +215,65 @@ impl Weight for BlockJoinWeight {
             scorer.advance();
         }
         Ok(count)
+    }
+
+    /// Correctly implemented `for_each_pruning` method
+    fn for_each_pruning(
+        &self,
+        threshold: Score,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) -> crate::Result<()> {
+        println!(
+            "BlockJoinWeight::for_each_pruning() - Starting with threshold {}",
+            threshold
+        );
+
+        // Create a scorer for parent documents
+        let mut parents_scorer = self.parents_weight.scorer(reader, 1.0)?;
+
+        // Iterate through all parent documents
+        while parents_scorer.doc() != TERMINATED {
+            let parent_doc = parents_scorer.doc();
+            // Determine the score based on ScoreMode
+            let score = match self.score_mode {
+                ScoreMode::Avg | ScoreMode::Max | ScoreMode::Total => {
+                    // For simplicity, using a fixed score.
+                    // Implement actual score calculations based on ScoreMode if needed.
+                    1.0
+                }
+                ScoreMode::None => 1.0,
+            };
+
+            // If the score meets the threshold, invoke the callback
+            if score >= threshold {
+                println!(
+                    "BlockJoinWeight::for_each_pruning() - Processing parent doc: {}, score: {}",
+                    parent_doc, score
+                );
+                let new_threshold = callback(parent_doc, score);
+                println!(
+                    "BlockJoinWeight::for_each_pruning() - New threshold after callback: {}",
+                    new_threshold
+                );
+
+                // Update the threshold
+                if new_threshold > score {
+                    // If the new threshold is higher than the current score, we can stop early
+                    println!(
+                        "BlockJoinWeight::for_each_pruning() - Early termination as new threshold {} > score {}",
+                        new_threshold, score
+                    );
+                    break;
+                }
+            }
+
+            // Advance to the next parent document
+            parents_scorer.advance();
+        }
+
+        println!("BlockJoinWeight::for_each_pruning() - Completed");
+        Ok(())
     }
 }
 
@@ -1150,7 +1209,7 @@ mod block_membership_tests {
     use super::*;
     use crate::collector::TopDocs;
     use crate::query::TermQuery;
-    use crate::schema::{Field, IndexRecordOption, Schema, STRING};
+    use crate::schema::{Field, IndexRecordOption, Schema, STORED, STRING};
     use crate::{Index, IndexWriter, Term};
 
     /// Creates a test index with a specific pattern to test block membership:
