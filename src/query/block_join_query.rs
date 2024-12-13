@@ -259,11 +259,7 @@ impl DocSet for BlockJoinScorer {
 
         if !self.initialized {
             self.initialized = true;
-            let doc = self.child_scorer.advance();
-            if doc == TERMINATED {
-                self.has_more = false;
-                return TERMINATED;
-            }
+            self.previous_parent = None;
             self.collect_matches();
             return self.current_parent;
         }
@@ -276,8 +272,8 @@ impl DocSet for BlockJoinScorer {
             return TERMINATED;
         }
 
-        self.current_parent = next_parent;
         self.previous_parent = Some(self.current_parent);
+        self.current_parent = next_parent;
         self.collect_matches();
         self.current_parent
     }
@@ -350,8 +346,8 @@ impl BlockJoinScorer {
 
         // Advance the child_scorer to the start_doc if necessary
         let mut current_child = self.child_scorer.doc();
-        if current_child == TERMINATED || current_child < start_doc {
-            current_child = self.child_scorer.seek(start_doc);
+        while current_child != TERMINATED && current_child < start_doc {
+            current_child = self.child_scorer.advance();
         }
 
         let end_doc = self.current_parent;
