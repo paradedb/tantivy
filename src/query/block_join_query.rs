@@ -195,7 +195,7 @@ impl Weight for BlockJoinWeight {
             parent_docs: parents_bitset,
             score_mode: self.score_mode,
             current_parent: TERMINATED,
-            previous_parent: u32::MAX,
+            previous_parent: None,
             current_score: 1.0,
             initialized: false,
             has_more: true,
@@ -281,7 +281,7 @@ impl DocSet for BlockJoinScorer {
         }
 
         // Update previous_parent before moving to next parent
-        self.previous_parent = self.current_parent;
+        self.previous_parent = Some(self.current_parent);
 
         // Find next parent
         let next_parent = self.find_next_parent(self.current_parent + 1);
@@ -364,10 +364,9 @@ impl BlockJoinScorer {
 
     fn collect_matches(&mut self) -> DocId {
         let parent_id = self.current_parent;
-        let start_doc = if self.previous_parent == u32::MAX {
-            0
-        } else {
-            self.previous_parent + 1
+        let start_doc = match self.previous_parent {
+            None => 0,
+            Some(prev_parent) => prev_parent + 1,
         };
 
         println!(
