@@ -276,8 +276,8 @@ impl DocSet for BlockJoinScorer {
             return TERMINATED;
         }
 
-        self.current_parent = next_parent;
         self.previous_parent = Some(self.current_parent);
+        self.current_parent = next_parent;
         self.collect_matches();
         self.current_parent
     }
@@ -341,19 +341,26 @@ impl BlockJoinScorer {
 
     fn collect_matches(&mut self) {
         let mut child_scores = Vec::new();
-        let mut current_child = self.child_scorer.doc();
 
-        // Advance to first child if needed
-        if current_child == TERMINATED {
-            current_child = self.child_scorer.advance();
+        // Determine the starting document ID for collecting child documents
+        let start_doc = match self.previous_parent {
+            Some(prev_parent_doc) => prev_parent_doc + 1,
+            None => 0,
+        };
+
+        // Advance the child_scorer to the start_doc if necessary
+        let mut current_child = self.child_scorer.doc();
+        if current_child == TERMINATED || current_child < start_doc {
+            current_child = self.child_scorer.seek(start_doc);
         }
 
-        // Collect all children before current parent
+        // Collect all child documents between start_doc and current_parent
         while current_child != TERMINATED && current_child < self.current_parent {
             child_scores.push(self.child_scorer.score());
             current_child = self.child_scorer.advance();
         }
 
+        // Aggregate the scores according to the score_mode
         self.current_score = match self.score_mode {
             ScoreMode::Avg => {
                 if child_scores.is_empty() {
