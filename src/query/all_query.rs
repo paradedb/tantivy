@@ -26,13 +26,10 @@ impl Query for AllQuery {
                 None,
             ))),
             None => {
-                #[cfg(test)]
-                {
-                    return Ok(Box::new(AllWeight));
-                }
-
-                #[cfg(not(test))]
-                {
+                if cfg!(test) {
+                    // only used for testing
+                    Ok(Box::new(AllWeight))
+                } else {
                     panic!("`AllQuery` requires a designated key field in the schema")
                 }
             }
