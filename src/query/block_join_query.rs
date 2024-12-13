@@ -195,6 +195,7 @@ impl Weight for BlockJoinWeight {
             parent_docs: parents_bitset,
             score_mode: self.score_mode,
             current_parent: TERMINATED,
+            previous_parent: -1,
             current_score: 1.0,
             initialized: false,
             has_more: true,
@@ -243,6 +244,7 @@ struct BlockJoinScorer {
     parent_docs: BitSet,
     score_mode: ScoreMode,
     current_parent: DocId,
+    previous_parent: DocId,
     current_score: Score,
     initialized: bool,
     has_more: bool,
@@ -274,6 +276,9 @@ impl DocSet for BlockJoinScorer {
             self.collect_matches();
             return self.current_parent;
         }
+
+        // Update previous_parent before moving to next parent
+        self.previous_parent = self.current_parent;
 
         // Find next parent
         let next_parent = self.find_next_parent(self.current_parent + 1);
@@ -356,7 +361,12 @@ impl BlockJoinScorer {
 
     fn collect_matches(&mut self) -> DocId {
         let parent_id = self.current_parent;
-        println!("Collecting matches for parent_id: {}", parent_id);
+        let start_doc = self.previous_parent + 1;
+
+        println!(
+            "Collecting matches for parent_id: {} between docs {} and {}",
+            parent_id, start_doc, parent_id
+        );
 
         if parent_id == TERMINATED {
             return TERMINATED;
@@ -365,7 +375,12 @@ impl BlockJoinScorer {
         let mut child_scores = Vec::new();
         let mut current_child = self.child_scorer.doc();
 
-        // Collect all children up to the current parent
+        // Advance child_scorer to start_doc
+        while current_child != TERMINATED && current_child < start_doc {
+            current_child = self.child_scorer.advance();
+        }
+
+        // Collect all children between start_doc and parent_id
         while current_child != TERMINATED && current_child < parent_id {
             child_scores.push(self.child_scorer.score());
             current_child = self.child_scorer.advance();
