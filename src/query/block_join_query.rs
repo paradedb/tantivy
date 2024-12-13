@@ -28,9 +28,6 @@ impl Default for ScoreMode {
 /// `BlockJoinQuery` performs a join from child documents to parent documents,
 /// based on a block structure: child documents are indexed before their parent.
 /// The `parents_filter` identifies the parent documents in each segment.
-///
-/// Similar to Lucene's `BlockJoinQuery`, we wrap a "child query" and produce
-/// matches in the "parent space".
 pub struct BlockJoinQuery {
     child_query: Box<dyn Query>,
     parents_filter: Box<dyn Query>,
@@ -91,18 +88,18 @@ impl Query for BlockJoinQuery {
         let mut scorer = self
             .weight(EnableScoring::enabled_from_searcher(searcher))?
             .scorer(reader, 1.0)?;
-        
+
         let mut current_doc = scorer.doc();
         while current_doc != TERMINATED && current_doc < doc_address.doc_id {
             current_doc = scorer.advance();
         }
-        
+
         let score = if current_doc == doc_address.doc_id {
             scorer.score()
         } else {
             0.0
         };
-        
+
         let mut explanation = Explanation::new("BlockJoinQuery", score);
         explanation.add_detail(Explanation::new("score", score));
         Ok(explanation)
@@ -337,17 +334,17 @@ impl BlockJoinScorer {
         let mut child_scores = Vec::new();
         let next_parent = self.find_next_parent(parent_id + 1);
 
-        // Collect all children between current parent and next parent
+        // Collect all child docs up to the next parent (or end)
         while child_doc != TERMINATED && (next_parent == TERMINATED || child_doc < next_parent) {
-            if child_doc > parent_id {
-                child_doc = self.child_scorer.advance();
-                continue;
+            if child_doc < parent_id {
+                // Child doc belongs to current parent block
+                child_scores.push(self.child_scorer.score());
             }
-            child_scores.push(self.child_scorer.score());
+
             child_doc = self.child_scorer.advance();
         }
 
-        // Update score and return parent doc ID
+        // Compute parent score
         self.current_score = if child_scores.is_empty() {
             match self.score_mode {
                 ScoreMode::None => 1.0,
@@ -371,102 +368,13 @@ impl Scorer for BlockJoinScorer {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use crate::collector::TopDocs;
-//     use crate::query::block_join_query::{BlockJoinQuery, ScoreMode};
-//     use crate::query::TermQuery;
-//     use crate::schema::{IndexRecordOption, Schema, INDEXED, STORED, STRING};
-//     use crate::{Index, Term};
-
-//     #[test]
-//     fn test_block_join_query() -> crate::Result<()> {
-//         // Build a schema:
-//         let mut schema_builder = Schema::builder();
-//         let name = schema_builder.add_text_field("name", STORED);
-//         let country = schema_builder.add_text_field("country", STRING | STORED);
-//         let doc_type = schema_builder.add_text_field("doc_type", STRING | STORED);
-//         let skill = schema_builder.add_text_field("skill", STRING | STORED);
-//         let year = schema_builder.add_u64_field("year", INDEXED | STORED);
-//         let schema = schema_builder.build();
-
-//         // Create index
-//         let index = Index::create_in_ram(schema);
-//         let mut writer = index.writer(50_000_000)?;
-
-//         // Add a set of child docs followed by a parent doc
-//         // child docs:
-//         writer.add_documents(vec![
-//             doc!(skill => "java",   year => 2006u64),
-//             doc!(skill => "python", year => 2010u64),
-//             doc!(name => "Lisa", country => "United Kingdom", doc_type => "resume"),
-//             doc!(skill => "ruby",  year => 2005u64),
-//             doc!(skill => "java",  year => 2007u64),
-//             doc!(name => "Frank", country => "United States", doc_type => "resume"),
-//         ])?;
-
-//         writer.commit()?;
-
-//         let reader = index.reader()?;
-//         let searcher = reader.searcher();
-
-//         // parent filter query
-//         let parent_query = Box::new(TermQuery::new(
-//             Term::from_field_text(doc_type, "resume"),
-//             IndexRecordOption::Basic,
-//         ));
-
-//         // child query
-//         let child_query = Box::new(crate::query::BooleanQuery::new_multiterms_query(vec![
-//             Term::from_field_text(skill, "java"),
-//             Term::from_field_u64(year, 2006),
-//         ]));
-
-//         // Wrap child query in BlockJoinQuery:
-//         let block_join_query = BlockJoinQuery::new(child_query, parent_query, ScoreMode::Avg);
-
-//         // Just test searching top docs:
-//         let top_docs = searcher.search(&block_join_query, &TopDocs::with_limit(10))?;
-//         assert_eq!(
-//             top_docs.len(),
-//             2,
-//             "Should find 2 parent matches from children"
-//         );
-
-//         Ok(())
-//     }
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::collector::TopDocs;
-    use crate::query::{Query, Scorer, TermQuery};
+    use crate::query::{Query, TermQuery};
     use crate::schema::*;
-    use crate::{DocAddress, DocId, Index, IndexWriter, Score};
-
-    /// Adds multiple documents as a block.
-    ///
-    /// This method allows adding multiple documents together as a single block.
-    /// This is important for nested documents, where child documents need to be
-    /// added before their parent document, and they need to be stored together
-    /// in the same block.
-    ///
-    /// The opstamp returned is the opstamp of the last document added.
-    /// This is here for reference, it is a method on IndexWriter.
-    // pub fn add_documents(&self, documents: Vec<D>) -> crate::Result<Opstamp> {
-    //     let count = documents.len() as u64;
-    //     if count == 0 {
-    //         return Ok(self.stamper.stamp());
-    //     }
-    //     let (batch_opstamp, stamps) = self.get_batch_opstamps(count);
-    //     let mut adds = AddBatch::default();
-    //     for (document, opstamp) in documents.into_iter().zip(stamps) {
-    //         adds.push(AddOperation { opstamp, document });
-    //     }
-    //     self.send_add_documents_batch(adds)?;
-    //     Ok(batch_opstamp)
-    // }
+    use crate::{DocAddress, Index, IndexWriter, Term};
 
     fn create_test_index() -> crate::Result<(Index, Field, Field, Field, Field)> {
         let mut schema_builder = Schema::builder();
@@ -480,42 +388,22 @@ mod tests {
         {
             let mut index_writer: IndexWriter = index.writer_for_tests()?;
 
-            // First resume block
+            // First block:
+            // children docs first, parent doc last
             index_writer.add_documents(vec![
-                doc!(
-                    skill_field => "java",
-                    doc_type_field => "job"
-                ),
-                doc!(
-                    skill_field => "python",
-                    doc_type_field => "job"
-                ),
-                doc!(
-                    name_field => "Lisa",
-                    country_field => "United Kingdom",
-                    doc_type_field => "resume"
-                ),
-                doc!(
-                    skill_field => "java",
-                    doc_type_field => "job"
-                ),
+                doc!(skill_field => "java", doc_type_field => "job"),
+                doc!(skill_field => "python", doc_type_field => "job"),
+                doc!(skill_field => "java", doc_type_field => "job"),
+                // parent last in this block
+                doc!(name_field => "Lisa", country_field => "United Kingdom", doc_type_field => "resume"),
             ])?;
 
-            // Second resume block
+            // Second block:
             index_writer.add_documents(vec![
-                doc!(
-                    skill_field => "ruby",
-                    doc_type_field => "job"
-                ),
-                doc!(
-                    skill_field => "java",
-                    doc_type_field => "job"
-                ),
-                doc!(
-                    name_field => "Frank",
-                    country_field => "United States",
-                    doc_type_field => "resume"
-                ),
+                doc!(skill_field => "ruby", doc_type_field => "job"),
+                doc!(skill_field => "java", doc_type_field => "job"),
+                // parent last in this block
+                doc!(name_field => "Frank", country_field => "United States", doc_type_field => "resume"),
             ])?;
 
             index_writer.commit()?;
@@ -531,7 +419,7 @@ mod tests {
 
     #[test]
     pub fn test_simple_block_join() -> crate::Result<()> {
-        let (index, name_field, country_field, skill_field, doc_type_field) = create_test_index()?;
+        let (index, name_field, _country_field, skill_field, doc_type_field) = create_test_index()?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
@@ -546,8 +434,8 @@ mod tests {
         );
 
         let block_join_query = BlockJoinQuery::new(
-            Box::new(parent_query),
             Box::new(child_query),
+            Box::new(parent_query),
             ScoreMode::Avg,
         );
 
@@ -577,8 +465,8 @@ mod tests {
         );
 
         let block_join_query = BlockJoinQuery::new(
-            Box::new(parent_query),
             Box::new(child_query),
+            Box::new(parent_query),
             ScoreMode::Avg,
         );
 
@@ -590,7 +478,8 @@ mod tests {
 
     #[test]
     pub fn test_block_join_scoring() -> crate::Result<()> {
-        let (index, _name_field, country_field, skill_field, doc_type_field) = create_test_index()?;
+        let (index, _name_field, _country_field, skill_field, doc_type_field) =
+            create_test_index()?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
@@ -605,15 +494,15 @@ mod tests {
         );
 
         let block_join_query = BlockJoinQuery::new(
-            Box::new(parent_query),
             Box::new(child_query),
+            Box::new(parent_query),
             ScoreMode::Avg,
         );
 
         let top_docs = searcher.search(&block_join_query, &TopDocs::with_limit(1))?;
         assert_eq!(top_docs.len(), 1);
 
-        // Score should be influenced by both parent and child matches
+        // Score should be influenced by children, ensure it's not zero
         assert!(top_docs[0].0 > 0.0);
 
         Ok(())
@@ -637,12 +526,13 @@ mod tests {
         );
 
         let block_join_query = BlockJoinQuery::new(
-            Box::new(parent_query),
             Box::new(child_query),
+            Box::new(parent_query),
             ScoreMode::Avg,
         );
 
-        let explanation = block_join_query.explain(&searcher, DocAddress::new(0, 2))?;
+        // The parent doc for "United Kingdom" is doc 3 in the first segment
+        let explanation = block_join_query.explain(&searcher, DocAddress::new(0, 3))?;
         assert!(explanation.value() > 0.0);
 
         Ok(())
