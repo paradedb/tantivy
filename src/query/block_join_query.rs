@@ -354,8 +354,10 @@ impl BlockJoinScorer {
             current_child = self.child_scorer.seek(start_doc);
         }
 
-        // Collect all child documents between start_doc and current_parent
-        while current_child != TERMINATED && current_child < self.current_parent {
+        let end_doc = self.current_parent;
+
+        // Collect all child documents between start_doc and end_doc
+        while current_child != TERMINATED && current_child < end_doc {
             child_scores.push(self.child_scorer.score());
             current_child = self.child_scorer.advance();
         }
