@@ -194,9 +194,9 @@ impl Weight for BlockJoinWeight {
             child_scorer,
             parent_docs: parents_bitset,
             score_mode: self.score_mode,
-            current_parent: first_parent,
+            current_parent: TERMINATED,
             current_score: 1.0,
-            initialized: true,
+            initialized: false,
             has_more: true,
         }))
     }
