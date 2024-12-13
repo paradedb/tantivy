@@ -276,8 +276,8 @@ impl DocSet for BlockJoinScorer {
             return TERMINATED;
         }
 
-        self.previous_parent = Some(self.current_parent);
         self.current_parent = next_parent;
+        self.previous_parent = Some(self.current_parent);
         self.collect_matches();
         self.current_parent
     }
