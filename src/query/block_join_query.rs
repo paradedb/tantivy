@@ -190,16 +190,23 @@ impl Weight for BlockJoinWeight {
             "BlockJoinWeight::scorer() - Creating BlockJoinScorer (first_parent: {})",
             first_parent
         );
-        Ok(Box::new(BlockJoinScorer {
+        let mut scorer = BlockJoinScorer {
             child_scorer,
             parent_docs: parents_bitset,
             score_mode: self.score_mode,
-            current_parent: TERMINATED,
+            current_parent: first_parent,
             previous_parent: None,
             current_score: 1.0,
-            initialized: false,
-            has_more: true,
-        }))
+            initialized: true,
+            has_more: first_parent != TERMINATED,
+        };
+        
+        // Initialize the scorer by collecting matches for the first parent
+        if scorer.has_more {
+            scorer.collect_matches();
+        }
+        
+        Ok(Box::new(scorer))
     }
 
     fn explain(&self, _reader: &SegmentReader, _doc: DocId) -> Result<Explanation> {
@@ -304,15 +311,11 @@ impl DocSet for BlockJoinScorer {
     }
 
     fn doc(&self) -> DocId {
-        let result = if !self.initialized {
-            TERMINATED
-        } else if self.has_more {
+        if self.has_more {
             self.current_parent
         } else {
             TERMINATED
-        };
-        println!("doc() called, returning: {}", result);
-        result
+        }
     }
 
     fn size_hint(&self) -> u32 {
