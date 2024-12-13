@@ -386,6 +386,12 @@ impl Schema {
         }
         Some((field, json_path))
     }
+
+    pub fn find_key_field_name(&self) -> Option<&str> {
+        self.fields()
+            .find(|(_, field_entry)| field_entry.is_key_field())
+            .map(|(_, field_entry)| field_entry.name())
+    }
 }
 
 impl Serialize for Schema {

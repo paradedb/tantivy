@@ -105,7 +105,10 @@ impl Query for RangeQuery {
         let schema = enable_scoring.schema();
         let field_type = schema.get_field_entry(self.field()).field_type();
 
-        if field_type.is_fast() && is_type_valid_for_fastfield_range_query(self.value_type()) {
+        if schema.find_key_field_name().is_none()
+            && field_type.is_fast()
+            && is_type_valid_for_fastfield_range_query(self.value_type())
+        {
             Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
         } else {
             if field_type.is_json() {
@@ -164,8 +167,10 @@ impl Query for InvertedIndexRangeQuery {
 }
 
 /// Range weight on the inverted index
+#[derive(Clone)]
 pub struct InvertedIndexRangeWeight {
     field: Field,
+    path: Option<Vec<u8>>,
     lower_bound: Bound<Vec<u8>>,
     upper_bound: Bound<Vec<u8>>,
     limit: Option<u64>,
@@ -184,6 +189,29 @@ impl InvertedIndexRangeWeight {
         let verify_and_unwrap_term = |val: &Term| val.serialized_value_bytes().to_owned();
         Self {
             field,
+            path: None,
+            lower_bound: map_bound(lower_bound, verify_and_unwrap_term),
+            upper_bound: map_bound(upper_bound, verify_and_unwrap_term),
+            limit,
+        }
+    }
+
+    pub fn with_path(
+        field: Field,
+        path: &str,
+        lower_bound: &Bound<Term>,
+        upper_bound: &Bound<Term>,
+        limit: Option<u64>,
+    ) -> Self {
+        let verify_and_unwrap_term = |val: &Term| val.serialized_value_bytes().to_owned();
+        Self {
+            field,
+            path: Some(
+                path.as_bytes()
+                    .iter()
+                    .map(|b| if *b == b'.' { 1 } else { *b })
+                    .collect(),
+            ),
             lower_bound: map_bound(lower_bound, verify_and_unwrap_term),
             upper_bound: map_bound(upper_bound, verify_and_unwrap_term),
             limit,
@@ -226,8 +254,16 @@ impl Weight for InvertedIndexRangeWeight {
                     break;
                 }
             }
+            if let Some(path) = &self.path {
+                if !term_range.key().starts_with(path) {
+                    continue;
+                }
+            }
+
             processed_count += 1;
             let term_info = term_range.value();
+            let mut bytes = Vec::new();
+            term_dict.ord_to_term(term_range.term_ord(), &mut bytes)?;
             let mut block_segment_postings = inverted_index
                 .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
             loop {

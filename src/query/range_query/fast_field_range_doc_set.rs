@@ -3,7 +3,7 @@ use std::ops::RangeInclusive;
 
 use columnar::Column;
 
-use crate::{DocId, DocSet, TERMINATED};
+use crate::{Ctid, DocId, DocSet, INVALID_CTID, TERMINATED};
 
 /// Helper to have a cursor over a vec of docids
 #[derive(Debug)]
@@ -146,6 +146,12 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
     #[inline]
     fn doc(&self) -> DocId {
         self.loaded_docs.current().unwrap_or(TERMINATED)
+    }
+
+    #[cfg(test)]
+    fn ctid(&self) -> Ctid {
+        // only used for testing
+        INVALID_CTID
     }
 
     /// Advances the `DocSet` forward until reaching the target, or going to the
