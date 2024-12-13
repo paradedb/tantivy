@@ -213,6 +213,24 @@ impl SchemaBuilder {
             fields_map: self.fields_map,
         }))
     }
+
+    /// Finalize the creation of a `Schema`, setting the key field at the same time
+    /// This will consume your `SchemaBuilder`
+    pub fn build_with_key_field(mut self, key_field_name: &str) -> Schema {
+        'outer: loop {
+            for field in &mut self.fields {
+                if field.name() == key_field_name {
+                    field.set_key_field();
+                    break 'outer;
+                }
+            }
+            panic!("cannot set key field:  `{key_field_name}` not found in schema");
+        }
+        Schema(Arc::new(InnerSchema {
+            fields: self.fields,
+            fields_map: self.fields_map,
+        }))
+    }
 }
 #[derive(Debug)]
 struct InnerSchema {
@@ -372,7 +390,9 @@ impl Schema {
 
 impl Serialize for Schema {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
+    where
+        S: Serializer,
+    {
         let mut seq = serializer.serialize_seq(Some(self.0.fields.len()))?;
         for e in &self.0.fields {
             seq.serialize_element(e)?;
@@ -383,7 +403,9 @@ impl Serialize for Schema {
 
 impl<'de> Deserialize<'de> for Schema {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         struct SchemaVisitor;
 
         impl<'de> Visitor<'de> for SchemaVisitor {
@@ -394,7 +416,9 @@ impl<'de> Deserialize<'de> for Schema {
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where A: SeqAccess<'de> {
+            where
+                A: SeqAccess<'de>,
+            {
                 let mut schema = SchemaBuilder {
                     fields: Vec::with_capacity(seq.size_hint().unwrap_or(0)),
                     fields_map: HashMap::with_capacity(seq.size_hint().unwrap_or(0)),

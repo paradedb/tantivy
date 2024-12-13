@@ -3,7 +3,7 @@
 use common::HasLen;
 
 use crate::docset::{DocSet, TERMINATED};
-use crate::DocId;
+use crate::{Ctid, DocId, INVALID_CTID};
 
 /// Simulate a `Postings` objects from a `VecPostings`.
 /// `VecPostings` only exist for testing purposes.
@@ -36,6 +36,11 @@ impl DocSet for VecDocSet {
             return TERMINATED;
         }
         self.doc_ids[self.cursor]
+    }
+
+    fn ctid(&self) -> Ctid {
+        // hardcoded for testing purposes
+        INVALID_CTID
     }
 
     fn size_hint(&self) -> u32 {
