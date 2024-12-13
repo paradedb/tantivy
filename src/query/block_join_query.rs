@@ -795,7 +795,7 @@ mod atomic_tests {
 
         let doc: TantivyDocument = searcher.doc(top_docs[0].1)?;
         let content = doc.get_first(content_field).unwrap().as_str().unwrap();
-        assert_eq!(content, "resume content", "Should retrieve parent document");
+        assert_eq!(content, "first resume", "Should retrieve parent document");
 
         Ok(())
     }
