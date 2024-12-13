@@ -690,7 +690,7 @@ mod atomic_tests {
                     doc_type_field => "child"
                 ),
                 doc!(
-                    content_field => "resume content", // Changed from "parent" to "resume"
+                    content_field => "first resume", // Changed from "parent" to "resume"
                     doc_type_field => "resume"         // Changed from "parent" to "resume"
                 ),
             ])?;
