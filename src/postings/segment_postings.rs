@@ -5,7 +5,7 @@ use crate::fastfield::AliveBitSet;
 use crate::positions::PositionReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 use crate::postings::{branchless_binary_search, BlockSegmentPostings, Postings};
-use crate::{Ctid, DocId, INVALID_CTID, TERMINATED};
+use crate::{Ctid, DocId, TERMINATED};
 
 /// `SegmentPostings` represents the inverted list or postings associated with
 /// a term in a `Segment`.

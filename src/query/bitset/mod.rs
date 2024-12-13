@@ -128,15 +128,17 @@ mod tests {
         let arr = generate_nonunique_unsorted(100_000, 5_000);
         let mut btreeset: BTreeSet<u32> = BTreeSet::new();
         let mut bitset = BitSet::with_max_value(100_000);
+        let mut ctids = FxHashMap::default();
         for el in arr {
             btreeset.insert(el);
             bitset.insert(el);
+            ctids.insert(el, INVALID_CTID);
         }
         for i in 0..100_000 {
             assert_eq!(btreeset.contains(&i), bitset.contains(i));
         }
         assert_eq!(btreeset.len(), bitset.len());
-        let mut bitset_docset = BitSetDocSet::from(bitset);
+        let mut bitset_docset = BitSetDocSet::from((bitset, ctids));
         let mut remaining = true;
         for el in btreeset.into_iter() {
             assert!(remaining);

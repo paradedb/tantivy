@@ -9,7 +9,6 @@ use crate::query::Bm25Weight;
 use crate::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use crate::termdict::TermDictionaryBuilder;
 use crate::{Ctid, DocId, Score, INVALID_BLOCK_NUMBER, INVALID_OFFSET_NUMBER};
-use byteorder::{LittleEndian, WriteBytesExt};
 use common::{BinarySerializable, CountingWriter, VInt};
 use std::cmp::Ordering;
 use std::io::{self, Write};

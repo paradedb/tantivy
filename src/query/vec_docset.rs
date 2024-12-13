@@ -89,6 +89,6 @@ pub mod tests {
         for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i + 1 + COLLECT_BLOCK_BUFFER_LEN as u32);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), 9);
+        assert_eq!(postings.fill_buffer(&mut buffer, &mut ctid_buffer), 9);
     }
 }

@@ -429,7 +429,7 @@ impl SegmentUpdater {
             // TODO add context to the error.
             save_metas(
                 &index_meta,
-                &previous_metas,
+                previous_metas,
                 directory.box_clone().borrow_mut(),
             )?;
             self.store_meta(&index_meta);

@@ -83,7 +83,7 @@
 
 use downcast_rs::impl_downcast;
 
-use crate::{Ctid, DocId, Score, SegmentOrdinal, SegmentReader, INVALID_CTID};
+use crate::{Ctid, DocId, Score, SegmentOrdinal, SegmentReader};
 
 mod count_collector;
 pub use self::count_collector::Count;

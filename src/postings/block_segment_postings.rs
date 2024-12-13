@@ -1,4 +1,3 @@
-use byteorder::{LittleEndian, ReadBytesExt};
 use common::VInt;
 use std::io;
 

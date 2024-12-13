@@ -3,7 +3,7 @@ use std::ops::RangeInclusive;
 
 use columnar::Column;
 
-use crate::{Ctid, DocId, DocSet, TERMINATED};
+use crate::{DocId, DocSet, TERMINATED};
 
 /// Helper to have a cursor over a vec of docids
 #[derive(Debug)]

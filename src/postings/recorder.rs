@@ -2,7 +2,7 @@ use common::read_u32_vint;
 use stacker::{ExpUnrolledLinkedList, MemoryArena};
 
 use crate::postings::FieldSerializer;
-use crate::{Ctid, DocId, INVALID_CTID};
+use crate::{Ctid, DocId};
 
 const POSITION_END: u32 = 0;
 
