@@ -1,6 +1,7 @@
 mod all_query;
 mod automaton_weight;
 mod bitset;
+mod block_join_query;
 mod bm25;
 mod boolean_query;
 mod boost_query;

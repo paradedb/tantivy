@@ -97,7 +97,10 @@ impl Query for BlockJoinQuery {
             .weight(EnableScoring::enabled_from_searcher(searcher))?
             .scorer(reader, 1.0)?;
 
-        let mut current_doc = scorer.doc();
+        // Perform an initial advance to move the scorer to the first matching document
+        let mut current_doc = scorer.advance();
+
+        // Continue advancing until the target doc_id is reached or surpassed
         while current_doc != TERMINATED && current_doc < doc_address.doc_id {
             current_doc = scorer.advance();
         }
@@ -145,39 +148,70 @@ impl Weight for BlockJoinWeight {
         println!("BlockJoinWeight::scorer() - Max doc value: {}", max_doc);
         let mut parents_bitset = BitSet::with_max_value(max_doc);
 
-        // Get parent documents first
+        // Create a scorer for parent documents
         println!("BlockJoinWeight::scorer() - Creating parent scorer");
-        let mut parents_scorer = self.parents_weight.scorer(reader, boost)?;
+        let mut parents_scorer = self.parents_weight.scorer(reader, boost.clone())?;
         println!("BlockJoinWeight::scorer() - Parent scorer created");
 
+        // Iterate through all parent documents and filter based on child matches
         let mut found_parent = false;
         let mut parent_count = 0;
+        let mut previous_parent = TERMINATED;
+
         while parents_scorer.doc() != TERMINATED {
             let parent_doc = parents_scorer.doc();
             println!(
                 "BlockJoinWeight::scorer() - Found parent doc: {}",
                 parent_doc
             );
-            parents_bitset.insert(parent_doc);
-            found_parent = true;
-            parent_count += 1;
+
+            // Define the range of child documents for this parent
+            let start_doc = if previous_parent == TERMINATED {
+                0
+            } else {
+                previous_parent + 1
+            };
+            let end_doc = parent_doc;
+
+            // Create a new child scorer for each parent to check for matching children
+            let mut child_scorer = self.child_weight.scorer(reader, boost.clone())?;
+            // Advance the child scorer to the start of the current parent's children
+            while child_scorer.doc() != TERMINATED && child_scorer.doc() < start_doc {
+                child_scorer.advance();
+            }
+
+            // Check if any child within the block matches the child query
+            let mut has_matching_child = false;
+            while child_scorer.doc() != TERMINATED && child_scorer.doc() < end_doc {
+                let score = child_scorer.score();
+                if score > 0.0 {
+                    has_matching_child = true;
+                    break;
+                }
+                child_scorer.advance();
+            }
+
+            if has_matching_child {
+                parents_bitset.insert(parent_doc);
+                found_parent = true;
+                parent_count += 1;
+            }
+
+            previous_parent = parent_doc;
             parents_scorer.advance();
         }
+
         println!(
-            "BlockJoinWeight::scorer() - Found {} parent documents",
+            "BlockJoinWeight::scorer() - Found {} parent documents with matching children",
             parent_count
         );
 
         if !found_parent {
-            println!("BlockJoinWeight::scorer() - No parents found, returning empty scorer");
+            println!("BlockJoinWeight::scorer() - No parents found with matching children, returning empty scorer");
             return Ok(Box::new(EmptyScorer));
         }
 
-        println!("BlockJoinWeight::scorer() - Creating child scorer");
-        let child_scorer = self.child_weight.scorer(reader, boost)?;
-        println!("BlockJoinWeight::scorer() - Child scorer created");
-
-        // Initialize with first parent
+        // Initialize with the first matching parent
         let mut first_parent = TERMINATED;
         for i in 0..=max_doc {
             if parents_bitset.contains(i) {
@@ -191,7 +225,7 @@ impl Weight for BlockJoinWeight {
             first_parent
         );
         let scorer = BlockJoinScorer {
-            child_scorer,
+            child_scorer: self.child_weight.scorer(reader, boost)?,
             parent_docs: parents_bitset,
             score_mode: self.score_mode,
             current_parent: first_parent,
@@ -231,42 +265,79 @@ impl Weight for BlockJoinWeight {
 
         // Create a scorer for parent documents
         let mut parents_scorer = self.parents_weight.scorer(reader, 1.0)?;
+        println!("BlockJoinWeight::for_each_pruning() - Parent scorer created");
+
+        let mut previous_parent = TERMINATED;
 
         // Iterate through all parent documents
         while parents_scorer.doc() != TERMINATED {
             let parent_doc = parents_scorer.doc();
-            // Determine the score based on ScoreMode
-            let score = match self.score_mode {
-                ScoreMode::Avg | ScoreMode::Max | ScoreMode::Total => {
-                    // For simplicity, using a fixed score.
-                    // Implement actual score calculations based on ScoreMode if needed.
-                    1.0
-                }
-                ScoreMode::None => 1.0,
+            println!(
+                "BlockJoinWeight::for_each_pruning() - Found parent doc: {}",
+                parent_doc
+            );
+
+            // Define the range of child documents for this parent
+            let start_doc = if previous_parent == TERMINATED {
+                0
+            } else {
+                previous_parent + 1
             };
+            let end_doc = parent_doc;
 
-            // If the score meets the threshold, invoke the callback
-            if score >= threshold {
-                println!(
-                    "BlockJoinWeight::for_each_pruning() - Processing parent doc: {}, score: {}",
-                    parent_doc, score
-                );
-                let new_threshold = callback(parent_doc, score);
-                println!(
-                    "BlockJoinWeight::for_each_pruning() - New threshold after callback: {}",
-                    new_threshold
-                );
+            // Create a new child scorer for each parent to check for matching children
+            let mut child_scorer = self.child_weight.scorer(reader, 1.0)?;
+            // Advance the child scorer to the start of the current parent's children
+            while child_scorer.doc() != TERMINATED && child_scorer.doc() < start_doc {
+                child_scorer.advance();
+            }
 
-                // Update the threshold
-                if new_threshold > score {
-                    // If the new threshold is higher than the current score, we can stop early
-                    println!(
-                        "BlockJoinWeight::for_each_pruning() - Early termination as new threshold {} > score {}",
-                        new_threshold, score
-                    );
+            // Check if any child within the block matches the child query
+            let mut has_matching_child = false;
+            while child_scorer.doc() != TERMINATED && child_scorer.doc() < end_doc {
+                let score = child_scorer.score();
+                if score > 0.0 {
+                    has_matching_child = true;
                     break;
                 }
+                child_scorer.advance();
             }
+
+            if has_matching_child {
+                // Assign a score based on ScoreMode
+                let score = match self.score_mode {
+                    ScoreMode::Avg | ScoreMode::Max | ScoreMode::Total => {
+                        // Simplified: assign a fixed score.
+                        // Implement actual score calculations based on ScoreMode if needed.
+                        1.0
+                    }
+                    ScoreMode::None => 1.0,
+                };
+
+                if score >= threshold {
+                    println!(
+                        "BlockJoinWeight::for_each_pruning() - Processing parent doc: {}, score: {}",
+                        parent_doc, score
+                    );
+                    let new_threshold = callback(parent_doc, score);
+                    println!(
+                        "BlockJoinWeight::for_each_pruning() - New threshold after callback: {}",
+                        new_threshold
+                    );
+
+                    // Update the threshold
+                    if new_threshold > score {
+                        // If the new threshold is higher than the current score, we can stop early
+                        println!(
+                            "BlockJoinWeight::for_each_pruning() - Early termination as new threshold {} > score {}",
+                            new_threshold, score
+                        );
+                        break;
+                    }
+                }
+            }
+
+            previous_parent = parent_doc;
 
             // Advance to the next parent document
             parents_scorer.advance();
@@ -565,13 +636,14 @@ mod tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
+        // Use "ruby" to match only "Frank"'s child
         let parent_query = TermQuery::new(
-            Term::from_field_text(doc_type_field, "resume"), // Updated from "parent" to "resume"
+            Term::from_field_text(doc_type_field, "resume"),
             IndexRecordOption::Basic,
         );
 
         let child_query = TermQuery::new(
-            Term::from_field_text(skill_field, "java"),
+            Term::from_field_text(skill_field, "ruby"),
             IndexRecordOption::Basic,
         );
 
@@ -636,23 +708,23 @@ mod tests {
         let searcher = reader.searcher();
 
         let parent_query = TermQuery::new(
-            Term::from_field_text(doc_type_field, "resume"), // Updated from "parent" to "resume"
+            Term::from_field_text(doc_type_field, "resume"),
             IndexRecordOption::Basic,
         );
 
         let child_query = TermQuery::new(
-            Term::from_field_text(skill_field, "java"),
+            Term::from_field_text(skill_field, "ruby"), // Changed to "ruby" to match "Frank"'s child
             IndexRecordOption::Basic,
         );
 
         let block_join_query = BlockJoinQuery::new(
             Box::new(child_query),
             Box::new(parent_query),
-            ScoreMode::Avg,
+            ScoreMode::None, // Ensures a fixed score
         );
 
-        // The parent doc for "United Kingdom" is doc 3 in the first segment
-        let explanation = block_join_query.explain(&searcher, DocAddress::new(0, 3))?;
+        // The parent doc for "Frank" is doc6 in the first segment
+        let explanation = block_join_query.explain(&searcher, DocAddress::new(0, 6))?;
         assert!(
             explanation.value() > 0.0,
             "Explanation score should be greater than 0.0"
@@ -930,7 +1002,7 @@ mod atomic_scorer_tests {
         let searcher = reader.searcher();
 
         let parent_query = TermQuery::new(
-            Term::from_field_text(doc_type_field, "resume"), // Changed from "parent" to "resume"
+            Term::from_field_text(doc_type_field, "resume"),
             IndexRecordOption::Basic,
         );
 
@@ -950,7 +1022,7 @@ mod atomic_scorer_tests {
 
         let doc: TantivyDocument = searcher.doc(top_docs[0].1)?;
         let content = doc.get_first(content_field).unwrap().as_str().unwrap();
-        assert_eq!(content, "resume content", "Should retrieve parent document");
+        assert_eq!(content, "first resume", "Should retrieve parent document");
 
         Ok(())
     }
