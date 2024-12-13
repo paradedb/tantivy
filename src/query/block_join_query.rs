@@ -197,15 +197,9 @@ impl Weight for BlockJoinWeight {
             current_parent: first_parent,
             previous_parent: None,
             current_score: 1.0,
-            initialized: true,
+            initialized: false,
             has_more: first_parent != TERMINATED,
         };
-        
-        // Initialize the scorer by collecting matches for the first parent
-        if scorer.has_more {
-            scorer.collect_matches();
-        }
-        
         Ok(Box::new(scorer))
     }
 
@@ -271,24 +265,11 @@ impl DocSet for BlockJoinScorer {
         }
 
         if !self.initialized {
-            // Advance the child_scorer to the first document
-            let _ = self.child_scorer.advance();
-
-            // Initialize by finding first parent
-            self.current_parent = self.find_next_parent(0);
+            // Initialize by finding first parent and collecting matches
             self.initialized = true;
-            if self.current_parent == TERMINATED {
-                self.has_more = false;
-                println!("No parents found during initialization");
-                return TERMINATED;
-            }
-            println!("Initialized with first parent: {}", self.current_parent);
             self.collect_matches();
             return self.current_parent;
         }
-
-        // Update previous_parent before moving to next parent
-        self.previous_parent = Some(self.current_parent);
 
         // Find next parent
         let next_parent = self.find_next_parent(self.current_parent + 1);
@@ -302,6 +283,7 @@ impl DocSet for BlockJoinScorer {
         }
 
         self.current_parent = next_parent;
+        self.previous_parent = Some(self.current_parent);
         self.collect_matches();
         println!(
             "Advanced to parent {} with score {}",
@@ -311,7 +293,9 @@ impl DocSet for BlockJoinScorer {
     }
 
     fn doc(&self) -> DocId {
-        if self.has_more {
+        if !self.initialized {
+            TERMINATED
+        } else if self.has_more {
             self.current_parent
         } else {
             TERMINATED
