@@ -253,43 +253,33 @@ struct BlockJoinScorer {
 
 impl DocSet for BlockJoinScorer {
     fn advance(&mut self) -> DocId {
-        println!("\n=== BlockJoinScorer::advance() called ===");
-        println!(
-            "Current state: initialized={}, has_more={}, current_parent={}",
-            self.initialized, self.has_more, self.current_parent
-        );
-
         if !self.has_more {
-            println!("No more documents, returning TERMINATED");
             return TERMINATED;
         }
 
         if !self.initialized {
-            // Initialize by finding first parent and collecting matches
             self.initialized = true;
+            let doc = self.child_scorer.advance();
+            if doc == TERMINATED {
+                self.has_more = false;
+                return TERMINATED;
+            }
             self.collect_matches();
             return self.current_parent;
         }
 
-        // Find next parent
+        // Find next parent after current one
         let next_parent = self.find_next_parent(self.current_parent + 1);
-        println!("Found next parent: {}", next_parent);
-
         if next_parent == TERMINATED {
             self.has_more = false;
             self.current_parent = TERMINATED;
-            println!("No more parents found");
             return TERMINATED;
         }
 
         self.current_parent = next_parent;
         self.previous_parent = Some(self.current_parent);
         self.collect_matches();
-        println!(
-            "Advanced to parent {} with score {}",
-            next_parent, self.current_score
-        );
-        next_parent
+        self.current_parent
     }
 
     fn doc(&self) -> DocId {
@@ -349,36 +339,17 @@ impl BlockJoinScorer {
         TERMINATED
     }
 
-    fn collect_matches(&mut self) -> DocId {
-        let parent_id = self.current_parent;
-        let start_doc = match self.previous_parent {
-            None => 0,
-            Some(prev_parent) => prev_parent + 1,
-        };
-
-        println!(
-            "Collecting matches for parent_id: {} between docs {} and {}",
-            parent_id, start_doc, parent_id
-        );
-
-        if parent_id == TERMINATED {
-            return TERMINATED;
-        }
-
+    fn collect_matches(&mut self) {
         let mut child_scores = Vec::new();
         let mut current_child = self.child_scorer.doc();
 
-        // Advance child_scorer if it's before start_doc
-        let mut current_child = self.child_scorer.doc();
-        if current_child == TERMINATED || current_child < start_doc {
-            current_child = self.child_scorer.advance();
-        }
-        while current_child != TERMINATED && current_child < start_doc {
+        // Advance to first child if needed
+        if current_child == TERMINATED {
             current_child = self.child_scorer.advance();
         }
 
-        // Collect all children between start_doc and parent_id
-        while current_child != TERMINATED && current_child < parent_id {
+        // Collect all children before current parent
+        while current_child != TERMINATED && current_child < self.current_parent {
             child_scores.push(self.child_scorer.score());
             current_child = self.child_scorer.advance();
         }
@@ -407,8 +378,6 @@ impl BlockJoinScorer {
             }
             ScoreMode::None => 1.0,
         };
-
-        parent_id
     }
 }
 
