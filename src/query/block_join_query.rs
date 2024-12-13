@@ -244,7 +244,7 @@ struct BlockJoinScorer {
     parent_docs: BitSet,
     score_mode: ScoreMode,
     current_parent: DocId,
-    previous_parent: DocId,
+    previous_parent: Option<DocId>,
     current_score: Score,
     initialized: bool,
     has_more: bool,
