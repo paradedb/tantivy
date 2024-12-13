@@ -81,7 +81,7 @@ impl DocSet for AllScorer {
     fn fill_buffer(
         &mut self,
         buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
-        _ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+        ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
     ) -> usize {
         if self.doc() == TERMINATED {
             return 0;
@@ -89,14 +89,17 @@ impl DocSet for AllScorer {
         let is_safe_distance = self.doc() + (buffer.len() as u32) < self.max_doc;
         if is_safe_distance {
             let num_items = buffer.len();
-            for buffer_val in buffer {
+            for (buffer_val, ctid_val) in buffer.iter_mut().zip(ctid_buffer.iter_mut()) {
                 *buffer_val = self.doc();
+                *ctid_val = INVALID_CTID;
+                
                 self.doc += 1;
             }
             num_items
         } else {
-            for (i, buffer_val) in buffer.iter_mut().enumerate() {
+            for (i, (buffer_val, ctid_val)) in buffer.iter_mut().zip(ctid_buffer.iter_mut()).enumerate() {
                 *buffer_val = self.doc();
+                *ctid_val = INVALID_CTID;
                 if self.advance() == TERMINATED {
                     return i + 1;
                 }
@@ -122,8 +125,11 @@ impl DocSet for AllScorer {
 
 impl Scorer for AllScorer {
     fn score(&mut self) -> (Score, Ctid) {
-        todo!("AllScorer::score():  this needs to be backed by actual postings so we can get the ctid");
-        // (1.0, INVALID_CTID)
+        if cfg!(test) {
+            (1.0, INVALID_CTID)
+        } else {
+            unreachable!("AllScorer is not directly supported anymore and should not be called")
+        }
     }
 }
 

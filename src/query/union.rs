@@ -3,7 +3,7 @@ use common::TinySet;
 use crate::docset::{DocSet, TERMINATED};
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::Scorer;
-use crate::{Ctid, DocId, Score};
+use crate::{Ctid, DocId, Score, INVALID_CTID};
 
 const HORIZON_NUM_TINYBITSETS: usize = 64;
 const HORIZON: u32 = 64u32 * HORIZON_NUM_TINYBITSETS as u32;
@@ -72,7 +72,10 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Union<TScorer, TScoreCombin
             .into_iter()
             .filter(|docset| docset.doc() != TERMINATED)
             .collect();
-        let ctid = non_empty_docsets[0].score().1;
+        let ctid = non_empty_docsets
+            .get_mut(0)
+            .map(|scorer| scorer.score().1)
+            .unwrap_or(INVALID_CTID);
         let mut union = Union {
             docsets: non_empty_docsets,
             bitsets: Box::new([TinySet::empty(); HORIZON_NUM_TINYBITSETS]),

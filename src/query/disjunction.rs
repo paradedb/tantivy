@@ -3,7 +3,7 @@ use std::collections::BinaryHeap;
 
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{ScoreCombiner, Scorer};
-use crate::{Ctid, DocId, DocSet, Score, TERMINATED};
+use crate::{Ctid, DocId, DocSet, Score, INVALID_CTID, TERMINATED};
 
 /// `Disjunction` is responsible for merging `DocSet` from multiple
 /// source. Specifically, It takes the union of two or more `DocSet`s
@@ -86,25 +86,16 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Disjunction<TScorer, TScore
             minimum_matches_required > 1,
             "union scorer works better if just one matches required"
         );
-        let mut ctid = None;
         let chains = docsets
             .into_iter()
-            .map(|mut doc| {
-                if ctid.is_none() {
-                    ctid = Some(doc.score().1);
-                }
-                ScorerWrapper::new(doc)
-            })
+            .map(|mut doc| ScorerWrapper::new(doc))
             .collect();
         let mut disjunction = Self {
             chains,
             score_combiner,
             current_doc: TERMINATED,
             minimum_matches_required,
-            current_score: (
-                0.0,
-                ctid.expect("Disjunction::new() should have found a ctid"),
-            ),
+            current_score: (0.0, INVALID_CTID),
         };
         if minimum_matches_required > disjunction.chains.len() {
             return disjunction;
