@@ -264,6 +264,9 @@ impl DocSet for BlockJoinScorer {
         }
 
         if !self.initialized {
+            // Advance the child_scorer to the first document
+            let _ = self.child_scorer.advance();
+
             // Initialize by finding first parent
             self.current_parent = self.find_next_parent(0);
             self.initialized = true;
@@ -379,7 +382,11 @@ impl BlockJoinScorer {
         let mut child_scores = Vec::new();
         let mut current_child = self.child_scorer.doc();
 
-        // Advance child_scorer to start_doc
+        // Advance child_scorer if it's before start_doc
+        let mut current_child = self.child_scorer.doc();
+        if current_child == TERMINATED || current_child < start_doc {
+            current_child = self.child_scorer.advance();
+        }
         while current_child != TERMINATED && current_child < start_doc {
             current_child = self.child_scorer.advance();
         }
