@@ -114,6 +114,10 @@ impl DocSet for TermScorer {
         self.postings.doc()
     }
 
+    fn ctid(&self) -> Ctid {
+        self.postings.ctid()
+    }
+
     fn size_hint(&self) -> u32 {
         self.postings.size_hint()
     }

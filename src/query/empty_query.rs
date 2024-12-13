@@ -49,6 +49,10 @@ impl DocSet for EmptyScorer {
         TERMINATED
     }
 
+    fn ctid(&self) -> Ctid {
+        INVALID_CTID
+    }
+
     fn size_hint(&self) -> u32 {
         0
     }

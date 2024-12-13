@@ -74,11 +74,18 @@ pub mod tests {
         let doc_ids: Vec<DocId> = (1u32..=(COLLECT_BLOCK_BUFFER_LEN as u32 * 2 + 9)).collect();
         let mut postings = VecDocSet::from(doc_ids);
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        let mut ctid_buffer = [(0, 0); COLLECT_BLOCK_BUFFER_LEN];
+        assert_eq!(
+            postings.fill_buffer(&mut buffer, &mut ctid_buffer),
+            COLLECT_BLOCK_BUFFER_LEN
+        );
         for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i + 1);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        assert_eq!(
+            postings.fill_buffer(&mut buffer, &mut ctid_buffer),
+            COLLECT_BLOCK_BUFFER_LEN
+        );
         for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i + 1 + COLLECT_BLOCK_BUFFER_LEN as u32);
         }

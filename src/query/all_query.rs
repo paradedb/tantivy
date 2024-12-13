@@ -58,7 +58,11 @@ impl DocSet for AllScorer {
         self.doc
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
+    fn fill_buffer(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+    ) -> usize {
         if self.doc() == TERMINATED {
             return 0;
         }
@@ -170,14 +174,21 @@ mod tests {
             max_doc: COLLECT_BLOCK_BUFFER_LEN as u32 * 2 + 9,
         };
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        let mut ctid_buffer = [(0, 0); COLLECT_BLOCK_BUFFER_LEN];
+        assert_eq!(
+            postings.fill_buffer(&mut buffer, &mut ctid_buffer),
+            COLLECT_BLOCK_BUFFER_LEN
+        );
         for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        assert_eq!(
+            postings.fill_buffer(&mut buffer, &mut ctid_buffer),
+            COLLECT_BLOCK_BUFFER_LEN
+        );
         for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i + COLLECT_BLOCK_BUFFER_LEN as u32);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), 9);
+        assert_eq!(postings.fill_buffer(&mut buffer, &mut ctid_buffer), 9);
     }
 }

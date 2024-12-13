@@ -28,7 +28,7 @@ pub(crate) fn for_each_docset_buffered<T: DocSet + ?Sized>(
     mut callback: impl FnMut(&[DocId], &[Ctid]),
 ) {
     loop {
-        let num_items = docset.fill_buffer(buffer);
+        let num_items = docset.fill_buffer(buffer, ctid_buffer);
         // eprintln!("TODO:  fill the ctid_buffer!");
         callback(&buffer[..num_items], &ctid_buffer[..num_items]);
         if num_items != buffer.len() {

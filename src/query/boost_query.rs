@@ -105,12 +105,20 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
         self.underlying.seek(target)
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
-        self.underlying.fill_buffer(buffer)
+    fn fill_buffer(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+    ) -> usize {
+        self.underlying.fill_buffer(buffer, ctid_buffer)
     }
 
     fn doc(&self) -> u32 {
         self.underlying.doc()
+    }
+
+    fn ctid(&self) -> Ctid {
+        self.underlying.ctid()
     }
 
     fn size_hint(&self) -> u32 {

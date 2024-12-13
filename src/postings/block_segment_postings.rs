@@ -272,6 +272,14 @@ impl BlockSegmentPostings {
         self.doc_decoder.output_array()
     }
 
+    #[inline]
+    pub fn ctids(&self) -> (&[u32], &[u32]) {
+        debug_assert!(self.block_is_loaded());
+        let blocknos = self.ctid_decoders.0.output_array();
+        let offnos = self.ctid_decoders.1.output_array();
+        (blocknos, offnos)
+    }
+
     /// Returns a full block, regardless of whether the block is complete or incomplete (
     /// as it happens for the last block of the posting list).
     ///

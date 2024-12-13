@@ -71,6 +71,10 @@ where
         self.underlying_docset.doc()
     }
 
+    fn ctid(&self) -> Ctid {
+        self.underlying_docset.ctid()
+    }
+
     /// `.size_hint()` directly returns the size
     /// of the underlying docset without taking in account
     /// the fact that docs might be deleted.

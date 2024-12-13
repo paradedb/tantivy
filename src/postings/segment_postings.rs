@@ -204,6 +204,11 @@ impl DocSet for SegmentPostings {
         self.block_cursor.doc(self.cur)
     }
 
+    #[inline]
+    fn ctid(&self) -> Ctid {
+        self.block_cursor.ctid(self.cur)
+    }
+
     fn size_hint(&self) -> u32 {
         self.len() as u32
     }
@@ -237,10 +242,9 @@ impl Postings for SegmentPostings {
         self.block_cursor.freq(self.cur)
     }
 
-    fn ctid(&self) -> Ctid {
+    fn ctid_value(&self) -> Ctid {
         self.block_cursor.ctid(self.cur)
     }
-
 
     fn positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
         let term_freq = self.term_freq();

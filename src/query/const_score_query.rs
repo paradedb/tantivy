@@ -119,12 +119,20 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
         self.docset.seek(target)
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
-        self.docset.fill_buffer(buffer)
+    fn fill_buffer(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+    ) -> usize {
+        self.docset.fill_buffer(buffer, ctid_buffer)
     }
 
     fn doc(&self) -> DocId {
         self.docset.doc()
+    }
+
+    fn ctid(&self) -> Ctid {
+        self.docset.ctid()
     }
 
     fn size_hint(&self) -> u32 {

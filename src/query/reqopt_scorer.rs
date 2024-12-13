@@ -60,6 +60,10 @@ where
         self.req_scorer.doc()
     }
 
+    fn ctid(&self) -> Ctid {
+        self.req_scorer.ctid()
+    }
+
     fn size_hint(&self) -> u32 {
         self.req_scorer.size_hint()
     }

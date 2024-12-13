@@ -202,6 +202,10 @@ where
         self.doc
     }
 
+    fn ctid(&self) -> Ctid {
+        self.score.1
+    }
+
     fn size_hint(&self) -> u32 {
         self.docsets
             .iter()

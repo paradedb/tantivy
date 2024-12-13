@@ -1,8 +1,8 @@
-use std::io;
-use std::ops::Bound;
-
 use common::bounds::{map_bound, BoundsRange};
 use common::BitSet;
+use rustc_hash::FxHashMap;
+use std::io;
+use std::ops::Bound;
 
 use super::range_query_fastfield::FastFieldRangeWeight;
 use crate::index::SegmentReader;
@@ -215,7 +215,7 @@ impl Weight for InvertedIndexRangeWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let max_doc = reader.max_doc();
         let mut doc_bitset = BitSet::with_max_value(max_doc);
-
+        let mut ctids_map = FxHashMap::default();
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
         let mut term_range = self.term_range(term_dict)?;
@@ -232,16 +232,18 @@ impl Weight for InvertedIndexRangeWeight {
                 .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
             loop {
                 let docs = block_segment_postings.docs();
+                let ctids = block_segment_postings.ctids();
                 if docs.is_empty() {
                     break;
                 }
-                for &doc in block_segment_postings.docs() {
+                for ((&doc, &blockno), &offno) in docs.iter().zip(ctids.0).zip(ctids.1) {
                     doc_bitset.insert(doc);
+                    ctids_map.insert(doc, (blockno, offno as u16));
                 }
                 block_segment_postings.advance();
             }
         }
-        let doc_bitset = BitSetDocSet::from(doc_bitset);
+        let doc_bitset = BitSetDocSet::from((doc_bitset, ctids_map));
         Ok(Box::new(ConstScorer::new(doc_bitset, boost)))
     }
 

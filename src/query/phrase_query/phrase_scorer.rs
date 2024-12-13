@@ -25,7 +25,7 @@ impl<TPostings: Postings> PostingsWithOffset<TPostings> {
     }
 
     pub fn ctid(&self) -> Ctid {
-        self.postings.ctid()
+        self.postings.ctid_value()
     }
 }
 
@@ -40,6 +40,10 @@ impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
 
     fn doc(&self) -> DocId {
         self.postings.doc()
+    }
+
+    fn ctid(&self) -> Ctid {
+        self.postings.ctid_value()
     }
 
     fn size_hint(&self) -> u32 {
@@ -538,6 +542,10 @@ impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
 
     fn doc(&self) -> DocId {
         self.intersection_docset.doc()
+    }
+
+    fn ctid(&self) -> Ctid {
+        self.intersection_docset.ctid()
     }
 
     fn size_hint(&self) -> u32 {

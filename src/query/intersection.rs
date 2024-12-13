@@ -140,6 +140,10 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
         self.left.doc()
     }
 
+    fn ctid(&self) -> Ctid {
+        self.left.ctid()
+    }
+
     fn size_hint(&self) -> u32 {
         self.left.size_hint()
     }

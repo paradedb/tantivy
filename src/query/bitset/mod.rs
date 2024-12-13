@@ -1,7 +1,8 @@
 use common::{BitSet, TinySet};
+use rustc_hash::FxHashMap;
 
 use crate::docset::{DocSet, TERMINATED};
-use crate::DocId;
+use crate::{Ctid, DocId};
 
 /// A `BitSetDocSet` makes it possible to iterate through a bitset as if it was a `DocSet`.
 ///
@@ -17,6 +18,7 @@ pub struct BitSetDocSet {
     cursor_bucket: u32, //< index associated with the current tiny bitset
     cursor_tinybitset: TinySet,
     doc: u32,
+    ctids: FxHashMap<DocId, Ctid>,
 }
 
 impl BitSetDocSet {
@@ -26,8 +28,10 @@ impl BitSetDocSet {
     }
 }
 
-impl From<BitSet> for BitSetDocSet {
-    fn from(docs: BitSet) -> BitSetDocSet {
+impl From<(BitSet, FxHashMap<DocId, Ctid>)> for BitSetDocSet {
+    fn from(value: (BitSet, FxHashMap<DocId, Ctid>)) -> BitSetDocSet {
+        let docs = value.0;
+        let ctids = value.1;
         let first_tiny_bitset = if docs.max_value() == 0 {
             TinySet::empty()
         } else {
@@ -38,6 +42,7 @@ impl From<BitSet> for BitSetDocSet {
             cursor_bucket: 0,
             cursor_tinybitset: first_tiny_bitset,
             doc: 0u32,
+            ctids,
         };
         docset.advance();
         docset
@@ -87,6 +92,10 @@ impl DocSet for BitSetDocSet {
         self.doc
     }
 
+    fn ctid(&self) -> Ctid {
+        self.ctids[&self.doc]
+    }
+
     /// Returns the number of values set in the underlying bitset.
     fn size_hint(&self) -> u32 {
         self.docs.len() as u32
@@ -95,21 +104,23 @@ impl DocSet for BitSetDocSet {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use common::BitSet;
+    use rustc_hash::FxHashMap;
+    use std::collections::BTreeSet;
 
     use super::BitSetDocSet;
     use crate::docset::{DocSet, TERMINATED};
     use crate::tests::generate_nonunique_unsorted;
-    use crate::DocId;
+    use crate::{DocId, INVALID_CTID};
 
     fn create_docbitset(docs: &[DocId], max_doc: DocId) -> BitSetDocSet {
         let mut docset = BitSet::with_max_value(max_doc);
+        let mut ctids = FxHashMap::default();
         for &doc in docs {
             docset.insert(doc);
+            ctids.insert(doc, INVALID_CTID);
         }
-        BitSetDocSet::from(docset)
+        BitSetDocSet::from((docset, ctids))
     }
 
     #[test]
@@ -138,14 +149,14 @@ mod tests {
     #[test]
     fn test_empty() {
         let bitset = BitSet::with_max_value(1000);
-        let mut empty = BitSetDocSet::from(bitset);
+        let mut empty = BitSetDocSet::from((bitset, Default::default()));
         assert_eq!(empty.advance(), TERMINATED)
     }
 
     #[test]
     fn test_seek_terminated() {
         let bitset = BitSet::with_max_value(1000);
-        let mut empty = BitSetDocSet::from(bitset);
+        let mut empty = BitSetDocSet::from((bitset, Default::default()));
         assert_eq!(empty.seek(TERMINATED), TERMINATED)
     }
 
@@ -234,10 +245,10 @@ mod tests {
 
 #[cfg(all(test, feature = "unstable"))]
 mod bench {
-
     use super::{BitSet, BitSetDocSet};
     use crate::docset::TERMINATED;
-    use crate::{test, tests, DocSet};
+    use crate::{test, tests, DocSet, INVALID_CTID};
+    use rustc_hash::FxHashMap;
 
     #[bench]
     fn bench_bitset_1pct_insert(b: &mut test::Bencher) {
@@ -264,11 +275,13 @@ mod bench {
     fn bench_bitset_1pct_clone_iterate(b: &mut test::Bencher) {
         let els = tests::sample(1_000_000u32, 0.01);
         let mut bitset = BitSet::with_max_value(1_000_000);
+        let mut ctids = FxHashMap::default();
         for el in els {
             bitset.insert(el);
+            ctids.insert(el, INVALID_CTID);
         }
         b.iter(|| {
-            let mut docset = BitSetDocSet::from(bitset.clone());
+            let mut docset = BitSetDocSet::from((bitset.clone(), ctids.clone()));
             while docset.advance() != TERMINATED {}
         });
     }

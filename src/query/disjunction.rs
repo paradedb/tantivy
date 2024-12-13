@@ -67,6 +67,10 @@ impl<T: Scorer> DocSet for ScorerWrapper<T> {
         self.current_doc
     }
 
+    fn ctid(&self) -> Ctid {
+        self.scorer.ctid()
+    }
+
     fn size_hint(&self) -> u32 {
         self.scorer.size_hint()
     }
@@ -146,6 +150,10 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
     #[inline]
     fn doc(&self) -> DocId {
         self.current_doc
+    }
+
+    fn ctid(&self) -> Ctid {
+        self.current_score.1
     }
 
     fn size_hint(&self) -> u32 {
