@@ -5,7 +5,7 @@ use crate::fieldnorm::FieldNormReader;
 use crate::postings::Postings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Intersection, Scorer};
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score};
 
 struct PostingsWithOffset<TPostings> {
     offset: u32,
@@ -23,6 +23,10 @@ impl<TPostings: Postings> PostingsWithOffset<TPostings> {
     pub fn positions(&mut self, output: &mut Vec<u32>) {
         self.postings.positions_with_offset(self.offset, output)
     }
+
+    pub fn ctid(&self) -> Ctid {
+        self.postings.ctid_value()
+    }
 }
 
 impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
@@ -36,6 +40,10 @@ impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
 
     fn doc(&self) -> DocId {
         self.postings.doc()
+    }
+
+    fn ctid(&self) -> Ctid {
+        self.postings.ctid_value()
     }
 
     fn size_hint(&self) -> u32 {
@@ -361,6 +369,10 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         )
     }
 
+    fn ctid(&self) -> Ctid {
+        self.intersection_docset.left.ctid()
+    }
+
     pub(crate) fn new_with_offset(
         term_postings_with_offset: Vec<(usize, TPostings)>,
         similarity_weight_opt: Option<Bm25Weight>,
@@ -532,19 +544,27 @@ impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
         self.intersection_docset.doc()
     }
 
+    fn ctid(&self) -> Ctid {
+        self.intersection_docset.ctid()
+    }
+
     fn size_hint(&self) -> u32 {
         self.intersection_docset.size_hint()
     }
 }
 
 impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
-    fn score(&mut self) -> Score {
+    fn score(&mut self) -> (Score, Ctid) {
         let doc = self.doc();
+        let ctid = self.ctid();
         let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(doc);
         if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
-            similarity_weight.score(fieldnorm_id, self.phrase_count)
+            (
+                similarity_weight.score(fieldnorm_id, self.phrase_count),
+                ctid,
+            )
         } else {
-            1.0f32
+            (1.0f32, ctid)
         }
     }
 }

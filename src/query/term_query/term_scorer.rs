@@ -3,7 +3,7 @@ use crate::fieldnorm::FieldNormReader;
 use crate::postings::{FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Explanation, Scorer};
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score};
 
 #[derive(Clone)]
 pub struct TermScorer {
@@ -78,6 +78,10 @@ impl TermScorer {
         self.postings.term_freq()
     }
 
+    pub fn ctid(&self) -> Ctid {
+        self.postings.ctid()
+    }
+
     pub fn fieldnorm_id(&self) -> u8 {
         self.fieldnorm_reader.fieldnorm_id(self.doc())
     }
@@ -110,16 +114,22 @@ impl DocSet for TermScorer {
         self.postings.doc()
     }
 
+    fn ctid(&self) -> Ctid {
+        self.postings.ctid()
+    }
+
     fn size_hint(&self) -> u32 {
         self.postings.size_hint()
     }
 }
 
 impl Scorer for TermScorer {
-    fn score(&mut self) -> Score {
+    fn score(&mut self) -> (Score, Ctid) {
         let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
-        self.similarity_weight.score(fieldnorm_id, term_freq)
+        let ctid = self.ctid();
+        let score = self.similarity_weight.score(fieldnorm_id, term_freq);
+        (score, ctid)
     }
 }
 
@@ -151,15 +161,15 @@ mod tests {
         assert_eq!(term_scorer.doc(), 2);
         assert_eq!(term_scorer.term_freq(), 3);
         assert_nearly_equals!(term_scorer.block_max_score(), 1.3676447);
-        assert_nearly_equals!(term_scorer.score(), 1.0892314);
+        assert_nearly_equals!(term_scorer.score().0, 1.0892314);
         assert_eq!(term_scorer.advance(), 3);
         assert_eq!(term_scorer.doc(), 3);
         assert_eq!(term_scorer.term_freq(), 12);
-        assert_nearly_equals!(term_scorer.score(), 1.3676447);
+        assert_nearly_equals!(term_scorer.score().0, 1.3676447);
         assert_eq!(term_scorer.advance(), 7);
         assert_eq!(term_scorer.doc(), 7);
         assert_eq!(term_scorer.term_freq(), 8);
-        assert_nearly_equals!(term_scorer.score(), 0.72015285);
+        assert_nearly_equals!(term_scorer.score().0, 0.72015285);
         assert_eq!(term_scorer.advance(), TERMINATED);
         Ok(())
     }
@@ -217,7 +227,7 @@ mod tests {
              let mut block_max_score_computed: Score = 0.0;
              for &doc in block {
                 assert_eq!(term_scorer.doc(), doc);
-                block_max_score_computed = block_max_score_computed.max(term_scorer.score());
+                block_max_score_computed = block_max_score_computed.max(term_scorer.score().0);
                 term_scorer.advance();
              }
              assert_nearly_equals!(block_max_score_computed, block_max_score);
@@ -261,10 +271,10 @@ mod tests {
             {
                 let mut term_scorer = term_weight.specialized_scorer(reader, 1.0)?;
                 while term_scorer.doc() != TERMINATED {
-                    let mut score = term_scorer.score();
+                    let mut score = term_scorer.score().0;
                     docs.push(term_scorer.doc());
                     for _ in 0..128 {
-                        score = score.max(term_scorer.score());
+                        score = score.max(term_scorer.score().0);
                         if term_scorer.advance() == TERMINATED {
                             break;
                         }

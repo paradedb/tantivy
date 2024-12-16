@@ -2,17 +2,18 @@ use super::Scorer;
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
 use crate::query::Explanation;
-use crate::{DocId, DocSet, Score, TERMINATED};
+use crate::{Ctid, DocId, DocSet, Score, TERMINATED};
 
 /// Iterates through all of the documents and scores matched by the DocSet
 /// `DocSet`.
 pub(crate) fn for_each_scorer<TScorer: Scorer + ?Sized>(
     scorer: &mut TScorer,
-    callback: &mut dyn FnMut(DocId, Score),
+    callback: &mut dyn FnMut(DocId, Score, Ctid),
 ) {
     let mut doc = scorer.doc();
     while doc != TERMINATED {
-        callback(doc, scorer.score());
+        let (score, ctid) = scorer.score();
+        callback(doc, score, ctid);
         doc = scorer.advance();
     }
 }
@@ -23,11 +24,13 @@ pub(crate) fn for_each_scorer<TScorer: Scorer + ?Sized>(
 pub(crate) fn for_each_docset_buffered<T: DocSet + ?Sized>(
     docset: &mut T,
     buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
-    mut callback: impl FnMut(&[DocId]),
+    ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+    mut callback: impl FnMut(&[DocId], &[Ctid]),
 ) {
     loop {
-        let num_items = docset.fill_buffer(buffer);
-        callback(&buffer[..num_items]);
+        let num_items = docset.fill_buffer(buffer, ctid_buffer);
+        // eprintln!("TODO:  fill the ctid_buffer!");
+        callback(&buffer[..num_items], &ctid_buffer[..num_items]);
         if num_items != buffer.len() {
             break;
         }
@@ -47,13 +50,13 @@ pub(crate) fn for_each_docset_buffered<T: DocSet + ?Sized>(
 pub(crate) fn for_each_pruning_scorer<TScorer: Scorer + ?Sized>(
     scorer: &mut TScorer,
     mut threshold: Score,
-    callback: &mut dyn FnMut(DocId, Score) -> Score,
+    callback: &mut dyn FnMut(DocId, Score, Ctid) -> Score,
 ) {
     let mut doc = scorer.doc();
     while doc != TERMINATED {
-        let score = scorer.score();
+        let (score, ctid) = scorer.score();
         if score > threshold {
-            threshold = callback(doc, score);
+            threshold = callback(doc, score, ctid);
         }
         doc = scorer.advance();
     }
@@ -89,7 +92,7 @@ pub trait Weight: Send + Sync + 'static {
     fn for_each(
         &self,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(DocId, Score),
+        callback: &mut dyn FnMut(DocId, Score, Ctid),
     ) -> crate::Result<()> {
         let mut scorer = self.scorer(reader, 1.0)?;
         for_each_scorer(scorer.as_mut(), callback);
@@ -101,12 +104,13 @@ pub trait Weight: Send + Sync + 'static {
     fn for_each_no_score(
         &self,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(&[DocId]),
+        callback: &mut dyn FnMut(&[DocId], &[Ctid]),
     ) -> crate::Result<()> {
         let mut docset = self.scorer(reader, 1.0)?;
 
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        for_each_docset_buffered(&mut docset, &mut buffer, callback);
+        let mut ctid_buffer = [(0, 0); COLLECT_BLOCK_BUFFER_LEN];
+        for_each_docset_buffered(&mut docset, &mut buffer, &mut ctid_buffer, callback);
         Ok(())
     }
 
@@ -124,7 +128,7 @@ pub trait Weight: Send + Sync + 'static {
         &self,
         threshold: Score,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(DocId, Score) -> Score,
+        callback: &mut dyn FnMut(DocId, Score, Ctid) -> Score,
     ) -> crate::Result<()> {
         let mut scorer = self.scorer(reader, 1.0)?;
         for_each_pruning_scorer(scorer.as_mut(), threshold, callback);

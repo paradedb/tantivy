@@ -14,7 +14,7 @@ use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::index::SegmentReader;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Schema, FAST, INDEXED, TEXT};
-use tantivy::{doc, Index, IndexWriter, Score};
+use tantivy::{doc, Ctid, Index, IndexWriter, Score};
 
 #[derive(Default)]
 struct Stats {
@@ -103,7 +103,7 @@ struct StatsSegmentCollector {
 impl SegmentCollector for StatsSegmentCollector {
     type Fruit = Option<Stats>;
 
-    fn collect(&mut self, doc: u32, _score: Score) {
+    fn collect(&mut self, doc: u32, _score: Score, _ctid: Ctid) {
         // Since we know the values are single value, we could call `first_or_default_col` on the
         // column and fetch single values.
         for value in self.fast_field_reader.values_for_doc(doc) {

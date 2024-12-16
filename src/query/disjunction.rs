@@ -3,7 +3,7 @@ use std::collections::BinaryHeap;
 
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{ScoreCombiner, Scorer};
-use crate::{DocId, DocSet, Score, TERMINATED};
+use crate::{Ctid, DocId, DocSet, Score, INVALID_CTID, TERMINATED};
 
 /// `Disjunction` is responsible for merging `DocSet` from multiple
 /// source. Specifically, It takes the union of two or more `DocSet`s
@@ -15,7 +15,7 @@ pub struct Disjunction<TScorer, TScoreCombiner = DoNothingCombiner> {
     score_combiner: TScoreCombiner,
 
     current_doc: DocId,
-    current_score: Score,
+    current_score: (Score, Ctid),
 }
 
 /// A wrapper around a `Scorer` that caches the current `doc_id` and implements the `DocSet` trait.
@@ -67,6 +67,10 @@ impl<T: Scorer> DocSet for ScorerWrapper<T> {
         self.current_doc
     }
 
+    fn ctid(&self) -> Ctid {
+        self.scorer.ctid()
+    }
+
     fn size_hint(&self) -> u32 {
         self.scorer.size_hint()
     }
@@ -91,7 +95,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Disjunction<TScorer, TScore
             score_combiner,
             current_doc: TERMINATED,
             minimum_matches_required,
-            current_score: 0.0,
+            current_score: (0.0, INVALID_CTID),
         };
         if minimum_matches_required > disjunction.chains.len() {
             return disjunction;
@@ -122,7 +126,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
                     self.score_combiner.clear();
                 }
                 current_num_matches += 1;
-                self.score_combiner.update(&mut candidate.scorer);
+                let _ = self.score_combiner.update(&mut candidate.scorer);
                 candidate.advance();
                 self.chains.push(candidate);
             }
@@ -139,6 +143,10 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
         self.current_doc
     }
 
+    fn ctid(&self) -> Ctid {
+        self.current_score.1
+    }
+
     fn size_hint(&self) -> u32 {
         self.chains
             .iter()
@@ -151,7 +159,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
 impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Scorer
     for Disjunction<TScorer, TScoreCombiner>
 {
-    fn score(&mut self) -> Score {
+    fn score(&mut self) -> (Score, Ctid) {
         self.current_score
     }
 }
@@ -163,7 +171,7 @@ mod tests {
     use super::Disjunction;
     use crate::query::score_combiner::DoNothingCombiner;
     use crate::query::{ConstScorer, Scorer, SumCombiner, VecDocSet};
-    use crate::{DocId, DocSet, Score, TERMINATED};
+    use crate::{Ctid, DocId, DocSet, Score, INVALID_CTID, TERMINATED};
 
     fn conjunct<T: Ord + Copy>(arrays: &[Vec<T>], pass_line: usize) -> Vec<T> {
         let mut counts = BTreeMap::new();
@@ -192,7 +200,7 @@ mod tests {
                     .cloned()
                     .map(VecDocSet::from)
                     .map(|d| ConstScorer::new(d, 1.0)),
-                DoNothingCombiner,
+                DoNothingCombiner::default(),
                 min_match,
             )
         };
@@ -285,8 +293,11 @@ mod tests {
     }
 
     impl Scorer for DummyScorer {
-        fn score(&mut self) -> Score {
-            self.foo.get(self.cursor).map(|x| x.1).unwrap_or(0.0)
+        fn score(&mut self) -> (Score, Ctid) {
+            (
+                self.foo.get(self.cursor).map(|x| x.1).unwrap_or(0.0),
+                INVALID_CTID,
+            )
         }
     }
 
@@ -303,9 +314,9 @@ mod tests {
             SumCombiner::default(),
             3,
         );
-        assert_eq!(scorer.score(), 5.0);
+        assert_eq!(scorer.score().0, 5.0);
         assert_eq!(scorer.advance(), 2);
-        assert_eq!(scorer.score(), 3.0);
+        assert_eq!(scorer.score().0, 3.0);
     }
 
     #[test]
@@ -320,8 +331,8 @@ mod tests {
             2,
         );
         assert_eq!(scorer.doc(), 1);
-        assert_eq!(scorer.score(), 3.0);
+        assert_eq!(scorer.score().0, 3.0);
         assert_eq!(scorer.advance(), 3);
-        assert_eq!(scorer.score(), 2.0);
+        assert_eq!(scorer.score().0, 2.0);
     }
 }

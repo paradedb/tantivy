@@ -15,10 +15,10 @@ use crate::collector::{
 };
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::query::Weight;
-use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::{Ctid, DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 struct FastFieldConvertCollector<
-    TCollector: Collector<Fruit = Vec<(u64, DocAddress)>>,
+    TCollector: Collector<Fruit = Vec<(u64, DocAddress, Ctid)>>,
     TFastValue: FastValue,
 > {
     pub collector: TCollector,
@@ -29,10 +29,10 @@ struct FastFieldConvertCollector<
 
 impl<TCollector, TFastValue> Collector for FastFieldConvertCollector<TCollector, TFastValue>
 where
-    TCollector: Collector<Fruit = Vec<(u64, DocAddress)>>,
+    TCollector: Collector<Fruit = Vec<(u64, DocAddress, Ctid)>>,
     TFastValue: FastValue,
 {
-    type Fruit = Vec<(TFastValue, DocAddress)>;
+    type Fruit = Vec<(TFastValue, DocAddress, Ctid)>;
 
     type Child = TCollector::Child;
 
@@ -72,11 +72,11 @@ where
         let raw_result = self.collector.merge_fruits(segment_fruits)?;
         let transformed_result = raw_result
             .into_iter()
-            .map(|(score, doc_address)| {
+            .map(|(score, doc_address, ctid)| {
                 if self.order.is_desc() {
-                    (TFastValue::from_u64(score), doc_address)
+                    (TFastValue::from_u64(score), doc_address, ctid)
                 } else {
-                    (TFastValue::from_u64(u64::MAX - score), doc_address)
+                    (TFastValue::from_u64(u64::MAX - score), doc_address, ctid)
                 }
             })
             .collect::<Vec<_>>();
@@ -257,6 +257,7 @@ impl TopDocs {
     /// # use tantivy::query::{Query, QueryParser};
     /// use tantivy::Searcher;
     /// use tantivy::collector::TopDocs;
+    /// use tantivy::{Ctid, INVALID_CTID};
     ///
     /// # fn main() -> tantivy::Result<()> {
     /// #   let mut schema_builder = Schema::builder();
@@ -275,8 +276,8 @@ impl TopDocs {
     /// #   let query = QueryParser::for_index(&index, vec![title]).parse_query("diary")?;
     /// #   let top_docs = docs_sorted_by_rating(&reader.searcher(), &query)?;
     /// #   assert_eq!(top_docs,
-    /// #            vec![(97u64, DocAddress::new(0u32, 1)),
-    /// #                 (80u64, DocAddress::new(0u32, 3))]);
+    /// #            vec![(97u64, DocAddress::new(0u32, 1), INVALID_CTID),
+    /// #                 (80u64, DocAddress::new(0u32, 3), INVALID_CTID)]);
     /// #   Ok(())
     /// # }
     /// /// Searches the document matching the given query, and
@@ -284,12 +285,12 @@ impl TopDocs {
     /// /// given in argument.
     /// fn docs_sorted_by_rating(searcher: &Searcher,
     ///                          query: &dyn Query)
-    ///     -> tantivy::Result<Vec<(u64, DocAddress)>> {
+    ///     -> tantivy::Result<Vec<(u64, DocAddress, Ctid)>> {
     ///
     ///     // This is where we build our topdocs collector
     ///     //
     ///     // Note the `rating_field` needs to be a FAST field here.
-    ///     let top_books_by_rating = TopDocs
+    /// let top_books_by_rating = TopDocs
     ///                 ::with_limit(10)
     ///                  .order_by_fast_field("rating", Order::Desc);
     ///
@@ -300,7 +301,7 @@ impl TopDocs {
     ///     // The vec is sorted decreasingly by `sort_by_field`, and has a
     ///     // length of 10, or less if not enough documents matched the
     ///     // query.
-    ///     let resulting_docs: Vec<(u64, DocAddress)> =
+    ///     let resulting_docs: Vec<(u64, DocAddress, Ctid)> =
     ///          searcher.search(query, &top_books_by_rating)?;
     ///
     ///     Ok(resulting_docs)
@@ -315,7 +316,7 @@ impl TopDocs {
         self,
         field: impl ToString,
         order: Order,
-    ) -> impl Collector<Fruit = Vec<(u64, DocAddress)>> {
+    ) -> impl Collector<Fruit = Vec<(u64, DocAddress, Ctid)>> {
         CustomScoreTopCollector::new(
             ScorerByField {
                 field: field.to_string(),
@@ -345,6 +346,7 @@ impl TopDocs {
     /// # use tantivy::query::{Query, AllQuery};
     /// use tantivy::Searcher;
     /// use tantivy::collector::TopDocs;
+    /// use tantivy::{Ctid, INVALID_CTID};
     ///
     /// # fn main() -> tantivy::Result<()> {
     /// #   let mut schema_builder = Schema::builder();
@@ -361,8 +363,8 @@ impl TopDocs {
     /// #   let reader = index.reader()?;
     /// #   let top_docs = docs_sorted_by_revenue(&reader.searcher(), &AllQuery, "revenue")?;
     /// #   assert_eq!(top_docs,
-    /// #            vec![(119_000_000i64, DocAddress::new(0, 1)),
-    /// #                 (92_000_000i64, DocAddress::new(0, 0))]);
+    /// #            vec![(119_000_000i64, DocAddress::new(0, 1), INVALID_CTID),
+    /// #                 (92_000_000i64, DocAddress::new(0, 0), INVALID_CTID)]);
     /// #   Ok(())
     /// # }
     /// /// Searches the document matching the given query, and
@@ -371,13 +373,13 @@ impl TopDocs {
     /// fn docs_sorted_by_revenue(searcher: &Searcher,
     ///                          query: &dyn Query,
     ///                          revenue_field: &str)
-    ///     -> tantivy::Result<Vec<(i64, DocAddress)>> {
+    ///     -> tantivy::Result<Vec<(i64, DocAddress, Ctid)>> {
     ///
     ///     // This is where we build our topdocs collector
     ///     //
     ///     // Note the generics parameter that needs to match the
     ///     // type `sort_by_field`. revenue_field here is a FAST i64 field.
-    ///     let top_company_by_revenue = TopDocs
+    /// let top_company_by_revenue = TopDocs
     ///                 ::with_limit(2)
     ///                  .order_by_fast_field("revenue", Order::Desc);
     ///
@@ -388,7 +390,7 @@ impl TopDocs {
     ///     // The vec is sorted decreasingly by `sort_by_field`, and has a
     ///     // length of 10, or less if not enough documents matched the
     ///     // query.
-    ///     let resulting_docs: Vec<(i64, DocAddress)> =
+    ///     let resulting_docs: Vec<(i64, DocAddress, Ctid)> =
     ///          searcher.search(query, &top_company_by_revenue)?;
     ///
     ///     Ok(resulting_docs)
@@ -398,7 +400,7 @@ impl TopDocs {
         self,
         fast_field: impl ToString,
         order: Order,
-    ) -> impl Collector<Fruit = Vec<(TFastValue, DocAddress)>>
+    ) -> impl Collector<Fruit = Vec<(TFastValue, DocAddress, Ctid)>>
     where
         TFastValue: FastValue,
     {
@@ -437,7 +439,7 @@ impl TopDocs {
     ///
     /// ```rust
     /// # use tantivy::schema::{Schema, FAST, TEXT};
-    /// # use tantivy::{doc, Index, DocAddress, DocId, Score};
+    /// # use tantivy::{doc, Index, DocAddress, DocId, Score, Ctid};
     /// # use tantivy::query::QueryParser;
     /// use tantivy::SegmentReader;
     /// use tantivy::collector::TopDocs;
@@ -501,7 +503,7 @@ impl TopDocs {
     /// let searcher = reader.searcher();
     /// // ... and here are our documents. Note this is a simple vec.
     /// // The `Score` in the pair is our tweaked score.
-    /// let resulting_docs: Vec<(Score, DocAddress)> =
+    /// let resulting_docs: Vec<(Score, DocAddress, Ctid)> =
     ///      searcher.search(&query, &top_docs_by_custom_score).unwrap();
     /// ```
     ///
@@ -510,7 +512,7 @@ impl TopDocs {
     pub fn tweak_score<TScore, TScoreSegmentTweaker, TScoreTweaker>(
         self,
         score_tweaker: TScoreTweaker,
-    ) -> impl Collector<Fruit = Vec<(TScore, DocAddress)>>
+    ) -> impl Collector<Fruit = Vec<(TScore, DocAddress, Ctid)>>
     where
         TScore: 'static + Send + Sync + Clone + PartialOrd,
         TScoreSegmentTweaker: ScoreSegmentTweaker<TScore> + 'static,
@@ -558,7 +560,8 @@ impl TopDocs {
     /// # }
     /// #
     /// # fn main() -> tantivy::Result<()> {
-    /// #   let schema = create_schema();
+    /// #   use tantivy::Ctid;
+    /// let schema = create_schema();
     /// #   let index = Index::create_in_ram(schema);
     /// #   let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
     /// #   let product_name = index.schema().get_field("product_name").unwrap();
@@ -611,7 +614,7 @@ impl TopDocs {
     /// # let searcher = reader.searcher();
     /// // ... and here are our documents. Note this is a simple vec.
     /// // The `Score` in the pair is our tweaked score.
-    /// let resulting_docs: Vec<((u64, u64), DocAddress)> =
+    /// let resulting_docs: Vec<((u64, u64), DocAddress, Ctid)> =
     ///      searcher.search(&*query, &top_docs_by_custom_score)?;
     ///
     /// # Ok(())
@@ -623,7 +626,7 @@ impl TopDocs {
     pub fn custom_score<TScore, TCustomSegmentScorer, TCustomScorer>(
         self,
         custom_score: TCustomScorer,
-    ) -> impl Collector<Fruit = Vec<(TScore, DocAddress)>>
+    ) -> impl Collector<Fruit = Vec<(TScore, DocAddress, Ctid)>>
     where
         TScore: 'static + Send + Sync + Clone + PartialOrd,
         TCustomSegmentScorer: CustomSegmentScorer<TScore> + 'static,
@@ -634,7 +637,7 @@ impl TopDocs {
 }
 
 impl Collector for TopDocs {
-    type Fruit = Vec<(Score, DocAddress)>;
+    type Fruit = Vec<(Score, DocAddress, Ctid)>;
 
     type Child = TopScoreSegmentCollector;
 
@@ -653,7 +656,7 @@ impl Collector for TopDocs {
 
     fn merge_fruits(
         &self,
-        child_fruits: Vec<Vec<(Score, DocAddress)>>,
+        child_fruits: Vec<Vec<(Score, DocAddress, Ctid)>>,
     ) -> crate::Result<Self::Fruit> {
         self.0.merge_fruits(child_fruits)
     }
@@ -670,17 +673,17 @@ impl Collector for TopDocs {
         if let Some(alive_bitset) = reader.alive_bitset() {
             let mut threshold = Score::MIN;
             top_n.threshold = Some(threshold);
-            weight.for_each_pruning(Score::MIN, reader, &mut |doc, score| {
+            weight.for_each_pruning(Score::MIN, reader, &mut |doc, score, ctid| {
                 if alive_bitset.is_deleted(doc) {
                     return threshold;
                 }
-                top_n.push(score, doc);
+                top_n.push(score, doc, ctid);
                 threshold = top_n.threshold.unwrap_or(Score::MIN);
                 threshold
             })?;
         } else {
-            weight.for_each_pruning(Score::MIN, reader, &mut |doc, score| {
-                top_n.push(score, doc);
+            weight.for_each_pruning(Score::MIN, reader, &mut |doc, score, ctid| {
+                top_n.push(score, doc, ctid);
                 top_n.threshold.unwrap_or(Score::MIN)
             })?;
         }
@@ -695,6 +698,7 @@ impl Collector for TopDocs {
                         segment_ord,
                         doc_id: cid.doc,
                     },
+                    cid.ctid,
                 )
             })
             .collect();
@@ -706,13 +710,13 @@ impl Collector for TopDocs {
 pub struct TopScoreSegmentCollector(TopSegmentCollector<Score>);
 
 impl SegmentCollector for TopScoreSegmentCollector {
-    type Fruit = Vec<(Score, DocAddress)>;
+    type Fruit = Vec<(Score, DocAddress, Ctid)>;
 
-    fn collect(&mut self, doc: DocId, score: Score) {
-        self.0.collect(doc, score);
+    fn collect(&mut self, doc: DocId, score: Score, ctid: Ctid) {
+        self.0.collect(doc, score, ctid);
     }
 
-    fn harvest(self) -> Vec<(Score, DocAddress)> {
+    fn harvest(self) -> Vec<(Score, DocAddress, Ctid)> {
         self.0.harvest()
     }
 }
@@ -806,7 +810,7 @@ where
     /// Push a new document to the top n.
     /// If the document is below the current threshold, it will be ignored.
     #[inline]
-    pub fn push(&mut self, feature: Score, doc: D) {
+    pub fn push(&mut self, feature: Score, doc: D, ctid: Ctid) {
         if let Some(last_median) = self.threshold.clone() {
             if feature < last_median {
                 return;
@@ -823,7 +827,7 @@ where
         let uninit = self.buffer.spare_capacity_mut();
         // This cannot panic, because we truncate_median will at least remove one element, since
         // the min capacity is 2.
-        uninit[0].write(ComparableDoc { doc, feature });
+        uninit[0].write(ComparableDoc { doc, feature, ctid });
         // This is safe because it would panic in the line above
         unsafe {
             self.buffer.set_len(self.buffer.len() + 1);
@@ -872,8 +876,8 @@ mod tests {
     use crate::time::format_description::well_known::Rfc3339;
     use crate::time::OffsetDateTime;
     use crate::{
-        assert_nearly_equals, DateTime, DocAddress, DocId, Index, IndexWriter, Order, Score,
-        SegmentReader,
+        assert_nearly_equals, Ctid, DateTime, DocAddress, DocId, Index, IndexWriter, Order, Score,
+        SegmentReader, INVALID_CTID,
     };
 
     fn make_index() -> crate::Result<Index> {
@@ -890,7 +894,10 @@ mod tests {
         Ok(index)
     }
 
-    fn assert_results_equals(results: &[(Score, DocAddress)], expected: &[(Score, DocAddress)]) {
+    fn assert_results_equals(
+        results: &[(Score, DocAddress, Ctid)],
+        expected: &[(Score, DocAddress, Ctid)],
+    ) {
         for (result, expected) in results.iter().zip(expected.iter()) {
             assert_eq!(result.1, expected.1);
             crate::assert_nearly_equals!(result.0, expected.0);
@@ -903,15 +910,16 @@ mod tests {
         let computer_ser = serde_json::to_string(&computer).unwrap();
         let mut computer: TopNComputer<u32, u32> = serde_json::from_str(&computer_ser).unwrap();
 
-        computer.push(1u32, 5u32);
-        computer.push(1u32, 0u32);
-        computer.push(1u32, 7u32);
+        computer.push(1u32, 5u32, INVALID_CTID);
+        computer.push(1u32, 0u32, INVALID_CTID);
+        computer.push(1u32, 7u32, INVALID_CTID);
 
         assert_eq!(
             computer.into_sorted_vec(),
             &[ComparableDoc {
                 feature: 1u32,
                 doc: 0u32,
+                ctid: INVALID_CTID
             },]
         );
     }
@@ -920,30 +928,32 @@ mod tests {
     fn test_empty_topn_computer() {
         let mut computer: TopNComputer<u32, u32> = TopNComputer::new(0);
 
-        computer.push(1u32, 1u32);
-        computer.push(1u32, 2u32);
-        computer.push(1u32, 3u32);
+        computer.push(1u32, 1u32, INVALID_CTID);
+        computer.push(1u32, 2u32, INVALID_CTID);
+        computer.push(1u32, 3u32, INVALID_CTID);
         assert!(computer.into_sorted_vec().is_empty());
     }
     #[test]
     fn test_topn_computer() {
         let mut computer: TopNComputer<u32, u32> = TopNComputer::new(2);
 
-        computer.push(1u32, 1u32);
-        computer.push(2u32, 2u32);
-        computer.push(3u32, 3u32);
-        computer.push(2u32, 4u32);
-        computer.push(1u32, 5u32);
+        computer.push(1u32, 1u32, INVALID_CTID);
+        computer.push(2u32, 2u32, INVALID_CTID);
+        computer.push(3u32, 3u32, INVALID_CTID);
+        computer.push(2u32, 4u32, INVALID_CTID);
+        computer.push(1u32, 5u32, INVALID_CTID);
         assert_eq!(
             computer.into_sorted_vec(),
             &[
                 ComparableDoc {
                     feature: 3u32,
                     doc: 3u32,
+                    ctid: INVALID_CTID
                 },
                 ComparableDoc {
                     feature: 2u32,
                     doc: 2u32,
+                    ctid: INVALID_CTID
                 }
             ]
         );
@@ -955,7 +965,7 @@ mod tests {
             let mut computer: TopNComputer<u32, u32> = TopNComputer::new(top_n);
 
             for _ in 0..1 + top_n * 2 {
-                computer.push(1u32, 1u32);
+                computer.push(1u32, 1u32, INVALID_CTID);
             }
             let _vals = computer.into_sorted_vec();
         }
@@ -967,16 +977,16 @@ mod tests {
         let field = index.schema().get_field("text").unwrap();
         let query_parser = QueryParser::for_index(&index, vec![field]);
         let text_query = query_parser.parse_query("droopy tax")?;
-        let score_docs: Vec<(Score, DocAddress)> = index
+        let score_docs: Vec<(Score, DocAddress, Ctid)> = index
             .reader()?
             .searcher()
             .search(&text_query, &TopDocs::with_limit(4))?;
         assert_results_equals(
             &score_docs,
             &[
-                (0.81221175, DocAddress::new(0u32, 1)),
-                (0.5376842, DocAddress::new(0u32, 2)),
-                (0.48527452, DocAddress::new(0, 0)),
+                (0.81221175, DocAddress::new(0u32, 1), INVALID_CTID),
+                (0.5376842, DocAddress::new(0u32, 2), INVALID_CTID),
+                (0.48527452, DocAddress::new(0, 0), INVALID_CTID),
             ],
         );
         Ok(())
@@ -988,13 +998,16 @@ mod tests {
         let field = index.schema().get_field("text").unwrap();
         let query_parser = QueryParser::for_index(&index, vec![field]);
         let text_query = query_parser.parse_query("droopy tax").unwrap();
-        let score_docs: Vec<(Score, DocAddress)> = index
+        let score_docs: Vec<(Score, DocAddress, Ctid)> = index
             .reader()
             .unwrap()
             .searcher()
             .search(&text_query, &TopDocs::with_limit(4).and_offset(2))
             .unwrap();
-        assert_results_equals(&score_docs[..], &[(0.48527452, DocAddress::new(0, 0))]);
+        assert_results_equals(
+            &score_docs[..],
+            &[(0.48527452, DocAddress::new(0, 0), INVALID_CTID)],
+        );
     }
 
     #[test]
@@ -1003,7 +1016,7 @@ mod tests {
         let field = index.schema().get_field("text").unwrap();
         let query_parser = QueryParser::for_index(&index, vec![field]);
         let text_query = query_parser.parse_query("droopy tax").unwrap();
-        let score_docs: Vec<(Score, DocAddress)> = index
+        let score_docs: Vec<(Score, DocAddress, Ctid)> = index
             .reader()
             .unwrap()
             .searcher()
@@ -1012,8 +1025,8 @@ mod tests {
         assert_results_equals(
             &score_docs,
             &[
-                (0.81221175, DocAddress::new(0u32, 1)),
-                (0.5376842, DocAddress::new(0u32, 2)),
+                (0.81221175, DocAddress::new(0u32, 1), INVALID_CTID),
+                (0.5376842, DocAddress::new(0u32, 2), INVALID_CTID),
             ],
         );
     }
@@ -1024,7 +1037,7 @@ mod tests {
         let field = index.schema().get_field("text").unwrap();
         let query_parser = QueryParser::for_index(&index, vec![field]);
         let text_query = query_parser.parse_query("droopy tax").unwrap();
-        let score_docs: Vec<(Score, DocAddress)> = index
+        let score_docs: Vec<(Score, DocAddress, Ctid)> = index
             .reader()
             .unwrap()
             .searcher()
@@ -1033,8 +1046,8 @@ mod tests {
         assert_results_equals(
             &score_docs[..],
             &[
-                (0.5376842, DocAddress::new(0u32, 2)),
-                (0.48527452, DocAddress::new(0, 0)),
+                (0.5376842, DocAddress::new(0u32, 2), INVALID_CTID),
+                (0.48527452, DocAddress::new(0, 0), INVALID_CTID),
             ],
         );
     }
@@ -1105,13 +1118,13 @@ mod tests {
         let searcher = index.reader()?.searcher();
 
         let top_collector = TopDocs::with_limit(4).order_by_u64_field(SIZE, Order::Desc);
-        let top_docs: Vec<(u64, DocAddress)> = searcher.search(&query, &top_collector)?;
+        let top_docs: Vec<(u64, DocAddress, Ctid)> = searcher.search(&query, &top_collector)?;
         assert_eq!(
             &top_docs[..],
             &[
-                (64, DocAddress::new(0, 1)),
-                (16, DocAddress::new(0, 2)),
-                (12, DocAddress::new(0, 0))
+                (64, DocAddress::new(0, 1), INVALID_CTID),
+                (16, DocAddress::new(0, 2), INVALID_CTID),
+                (12, DocAddress::new(0, 0), INVALID_CTID)
             ]
         );
         Ok(())
@@ -1144,12 +1157,13 @@ mod tests {
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
         let top_collector = TopDocs::with_limit(3).order_by_fast_field("birthday", Order::Desc);
-        let top_docs: Vec<(DateTime, DocAddress)> = searcher.search(&AllQuery, &top_collector)?;
+        let top_docs: Vec<(DateTime, DocAddress, Ctid)> =
+            searcher.search(&AllQuery, &top_collector)?;
         assert_eq!(
             &top_docs[..],
             &[
-                (mr_birthday, DocAddress::new(0, 1)),
-                (pr_birthday, DocAddress::new(0, 0)),
+                (mr_birthday, DocAddress::new(0, 1), INVALID_CTID),
+                (pr_birthday, DocAddress::new(0, 0), INVALID_CTID),
             ]
         );
         Ok(())
@@ -1174,12 +1188,12 @@ mod tests {
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
         let top_collector = TopDocs::with_limit(3).order_by_fast_field("altitude", Order::Desc);
-        let top_docs: Vec<(i64, DocAddress)> = searcher.search(&AllQuery, &top_collector)?;
+        let top_docs: Vec<(i64, DocAddress, Ctid)> = searcher.search(&AllQuery, &top_collector)?;
         assert_eq!(
             &top_docs[..],
             &[
-                (40i64, DocAddress::new(0, 1)),
-                (-1i64, DocAddress::new(0, 0)),
+                (40i64, DocAddress::new(0, 1), INVALID_CTID),
+                (-1i64, DocAddress::new(0, 0), INVALID_CTID),
             ]
         );
         Ok(())
@@ -1204,12 +1218,12 @@ mod tests {
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
         let top_collector = TopDocs::with_limit(3).order_by_fast_field("altitude", Order::Desc);
-        let top_docs: Vec<(f64, DocAddress)> = searcher.search(&AllQuery, &top_collector)?;
+        let top_docs: Vec<(f64, DocAddress, Ctid)> = searcher.search(&AllQuery, &top_collector)?;
         assert_eq!(
             &top_docs[..],
             &[
-                (40f64, DocAddress::new(0, 1)),
-                (-1.0f64, DocAddress::new(0, 0)),
+                (40f64, DocAddress::new(0, 1), INVALID_CTID),
+                (-1.0f64, DocAddress::new(0, 0), INVALID_CTID),
             ]
         );
         Ok(())
@@ -1281,13 +1295,18 @@ mod tests {
         let query_parser = QueryParser::for_index(&index, vec![field]);
         let text_query = query_parser.parse_query("droopy tax")?;
         let collector = TopDocs::with_limit(2).and_offset(1).tweak_score(
-            move |_segment_reader: &SegmentReader| move |doc: DocId, _original_score: Score| doc,
+            move |_segment_reader: &SegmentReader| {
+                move |doc: DocId, _original_score: Score, _ctid: Ctid| doc
+            },
         );
-        let score_docs: Vec<(u32, DocAddress)> =
+        let score_docs: Vec<(u32, DocAddress, Ctid)> =
             index.reader()?.searcher().search(&text_query, &collector)?;
         assert_eq!(
             score_docs,
-            vec![(1, DocAddress::new(0, 1)), (0, DocAddress::new(0, 0)),]
+            vec![
+                (1, DocAddress::new(0, 1), INVALID_CTID),
+                (0, DocAddress::new(0, 0), INVALID_CTID),
+            ]
         );
         Ok(())
     }
@@ -1301,7 +1320,7 @@ mod tests {
         let collector = TopDocs::with_limit(2)
             .and_offset(1)
             .custom_score(move |_segment_reader: &SegmentReader| move |doc: DocId| doc);
-        let score_docs: Vec<(u32, DocAddress)> = index
+        let score_docs: Vec<(u32, DocAddress, Ctid)> = index
             .reader()
             .unwrap()
             .searcher()
@@ -1310,7 +1329,10 @@ mod tests {
 
         assert_eq!(
             score_docs,
-            vec![(1, DocAddress::new(0, 1)), (0, DocAddress::new(0, 0)),]
+            vec![
+                (1, DocAddress::new(0, 1), INVALID_CTID),
+                (0, DocAddress::new(0, 0), INVALID_CTID),
+            ]
         );
     }
 
@@ -1362,14 +1384,14 @@ mod tests {
         let searcher = index.reader()?.searcher();
 
         let top_collector = TopDocs::with_limit(4).order_by_fast_field(SIZE, Order::Asc);
-        let top_docs: Vec<(u64, DocAddress)> = searcher.search(&query, &top_collector)?;
+        let top_docs: Vec<(u64, DocAddress, Ctid)> = searcher.search(&query, &top_collector)?;
         assert_eq!(
             &top_docs[..],
             &[
-                (12, DocAddress::new(0, 0)),
-                (16, DocAddress::new(0, 2)),
-                (64, DocAddress::new(0, 1)),
-                (18446744073709551615, DocAddress::new(0, 3)),
+                (12, DocAddress::new(0, 0), INVALID_CTID),
+                (16, DocAddress::new(0, 2), INVALID_CTID),
+                (64, DocAddress::new(0, 1), INVALID_CTID),
+                (18446744073709551615, DocAddress::new(0, 3), INVALID_CTID),
             ]
         );
         Ok(())

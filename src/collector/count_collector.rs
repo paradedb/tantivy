@@ -1,6 +1,6 @@
 use super::Collector;
 use crate::collector::SegmentCollector;
-use crate::{DocId, Score, SegmentOrdinal, SegmentReader};
+use crate::{Ctid, DocId, Score, SegmentOrdinal, SegmentReader};
 
 /// `CountCollector` collector only counts how many
 /// documents match the query.
@@ -65,7 +65,7 @@ pub struct SegmentCountCollector {
 impl SegmentCollector for SegmentCountCollector {
     type Fruit = usize;
 
-    fn collect(&mut self, _: DocId, _: Score) {
+    fn collect(&mut self, _: DocId, _: Score, _: Ctid) {
         self.count += 1;
     }
 
@@ -78,6 +78,7 @@ impl SegmentCollector for SegmentCountCollector {
 mod tests {
     use super::{Count, SegmentCountCollector};
     use crate::collector::{Collector, SegmentCollector};
+    use crate::INVALID_CTID;
 
     #[test]
     fn test_count_collect_does_not_requires_scoring() {
@@ -92,18 +93,18 @@ mod tests {
         }
         {
             let mut count_collector = SegmentCountCollector::default();
-            count_collector.collect(0u32, 1.0);
+            count_collector.collect(0u32, 1.0, INVALID_CTID);
             assert_eq!(count_collector.harvest(), 1);
         }
         {
             let mut count_collector = SegmentCountCollector::default();
-            count_collector.collect(0u32, 1.0);
+            count_collector.collect(0u32, 1.0, INVALID_CTID);
             assert_eq!(count_collector.harvest(), 1);
         }
         {
             let mut count_collector = SegmentCountCollector::default();
-            count_collector.collect(0u32, 1.0);
-            count_collector.collect(1u32, 1.0);
+            count_collector.collect(0u32, 1.0, INVALID_CTID);
+            count_collector.collect(1u32, 1.0, INVALID_CTID);
             assert_eq!(count_collector.harvest(), 2);
         }
     }

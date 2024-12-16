@@ -30,7 +30,7 @@ fn extract_doc_given_isbn(
     let term_query = TermQuery::new(isbn_term.clone(), IndexRecordOption::Basic);
     let top_docs = searcher.search(&term_query, &TopDocs::with_limit(1))?;
 
-    if let Some((_score, doc_address)) = top_docs.first() {
+    if let Some((_score, doc_address, _ctid)) = top_docs.first() {
         let doc = searcher.doc(*doc_address)?;
         Ok(Some(doc))
     } else {

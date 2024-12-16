@@ -2,8 +2,9 @@ use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::index::SegmentReader;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
-use crate::{DocId, Score};
+use crate::query::{EnableScoring, Explanation, InvertedIndexRangeWeight, Query, Scorer, Weight};
+use crate::{Ctid, DocId, Score, INVALID_CTID};
+use std::ops::Bound;
 
 /// Query that matches all of the documents.
 ///
@@ -12,8 +13,27 @@ use crate::{DocId, Score};
 pub struct AllQuery;
 
 impl Query for AllQuery {
-    fn weight(&self, _: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        Ok(Box::new(AllWeight))
+    fn weight(&self, scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        match scoring
+            .schema()
+            .fields()
+            .find(|(_, field)| field.is_key_field())
+        {
+            Some((key_field, _)) => Ok(Box::new(InvertedIndexRangeWeight::new(
+                key_field,
+                &Bound::Unbounded,
+                &Bound::Unbounded,
+                None,
+            ))),
+            None => {
+                if cfg!(test) {
+                    // only used for testing
+                    Ok(Box::new(AllWeight))
+                } else {
+                    panic!("`AllQuery` requires a designated key field in the schema")
+                }
+            }
+        }
     }
 }
 
@@ -42,6 +62,7 @@ pub struct AllScorer {
 
 impl AllScorer {
     /// Creates a new AllScorer with `max_doc` docs.
+    #[allow(unused)]
     pub fn new(max_doc: DocId) -> AllScorer {
         AllScorer { doc: 0u32, max_doc }
     }
@@ -58,21 +79,30 @@ impl DocSet for AllScorer {
         self.doc
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
+    fn fill_buffer(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+    ) -> usize {
         if self.doc() == TERMINATED {
             return 0;
         }
         let is_safe_distance = self.doc() + (buffer.len() as u32) < self.max_doc;
         if is_safe_distance {
             let num_items = buffer.len();
-            for buffer_val in buffer {
+            for (buffer_val, ctid_val) in buffer.iter_mut().zip(ctid_buffer.iter_mut()) {
                 *buffer_val = self.doc();
+                *ctid_val = INVALID_CTID;
+
                 self.doc += 1;
             }
             num_items
         } else {
-            for (i, buffer_val) in buffer.iter_mut().enumerate() {
+            for (i, (buffer_val, ctid_val)) in
+                buffer.iter_mut().zip(ctid_buffer.iter_mut()).enumerate()
+            {
                 *buffer_val = self.doc();
+                *ctid_val = INVALID_CTID;
                 if self.advance() == TERMINATED {
                     return i + 1;
                 }
@@ -86,14 +116,23 @@ impl DocSet for AllScorer {
         self.doc
     }
 
+    fn ctid(&self) -> Ctid {
+        // hardcoded for tests
+        INVALID_CTID
+    }
+
     fn size_hint(&self) -> u32 {
         self.max_doc
     }
 }
 
 impl Scorer for AllScorer {
-    fn score(&mut self) -> Score {
-        1.0
+    fn score(&mut self) -> (Score, Ctid) {
+        if cfg!(test) {
+            (1.0, INVALID_CTID)
+        } else {
+            unreachable!("AllScorer is not directly supported anymore and should not be called")
+        }
     }
 }
 
@@ -152,12 +191,12 @@ mod tests {
         {
             let mut scorer = weight.scorer(reader, 2.0)?;
             assert_eq!(scorer.doc(), 0u32);
-            assert_eq!(scorer.score(), 2.0);
+            assert_eq!(scorer.score().0, 2.0);
         }
         {
             let mut scorer = weight.scorer(reader, 1.5)?;
             assert_eq!(scorer.doc(), 0u32);
-            assert_eq!(scorer.score(), 1.5);
+            assert_eq!(scorer.score().0, 1.5);
         }
         Ok(())
     }
@@ -169,14 +208,21 @@ mod tests {
             max_doc: COLLECT_BLOCK_BUFFER_LEN as u32 * 2 + 9,
         };
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        let mut ctid_buffer = [(0, 0); COLLECT_BLOCK_BUFFER_LEN];
+        assert_eq!(
+            postings.fill_buffer(&mut buffer, &mut ctid_buffer),
+            COLLECT_BLOCK_BUFFER_LEN
+        );
         for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        assert_eq!(
+            postings.fill_buffer(&mut buffer, &mut ctid_buffer),
+            COLLECT_BLOCK_BUFFER_LEN
+        );
         for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i + COLLECT_BLOCK_BUFFER_LEN as u32);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), 9);
+        assert_eq!(postings.fill_buffer(&mut buffer, &mut ctid_buffer), 9);
     }
 }

@@ -1,7 +1,7 @@
+use common::BitSet;
+use rustc_hash::FxHashMap;
 use std::io;
 use std::sync::Arc;
-
-use common::BitSet;
 use tantivy_fst::Automaton;
 
 use super::phrase_prefix_query::prefix_end;
@@ -74,6 +74,7 @@ where
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let max_doc = reader.max_doc();
         let mut doc_bitset = BitSet::with_max_value(max_doc);
+        let mut ctids_map = FxHashMap::default();
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
         let mut term_stream = self.automaton_stream(term_dict)?;
@@ -83,16 +84,18 @@ where
                 .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
             loop {
                 let docs = block_segment_postings.docs();
+                let ctids = block_segment_postings.ctids();
                 if docs.is_empty() {
                     break;
                 }
-                for &doc in docs {
+                for ((&doc, &blockno), &offno) in docs.iter().zip(ctids.0).zip(ctids.1) {
                     doc_bitset.insert(doc);
+                    ctids_map.insert(doc, (blockno, offno as u16));
                 }
                 block_segment_postings.advance();
             }
         }
-        let doc_bitset = BitSetDocSet::from(doc_bitset);
+        let doc_bitset = BitSetDocSet::from((doc_bitset, ctids_map));
         let const_scorer = ConstScorer::new(doc_bitset, boost);
         Ok(Box::new(const_scorer))
     }
@@ -175,10 +178,10 @@ mod tests {
         let searcher = reader.searcher();
         let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
         assert_eq!(scorer.doc(), 0u32);
-        assert_eq!(scorer.score(), 1.0);
+        assert_eq!(scorer.score().0, 1.0);
         assert_eq!(scorer.advance(), 2u32);
         assert_eq!(scorer.doc(), 2u32);
-        assert_eq!(scorer.score(), 1.0);
+        assert_eq!(scorer.score().0, 1.0);
         assert_eq!(scorer.advance(), TERMINATED);
         Ok(())
     }
@@ -192,7 +195,7 @@ mod tests {
         let searcher = reader.searcher();
         let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.32)?;
         assert_eq!(scorer.doc(), 0u32);
-        assert_eq!(scorer.score(), 1.32);
+        assert_eq!(scorer.score().0, 1.32);
         Ok(())
     }
 }

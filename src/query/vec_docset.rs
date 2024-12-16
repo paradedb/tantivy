@@ -3,7 +3,7 @@
 use common::HasLen;
 
 use crate::docset::{DocSet, TERMINATED};
-use crate::DocId;
+use crate::{Ctid, DocId, INVALID_CTID};
 
 /// Simulate a `Postings` objects from a `VecPostings`.
 /// `VecPostings` only exist for testing purposes.
@@ -36,6 +36,11 @@ impl DocSet for VecDocSet {
             return TERMINATED;
         }
         self.doc_ids[self.cursor]
+    }
+
+    fn ctid(&self) -> Ctid {
+        // hardcoded for testing purposes
+        INVALID_CTID
     }
 
     fn size_hint(&self) -> u32 {
@@ -74,14 +79,21 @@ pub mod tests {
         let doc_ids: Vec<DocId> = (1u32..=(COLLECT_BLOCK_BUFFER_LEN as u32 * 2 + 9)).collect();
         let mut postings = VecDocSet::from(doc_ids);
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        let mut ctid_buffer = [(0, 0); COLLECT_BLOCK_BUFFER_LEN];
+        assert_eq!(
+            postings.fill_buffer(&mut buffer, &mut ctid_buffer),
+            COLLECT_BLOCK_BUFFER_LEN
+        );
         for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i + 1);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        assert_eq!(
+            postings.fill_buffer(&mut buffer, &mut ctid_buffer),
+            COLLECT_BLOCK_BUFFER_LEN
+        );
         for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i + 1 + COLLECT_BLOCK_BUFFER_LEN as u32);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), 9);
+        assert_eq!(postings.fill_buffer(&mut buffer, &mut ctid_buffer), 9);
     }
 }

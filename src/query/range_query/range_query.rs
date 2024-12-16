@@ -1,8 +1,8 @@
-use std::io;
-use std::ops::Bound;
-
 use common::bounds::{map_bound, BoundsRange};
 use common::BitSet;
+use rustc_hash::FxHashMap;
+use std::io;
+use std::ops::Bound;
 
 use super::range_query_fastfield::FastFieldRangeWeight;
 use crate::index::SegmentReader;
@@ -70,6 +70,7 @@ use crate::{DocId, Score};
 #[derive(Clone, Debug)]
 pub struct RangeQuery {
     bounds: BoundsRange<Term>,
+    path: Option<String>,
 }
 
 impl RangeQuery {
@@ -80,12 +81,28 @@ impl RangeQuery {
     pub fn new(lower_bound: Bound<Term>, upper_bound: Bound<Term>) -> RangeQuery {
         RangeQuery {
             bounds: BoundsRange::new(lower_bound, upper_bound),
+            path: None,
+        }
+    }
+
+    pub fn with_path(
+        lower_bound: Bound<Term>,
+        upper_bound: Bound<Term>,
+        path: Option<String>,
+    ) -> RangeQuery {
+        RangeQuery {
+            bounds: BoundsRange::new(lower_bound, upper_bound),
+            path,
         }
     }
 
     /// Field to search over
     pub fn field(&self) -> Field {
         self.get_term().field()
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
     }
 
     /// The value type of the field
@@ -105,20 +122,34 @@ impl Query for RangeQuery {
         let schema = enable_scoring.schema();
         let field_type = schema.get_field_entry(self.field()).field_type();
 
-        if field_type.is_fast() && is_type_valid_for_fastfield_range_query(self.value_type()) {
+        if schema.find_key_field_name().is_none()
+            && field_type.is_fast()
+            && is_type_valid_for_fastfield_range_query(self.value_type())
+        {
             Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
         } else {
-            if field_type.is_json() {
-                return Err(crate::TantivyError::InvalidArgument(
-                    "RangeQuery on JSON is only supported for fast fields currently".to_string(),
-                ));
+            // if field_type.is_json() {
+            //     return Err(crate::TantivyError::InvalidArgument(
+            //         "RangeQuery on JSON is only supported for fast fields currently".to_string(),
+            //     ));
+            // }
+
+            if let Some(path) = &self.path {
+                Ok(Box::new(InvertedIndexRangeWeight::with_path(
+                    self.field(),
+                    path,
+                    &self.bounds.lower_bound,
+                    &self.bounds.upper_bound,
+                    None,
+                )))
+            } else {
+                Ok(Box::new(InvertedIndexRangeWeight::new(
+                    self.field(),
+                    &self.bounds.lower_bound,
+                    &self.bounds.upper_bound,
+                    None,
+                )))
             }
-            Ok(Box::new(InvertedIndexRangeWeight::new(
-                self.field(),
-                &self.bounds.lower_bound,
-                &self.bounds.upper_bound,
-                None,
-            )))
         }
     }
 }
@@ -164,8 +195,10 @@ impl Query for InvertedIndexRangeQuery {
 }
 
 /// Range weight on the inverted index
+#[derive(Clone)]
 pub struct InvertedIndexRangeWeight {
     field: Field,
+    path: Option<Vec<u8>>,
     lower_bound: Bound<Vec<u8>>,
     upper_bound: Bound<Vec<u8>>,
     limit: Option<u64>,
@@ -184,6 +217,30 @@ impl InvertedIndexRangeWeight {
         let verify_and_unwrap_term = |val: &Term| val.serialized_value_bytes().to_owned();
         Self {
             field,
+            path: None,
+            lower_bound: map_bound(lower_bound, verify_and_unwrap_term),
+            upper_bound: map_bound(upper_bound, verify_and_unwrap_term),
+            limit,
+        }
+    }
+
+    pub fn with_path(
+        field: Field,
+        path: &str,
+        lower_bound: &Bound<Term>,
+        upper_bound: &Bound<Term>,
+        limit: Option<u64>,
+    ) -> Self {
+        let verify_and_unwrap_term = |val: &Term| val.serialized_value_bytes().to_owned();
+        Self {
+            field,
+            path: Some(
+                path.as_bytes()
+                    .iter()
+                    .map(|b| if *b == b'.' { 1 } else { *b }) // convert dot separators into 1
+                    .chain(std::iter::once(0)) // null terminate the path
+                    .collect(),
+            ),
             lower_bound: map_bound(lower_bound, verify_and_unwrap_term),
             upper_bound: map_bound(upper_bound, verify_and_unwrap_term),
             limit,
@@ -215,7 +272,7 @@ impl Weight for InvertedIndexRangeWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let max_doc = reader.max_doc();
         let mut doc_bitset = BitSet::with_max_value(max_doc);
-
+        let mut ctids_map = FxHashMap::default();
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
         let mut term_range = self.term_range(term_dict)?;
@@ -226,22 +283,31 @@ impl Weight for InvertedIndexRangeWeight {
                     break;
                 }
             }
+
+            if let Some(path) = &self.path {
+                if !term_range.key().starts_with(path) {
+                    continue;
+                }
+            }
+
             processed_count += 1;
             let term_info = term_range.value();
             let mut block_segment_postings = inverted_index
                 .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
             loop {
                 let docs = block_segment_postings.docs();
+                let ctids = block_segment_postings.ctids();
                 if docs.is_empty() {
                     break;
                 }
-                for &doc in block_segment_postings.docs() {
+                for ((&doc, &blockno), &offno) in docs.iter().zip(ctids.0).zip(ctids.1) {
                     doc_bitset.insert(doc);
+                    ctids_map.insert(doc, (blockno, offno as u16));
                 }
                 block_segment_postings.advance();
             }
         }
-        let doc_bitset = BitSetDocSet::from(doc_bitset);
+        let doc_bitset = BitSetDocSet::from((doc_bitset, ctids_map));
         Ok(Box::new(ConstScorer::new(doc_bitset, boost)))
     }
 

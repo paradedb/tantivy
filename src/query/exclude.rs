@@ -1,6 +1,6 @@
 use crate::docset::{DocSet, TERMINATED};
 use crate::query::Scorer;
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score};
 
 #[inline]
 fn is_within<TDocSetExclude: DocSet>(docset: &mut TDocSetExclude, doc: DocId) -> bool {
@@ -71,6 +71,10 @@ where
         self.underlying_docset.doc()
     }
 
+    fn ctid(&self) -> Ctid {
+        self.underlying_docset.ctid()
+    }
+
     /// `.size_hint()` directly returns the size
     /// of the underlying docset without taking in account
     /// the fact that docs might be deleted.
@@ -84,7 +88,7 @@ where
     TScorer: Scorer,
     TDocSetExclude: DocSet + 'static,
 {
-    fn score(&mut self) -> Score {
+    fn score(&mut self) -> (Score, Ctid) {
         self.underlying_docset.score()
     }
 }

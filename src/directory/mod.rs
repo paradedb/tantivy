@@ -5,6 +5,7 @@ mod mmap_directory;
 
 mod directory;
 mod directory_lock;
+#[cfg(feature = "mmap")]
 mod file_watcher;
 mod footer;
 mod managed_directory;

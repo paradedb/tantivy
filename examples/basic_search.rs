@@ -216,7 +216,7 @@ fn main() -> tantivy::Result<()> {
     // Since the body field was not configured as stored,
     // the document returned will only contain
     // a title.
-    for (_score, doc_address) in top_docs {
+    for (_score, doc_address, _ctid) in top_docs {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
         println!("{}", retrieved_doc.to_json(&schema));
     }
@@ -225,7 +225,7 @@ fn main() -> tantivy::Result<()> {
     // how a found document got its score.
     let query = query_parser.parse_query("title:sea^20 body:whale^70")?;
 
-    let (_score, doc_address) = searcher
+    let (_score, doc_address, _ctid) = searcher
         .search(&query, &TopDocs::with_limit(1))?
         .into_iter()
         .next()

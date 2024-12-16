@@ -3,7 +3,7 @@ use common::TinySet;
 use crate::docset::{DocSet, TERMINATED};
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::Scorer;
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score, INVALID_CTID};
 
 const HORIZON_NUM_TINYBITSETS: usize = 64;
 const HORIZON: u32 = 64u32 * HORIZON_NUM_TINYBITSETS as u32;
@@ -14,7 +14,9 @@ const HORIZON: u32 = 64u32 * HORIZON_NUM_TINYBITSETS as u32;
 //
 // Also, it does not "yield" any elements.
 fn unordered_drain_filter<T, P>(v: &mut Vec<T>, mut predicate: P)
-where P: FnMut(&mut T) -> bool {
+where
+    P: FnMut(&mut T) -> bool,
+{
     let mut i = 0;
     while i < v.len() {
         if predicate(&mut v[i]) {
@@ -33,7 +35,7 @@ pub struct Union<TScorer, TScoreCombiner = DoNothingCombiner> {
     cursor: usize,
     offset: DocId,
     doc: DocId,
-    score: Score,
+    score: (Score, Ctid),
 }
 
 fn refill<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
@@ -52,7 +54,7 @@ fn refill<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
             // add this document
             let delta = doc - min_doc;
             bitsets[(delta / 64) as usize].insert_mut(delta % 64u32);
-            score_combiner[delta as usize].update(scorer);
+            let _ = score_combiner[delta as usize].update(scorer);
             if scorer.advance() == TERMINATED {
                 // remove the docset, it has been entirely consumed.
                 return true;
@@ -66,10 +68,14 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Union<TScorer, TScoreCombin
         docsets: Vec<TScorer>,
         score_combiner_fn: impl FnOnce() -> TScoreCombiner,
     ) -> Union<TScorer, TScoreCombiner> {
-        let non_empty_docsets: Vec<TScorer> = docsets
+        let mut non_empty_docsets: Vec<TScorer> = docsets
             .into_iter()
             .filter(|docset| docset.doc() != TERMINATED)
             .collect();
+        let ctid = non_empty_docsets
+            .get_mut(0)
+            .map(|scorer| scorer.score().1)
+            .unwrap_or(INVALID_CTID);
         let mut union = Union {
             docsets: non_empty_docsets,
             bitsets: Box::new([TinySet::empty(); HORIZON_NUM_TINYBITSETS]),
@@ -77,7 +83,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Union<TScorer, TScoreCombin
             cursor: HORIZON_NUM_TINYBITSETS,
             offset: 0,
             doc: 0,
-            score: 0.0,
+            score: (0.0, ctid),
         };
         if union.refill() {
             union.advance();
@@ -199,6 +205,10 @@ where
         self.doc
     }
 
+    fn ctid(&self) -> Ctid {
+        self.score.1
+    }
+
     fn size_hint(&self) -> u32 {
         self.docsets
             .iter()
@@ -235,7 +245,7 @@ where
     TScoreCombiner: ScoreCombiner,
     TScorer: Scorer,
 {
-    fn score(&mut self) -> Score {
+    fn score(&mut self) -> (Score, Ctid) {
         self.score
     }
 }

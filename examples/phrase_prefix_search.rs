@@ -66,7 +66,7 @@ fn main() -> Result<()> {
     let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
     let mut titles = top_docs
         .into_iter()
-        .map(|(_score, doc_address)| {
+        .map(|(_score, doc_address, _ctid)| {
             let doc = searcher.doc::<TantivyDocument>(doc_address)?;
             let title = doc
                 .get_first(title)

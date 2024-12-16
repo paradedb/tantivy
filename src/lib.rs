@@ -1,7 +1,7 @@
 #![doc(html_logo_url = "http://fulmicoton.com/tantivy-logo/tantivy-logo.png")]
 #![cfg_attr(all(feature = "unstable", test), feature(test))]
 #![doc(test(attr(allow(unused_variables), deny(warnings))))]
-#![warn(missing_docs)]
+// #![warn(missing_docs)]
 #![allow(
     clippy::len_without_is_empty,
     clippy::derive_partial_eq_without_eq,
@@ -292,6 +292,11 @@ pub mod merge_policy {
 ///
 /// At most, a segment can contain 2^31 documents.
 pub type DocId = u32;
+
+pub type Ctid = (u32, u16);
+pub const INVALID_BLOCK_NUMBER: u32 = 0xFFFFFFFF;
+pub const INVALID_OFFSET_NUMBER: u16 = 0;
+pub const INVALID_CTID: Ctid = (INVALID_BLOCK_NUMBER, INVALID_OFFSET_NUMBER);
 
 /// A u64 assigned to every operation incrementally
 ///

@@ -1,7 +1,7 @@
 use std::borrow::{Borrow, BorrowMut};
 
 use crate::fastfield::AliveBitSet;
-use crate::DocId;
+use crate::{Ctid, DocId};
 
 /// Sentinel value returned when a [`DocSet`] has been entirely consumed.
 ///
@@ -64,12 +64,18 @@ pub trait DocSet: Send {
     /// This method is only here for specific high-performance
     /// use case where batching. The normal way to
     /// go through the `DocId`'s is to call `.advance()`.
-    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
+    fn fill_buffer(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+    ) -> usize {
         if self.doc() == TERMINATED {
             return 0;
         }
-        for (i, buffer_val) in buffer.iter_mut().enumerate() {
+        for (i, (buffer_val, ctid_val)) in buffer.iter_mut().zip(ctid_buffer.iter_mut()).enumerate()
+        {
             *buffer_val = self.doc();
+            *ctid_val = self.ctid();
             if self.advance() == TERMINATED {
                 return i + 1;
             }
@@ -82,6 +88,10 @@ pub trait DocSet: Send {
     ///
     /// If the `DocSet` is empty, `.doc()` should return [`TERMINATED`].
     fn doc(&self) -> DocId;
+
+    fn ctid(&self) -> Ctid {
+        todo!("DocSet::ctid() for {}", std::any::type_name_of_val(self))
+    }
 
     /// Returns a best-effort hint of the
     /// length of the docset.
@@ -130,6 +140,10 @@ impl<'a> DocSet for &'a mut dyn DocSet {
         (**self).doc()
     }
 
+    fn ctid(&self) -> Ctid {
+        (**self).ctid()
+    }
+
     fn size_hint(&self) -> u32 {
         (**self).size_hint()
     }
@@ -154,14 +168,23 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
         unboxed.seek(target)
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
+    fn fill_buffer(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+    ) -> usize {
         let unboxed: &mut TDocSet = self.borrow_mut();
-        unboxed.fill_buffer(buffer)
+        unboxed.fill_buffer(buffer, ctid_buffer)
     }
 
     fn doc(&self) -> DocId {
         let unboxed: &TDocSet = self.borrow();
         unboxed.doc()
+    }
+
+    fn ctid(&self) -> Ctid {
+        let unboxed: &TDocSet = self.borrow();
+        unboxed.ctid()
     }
 
     fn size_hint(&self) -> u32 {

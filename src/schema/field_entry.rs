@@ -19,6 +19,8 @@ pub struct FieldEntry {
     name: String,
     #[serde(flatten)]
     field_type: FieldType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_key_field: Option<bool>,
 }
 
 impl FieldEntry {
@@ -28,6 +30,7 @@ impl FieldEntry {
         FieldEntry {
             name: field_name,
             field_type,
+            is_key_field: None,
         }
     }
 
@@ -131,6 +134,14 @@ impl FieldEntry {
             FieldType::JsonObject(ref options) => options.is_stored(),
             FieldType::IpAddr(ref options) => options.is_stored(),
         }
+    }
+
+    pub fn is_key_field(&self) -> bool {
+        self.is_key_field.unwrap_or(false)
+    }
+
+    pub fn set_key_field(&mut self) {
+        self.is_key_field = Some(true);
     }
 }
 

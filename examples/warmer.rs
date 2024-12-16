@@ -8,7 +8,7 @@ use tantivy::query::QueryParser;
 use tantivy::schema::{Schema, FAST, TEXT};
 use tantivy::{
     doc, DocAddress, DocId, Index, IndexWriter, Opstamp, Searcher, SearcherGeneration,
-    SegmentReader, Warmer,
+    SegmentReader, Warmer, INVALID_CTID,
 };
 
 // This example shows how warmers can be used to
@@ -175,14 +175,16 @@ fn main() -> tantivy::Result<()> {
                 DocAddress {
                     segment_ord: 0,
                     doc_id: 0u32
-                }
+                },
+                INVALID_CTID
             ),
             (
                 Reverse(13u32),
                 DocAddress {
                     segment_ord: 0,
                     doc_id: 1u32
-                }
+                },
+                INVALID_CTID
             ),
         ]
     );
@@ -209,14 +211,16 @@ fn main() -> tantivy::Result<()> {
                 DocAddress {
                     segment_ord: 0,
                     doc_id: 1u32
-                }
+                },
+                INVALID_CTID
             ),
             (
                 Reverse(15u32),
                 DocAddress {
                     segment_ord: 0,
                     doc_id: 0u32
-                }
+                },
+                INVALID_CTID
             ),
         ]
     );

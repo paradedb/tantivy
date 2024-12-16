@@ -36,7 +36,7 @@ mod tests {
         let segment_reader = searcher.segment_reader(0);
         let mut term_scorer = term_weight.scorer(segment_reader, 1.0)?;
         assert_eq!(term_scorer.doc(), 0);
-        assert_nearly_equals!(term_scorer.score(), 0.28768212);
+        assert_nearly_equals!(term_scorer.score().0, 0.28768212);
         Ok(())
     }
 
@@ -99,7 +99,7 @@ mod tests {
             let term_query = TermQuery::new(term, IndexRecordOption::WithFreqs);
             let topdocs = searcher.search(&term_query, &TopDocs::with_limit(2))?;
             assert_eq!(topdocs.len(), 1);
-            let (score, _) = topdocs[0];
+            let (score, _, _) = topdocs[0];
             assert_nearly_equals!(0.77802235, score);
         }
         {
@@ -107,9 +107,9 @@ mod tests {
             let term_query = TermQuery::new(term, IndexRecordOption::WithFreqs);
             let top_docs = searcher.search(&term_query, &TopDocs::with_limit(2))?;
             assert_eq!(top_docs.len(), 2);
-            let (score1, _) = top_docs[0];
+            let (score1, _, _) = top_docs[0];
             assert_nearly_equals!(0.27101856, score1);
-            let (score2, _) = top_docs[1];
+            let (score2, _, _) = top_docs[1];
             assert_nearly_equals!(0.13736556, score2);
         }
         {
@@ -117,9 +117,9 @@ mod tests {
             let query = query_parser.parse_query("left:left2 left:left1")?;
             let top_docs = searcher.search(&query, &TopDocs::with_limit(2))?;
             assert_eq!(top_docs.len(), 2);
-            let (score1, _) = top_docs[0];
+            let (score1, _, _) = top_docs[0];
             assert_nearly_equals!(0.9153879, score1);
-            let (score2, _) = top_docs[1];
+            let (score2, _, _) = top_docs[1];
             assert_nearly_equals!(0.27101856, score2);
         }
         Ok(())

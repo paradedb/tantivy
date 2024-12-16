@@ -139,7 +139,7 @@ impl Collector for TestCollector {
 impl SegmentCollector for TestSegmentCollector {
     type Fruit = TestFruit;
 
-    fn collect(&mut self, doc: DocId, score: Score) {
+    fn collect(&mut self, doc: DocId, score: Score, _ctid: Ctid) {
         self.fruit.docs.push(DocAddress::new(self.segment_id, doc));
         self.fruit.scores.push(score);
     }
@@ -201,7 +201,7 @@ impl Collector for FastFieldTestCollector {
 impl SegmentCollector for FastFieldSegmentCollector {
     type Fruit = Vec<u64>;
 
-    fn collect(&mut self, doc: DocId, _score: Score) {
+    fn collect(&mut self, doc: DocId, _score: Score, _ctid: Ctid) {
         self.vals.extend(self.reader.values_for_doc(doc));
     }
 
@@ -262,7 +262,7 @@ impl Collector for BytesFastFieldTestCollector {
 impl SegmentCollector for BytesFastFieldSegmentCollector {
     type Fruit = Vec<u8>;
 
-    fn collect(&mut self, doc: DocId, _score: Score) {
+    fn collect(&mut self, doc: DocId, _score: Score, _ctid: Ctid) {
         if let Some(column) = self.column_opt.as_ref() {
             for term_ord in column.term_ords(doc) {
                 let (vals, buffer) = (&mut self.vals, &mut self.buffer);

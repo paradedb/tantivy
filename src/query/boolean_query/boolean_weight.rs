@@ -12,7 +12,7 @@ use crate::query::{
     intersect_scorers, EmptyScorer, Exclude, Explanation, Occur, RequiredOptionalScorer, Scorer,
     Union, Weight,
 };
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score};
 
 enum SpecializedScorer {
     TermUnion(Vec<TermScorer>),
@@ -277,7 +277,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             return Ok(Explanation::new("BooleanQuery with no scoring", 1.0));
         }
 
-        let mut explanation = Explanation::new("BooleanClause. sum of ...", scorer.score());
+        let mut explanation = Explanation::new("BooleanClause. sum of ...", scorer.score().0);
         for (occur, subweight) in &self.weights {
             if is_positive_occur(*occur) {
                 if let Ok(child_explanation) = subweight.explain(reader, doc) {
@@ -291,7 +291,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
     fn for_each(
         &self,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(DocId, Score),
+        callback: &mut dyn FnMut(DocId, Score, Ctid),
     ) -> crate::Result<()> {
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
         match scorer {
@@ -309,18 +309,24 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
     fn for_each_no_score(
         &self,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(&[DocId]),
+        callback: &mut dyn FnMut(&[DocId], &[Ctid]),
     ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, || DoNothingCombiner)?;
+        let scorer = self.complex_scorer(reader, 1.0, || DoNothingCombiner::default())?;
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+        let mut ctid_buffer = [(0, 0); COLLECT_BLOCK_BUFFER_LEN];
 
         match scorer {
             SpecializedScorer::TermUnion(term_scorers) => {
                 let mut union_scorer = Union::build(term_scorers, &self.score_combiner_fn);
-                for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+                for_each_docset_buffered(
+                    &mut union_scorer,
+                    &mut buffer,
+                    &mut ctid_buffer,
+                    callback,
+                );
             }
             SpecializedScorer::Other(mut scorer) => {
-                for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
+                for_each_docset_buffered(scorer.as_mut(), &mut buffer, &mut ctid_buffer, callback);
             }
         }
         Ok(())
@@ -340,7 +346,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         &self,
         threshold: Score,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(DocId, Score) -> Score,
+        callback: &mut dyn FnMut(DocId, Score, Ctid) -> Score,
     ) -> crate::Result<()> {
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
         match scorer {

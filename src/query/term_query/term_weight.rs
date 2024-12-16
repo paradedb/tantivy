@@ -8,7 +8,7 @@ use crate::query::explanation::does_not_match;
 use crate::query::weight::{for_each_docset_buffered, for_each_scorer};
 use crate::query::{Explanation, Scorer, Weight};
 use crate::schema::IndexRecordOption;
-use crate::{DocId, Score, Term};
+use crate::{Ctid, DocId, Score, Term};
 
 pub struct TermWeight {
     term: Term,
@@ -49,7 +49,7 @@ impl Weight for TermWeight {
     fn for_each(
         &self,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(DocId, Score),
+        callback: &mut dyn FnMut(DocId, Score, Ctid),
     ) -> crate::Result<()> {
         let mut scorer = self.specialized_scorer(reader, 1.0)?;
         for_each_scorer(&mut scorer, callback);
@@ -61,11 +61,12 @@ impl Weight for TermWeight {
     fn for_each_no_score(
         &self,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(&[DocId]),
+        callback: &mut dyn FnMut(&[DocId], &[Ctid]),
     ) -> crate::Result<()> {
         let mut scorer = self.specialized_scorer(reader, 1.0)?;
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        for_each_docset_buffered(&mut scorer, &mut buffer, callback);
+        let mut ctid_buffer = [(0, 0); COLLECT_BLOCK_BUFFER_LEN];
+        for_each_docset_buffered(&mut scorer, &mut buffer, &mut ctid_buffer, callback);
         Ok(())
     }
 
@@ -83,7 +84,7 @@ impl Weight for TermWeight {
         &self,
         threshold: Score,
         reader: &SegmentReader,
-        callback: &mut dyn FnMut(DocId, Score) -> Score,
+        callback: &mut dyn FnMut(DocId, Score, Ctid) -> Score,
     ) -> crate::Result<()> {
         let scorer = self.specialized_scorer(reader, 1.0)?;
         crate::query::boolean_query::block_wand_single_scorer(scorer, threshold, callback);

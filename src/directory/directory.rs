@@ -239,21 +239,25 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
 
     /// Allows the directory to register a file as managed, overriding the ManagedDirectory's
     /// default register_file_as_managed
-    fn register_files_as_managed(&self, files: Vec<PathBuf>, overwrite: bool) -> crate::Result<()> {
+    fn register_files_as_managed(
+        &self,
+        _files: Vec<PathBuf>,
+        _overwrite: bool,
+    ) -> crate::Result<()> {
         Err(crate::TantivyError::InternalError(
             "register_files_as_managed not implemented".to_string(),
         ))
     }
 
     /// Allows the directory to save IndexMeta, overriding the SegmentUpdater's default save_meta
-    fn save_metas(&self, metas: &IndexMeta, previous_metas: &IndexMeta) -> crate::Result<()> {
+    fn save_metas(&self, _metas: &IndexMeta, _previous_metas: &IndexMeta) -> crate::Result<()> {
         Err(crate::TantivyError::InternalError(
             "save_meta not implemented".to_string(),
         ))
     }
 
     /// Allows the directory to load IndexMeta, overriding the SegmentUpdater's default load_meta
-    fn load_metas(&self, inventory: &SegmentMetaInventory) -> crate::Result<IndexMeta> {
+    fn load_metas(&self, _inventory: &SegmentMetaInventory) -> crate::Result<IndexMeta> {
         Err(crate::TantivyError::InternalError(
             "load_metas not implemented".to_string(),
         ))
@@ -267,7 +271,8 @@ pub trait DirectoryClone {
 }
 
 impl<T> DirectoryClone for T
-where T: 'static + Directory + Clone
+where
+    T: 'static + Directory + Clone,
 {
     fn box_clone(&self) -> Box<dyn Directory> {
         Box::new(self.clone())

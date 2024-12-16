@@ -13,7 +13,7 @@ use crate::directory::error::OpenReadError;
 #[cfg(feature = "mmap")]
 use crate::directory::MmapDirectory;
 use crate::directory::{
-    Directory, DirectoryLock, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK,
+    Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK,
 };
 use crate::error::{DataCorruption, TantivyError};
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};

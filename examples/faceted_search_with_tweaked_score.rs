@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use tantivy::collector::TopDocs;
 use tantivy::query::BooleanQuery;
 use tantivy::schema::*;
-use tantivy::{doc, DocId, Index, IndexWriter, Score, SegmentReader};
+use tantivy::{doc, Ctid, DocId, Index, IndexWriter, Score, SegmentReader};
 
 fn main() -> tantivy::Result<()> {
     let mut schema_builder = Schema::builder();
@@ -74,7 +74,7 @@ fn main() -> tantivy::Result<()> {
                     .filter_map(|key| facet_dict.term_ord(key.encoded_str()).unwrap())
                     .collect();
 
-                move |doc: DocId, original_score: Score| {
+                move |doc: DocId, original_score: Score, _ctid: Ctid| {
                     // Update the original score with a tweaked score
                     let missing_ingredients = ingredient_reader
                         .facet_ords(doc)
@@ -89,7 +89,7 @@ fn main() -> tantivy::Result<()> {
 
         let titles: Vec<String> = top_docs
             .iter()
-            .map(|(_, doc_id)| {
+            .map(|(_, doc_id, _ctid)| {
                 searcher
                     .doc::<TantivyDocument>(*doc_id)
                     .unwrap()

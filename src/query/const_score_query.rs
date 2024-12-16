@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
-use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
+use crate::{Ctid, DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
 /// `ConstScoreQuery` is a wrapper over a query to provide a constant score.
 /// It can avoid unnecessary score computation on the wrapped query.
@@ -119,12 +119,20 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
         self.docset.seek(target)
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
-        self.docset.fill_buffer(buffer)
+    fn fill_buffer(
+        &mut self,
+        buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN],
+        ctid_buffer: &mut [Ctid; COLLECT_BLOCK_BUFFER_LEN],
+    ) -> usize {
+        self.docset.fill_buffer(buffer, ctid_buffer)
     }
 
     fn doc(&self) -> DocId {
         self.docset.doc()
+    }
+
+    fn ctid(&self) -> Ctid {
+        self.docset.ctid()
     }
 
     fn size_hint(&self) -> u32 {
@@ -133,8 +141,8 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
 }
 
 impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
-    fn score(&mut self) -> Score {
-        self.score
+    fn score(&mut self) -> (Score, Ctid) {
+        (self.score, self.docset.ctid())
     }
 }
 

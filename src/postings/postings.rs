@@ -1,4 +1,5 @@
 use crate::docset::DocSet;
+use crate::Ctid;
 
 /// Postings (also called inverted list)
 ///
@@ -13,6 +14,9 @@ use crate::docset::DocSet;
 pub trait Postings: DocSet + 'static {
     /// The number of times the term appears in the document.
     fn term_freq(&self) -> u32;
+
+    /// The Postgres `Ctid` of this posting
+    fn ctid_value(&self) -> Ctid;
 
     /// Returns the positions offsetted with a given value.
     /// It is not necessary to clear the `output` before calling this method.

@@ -9,7 +9,7 @@ mod tests {
         self, BytesOptions, Facet, FacetOptions, IndexRecordOption, NumericOptions,
         TextFieldIndexing, TextOptions,
     };
-    use crate::{DocAddress, DocSet, IndexSettings, IndexWriter, Term};
+    use crate::{Ctid, DocAddress, DocSet, IndexSettings, IndexWriter, Term};
 
     fn create_test_index(index_settings: Option<IndexSettings>) -> crate::Result<Index> {
         let mut schema_builder = schema::Schema::builder();
@@ -104,7 +104,7 @@ mod tests {
                 let query = QueryParser::for_index(&index, vec![my_text_field])
                     .parse_query(term)
                     .unwrap();
-                let top_docs: Vec<(f32, DocAddress)> =
+                let top_docs: Vec<(f32, DocAddress, Ctid)> =
                     searcher.search(&query, &TopDocs::with_limit(3)).unwrap();
 
                 top_docs.iter().map(|el| el.1.doc_id).collect::<Vec<_>>()

@@ -5,7 +5,7 @@ use crate::fastfield::AliveBitSet;
 use crate::positions::PositionReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 use crate::postings::{branchless_binary_search, BlockSegmentPostings, Postings};
-use crate::{DocId, TERMINATED};
+use crate::{Ctid, DocId, TERMINATED};
 
 /// `SegmentPostings` represents the inverted list or postings associated with
 /// a term in a `Segment`.
@@ -73,7 +73,7 @@ impl SegmentPostings {
                 PostingsSerializer::new(&mut buffer, 0.0, IndexRecordOption::Basic, None);
             postings_serializer.new_term(docs.len() as u32, false);
             for &doc in docs {
-                postings_serializer.write_doc(doc, 1u32);
+                postings_serializer.write_doc(doc, 1u32, crate::INVALID_CTID);
             }
             postings_serializer
                 .close_term(docs.len() as u32)
@@ -122,7 +122,7 @@ impl SegmentPostings {
         );
         postings_serializer.new_term(doc_and_tfs.len() as u32, true);
         for &(doc, tf) in doc_and_tfs {
-            postings_serializer.write_doc(doc, tf);
+            postings_serializer.write_doc(doc, tf, crate::INVALID_CTID);
         }
         postings_serializer
             .close_term(doc_and_tfs.len() as u32)
@@ -204,6 +204,11 @@ impl DocSet for SegmentPostings {
         self.block_cursor.doc(self.cur)
     }
 
+    #[inline]
+    fn ctid(&self) -> Ctid {
+        self.block_cursor.ctid(self.cur)
+    }
+
     fn size_hint(&self) -> u32 {
         self.len() as u32
     }
@@ -235,6 +240,10 @@ impl Postings for SegmentPostings {
             "Have you forgotten to call `.advance()` at least once before calling `.term_freq()`."
         );
         self.block_cursor.freq(self.cur)
+    }
+
+    fn ctid_value(&self) -> Ctid {
+        self.block_cursor.ctid(self.cur)
     }
 
     fn positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {

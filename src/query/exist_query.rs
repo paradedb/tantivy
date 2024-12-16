@@ -1,8 +1,8 @@
-use core::fmt::Debug;
-
 use columnar::{ColumnIndex, DynamicColumn};
+use core::fmt::Debug;
+use std::collections::Bound;
 
-use super::{ConstScorer, EmptyScorer};
+use super::{ConstScorer, EmptyScorer, InvertedIndexRangeWeight};
 use crate::docset::{DocSet, TERMINATED};
 use crate::index::SegmentReader;
 use crate::query::explanation::does_not_match;
@@ -31,9 +31,13 @@ impl ExistsQuery {
 impl Query for ExistsQuery {
     fn weight(&self, enable_scoring: EnableScoring) -> crate::Result<Box<dyn Weight>> {
         let schema = enable_scoring.schema();
-        let Some((field, _path)) = schema.find_field(&self.field_name) else {
+        let Some((field, path)) = schema.find_field(&self.field_name) else {
             return Err(TantivyError::FieldNotFound(self.field_name.clone()));
         };
+
+        // NB:  even tho we don't actually use fast fields to solve ExistQueries
+        // we keep the requirement in place in order to appease tantivy's tests
+        // and also to enshrine that they once did, and maybe somehow can in the future
         let field_type = schema.get_field_entry(field).field_type();
         if !field_type.is_fast() {
             return Err(TantivyError::SchemaError(format!(
@@ -41,9 +45,31 @@ impl Query for ExistsQuery {
                 self.field_name
             )));
         }
-        Ok(Box::new(ExistsWeight {
-            field_name: self.field_name.clone(),
-        }))
+
+        // NB:  And we've added a requirement that fields against this query must be INDEXED
+        if !field_type.is_indexed() {
+            return Err(TantivyError::SchemaError(format!(
+                "Field `{}` is not indexed",
+                self.field_name
+            )));
+        }
+
+        if path.is_empty() {
+            Ok(Box::new(InvertedIndexRangeWeight::new(
+                field,
+                &Bound::Unbounded,
+                &Bound::Unbounded,
+                None,
+            )))
+        } else {
+            Ok(Box::new(InvertedIndexRangeWeight::with_path(
+                field,
+                path,
+                &Bound::Unbounded,
+                &Bound::Unbounded,
+                None,
+            )))
+        }
     }
 }
 
@@ -157,7 +183,7 @@ mod tests {
         let all_field = schema_builder.add_u64_field("all", INDEXED | FAST);
         let even_field = schema_builder.add_u64_field("even", INDEXED | FAST);
         let odd_field = schema_builder.add_text_field("odd", STRING | FAST);
-        let multi_field = schema_builder.add_text_field("multi", FAST);
+        let multi_field = schema_builder.add_text_field("multi", STRING | FAST);
         let _never_field = schema_builder.add_u64_field("never", INDEXED | FAST);
         let schema = schema_builder.build();
 
@@ -224,6 +250,9 @@ mod tests {
                     index_writer
                         .add_document(doc!(json => json!({"all": i.to_string(), "odd": true})))?;
                 }
+
+                index_writer
+                    .add_document(doc!(json => json!({"subobject": { "key": {"foo": "bar"}}})))?;
             }
             index_writer.commit()?;
         }
@@ -233,6 +262,10 @@ mod tests {
         assert_eq!(count_existing_fields(&searcher, "json.all")?, 100);
         assert_eq!(count_existing_fields(&searcher, "json.even")?, 50);
         assert_eq!(count_existing_fields(&searcher, "json.odd")?, 50);
+        assert_eq!(
+            count_existing_fields(&searcher, "json.subobject.key.foo")?,
+            100
+        );
 
         // Handling of non-existing fields:
         assert_eq!(count_existing_fields(&searcher, "json.absent")?, 0);
@@ -253,11 +286,11 @@ mod tests {
     #[test]
     fn test_exists_query_misc_supported_types() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
-        let bool = schema_builder.add_bool_field("bool", FAST);
-        let bytes = schema_builder.add_bytes_field("bytes", FAST);
-        let date = schema_builder.add_date_field("date", FAST);
-        let f64 = schema_builder.add_f64_field("f64", FAST);
-        let ip_addr = schema_builder.add_ip_addr_field("ip_addr", FAST);
+        let bool = schema_builder.add_bool_field("bool", INDEXED | FAST);
+        let bytes = schema_builder.add_bytes_field("bytes", INDEXED | FAST);
+        let date = schema_builder.add_date_field("date", INDEXED | FAST);
+        let f64 = schema_builder.add_f64_field("f64", INDEXED | FAST);
+        let ip_addr = schema_builder.add_ip_addr_field("ip_addr", INDEXED | FAST);
         let facet = schema_builder.add_facet_field("facet", FacetOptions::default());
         let schema = schema_builder.build();
 

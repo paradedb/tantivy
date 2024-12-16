@@ -228,7 +228,7 @@ impl Weight for FastFieldRangeWeight {
                 "Document #({doc}) does not match"
             )));
         }
-        let explanation = Explanation::new("Const", scorer.score());
+        let explanation = Explanation::new("Const", scorer.score().0);
 
         Ok(explanation)
     }
@@ -1582,7 +1582,6 @@ pub mod ip_range_tests {
 
 #[cfg(all(test, feature = "unstable"))]
 mod bench {
-
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use test::Bencher;
@@ -1790,7 +1789,6 @@ mod bench {
 
 #[cfg(all(test, feature = "unstable"))]
 mod bench_ip {
-
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use test::Bencher;

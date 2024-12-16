@@ -6,7 +6,7 @@ use fastdivide::DividerU64;
 use crate::collector::{Collector, SegmentCollector};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::schema::Type;
-use crate::{DocId, Score};
+use crate::{Ctid, DocId, Score};
 
 /// Histogram builds an histogram of the values of a fastfield for the
 /// collected DocSet.
@@ -93,7 +93,7 @@ pub struct SegmentHistogramCollector {
 impl SegmentCollector for SegmentHistogramCollector {
     type Fruit = Vec<u64>;
 
-    fn collect(&mut self, doc: DocId, _score: Score) {
+    fn collect(&mut self, doc: DocId, _score: Score, _ctid: Ctid) {
         let value = self.column_u64.get_val(doc);
         self.histogram_computer.add_value(value);
     }

@@ -114,7 +114,7 @@ fn main() -> tantivy::Result<()> {
     // Now let's print out the results.
     // Note that the tokens are not stored along with the original text
     // in the document store
-    for (_score, doc_address) in top_docs {
+    for (_score, doc_address, _ctid) in top_docs {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
         println!("{}", retrieved_doc.to_json(&schema));
     }

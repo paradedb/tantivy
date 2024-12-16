@@ -59,7 +59,7 @@ fn main() -> tantivy::Result<()> {
             .parse_query(r#"occurred_at:[2022-06-22T12:58:00Z TO 2022-06-23T00:00:00Z}"#)?;
         let count_docs = searcher.search(&*query, &TopDocs::with_limit(4))?;
         assert_eq!(count_docs.len(), 1);
-        for (_score, doc_address) in count_docs {
+        for (_score, doc_address, _ctid) in count_docs {
             let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
             assert!(retrieved_doc
                 .get_first(occurred_at)

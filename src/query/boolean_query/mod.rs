@@ -192,7 +192,7 @@ mod tests {
                 BooleanQuery::new(vec![(Occur::Must, make_term_query("d"))]);
             let topdocs_no_excluded = matching_topdocs(&boolean_query_no_excluded);
             assert_eq!(topdocs_no_excluded.len(), 2);
-            let (top_score, top_doc) = topdocs_no_excluded[0];
+            let (top_score, top_doc, _) = topdocs_no_excluded[0];
             assert_eq!(top_doc, DocAddress::new(0, 4));
             assert_eq!(topdocs_no_excluded[1].1, DocAddress::new(0, 3)); // ignore score of doc 3.
             score_doc_4 = top_score;
@@ -206,7 +206,7 @@ mod tests {
             ]);
             let topdocs_excluded = matching_topdocs(&boolean_query_two_excluded);
             assert_eq!(topdocs_excluded.len(), 1);
-            let (top_score, top_doc) = topdocs_excluded[0];
+            let (top_score, top_doc, _) = topdocs_excluded[0];
             assert_eq!(top_doc, DocAddress::new(0, 4));
             assert_eq!(top_score, score_doc_4);
         }
@@ -244,12 +244,12 @@ mod tests {
         {
             let mut boolean_scorer = boolean_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
             assert_eq!(boolean_scorer.doc(), 0u32);
-            assert_nearly_equals!(boolean_scorer.score(), 0.84163445);
+            assert_nearly_equals!(boolean_scorer.score().0, 0.84163445);
         }
         {
             let mut boolean_scorer = boolean_weight.scorer(searcher.segment_reader(0u32), 2.0)?;
             assert_eq!(boolean_scorer.doc(), 0u32);
-            assert_nearly_equals!(boolean_scorer.score(), 1.6832689);
+            assert_nearly_equals!(boolean_scorer.score().0, 1.6832689);
         }
         Ok(())
     }

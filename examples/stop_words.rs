@@ -104,7 +104,7 @@ fn main() -> tantivy::Result<()> {
     let query = query_parser.parse_query("title:\"the Frankenstein\"")?;
     let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
 
-    for (score, doc_address) in top_docs {
+    for (score, doc_address, _ctid) in top_docs {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
         println!("\n==\nDocument score {score}:");
         println!("{}", retrieved_doc.to_json(&schema));

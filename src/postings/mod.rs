@@ -52,7 +52,7 @@ pub mod tests {
         Field, IndexRecordOption, Schema, Term, TextFieldIndexing, TextOptions, INDEXED, TEXT,
     };
     use crate::tokenizer::{SimpleTokenizer, MAX_TOKEN_LEN};
-    use crate::{DocId, HasLen, IndexWriter, Score};
+    use crate::{Ctid, DocId, HasLen, IndexWriter, Score, INVALID_CTID};
 
     #[test]
     pub fn test_position_write() -> crate::Result<()> {
@@ -66,7 +66,7 @@ pub mod tests {
         field_serializer.new_term("abc".as_bytes(), 12u32, true)?;
         for doc_id in 0u32..120u32 {
             let delta_positions = vec![1, 2, 3, 2];
-            field_serializer.write_doc(doc_id, 4, &delta_positions);
+            field_serializer.write_doc(doc_id, 4, INVALID_CTID, &delta_positions);
         }
         field_serializer.close_term()?;
         mem::drop(field_serializer);
@@ -234,6 +234,7 @@ pub mod tests {
                        text_field => "a b a c a d a a.",
                        text_field => "d d d d a"
                     ),
+                    ctid: INVALID_CTID,
                 };
                 segment_writer.add_document(op)?;
             }
@@ -241,6 +242,7 @@ pub mod tests {
                 let op = AddOperation {
                     opstamp: 1u64,
                     document: doc!(text_field => "b a"),
+                    ctid: INVALID_CTID,
                 };
                 segment_writer.add_document(op).unwrap();
             }
@@ -250,6 +252,7 @@ pub mod tests {
                 let op = AddOperation {
                     opstamp: 2u64,
                     document: doc!(text_field => text),
+                    ctid: INVALID_CTID,
                 };
                 segment_writer.add_document(op).unwrap();
             }
@@ -525,7 +528,7 @@ pub mod tests {
     }
 
     impl<TScorer: Scorer> Scorer for UnoptimizedDocSet<TScorer> {
-        fn score(&mut self) -> Score {
+        fn score(&mut self) -> (Score, Ctid) {
             self.0.score()
         }
     }

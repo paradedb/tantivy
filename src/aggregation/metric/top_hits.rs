@@ -17,7 +17,7 @@ use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
 use crate::aggregation::AggregationError;
 use crate::collector::TopNComputer;
 use crate::schema::OwnedValue;
-use crate::{DocAddress, DocId, SegmentOrdinal};
+use crate::{Ctid, DocAddress, DocId, SegmentOrdinal, INVALID_CTID};
 
 /// # Top Hits
 ///
@@ -124,7 +124,9 @@ impl Serialize for KeyOrder {
 
 impl<'de> Deserialize<'de> for KeyOrder {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let mut key_order = <HashMap<String, Order>>::deserialize(deserializer)?.into_iter();
         let (field, order) = key_order.next().ok_or(serde::de::Error::custom(
             "Expected exactly one key-value pair in sort parameter of top_hits, found none",
@@ -450,13 +452,13 @@ impl TopHitsTopNComputer {
         }
     }
 
-    fn collect(&mut self, features: DocSortValuesAndFields, doc: DocAddress) {
-        self.top_n.push(features, doc);
+    fn collect(&mut self, features: DocSortValuesAndFields, doc: DocAddress, ctid: Ctid) {
+        self.top_n.push(features, doc, ctid);
     }
 
     pub(crate) fn merge_fruits(&mut self, other_fruit: Self) -> crate::Result<()> {
         for doc in other_fruit.top_n.into_vec() {
-            self.collect(doc.feature, doc.doc);
+            self.collect(doc.feature, doc.doc, doc.ctid);
         }
         Ok(())
     }
@@ -522,6 +524,7 @@ impl TopHitsSegmentCollector {
                     doc_value_fields,
                 },
                 res.doc,
+                res.ctid,
             );
         }
 
@@ -557,6 +560,7 @@ impl TopHitsSegmentCollector {
                 segment_ord: self.segment_ordinal,
                 doc_id,
             },
+            INVALID_CTID,
         );
         Ok(())
     }
@@ -637,6 +641,7 @@ mod tests {
     use crate::collector::ComparableDoc;
     use crate::query::AllQuery;
     use crate::schema::OwnedValue;
+    use crate::INVALID_CTID;
 
     fn invert_order(cmp_feature: DocValueAndOrder) -> DocValueAndOrder {
         let DocValueAndOrder { value, order } = cmp_feature;
@@ -775,6 +780,7 @@ mod tests {
                     }],
                     doc_value_fields: Default::default(),
                 },
+                ctid: INVALID_CTID,
             },
             ComparableDoc {
                 doc: crate::DocAddress {
@@ -788,6 +794,7 @@ mod tests {
                     }],
                     doc_value_fields: Default::default(),
                 },
+                ctid: INVALID_CTID,
             },
             ComparableDoc {
                 doc: crate::DocAddress {
@@ -801,12 +808,13 @@ mod tests {
                     }],
                     doc_value_fields: Default::default(),
                 },
+                ctid: INVALID_CTID,
             },
         ];
 
         let mut collector = collector_with_capacity(3);
         for doc in docs.clone() {
-            collector.collect(doc.feature, doc.doc);
+            collector.collect(doc.feature, doc.doc, doc.ctid);
         }
 
         let res = collector.into_final_result();
