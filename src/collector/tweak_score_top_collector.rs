@@ -28,7 +28,7 @@ where
 /// It is the segment local version of the [`ScoreTweaker`].
 pub trait ScoreSegmentTweaker<TScore>: 'static {
     /// Tweak the given `score` for the document `doc`.
-    fn score(&mut self, doc: DocId, score: Score) -> TScore;
+    fn score(&mut self, doc: DocId, score: Score, ctid: Ctid) -> TScore;
 }
 
 /// `ScoreTweaker` makes it possible to tweak the score
@@ -95,7 +95,7 @@ where
     type Fruit = Vec<(TScore, DocAddress, Ctid)>;
 
     fn collect(&mut self, doc: DocId, score: Score, ctid: Ctid) {
-        let score = self.segment_scorer.score(doc, score);
+        let score = self.segment_scorer.score(doc, score, ctid);
         self.segment_collector.collect(doc, score, ctid);
     }
 
@@ -118,9 +118,9 @@ where
 
 impl<F, TScore> ScoreSegmentTweaker<TScore> for F
 where
-    F: 'static + FnMut(DocId, Score) -> TScore,
+    F: 'static + FnMut(DocId, Score, Ctid) -> TScore,
 {
-    fn score(&mut self, doc: DocId, score: Score) -> TScore {
-        (self)(doc, score)
+    fn score(&mut self, doc: DocId, score: Score, ctid: Ctid) -> TScore {
+        (self)(doc, score, ctid)
     }
 }

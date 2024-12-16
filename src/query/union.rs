@@ -116,7 +116,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Union<TScorer, TScoreCombin
                 let delta = val + (self.cursor as u32) * 64;
                 self.doc = self.offset + delta;
                 let score_combiner = &mut self.scores[delta as usize];
-                self.score = (score_combiner.score(), self.score.1);
+                self.score = score_combiner.score();
                 score_combiner.clear();
                 return true;
             } else {

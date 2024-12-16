@@ -70,6 +70,7 @@ use crate::{DocId, Score};
 #[derive(Clone, Debug)]
 pub struct RangeQuery {
     bounds: BoundsRange<Term>,
+    path: Option<String>,
 }
 
 impl RangeQuery {
@@ -80,12 +81,28 @@ impl RangeQuery {
     pub fn new(lower_bound: Bound<Term>, upper_bound: Bound<Term>) -> RangeQuery {
         RangeQuery {
             bounds: BoundsRange::new(lower_bound, upper_bound),
+            path: None,
+        }
+    }
+
+    pub fn with_path(
+        lower_bound: Bound<Term>,
+        upper_bound: Bound<Term>,
+        path: Option<String>,
+    ) -> RangeQuery {
+        RangeQuery {
+            bounds: BoundsRange::new(lower_bound, upper_bound),
+            path,
         }
     }
 
     /// Field to search over
     pub fn field(&self) -> Field {
         self.get_term().field()
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
     }
 
     /// The value type of the field
@@ -111,17 +128,28 @@ impl Query for RangeQuery {
         {
             Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
         } else {
-            if field_type.is_json() {
-                return Err(crate::TantivyError::InvalidArgument(
-                    "RangeQuery on JSON is only supported for fast fields currently".to_string(),
-                ));
+            // if field_type.is_json() {
+            //     return Err(crate::TantivyError::InvalidArgument(
+            //         "RangeQuery on JSON is only supported for fast fields currently".to_string(),
+            //     ));
+            // }
+
+            if let Some(path) = &self.path {
+                Ok(Box::new(InvertedIndexRangeWeight::with_path(
+                    self.field(),
+                    path,
+                    &self.bounds.lower_bound,
+                    &self.bounds.upper_bound,
+                    None,
+                )))
+            } else {
+                Ok(Box::new(InvertedIndexRangeWeight::new(
+                    self.field(),
+                    &self.bounds.lower_bound,
+                    &self.bounds.upper_bound,
+                    None,
+                )))
             }
-            Ok(Box::new(InvertedIndexRangeWeight::new(
-                self.field(),
-                &self.bounds.lower_bound,
-                &self.bounds.upper_bound,
-                None,
-            )))
         }
     }
 }
@@ -262,8 +290,6 @@ impl Weight for InvertedIndexRangeWeight {
 
             processed_count += 1;
             let term_info = term_range.value();
-            let mut bytes = Vec::new();
-            term_dict.ord_to_term(term_range.term_ord(), &mut bytes)?;
             let mut block_segment_postings = inverted_index
                 .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
             loop {

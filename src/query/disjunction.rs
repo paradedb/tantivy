@@ -117,7 +117,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
                 if self.current_doc != next {
                     if current_num_matches >= self.minimum_matches_required {
                         self.chains.push(candidate);
-                        self.current_score = (self.score_combiner.score(), self.current_score.1);
+                        self.current_score = self.score_combiner.score();
                         return self.current_doc;
                     }
                     // Reset current_num_matches and scores.
@@ -134,7 +134,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
         if current_num_matches < self.minimum_matches_required {
             self.current_doc = TERMINATED;
         }
-        self.current_score = (self.score_combiner.score(), self.current_score.1);
+        self.current_score = self.score_combiner.score();
         self.current_doc
     }
 
@@ -200,7 +200,7 @@ mod tests {
                     .cloned()
                     .map(VecDocSet::from)
                     .map(|d| ConstScorer::new(d, 1.0)),
-                DoNothingCombiner,
+                DoNothingCombiner::default(),
                 min_match,
             )
         };

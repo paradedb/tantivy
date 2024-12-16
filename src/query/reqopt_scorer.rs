@@ -82,13 +82,13 @@ where
         }
         let doc = self.doc();
         let mut score_combiner = TScoreCombiner::default();
-        let ctid = score_combiner.update(&mut self.req_scorer);
+        let _ = score_combiner.update(&mut self.req_scorer);
         if self.opt_scorer.doc() <= doc && self.opt_scorer.seek(doc) == doc {
             let _ = score_combiner.update(&mut self.opt_scorer);
         }
         let score = score_combiner.score();
-        self.score_cache = Some((score, ctid));
-        (score, ctid)
+        self.score_cache = Some(score);
+        score
     }
 }
 
