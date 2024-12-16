@@ -1295,7 +1295,9 @@ mod tests {
         let query_parser = QueryParser::for_index(&index, vec![field]);
         let text_query = query_parser.parse_query("droopy tax")?;
         let collector = TopDocs::with_limit(2).and_offset(1).tweak_score(
-            move |_segment_reader: &SegmentReader| move |doc: DocId, _original_score: Score| doc,
+            move |_segment_reader: &SegmentReader| {
+                move |doc: DocId, _original_score: Score, _ctid: Ctid| doc
+            },
         );
         let score_docs: Vec<(u32, DocAddress, Ctid)> =
             index.reader()?.searcher().search(&text_query, &collector)?;
