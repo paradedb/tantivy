@@ -237,7 +237,8 @@ impl InvertedIndexRangeWeight {
             path: Some(
                 path.as_bytes()
                     .iter()
-                    .map(|b| if *b == b'.' { 1 } else { *b })
+                    .map(|b| if *b == b'.' { 1 } else { *b }) // convert dot separators into 1
+                    .chain(std::iter::once(0)) // null terminate the path
                     .collect(),
             ),
             lower_bound: map_bound(lower_bound, verify_and_unwrap_term),
@@ -282,6 +283,7 @@ impl Weight for InvertedIndexRangeWeight {
                     break;
                 }
             }
+
             if let Some(path) = &self.path {
                 if !term_range.key().starts_with(path) {
                     continue;
