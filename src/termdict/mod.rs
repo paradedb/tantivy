@@ -42,12 +42,13 @@ use common::BinarySerializable;
 pub use sstable::{sort_and_dedupe_terms, BatchedTermInfoIter, SortedTermSlice};
 use tantivy_fst::Automaton;
 
-use self::fst_termdict::TermWithStateStreamerBuilder;
+#[cfg(feature = "quickwit")]
+use self::termdict::TermDictionaryExt;
 #[cfg(feature = "quickwit")]
 use self::termdict::TermSSTable;
 use self::termdict::{
     TermDictionary as InnerTermDict, TermDictionaryBuilder as InnerTermDictBuilder,
-    TermStreamerBuilder,
+    TermStreamerBuilder, TermWithStateStreamerBuilder,
 };
 pub use self::termdict::{TermMerger, TermStreamer, TermWithStateStreamer};
 use crate::postings::TermInfo;

@@ -45,7 +45,7 @@ mod block_match_automaton;
 mod delta;
 mod dictionary;
 pub mod merge;
-mod streamer;
+pub mod streamer;
 pub mod value;
 
 mod index;
