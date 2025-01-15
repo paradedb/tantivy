@@ -269,7 +269,6 @@ impl SegmentCollector for MultiCollectorChild {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::collector::{Count, TopDocs};
     use crate::query::TermQuery;
