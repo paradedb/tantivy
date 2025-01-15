@@ -16,3 +16,6 @@ trace.dat
 cargo-timing*
 control
 variable
+
+# for `sample record -p`
+profile.json
