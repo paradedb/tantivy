@@ -1,11 +1,12 @@
-use common::file_slice::FileSlice;
-use common::{BinarySerializable, CountingWriter, DeserializeFrom, HasLen, OwnedBytes};
-use fastdivide::DividerU64;
-use parking_lot::Mutex;
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::{io, iter};
+
+use common::file_slice::FileSlice;
+use common::{BinarySerializable, CountingWriter, DeserializeFrom, HasLen, OwnedBytes};
+use fastdivide::DividerU64;
+use parking_lot::Mutex;
 use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
 use crate::column_values::u64_based::line::Line;

@@ -1,8 +1,9 @@
-use common::file_slice::FileSlice;
-use sstable::Dictionary;
 use std::io;
 use std::io::Write;
 use std::sync::Arc;
+
+use common::file_slice::FileSlice;
+use sstable::Dictionary;
 
 use crate::column::{BytesColumn, Column};
 use crate::column_index::{serialize_column_index, SerializableColumnIndex};

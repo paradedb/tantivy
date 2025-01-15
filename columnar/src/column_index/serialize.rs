@@ -1,6 +1,9 @@
 use std::io;
 use std::io::Write;
 
+use common::file_slice::FileSlice;
+use common::{CountingWriter, HasLen};
+
 use super::multivalued_index::SerializableMultivalueIndex;
 use super::OptionalIndex;
 use crate::column_index::multivalued_index::serialize_multivalued_index;
@@ -8,8 +11,6 @@ use crate::column_index::optional_index::serialize_optional_index;
 use crate::column_index::ColumnIndex;
 use crate::iterable::Iterable;
 use crate::{Cardinality, RowId, Version};
-use common::file_slice::FileSlice;
-use common::{CountingWriter, HasLen};
 
 pub struct SerializableOptionalIndex<'a> {
     pub non_null_row_ids: Box<dyn Iterable<RowId> + 'a>,

@@ -3,6 +3,9 @@ use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
 
+use common::file_slice::FileSlice;
+use common::CountingWriter;
+
 use super::optional_index::{open_optional_index, serialize_optional_index};
 use super::{OptionalIndex, SerializableOptionalIndex, Set};
 use crate::column_values::{
@@ -10,8 +13,6 @@ use crate::column_values::{
 };
 use crate::iterable::Iterable;
 use crate::{DocId, RowId, Version};
-use common::file_slice::FileSlice;
-use common::CountingWriter;
 
 pub struct SerializableMultivalueIndex<'a> {
     pub doc_ids_with_values: SerializableOptionalIndex<'a>,

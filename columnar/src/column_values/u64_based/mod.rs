@@ -8,6 +8,9 @@ use std::io;
 use std::io::Write;
 use std::sync::Arc;
 
+use common::file_slice::FileSlice;
+use common::BinarySerializable;
+
 use crate::column_values::monotonic_mapping::{
     StrictlyMonotonicMappingInverter, StrictlyMonotonicMappingToInternal,
 };
@@ -18,8 +21,6 @@ pub use crate::column_values::u64_based::stats_collector::StatsCollector;
 use crate::column_values::{monotonic_map_column, ColumnStats};
 use crate::iterable::Iterable;
 use crate::{ColumnValues, MonotonicallyMappableToU64};
-use common::file_slice::FileSlice;
-use common::BinarySerializable;
 
 /// A `ColumnCodecEstimator` is in charge of gathering all
 /// data required to serialize a column.
