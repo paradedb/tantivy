@@ -1,12 +1,11 @@
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{io, iter};
 
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, CountingWriter, DeserializeFrom, HasLen, OwnedBytes};
 use fastdivide::DividerU64;
-use parking_lot::Mutex;
 use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
 use crate::column_values::u64_based::line::Line;
@@ -197,7 +196,8 @@ impl ColumnCodec<u64> for BlockwiseLinearCodec {
                 .map(|block| {
                     block.map(|block| BlockWithLength {
                         block,
-                        data: (None, Mutex::new(None)),
+                        file_slice: FileSlice::from(Vec::new()),
+                        data: OnceLock::default(),
                     })
                 })
                 .collect::<io::Result<_>>()?;
@@ -206,13 +206,9 @@ impl ColumnCodec<u64> for BlockwiseLinearCodec {
         for block in &mut blocks {
             let len = (block.bit_unpacker.bit_width() as usize) * BLOCK_SIZE as usize / 8;
             block.data_start_offset = start_offset;
-            block.data = (
-                Some(
-                    data.clone()
-                        .slice(start_offset..(start_offset + len).min(data.len())),
-                ),
-                Mutex::new(None),
-            );
+            block.file_slice = data
+                .clone()
+                .slice(start_offset..(start_offset + len).min(data.len()));
             start_offset += len;
         }
 
@@ -225,7 +221,8 @@ impl ColumnCodec<u64> for BlockwiseLinearCodec {
 
 struct BlockWithLength {
     block: Block,
-    data: (Option<FileSlice>, Mutex<Option<OwnedBytes>>),
+    file_slice: FileSlice,
+    data: OnceLock<OwnedBytes>,
 }
 
 impl Deref for BlockWithLength {
@@ -255,10 +252,9 @@ impl ColumnValues for BlockwiseLinearReader {
         let idx_within_block = idx % BLOCK_SIZE;
         let block = &self.blocks[block_id];
         let interpoled_val: u64 = block.line.eval(idx_within_block);
-        let (file_slice, mutex) = &block.data;
-        let mut lock = mutex.lock();
-        let block_bytes =
-            lock.get_or_insert_with(|| file_slice.as_ref().unwrap().read_bytes().unwrap());
+        let block_bytes = block
+            .data
+            .get_or_init(|| block.file_slice.read_bytes().unwrap());
         let bitpacked_diff = block.bit_unpacker.get(idx_within_block, block_bytes);
         // TODO optimize me! the line parameters could be tweaked to include the multiplication and
         // remove the dependency.
