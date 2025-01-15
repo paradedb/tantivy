@@ -821,8 +821,8 @@ mod tests {
         let _data = test_aux_vals(vals);
     }
 
-    use proptest::prelude::*;
     use common::file_slice::FileSlice;
+    use proptest::prelude::*;
 
     fn num_strategy() -> impl Strategy<Value = u128> {
         prop_oneof![
