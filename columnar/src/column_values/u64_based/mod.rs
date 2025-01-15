@@ -211,10 +211,9 @@ pub fn serialize_and_load_u64_based_column_values<T: MonotonicallyMappableToU64>
     vals: &dyn Iterable,
     codec_types: &[CodecType],
 ) -> Arc<dyn ColumnValues<T>> {
-    todo!("fix serialize_and_load_u64_based_column_values() for tests");
-    // let mut buffer = Vec::new();
-    // serialize_u64_based_column_values(vals, codec_types, &mut buffer).unwrap();
-    // load_u64_based_column_values::<T>(OwnedBytes::new(buffer)).unwrap()
+    let mut buffer = Vec::new();
+    serialize_u64_based_column_values(vals, codec_types, &mut buffer).unwrap();
+    load_u64_based_column_values::<T>(FileSlice::from(buffer)).unwrap()
 }
 
 #[cfg(test)]

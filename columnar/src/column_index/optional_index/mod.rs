@@ -177,7 +177,8 @@ impl SelectCursor<RowId> for OptionalIndexSelectCursor<'_> {
 impl Set<RowId> for OptionalIndex {
     type SelectCursor<'b>
         = OptionalIndexSelectCursor<'b>
-    where Self: 'b;
+    where
+        Self: 'b;
     // Check if value at position is not null.
     #[inline]
     fn contains(&self, row_id: RowId) -> bool {
@@ -259,17 +260,16 @@ impl Set<RowId> for OptionalIndex {
 }
 
 impl OptionalIndex {
-    pub fn for_test(_num_rows: RowId, _row_ids: &[RowId]) -> OptionalIndex {
-        todo!("fix OptionalIndex::for_test()")
-        // assert!(row_ids
-        //     .last()
-        //     .copied()
-        //     .map(|last_row_id| last_row_id < num_rows)
-        //     .unwrap_or(true));
-        // let mut buffer = Vec::new();
-        // serialize_optional_index(&row_ids, num_rows, &mut buffer).unwrap();
-        // let bytes = OwnedBytes::new(buffer);
-        // open_optional_index(bytes).unwrap()
+    pub fn for_test(num_rows: RowId, row_ids: &[RowId]) -> OptionalIndex {
+        assert!(row_ids
+            .last()
+            .copied()
+            .map(|last_row_id| last_row_id < num_rows)
+            .unwrap_or(true));
+        let mut buffer = Vec::new();
+        serialize_optional_index(&row_ids, num_rows, &mut buffer).unwrap();
+        let file_slice = FileSlice::from(buffer);
+        open_optional_index(file_slice).unwrap()
     }
 
     pub fn num_docs(&self) -> RowId {
@@ -517,7 +517,6 @@ fn deserialize_optional_index_block_metadatas(
     (block_metas.into_boxed_slice(), non_null_rows_before_block)
 }
 
-// TODO:  look here
 pub fn open_optional_index(file_slice: FileSlice) -> io::Result<OptionalIndex> {
     let (bytes, num_non_empty_blocks_bytes) = file_slice.split_from_end(2);
     let num_non_empty_block_bytes = u16::from_le_bytes(
