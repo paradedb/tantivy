@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -309,7 +309,7 @@ pub struct IndexMeta {
     /// List of `SegmentMeta` information associated with each finalized segment of the index.
     pub segments: Vec<SegmentMeta>,
     /// Index `Schema`
-    pub schema: (Vec<u8>, OnceLock<Schema>),
+    pub schema: Schema,
     /// Opstamp associated with the last `commit` operation.
     pub opstamp: Opstamp,
     /// Payload associated with the last commit.
