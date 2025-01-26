@@ -75,6 +75,8 @@ pub struct SegmentSpaceUsage {
     deletes: ByteCount,
 
     total: ByteCount,
+
+    path_lookup: ByteCount,
 }
 
 impl SegmentSpaceUsage {
@@ -88,6 +90,7 @@ impl SegmentSpaceUsage {
         fieldnorms: PerFieldSpaceUsage,
         store: StoreSpaceUsage,
         deletes: ByteCount,
+        path_lookup: ByteCount,
     ) -> SegmentSpaceUsage {
         let total = termdict.total()
             + postings.total()
@@ -106,6 +109,7 @@ impl SegmentSpaceUsage {
             store,
             deletes,
             total,
+            path_lookup,
         }
     }
 
@@ -125,6 +129,7 @@ impl SegmentSpaceUsage {
             SegmentComponent::Store => ComponentSpaceUsage::Store(self.store().clone()),
             SegmentComponent::TempStore => ComponentSpaceUsage::Store(self.store().clone()),
             Delete => Basic(self.deletes()),
+            PathLookup => Basic(self.path_lookup()),
         }
     }
 
@@ -171,6 +176,10 @@ impl SegmentSpaceUsage {
     /// Total space usage in bytes for this segment.
     pub fn total(&self) -> ByteCount {
         self.total
+    }
+
+    pub fn path_lookup(&self) -> ByteCount {
+        self.path_lookup
     }
 }
 

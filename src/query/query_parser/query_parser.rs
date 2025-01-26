@@ -328,7 +328,10 @@ impl QueryParser {
     pub fn parse_query(&self, query: &str) -> Result<Box<dyn Query>, QueryParserError> {
         println!("QueryParser::parse_query => input query: {}", query);
         let logical_ast = self.parse_query_to_logical_ast(query)?;
-        println!("QueryParser::parse_query => generated logical AST: {:?}", logical_ast);
+        println!(
+            "QueryParser::parse_query => generated logical AST: {:?}",
+            logical_ast
+        );
         let query = convert_to_query(&self.fuzzy, logical_ast);
         println!("QueryParser::parse_query => final query: {:?}", query);
         Ok(query)
@@ -428,17 +431,24 @@ impl QueryParser {
         json_path: &str,
         phrase: &str,
     ) -> Result<Term, QueryParserError> {
-        println!("QueryParser::compute_boundary_term => field={:?}, json_path={}, phrase={}", field, json_path, phrase);
+        println!(
+            "QueryParser::compute_boundary_term => field={:?}, json_path={}, phrase={}",
+            field, json_path, phrase
+        );
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         let field_supports_ff_range_queries = field_type.is_fast()
             && is_type_valid_for_fastfield_range_query(field_type.value_type());
 
         if field_type.is_nested() {
-            println!("QueryParser => found nested field: {}, raising range query error", field_entry.name());
-            return Err(QueryParserError::UnsupportedQuery(
-                format!("Range query on a nested field is not supported. Query: {}", phrase)
-            ));
+            println!(
+                "QueryParser => found nested field: {}, raising range query error",
+                field_entry.name()
+            );
+            return Err(QueryParserError::UnsupportedQuery(format!(
+                "Range query on a nested field is not supported. Query: {}",
+                phrase
+            )));
         }
 
         if !field_type.is_indexed() && !field_supports_ff_range_queries {
@@ -452,7 +462,11 @@ impl QueryParser {
                 field_entry.name()
             )));
         }
-        println!("QueryParser => normal parse of field={} text={}", field_entry.name(), phrase);
+        println!(
+            "QueryParser => normal parse of field={} text={}",
+            field_entry.name(),
+            phrase
+        );
         match *field_type {
             FieldType::U64(_) => {
                 let val: u64 = u64::from_str(phrase)?;
@@ -542,6 +556,11 @@ impl QueryParser {
                     "Range query on a nested field is not supported.".into(),
                 ));
             }
+            FieldType::NestedJson(_) => {
+                return Err(QueryParserError::UnsupportedQuery(
+                    "Range query on a nested json field is not supported.".into(),
+                ));
+            }
         }
     }
 
@@ -560,10 +579,14 @@ impl QueryParser {
         let field_name = field_entry.name();
 
         if field_type.is_nested() {
-            println!("QueryParser => found nested field: {}, raising direct text search error", field_name);
-            return Err(QueryParserError::UnsupportedQuery(
-                format!("Cannot run direct text search on a `nested` field. Field: {}, Query: {}", field_name, phrase)
-            ));
+            println!(
+                "QueryParser => found nested field: {}, raising direct text search error",
+                field_name
+            );
+            return Err(QueryParserError::UnsupportedQuery(format!(
+                "Cannot run direct text search on a `nested` field. Field: {}, Query: {}",
+                field_name, phrase
+            )));
         }
 
         if !field_type.is_indexed() {
@@ -657,6 +680,11 @@ impl QueryParser {
                     "Cannot run direct text search on a `nested` field."
                 )));
             }
+            FieldType::NestedJson(_) => {
+                return Err(QueryParserError::UnsupportedQuery(format!(
+                    "Cannot run direct text search on a `nested` field."
+                )));
+            }
         }
     }
 
@@ -689,7 +717,10 @@ impl QueryParser {
         &self,
         user_input_ast: UserInputAst,
     ) -> (LogicalAst, Vec<QueryParserError>) {
-        println!("QueryParser::compute_logical_ast_with_occur_lenient => input AST: {:?}", user_input_ast);
+        println!(
+            "QueryParser::compute_logical_ast_with_occur_lenient => input AST: {:?}",
+            user_input_ast
+        );
         match user_input_ast {
             UserInputAst::Clause(sub_queries) => {
                 let default_occur = self.default_occur();
@@ -756,7 +787,10 @@ impl QueryParser {
         &self,
         literal: &'a UserInputLiteral,
     ) -> Result<Vec<(Field, &'a str, &'a str)>, QueryParserError> {
-        println!("QueryParser::compute_path_triplets_for_literal => processing literal: {:?}", literal);
+        println!(
+            "QueryParser::compute_path_triplets_for_literal => processing literal: {:?}",
+            literal
+        );
         let full_path = if let Some(full_path) = &literal.field_name {
             full_path
         } else {
@@ -789,7 +823,10 @@ impl QueryParser {
         &self,
         leaf: UserInputLeaf,
     ) -> (Option<LogicalAst>, Vec<QueryParserError>) {
-        println!("QueryParser::compute_logical_ast_from_leaf_lenient => processing leaf: {:?}", leaf);
+        println!(
+            "QueryParser::compute_logical_ast_from_leaf_lenient => processing leaf: {:?}",
+            leaf
+        );
         match leaf {
             UserInputLeaf::Literal(literal) => {
                 let term_phrases: Vec<(Field, &str, &str)> =
@@ -946,8 +983,10 @@ fn generate_literals_for_str(
     indexing_options: &TextFieldIndexing,
     text_analyzer: &mut TextAnalyzer,
 ) -> Result<Option<LogicalLiteral>, QueryParserError> {
-    println!("QueryParser::generate_literals_for_str => field={}, phrase={}, slop={}, prefix={}", 
-             field_name, phrase, slop, prefix);
+    println!(
+        "QueryParser::generate_literals_for_str => field={}, phrase={}, slop={}, prefix={}",
+        field_name, phrase, slop, prefix
+    );
     let mut terms: Vec<(usize, Term)> = Vec::new();
     let mut token_stream = text_analyzer.token_stream(phrase);
     token_stream.process(&mut |token| {
@@ -987,8 +1026,10 @@ fn generate_literals_for_json_object(
     tokenizer_manager: &TokenizerManager,
     json_options: &JsonObjectOptions,
 ) -> Result<Vec<LogicalLiteral>, QueryParserError> {
-    println!("QueryParser::generate_literals_for_json_object => field={}, json_path={}, phrase={}", 
-             field_name, json_path, phrase);
+    println!(
+        "QueryParser::generate_literals_for_json_object => field={}, json_path={}, phrase={}",
+        field_name, json_path, phrase
+    );
     let text_options = json_options.get_text_indexing_options().ok_or_else(|| {
         // This should have been seen earlier really.
         QueryParserError::FieldNotIndexed(field_name.to_string())
@@ -1041,7 +1082,10 @@ fn generate_literals_for_json_object(
 }
 
 fn convert_to_query(fuzzy: &FxHashMap<Field, Fuzzy>, logical_ast: LogicalAst) -> Box<dyn Query> {
-    println!("QueryParser::convert_to_query => converting AST: {:?}", logical_ast);
+    println!(
+        "QueryParser::convert_to_query => converting AST: {:?}",
+        logical_ast
+    );
     match trim_ast(logical_ast) {
         Some(LogicalAst::Clause(trimmed_clause)) => {
             let occur_subqueries = trimmed_clause

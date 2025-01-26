@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ip_options::IpAddrOptions;
 use super::nested_options::NestedOptions;
+use super::NestedJsonObjectOptions;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::{
     is_valid_field_name, DateOptions, FacetOptions, FieldType, JsonObjectOptions, NumericOptions,
@@ -26,7 +27,10 @@ impl FieldEntry {
     /// Creates a new field entry given a name and a field type
     pub fn new(field_name: String, field_type: FieldType) -> FieldEntry {
         assert!(is_valid_field_name(&field_name));
-        println!("Creating new FieldEntry with name: {}, type: {:?}", field_name, field_type);
+        println!(
+            "Creating new FieldEntry with name: {}, type: {:?}",
+            field_name, field_type
+        );
         FieldEntry {
             name: field_name,
             field_type,
@@ -88,6 +92,15 @@ impl FieldEntry {
         Self::new(field_name, FieldType::Nested(nested_opts))
     }
 
+    pub fn new_nested_json(field_name: String, nested_opts: NestedJsonObjectOptions) -> FieldEntry {
+        // If you want a single place to control `is_indexed`, `is_stored`, etc.,
+        // do that here based on `nested_opts` + `text_opts`.
+        FieldEntry {
+            name: field_name,
+            field_type: FieldType::NestedJson(nested_opts),
+        }
+    }
+
     /// Returns the name of the field
     pub fn name(&self) -> &str {
         println!("Accessing field name: {}", self.name);
@@ -129,7 +142,10 @@ impl FieldEntry {
             FieldType::JsonObject(ref options) => options.is_expand_dots_enabled(),
             _ => false,
         };
-        println!("Field {} is_expand_dots_enabled: {}", self.name, expand_dots);
+        println!(
+            "Field {} is_expand_dots_enabled: {}",
+            self.name, expand_dots
+        );
         expand_dots
     }
 
@@ -148,8 +164,12 @@ impl FieldEntry {
             FieldType::JsonObject(ref options) => options.is_stored(),
             FieldType::IpAddr(ref options) => options.is_stored(),
             FieldType::Nested(ref options) => options.is_stored(),
+            FieldType::NestedJson(ref options) => options.is_stored(),
         };
-        println!("Field {} is_stored: {} (type: {:?})", self.name, stored, self.field_type);
+        println!(
+            "Field {} is_stored: {} (type: {:?})",
+            self.name, stored, self.field_type
+        );
         stored
     }
 }

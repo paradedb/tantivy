@@ -71,7 +71,10 @@ impl SegmentWriter {
     /// - segment: The segment being written
     /// - schema
     pub fn for_segment(memory_budget_in_bytes: usize, segment: Segment) -> crate::Result<Self> {
-        debug!("SegmentWriter::for_segment => Creating new segment writer with memory_budget={}", memory_budget_in_bytes);
+        debug!(
+            "SegmentWriter::for_segment => Creating new segment writer with memory_budget={}",
+            memory_budget_in_bytes
+        );
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
         let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
@@ -124,7 +127,10 @@ impl SegmentWriter {
     /// Finalize consumes the `SegmentWriter`, so that it cannot
     /// be used afterwards.
     pub fn finalize(mut self) -> crate::Result<Vec<u64>> {
-        debug!("SegmentWriter::finalize => Finalizing segment with max_doc={}", self.max_doc);
+        debug!(
+            "SegmentWriter::finalize => Finalizing segment with max_doc={}",
+            self.max_doc
+        );
         self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
         remap_and_write(
             self.schema,
@@ -148,7 +154,10 @@ impl SegmentWriter {
 
     fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
         let doc_id = self.max_doc;
-        debug!("SegmentWriter::index_document => Starting to index document {}", doc_id);
+        debug!(
+            "SegmentWriter::index_document => Starting to index document {}",
+            doc_id
+        );
 
         // TODO: Can this be optimised a bit?
         let vals_grouped_by_field = doc
@@ -176,7 +185,8 @@ impl SegmentWriter {
             if !field_entry.is_indexed() {
                 debug!(
                     "SegmentWriter => Skipping non-indexed field: doc_id={}, field={}",
-                    doc_id, field_entry.name()
+                    doc_id,
+                    field_entry.name()
                 );
                 continue;
             }
@@ -209,35 +219,38 @@ impl SegmentWriter {
                     for (i, value) in values.enumerate() {
                         let value = value.as_value();
                         debug!(
-                            "SegmentWriter => Processing string value #{} for doc_id={}, field={}", 
-                            i, doc_id, field_entry.name()
+                            "SegmentWriter => Processing string value #{} for doc_id={}, field={}",
+                            i,
+                            doc_id,
+                            field_entry.name()
                         );
 
-                        let mut token_stream = if let Some(text) = value.as_str() {
-                            debug!(
+                        let mut token_stream =
+                            if let Some(text) = value.as_str() {
+                                debug!(
                                 "SegmentWriter => Tokenizing text for doc_id={}, field={}: '{}'",
                                 doc_id, field_entry.name(), text
                             );
-                            debug!(
+                                debug!(
                                 "SegmentWriter => tokenizing text for doc_id={}, field={}: '{}'",
                                 doc_id, field_entry.name(), text
                             );
-                            let text_analyzer =
-                                &mut self.per_field_text_analyzers[field.field_id() as usize];
-                            text_analyzer.token_stream(text)
-                        } else if let Some(tok_str) = value.into_pre_tokenized_text() {
-                            debug!(
+                                let text_analyzer =
+                                    &mut self.per_field_text_analyzers[field.field_id() as usize];
+                                text_analyzer.token_stream(text)
+                            } else if let Some(tok_str) = value.into_pre_tokenized_text() {
+                                debug!(
                                 "SegmentWriter => using pre-tokenized text for doc_id={}, field={}",
                                 doc_id, field_entry.name()
                             );
-                            BoxTokenStream::new(PreTokenizedStream::from(*tok_str.clone()))
-                        } else {
-                            debug!(
+                                BoxTokenStream::new(PreTokenizedStream::from(*tok_str.clone()))
+                            } else {
+                                debug!(
                                 "SegmentWriter => skipping non-text value for doc_id={}, field={}",
                                 doc_id, field_entry.name()
                             );
-                            continue;
-                        };
+                                continue;
+                            };
 
                         assert!(term_buffer.is_empty());
                         postings_writer.index_text(
@@ -262,11 +275,16 @@ impl SegmentWriter {
                         let u64_val = value.as_u64().ok_or_else(make_schema_error)?;
                         debug!(
                             "SegmentWriter => Processing U64 value #{} for doc_id={}, field={}: {}",
-                            i, doc_id, field_entry.name(), u64_val
+                            i,
+                            doc_id,
+                            field_entry.name(),
+                            u64_val
                         );
                         debug!(
                             "SegmentWriter => indexing u64 value for doc_id={}, field={}: {}",
-                            doc_id, field_entry.name(), u64_val
+                            doc_id,
+                            field_entry.name(),
+                            u64_val
                         );
                         term_buffer.set_u64(u64_val);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
@@ -335,7 +353,9 @@ impl SegmentWriter {
                         let bool_val = value.as_bool().ok_or_else(make_schema_error)?;
                         debug!(
                             "SegmentWriter => indexing bool value for doc_id={}, field={}: {}",
-                            doc_id, field_entry.name(), bool_val
+                            doc_id,
+                            field_entry.name(),
+                            bool_val
                         );
                         term_buffer.set_bool(bool_val);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
@@ -402,6 +422,28 @@ impl SegmentWriter {
                     // have already been expanded into child docs
                     // at parse time (parse_json_for_nested).
                     continue;
+                }
+                FieldType::NestedJson(nested_opts) => {
+                    let text_analyzer =
+                        &mut self.per_field_text_analyzers[field.field_id() as usize];
+
+                    self.json_positions_per_path.clear();
+                    self.json_path_writer
+                        .set_expand_dots(nested_opts.json_opts.is_expand_dots_enabled());
+                    for json_value in values {
+                        self.json_path_writer.clear();
+
+                        index_json_value(
+                            doc_id,
+                            json_value,
+                            text_analyzer,
+                            term_buffer,
+                            &mut self.json_path_writer,
+                            postings_writer,
+                            ctx,
+                            &mut self.json_positions_per_path,
+                        );
+                    }
                 }
             }
         }

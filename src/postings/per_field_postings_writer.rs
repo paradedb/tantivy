@@ -103,6 +103,11 @@ fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn Postings
             println!("Note: Nested fields currently only support basic doc ID recording");
             Box::<SpecializedPostingsWriter<DocIdRecorder>>::default()
         }
+        FieldType::NestedJson(opts) => {
+            println!("FieldType::NestedJson - Creating default DocIdRecorder for nestedJson field with options: {:?}", opts);
+            println!("Note: NestedJson fields currently only support basic doc ID recording");
+            Box::<SpecializedPostingsWriter<DocIdRecorder>>::default()
+        }
         FieldType::JsonObject(ref json_object_options) => {
             println!(
                 "FieldType::JsonObject - Processing JSON field with options: {:?}",

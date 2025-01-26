@@ -10,6 +10,7 @@ pub(crate) mod path_to_unordered_id;
 pub(crate) mod doc_id_mapping;
 mod doc_opstamp_mapping;
 mod flat_map_with_buffer;
+pub(crate) mod global_sort_segment_writer;
 pub(crate) mod index_writer;
 pub(crate) mod index_writer_status;
 mod log_merge_policy;

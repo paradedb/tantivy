@@ -11,7 +11,7 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 use super::ip_options::IpAddrOptions;
-use super::nested_options::{self, NestedOptions};
+use super::nested_options::{self, NestedJsonObjectOptions, NestedOptions};
 use super::IntoIpv6Addr;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::facet_options::FacetOptions;
@@ -194,6 +194,8 @@ pub enum FieldType {
     IpAddr(IpAddrOptions),
     /// Nested field
     Nested(NestedOptions),
+    /// NestedJson field
+    NestedJson(NestedJsonObjectOptions),
 }
 
 impl FieldType {
@@ -214,7 +216,7 @@ impl FieldType {
             // For simplicity, treat `Nested` as if it were JSON if code attempts
             // direct 'value_from_json'. We'll actually do the real expansion logic
             // separately in `parse_json_for_nested`.
-            FieldType::Nested(_) => Type::Json,
+            FieldType::Nested(_) | FieldType::NestedJson(_) => Type::Json,
         }
     }
 
@@ -293,6 +295,13 @@ impl FieldType {
                 println!("Checking if Nested field is indexed: {:?}", nested_options);
                 nested_options.is_indexed()
             }
+            FieldType::NestedJson(ref nested_options) => {
+                println!(
+                    "Checking if NestedJson field is indexed: {:?}",
+                    nested_options
+                );
+                nested_options.is_indexed()
+            }
         };
         println!("is_indexed() returning: {}", result);
         result
@@ -369,6 +378,10 @@ impl FieldType {
                 println!("Checking if Nested field is fast: {:?}", nested_options);
                 nested_options.is_fast()
             }
+            FieldType::NestedJson(ref nested_options) => {
+                println!("Checking if NestedJson field is fast: {:?}", nested_options);
+                nested_options.is_fast()
+            }
         };
         println!("is_fast() returning: {}", result);
         result
@@ -391,6 +404,7 @@ impl FieldType {
             FieldType::JsonObject(ref _json_object_options) => false,
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.fieldnorms(),
             FieldType::Nested(ref nested_options) => nested_options.fieldnorms(),
+            FieldType::NestedJson(ref nested_options) => nested_options.fieldnorms(),
         }
     }
 
@@ -449,6 +463,13 @@ impl FieldType {
                     None
                 }
             }
+            FieldType::NestedJson(ref nested_options) => {
+                if nested_options.is_indexed() {
+                    Some(IndexRecordOption::Basic)
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -462,7 +483,7 @@ impl FieldType {
         println!("\nvalue_from_json called with JSON: {:?}", json);
         println!("Field type is: {:?}", self);
 
-        if let FieldType::Nested(_nested_opts) = self {
+        if matches!(self, FieldType::Nested(_) | FieldType::NestedJson(_)) {
             println!("Nested field detected - returning error");
             return Err(ValueParsingError::TypeError {
                 expected: "nested field must be expanded via custom logic",
@@ -584,6 +605,11 @@ impl FieldType {
                         expected: "a nested object",
                         json: JsonValue::String(field_text),
                     }),
+
+                    FieldType::NestedJson(_) => Err(ValueParsingError::TypeError {
+                        expected: "a nested json object",
+                        json: JsonValue::String(field_text),
+                    }),
                 }
             }
             JsonValue::Number(field_val_num) => {
@@ -649,6 +675,10 @@ impl FieldType {
                     }),
                     FieldType::Nested(_) => Err(ValueParsingError::TypeError {
                         expected: "a nested object",
+                        json: JsonValue::Number(field_val_num),
+                    }),
+                    FieldType::NestedJson(_) => Err(ValueParsingError::TypeError {
+                        expected: "a nested json object",
                         json: JsonValue::Number(field_val_num),
                     }),
                 }

@@ -230,6 +230,39 @@ impl SchemaBuilder {
         field
     }
 
+    /// Adds a single "nested" field that also stores a JSON object in the same field,
+    /// flattening all subkeys into text tokens via `TextOptions`.
+    /// The `NestedOptions` control how child docs are expanded (include_in_parent, etc.).
+    /// If `NestedOptions::stor_parent_flag == true`, we create an internal boolean field
+    /// named `"_is_parent_<field_name>"` to mark parent docs.
+    pub fn add_nested_json_field(
+        &mut self,
+        field_name: &str,
+        nested_opts: NestedJsonObjectOptions,
+    ) -> Field {
+        // 1) Create a FieldEntry with the new FieldType::NestedJson variant
+        let field_entry = FieldEntry::new_nested_json(field_name.to_string(), nested_opts.clone());
+
+        // 2) Add that field to our schema
+        let field = self.add_field(field_entry);
+
+        // 3) If `store_parent_flag` is set, also create a parent-flag field
+        if nested_opts.nested_opts.store_parent_flag {
+            let parent_field_name = format!("_is_parent_{}", field_name);
+            // We'll store this flag as an indexed bool so we can find parent docs easily.
+            let bool_options = NumericOptions::default().set_indexed();
+            let bool_field_entry =
+                FieldEntry::new(parent_field_name.clone(), FieldType::Bool(bool_options));
+            self.add_field(bool_field_entry);
+
+            // Also record the mapping in `nested_paths` so queries can look it up
+            self.nested_paths
+                .insert(field_name.to_string(), parent_field_name);
+        }
+
+        field
+    }
+
     /// Adds a field entry to the schema in build.
     pub fn add_field(&mut self, field_entry: FieldEntry) -> Field {
         println!(

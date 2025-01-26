@@ -6,8 +6,12 @@ use crate::query::{
     block_join_query::{ParentBitSetProducer, ScoreMode as BJScoreMode, ToParentBlockJoinQuery},
     EnableScoring, Explanation, Query, QueryClone, Scorer, Weight,
 };
-use crate::schema::{Field, IndexRecordOption, Term};
-use crate::{DocAddress, DocId, DocSet, Score, SegmentReader, TantivyError, TERMINATED};
+use crate::schema::{
+    Field, IndexRecordOption, NestedJsonObjectOptions, Term, TextFieldIndexing, Value, STRING,
+};
+use crate::{
+    DocAddress, DocId, DocSet, IndexWriter, Score, SegmentReader, TantivyError, TERMINATED,
+};
 
 /// Our smaller enum for nested query's score_mode
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1235,4 +1239,92 @@ mod nested_query_extended_examples {
 
         Ok(())
     }
+}
+
+#[test]
+fn test_nested_query_without_subfields() -> crate::Result<()> {
+    use crate::collector::TopDocs;
+    use crate::query::{EnableScoring, TermQuery};
+    use crate::schema::{NestedOptions, Schema, SchemaBuilder, TantivyDocument, TextOptions};
+    use crate::{Index, Term};
+
+    // 1) Build a schema with ONE nested field: "user"
+    let mut builder = Schema::builder();
+    let nested_json_opts = NestedJsonObjectOptions::new()
+        .set_include_in_parent(true)
+        .set_store_parent_flag(true)
+        // The JSON will be indexed
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("default")
+                .set_index_option(IndexRecordOption::Basic),
+        )
+        // Also store the entire JSON
+        .set_stored();
+
+    // Suppose we index the JSON with TEXT options for flattening
+    let user_field = builder.add_nested_json_field("user", nested_json_opts);
+
+    // Also define a top-level "title" or "group" for the parent doc
+    let group_field = builder.add_text_field("group", STRING);
+
+    let schema = builder.build();
+    let index = Index::create_in_ram(schema.clone());
+
+    // 2) Index a doc with user => array-of-objects
+    {
+        let mut writer: IndexWriter<TantivyDocument> = index.writer_for_tests()?;
+        let doc_json = r#"
+        {
+            "group": "fans",
+            "user": [
+               { "first": "John", "last": "Smith" },
+               { "first": "Alice", "last": "White" }
+            ]
+        }
+        "#;
+        // Expand into parent+child docs
+        let expanded_docs = TantivyDocument::parse_json_for_nested(&schema, doc_json)
+            .expect("Could not parse nested JSON");
+
+        let docs: Vec<_> = expanded_docs.into_iter().map(|d| d.into()).collect();
+        writer.add_documents(docs).unwrap();
+        writer.commit()?;
+    }
+
+    // 3) Search for the parent doc that has a child doc containing "Alice" in "user"
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+
+    // Because we have no subfield "user.first", we just look for the token "alice"
+    let child_query = TermQuery::new(
+        Term::from_field_text(user_field, "alice"), // single field
+        IndexRecordOption::Basic,
+    );
+
+    let nested_query = NestedQuery::new(
+        "user".to_string(), // path
+        Box::new(child_query),
+        NestedScoreMode::None,
+        false, // ignore_unmapped
+    );
+
+    // Execute search
+    let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+    assert_eq!(
+        top_docs.len(),
+        1,
+        "Should find the parent doc that had child with 'Alice'"
+    );
+
+    // 4) Check the stored value
+    let (score, doc_address) = top_docs[0];
+    let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
+    let group_vals = retrieved_doc
+        .get_all(group_field)
+        .map(|v| v.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(group_vals, vec![Some("fans")]);
+
+    Ok(())
 }

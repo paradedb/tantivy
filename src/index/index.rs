@@ -30,19 +30,30 @@ fn load_metas(
     directory: &dyn Directory,
     inventory: &SegmentMetaInventory,
 ) -> crate::Result<IndexMeta> {
+    println!(
+        "load_metas: Attempting to load metas from directory: {:?}",
+        directory
+    );
     match directory.load_metas(inventory) {
-        Ok(metas) => Ok(metas),
+        Ok(metas) => {
+            println!("load_metas: Successfully loaded metas.");
+            Ok(metas)
+        }
         Err(crate::TantivyError::InternalError(_)) => {
+            println!("load_metas: Caught InternalError while loading metas. Attempting fallback.");
             let meta_data = directory.atomic_read(&META_FILEPATH)?;
+            println!("load_metas: Read raw meta data from {:?}.", META_FILEPATH);
             let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
-                error!("Meta data is not valid utf8.");
+                println!("load_metas: Meta data is not valid UTF-8.");
                 DataCorruption::new(
                     META_FILEPATH.to_path_buf(),
-                    "Meta file does not contain valid utf8 file.".to_string(),
+                    "Meta file does not contain valid UTF-8.".to_string(),
                 )
             })?;
+            println!("load_metas: Deserializing meta string.");
             IndexMeta::deserialize(&meta_string, inventory)
                 .map_err(|e| {
+                    println!("load_metas: Failed to deserialize meta string: {:?}", e);
                     DataCorruption::new(
                         META_FILEPATH.to_path_buf(),
                         format!(
@@ -52,7 +63,10 @@ fn load_metas(
                 })
                 .map_err(From::from)
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            println!("load_metas: Encountered error: {:?}", err);
+            Err(err)
+        }
     }
 }
 
@@ -68,6 +82,7 @@ fn save_new_metas(
     index_settings: IndexSettings,
     directory: &dyn Directory,
 ) -> crate::Result<()> {
+    println!("save_new_metas: Preparing to save new metas.");
     let empty_metas = IndexMeta {
         index_settings,
         segments: Vec::new(),
@@ -75,8 +90,11 @@ fn save_new_metas(
         opstamp: 0u64,
         payload: None,
     };
+    println!("save_new_metas: Creating empty metas structure.");
     save_metas(&empty_metas, &empty_metas, directory)?;
+    println!("save_new_metas: Metas saved successfully. Syncing directory.");
     directory.sync_directory()?;
+    println!("save_new_metas: Directory synced successfully.");
     Ok(())
 }
 
@@ -113,14 +131,18 @@ pub struct IndexBuilder {
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
 }
+
 impl Default for IndexBuilder {
     fn default() -> Self {
+        println!("IndexBuilder::default: Initializing with default values.");
         IndexBuilder::new()
     }
 }
+
 impl IndexBuilder {
     /// Creates a new `IndexBuilder`
     pub fn new() -> Self {
+        println!("IndexBuilder::new: Creating a new IndexBuilder instance.");
         Self {
             schema: None,
             index_settings: IndexSettings::default(),
@@ -132,6 +154,7 @@ impl IndexBuilder {
     /// Set the settings
     #[must_use]
     pub fn settings(mut self, settings: IndexSettings) -> Self {
+        println!("IndexBuilder::settings: Setting index settings.");
         self.index_settings = settings;
         self
     }
@@ -139,6 +162,7 @@ impl IndexBuilder {
     /// Set the schema
     #[must_use]
     pub fn schema(mut self, schema: Schema) -> Self {
+        println!("IndexBuilder::schema: Setting schema.");
         self.schema = Some(schema);
         self
     }
@@ -161,6 +185,7 @@ impl IndexBuilder {
     /// This is useful for indexing small set of documents
     /// for instances like unit test or temporary in memory index.
     pub fn create_in_ram(self) -> Result<Index, TantivyError> {
+        println!("IndexBuilder::create_in_ram: Creating index in RAM.");
         let ram_directory = RamDirectory::create();
         self.create(ram_directory)
     }
@@ -172,6 +197,10 @@ impl IndexBuilder {
     /// [`TantivyError::IndexAlreadyExists`] error.
     #[cfg(feature = "mmap")]
     pub fn create_in_dir<P: AsRef<Path>>(self, directory_path: P) -> crate::Result<Index> {
+        println!(
+            "IndexBuilder::create_in_dir: Creating index in directory: {:?}",
+            directory_path.as_ref()
+        );
         let mmap_directory: Box<dyn Directory> = Box::new(MmapDirectory::open(directory_path)?);
         if Index::exists(&*mmap_directory)? {
             return Err(TantivyError::IndexAlreadyExists);
@@ -193,8 +222,13 @@ impl IndexBuilder {
         dir: impl Into<Box<dyn Directory>>,
         mem_budget: usize,
     ) -> crate::Result<SingleSegmentIndexWriter<D>> {
+        println!(
+            "IndexBuilder::single_segment_index_writer: Creating single segment index writer with memory budget: {}",
+            mem_budget
+        );
         let index = self.create(dir)?;
         let index_simple_writer = SingleSegmentIndexWriter::new(index, mem_budget)?;
+        println!("IndexBuilder::single_segment_index_writer: SingleSegmentIndexWriter created successfully.");
         Ok(index_simple_writer)
     }
 
@@ -209,11 +243,13 @@ impl IndexBuilder {
     /// [`IndexBuilder::create_in_ram()`].
     #[cfg(feature = "mmap")]
     pub fn create_from_tempdir(self) -> crate::Result<Index> {
+        println!("IndexBuilder::create_from_tempdir: Creating index in a temporary directory.");
         let mmap_directory: Box<dyn Directory> = Box::new(MmapDirectory::create_from_tempdir()?);
         self.create(mmap_directory)
     }
 
     fn get_expect_schema(&self) -> crate::Result<Schema> {
+        println!("IndexBuilder::get_expect_schema: Retrieving expected schema.");
         self.schema
             .as_ref()
             .cloned()
@@ -222,15 +258,22 @@ impl IndexBuilder {
 
     /// Opens or creates a new index in the provided directory
     pub fn open_or_create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+        println!(
+            "IndexBuilder::open_or_create: Checking if index exists in the provided directory."
+        );
         let dir = dir.into();
         if !Index::exists(&*dir)? {
+            println!("IndexBuilder::open_or_create: Index does not exist. Creating a new one.");
             return self.create(dir);
         }
+        println!("IndexBuilder::open_or_create: Index exists. Attempting to open existing index.");
         let mut index = Index::open(dir)?;
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
+            println!("IndexBuilder::open_or_create: Schema matches. Returning opened index.");
             Ok(index)
         } else {
+            println!("IndexBuilder::open_or_create: Schema mismatch detected. Cannot open index.");
             Err(TantivyError::SchemaError(
                 "An index exists but the schema does not match.".to_string(),
             ))
@@ -238,9 +281,12 @@ impl IndexBuilder {
     }
 
     fn validate(&self) -> crate::Result<()> {
+        println!("IndexBuilder::validate: Validating IndexBuilder configuration.");
         if let Some(_schema) = self.schema.as_ref() {
+            println!("IndexBuilder::validate: Schema is set.");
             Ok(())
         } else {
+            println!("IndexBuilder::validate: Schema is missing.");
             Err(TantivyError::InvalidArgument(
                 "no schema passed".to_string(),
             ))
@@ -251,19 +297,27 @@ impl IndexBuilder {
     ///
     /// If a directory previously existed, it will be erased.
     fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+        println!("IndexBuilder::create: Starting index creation process.");
         self.validate()?;
         let dir = dir.into();
+        println!("IndexBuilder::create: Wrapping directory.");
         let directory = ManagedDirectory::wrap(dir)?;
+        println!("IndexBuilder::create: Saving new metas.");
         save_new_metas(
             self.get_expect_schema()?,
             self.index_settings.clone(),
             &directory,
         )?;
+        println!("IndexBuilder::create: Metas saved. Initializing IndexMeta.");
         let mut metas = IndexMeta::with_schema(self.get_expect_schema()?);
         metas.index_settings = self.index_settings;
+        println!("IndexBuilder::create: Opening index from metas.");
         let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
+        println!("IndexBuilder::create: Setting tokenizers.");
         index.set_tokenizers(self.tokenizer_manager);
+        println!("IndexBuilder::create: Setting fast field tokenizers.");
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
+        println!("IndexBuilder::create: Index created successfully.");
         Ok(index)
     }
 }
@@ -283,12 +337,18 @@ pub struct Index {
 impl Index {
     /// Creates a new builder.
     pub fn builder() -> IndexBuilder {
+        println!("Index::builder: Creating a new IndexBuilder.");
         IndexBuilder::new()
     }
+
     /// Examines the directory to see if it contains an index.
     ///
     /// Effectively, it only checks for the presence of the `meta.json` file.
     pub fn exists(dir: &dyn Directory) -> Result<bool, OpenReadError> {
+        println!(
+            "Index::exists: Checking existence of meta file in directory: {:?}",
+            dir
+        );
         dir.exists(&META_FILEPATH)
     }
 
@@ -299,24 +359,34 @@ impl Index {
     ///
     /// By default the executor is single thread, and simply runs in the calling thread.
     pub fn search_executor(&self) -> &Executor {
+        println!("Index::search_executor: Accessing search executor.");
         &self.executor
     }
 
     /// Replace the default single thread search executor pool
     /// by a thread pool with a given number of threads.
     pub fn set_multithread_executor(&mut self, num_threads: usize) -> crate::Result<()> {
+        println!(
+            "Index::set_multithread_executor: Setting multithread executor with {} threads.",
+            num_threads
+        );
         self.executor = Executor::multi_thread(num_threads, "tantivy-search-")?;
+        println!("Index::set_multithread_executor: Multithread executor set successfully.");
         Ok(())
     }
 
     /// Custom thread pool by a outer thread pool.
     pub fn set_executor(&mut self, executor: Executor) {
+        println!("Index::set_executor: Setting a custom executor.");
         self.executor = executor;
     }
 
     /// Replace the default single thread search executor pool
     /// by a thread pool with as many threads as there are CPUs on the system.
     pub fn set_default_multithread_executor(&mut self) -> crate::Result<()> {
+        println!(
+            "Index::set_default_multithread_executor: Setting default multithread executor based on available CPUs."
+        );
         let default_num_threads = available_parallelism()?.get();
         self.set_multithread_executor(default_num_threads)
     }
@@ -327,6 +397,7 @@ impl Index {
     /// This is useful for indexing small set of documents
     /// for instances like unit test or temporary in memory index.
     pub fn create_in_ram(schema: Schema) -> Index {
+        println!("Index::create_in_ram: Creating in-memory index.");
         IndexBuilder::new().schema(schema).create_in_ram().unwrap()
     }
 
@@ -340,6 +411,10 @@ impl Index {
         directory_path: P,
         schema: Schema,
     ) -> crate::Result<Index> {
+        println!(
+            "Index::create_in_dir: Creating index in directory: {:?}",
+            directory_path.as_ref()
+        );
         IndexBuilder::new()
             .schema(schema)
             .create_in_dir(directory_path)
@@ -350,6 +425,7 @@ impl Index {
         dir: T,
         schema: Schema,
     ) -> crate::Result<Index> {
+        println!("Index::open_or_create: Opening or creating index.");
         let dir = dir.into();
         IndexBuilder::new().schema(schema).open_or_create(dir)
     }
@@ -365,6 +441,7 @@ impl Index {
     /// see: [`IndexBuilder::create_in_ram()`].
     #[cfg(feature = "mmap")]
     pub fn create_from_tempdir(schema: Schema) -> crate::Result<Index> {
+        println!("Index::create_from_tempdir: Creating index in a temporary directory.");
         IndexBuilder::new().schema(schema).create_from_tempdir()
     }
 
@@ -376,6 +453,7 @@ impl Index {
         schema: Schema,
         settings: IndexSettings,
     ) -> crate::Result<Index> {
+        println!("Index::create: Creating index with provided directory, schema, and settings.");
         let dir: Box<dyn Directory> = dir.into();
         let mut builder = IndexBuilder::new().schema(schema);
         builder = builder.settings(settings);
@@ -388,6 +466,7 @@ impl Index {
         metas: &IndexMeta,
         inventory: SegmentMetaInventory,
     ) -> Index {
+        println!("Index::open_from_metas: Opening index from metas.");
         let schema = metas.schema.clone();
         Index {
             settings: metas.index_settings.clone(),
@@ -402,26 +481,34 @@ impl Index {
 
     /// Setter for the tokenizer manager.
     pub fn set_tokenizers(&mut self, tokenizers: TokenizerManager) {
+        println!("Index::set_tokenizers: Setting tokenizer manager.");
         self.tokenizers = tokenizers;
     }
 
     /// Accessor for the tokenizer manager.
     pub fn tokenizers(&self) -> &TokenizerManager {
+        println!("Index::tokenizers: Accessing tokenizer manager.");
         &self.tokenizers
     }
 
     /// Setter for the fast field tokenizer manager.
     pub fn set_fast_field_tokenizers(&mut self, tokenizers: TokenizerManager) {
+        println!("Index::set_fast_field_tokenizers: Setting fast field tokenizer manager.");
         self.fast_field_tokenizers = tokenizers;
     }
 
     /// Accessor for the fast field tokenizer manager.
     pub fn fast_field_tokenizer(&self) -> &TokenizerManager {
+        println!("Index::fast_field_tokenizer: Accessing fast field tokenizer manager.");
         &self.fast_field_tokenizers
     }
 
     /// Get the tokenizer associated with a specific field.
     pub fn tokenizer_for_field(&self, field: Field) -> crate::Result<TextAnalyzer> {
+        println!(
+            "Index::tokenizer_for_field: Retrieving tokenizer for field: {:?}",
+            field
+        );
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         let tokenizer_manager: &TokenizerManager = self.tokenizers();
@@ -429,23 +516,42 @@ impl Index {
             FieldType::JsonObject(options) => options.get_text_indexing_options(),
             FieldType::Str(options) => options.get_indexing_options(),
             _ => {
+                println!(
+                    "Index::tokenizer_for_field: Field {:?} is not a text field.",
+                    field_entry.name()
+                );
                 return Err(TantivyError::SchemaError(format!(
                     "{:?} is not a text field.",
                     field_entry.name()
-                )))
+                )));
             }
         };
         let indexing_options = indexing_options_opt.ok_or_else(|| {
+            println!(
+                "Index::tokenizer_for_field: No indexing options set for field {:?}.",
+                field_entry.name()
+            );
             TantivyError::InvalidArgument(format!(
-                "No indexing options set for field {field_entry:?}"
+                "No indexing options set for field {:?}",
+                field_entry.name()
             ))
         })?;
+        println!(
+            "Index::tokenizer_for_field: Found tokenizer '{}' for field {:?}.",
+            indexing_options.tokenizer(),
+            field_entry.name()
+        );
 
         tokenizer_manager
             .get(indexing_options.tokenizer())
             .ok_or_else(|| {
+                println!(
+                    "Index::tokenizer_for_field: No tokenizer found named '{}'.",
+                    indexing_options.tokenizer()
+                );
                 TantivyError::InvalidArgument(format!(
-                    "No Tokenizer found for field {field_entry:?}"
+                    "No Tokenizer found for field {:?}",
+                    field_entry.name()
                 ))
             })
     }
@@ -454,20 +560,26 @@ impl Index {
     ///
     /// See [`Index.reader_builder()`].
     pub fn reader(&self) -> crate::Result<IndexReader> {
+        println!("Index::reader: Creating default IndexReader.");
         self.reader_builder().try_into()
     }
 
     /// Create a [`IndexReader`] for the given index.
     ///
-    /// Most project should create at most one reader for a given index.
+    /// Most projects should create at most one reader for a given index.
     /// This method is typically called only once per `Index` instance.
     pub fn reader_builder(&self) -> IndexReaderBuilder {
+        println!("Index::reader_builder: Creating IndexReaderBuilder.");
         IndexReaderBuilder::new(self.clone())
     }
 
     /// Opens a new directory from an index path.
     #[cfg(feature = "mmap")]
     pub fn open_in_dir<P: AsRef<Path>>(directory_path: P) -> crate::Result<Index> {
+        println!(
+            "Index::open_in_dir: Opening index in directory: {:?}",
+            directory_path.as_ref()
+        );
         let mmap_directory = MmapDirectory::open(directory_path)?;
         Index::open(mmap_directory)
     }
@@ -478,6 +590,7 @@ impl Index {
     /// but also they could be segments being currently built or in the middle of a merge
     /// operation.
     pub(crate) fn list_all_segment_metas(&self) -> Vec<SegmentMeta> {
+        println!("Index::list_all_segment_metas: Listing all segment metas.");
         self.inventory.all()
     }
 
@@ -495,11 +608,23 @@ impl Index {
     /// field that is not indexed nor a fast field but is stored, it is possible for the field
     /// to not be listed.
     pub fn fields_metadata(&self) -> crate::Result<Vec<FieldMetadata>> {
+        println!("Index::fields_metadata: Gathering fields metadata.");
         let segments = self.searchable_segments()?;
+        println!(
+            "Index::fields_metadata: Retrieved {} searchable segments.",
+            segments.len()
+        );
         let fields_metadata: Vec<Vec<FieldMetadata>> = segments
             .into_iter()
-            .map(|segment| SegmentReader::open(&segment)?.fields_metadata())
+            .map(|segment| {
+                println!(
+                    "Index::fields_metadata: Opening SegmentReader for segment: {:?}",
+                    segment
+                );
+                SegmentReader::open(&segment)?.fields_metadata()
+            })
             .collect::<Result<_, _>>()?;
+        println!("Index::fields_metadata: Merging fields metadata from all segments.");
         Ok(merge_field_meta_data(fields_metadata, &self.schema()))
     }
 
@@ -509,21 +634,30 @@ impl Index {
     /// `SegmentMeta` are guaranteed to not be garbage collected, regardless of
     /// whether the segment is recorded as part of the index or not.
     pub fn new_segment_meta(&self, segment_id: SegmentId, max_doc: u32) -> SegmentMeta {
+        println!(
+            "Index::new_segment_meta: Creating new SegmentMeta with ID {:?} and max_doc {}.",
+            segment_id, max_doc
+        );
         self.inventory.new_segment_meta(segment_id, max_doc)
     }
 
     /// Open the index using the provided directory
     pub fn open<T: Into<Box<dyn Directory>>>(directory: T) -> crate::Result<Index> {
+        println!("Index::open: Opening index from provided directory.");
         let directory = directory.into();
         let directory = ManagedDirectory::wrap(directory)?;
         let inventory = SegmentMetaInventory::default();
+        println!("Index::open: Loading metas.");
         let metas = load_metas(&directory, &inventory)?;
+        println!("Index::open: Opening index from metas.");
         let index = Index::open_from_metas(directory, &metas, inventory);
+        println!("Index::open: Index opened successfully.");
         Ok(index)
     }
 
     /// Reads the index meta file from the directory.
     pub fn load_metas(&self) -> crate::Result<IndexMeta> {
+        println!("Index::load_metas: Loading metas from directory.");
         load_metas(self.directory(), &self.inventory)
     }
 
@@ -550,6 +684,10 @@ impl Index {
             .directory
             .acquire_lock(&INDEX_WRITER_LOCK)
             .map_err(|err| {
+                println!(
+                    "Index::writer_with_options: Failed to acquire lock: {:?}",
+                    err
+                );
                 TantivyError::LockFailure(
                     err,
                     Some(
@@ -560,7 +698,9 @@ impl Index {
                     ),
                 )
             })?;
+        println!("Index::writer_with_options: Lock acquired successfully.");
 
+        println!("Index::writer_with_options: Initializing IndexWriter with Document type D.");
         IndexWriter::new(self, options, directory_lock)
     }
 
@@ -588,7 +728,15 @@ impl Index {
         num_threads: usize,
         overall_memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter<D>> {
+        println!(
+            "Index::writer_with_num_threads: Creating writer with {} threads and memory budget {} bytes.",
+            num_threads, overall_memory_budget_in_bytes
+        );
         let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
+        println!(
+            "Index::writer_with_num_threads: Memory arena per thread: {} bytes.",
+            memory_arena_in_bytes_per_thread
+        );
         let options = IndexWriterOptions::builder()
             .num_worker_threads(num_threads)
             .memory_budget_per_thread(memory_arena_in_bytes_per_thread)
@@ -602,6 +750,7 @@ impl Index {
     /// Using a single thread gives us a deterministic allocation of DocId.
     #[cfg(test)]
     pub fn writer_for_tests<D: Document>(&self) -> crate::Result<IndexWriter<D>> {
+        println!("Index::writer_for_tests: Creating test IndexWriter with single thread and minimal memory budget.");
         self.writer_with_num_threads(1, MEMORY_BUDGET_NUM_BYTES_MIN)
     }
 
@@ -620,21 +769,42 @@ impl Index {
         &self,
         memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter<D>> {
+        println!(
+            "Index::writer: Creating multithreaded writer with memory budget {} bytes.",
+            memory_budget_in_bytes
+        );
         let mut num_threads = std::cmp::min(available_parallelism()?.get(), MAX_NUM_THREAD);
+        println!(
+            "Index::writer: Using {} threads for the writer (max allowed: {}).",
+            num_threads, MAX_NUM_THREAD
+        );
         let memory_budget_num_bytes_per_thread = memory_budget_in_bytes / num_threads;
+        println!(
+            "Index::writer: Memory budget per thread: {} bytes.",
+            memory_budget_num_bytes_per_thread
+        );
         if memory_budget_num_bytes_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
+            println!(
+                "Index::writer: Memory per thread below minimum. Adjusting number of threads."
+            );
             num_threads = (memory_budget_in_bytes / MEMORY_BUDGET_NUM_BYTES_MIN).max(1);
+            println!(
+                "Index::writer: Adjusted number of threads: {}.",
+                num_threads
+            );
         }
         self.writer_with_num_threads(num_threads, memory_budget_in_bytes)
     }
 
     /// Accessor to the index settings
     pub fn settings(&self) -> &IndexSettings {
+        println!("Index::settings: Accessing index settings.");
         &self.settings
     }
 
     /// Accessor to the index settings
     pub fn settings_mut(&mut self) -> &mut IndexSettings {
+        println!("Index::settings_mut: Accessing mutable index settings.");
         &mut self.settings
     }
 
@@ -642,79 +812,137 @@ impl Index {
     ///
     /// The schema is actually cloned.
     pub fn schema(&self) -> Schema {
+        println!("Index::schema: Accessing and cloning schema.");
         self.schema.clone()
     }
 
     /// Returns the list of segments that are searchable
     pub fn searchable_segments(&self) -> crate::Result<Vec<Segment>> {
-        Ok(self
-            .searchable_segment_metas()?
+        println!("Index::searchable_segments: Retrieving searchable segments.");
+        let segments = self.searchable_segment_metas()?;
+        println!(
+            "Index::searchable_segments: Found {} searchable segment metas.",
+            segments.len()
+        );
+        Ok(segments
             .into_iter()
-            .map(|segment_meta| self.segment(segment_meta))
+            .map(|segment_meta| {
+                println!(
+                    "Index::searchable_segments: Creating Segment for meta: {:?}",
+                    segment_meta
+                );
+                self.segment(segment_meta)
+            })
             .collect())
     }
 
     #[doc(hidden)]
     pub fn segment(&self, segment_meta: SegmentMeta) -> Segment {
+        println!(
+            "Index::segment: Creating Segment from SegmentMeta with ID {:?}.",
+            segment_meta.id()
+        );
         Segment::for_index(self.clone(), segment_meta)
     }
 
     /// Creates a new segment.
     pub fn new_segment(&self) -> Segment {
+        println!("Index::new_segment: Creating a new segment.");
         let segment_meta = self
             .inventory
             .new_segment_meta(SegmentId::generate_random(), 0);
+        println!(
+            "Index::new_segment: Generated new SegmentMeta with ID {:?}.",
+            segment_meta.id()
+        );
         self.segment(segment_meta)
     }
 
     /// Return a reference to the index directory.
     pub fn directory(&self) -> &ManagedDirectory {
+        println!("Index::directory: Accessing index directory.");
         &self.directory
     }
 
     /// Return a mutable reference to the index directory.
     pub fn directory_mut(&mut self) -> &mut ManagedDirectory {
+        println!("Index::directory_mut: Accessing mutable index directory.");
         &mut self.directory
     }
 
     /// Reads the meta.json and returns the list of
     /// `SegmentMeta` from the last commit.
     pub fn searchable_segment_metas(&self) -> crate::Result<Vec<SegmentMeta>> {
+        println!("Index::searchable_segment_metas: Loading metas for searchable segments.");
         Ok(self.load_metas()?.segments)
     }
 
     /// Returns the list of segment ids that are searchable.
     pub fn searchable_segment_ids(&self) -> crate::Result<Vec<SegmentId>> {
-        Ok(self
-            .searchable_segment_metas()?
-            .iter()
-            .map(SegmentMeta::id)
-            .collect())
+        println!("Index::searchable_segment_ids: Retrieving searchable segment IDs.");
+        let metas = self.searchable_segment_metas()?;
+        let segment_ids: Vec<_> = metas.iter().map(SegmentMeta::id).collect();
+        println!(
+            "Index::searchable_segment_ids: Found segment IDs: {:?}",
+            segment_ids
+        );
+        Ok(segment_ids)
     }
 
     /// Returns the set of corrupted files
     pub fn validate_checksum(&self) -> crate::Result<HashSet<PathBuf>> {
+        println!("Index::validate_checksum: Starting checksum validation.");
         let managed_files = self.directory.list_managed_files()?;
+        println!(
+            "Index::validate_checksum: Retrieved {} managed files.",
+            managed_files.len()
+        );
         let active_segments_files: HashSet<PathBuf> = self
             .searchable_segment_metas()?
             .iter()
             .flat_map(|segment_meta| segment_meta.list_files())
             .collect();
+        println!(
+            "Index::validate_checksum: Collected {} active segment files.",
+            active_segments_files.len()
+        );
         let active_existing_files: HashSet<&PathBuf> =
             active_segments_files.intersection(&managed_files).collect();
+        println!(
+            "Index::validate_checksum: Identified {} active existing files for validation.",
+            active_existing_files.len()
+        );
 
         let mut damaged_files = HashSet::new();
         for path in active_existing_files {
+            println!(
+                "Index::validate_checksum: Validating checksum for file: {:?}",
+                path
+            );
             if !self.directory.validate_checksum(path)? {
+                println!(
+                    "Index::validate_checksum: Checksum validation failed for file: {:?}",
+                    path
+                );
                 damaged_files.insert((*path).clone());
+            } else {
+                println!(
+                    "Index::validate_checksum: Checksum valid for file: {:?}",
+                    path
+                );
             }
         }
+        println!(
+            "Index::validate_checksum: Validation complete. Found {} damaged files.",
+            damaged_files.len()
+        );
         Ok(damaged_files)
     }
 }
 
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        println!("Index::fmt::Debug: Formatting Index for debug.");
         write!(f, "Index({:?})", self.directory)
     }
 }

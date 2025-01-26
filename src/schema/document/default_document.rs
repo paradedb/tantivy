@@ -135,7 +135,7 @@ impl CompactDoc {
             field: field
                 .field_id()
                 .try_into()
-                .expect("support only up to u16::MAX field ids"),
+                .expect("only up to u16::MAX fields supported"),
             value_addr: self.add_value(value),
         };
         self.field_values.push(field_value);
@@ -153,7 +153,7 @@ impl CompactDoc {
             field: field
                 .field_id()
                 .try_into()
-                .expect("support only up to u16::MAX field ids"),
+                .expect("only up to u16::MAX fields supported"),
             value_addr: self.add_value_leaf(value),
         };
         self.field_values.push(field_value);
@@ -161,10 +161,11 @@ impl CompactDoc {
 
     /// field_values accessor
     pub fn field_values(&self) -> impl Iterator<Item = (Field, CompactDocValue<'_>)> {
-        self.field_values.iter().map(|field_val| {
-            let field = Field::from_field_id(field_val.field as u32);
-            let val = self.get_compact_doc_value(field_val.value_addr);
-            (field, val)
+        self.field_values.iter().map(|fv| {
+            (
+                Field::from_field_id(fv.field as u32),
+                self.get_compact_doc_value(fv.value_addr),
+            )
         })
     }
 
@@ -172,8 +173,8 @@ impl CompactDoc {
     pub fn get_all(&self, field: Field) -> impl Iterator<Item = CompactDocValue<'_>> + '_ {
         self.field_values
             .iter()
-            .filter(move |field_value| Field::from_field_id(field_value.field as u32) == field)
-            .map(|val| self.get_compact_doc_value(val.value_addr))
+            .filter(move |fv| fv.field as u32 == field.field_id())
+            .map(|fv| self.get_compact_doc_value(fv.value_addr))
     }
 
     /// Returns the first `ReferenceValue` associated the given field
@@ -199,9 +200,9 @@ impl CompactDoc {
 
     /// Build a document object from a json-object.
     pub fn parse_json(schema: &Schema, doc_json: &str) -> Result<Self, DocParsingError> {
-        let json_obj: Map<String, serde_json::Value> =
+        let top_obj: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(doc_json).map_err(|_| DocParsingError::invalid_json(doc_json))?;
-        Self::from_json_object(schema, json_obj)
+        Self::from_json_object(schema, top_obj)
     }
 
     /// Parse a top-level JSON *object* that may contain nested fields.
@@ -210,22 +211,17 @@ impl CompactDoc {
         schema: &Schema,
         json_str: &str,
     ) -> Result<Vec<TantivyDocument>, DocParsingError> {
-        // 1) Parse the top-level JSON to a serde_json::Value
         let top_val: serde_json::Value = serde_json::from_str(json_str)
             .map_err(|e| DocParsingError::InvalidJson(e.to_string()))?;
-
         let obj = top_val.as_object().ok_or_else(|| {
             DocParsingError::InvalidJson("Top-level JSON must be an object".to_string())
         })?;
 
-        // We'll accumulate child docs in `child_docs`, plus one "parent doc"
         let mut child_docs = Vec::new();
         let mut parent_doc = TantivyDocument::default();
-
-        // Flattened recursion: parse the top object with an empty prefix
+        // parse the object with no prefix
         Self::parse_object_with_prefix(schema, "", obj, &mut parent_doc, &mut child_docs)?;
-
-        // Finally push the parent doc last
+        // push the parent doc last
         child_docs.push(parent_doc);
         Ok(child_docs)
     }
@@ -242,98 +238,166 @@ impl CompactDoc {
         child_docs: &mut Vec<TantivyDocument>,
     ) -> Result<(), DocParsingError> {
         for (sub_key, sub_val) in object {
-            // Build the dotted name. e.g. if parent_prefix="driver",
-            // and sub_key="last_name", then full_key="driver.last_name".
+            // Build the dotted name: e.g. "parent.child"
             let full_key = if parent_prefix.is_empty() {
-                sub_key.clone()
+                sub_key.to_string()
             } else {
                 format!("{}.{}", parent_prefix, sub_key)
             };
 
-            // Try to find a field in the schema with that dotted name
-            let field_res = schema.get_field(&full_key);
-            if field_res.is_err() {
-                // No field found => skip or log
+            let field_opt = schema.get_field(&full_key);
+            if field_opt.is_err() {
+                // Unknown field => skip
                 eprintln!("Skipping unknown field '{}' in JSON", full_key);
                 continue;
             }
-            let field = field_res.unwrap();
+            let field = field_opt.unwrap();
             let field_entry = schema.get_field_entry(field);
-            let ftype = field_entry.field_type();
-
-            match ftype {
+            match field_entry.field_type() {
+                // ---------------------------------------
+                // NESTED
+                // ---------------------------------------
                 FieldType::Nested(nested_opts) => {
-                    // Mark the parent doc if store_parent_flag = true
+                    // optionally set the parent-flag
                     if nested_opts.store_parent_flag {
                         let parent_flag_name = format!("_is_parent_{}", full_key);
                         if let Ok(parent_flag_field) = schema.get_field(&parent_flag_name) {
-                            // Set bool=true on the parent
                             parent_doc.add_field_value(parent_flag_field, &OwnedValue::from(true));
                         }
                     }
-
-                    // Expand array-of-objects or a single object
-                    if let Some(arr) = sub_val.as_array() {
-                        for arr_item in arr {
-                            if let Some(child_obj) = arr_item.as_object() {
-                                // Create a new child doc
-                                let mut child_doc = TantivyDocument::default();
-
-                                // If you want `include_in_parent==true` to also copy
-                                // these subfields up to the parent doc, do that here:
-                                if nested_opts.include_in_parent {
-                                    Self::parse_object_with_prefix(
-                                        schema, &full_key, // pass the same prefix
-                                        child_obj, parent_doc, child_docs,
-                                    )?;
-                                }
-
-                                // Now parse the child's fields
-                                Self::parse_object_with_prefix(
-                                    schema,
-                                    &full_key, // pass the same prefix
-                                    child_obj,
-                                    &mut child_doc,
-                                    child_docs,
-                                )?;
-                                child_docs.push(child_doc);
-                            } else {
-                                eprintln!(
-                                    "WARNING: nested field '{}' expected object, got {:?}",
-                                    full_key, arr_item
-                                );
-                            }
-                        }
-                    } else if let Some(single_obj) = sub_val.as_object() {
-                        // single nested object => treat like array-of-one
-                        let mut child_doc = TantivyDocument::default();
-
-                        if nested_opts.include_in_parent {
-                            Self::parse_object_with_prefix(
-                                schema, &full_key, single_obj, parent_doc, child_docs,
-                            )?;
-                        }
-                        Self::parse_object_with_prefix(
-                            schema,
-                            &full_key,
-                            single_obj,
-                            &mut child_doc,
-                            child_docs,
-                        )?;
-                        child_docs.push(child_doc);
-                    } else {
-                        eprintln!(
-                            "WARNING: nested field '{}' expected array-of-objects, got: {:?}",
-                            full_key, sub_val
-                        );
-                    }
+                    Self::expand_nested_array_of_objects(
+                        schema,
+                        &full_key,
+                        sub_val,
+                        nested_opts.include_in_parent,
+                        parent_doc,
+                        child_docs,
+                    )?;
                 }
 
-                // If it's a normal (non-nested) field => parse & add to the current doc
+                // ---------------------------------------
+                // NESTED JSON
+                // ---------------------------------------
+                FieldType::NestedJson(nj_opts) => {
+                    // <--- ADDED NestedJson handling
+                    // If store_parent_flag is true
+                    if nj_opts.nested_opts.store_parent_flag {
+                        let parent_flag_name = format!("_is_parent_{}", full_key);
+                        if let Ok(parent_flag_field) = schema.get_field(&parent_flag_name) {
+                            parent_doc.add_field_value(parent_flag_field, &OwnedValue::from(true));
+                        }
+                    }
+                    // Optionally store the entire JSON if `is_stored()` is set
+                    if nj_opts.json_opts.is_stored() {
+                        // For instance, store it as a raw string
+                        let raw_string = sub_val.to_string();
+                        parent_doc.add_field_value(field, &OwnedValue::Str(raw_string));
+                    }
+                    // Expand array-of-objects
+                    Self::expand_nested_array_of_objects(
+                        schema,
+                        &full_key,
+                        sub_val,
+                        nj_opts.nested_opts.include_in_parent,
+                        parent_doc,
+                        child_docs,
+                    )?;
+                }
+
+                // ---------------------------------------
+                // NORMAL FIELD
+                // ---------------------------------------
                 _ => {
                     Self::parse_regular_field(schema, field, sub_val, parent_doc)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn expand_nested_array_of_objects(
+        schema: &Schema,
+        full_key: &str,
+        json_val: &serde_json::Value,
+        include_in_parent: bool,
+        parent_doc: &mut TantivyDocument,
+        child_docs: &mut Vec<TantivyDocument>,
+    ) -> Result<(), DocParsingError> {
+        if let Some(arr) = json_val.as_array() {
+            for item in arr {
+                if let Some(child_obj) = item.as_object() {
+                    // 1) If we’re including in parent, add to parent’s JSON field
+                    if include_in_parent {
+                        // “full_key” is the dotted path like “user”.
+                        // Find that field in the schema
+                        if let Ok(parent_field) = schema.get_field(&full_key) {
+                            // Convert just this child object to JSON text
+                            let raw_str = serde_json::to_string(child_obj).unwrap();
+                            // Add it to the parent's doc
+                            parent_doc.add_field_value(parent_field, &OwnedValue::Str(raw_str));
+                        }
+                        // Then also parse subkeys, in case we want to fill in any typed subfields, etc.
+                        Self::parse_object_with_prefix(
+                            schema, full_key, child_obj, parent_doc, child_docs,
+                        )?;
+                    }
+
+                    // 2) Create a new child doc for the block-join logic
+                    let mut child_doc = TantivyDocument::default();
+                    if let Ok(user_field) = schema.get_field(full_key) {
+                        child_doc.add_field_value(
+                            user_field,
+                            &OwnedValue::Object(
+                                child_obj
+                                    .clone()
+                                    .into_iter()
+                                    .map(|(k, v)| (k, v.into()))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    Self::parse_object_with_prefix(
+                        schema,
+                        full_key,
+                        child_obj,
+                        &mut child_doc,
+                        child_docs,
+                    )?;
+                    child_docs.push(child_doc);
+                } else {
+                    eprintln!(
+                        "WARNING: nested field '{}' expected object, got {:?}",
+                        full_key, item
+                    );
+                }
+            }
+        } else if let Some(single_obj) = json_val.as_object() {
+            // same logic for single object
+            if include_in_parent {
+                // store the single object in the parent's doc
+                if let Ok(parent_field) = schema.get_field(&full_key) {
+                    let raw_str = serde_json::to_string(&single_obj).unwrap();
+                    parent_doc.add_field_value(parent_field, &OwnedValue::Str(raw_str));
+                }
+                Self::parse_object_with_prefix(
+                    schema, full_key, single_obj, parent_doc, child_docs,
+                )?;
+            }
+
+            let mut child_doc = TantivyDocument::default();
+            Self::parse_object_with_prefix(
+                schema,
+                full_key,
+                single_obj,
+                &mut child_doc,
+                child_docs,
+            )?;
+            child_docs.push(child_doc);
+        } else {
+            eprintln!(
+                "WARNING: nested field '{}' expected array-of-objects, got {:?}",
+                full_key, json_val
+            );
         }
         Ok(())
     }
@@ -345,9 +409,10 @@ impl CompactDoc {
         json_val: &serde_json::Value,
         doc: &mut TantivyDocument,
     ) -> Result<(), DocParsingError> {
-        let field_entry = schema.get_field_entry(field);
-        if field_entry.field_type().is_nested() {
-            // Means user put a raw object in a nested field but didn't expand it => error
+        let fentry = schema.get_field_entry(field);
+        let ftype = fentry.field_type();
+        // If it's `Nested` or `NestedJson`, raw parse is an error:
+        if matches!(ftype, FieldType::Nested(_) | FieldType::NestedJson(_)) {
             return Err(DocParsingError::ValueError(
                 schema.get_field_name(field).to_string(),
                 ValueParsingError::TypeError {
@@ -357,14 +422,12 @@ impl CompactDoc {
             ));
         }
 
-        // Otherwise parse normally
-        let typed_val = field_entry
-            .field_type()
+        // Otherwise parse the JSON normally
+        let typed_val = ftype
             .value_from_json_non_nested(json_val.clone())
-            .map_err(|err| {
-                DocParsingError::ValueError(schema.get_field_name(field).to_string(), err)
+            .map_err(|e| {
+                DocParsingError::ValueError(schema.get_field_name(field).to_string(), e)
             })?;
-
         doc.add_field_value(field, &typed_val);
         Ok(())
     }
@@ -411,9 +474,10 @@ impl CompactDoc {
         json_val: &serde_json::Value,
         schema: &Schema,
     ) -> Result<(), DocParsingError> {
-        let field_entry = schema.get_field_entry(field);
-        // If it's nested, error or skip
-        if field_entry.field_type().is_nested() {
+        let fentry = schema.get_field_entry(field);
+        let ftype = fentry.field_type();
+        // forbid direct parse on nested fields
+        if matches!(ftype, FieldType::Nested(_) | FieldType::NestedJson(_)) {
             return Err(DocParsingError::ValueError(
                 schema.get_field_name(field).to_string(),
                 ValueParsingError::TypeError {
@@ -422,16 +486,11 @@ impl CompactDoc {
                 },
             ));
         }
-
-        // Otherwise parse normally:
-        let typed_val = field_entry
-            .field_type()
+        let typed_val = ftype
             .value_from_json_non_nested(json_val.clone())
-            .map_err(|err| {
-                DocParsingError::ValueError(schema.get_field_name(field).to_string(), err)
+            .map_err(|e| {
+                DocParsingError::ValueError(schema.get_field_name(field).to_string(), e)
             })?;
-
-        // Insert into doc
         self.add_field_value(field, &typed_val);
         Ok(())
     }
@@ -442,24 +501,24 @@ impl CompactDoc {
         json_obj: Map<String, serde_json::Value>,
     ) -> Result<Self, DocParsingError> {
         let mut doc = Self::default();
-        for (field_name, json_value) in json_obj {
+        for (field_name, value) in json_obj {
             if let Ok(field) = schema.get_field(&field_name) {
-                let field_entry = schema.get_field_entry(field);
-                let field_type = field_entry.field_type();
-                match json_value {
-                    serde_json::Value::Array(json_items) => {
-                        for json_item in json_items {
-                            let value = field_type
-                                .value_from_json(json_item)
+                let field_type = schema.get_field_entry(field).field_type();
+                match value {
+                    serde_json::Value::Array(arr) => {
+                        // Insert each array item
+                        for item in arr {
+                            let parsed_val = field_type
+                                .value_from_json(item)
                                 .map_err(|e| DocParsingError::ValueError(field_name.clone(), e))?;
-                            doc.add_field_value(field, &value);
+                            doc.add_field_value(field, &parsed_val);
                         }
                     }
-                    _ => {
-                        let value = field_type
-                            .value_from_json(json_value)
+                    other => {
+                        let parsed_val = field_type
+                            .value_from_json(other)
                             .map_err(|e| DocParsingError::ValueError(field_name.clone(), e))?;
-                        doc.add_field_value(field, &value);
+                        doc.add_field_value(field, &parsed_val);
                     }
                 }
             }
@@ -469,62 +528,50 @@ impl CompactDoc {
 
     fn add_value_leaf(&mut self, leaf: ReferenceValueLeaf) -> ValueAddr {
         let type_id = ValueType::from(&leaf);
-        // Write into `node_data` and return u32 position as its address
-        // Null and bool are inlined into the address
+        // For booleans & null, we inline them in the u32, everything else we write into node_data
         let val_addr = match leaf {
             ReferenceValueLeaf::Null => 0,
-            ReferenceValueLeaf::Str(bytes) => {
-                write_bytes_into(&mut self.node_data, bytes.as_bytes())
-            }
-            ReferenceValueLeaf::Facet(bytes) => {
-                write_bytes_into(&mut self.node_data, bytes.as_bytes())
-            }
-            ReferenceValueLeaf::Bytes(bytes) => write_bytes_into(&mut self.node_data, bytes),
+            ReferenceValueLeaf::Bool(bval) => bval as u32,
+            ReferenceValueLeaf::Str(s) => write_bytes_into(&mut self.node_data, s.as_bytes()),
+            ReferenceValueLeaf::Facet(s) => write_bytes_into(&mut self.node_data, s.as_bytes()),
+            ReferenceValueLeaf::Bytes(b) => write_bytes_into(&mut self.node_data, b),
             ReferenceValueLeaf::U64(num) => write_into(&mut self.node_data, num),
             ReferenceValueLeaf::I64(num) => write_into(&mut self.node_data, num),
             ReferenceValueLeaf::F64(num) => write_into(&mut self.node_data, num),
-            ReferenceValueLeaf::Bool(b) => b as u32,
-            ReferenceValueLeaf::Date(date) => {
-                write_into(&mut self.node_data, date.into_timestamp_nanos())
+            ReferenceValueLeaf::Date(d) => {
+                write_into(&mut self.node_data, d.into_timestamp_nanos())
             }
-            ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
-            ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
+            ReferenceValueLeaf::IpAddr(ipv6) => write_into(&mut self.node_data, ipv6.to_u128()),
+            ReferenceValueLeaf::PreTokStr(pretok) => write_into(&mut self.node_data, *pretok),
         };
         ValueAddr { type_id, val_addr }
     }
     /// Adds a value and returns in address into the
     fn add_value<'a, V: Value<'a>>(&mut self, value: V) -> ValueAddr {
-        let value = value.as_value();
-        let type_id = ValueType::from(&value);
-        match value {
+        let refval = value.as_value();
+        let type_id = ValueType::from(&refval);
+        match refval {
             ReferenceValue::Leaf(leaf) => self.add_value_leaf(leaf),
-            ReferenceValue::Array(elements) => {
-                // addresses of the elements in node_data
-                // Reusing a vec would be nicer, but it's not easy because of the recursion
-                // A global vec would work if every writer get it's discriminator
-                let mut addresses = Vec::new();
-                for elem in elements {
-                    let value_addr = self.add_value(elem);
-                    write_into(&mut addresses, value_addr);
+            ReferenceValue::Object(obj_iter) => {
+                // gather addresses for (key, value) pairs
+                let mut addrs_buf = Vec::new();
+                for (k, v) in obj_iter {
+                    let k_addr = self.add_value_leaf(ReferenceValueLeaf::Str(k));
+                    let v_addr = self.add_value(v);
+                    write_into(&mut addrs_buf, k_addr);
+                    write_into(&mut addrs_buf, v_addr);
                 }
-                ValueAddr {
-                    type_id,
-                    val_addr: write_bytes_into(&mut self.node_data, &addresses),
-                }
+                let val_addr = write_bytes_into(&mut self.node_data, &addrs_buf);
+                ValueAddr { type_id, val_addr }
             }
-            ReferenceValue::Object(entries) => {
-                // addresses of the elements in node_data
-                let mut addresses = Vec::new();
-                for (key, value) in entries {
-                    let key_addr = self.add_value_leaf(ReferenceValueLeaf::Str(key));
-                    let value_addr = self.add_value(value);
-                    write_into(&mut addresses, key_addr);
-                    write_into(&mut addresses, value_addr);
+            ReferenceValue::Array(arr_iter) => {
+                let mut addrs_buf = Vec::new();
+                for elem in arr_iter {
+                    let elem_addr = self.add_value(elem);
+                    write_into(&mut addrs_buf, elem_addr);
                 }
-                ValueAddr {
-                    type_id,
-                    val_addr: write_bytes_into(&mut self.node_data, &addresses),
-                }
+                let val_addr = write_bytes_into(&mut self.node_data, &addrs_buf);
+                ValueAddr { type_id, val_addr }
             }
         }
     }
