@@ -550,15 +550,33 @@ impl QueryParser {
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
                 Ok(Term::from_field_ip_addr(field, ip_v6))
             }
+            FieldType::NestedJson(ref nested_json_options) => {
+                let get_term_with_path = || {
+                    Term::from_field_json_path(
+                        field,
+                        json_path,
+                        nested_json_options.json_opts.is_expand_dots_enabled(),
+                    )
+                };
+                if let Some(term) =
+                    // Try to convert the phrase to a fast value
+                    convert_to_fast_value_and_append_to_json_term(
+                        get_term_with_path(),
+                        phrase,
+                        false,
+                    )
+                {
+                    Ok(term)
+                } else {
+                    let mut term = get_term_with_path();
+                    term.append_type_and_str(phrase);
+                    Ok(term)
+                }
+            }
 
             FieldType::Nested(_) => {
                 return Err(QueryParserError::UnsupportedQuery(
                     "Range query on a nested field is not supported.".into(),
-                ));
-            }
-            FieldType::NestedJson(_) => {
-                return Err(QueryParserError::UnsupportedQuery(
-                    "Range query on a nested json field is not supported.".into(),
                 ));
             }
         }
@@ -680,11 +698,14 @@ impl QueryParser {
                     "Cannot run direct text search on a `nested` field."
                 )));
             }
-            FieldType::NestedJson(_) => {
-                return Err(QueryParserError::UnsupportedQuery(format!(
-                    "Cannot run direct text search on a `nested` field."
-                )));
-            }
+            FieldType::NestedJson(ref nested_json_options) => generate_literals_for_json_object(
+                field_name,
+                field,
+                json_path,
+                phrase,
+                &self.tokenizer_manager,
+                &nested_json_options.json_opts,
+            ),
         }
     }
 

@@ -103,10 +103,32 @@ fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn Postings
             println!("Note: Nested fields currently only support basic doc ID recording");
             Box::<SpecializedPostingsWriter<DocIdRecorder>>::default()
         }
-        FieldType::NestedJson(opts) => {
-            println!("FieldType::NestedJson - Creating default DocIdRecorder for nestedJson field with options: {:?}", opts);
-            println!("Note: NestedJson fields currently only support basic doc ID recording");
-            Box::<SpecializedPostingsWriter<DocIdRecorder>>::default()
+        FieldType::NestedJson(ref nested_json_options) => {
+            println!(
+                "FieldType::JsonObject - Processing JSON field with options: {:?}",
+                nested_json_options.json_opts
+            );
+            if let Some(text_indexing_option) =
+                nested_json_options.json_opts.get_text_indexing_options()
+            {
+                match text_indexing_option.index_option() {
+                    IndexRecordOption::Basic => {
+                        println!("Creating JsonPostingsWriter<DocIdRecorder> for JSON field - basic indexing");
+                        JsonPostingsWriter::<DocIdRecorder>::default().into()
+                    }
+                    IndexRecordOption::WithFreqs => {
+                        println!("Creating JsonPostingsWriter<TermFrequencyRecorder> for JSON field - with frequencies");
+                        JsonPostingsWriter::<TermFrequencyRecorder>::default().into()
+                    }
+                    IndexRecordOption::WithFreqsAndPositions => {
+                        println!("Creating JsonPostingsWriter<TfAndPositionRecorder> for JSON field - with frequencies and positions");
+                        JsonPostingsWriter::<TfAndPositionRecorder>::default().into()
+                    }
+                }
+            } else {
+                println!("No text indexing options specified for JSON field, defaulting to DocIdRecorder");
+                JsonPostingsWriter::<DocIdRecorder>::default().into()
+            }
         }
         FieldType::JsonObject(ref json_object_options) => {
             println!(

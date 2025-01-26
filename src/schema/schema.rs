@@ -300,7 +300,7 @@ impl SchemaBuilder {
 struct InnerSchema {
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>, // transient
-    nested_paths: HashMap<String, String>,
+    nested_paths: HashMap<String, usize>,
 }
 
 impl PartialEq for InnerSchema {
