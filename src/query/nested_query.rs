@@ -5,8 +5,8 @@ use common::JsonPathWriter;
 
 use crate::core::searcher::Searcher;
 use crate::query::{
-    BooleanQuery, EnableScoring, Explanation, Occur, Query, QueryClone, Scorer, TermQuery, Weight,
-    {ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery},
+    BooleanQuery, EnableScoring, Explanation, Occur, ParentBitSetProducer, Query, QueryClone,
+    ScoreMode, Scorer, TermQuery, ToParentBlockJoinQuery, Weight,
 };
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::{DocAddress, DocId, DocSet, Score, SegmentReader, TantivyError, TERMINATED};
@@ -209,16 +209,18 @@ impl ParentBitSetProducer for NestedParentBitSetProducer {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::collector::TopDocs;
-    use crate::query::{nested_query::ScoreMode, AllQuery, QueryClone, QueryParser, TermQuery};
+    use crate::query::nested_query::ScoreMode;
+    use crate::query::{AllQuery, QueryClone, QueryParser, TermQuery};
     use crate::schema::document::parse_json_for_nested_sorted;
     use crate::schema::{
         DocParsingError, Field, IndexRecordOption, NestedJsonObjectOptions, Schema, SchemaBuilder,
         TextFieldIndexing, Value, STORED, STRING, TEXT,
     };
     use crate::{Index, IndexWriter, TantivyDocument, Term};
-    use serde_json::json;
 
     fn make_schema_for_eq_tests() -> (Schema, Field, Field) {
         let mut builder = SchemaBuilder::default();
@@ -1064,14 +1066,6 @@ mod tests {
     #[test]
     #[ignore]
     fn test_nested_query_numeric_leaf() -> crate::Result<()> {
-        use crate::schema::document::parse_json_for_nested_sorted;
-        use crate::schema::{
-            IndexRecordOption, NestedJsonObjectOptions, SchemaBuilder, TantivyDocument,
-            TextFieldIndexing,
-        };
-        use crate::{collector::TopDocs, index::Index, query::nested_query::NestedQuery};
-        use serde_json::json;
-
         let mut builder = SchemaBuilder::default();
         let nested_opts = NestedJsonObjectOptions::new()
             .set_include_in_parent(false)
