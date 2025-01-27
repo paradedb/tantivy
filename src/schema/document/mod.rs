@@ -165,9 +165,10 @@ mod owned_value;
 mod se;
 mod value;
 
-pub use nested_json_sorted_expansion::parse_json_for_nested_sorted;
 use std::collections::BTreeMap;
 use std::mem;
+
+pub use nested_json_sorted_expansion::parse_json_for_nested_sorted;
 
 pub(crate) use self::de::BinaryDocumentDeserializer;
 pub use self::de::{
@@ -186,13 +187,11 @@ use super::*;
 pub trait Document: Send + Sync + 'static {
     /// The value of the field.
     type Value<'a>: Value<'a> + Clone
-    where
-        Self: 'a;
+    where Self: 'a;
 
     /// The iterator over all of the fields and values within the doc.
     type FieldsValuesIter<'a>: Iterator<Item = (Field, Self::Value<'a>)>
-    where
-        Self: 'a;
+    where Self: 'a;
 
     /// Get an iterator iterating over all fields and values in a document.
     fn iter_fields_and_values(&self) -> Self::FieldsValuesIter<'_>;

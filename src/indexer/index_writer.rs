@@ -398,11 +398,9 @@ impl<D: Document> IndexWriter<D> {
     pub fn add_segment(&self, segment_meta: SegmentMeta) -> crate::Result<()> {
         let delete_cursor = self.delete_queue.cursor();
         let segment_entry = SegmentEntry::new(segment_meta, delete_cursor, None);
-        let result = self
-            .segment_updater
+        self.segment_updater
             .schedule_add_segment(segment_entry)
-            .wait();
-        result
+            .wait()
     }
 
     /// Creates a new segment.
@@ -414,8 +412,7 @@ impl<D: Document> IndexWriter<D> {
     /// These will not be garbage collected as long as an instance object of
     /// `SegmentMeta` object associated with the new `Segment` is "alive".
     pub fn new_segment(&self) -> Segment {
-        let segment = self.index.new_segment();
-        segment
+        self.index.new_segment()
     }
 
     fn operation_receiver(&self) -> crate::Result<AddBatchReceiver<D>> {
@@ -583,6 +580,7 @@ impl<D: Document> IndexWriter<D> {
     ///
     /// The opstamp at the last commit is returned.
     pub fn rollback(&mut self) -> crate::Result<Opstamp> {
+        info!("Rolling back to opstamp {}", self.committed_opstamp);
         // marks the segment updater as killed. From now on, all
         // segment updates will be ignored.
         self.segment_updater.kill();
@@ -636,6 +634,18 @@ impl<D: Document> IndexWriter<D> {
     /// using this API.
     /// See [`PreparedCommit::set_payload()`].
     pub fn prepare_commit(&mut self) -> crate::Result<PreparedCommit<D>> {
+        // Here, because we join all of the worker threads,
+        // all of the segment update for this commit have been
+        // sent.
+        //
+        // No document belonging to the next commit have been
+        // pushed too, because add_document can only happen
+        // on this thread.
+        //
+        // This will move uncommitted segments to the state of
+        // committed segments.
+        info!("Preparing commit");
+
         // this will drop the current document channel
         // and recreate a new one.
         self.recreate_document_channel();
@@ -652,6 +662,7 @@ impl<D: Document> IndexWriter<D> {
 
         let commit_opstamp = self.stamper.stamp();
         let prepared_commit = PreparedCommit::new(self, commit_opstamp);
+        info!("Prepared commit {}", commit_opstamp);
         Ok(prepared_commit)
     }
 
@@ -849,11 +860,8 @@ impl<D: Document> IndexWriter<D> {
     }
 
     fn send_add_documents_batch(&self, add_ops: AddBatch<D>) -> crate::Result<()> {
-        if self.index_writer_status.is_alive() {
-            match self.operation_sender.send(add_ops) {
-                Ok(_) => Ok(()),
-                Err(_) => Err(error_in_index_worker_thread("An index writer was killed.")),
-            }
+        if self.index_writer_status.is_alive() && self.operation_sender.send(add_ops).is_ok() {
+            Ok(())
         } else {
             Err(error_in_index_worker_thread("An index writer was killed."))
         }
@@ -892,7 +900,6 @@ mod tests {
         STRING, TEXT,
     };
     use crate::store::DOCSTORE_CACHE_CAPACITY;
-    use crate::Result;
     use crate::{
         DateTime, DocAddress, Index, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument,
         Term,
@@ -1300,22 +1307,21 @@ mod tests {
             index_writer.commit()?;
         }
         let num_docs_containing = |s: &str| {
-            let searcher = index
+            let term_a = Term::from_field_text(text_field, s);
+            index
                 .reader_builder()
                 .reload_policy(ReloadPolicy::Manual)
-                .try_into()
-                .unwrap()
-                .searcher();
-            let term_a = Term::from_field_text(text_field, s);
-            searcher.doc_freq(&term_a).unwrap()
+                .try_into()?
+                .searcher()
+                .doc_freq(&term_a)
         };
-        assert_eq!(num_docs_containing("a"), 0);
-        assert_eq!(num_docs_containing("b"), 100);
+        assert_eq!(num_docs_containing("a")?, 0);
+        assert_eq!(num_docs_containing("b")?, 100);
         Ok(())
     }
 
     #[test]
-    fn test_add_documents() -> Result<()> {
+    fn test_add_documents() -> crate::Result<()> {
         // Create a simple schema with one text field
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
@@ -1364,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_documents_empty() -> Result<()> {
+    fn test_add_documents_empty() -> crate::Result<()> {
         // Test adding an empty list of documents
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
@@ -1394,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_documents_order() -> Result<()> {
+    fn test_add_documents_order() -> crate::Result<()> {
         // Test that documents are indexed in the order they are added
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT | STORED);
@@ -1449,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_documents_concurrency() -> Result<()> {
+    fn test_add_documents_concurrency() -> crate::Result<()> {
         // Test adding documents concurrently
         use std::sync::mpsc;
         use std::thread;
@@ -1506,7 +1512,7 @@ mod tests {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .unwrap();
-        let _num_docs_containing = |s: &str| {
+        let num_docs_containing = |s: &str| {
             reader.reload().unwrap();
             let searcher = reader.searcher();
             let term = Term::from_field_text(text_field, s);
@@ -1519,25 +1525,60 @@ mod tests {
         let add_tstamp = index_writer.add_document(doc!(text_field => "a")).unwrap();
         let commit_tstamp = index_writer.commit().unwrap();
         assert!(commit_tstamp > add_tstamp);
+        index_writer.delete_all_documents().unwrap();
+        index_writer.commit().unwrap();
 
-        // clear but don't commit!
+        // Search for documents with the same term that we added
+        assert_eq!(num_docs_containing("a"), 0);
+    }
+
+    #[test]
+    fn test_delete_all_documents_rollback_correct_stamp() {
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer = index
+            .writer_with_num_threads(4, MEMORY_BUDGET_NUM_BYTES_MIN * 4)
+            .unwrap();
+
+        let add_tstamp = index_writer.add_document(doc!(text_field => "a")).unwrap();
+
+        // commit documents - they are now available
+        let first_commit = index_writer.commit();
+        assert!(first_commit.is_ok());
+        let first_commit_tstamp = first_commit.unwrap();
+        assert!(first_commit_tstamp > add_tstamp);
+
+        // delete_all_documents the index
         let clear_tstamp = index_writer.delete_all_documents().unwrap();
-        // clear_tstamp should reset to before the last commit
-        assert!(clear_tstamp < commit_tstamp);
+        assert_eq!(clear_tstamp, add_tstamp);
 
-        // rollback
-        let _rollback_tstamp = index_writer.rollback().unwrap();
-        // Find original docs in the index
-        let term_a = Term::from_field_text(text_field, "a");
-        // expect the document with that term to be in the index
+        // commit the clear command - now documents aren't available
+        let second_commit = index_writer.commit();
+        assert!(second_commit.is_ok());
+        let second_commit_tstamp = second_commit.unwrap();
+
+        // add new documents again
+        for _ in 0..100 {
+            index_writer.add_document(doc!(text_field => "b")).unwrap();
+        }
+
+        // rollback to last commit, when index was empty
+        let rollback = index_writer.rollback();
+        assert!(rollback.is_ok());
+        let rollback_tstamp = rollback.unwrap();
+        assert_eq!(rollback_tstamp, second_commit_tstamp);
+
+        // working with an empty index == no documents
+        let term_b = Term::from_field_text(text_field, "b");
         assert_eq!(
             index
                 .reader()
                 .unwrap()
                 .searcher()
-                .doc_freq(&term_a)
+                .doc_freq(&term_b)
                 .unwrap(),
-            1
+            0
         );
     }
 
@@ -1551,9 +1592,9 @@ mod tests {
             .writer_with_num_threads(4, MEMORY_BUDGET_NUM_BYTES_MIN * 4)
             .unwrap();
         let res = index_writer.delete_all_documents();
-        let commit = index_writer.commit();
         assert!(res.is_ok());
-        assert!(commit.is_ok());
+
+        assert!(index_writer.commit().is_ok());
         // add one simple doc
         index_writer.add_document(doc!(text_field => "a")).unwrap();
         assert!(index_writer.commit().is_ok());
@@ -1643,7 +1684,7 @@ mod tests {
         let text_field = schema_builder.add_text_field("text", STRING | FAST);
         let schema = schema_builder.build();
 
-        let index = Index::create_in_ram(schema);
+        let index = Index::builder().schema(schema).create_in_ram().unwrap();
         let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         index_writer
             .add_document(doc!(text_field => "one"))
@@ -1675,9 +1716,8 @@ mod tests {
             .merge(&[segment_reader.segment_id()])
             .wait()
             .unwrap();
-        index_writer.wait_merging_threads().unwrap();
-
-        let searcher = index.reader().unwrap().searcher();
+        index_reader.reload().unwrap();
+        let searcher = index_reader.searcher();
         let segment_reader = searcher.segment_reader(0);
         assert_eq!(segment_reader.max_doc(), 2);
         let text_fast_field = segment_reader.fast_fields().str("text").unwrap().unwrap();
@@ -2298,24 +2338,23 @@ mod tests {
         }
         // search ip address
         //
-        for (existing_id, count) in expected_ids_and_num_occurrences.iter().take(10) {
+        for (existing_id, count) in &expected_ids_and_num_occurrences {
             let (existing_id, count) = (*existing_id, *count);
             if !id_is_full_doc(existing_id) {
                 continue;
             }
-            let gen_query_inclusive = |field: &str, from: Ipv6Addr, to: Ipv6Addr| {
-                format!("{}:[{} TO {}]", field, &from.to_string(), &to.to_string())
-            };
-            let ip = ip_from_id(existing_id);
-
             let do_search_ip_field = |term: &str| count_search(term, ip_field) as u64;
-            // Range query on single value field
-            let query = gen_query_inclusive("ip", ip, ip);
-            assert_eq!(do_search_ip_field(&query), count);
+            let ip_addr = Ipv6Addr::from_u128(existing_id as u128);
+            // Test incoming ip as ipv6
+            assert_eq!(do_search_ip_field(&format!("\"{ip_addr}\"")), count);
 
-            // Range query on multi value field
-            let query = gen_query_inclusive("ips", ip, ip);
-            assert_eq!(do_search_ip_field(&query), count);
+            let term = Term::from_field_ip_addr(ip_field, ip_addr);
+            assert_eq!(count_search2(term) as u64, count);
+
+            // Test incoming ip as ipv4
+            if let Some(ip_addr) = ip_addr.to_ipv4_mapped() {
+                assert_eq!(do_search_ip_field(&format!("\"{ip_addr}\"")), count);
+            }
         }
 
         // Range query
@@ -2331,7 +2370,7 @@ mod tests {
                 sample
                     .iter()
                     .filter(|(id, _)| id_is_full_doc(**id))
-                    .map(|(_, id_occurrences)| **id_occurrences)
+                    .map(|(_id, num_occurrences)| **num_occurrences)
                     .sum::<u64>()
             };
             fn gen_query_inclusive<T1: ToString, T2: ToString>(
@@ -2443,7 +2482,7 @@ mod tests {
     #[test]
     fn test_fast_field_range() {
         let ops: Vec<_> = (0..1000).map(IndexingOp::add).collect();
-        assert!(test_operation_strategy(&ops[..], true).is_ok());
+        assert!(test_operation_strategy(&ops, true).is_ok());
     }
 
     #[test]
@@ -2735,6 +2774,8 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::builder().schema(schema).create_in_ram()?;
         let mut index_writer = index.writer_for_tests()?;
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+
         index_writer
             .add_document(doc!(
                 json_field=>json!({"\u{0000}B":"1"})

@@ -1,7 +1,7 @@
 use std::io;
 use std::marker::PhantomData;
+use std::ops::Range;
 
-use itertools::Itertools;
 use stacker::Addr;
 
 use crate::fieldnorm::FieldNormReaders;
@@ -10,111 +10,86 @@ use crate::postings::recorder::{BufferLender, Recorder};
 use crate::postings::{
     FieldSerializer, IndexingContext, InvertedIndexSerializer, PerFieldPostingsWriter,
 };
-use crate::schema::{Field, Schema, Term};
+use crate::schema::{Field, Schema, Term, Type};
 use crate::tokenizer::{Token, TokenStream, MAX_TOKEN_LEN};
 use crate::DocId;
 
 const POSITION_GAP: u32 = 1;
 
-pub fn serialize_postings(
+fn make_field_partition(
+    term_offsets: &[(Field, OrderedPathId, &[u8], Addr)],
+) -> Vec<(Field, Range<usize>)> {
+    let term_offsets_it = term_offsets
+        .iter()
+        .map(|(field, _, _, _)| *field)
+        .enumerate();
+    let mut prev_field_opt = None;
+    let mut fields = vec![];
+    let mut offsets = vec![];
+    for (offset, field) in term_offsets_it {
+        if Some(field) != prev_field_opt {
+            prev_field_opt = Some(field);
+            fields.push(field);
+            offsets.push(offset);
+        }
+    }
+    offsets.push(term_offsets.len());
+    let mut field_offsets = vec![];
+    for i in 0..fields.len() {
+        field_offsets.push((fields[i], offsets[i]..offsets[i + 1]));
+    }
+    field_offsets
+}
+
+/// Serialize the inverted index.
+/// It pushes all term, one field at a time, towards the
+/// postings serializer.
+pub(crate) fn serialize_postings(
     ctx: IndexingContext,
-    _schema: Schema,
+    schema: Schema,
     per_field_postings_writers: &PerFieldPostingsWriter,
     fieldnorm_readers: FieldNormReaders,
     serializer: &mut InvertedIndexSerializer,
 ) -> crate::Result<()> {
-    // 1) Path-id mapping
-    let unordered_id_to_ordered_id = ctx.path_to_unordered_id.unordered_id_to_ordered_id();
+    // Replace unordered ids by ordered ids to be able to sort
+    let unordered_id_to_ordered_id: Vec<OrderedPathId> =
+        ctx.path_to_unordered_id.unordered_id_to_ordered_id();
 
-    // 2) Gather all into `term_offsets`, but keep the type code for sorting
-    let mut term_offsets = Vec::with_capacity(ctx.term_index.len());
-    for (raw_key, postings_addr) in ctx.term_index.iter() {
-        let field = Term::wrap(raw_key).field();
-        let type_code = raw_key[4];
-        let leftover = &raw_key[5..];
-
-        // If it's a JSON field => parse the 4-byte path ID
-        let path_id = if type_code == b'j' {
-            let unordered_id = u32::from_be_bytes(leftover[0..4].try_into().unwrap());
-            unordered_id_to_ordered_id[unordered_id as usize]
+    let mut term_offsets: Vec<(Field, OrderedPathId, &[u8], Addr)> =
+        Vec::with_capacity(ctx.term_index.len());
+    term_offsets.extend(ctx.term_index.iter().map(|(key, addr)| {
+        let field = Term::wrap(key).field();
+        if schema.get_field_entry(field).field_type().value_type() == Type::Json {
+            let byte_range_path = 5..5 + 4;
+            let unordered_id = u32::from_be_bytes(key[byte_range_path.clone()].try_into().unwrap());
+            let path_id = unordered_id_to_ordered_id[unordered_id as usize];
+            (field, path_id, &key[byte_range_path.end..], addr)
         } else {
-            0.into()
-        };
-
-        // For JSON fields, skip the 4 path bytes to get the actual token text
-        let text_bytes = if type_code == b'j' {
-            &leftover[4..]
-        } else {
-            leftover
-        };
-
-        term_offsets.push((field, type_code, path_id, text_bytes, postings_addr));
-    }
-
-    // 3) Sort by (field, type_code, path_id, text_bytes).
-    term_offsets.sort_unstable_by(|(f1, tc1, p1, text1, _), (f2, tc2, p2, text2, _)| {
-        (f1, tc1, p1, *text1).cmp(&(f2, tc2, p2, *text2))
-    });
-
-    #[allow(deprecated)]
-    // 4) Partition by field
-    let field_offsets = term_offsets
-        .iter()
-        .enumerate()
-        .group_by(|(_i, (field, ..))| *field)
-        .into_iter()
-        .map(|(field, group)| {
-            let indices: Vec<_> = group.map(|(i, _)| i).collect();
-            let start = *indices.iter().min().unwrap();
-            let end = *indices.iter().max().unwrap() + 1;
-            (field, start..end)
-        })
-        .collect::<Vec<_>>();
-
-    // 5) For each field, call `.serialize(...)`
+            (field, 0.into(), &key[5..], addr)
+        }
+    }));
+    // Sort by field, path, and term
+    term_offsets.sort_unstable_by(
+        |(field1, path_id1, bytes1, _), (field2, path_id2, bytes2, _)| {
+            (field1, path_id1, bytes1).cmp(&(field2, path_id2, bytes2))
+        },
+    );
     let ordered_id_to_path = ctx.path_to_unordered_id.ordered_id_to_path();
-    for (field, range) in &field_offsets {
-        // No calls to `as_any()`:
-        let postings_writer = per_field_postings_writers.get_for_field(*field);
-
-        let fieldnorm_reader = match fieldnorm_readers.get_field(*field) {
-            Ok(reader) => reader,
-            Err(e) => {
-                return Err(e);
-            }
-        };
-
-        let total_num_tokens = postings_writer.total_num_tokens();
-
+    let field_offsets = make_field_partition(&term_offsets);
+    for (field, byte_offsets) in field_offsets {
+        let postings_writer = per_field_postings_writers.get_for_field(field);
+        let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
         let mut field_serializer =
-            match serializer.new_field(*field, total_num_tokens, fieldnorm_reader) {
-                Ok(fs) => fs,
-                Err(e) => {
-                    return Err(e.into());
-                }
-            };
-
-        // transform back to (field, path_id, bytes, addr)
-        let subset_for_field: Vec<_> = term_offsets[range.clone()]
-            .iter()
-            .map(|(f, _tc, p, txt, addr)| (*f, *p, *txt, *addr))
-            .collect();
-
-        if let Err(e) = postings_writer.serialize(
-            &subset_for_field,
+            serializer.new_field(field, postings_writer.total_num_tokens(), fieldnorm_reader)?;
+        postings_writer.serialize(
+            &term_offsets[byte_offsets],
             &ordered_id_to_path,
             &ctx,
             &mut field_serializer,
-        ) {
-            return Err(e.into());
-        }
-
-        if let Err(e) = field_serializer.close() {
-            return Err(e.into());
-        }
+        )?;
+        field_serializer.close()?;
     }
 
-    // We do *not* call serializer.close() here (it would consume `serializer`).
     Ok(())
 }
 
@@ -254,7 +229,7 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
     ) -> io::Result<()> {
         let mut buffer_lender = BufferLender::default();
         for (_field, _path_id, term, addr) in term_addrs {
-            Self::serialize_one_term(term, *addr, &mut buffer_lender, ctx, serializer)?
+            Self::serialize_one_term(term, *addr, &mut buffer_lender, ctx, serializer)?;
         }
         Ok(())
     }

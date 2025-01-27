@@ -69,7 +69,6 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
         term_buffer.clear_with_field_and_type(Type::Json, Field::from_field_id(0));
         let mut prev_term_id = u32::MAX;
         let mut term_path_len = 0; // this will be set in the first iteration
-
         for (_field, path_id, term, addr) in ordered_term_addrs {
             if prev_term_id != path_id.path_id() {
                 term_buffer.truncate_value_bytes(0);
@@ -78,10 +77,8 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
                 term_path_len = term_buffer.len_bytes();
                 prev_term_id = path_id.path_id();
             }
-
             term_buffer.truncate_value_bytes(term_path_len);
             term_buffer.append_bytes(term);
-
             if let Some(json_value) = term_buffer.value().as_json_value_bytes() {
                 let typ = json_value.typ();
                 if typ == Type::Str {

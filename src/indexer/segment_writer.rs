@@ -192,7 +192,7 @@ impl SegmentWriter {
                 }
                 FieldType::Str(_) => {
                     let mut indexing_position = IndexingPosition::default();
-                    for (_, value) in values.enumerate() {
+                    for value in values {
                         let value = value.as_value();
 
                         let mut token_stream = if let Some(text) = value.as_str() {
@@ -221,7 +221,7 @@ impl SegmentWriter {
                 }
                 FieldType::U64(_) => {
                     let mut num_vals = 0;
-                    for (_, value) in values.enumerate() {
+                    for value in values {
                         let value = value.as_value();
 
                         num_vals += 1;
@@ -422,6 +422,7 @@ fn remap_and_write(
     fieldnorms_writer: &FieldNormsWriter,
     mut serializer: SegmentSerializer,
 ) -> crate::Result<()> {
+    debug!("remap-and-write");
     if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
         fieldnorms_writer.serialize(fieldnorms_serializer)?;
     }
@@ -436,8 +437,10 @@ fn remap_and_write(
         fieldnorm_readers,
         serializer.get_postings_serializer(),
     )?;
+    debug!("fastfield-serialize");
     fast_field_writers.serialize(serializer.get_fast_field_write())?;
 
+    debug!("serializer-close");
     serializer.close()?;
 
     Ok(())
@@ -757,7 +760,7 @@ mod tests {
     #[test]
     fn test_json_tokenized_with_position() {
         let mut schema_builder = Schema::builder();
-        let json_field = schema_builder.add_json_field("json", TEXT);
+        let json_field = schema_builder.add_json_field("json", STORED | TEXT);
         let schema = schema_builder.build();
         let mut doc = TantivyDocument::default();
         let json_val: BTreeMap<String, crate::schema::OwnedValue> =
@@ -977,7 +980,7 @@ mod tests {
         let index = Index::create_in_ram(schema);
         let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         index_writer.add_document(doc).unwrap();
-        // On println this did panic on the underflow
+        // On debug this did panic on the underflow
         index_writer.commit().unwrap();
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();

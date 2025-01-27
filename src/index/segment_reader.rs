@@ -404,7 +404,6 @@ impl SegmentReader {
                 .as_ref()
                 .map(AliveBitSet::space_usage)
                 .unwrap_or_default(),
-            common::ByteCount::from(0u64),
         ))
     }
 

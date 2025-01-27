@@ -65,30 +65,29 @@ impl IndexReaderBuilder {
     /// of time and it may return an error.
     pub fn try_into(self) -> crate::Result<IndexReader> {
         let searcher_generation_inventory = Inventory::default();
-
         let warming_state = WarmingState::new(
             self.num_warming_threads,
-            self.warmers.clone(),
+            self.warmers,
             searcher_generation_inventory.clone(),
         )?;
-
         let inner_reader = InnerIndexReader::new(
             self.doc_store_cache_num_blocks,
-            self.index.clone(),
+            self.index,
             warming_state,
             searcher_generation_inventory,
         )?;
-
         let inner_reader_arc = Arc::new(inner_reader);
-
         let watch_handle_opt: Option<WatchHandle> = match self.reload_policy {
-            ReloadPolicy::Manual => None,
+            ReloadPolicy::Manual => {
+                // No need to set anything...
+                None
+            }
             ReloadPolicy::OnCommitWithDelay => {
                 let inner_reader_arc_clone = inner_reader_arc.clone();
                 let callback = move || {
                     if let Err(err) = inner_reader_arc_clone.reload() {
                         error!(
-                            "Error while loading searcher after commit was detected: {:?}",
+                            "Error while loading searcher after commit was detected. {:?}",
                             err
                         );
                     }
@@ -117,7 +116,7 @@ impl IndexReaderBuilder {
 
     /// Sets the cache size of the doc store readers.
     ///
-    /// The doc store readers cache by default DOCSTORE_CACHE_CAPACITY (100) decompressed blocks.
+    /// The doc store readers cache by default DOCSTORE_CACHE_CAPACITY(100) decompressed blocks.
     #[must_use]
     pub fn doc_store_cache_num_blocks(
         mut self,
@@ -167,6 +166,8 @@ impl InnerIndexReader {
         doc_store_cache_num_blocks: usize,
         index: Index,
         warming_state: WarmingState,
+        // The searcher_generation_inventory is not used as source, but as target to track the
+        // loaded segments.
         searcher_generation_inventory: Inventory<SearcherGeneration>,
     ) -> crate::Result<Self> {
         let searcher_generation_counter: Arc<AtomicU64> = Default::default();
@@ -178,7 +179,6 @@ impl InnerIndexReader {
             &searcher_generation_counter,
             &searcher_generation_inventory,
         )?;
-
         Ok(InnerIndexReader {
             doc_store_cache_num_blocks,
             index,
@@ -188,7 +188,6 @@ impl InnerIndexReader {
             searcher_generation_inventory,
         })
     }
-
     /// Opens the freshest segments [`SegmentReader`].
     ///
     /// This function acquires a lock to prevent GC from removing files
@@ -196,10 +195,8 @@ impl InnerIndexReader {
     fn open_segment_readers(index: &Index) -> crate::Result<Vec<SegmentReader>> {
         // Prevents segment files from getting deleted while we are in the process of opening them
         let _meta_lock = index.directory().acquire_lock(&META_LOCK)?;
-
         let searchable_segments = index.searchable_segments()?;
-
-        let segment_readers: Vec<_> = searchable_segments
+        let segment_readers = searchable_segments
             .iter()
             .map(SegmentReader::open)
             .collect::<crate::Result<_>>()?;
@@ -241,7 +238,6 @@ impl InnerIndexReader {
         )?);
 
         warming_state.warm_new_searcher_generation(&searcher.clone().into())?;
-
         Ok(searcher)
     }
 

@@ -29,7 +29,6 @@ pub enum SegmentComponent {
     /// Bitset describing which document of the segment is alive.
     /// (It was representing deleted docs but changed to represent alive docs from v0.17)
     Delete,
-    PathLookup,
 }
 
 impl TryFrom<&str> for SegmentComponent {
@@ -61,7 +60,6 @@ impl Display for SegmentComponent {
             SegmentComponent::Store => write!(f, "store"),
             SegmentComponent::TempStore => write!(f, "temp"),
             SegmentComponent::Delete => write!(f, "del"),
-            SegmentComponent::PathLookup => write!(f, "pathlookup"),
         }
     }
 }

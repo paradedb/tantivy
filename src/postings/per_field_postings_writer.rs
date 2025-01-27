@@ -1,4 +1,3 @@
-// src/postings/per_field_postings_writer.rs
 use crate::postings::json_postings_writer::JsonPostingsWriter;
 use crate::postings::postings_writer::SpecializedPostingsWriter;
 use crate::postings::recorder::{DocIdRecorder, TermFrequencyRecorder, TfAndPositionRecorder};
@@ -30,7 +29,7 @@ impl PerFieldPostingsWriter {
 }
 
 fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn PostingsWriter> {
-    match field_entry.field_type() {
+    match *field_entry.field_type() {
         FieldType::Str(ref text_options) => text_options
             .get_indexing_options()
             .map(|indexing_options| match indexing_options.index_option() {
@@ -52,12 +51,9 @@ fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn Postings
         | FieldType::Date(_)
         | FieldType::Bytes(_)
         | FieldType::IpAddr(_)
-        | FieldType::Facet(_)
-        | FieldType::Nested(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::NestedJson(ref nested_json_options) => {
-            if let Some(text_indexing_option) =
-                nested_json_options.json_opts.get_text_indexing_options()
-            {
+        | FieldType::Facet(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
+        FieldType::JsonObject(ref json_object_options) => {
+            if let Some(text_indexing_option) = json_object_options.get_text_indexing_options() {
                 match text_indexing_option.index_option() {
                     IndexRecordOption::Basic => {
                         JsonPostingsWriter::<DocIdRecorder>::default().into()
@@ -73,8 +69,11 @@ fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn Postings
                 JsonPostingsWriter::<DocIdRecorder>::default().into()
             }
         }
-        FieldType::JsonObject(ref json_object_options) => {
-            if let Some(text_indexing_option) = json_object_options.get_text_indexing_options() {
+        FieldType::Nested(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
+        FieldType::NestedJson(ref nested_json_options) => {
+            if let Some(text_indexing_option) =
+                nested_json_options.json_opts.get_text_indexing_options()
+            {
                 match text_indexing_option.index_option() {
                     IndexRecordOption::Basic => {
                         JsonPostingsWriter::<DocIdRecorder>::default().into()

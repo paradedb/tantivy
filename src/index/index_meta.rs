@@ -142,7 +142,6 @@ impl SegmentMeta {
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
-            SegmentComponent::PathLookup => ".pathlookup".to_string(),
         });
         PathBuf::from(path)
     }
@@ -357,11 +356,10 @@ impl IndexMeta {
     /// Opstamp will the value `0u64`.
     pub fn with_schema(schema: Schema) -> IndexMeta {
         IndexMeta {
-            // other fields:
-            schema: schema.clone(),
-            opstamp: 0,
-            segments: vec![],
             index_settings: IndexSettings::default(),
+            segments: vec![],
+            schema,
+            opstamp: 0u64,
             payload: None,
         }
     }

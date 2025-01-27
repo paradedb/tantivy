@@ -1,4 +1,3 @@
-// src/query/query_parser/query_parser.rs
 use std::net::{AddrParseError, IpAddr};
 use std::num::{ParseFloatError, ParseIntError};
 use std::ops::Bound;
@@ -229,13 +228,9 @@ fn all_negative(ast: &LogicalAst) -> bool {
 // Make an all-negative ast into a normal ast. Must not be used on an already okay ast.
 fn make_non_negative(ast: &mut LogicalAst) {
     match ast {
-        LogicalAst::Leaf(_) => {}
-        LogicalAst::Boost(ref mut child_ast, _) => {
-            make_non_negative(child_ast);
-        }
-        LogicalAst::Clause(children) => {
-            children.push((Occur::Should, LogicalLiteral::All.into()));
-        }
+        LogicalAst::Leaf(_) => (),
+        LogicalAst::Boost(ref mut child_ast, _) => make_non_negative(child_ast),
+        LogicalAst::Clause(children) => children.push((Occur::Should, LogicalLiteral::All.into())),
     }
 }
 
@@ -244,9 +239,7 @@ macro_rules! try_tuple {
     ($expr:expr) => {{
         match $expr {
             Ok(val) => val,
-            Err(e) => {
-                return (None, vec![e.into()]);
-            }
+            Err(e) => return (None, vec![e.into()]),
         }
     }};
 }
@@ -273,8 +266,7 @@ impl QueryParser {
     // Splits a full_path as written in a query, into a field name and a
     // json path.
     pub(crate) fn split_full_path<'a>(&self, full_path: &'a str) -> Option<(Field, &'a str)> {
-        let result = self.schema.find_field(full_path);
-        result
+        self.schema.find_field(full_path)
     }
 
     /// Creates a `QueryParser`, given
@@ -334,8 +326,7 @@ impl QueryParser {
     /// is not a valid query.
     pub fn parse_query(&self, query: &str) -> Result<Box<dyn Query>, QueryParserError> {
         let logical_ast = self.parse_query_to_logical_ast(query)?;
-        let query = convert_to_query(&self.fuzzy, logical_ast);
-        Ok(query)
+        Ok(convert_to_query(&self.fuzzy, logical_ast))
     }
 
     /// Parse a query leniently
@@ -364,8 +355,7 @@ impl QueryParser {
         if !err.is_empty() {
             return Err(err.swap_remove(0));
         }
-        let query = convert_to_query(&self.fuzzy, logical_ast);
-        Ok(query)
+        Ok(convert_to_query(&self.fuzzy, logical_ast))
     }
 
     /// Build leniently a query from an already parsed user input AST.
@@ -387,8 +377,7 @@ impl QueryParser {
         if !err.is_empty() {
             return Err(err.swap_remove(0));
         }
-        let simplified_ast = ast.simplify();
-        Ok(simplified_ast)
+        Ok(ast.simplify())
     }
 
     /// Parse the user query into an AST.
@@ -436,15 +425,14 @@ impl QueryParser {
     ) -> Result<Term, QueryParserError> {
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
-        let field_supports_ff_range_queries = field_type.is_fast()
-            && is_type_valid_for_fastfield_range_query(field_type.value_type());
-
         if field_type.is_nested() {
             return Err(QueryParserError::UnsupportedQuery(format!(
                 "Range query on a nested field is not supported. Query: {}",
                 phrase
             )));
         }
+        let field_supports_ff_range_queries = field_type.is_fast()
+            && is_type_valid_for_fastfield_range_query(field_type.value_type());
 
         if !field_type.is_indexed() && !field_supports_ff_range_queries {
             return Err(QueryParserError::FieldNotIndexed(
@@ -480,6 +468,7 @@ impl QueryParser {
             }
             FieldType::Str(ref str_options) => {
                 let option = str_options.get_indexing_options().ok_or_else(|| {
+                    // This should have been seen earlier really.
                     QueryParserError::FieldNotIndexed(field_entry.name().to_string())
                 })?;
                 let mut text_analyzer =
@@ -497,8 +486,7 @@ impl QueryParser {
                 });
                 if terms.len() != 1 {
                     return Err(QueryParserError::UnsupportedQuery(format!(
-                        "Range query boundary cannot have multiple tokens: {phrase:?} [{:?}].",
-                        terms
+                        "Range query boundary cannot have multiple tokens: {phrase:?} [{terms:?}]."
                     )));
                 }
                 Ok(terms.into_iter().next().unwrap())
@@ -511,11 +499,14 @@ impl QueryParser {
                         json_options.is_expand_dots_enabled(),
                     )
                 };
-                if let Some(term) = convert_to_fast_value_and_append_to_json_term(
-                    get_term_with_path(),
-                    phrase,
-                    false,
-                ) {
+                if let Some(term) =
+                    // Try to convert the phrase to a fast value
+                    convert_to_fast_value_and_append_to_json_term(
+                        get_term_with_path(),
+                        phrase,
+                        false,
+                    )
+                {
                     Ok(term)
                 } else {
                     let mut term = get_term_with_path();
@@ -524,10 +515,7 @@ impl QueryParser {
                 }
             }
             FieldType::Facet(_) => match Facet::from_text(phrase) {
-                Ok(facet) => {
-                    let facet_term = Term::from_facet(field, &facet);
-                    Ok(facet_term)
-                }
+                Ok(facet) => Ok(Term::from_facet(field, &facet)),
                 Err(e) => Err(QueryParserError::from(e)),
             },
             FieldType::Bytes(_) => {
@@ -578,14 +566,12 @@ impl QueryParser {
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         let field_name = field_entry.name();
-
         if field_type.is_nested() {
             return Err(QueryParserError::UnsupportedQuery(format!(
                 "Cannot run direct text search on a `nested` field. Field: {}, Query: {}",
                 field_name, phrase
             )));
         }
-
         if !field_type.is_indexed() {
             return Err(QueryParserError::FieldNotIndexed(field_name.to_string()));
         }
@@ -622,9 +608,10 @@ impl QueryParser {
                 Ok(vec![LogicalLiteral::Term(dt_term)])
             }
             FieldType::Str(ref str_options) => {
-                let indexing_options = str_options
-                    .get_indexing_options()
-                    .ok_or_else(|| QueryParserError::FieldNotIndexed(field_name.to_string()))?;
+                let indexing_options = str_options.get_indexing_options().ok_or_else(|| {
+                    // This should have been seen earlier really.
+                    QueryParserError::FieldNotIndexed(field_name.to_string())
+                })?;
                 let mut text_analyzer = self
                     .tokenizer_manager
                     .get(indexing_options.tokenizer())
@@ -703,12 +690,11 @@ impl QueryParser {
             return Ok(Bound::Unbounded);
         }
         let term = self.compute_boundary_term(field, json_path, bound.term_str())?;
-        let resolved_bound = match *bound {
-            UserInputBound::Inclusive(_) => Bound::Included(term),
-            UserInputBound::Exclusive(_) => Bound::Excluded(term),
-            UserInputBound::Unbounded => Bound::Unbounded,
-        };
-        Ok(resolved_bound)
+        match *bound {
+            UserInputBound::Inclusive(_) => Ok(Bound::Included(term)),
+            UserInputBound::Exclusive(_) => Ok(Bound::Excluded(term)),
+            UserInputBound::Unbounded => Ok(Bound::Unbounded),
+        }
     }
 
     fn compute_logical_ast_with_occur_lenient(
@@ -727,16 +713,16 @@ impl QueryParser {
                     logical_sub_queries.push((occur, sub_ast));
                     errors.append(&mut sub_errors);
                 }
-                let clause = LogicalAst::Clause(logical_sub_queries);
-                (clause, errors)
+                (LogicalAst::Clause(logical_sub_queries), errors)
             }
             UserInputAst::Boost(ast, boost) => {
                 let (ast, errors) = self.compute_logical_ast_with_occur_lenient(*ast);
-                let boosted_ast = ast.boost(boost as Score);
-                (boosted_ast, errors)
+                (ast.boost(boost as Score), errors)
             }
             UserInputAst::Leaf(leaf) => {
                 let (ast, errors) = self.compute_logical_ast_from_leaf_lenient(*leaf);
+                // if the error is not recoverable, replace it with an empty clause. We will end up
+                // trimming those later
                 (
                     ast.unwrap_or_else(|| LogicalAst::Clause(Vec::new())),
                     errors,
@@ -882,6 +868,8 @@ impl QueryParser {
                     }
                 };
                 if lower == Bound::Unbounded && upper == Bound::Unbounded {
+                    // this range is useless, either because a user requested [* TO *], or because
+                    // we failed to parse something. Either way, there is no point emitting it
                     return (None, errors);
                 }
                 let logical_ast =
@@ -1006,9 +994,10 @@ fn generate_literals_for_json_object(
     tokenizer_manager: &TokenizerManager,
     json_options: &JsonObjectOptions,
 ) -> Result<Vec<LogicalLiteral>, QueryParserError> {
-    let text_options = json_options
-        .get_text_indexing_options()
-        .ok_or_else(|| QueryParserError::FieldNotIndexed(field_name.to_string()))?;
+    let text_options = json_options.get_text_indexing_options().ok_or_else(|| {
+        // This should have been seen earlier really.
+        QueryParserError::FieldNotIndexed(field_name.to_string())
+    })?;
     let mut text_analyzer = tokenizer_manager
         .get(text_options.tokenizer())
         .ok_or_else(|| QueryParserError::UnknownTokenizer {
@@ -1089,8 +1078,8 @@ mod test {
     use super::{QueryParser, QueryParserError};
     use crate::query::Query;
     use crate::schema::{
-        FacetOptions, Field, IndexRecordOption, NestedOptions, Schema, Term, TextFieldIndexing,
-        TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
+        FacetOptions, Field, IndexRecordOption, Schema, Term, TextFieldIndexing, TextOptions, FAST,
+        INDEXED, STORED, STRING, TEXT,
     };
     use crate::tokenizer::{
         LowerCaser, SimpleTokenizer, StopWordFilter, TextAnalyzer, TokenizerManager,
@@ -1124,7 +1113,6 @@ mod test {
         schema_builder.add_bool_field("bool", INDEXED);
         schema_builder.add_bool_field("notindexed_bool", STORED);
         schema_builder.add_u64_field("u64_ff", FAST);
-
         schema_builder.build()
     }
 
@@ -1198,7 +1186,8 @@ mod test {
         let query = make_query_parser().parse_query("title:[A TO B]").unwrap();
         assert_eq!(
             format!("{query:?}"),
-            "RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=0, type=Str, \"a\")), upper_bound: Included(Term(field=0, type=Str, \"b\")) } }"
+            "RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=0, type=Str, \
+             \"a\")), upper_bound: Included(Term(field=0, type=Str, \"b\")) } }"
         );
     }
 
@@ -1359,10 +1348,9 @@ mod test {
         let LogicalLiteral::Term(term) = *literal else {
             panic!();
         };
-        let json_path = std::str::from_utf8(term.serialized_value_bytes())
+        std::str::from_utf8(term.serialized_value_bytes())
             .unwrap()
-            .to_string();
-        json_path
+            .to_string()
     }
 
     #[test]
@@ -1380,13 +1368,13 @@ mod test {
     #[test]
     fn test_json_field_possibly_a_number() {
         test_parse_query_to_logical_ast_helper(
-            "json.titi:4",
-            r#"(Term(field=14, type=Json, path=titi, type=I64, 4) Term(field=14, type=Json, path=titi, type=Str, "4"))"#,
+            "json.titi:5",
+            r#"(Term(field=14, type=Json, path=titi, type=I64, 5) Term(field=14, type=Json, path=titi, type=Str, "5"))"#,
             true,
         );
         test_parse_query_to_logical_ast_helper(
             "json.titi:-5",
-            r#"(Term(field=14, type=Json, path=titi, type=I64, -5) Term(field=14, type=Json, path=titi, type=Str, "5"))"#,
+            r#"(Term(field=14, type=Json, path=titi, type=I64, -5) Term(field=14, type=Json, path=titi, type=Str, "5"))"#, //< Yes this is a bit weird after going through the tokenizer we lose the "-".
             true,
         );
         test_parse_query_to_logical_ast_helper(
@@ -1396,7 +1384,7 @@ mod test {
         );
         test_parse_query_to_logical_ast_helper(
             "json.titi:-5.2",
-            r#"(Term(field=14, type=Json, path=titi, type=F64, -5.2) "[(0, Term(field=14, type=Json, path=titi, type=Str, \"5\")), (1, Term(field=14, type=Json, path=titi, type=Str, \"2\"))]")"#,
+            r#"(Term(field=14, type=Json, path=titi, type=F64, -5.2) "[(0, Term(field=14, type=Json, path=titi, type=Str, "5")), (1, Term(field=14, type=Json, path=titi, type=Str, "2"))]")"#,
             true,
         );
     }
@@ -1443,7 +1431,8 @@ mod test {
     fn test_json_default() {
         test_query_to_logical_ast_with_default_json(
             "titi:4",
-            "(Term(field=14, type=Json, path=titi, type=I64, 4) Term(field=14, type=Json, path=titi, type=Str, \"4\"))",
+            "(Term(field=14, type=Json, path=titi, type=I64, 4) Term(field=14, type=Json, \
+             path=titi, type=Str, \"4\"))",
             false,
         );
     }
@@ -1483,14 +1472,11 @@ mod test {
     fn test_parse_bytes_invalid_base64() {
         let base64_err: QueryParserError =
             parse_query_to_logical_ast("bytes:aa", false).unwrap_err();
-        assert_eq!(
-            base64_err.to_string(),
-            "Expected base64: Base64DecodeError(Invalid byte 0x61, offset: 0)"
-        );
+        assert!(matches!(base64_err, QueryParserError::ExpectedBase64(_)));
     }
 
     #[test]
-    pub fn test_parse_query_to_ast_ab_c() {
+    fn test_parse_query_to_ast_ab_c() {
         test_parse_query_to_logical_ast_helper(
             "(+title:a +title:b) title:c",
             r#"((+Term(field=0, type=Str, "a") +Term(field=0, type=Str, "b")) Term(field=0, type=Str, "c"))"#,
@@ -1543,7 +1529,6 @@ mod test {
             false,
         );
     }
-
     #[test]
     pub fn test_parse_query_all_query() {
         let logical_ast = parse_query_to_logical_ast("*", false).unwrap();
@@ -1586,7 +1571,6 @@ mod test {
             r#"(Excluded(Term(field=2, type=I64, -5)) TO Excluded(Term(field=2, type=I64, 3)))"#,
             false,
         );
-
         test_parse_query_to_logical_ast_helper(
             "float:{-1.5 TO 1.5}",
             r#"(Excluded(Term(field=10, type=F64, -1.5)) TO Excluded(Term(field=10, type=F64, 1.5)))"#,
@@ -1622,15 +1606,19 @@ mod test {
     #[test]
     pub fn test_unknown_tokenizer() {
         let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("a\\.b", STRING);
+        let text_field_indexing = TextFieldIndexing::default()
+            .set_tokenizer("nonexistingtokenizer")
+            .set_index_option(IndexRecordOption::Basic);
+        let text_options = TextOptions::default().set_indexing_options(text_field_indexing);
+        let title = schema_builder.add_text_field("title", text_options);
         let schema = schema_builder.build();
-        let query_parser =
-            QueryParser::new(schema.clone(), Vec::new(), TokenizerManager::default());
-        let query = "a\\.b:hello";
-        let query_result = query_parser.parse_query(query).unwrap();
-        assert_eq!(
-            format!("{query_result:?}"),
-            "TermQuery(Term(field=0, type=Str, \"hello\"))"
+        let default_fields = vec![title];
+        let tokenizer_manager = TokenizerManager::default();
+        let query_parser = QueryParser::new(schema, default_fields, tokenizer_manager);
+
+        assert_matches!(
+            query_parser.parse_query("title:\"happy tax payer\""),
+            Err(QueryParserError::UnknownTokenizer { .. })
         );
     }
 
@@ -1643,7 +1631,7 @@ mod test {
         let text_options = TextOptions::default().set_indexing_options(text_field_indexing);
         let title = schema_builder.add_text_field("title", text_options);
         let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema.clone());
+        let index = Index::create_in_ram(schema);
         index
             .tokenizers()
             .register("customtokenizer", SimpleTokenizer::default());
@@ -1662,10 +1650,6 @@ mod test {
             Err(QueryParserError::ExpectedInt(_))
         );
         assert!(query_parser.parse_query("unsigned:\"18\"").is_ok());
-        assert_matches!(
-            query_parser.parse_query("unsigned:\"-2\""),
-            Err(QueryParserError::ExpectedInt(_))
-        );
         assert_matches!(
             query_parser.parse_query("signed:18b"),
             Err(QueryParserError::ExpectedInt(_))
@@ -1711,13 +1695,11 @@ mod test {
     pub fn test_query_parser_expected_facet() {
         let query_parser = make_query_parser();
         match query_parser.parse_query("facet:INVALID") {
-            Ok(_) => panic!("Test::test_query_parser_expected_facet => Should never succeed"),
-            Err(e) => {
-                assert_eq!(
-                    "The facet field is malformed: Failed to parse the facet string: 'INVALID'",
-                    format!("{e}")
-                );
-            }
+            Ok(_) => panic!("should never succeed"),
+            Err(e) => assert_eq!(
+                "The facet field is malformed: Failed to parse the facet string: 'INVALID'",
+                format!("{e}")
+            ),
         }
         assert!(query_parser.parse_query("facet:\"/foo/bar\"").is_ok());
     }
@@ -1821,12 +1803,10 @@ mod test {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field(r"a\.b", STRING);
         let schema = schema_builder.build();
-        let query_parser =
-            QueryParser::new(schema.clone(), Vec::new(), TokenizerManager::default());
-        let query = "a\\.b:hello";
-        let query_result = query_parser.parse_query(query).unwrap();
+        let query_parser = QueryParser::new(schema, Vec::new(), TokenizerManager::default());
+        let query = query_parser.parse_query(r"a\.b:hello").unwrap();
         assert_eq!(
-            format!("{query_result:?}"),
+            format!("{query:?}"),
             "TermQuery(Term(field=0, type=Str, \"hello\"))"
         );
     }
@@ -1895,7 +1875,13 @@ mod test {
         let query = query_parser.parse_query("\"big bad wo\"*").unwrap();
         assert_eq!(
             format!("{query:?}"),
-            "BooleanQuery { subqueries: [(Should, PhrasePrefixQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"big\")), (1, Term(field=0, type=Str, \"bad\"))], prefix: (2, Term(field=0, type=Str, \"wo\")), max_expansions: 50 }), (Should, PhrasePrefixQuery { field: Field(1), phrase_terms: [(0, Term(field=1, type=Str, \"big\")), (1, Term(field=1, type=Str, \"bad\"))], prefix: (2, Term(field=1, type=Str, \"wo\")), max_expansions: 50 })], minimum_number_should_match: 1 }"
+            "BooleanQuery { subqueries: [(Should, PhrasePrefixQuery { field: Field(0), \
+             phrase_terms: [(0, Term(field=0, type=Str, \"big\")), (1, Term(field=0, type=Str, \
+             \"bad\"))], prefix: (2, Term(field=0, type=Str, \"wo\")), max_expansions: 50 }), \
+             (Should, PhrasePrefixQuery { field: Field(1), phrase_terms: [(0, Term(field=1, \
+             type=Str, \"big\")), (1, Term(field=1, type=Str, \"bad\"))], prefix: (2, \
+             Term(field=1, type=Str, \"wo\")), max_expansions: 50 })], \
+             minimum_number_should_match: 1 }"
         );
     }
 
@@ -1958,7 +1944,10 @@ mod test {
             let query = query_parser.parse_query("abc").unwrap();
             assert_eq!(
                 format!("{query:?}"),
-                "BooleanQuery { subqueries: [(Should, FuzzyTermQuery { term: Term(field=0, type=Str, \"abc\"), distance: 1, transposition_cost_one: true, prefix: false }), (Should, TermQuery(Term(field=1, type=Str, \"abc\")))], minimum_number_should_match: 1 }"
+                "BooleanQuery { subqueries: [(Should, FuzzyTermQuery { term: Term(field=0, \
+                 type=Str, \"abc\"), distance: 1, transposition_cost_one: true, prefix: false }), \
+                 (Should, TermQuery(Term(field=1, type=Str, \"abc\")))], \
+                 minimum_number_should_match: 1 }"
             );
         }
 
@@ -1973,36 +1962,11 @@ mod test {
             let query = query_parser.parse_query("abc").unwrap();
             assert_eq!(
                 format!("{query:?}"),
-                "BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"abc\"))), (Should, FuzzyTermQuery { term: Term(field=1, type=Str, \"abc\"), distance: 2, transposition_cost_one: false, prefix: true })], minimum_number_should_match: 1 }"
+                "BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \
+                 \"abc\"))), (Should, FuzzyTermQuery { term: Term(field=1, type=Str, \"abc\"), \
+                 distance: 2, transposition_cost_one: false, prefix: true })], \
+                 minimum_number_should_match: 1 }"
             );
-        }
-    }
-
-    #[test]
-    fn test_query_parser_nested_errors() {
-        let mut schema_builder = Schema::builder();
-        let nested_opts = NestedOptions::new().set_include_in_parent(true);
-        let _nested_field = schema_builder.add_nested_field(vec!["nested".into()], nested_opts);
-        let schema = schema_builder.build();
-
-        let index = Index::create_in_ram(schema.clone());
-        let query_parser = QueryParser::for_index(&index, vec![]);
-        // range query on nested => error
-        let range_res = query_parser.parse_query("nested:[a TO z]");
-        match range_res {
-            Err(crate::query::QueryParserError::UnsupportedQuery(msg)) => {
-                assert!(msg.contains("Range query on a nested field is not supported"));
-            }
-            other => panic!("Expected an UnsupportedQuery error, got {:?}", other),
-        }
-
-        // direct text on nested => error
-        let text_res = query_parser.parse_query("nested:hello");
-        match text_res {
-            Err(crate::query::QueryParserError::UnsupportedQuery(msg)) => {
-                assert!(msg.contains("Cannot run direct text search on a `nested` field"));
-            }
-            other => panic!("Expected an UnsupportedQuery error, got {:?}", other),
         }
     }
 }

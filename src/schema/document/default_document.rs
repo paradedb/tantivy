@@ -1,4 +1,3 @@
-// src/schema/document/default_document.rs
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::Ipv6Addr;
@@ -69,9 +68,7 @@ impl CompactDoc {
 
     /// Adding a facet to the document.
     pub fn add_facet<F>(&mut self, field: Field, path: F)
-    where
-        Facet: From<F>,
-    {
+    where Facet: From<F> {
         let facet = Facet::from(path);
         self.add_leaf_field_value(field, ReferenceValueLeaf::Facet(facet.encoded_str()));
     }
@@ -135,7 +132,7 @@ impl CompactDoc {
             field: field
                 .field_id()
                 .try_into()
-                .expect("only up to u16::MAX fields supported"),
+                .expect("support only up to u16::MAX field ids"),
             value_addr: self.add_value(value),
         };
         self.field_values.push(field_value);
@@ -153,7 +150,7 @@ impl CompactDoc {
             field: field
                 .field_id()
                 .try_into()
-                .expect("only up to u16::MAX fields supported"),
+                .expect("support only up to u16::MAX field ids"),
             value_addr: self.add_value_leaf(value),
         };
         self.field_values.push(field_value);
@@ -161,11 +158,10 @@ impl CompactDoc {
 
     /// field_values accessor
     pub fn field_values(&self) -> impl Iterator<Item = (Field, CompactDocValue<'_>)> {
-        self.field_values.iter().map(|fv| {
-            (
-                Field::from_field_id(fv.field as u32),
-                self.get_compact_doc_value(fv.value_addr),
-            )
+        self.field_values.iter().map(|field_val| {
+            let field = Field::from_field_id(field_val.field as u32);
+            let val = self.get_compact_doc_value(field_val.value_addr);
+            (field, val)
         })
     }
 
@@ -173,8 +169,8 @@ impl CompactDoc {
     pub fn get_all(&self, field: Field) -> impl Iterator<Item = CompactDocValue<'_>> + '_ {
         self.field_values
             .iter()
-            .filter(move |fv| fv.field as u32 == field.field_id())
-            .map(|fv| self.get_compact_doc_value(fv.value_addr))
+            .filter(move |field_value| Field::from_field_id(field_value.field as u32) == field)
+            .map(|val| self.get_compact_doc_value(val.value_addr))
     }
 
     /// Returns the first `ReferenceValue` associated the given field
@@ -200,9 +196,9 @@ impl CompactDoc {
 
     /// Build a document object from a json-object.
     pub fn parse_json(schema: &Schema, doc_json: &str) -> Result<Self, DocParsingError> {
-        let top_obj: serde_json::Map<String, serde_json::Value> =
+        let json_obj: Map<String, serde_json::Value> =
             serde_json::from_str(doc_json).map_err(|_| DocParsingError::invalid_json(doc_json))?;
-        Self::from_json_object(schema, top_obj)
+        Self::from_json_object(schema, json_obj)
     }
 
     /// Build a document object from a json-object.
@@ -211,24 +207,24 @@ impl CompactDoc {
         json_obj: Map<String, serde_json::Value>,
     ) -> Result<Self, DocParsingError> {
         let mut doc = Self::default();
-        for (field_name, value) in json_obj {
+        for (field_name, json_value) in json_obj {
             if let Ok(field) = schema.get_field(&field_name) {
-                let field_type = schema.get_field_entry(field).field_type();
-                match value {
-                    serde_json::Value::Array(arr) => {
-                        // Insert each array item
-                        for item in arr {
-                            let parsed_val = field_type
-                                .value_from_json(item)
+                let field_entry = schema.get_field_entry(field);
+                let field_type = field_entry.field_type();
+                match json_value {
+                    serde_json::Value::Array(json_items) => {
+                        for json_item in json_items {
+                            let value = field_type
+                                .value_from_json(json_item)
                                 .map_err(|e| DocParsingError::ValueError(field_name.clone(), e))?;
-                            doc.add_field_value(field, &parsed_val);
+                            doc.add_field_value(field, &value);
                         }
                     }
-                    other => {
-                        let parsed_val = field_type
-                            .value_from_json(other)
+                    _ => {
+                        let value = field_type
+                            .value_from_json(json_value)
                             .map_err(|e| DocParsingError::ValueError(field_name.clone(), e))?;
-                        doc.add_field_value(field, &parsed_val);
+                        doc.add_field_value(field, &value);
                     }
                 }
             }
@@ -238,50 +234,62 @@ impl CompactDoc {
 
     fn add_value_leaf(&mut self, leaf: ReferenceValueLeaf) -> ValueAddr {
         let type_id = ValueType::from(&leaf);
-        // For booleans & null, we inline them in the u32, everything else we write into node_data
+        // Write into `node_data` and return u32 position as its address
+        // Null and bool are inlined into the address
         let val_addr = match leaf {
             ReferenceValueLeaf::Null => 0,
-            ReferenceValueLeaf::Bool(bval) => bval as u32,
-            ReferenceValueLeaf::Str(s) => write_bytes_into(&mut self.node_data, s.as_bytes()),
-            ReferenceValueLeaf::Facet(s) => write_bytes_into(&mut self.node_data, s.as_bytes()),
-            ReferenceValueLeaf::Bytes(b) => write_bytes_into(&mut self.node_data, b),
+            ReferenceValueLeaf::Str(bytes) => {
+                write_bytes_into(&mut self.node_data, bytes.as_bytes())
+            }
+            ReferenceValueLeaf::Facet(bytes) => {
+                write_bytes_into(&mut self.node_data, bytes.as_bytes())
+            }
+            ReferenceValueLeaf::Bytes(bytes) => write_bytes_into(&mut self.node_data, bytes),
             ReferenceValueLeaf::U64(num) => write_into(&mut self.node_data, num),
             ReferenceValueLeaf::I64(num) => write_into(&mut self.node_data, num),
             ReferenceValueLeaf::F64(num) => write_into(&mut self.node_data, num),
-            ReferenceValueLeaf::Date(d) => {
-                write_into(&mut self.node_data, d.into_timestamp_nanos())
+            ReferenceValueLeaf::Bool(b) => b as u32,
+            ReferenceValueLeaf::Date(date) => {
+                write_into(&mut self.node_data, date.into_timestamp_nanos())
             }
-            ReferenceValueLeaf::IpAddr(ipv6) => write_into(&mut self.node_data, ipv6.to_u128()),
-            ReferenceValueLeaf::PreTokStr(pretok) => write_into(&mut self.node_data, *pretok),
+            ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
+            ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
         };
         ValueAddr { type_id, val_addr }
     }
     /// Adds a value and returns in address into the
     fn add_value<'a, V: Value<'a>>(&mut self, value: V) -> ValueAddr {
-        let refval = value.as_value();
-        let type_id = ValueType::from(&refval);
-        match refval {
+        let value = value.as_value();
+        let type_id = ValueType::from(&value);
+        match value {
             ReferenceValue::Leaf(leaf) => self.add_value_leaf(leaf),
-            ReferenceValue::Object(obj_iter) => {
-                // gather addresses for (key, value) pairs
-                let mut addrs_buf = Vec::new();
-                for (k, v) in obj_iter {
-                    let k_addr = self.add_value_leaf(ReferenceValueLeaf::Str(k));
-                    let v_addr = self.add_value(v);
-                    write_into(&mut addrs_buf, k_addr);
-                    write_into(&mut addrs_buf, v_addr);
+            ReferenceValue::Array(elements) => {
+                // addresses of the elements in node_data
+                // Reusing a vec would be nicer, but it's not easy because of the recursion
+                // A global vec would work if every writer get it's discriminator
+                let mut addresses = Vec::new();
+                for elem in elements {
+                    let value_addr = self.add_value(elem);
+                    write_into(&mut addresses, value_addr);
                 }
-                let val_addr = write_bytes_into(&mut self.node_data, &addrs_buf);
-                ValueAddr { type_id, val_addr }
+                ValueAddr {
+                    type_id,
+                    val_addr: write_bytes_into(&mut self.node_data, &addresses),
+                }
             }
-            ReferenceValue::Array(arr_iter) => {
-                let mut addrs_buf = Vec::new();
-                for elem in arr_iter {
-                    let elem_addr = self.add_value(elem);
-                    write_into(&mut addrs_buf, elem_addr);
+            ReferenceValue::Object(entries) => {
+                // addresses of the elements in node_data
+                let mut addresses = Vec::new();
+                for (key, value) in entries {
+                    let key_addr = self.add_value_leaf(ReferenceValueLeaf::Str(key));
+                    let value_addr = self.add_value(value);
+                    write_into(&mut addresses, key_addr);
+                    write_into(&mut addresses, value_addr);
                 }
-                let val_addr = write_bytes_into(&mut self.node_data, &addrs_buf);
-                ValueAddr { type_id, val_addr }
+                ValueAddr {
+                    type_id,
+                    val_addr: write_bytes_into(&mut self.node_data, &addresses),
+                }
             }
         }
     }
@@ -369,9 +377,7 @@ impl Eq for CompactDoc {}
 
 impl DocumentDeserialize for CompactDoc {
     fn deserialize<'de, D>(mut deserializer: D) -> Result<Self, DeserializeError>
-    where
-        D: DocumentDeserializer<'de>,
-    {
+    where D: DocumentDeserializer<'de> {
         let mut doc = CompactDoc::default();
         // TODO: Deserializing into OwnedValue is wasteful. The deserializer should be able to work
         // on slices and referenced data.

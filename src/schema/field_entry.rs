@@ -1,4 +1,3 @@
-// src/schema/field_entry.rs
 use serde::{Deserialize, Serialize};
 
 use super::ip_options::IpAddrOptions;

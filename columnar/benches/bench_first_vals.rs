@@ -4,7 +4,7 @@ extern crate test;
 use std::sync::Arc;
 
 use rand::prelude::*;
-use tantivy_columnar::column_values::{serialize_and_load_u64_based_column_values, CodecType};
+use tantivy_columnar::column_values::CodecType;
 use tantivy_columnar::*;
 use test::{black_box, Bencher};
 

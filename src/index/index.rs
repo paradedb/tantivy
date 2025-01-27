@@ -35,9 +35,10 @@ fn load_metas(
         Err(crate::TantivyError::InternalError(_)) => {
             let meta_data = directory.atomic_read(&META_FILEPATH)?;
             let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
+                error!("Meta data is not valid utf8.");
                 DataCorruption::new(
                     META_FILEPATH.to_path_buf(),
-                    "Meta file does not contain valid UTF-8.".to_string(),
+                    "Meta file does not contain valid utf8 file.".to_string(),
                 )
             })?;
             IndexMeta::deserialize(&meta_string, inventory)
@@ -112,13 +113,11 @@ pub struct IndexBuilder {
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
 }
-
 impl Default for IndexBuilder {
     fn default() -> Self {
         IndexBuilder::new()
     }
 }
-
 impl IndexBuilder {
     /// Creates a new `IndexBuilder`
     pub fn new() -> Self {
@@ -286,7 +285,6 @@ impl Index {
     pub fn builder() -> IndexBuilder {
         IndexBuilder::new()
     }
-
     /// Examines the directory to see if it contains an index.
     ///
     /// Effectively, it only checks for the presence of the `meta.json` file.
@@ -335,7 +333,7 @@ impl Index {
     /// Creates a new index in a given filepath.
     /// The index will use the [`MmapDirectory`].
     ///
-    /// If a previous index was in this directory, it returns
+    /// If a previous index was in this directory, then it returns
     /// a [`TantivyError::IndexAlreadyExists`] error.
     #[cfg(feature = "mmap")]
     pub fn create_in_dir<P: AsRef<Path>>(
@@ -434,21 +432,20 @@ impl Index {
                 return Err(TantivyError::SchemaError(format!(
                     "{:?} is not a text field.",
                     field_entry.name()
-                )));
+                )))
             }
         };
         let indexing_options = indexing_options_opt.ok_or_else(|| {
             TantivyError::InvalidArgument(format!(
-                "No indexing options set for field {:?}",
-                field_entry.name()
+                "No indexing options set for field {field_entry:?}"
             ))
         })?;
+
         tokenizer_manager
             .get(indexing_options.tokenizer())
             .ok_or_else(|| {
                 TantivyError::InvalidArgument(format!(
-                    "No Tokenizer found for field {:?}",
-                    field_entry.name()
+                    "No Tokenizer found for field {field_entry:?}"
                 ))
             })
     }
@@ -462,7 +459,7 @@ impl Index {
 
     /// Create a [`IndexReader`] for the given index.
     ///
-    /// Most projects should create at most one reader for a given index.
+    /// Most project should create at most one reader for a given index.
     /// This method is typically called only once per `Index` instance.
     pub fn reader_builder(&self) -> IndexReaderBuilder {
         IndexReaderBuilder::new(self.clone())
@@ -530,7 +527,7 @@ impl Index {
         load_metas(self.directory(), &self.inventory)
     }
 
-    /// Opens a new index writer with the given options. Attempts to acquire a lockfile.
+    /// Open a new index writer with the given options. Attempts to acquire a lockfile.
     ///
     /// The lockfile should be deleted on drop, but it is possible
     /// that due to a panic or other error, a stale lockfile will be
@@ -563,6 +560,7 @@ impl Index {
                     ),
                 )
             })?;
+
         IndexWriter::new(self, options, directory_lock)
     }
 
@@ -587,13 +585,10 @@ impl Index {
     /// `TantivyError::InvalidArgument`
     pub fn writer_with_num_threads<D: Document>(
         &self,
-        mut num_threads: usize,
+        num_threads: usize,
         overall_memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter<D>> {
         let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
-        if memory_arena_in_bytes_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
-            num_threads = (overall_memory_budget_in_bytes / MEMORY_BUDGET_NUM_BYTES_MIN).max(1);
-        }
         let options = IndexWriterOptions::builder()
             .num_worker_threads(num_threads)
             .memory_budget_per_thread(memory_arena_in_bytes_per_thread)
@@ -652,8 +647,8 @@ impl Index {
 
     /// Returns the list of segments that are searchable
     pub fn searchable_segments(&self) -> crate::Result<Vec<Segment>> {
-        let segments = self.searchable_segment_metas()?;
-        Ok(segments
+        Ok(self
+            .searchable_segment_metas()?
             .into_iter()
             .map(|segment_meta| self.segment(segment_meta))
             .collect())
@@ -690,9 +685,11 @@ impl Index {
 
     /// Returns the list of segment ids that are searchable.
     pub fn searchable_segment_ids(&self) -> crate::Result<Vec<SegmentId>> {
-        let metas = self.searchable_segment_metas()?;
-        let segment_ids: Vec<_> = metas.iter().map(SegmentMeta::id).collect();
-        Ok(segment_ids)
+        Ok(self
+            .searchable_segment_metas()?
+            .iter()
+            .map(SegmentMeta::id)
+            .collect())
     }
 
     /// Returns the set of corrupted files
@@ -705,6 +702,7 @@ impl Index {
             .collect();
         let active_existing_files: HashSet<&PathBuf> =
             active_segments_files.intersection(&managed_files).collect();
+
         let mut damaged_files = HashSet::new();
         for path in active_existing_files {
             if !self.directory.validate_checksum(path)? {
