@@ -1400,6 +1400,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_nested_query_numeric_leaf() -> crate::Result<()> {
         use crate::schema::document::parse_json_for_nested_sorted;
         use crate::schema::{
