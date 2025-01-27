@@ -308,51 +308,25 @@ impl SchemaBuilder {
         field_path: Vec<String>,
         nested_opts: NestedOptions,
     ) -> Field {
-        println!(
-            "SchemaBuilder::add_nested_field => Adding nested field with path '{:?}' and options {:?}",
-            field_path, nested_opts
-        );
         let mut field_name_builder = JsonPathWriter::new();
         for seg in &field_path {
             field_name_builder.push(&seg);
         }
         let field_name = field_name_builder.as_str();
-        println!(
-            "SchemaBuilder::add_nested_field => Constructed field name '{}'",
-            field_name
-        );
         let field_entry = FieldEntry::new_nested(field_name.to_string(), nested_opts.clone());
         let field = self.add_field(field_entry);
-        println!(
-            "SchemaBuilder::add_nested_field => Added nested field '{}' with ID {}",
-            field_name,
-            field.field_id()
-        );
 
         if nested_opts.store_parent_flag {
             let parent_field_name = format!("_is_parent_{}", field_name);
-            println!(
-                "SchemaBuilder::add_nested_field => Creating parent flag field '{}'",
-                parent_field_name
-            );
 
             // We'll store it as an indexed bool, for the parent doc
             let bool_options = NumericOptions::default().set_indexed();
             let bool_field_entry =
                 FieldEntry::new(parent_field_name.clone(), FieldType::Bool(bool_options));
             let parent_field = self.add_field(bool_field_entry);
-            println!(
-                "SchemaBuilder::add_nested_field => Added parent flag field '{}' with ID {}",
-                parent_field_name,
-                parent_field.field_id()
-            );
 
             // Record the mapping in nested_paths
             self.nested_paths.insert(field_path, field);
-            println!(
-                "SchemaBuilder::add_nested_field => Recorded nested path mapping for field '{}'",
-                field_name
-            );
         }
 
         field
@@ -572,6 +546,15 @@ impl Schema {
             .iter()
             .enumerate()
             .map(|(field_id, field_entry)| (Field::from_field_id(field_id as u32), field_entry))
+    }
+
+    /// Return the list of all the `Field`s.
+    pub fn nested_fields(&self) -> impl Iterator<Item = (&Vec<String>, Field, &FieldEntry)> {
+        self.0
+            .nested_paths
+            .iter()
+            .enumerate()
+            .map(|(i, (path, field))| (path, *field, &self.0.fields[i]))
     }
 
     /// Creates a new builder.

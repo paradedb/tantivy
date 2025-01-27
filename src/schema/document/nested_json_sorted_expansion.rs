@@ -237,11 +237,6 @@ fn parse_value(
     Ok(())
 }
 
-/// Expand a nested field. If it’s an array => multiple child docs; if a single object => one child doc.
-/// If it’s a scalar => store in the parent if `include_in_parent`.
-///
-/// We fix the parent-flag logic: we only set `_is_parent_... = true` if `store_parent_flag` is `true` **and**
-/// the current JSON `val` is an **object or array** (meaning we have sub-docs).
 fn expand_nested_value(
     schema: &Schema,
     path_stack: &mut Vec<String>,
@@ -261,8 +256,8 @@ fn expand_nested_value(
     );
 
     // Only set the parent flag if store_parent_flag == true *and* we see sub-doc structures
-    // (i.e. val is an object or array). If the user’s doc is just a scalar, it’s not a “parent”.
-    if store_parent_flag && (val.is_object() || val.is_array()) {
+    let is_parent = schema.get_nested_field(path_stack).is_some();
+    if store_parent_flag && is_parent {
         let parent_flag_name = format!("_is_parent_{}", schema.get_field_name(nested_field));
         println!(
             "expand_nested_value: Setting parent flag field '{}' to true (depth={})",
