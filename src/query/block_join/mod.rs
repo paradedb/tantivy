@@ -1078,14 +1078,6 @@ mod test {
     }
 
     #[test]
-    fn test_to_child_block_join_query_explain() -> Result<()> {
-        // We'll skip real logic, just ensure no panic
-        println!("Skipping real .explain logic in test_to_child_block_join_query_explain");
-        assert!(true);
-        Ok(())
-    }
-
-    #[test]
     fn test_to_child_initial_advance_parent_but_no_kids() -> Result<()> {
         // The first block => parent only, second => child + parent
         let mut sb = SchemaBuilder::default();
@@ -1142,16 +1134,6 @@ mod test {
         let top_docs = searcher.search(&to_child, &TopDocs::with_limit(10))?;
         // we expect 1 child => skill=java
         assert_eq!(1, top_docs.len());
-        Ok(())
-    }
-
-    #[test]
-    fn test_multi_child_queries_of_diff_parent_levels() -> Result<()> {
-        // We'll do a minimal approach or just skip real multi-level testing
-        println!(
-            "Skipping big multi-level parent->child->grandchild test, just ensuring code runs."
-        );
-        assert!(true);
         Ok(())
     }
 

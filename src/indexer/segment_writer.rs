@@ -1,4 +1,3 @@
-// src/indexer/segment_writer.rs
 use columnar::MonotonicallyMappableToU64;
 use common::JsonPathWriter;
 use itertools::Itertools;
@@ -71,10 +70,6 @@ impl SegmentWriter {
     /// - segment: The segment being written
     /// - schema
     pub fn for_segment(memory_budget_in_bytes: usize, segment: Segment) -> crate::Result<Self> {
-        println!(
-            "SegmentWriter::for_segment => Creating new segment writer with memory_budget={}",
-            memory_budget_in_bytes
-        );
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
         let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
@@ -127,10 +122,6 @@ impl SegmentWriter {
     /// Finalize consumes the `SegmentWriter`, so that it cannot
     /// be used afterwards.
     pub fn finalize(mut self) -> crate::Result<Vec<u64>> {
-        println!(
-            "SegmentWriter::finalize => Finalizing segment with max_doc={}",
-            self.max_doc
-        );
         self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
         remap_and_write(
             self.schema,
@@ -154,10 +145,6 @@ impl SegmentWriter {
 
     fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
         let doc_id = self.max_doc;
-        println!(
-            "SegmentWriter::index_document => Starting to index document {}",
-            doc_id
-        );
 
         // TODO: Can this be optimised a bit?
         let vals_grouped_by_field = doc
@@ -169,12 +156,6 @@ impl SegmentWriter {
             let values = field_values.map(|el| el.1);
 
             let field_entry = self.schema.get_field_entry(field);
-            println!(
-                "SegmentWriter => Processing field: doc_id={}, field={}, field_type={:?}",
-                doc_id,
-                field_entry.name(),
-                field_entry.field_type()
-            );
             let make_schema_error = || {
                 TantivyError::SchemaError(format!(
                     "Expected a {:?} for field {:?}",
@@ -183,11 +164,6 @@ impl SegmentWriter {
                 ))
             };
             if !field_entry.is_indexed() {
-                println!(
-                    "SegmentWriter => Skipping non-indexed field: doc_id={}, field={}",
-                    doc_id,
-                    field_entry.name()
-                );
                 continue;
             }
 
@@ -216,41 +192,18 @@ impl SegmentWriter {
                 }
                 FieldType::Str(_) => {
                     let mut indexing_position = IndexingPosition::default();
-                    for (i, value) in values.enumerate() {
+                    for (_, value) in values.enumerate() {
                         let value = value.as_value();
-                        println!(
-                            "SegmentWriter => Processing string value #{} for doc_id={}, field={}",
-                            i,
-                            doc_id,
-                            field_entry.name()
-                        );
 
-                        let mut token_stream =
-                            if let Some(text) = value.as_str() {
-                                println!(
-                                "SegmentWriter => Tokenizing text for doc_id={}, field={}: '{}'",
-                                doc_id, field_entry.name(), text
-                            );
-                                println!(
-                                "SegmentWriter => tokenizing text for doc_id={}, field={}: '{}'",
-                                doc_id, field_entry.name(), text
-                            );
-                                let text_analyzer =
-                                    &mut self.per_field_text_analyzers[field.field_id() as usize];
-                                text_analyzer.token_stream(text)
-                            } else if let Some(tok_str) = value.into_pre_tokenized_text() {
-                                println!(
-                                "SegmentWriter => using pre-tokenized text for doc_id={}, field={}",
-                                doc_id, field_entry.name()
-                            );
-                                BoxTokenStream::new(PreTokenizedStream::from(*tok_str.clone()))
-                            } else {
-                                println!(
-                                "SegmentWriter => skipping non-text value for doc_id={}, field={}",
-                                doc_id, field_entry.name()
-                            );
-                                continue;
-                            };
+                        let mut token_stream = if let Some(text) = value.as_str() {
+                            let text_analyzer =
+                                &mut self.per_field_text_analyzers[field.field_id() as usize];
+                            text_analyzer.token_stream(text)
+                        } else if let Some(tok_str) = value.into_pre_tokenized_text() {
+                            BoxTokenStream::new(PreTokenizedStream::from(*tok_str.clone()))
+                        } else {
+                            continue;
+                        };
 
                         assert!(term_buffer.is_empty());
                         postings_writer.index_text(
@@ -268,38 +221,15 @@ impl SegmentWriter {
                 }
                 FieldType::U64(_) => {
                     let mut num_vals = 0;
-                    for (i, value) in values.enumerate() {
+                    for (_, value) in values.enumerate() {
                         let value = value.as_value();
 
                         num_vals += 1;
                         let u64_val = value.as_u64().ok_or_else(make_schema_error)?;
-                        println!(
-                            "SegmentWriter => Processing U64 value #{} for doc_id={}, field={}: {}",
-                            i,
-                            doc_id,
-                            field_entry.name(),
-                            u64_val
-                        );
-                        println!(
-                            "SegmentWriter => indexing u64 value for doc_id={}, field={}: {}",
-                            doc_id,
-                            field_entry.name(),
-                            u64_val
-                        );
                         term_buffer.set_u64(u64_val);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
-                    println!(
-                        "SegmentWriter => indexing normal field: field={}, doc_id={}, num_vals={}",
-                        field_entry.name(),
-                        doc_id,
-                        num_vals
-                    );
                     if field_entry.has_fieldnorms() {
-                        println!(
-                            "SegmentWriter => Recording fieldnorms for doc_id={}, field={}: {} values",
-                            doc_id, field_entry.name(), num_vals
-                        );
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
@@ -351,12 +281,6 @@ impl SegmentWriter {
                         let value = value.as_value();
                         num_vals += 1;
                         let bool_val = value.as_bool().ok_or_else(make_schema_error)?;
-                        println!(
-                            "SegmentWriter => indexing bool value for doc_id={}, field={}: {}",
-                            doc_id,
-                            field_entry.name(),
-                            bool_val
-                        );
                         term_buffer.set_bool(bool_val);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
@@ -414,10 +338,6 @@ impl SegmentWriter {
                     }
                 }
                 FieldType::Nested(_nested_opts) => {
-                    println!(
-                        "SegmentWriter => Skipping nested field indexing for doc_id={}, field={} (already expanded into child docs)",
-                        doc_id, field_entry.name()
-                    );
                     // Here, we skip indexing because these fields
                     // have already been expanded into child docs
                     // at parse time (parse_json_for_nested).
@@ -502,7 +422,6 @@ fn remap_and_write(
     fieldnorms_writer: &FieldNormsWriter,
     mut serializer: SegmentSerializer,
 ) -> crate::Result<()> {
-    println!("remap-and-write");
     if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
         fieldnorms_writer.serialize(fieldnorms_serializer)?;
     }
@@ -517,10 +436,8 @@ fn remap_and_write(
         fieldnorm_readers,
         serializer.get_postings_serializer(),
     )?;
-    println!("fastfield-serialize");
     fast_field_writers.serialize(serializer.get_fast_field_write())?;
 
-    println!("serializer-close");
     serializer.close()?;
 
     Ok(())
@@ -840,7 +757,7 @@ mod tests {
     #[test]
     fn test_json_tokenized_with_position() {
         let mut schema_builder = Schema::builder();
-        let json_field = schema_builder.add_json_field("json", STORED | TEXT);
+        let json_field = schema_builder.add_json_field("json", TEXT);
         let schema = schema_builder.build();
         let mut doc = TantivyDocument::default();
         let json_val: BTreeMap<String, crate::schema::OwnedValue> =

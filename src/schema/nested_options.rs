@@ -1,4 +1,3 @@
-// src/schema/nested_options.rs
 use crate::schema::TextFieldIndexing;
 use serde::{Deserialize, Serialize};
 
@@ -89,13 +88,11 @@ impl NestedOptions {
 /// Options for a “nested JSON” field in Tantivy.
 /// Combines `NestedOptions` for child/parent docs,
 /// plus `JsonObjectOptions` for storing/indexing JSON text.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct NestedJsonObjectOptions {
     pub nested_opts: NestedOptions,
     pub json_opts: JsonObjectOptions,
 }
-
 
 impl NestedJsonObjectOptions {
     /// Convenience constructor

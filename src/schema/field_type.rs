@@ -1,5 +1,3 @@
-// src/schema/field_type.rs
-
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -212,10 +210,6 @@ impl FieldType {
             FieldType::Bytes(_) => Type::Bytes,
             FieldType::JsonObject(_) => Type::Json,
             FieldType::IpAddr(_) => Type::IpAddr,
-
-            // For simplicity, treat `Nested` as if it were JSON if code attempts
-            // direct 'value_from_json'. We'll actually do the real expansion logic
-            // separately in `parse_json_for_nested`.
             FieldType::Nested(_) | FieldType::NestedJson(_) => Type::Json,
         }
     }
@@ -248,62 +242,19 @@ impl FieldType {
     /// returns true if the field is indexed.
     pub fn is_indexed(&self) -> bool {
         let result = match *self {
-            FieldType::Str(ref text_options) => {
-                println!("Checking if Str field is indexed: {:?}", text_options);
-                text_options.get_indexing_options().is_some()
-            }
-            FieldType::U64(ref int_options) => {
-                println!("Checking if U64 field is indexed: {:?}", int_options);
-                int_options.is_indexed()
-            }
-            FieldType::I64(ref int_options) => {
-                println!("Checking if I64 field is indexed: {:?}", int_options);
-                int_options.is_indexed()
-            }
-            FieldType::F64(ref int_options) => {
-                println!("Checking if F64 field is indexed: {:?}", int_options);
-                int_options.is_indexed()
-            }
-            FieldType::Bool(ref int_options) => {
-                println!("Checking if Bool field is indexed: {:?}", int_options);
-                int_options.is_indexed()
-            }
-            FieldType::Date(ref date_options) => {
-                println!("Checking if Date field is indexed: {:?}", date_options);
-                date_options.is_indexed()
-            }
-            FieldType::Facet(ref facet_options) => {
-                println!("Checking if Facet field is indexed: {:?}", facet_options);
-                true
-            }
-            FieldType::Bytes(ref bytes_options) => {
-                println!("Checking if Bytes field is indexed: {:?}", bytes_options);
-                bytes_options.is_indexed()
-            }
-            FieldType::JsonObject(ref json_object_options) => {
-                println!(
-                    "Checking if JsonObject field is indexed: {:?}",
-                    json_object_options
-                );
-                json_object_options.is_indexed()
-            }
-            FieldType::IpAddr(ref ip_addr_options) => {
-                println!("Checking if IpAddr field is indexed: {:?}", ip_addr_options);
-                ip_addr_options.is_indexed()
-            }
-            FieldType::Nested(ref nested_options) => {
-                println!("Checking if Nested field is indexed: {:?}", nested_options);
-                nested_options.is_indexed()
-            }
-            FieldType::NestedJson(ref nested_options) => {
-                println!(
-                    "Checking if NestedJson field is indexed: {:?}",
-                    nested_options
-                );
-                nested_options.is_indexed()
-            }
+            FieldType::Str(ref text_options) => text_options.get_indexing_options().is_some(),
+            FieldType::U64(ref int_options) => int_options.is_indexed(),
+            FieldType::I64(ref int_options) => int_options.is_indexed(),
+            FieldType::F64(ref int_options) => int_options.is_indexed(),
+            FieldType::Bool(ref int_options) => int_options.is_indexed(),
+            FieldType::Date(ref date_options) => date_options.is_indexed(),
+            FieldType::Facet(ref _facet_options) => true,
+            FieldType::Bytes(ref bytes_options) => bytes_options.is_indexed(),
+            FieldType::JsonObject(ref json_object_options) => json_object_options.is_indexed(),
+            FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_indexed(),
+            FieldType::Nested(ref nested_options) => nested_options.is_indexed(),
+            FieldType::NestedJson(ref nested_options) => nested_options.is_indexed(),
         };
-        println!("is_indexed() returning: {}", result);
         result
     }
 
@@ -473,43 +424,16 @@ impl FieldType {
         }
     }
 
-    /// In normal usage, a user might attempt to parse the raw JSON field directly.
-    /// If they do so on a `Nested` field, we typically *error* or treat it as object,
-    /// because we want custom block expansions. For demonstration, we return an error here:
-    pub fn value_from_json(
-        &self,
-        json: serde_json::Value,
-    ) -> Result<OwnedValue, ValueParsingError> {
-        println!("\nvalue_from_json called with JSON: {:?}", json);
-        println!("Field type is: {:?}", self);
-
-        if matches!(self, FieldType::Nested(_) | FieldType::NestedJson(_)) {
-            println!("Nested field detected - returning error");
-            return Err(ValueParsingError::TypeError {
-                expected: "nested field must be expanded via custom logic",
-                json,
-            });
-        }
-        println!("Delegating to value_from_json_non_nested");
-        let result = self.value_from_json_non_nested(json);
-        println!("value_from_json returning: {:?}", result);
-        result
-    }
-
     /// Parses a field value from json, given the target FieldType.
     ///
     /// Tantivy will try to cast values only with the coerce option.
     /// For instance, If the json value is the integer `3` and the
     /// target field is a `Str`, this method will return an Error if `coerce`
     /// is not enabled.
-    pub fn value_from_json_non_nested(
+    pub fn value_from_json(
         &self,
-        json: JsonValue,
+        json: serde_json::Value,
     ) -> Result<OwnedValue, ValueParsingError> {
-        println!("\nvalue_from_json_non_nested called with JSON: {:?}", json);
-        println!("Field type is: {:?}", self);
-
-        
         match json {
             JsonValue::String(field_text) => {
                 println!("Processing String value: {}", field_text);

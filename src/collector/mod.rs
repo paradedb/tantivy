@@ -100,6 +100,9 @@ mod top_score_collector;
 pub use self::top_collector::ComparableDoc;
 pub use self::top_score_collector::{TopDocs, TopNComputer};
 
+mod block_join_collector;
+pub use self::block_join_collector::BlockJoinCollector;
+
 mod custom_score_top_collector;
 pub use self::custom_score_top_collector::{CustomScorer, CustomSegmentScorer};
 

@@ -1,4 +1,3 @@
-// common/src/bitset.rs
 use std::io::Write;
 use std::{fmt, io};
 

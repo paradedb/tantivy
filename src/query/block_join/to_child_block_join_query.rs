@@ -18,7 +18,6 @@ pub struct ToChildBlockJoinQuery {
 
 impl Clone for ToChildBlockJoinQuery {
     fn clone(&self) -> Self {
-        println!("ToChildBlockJoinQuery::clone called.");
         ToChildBlockJoinQuery {
             parent_query: self.parent_query.box_clone(),
             parent_bitset_producer: Arc::clone(&self.parent_bitset_producer),
@@ -38,7 +37,6 @@ impl ToChildBlockJoinQuery {
         parent_query: Box<dyn Query>,
         parent_bitset_producer: Arc<dyn ParentBitSetProducer>,
     ) -> Self {
-        println!("[ToChildBlockJoinQuery::new] => constructing query");
         Self {
             parent_query,
             parent_bitset_producer,
@@ -66,9 +64,7 @@ struct ToChildBlockJoinScorer {
 
 impl Query for ToChildBlockJoinQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> Result<Box<dyn Weight>> {
-        println!("ToChildBlockJoinQuery::weight => building parent_weight");
         let pw = self.parent_query.weight(enable_scoring)?;
-        println!("  parent weight built, constructing ToChildBlockJoinWeight");
         Ok(Box::new(ToChildBlockJoinWeight {
             parent_weight: pw,
             parent_bits: Arc::clone(&self.parent_bitset_producer),
@@ -76,55 +72,32 @@ impl Query for ToChildBlockJoinQuery {
     }
 
     fn explain(&self, searcher: &Searcher, doc_addr: DocAddress) -> Result<Explanation> {
-        println!(
-            "ToChildBlockJoinQuery::explain => doc_addr={:?}, enabling scoring",
-            doc_addr
-        );
         let sr = searcher.segment_reader(doc_addr.segment_ord);
         let w = self.weight(EnableScoring::enabled_from_searcher(searcher))?;
         w.explain(sr, doc_addr.doc_id)
     }
 
     fn count(&self, searcher: &Searcher) -> Result<usize> {
-        println!("ToChildBlockJoinQuery::count => disabling scoring, summing counts");
         let w = self.weight(EnableScoring::disabled_from_searcher(searcher))?;
         let mut c = 0usize;
-        for (i, seg) in searcher.segment_readers().iter().enumerate() {
+        for (_, seg) in searcher.segment_readers().iter().enumerate() {
             let sub_count = w.count(seg)? as usize;
-            println!(
-                "  segment #{} => child-block-join sub_count={}",
-                i, sub_count
-            );
             c += sub_count;
         }
-        println!("  total child-block-join count => {}", c);
         Ok(c)
     }
 
     fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
-        println!("ToChildBlockJoinQuery::query_terms => forwarding to parent_query");
         self.parent_query.query_terms(visitor);
     }
 }
 impl Weight for ToChildBlockJoinWeight {
     fn scorer(&self, reader: &SegmentReader, boost: f32) -> Result<Box<dyn Scorer>> {
-        println!(
-            "ToChildBlockJoinWeight::scorer => obtaining parent_scorer with boost={}",
-            boost
-        );
         let ps = self.parent_weight.scorer(reader, boost)?;
-        println!("  parent_scorer obtained, building parent bits");
         let bits = self.parent_bits.produce(reader)?;
-        println!(
-            "  parent bits => len={}, max_doc={}",
-            bits.len(),
-            reader.max_doc()
-        );
         if bits.is_empty() {
-            println!("  bits empty => returning EmptyScorer");
             return Ok(Box::new(EmptyScorer));
         }
-        println!("  returning ToChildBlockJoinScorer => doc_done=false, init=false");
         Ok(Box::new(ToChildBlockJoinScorer {
             parent_scorer: RefCell::new(ps), // <-- wrap in RefCell
             bits,
@@ -137,10 +110,6 @@ impl Weight for ToChildBlockJoinWeight {
     }
 
     fn explain(&self, reader: &SegmentReader, doc_id: DocId) -> Result<Explanation> {
-        println!(
-            "ToChildBlockJoinWeight::explain => doc_id={} => scorer(1.0)",
-            doc_id
-        );
         let mut sc = self.scorer(reader, 1.0)?;
 
         // "Advance first" approach
@@ -149,14 +118,9 @@ impl Weight for ToChildBlockJoinWeight {
             current = sc.advance();
         }
         if current != doc_id {
-            println!(
-                "  doc_id={} => not matched => Explanation::new('Not a match',0.0)",
-                doc_id
-            );
             return Ok(Explanation::new("Not a match", 0.0));
         }
         let val = sc.score();
-        println!("  doc_id={} => matched => score={}", doc_id, val);
         let mut ex = Explanation::new_with_string("ToChildBlockJoin".to_string(), val);
         ex.add_detail(Explanation::new_with_string(
             "child doc matched".to_string(),
@@ -166,7 +130,6 @@ impl Weight for ToChildBlockJoinWeight {
     }
 
     fn count(&self, reader: &SegmentReader) -> Result<u32> {
-        println!("ToChildBlockJoinWeight::count => doc loop => building scorer");
         let mut sc = self.scorer(reader, 1.0)?;
         let mut c = 0;
 
@@ -176,7 +139,6 @@ impl Weight for ToChildBlockJoinWeight {
             c += 1;
             doc_id = sc.advance();
         }
-        println!("  => final count c={}", c);
         Ok(c)
     }
 
@@ -186,22 +148,16 @@ impl Weight for ToChildBlockJoinWeight {
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> Result<()> {
-        println!("ToChildBlockJoinWeight::for_each_pruning => naive approach");
         let mut scorer = self.scorer(reader, 1.0)?;
-        let mut current_threshold = threshold;
+        let mut _current_threshold = threshold;
 
         // Advance first, then loop
         let mut doc_id = scorer.advance();
         while doc_id != TERMINATED {
             let score = scorer.score();
-            println!(
-                "  doc={}, score={}, current_threshold={} => callback",
-                doc_id, score, current_threshold
-            );
-            current_threshold = callback(doc_id, score);
+            _current_threshold = callback(doc_id, score);
             doc_id = scorer.advance();
         }
-        println!("  done => Ok(())");
         Ok(())
     }
 }

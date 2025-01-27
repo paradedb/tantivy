@@ -8,7 +8,7 @@ use common::{read_u32_vint_no_advance, serialize_vint_u32, BinarySerializable, D
 use serde_json::Map;
 pub use CompactDoc as TantivyDocument;
 
-use super::{FieldType, ReferenceValue, ReferenceValueLeaf, Value};
+use super::{ReferenceValue, ReferenceValueLeaf, Value};
 use crate::schema::document::{
     DeserializeError, Document, DocumentDeserialize, DocumentDeserializer,
 };
@@ -203,48 +203,6 @@ impl CompactDoc {
         let top_obj: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(doc_json).map_err(|_| DocParsingError::invalid_json(doc_json))?;
         Self::from_json_object(schema, top_obj)
-    }
-
-    /// Parse a top-level JSON *object* that may contain nested fields.
-    /// Returns all docs in a `Vec`: child docs first, then the “parent” doc last.
-
-    /// Recursively parse key→value pairs. If we detect a `FieldType::Nested(...)`,
-    /// we expand any array-of-objects into child docs. Otherwise we parse normally.
-    /// Recursively flattens sub-keys to match dotted fields in the schema.
-    /// Also expands any `Nested` fields by creating child docs.
-
-    /// Parse a single normal field (non-nested) from `sub_val` and add it to `doc`.
-
-    /// Helper to parse a single field's JSON value & insert into doc
-
-    /// A small helper that takes a single field + JSON value + schema,
-    /// parses it, and adds it to self. This is what your code calls
-    /// `doc.parse_and_add_json(field, json_val, schema)?;`
-    pub fn parse_and_add_json(
-        &mut self,
-        field: Field,
-        json_val: &serde_json::Value,
-        schema: &Schema,
-    ) -> Result<(), DocParsingError> {
-        let fentry = schema.get_field_entry(field);
-        let ftype = fentry.field_type();
-        // forbid direct parse on nested fields
-        if matches!(ftype, FieldType::Nested(_) | FieldType::NestedJson(_)) {
-            return Err(DocParsingError::ValueError(
-                schema.get_field_name(field).to_string(),
-                ValueParsingError::TypeError {
-                    expected: "array-of-objects for nested fields",
-                    json: json_val.clone(),
-                },
-            ));
-        }
-        let typed_val = ftype
-            .value_from_json_non_nested(json_val.clone())
-            .map_err(|e| {
-                DocParsingError::ValueError(schema.get_field_name(field).to_string(), e)
-            })?;
-        self.add_field_value(field, &typed_val);
-        Ok(())
     }
 
     /// Build a document object from a json-object.

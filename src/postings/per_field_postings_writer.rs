@@ -45,15 +45,15 @@ fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn Postings
                 }
             })
             .unwrap_or_else(|| SpecializedPostingsWriter::<DocIdRecorder>::default().into()),
-        FieldType::U64(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::I64(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::F64(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::Bool(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::Date(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::Bytes(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::IpAddr(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::Facet(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::Nested(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
+        FieldType::U64(_)
+        | FieldType::I64(_)
+        | FieldType::F64(_)
+        | FieldType::Bool(_)
+        | FieldType::Date(_)
+        | FieldType::Bytes(_)
+        | FieldType::IpAddr(_)
+        | FieldType::Facet(_)
+        | FieldType::Nested(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
         FieldType::NestedJson(ref nested_json_options) => {
             if let Some(text_indexing_option) =
                 nested_json_options.json_opts.get_text_indexing_options()

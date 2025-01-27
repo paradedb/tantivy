@@ -1,4 +1,3 @@
-// src/schema/mod.rs
 //! Schema definition for tantivy's indices.
 //!
 //! # Setting your schema in Tantivy
