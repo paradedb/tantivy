@@ -195,7 +195,7 @@ impl DeleteCursor {
 
     fn is_behind_opstamp(&mut self, target_opstamp: Opstamp) -> bool {
         self.get()
-            .map(|operation| operation.opstamp < target_opstamp)
+            .map(|operation| operation.opstamp() < target_opstamp)
             .unwrap_or(false)
     }
 
@@ -269,7 +269,7 @@ mod tests {
     fn test_deletequeue() {
         let delete_queue = DeleteQueue::new();
 
-        let make_op = |i: usize| DeleteOperation {
+        let make_op = |i: usize| DeleteOperation::ByWeight {
             opstamp: i as u64,
             target: Box::new(DummyWeight),
         };
@@ -280,9 +280,9 @@ mod tests {
         let snapshot = delete_queue.cursor();
         {
             let mut operations_it = snapshot.clone();
-            assert_eq!(operations_it.get().unwrap().opstamp, 1);
+            assert_eq!(operations_it.get().unwrap().opstamp(), 1);
             operations_it.advance();
-            assert_eq!(operations_it.get().unwrap().opstamp, 2);
+            assert_eq!(operations_it.get().unwrap().opstamp(), 2);
             operations_it.advance();
             assert!(operations_it.get().is_none());
             operations_it.advance();
@@ -290,20 +290,20 @@ mod tests {
             let mut snapshot2 = delete_queue.cursor();
             assert!(snapshot2.get().is_none());
             delete_queue.push(make_op(3));
-            assert_eq!(snapshot2.get().unwrap().opstamp, 3);
-            assert_eq!(operations_it.get().unwrap().opstamp, 3);
-            assert_eq!(operations_it.get().unwrap().opstamp, 3);
+            assert_eq!(snapshot2.get().unwrap().opstamp(), 3);
+            assert_eq!(operations_it.get().unwrap().opstamp(), 3);
+            assert_eq!(operations_it.get().unwrap().opstamp(), 3);
             operations_it.advance();
             assert!(operations_it.get().is_none());
             operations_it.advance();
         }
         {
             let mut operations_it = snapshot;
-            assert_eq!(operations_it.get().unwrap().opstamp, 1);
+            assert_eq!(operations_it.get().unwrap().opstamp(), 1);
             operations_it.advance();
-            assert_eq!(operations_it.get().unwrap().opstamp, 2);
+            assert_eq!(operations_it.get().unwrap().opstamp(), 2);
             operations_it.advance();
-            assert_eq!(operations_it.get().unwrap().opstamp, 3);
+            assert_eq!(operations_it.get().unwrap().opstamp(), 3);
             operations_it.advance();
             assert!(operations_it.get().is_none());
         }
