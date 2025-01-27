@@ -311,6 +311,7 @@ impl SegmentWriter {
                     for json_value in values {
                         self.json_path_writer.clear();
 
+                        #[allow(clippy::too_many_arguments)]
                         index_json_value(
                             doc_id,
                             json_value,

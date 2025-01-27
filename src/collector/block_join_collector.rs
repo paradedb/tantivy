@@ -1,20 +1,23 @@
-use crate::collector::{Collector, SegmentCollector};
-use crate::{DocId, Result, Score, SegmentOrdinal, SegmentReader};
-use common::BitSet;
 use std::sync::Arc;
 
+use common::BitSet;
+
+use crate::collector::{Collector, SegmentCollector};
+use crate::{DocId, Result, Score, SegmentOrdinal, SegmentReader};
+
+#[allow(clippy::type_complexity)]
 /// A conceptual `BlockJoinCollector` for Tantivy.
 ///
 /// It collects "parent" documents and, for each parent, stores all "child" docs (and scores) that
 /// matched a given query. The notion of which docs are parents is customizable via the
 /// `parent_bitset_fn` closure passed at creation time.
 pub struct BlockJoinCollector {
-    /// A user-provided closure/adapter that, for each segment, returns a `BitSet` marking which docs
-    /// are “parent” docs in that segment.
+    /// A user-provided closure/adapter that, for each segment, returns a `BitSet` marking which
+    /// docs are “parent” docs in that segment.
     ///
-    /// Typically you'd build this using a separate query or a known `_is_parent` boolean field, but
-    /// we leave the logic up to you. The collector will then store children in the last parent doc
-    /// encountered.
+    /// Typically you'd build this using a separate query or a known `_is_parent` boolean field,
+    /// but we leave the logic up to you. The collector will then store children in the last
+    /// parent doc encountered.
     parent_bitset_fn: Arc<dyn Fn(&SegmentReader) -> Result<BitSet> + Send + Sync>,
 }
 
@@ -28,22 +31,8 @@ pub type BlockJoinFruit = Vec<(DocId, Vec<DocId>, Vec<Score>)>;
 impl BlockJoinCollector {
     /// Create a new `BlockJoinCollector` with a parent filter function. That function
     /// must build a `BitSet` of parent docs for each segment, marking which doc IDs are parents.
-    ///
-    /// ```no_run
-    /// # use tantivy::SegmentReader;
-    /// # use common::BitSet;
-    /// # use tantivy::Result;
-    /// #
-    /// let c = BlockJoinCollector::new(|segment_reader: &SegmentReader| {
-    ///     // Build or load a BitSet for parent docs in this segment:
-    ///     // e.g., run a query that matches `is_parent==true`
-    ///     Ok(BitSet::with_max_value(segment_reader.max_doc()))
-    /// });
-    /// ```
     pub fn new<F>(parent_filter_fn: F) -> Self
-    where
-        F: Fn(&SegmentReader) -> Result<BitSet> + Send + Sync + 'static,
-    {
+    where F: Fn(&SegmentReader) -> Result<BitSet> + Send + Sync + 'static {
         BlockJoinCollector {
             parent_bitset_fn: Arc::new(parent_filter_fn),
         }
@@ -116,7 +105,6 @@ impl SegmentCollector for BlockJoinSegmentCollector {
     /// We'll rely on the default, which calls `collect(doc, 0.0)` for each doc.
     ///
     /// fn collect_block(&mut self, docs: &[DocId]) { ... } // default is fine
-
     fn harvest(self) -> Self::Fruit {
         self.groups
     }
@@ -338,7 +326,8 @@ mod tests {
     #[test]
     fn test_block_join_multiple_segments() -> Result<()> {
         // We'll create 2 commits => each has 1 parent + 2 children => total 2 segments
-        // We'll see parent doc=0 + child docs=1,2 in first segment => parent doc=0 + child=1,2 in second seg
+        // We'll see parent doc=0 + child docs=1,2 in first segment => parent doc=0 + child=1,2 in
+        // second seg
         let (schema, title_f, parent_f) = make_schema();
         let index = Index::create_in_ram(schema);
 

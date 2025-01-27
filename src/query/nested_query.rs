@@ -209,6 +209,8 @@ impl ParentBitSetProducer for NestedParentBitSetProducer {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use serde_json::json;
 
     use super::*;

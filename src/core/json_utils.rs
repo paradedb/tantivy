@@ -71,6 +71,7 @@ pub fn json_path_sep_to_dot(path: &mut str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn index_json_value<'a, V: Value<'a>>(
     doc: DocId,
     json_value: V,
@@ -178,6 +179,7 @@ pub(crate) fn index_json_value_nested<'a, V: Value<'a>>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Index a JSON leaf (scalar) at the current path.
 fn index_json_leaf(
     doc: DocId,

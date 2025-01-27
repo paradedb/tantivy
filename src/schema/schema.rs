@@ -362,7 +362,7 @@ impl Schema {
             .ok_or_else(|| TantivyError::FieldNotFound(field_name.to_string()))
     }
 
-    pub fn get_nested_field(&self, path: &Vec<String>) -> Option<(Field, FieldEntry)> {
+    pub fn get_nested_field(&self, path: &[String]) -> Option<(Field, FieldEntry)> {
         let path_vec: Vec<String> = path.to_vec();
         self.0
             .nested_paths

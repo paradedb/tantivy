@@ -80,7 +80,7 @@ impl Query for ToChildBlockJoinQuery {
     fn count(&self, searcher: &Searcher) -> Result<usize> {
         let w = self.weight(EnableScoring::disabled_from_searcher(searcher))?;
         let mut c = 0usize;
-        for (_, seg) in searcher.segment_readers().iter().enumerate() {
+        for seg in searcher.segment_readers().iter() {
             let sub_count = w.count(seg)? as usize;
             c += sub_count;
         }

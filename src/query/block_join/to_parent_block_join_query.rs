@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use common::BitSet;
@@ -19,35 +20,37 @@ pub enum ScoreMode {
     None,
 }
 
-impl ScoreMode {
-    /// Convert the user input like "none", "min", etc. into `ScoreMode`.
-    pub fn from_str(mode: &str) -> crate::Result<ScoreMode> {
-        match mode.to_lowercase().as_str() {
+impl FromStr for ScoreMode {
+    type Err = TantivyError;
+
+    fn from_str(mode: &str) -> std::result::Result<Self, Self::Err> {
+        match mode.trim().to_lowercase().as_str() {
             "none" => Ok(ScoreMode::None),
             "avg" => Ok(ScoreMode::Avg),
             "max" => Ok(ScoreMode::Max),
             "min" => Ok(ScoreMode::Min),
             "total" => Ok(ScoreMode::Total),
             other => Err(TantivyError::InvalidArgument(format!(
-                "Unrecognized nested score_mode: {}",
+                "Unrecognized nested score_mode: '{}'",
                 other
             ))),
         }
     }
+}
 
+impl ScoreMode {
     fn combine(&self, child_score: f32, accum: f32, _count: u32) -> f32 {
-        let result = match self {
+        match self {
             ScoreMode::None => 0.0,
             ScoreMode::Total => accum + child_score,
             ScoreMode::Avg => accum + child_score,
             ScoreMode::Max => accum.max(child_score),
             ScoreMode::Min => accum.min(child_score),
-        };
-        result
+        }
     }
 
     fn finalize_score(&self, sumval: f32, count: u32) -> f32 {
-        let final_val = match self {
+        match self {
             ScoreMode::None => 0.0,
             ScoreMode::Total => sumval,
             ScoreMode::Avg => {
@@ -59,8 +62,7 @@ impl ScoreMode {
             }
             ScoreMode::Max => sumval,
             ScoreMode::Min => sumval,
-        };
-        final_val
+        }
     }
 }
 
@@ -258,21 +260,19 @@ impl Weight for ToParentBlockJoinWeight {
 
 impl DocSet for ToParentBlockJoinScorer {
     fn advance(&mut self) -> DocId {
-        let doc_id = self.advance_doc();
-        doc_id
+        self.advance_doc()
     }
 
     fn doc(&self) -> DocId {
-        let d = if self.doc_done.get() {
+        if self.doc_done.get() {
             TERMINATED
         } else if !self.init.get() {
             // We do lazy init here:
-            let doc_id = self.advance_doc();
-            doc_id
+
+            self.advance_doc()
         } else {
             self.current_parent.get()
-        };
-        d
+        }
     }
 
     fn size_hint(&self) -> u32 {
@@ -288,8 +288,8 @@ impl Scorer for ToParentBlockJoinScorer {
             let sum_val = self.current_score.get();
             let cnt = self.child_count.get();
             let final_score = self.score_mode.finalize_score(sum_val, cnt);
-            let final_boosted = final_score * self.boost;
-            final_boosted
+
+            final_score * self.boost
         }
     }
 }
