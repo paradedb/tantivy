@@ -1564,7 +1564,7 @@ mod nested_query_tests_more {
             .set_indexing_options(
                 TextFieldIndexing::default()
                     .set_tokenizer("default")
-                    .set_index_option(IndexRecordOption::Basic),
+                    .set_index_option(IndexRecordOption::WithFreqs),
             );
         let user_field = builder.add_nested_json_field(vec!["user".into()], nested_opts);
         let schema = builder.build();
@@ -1599,7 +1599,7 @@ mod nested_query_tests_more {
 
         // Make a term that says: user_field, sub-path = "age", numeric value = 20
         let query_parser = QueryParser::for_index(&index, vec![user_field]);
-        let child_query = query_parser.parse_query("age:20").unwrap();
+        let child_query = query_parser.parse_query(r#"age:20"#).unwrap();
 
         // Finally, wrap it in a NestedQuery => path="user"
         let nested_query = NestedQuery::new(
