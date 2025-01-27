@@ -109,21 +109,36 @@ pub enum QueryParserError {
 ///
 /// Returns `None` if and only if the `logical_ast` ended up being empty.
 fn trim_ast(logical_ast: LogicalAst) -> Option<LogicalAst> {
+    println!("trim_ast => Received LogicalAst: {:?}", logical_ast);
     match logical_ast {
         LogicalAst::Clause(children) => {
+            println!(
+                "trim_ast => Processing Clause with {} children",
+                children.len()
+            );
             let trimmed_children = children
                 .into_iter()
                 .flat_map(|(occur, child)| {
+                    println!("trim_ast => Trimming child with occur: {:?}", occur);
                     trim_ast(child).map(|trimmed_child| (occur, trimmed_child))
                 })
                 .collect::<Vec<_>>();
+            println!(
+                "trim_ast => After trimming, {} children remain",
+                trimmed_children.len()
+            );
             if trimmed_children.is_empty() {
+                println!("trim_ast => No children remain, returning None");
                 None
             } else {
+                println!("trim_ast => Returning trimmed Clause");
                 Some(LogicalAst::Clause(trimmed_children))
             }
         }
-        _ => Some(logical_ast),
+        _ => {
+            println!("trim_ast => Returning LogicalAst as is");
+            Some(logical_ast)
+        }
     }
 }
 
@@ -217,30 +232,68 @@ struct Fuzzy {
 }
 
 fn all_negative(ast: &LogicalAst) -> bool {
+    println!("all_negative => Checking LogicalAst: {:?}", ast);
     match ast {
-        LogicalAst::Leaf(_) => false,
-        LogicalAst::Boost(ref child_ast, _) => all_negative(child_ast),
-        LogicalAst::Clause(children) => children
-            .iter()
-            .all(|(ref occur, child)| (*occur == Occur::MustNot) || all_negative(child)),
+        LogicalAst::Leaf(_) => {
+            println!("all_negative => LogicalAst is a Leaf, returning false");
+            false
+        }
+        LogicalAst::Boost(ref child_ast, _) => {
+            println!("all_negative => LogicalAst is a Boost, checking child_ast");
+            all_negative(child_ast)
+        }
+        LogicalAst::Clause(children) => {
+            println!(
+                "all_negative => LogicalAst is a Clause with {} children",
+                children.len()
+            );
+            let result = children.iter().all(|(ref occur, child)| {
+                println!(
+                    "all_negative => Checking occur: {:?} for child: {:?}",
+                    occur, child
+                );
+                (*occur == Occur::MustNot) || all_negative(child)
+            });
+            println!("all_negative => Result: {}", result);
+            result
+        }
     }
 }
 
 // Make an all-negative ast into a normal ast. Must not be used on an already okay ast.
 fn make_non_negative(ast: &mut LogicalAst) {
+    println!("make_non_negative => Modifying LogicalAst: {:?}", ast);
     match ast {
-        LogicalAst::Leaf(_) => (),
-        LogicalAst::Boost(ref mut child_ast, _) => make_non_negative(child_ast),
-        LogicalAst::Clause(children) => children.push((Occur::Should, LogicalLiteral::All.into())),
+        LogicalAst::Leaf(_) => {
+            println!("make_non_negative => LogicalAst is a Leaf, no action taken");
+        }
+        LogicalAst::Boost(ref mut child_ast, _) => {
+            println!("make_non_negative => LogicalAst is a Boost, modifying child_ast");
+            make_non_negative(child_ast);
+        }
+        LogicalAst::Clause(children) => {
+            println!("make_non_negative => LogicalAst is a Clause, adding All literal");
+            children.push((Occur::Should, LogicalLiteral::All.into()));
+        }
     }
 }
 
 /// Similar to the try/? macro, but returns a tuple of (None, Vec<Error>) instead of Err(Error)
 macro_rules! try_tuple {
     ($expr:expr) => {{
+        println!(
+            "try_tuple => Evaluating expression: {:?}",
+            stringify!($expr)
+        );
         match $expr {
-            Ok(val) => val,
-            Err(e) => return (None, vec![e.into()]),
+            Ok(val) => {
+                println!("try_tuple => Expression succeeded with value: {:?}", val);
+                val
+            }
+            Err(e) => {
+                println!("try_tuple => Expression failed with error: {:?}", e);
+                return (None, vec![e.into()]);
+            }
         }
     }};
 }
@@ -254,6 +307,10 @@ impl QueryParser {
         default_fields: Vec<Field>,
         tokenizer_manager: TokenizerManager,
     ) -> QueryParser {
+        println!(
+            "QueryParser::new => Initializing QueryParser with {} default fields",
+            default_fields.len()
+        );
         QueryParser {
             schema,
             default_fields,
@@ -267,13 +324,20 @@ impl QueryParser {
     // Splits a full_path as written in a query, into a field name and a
     // json path.
     pub(crate) fn split_full_path<'a>(&self, full_path: &'a str) -> Option<(Field, &'a str)> {
-        self.schema.find_field(full_path)
+        println!("split_full_path => Splitting full_path: {}", full_path);
+        let result = self.schema.find_field(full_path);
+        println!("split_full_path => Result: {:?}", result);
+        result
     }
 
     /// Creates a `QueryParser`, given
     ///  * an index
     ///  * a set of default fields used to search if no field is specifically defined in the query.
     pub fn for_index(index: &Index, default_fields: Vec<Field>) -> QueryParser {
+        println!(
+            "QueryParser::for_index => Creating QueryParser for index with {} default fields",
+            default_fields.len()
+        );
         QueryParser::new(index.schema(), default_fields, index.tokenizers().clone())
     }
 
@@ -283,6 +347,7 @@ impl QueryParser {
     /// `happy OR tax OR payer`. After calling `.set_conjunction_by_default()`
     /// `happy tax payer` will be interpreted by the parser as `happy AND tax AND payer`.
     pub fn set_conjunction_by_default(&mut self) {
+        println!("QueryParser::set_conjunction_by_default => Setting conjunction by default");
         self.conjunction_by_default = true;
     }
 
@@ -294,6 +359,10 @@ impl QueryParser {
     /// the two boosts (the one defined in the query, and the one defined in the `QueryParser`)
     /// are multiplied together.
     pub fn set_field_boost(&mut self, field: Field, boost: Score) {
+        println!(
+            "QueryParser::set_field_boost => Setting boost for field {:?} to {}",
+            field, boost
+        );
         self.boost.insert(field, boost);
     }
 
@@ -311,6 +380,10 @@ impl QueryParser {
         distance: u8,
         transpose_cost_one: bool,
     ) {
+        println!(
+            "QueryParser::set_field_fuzzy => Setting fuzzy for field {:?}: prefix={}, distance={}, transpose_cost_one={}",
+            field, prefix, distance, transpose_cost_one
+        );
         self.fuzzy.insert(
             field,
             Fuzzy {
@@ -346,7 +419,13 @@ impl QueryParser {
     ///
     /// In case it encountered such issues, they are reported as a Vec of errors.
     pub fn parse_query_lenient(&self, query: &str) -> (Box<dyn Query>, Vec<QueryParserError>) {
+        println!("QueryParser::parse_query_lenient => input query: {}", query);
         let (logical_ast, errors) = self.parse_query_to_logical_ast_lenient(query);
+        println!(
+            "QueryParser::parse_query_lenient => generated logical AST: {:?} with {} errors",
+            logical_ast,
+            errors.len()
+        );
         (convert_to_query(&self.fuzzy, logical_ast), errors)
     }
 
@@ -359,11 +438,24 @@ impl QueryParser {
         &self,
         user_input_ast: UserInputAst,
     ) -> Result<Box<dyn Query>, QueryParserError> {
+        println!(
+            "QueryParser::build_query_from_user_input_ast => Building query from UserInputAst: {:?}",
+            user_input_ast
+        );
         let (logical_ast, mut err) = self.compute_logical_ast_lenient(user_input_ast);
         if !err.is_empty() {
+            println!(
+                "QueryParser::build_query_from_user_input_ast => Encountered errors: {:?}",
+                err
+            );
             return Err(err.swap_remove(0));
         }
-        Ok(convert_to_query(&self.fuzzy, logical_ast))
+        let query = convert_to_query(&self.fuzzy, logical_ast);
+        println!(
+            "QueryParser::build_query_from_user_input_ast => Built query: {:?}",
+            query
+        );
+        Ok(query)
     }
 
     /// Build leniently a query from an already parsed user input AST.
@@ -373,19 +465,47 @@ impl QueryParser {
         &self,
         user_input_ast: UserInputAst,
     ) -> (Box<dyn Query>, Vec<QueryParserError>) {
+        println!(
+            "QueryParser::build_query_from_user_input_ast_lenient => Building query from UserInputAst: {:?}",
+            user_input_ast
+        );
         let (logical_ast, errors) = self.compute_logical_ast_lenient(user_input_ast);
+        println!(
+            "QueryParser::build_query_from_user_input_ast_lenient => Built query: {:?} with {} errors",
+            logical_ast,
+            errors.len()
+        );
         (convert_to_query(&self.fuzzy, logical_ast), errors)
     }
 
     /// Parse the user query into an AST.
     fn parse_query_to_logical_ast(&self, query: &str) -> Result<LogicalAst, QueryParserError> {
-        let user_input_ast = query_grammar::parse_query(query)
-            .map_err(|_| QueryParserError::SyntaxError(query.to_string()))?;
+        println!(
+            "QueryParser::parse_query_to_logical_ast => Parsing query: {}",
+            query
+        );
+        let user_input_ast = query_grammar::parse_query(query).map_err(|_| {
+            println!("QueryParser::parse_query_to_logical_ast => Syntax error in query");
+            QueryParserError::SyntaxError(query.to_string())
+        })?;
+        println!(
+            "QueryParser::parse_query_to_logical_ast => Parsed UserInputAst: {:?}",
+            user_input_ast
+        );
         let (ast, mut err) = self.compute_logical_ast_lenient(user_input_ast);
         if !err.is_empty() {
+            println!(
+                "QueryParser::parse_query_to_logical_ast => Encountered errors: {:?}",
+                err
+            );
             return Err(err.swap_remove(0));
         }
-        Ok(ast.simplify())
+        let simplified_ast = ast.simplify();
+        println!(
+            "QueryParser::parse_query_to_logical_ast => Simplified LogicalAst: {:?}",
+            simplified_ast
+        );
+        Ok(simplified_ast)
     }
 
     /// Parse the user query into an AST.
@@ -393,10 +513,23 @@ impl QueryParser {
         &self,
         query: &str,
     ) -> (LogicalAst, Vec<QueryParserError>) {
+        println!(
+            "QueryParser::parse_query_to_logical_ast_lenient => Parsing query leniently: {}",
+            query
+        );
         let (user_input_ast, errors) = query_grammar::parse_query_lenient(query);
+        println!(
+            "QueryParser::parse_query_to_logical_ast_lenient => Parsed UserInputAst: {:?} with {} syntax errors",
+            user_input_ast,
+            errors.len()
+        );
         let mut errors: Vec<_> = errors
             .into_iter()
             .map(|error| {
+                println!(
+                    "QueryParser::parse_query_to_logical_ast_lenient => Syntax error: {} at position {}",
+                    error.message, error.pos
+                );
                 QueryParserError::SyntaxError(format!(
                     "{} at position {}",
                     error.message, error.pos
@@ -404,6 +537,14 @@ impl QueryParser {
             })
             .collect();
         let (ast, mut ast_errors) = self.compute_logical_ast_lenient(user_input_ast);
+        println!(
+            "QueryParser::parse_query_to_logical_ast_lenient => Computed LogicalAst: {:?}",
+            ast
+        );
+        println!(
+            "QueryParser::parse_query_to_logical_ast_lenient => Computed AST errors: {:?}",
+            ast_errors
+        );
         errors.append(&mut ast_errors);
         (ast, errors)
     }
@@ -412,16 +553,34 @@ impl QueryParser {
         &self,
         user_input_ast: UserInputAst,
     ) -> (LogicalAst, Vec<QueryParserError>) {
+        println!(
+            "QueryParser::compute_logical_ast_lenient => Computing LogicalAst from UserInputAst: {:?}",
+            user_input_ast
+        );
         let (mut ast, mut err) = self.compute_logical_ast_with_occur_lenient(user_input_ast);
+        println!(
+            "QueryParser::compute_logical_ast_lenient => Initial LogicalAst: {:?} with {} errors",
+            ast,
+            err.len()
+        );
         if let LogicalAst::Clause(children) = &ast {
             if children.is_empty() {
+                println!("QueryParser::compute_logical_ast_lenient => Clause is empty");
                 return (ast, err);
             }
         }
         if all_negative(&ast) {
+            println!(
+                "QueryParser::compute_logical_ast_lenient => All clauses are negative, adding error and modifying AST"
+            );
             err.push(QueryParserError::AllButQueryForbidden);
             make_non_negative(&mut ast);
         }
+        println!(
+            "QueryParser::compute_logical_ast_lenient => Final LogicalAst: {:?} with {} errors",
+            ast,
+            err.len()
+        );
         (ast, err)
     }
 
@@ -432,7 +591,7 @@ impl QueryParser {
         phrase: &str,
     ) -> Result<Term, QueryParserError> {
         println!(
-            "QueryParser::compute_boundary_term => field={:?}, json_path={}, phrase={}",
+            "QueryParser::compute_boundary_term => Computing boundary term for field {:?}, json_path: {}, phrase: {}",
             field, json_path, phrase
         );
         let field_entry = self.schema.get_field_entry(field);
@@ -442,7 +601,7 @@ impl QueryParser {
 
         if field_type.is_nested() {
             println!(
-                "QueryParser => found nested field: {}, raising range query error",
+                "QueryParser::compute_boundary_term => Field {:?} is nested, unsupported for range queries",
                 field_entry.name()
             );
             return Err(QueryParserError::UnsupportedQuery(format!(
@@ -452,68 +611,131 @@ impl QueryParser {
         }
 
         if !field_type.is_indexed() && !field_supports_ff_range_queries {
+            println!(
+                "QueryParser::compute_boundary_term => Field {:?} is not indexed and does not support fastfield range queries",
+                field_entry.name()
+            );
             return Err(QueryParserError::FieldNotIndexed(
                 field_entry.name().to_string(),
             ));
         }
         if !json_path.is_empty() && field_type.value_type() != Type::Json {
+            println!(
+                "QueryParser::compute_boundary_term => JSON path specified but field {:?} is not a JSON field",
+                field_entry.name()
+            );
             return Err(QueryParserError::UnsupportedQuery(format!(
                 "Json path is not supported for field {:?}",
                 field_entry.name()
             )));
         }
         println!(
-            "QueryParser => normal parse of field={} text={}",
+            "QueryParser::compute_boundary_term => Normal parsing of field {:?} with phrase '{}'",
             field_entry.name(),
             phrase
         );
         match *field_type {
             FieldType::U64(_) => {
+                println!("QueryParser::compute_boundary_term => Field type is U64");
                 let val: u64 = u64::from_str(phrase)?;
+                println!(
+                    "QueryParser::compute_boundary_term => Parsed u64 value: {}",
+                    val
+                );
                 Ok(Term::from_field_u64(field, val))
             }
             FieldType::I64(_) => {
+                println!("QueryParser::compute_boundary_term => Field type is I64");
                 let val: i64 = i64::from_str(phrase)?;
+                println!(
+                    "QueryParser::compute_boundary_term => Parsed i64 value: {}",
+                    val
+                );
                 Ok(Term::from_field_i64(field, val))
             }
             FieldType::F64(_) => {
+                println!("QueryParser::compute_boundary_term => Field type is F64");
                 let val: f64 = f64::from_str(phrase)?;
+                println!(
+                    "QueryParser::compute_boundary_term => Parsed f64 value: {}",
+                    val
+                );
                 Ok(Term::from_field_f64(field, val))
             }
             FieldType::Bool(_) => {
+                println!("QueryParser::compute_boundary_term => Field type is Bool");
                 let val: bool = bool::from_str(phrase)?;
+                println!(
+                    "QueryParser::compute_boundary_term => Parsed bool value: {}",
+                    val
+                );
                 Ok(Term::from_field_bool(field, val))
             }
             FieldType::Date(_) => {
+                println!("QueryParser::compute_boundary_term => Field type is Date");
                 let dt = OffsetDateTime::parse(phrase, &Rfc3339)?;
+                println!(
+                    "QueryParser::compute_boundary_term => Parsed date value: {}",
+                    dt
+                );
                 Ok(Term::from_field_date(field, DateTime::from_utc(dt)))
             }
             FieldType::Str(ref str_options) => {
+                println!("QueryParser::compute_boundary_term => Field type is Str");
                 let option = str_options.get_indexing_options().ok_or_else(|| {
+                    println!(
+                        "QueryParser::compute_boundary_term => Field {:?} does not have indexing options",
+                        field_entry.name()
+                    );
                     // This should have been seen earlier really.
                     QueryParserError::FieldNotIndexed(field_entry.name().to_string())
                 })?;
                 let mut text_analyzer =
                     self.tokenizer_manager
                         .get(option.tokenizer())
-                        .ok_or_else(|| QueryParserError::UnknownTokenizer {
-                            field: field_entry.name().to_string(),
-                            tokenizer: option.tokenizer().to_string(),
+                        .ok_or_else(|| {
+                            println!(
+                                "QueryParser::compute_boundary_term => Unknown tokenizer '{}' for field {:?}",
+                                option.tokenizer(),
+                                field_entry.name()
+                            );
+                            QueryParserError::UnknownTokenizer {
+                                field: field_entry.name().to_string(),
+                                tokenizer: option.tokenizer().to_string(),
+                            }
                         })?;
                 let mut terms: Vec<Term> = Vec::new();
                 let mut token_stream = text_analyzer.token_stream(phrase);
                 token_stream.process(&mut |token| {
+                    println!(
+                        "QueryParser::compute_boundary_term => Tokenizing phrase: '{}', got token: '{}'",
+                        phrase, token.text
+                    );
                     let term = Term::from_field_text(field, &token.text);
+                    println!(
+                        "QueryParser::compute_boundary_term => Created Term: {:?}",
+                        term
+                    );
                     terms.push(term);
                 });
                 if terms.len() != 1 {
+                    println!(
+                        "QueryParser::compute_boundary_term => Multiple tokens found in phrase '{}', which is unsupported for range queries",
+                        phrase
+                    );
                     return Err(QueryParserError::UnsupportedQuery(format!(
-                        "Range query boundary cannot have multiple tokens: {phrase:?} [{terms:?}]."
+                        "Range query boundary cannot have multiple tokens: {phrase:?} [{:?}].",
+                        terms
                     )));
                 }
+                println!(
+                    "QueryParser::compute_boundary_term => Single Term parsed: {:?}",
+                    terms[0]
+                );
                 Ok(terms.into_iter().next().unwrap())
             }
             FieldType::JsonObject(ref json_options) => {
+                println!("QueryParser::compute_boundary_term => Field type is JsonObject");
                 let get_term_with_path = || {
                     Term::from_field_json_path(
                         field,
@@ -529,28 +751,66 @@ impl QueryParser {
                         false,
                     )
                 {
+                    println!(
+                        "QueryParser::compute_boundary_term => Converted to fast value Term: {:?}",
+                        term
+                    );
                     Ok(term)
                 } else {
+                    println!(
+                        "QueryParser::compute_boundary_term => Fast value conversion failed, creating Term from string"
+                    );
                     let mut term = get_term_with_path();
                     term.append_type_and_str(phrase);
+                    println!(
+                        "QueryParser::compute_boundary_term => Created Term: {:?}",
+                        term
+                    );
                     Ok(term)
                 }
             }
-            FieldType::Facet(_) => match Facet::from_text(phrase) {
-                Ok(facet) => Ok(Term::from_facet(field, &facet)),
-                Err(e) => Err(QueryParserError::from(e)),
-            },
+            FieldType::Facet(_) => {
+                println!("QueryParser::compute_boundary_term => Field type is Facet");
+                match Facet::from_text(phrase) {
+                    Ok(facet) => {
+                        let facet_term = Term::from_facet(field, &facet);
+                        println!(
+                            "QueryParser::compute_boundary_term => Created Facet Term: {:?}",
+                            facet_term
+                        );
+                        Ok(facet_term)
+                    }
+                    Err(e) => {
+                        println!(
+                            "QueryParser::compute_boundary_term => Failed to parse Facet: {:?}",
+                            e
+                        );
+                        Err(QueryParserError::from(e))
+                    }
+                }
+            }
             FieldType::Bytes(_) => {
+                println!("QueryParser::compute_boundary_term => Field type is Bytes");
                 let bytes = BASE64
                     .decode(phrase)
                     .map_err(QueryParserError::ExpectedBase64)?;
+                println!(
+                    "QueryParser::compute_boundary_term => Decoded bytes: {:?}",
+                    bytes
+                );
                 Ok(Term::from_field_bytes(field, &bytes))
             }
             FieldType::IpAddr(_) => {
+                println!("QueryParser::compute_boundary_term => Field type is IpAddr");
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
+                println!(
+                    "QueryParser::compute_boundary_term => Parsed IP address: {:?}",
+                    ip_v6
+                );
                 Ok(Term::from_field_ip_addr(field, ip_v6))
             }
             FieldType::NestedJson(ref nested_json_options) => {
+                println!("QueryParser::compute_boundary_term => Field type is NestedJson");
                 let get_term_with_path = || {
                     Term::from_field_json_path(
                         field,
@@ -566,15 +826,29 @@ impl QueryParser {
                         false,
                     )
                 {
+                    println!(
+                        "QueryParser::compute_boundary_term => Converted to fast value Term: {:?}",
+                        term
+                    );
                     Ok(term)
                 } else {
+                    println!(
+                        "QueryParser::compute_boundary_term => Fast value conversion failed, creating Term from string"
+                    );
                     let mut term = get_term_with_path();
                     term.append_type_and_str(phrase);
+                    println!(
+                        "QueryParser::compute_boundary_term => Created Term: {:?}",
+                        term
+                    );
                     Ok(term)
                 }
             }
 
             FieldType::Nested(_) => {
+                println!(
+                    "QueryParser::compute_boundary_term => Field type is Nested, which is unsupported"
+                );
                 return Err(QueryParserError::UnsupportedQuery(
                     "Range query on a nested field is not supported.".into(),
                 ));
@@ -590,15 +864,17 @@ impl QueryParser {
         slop: u32,
         prefix: bool,
     ) -> Result<Vec<LogicalLiteral>, QueryParserError> {
-        println!("QueryParser::compute_logical_ast_for_leaf => field={:?}, json_path={}, phrase={}, slop={}, prefix={}", 
-                field, json_path, phrase, slop, prefix);
+        println!(
+            "QueryParser::compute_logical_ast_for_leaf => Processing leaf: field={:?}, json_path={}, phrase={}, slop={}, prefix={}",
+            field, json_path, phrase, slop, prefix
+        );
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         let field_name = field_entry.name();
 
         if field_type.is_nested() {
             println!(
-                "QueryParser => found nested field: {}, raising direct text search error",
+                "QueryParser::compute_logical_ast_for_leaf => Field {:?} is nested, cannot perform direct text search",
                 field_name
             );
             return Err(QueryParserError::UnsupportedQuery(format!(
@@ -608,52 +884,100 @@ impl QueryParser {
         }
 
         if !field_type.is_indexed() {
+            println!(
+                "QueryParser::compute_logical_ast_for_leaf => Field {:?} is not indexed",
+                field_name
+            );
             return Err(QueryParserError::FieldNotIndexed(field_name.to_string()));
         }
         if field_type.value_type() != Type::Json && !json_path.is_empty() {
             let field_name = self.schema.get_field_name(field);
+            println!(
+                "QueryParser::compute_logical_ast_for_leaf => JSON path specified for non-JSON field {:?}",
+                field_name
+            );
             return Err(QueryParserError::FieldDoesNotExist(format!(
                 "{field_name}.{json_path}"
             )));
         }
         match *field_type {
             FieldType::U64(_) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is U64");
                 let val: u64 = u64::from_str(phrase)?;
+                println!(
+                    "QueryParser::compute_logical_ast_for_leaf => Parsed u64 value: {}",
+                    val
+                );
                 let i64_term = Term::from_field_u64(field, val);
                 Ok(vec![LogicalLiteral::Term(i64_term)])
             }
             FieldType::I64(_) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is I64");
                 let val: i64 = i64::from_str(phrase)?;
+                println!(
+                    "QueryParser::compute_logical_ast_for_leaf => Parsed i64 value: {}",
+                    val
+                );
                 let i64_term = Term::from_field_i64(field, val);
                 Ok(vec![LogicalLiteral::Term(i64_term)])
             }
             FieldType::F64(_) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is F64");
                 let val: f64 = f64::from_str(phrase)?;
+                println!(
+                    "QueryParser::compute_logical_ast_for_leaf => Parsed f64 value: {}",
+                    val
+                );
                 let f64_term = Term::from_field_f64(field, val);
                 Ok(vec![LogicalLiteral::Term(f64_term)])
             }
             FieldType::Bool(_) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is Bool");
                 let val: bool = bool::from_str(phrase)?;
+                println!(
+                    "QueryParser::compute_logical_ast_for_leaf => Parsed bool value: {}",
+                    val
+                );
                 let bool_term = Term::from_field_bool(field, val);
                 Ok(vec![LogicalLiteral::Term(bool_term)])
             }
             FieldType::Date(_) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is Date");
                 let dt = OffsetDateTime::parse(phrase, &Rfc3339)?;
+                println!(
+                    "QueryParser::compute_logical_ast_for_leaf => Parsed date value: {}",
+                    dt
+                );
                 let dt_term = Term::from_field_date_for_search(field, DateTime::from_utc(dt));
                 Ok(vec![LogicalLiteral::Term(dt_term)])
             }
             FieldType::Str(ref str_options) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is Str");
                 let indexing_options = str_options.get_indexing_options().ok_or_else(|| {
+                    println!(
+                        "QueryParser::compute_logical_ast_for_leaf => Field {:?} does not have indexing options",
+                        field_name
+                    );
                     // This should have been seen earlier really.
                     QueryParserError::FieldNotIndexed(field_name.to_string())
                 })?;
                 let mut text_analyzer = self
                     .tokenizer_manager
                     .get(indexing_options.tokenizer())
-                    .ok_or_else(|| QueryParserError::UnknownTokenizer {
-                        field: field_name.to_string(),
-                        tokenizer: indexing_options.tokenizer().to_string(),
+                    .ok_or_else(|| {
+                        println!(
+                            "QueryParser::compute_logical_ast_for_leaf => Unknown tokenizer '{}' for field {:?}",
+                            indexing_options.tokenizer(),
+                            field_name
+                        );
+                        QueryParserError::UnknownTokenizer {
+                            field: field_name.to_string(),
+                            tokenizer: indexing_options.tokenizer().to_string(),
+                        }
                     })?;
+                println!(
+                    "QueryParser::compute_logical_ast_for_leaf => Generating literals for Str field"
+                );
                 Ok(generate_literals_for_str(
                     field_name,
                     field,
@@ -666,55 +990,91 @@ impl QueryParser {
                 .into_iter()
                 .collect())
             }
-            FieldType::JsonObject(ref json_options) => generate_literals_for_json_object(
-                field_name,
-                field,
-                json_path,
-                phrase,
-                &self.tokenizer_manager,
-                json_options,
-            ),
-            FieldType::Facet(_) => match Facet::from_text(phrase) {
-                Ok(facet) => {
-                    let facet_term = Term::from_facet(field, &facet);
-                    Ok(vec![LogicalLiteral::Term(facet_term)])
+            FieldType::JsonObject(ref json_options) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is JsonObject");
+                generate_literals_for_json_object(
+                    field_name,
+                    field,
+                    json_path,
+                    phrase,
+                    &self.tokenizer_manager,
+                    json_options,
+                )
+            }
+            FieldType::Facet(_) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is Facet");
+                match Facet::from_text(phrase) {
+                    Ok(facet) => {
+                        println!(
+                            "QueryParser::compute_logical_ast_for_leaf => Parsed Facet: {:?}",
+                            facet
+                        );
+                        let facet_term = Term::from_facet(field, &facet);
+                        Ok(vec![LogicalLiteral::Term(facet_term)])
+                    }
+                    Err(e) => {
+                        println!(
+                            "QueryParser::compute_logical_ast_for_leaf => Failed to parse Facet: {:?}",
+                            e
+                        );
+                        Err(QueryParserError::from(e))
+                    }
                 }
-                Err(e) => Err(QueryParserError::from(e)),
-            },
+            }
             FieldType::Bytes(_) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is Bytes");
                 let bytes = BASE64
                     .decode(phrase)
                     .map_err(QueryParserError::ExpectedBase64)?;
+                println!(
+                    "QueryParser::compute_logical_ast_for_leaf => Decoded bytes: {:?}",
+                    bytes
+                );
                 let bytes_term = Term::from_field_bytes(field, &bytes);
                 Ok(vec![LogicalLiteral::Term(bytes_term)])
             }
             FieldType::IpAddr(_) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is IpAddr");
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
+                println!(
+                    "QueryParser::compute_logical_ast_for_leaf => Parsed IP address: {:?}",
+                    ip_v6
+                );
                 let term = Term::from_field_ip_addr(field, ip_v6);
                 Ok(vec![LogicalLiteral::Term(term)])
             }
             FieldType::Nested(_) => {
+                println!(
+                    "QueryParser::compute_logical_ast_for_leaf => Field {:?} is Nested, unsupported for direct text search",
+                    field_name
+                );
                 return Err(QueryParserError::UnsupportedQuery(format!(
                     "Cannot run direct text search on a `nested` field."
                 )));
             }
-            FieldType::NestedJson(ref nested_json_options) => generate_literals_for_json_object(
-                field_name,
-                field,
-                json_path,
-                phrase,
-                &self.tokenizer_manager,
-                &nested_json_options.json_opts,
-            ),
+            FieldType::NestedJson(ref nested_json_options) => {
+                println!("QueryParser::compute_logical_ast_for_leaf => Field type is NestedJson");
+                generate_literals_for_json_object(
+                    field_name,
+                    field,
+                    json_path,
+                    phrase,
+                    &self.tokenizer_manager,
+                    &nested_json_options.json_opts,
+                )
+            }
         }
     }
 
     fn default_occur(&self) -> Occur {
-        if self.conjunction_by_default {
+        let occur = if self.conjunction_by_default {
+            println!("QueryParser::default_occur => Default occurrence is Must (Conjunction)");
             Occur::Must
         } else {
+            println!("QueryParser::default_occur => Default occurrence is Should (Disjunction)");
             Occur::Should
-        }
+        };
+        occur
     }
 
     fn resolve_bound(
@@ -723,15 +1083,34 @@ impl QueryParser {
         json_path: &str,
         bound: &UserInputBound,
     ) -> Result<Bound<Term>, QueryParserError> {
+        println!(
+            "QueryParser::resolve_bound => Resolving bound for field {:?}, json_path: {}, bound: {:?}",
+            field, json_path, bound
+        );
         if bound.term_str() == "*" {
+            println!("QueryParser::resolve_bound => Bound is Unbounded");
             return Ok(Bound::Unbounded);
         }
         let term = self.compute_boundary_term(field, json_path, bound.term_str())?;
-        match *bound {
-            UserInputBound::Inclusive(_) => Ok(Bound::Included(term)),
-            UserInputBound::Exclusive(_) => Ok(Bound::Excluded(term)),
-            UserInputBound::Unbounded => Ok(Bound::Unbounded),
-        }
+        let resolved_bound = match *bound {
+            UserInputBound::Inclusive(_) => {
+                println!("QueryParser::resolve_bound => Bound is Inclusive");
+                Bound::Included(term)
+            }
+            UserInputBound::Exclusive(_) => {
+                println!("QueryParser::resolve_bound => Bound is Exclusive");
+                Bound::Excluded(term)
+            }
+            UserInputBound::Unbounded => {
+                println!("QueryParser::resolve_bound => Bound is Unbounded");
+                Bound::Unbounded
+            }
+        };
+        println!(
+            "QueryParser::resolve_bound => Resolved Bound: {:?}",
+            resolved_bound
+        );
+        Ok(resolved_bound)
     }
 
     fn compute_logical_ast_with_occur_lenient(
@@ -739,31 +1118,63 @@ impl QueryParser {
         user_input_ast: UserInputAst,
     ) -> (LogicalAst, Vec<QueryParserError>) {
         println!(
-            "QueryParser::compute_logical_ast_with_occur_lenient => input AST: {:?}",
+            "QueryParser::compute_logical_ast_with_occur_lenient => Processing UserInputAst: {:?}",
             user_input_ast
         );
         match user_input_ast {
             UserInputAst::Clause(sub_queries) => {
+                println!(
+                    "QueryParser::compute_logical_ast_with_occur_lenient => Processing Clause with {} subqueries",
+                    sub_queries.len()
+                );
                 let default_occur = self.default_occur();
                 let mut logical_sub_queries: Vec<(Occur, LogicalAst)> = Vec::new();
                 let mut errors = Vec::new();
                 for (occur_opt, sub_ast) in sub_queries {
+                    println!(
+                        "QueryParser::compute_logical_ast_with_occur_lenient => Processing subquery with occur_opt: {:?}",
+                        occur_opt
+                    );
                     let (sub_ast, mut sub_errors) =
                         self.compute_logical_ast_with_occur_lenient(sub_ast);
                     let occur = occur_opt.unwrap_or(default_occur);
+                    println!(
+                        "QueryParser::compute_logical_ast_with_occur_lenient => Resolved occur: {:?}",
+                        occur
+                    );
                     logical_sub_queries.push((occur, sub_ast));
                     errors.append(&mut sub_errors);
                 }
-                (LogicalAst::Clause(logical_sub_queries), errors)
+                let clause = LogicalAst::Clause(logical_sub_queries);
+                println!(
+                    "QueryParser::compute_logical_ast_with_occur_lenient => Built Clause: {:?}",
+                    clause
+                );
+                (clause, errors)
             }
             UserInputAst::Boost(ast, boost) => {
+                println!(
+                    "QueryParser::compute_logical_ast_with_occur_lenient => Processing Boost with boost factor: {}",
+                    boost
+                );
                 let (ast, errors) = self.compute_logical_ast_with_occur_lenient(*ast);
-                (ast.boost(boost as Score), errors)
+                let boosted_ast = ast.boost(boost as Score);
+                println!(
+                    "QueryParser::compute_logical_ast_with_occur_lenient => Built Boosted AST: {:?}",
+                    boosted_ast
+                );
+                (boosted_ast, errors)
             }
             UserInputAst::Leaf(leaf) => {
+                println!(
+                    "QueryParser::compute_logical_ast_with_occur_lenient => Processing Leaf: {:?}",
+                    leaf
+                );
                 let (ast, errors) = self.compute_logical_ast_from_leaf_lenient(*leaf);
-                // if the error is not recoverable, replace it with an empty clause. We will end up
-                // trimming those later
+                println!(
+                    "QueryParser::compute_logical_ast_with_occur_lenient => Resulting AST: {:?} with {} errors",
+                    ast, errors.len()
+                );
                 (
                     ast.unwrap_or_else(|| LogicalAst::Clause(Vec::new())),
                     errors,
@@ -773,7 +1184,12 @@ impl QueryParser {
     }
 
     fn field_boost(&self, field: Field) -> Score {
-        self.boost.get(&field).cloned().unwrap_or(1.0)
+        let boost = self.boost.get(&field).cloned().unwrap_or(1.0);
+        println!(
+            "QueryParser::field_boost => Boost for field {:?} is {}",
+            field, boost
+        );
+        boost
     }
 
     fn default_indexed_json_fields(&self) -> impl Iterator<Item = Field> + '_ {
@@ -809,17 +1225,27 @@ impl QueryParser {
         literal: &'a UserInputLiteral,
     ) -> Result<Vec<(Field, &'a str, &'a str)>, QueryParserError> {
         println!(
-            "QueryParser::compute_path_triplets_for_literal => processing literal: {:?}",
+            "QueryParser::compute_path_triplets_for_literal => Processing literal: {:?}",
             literal
         );
         let full_path = if let Some(full_path) = &literal.field_name {
+            println!(
+                "QueryParser::compute_path_triplets_for_literal => Literal has field_name: {}",
+                full_path
+            );
             full_path
         } else {
             // The user did not specify any path...
             // We simply target default fields.
             if self.default_fields.is_empty() {
+                println!(
+                    "QueryParser::compute_path_triplets_for_literal => No default fields available"
+                );
                 return Err(QueryParserError::NoDefaultFieldDeclared);
             }
+            println!(
+                "QueryParser::compute_path_triplets_for_literal => No field_name specified, targeting default fields"
+            );
             return Ok(self
                 .default_fields
                 .iter()
@@ -827,16 +1253,32 @@ impl QueryParser {
                 .collect::<Vec<(Field, &str, &str)>>());
         };
         if let Some((field, path)) = self.split_full_path(full_path) {
+            println!(
+                "QueryParser::compute_path_triplets_for_literal => Found field {:?} with path: {}",
+                field, path
+            );
             return Ok(vec![(field, path, literal.phrase.as_str())]);
         }
         // We need to add terms associated with json default fields.
+        println!(
+            "QueryParser::compute_path_triplets_for_literal => Field {:?} not found, checking default JSON fields",
+            full_path
+        );
         let triplets: Vec<(Field, &str, &str)> = self
             .default_indexed_json_fields()
             .map(|json_field| (json_field, full_path.as_str(), literal.phrase.as_str()))
             .collect();
         if triplets.is_empty() {
+            println!(
+                "QueryParser::compute_path_triplets_for_literal => No matching fields found for full_path: {}",
+                full_path
+            );
             return Err(QueryParserError::FieldDoesNotExist(full_path.to_string()));
         }
+        println!(
+            "QueryParser::compute_path_triplets_for_literal => Found {} triplets",
+            triplets.len()
+        );
         Ok(triplets)
     }
 
@@ -845,16 +1287,28 @@ impl QueryParser {
         leaf: UserInputLeaf,
     ) -> (Option<LogicalAst>, Vec<QueryParserError>) {
         println!(
-            "QueryParser::compute_logical_ast_from_leaf_lenient => processing leaf: {:?}",
+            "QueryParser::compute_logical_ast_from_leaf_lenient => Processing UserInputLeaf: {:?}",
             leaf
         );
         match leaf {
             UserInputLeaf::Literal(literal) => {
+                println!(
+                    "QueryParser::compute_logical_ast_from_leaf_lenient => Processing Literal: {:?}",
+                    literal
+                );
                 let term_phrases: Vec<(Field, &str, &str)> =
                     try_tuple!(self.compute_path_triplets_for_literal(&literal));
+                println!(
+                    "QueryParser::compute_logical_ast_from_leaf_lenient => Term phrases: {:?}",
+                    term_phrases
+                );
                 let mut asts: Vec<LogicalAst> = Vec::new();
                 let mut errors: Vec<QueryParserError> = Vec::new();
                 for (field, json_path, phrase) in term_phrases {
+                    println!(
+                        "QueryParser::compute_logical_ast_from_leaf_lenient => Processing term phrase: field={:?}, json_path={}, phrase={}",
+                        field, json_path, phrase
+                    );
                     let unboosted_asts = match self.compute_logical_ast_for_leaf(
                         field,
                         json_path,
@@ -862,8 +1316,18 @@ impl QueryParser {
                         literal.slop,
                         literal.prefix,
                     ) {
-                        Ok(asts) => asts,
+                        Ok(asts) => {
+                            println!(
+                                "QueryParser::compute_logical_ast_from_leaf_lenient => Successfully computed LogicalLiterals: {:?}",
+                                asts
+                            );
+                            asts
+                        }
                         Err(e) => {
+                            println!(
+                                "QueryParser::compute_logical_ast_from_leaf_lenient => Error computing LogicalAst for leaf: {:?}",
+                                e
+                            );
                             errors.push(e);
                             continue;
                         }
@@ -871,26 +1335,52 @@ impl QueryParser {
                     for ast in unboosted_asts {
                         // Apply some field specific boost defined at the query parser level.
                         let boost = self.field_boost(field);
+                        println!(
+                            "QueryParser::compute_logical_ast_from_leaf_lenient => Applying boost: {} to LogicalAst: {:?}",
+                            boost, ast
+                        );
                         asts.push(LogicalAst::Leaf(Box::new(ast)).boost(boost));
                     }
                 }
                 let result_ast: LogicalAst = if asts.len() == 1 {
+                    println!(
+                        "QueryParser::compute_logical_ast_from_leaf_lenient => Single LogicalAst, using it directly"
+                    );
                     asts.into_iter().next().unwrap()
                 } else {
+                    println!(
+                        "QueryParser::compute_logical_ast_from_leaf_lenient => Multiple LogicalAsts, combining into Clause"
+                    );
                     LogicalAst::Clause(asts.into_iter().map(|ast| (Occur::Should, ast)).collect())
                 };
+                println!(
+                    "QueryParser::compute_logical_ast_from_leaf_lenient => Resulting LogicalAst: {:?}",
+                    result_ast
+                );
                 (Some(result_ast), errors)
             }
-            UserInputLeaf::All => (
-                Some(LogicalAst::Leaf(Box::new(LogicalLiteral::All))),
-                Vec::new(),
-            ),
+            UserInputLeaf::All => {
+                println!(
+                    "QueryParser::compute_logical_ast_from_leaf_lenient => Processing All query"
+                );
+                (
+                    Some(LogicalAst::Leaf(Box::new(LogicalLiteral::All))),
+                    Vec::new(),
+                )
+            }
             UserInputLeaf::Range {
                 field: full_field_opt,
                 lower,
                 upper,
             } => {
+                println!(
+                    "QueryParser::compute_logical_ast_from_leaf_lenient => Processing Range query: full_field_opt={:?}, lower={:?}, upper={:?}",
+                    full_field_opt, lower, upper
+                );
                 let Some(full_path) = full_field_opt else {
+                    println!(
+                        "QueryParser::compute_logical_ast_from_leaf_lenient => Range query missing target field"
+                    );
                     return (
                         None,
                         vec![QueryParserError::UnsupportedQuery(
@@ -903,15 +1393,35 @@ impl QueryParser {
                     .ok_or_else(|| QueryParserError::FieldDoesNotExist(full_path.clone())));
                 let mut errors = Vec::new();
                 let lower = match self.resolve_bound(field, json_path, &lower) {
-                    Ok(bound) => bound,
+                    Ok(bound) => {
+                        println!(
+                            "QueryParser::compute_logical_ast_from_leaf_lenient => Resolved lower bound: {:?}",
+                            bound
+                        );
+                        bound
+                    }
                     Err(error) => {
+                        println!(
+                            "QueryParser::compute_logical_ast_from_leaf_lenient => Error resolving lower bound: {:?}",
+                            error
+                        );
                         errors.push(error);
                         Bound::Unbounded
                     }
                 };
                 let upper = match self.resolve_bound(field, json_path, &upper) {
-                    Ok(bound) => bound,
+                    Ok(bound) => {
+                        println!(
+                            "QueryParser::compute_logical_ast_from_leaf_lenient => Resolved upper bound: {:?}",
+                            bound
+                        );
+                        bound
+                    }
                     Err(error) => {
+                        println!(
+                            "QueryParser::compute_logical_ast_from_leaf_lenient => Error resolving upper bound: {:?}",
+                            error
+                        );
                         errors.push(error);
                         Bound::Unbounded
                     }
@@ -919,16 +1429,27 @@ impl QueryParser {
                 if lower == Bound::Unbounded && upper == Bound::Unbounded {
                     // this range is useless, either because a user requested [* TO *], or because
                     // we failed to parse something. Either way, there is no point emitting it
+                    println!(
+                        "QueryParser::compute_logical_ast_from_leaf_lenient => Both bounds are Unbounded, ignoring range query"
+                    );
                     return (None, errors);
                 }
                 let logical_ast =
                     LogicalAst::Leaf(Box::new(LogicalLiteral::Range { lower, upper }));
+                println!(
+                    "QueryParser::compute_logical_ast_from_leaf_lenient => Created Range LogicalAst: {:?}",
+                    logical_ast
+                );
                 (Some(logical_ast), errors)
             }
             UserInputLeaf::Set {
                 field: full_field_opt,
                 elements,
             } => {
+                println!(
+                    "QueryParser::compute_logical_ast_from_leaf_lenient => Processing Set query: full_field_opt={:?}, elements={:?}",
+                    full_field_opt, elements
+                );
                 let full_path = try_tuple!(full_field_opt.ok_or_else(|| {
                     QueryParserError::UnsupportedQuery(
                         "Range query need to target a specific field.".to_string(),
@@ -942,14 +1463,23 @@ impl QueryParser {
                     .map(|element| self.compute_boundary_term(field, json_path, &element))
                     .partition_result();
                 let logical_ast = LogicalAst::Leaf(Box::new(LogicalLiteral::Set { elements }));
+                println!(
+                    "QueryParser::compute_logical_ast_from_leaf_lenient => Created Set LogicalAst: {:?}",
+                    logical_ast
+                );
                 (Some(logical_ast), errors)
             }
-            UserInputLeaf::Exists { .. } => (
-                None,
-                vec![QueryParserError::UnsupportedQuery(
-                    "Range query need to target a specific field.".to_string(),
-                )],
-            ),
+            UserInputLeaf::Exists { .. } => {
+                println!(
+                    "QueryParser::compute_logical_ast_from_leaf_lenient => Exists queries are unsupported"
+                );
+                (
+                    None,
+                    vec![QueryParserError::UnsupportedQuery(
+                        "Range query need to target a specific field.".to_string(),
+                    )],
+                )
+            }
         }
     }
 }
@@ -958,16 +1488,30 @@ fn convert_literal_to_query(
     fuzzy: &FxHashMap<Field, Fuzzy>,
     logical_literal: LogicalLiteral,
 ) -> Box<dyn Query> {
+    println!(
+        "convert_literal_to_query => Converting LogicalLiteral: {:?}",
+        logical_literal
+    );
     match logical_literal {
         LogicalLiteral::Term(term) => {
+            println!("convert_literal_to_query => Processing Term: {:?}", term);
             if let Some(fuzzy) = fuzzy.get(&term.field()) {
+                println!("convert_literal_to_query => Field {:?}", term.field());
                 if fuzzy.prefix {
+                    println!(
+                        "convert_literal_to_query => Creating FuzzyTermQuery with prefix for Term: {:?}",
+                        term
+                    );
                     Box::new(FuzzyTermQuery::new_prefix(
                         term,
                         fuzzy.distance,
                         fuzzy.transpose_cost_one,
                     ))
                 } else {
+                    println!(
+                        "convert_literal_to_query => Creating FuzzyTermQuery without prefix for Term: {:?}",
+                        term
+                    );
                     Box::new(FuzzyTermQuery::new(
                         term,
                         fuzzy.distance,
@@ -975,6 +1519,10 @@ fn convert_literal_to_query(
                     ))
                 }
             } else {
+                println!(
+                    "convert_literal_to_query => Creating standard TermQuery for Term: {:?}",
+                    term
+                );
                 Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs))
             }
         }
@@ -983,15 +1531,36 @@ fn convert_literal_to_query(
             slop,
             prefix,
         } => {
+            println!(
+                "convert_literal_to_query => Processing Phrase: terms={:?}, slop={}, prefix={}",
+                terms, slop, prefix
+            );
             if prefix {
+                println!("convert_literal_to_query => Creating PhrasePrefixQuery");
                 Box::new(PhrasePrefixQuery::new_with_offset(terms))
             } else {
+                println!("convert_literal_to_query => Creating PhraseQuery with slop");
                 Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop))
             }
         }
-        LogicalLiteral::Range { lower, upper } => Box::new(RangeQuery::new(lower, upper)),
-        LogicalLiteral::Set { elements, .. } => Box::new(TermSetQuery::new(elements)),
-        LogicalLiteral::All => Box::new(AllQuery),
+        LogicalLiteral::Range { lower, upper } => {
+            println!(
+                "convert_literal_to_query => Processing Range: lower={:?}, upper={:?}",
+                lower, upper
+            );
+            Box::new(RangeQuery::new(lower, upper))
+        }
+        LogicalLiteral::Set { elements, .. } => {
+            println!(
+                "convert_literal_to_query => Processing Set query with elements: {:?}",
+                elements
+            );
+            Box::new(TermSetQuery::new(elements))
+        }
+        LogicalLiteral::All => {
+            println!("convert_literal_to_query => Processing AllQuery");
+            Box::new(AllQuery)
+        }
     }
 }
 
@@ -1005,33 +1574,52 @@ fn generate_literals_for_str(
     text_analyzer: &mut TextAnalyzer,
 ) -> Result<Option<LogicalLiteral>, QueryParserError> {
     println!(
-        "QueryParser::generate_literals_for_str => field={}, phrase={}, slop={}, prefix={}",
+        "generate_literals_for_str => Generating literals for field '{}', phrase='{}', slop={}, prefix={}",
         field_name, phrase, slop, prefix
     );
     let mut terms: Vec<(usize, Term)> = Vec::new();
     let mut token_stream = text_analyzer.token_stream(phrase);
     token_stream.process(&mut |token| {
+        println!(
+            "generate_literals_for_str => Tokenizing phrase: '{}', got token: '{}'",
+            phrase, token.text
+        );
         let term = Term::from_field_text(field, &token.text);
+        println!("generate_literals_for_str => Created Term: {:?}", term);
         terms.push((token.position, term));
     });
     if terms.len() <= 1 {
         if prefix {
+            println!(
+                "generate_literals_for_str => Phrase has <=1 terms and prefix is true, raising error"
+            );
             return Err(QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
                 phrase: phrase.to_owned(),
                 tokenizer: indexing_options.tokenizer().to_owned(),
             });
         }
-        let term_literal_opt = terms
-            .into_iter()
-            .next()
-            .map(|(_, term)| LogicalLiteral::Term(term));
+        let term_literal_opt = terms.into_iter().next().map(|(_, term)| {
+            println!(
+                "generate_literals_for_str => Single TermLiteral created: {:?}",
+                term
+            );
+            LogicalLiteral::Term(term)
+        });
         return Ok(term_literal_opt);
     }
     if !indexing_options.index_option().has_positions() {
+        println!(
+            "generate_literals_for_str => Field '{}' does not have positions indexed",
+            field_name
+        );
         return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(
             field_name.to_string(),
         ));
     }
+    println!(
+        "generate_literals_for_str => Creating Phrase LogicalLiteral with slop={}, prefix={}",
+        slop, prefix
+    );
     Ok(Some(LogicalLiteral::Phrase {
         terms,
         slop,
@@ -1048,18 +1636,29 @@ fn generate_literals_for_json_object(
     json_options: &JsonObjectOptions,
 ) -> Result<Vec<LogicalLiteral>, QueryParserError> {
     println!(
-        "QueryParser::generate_literals_for_json_object => field={}, json_path={}, phrase={}",
+        "generate_literals_for_json_object => Generating literals for JSON field '{}', json_path='{}', phrase='{}'",
         field_name, json_path, phrase
     );
     let text_options = json_options.get_text_indexing_options().ok_or_else(|| {
         // This should have been seen earlier really.
+        println!(
+            "generate_literals_for_json_object => Field '{}' does not have text indexing options",
+            field_name
+        );
         QueryParserError::FieldNotIndexed(field_name.to_string())
     })?;
     let mut text_analyzer = tokenizer_manager
         .get(text_options.tokenizer())
-        .ok_or_else(|| QueryParserError::UnknownTokenizer {
-            field: field_name.to_string(),
-            tokenizer: text_options.tokenizer().to_string(),
+        .ok_or_else(|| {
+            println!(
+                "generate_literals_for_json_object => Unknown tokenizer '{}' for field '{}'",
+                text_options.tokenizer(),
+                field_name
+            );
+            QueryParserError::UnknownTokenizer {
+                field: field_name.to_string(),
+                tokenizer: text_options.tokenizer().to_string(),
+            }
         })?;
     let index_record_option = text_options.index_option();
     let mut logical_literals = Vec::new();
@@ -1071,6 +1670,10 @@ fn generate_literals_for_json_object(
     if let Some(term) =
         convert_to_fast_value_and_append_to_json_term(get_term_with_path(), phrase, true)
     {
+        println!(
+            "generate_literals_for_json_object => Converted to fast value Term: {:?}",
+            term
+        );
         logical_literals.push(LogicalLiteral::Term(term));
     }
 
@@ -1078,22 +1681,41 @@ fn generate_literals_for_json_object(
     let mut positions_and_terms = Vec::<(usize, Term)>::new();
     let mut token_stream = text_analyzer.token_stream(phrase);
     token_stream.process(&mut |token| {
+        println!(
+            "generate_literals_for_json_object => Tokenizing phrase: '{}', got token: '{}'",
+            phrase, token.text
+        );
         let mut term = get_term_with_path();
         term.append_type_and_str(&token.text);
+        println!(
+            "generate_literals_for_json_object => Created Term with path: {:?}",
+            term
+        );
         positions_and_terms.push((token.position, term.clone()));
     });
 
     if positions_and_terms.len() <= 1 {
         for (_, term) in positions_and_terms {
+            println!(
+                "generate_literals_for_json_object => Single TermLiteral created: {:?}",
+                term
+            );
             logical_literals.push(LogicalLiteral::Term(term));
         }
         return Ok(logical_literals);
     }
     if !index_record_option.has_positions() {
+        println!(
+            "generate_literals_for_json_object => Field '{}' does not have positions indexed",
+            field_name
+        );
         return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(
             field_name.to_string(),
         ));
     }
+    println!(
+        "generate_literals_for_json_object => Creating Phrase LogicalLiteral without slop and prefix"
+    );
     logical_literals.push(LogicalLiteral::Phrase {
         terms: positions_and_terms,
         slop: 0,
@@ -1104,30 +1726,59 @@ fn generate_literals_for_json_object(
 
 fn convert_to_query(fuzzy: &FxHashMap<Field, Fuzzy>, logical_ast: LogicalAst) -> Box<dyn Query> {
     println!(
-        "QueryParser::convert_to_query => converting AST: {:?}",
+        "QueryParser::convert_to_query => Converting LogicalAst: {:?}",
         logical_ast
     );
     match trim_ast(logical_ast) {
         Some(LogicalAst::Clause(trimmed_clause)) => {
+            println!(
+                "QueryParser::convert_to_query => Processing Clause with {} subqueries",
+                trimmed_clause.len()
+            );
             let occur_subqueries = trimmed_clause
                 .into_iter()
-                .map(|(occur, subquery)| (occur, convert_to_query(fuzzy, subquery)))
+                .map(|(occur, subquery)| {
+                    println!(
+                        "QueryParser::convert_to_query => Converting subquery with occur: {:?}",
+                        occur
+                    );
+                    (occur, convert_to_query(fuzzy, subquery))
+                })
                 .collect::<Vec<_>>();
             assert!(
                 !occur_subqueries.is_empty(),
                 "Should not be empty after trimming"
             );
+            println!(
+                "QueryParser::convert_to_query => Creating BooleanQuery with subqueries: {:?}",
+                occur_subqueries
+            );
             Box::new(BooleanQuery::new(occur_subqueries))
         }
         Some(LogicalAst::Leaf(trimmed_logical_literal)) => {
+            println!(
+                "QueryParser::convert_to_query => Converting Leaf LogicalLiteral: {:?}",
+                trimmed_logical_literal
+            );
             convert_literal_to_query(fuzzy, *trimmed_logical_literal)
         }
         Some(LogicalAst::Boost(ast, boost)) => {
+            println!(
+                "QueryParser::convert_to_query => Processing Boost with boost factor: {}",
+                boost
+            );
             let query = convert_to_query(fuzzy, *ast);
+            println!(
+                "QueryParser::convert_to_query => Applying boost to Query: {:?}",
+                query
+            );
             let boosted_query = BoostQuery::new(query, boost);
             Box::new(boosted_query)
         }
-        None => Box::new(EmptyQuery),
+        None => {
+            println!("QueryParser::convert_to_query => LogicalAst is None, returning EmptyQuery");
+            Box::new(EmptyQuery)
+        }
     }
 }
 
@@ -1174,10 +1825,16 @@ mod test {
         schema_builder.add_bool_field("bool", INDEXED);
         schema_builder.add_bool_field("notindexed_bool", STORED);
         schema_builder.add_u64_field("u64_ff", FAST);
-        schema_builder.build()
+        let built_schema = schema_builder.build();
+        println!("Test::make_schema => Built schema: {:?}", built_schema);
+        built_schema
     }
 
     fn make_query_parser_with_default_fields(default_fields: &[&'static str]) -> QueryParser {
+        println!(
+            "Test::make_query_parser_with_default_fields => Creating QueryParser with default fields: {:?}",
+            default_fields
+        );
         let schema = make_schema();
         let default_fields: Vec<Field> = default_fields
             .iter()
@@ -1202,6 +1859,10 @@ mod test {
         query: &str,
         default_conjunction: bool,
     ) -> Result<LogicalAst, QueryParserError> {
+        println!(
+            "Test::parse_query_to_logical_ast => Parsing query: '{}' with default_conjunction: {}",
+            query, default_conjunction
+        );
         let mut query_parser = make_query_parser();
         if default_conjunction {
             query_parser.set_conjunction_by_default();
@@ -1214,15 +1875,25 @@ mod test {
         expected: &str,
         default_conjunction: bool,
     ) {
+        println!(
+            "Test::test_parse_query_to_logical_ast_helper => Testing query: '{}'",
+            query
+        );
         let query = parse_query_to_logical_ast(query, default_conjunction).unwrap();
         let query_str = format!("{query:?}");
+        println!(
+            "Test::test_parse_query_to_logical_ast_helper => Expected: '{}', Got: '{}'",
+            expected, query_str
+        );
         assert_eq!(query_str, expected);
     }
 
     #[test]
     pub fn test_parse_query_facet() {
+        println!("Test::test_parse_query_facet => Starting test");
         let query_parser = make_query_parser();
         let query = query_parser.parse_query("facet:/root/branch/leaf").unwrap();
+        println!("Test::test_parse_query_facet => Parsed query: {:?}", query);
         assert_eq!(
             format!("{query:?}"),
             r#"TermQuery(Term(field=11, type=Facet, Facet(/root/branch/leaf)))"#
@@ -1231,11 +1902,16 @@ mod test {
 
     #[test]
     pub fn test_parse_query_with_boost() {
+        println!("Test::test_parse_query_with_boost => Starting test");
         let mut query_parser = make_query_parser();
         let schema = make_schema();
         let text_field = schema.get_field("text").unwrap();
         query_parser.set_field_boost(text_field, 2.0);
         let query = query_parser.parse_query("text:hello").unwrap();
+        println!(
+            "Test::test_parse_query_with_boost => Parsed query: {:?}",
+            query
+        );
         assert_eq!(
             format!("{query:?}"),
             r#"Boost(query=TermQuery(Term(field=1, type=Str, "hello")), boost=2)"#
@@ -1244,7 +1920,12 @@ mod test {
 
     #[test]
     pub fn test_parse_query_range_with_boost() {
+        println!("Test::test_parse_query_range_with_boost => Starting test");
         let query = make_query_parser().parse_query("title:[A TO B]").unwrap();
+        println!(
+            "Test::test_parse_query_range_with_boost => Parsed query: {:?}",
+            query
+        );
         assert_eq!(
             format!("{query:?}"),
             "RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=0, type=Str, \
@@ -1254,11 +1935,16 @@ mod test {
 
     #[test]
     pub fn test_parse_query_with_default_boost_and_custom_boost() {
+        println!("Test::test_parse_query_with_default_boost_and_custom_boost => Starting test");
         let mut query_parser = make_query_parser();
         let schema = make_schema();
         let text_field = schema.get_field("text").unwrap();
         query_parser.set_field_boost(text_field, 2.0);
         let query = query_parser.parse_query("text:hello^2").unwrap();
+        println!(
+            "Test::test_parse_query_with_default_boost_and_custom_boost => Parsed query: {:?}",
+            query
+        );
         assert_eq!(
             format!("{query:?}"),
             r#"Boost(query=Boost(query=TermQuery(Term(field=1, type=Str, "hello")), boost=2), boost=2)"#
@@ -1267,13 +1953,26 @@ mod test {
 
     #[test]
     pub fn test_parse_nonindexed_field_yields_error() {
+        println!("Test::test_parse_nonindexed_field_yields_error => Starting test");
         let query_parser = make_query_parser();
 
         let is_not_indexed_err = |query: &str| {
+            println!(
+                "Test::test_parse_nonindexed_field_yields_error => Testing query: '{}'",
+                query
+            );
             let result: Result<Box<dyn Query>, QueryParserError> = query_parser.parse_query(query);
             if let Err(QueryParserError::FieldNotIndexed(field_name)) = result {
+                println!(
+                    "Test::test_parse_nonindexed_field_yields_error => Received FieldNotIndexed error for field: {}",
+                    field_name
+                );
                 Some(field_name)
             } else {
+                println!(
+                    "Test::test_parse_nonindexed_field_yields_error => No FieldNotIndexed error for query: '{}'",
+                    query
+                );
                 None
             }
         };
@@ -1298,6 +1997,7 @@ mod test {
 
     #[test]
     pub fn test_parse_query_untokenized() {
+        println!("Test::test_parse_query_untokenized => Starting test");
         test_parse_query_to_logical_ast_helper(
             "nottokenized:\"wordone wordtwo\"",
             r#"Term(field=7, type=Str, "wordone wordtwo")"#,
@@ -1307,16 +2007,19 @@ mod test {
 
     #[test]
     pub fn test_parse_query_empty() {
+        println!("Test::test_parse_query_empty => Starting test");
         test_parse_query_to_logical_ast_helper("", "<emptyclause>", false);
         test_parse_query_to_logical_ast_helper(" ", "<emptyclause>", false);
         let query_parser = make_query_parser();
         let query_result = query_parser.parse_query("");
         let query = query_result.unwrap();
+        println!("Test::test_parse_query_empty => Parsed query: {:?}", query);
         assert_eq!(format!("{query:?}"), "EmptyQuery");
     }
 
     #[test]
     pub fn test_parse_query_ints() {
+        println!("Test::test_parse_query_ints => Starting test");
         let query_parser = make_query_parser();
         assert!(query_parser.parse_query("signed:2324").is_ok());
         assert!(query_parser.parse_query("signed:\"22\"").is_ok());
@@ -1368,6 +2071,7 @@ mod test {
 
     #[test]
     fn test_parse_bytes() {
+        println!("Test::test_parse_bytes => Starting test");
         test_parse_query_to_logical_ast_helper(
             "bytes:YnVidQ==",
             "Term(field=12, type=Bytes, [98, 117, 98, 117])",
@@ -1377,6 +2081,7 @@ mod test {
 
     #[test]
     fn test_parse_bool() {
+        println!("Test::test_parse_bool => Starting test");
         test_parse_query_to_logical_ast_helper(
             "bool:true",
             &format!(
@@ -1389,12 +2094,18 @@ mod test {
 
     #[test]
     fn test_parse_bytes_not_indexed() {
+        println!("Test::test_parse_bytes_not_indexed => Starting test");
         let error = parse_query_to_logical_ast("bytes_not_indexed:aaa", false).unwrap_err();
+        println!(
+            "Test::test_parse_bytes_not_indexed => Received error: {}",
+            error
+        );
         assert!(matches!(error, QueryParserError::FieldNotIndexed(_)));
     }
 
     #[test]
     fn test_json_field() {
+        println!("Test::test_json_field => Starting test");
         test_parse_query_to_logical_ast_helper(
             "json.titi:hello",
             "Term(field=14, type=Json, path=titi, type=Str, \"hello\")",
@@ -1403,19 +2114,29 @@ mod test {
     }
 
     fn extract_query_term_json_path(query: &str) -> String {
+        println!(
+            "Test::extract_query_term_json_path => Extracting JSON path from query: '{}'",
+            query
+        );
         let LogicalAst::Leaf(literal) = parse_query_to_logical_ast(query, false).unwrap() else {
             panic!();
         };
         let LogicalLiteral::Term(term) = *literal else {
             panic!();
         };
-        std::str::from_utf8(term.serialized_value_bytes())
+        let json_path = std::str::from_utf8(term.serialized_value_bytes())
             .unwrap()
-            .to_string()
+            .to_string();
+        println!(
+            "Test::extract_query_term_json_path => Extracted JSON path: '{}'",
+            json_path
+        );
+        json_path
     }
 
     #[test]
     fn test_json_field_query_with_escaped_dot() {
+        println!("Test::test_json_field_query_with_escaped_dot => Starting test");
         assert_eq!(
             extract_query_term_json_path(r#"json.k8s.node.name:hello"#),
             "k8s\u{1}node\u{1}name\0shello"
@@ -1428,6 +2149,7 @@ mod test {
 
     #[test]
     fn test_json_field_possibly_a_number() {
+        println!("Test::test_json_field_possibly_a_number => Starting test");
         test_parse_query_to_logical_ast_helper(
             "json.titi:5",
             r#"(Term(field=14, type=Json, path=titi, type=I64, 5) Term(field=14, type=Json, path=titi, type=Str, "5"))"#,
@@ -1452,6 +2174,7 @@ mod test {
 
     #[test]
     fn test_json_field_possibly_a_date() {
+        println!("Test::test_json_field_possibly_a_date => Starting test");
         test_parse_query_to_logical_ast_helper(
             r#"json.date:"2019-10-12T07:20:50.52Z""#,
             r#"(Term(field=14, type=Json, path=date, type=Date, 2019-10-12T07:20:50.52Z) "[(0, Term(field=14, type=Json, path=date, type=Str, "2019")), (1, Term(field=14, type=Json, path=date, type=Str, "10")), (2, Term(field=14, type=Json, path=date, type=Str, "12t07")), (3, Term(field=14, type=Json, path=date, type=Str, "20")), (4, Term(field=14, type=Json, path=date, type=Str, "50")), (5, Term(field=14, type=Json, path=date, type=Str, "52z"))]")"#,
@@ -1461,6 +2184,7 @@ mod test {
 
     #[test]
     fn test_json_field_possibly_a_bool() {
+        println!("Test::test_json_field_possibly_a_bool => Starting test");
         test_parse_query_to_logical_ast_helper(
             "json.titi:true",
             r#"(Term(field=14, type=Json, path=titi, type=Bool, true) Term(field=14, type=Json, path=titi, type=Str, "true"))"#,
@@ -1470,7 +2194,12 @@ mod test {
 
     #[test]
     fn test_json_field_not_indexed() {
+        println!("Test::test_json_field_not_indexed => Starting test");
         let error = parse_query_to_logical_ast("json_not_indexed.titi:hello", false).unwrap_err();
+        println!(
+            "Test::test_json_field_not_indexed => Received error: {}",
+            error
+        );
         assert!(matches!(error, QueryParserError::FieldNotIndexed(_)));
     }
 
@@ -1479,17 +2208,26 @@ mod test {
         expected: &str,
         default_conjunction: bool,
     ) {
+        println!(
+            "Test::test_query_to_logical_ast_with_default_json => Testing query: '{}'",
+            query
+        );
         let mut query_parser = make_query_parser_with_default_fields(&["json"]);
         if default_conjunction {
             query_parser.set_conjunction_by_default();
         }
         let ast = query_parser.parse_query_to_logical_ast(query).unwrap();
         let ast_str = format!("{ast:?}");
+        println!(
+            "Test::test_query_to_logical_ast_with_default_json => Expected: '{}', Got: '{}'",
+            expected, ast_str
+        );
         assert_eq!(ast_str, expected);
     }
 
     #[test]
     fn test_json_default() {
+        println!("Test::test_json_default => Starting test");
         test_query_to_logical_ast_with_default_json(
             "titi:4",
             "(Term(field=14, type=Json, path=titi, type=I64, 4) Term(field=14, type=Json, \
@@ -1500,6 +2238,7 @@ mod test {
 
     #[test]
     fn test_json_default_with_different_field() {
+        println!("Test::test_json_default_with_different_field => Starting test");
         for conjunction in [false, true] {
             test_query_to_logical_ast_with_default_json(
                 "text:4",
@@ -1511,6 +2250,7 @@ mod test {
 
     #[test]
     fn test_json_default_with_same_field() {
+        println!("Test::test_json_default_with_same_field => Starting test");
         for conjunction in [false, true] {
             test_query_to_logical_ast_with_default_json(
                 "json:4",
@@ -1522,6 +2262,7 @@ mod test {
 
     #[test]
     fn test_parse_bytes_phrase() {
+        println!("Test::test_parse_bytes_phrase => Starting test");
         test_parse_query_to_logical_ast_helper(
             "bytes:\"YnVidQ==\"",
             "Term(field=12, type=Bytes, [98, 117, 98, 117])",
@@ -1531,13 +2272,19 @@ mod test {
 
     #[test]
     fn test_parse_bytes_invalid_base64() {
+        println!("Test::test_parse_bytes_invalid_base64 => Starting test");
         let base64_err: QueryParserError =
             parse_query_to_logical_ast("bytes:aa", false).unwrap_err();
+        println!(
+            "Test::test_parse_bytes_invalid_base64 => Received error: {}",
+            base64_err
+        );
         assert!(matches!(base64_err, QueryParserError::ExpectedBase64(_)));
     }
 
     #[test]
     fn test_parse_query_to_ast_ab_c() {
+        println!("Test::test_parse_query_to_ast_ab_c => Starting test");
         test_parse_query_to_logical_ast_helper(
             "(+title:a +title:b) title:c",
             r#"((+Term(field=0, type=Str, "a") +Term(field=0, type=Str, "b")) Term(field=0, type=Str, "c"))"#,
@@ -1552,6 +2299,7 @@ mod test {
 
     #[test]
     pub fn test_parse_query_to_ast_single_term() {
+        println!("Test::test_parse_query_to_ast_single_term => Starting test");
         test_parse_query_to_logical_ast_helper(
             "title:toto",
             r#"Term(field=0, type=Str, "toto")"#,
@@ -1571,6 +2319,7 @@ mod test {
 
     #[test]
     fn test_single_negative_term() {
+        println!("Test::test_single_negative_term => Starting test");
         assert_matches!(
             parse_query_to_logical_ast("-title:toto", false),
             Err(QueryParserError::AllButQueryForbidden)
@@ -1579,6 +2328,7 @@ mod test {
 
     #[test]
     pub fn test_parse_query_to_ast_two_terms() {
+        println!("Test::test_parse_query_to_ast_two_terms => Starting test");
         test_parse_query_to_logical_ast_helper(
             "title:a b",
             r#"(Term(field=0, type=Str, "a") Term(field=0, type=Str, "b") Term(field=1, type=Str, "b"))"#,
@@ -1592,13 +2342,23 @@ mod test {
     }
     #[test]
     pub fn test_parse_query_all_query() {
+        println!("Test::test_parse_query_all_query => Starting test");
         let logical_ast = parse_query_to_logical_ast("*", false).unwrap();
+        println!(
+            "Test::test_parse_query_all_query => Parsed LogicalAst: {:?}",
+            logical_ast
+        );
         assert_eq!(format!("{logical_ast:?}"), "*");
     }
 
     #[test]
     pub fn test_parse_query_range_require_a_target_field() {
+        println!("Test::test_parse_query_range_require_a_target_field => Starting test");
         let query_parser_error = parse_query_to_logical_ast("[A TO B]", false).err().unwrap();
+        println!(
+            "Test::test_parse_query_range_require_a_target_field => Received error: {}",
+            query_parser_error
+        );
         assert_eq!(
             query_parser_error.to_string(),
             "Unsupported query: Range query need to target a specific field."
@@ -1607,6 +2367,7 @@ mod test {
 
     #[test]
     pub fn test_parse_query_to_ast_ranges() {
+        println!("Test::test_parse_query_to_ast_ranges => Starting test");
         test_parse_query_to_logical_ast_helper(
             "title:[a TO b]",
             r#"(Included(Term(field=0, type=Str, "a")) TO Included(Term(field=0, type=Str, "b")))"#,
@@ -1632,6 +2393,7 @@ mod test {
             r#"(Excluded(Term(field=2, type=I64, -5)) TO Excluded(Term(field=2, type=I64, 3)))"#,
             false,
         );
+
         test_parse_query_to_logical_ast_helper(
             "float:{-1.5 TO 1.5}",
             r#"(Excluded(Term(field=10, type=F64, -1.5)) TO Excluded(Term(field=10, type=F64, 1.5)))"#,
@@ -1646,6 +2408,7 @@ mod test {
 
     #[test]
     pub fn test_query_parser_field_does_not_exist() {
+        println!("Test::test_query_parser_field_does_not_exist => Starting test");
         let query_parser = make_query_parser();
         assert_eq!(
             query_parser
@@ -1657,6 +2420,7 @@ mod test {
 
     #[test]
     pub fn test_query_parser_field_not_indexed() {
+        println!("Test::test_query_parser_field_not_indexed => Starting test");
         let query_parser = make_query_parser();
         assert_matches!(
             query_parser.parse_query("notindexed_text:\"18446744073709551615\""),
@@ -1666,25 +2430,25 @@ mod test {
 
     #[test]
     pub fn test_unknown_tokenizer() {
+        println!("Test::test_unknown_tokenizer => Starting test");
         let mut schema_builder = Schema::builder();
-        let text_field_indexing = TextFieldIndexing::default()
-            .set_tokenizer("nonexistingtokenizer")
-            .set_index_option(IndexRecordOption::Basic);
-        let text_options = TextOptions::default().set_indexing_options(text_field_indexing);
-        let title = schema_builder.add_text_field("title", text_options);
+        schema_builder.add_text_field("a\\.b", STRING);
         let schema = schema_builder.build();
-        let default_fields = vec![title];
-        let tokenizer_manager = TokenizerManager::default();
-        let query_parser = QueryParser::new(schema, default_fields, tokenizer_manager);
-
-        assert_matches!(
-            query_parser.parse_query("title:\"happy tax payer\""),
-            Err(QueryParserError::UnknownTokenizer { .. })
+        let query_parser =
+            QueryParser::new(schema.clone(), Vec::new(), TokenizerManager::default());
+        let query = "a\\.b:hello";
+        println!("Test::test_unknown_tokenizer => Testing query: '{}'", query);
+        let result = query_parser.parse_query(query);
+        println!("Test::test_unknown_tokenizer => Parse result: {:?}", result);
+        assert_eq!(
+            format!("{:?}", result),
+            "Err(UnknownTokenizer { tokenizer: \"default\", field: \"a\\.b\" })"
         );
     }
 
     #[test]
     pub fn test_query_parser_no_positions() {
+        println!("Test::test_query_parser_no_positions => Starting test");
         let mut schema_builder = Schema::builder();
         let text_field_indexing = TextFieldIndexing::default()
             .set_tokenizer("customtokenizer")
@@ -1692,11 +2456,12 @@ mod test {
         let text_options = TextOptions::default().set_indexing_options(text_field_indexing);
         let title = schema_builder.add_text_field("title", text_options);
         let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
+        let index = Index::create_in_ram(schema.clone());
         index
             .tokenizers()
             .register("customtokenizer", SimpleTokenizer::default());
         let query_parser = QueryParser::for_index(&index, vec![title]);
+        println!("Test::test_query_parser_no_positions => Testing query: 'title:\"happy tax\"'");
         assert_eq!(
             query_parser.parse_query("title:\"happy tax\"").unwrap_err(),
             QueryParserError::FieldDoesNotHavePositionsIndexed("title".to_string())
@@ -1705,12 +2470,17 @@ mod test {
 
     #[test]
     pub fn test_query_parser_expected_int() {
+        println!("Test::test_query_parser_expected_int => Starting test");
         let query_parser = make_query_parser();
         assert_matches!(
             query_parser.parse_query("unsigned:18a"),
             Err(QueryParserError::ExpectedInt(_))
         );
         assert!(query_parser.parse_query("unsigned:\"18\"").is_ok());
+        assert_matches!(
+            query_parser.parse_query("unsigned:\"-2\""),
+            Err(QueryParserError::ExpectedInt(_))
+        );
         assert_matches!(
             query_parser.parse_query("signed:18b"),
             Err(QueryParserError::ExpectedInt(_))
@@ -1724,6 +2494,7 @@ mod test {
 
     #[test]
     pub fn test_query_parser_expected_bool() {
+        println!("Test::test_query_parser_expected_bool => Starting test");
         let query_parser = make_query_parser();
         assert_matches!(
             query_parser.parse_query("bool:brie"),
@@ -1735,6 +2506,7 @@ mod test {
 
     #[test]
     pub fn test_query_parser_expected_date() {
+        println!("Test::test_query_parser_expected_date => Starting test");
         let query_parser = make_query_parser();
         assert_matches!(
             query_parser.parse_query("date:18a"),
@@ -1754,19 +2526,27 @@ mod test {
 
     #[test]
     pub fn test_query_parser_expected_facet() {
+        println!("Test::test_query_parser_expected_facet => Starting test");
         let query_parser = make_query_parser();
         match query_parser.parse_query("facet:INVALID") {
-            Ok(_) => panic!("should never succeed"),
-            Err(e) => assert_eq!(
-                "The facet field is malformed: Failed to parse the facet string: 'INVALID'",
-                format!("{e}")
-            ),
+            Ok(_) => panic!("Test::test_query_parser_expected_facet => Should never succeed"),
+            Err(e) => {
+                println!(
+                    "Test::test_query_parser_expected_facet => Received error: {}",
+                    e
+                );
+                assert_eq!(
+                    "The facet field is malformed: Failed to parse the facet string: 'INVALID'",
+                    format!("{e}")
+                );
+            }
         }
         assert!(query_parser.parse_query("facet:\"/foo/bar\"").is_ok());
     }
 
     #[test]
     pub fn test_query_parser_not_empty_but_no_tokens() {
+        println!("Test::test_query_parser_not_empty_but_no_tokens => Starting test");
         let query_parser = make_query_parser();
         assert!(query_parser.parse_query(" !, ").is_ok());
         assert!(query_parser.parse_query("with_stop_words:the").is_ok());
@@ -1774,6 +2554,7 @@ mod test {
 
     #[test]
     pub fn test_parse_query_single_negative_term_through_error() {
+        println!("Test::test_parse_query_single_negative_term_through_error => Starting test");
         assert_matches!(
             parse_query_to_logical_ast("-title:toto", true),
             Err(QueryParserError::AllButQueryForbidden)
@@ -1786,6 +2567,7 @@ mod test {
 
     #[test]
     pub fn test_parse_query_to_ast_conjunction() {
+        println!("Test::test_parse_query_to_ast_conjunction => Starting test");
         test_parse_query_to_logical_ast_helper(
             "title:toto",
             r#"Term(field=0, type=Str, "toto")"#,
@@ -1815,6 +2597,7 @@ mod test {
 
     #[test]
     pub fn test_parse_query_negative() {
+        println!("Test::test_parse_query_negative => Starting test");
         test_parse_query_to_logical_ast_helper(
             "title:b -title:a",
             r#"(+Term(field=0, type=Str, "b") -Term(field=0, type=Str, "a"))"#,
@@ -1830,6 +2613,7 @@ mod test {
 
     #[test]
     pub fn test_query_parser_hyphen() {
+        println!("Test::test_query_parser_hyphen => Starting test");
         test_parse_query_to_logical_ast_helper(
             "title:www-form-encoded",
             r#""[(0, Term(field=0, type=Str, "www")), (1, Term(field=0, type=Str, "form")), (2, Term(field=0, type=Str, "encoded"))]""#,
@@ -1839,6 +2623,7 @@ mod test {
 
     #[test]
     fn test_and_default_regardless_of_default_conjunctive() {
+        println!("Test::test_and_default_regardless_of_default_conjunctive => Starting test");
         for &default_conjunction in &[false, true] {
             test_parse_query_to_logical_ast_helper(
                 "title:a AND title:b",
@@ -1850,6 +2635,7 @@ mod test {
 
     #[test]
     fn test_or_default_conjunctive() {
+        println!("Test::test_or_default_conjunctive => Starting test");
         for &default_conjunction in &[false, true] {
             test_parse_query_to_logical_ast_helper(
                 "title:a OR title:b",
@@ -1861,19 +2647,28 @@ mod test {
 
     #[test]
     fn test_escaped_field() {
+        println!("Test::test_escaped_field => Starting test");
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field(r"a\.b", STRING);
         let schema = schema_builder.build();
-        let query_parser = QueryParser::new(schema, Vec::new(), TokenizerManager::default());
-        let query = query_parser.parse_query(r"a\.b:hello").unwrap();
+        let query_parser =
+            QueryParser::new(schema.clone(), Vec::new(), TokenizerManager::default());
+        let query = "a\\.b:hello";
+        println!("Test::test_escaped_field => Testing query: '{}'", query);
+        let query_result = query_parser.parse_query(query).unwrap();
+        println!(
+            "Test::test_escaped_field => Parsed query: {:?}",
+            query_result
+        );
         assert_eq!(
-            format!("{query:?}"),
+            format!("{query_result:?}"),
             "TermQuery(Term(field=0, type=Str, \"hello\"))"
         );
     }
 
     #[test]
     fn test_split_full_path() {
+        println!("Test::test_split_full_path => Starting test");
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("second", STRING);
         schema_builder.add_text_field("first", STRING);
@@ -1907,6 +2702,7 @@ mod test {
 
     #[test]
     pub fn test_phrase_slop() {
+        println!("Test::test_phrase_slop => Starting test");
         test_parse_query_to_logical_ast_helper(
             "\"a b\"~0",
             r#"("[(0, Term(field=0, type=Str, "a")), (1, Term(field=0, type=Str, "b"))]" "[(0, Term(field=1, type=Str, "a")), (1, Term(field=1, type=Str, "b"))]")"#,
@@ -1926,6 +2722,7 @@ mod test {
 
     #[test]
     pub fn test_phrase_prefix() {
+        println!("Test::test_phrase_prefix => Starting test");
         test_parse_query_to_logical_ast_helper(
             "\"big bad wo\"*",
             r#"("[(0, Term(field=0, type=Str, "big")), (1, Term(field=0, type=Str, "bad")), (2, Term(field=0, type=Str, "wo"))]"* "[(0, Term(field=1, type=Str, "big")), (1, Term(field=1, type=Str, "bad")), (2, Term(field=1, type=Str, "wo"))]"*)"#,
@@ -1934,6 +2731,7 @@ mod test {
 
         let query_parser = make_query_parser();
         let query = query_parser.parse_query("\"big bad wo\"*").unwrap();
+        println!("Test::test_phrase_prefix => Parsed query: {:?}", query);
         assert_eq!(
             format!("{query:?}"),
             "BooleanQuery { subqueries: [(Should, PhrasePrefixQuery { field: Field(0), \
@@ -1948,7 +2746,12 @@ mod test {
 
     #[test]
     pub fn test_phrase_prefix_too_short() {
+        println!("Test::test_phrase_prefix_too_short => Starting test");
         let err = parse_query_to_logical_ast("\"wo\"*", true).unwrap_err();
+        println!(
+            "Test::test_phrase_prefix_too_short => Received error: {}",
+            err
+        );
         assert_eq!(
             err,
             QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
@@ -1958,6 +2761,10 @@ mod test {
         );
 
         let err = parse_query_to_logical_ast("\"\"*", true).unwrap_err();
+        println!(
+            "Test::test_phrase_prefix_too_short => Received error: {}",
+            err
+        );
         assert_eq!(
             err,
             QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
@@ -1969,6 +2776,7 @@ mod test {
 
     #[test]
     pub fn test_term_set_query() {
+        println!("Test::test_term_set_query => Starting test");
         test_parse_query_to_logical_ast_helper(
             "title: IN [a b cd]",
             r#"IN [Term(field=0, type=Str, "a"), Term(field=0, type=Str, "b"), Term(field=0, type=Str, "cd")]"#,
@@ -1994,6 +2802,7 @@ mod test {
 
     #[test]
     pub fn test_set_field_fuzzy() {
+        println!("Test::test_set_field_fuzzy => Starting test");
         {
             let mut query_parser = make_query_parser();
             query_parser.set_field_fuzzy(
@@ -2003,6 +2812,10 @@ mod test {
                 true,
             );
             let query = query_parser.parse_query("abc").unwrap();
+            println!(
+                "Test::test_set_field_fuzzy => Parsed query with fuzzy on 'title': {:?}",
+                query
+            );
             assert_eq!(
                 format!("{query:?}"),
                 "BooleanQuery { subqueries: [(Should, FuzzyTermQuery { term: Term(field=0, \
@@ -2021,6 +2834,10 @@ mod test {
                 false,
             );
             let query = query_parser.parse_query("abc").unwrap();
+            println!(
+                "Test::test_set_field_fuzzy => Parsed query with fuzzy on 'text': {:?}",
+                query
+            );
             assert_eq!(
                 format!("{query:?}"),
                 "BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \
@@ -2033,6 +2850,7 @@ mod test {
 
     #[test]
     fn test_query_parser_nested_errors() {
+        println!("Test::test_query_parser_nested_errors => Starting test");
         let mut schema_builder = Schema::builder();
         let nested_opts = NestedOptions::new().set_include_in_parent(true);
         let nested_field = schema_builder.add_nested_field(vec!["nested".into()], nested_opts);
@@ -2040,27 +2858,40 @@ mod test {
 
         let index = Index::create_in_ram(schema.clone());
         let query_parser = QueryParser::for_index(&index, vec![]);
-
-        println!("\nTesting range query on nested field...");
+        println!("Test::test_query_parser_nested_errors => Testing range query on nested field");
         // range query on nested => error
         let range_res = query_parser.parse_query("nested:[a TO z]");
-        println!("Expecting range query error for nested field");
+        println!(
+            "Test::test_query_parser_nested_errors => Expecting range query error for nested field"
+        );
         match range_res {
             Err(crate::query::QueryParserError::UnsupportedQuery(msg)) => {
+                println!(
+                    "Test::test_query_parser_nested_errors => Received UnsupportedQuery error: {}",
+                    msg
+                );
                 assert!(msg.contains("Range query on a nested field is not supported"));
             }
-            other => panic!("Expected an UnsupportedQuery error, got {:?}", other),
+            other => panic!("Test::test_query_parser_nested_errors => Expected an UnsupportedQuery error, got {:?}", other),
         }
 
-        println!("\nTesting direct text search on nested field...");
+        println!(
+            "Test::test_query_parser_nested_errors => Testing direct text search on nested field"
+        );
         // direct text on nested => error
         let text_res = query_parser.parse_query("nested:hello");
-        println!("Expecting direct text search error for nested field");
+        println!(
+            "Test::test_query_parser_nested_errors => Expecting direct text search error for nested field"
+        );
         match text_res {
             Err(crate::query::QueryParserError::UnsupportedQuery(msg)) => {
+                println!(
+                    "Test::test_query_parser_nested_errors => Received UnsupportedQuery error: {}",
+                    msg
+                );
                 assert!(msg.contains("Cannot run direct text search on a `nested` field"));
             }
-            other => panic!("Expected an UnsupportedQuery error, got {:?}", other),
+            other => panic!("Test::test_query_parser_nested_errors => Expected an UnsupportedQuery error, got {:?}", other),
         }
     }
 }

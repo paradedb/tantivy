@@ -137,7 +137,7 @@ pub fn parse_json_for_nested_sorted(
 /// we keep treating all sub-keys/arrays as belonging to that same field. If we’re
 /// not in a nested context, we check if `path_stack` matches a nested field. Otherwise, we do fallback.
 ///
-/// `depth` tracks how deep we are in the hierarchy, so only `depth=0` doc becomes `_is_parent_...=true`.
+/// `depth` tracks how deep we are in the hierarchy, so we can see which doc is parent for sub-nesting.
 fn parse_value(
     schema: &Schema,
     path_stack: &mut Vec<String>,
@@ -153,27 +153,19 @@ fn parse_value(
         path_stack, current_nested_field
     );
 
-    let nested_field = match current_nested_field {
-        Some(f) => {
-            println!("parse_value: Continuing with existing nested_field {:?}", f);
-            Some(f)
-        }
-        None => {
-            // see if the path_stack is recognized as nested in the schema
-            if let Some((field, _fentry)) = schema.get_nested_field(path_stack) {
-                println!(
-                    "parse_value: Found nested_field {:?} for path_stack={:?}",
-                    field, path_stack
-                );
-                Some(field)
-            } else {
-                println!(
-                    "parse_value: No nested_field found for path_stack={:?}",
-                    path_stack
-                );
-                None
-            }
-        }
+    // see if the path_stack is recognized as nested in the schema
+    let nested_field = if let Some((field, _fentry)) = schema.get_nested_field(path_stack) {
+        println!(
+            "parse_value: Found nested_field {:?} for path_stack={:?}",
+            field, path_stack
+        );
+        Some(field)
+    } else {
+        println!(
+            "parse_value: No nested_field found for path_stack={:?}, current_nested_field={:?}",
+            path_stack, current_nested_field
+        );
+        current_nested_field
     };
 
     // If there's still no recognized nested field => fallback
@@ -248,7 +240,8 @@ fn parse_value(
 /// Expand a nested field. If it’s an array => multiple child docs; if a single object => one child doc.
 /// If it’s a scalar => store in the parent if `include_in_parent`.
 ///
-/// We add `depth` so we only set `_is_parent_XXX = true` at `depth == 0`.
+/// We fix the parent-flag logic: we only set `_is_parent_... = true` if `store_parent_flag` is `true` **and**
+/// the current JSON `val` is an **object or array** (meaning we have sub-docs).
 fn expand_nested_value(
     schema: &Schema,
     path_stack: &mut Vec<String>,
@@ -267,12 +260,13 @@ fn expand_nested_value(
         nested_field, include_in_parent, store_parent_flag, gather_tokens, depth
     );
 
-    // Only set the parent flag if `store_parent_flag` is true AND depth==0
-    if store_parent_flag && depth == 0 {
+    // Only set the parent flag if store_parent_flag == true *and* we see sub-doc structures
+    // (i.e. val is an object or array). If the user’s doc is just a scalar, it’s not a “parent”.
+    if store_parent_flag && (val.is_object() || val.is_array()) {
         let parent_flag_name = format!("_is_parent_{}", schema.get_field_name(nested_field));
         println!(
-            "expand_nested_value: Setting parent flag field '{}' to true (depth=0)",
-            parent_flag_name
+            "expand_nested_value: Setting parent flag field '{}' to true (depth={})",
+            parent_flag_name, depth
         );
         if let Ok(flag_field) = schema.get_field(&parent_flag_name) {
             parent_doc.add_field_value(flag_field, &OwnedValue::from(true));
@@ -288,8 +282,8 @@ fn expand_nested_value(
         }
     } else if store_parent_flag {
         println!(
-            "expand_nested_value: store_parent_flag is true but depth={} != 0; skipping setting parent flag.",
-            depth
+            "expand_nested_value: store_parent_flag={} but 'val' is scalar or empty => not setting parent flag (depth={})",
+            store_parent_flag, depth
         );
     }
 
@@ -359,8 +353,7 @@ fn expand_nested_value(
     Ok(())
 }
 
-/// Expand a single item (object or scalar) as one child doc (or store in parent).
-/// We pass `depth` along. Child docs become `depth+1`.
+/// Expand a single item (object or scalar) as one child doc (or store in parent if `include_in_parent==true`).
 fn expand_single_nested_item(
     schema: &Schema,
     path_stack: &mut Vec<String>,
@@ -423,7 +416,7 @@ fn expand_single_nested_item(
             );
         }
 
-        // parse sub-keys inside that child doc, still referencing the same nested_field,
+        // parse sub-keys inside that child doc, referencing the same nested_field
         // but now at depth+1
         println!(
             "expand_single_nested_item: Recursively parsing sub-keys for child_doc of field {:?} at depth={}",
@@ -518,10 +511,7 @@ fn gather_all_strings(val: &SerdeValue, out: &mut Vec<String>) {
                 arr.len()
             );
             for (i, item) in arr.iter().enumerate() {
-                println!(
-                    "gather_all_strings: Processing array element {}: {:?}",
-                    i, item
-                );
+                println!("gather_all_strings: Processing array element 0: {:?}", item);
                 gather_all_strings(item, out);
             }
         }
@@ -543,9 +533,9 @@ fn gather_all_strings(val: &SerdeValue, out: &mut Vec<String>) {
 
 /// Fallback for sub-values not recognized as nested:
 fn store_in_fallback(
-    schema: &Schema,
-    val: &SerdeValue,
-    parent_doc: &mut TantivyDocument,
+    _schema: &Schema,
+    _val: &SerdeValue,
+    _parent_doc: &mut TantivyDocument,
 ) -> Result<(), DocParsingError> {
     println!("store_in_fallback: Attempting to store value in fallback");
     // In this test, no fallback field is defined => skip
@@ -613,8 +603,8 @@ fn convert_serde_to_owned(val: &SerdeValue) -> OwnedValue {
             OwnedValue::Array(converted)
         }
         SerdeValue::Object(obj) => OwnedValue::Object(
-            obj.into_iter()
-                .map(|v| (v.0.into(), OwnedValue::from(v.1.clone())))
+            obj.iter()
+                .map(|(kk, vv)| (kk.clone(), convert_serde_to_owned(vv)))
                 .collect(),
         ),
     }

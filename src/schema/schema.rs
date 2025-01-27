@@ -1,4 +1,3 @@
-// src/schema/schema.rs
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -59,9 +58,19 @@ impl SchemaBuilder {
         field_name_str: &str,
         field_options: T,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_u64_field => Adding u64 field '{}'",
+            field_name_str
+        );
         let field_name = String::from(field_name_str);
-        let field_entry = FieldEntry::new_u64(field_name, field_options.into());
-        self.add_field(field_entry)
+        let field_entry = FieldEntry::new_u64(field_name.clone(), field_options.into());
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_u64_field => Added u64 field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a new i64 field.
@@ -75,9 +84,19 @@ impl SchemaBuilder {
         field_name_str: &str,
         field_options: T,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_i64_field => Adding i64 field '{}'",
+            field_name_str
+        );
         let field_name = String::from(field_name_str);
-        let field_entry = FieldEntry::new_i64(field_name, field_options.into());
-        self.add_field(field_entry)
+        let field_entry = FieldEntry::new_i64(field_name.clone(), field_options.into());
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_i64_field => Added i64 field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a new f64 field.
@@ -91,9 +110,19 @@ impl SchemaBuilder {
         field_name_str: &str,
         field_options: T,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_f64_field => Adding f64 field '{}'",
+            field_name_str
+        );
         let field_name = String::from(field_name_str);
-        let field_entry = FieldEntry::new_f64(field_name, field_options.into());
-        self.add_field(field_entry)
+        let field_entry = FieldEntry::new_f64(field_name.clone(), field_options.into());
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_f64_field => Added f64 field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a new bool field.
@@ -107,9 +136,19 @@ impl SchemaBuilder {
         field_name_str: &str,
         field_options: T,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_bool_field => Adding bool field '{}'",
+            field_name_str
+        );
         let field_name = String::from(field_name_str);
-        let field_entry = FieldEntry::new_bool(field_name, field_options.into());
-        self.add_field(field_entry)
+        let field_entry = FieldEntry::new_bool(field_name.clone(), field_options.into());
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_bool_field => Added bool field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a new date field.
@@ -125,9 +164,19 @@ impl SchemaBuilder {
         field_name_str: &str,
         field_options: T,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_date_field => Adding date field '{}'",
+            field_name_str
+        );
         let field_name = String::from(field_name_str);
-        let field_entry = FieldEntry::new_date(field_name, field_options.into());
-        self.add_field(field_entry)
+        let field_entry = FieldEntry::new_date(field_name.clone(), field_options.into());
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_date_field => Added date field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a ip field.
@@ -141,9 +190,19 @@ impl SchemaBuilder {
         field_name_str: &str,
         field_options: T,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_ip_addr_field => Adding IP address field '{}'",
+            field_name_str
+        );
         let field_name = String::from(field_name_str);
-        let field_entry = FieldEntry::new_ip_addr(field_name, field_options.into());
-        self.add_field(field_entry)
+        let field_entry = FieldEntry::new_ip_addr(field_name.clone(), field_options.into());
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_ip_addr_field => Added IP address field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a new text field.
@@ -157,9 +216,19 @@ impl SchemaBuilder {
         field_name_str: &str,
         field_options: T,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_text_field => Adding text field '{}'",
+            field_name_str
+        );
         let field_name = String::from(field_name_str);
-        let field_entry = FieldEntry::new_text(field_name, field_options.into());
-        self.add_field(field_entry)
+        let field_entry = FieldEntry::new_text(field_name.clone(), field_options.into());
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_text_field => Added text field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a facet field to the schema.
@@ -168,8 +237,18 @@ impl SchemaBuilder {
         field_name: &str,
         facet_options: impl Into<FacetOptions>,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_facet_field => Adding facet field '{}'",
+            field_name
+        );
         let field_entry = FieldEntry::new_facet(field_name.to_string(), facet_options.into());
-        self.add_field(field_entry)
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_facet_field => Added facet field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a fast bytes field to the schema.
@@ -187,8 +266,18 @@ impl SchemaBuilder {
         field_name: &str,
         field_options: T,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_bytes_field => Adding bytes field '{}'",
+            field_name
+        );
         let field_entry = FieldEntry::new_bytes(field_name.to_string(), field_options.into());
-        self.add_field(field_entry)
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_bytes_field => Added bytes field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a json object field to the schema.
@@ -197,8 +286,18 @@ impl SchemaBuilder {
         field_name: &str,
         field_options: T,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_json_field => Adding JSON object field '{}'",
+            field_name
+        );
         let field_entry = FieldEntry::new_json(field_name.to_string(), field_options.into());
-        self.add_field(field_entry)
+        let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_json_field => Added JSON object field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
+        field
     }
 
     /// Adds a new nested field to the schema, with the given name and NestedOptions.
@@ -209,30 +308,51 @@ impl SchemaBuilder {
         field_path: Vec<String>,
         nested_opts: NestedOptions,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_nested_field => Adding nested field with path '{:?}' and options {:?}",
+            field_path, nested_opts
+        );
         let mut field_name_builder = JsonPathWriter::new();
         for seg in &field_path {
             field_name_builder.push(&seg);
         }
         let field_name = field_name_builder.as_str();
         println!(
-            "Adding nested field '{}' with options: {:?}",
-            field_name, nested_opts
+            "SchemaBuilder::add_nested_field => Constructed field name '{}'",
+            field_name
         );
         let field_entry = FieldEntry::new_nested(field_name.to_string(), nested_opts.clone());
         let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_nested_field => Added nested field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
 
         if nested_opts.store_parent_flag {
             let parent_field_name = format!("_is_parent_{}", field_name);
-            println!("Creating parent flag field '{}'", parent_field_name);
+            println!(
+                "SchemaBuilder::add_nested_field => Creating parent flag field '{}'",
+                parent_field_name
+            );
 
             // We'll store it as an indexed bool, for the parent doc
             let bool_options = NumericOptions::default().set_indexed();
             let bool_field_entry =
                 FieldEntry::new(parent_field_name.clone(), FieldType::Bool(bool_options));
             let parent_field = self.add_field(bool_field_entry);
+            println!(
+                "SchemaBuilder::add_nested_field => Added parent flag field '{}' with ID {}",
+                parent_field_name,
+                parent_field.field_id()
+            );
 
             // Record the mapping in nested_paths
             self.nested_paths.insert(field_path, field);
+            println!(
+                "SchemaBuilder::add_nested_field => Recorded nested path mapping for field '{}'",
+                field_name
+            );
         }
 
         field
@@ -241,39 +361,59 @@ impl SchemaBuilder {
     /// Adds a single "nested" field that also stores a JSON object in the same field,
     /// flattening all subkeys into text tokens via `TextOptions`.
     /// The `NestedOptions` control how child docs are expanded (include_in_parent, etc.).
-    /// If `NestedOptions::stor_parent_flag == true`, we create an internal boolean field
+    /// If `NestedOptions::store_parent_flag == true`, we create an internal boolean field
     /// named `"_is_parent_<field_name>"` to mark parent docs.
     pub fn add_nested_json_field(
         &mut self,
         field_path: Vec<String>,
         nested_opts: NestedJsonObjectOptions,
     ) -> Field {
+        println!(
+            "SchemaBuilder::add_nested_json_field => Adding nested JSON field with path '{:?}' and options {:?}",
+            field_path, nested_opts
+        );
         let mut field_name_builder = JsonPathWriter::new();
         for seg in &field_path {
             field_name_builder.push(&seg);
         }
         let field_name = field_name_builder.as_str();
         println!(
-            "Adding nested field '{}' with options: {:?}",
-            field_name, nested_opts
+            "SchemaBuilder::add_nested_json_field => Constructed field name '{}'",
+            field_name
         );
-        // 1) Create a FieldEntry with the new FieldType::NestedJson variant
         let field_entry = FieldEntry::new_nested_json(field_name.to_string(), nested_opts.clone());
-
-        // 2) Add that field to our schema
         let field = self.add_field(field_entry);
+        println!(
+            "SchemaBuilder::add_nested_json_field => Added nested JSON field '{}' with ID {}",
+            field_name,
+            field.field_id()
+        );
 
-        // 3) If `store_parent_flag` is set, also create a parent-flag field
+        // If `store_parent_flag` is set, also create a parent-flag field
         if nested_opts.nested_opts.store_parent_flag {
             let parent_field_name = format!("_is_parent_{}", field_name);
+            println!(
+                "SchemaBuilder::add_nested_json_field => Creating parent flag field '{}'",
+                parent_field_name
+            );
+
             // We'll store this flag as an indexed bool so we can find parent docs easily.
             let bool_options = NumericOptions::default().set_indexed();
             let bool_field_entry =
                 FieldEntry::new(parent_field_name.clone(), FieldType::Bool(bool_options));
-            self.add_field(bool_field_entry);
+            let parent_field = self.add_field(bool_field_entry);
+            println!(
+                "SchemaBuilder::add_nested_json_field => Added parent flag field '{}' with ID {}",
+                parent_field_name,
+                parent_field.field_id()
+            );
 
             // Also record the mapping in `nested_paths` so queries can look it up
             self.nested_paths.insert(field_path, field);
+            println!(
+                "SchemaBuilder::add_nested_json_field => Recorded nested path mapping for field '{}'",
+                field_name
+            );
         }
 
         field
@@ -282,20 +422,25 @@ impl SchemaBuilder {
     /// Adds a field entry to the schema in build.
     pub fn add_field(&mut self, field_entry: FieldEntry) -> Field {
         println!(
-            "Adding field '{}' of type {:?}",
-            field_entry.name(),
-            field_entry.field_type()
+            "SchemaBuilder::add_field => Adding field '{}'",
+            field_entry.name()
         );
         let field = Field::from_field_id(self.fields.len() as u32);
-        println!("Assigned field ID: {}", field.field_id());
+        println!(
+            "SchemaBuilder::add_field => Assigned field ID: {}",
+            field.field_id()
+        );
 
         let field_name = field_entry.name().to_string();
         if let Some(_previous_value) = self.fields_map.insert(field_name.clone(), field) {
-            panic!("Field already exists in schema {}", field_entry.name());
+            panic!(
+                "SchemaBuilder::add_field => Field '{}' already exists in schema",
+                field_name
+            );
         };
         self.fields.push(field_entry);
         println!(
-            "Successfully added field '{}' with ID {}",
+            "SchemaBuilder::add_field => Successfully added field '{}' with ID {}",
             field_name,
             field.field_id()
         );
@@ -305,13 +450,20 @@ impl SchemaBuilder {
     /// Finalize the creation of a `Schema`
     /// This will consume your `SchemaBuilder`
     pub fn build(self) -> Schema {
-        Schema(Arc::new(InnerSchema {
+        println!(
+            "SchemaBuilder::build => Finalizing schema with {} fields",
+            self.fields.len()
+        );
+        let built_schema = Schema(Arc::new(InnerSchema {
             fields: self.fields,
             fields_map: self.fields_map,
             nested_paths: self.nested_paths, // <==== store it
-        }))
+        }));
+        println!("SchemaBuilder::build => Schema finalized successfully");
+        built_schema
     }
 }
+
 #[derive(Debug)]
 struct InnerSchema {
     fields: Vec<FieldEntry>,
@@ -354,23 +506,45 @@ pub struct Schema(Arc<InnerSchema>);
 // This function operates directly on bytes (as opposed to codepoint), relying
 // on a encoding property of utf-8 for its correctness.
 fn locate_splitting_dots(field_path: &str) -> Vec<usize> {
+    println!(
+        "locate_splitting_dots => Locating splitting dots in field_path '{}'",
+        field_path
+    );
     let mut splitting_dots_pos = Vec::new();
     let mut escape_state = false;
     for (pos, b) in field_path.bytes().enumerate() {
         if escape_state {
+            println!(
+                "locate_splitting_dots => Escaped character '{}' at position {}",
+                b as char, pos
+            );
             escape_state = false;
             continue;
         }
         match b {
             b'\\' => {
+                println!(
+                    "locate_splitting_dots => Found escape character '\\' at position {}",
+                    pos
+                );
                 escape_state = true;
             }
             b'.' => {
+                println!(
+                    "locate_splitting_dots => Found splitting dot '.' at position {}",
+                    pos
+                );
                 splitting_dots_pos.push(pos);
             }
-            _ => {}
+            _ => {
+                // No action needed
+            }
         }
     }
+    println!(
+        "locate_splitting_dots => Splitting dots found at positions: {:?}",
+        splitting_dots_pos
+    );
     splitting_dots_pos
 }
 
@@ -402,12 +576,13 @@ impl Schema {
 
     /// Creates a new builder.
     pub fn builder() -> SchemaBuilder {
+        println!("Schema::builder => Creating new SchemaBuilder");
         SchemaBuilder::default()
     }
 
     /// Returns the field option associated with a given name.
     pub fn get_field(&self, field_name: &str) -> crate::Result<Field> {
-        println!("Looking up field '{}'", field_name);
+        println!("Schema::get_field => Looking up field '{}'", field_name);
         let result = self
             .0
             .fields_map
@@ -416,13 +591,21 @@ impl Schema {
             .ok_or_else(|| TantivyError::FieldNotFound(field_name.to_string()));
 
         match &result {
-            Ok(field) => println!("Found field '{}' with ID {}", field_name, field.field_id()),
-            Err(_) => println!("Field '{}' not found in schema", field_name),
+            Ok(field) => println!(
+                "Schema::get_field => Found field '{}' with ID {}",
+                field_name,
+                field.field_id()
+            ),
+            Err(_) => println!("Schema::get_field => Field '{}' not found", field_name),
         }
         result
     }
 
     pub fn get_nested_field(&self, path: &Vec<String>) -> Option<(Field, FieldEntry)> {
+        println!(
+            "Schema::get_nested_field => Looking up nested field with path '{:?}'",
+            path
+        );
         let path_vec: Vec<String> = path.iter().map(|s| s.clone()).collect();
         self.0
             .nested_paths
@@ -439,23 +622,54 @@ impl Schema {
     /// This does not check if field is a JSON field. It is possible for this functions to
     /// return a non-empty JSON path with a non-JSON field.
     pub fn find_field<'a>(&self, full_path: &'a str) -> Option<(Field, &'a str)> {
+        println!(
+            "Schema::find_field => Searching for full_path '{}'",
+            full_path
+        );
         if let Some(field) = self.0.fields_map.get(full_path) {
+            println!(
+                "Schema::find_field => Exact match found for '{}', returning field ID {} with empty JSON path",
+                full_path,
+                field.field_id()
+            );
             return Some((*field, ""));
         }
 
         let mut splitting_period_pos: Vec<usize> = locate_splitting_dots(full_path);
+        println!(
+            "Schema::find_field => Initial splitting dots positions: {:?}",
+            splitting_period_pos
+        );
+
         while let Some(pos) = splitting_period_pos.pop() {
+            println!("Schema::find_field => Processing split at position {}", pos);
             let (prefix, suffix) = full_path.split_at(pos);
 
             if let Some(field) = self.0.fields_map.get(prefix) {
+                println!(
+                    "Schema::find_field => Found field '{:?}' matching prefix '{}', JSON path '{}'",
+                    field,
+                    prefix,
+                    &suffix[1..]
+                );
                 return Some((*field, &suffix[1..]));
             }
             // JSON path may contain a dot, for now we try both variants to find the field.
-            let prefix = split_json_path(prefix).join(".");
-            if let Some(field) = self.0.fields_map.get(&prefix) {
+            let prefix_split = split_json_path(prefix).join(".");
+            if let Some(field) = self.0.fields_map.get(&prefix_split) {
+                println!(
+                    "Schema::find_field => Found field '{:?}' matching split prefix '{}', JSON path '{}'",
+                    field,
+                    prefix_split,
+                    &suffix[1..]
+                );
                 return Some((*field, &suffix[1..]));
             }
         }
+        println!(
+            "Schema::find_field => No matching field found for full_path '{}'",
+            full_path
+        );
         None
     }
 
@@ -473,14 +687,33 @@ impl Schema {
 
         default_field_opt: Option<Field>,
     ) -> Option<(Field, &'a str)> {
+        println!(
+            "Schema::find_field_with_default => Searching with full_path '{}' and default_field_opt {:?}",
+            full_path, default_field_opt
+        );
         let (field, json_path) = self
             .find_field(full_path)
             .or(default_field_opt.map(|field| (field, full_path)))?;
         let field_entry = self.get_field_entry(field);
         let is_json = field_entry.field_type().value_type() == Type::Json;
+        println!(
+            "Schema::find_field_with_default => Field '{}' is_json: {}",
+            field_entry.name(),
+            is_json
+        );
         if !is_json && !json_path.is_empty() {
+            println!(
+                "Schema::find_field_with_default => Non-JSON field '{}' has non-empty JSON path '{}', returning None",
+                field_entry.name(),
+                json_path
+            );
             return None;
         }
+        println!(
+            "Schema::find_field_with_default => Returning field '{}' with JSON path '{}'",
+            field_entry.name(),
+            json_path
+        );
         Some((field, json_path))
     }
 }
@@ -490,18 +723,21 @@ impl Serialize for Schema {
     where
         S: Serializer,
     {
-        println!("Serializing schema with {} fields", self.0.fields.len());
+        println!(
+            "Schema::serialize => Serializing schema with {} fields",
+            self.0.fields.len()
+        );
         let mut seq = serializer.serialize_seq(Some(self.0.fields.len()))?;
         for (i, e) in self.0.fields.iter().enumerate() {
             println!(
-                "Serializing field {}: {} ({:?})",
+                "Schema::serialize => Serializing field {}: {} ({:?})",
                 i,
                 e.name(),
                 e.field_type()
             );
             seq.serialize_element(e)?;
         }
-        println!("Schema serialization complete");
+        println!("Schema::serialize => Serialization complete");
         seq.end()
     }
 }
@@ -511,6 +747,7 @@ impl<'de> Deserialize<'de> for Schema {
     where
         D: Deserializer<'de>,
     {
+        println!("Schema::deserialize => Starting deserialization");
         struct SchemaVisitor;
 
         impl<'de> Visitor<'de> for SchemaVisitor {
@@ -524,640 +761,42 @@ impl<'de> Deserialize<'de> for Schema {
             where
                 A: SeqAccess<'de>,
             {
+                println!("SchemaVisitor::visit_seq => Visiting sequence of fields");
                 // Pre-size our vectors/maps based on the size hint if available
                 let capacity = seq.size_hint().unwrap_or(0);
+                println!(
+                    "SchemaVisitor::visit_seq => Sequence size hint: {}",
+                    capacity
+                );
 
                 // Build a temporary SchemaBuilder
                 let mut schema_builder = SchemaBuilder {
                     fields: Vec::with_capacity(capacity),
                     fields_map: HashMap::with_capacity(capacity),
-                    // If you also store nested_paths in JSON, you'd parse it differently
-                    // but for now we assume it's not in the same seq.
                     nested_paths: HashMap::new(),
                 };
+                println!("SchemaVisitor::visit_seq => Initialized SchemaBuilder");
 
                 // Read each FieldEntry from the sequence
                 while let Some(field_entry) = seq.next_element::<FieldEntry>()? {
-                    schema_builder.add_field(field_entry);
+                    println!(
+                        "SchemaVisitor::visit_seq => Adding FieldEntry '{}' of type {:?}",
+                        field_entry.name(),
+                        field_entry.field_type()
+                    );
+                    schema_builder.add_field(field_entry.clone());
                 }
 
                 // Finally, build the actual Schema
+                println!("SchemaVisitor::visit_seq => Finalizing Schema");
                 Ok(schema_builder.build())
             }
         }
 
         // We delegate to our `SchemaVisitor` to parse a sequence of FieldEntry
-        deserializer.deserialize_seq(SchemaVisitor)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use std::collections::BTreeMap;
-
-    use matches::{assert_matches, matches};
-    use pretty_assertions::assert_eq;
-
-    use crate::schema::field_type::ValueParsingError;
-    use crate::schema::schema::DocParsingError::InvalidJson;
-    use crate::schema::*;
-
-    #[test]
-    fn test_locate_splitting_dots() {
-        assert_eq!(&super::locate_splitting_dots("a.b.c"), &[1, 3]);
-        assert_eq!(&super::locate_splitting_dots(r"a\.b.c"), &[4]);
-        assert_eq!(&super::locate_splitting_dots(r"a\..b.c"), &[3, 5]);
-    }
-
-    #[test]
-    pub fn is_indexed_test() {
-        let mut schema_builder = Schema::builder();
-        let field_str = schema_builder.add_text_field("field_str", STRING);
-        let schema = schema_builder.build();
-        assert!(schema.get_field_entry(field_str).is_indexed());
-    }
-
-    #[test]
-    pub fn test_schema_serialization() {
-        let mut schema_builder = Schema::builder();
-        let count_options = NumericOptions::default().set_stored().set_fast();
-        let popularity_options = NumericOptions::default().set_stored().set_fast();
-        let score_options = NumericOptions::default()
-            .set_indexed()
-            .set_fieldnorm()
-            .set_fast();
-        let is_read_options = NumericOptions::default().set_stored().set_fast();
-        schema_builder.add_text_field("title", TEXT);
-        schema_builder.add_text_field(
-            "author",
-            TextOptions::default().set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("raw")
-                    .set_fieldnorms(false),
-            ),
-        );
-        schema_builder.add_u64_field("count", count_options);
-        schema_builder.add_i64_field("popularity", popularity_options);
-        schema_builder.add_f64_field("score", score_options);
-        schema_builder.add_bool_field("is_read", is_read_options);
-        let schema = schema_builder.build();
-        let schema_json = serde_json::to_string_pretty(&schema).unwrap();
-        let expected = r#"[
-  {
-    "name": "title",
-    "type": "text",
-    "options": {
-      "indexing": {
-        "record": "position",
-        "fieldnorms": true,
-        "tokenizer": "default"
-      },
-      "stored": false,
-      "fast": false
-    }
-  },
-  {
-    "name": "author",
-    "type": "text",
-    "options": {
-      "indexing": {
-        "record": "basic",
-        "fieldnorms": false,
-        "tokenizer": "raw"
-      },
-      "stored": false,
-      "fast": false
-    }
-  },
-  {
-    "name": "count",
-    "type": "u64",
-    "options": {
-      "indexed": false,
-      "fieldnorms": false,
-      "fast": true,
-      "stored": true
-    }
-  },
-  {
-    "name": "popularity",
-    "type": "i64",
-    "options": {
-      "indexed": false,
-      "fieldnorms": false,
-      "fast": true,
-      "stored": true
-    }
-  },
-  {
-    "name": "score",
-    "type": "f64",
-    "options": {
-      "indexed": true,
-      "fieldnorms": true,
-      "fast": true,
-      "stored": false
-    }
-  },
-  {
-    "name": "is_read",
-    "type": "bool",
-    "options": {
-      "indexed": false,
-      "fieldnorms": false,
-      "fast": true,
-      "stored": true
-    }
-  }
-]"#;
-        assert_eq!(schema_json, expected);
-
-        let schema: Schema = serde_json::from_str(expected).unwrap();
-
-        let mut fields = schema.fields();
-        {
-            let (field, field_entry) = fields.next().unwrap();
-            assert_eq!("title", field_entry.name());
-            assert_eq!(0, field.field_id());
-        }
-        {
-            let (field, field_entry) = fields.next().unwrap();
-            assert_eq!("author", field_entry.name());
-            assert_eq!(1, field.field_id());
-        }
-        {
-            let (field, field_entry) = fields.next().unwrap();
-            assert_eq!("count", field_entry.name());
-            assert_eq!(2, field.field_id());
-        }
-        {
-            let (field, field_entry) = fields.next().unwrap();
-            assert_eq!("popularity", field_entry.name());
-            assert_eq!(3, field.field_id());
-        }
-        {
-            let (field, field_entry) = fields.next().unwrap();
-            assert_eq!("score", field_entry.name());
-            assert_eq!(4, field.field_id());
-        }
-        {
-            let (field, field_entry) = fields.next().unwrap();
-            assert_eq!("is_read", field_entry.name());
-            assert_eq!(5, field.field_id());
-        }
-        assert!(fields.next().is_none());
-    }
-
-    #[test]
-    pub fn test_document_to_json() {
-        let mut schema_builder = Schema::builder();
-        let count_options = NumericOptions::default().set_stored().set_fast();
-        let is_read_options = NumericOptions::default().set_stored().set_fast();
-        schema_builder.add_text_field("title", TEXT);
-        schema_builder.add_text_field("author", STRING);
-        schema_builder.add_u64_field("count", count_options);
-        schema_builder.add_ip_addr_field("ip", FAST | STORED);
-        schema_builder.add_bool_field("is_read", is_read_options);
-        let schema = schema_builder.build();
-        let doc_json = r#"{
-                "title": "my title",
-                "author": "fulmicoton",
-                "count": 4,
-                "ip": "127.0.0.1",
-                "is_read": true
-        }"#;
-        let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
-
-        let doc_serdeser = TantivyDocument::parse_json(&schema, &doc.to_json(&schema)).unwrap();
-        assert_eq!(doc, doc_serdeser);
-    }
-
-    #[test]
-    pub fn test_document_to_ipv4_json() {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_ip_addr_field("ip", FAST | STORED);
-        let schema = schema_builder.build();
-
-        // IpV4 loopback
-        let doc_json = r#"{
-                "ip": "127.0.0.1"
-        }"#;
-        let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&doc.to_json(&schema)).unwrap();
-        assert_eq!(value["ip"][0], "127.0.0.1");
-
-        // Special case IpV6 loopback. We don't want to map that to IPv4
-        let doc_json = r#"{
-                "ip": "::1"
-        }"#;
-        let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
-
-        let value: serde_json::Value = serde_json::from_str(&doc.to_json(&schema)).unwrap();
-        assert_eq!(value["ip"][0], "::1");
-
-        // testing ip address of every router in the world
-        let doc_json = r#"{
-                "ip": "192.168.0.1"
-        }"#;
-        let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
-
-        let value: serde_json::Value = serde_json::from_str(&doc.to_json(&schema)).unwrap();
-        assert_eq!(value["ip"][0], "192.168.0.1");
-    }
-
-    #[test]
-    pub fn test_document_from_nameddoc() {
-        let mut schema_builder = Schema::builder();
-        let title = schema_builder.add_text_field("title", TEXT);
-        let val = schema_builder.add_i64_field("val", INDEXED);
-        let schema = schema_builder.build();
-        let mut named_doc_map = BTreeMap::default();
-        named_doc_map.insert(
-            "title".to_string(),
-            vec![OwnedValue::from("title1"), OwnedValue::from("title2")],
-        );
-        named_doc_map.insert(
-            "val".to_string(),
-            vec![OwnedValue::from(14u64), OwnedValue::from(-1i64)],
-        );
-        let doc =
-            TantivyDocument::convert_named_doc(&schema, NamedFieldDocument(named_doc_map)).unwrap();
-        assert_eq!(
-            doc.get_all(title).map(OwnedValue::from).collect::<Vec<_>>(),
-            vec![
-                OwnedValue::from("title1".to_string()),
-                OwnedValue::from("title2".to_string())
-            ]
-        );
-        assert_eq!(
-            doc.get_all(val).map(OwnedValue::from).collect::<Vec<_>>(),
-            vec![OwnedValue::from(14u64), OwnedValue::from(-1i64)]
-        );
-    }
-
-    #[test]
-    pub fn test_document_missing_field_no_error() {
-        let schema = Schema::builder().build();
-        let mut named_doc_map = BTreeMap::default();
-        named_doc_map.insert(
-            "title".to_string(),
-            vec![OwnedValue::from("title1"), OwnedValue::from("title2")],
-        );
-        TantivyDocument::convert_named_doc(&schema, NamedFieldDocument(named_doc_map)).unwrap();
-    }
-
-    #[test]
-    pub fn test_parse_document() {
-        let mut schema_builder = Schema::builder();
-        let count_options = NumericOptions::default().set_stored().set_fast();
-        let popularity_options = NumericOptions::default().set_stored().set_fast();
-        let score_options = NumericOptions::default().set_indexed().set_fast();
-        let title_field = schema_builder.add_text_field("title", TEXT);
-        let author_field = schema_builder.add_text_field("author", STRING);
-        let count_field = schema_builder.add_u64_field("count", count_options);
-        let popularity_field = schema_builder.add_i64_field("popularity", popularity_options);
-        let score_field = schema_builder.add_f64_field("score", score_options);
-        let schema = schema_builder.build();
-        {
-            let doc = TantivyDocument::parse_json(&schema, "{}").unwrap();
-            assert!(doc.field_values().next().is_none());
-        }
-        {
-            let doc = TantivyDocument::parse_json(
-                &schema,
-                r#"{
-                "title": "my title",
-                "author": "fulmicoton",
-                "count": 4,
-                "popularity": 10,
-                "score": 80.5
-            }"#,
-            )
-            .unwrap();
-            assert_eq!(
-                doc.get_first(title_field).unwrap().as_str(),
-                Some("my title")
-            );
-            assert_eq!(
-                doc.get_first(author_field).unwrap().as_str(),
-                Some("fulmicoton")
-            );
-            assert_eq!(doc.get_first(count_field).unwrap().as_u64(), Some(4));
-            assert_eq!(doc.get_first(popularity_field).unwrap().as_i64(), Some(10));
-            assert_eq!(doc.get_first(score_field).unwrap().as_f64(), Some(80.5f64));
-        }
-        {
-            let res = TantivyDocument::parse_json(
-                &schema,
-                r#"{
-                "thisfieldisnotdefinedintheschema": "my title",
-                "title": "my title",
-                "author": "fulmicoton",
-                "count": 4,
-                "popularity": 10,
-                "score": 80.5,
-                "jambon": "bayonne"
-            }"#,
-            );
-            assert!(res.is_ok());
-        }
-        {
-            let json_err = TantivyDocument::parse_json(
-                &schema,
-                r#"{
-                "title": "my title",
-                "author": "fulmicoton",
-                "count": "5",
-                "popularity": "10",
-                "score": "80.5",
-                "jambon": "bayonne"
-            }"#,
-            );
-            assert_matches!(
-                json_err,
-                Err(DocParsingError::ValueError(
-                    _,
-                    ValueParsingError::TypeError { .. }
-                ))
-            );
-        }
-        {
-            let json_err = TantivyDocument::parse_json(
-                &schema,
-                r#"{
-                "title": "my title",
-                "author": "fulmicoton",
-                "count": -5,
-                "popularity": 10,
-                "score": 80.5
-            }"#,
-            );
-            assert_matches!(
-                json_err,
-                Err(DocParsingError::ValueError(
-                    _,
-                    ValueParsingError::OverflowError { .. }
-                ))
-            );
-        }
-        {
-            let json_err = TantivyDocument::parse_json(
-                &schema,
-                r#"{
-                "title": "my title",
-                "author": "fulmicoton",
-                "count": 9223372036854775808,
-                "popularity": 10,
-                "score": 80.5
-            }"#,
-            );
-            assert!(!matches!(
-                json_err,
-                Err(DocParsingError::ValueError(
-                    _,
-                    ValueParsingError::OverflowError { .. }
-                ))
-            ));
-        }
-        {
-            let json_err = TantivyDocument::parse_json(
-                &schema,
-                r#"{
-                "title": "my title",
-                "author": "fulmicoton",
-                "count": 50,
-                "popularity": 9223372036854775808,
-                "score": 80.5
-            }"#,
-            );
-            assert_matches!(
-                json_err,
-                Err(DocParsingError::ValueError(
-                    _,
-                    ValueParsingError::OverflowError { .. }
-                ))
-            );
-        }
-        {
-            // Short JSON, under the 20 char take.
-            let json_err = TantivyDocument::parse_json(&schema, r#"{"count": 50,}"#);
-            assert_matches!(json_err, Err(InvalidJson(_)));
-        }
-        {
-            let json_err = TantivyDocument::parse_json(
-                &schema,
-                r#"{
-                "title": "my title",
-                "author": "fulmicoton",
-                "count": 50,
-            }"#,
-            );
-            assert_matches!(json_err, Err(InvalidJson(_)));
-        }
-    }
-
-    #[test]
-    pub fn test_schema_add_field() {
-        let mut schema_builder = SchemaBuilder::default();
-        let id_options = TextOptions::default().set_stored().set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer("raw")
-                .set_index_option(IndexRecordOption::Basic),
-        );
-        let timestamp_options = DateOptions::default()
-            .set_stored()
-            .set_indexed()
-            .set_fieldnorm()
-            .set_fast();
-        schema_builder.add_text_field("_id", id_options);
-        schema_builder.add_date_field("_timestamp", timestamp_options);
-
-        let schema_content = r#"[
-  {
-    "name": "text",
-    "type": "text",
-    "options": {
-      "indexing": {
-        "record": "position",
-        "fieldnorms": true,
-        "tokenizer": "default"
-      },
-      "stored": false,
-      "fast": false
-    }
-  },
-  {
-    "name": "popularity",
-    "type": "i64",
-    "options": {
-      "indexed": false,
-      "fieldnorms": false,
-      "fast": true,
-      "stored": true
-    }
-  }
-]"#;
-        let tmp_schema: Schema =
-            serde_json::from_str(schema_content).expect("error while reading json");
-        for (_field, field_entry) in tmp_schema.fields() {
-            schema_builder.add_field(field_entry.clone());
-        }
-
-        let schema = schema_builder.build();
-        let schema_json = serde_json::to_string_pretty(&schema).unwrap();
-        let expected = r#"[
-  {
-    "name": "_id",
-    "type": "text",
-    "options": {
-      "indexing": {
-        "record": "basic",
-        "fieldnorms": true,
-        "tokenizer": "raw"
-      },
-      "stored": true,
-      "fast": false
-    }
-  },
-  {
-    "name": "_timestamp",
-    "type": "date",
-    "options": {
-      "indexed": true,
-      "fieldnorms": true,
-      "fast": true,
-      "stored": true,
-      "precision": "seconds"
-    }
-  },
-  {
-    "name": "text",
-    "type": "text",
-    "options": {
-      "indexing": {
-        "record": "position",
-        "fieldnorms": true,
-        "tokenizer": "default"
-      },
-      "stored": false,
-      "fast": false
-    }
-  },
-  {
-    "name": "popularity",
-    "type": "i64",
-    "options": {
-      "indexed": false,
-      "fieldnorms": false,
-      "fast": true,
-      "stored": true
-    }
-  }
-]"#;
-        assert_eq!(schema_json, expected);
-    }
-
-    #[test]
-    fn test_find_field() {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_json_field("foo", STRING);
-
-        schema_builder.add_text_field("bar", STRING);
-        schema_builder.add_text_field("foo.bar", STRING);
-        schema_builder.add_text_field("foo.bar.baz", STRING);
-        schema_builder.add_text_field("bar.a.b.c", STRING);
-        let schema = schema_builder.build();
-
-        assert_eq!(
-            schema.find_field("foo.bar"),
-            Some((schema.get_field("foo.bar").unwrap(), ""))
-        );
-        assert_eq!(
-            schema.find_field("foo.bar.bar"),
-            Some((schema.get_field("foo.bar").unwrap(), "bar"))
-        );
-        assert_eq!(
-            schema.find_field("foo.bar.baz"),
-            Some((schema.get_field("foo.bar.baz").unwrap(), ""))
-        );
-        assert_eq!(
-            schema.find_field("foo.toto"),
-            Some((schema.get_field("foo").unwrap(), "toto"))
-        );
-        assert_eq!(
-            schema.find_field("foo.bar"),
-            Some((schema.get_field("foo.bar").unwrap(), ""))
-        );
-        assert_eq!(
-            schema.find_field("bar.toto.titi"),
-            Some((schema.get_field("bar").unwrap(), "toto.titi"))
-        );
-
-        assert_eq!(schema.find_field("hello"), None);
-        assert_eq!(schema.find_field(""), None);
-        assert_eq!(schema.find_field("thiswouldbeareallylongfieldname"), None);
-        assert_eq!(schema.find_field("baz.bar.foo"), None);
-    }
-
-    #[test]
-    fn test_find_field_with_default() {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_json_field("_default", JsonObjectOptions::default());
-        let default = Field::from_field_id(0);
-        schema_builder.add_json_field("foo", STRING);
-        let foo = Field::from_field_id(1);
-        schema_builder.add_text_field("foo.bar", STRING);
-        let foo_bar = Field::from_field_id(2);
-        schema_builder.add_text_field("bar", STRING);
-        let bar = Field::from_field_id(3);
-        schema_builder.add_json_field("baz", JsonObjectOptions::default());
-        let baz = Field::from_field_id(4);
-        let schema = schema_builder.build();
-
-        assert_eq!(schema.find_field_with_default("foo", None), Some((foo, "")));
-        assert_eq!(
-            schema.find_field_with_default("foo.bar", None),
-            Some((foo_bar, ""))
-        );
-        assert_eq!(schema.find_field_with_default("bar", None), Some((bar, "")));
-        assert_eq!(schema.find_field_with_default("bar.baz", None), None);
-        assert_eq!(schema.find_field_with_default("baz", None), Some((baz, "")));
-        assert_eq!(
-            schema.find_field_with_default("baz.foobar", None),
-            Some((baz, "foobar"))
-        );
-        assert_eq!(schema.find_field_with_default("foobar", None), None);
-
-        assert_eq!(
-            schema.find_field_with_default("foo", Some(default)),
-            Some((foo, ""))
-        );
-        assert_eq!(
-            schema.find_field_with_default("foo.bar", Some(default)),
-            Some((foo_bar, ""))
-        );
-        assert_eq!(
-            schema.find_field_with_default("bar", Some(default)),
-            Some((bar, ""))
-        );
-        // still None, we are under an existing field
-        assert_eq!(
-            schema.find_field_with_default("bar.baz", Some(default)),
-            None
-        );
-        assert_eq!(
-            schema.find_field_with_default("baz", Some(default)),
-            Some((baz, ""))
-        );
-        assert_eq!(
-            schema.find_field_with_default("baz.foobar", Some(default)),
-            Some((baz, "foobar"))
-        );
-        assert_eq!(
-            schema.find_field_with_default("foobar", Some(default)),
-            Some((default, "foobar"))
-        );
+        let schema = deserializer.deserialize_seq(SchemaVisitor)?;
+        println!("Schema::deserialize => Deserialization complete");
+        Ok(schema)
     }
 }
 
