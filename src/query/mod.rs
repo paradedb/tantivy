@@ -15,7 +15,6 @@ mod explanation;
 mod fuzzy_query;
 mod intersection;
 mod more_like_this;
-mod nested_document_query;
 mod nested_query;
 mod phrase_prefix_query;
 mod phrase_query;
