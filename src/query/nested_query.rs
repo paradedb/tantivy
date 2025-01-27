@@ -5,8 +5,8 @@ use common::JsonPathWriter;
 
 use crate::core::searcher::Searcher;
 use crate::query::{
-    block_join_query::{ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery},
     BooleanQuery, EnableScoring, Explanation, Occur, Query, QueryClone, Scorer, TermQuery, Weight,
+    {ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery},
 };
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::{DocAddress, DocId, DocSet, Score, SegmentReader, TantivyError, TERMINATED};
