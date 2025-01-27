@@ -90,19 +90,12 @@ impl NestedOptions {
 /// Combines `NestedOptions` for child/parent docs,
 /// plus `JsonObjectOptions` for storing/indexing JSON text.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct NestedJsonObjectOptions {
     pub nested_opts: NestedOptions,
     pub json_opts: JsonObjectOptions,
 }
 
-impl Default for NestedJsonObjectOptions {
-    fn default() -> Self {
-        NestedJsonObjectOptions {
-            nested_opts: NestedOptions::default(),
-            json_opts: JsonObjectOptions::default(),
-        }
-    }
-}
 
 impl NestedJsonObjectOptions {
     /// Convenience constructor

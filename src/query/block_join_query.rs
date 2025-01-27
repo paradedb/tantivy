@@ -9,24 +9,35 @@ use crate::core::searcher::Searcher;
 use crate::index::SegmentId;
 use crate::query::{EnableScoring, Explanation, Query, QueryClone, Scorer, Weight};
 use crate::schema::Term;
-use crate::{DocAddress, DocId, DocSet, Result, Score, SegmentReader, TERMINATED};
+use crate::{DocAddress, DocId, DocSet, Result, Score, SegmentReader, TantivyError, TERMINATED};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ScoreMode {
     Total,
+    #[default]
     Avg,
     Max,
     Min,
     None,
 }
 
-impl Default for ScoreMode {
-    fn default() -> Self {
-        ScoreMode::Avg
-    }
-}
-
 impl ScoreMode {
+    /// Convert the user input like "none", "min", etc. into `ScoreMode`.
+    pub fn from_str(mode: &str) -> crate::Result<ScoreMode> {
+        println!("ScoreMode::from_str: Parsing mode '{}'", mode);
+        match mode.to_lowercase().as_str() {
+            "none" => Ok(ScoreMode::None),
+            "avg" => Ok(ScoreMode::Avg),
+            "max" => Ok(ScoreMode::Max),
+            "min" => Ok(ScoreMode::Min),
+            "total" => Ok(ScoreMode::Total),
+            other => Err(TantivyError::InvalidArgument(format!(
+                "Unrecognized nested score_mode: {}",
+                other
+            ))),
+        }
+    }
+
     fn combine(&self, child_score: f32, accum: f32, count: u32) -> f32 {
         let result = match self {
             ScoreMode::None => 0.0,
@@ -355,7 +366,7 @@ impl Scorer for ToParentBlockJoinScorer {
     fn score(&mut self) -> Score {
         if self.doc_done.get() || self.current_parent.get() == TERMINATED {
             println!("[ToParentBlockJoinScorer::score] doc_done or TERMINATED => 0.0");
-            return 0.0;
+            0.0
         } else {
             let sum_val = self.current_score.get();
             let cnt = self.child_count.get();
@@ -493,6 +504,7 @@ impl fmt::Debug for ToChildBlockJoinQuery {
     }
 }
 
+#[allow(unused)]
 impl ToChildBlockJoinQuery {
     pub fn new(
         parent_query: Box<dyn Query>,
@@ -720,7 +732,7 @@ impl ToChildBlockJoinScorer {
                 return TERMINATED;
             }
             // Move to that parent's first child
-            return self.advance_to_first_child_of_parent();
+            self.advance_to_first_child_of_parent()
         } else {
             // Normal “go to next child doc”
             let next_child = self.current_doc.get().saturating_add(1);
@@ -798,6 +810,7 @@ pub struct ParentChildrenBlockJoinQuery {
     parent_doc_id: DocId,
 }
 
+#[allow(unused)]
 impl ParentChildrenBlockJoinQuery {
     /// Create a new parent->children block-join query.
     ///
@@ -925,7 +938,7 @@ impl Weight for ParentChildrenBlockJoinWeight {
         }
 
         // Build the underlying child scorer
-        let mut child_scorer = self.child_weight.scorer(reader, boost)?;
+        let child_scorer = self.child_weight.scorer(reader, boost)?;
         if child_scorer.doc() == TERMINATED {
             return Ok(Box::new(super::EmptyScorer));
         }
@@ -962,11 +975,11 @@ impl Weight for ParentChildrenBlockJoinWeight {
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> Result<()> {
         let mut sc = self.scorer(reader, 1.0)?;
-        let mut current_threshold = threshold;
+        let mut _current_threshold = threshold;
         let mut doc_id = sc.advance();
         while doc_id != TERMINATED {
             let s = sc.score();
-            current_threshold = callback(doc_id, s);
+            _current_threshold = callback(doc_id, s);
             doc_id = sc.advance();
         }
         Ok(())
@@ -1031,7 +1044,7 @@ impl Scorer for ParentChildrenBlockJoinScorer {
 #[cfg(test)]
 mod test {
     use std::collections::HashSet;
-    use std::fmt;
+
     use std::ops::Bound;
     use std::sync::Arc;
 
@@ -1043,22 +1056,16 @@ mod test {
     use crate::docset::DocSet;
     use crate::index::{Index, IndexSettings};
     use crate::query::block_join_query::{
-        ParentBitSetProducer, ParentChildrenBlockJoinQuery, ScoreMode, ToChildBlockJoinQuery,
-        ToParentBlockJoinQuery,
+        ParentBitSetProducer, ScoreMode, ToChildBlockJoinQuery, ToParentBlockJoinQuery,
     };
-    use crate::query::{
-        AllQuery, BooleanQuery, BoostQuery, EnableScoring, Explanation, Occur, Query, QueryClone,
-        RangeQuery, TermQuery, Weight,
-    };
+    use crate::query::{BooleanQuery, BoostQuery, Occur, RangeQuery, TermQuery};
     use crate::schema::{
-        Field, IndexRecordOption, Schema, SchemaBuilder, TantivyDocument, TextFieldIndexing,
-        TextOptions, Value, FAST, STORED, STRING, TEXT,
+        Field, IndexRecordOption, SchemaBuilder, TantivyDocument, TextFieldIndexing, TextOptions,
+        Value, FAST, STORED, STRING, TEXT,
     };
-    use crate::tokenizer::{
-        RawTokenizer, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, TokenizerManager,
-    };
+    use crate::tokenizer::{RawTokenizer, TextAnalyzer, TokenizerManager};
     use crate::{doc, IndexWriter, Term};
-    use crate::{DocAddress, DocId, ReloadPolicy, Result, Score, SegmentReader, TERMINATED};
+    use crate::{DocAddress, Result, SegmentReader, TERMINATED};
 
     // --------------------------------------------------------------------------
     // A small helper for building test doc arrays (resumes vs children).
@@ -1137,7 +1144,6 @@ mod test {
     // Now the test functions follow
     // --------------------------------------------------------------------------
 
-    #[test]
     /// This test checks that if we have a child filter that matches zero child docs,
     /// then ToParentBlockJoinQuery should produce no parent documents.
     #[test]
@@ -1349,11 +1355,11 @@ mod test {
         let schema = sb.build();
 
         // 3) Create the index, add documents in parent-child blocks
-        let ram = RamDirectory::create();
+        let _ram = RamDirectory::create();
         // Create index as before
         //
         // Create our custom TokenizerManager
-        let mut my_tokenizers = TokenizerManager::default();
+        let my_tokenizers = TokenizerManager::default();
         my_tokenizers.register("raw", TextAnalyzer::from(RawTokenizer::default()));
         let index = Index::builder()
             .schema(schema)
@@ -2122,18 +2128,16 @@ mod scorer_tests {
     use common::BitSet;
 
     use crate::collector::TopDocs;
-    use crate::query::block_join_query::test::{doc_string_field, ResumeParentBitSetProducer};
-    use crate::query::{AllQuery, BooleanQuery, BoostQuery, Occur, Query, TermQuery};
-    use crate::schema::{Field, IndexRecordOption, SchemaBuilder, STORED, STRING, TEXT};
+    use crate::query::block_join_query::test::doc_string_field;
+    use crate::query::AllQuery;
+    use crate::schema::{Field, IndexRecordOption, SchemaBuilder, STORED, STRING};
     use crate::{doc, DocSet, SegmentReader};
-    use crate::{DocAddress, DocId, Index, IndexSettings, ReloadPolicy, Term};
+    use crate::{Index, IndexSettings};
     use std::sync::Arc;
 
     use crate::directory::RamDirectory;
-    use crate::query::block_join_query::{
-        ParentBitSetProducer, ScoreMode, ToChildBlockJoinQuery, ToParentBlockJoinQuery,
-    };
-    use crate::IndexWriter;
+    use crate::query::block_join_query::{ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery};
+
     use crate::Result;
 
     pub struct ParentBitsForScorerTest {
@@ -2196,7 +2200,7 @@ mod scorer_tests {
                     block_docs.push(child_doc);
                 }
                 // parent doc
-                let mut parent_doc = doc! {
+                let parent_doc = doc! {
                     doctype_f => "parent",
                     value_f   => i.to_string(),
                 };
@@ -2231,7 +2235,7 @@ mod scorer_tests {
         assert_eq!(10, top_docs.len(), "We should find exactly 10 parents.");
 
         // Scores must be zero with ScoreMode::None
-        for (score, addr) in &top_docs {
+        for (score, _addr) in &top_docs {
             assert!(
                 (*score - 0.0).abs() < f32::EPSILON,
                 "ScoreMode::None => parent's score must be 0.0"

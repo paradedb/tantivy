@@ -11,7 +11,7 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 use super::ip_options::IpAddrOptions;
-use super::nested_options::{self, NestedJsonObjectOptions, NestedOptions};
+use super::nested_options::{NestedJsonObjectOptions, NestedOptions};
 use super::IntoIpv6Addr;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::facet_options::FacetOptions;
@@ -509,7 +509,8 @@ impl FieldType {
         println!("\nvalue_from_json_non_nested called with JSON: {:?}", json);
         println!("Field type is: {:?}", self);
 
-        let result = match json {
+        
+        match json {
             JsonValue::String(field_text) => {
                 println!("Processing String value: {}", field_text);
                 match self {
@@ -749,8 +750,7 @@ impl FieldType {
                 expected: self.value_type().name(),
                 json: json.clone(),
             }),
-        };
-        result
+        }
     }
 }
 

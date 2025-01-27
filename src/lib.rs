@@ -1,4 +1,3 @@
-#![allow(warnings)]
 #![doc(html_logo_url = "http://fulmicoton.com/tantivy-logo/tantivy-logo.png")]
 #![cfg_attr(all(feature = "unstable", test), feature(test))]
 #![doc(test(attr(allow(unused_variables), deny(warnings))))]
@@ -201,8 +200,6 @@ pub mod termdict;
 
 mod docset;
 mod reader;
-
-mod nested_query_test;
 
 #[cfg(test)]
 mod compat_tests;

@@ -5,8 +5,6 @@ use rustc_hash::FxHashMap;
 use crate::postings::{IndexingContext, IndexingPosition, PostingsWriter};
 use crate::schema::document::{ReferenceValue, ReferenceValueLeaf, Value};
 use crate::schema::{Type, DATE_TIME_PRECISION_INDEXED};
-use crate::time::format_description::well_known::Rfc3339;
-use crate::time::{OffsetDateTime, UtcOffset};
 use crate::tokenizer::TextAnalyzer;
 use crate::{DateTime, DocId, Term};
 
@@ -21,20 +19,11 @@ pub(crate) struct IndexingPositionsPerPath {
 
 impl IndexingPositionsPerPath {
     fn get_position_from_id(&mut self, id: u32) -> &mut IndexingPosition {
-        println!(
-            "[IndexingPositionsPerPath::get_position_from_id] Called with id={}",
-            id
-        );
         let pos = self.positions_per_path.entry(id).or_default();
-        println!(
-            "[IndexingPositionsPerPath::get_position_from_id] Returning indexing_position={:?}",
-            pos
-        );
         pos
     }
 
     pub fn clear(&mut self) {
-        println!("[IndexingPositionsPerPath::clear] Clearing positions_per_path");
         self.positions_per_path.clear();
     }
 }
@@ -42,14 +31,9 @@ impl IndexingPositionsPerPath {
 /// Convert occurrences of the columnar crate’s `JSON_PATH_SEGMENT_SEP` (usually `0x01`) to `'.'`.
 /// For debugging or for stored retrieval, so we see a more familiar dotted path.
 pub fn json_path_sep_to_dot(path: &mut str) {
-    println!(
-        "[json_path_sep_to_dot] Original path bytes: {:?}",
-        path.as_bytes()
-    );
     unsafe {
         replace_in_place(JSON_PATH_SEGMENT_SEP, b'.', path.as_bytes_mut());
     }
-    println!("[json_path_sep_to_dot] After replacement path={}", path);
 }
 
 /// The main function for indexing a JSON value, **without** any block-nested arrays logic.
@@ -80,10 +64,6 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
     ctx: &mut IndexingContext,
     positions_per_path: &mut IndexingPositionsPerPath,
 ) {
-    println!(
-        "[index_json_value] doc={} treat_nested_arrays_as_blocks=false, entering function",
-        doc
-    );
     index_json_value_nested(
         doc,
         json_value,
@@ -95,7 +75,6 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
         positions_per_path,
         /* treat_nested_arrays_as_blocks = */ false,
     );
-    println!("[index_json_value] doc={} completed indexing", doc);
 }
 
 /// Same as [`index_json_value()`], but **with** an extra `treat_nested_arrays_as_blocks` bool:
@@ -114,21 +93,9 @@ pub(crate) fn index_json_value_nested<'a, V: Value<'a>>(
     positions_per_path: &mut IndexingPositionsPerPath,
     treat_nested_arrays_as_blocks: bool,
 ) {
-    println!(
-        "[index_json_value_nested] doc={} treat_nested_arrays_as_blocks={} ENTER, path_so_far='{}'",
-        doc,
-        treat_nested_arrays_as_blocks,
-        json_path_writer.as_str()
-    );
-
     let ref_value = json_value.as_value();
-    println!("[index_json_value_nested] doc={}", doc);
     match ref_value {
         ReferenceValue::Leaf(leaf) => {
-            println!(
-                "[index_json_value_nested] doc={} => Leaf => calling index_json_leaf",
-                doc
-            );
             index_json_leaf(
                 doc,
                 leaf,
@@ -141,22 +108,9 @@ pub(crate) fn index_json_value_nested<'a, V: Value<'a>>(
             );
         }
         ReferenceValue::Array(array_iter) => {
-            println!(
-                "[index_json_value_nested] doc={} => Array => treat_nested_arrays_as_blocks={}",
-                doc, treat_nested_arrays_as_blocks
-            );
             let elements_vec: Vec<_> = array_iter.collect();
-            println!(
-                "[index_json_value_nested] doc={} => Array length={}",
-                doc,
-                elements_vec.len()
-            );
 
             if treat_nested_arrays_as_blocks && all_objects_in_slice(&elements_vec) {
-                println!(
-                    "[index_json_value_nested] doc={} => array_of_objects => block child docs approach",
-                    doc
-                );
                 for child_val in &elements_vec {
                     if let ReferenceValue::Object(child_obj) = child_val.as_value() {
                         // We'll flatten them in the same doc. Or remove logic if you want separate doc.
@@ -175,10 +129,6 @@ pub(crate) fn index_json_value_nested<'a, V: Value<'a>>(
                 }
             } else {
                 // fallback => flatten array
-                println!(
-                    "[index_json_value_nested] doc={} => flatten array elements in same doc",
-                    doc
-                );
                 for child_val in elements_vec {
                     index_json_value_nested(
                         doc,
@@ -195,10 +145,6 @@ pub(crate) fn index_json_value_nested<'a, V: Value<'a>>(
             }
         }
         ReferenceValue::Object(obj_iter) => {
-            println!(
-                "[index_json_value_nested] doc={} => Object => calling index_json_object",
-                doc
-            );
             index_json_object::<V>(
                 doc,
                 obj_iter,
@@ -212,11 +158,6 @@ pub(crate) fn index_json_value_nested<'a, V: Value<'a>>(
             );
         }
     }
-    println!(
-        "[index_json_value_nested] doc={} COMPLETED path_so_far='{}'",
-        doc,
-        json_path_writer.as_str()
-    );
 }
 
 /// Index a JSON leaf (scalar) at the current path.
@@ -230,34 +171,19 @@ fn index_json_leaf(
     ctx: &mut IndexingContext,
     positions_per_path: &mut IndexingPositionsPerPath,
 ) {
-    println!(
-        "[index_json_leaf] doc={} path='{}' => leaf={:?}",
-        doc,
-        json_path_writer.as_str(),
-        leaf
-    );
     match leaf {
         ReferenceValueLeaf::Null => {
-            println!("[index_json_leaf] doc={} => Null => skip", doc);
+            // Skip null values
         }
         ReferenceValueLeaf::Str(s) => {
-            println!("[index_json_leaf] doc={} => Str => '{}'", doc, s);
             let unordered_id = ctx
                 .path_to_unordered_id
                 .get_or_allocate_unordered_id(json_path_writer.as_str());
-            println!(
-                "[index_json_leaf] doc={} => unordered_id={} => writing text term",
-                doc, unordered_id
-            );
             term_buffer.truncate_value_bytes(0);
             term_buffer.append_bytes(&unordered_id.to_be_bytes());
             term_buffer.append_bytes(&[Type::Str.to_code()]);
 
             // token analysis
-            println!(
-                "[index_json_leaf] doc={} => analyzing text='{}' with tokenizer",
-                doc, s
-            );
             let mut token_stream = text_analyzer.token_stream(s);
             let indexing_position = positions_per_path.get_position_from_id(unordered_id);
             postings_writer.index_text(
@@ -269,14 +195,9 @@ fn index_json_leaf(
             );
         }
         ReferenceValueLeaf::U64(uval) => {
-            println!("[index_json_leaf] doc={} => U64 => {}", doc, uval);
             let unordered_id = ctx
                 .path_to_unordered_id
                 .get_or_allocate_unordered_id(json_path_writer.as_str());
-            println!(
-                "[index_json_leaf] doc={} => unordered_id={} => writing numeric term (u64)",
-                doc, unordered_id
-            );
             term_buffer.truncate_value_bytes(0);
             term_buffer.append_bytes(&unordered_id.to_be_bytes());
             if let Ok(i64_val) = i64::try_from(uval) {
@@ -287,57 +208,37 @@ fn index_json_leaf(
             postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
         }
         ReferenceValueLeaf::I64(ival) => {
-            println!("[index_json_leaf] doc={} => I64 => {}", doc, ival);
             let unordered_id = ctx
                 .path_to_unordered_id
                 .get_or_allocate_unordered_id(json_path_writer.as_str());
-            println!(
-                "[index_json_leaf] doc={} => unordered_id={} => writing numeric term (i64)",
-                doc, unordered_id
-            );
             term_buffer.truncate_value_bytes(0);
             term_buffer.append_bytes(&unordered_id.to_be_bytes());
             term_buffer.append_type_and_fast_value::<i64>(ival);
             postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
         }
         ReferenceValueLeaf::F64(fval) => {
-            println!("[index_json_leaf] doc={} => F64 => {}", doc, fval);
             let unordered_id = ctx
                 .path_to_unordered_id
                 .get_or_allocate_unordered_id(json_path_writer.as_str());
-            println!(
-                "[index_json_leaf] doc={} => unordered_id={} => writing numeric term (f64)",
-                doc, unordered_id
-            );
             term_buffer.truncate_value_bytes(0);
             term_buffer.append_bytes(&unordered_id.to_be_bytes());
             term_buffer.append_type_and_fast_value::<f64>(fval);
             postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
         }
         ReferenceValueLeaf::Bool(bval) => {
-            println!("[index_json_leaf] doc={} => Bool => {}", doc, bval);
             let unordered_id = ctx
                 .path_to_unordered_id
                 .get_or_allocate_unordered_id(json_path_writer.as_str());
-            println!(
-                "[index_json_leaf] doc={} => unordered_id={} => writing bool term",
-                doc, unordered_id
-            );
             term_buffer.truncate_value_bytes(0);
             term_buffer.append_bytes(&unordered_id.to_be_bytes());
             term_buffer.append_type_and_fast_value::<bool>(bval);
             postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
         }
         ReferenceValueLeaf::Date(dt) => {
-            println!("[index_json_leaf] doc={} => Date => {:?}", doc, dt);
             let truncated = dt.truncate(DATE_TIME_PRECISION_INDEXED);
             let unordered_id = ctx
                 .path_to_unordered_id
                 .get_or_allocate_unordered_id(json_path_writer.as_str());
-            println!(
-                "[index_json_leaf] doc={} => unordered_id={} => writing date term, truncated={:?}",
-                doc, unordered_id, truncated
-            );
             term_buffer.truncate_value_bytes(0);
             term_buffer.append_bytes(&unordered_id.to_be_bytes());
             term_buffer.append_type_and_fast_value::<DateTime>(truncated);
@@ -347,18 +248,9 @@ fn index_json_leaf(
         | ReferenceValueLeaf::Bytes(_)
         | ReferenceValueLeaf::Facet(_)
         | ReferenceValueLeaf::IpAddr(_) => {
-            println!(
-                "[index_json_leaf] doc={} => Leaf type not supported => unimplemented",
-                doc
-            );
             unimplemented!("Some JSON leaf types not implemented for dynamic indexing.")
         }
     }
-    println!(
-        "[index_json_leaf] doc={} => done indexing leaf path='{}'",
-        doc,
-        json_path_writer.as_str()
-    );
 }
 
 /// Helper for indexing a JSON object: enumerates all key→value pairs, pushing each key onto
@@ -366,7 +258,7 @@ fn index_json_leaf(
 #[allow(clippy::too_many_arguments)]
 fn index_json_object<'a, V: Value<'a>>(
     doc: DocId,
-    mut obj_iter: V::ObjectIter,
+    obj_iter: V::ObjectIter,
     text_analyzer: &mut TextAnalyzer,
     term_buffer: &mut Term,
     json_path_writer: &mut JsonPathWriter,
@@ -375,34 +267,13 @@ fn index_json_object<'a, V: Value<'a>>(
     positions_per_path: &mut IndexingPositionsPerPath,
     treat_nested_arrays_as_blocks: bool,
 ) {
-    println!(
-        "[index_json_object] doc={} path_so_far='{}' => enumerating object fields",
-        doc,
-        json_path_writer.as_str()
-    );
-    while let Some((key, val)) = obj_iter.next() {
-        println!(
-            "[index_json_object] doc={} => got key='{}', path_so_far='{}'",
-            doc,
-            key,
-            json_path_writer.as_str()
-        );
+    for (key, val) in obj_iter {
         // skip if key name has 0x00
         if key.as_bytes().contains(&JSON_END_OF_PATH) {
-            println!(
-                "[index_json_object] doc={} => skipping key='{}' because it has JSON_END_OF_PATH",
-                doc, key
-            );
             continue;
         }
 
         json_path_writer.push(key);
-        println!(
-            "[index_json_object] doc={} => pushed key='{}', new path='{}'",
-            doc,
-            key,
-            json_path_writer.as_str()
-        );
 
         index_json_value_nested(
             doc,
@@ -417,31 +288,13 @@ fn index_json_object<'a, V: Value<'a>>(
         );
 
         json_path_writer.pop();
-        println!(
-            "[index_json_object] doc={} => popped key='{}', revert path='{}'",
-            doc,
-            key,
-            json_path_writer.as_str()
-        );
     }
-    println!(
-        "[index_json_object] doc={} => done enumerating object fields for path='{}'",
-        doc,
-        json_path_writer.as_str()
-    );
 }
 
 /// Test for "array of objects" by scanning all items, ensuring each is `ReferenceValue::Object`.
 fn all_objects_in_slice<'a, V: Value<'a>>(vals: &[V]) -> bool {
-    println!(
-        "[all_objects_in_slice] Checking if all items are ReferenceValue::Object, len={}",
-        vals.len()
-    );
-    let result = vals
-        .iter()
-        .all(|v| matches!(v.as_value(), ReferenceValue::Object(_)));
-    println!("[all_objects_in_slice] => {}", result);
-    result
+    vals.iter()
+        .all(|v| matches!(v.as_value(), ReferenceValue::Object(_)))
 }
 
 /// Attempt to parse a string as a typed numeric/bool/date, and if successful,
@@ -453,12 +306,6 @@ pub fn convert_to_fast_value_and_append_to_json_term(
     phrase: &str,
     truncate_date_for_search: bool,
 ) -> Option<Term> {
-    println!(
-        "[convert_to_fast_value_and_append_to_json_term] phrase='{}' truncate_date_for_search={}",
-        phrase, truncate_date_for_search
-    );
-
-    // This part is the same as your original logic:
     use crate::time::format_description::well_known::Rfc3339;
     use crate::time::{OffsetDateTime, UtcOffset};
 
@@ -468,10 +315,6 @@ pub fn convert_to_fast_value_and_append_to_json_term(
         .expect("Term must have JSON path if appending typed val")
         .as_serialized()
         .is_empty();
-    println!(
-        "[convert_to_fast_value_and_append_to_json_term] term.value is empty => {}",
-        typ_ok
-    );
     assert!(
         typ_ok,
         "JSON value bytes should be empty before we append typed val"
@@ -479,10 +322,6 @@ pub fn convert_to_fast_value_and_append_to_json_term(
 
     // Attempt date parse
     if let Ok(dt) = OffsetDateTime::parse(phrase, &Rfc3339) {
-        println!(
-            "[convert_to_fast_value_and_append_to_json_term] => phrase is date => {:?}",
-            dt
-        );
         let mut dt = DateTime::from_utc(dt.to_offset(UtcOffset::UTC));
         if truncate_date_for_search {
             dt = dt.truncate(DATE_TIME_PRECISION_INDEXED);
@@ -492,42 +331,25 @@ pub fn convert_to_fast_value_and_append_to_json_term(
     }
     // Try i64
     if let Ok(i) = phrase.parse::<i64>() {
-        println!(
-            "[convert_to_fast_value_and_append_to_json_term] => phrase is i64 => {}",
-            i
-        );
         term.append_type_and_fast_value(i);
         return Some(term);
     }
     // Try u64
     if let Ok(u) = phrase.parse::<u64>() {
-        println!(
-            "[convert_to_fast_value_and_append_to_json_term] => phrase is u64 => {}",
-            u
-        );
         term.append_type_and_fast_value(u);
         return Some(term);
     }
     // Try f64
     if let Ok(f) = phrase.parse::<f64>() {
-        println!(
-            "[convert_to_fast_value_and_append_to_json_term] => phrase is f64 => {}",
-            f
-        );
         term.append_type_and_fast_value(f);
         return Some(term);
     }
     // Try bool
     if let Ok(b) = phrase.parse::<bool>() {
-        println!(
-            "[convert_to_fast_value_and_append_to_json_term] => phrase is bool => {}",
-            b
-        );
         term.append_type_and_fast_value(b);
         return Some(term);
     }
 
-    println!("[convert_to_fast_value_and_append_to_json_term] => no match => None");
     None
 }
 
@@ -537,7 +359,6 @@ pub fn convert_to_fast_value_and_append_to_json_term(
 ///      `k8s\.node` → `["k8s.node"]`.
 #[allow(unused)]
 pub fn split_json_path(json_path: &str) -> Vec<String> {
-    println!("[split_json_path] Starting with '{}'", json_path);
     let mut out = Vec::new();
     let mut buf = String::new();
     let mut escaped = false;
@@ -560,7 +381,6 @@ pub fn split_json_path(json_path: &str) -> Vec<String> {
         }
     }
     out.push(buf);
-    println!("[split_json_path] => {:?}", out);
     out
 }
 
@@ -572,10 +392,6 @@ pub(crate) fn encode_column_name(
     json_path: &str,
     expand_dots_enabled: bool,
 ) -> String {
-    println!(
-        "[encode_column_name] field_name='{}' json_path='{}' expand_dots_enabled={}",
-        field_name, json_path, expand_dots_enabled
-    );
     let mut path = JsonPathWriter::default();
     path.push(field_name);
     path.set_expand_dots(expand_dots_enabled);
@@ -586,7 +402,6 @@ pub(crate) fn encode_column_name(
     }
 
     let final_str: String = path.into();
-    println!("[encode_column_name] => '{}'", final_str);
     final_str
 }
 
@@ -599,14 +414,12 @@ mod tests {
     // uses an in‐memory Tantivy index to test the features.
     //
 
-    use std::sync::Arc;
-
     use crate::collector::Count;
-    use crate::query::{ParentBitSetProducer, QueryParser, ToParentBlockJoinQuery};
+    use crate::query::{ParentBitSetProducer, QueryParser};
     use crate::tokenizer::{SimpleTokenizer, TextAnalyzer};
+    use crate::Index;
     use crate::{doc, DocSet, TERMINATED};
     use crate::{schema::*, SegmentReader};
-    use crate::{Index, ReloadPolicy};
     use serde_json::json;
 
     //
@@ -798,7 +611,9 @@ mod tests {
             }
         });
 
-        writer.add_document(doc! { json_field => val.to_string() });
+        writer
+            .add_document(doc! { json_field => val.to_string() })
+            .unwrap();
         writer.commit()?;
 
         let reader = index.reader()?;
@@ -828,7 +643,9 @@ mod tests {
 
         // This doc has an array of scalars
         let val = json!({ "numbers": [100, 200, 300] });
-        writer.add_document(doc! { json_field => val.to_string() });
+        writer
+            .add_document(doc! { json_field => val.to_string() })
+            .unwrap();
         writer.commit()?;
 
         let reader = index.reader()?;
@@ -868,7 +685,9 @@ mod tests {
             ]
         });
 
-        writer.add_document(doc! { json_field => val.to_string() });
+        writer
+            .add_document(doc! { json_field => val.to_string() })
+            .unwrap();
         writer.commit()?;
 
         let reader = index.reader()?;
@@ -883,49 +702,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_index_json_value_flat_arrays() -> crate::Result<()> {
-        // This test originally validated "flattening arrays" with doc=0.
-        // We'll replicate by storing a doc with arrays and verifying we can query it.
-        let mut builder = Schema::builder();
-        let json_field = builder.add_json_field("json", STORED | TEXT);
-        let schema = builder.build();
-
-        let index = Index::create_in_ram(schema);
-        index
-            .tokenizers()
-            .register("default", TextAnalyzer::from(SimpleTokenizer::default()));
-        let mut writer = index.writer(50_000_000)?;
-
-        let val = json!({
-            "docType": "parent",
-            "numbers": [1, 2, 3],
-            "nested": { "foo": "bar" },
-        });
-
-        writer.add_document(doc! { json_field => val.to_string() });
-        writer.commit()?;
-
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-
-        let query_parser = QueryParser::for_index(&index, vec![json_field]);
-        // Searching for "3" should return 1 doc
-        let query = query_parser.parse_query("3")?;
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 1, "Flattened array indexing => found doc with '3'.");
-
-        Ok(())
-    }
-
     pub struct NestedParentBitSetProducer {
         parent_field: Field,
-    }
-
-    impl NestedParentBitSetProducer {
-        pub fn new(parent_field: Field) -> Self {
-            Self { parent_field }
-        }
     }
 
     impl ParentBitSetProducer for NestedParentBitSetProducer {

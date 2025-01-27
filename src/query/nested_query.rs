@@ -3,88 +3,13 @@ use std::sync::Arc;
 
 use common::JsonPathWriter;
 
-use crate::collector::TopDocs;
 use crate::core::searcher::Searcher;
-use crate::query::QueryParser;
 use crate::query::{
-    block_join_query::{ParentBitSetProducer, ScoreMode as BJScoreMode, ToParentBlockJoinQuery},
+    block_join_query::{ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery},
     BooleanQuery, EnableScoring, Explanation, Occur, Query, QueryClone, Scorer, TermQuery, Weight,
 };
-use crate::schema::document::parse_json_for_nested_sorted;
-use crate::schema::{
-    Field, IndexRecordOption, NestedJsonObjectOptions, NestedOptions, SchemaBuilder, Term,
-    TextFieldIndexing, Value, STORED, STRING, TEXT,
-};
-use crate::{
-    DocAddress, DocId, DocSet, Index, IndexWriter, Score, SegmentReader, TantivyDocument,
-    TantivyError, TERMINATED,
-};
-
-/// Our smaller enum for nested query's score_mode
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NestedScoreMode {
-    None,
-    Avg,
-    Max,
-    Min,
-    Sum,
-}
-
-impl NestedScoreMode {
-    /// Convert the user input like "none", "min", etc. into `NestedScoreMode`.
-    pub fn from_str(mode: &str) -> Result<NestedScoreMode, String> {
-        println!("NestedScoreMode::from_str: Parsing mode '{}'", mode);
-        match mode.to_lowercase().as_str() {
-            "none" => {
-                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::None");
-                Ok(NestedScoreMode::None)
-            }
-            "avg" => {
-                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::Avg");
-                Ok(NestedScoreMode::Avg)
-            }
-            "max" => {
-                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::Max");
-                Ok(NestedScoreMode::Max)
-            }
-            "min" => {
-                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::Min");
-                Ok(NestedScoreMode::Min)
-            }
-            "sum" => {
-                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::Sum");
-                Ok(NestedScoreMode::Sum)
-            }
-            other => {
-                println!(
-                    "NestedScoreMode::from_str: Unrecognized mode '{}'. Returning error.",
-                    other
-                );
-                Err(format!("Unrecognized nested score_mode: {}", other))
-            }
-        }
-    }
-
-    /// Convert `NestedScoreMode` into block_join’s `ScoreMode`.
-    fn to_block_join_score_mode(&self) -> BJScoreMode {
-        println!(
-            "NestedScoreMode::to_block_join_score_mode: Converting {:?} to BJScoreMode",
-            self
-        );
-        let mode = match self {
-            NestedScoreMode::None => BJScoreMode::None,
-            NestedScoreMode::Avg => BJScoreMode::Avg,
-            NestedScoreMode::Max => BJScoreMode::Max,
-            NestedScoreMode::Min => BJScoreMode::Min,
-            NestedScoreMode::Sum => BJScoreMode::Total,
-        };
-        println!(
-            "NestedScoreMode::to_block_join_score_mode: Converted to {:?}",
-            mode
-        );
-        mode
-    }
-}
+use crate::schema::{Field, IndexRecordOption, Term};
+use crate::{DocAddress, DocId, DocSet, Score, SegmentReader, TantivyError, TERMINATED};
 
 /// The `NestedQuery` struct, analogous to Elasticsearch's `NestedQueryBuilder`.
 ///
@@ -98,15 +23,16 @@ impl NestedScoreMode {
 pub struct NestedQuery {
     path: Vec<String>,
     child_query: Box<dyn Query>,
-    score_mode: NestedScoreMode,
+    score_mode: ScoreMode,
     ignore_unmapped: bool,
 }
 
+#[allow(unused)]
 impl NestedQuery {
     pub fn new(
         path: Vec<String>,
         child_query: Box<dyn Query>,
-        score_mode: NestedScoreMode,
+        score_mode: ScoreMode,
         ignore_unmapped: bool,
     ) -> Self {
         println!(
@@ -127,7 +53,7 @@ impl NestedQuery {
     pub fn child_query(&self) -> &dyn Query {
         self.child_query.as_ref()
     }
-    pub fn score_mode(&self) -> NestedScoreMode {
+    pub fn score_mode(&self) -> ScoreMode {
         self.score_mode
     }
     pub fn ignore_unmapped(&self) -> bool {
@@ -226,14 +152,7 @@ impl Query for NestedQuery {
             "NestedQuery::weight: Created BooleanQuery with child_query and exclude_parent_query"
         );
 
-        // 4) Convert user-chosen NestedScoreMode => block_join::ScoreMode
-        let bj_score_mode = self.score_mode.to_block_join_score_mode();
-        println!(
-            "NestedQuery::weight: Converted NestedScoreMode {:?} to BJScoreMode {:?}",
-            self.score_mode, bj_score_mode
-        );
-
-        // 5) Wrap in a ToParentBlockJoinQuery, using our parent-flag field
+        // Wrap in a ToParentBlockJoinQuery, using our parent-flag field
         println!(
             "NestedQuery::weight: Creating ToParentBlockJoinQuery with BooleanQuery and parent_field {:?}",
             parent_field
@@ -241,7 +160,7 @@ impl Query for NestedQuery {
         let block_join_query = ToParentBlockJoinQuery::new(
             Box::new(child_plus_exclude),
             Arc::new(NestedParentBitSetProducer::new(parent_field)),
-            bj_score_mode,
+            self.score_mode,
         );
         println!("NestedQuery::weight: ToParentBlockJoinQuery created successfully");
 
@@ -420,19 +339,16 @@ impl ParentBitSetProducer for NestedParentBitSetProducer {
 }
 
 #[cfg(test)]
-mod nested_query_equiv_tests {
+mod tests {
     use super::*;
     use crate::collector::TopDocs;
-    use crate::query::{
-        nested_query::{NestedQuery, NestedScoreMode},
-        Query, QueryClone, TermQuery,
-    };
-    use crate::query::{EnableScoring, Explanation, QueryParserError};
+    use crate::query::{nested_query::ScoreMode, AllQuery, QueryClone, QueryParser, TermQuery};
+    use crate::schema::document::parse_json_for_nested_sorted;
     use crate::schema::{
-        Field, FieldEntry, FieldType, IndexRecordOption, NestedJsonObjectOptions, Schema,
-        SchemaBuilder, TantivyDocument, TextOptions, Value, STORED, STRING,
+        DocParsingError, Field, IndexRecordOption, NestedJsonObjectOptions, Schema, SchemaBuilder,
+        TextFieldIndexing, Value, STORED, STRING, TEXT,
     };
-    use crate::{doc, DocAddress, DocId, Index, ReloadPolicy, Term, TERMINATED};
+    use crate::{Index, IndexWriter, TantivyDocument, Term};
     use serde_json::json;
 
     // A small helper that sets up a nested schema with a user` nested field.
@@ -470,7 +386,7 @@ mod nested_query_equiv_tests {
             "user": user_array
         });
         let mut document = TantivyDocument::default();
-        let expanded = parse_json_for_nested_sorted(&schema, &mut document, &top_obj).unwrap();
+        let expanded = parse_json_for_nested_sorted(schema, &mut document, &top_obj).unwrap();
 
         index_writer.add_documents(expanded).unwrap();
     }
@@ -478,7 +394,7 @@ mod nested_query_equiv_tests {
     #[test]
     fn test_ignore_unmapped_true() {
         // If we specify path="unmapped" but ignore_unmapped=true => no error => no hits
-        let (schema, _user_nested_f, group_f) = make_schema_for_eq_tests();
+        let (schema, _user_nested_f, _group_f) = make_schema_for_eq_tests();
         let index = Index::create_in_ram(schema.clone());
 
         // Index one doc
@@ -504,7 +420,7 @@ mod nested_query_equiv_tests {
         let nested_q = NestedQuery::new(
             vec!["unmapped".into()], // does not exist in nested_paths
             Box::new(child_q),
-            NestedScoreMode::None,
+            ScoreMode::None,
             true, // ignore_unmapped
         );
 
@@ -534,7 +450,7 @@ mod nested_query_equiv_tests {
         let nested_q = NestedQuery::new(
             vec!["unmapped".into()],
             Box::new(child_q),
-            NestedScoreMode::None,
+            ScoreMode::None,
             false,
         );
 
@@ -551,7 +467,7 @@ mod nested_query_equiv_tests {
     #[test]
     fn test_nested_query_some_match() -> crate::Result<()> {
         // If path="user" is found, we match doc #1 but not doc #2
-        let (schema, user_nested_f, group_f) = make_schema_for_eq_tests();
+        let (schema, user_nested_f, _group_f) = make_schema_for_eq_tests();
         let index = Index::create_in_ram(schema.clone());
 
         {
@@ -577,7 +493,7 @@ mod nested_query_equiv_tests {
         let nested_q = NestedQuery::new(
             vec!["user".into()],
             Box::new(child_q),
-            NestedScoreMode::Avg,
+            ScoreMode::Avg,
             false,
         );
 
@@ -597,7 +513,7 @@ mod nested_query_equiv_tests {
 
         // For simplicity, we’ll just confirm that we got 1 parent, and let the aggregator do something
         // minimal. If you want to truly test sum/avg, you'd need to re-check parent doc’s actual score.
-        let (schema, nested_f, group_f) = make_schema_for_eq_tests();
+        let (schema, nested_f, _group_f) = make_schema_for_eq_tests();
         let index = Index::create_in_ram(schema.clone());
 
         {
@@ -624,11 +540,11 @@ mod nested_query_equiv_tests {
         let query_parser = QueryParser::for_index(&index, vec![nested_f]);
         let child_q = query_parser.parse_query("first:java").unwrap();
         for &mode in &[
-            NestedScoreMode::None,
-            NestedScoreMode::Sum,
-            NestedScoreMode::Avg,
-            NestedScoreMode::Max,
-            NestedScoreMode::Min,
+            ScoreMode::None,
+            ScoreMode::Total,
+            ScoreMode::Avg,
+            ScoreMode::Max,
+            ScoreMode::Min,
         ] {
             let nested_q = NestedQuery::new(
                 vec!["user".into()],
@@ -644,51 +560,19 @@ mod nested_query_equiv_tests {
 
     // Additional tests can replicate ES’s
     // “testMinFromString/testMaxFromString/testAvgFromString/testSumFromString/testNoneFromString”
-    // to confirm NestedScoreMode::from_str(...) works.
+    // to confirm ScoreMode::from_str(...) works.
     #[test]
     fn test_nested_score_mode_parsing() {
-        assert_eq!(
-            NestedScoreMode::from_str("none").unwrap(),
-            NestedScoreMode::None
-        );
-        assert_eq!(
-            NestedScoreMode::from_str("avg").unwrap(),
-            NestedScoreMode::Avg
-        );
-        assert_eq!(
-            NestedScoreMode::from_str("max").unwrap(),
-            NestedScoreMode::Max
-        );
-        assert_eq!(
-            NestedScoreMode::from_str("min").unwrap(),
-            NestedScoreMode::Min
-        );
-        assert_eq!(
-            NestedScoreMode::from_str("sum").unwrap(),
-            NestedScoreMode::Sum
-        );
+        assert_eq!(ScoreMode::from_str("none").unwrap(), ScoreMode::None);
+        assert_eq!(ScoreMode::from_str("avg").unwrap(), ScoreMode::Avg);
+        assert_eq!(ScoreMode::from_str("max").unwrap(), ScoreMode::Max);
+        assert_eq!(ScoreMode::from_str("min").unwrap(), ScoreMode::Min);
+        assert_eq!(ScoreMode::from_str("total").unwrap(), ScoreMode::Total);
 
         // unknown => error
-        let err = NestedScoreMode::from_str("garbage").unwrap_err();
-        assert!(err.contains("Unrecognized nested score_mode"));
+        let err = ScoreMode::from_str("garbage").unwrap_err();
+        assert!(err.to_string().contains("Unrecognized nested score_mode"));
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::collector::TopDocs;
-    use crate::query::AllQuery;
-    use crate::query::{
-        nested_query::{NestedQuery, NestedScoreMode},
-        Query, TermQuery,
-    };
-    use crate::schema::{
-        DocParsingError, Field, FieldType, IndexRecordOption, NestedJsonObjectOptions, Schema,
-        SchemaBuilder, TantivyDocument, TextOptions, Value, STORED, STRING,
-    };
-    use crate::{Index, IndexWriter, Term};
-    use serde_json::json;
 
     // --------------------------------------------------------------------------
     // 1) Multi-level nested queries example (similar to "drivers" in the ES docs)
@@ -771,7 +655,7 @@ mod tests {
         let json_doc = serde_json::to_string(&doc_obj).unwrap();
         let mut document = TantivyDocument::default();
         let expanded = parse_json_for_nested_sorted(
-            &schema,
+            schema,
             &mut document,
             &serde_json::from_str::<serde_json::Value>(&json_doc).unwrap(),
         )
@@ -785,7 +669,7 @@ mod tests {
     /// We'll match the doc that has vehicle=Powell Motors => model=Canyonero
     #[test]
     fn test_multi_level_nested_query() -> crate::Result<()> {
-        let (schema, doc_tag_field, driver_field, vehicle_field) = make_multi_level_schema();
+        let (schema, _doc_tag_field, driver_field, vehicle_field) = make_multi_level_schema();
 
         let index = Index::create_in_ram(schema.clone());
         {
@@ -834,13 +718,13 @@ mod tests {
         let vehicle_nested = NestedQuery::new(
             vec!["driver".into(), "vehicle".into()],
             Box::new(bool_sub),
-            NestedScoreMode::Avg,
+            ScoreMode::Avg,
             false,
         );
         let driver_nested = NestedQuery::new(
             vec!["driver".into()],
             Box::new(vehicle_nested),
-            NestedScoreMode::Avg,
+            ScoreMode::Avg,
             false,
         );
 
@@ -889,7 +773,7 @@ mod tests {
         let json_doc = serde_json::to_string(&doc_obj).unwrap();
         let mut document = TantivyDocument::default();
         let expanded = parse_json_for_nested_sorted(
-            &schema,
+            schema,
             &mut document,
             &serde_json::from_str::<serde_json::Value>(&json_doc).unwrap(),
         )
@@ -969,7 +853,7 @@ mod tests {
         let nested_query = NestedQuery::new(
             vec!["comments".into()],
             Box::new(must_not),
-            NestedScoreMode::None,
+            ScoreMode::None,
             false,
         );
 
@@ -1016,7 +900,7 @@ mod tests {
         let nested2 = NestedQuery::new(
             vec!["comments".into()],
             Box::new(tq_nik2),
-            NestedScoreMode::None,
+            ScoreMode::None,
             false,
         );
         let bool_q = BooleanQuery::new(vec![
@@ -1034,7 +918,7 @@ mod tests {
             hits2.len(),
             "Only doc #1 remains under an outer must_not"
         );
-        let (score2, addr2) = hits2[0];
+        let (_score2, addr2) = hits2[0];
         let doc_stored2: TantivyDocument = searcher.doc(addr2)?;
         let doc_num2 = doc_stored2
             .get_first(doc_num_f)
@@ -1050,8 +934,8 @@ mod tests {
         use crate::collector::TopDocs;
         use crate::query::TermQuery;
         use crate::schema::{
-            IndexRecordOption, NestedJsonObjectOptions, Schema, SchemaBuilder, TantivyDocument,
-            TextFieldIndexing, STORED, TEXT,
+            IndexRecordOption, NestedJsonObjectOptions, SchemaBuilder, TantivyDocument,
+            TextFieldIndexing, TEXT,
         };
         use crate::{Index, Term};
 
@@ -1070,7 +954,7 @@ mod tests {
             );
         let user_field = builder.add_nested_json_field(vec!["user".into()], nested_json_opts);
         // Another top-level field
-        let group_field = builder.add_text_field("group", TEXT);
+        builder.add_text_field("group", TEXT);
 
         let schema = builder.build();
         let index = Index::create_in_ram(schema.clone());
@@ -1093,10 +977,7 @@ mod tests {
                 &serde_json::from_str::<serde_json::Value>(json_doc).unwrap(),
             )
             .expect("parse nested doc");
-            let docs = expanded_docs
-                .into_iter()
-                .map(|d| d.into())
-                .collect::<Vec<_>>();
+            let docs = expanded_docs.into_iter().collect::<Vec<_>>();
             writer.add_documents(docs)?;
             writer.commit()?;
         }
@@ -1114,7 +995,7 @@ mod tests {
         let nested_query = NestedQuery::new(
             vec!["user".into()],
             Box::new(child_query),
-            NestedScoreMode::None,
+            ScoreMode::None,
             false, // ignore_unmapped
         );
 
@@ -1147,7 +1028,7 @@ mod tests {
                     .set_index_option(IndexRecordOption::Basic),
             );
         let user_field = builder.add_nested_json_field(vec!["user".into()], nested_json_opts);
-        let group_field = builder.add_text_field("group", TEXT | STORED); // for retrieval
+        let _group_field = builder.add_text_field("group", TEXT | STORED); // for retrieval
 
         let schema = builder.build();
         let index = Index::create_in_ram(schema.clone());
@@ -1252,7 +1133,7 @@ mod tests {
             let nested_query = NestedQuery::new(
                 vec!["user".into()],
                 Box::new(query_parser.parse_query("kids.name:Bob AND kids.age:8")?),
-                NestedScoreMode::None,
+                ScoreMode::None,
                 false, // ignore_unmapped
             );
 
@@ -1267,7 +1148,7 @@ mod tests {
             let nested_query = NestedQuery::new(
                 vec!["user".into()],
                 Box::new(query_parser.parse_query("kids.name:Bob AND kids.age:3")?),
-                NestedScoreMode::None,
+                ScoreMode::None,
                 false, // ignore_unmapped
             );
 
@@ -1282,29 +1163,10 @@ mod tests {
 
         Ok(())
     }
-}
 
-//////////////////////////////////////////////////////////////
-// The final, complete tests for NestedQuery, drop-in ready //
-//////////////////////////////////////////////////////////////
-
-#[cfg(test)]
-mod nested_query_tests_more {
-    use super::*; // or import your nested_query, NestedQuery, etc. explicitly
-    use crate::collector::TopDocs;
-    use crate::index::Index;
-    use crate::query::EnableScoring;
-    use crate::query::{
-        nested_query::{NestedQuery, NestedScoreMode},
-        Query, TermQuery,
-    };
-    use crate::schema::{
-        DocParsingError, Field, FieldType, IndexRecordOption, NestedJsonObjectOptions, Schema,
-        SchemaBuilder, TantivyDocument, TextOptions, Value, STORED, STRING, TEXT,
-    };
-    use crate::IndexWriter;
-    use crate::Term;
-    use serde_json::json;
+    //////////////////////////////////////////////////////////////
+    // The final, complete tests for NestedQuery, drop-in ready //
+    //////////////////////////////////////////////////////////////
 
     /// A small helper to build a nested schema:
     /// - `user` is a nested field (with `include_in_parent=true` for demonstration).
@@ -1348,7 +1210,7 @@ mod nested_query_tests_more {
 
         // Expand into multiple docs
         let mut document = TantivyDocument::default();
-        let expanded = parse_json_for_nested_sorted(&schema, &mut document, &full_doc).unwrap();
+        let expanded = parse_json_for_nested_sorted(schema, &mut document, &full_doc).unwrap();
 
         // Add them as a block using add_documents
         index_writer.add_documents(expanded).unwrap();
@@ -1359,7 +1221,7 @@ mod nested_query_tests_more {
     #[test]
     fn test_nested_query_single_level() -> crate::Result<()> {
         // 1) Build the nested schema
-        let (schema, user_nested_field, group_field) = make_nested_schema();
+        let (schema, user_nested_field, _group_field) = make_nested_schema();
         let index = Index::create_in_ram(schema.clone());
 
         // 2) Create an index writer & add docs
@@ -1408,7 +1270,7 @@ mod nested_query_tests_more {
         let nested_query = NestedQuery::new(
             vec!["user".to_string()],
             Box::new(child_query),
-            NestedScoreMode::Avg,
+            ScoreMode::Avg,
             false, // ignore_unmapped
         );
 
@@ -1452,7 +1314,7 @@ mod nested_query_tests_more {
         let nested_query = NestedQuery::new(
             vec!["user".into()],
             Box::new(child_query),
-            NestedScoreMode::None,
+            ScoreMode::None,
             false,
         );
 
@@ -1492,7 +1354,7 @@ mod nested_query_tests_more {
         let nested_query = NestedQuery::new(
             vec!["someUnknownPath".to_string()],
             Box::new(child_query),
-            NestedScoreMode::Sum,
+            ScoreMode::Total,
             true, // ignore_unmapped
         );
 
@@ -1518,7 +1380,7 @@ mod nested_query_tests_more {
         let nested_query = NestedQuery::new(
             vec!["badPath".into()],
             Box::new(child_query),
-            NestedScoreMode::None,
+            ScoreMode::None,
             false, // ignore_unmapped=false => expect error
         );
 
@@ -1541,16 +1403,10 @@ mod nested_query_tests_more {
     fn test_nested_query_numeric_leaf() -> crate::Result<()> {
         use crate::schema::document::parse_json_for_nested_sorted;
         use crate::schema::{
-            IndexRecordOption, NestedJsonObjectOptions, Schema, SchemaBuilder, TantivyDocument,
+            IndexRecordOption, NestedJsonObjectOptions, SchemaBuilder, TantivyDocument,
             TextFieldIndexing,
         };
-        use crate::{
-            collector::TopDocs,
-            index::Index,
-            query::{nested_query::NestedQuery, Query, TermQuery},
-            schema::Term,
-            IndexWriter, TantivyDocument as Doc,
-        };
+        use crate::{collector::TopDocs, index::Index, query::nested_query::NestedQuery};
         use serde_json::json;
 
         // 1) Build a schema with one nested field "user".
@@ -1605,7 +1461,7 @@ mod nested_query_tests_more {
         let nested_query = NestedQuery::new(
             vec!["user".into()],
             Box::new(child_query),
-            NestedScoreMode::None,
+            ScoreMode::None,
             false, // ignore_unmapped
         );
 

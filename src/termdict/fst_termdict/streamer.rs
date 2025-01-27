@@ -228,7 +228,7 @@ where
     current_state: Option<A::State>,
 }
 
-impl<'a, A> TermWithStateStreamer<'a, A>
+impl<A> TermWithStateStreamer<'_, A>
 where
     A: Automaton,
     A::State: Clone,

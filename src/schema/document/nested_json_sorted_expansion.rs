@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::schema::{
     document::{DocParsingError, OwnedValue},
-    Field, FieldEntry, FieldType, NestedJsonObjectOptions, NestedOptions, Schema, TantivyDocument,
+    Field, FieldType, Schema,
 };
-use crate::TantivyError;
+
+use super::TantivyDocument;
 
 /// A structure for collecting text/numeric/boolean tokens for a `NestedJson` field
 /// and storing them in memory until we flush them into a `TantivyDocument`.
