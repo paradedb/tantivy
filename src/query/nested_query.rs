@@ -6,12 +6,12 @@ use crate::core::searcher::Searcher;
 use crate::query::QueryParser;
 use crate::query::{
     block_join_query::{ParentBitSetProducer, ScoreMode as BJScoreMode, ToParentBlockJoinQuery},
-    EnableScoring, Explanation, Query, QueryClone, Scorer, Weight,
+    BooleanQuery, EnableScoring, Explanation, Occur, Query, QueryClone, Scorer, TermQuery, Weight,
 };
 use crate::schema::document::parse_json_for_nested_sorted;
 use crate::schema::{
-    Field, IndexRecordOption, NestedJsonObjectOptions, SchemaBuilder, Term, TextFieldIndexing,
-    Value, STORED, STRING, TEXT,
+    Field, IndexRecordOption, NestedJsonObjectOptions, NestedOptions, SchemaBuilder, Term,
+    TextFieldIndexing, Value, STORED, STRING, TEXT,
 };
 use crate::{
     DocAddress, DocId, DocSet, Index, IndexWriter, Score, SegmentReader, TantivyDocument,
@@ -31,25 +31,56 @@ pub enum NestedScoreMode {
 impl NestedScoreMode {
     /// Convert the user input like "none", "min", etc. into `NestedScoreMode`.
     pub fn from_str(mode: &str) -> Result<NestedScoreMode, String> {
+        println!("NestedScoreMode::from_str: Parsing mode '{}'", mode);
         match mode.to_lowercase().as_str() {
-            "none" => Ok(NestedScoreMode::None),
-            "avg" => Ok(NestedScoreMode::Avg),
-            "max" => Ok(NestedScoreMode::Max),
-            "min" => Ok(NestedScoreMode::Min),
-            "sum" => Ok(NestedScoreMode::Sum),
-            other => Err(format!("Unrecognized nested score_mode: {}", other)),
+            "none" => {
+                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::None");
+                Ok(NestedScoreMode::None)
+            }
+            "avg" => {
+                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::Avg");
+                Ok(NestedScoreMode::Avg)
+            }
+            "max" => {
+                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::Max");
+                Ok(NestedScoreMode::Max)
+            }
+            "min" => {
+                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::Min");
+                Ok(NestedScoreMode::Min)
+            }
+            "sum" => {
+                println!("NestedScoreMode::from_str: Parsed mode as NestedScoreMode::Sum");
+                Ok(NestedScoreMode::Sum)
+            }
+            other => {
+                println!(
+                    "NestedScoreMode::from_str: Unrecognized mode '{}'. Returning error.",
+                    other
+                );
+                Err(format!("Unrecognized nested score_mode: {}", other))
+            }
         }
     }
 
     /// Convert `NestedScoreMode` into block_join’s `ScoreMode`.
     fn to_block_join_score_mode(&self) -> BJScoreMode {
-        match self {
+        println!(
+            "NestedScoreMode::to_block_join_score_mode: Converting {:?} to BJScoreMode",
+            self
+        );
+        let mode = match self {
             NestedScoreMode::None => BJScoreMode::None,
             NestedScoreMode::Avg => BJScoreMode::Avg,
             NestedScoreMode::Max => BJScoreMode::Max,
             NestedScoreMode::Min => BJScoreMode::Min,
             NestedScoreMode::Sum => BJScoreMode::Total,
-        }
+        };
+        println!(
+            "NestedScoreMode::to_block_join_score_mode: Converted to {:?}",
+            mode
+        );
+        mode
     }
 }
 
@@ -59,8 +90,11 @@ impl NestedScoreMode {
 /// - `child_query`: the query to match child docs.
 /// - `score_mode`: how child scores get aggregated.
 /// - `ignore_unmapped`: if `true`, we produce a no-match scorer if the path is unmapped.
+///
+/// **Notable change**: we do a `BooleanQuery` to exclude docs that have `_is_parent_<path> == true`
+/// from matching the child side.
 pub struct NestedQuery {
-    path: String,
+    path: Vec<String>,
     child_query: Box<dyn Query>,
     score_mode: NestedScoreMode,
     ignore_unmapped: bool,
@@ -68,11 +102,15 @@ pub struct NestedQuery {
 
 impl NestedQuery {
     pub fn new(
-        path: String,
+        path: Vec<String>,
         child_query: Box<dyn Query>,
         score_mode: NestedScoreMode,
         ignore_unmapped: bool,
     ) -> Self {
+        println!(
+            "NestedQuery::new: Creating NestedQuery with path={:?}, score_mode={:?}, ignore_unmapped={}",
+            path, score_mode, ignore_unmapped
+        );
         Self {
             path,
             child_query,
@@ -81,7 +119,7 @@ impl NestedQuery {
         }
     }
 
-    pub fn path(&self) -> &str {
+    pub fn path(&self) -> &Vec<String> {
         &self.path
     }
     pub fn child_query(&self) -> &dyn Query {
@@ -107,6 +145,7 @@ impl fmt::Debug for NestedQuery {
 
 impl QueryClone for NestedQuery {
     fn box_clone(&self) -> Box<dyn Query> {
+        println!("NestedQuery::box_clone: Cloning NestedQuery");
         Box::new(NestedQuery {
             path: self.path.clone(),
             child_query: self.child_query.box_clone(),
@@ -118,73 +157,138 @@ impl QueryClone for NestedQuery {
 
 impl Query for NestedQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        // 1. Build the child's weight:
-        let _child_weight = self.child_query.weight(enable_scoring)?;
+        println!(
+            "NestedQuery::weight: Creating Weight for NestedQuery with path={:?}",
+            self.path
+        );
 
-        // 2. Lookup "_is_parent_<path>" from schema.nested_paths()
+        // 1) Convert our nested path into the parent-flag name, e.g. "_is_parent_user"
+        let path_str = self.path.join(".");
+        let parent_flag_name = format!("_is_parent_{}", path_str);
+        println!(
+            "NestedQuery::weight: Derived parent_flag_name='{parent_flag_name}' from path_str='{path_str}'"
+        );
+
+        // 2) Look up that exact field in the schema. If it doesn't exist and
+        //    ignore_unmapped=true, return a no-match query. Otherwise, error.
         let schema = enable_scoring.schema();
-        let Some(parent_name) = schema.nested_paths().get(&self.path) else {
-            // Path not found in nested_paths
-            if self.ignore_unmapped {
+        let parent_field = match schema.get_field(&parent_flag_name) {
+            Ok(f) => {
+                println!(
+                    "NestedQuery::weight: Found parent_field '{parent_flag_name}' with Field ID {:?}",
+                    f
+                );
+                f
+            }
+            Err(_) if self.ignore_unmapped => {
+                println!(
+                    "NestedQuery::weight: parent_field '{parent_flag_name}' not found and ignore_unmapped=true. Returning NoMatchWeight."
+                );
                 // produce an empty (no-match) weight
                 return Ok(Box::new(NoMatchWeight));
-            } else {
+            }
+            Err(_) => {
+                println!(
+                    "NestedQuery::weight: parent_field '{parent_flag_name}' not found and ignore_unmapped=false. Returning error."
+                );
                 return Err(TantivyError::SchemaError(format!(
-                    "NestedQuery path '{}' not mapped, and ignore_unmapped=false",
-                    self.path
+                    "NestedQuery path '{:?}' not mapped (no field '{}'), and ignore_unmapped=false",
+                    self.path, parent_flag_name
                 )));
             }
         };
 
-        // 3. Check that parent_name maps to a real Field in the schema
-        let maybe_parent_field = schema.get_field(parent_name).ok();
-        if maybe_parent_field.is_none() {
-            if self.ignore_unmapped {
-                return Ok(Box::new(NoMatchWeight));
-            } else {
-                return Err(TantivyError::SchemaError(format!(
-                    "NestedQuery path '{}' not mapped, and ignore_unmapped=false",
-                    self.path
-                )));
-            }
-        }
-        let parent_field = maybe_parent_field.unwrap();
+        // 3) We want to exclude parent docs from the child side. So the child
+        //    query must match, and `_is_parent_<path>` must NOT be true.
+        //    We'll do that by a BooleanQuery: MUST=child, MUST_NOT=parent:true
+        println!(
+            "NestedQuery::weight: Creating BooleanQuery to combine child_query and exclude parent docs"
+        );
+        let exclude_parent_term = Term::from_field_bool(parent_field, true);
+        let exclude_parent_q =
+            TermQuery::new(exclude_parent_term.clone(), IndexRecordOption::Basic);
+        println!(
+            "NestedQuery::weight: Created exclude_parent_term={:?}",
+            exclude_parent_term
+        );
 
-        // 4. Create the ParentBitSetProducer
-        let parent_bitset_producer = Arc::new(NestedParentBitSetProducer::new(parent_field));
+        let child_plus_exclude = BooleanQuery::new(vec![
+            (Occur::Must, self.child_query.box_clone()),
+            (Occur::MustNot, Box::new(exclude_parent_q)),
+        ]);
+        println!(
+            "NestedQuery::weight: Created BooleanQuery with child_query and exclude_parent_query"
+        );
 
-        // 5. Convert NestedScoreMode => block_join::ScoreMode
+        // 4) Convert user-chosen NestedScoreMode => block_join::ScoreMode
         let bj_score_mode = self.score_mode.to_block_join_score_mode();
+        println!(
+            "NestedQuery::weight: Converted NestedScoreMode {:?} to BJScoreMode {:?}",
+            self.score_mode, bj_score_mode
+        );
 
-        // 6. Build and return a ToParentBlockJoinQuery
+        // 5) Wrap in a ToParentBlockJoinQuery, using our parent-flag field
+        println!(
+            "NestedQuery::weight: Creating ToParentBlockJoinQuery with BooleanQuery and parent_field {:?}",
+            parent_field
+        );
         let block_join_query = ToParentBlockJoinQuery::new(
-            self.child_query.box_clone(),
-            parent_bitset_producer,
+            Box::new(child_plus_exclude),
+            Arc::new(NestedParentBitSetProducer::new(parent_field)),
             bj_score_mode,
         );
-        block_join_query.weight(enable_scoring)
+        println!("NestedQuery::weight: ToParentBlockJoinQuery created successfully");
+
+        // 6) Delegate weight creation to that block-join query
+        println!("NestedQuery::weight: Delegating weight creation to ToParentBlockJoinQuery");
+        let weight = block_join_query.weight(enable_scoring)?;
+        println!("NestedQuery::weight: Weight created successfully");
+        Ok(weight)
     }
 
+    // (Optional) keep the rest of the Query trait’s methods the same...
     fn explain(&self, searcher: &Searcher, doc_address: DocAddress) -> crate::Result<Explanation> {
+        println!(
+            "NestedQuery::explain: Explaining score for doc_address {:?}",
+            doc_address
+        );
         let w = self.weight(EnableScoring::enabled_from_searcher(searcher))?;
-        w.explain(
+        let explanation = w.explain(
             searcher.segment_reader(doc_address.segment_ord),
             doc_address.doc_id,
-        )
+        )?;
+        println!(
+            "NestedQuery::explain: Explanation for doc_address {:?}: {:?}",
+            doc_address, explanation
+        );
+        Ok(explanation)
     }
 
     fn count(&self, searcher: &Searcher) -> crate::Result<usize> {
+        println!("NestedQuery::count: Counting matching documents for NestedQuery");
         let w = self.weight(EnableScoring::disabled_from_searcher(searcher))?;
         let mut sum = 0usize;
         for seg_reader in searcher.segment_readers() {
-            sum += w.count(seg_reader)? as usize;
+            let seg_count = w.count(seg_reader)? as usize;
+            println!(
+                "NestedQuery::count: Segment {:?} has {} matching documents",
+                seg_reader.segment_id(),
+                seg_count
+            );
+            sum += seg_count;
         }
+        println!(
+            "NestedQuery::count: Total matching documents across all segments: {}",
+            sum
+        );
         Ok(sum)
     }
 
     fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
-        // pass down to child query
+        println!("NestedQuery::query_terms: Delegating query_terms to child_query");
+        // Pass down to child query (the MUST_NOT is just an internal detail).
         self.child_query.query_terms(visitor);
+        println!("NestedQuery::query_terms: Completed delegating query_terms to child_query");
     }
 }
 
@@ -193,12 +297,15 @@ pub struct NoMatchWeight;
 
 impl Weight for NoMatchWeight {
     fn scorer(&self, _reader: &SegmentReader, _boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        println!("NoMatchWeight::scorer: Creating NoMatchScorer");
         Ok(Box::new(NoMatchScorer))
     }
     fn explain(&self, _reader: &SegmentReader, _doc: DocId) -> crate::Result<Explanation> {
+        println!("NoMatchWeight::explain: Explaining NoMatchWeight");
         Ok(Explanation::new("No-match query", 0.0))
     }
     fn count(&self, _reader: &SegmentReader) -> crate::Result<u32> {
+        println!("NoMatchWeight::count: Counting NoMatchWeight documents (always 0)");
         Ok(0)
     }
     fn for_each_pruning(
@@ -207,6 +314,7 @@ impl Weight for NoMatchWeight {
         _reader: &SegmentReader,
         _callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
+        println!("NoMatchWeight::for_each_pruning: No pruning necessary for NoMatchWeight");
         Ok(())
     }
 }
@@ -216,324 +324,92 @@ pub struct NoMatchScorer;
 
 impl crate::docset::DocSet for NoMatchScorer {
     fn advance(&mut self) -> DocId {
+        println!("NoMatchScorer::advance: Always TERMINATED");
         TERMINATED
     }
     fn doc(&self) -> DocId {
+        println!("NoMatchScorer::doc: Always TERMINATED");
         TERMINATED
     }
     fn size_hint(&self) -> u32 {
+        println!("NoMatchScorer::size_hint: Size hint is 0");
         0
     }
 }
 
 impl Scorer for NoMatchScorer {
     fn score(&mut self) -> Score {
+        println!("NoMatchScorer::score: Returning score 0.0");
         0.0
     }
 }
 
 /// Example `NestedParentBitSetProducer` to find docs where a `_is_parent_<path>` bool field = true
+/// i.e. doc is the "parent" doc for that nested path.
 pub struct NestedParentBitSetProducer {
     parent_field: Field,
 }
 
 impl NestedParentBitSetProducer {
     pub fn new(parent_field: Field) -> Self {
+        println!(
+            "NestedParentBitSetProducer::new: Creating NestedParentBitSetProducer for parent_field {:?}",
+            parent_field
+        );
         Self { parent_field }
     }
 }
 
 impl ParentBitSetProducer for NestedParentBitSetProducer {
     fn produce(&self, reader: &SegmentReader) -> crate::Result<common::BitSet> {
+        println!(
+            "NestedParentBitSetProducer::produce: Producing BitSet for parent_field {:?}",
+            self.parent_field
+        );
         let max_doc = reader.max_doc();
         let mut bitset = common::BitSet::with_max_value(max_doc);
+        println!(
+            "NestedParentBitSetProducer::produce: Initialized BitSet with max_doc={}",
+            max_doc
+        );
 
-        // For example, if the parent_field is a boolean field, you read all postings for “true”.
+        // If the parent_field is a boolean field, read all postings for “true”.
         let inverted = reader.inverted_index(self.parent_field)?;
+        println!(
+            "NestedParentBitSetProducer::produce: Retrieved inverted index for parent_field {:?}",
+            self.parent_field
+        );
         let term_true = Term::from_field_bool(self.parent_field, true);
+        println!(
+            "NestedParentBitSetProducer::produce: Created Term {:?} for boolean true",
+            term_true
+        );
+
         if let Some(mut postings) = inverted.read_postings(&term_true, IndexRecordOption::Basic)? {
-            let mut d = postings.doc();
-            while d != TERMINATED {
-                bitset.insert(d);
-                d = postings.advance();
-            }
-        }
-        Ok(bitset)
-    }
-}
-
-#[cfg(test)]
-mod nested_query_tests {
-    use super::*; // or import your nested_query, NestedQuery, etc. explicitly
-    use crate::collector::TopDocs;
-    use crate::index::Index;
-    use crate::query::EnableScoring;
-    use crate::query::{
-        nested_query::{NestedQuery, NestedScoreMode},
-        Query, TermQuery,
-    };
-    use crate::schema::{
-        DocParsingError, Field, FieldType, IndexRecordOption, NestedOptions, Schema, SchemaBuilder,
-        TantivyDocument, TextOptions, Value, STORED, STRING, TEXT,
-    };
-    use crate::IndexWriter;
-    use crate::Term;
-    use serde_json::json;
-
-    /// A small helper to build a nested schema:
-    /// - `user` is a nested field (with `include_in_parent=true` for demonstration).
-    /// - We'll also add "user.first" and "user.last" fields as TEXT,
-    ///   plus a top-level "group" field as STRING, etc.
-    fn make_nested_schema() -> (Schema, Field, Field, Field, Field) {
-        let mut builder = Schema::builder();
-
-        // normal top-level field
-        let group_field = builder.add_text_field("group", STRING | STORED);
-
-        // nested field
-        let nested_opts = NestedOptions::new()
-            .set_include_in_parent(true) // or false as you need
-            .set_store_parent_flag(true);
-        let user_nested_field = builder.add_nested_field("user", nested_opts);
-
-        // child fields "first" and "last"
-        // CHANGED: Use STRING, so the exact token "Alice" is indexed.
-        let first_field = builder.add_text_field("user.first", STRING);
-        let last_field = builder.add_text_field("user.last", STRING);
-
-        let schema = builder.build();
-        (
-            schema,
-            user_nested_field,
-            first_field,
-            last_field,
-            group_field,
-        )
-    }
-
-    /// Index a single JSON doc that has nested `user` array-of-objects.
-    /// Uses your parse_json_for_nested(...) method to produce child docs + parent doc.
-    fn index_test_document(
-        index_writer: &mut IndexWriter,
-        schema: &Schema,
-        group_val: &str,
-        users: serde_json::Value,
-    ) -> Result<(), DocParsingError> {
-        // Build up a single top-level JSON object
-        let full_doc = json!({
-            "group": group_val,
-            "user": users, // e.g. an array of { "first": "...", "last": "..." }
-        });
-        let doc_str = serde_json::to_string(&full_doc).unwrap();
-
-        // Expand into multiple docs
-        let expanded_docs = TantivyDocument::parse_json_for_nested(schema, &doc_str)?;
-
-        // Add them as a block using add_documents
-        let docs: Vec<_> = expanded_docs.into_iter().map(|d| d.into()).collect();
-        index_writer.add_documents(docs).unwrap();
-
-        Ok(())
-    }
-
-    /// A trivial lookup function for `_is_parent_<path>` that your NestedQuery calls.
-    /// In real code, you might do something more robust. Here we hard-code `_is_parent_user`.
-    ///
-    /// This must be *hooked* into your `NestedQuery::lookup_parent_field_for_path`
-    /// either by rewriting that function or making it pick from a static map.
-    fn test_lookup_parent_field(path: &str, schema: &Schema) -> Option<Field> {
-        // if path == "user", we expect a field named `_is_parent_user`
-        let maybe_name = format!("_is_parent_{}", path);
-        schema.get_field(&maybe_name).ok()
-    }
-
-    #[test]
-    fn test_nested_query_single_level() -> crate::Result<()> {
-        // 1) Build the nested schema
-        let (schema, _user_nested_field, first_field, last_field, group_field) =
-            make_nested_schema();
-        let index = Index::create_in_ram(schema.clone());
-
-        // 2) Create an index writer & add docs
-        {
-            let mut writer = index.writer_for_tests()?;
-
-            // Document #1: group="fans", user => [ {"first":"John","last":"Smith"}, {"first":"Alice","last":"White"} ]
-            index_test_document(
-                &mut writer,
-                &schema,
-                "fans",
-                json!([
-                    { "first": "John", "last": "Smith" },
-                    { "first": "Alice", "last": "White" }
-                ]),
-            )?;
-
-            // Document #2: group="boring", user => [ {"first":"Bob","last":"Marley"} ]
-            index_test_document(
-                &mut writer,
-                &schema,
-                "boring",
-                json!([
-                    { "first": "Bob", "last": "Marley" }
-                ]),
-            )?;
-
-            writer.commit()?;
-        }
-
-        // 4) Search
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-
-        // We'll query for child docs whose `first=="Alice"`
-        let child_term = Term::from_field_text(first_field, "Alice");
-        let child_query = TermQuery::new(child_term, IndexRecordOption::Basic);
-
-        // Build the NestedQuery
-        let nested_query = NestedQuery::new(
-            "user".to_string(),
-            Box::new(child_query),
-            NestedScoreMode::Avg,
-            false, // ignore_unmapped
-        );
-
-        // Execute search
-        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-        // We expect 1 doc: the parent doc that had "Alice" in user array
-        assert_eq!(1, top_docs.len(), "Should match exactly one parent doc");
-
-        // Fetch that doc & check "group= fans"
-        let (score, doc_address) = top_docs[0];
-        let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-        let group_vals = retrieved_doc
-            .get_all(group_field)
-            .map(|v| v.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(group_vals, vec![Some("fans")]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_nested_query_no_match() -> crate::Result<()> {
-        // This time we’ll test a nested query that doesn’t match any child => no parent docs.
-        let (schema, _user_nested_field, first_field, _last_field, _group_field) =
-            make_nested_schema();
-        let index = Index::create_in_ram(schema.clone());
-
-        {
-            let mut writer = index.writer_for_tests()?;
-            // Insert one doc => user => [ { first:"John"}, { first:"Alice"} ] ...
-            index_test_document(
-                &mut writer,
-                &schema,
-                "groupVal",
-                json!([
-                    {"first":"John"},
-                    {"first":"Alice"}
-                ]),
-            )?;
-            writer.commit()?;
-        }
-
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-
-        // child query => "first=NoSuchName"
-        let child_query = TermQuery::new(
-            Term::from_field_text(first_field, "NoSuchName"),
-            IndexRecordOption::Basic,
-        );
-        let nested_query = NestedQuery::new(
-            "user".into(),
-            Box::new(child_query),
-            NestedScoreMode::None,
-            false,
-        );
-
-        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-        assert_eq!(0, top_docs.len(), "No matches expected");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_nested_query_ignore_unmapped() -> crate::Result<()> {
-        // Demonstrates that if `path="badPath"` is not recognized and `ignore_unmapped=true`,
-        // we get no matches instead of an error.
-        let (schema, _ufield, first_field, _last_field, _group_field) = make_nested_schema();
-        let index = Index::create_in_ram(schema.clone());
-
-        {
-            let mut writer = index.writer_for_tests()?;
-            // Insert doc
-            index_test_document(
-                &mut writer,
-                &schema,
-                "unmappedTest",
-                json!([
-                    {"first":"SomeName"}
-                ]),
-            )?;
-            writer.commit()?;
-        }
-
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-
-        // We do a NestedQuery with path="someUnknownPath", but ignore_unmapped=true => no error => no docs
-        let child_query = TermQuery::new(
-            Term::from_field_text(first_field, "SomeName"),
-            IndexRecordOption::Basic,
-        );
-        let nested_query = NestedQuery::new(
-            "someUnknownPath".to_string(),
-            Box::new(child_query),
-            NestedScoreMode::Sum,
-            true, // ignore_unmapped
-        );
-
-        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-        assert_eq!(0, top_docs.len(), "No docs returned, but no error either");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_nested_query_unmapped_error() {
-        // If ignore_unmapped=false, we expect an error instead.
-        let (schema, _ufield, first_field, _last_field, _group_field) = make_nested_schema();
-        let index = Index::create_in_ram(schema.clone());
-
-        // We won't even index anything for this example. We'll just do the query.
-        let reader = index.reader().unwrap();
-        let searcher = reader.searcher();
-
-        let child_query = TermQuery::new(
-            Term::from_field_text(first_field, "X"),
-            IndexRecordOption::Basic,
-        );
-        let nested_query = NestedQuery::new(
-            "badPath".into(),
-            Box::new(child_query),
-            NestedScoreMode::None,
-            false, // ignore_unmapped=false => expect error
-        );
-
-        let res = searcher.search(&nested_query, &TopDocs::with_limit(10));
-        match res {
-            Err(e) => {
-                // Should be a schema error about path unmapped
-                let msg = format!("{:?}", e);
-                assert!(
-                    msg.contains("NestedQuery path 'badPath' not mapped")
-                        && !msg.contains("ignore_unmapped=true"),
-                    "Expected schema error complaining about unmapped path"
+            println!(
+                "NestedParentBitSetProducer::produce: Iterating over postings for term {:?}",
+                term_true
+            );
+            while postings.doc() != TERMINATED {
+                println!(
+                    "NestedParentBitSetProducer::produce: Found doc_id {:?}",
+                    postings.doc()
                 );
+                bitset.insert(postings.doc());
+                postings.advance();
             }
-            Ok(_) => panic!("Expected an error for unmapped path with ignore_unmapped=false"),
+        } else {
+            println!(
+                "NestedParentBitSetProducer::produce: No postings found for term {:?}",
+                term_true
+            );
         }
+
+        println!(
+            "NestedParentBitSetProducer::produce: Completed producing BitSet with {} bits set",
+            bitset.len()
+        );
+        Ok(bitset)
     }
 }
 
@@ -547,31 +423,32 @@ mod nested_query_equiv_tests {
     };
     use crate::query::{EnableScoring, Explanation, QueryParserError};
     use crate::schema::{
-        Field, FieldEntry, FieldType, IndexRecordOption, NestedOptions, Schema, SchemaBuilder,
-        TantivyDocument, TextOptions, Value, STORED, STRING,
+        Field, FieldEntry, FieldType, IndexRecordOption, NestedJsonObjectOptions, Schema,
+        SchemaBuilder, TantivyDocument, TextOptions, Value, STORED, STRING,
     };
     use crate::{doc, DocAddress, DocId, Index, ReloadPolicy, Term, TERMINATED};
     use serde_json::json;
 
-    // A small helper that sets up a nested schema with a `user` nested field.
-    fn make_schema_for_eq_tests() -> (Schema, Field, Field, Field, Field) {
+    // A small helper that sets up a nested schema with a user` nested field.
+    fn make_schema_for_eq_tests() -> (Schema, Field, Field) {
         let mut builder = SchemaBuilder::default();
 
         // A top-level string field, stored so we can retrieve it.
         let group_f = builder.add_text_field("group", STRING | STORED);
 
         // Create a nested field named `user`
-        let nested_opts = NestedOptions::new()
-            .set_include_in_parent(true)
-            .set_store_parent_flag(true);
-        let user_nested_f = builder.add_nested_field("user", nested_opts);
-
-        // Child fields: "first" and "last"
-        let first_f = builder.add_text_field("user.first", STRING);
-        let last_f = builder.add_text_field("user.last", STRING);
+        let nested_opts = NestedJsonObjectOptions::new()
+            .set_include_in_parent(false)
+            .set_store_parent_flag(true)
+            .set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("default")
+                    .set_index_option(IndexRecordOption::Basic),
+            );
+        let user_nested_f = builder.add_nested_json_field(vec!["user".into()], nested_opts);
 
         let schema = builder.build();
-        (schema, user_nested_f, first_f, last_f, group_f)
+        (schema, user_nested_f, group_f)
     }
 
     // Helper: indexes a doc with user: [{first,... last,...}] array
@@ -585,21 +462,23 @@ mod nested_query_equiv_tests {
             "group": group_val,
             "user": user_array
         });
-        let doc_str = serde_json::to_string(&top_obj).unwrap();
-        let expanded_docs =
-            TantivyDocument::parse_json_for_nested(schema, &doc_str).expect("parse nested doc");
+        let json_doc = serde_json::to_string(&top_obj).unwrap();
+        let mut document = TantivyDocument::default();
+        let expanded = parse_json_for_nested_sorted(
+            &schema,
+            &mut document,
+            &serde_json::from_str::<serde_json::Value>(&json_doc).unwrap(),
+        )
+        .unwrap();
 
-        let docs = expanded_docs
-            .into_iter()
-            .map(|d| d.into())
-            .collect::<Vec<_>>();
+        let docs = expanded.into_iter().map(|d| d.into()).collect::<Vec<_>>();
         index_writer.add_documents(docs).unwrap();
     }
 
     #[test]
     fn test_ignore_unmapped_true() {
         // If we specify path="unmapped" but ignore_unmapped=true => no error => no hits
-        let (schema, _user_nested_f, first_f, last_f, group_f) = make_schema_for_eq_tests();
+        let (schema, _user_nested_f, group_f) = make_schema_for_eq_tests();
         let index = Index::create_in_ram(schema.clone());
 
         // Index one doc
@@ -619,14 +498,11 @@ mod nested_query_equiv_tests {
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
 
-        // child query => first=Bob
-        let child_q = TermQuery::new(
-            Term::from_field_text(first_f, "Bob"),
-            IndexRecordOption::Basic,
-        );
+        let query_parser = QueryParser::for_index(&index, vec![]);
+        let child_q = query_parser.parse_query("user.first:Bob").unwrap();
 
         let nested_q = NestedQuery::new(
-            "unmapped".into(), // does not exist in nested_paths
+            vec!["unmapped".into()], // does not exist in nested_paths
             Box::new(child_q),
             NestedScoreMode::None,
             true, // ignore_unmapped
@@ -646,19 +522,17 @@ mod nested_query_equiv_tests {
     #[test]
     fn test_ignore_unmapped_false_error() {
         // If we specify path="unmapped" but ignore_unmapped=false => expect an error
-        let (schema, _user_nested_f, first_f, _last_f, _group_f) = make_schema_for_eq_tests();
+        let (schema, _user_nested_f, _group_f) = make_schema_for_eq_tests();
         let index = Index::create_in_ram(schema.clone());
 
         // no docs needed
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
 
-        let child_q = TermQuery::new(
-            Term::from_field_text(first_f, "Anything"),
-            IndexRecordOption::Basic,
-        );
+        let query_parser = QueryParser::for_index(&index, vec![]);
+        let child_q = query_parser.parse_query("user.first:Anything").unwrap();
         let nested_q = NestedQuery::new(
-            "unmapped".into(),
+            vec!["unmapped".into()],
             Box::new(child_q),
             NestedScoreMode::None,
             false,
@@ -677,7 +551,7 @@ mod nested_query_equiv_tests {
     #[test]
     fn test_nested_query_some_match() -> crate::Result<()> {
         // If path="user" is found, we match doc #1 but not doc #2
-        let (schema, _user_nested_f, first_f, last_f, group_f) = make_schema_for_eq_tests();
+        let (schema, _user_nested_f, group_f) = make_schema_for_eq_tests();
         let index = Index::create_in_ram(schema.clone());
 
         {
@@ -707,12 +581,14 @@ mod nested_query_equiv_tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        // child query => first=Alice
-        let tq = TermQuery::new(
-            Term::from_field_text(first_f, "Alice"),
-            IndexRecordOption::Basic,
+        let query_parser = QueryParser::for_index(&index, vec![]);
+        let child_q = query_parser.parse_query("user.first:Alice").unwrap();
+        let nested_q = NestedQuery::new(
+            vec!["user".into()],
+            Box::new(child_q),
+            NestedScoreMode::Avg,
+            false,
         );
-        let nested_q = NestedQuery::new("user".into(), Box::new(tq), NestedScoreMode::Avg, false);
 
         let top_docs = searcher.search(&nested_q, &TopDocs::with_limit(10))?;
         // => doc1 is matched because user array has (Alice)
@@ -731,7 +607,7 @@ mod nested_query_equiv_tests {
     #[test]
     fn test_no_child_match() -> crate::Result<()> {
         // No child match => zero parents
-        let (schema, _user_nested_f, first_f, _last_f, _group_f) = make_schema_for_eq_tests();
+        let (schema, user_nested_f, _group_f) = make_schema_for_eq_tests();
         let index = Index::create_in_ram(schema.clone());
 
         // doc => user => Alice
@@ -749,14 +625,12 @@ mod nested_query_equiv_tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        // but we search for first=Nope
-        let child_q = TermQuery::new(
-            Term::from_field_text(first_f, "Nope"),
-            IndexRecordOption::Basic,
-        );
+        let mut child_term = Term::from_field_json_path(user_nested_f, "first", false);
+        child_term.append_type_and_str("alice");
+        let child_query = TermQuery::new(child_term, IndexRecordOption::Basic);
         let nested_q = NestedQuery::new(
-            "user".into(),
-            Box::new(child_q),
+            vec!["user".into()],
+            Box::new(child_query),
             NestedScoreMode::None,
             false,
         );
@@ -775,7 +649,7 @@ mod nested_query_equiv_tests {
 
         // For simplicity, we’ll just confirm that we got 1 parent, and let the aggregator do something
         // minimal. If you want to truly test sum/avg, you'd need to re-check parent doc’s actual score.
-        let (schema, _nested_f, first_f, _last_f, group_f) = make_schema_for_eq_tests();
+        let (schema, nested_f, group_f) = make_schema_for_eq_tests();
         let index = Index::create_in_ram(schema.clone());
 
         {
@@ -799,10 +673,8 @@ mod nested_query_equiv_tests {
         let searcher = reader.searcher();
 
         // We match children with first=java
-        let tq = TermQuery::new(
-            Term::from_field_text(first_f, "java"),
-            IndexRecordOption::Basic,
-        );
+        let query_parser = QueryParser::for_index(&index, vec![nested_f]);
+        let child_q = query_parser.parse_query("user.first:java").unwrap();
         for &mode in &[
             NestedScoreMode::None,
             NestedScoreMode::Sum,
@@ -810,7 +682,12 @@ mod nested_query_equiv_tests {
             NestedScoreMode::Max,
             NestedScoreMode::Min,
         ] {
-            let nested_q = NestedQuery::new("user".into(), Box::new(tq.box_clone()), mode, false);
+            let nested_q = NestedQuery::new(
+                vec!["user".into()],
+                Box::new(child_q.box_clone()),
+                mode,
+                false,
+            );
             let hits = searcher.search(&nested_q, &TopDocs::with_limit(10))?;
             assert_eq!(1, hits.len());
             // We won't compare the parent's actual final score, but you can check:
@@ -855,7 +732,7 @@ mod nested_query_equiv_tests {
 }
 
 #[cfg(test)]
-mod nested_query_extended_examples {
+mod tests {
     use super::*;
     use crate::collector::TopDocs;
     use crate::query::AllQuery;
@@ -864,8 +741,8 @@ mod nested_query_extended_examples {
         Query, TermQuery,
     };
     use crate::schema::{
-        DocParsingError, Field, FieldType, IndexRecordOption, NestedOptions, Schema, SchemaBuilder,
-        TantivyDocument, TextOptions, Value, STORED, STRING,
+        DocParsingError, Field, FieldType, IndexRecordOption, NestedJsonObjectOptions, Schema,
+        SchemaBuilder, TantivyDocument, TextOptions, Value, STORED, STRING,
     };
     use crate::{Index, IndexWriter, Term};
     use serde_json::json;
@@ -887,43 +764,28 @@ mod nested_query_extended_examples {
     ///  }
     ///
     /// We'll also add a top-level "misc" field or something, if we want.
-    fn make_multi_level_schema() -> (Schema, Field, Field, Field, Field, Field, Field) {
+    fn make_multi_level_schema() -> (Schema, Field, Field, Field) {
         let mut builder = Schema::builder();
 
         // A top-level stored field, just for demonstration
         let doc_tag_field = builder.add_text_field("doc_tag", STRING | STORED);
 
         // 1) The first nested field => "driver"
-        let driver_nested_opts = NestedOptions::new()
+        let driver_nested_opts = NestedJsonObjectOptions::new()
             .set_include_in_parent(false)
             .set_store_parent_flag(true);
-        let driver_field = builder.add_nested_field("driver", driver_nested_opts);
-
-        // If you want "driver.last_name" to exist as a child field,
-        // just add a text field named "driver.last_name" (not a nested field):
-        let last_name_field = builder.add_text_field("driver.last_name", STRING);
+        let driver_field = builder.add_nested_json_field(vec!["driver".into()], driver_nested_opts);
 
         // 2) The second nested field => literally "driver.vehicle"
         // so the path is "driver.vehicle" in the queries
-        let vehicle_nested_opts = NestedOptions::new()
+        let vehicle_nested_opts = NestedJsonObjectOptions::new()
             .set_include_in_parent(false)
             .set_store_parent_flag(true);
-        let vehicle_field = builder.add_nested_field("driver.vehicle", vehicle_nested_opts);
-
-        // Then the subfields for "driver.vehicle.make" and "driver.vehicle.model":
-        let make_field = builder.add_text_field("driver.vehicle.make", STRING);
-        let model_field = builder.add_text_field("driver.vehicle.model", STRING);
+        let vehicle_field =
+            builder.add_nested_json_field(vec!["driver.vehicle".into()], vehicle_nested_opts);
 
         let schema = builder.build();
-        (
-            schema,
-            doc_tag_field,
-            driver_field,
-            last_name_field,
-            vehicle_field,
-            make_field,
-            model_field,
-        )
+        (schema, doc_tag_field, driver_field, vehicle_field)
     }
 
     /// Expands JSON like:
@@ -953,10 +815,15 @@ mod nested_query_extended_examples {
                 "vehicle": vehicles
             }
         });
-        let doc_str = serde_json::to_string(&doc_obj).unwrap();
-        let expanded_docs = TantivyDocument::parse_json_for_nested(schema, &doc_str)?;
-        let docs: Vec<_> = expanded_docs.into_iter().map(|d| d.into()).collect();
-        writer.add_documents(docs).unwrap();
+        let json_doc = serde_json::to_string(&doc_obj).unwrap();
+        let mut document = TantivyDocument::default();
+        let expanded = parse_json_for_nested_sorted(
+            &schema,
+            &mut document,
+            &serde_json::from_str::<serde_json::Value>(&json_doc).unwrap(),
+        )
+        .unwrap();
+        writer.add_documents(expanded).unwrap();
         Ok(())
     }
 
@@ -965,15 +832,7 @@ mod nested_query_extended_examples {
     /// We'll match the doc that has vehicle=Powell Motors => model=Canyonero
     #[test]
     fn test_multi_level_nested_query() -> crate::Result<()> {
-        let (
-            schema,
-            doc_tag_field,
-            driver_field,
-            last_name_field,
-            vehicle_field,
-            make_field,
-            model_field,
-        ) = make_multi_level_schema();
+        let (schema, doc_tag_field, driver_field, vehicle_field) = make_multi_level_schema();
 
         let index = Index::create_in_ram(schema.clone());
         {
@@ -1011,31 +870,27 @@ mod nested_query_extended_examples {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        // We'll do a multi-level nested query:
+        // Well do a multi-level nested query:
         //   nested(path="driver") -> child = nested(path="driver.vehicle") -> child= bool must => match make=Powell Motors, model=Canyonero
-        use crate::query::{BooleanQuery, Occur};
 
-        let tq_make = TermQuery::new(
-            Term::from_field_text(make_field, "Powell Motors"),
-            IndexRecordOption::Basic,
-        );
-        let tq_model = TermQuery::new(
-            Term::from_field_text(model_field, "Canyonero"),
-            IndexRecordOption::Basic,
-        );
+        let query_parser = QueryParser::for_index(&index, vec![]);
+        let make_q = query_parser
+            .parse_query("vehicle.make:\"Powell Motors\"")
+            .unwrap();
+        let model_q = query_parser.parse_query("vehicle.model:Canyonero").unwrap();
         let bool_sub = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(tq_make)),
-            (Occur::Must, Box::new(tq_model)),
+            (Occur::Must, Box::new(make_q)),
+            (Occur::Must, Box::new(model_q)),
         ]);
 
         let vehicle_nested = NestedQuery::new(
-            "driver.vehicle".into(),
+            vec!["driver.vehicle".into()],
             Box::new(bool_sub),
             NestedScoreMode::None,
             false,
         );
         let driver_nested = NestedQuery::new(
-            "driver".into(),
+            vec!["driver".into()],
             Box::new(vehicle_nested),
             NestedScoreMode::None,
             false,
@@ -1061,7 +916,7 @@ mod nested_query_extended_examples {
     // --------------------------------------------------------------------------
 
     /// Build a schema with "comments" => nested => properties: author => text
-    /// We'll also have a top-level "doc_num" so we can identify the doc easily in test results.
+    /// Well also have a top-level "doc_num" so we can identify the doc easily in test results.
     fn make_comments_schema() -> (Schema, Field, Field, Field) {
         let mut builder = Schema::builder();
 
@@ -1069,10 +924,10 @@ mod nested_query_extended_examples {
         let doc_num_field = builder.add_text_field("doc_num", STRING | STORED);
 
         // "comments" => nested
-        let nested_opts = NestedOptions::new()
+        let nested_opts = NestedJsonObjectOptions::new()
             .set_include_in_parent(false)
             .set_store_parent_flag(true);
-        let comments_field = builder.add_nested_field("comments", nested_opts);
+        let comments_field = builder.add_nested_json_field(vec!["comments".into()], nested_opts);
 
         // "comments.author" => text
         let author_field = builder.add_text_field("comments.author", STRING);
@@ -1091,10 +946,15 @@ mod nested_query_extended_examples {
             "doc_num": doc_num,
             "comments": comments
         });
-        let doc_str = serde_json::to_string(&doc_obj).unwrap();
-        let expanded = TantivyDocument::parse_json_for_nested(schema, &doc_str)?;
-        let docs: Vec<_> = expanded.into_iter().map(|d| d.into()).collect();
-        writer.add_documents(docs).unwrap();
+        let json_doc = serde_json::to_string(&doc_obj).unwrap();
+        let mut document = TantivyDocument::default();
+        let expanded = parse_json_for_nested_sorted(
+            &schema,
+            &mut document,
+            &serde_json::from_str::<serde_json::Value>(&json_doc).unwrap(),
+        )
+        .unwrap();
+        writer.add_documents(expanded).unwrap();
         Ok(())
     }
 
@@ -1167,7 +1027,7 @@ mod nested_query_extended_examples {
             (Occur::MustNot, Box::new(tq_nik)),
         ]);
         let nested_query = NestedQuery::new(
-            "comments".into(),
+            vec!["comments".into()],
             Box::new(must_not),
             NestedScoreMode::None,
             false,
@@ -1214,7 +1074,7 @@ mod nested_query_extended_examples {
             IndexRecordOption::Basic,
         );
         let nested2 = NestedQuery::new(
-            "comments".into(),
+            vec!["comments".into()],
             Box::new(tq_nik2),
             NestedScoreMode::None,
             false,
@@ -1244,42 +1104,41 @@ mod nested_query_extended_examples {
 
         Ok(())
     }
-}
 
-#[test]
-fn test_nested_query_without_subfields() -> crate::Result<()> {
-    use crate::collector::TopDocs;
-    use crate::query::TermQuery;
-    use crate::schema::{
-        IndexRecordOption, NestedJsonObjectOptions, NestedOptions, Schema, SchemaBuilder,
-        TantivyDocument, TextFieldIndexing, STORED, TEXT,
-    };
-    use crate::{Index, Term};
+    #[test]
+    fn test_nested_query_without_subfields() -> crate::Result<()> {
+        use crate::collector::TopDocs;
+        use crate::query::TermQuery;
+        use crate::schema::{
+            IndexRecordOption, NestedJsonObjectOptions, Schema, SchemaBuilder, TantivyDocument,
+            TextFieldIndexing, STORED, TEXT,
+        };
+        use crate::{Index, Term};
 
-    // 1) Build a schema with a single NestedJson field "user"
-    let mut builder = SchemaBuilder::default();
-    let nested_json_opts = NestedJsonObjectOptions::new()
-        .set_include_in_parent(true)
-        .set_store_parent_flag(true)
-        // Also store the entire JSON
-        .set_stored()
-        // and set indexing
-        .set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer("default")
-                .set_index_option(IndexRecordOption::Basic),
-        );
-    let user_field = builder.add_nested_json_field("user", nested_json_opts);
-    // Another top-level field
-    let group_field = builder.add_text_field("group", TEXT);
+        // 1) Build a schema with a single NestedJson field "user"
+        let mut builder = SchemaBuilder::default();
+        let nested_json_opts = NestedJsonObjectOptions::new()
+            .set_include_in_parent(false)
+            .set_store_parent_flag(true)
+            // Also store the entire JSON
+            .set_stored()
+            // and set indexing
+            .set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("default")
+                    .set_index_option(IndexRecordOption::Basic),
+            );
+        let user_field = builder.add_nested_json_field(vec!["user".into()], nested_json_opts);
+        // Another top-level field
+        let group_field = builder.add_text_field("group", TEXT);
 
-    let schema = builder.build();
-    let index = Index::create_in_ram(schema.clone());
+        let schema = builder.build();
+        let index = Index::create_in_ram(schema.clone());
 
-    // 2) Index a doc that has "user": [ { "first":"John" }, { "first":"Alice" } ], etc.
-    {
-        let mut writer: IndexWriter<TantivyDocument> = index.writer_for_tests()?;
-        let json_doc = r#"{
+        // 2) Index a doc that has "user": [ { "first":"John" }, { "first":"Alice" } ], etc.
+        {
+            let mut writer: IndexWriter<TantivyDocument> = index.writer_for_tests()?;
+            let json_doc = r#"{
             "group": "fans",
             "user": [
                 { "first": "John", "last": "Smith" },
@@ -1287,73 +1146,77 @@ fn test_nested_query_without_subfields() -> crate::Result<()> {
             ]
         }"#;
 
-        let expanded_docs =
-            crate::schema::document::parse_json_for_nested_sorted(&schema, json_doc)
-                .expect("parse nested doc");
-        let docs = expanded_docs
-            .into_iter()
-            .map(|d| d.into())
-            .collect::<Vec<_>>();
-        writer.add_documents(docs)?;
-        writer.commit()?;
+            let mut document = TantivyDocument::default();
+            let expanded_docs = parse_json_for_nested_sorted(
+                &schema,
+                &mut document,
+                &serde_json::from_str::<serde_json::Value>(json_doc).unwrap(),
+            )
+            .expect("parse nested doc");
+            let docs = expanded_docs
+                .into_iter()
+                .map(|d| d.into())
+                .collect::<Vec<_>>();
+            writer.add_documents(docs)?;
+            writer.commit()?;
+        }
+
+        // 3) Now do a nested query for `user.first = "Alice"`
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // Build the child term => path="first", text="alice"
+        let mut child_term = Term::from_field_json_path(user_field, "first", false);
+        child_term.append_type_and_str("alice");
+        let child_query = TermQuery::new(child_term, IndexRecordOption::Basic);
+
+        // Then wrap in a NestedQuery => path="user"
+        let nested_query = NestedQuery::new(
+            vec!["user".into()],
+            Box::new(child_query),
+            NestedScoreMode::None,
+            false, // ignore_unmapped
+        );
+
+        // Search
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+
+        // We expect 1 parent doc => the one that had Alice
+        assert_eq!(
+            top_docs.len(),
+            1,
+            "Should find parent doc with child 'alice'"
+        );
+
+        // Done!
+        Ok(())
     }
 
-    // 3) Now do a nested query for `user.first = "Alice"`
-    let reader = index.reader()?;
-    let searcher = reader.searcher();
+    #[test]
+    fn test_nested_query_parser_syntax() -> crate::Result<()> {
+        // 1) Build a schema with a single NestedJson field "user",
+        //    plus a "group" field for demonstration.
+        let mut builder = SchemaBuilder::default();
+        let nested_json_opts = NestedJsonObjectOptions::new()
+            .set_include_in_parent(false)
+            .set_store_parent_flag(true)
+            .set_stored()
+            .set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("default")
+                    .set_index_option(IndexRecordOption::Basic),
+            );
+        let user_field = builder.add_nested_json_field(vec!["user".into()], nested_json_opts);
+        let group_field = builder.add_text_field("group", TEXT | STORED); // for retrieval
 
-    // Build the child term => path="first", text="alice"
-    let mut child_term = Term::from_field_json_path(user_field, "first", false);
-    child_term.append_type_and_str("alice");
-    let child_query = TermQuery::new(child_term, IndexRecordOption::Basic);
+        let schema = builder.build();
+        let index = Index::create_in_ram(schema.clone());
 
-    // Then wrap in a NestedQuery => path="user"
-    let nested_query = NestedQuery::new(
-        "user".into(),
-        Box::new(child_query),
-        NestedScoreMode::None,
-        false, // ignore_unmapped
-    );
-
-    // Search
-    let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-
-    // We expect 1 parent doc => the one that had Alice
-    assert_eq!(
-        top_docs.len(),
-        1,
-        "Should find parent doc with child 'alice'"
-    );
-
-    // Done!
-    Ok(())
-}
-
-#[test]
-fn test_nested_query_parser_syntax() -> crate::Result<()> {
-    // 1) Build a schema with a single NestedJson field "user",
-    //    plus a "group" field for demonstration.
-    let mut builder = SchemaBuilder::default();
-    let nested_json_opts = NestedJsonObjectOptions::new()
-        .set_include_in_parent(true)
-        .set_store_parent_flag(true)
-        .set_stored()
-        .set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer("default")
-                .set_index_option(IndexRecordOption::Basic),
-        );
-    let user_field = builder.add_nested_json_field("user", nested_json_opts);
-    let group_field = builder.add_text_field("group", TEXT | STORED); // for retrieval
-
-    let schema = builder.build();
-    let index = Index::create_in_ram(schema.clone());
-
-    // 2) Index a doc with a complex `user` array:
-    //    - The "Alice" object has multiple hobbies, numeric "age" for kids, etc.
-    {
-        let mut writer = index.writer_for_tests()?;
-        let json_doc = r#"
+        // 2) Index a doc with a complex `user` array:
+        //    - The "Alice" object has multiple hobbies, numeric "age" for kids, etc.
+        {
+            let mut writer = index.writer_for_tests()?;
+            let json_doc = r#"
         {
           "group": "complexFans",
           "user": [
@@ -1378,106 +1241,365 @@ fn test_nested_query_parser_syntax() -> crate::Result<()> {
         }
         "#;
 
-        // Expand into child docs + parent doc
-        let expanded = parse_json_for_nested_sorted(&schema, json_doc).expect("parse nested doc");
-        let docs: Vec<TantivyDocument> = expanded.into_iter().map(Into::into).collect();
-        writer.add_documents(docs)?;
-        writer.commit()?;
+            let mut document = TantivyDocument::default();
+
+            // Expand into child docs + parent doc
+            let expanded = parse_json_for_nested_sorted(
+                &schema,
+                &mut document,
+                &serde_json::from_str::<serde_json::Value>(json_doc).unwrap(),
+            )
+            .expect("parse nested doc");
+            let docs: Vec<TantivyDocument> = expanded.into_iter().map(Into::into).collect();
+            writer.add_documents(docs)?;
+            writer.commit()?;
+        }
+
+        // 3) Use QueryParser to build a query for e.g.
+        //    `user.first:Alice AND user.hobbies:Chess AND user.kids.age:[8 TO 9]`
+        //    so we want the child that has `"first":"Alice"`
+        //    AND has a "hobbies" = "Chess"
+        //    AND has a child array "kids" with "age" in [8..9].
+        //    This should match the parent doc because the "Alice" child
+        //    has a kid with age=8, and also has a hobby="Chess".
+        {
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+
+            // We'll specify user_field as a "default field" for parsing
+            // if the user doesn't write fieldnames, but here we do specify them explicitly.
+            let query_parser = QueryParser::for_index(&index, vec![user_field]);
+
+            // The child clause we want is:
+            //   user.first:Alice
+            //   AND user.hobbies:Chess
+            //   AND user.kids.age:[8 TO 9]
+            // We'll combine them in a single parser input.
+            // Ensure the `[8 TO 9]` is recognized as a numeric range.
+            // (By default, Tantivy tries to parse them as strings,
+            //  but nested numeric search can still work if the field is typed numeric.
+            //  Alternatively, we rely on the fact that "age" was recognized as numeric
+            //  from the "kinds" array. This can require "coerce" or some numeric settings.)
+            let query_str = r#"
+           user.first:Alice
+           AND user.hobbies:Chess
+           AND user.kids.age:[8 TO 9]
+        "#;
+
+            // Let the parser do its job:
+            let query = query_parser.parse_query(query_str)?;
+            // This query is effectively a "NestedQuery" under the hood,
+            // once we've associated the `user` path with a nested field,
+            // but depends on your QueryParser integration.
+            // If you have a direct "NestedQuery" wrapper,
+            // you might still do that by post-processing.
+            // Or if your parser is set up to produce a NestedQuery,
+            // it should do so automatically.
+
+            let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
+
+            // We expect exactly 1 doc: the parent doc that had Alice/hobbies=Chess/kids age=8
+            assert_eq!(
+                top_docs.len(),
+                1,
+                "Should find exactly one parent doc with child that meets all constraints."
+            );
+
+            // (B) A simpler child query: user.kids.name:Bob
+            // We check that the doc that has a kid "Bob" also matches.
+            // We reuse the same parse + search approach.
+
+            let nested_query = NestedQuery::new(
+                vec!["user".into()],
+                Box::new(query_parser.parse_query("kids.name:Bob AND kids.age:8")?),
+                NestedScoreMode::None,
+                false, // ignore_unmapped
+            );
+
+            let top_docs2 = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+
+            assert_eq!(
+                top_docs2.len(),
+                1,
+                "Should match the same doc that has a kid named Bob and age 8"
+            );
+
+            let nested_query = NestedQuery::new(
+                vec!["user".into()],
+                Box::new(query_parser.parse_query("kids.name:Bob AND kids.age:3")?),
+                NestedScoreMode::None,
+                false, // ignore_unmapped
+            );
+
+            let top_docs3 = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+
+            assert_eq!(
+                top_docs3.len(),
+                0,
+                "Should not match two separate nested docs at the same level"
+            );
+        }
+
+        Ok(())
+    }
+}
+
+//////////////////////////////////////////////////////////////
+// The final, complete tests for NestedQuery, drop-in ready //
+//////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod nested_query_tests_more {
+    use super::*; // or import your nested_query, NestedQuery, etc. explicitly
+    use crate::collector::TopDocs;
+    use crate::index::Index;
+    use crate::query::EnableScoring;
+    use crate::query::{
+        nested_query::{NestedQuery, NestedScoreMode},
+        Query, TermQuery,
+    };
+    use crate::schema::{
+        DocParsingError, Field, FieldType, IndexRecordOption, NestedJsonObjectOptions, Schema,
+        SchemaBuilder, TantivyDocument, TextOptions, Value, STORED, STRING, TEXT,
+    };
+    use crate::IndexWriter;
+    use crate::Term;
+    use serde_json::json;
+
+    /// A small helper to build a nested schema:
+    /// - `user` is a nested field (with `include_in_parent=true` for demonstration).
+    /// - We'll also add "user.first" and "user.last" fields as TEXT,
+    ///   plus a top-level "group" field as STRING, etc.
+    fn make_nested_schema() -> (Schema, Field, Field) {
+        let mut builder = Schema::builder();
+
+        // normal top-level field
+        let group_field = builder.add_text_field("group", STRING | STORED);
+
+        // nested field
+        let nested_opts = NestedJsonObjectOptions::new()
+            .set_include_in_parent(false) // or false as you need
+            .set_store_parent_flag(true)
+            .set_stored()
+            .set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("default")
+                    .set_index_option(IndexRecordOption::Basic),
+            );
+        let user_nested_field = builder.add_nested_json_field(vec!["user".into()], nested_opts);
+
+        let schema = builder.build();
+        (schema, user_nested_field, group_field)
     }
 
-    // 3) Use QueryParser to build a query for e.g.
-    //    `user.first:Alice AND user.hobbies:Chess AND user.kids.age:[8 TO 9]`
-    //    so we want the child that has `"first":"Alice"`
-    //    AND has a "hobbies" = "Chess"
-    //    AND has a child array "kids" with "age" in [8..9].
-    //    This should match the parent doc because the "Alice" child
-    //    has a kid with age=8, and also has a hobby="Chess".
-    {
+    /// Index a single JSON doc that has nested `user` array-of-objects.
+    /// Uses your parse_json_for_nested(...) method to produce child docs + parent doc.
+    fn index_test_document(
+        index_writer: &mut IndexWriter,
+        schema: &Schema,
+        group_val: &str,
+        users: serde_json::Value,
+    ) -> Result<(), DocParsingError> {
+        // Build up a single top-level JSON object
+        let full_doc = json!({
+            "group": group_val,
+            "user": users, // e.g. an array of { "first": "...", "last": "..." }
+        });
+        let json_doc = serde_json::to_string(&full_doc).unwrap();
+
+        // Expand into multiple docs
+        let mut document = TantivyDocument::default();
+        let expanded = parse_json_for_nested_sorted(
+            &schema,
+            &mut document,
+            &serde_json::from_str::<serde_json::Value>(&json_doc).unwrap(),
+        )
+        .unwrap();
+
+        // Add them as a block using add_documents
+        index_writer.add_documents(expanded).unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_query_single_level() -> crate::Result<()> {
+        // 1) Build the nested schema
+        let (schema, _user_nested_field, group_field) = make_nested_schema();
+        let index = Index::create_in_ram(schema.clone());
+
+        // 2) Create an index writer & add docs
+        {
+            let mut writer = index.writer_for_tests()?;
+
+            // Document #1: group="fans", user => [ {"first":"John","last":"Smith"}, {"first":"Alice","last":"White"} ]
+            index_test_document(
+                &mut writer,
+                &schema,
+                "fans",
+                json!([
+                    { "first": "John", "last": "Smith" },
+                    { "first": "Alice", "last": "White" }
+                ]),
+            )?;
+
+            // Document #2: group="boring", user => [ {"first":"Bob","last":"Marley"} ]
+            index_test_document(
+                &mut writer,
+                &schema,
+                "boring",
+                json!([
+                    { "first": "Bob", "last": "Marley" }
+                ]),
+            )?;
+
+            writer.commit()?;
+        }
+
+        // 4) Search
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        // We'll specify user_field as a "default field" for parsing
-        // if the user doesn't write fieldnames, but here we do specify them explicitly.
-        let query_parser = QueryParser::for_index(&index, vec![user_field]);
+        // We'll query for child docs whose `first=="Alice"`
+        let query_parser = QueryParser::for_index(&index, vec![]);
+        let child_query = query_parser.parse_query("first:Alice").unwrap();
 
-        // // The child clause we want is:
-        // //   user.first:Alice
-        // //   AND user.hobbies:Chess
-        // //   AND user.kids.age:[8 TO 9]
-        // // We'll combine them in a single parser input.
-        // // Ensure the `[8 TO 9]` is recognized as a numeric range.
-        // // (By default, Tantivy tries to parse them as strings,
-        // //  but nested numeric search can still work if the field is typed numeric.
-        // //  Alternatively, we rely on the fact that "age" was recognized as numeric
-        // //  from the "kinds" array. This can require "coerce" or some numeric settings.)
-        // let query_str = r#"
-        //    user.first:Alice
-        //    AND user.hobbies:Chess
-        //    AND user.kids.age:[8 TO 9]
-        // "#;
-
-        // // Let the parser do its job:
-        // let query = query_parser.parse_query(query_str)?;
-        // // This query is effectively a "NestedQuery" under the hood,
-        // // once we've associated the `user` path with a nested field,
-        // // but depends on your QueryParser integration.
-        // // If you have a direct "NestedQuery" wrapper,
-        // // you might still do that by post-processing.
-        // // Or if your parser is set up to produce a NestedQuery,
-        // // it should do so automatically.
-
-        // let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
-
-        // // We expect exactly 1 doc: the parent doc that had Alice/hobbies=Chess/kids age=8
-        // assert_eq!(
-        //     top_docs.len(),
-        //     1,
-        //     "Should find exactly one parent doc with child that meets all constraints."
-        // );
-
-        // (B) A simpler child query: user.kids.name:Bob
-        // We check that the doc that has a kid "Bob" also matches.
-        // We reuse the same parse + search approach.
-
+        // Build the NestedQuery
         let nested_query = NestedQuery::new(
-            "user".into(),
-            Box::new(query_parser.parse_query("kids.name:Bob AND kids.age:8")?),
-            NestedScoreMode::None,
+            vec!["user".to_string()],
+            Box::new(child_query),
+            NestedScoreMode::Avg,
             false, // ignore_unmapped
         );
 
-        let top_docs2 = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        // Execute search
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        // We expect 1 doc: the parent doc that had "Alice" in user array
+        assert_eq!(1, top_docs.len(), "Should match exactly one parent doc");
 
-        assert_eq!(
-            top_docs2.len(),
-            1,
-            "Should match the same doc that has a kid named Bob and age 8"
-        );
+        // Fetch that doc & check "group= fans"
+        let (_score, doc_address) = top_docs[0];
+        let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
+        let group_vals = retrieved_doc
+            .get_all(group_field)
+            .map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(group_vals, vec![Some("fans")]);
 
-        let nested_query = NestedQuery::new(
-            "user".into(),
-            Box::new(query_parser.parse_query("kids.name:Bob AND kids.age:3")?),
-            NestedScoreMode::None,
-            false, // ignore_unmapped
-        );
-
-        let top_docs3 = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-
-        assert_eq!(
-            top_docs3.len(),
-            0,
-            "Should not match two separate nested docs at the same level"
-        );
-
-        // Optionally confirm that doc’s "group" = "complexFans"
-        // let doc_addr: DocAddress = top_docs[0].1;
-        // let retrieved: TantivyDocument = searcher.doc(doc_addr)?;
-        // let group_vals = retrieved
-        //     .get_all(group_field)
-        //     .map(|v| v.as_str())
-        //     .collect::<Vec<_>>();
-        // assert_eq!(&group_vals, &[Some("complexFans")]);
+        Ok(())
     }
 
-    Ok(())
+    #[test]
+    fn test_nested_query_no_match() -> crate::Result<()> {
+        // This time we’ll test a nested query that doesn’t match any child => no parent docs.
+        let (schema, _user_nested_field, _group_field) = make_nested_schema();
+        let index = Index::create_in_ram(schema.clone());
+
+        {
+            let mut writer = index.writer_for_tests()?;
+            // Insert one doc => user => [ { first:"John"}, { first:"Alice"} ] ...
+            index_test_document(
+                &mut writer,
+                &schema,
+                "groupVal",
+                json!([
+                    {"first":"John"},
+                    {"first":"Alice"}
+                ]),
+            )?;
+            writer.commit()?;
+        }
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let query_parser = QueryParser::for_index(&index, vec![]);
+        let child_query = query_parser.parse_query("first:NoSuchName").unwrap();
+        let nested_query = NestedQuery::new(
+            vec!["user".into()],
+            Box::new(child_query),
+            NestedScoreMode::None,
+            false,
+        );
+
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        assert_eq!(0, top_docs.len(), "No matches expected");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_query_ignore_unmapped() -> crate::Result<()> {
+        // Demonstrates that if `path="badPath"` is not recognized and `ignore_unmapped=true`,
+        // we get no matches instead of an error.
+        let (schema, _ufield, _group_field) = make_nested_schema();
+        let index = Index::create_in_ram(schema.clone());
+
+        {
+            let mut writer = index.writer_for_tests()?;
+            // Insert doc
+            index_test_document(
+                &mut writer,
+                &schema,
+                "unmappedTest",
+                json!([
+                    {"first":"SomeName"}
+                ]),
+            )?;
+            writer.commit()?;
+        }
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // We do a NestedQuery with path="someUnknownPath", but ignore_unmapped=true => no error => no docs
+        let query_parser = QueryParser::for_index(&index, vec![]);
+        let child_query = query_parser.parse_query("first:SomeName").unwrap();
+        let nested_query = NestedQuery::new(
+            vec!["someUnknownPath".to_string()],
+            Box::new(child_query),
+            NestedScoreMode::Sum,
+            true, // ignore_unmapped
+        );
+
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        assert_eq!(0, top_docs.len(), "No docs returned, but no error either");
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn test_nested_query_unmapped_error() {
+        // If ignore_unmapped=false, we expect an error instead.
+        let (schema, _ufield, _group_field) = make_nested_schema();
+        let index = Index::create_in_ram(schema.clone());
+
+        // We won't even index anything for this example. We'll just do the query.
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        let query_parser = QueryParser::for_index(&index, vec![]);
+        let child_query = query_parser.parse_query("first:X").unwrap();
+        let nested_query = NestedQuery::new(
+            vec!["badPath".into()],
+            Box::new(child_query),
+            NestedScoreMode::None,
+            false, // ignore_unmapped=false => expect error
+        );
+
+        let res = searcher.search(&nested_query, &TopDocs::with_limit(10));
+        match res {
+            Err(e) => {
+                // Should be a schema error about path unmapped
+                let msg = format!("{:?}", e);
+                assert!(
+                    msg.contains("NestedQuery path 'badPath' not mapped")
+                        && !msg.contains("ignore_unmapped=true"),
+                    "Expected schema error complaining about unmapped path"
+                );
+            }
+            Ok(_) => panic!("Expected an error for unmapped path with ignore_unmapped=false"),
+        }
+    }
 }

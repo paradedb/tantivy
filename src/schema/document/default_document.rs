@@ -207,24 +207,6 @@ impl CompactDoc {
 
     /// Parse a top-level JSON *object* that may contain nested fields.
     /// Returns all docs in a `Vec`: child docs first, then the “parent” doc last.
-    pub fn parse_json_for_nested(
-        schema: &Schema,
-        json_str: &str,
-    ) -> Result<Vec<TantivyDocument>, DocParsingError> {
-        let top_val: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| DocParsingError::InvalidJson(e.to_string()))?;
-        let obj = top_val.as_object().ok_or_else(|| {
-            DocParsingError::InvalidJson("Top-level JSON must be an object".to_string())
-        })?;
-
-        let mut child_docs = Vec::new();
-        let mut parent_doc = TantivyDocument::default();
-        // parse the object with no prefix
-        Self::parse_object_with_prefix(schema, "", obj, &mut parent_doc, &mut child_docs)?;
-        // push the parent doc last
-        child_docs.push(parent_doc);
-        Ok(child_docs)
-    }
 
     /// Recursively parse key→value pairs. If we detect a `FieldType::Nested(...)`,
     /// we expand any array-of-objects into child docs. Otherwise we parse normally.
@@ -1223,7 +1205,8 @@ mod tests {
 mod nested_tests {
     use super::*;
     use crate::schema::{
-        nested_options::NestedOptions, Schema, TantivyDocument, TextOptions, STRING,
+        document::parse_json_for_nested_sorted, nested_options::NestedOptions, Schema,
+        TantivyDocument, TextOptions, STRING,
     };
 
     #[test]
@@ -1233,7 +1216,7 @@ mod nested_tests {
         let doc_type_field = builder.add_text_field("docType", STRING);
 
         let nested_opts = NestedOptions::new().set_include_in_parent(true);
-        let user_nested_field = builder.add_nested_field("user", nested_opts);
+        let user_nested_field = builder.add_nested_field(vec!["user".into()], nested_opts);
 
         // Also define the fields "first", "last", "group"
         let first_field = builder.add_text_field("user.first", STRING);
@@ -1243,7 +1226,7 @@ mod nested_tests {
         let schema = builder.build();
 
         // 2) Our input JSON
-        let input = r#"
+        let json_doc = r#"
         {
            "group": "fans",
            "user": [
@@ -1254,11 +1237,21 @@ mod nested_tests {
         "#;
 
         // 3) parse
-        let docs = TantivyDocument::parse_json_for_nested(&schema, input)?;
-        assert_eq!(docs.len(), 3, "Should produce 2 child docs + 1 parent doc");
+        let mut document = TantivyDocument::default();
+        let expanded = parse_json_for_nested_sorted(
+            &schema,
+            &mut document,
+            &serde_json::from_str::<serde_json::Value>(json_doc).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            expanded.len(),
+            3,
+            "Should produce 2 child docs + 1 parent doc"
+        );
 
         // child doc #1
-        let child1 = &docs[0];
+        let child1 = &expanded[0];
         let dt_vals = child1.get_all(doc_type_field).collect::<Vec<_>>();
         // we have not set docType = child in the snippet above, but you can do so if you prefer.
         // For now, we expect docType is absent:
@@ -1270,14 +1263,14 @@ mod nested_tests {
         assert_eq!(last_vals[0].as_str(), Some("Smith"));
 
         // child doc #2
-        let child2 = &docs[1];
+        let child2 = &expanded[1];
         let afirst = child2.get_all(first_field).collect::<Vec<_>>();
         let alast = child2.get_all(last_field).collect::<Vec<_>>();
         assert_eq!(afirst[0].as_str(), Some("Alice"));
         assert_eq!(alast[0].as_str(), Some("White"));
 
         // parent doc #3
-        let parent = &docs[2];
+        let parent = &expanded[2];
         // Because include_in_parent=true, the parent's doc also has "first" & "last" from the nested child docs
         let pf = parent
             .get_all(first_field)
@@ -1300,12 +1293,12 @@ mod nested_tests {
     fn test_default_document_parse_nested() -> Result<(), DocParsingError> {
         let mut builder = Schema::builder();
         let user_opts = NestedOptions::new().set_include_in_parent(true);
-        let nested_field = builder.add_nested_field("user", user_opts);
+        let nested_field = builder.add_nested_field(vec!["user".into()], user_opts);
         let normal_field = builder.add_text_field("title", STRING);
         let schema = builder.build();
 
         // Provide an example JSON with user as array-of-objects:
-        let json_str = r#"{
+        let json_doc = r#"{
             "title": "My doc",
             "user": [
               { "name": "John" },
@@ -1313,29 +1306,41 @@ mod nested_tests {
             ]
         }"#;
 
-        let docs = TantivyDocument::parse_json_for_nested(&schema, json_str)?;
+        let mut document = TantivyDocument::default();
+        let expanded = parse_json_for_nested_sorted(
+            &schema,
+            &mut document,
+            &serde_json::from_str::<serde_json::Value>(json_doc).unwrap(),
+        )
+        .unwrap();
         // We expect 2 child docs + 1 parent doc
-        assert_eq!(docs.len(), 3);
+        assert_eq!(expanded.len(), 3);
 
-        let child0 = &docs[0];
+        let child0 = &expanded[0];
         // There's no "title" => let's confirm
         assert_eq!(child0.get_first(normal_field), None);
         // If you want, confirm the name "John" is present
         //   => but we haven't added that field to the schema, so let's skip.
 
-        let parent = &docs[2];
+        let parent = &expanded[2];
         let title_val = parent.get_first(normal_field).unwrap().as_str().unwrap();
         assert_eq!(title_val, "My doc");
 
         // Now test the single object for a nested field => we skip it per the logic
         // in parse_json_for_nested:
-        let single_obj_json = r#"{
+        let json_doc = r#"{
             "user": { "name": "just one object" }
         }"#;
-        let docs2 = TantivyDocument::parse_json_for_nested(&schema, single_obj_json)?;
+        let mut document = TantivyDocument::default();
+        let expanded = parse_json_for_nested_sorted(
+            &schema,
+            &mut document,
+            &serde_json::from_str::<serde_json::Value>(json_doc).unwrap(),
+        )
+        .unwrap();
         // It won't error or panic. By default we "skip or handle error".
         // We'll get 1 doc => the parent
-        assert_eq!(docs2.len(), 1);
+        assert_eq!(expanded.len(), 1);
         Ok(())
     }
 
@@ -1343,7 +1348,7 @@ mod nested_tests {
     fn test_default_document_parse_one_field_nested_err() {
         let mut builder = Schema::builder();
         let nested_opts = NestedOptions::new().set_include_in_parent(true);
-        let nested_field = builder.add_nested_field("my_nested", nested_opts);
+        let nested_field = builder.add_nested_field(vec!["my_nested".into()], nested_opts);
         let schema = builder.build();
 
         let val = serde_json::json!({"key":"value"});
@@ -1369,7 +1374,7 @@ mod nested_tests {
     fn test_default_document_parse_and_add_json_nested_err() {
         let mut builder = Schema::builder();
         let nested_opts = NestedOptions::new().set_include_in_parent(true);
-        let nested_field = builder.add_nested_field("my_nested", nested_opts);
+        let nested_field = builder.add_nested_field(vec!["my_nested".into()], nested_opts);
         let schema = builder.build();
 
         let val = serde_json::json!({"k":"v"});

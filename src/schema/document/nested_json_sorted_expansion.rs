@@ -1,469 +1,623 @@
-//! parse_json_for_nested_sorted.rs
-//!
-//! Completely rewritten nested-JSON expansion for Tantivy, ensuring that
-//! arrays of objects expand into multiple child docs, never merging them in
-//! one single doc. Includes debug logs in every function.
-
 use serde_json::{Map as JsonMap, Value as SerdeValue};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::schema::{
     document::{DocParsingError, OwnedValue},
-    Field, FieldType, JsonObjectOptions, NestedJsonObjectOptions, NestedOptions, Schema,
-    TantivyDocument,
+    Field, FieldEntry, FieldType, NestedJsonObjectOptions, NestedOptions, Schema, TantivyDocument,
 };
 use crate::TantivyError;
-use std::collections::HashMap;
 
-/// A small debug container that accumulates string tokens for “NestedJson” fields
-/// so we can store them sorted in each doc.
+/// Helper to collect string tokens for `NestedJson` fields, storing them sorted & joined.
 #[derive(Default, Debug)]
 struct DocBuffers {
-    /// For each field, we collect a list of tokens. We only
-    /// finalize them at the end by sorting + joining.
     tokens_per_field: HashMap<Field, Vec<String>>,
 }
 
 impl DocBuffers {
     fn new() -> Self {
-        println!("[DocBuffers::new] Creating empty DocBuffers");
+        println!("DocBuffers: Initializing new DocBuffers instance");
         DocBuffers {
             tokens_per_field: HashMap::new(),
         }
     }
 
-    /// Appends a set of string tokens to the field’s buffer
+    /// Push tokens into the buffer for a given field
     fn push_tokens(&mut self, field: Field, tokens: &[String]) {
         println!(
-            "[DocBuffers::push_tokens] field={:?}, adding {} tokens",
-            field,
-            tokens.len()
+            "DocBuffers: Pushing {} tokens to field {:?}",
+            tokens.len(),
+            field
         );
         self.tokens_per_field
             .entry(field)
             .or_default()
             .extend_from_slice(tokens);
+        println!(
+            "DocBuffers: Current tokens for field {:?}: {:?}",
+            field,
+            self.tokens_per_field.get(&field)
+        );
     }
 
-    /// Once we’re done with a doc, we finalize these tokens by sorting,
-    /// joining, and adding them to the doc as a single “joined string”.
+    /// Flush all tokens into the doc as a single string, sorted + joined
     fn flush_to_tantivy_doc(&self, doc: &mut TantivyDocument) {
-        println!("[DocBuffers::flush_to_tantivy_doc] Start flushing tokens");
+        println!("DocBuffers: Flushing all tokens to TantivyDocument");
         for (&field, token_list) in &self.tokens_per_field {
             println!(
-                "  - Flushing field={:?} with {} tokens => sorting + joining",
+                "DocBuffers: Processing field {:?} with {} tokens",
                 field,
                 token_list.len()
             );
             let mut sorted = token_list.clone();
             sorted.sort();
-            let joined = sorted.join(" ");
-            doc.add_field_value(field, &OwnedValue::Str(joined.clone()));
             println!(
-                "  - Wrote joined string to doc for field={:?}: '{}'",
+                "DocBuffers: Sorted tokens for field {:?}: {:?}",
+                field, sorted
+            );
+            let joined = sorted.join(" ");
+            println!(
+                "DocBuffers: Joined tokens for field {:?}: '{}'",
                 field, joined
             );
+            doc.add_field_value(field, &OwnedValue::Str(joined));
+            println!(
+                "DocBuffers: Added joined tokens to TantivyDocument for field {:?}",
+                field
+            );
         }
-        println!("[DocBuffers::flush_to_tantivy_doc] Done!");
+        println!("DocBuffers: Completed flushing tokens to TantivyDocument");
     }
 }
 
-/// Parse a top-level JSON string into multiple child docs plus a final parent doc.
-/// - Each array-of-objects spawns child docs, so that no single doc merges data
-///   from different objects in that array. This prevents “cross talk” in queries.
-/// - The parent doc is returned last in the final `Vec<TantivyDocument>`.
-/// - We store debug logs in every function, so you can track exactly what is happening.
+/// The top-level function that expands arrays of objects for nested fields
+/// (including `NestedJson`). Otherwise, it tries to store sub-values in a fallback
+/// “dynamic” field—**but only if no nested context is found**.
+///
+/// We start here at `depth == 0` so that only this doc is recognized as “parent”.
 pub fn parse_json_for_nested_sorted(
     schema: &Schema,
-
-    json_str: &str,
+    parent_doc: &mut TantivyDocument,
+    root_value: &SerdeValue,
 ) -> Result<Vec<TantivyDocument>, DocParsingError> {
-    println!(
-        "[parse_json_for_nested_sorted] Entered with JSON length={}",
-        json_str.len()
-    );
+    println!("parse_json_for_nested_sorted: Starting parsing of JSON for nested sorted documents");
 
-    // 1) Parse
-    let top_val: SerdeValue = match serde_json::from_str(json_str) {
-        Ok(v) => {
-            println!("[parse_json_for_nested_sorted] Successfully parsed JSON into Value");
-            v
-        }
-        Err(e) => {
-            println!("[parse_json_for_nested_sorted] ERROR: {}", e);
-            return Err(DocParsingError::InvalidJson(e.to_string()));
-        }
-    };
-
-    // Expect top-level object
-    let objmap = top_val.as_object().ok_or_else(|| {
-        println!("[parse_json_for_nested_sorted] top-level JSON is not an object => error");
-        DocParsingError::InvalidJson("top-level JSON must be object".to_string())
-    })?;
-
-    println!(
-        "[parse_json_for_nested_sorted] Found top-level object with {} fields",
-        objmap.len()
-    );
-
-    // Prepare final results, plus a “parent doc” with buffer
-    let mut child_docs: Vec<TantivyDocument> = Vec::new();
-    let mut parent_doc = TantivyDocument::default();
+    let mut child_docs = Vec::new();
     let mut parent_bufs = DocBuffers::new();
 
-    // 2) Recursively parse the top-level object with no prefix
-    parse_object_with_prefix(
-        schema,
-        "",
-        objmap,
-        &mut parent_doc,
-        &mut parent_bufs,
-        &mut child_docs,
-    )?;
+    // If top-level is an object, iterate over its fields. Otherwise, skip or handle accordingly.
+    if let Some(obj) = root_value.as_object() {
+        let mut path_stack = Vec::new();
+        println!(
+            "parse_json_for_nested_sorted: Found top-level object with {} fields",
+            obj.len()
+        );
 
-    // 3) final flush => parent doc
-    println!("[parse_json_for_nested_sorted] flush parent doc buffers");
-    parent_bufs.flush_to_tantivy_doc(&mut parent_doc);
+        // For each key => push onto path_stack => call parse_value => pop.
+        for (key, sub_val) in obj {
+            path_stack.push(key.clone());
+            // depth=0 on top-level
+            parse_value(
+                schema,
+                &mut path_stack,
+                None,
+                sub_val,
+                parent_doc,
+                &mut parent_bufs,
+                &mut child_docs,
+                /* depth = */ 0,
+            )?;
+            path_stack.pop();
+        }
+    } else {
+        println!("parse_json_for_nested_sorted: Top-level JSON is not an object => skipping or returning error");
+        // Optionally handle arrays/scalars here
+    }
 
-    // 4) push parent doc last
-    child_docs.push(parent_doc);
+    // Finally, flush all tokens for the parent doc
+    println!(
+        "parse_json_for_nested_sorted: Flushing tokens from DocBuffers to parent TantivyDocument"
+    );
+    parent_bufs.flush_to_tantivy_doc(parent_doc);
+
+    // Append parent doc last
+    println!(
+        "parse_json_for_nested_sorted: Appending parent_doc to child_docs as the last document"
+    );
+    child_docs.push(parent_doc.clone());
 
     println!(
-        "[parse_json_for_nested_sorted] Completed => returning {} docs",
+        "parse_json_for_nested_sorted: Parsing completed successfully with {} documents",
         child_docs.len()
     );
+
     Ok(child_docs)
 }
 
-/// Recursively parse an object’s fields. If a field is “Nested” or “NestedJson” and has
-/// an array-of-objects, we spawn child docs. Otherwise we parse normally.
-fn parse_object_with_prefix(
+/// Recursively parses `val`. If we’re inside a recognized nested field (`current_nested_field`),
+/// we keep treating all sub-keys/arrays as belonging to that same field. If we’re
+/// not in a nested context, we check if `path_stack` matches a nested field. Otherwise, we do fallback.
+///
+/// `depth` tracks how deep we are in the hierarchy, so only `depth=0` doc becomes `_is_parent_...=true`.
+fn parse_value(
     schema: &Schema,
-    prefix: &str,
-    obj: &JsonMap<String, SerdeValue>,
+    path_stack: &mut Vec<String>,
+    current_nested_field: Option<Field>,
+    val: &SerdeValue,
     parent_doc: &mut TantivyDocument,
     parent_bufs: &mut DocBuffers,
     child_docs: &mut Vec<TantivyDocument>,
+    depth: usize,
 ) -> Result<(), DocParsingError> {
     println!(
-        "[parse_object_with_prefix] prefix='{}', {} fields",
-        prefix,
-        obj.len()
+        "parse_value: Entered with path_stack={:?}, current_nested_field={:?}",
+        path_stack, current_nested_field
     );
 
-    // For each key => build a “full_key”
-    for (k, v) in obj {
-        let full_key = if prefix.is_empty() {
-            k.clone()
-        } else {
-            format!("{}.{}", prefix, k)
-        };
-        println!(
-            "[parse_object_with_prefix] Processing key='{}' => full_key='{}'",
-            k, full_key
-        );
+    let nested_field = match current_nested_field {
+        Some(f) => {
+            println!("parse_value: Continuing with existing nested_field {:?}", f);
+            Some(f)
+        }
+        None => {
+            // see if the path_stack is recognized as nested in the schema
+            if let Some((field, _fentry)) = schema.get_nested_field(path_stack) {
+                println!(
+                    "parse_value: Found nested_field {:?} for path_stack={:?}",
+                    field, path_stack
+                );
+                Some(field)
+            } else {
+                println!(
+                    "parse_value: No nested_field found for path_stack={:?}",
+                    path_stack
+                );
+                None
+            }
+        }
+    };
 
-        // Check if schema has that field
-        let field_opt = schema.get_field(&full_key);
-        let field = match field_opt {
-            Ok(f) => f,
-            Err(_) => {
-                println!(
-                    "[parse_object_with_prefix] field='{}' not in schema => skip",
-                    full_key
-                );
-                continue;
-            }
-        };
-        let fentry = schema.get_field_entry(field);
-        let ftype = fentry.field_type();
-        println!(
-            "[parse_object_with_prefix] field='{}' found => type={:?}",
-            full_key, ftype
-        );
+    // If there's still no recognized nested field => fallback
+    if nested_field.is_none() {
+        println!("parse_value: No nested_field recognized. Proceeding with fallback storage.");
+        store_in_fallback(schema, val, parent_doc)?;
+        return Ok(());
+    }
 
-        match ftype {
-            FieldType::Nested(nested_opts) => {
-                println!(
-                    "[parse_object_with_prefix] => Nested => calling expand_nested_array_of_objects"
-                );
-                expand_nested_array_of_objects(
-                    schema,
-                    &full_key,
-                    v,
-                    nested_opts.include_in_parent,
-                    nested_opts.store_parent_flag,
-                    parent_doc,
-                    parent_bufs,
-                    child_docs,
-                )?;
-            }
-            FieldType::NestedJson(nested_json_opts) => {
-                println!(
-                    "[parse_object_with_prefix] => NestedJson => calling expand_nested_array_of_objects"
-                );
-                expand_nested_array_of_objects(
-                    schema,
-                    &full_key,
-                    v,
-                    nested_json_opts.nested_opts.include_in_parent,
-                    nested_json_opts.nested_opts.store_parent_flag,
-                    parent_doc,
-                    parent_bufs,
-                    child_docs,
-                )?;
-            }
-            _ => {
-                println!("[parse_object_with_prefix] => normal field => parse_regular_field");
-                parse_regular_field(schema, field, v, parent_doc)?;
-            }
+    // We do have a recognized nested field => expand arrays & objects
+    let field = nested_field.unwrap();
+    let fentry = schema.get_field_entry(field);
+    println!(
+        "parse_value: Processing nested_field {:?} with FieldType {:?}",
+        field,
+        fentry.field_type()
+    );
+
+    match fentry.field_type() {
+        FieldType::Nested(nopts) => {
+            println!(
+                "parse_value: Field {:?} is of type Nested. Expanding nested value.",
+                field
+            );
+            expand_nested_value(
+                schema,
+                path_stack,
+                field,
+                nopts.include_in_parent,
+                nopts.store_parent_flag,
+                /* gather_tokens= */ false,
+                val,
+                parent_doc,
+                parent_bufs,
+                child_docs,
+                depth,
+            )?;
+        }
+        FieldType::NestedJson(nj_opts) => {
+            println!(
+                "parse_value: Field {:?} is of type NestedJson. Expanding nested value with token gathering.",
+                field
+            );
+            expand_nested_value(
+                schema,
+                path_stack,
+                field,
+                nj_opts.nested_opts.include_in_parent,
+                nj_opts.nested_opts.store_parent_flag,
+                /* gather_tokens= */ true,
+                val,
+                parent_doc,
+                parent_bufs,
+                child_docs,
+                depth,
+            )?;
+        }
+        // If the schema returned a "nested field" that isn't actually Nested or NestedJson,
+        // we skip or parse no further
+        _ => {
+            println!(
+                "parse_value: Field {:?} is not Nested or NestedJson. Skipping further parsing.",
+                field
+            );
         }
     }
 
-    println!("[parse_object_with_prefix] done with prefix='{}'", prefix);
+    println!("parse_value: Exiting parse_value function");
     Ok(())
 }
 
-/// The key routine that expands an array-of-objects into separate child docs.
-fn expand_nested_array_of_objects(
+/// Expand a nested field. If it’s an array => multiple child docs; if a single object => one child doc.
+/// If it’s a scalar => store in the parent if `include_in_parent`.
+///
+/// We add `depth` so we only set `_is_parent_XXX = true` at `depth == 0`.
+fn expand_nested_value(
     schema: &Schema,
-    full_key: &str,
-    val: &SerdeValue,
+    path_stack: &mut Vec<String>,
+    nested_field: Field,
     include_in_parent: bool,
     store_parent_flag: bool,
+    gather_tokens: bool,
+    val: &SerdeValue,
     parent_doc: &mut TantivyDocument,
     parent_bufs: &mut DocBuffers,
     child_docs: &mut Vec<TantivyDocument>,
+    depth: usize,
 ) -> Result<(), DocParsingError> {
     println!(
-        "[expand_nested_array_of_objects] field='{}', include_in_parent={}, store_parent_flag={}",
-        full_key, include_in_parent, store_parent_flag
+        "expand_nested_value: Expanding nested_field {:?} with include_in_parent={}, store_parent_flag={}, gather_tokens={}, depth={}",
+        nested_field, include_in_parent, store_parent_flag, gather_tokens, depth
     );
 
-    // If store_parent_flag => set `_is_parent_<full_key>`=true in the parent doc
-    if store_parent_flag {
-        let parent_flag_name = format!("_is_parent_{}", full_key);
+    // Only set the parent flag if `store_parent_flag` is true AND depth==0
+    if store_parent_flag && depth == 0 {
+        let parent_flag_name = format!("_is_parent_{}", schema.get_field_name(nested_field));
+        println!(
+            "expand_nested_value: Setting parent flag field '{}' to true (depth=0)",
+            parent_flag_name
+        );
         if let Ok(flag_field) = schema.get_field(&parent_flag_name) {
-            println!(
-                "[expand_nested_array_of_objects] => set parent doc bool '{}' = true",
-                parent_flag_name
-            );
             parent_doc.add_field_value(flag_field, &OwnedValue::from(true));
+            println!(
+                "expand_nested_value: Added field '{:?}' with value 'true' to parent_doc",
+                flag_field
+            );
         } else {
             println!(
-                "[expand_nested_array_of_objects] => no field '{}' => skip parent_flag",
+                "expand_nested_value: Parent flag field '{}' not found in schema. Skipping.",
                 parent_flag_name
             );
         }
+    } else if store_parent_flag {
+        println!(
+            "expand_nested_value: store_parent_flag is true but depth={} != 0; skipping setting parent flag.",
+            depth
+        );
     }
 
-    // If val is an array => expand each array item into a child doc if it’s an object
     if let Some(arr) = val.as_array() {
         println!(
-            "[expand_nested_array_of_objects] => array with {} elements => scanning",
+            "expand_nested_value: Value is an array with {} elements",
             arr.len()
         );
-        for (idx, element) in arr.iter().enumerate() {
+        for (index, item) in arr.iter().enumerate() {
             println!(
-                "[expand_nested_array_of_objects] array elem #{} => value={:?}",
-                idx, element
+                "expand_nested_value: Processing array element {}: {:?}",
+                index, item
             );
-            if let Some(obj) = element.as_object() {
-                // If include_in_parent => flatten a copy into parent doc
-                if include_in_parent {
-                    println!(
-                        "[expand_nested_array_of_objects] => include_in_parent => storing text for field='{}'",
-                        full_key
-                    );
-                    parent_doc.add_text(field_for_key(schema, full_key)?, &element.to_string());
-                    gather_nestedjson_strings_if_applicable(schema, full_key, element, parent_bufs);
-                }
-                // Build a child doc
+            expand_single_nested_item(
+                schema,
+                path_stack,
+                nested_field,
+                include_in_parent,
+                gather_tokens,
+                item,
+                parent_doc,
+                parent_bufs,
+                child_docs,
+                depth,
+            )?;
+        }
+    } else if val.is_object() {
+        println!("expand_nested_value: Value is a single object");
+        expand_single_nested_item(
+            schema,
+            path_stack,
+            nested_field,
+            include_in_parent,
+            gather_tokens,
+            val,
+            parent_doc,
+            parent_bufs,
+            child_docs,
+            depth,
+        )?;
+    } else {
+        // scalar => store in parent if needed
+        println!(
+            "expand_nested_value: Value is a scalar. include_in_parent={}, depth={}",
+            include_in_parent, depth
+        );
+        if include_in_parent {
+            store_scalar_in_doc(parent_doc, nested_field, val);
+            println!(
+                "expand_nested_value: Stored scalar value in parent_doc for field {:?}",
+                nested_field
+            );
+            if gather_tokens {
                 println!(
-                    "[expand_nested_array_of_objects] => building child doc #{}",
-                    idx
+                    "expand_nested_value: Gathering tokens for NestedJson field {:?}",
+                    nested_field
                 );
-                let mut child_doc = TantivyDocument::default();
-                let mut child_bufs = DocBuffers::new();
-
-                // For NestedJson with “stored: true”, store the raw JSON in the child doc as well
-                store_raw_json_if_nestedjson(schema, full_key, element, &mut child_doc);
-
-                // Gather tokens if it’s NestedJson
-                gather_nestedjson_strings_if_applicable(schema, full_key, element, &mut child_bufs);
-
-                // Then parse subfields recursively
-                parse_object_with_prefix(
-                    schema,
-                    full_key,
-                    obj,
-                    &mut child_doc,
-                    &mut child_bufs,
-                    child_docs,
-                )?;
-
-                // finalize child’s tokens
-                child_bufs.flush_to_tantivy_doc(&mut child_doc);
-
-                // push child
-                child_docs.push(child_doc);
-            } else {
-                // If array item is scalar => store in parent if “include_in_parent”
-                println!("[expand_nested_array_of_objects] => scalar => store in parent if needed");
-                if include_in_parent {
-                    let field = field_for_key(schema, full_key)?;
-                    parent_doc.add_text(field, &element.to_string());
-                }
+                gather_tokens_for_nestedjson(nested_field, val, parent_bufs);
             }
         }
     }
-    // If single object => one child doc
-    else if let Some(obj) = val.as_object() {
-        println!("[expand_nested_array_of_objects] => single object => building child doc");
+
+    println!(
+        "expand_nested_value: Completed expanding nested_field {:?} at depth={}",
+        nested_field, depth
+    );
+    Ok(())
+}
+
+/// Expand a single item (object or scalar) as one child doc (or store in parent).
+/// We pass `depth` along. Child docs become `depth+1`.
+fn expand_single_nested_item(
+    schema: &Schema,
+    path_stack: &mut Vec<String>,
+    nested_field: Field,
+    include_in_parent: bool,
+    gather_tokens: bool,
+    val: &SerdeValue,
+    parent_doc: &mut TantivyDocument,
+    parent_bufs: &mut DocBuffers,
+    child_docs: &mut Vec<TantivyDocument>,
+    depth: usize,
+) -> Result<(), DocParsingError> {
+    println!(
+        "expand_single_nested_item: Expanding single nested item for field {:?} at depth={}",
+        nested_field, depth
+    );
+
+    if let Some(obj) = val.as_object() {
+        println!(
+            "expand_single_nested_item: Item is an object with {} keys",
+            obj.len()
+        );
+        // If include_in_parent => store object in the parent doc
         if include_in_parent {
-            let field = field_for_key(schema, full_key)?;
-            parent_doc.add_text(field, &val.to_string());
+            store_object_in_doc(parent_doc, nested_field, obj);
+            println!(
+                "expand_single_nested_item: Stored object in parent_doc for field {:?}",
+                nested_field
+            );
+            if gather_tokens {
+                println!(
+                    "expand_single_nested_item: Gathering tokens for NestedJson field {:?}",
+                    nested_field
+                );
+                gather_tokens_for_nestedjson(nested_field, val, parent_bufs);
+            }
         }
 
+        // build a new "child doc"
         let mut child_doc = TantivyDocument::default();
         let mut child_bufs = DocBuffers::new();
 
-        store_raw_json_if_nestedjson(schema, full_key, val, &mut child_doc);
-        gather_nestedjson_strings_if_applicable(schema, full_key, val, &mut child_bufs);
+        // If gather_tokens => possibly store raw object
+        if gather_tokens {
+            if let FieldType::NestedJson(nj_opts) =
+                schema.get_field_entry(nested_field).field_type()
+            {
+                if nj_opts.json_opts.is_stored() {
+                    store_object_in_doc(&mut child_doc, nested_field, obj);
+                    println!(
+                        "expand_single_nested_item: Stored raw object in child_doc for NestedJson field {:?}",
+                        nested_field
+                    );
+                }
+            }
+            gather_tokens_for_nestedjson(nested_field, val, &mut child_bufs);
+            println!(
+                "expand_single_nested_item: Gathered tokens for NestedJson field {:?}",
+                nested_field
+            );
+        }
 
-        parse_object_with_prefix(
-            schema,
-            full_key,
-            obj,
-            &mut child_doc,
-            &mut child_bufs,
-            child_docs,
-        )?;
+        // parse sub-keys inside that child doc, still referencing the same nested_field,
+        // but now at depth+1
+        println!(
+            "expand_single_nested_item: Recursively parsing sub-keys for child_doc of field {:?} at depth={}",
+            nested_field, depth
+        );
+        for (k, sub_val) in obj {
+            println!(
+                "expand_single_nested_item: Processing sub-key '{}' with value {:?}",
+                k, sub_val
+            );
+            path_stack.push(k.clone());
+            parse_value(
+                schema,
+                path_stack,
+                Some(nested_field),
+                sub_val,
+                &mut child_doc,
+                &mut child_bufs,
+                child_docs,
+                depth + 1,
+            )?;
+            path_stack.pop();
+            println!(
+                "expand_single_nested_item: Completed processing sub-key '{}'",
+                k
+            );
+        }
+
+        // flush tokens => child doc
+        println!("expand_single_nested_item: Flushing tokens from child_bufs to child_doc");
         child_bufs.flush_to_tantivy_doc(&mut child_doc);
 
+        println!(
+            "expand_single_nested_item: Appending child_doc to child_docs for field {:?}",
+            nested_field
+        );
         child_docs.push(child_doc);
-    }
-    // If it’s a scalar => store in parent doc if “include_in_parent”
-    else {
-        println!("[expand_nested_array_of_objects] => scalar => store in parent if needed");
+    } else {
+        // it’s a scalar => store in parent if needed
+        println!(
+            "expand_single_nested_item: Item is a scalar. include_in_parent={}, depth={}",
+            include_in_parent, depth
+        );
         if include_in_parent {
-            let field = field_for_key(schema, full_key)?;
-            parent_doc.add_text(field, &val.to_string());
-        }
-    }
-
-    println!(
-        "[expand_nested_array_of_objects] done for field='{}'",
-        full_key
-    );
-    Ok(())
-}
-
-/// For a “field name” => retrieve the Field from schema or fail
-fn field_for_key(schema: &Schema, key: &str) -> Result<Field, DocParsingError> {
-    println!("[field_for_key] => key='{}'", key);
-    schema
-        .get_field(key)
-        .map_err(|e| DocParsingError::InvalidJson(e.to_string()))
-}
-
-/// If the field is a `NestedJson` with “stored: true”, store the raw JSON string into the doc.
-fn store_raw_json_if_nestedjson(
-    schema: &Schema,
-    full_key: &str,
-    val: &SerdeValue,
-    child_doc: &mut TantivyDocument,
-) {
-    println!(
-        "[store_raw_json_if_nestedjson] => checking if field='{}' is NestedJson + stored",
-        full_key
-    );
-    if let Ok(f) = schema.get_field(full_key) {
-        if let FieldType::NestedJson(nj) = schema.get_field_entry(f).field_type() {
-            if nj.json_opts.is_stored() {
+            store_scalar_in_doc(parent_doc, nested_field, val);
+            println!(
+                "expand_single_nested_item: Stored scalar value in parent_doc for field {:?}",
+                nested_field
+            );
+            if gather_tokens {
                 println!(
-                    "[store_raw_json_if_nestedjson] => yes, storing raw JSON => field={:?}",
-                    f
+                    "expand_single_nested_item: Gathering tokens for NestedJson field {:?}",
+                    nested_field
                 );
-                child_doc.add_text(f, &val.to_string());
+                gather_tokens_for_nestedjson(nested_field, val, parent_bufs);
             }
         }
     }
+    Ok(())
 }
 
-/// If it’s NestedJson => gather tokens from subobject recursively
-fn gather_nestedjson_strings_if_applicable(
-    schema: &Schema,
-    full_key: &str,
-    val: &SerdeValue,
-    doc_bufs: &mut DocBuffers,
-) {
+/// If this is a `NestedJson` field, gather string tokens from `val`.
+fn gather_tokens_for_nestedjson(field: Field, val: &SerdeValue, doc_bufs: &mut DocBuffers) {
     println!(
-        "[gather_nestedjson_strings_if_applicable] => field='{}', val={:?}",
-        full_key, val
+        "gather_tokens_for_nestedjson: Gathering tokens for field {:?} from value {:?}",
+        field, val
     );
-    if let Ok(f) = schema.get_field(full_key) {
-        if let FieldType::NestedJson(nj) = schema.get_field_entry(f).field_type() {
-            println!(
-                "  => It's NestedJson => gather all strings recursively for field={:?}",
-                f
-            );
-            let mut v = Vec::new();
-            gather_strings_recursively(val, &mut v);
-            doc_bufs.push_tokens(f, &v);
-        } else {
-            println!("  => not NestedJson => skip gather");
-        }
-    } else {
-        println!("  => field not found => skip gather");
-    }
+    let mut strings = Vec::new();
+    gather_all_strings(val, &mut strings);
+    println!(
+        "gather_tokens_for_nestedjson: Collected {} strings for field {:?}",
+        strings.len(),
+        field
+    );
+    doc_bufs.push_tokens(field, &strings);
+    println!(
+        "gather_tokens_for_nestedjson: Tokens pushed to DocBuffers for field {:?}",
+        field
+    );
 }
 
-/// Actually gather all strings (recursively) from a JSON value, ignoring numeric/bool, etc.
-fn gather_strings_recursively(val: &SerdeValue, out: &mut Vec<String>) {
-    println!("[gather_strings_recursively] => val={:?}", val);
+/// Recursively gather all string values.
+fn gather_all_strings(val: &SerdeValue, out: &mut Vec<String>) {
     match val {
         SerdeValue::String(s) => {
-            println!("  => found string='{}'", s);
-            out.push(s.clone());
+            println!("gather_all_strings: Found string '{}'", s);
+            out.push(s.clone())
         }
         SerdeValue::Array(arr) => {
-            println!("  => found array with {} elems => rec", arr.len());
-            for elem in arr {
-                gather_strings_recursively(elem, out);
+            println!(
+                "gather_all_strings: Found array with {} elements",
+                arr.len()
+            );
+            for (i, item) in arr.iter().enumerate() {
+                println!(
+                    "gather_all_strings: Processing array element {}: {:?}",
+                    i, item
+                );
+                gather_all_strings(item, out);
             }
         }
         SerdeValue::Object(obj) => {
-            println!("  => found object with {} keys => rec", obj.len());
-            for (_k, subval) in obj {
-                gather_strings_recursively(subval, out);
+            println!("gather_all_strings: Found object with {} keys", obj.len());
+            for (k, v) in obj {
+                println!(
+                    "gather_all_strings: Processing key '{}' with value {:?}",
+                    k, v
+                );
+                gather_all_strings(v, out);
             }
         }
         _ => {
-            println!("  => ignoring non-string scalar");
+            println!("gather_all_strings: Encountered non-string, non-array, non-object value. Skipping.");
         }
     }
 }
 
-/// For normal (non-nested) fields => parse once, store once
-fn parse_regular_field(
+/// Fallback for sub-values not recognized as nested:
+fn store_in_fallback(
     schema: &Schema,
-    field: crate::schema::Field,
     val: &SerdeValue,
     parent_doc: &mut TantivyDocument,
 ) -> Result<(), DocParsingError> {
-    println!("[parse_regular_field] => field={:?}, val={:?}", field, val);
-    let fentry = schema.get_field_entry(field);
-    // Convert from JSON => OwnedValue
-    let typed_val = fentry
-        .field_type()
-        .value_from_json_non_nested(val.clone())
-        .map_err(|e| {
-            println!("[parse_regular_field] => error converting => {}", e);
-            DocParsingError::ValueError(schema.get_field_name(field).to_string(), e)
-        })?;
-    println!("[parse_regular_field] => succeeded => adding to doc");
-    parent_doc.add_field_value(field, &typed_val);
+    println!("store_in_fallback: Attempting to store value in fallback");
+    // In this test, no fallback field is defined => skip
+    println!("store_in_fallback: No fallback field defined. Skipping storage.");
     Ok(())
+}
+
+/// Store an object as OwnedValue::Object in the doc.
+fn store_object_in_doc(doc: &mut TantivyDocument, field: Field, obj: &JsonMap<String, SerdeValue>) {
+    println!(
+        "store_object_in_doc: Storing object in doc for field {:?} with {} keys",
+        field,
+        obj.len()
+    );
+    let mut map = BTreeMap::new();
+    for (k, v) in obj {
+        println!(
+            "store_object_in_doc: Converting sub-key '{}' with value {:?} to OwnedValue",
+            k, v
+        );
+        map.insert(k.clone(), convert_serde_to_owned(v));
+    }
+    doc.add_object(field, map);
+    println!(
+        "store_object_in_doc: Object stored in doc for field {:?}",
+        field
+    );
+}
+
+/// Store a scalar value in the doc as text (or typed).
+fn store_scalar_in_doc(doc: &mut TantivyDocument, field: Field, val: &SerdeValue) {
+    println!(
+        "store_scalar_in_doc: Storing scalar value {:?} in doc for field {:?}",
+        val, field
+    );
+    // For simplicity, store everything as text
+    doc.add_field_value(field, &OwnedValue::Str(val.to_string()));
+    println!(
+        "store_scalar_in_doc: Scalar value stored as text for field {:?}",
+        field
+    );
+}
+
+/// Convert `serde_json::Value` => `OwnedValue`.
+fn convert_serde_to_owned(val: &SerdeValue) -> OwnedValue {
+    match val {
+        SerdeValue::Null => OwnedValue::Null,
+        SerdeValue::Bool(b) => OwnedValue::from(*b),
+        SerdeValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                OwnedValue::from(i)
+            } else if let Some(u) = n.as_u64() {
+                OwnedValue::from(u)
+            } else if let Some(f) = n.as_f64() {
+                OwnedValue::from(f)
+            } else {
+                // extremely rare big integer
+                OwnedValue::Str(n.to_string())
+            }
+        }
+        SerdeValue::String(s) => OwnedValue::Str(s.clone()),
+        SerdeValue::Array(arr) => {
+            let converted: Vec<OwnedValue> =
+                arr.iter().map(|x| convert_serde_to_owned(x)).collect();
+            OwnedValue::Array(converted)
+        }
+        SerdeValue::Object(obj) => OwnedValue::Object(
+            obj.into_iter()
+                .map(|v| (v.0.into(), OwnedValue::from(v.1.clone())))
+                .collect(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -489,109 +643,242 @@ mod test_sorted_expansion {
 
     impl NestedParentBitSetProducer {
         pub fn new(parent_field: crate::schema::Field) -> Self {
+            println!(
+                "NestedParentBitSetProducer::new: Creating new producer for parent_field {:?}",
+                parent_field
+            );
             Self { parent_field }
         }
     }
 
     impl ParentBitSetProducer for NestedParentBitSetProducer {
         fn produce(&self, reader: &crate::SegmentReader) -> crate::Result<common::BitSet> {
+            println!(
+                "NestedParentBitSetProducer::produce: Producing BitSet for parent_field {:?}",
+                self.parent_field
+            );
             let max_doc = reader.max_doc();
             let mut bitset = common::BitSet::with_max_value(max_doc);
+            println!(
+                "NestedParentBitSetProducer::produce: Initialized BitSet with max_doc={}",
+                max_doc
+            );
             let inverted = reader.inverted_index(self.parent_field)?;
+            println!(
+                "NestedParentBitSetProducer::produce: Retrieved inverted index for parent_field {:?}",
+                self.parent_field
+            );
             let term_true = Term::from_field_bool(self.parent_field, true);
+            println!(
+                "NestedParentBitSetProducer::produce: Created Term {:?} for boolean true",
+                term_true
+            );
+
             if let Some(mut postings) =
                 inverted.read_postings(&term_true, IndexRecordOption::Basic)?
             {
+                println!(
+                    "NestedParentBitSetProducer::produce: Iterating over postings for term {:?}",
+                    term_true
+                );
                 while postings.doc() != crate::TERMINATED {
+                    println!(
+                        "NestedParentBitSetProducer::produce: Found doc_id {:?}",
+                        postings.doc()
+                    );
                     bitset.insert(postings.doc());
                     postings.advance();
                 }
+            } else {
+                println!(
+                    "NestedParentBitSetProducer::produce: No postings found for term {:?}",
+                    term_true
+                );
             }
+
+            println!(
+                "NestedParentBitSetProducer::produce: Completed producing BitSet with {} bits set",
+                bitset.len()
+            );
             Ok(bitset)
         }
     }
 
     #[test]
     fn test_avoids_out_of_order_tokens_fixed() -> crate::Result<()> {
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Starting test to avoid out-of-order tokens"
+        );
         // 1) Schema with user => NestedJson
-
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Building schema with NestedJson field 'user'"
+        );
         let mut builder = SchemaBuilder::default();
         let nested_opts = NestedOptions::new()
             .set_include_in_parent(true)
             .set_store_parent_flag(true);
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Configured NestedOptions: include_in_parent=true, store_parent_flag=true"
+        );
 
         let json_opts = JsonObjectOptions::default()
             .set_stored()
             .set_indexing_options(TextFieldIndexing::default());
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Configured JsonObjectOptions: stored=true, default indexing options"
+        );
 
         let nested_json_opts = NestedJsonObjectOptions {
             nested_opts,
             json_opts,
         };
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Created NestedJsonObjectOptions with nested_opts and json_opts"
+        );
 
-        let user_field = builder.add_nested_json_field("user", nested_json_opts);
+        let user_field = builder.add_nested_json_field(vec!["user".into()], nested_json_opts);
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Added NestedJson field 'user' to schema with Field ID {:?}",
+            user_field
+        );
 
         let schema = builder.build();
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Built schema with fields: {:?}",
+            schema.fields().collect::<Vec<_>>()
+        );
 
         // 2) Create index in memory
-
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Creating in-memory index with the built schema"
+        );
         let index = Index::create_in_ram(schema.clone());
+        println!("test_avoids_out_of_order_tokens_fixed: In-memory index created");
 
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Registering default tokenizer with SimpleTokenizer"
+        );
         index
             .tokenizers()
             .register("default", TextAnalyzer::from(SimpleTokenizer::default()));
+        println!("test_avoids_out_of_order_tokens_fixed: Default tokenizer registered");
 
         // 3) We'll have user => array-of-objects => ["white"] etc.
-
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Creating JSON document with 'user' field containing an array of objects"
+        );
         let json_doc = json!({
             "user": [
                 { "names": ["white", "alice"] }
             ]
         });
         let json_str = serde_json::to_string(&json_doc).unwrap();
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Serialized JSON document: {}",
+            json_str
+        );
 
         {
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Starting index writer and adding documents"
+            );
             let mut writer: IndexWriter<TantivyDocument> = index.writer_for_tests()?;
+            println!("test_avoids_out_of_order_tokens_fixed: Writer created");
 
             // Expand into child+parent docs
-
-            let expanded_docs = parse_json_for_nested_sorted(&schema, &json_str)?;
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Parsing JSON for nested sorted documents"
+            );
+            let mut parent_doc = TantivyDocument::new();
+            let expanded_docs = parse_json_for_nested_sorted(&schema, &mut parent_doc, &json_doc)?;
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Parsed into {} expanded documents",
+                expanded_docs.len()
+            );
 
             // Add them, ensuring the child doc is doc #0, parent doc is doc #1
             let docs: Vec<_> = expanded_docs.into_iter().map(Into::into).collect();
-
+            println!("test_avoids_out_of_order_tokens_fixed: Adding documents to the index writer");
             writer.add_documents(docs)?;
+            println!("test_avoids_out_of_order_tokens_fixed: Documents added to the writer");
 
+            println!("test_avoids_out_of_order_tokens_fixed: Committing changes to the index");
             writer.commit()?;
+            println!("test_avoids_out_of_order_tokens_fixed: Commit successful");
         }
 
         // 4) We'll do child-level queries => block-join => confirm the parent doc is found
-
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Opening index reader and creating searcher"
+        );
         let reader = index.reader()?;
         let searcher = reader.searcher();
+        println!("test_avoids_out_of_order_tokens_fixed: Searcher created successfully");
 
+        println!(
+            "test_avoids_out_of_order_tokens_fixed: Initializing QueryParser for field 'user'"
+        );
         let qp = QueryParser::for_index(&index, vec![user_field]);
+        println!("test_avoids_out_of_order_tokens_fixed: QueryParser initialized");
 
         for token in &["white", "alice", "names:white", "names:alice"] {
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Processing query token '{}'",
+                token
+            );
             let child_query = qp.parse_query(token)?;
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Parsed child_query for token '{}'",
+                token
+            );
 
             let parent_field = schema
                 .get_field("_is_parent_user")
                 .expect("auto-created by store_parent_flag=true");
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Retrieved parent_field '_is_parent_user' with Field ID {:?}",
+                parent_field
+            );
 
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Creating NestedParentBitSetProducer for parent_field {:?}",
+                parent_field
+            );
             let producer = std::sync::Arc::new(NestedParentBitSetProducer::new(parent_field));
+            println!("test_avoids_out_of_order_tokens_fixed: NestedParentBitSetProducer created");
 
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Creating ToParentBlockJoinQuery with child_query and producer"
+            );
             let block_join = ToParentBlockJoinQuery::new(child_query, producer, ScoreMode::None);
+            println!("test_avoids_out_of_order_tokens_fixed: ToParentBlockJoinQuery created");
 
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Executing search for token '{}'",
+                token
+            );
             let count = searcher.search(&block_join, &Count)?;
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Search completed. Documents found: {}",
+                count
+            );
 
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Asserting that exactly 1 parent document matches token '{}'",
+                token
+            );
             assert_eq!(
                 1, count,
                 "Expected 1 parent doc matching child token '{}'",
                 token
             );
+            println!(
+                "test_avoids_out_of_order_tokens_fixed: Assertion passed for token '{}'",
+                token
+            );
         }
 
+        println!("test_avoids_out_of_order_tokens_fixed: Test completed successfully");
         Ok(())
     }
 }

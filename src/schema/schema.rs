@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use common::JsonPathWriter;
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -35,7 +36,7 @@ use crate::TantivyError;
 pub struct SchemaBuilder {
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>,
-    nested_paths: HashMap<String, String>,
+    nested_paths: HashMap<Vec<String>, Field>,
 }
 
 impl SchemaBuilder {
@@ -203,12 +204,20 @@ impl SchemaBuilder {
     /// Adds a new nested field to the schema, with the given name and NestedOptions.
     /// Also, if `NestedOptions::store_parent_flag` is true, we create an internal field
     /// named `_is_parent_<field_name>` so we can easily detect parent docs.
-    pub fn add_nested_field(&mut self, field_name: &str, nested_opts: NestedOptions) -> Field {
+    pub fn add_nested_field(
+        &mut self,
+        field_path: Vec<String>,
+        nested_opts: NestedOptions,
+    ) -> Field {
+        let mut field_name_builder = JsonPathWriter::new();
+        for seg in &field_path {
+            field_name_builder.push(&seg);
+        }
+        let field_name = field_name_builder.as_str();
         println!(
             "Adding nested field '{}' with options: {:?}",
             field_name, nested_opts
         );
-
         let field_entry = FieldEntry::new_nested(field_name.to_string(), nested_opts.clone());
         let field = self.add_field(field_entry);
 
@@ -223,8 +232,7 @@ impl SchemaBuilder {
             let parent_field = self.add_field(bool_field_entry);
 
             // Record the mapping in nested_paths
-            self.nested_paths
-                .insert(field_name.to_string(), parent_field_name);
+            self.nested_paths.insert(field_path, field);
         }
 
         field
@@ -237,9 +245,18 @@ impl SchemaBuilder {
     /// named `"_is_parent_<field_name>"` to mark parent docs.
     pub fn add_nested_json_field(
         &mut self,
-        field_name: &str,
+        field_path: Vec<String>,
         nested_opts: NestedJsonObjectOptions,
     ) -> Field {
+        let mut field_name_builder = JsonPathWriter::new();
+        for seg in &field_path {
+            field_name_builder.push(&seg);
+        }
+        let field_name = field_name_builder.as_str();
+        println!(
+            "Adding nested field '{}' with options: {:?}",
+            field_name, nested_opts
+        );
         // 1) Create a FieldEntry with the new FieldType::NestedJson variant
         let field_entry = FieldEntry::new_nested_json(field_name.to_string(), nested_opts.clone());
 
@@ -256,8 +273,7 @@ impl SchemaBuilder {
             self.add_field(bool_field_entry);
 
             // Also record the mapping in `nested_paths` so queries can look it up
-            self.nested_paths
-                .insert(field_name.to_string(), parent_field_name);
+            self.nested_paths.insert(field_path, field);
         }
 
         field
@@ -300,7 +316,7 @@ impl SchemaBuilder {
 struct InnerSchema {
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>, // transient
-    nested_paths: HashMap<String, usize>,
+    nested_paths: HashMap<Vec<String>, Field>,
 }
 
 impl PartialEq for InnerSchema {
@@ -384,10 +400,6 @@ impl Schema {
             .map(|(field_id, field_entry)| (Field::from_field_id(field_id as u32), field_entry))
     }
 
-    pub fn nested_paths(&self) -> &HashMap<String, String> {
-        &self.0.nested_paths
-    }
-
     /// Creates a new builder.
     pub fn builder() -> SchemaBuilder {
         SchemaBuilder::default()
@@ -410,8 +422,12 @@ impl Schema {
         result
     }
 
-    pub fn lookup_parent_flag_name(&self, nested_path: &str) -> Option<&str> {
-        self.0.nested_paths.get(nested_path).map(|s| s.as_str())
+    pub fn get_nested_field(&self, path: &Vec<String>) -> Option<(Field, FieldEntry)> {
+        let path_vec: Vec<String> = path.iter().map(|s| s.clone()).collect();
+        self.0
+            .nested_paths
+            .get(&path_vec)
+            .and_then(|&f| Some((f, self.0.fields[f.field_id() as usize].clone())))
     }
 
     /// Searches for a full_path in the schema, returning the field name and a JSON path.
@@ -1199,7 +1215,7 @@ mod test_nested_code {
         // Mark the nested field with store_parent_flag = true, so that a hidden
         // "_is_parent_cart" field is created for parent docs.
         let nested_opts = NestedOptions::default().set_store_parent_flag(true);
-        schema_builder.add_nested_field("cart", nested_opts);
+        schema_builder.add_nested_field(vec!["cart".into()], nested_opts);
 
         // Also, let's add an example child field explicitly. (In practice you might
         // rely on JSON sub-objects inside the nested field. This test simply shows how

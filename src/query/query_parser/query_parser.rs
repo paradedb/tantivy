@@ -2035,7 +2035,7 @@ mod test {
     fn test_query_parser_nested_errors() {
         let mut schema_builder = Schema::builder();
         let nested_opts = NestedOptions::new().set_include_in_parent(true);
-        let nested_field = schema_builder.add_nested_field("nested", nested_opts);
+        let nested_field = schema_builder.add_nested_field(vec!["nested".into()], nested_opts);
         let schema = schema_builder.build();
 
         let index = Index::create_in_ram(schema.clone());
