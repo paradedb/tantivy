@@ -94,11 +94,11 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Same as [`index_json_value()`], but **with** an extra `treat_nested_arrays_as_blocks` bool:
 /// - If `true`, arrays that are _entirely_ objects get turned into separate sub‐docs (child docs),
 ///   ignoring the flatten approach.
 /// - If `false`, all arrays are flattened (the default older Tantivy behavior).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn index_json_value_nested<'a, V: Value<'a>>(
     doc: DocId,
     json_value: V,
