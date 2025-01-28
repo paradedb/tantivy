@@ -71,7 +71,37 @@ pub fn json_path_sep_to_dot(path: &mut str) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
+fn index_json_object<'a, V: Value<'a>>(
+    doc: DocId,
+    json_visitor: V::ObjectIter,
+    text_analyzer: &mut TextAnalyzer,
+    term_buffer: &mut Term,
+    json_path_writer: &mut JsonPathWriter,
+    postings_writer: &mut dyn PostingsWriter,
+    ctx: &mut IndexingContext,
+    positions_per_path: &mut IndexingPositionsPerPath,
+) {
+    for (json_path_segment, json_value_visitor) in json_visitor {
+        if json_path_segment.as_bytes().contains(&JSON_END_OF_PATH) {
+            continue;
+        }
+        json_path_writer.push(json_path_segment);
+        index_json_value(
+            doc,
+            json_value_visitor,
+            text_analyzer,
+            term_buffer,
+            json_path_writer,
+            postings_writer,
+            ctx,
+            positions_per_path,
+        );
+        json_path_writer.pop();
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn index_json_value<'a, V: Value<'a>>(
     doc: DocId,
     json_value: V,
@@ -82,239 +112,129 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
     ctx: &mut IndexingContext,
     positions_per_path: &mut IndexingPositionsPerPath,
 ) {
-    index_json_value_nested(
-        doc,
-        json_value,
-        text_analyzer,
-        term_buffer,
-        json_path_writer,
-        postings_writer,
-        ctx,
-        positions_per_path,
-        false,
-    )
-}
+    let set_path_id = |term_buffer: &mut Term, unordered_id: u32| {
+        term_buffer.truncate_value_bytes(0);
+        term_buffer.append_bytes(&unordered_id.to_be_bytes());
+    };
+    let set_type = |term_buffer: &mut Term, typ: Type| {
+        term_buffer.append_bytes(&[typ.to_code()]);
+    };
 
-#[allow(clippy::too_many_arguments)]
-/// Same as [`index_json_value()`], but **with** an extra `treat_nested_arrays_as_blocks` bool:
-/// - If `true`, arrays that are _entirely_ objects get turned into separate sub‐docs (child docs),
-///   ignoring the flatten approach.
-/// - If `false`, all arrays are flattened (the default older Tantivy behavior).
-pub(crate) fn index_json_value_nested<'a, V: Value<'a>>(
-    doc: DocId,
-    json_value: V,
-    text_analyzer: &mut TextAnalyzer,
-    term_buffer: &mut Term,
-    json_path_writer: &mut JsonPathWriter,
-    postings_writer: &mut dyn PostingsWriter,
-    ctx: &mut IndexingContext,
-    positions_per_path: &mut IndexingPositionsPerPath,
-    treat_nested_arrays_as_blocks: bool,
-) {
-    let ref_value = json_value.as_value();
-    match ref_value {
-        ReferenceValue::Leaf(leaf) => {
-            index_json_leaf(
-                doc,
-                leaf,
-                text_analyzer,
-                term_buffer,
-                json_path_writer,
-                postings_writer,
-                ctx,
-                positions_per_path,
-            );
-        }
-        ReferenceValue::Array(array_iter) => {
-            let elements_vec: Vec<_> = array_iter.collect();
+    match json_value.as_value() {
+        ReferenceValue::Leaf(leaf) => match leaf {
+            ReferenceValueLeaf::Null => {}
+            ReferenceValueLeaf::Str(val) => {
+                let mut token_stream = text_analyzer.token_stream(val);
+                let unordered_id = ctx
+                    .path_to_unordered_id
+                    .get_or_allocate_unordered_id(json_path_writer.as_str());
 
-            if treat_nested_arrays_as_blocks && all_objects_in_slice(&elements_vec) {
-                for child_val in &elements_vec {
-                    if let ReferenceValue::Object(child_obj) = child_val.as_value() {
-                        // We'll flatten them in the same doc. Or remove logic if you want separate
-                        // doc.
-                        index_json_object::<V>(
-                            doc,
-                            child_obj,
-                            text_analyzer,
-                            term_buffer,
-                            json_path_writer,
-                            postings_writer,
-                            ctx,
-                            positions_per_path,
-                            treat_nested_arrays_as_blocks,
-                        );
-                    }
+                // TODO: make sure the chain position works out.
+                set_path_id(term_buffer, unordered_id);
+                set_type(term_buffer, Type::Str);
+                let indexing_position = positions_per_path.get_position_from_id(unordered_id);
+                postings_writer.index_text(
+                    doc,
+                    &mut *token_stream,
+                    term_buffer,
+                    ctx,
+                    indexing_position,
+                );
+            }
+            ReferenceValueLeaf::U64(val) => {
+                // try to parse to i64, since when querying we will apply the same logic and prefer
+                // i64 values
+                set_path_id(
+                    term_buffer,
+                    ctx.path_to_unordered_id
+                        .get_or_allocate_unordered_id(json_path_writer.as_str()),
+                );
+                if let Ok(i64_val) = val.try_into() {
+                    term_buffer.append_type_and_fast_value::<i64>(i64_val);
+                } else {
+                    term_buffer.append_type_and_fast_value(val);
                 }
-            } else {
-                // fallback => flatten array
-                for child_val in elements_vec {
-                    index_json_value_nested(
-                        doc,
-                        child_val,
-                        text_analyzer,
-                        term_buffer,
-                        json_path_writer,
-                        postings_writer,
-                        ctx,
-                        positions_per_path,
-                        treat_nested_arrays_as_blocks,
-                    );
-                }
+                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+            }
+            ReferenceValueLeaf::I64(val) => {
+                set_path_id(
+                    term_buffer,
+                    ctx.path_to_unordered_id
+                        .get_or_allocate_unordered_id(json_path_writer.as_str()),
+                );
+                term_buffer.append_type_and_fast_value(val);
+                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+            }
+            ReferenceValueLeaf::F64(val) => {
+                set_path_id(
+                    term_buffer,
+                    ctx.path_to_unordered_id
+                        .get_or_allocate_unordered_id(json_path_writer.as_str()),
+                );
+                term_buffer.append_type_and_fast_value(val);
+                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+            }
+            ReferenceValueLeaf::Bool(val) => {
+                set_path_id(
+                    term_buffer,
+                    ctx.path_to_unordered_id
+                        .get_or_allocate_unordered_id(json_path_writer.as_str()),
+                );
+                term_buffer.append_type_and_fast_value(val);
+                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+            }
+            ReferenceValueLeaf::Date(val) => {
+                set_path_id(
+                    term_buffer,
+                    ctx.path_to_unordered_id
+                        .get_or_allocate_unordered_id(json_path_writer.as_str()),
+                );
+                let val = val.truncate(DATE_TIME_PRECISION_INDEXED);
+                term_buffer.append_type_and_fast_value(val);
+                postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
+            }
+            ReferenceValueLeaf::PreTokStr(_) => {
+                unimplemented!(
+                    "Pre-tokenized string support in dynamic fields is not yet implemented"
+                )
+            }
+            ReferenceValueLeaf::Bytes(_) => {
+                unimplemented!("Bytes support in dynamic fields is not yet implemented")
+            }
+            ReferenceValueLeaf::Facet(_) => {
+                unimplemented!("Facet support in dynamic fields is not yet implemented")
+            }
+            ReferenceValueLeaf::IpAddr(_) => {
+                unimplemented!("IP address support in dynamic fields is not yet implemented")
+            }
+        },
+        ReferenceValue::Array(elements) => {
+            for val in elements {
+                index_json_value(
+                    doc,
+                    val,
+                    text_analyzer,
+                    term_buffer,
+                    json_path_writer,
+                    postings_writer,
+                    ctx,
+                    positions_per_path,
+                );
             }
         }
-        ReferenceValue::Object(obj_iter) => {
+        ReferenceValue::Object(object) => {
             index_json_object::<V>(
                 doc,
-                obj_iter,
+                object,
                 text_analyzer,
                 term_buffer,
                 json_path_writer,
                 postings_writer,
                 ctx,
                 positions_per_path,
-                treat_nested_arrays_as_blocks,
             );
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Index a JSON leaf (scalar) at the current path.
-fn index_json_leaf(
-    doc: DocId,
-    leaf: ReferenceValueLeaf,
-    text_analyzer: &mut TextAnalyzer,
-    term_buffer: &mut Term,
-    json_path_writer: &mut JsonPathWriter,
-    postings_writer: &mut dyn PostingsWriter,
-    ctx: &mut IndexingContext,
-    positions_per_path: &mut IndexingPositionsPerPath,
-) {
-    match leaf {
-        ReferenceValueLeaf::Null => {
-            // Skip null values
-        }
-        ReferenceValueLeaf::Str(s) => {
-            let unordered_id = ctx
-                .path_to_unordered_id
-                .get_or_allocate_unordered_id(json_path_writer.as_str());
-            term_buffer.truncate_value_bytes(0);
-            term_buffer.append_bytes(&unordered_id.to_be_bytes());
-            term_buffer.append_bytes(&[Type::Str.to_code()]);
-
-            // token analysis
-            let mut token_stream = text_analyzer.token_stream(s);
-            let indexing_position = positions_per_path.get_position_from_id(unordered_id);
-            postings_writer.index_text(
-                doc,
-                &mut *token_stream,
-                term_buffer,
-                ctx,
-                indexing_position,
-            );
-        }
-        ReferenceValueLeaf::U64(uval) => {
-            let unordered_id = ctx
-                .path_to_unordered_id
-                .get_or_allocate_unordered_id(json_path_writer.as_str());
-            term_buffer.truncate_value_bytes(0);
-            term_buffer.append_bytes(&unordered_id.to_be_bytes());
-            if let Ok(i64_val) = i64::try_from(uval) {
-                term_buffer.append_type_and_fast_value::<i64>(i64_val);
-            } else {
-                term_buffer.append_type_and_fast_value(uval);
-            }
-            postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
-        }
-        ReferenceValueLeaf::I64(ival) => {
-            let unordered_id = ctx
-                .path_to_unordered_id
-                .get_or_allocate_unordered_id(json_path_writer.as_str());
-            term_buffer.truncate_value_bytes(0);
-            term_buffer.append_bytes(&unordered_id.to_be_bytes());
-            term_buffer.append_type_and_fast_value::<i64>(ival);
-            postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
-        }
-        ReferenceValueLeaf::F64(fval) => {
-            let unordered_id = ctx
-                .path_to_unordered_id
-                .get_or_allocate_unordered_id(json_path_writer.as_str());
-            term_buffer.truncate_value_bytes(0);
-            term_buffer.append_bytes(&unordered_id.to_be_bytes());
-            term_buffer.append_type_and_fast_value::<f64>(fval);
-            postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
-        }
-        ReferenceValueLeaf::Bool(bval) => {
-            let unordered_id = ctx
-                .path_to_unordered_id
-                .get_or_allocate_unordered_id(json_path_writer.as_str());
-            term_buffer.truncate_value_bytes(0);
-            term_buffer.append_bytes(&unordered_id.to_be_bytes());
-            term_buffer.append_type_and_fast_value::<bool>(bval);
-            postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
-        }
-        ReferenceValueLeaf::Date(dt) => {
-            let truncated = dt.truncate(DATE_TIME_PRECISION_INDEXED);
-            let unordered_id = ctx
-                .path_to_unordered_id
-                .get_or_allocate_unordered_id(json_path_writer.as_str());
-            term_buffer.truncate_value_bytes(0);
-            term_buffer.append_bytes(&unordered_id.to_be_bytes());
-            term_buffer.append_type_and_fast_value::<DateTime>(truncated);
-            postings_writer.subscribe(doc, 0u32, term_buffer, ctx);
-        }
-        ReferenceValueLeaf::PreTokStr(_)
-        | ReferenceValueLeaf::Bytes(_)
-        | ReferenceValueLeaf::Facet(_)
-        | ReferenceValueLeaf::IpAddr(_) => {
-            unimplemented!("Some JSON leaf types not implemented for dynamic indexing.")
-        }
-    }
-}
-
-/// Helper for indexing a JSON object: enumerates all key→value pairs, pushing each key onto
-/// the path before indexing the child value.
-#[allow(clippy::too_many_arguments)]
-fn index_json_object<'a, V: Value<'a>>(
-    doc: DocId,
-    obj_iter: V::ObjectIter,
-    text_analyzer: &mut TextAnalyzer,
-    term_buffer: &mut Term,
-    json_path_writer: &mut JsonPathWriter,
-    postings_writer: &mut dyn PostingsWriter,
-    ctx: &mut IndexingContext,
-    positions_per_path: &mut IndexingPositionsPerPath,
-    treat_nested_arrays_as_blocks: bool,
-) {
-    for (key, val) in obj_iter {
-        // skip if key name has 0x00
-        if key.as_bytes().contains(&JSON_END_OF_PATH) {
-            continue;
-        }
-
-        json_path_writer.push(key);
-
-        index_json_value_nested(
-            doc,
-            val,
-            text_analyzer,
-            term_buffer,
-            json_path_writer,
-            postings_writer,
-            ctx,
-            positions_per_path,
-            treat_nested_arrays_as_blocks,
-        );
-
-        json_path_writer.pop();
-    }
-}
-
-/// Test for "array of objects" by scanning all items, ensuring each is `ReferenceValue::Object`.
-fn all_objects_in_slice<'a, V: Value<'a>>(vals: &[V]) -> bool {
-    vals.iter()
-        .all(|v| matches!(v.as_value(), ReferenceValue::Object(_)))
 }
 
 /// Tries to infer a JSON type from a string and append it to the term.
@@ -419,11 +339,8 @@ pub(crate) fn encode_column_name(
 #[cfg(test)]
 mod tests {
     use super::split_json_path;
-    use crate::collector::Count;
-    use crate::query::{ParentBitSetProducer, QueryParser};
-    use crate::schema::{Field, IndexRecordOption, Schema, STORED, TEXT};
-    use crate::tokenizer::{SimpleTokenizer, TextAnalyzer};
-    use crate::{DocSet, Index, SegmentReader, Term, TERMINATED};
+    use crate::schema::Field;
+    use crate::Term;
 
     #[test]
     fn test_json_writer() {
@@ -540,137 +457,6 @@ mod tests {
     #[test]
     fn test_split_json_path_escaped_normal_letter() {
         let json_path = split_json_path(r"toto\titi");
-        assert_eq!(&json_path, &["tototiti"]);
-    }
-
-    #[test]
-    fn test_array_of_objects_is_not_flattened() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let json_field = schema_builder.add_json_field("json", STORED | TEXT);
-        let schema = schema_builder.build();
-
-        let index = Index::create_in_ram(schema);
-
-        index
-            .tokenizers()
-            .register("default", TextAnalyzer::from(SimpleTokenizer::default()));
-
-        let mut writer = index.writer(50_000_000)?;
-        let val = json!({
-            "driver": {
-               "vehicle": [
-                  { "make": "Powell", "model": "Canyonero" },
-                  { "make": "Miller-Meteor", "model": "Ecto-1" }
-               ]
-            }
-        });
-
-        writer
-            .add_document(doc! { json_field => val.to_string() })
-            .unwrap();
-        writer.commit()?;
-
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-
-        let query_parser = QueryParser::for_index(&index, vec![json_field]);
-        let query = query_parser.parse_query("Powell")?;
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 1, "Doc with 'Powell' found");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_array_of_scalars_flattened() -> crate::Result<()> {
-        let mut builder = Schema::builder();
-        let json_field = builder.add_json_field("json", STORED | TEXT);
-        let schema = builder.build();
-
-        let index = Index::create_in_ram(schema);
-        index
-            .tokenizers()
-            .register("default", TextAnalyzer::from(SimpleTokenizer::default()));
-        let mut writer = index.writer(50_000_000)?;
-
-        let val = json!({ "numbers": [100, 200, 300] });
-        writer
-            .add_document(doc! { json_field => val.to_string() })
-            .unwrap();
-        writer.commit()?;
-
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-
-        let query_parser = QueryParser::for_index(&index, vec![json_field]);
-        let query = query_parser.parse_query("200")?;
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 1, "We found the doc with '200' in the array.");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_nested_arrays_of_arrays() -> crate::Result<()> {
-        let mut builder = Schema::builder();
-        let json_field = builder.add_json_field("json", STORED | TEXT);
-        let schema = builder.build();
-
-        let index = Index::create_in_ram(schema);
-        index
-            .tokenizers()
-            .register("default", TextAnalyzer::from(SimpleTokenizer::default()));
-        let mut writer = index.writer(50_000_000)?;
-
-        let val = json!({
-            "top_arr": [
-                [1, 2],
-                [3, 4],
-            ],
-            "mixed_arr": [
-                { "foo": "bar" },
-                555,
-                { "make": "Powell", "model": "Canyonero" }
-            ]
-        });
-
-        writer
-            .add_document(doc! { json_field => val.to_string() })
-            .unwrap();
-        writer.commit()?;
-
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-
-        let query_parser = QueryParser::for_index(&index, vec![json_field]);
-        let query = query_parser.parse_query("Canyonero")?;
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 1, "Doc with 'Canyonero' found in nested array.");
-
-        Ok(())
-    }
-
-    pub struct NestedParentBitSetProducer {
-        parent_field: Field,
-    }
-
-    impl ParentBitSetProducer for NestedParentBitSetProducer {
-        fn produce(&self, reader: &SegmentReader) -> crate::Result<common::BitSet> {
-            let max_doc = reader.max_doc();
-            let mut bitset = common::BitSet::with_max_value(max_doc);
-
-            let inverted = reader.inverted_index(self.parent_field)?;
-            let term_true = Term::from_field_bool(self.parent_field, true);
-            if let Some(mut postings) =
-                inverted.read_postings(&term_true, IndexRecordOption::Basic)?
-            {
-                let mut d = postings.doc();
-                while d != TERMINATED {
-                    bitset.insert(d);
-                    d = postings.advance();
-                }
-            }
-            Ok(bitset)
-        }
+        assert_eq!(&json_path, &[r#"tototiti"#]);
     }
 }

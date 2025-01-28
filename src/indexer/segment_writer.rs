@@ -8,7 +8,7 @@ use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::segment_serializer::SegmentSerializer;
-use crate::json_utils::{index_json_value, index_json_value_nested, IndexingPositionsPerPath};
+use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
 use crate::postings::{
     compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
     PerFieldPostingsWriter, PostingsWriter,
@@ -336,35 +336,6 @@ impl SegmentWriter {
                     }
                     if field_entry.has_fieldnorms() {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
-                    }
-                }
-                FieldType::Nested(_nested_opts) => {
-                    // Here, we skip indexing because these fields
-                    // have already been expanded into child docs
-                    // at parse time (parse_json_for_nested).
-                    continue;
-                }
-                FieldType::NestedJson(nested_opts) => {
-                    let text_analyzer =
-                        &mut self.per_field_text_analyzers[field.field_id() as usize];
-
-                    self.json_positions_per_path.clear();
-                    self.json_path_writer
-                        .set_expand_dots(nested_opts.json_opts.is_expand_dots_enabled());
-                    for json_value in values {
-                        self.json_path_writer.clear();
-
-                        index_json_value_nested(
-                            doc_id,
-                            json_value,
-                            text_analyzer,
-                            term_buffer,
-                            &mut self.json_path_writer,
-                            postings_writer,
-                            ctx,
-                            &mut self.json_positions_per_path,
-                            true,
-                        );
                     }
                 }
             }
