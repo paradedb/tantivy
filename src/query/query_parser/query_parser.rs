@@ -528,30 +528,6 @@ impl QueryParser {
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
                 Ok(Term::from_field_ip_addr(field, ip_v6))
             }
-            FieldType::NestedJson(ref nested_json_options) => {
-                let get_term_with_path = || {
-                    Term::from_field_json_path(
-                        field,
-                        json_path,
-                        nested_json_options.json_opts.is_expand_dots_enabled(),
-                    )
-                };
-                if let Some(term) = convert_to_fast_value_and_append_to_json_term(
-                    get_term_with_path(),
-                    phrase,
-                    false,
-                ) {
-                    Ok(term)
-                } else {
-                    let mut term = get_term_with_path();
-                    term.append_type_and_str(phrase);
-                    Ok(term)
-                }
-            }
-
-            FieldType::Nested(_) => Err(QueryParserError::UnsupportedQuery(
-                "Range query on a nested field is not supported.".into(),
-            )),
         }
     }
 
@@ -567,10 +543,10 @@ impl QueryParser {
         let field_type = field_entry.field_type();
         let field_name = field_entry.name();
         if field_type.is_nested() {
-            return Err(QueryParserError::UnsupportedQuery(format!(
-                "Cannot run direct text search on a `nested` field. Field: {}, Query: {}",
-                field_name, phrase
-            )));
+            // return Err(QueryParserError::UnsupportedQuery(format!(
+            //     "Cannot run direct text search on a `nested` field. Field: {}, Query: {}",
+            //     field_name, phrase
+            // )));
         }
         if !field_type.is_indexed() {
             return Err(QueryParserError::FieldNotIndexed(field_name.to_string()));
@@ -658,17 +634,6 @@ impl QueryParser {
                 let term = Term::from_field_ip_addr(field, ip_v6);
                 Ok(vec![LogicalLiteral::Term(term)])
             }
-            FieldType::Nested(_) => Err(QueryParserError::UnsupportedQuery(
-                "Cannot run direct text search on a `nested` field.".to_string(),
-            )),
-            FieldType::NestedJson(ref nested_json_options) => generate_literals_for_json_object(
-                field_name,
-                field,
-                json_path,
-                phrase,
-                &self.tokenizer_manager,
-                &nested_json_options.json_opts,
-            ),
         }
     }
 

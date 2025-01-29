@@ -69,25 +69,5 @@ fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn Postings
                 JsonPostingsWriter::<DocIdRecorder>::default().into()
             }
         }
-        FieldType::Nested(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
-        FieldType::NestedJson(ref nested_json_options) => {
-            if let Some(text_indexing_option) =
-                nested_json_options.json_opts.get_text_indexing_options()
-            {
-                match text_indexing_option.index_option() {
-                    IndexRecordOption::Basic => {
-                        JsonPostingsWriter::<DocIdRecorder>::default().into()
-                    }
-                    IndexRecordOption::WithFreqs => {
-                        JsonPostingsWriter::<TermFrequencyRecorder>::default().into()
-                    }
-                    IndexRecordOption::WithFreqsAndPositions => {
-                        JsonPostingsWriter::<TfAndPositionRecorder>::default().into()
-                    }
-                }
-            } else {
-                JsonPostingsWriter::<DocIdRecorder>::default().into()
-            }
-        }
     }
 }

@@ -32,6 +32,7 @@ pub struct CompactDoc {
     pub node_data: Vec<u8>,
     /// The root (Field, Value) pairs
     field_values: Vec<FieldValueAddr>,
+    pub is_parent: bool,
 }
 
 impl Default for CompactDoc {
@@ -47,6 +48,7 @@ impl CompactDoc {
         CompactDoc {
             node_data: Vec::with_capacity(bytes),
             field_values: Vec::with_capacity(4),
+            is_parent: false,
         }
     }
 
@@ -68,7 +70,9 @@ impl CompactDoc {
 
     /// Adding a facet to the document.
     pub fn add_facet<F>(&mut self, field: Field, path: F)
-    where Facet: From<F> {
+    where
+        Facet: From<F>,
+    {
         let facet = Facet::from(path);
         self.add_leaf_field_value(field, ReferenceValueLeaf::Facet(facet.encoded_str()));
     }
@@ -325,6 +329,29 @@ impl CompactDoc {
     fn get_slice(&self, addr: Addr) -> &[u8] {
         &self.node_data[addr as usize..]
     }
+
+    pub fn set_is_parent(&mut self, field: Field, is_parent: bool) {
+        // or store a fieldvalue for the boolean
+        self.is_parent = is_parent;
+        if is_parent {
+            self.add_field_value(field, &OwnedValue::from(true));
+        }
+    }
+
+    pub fn debug_str(&self, root_field: Field, parent_flag_field: Field) -> String {
+        // Look up the JSON string in `root_field`
+        let mut json_val = "<none>".to_string();
+        let mut parent_str = String::new();
+        for (fld, val) in self.field_values() {
+            if fld == root_field {
+                json_val = format!("{val:?}");
+            }
+            if fld == parent_flag_field && val.as_bool() == Some(true) {
+                parent_str = ", is_parent=true".to_string();
+            }
+        }
+        format!("{{json={json_val}{parent_str}}}")
+    }
 }
 
 /// BinarySerializable alternative to read references
@@ -377,7 +404,9 @@ impl Eq for CompactDoc {}
 
 impl DocumentDeserialize for CompactDoc {
     fn deserialize<'de, D>(mut deserializer: D) -> Result<Self, DeserializeError>
-    where D: DocumentDeserializer<'de> {
+    where
+        D: DocumentDeserializer<'de>,
+    {
         let mut doc = CompactDoc::default();
         // TODO: Deserializing into OwnedValue is wasteful. The deserializer should be able to work
         // on slices and referenced data.

@@ -145,17 +145,38 @@ impl SegmentWriter {
 
     fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
         let doc_id = self.max_doc;
+        println!("index_document: Assigning doc_id: {}", doc_id);
 
         // TODO: Can this be optimised a bit?
+        println!("index_document: Iterating and grouping fields and values.");
         let vals_grouped_by_field = doc
             .iter_fields_and_values()
             .sorted_by_key(|(field, _)| *field)
             .chunk_by(|(field, _)| *field);
 
+        // It's useful to know how many field groups we're processing
+
         for (field, field_values) in &vals_grouped_by_field {
-            let values = field_values.map(|el| el.1);
+            println!(
+                "index_document: Processing field: {:?} (Field ID: {})",
+                field,
+                field.field_id()
+            );
+
+            // Collect the iterator into an owned Vec to break the borrowing chain
+            let values: Vec<_> = field_values.map(|el| el.1.clone()).collect();
+            println!(
+                "index_document: Collected {} values for field {:?}.",
+                values.len(),
+                self.schema.get_field_name(field)
+            );
 
             let field_entry = self.schema.get_field_entry(field);
+            println!(
+                "index_document: Retrieved FieldEntry for field {:?}: {:?}",
+                field, field_entry
+            );
+
             let make_schema_error = || {
                 TantivyError::SchemaError(format!(
                     "Expected a {:?} for field {:?}",
@@ -163,24 +184,67 @@ impl SegmentWriter {
                     field_entry.name()
                 ))
             };
+
             if !field_entry.is_indexed() {
+                println!(
+                    "index_document: Field {:?} is not indexed. Skipping.",
+                    field_entry.name()
+                );
                 continue;
             }
+            println!(
+                "index_document: Field {:?} is indexed. Proceeding with indexing.",
+                field_entry.name()
+            );
 
             let (term_buffer, ctx) = (&mut self.term_buffer, &mut self.ctx);
             let postings_writer: &mut dyn PostingsWriter =
                 self.per_field_postings_writers.get_for_field_mut(field);
+            println!(
+                "index_document: Retrieved PostingsWriter for field {:?}.",
+                field_entry.name()
+            );
+
             term_buffer.clear_with_field_and_type(field_entry.field_type().value_type(), field);
+            println!(
+                "index_document: Cleared term_buffer for field {:?} with type {:?}.",
+                field_entry.name(),
+                field_entry.field_type().value_type()
+            );
 
             match field_entry.field_type() {
                 FieldType::Facet(_) => {
+                    println!(
+                        "index_document: Handling FieldType::Facet for field {:?}.",
+                        field_entry.name()
+                    );
                     let mut facet_tokenizer = FacetTokenizer::default(); // this can be global
                     for value in values {
+                        println!(
+                            "index_document: Processing Facet value for field {:?}: {:?}",
+                            field_entry.name(),
+                            value
+                        );
                         let value = value.as_value();
 
-                        let facet_str = value.as_facet().ok_or_else(make_schema_error)?;
+                        let facet_str = match value.as_facet() {
+                            Some(facet) => facet,
+                            None => {
+                                println!(
+                                "index_document: Error converting value to Facet for field {:?}.",
+                                field_entry.name()
+                            );
+                                return Err(make_schema_error());
+                            }
+                        };
+                        println!("index_document: Facet string extracted: '{}'", facet_str);
+
                         let mut facet_tokenizer = facet_tokenizer.token_stream(facet_str);
                         let mut indexing_position = IndexingPosition::default();
+                        println!(
+                            "index_document: Indexing Facet text for field {:?}.",
+                            field_entry.name()
+                        );
                         postings_writer.index_text(
                             doc_id,
                             &mut facet_tokenizer,
@@ -188,24 +252,50 @@ impl SegmentWriter {
                             ctx,
                             &mut indexing_position,
                         );
+                        println!(
+                            "index_document: Indexed Facet text with indexing_position: {:?}",
+                            indexing_position
+                        );
                     }
                 }
                 FieldType::Str(_) => {
+                    println!(
+                        "index_document: Handling FieldType::Str for field {:?}.",
+                        field_entry.name()
+                    );
                     let mut indexing_position = IndexingPosition::default();
                     for value in values {
+                        println!(
+                            "index_document: Processing Str value for field {:?}: {:?}",
+                            field_entry.name(),
+                            value
+                        );
                         let value = value.as_value();
 
                         let mut token_stream = if let Some(text) = value.as_str() {
+                            println!(
+                            "index_document: Value is a string. Creating token_stream using text analyzer."
+                        );
                             let text_analyzer =
                                 &mut self.per_field_text_analyzers[field.field_id() as usize];
                             text_analyzer.token_stream(text)
                         } else if let Some(tok_str) = value.into_pre_tokenized_text() {
+                            println!(
+                            "index_document: Value is pre-tokenized text. Creating PreTokenizedStream."
+                        );
                             BoxTokenStream::new(PreTokenizedStream::from(*tok_str.clone()))
                         } else {
+                            println!(
+                            "index_document: Value does not contain a valid string or pre-tokenized text. Skipping."
+                        );
                             continue;
                         };
 
                         assert!(term_buffer.is_empty());
+                        println!(
+                        "index_document: Indexing text for field {:?} with term_buffer cleared.",
+                        field_entry.name()
+                    );
                         postings_writer.index_text(
                             doc_id,
                             &mut *token_stream,
@@ -213,106 +303,328 @@ impl SegmentWriter {
                             ctx,
                             &mut indexing_position,
                         );
+                        println!(
+                            "index_document: Indexed text with indexing_position: {:?}",
+                            indexing_position
+                        );
                     }
                     if field_entry.has_fieldnorms() {
+                        println!(
+                        "index_document: Recording fieldnorms for field {:?} with num_tokens: {}.",
+                        field_entry.name(),
+                        indexing_position.num_tokens
+                    );
                         self.fieldnorms_writer
                             .record(doc_id, field, indexing_position.num_tokens);
                     }
                 }
                 FieldType::U64(_) => {
+                    println!(
+                        "index_document: Handling FieldType::U64 for field {:?}.",
+                        field_entry.name()
+                    );
                     let mut num_vals = 0;
                     for value in values {
+                        println!(
+                            "index_document: Processing U64 value for field {:?}: {:?}",
+                            field_entry.name(),
+                            value
+                        );
                         let value = value.as_value();
 
                         num_vals += 1;
-                        let u64_val = value.as_u64().ok_or_else(make_schema_error)?;
+                        let u64_val = match value.as_u64() {
+                            Some(val) => val,
+                            None => {
+                                println!(
+                                    "index_document: Error converting value to u64 for field {:?}.",
+                                    field_entry.name()
+                                );
+                                return Err(make_schema_error());
+                            }
+                        };
+                        println!(
+                            "index_document: U64 value extracted: {}. Setting term_buffer.",
+                            u64_val
+                        );
                         term_buffer.set_u64(u64_val);
+                        println!(
+                        "index_document: Subscribing to postings_writer for doc_id: {}, field: {:?}.",
+                        doc_id,
+                        field_entry.name()
+                    );
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
+                        println!(
+                        "index_document: Recording fieldnorms for field {:?} with num_vals: {}.",
+                        field_entry.name(),
+                        num_vals
+                    );
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::Date(_) => {
+                    println!(
+                        "index_document: Handling FieldType::Date for field {:?}.",
+                        field_entry.name()
+                    );
                     let mut num_vals = 0;
                     for value in values {
+                        println!(
+                            "index_document: Processing Date value for field {:?}: {:?}",
+                            field_entry.name(),
+                            value
+                        );
                         let value = value.as_value();
 
                         num_vals += 1;
-                        let date_val = value.as_datetime().ok_or_else(make_schema_error)?;
+                        let date_val = match value.as_datetime() {
+                            Some(val) => val,
+                            None => {
+                                println!(
+                                "index_document: Error converting value to DateTime for field {:?}.",
+                                field_entry.name()
+                            );
+                                return Err(make_schema_error());
+                            }
+                        };
+                        println!(
+                        "index_document: DateTime value extracted: {:?}. Truncating and setting term_buffer.",
+                        date_val
+                    );
                         term_buffer
                             .set_u64(date_val.truncate(DATE_TIME_PRECISION_INDEXED).to_u64());
+                        println!(
+                        "index_document: Subscribing to postings_writer for doc_id: {}, field: {:?}.",
+                        doc_id,
+                        field_entry.name()
+                    );
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
+                        println!(
+                        "index_document: Recording fieldnorms for field {:?} with num_vals: {}.",
+                        field_entry.name(),
+                        num_vals
+                    );
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::I64(_) => {
+                    println!(
+                        "index_document: Handling FieldType::I64 for field {:?}.",
+                        field_entry.name()
+                    );
                     let mut num_vals = 0;
                     for value in values {
+                        println!(
+                            "index_document: Processing I64 value for field {:?}: {:?}",
+                            field_entry.name(),
+                            value
+                        );
                         let value = value.as_value();
 
                         num_vals += 1;
-                        let i64_val = value.as_i64().ok_or_else(make_schema_error)?;
+                        let i64_val = match value.as_i64() {
+                            Some(val) => val,
+                            None => {
+                                println!(
+                                    "index_document: Error converting value to i64 for field {:?}.",
+                                    field_entry.name()
+                                );
+                                return Err(make_schema_error());
+                            }
+                        };
+                        println!(
+                            "index_document: i64 value extracted: {}. Setting term_buffer.",
+                            i64_val
+                        );
                         term_buffer.set_i64(i64_val);
+                        println!(
+                        "index_document: Subscribing to postings_writer for doc_id: {}, field: {:?}.",
+                        doc_id,
+                        field_entry.name()
+                    );
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
+                        println!(
+                        "index_document: Recording fieldnorms for field {:?} with num_vals: {}.",
+                        field_entry.name(),
+                        num_vals
+                    );
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::F64(_) => {
+                    println!(
+                        "index_document: Handling FieldType::F64 for field {:?}.",
+                        field_entry.name()
+                    );
                     let mut num_vals = 0;
                     for value in values {
+                        println!(
+                            "index_document: Processing F64 value for field {:?}: {:?}",
+                            field_entry.name(),
+                            value
+                        );
                         let value = value.as_value();
                         num_vals += 1;
-                        let f64_val = value.as_f64().ok_or_else(make_schema_error)?;
+                        let f64_val = match value.as_f64() {
+                            Some(val) => val,
+                            None => {
+                                println!(
+                                    "index_document: Error converting value to f64 for field {:?}.",
+                                    field_entry.name()
+                                );
+                                return Err(make_schema_error());
+                            }
+                        };
+                        println!(
+                            "index_document: f64 value extracted: {}. Setting term_buffer.",
+                            f64_val
+                        );
                         term_buffer.set_f64(f64_val);
+                        println!(
+                        "index_document: Subscribing to postings_writer for doc_id: {}, field: {:?}.",
+                        doc_id,
+                        field_entry.name()
+                    );
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
+                        println!(
+                        "index_document: Recording fieldnorms for field {:?} with num_vals: {}.",
+                        field_entry.name(),
+                        num_vals
+                    );
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::Bool(_) => {
+                    println!(
+                        "index_document: Handling FieldType::Bool for field {:?}.",
+                        field_entry.name()
+                    );
                     let mut num_vals = 0;
                     for value in values {
+                        println!(
+                            "index_document: Processing Bool value for field {:?}: {:?}",
+                            field_entry.name(),
+                            value
+                        );
                         let value = value.as_value();
                         num_vals += 1;
-                        let bool_val = value.as_bool().ok_or_else(make_schema_error)?;
+                        let bool_val = match value.as_bool() {
+                            Some(val) => val,
+                            None => {
+                                println!(
+                                "index_document: Error converting value to bool for field {:?}.",
+                                field_entry.name()
+                            );
+                                return Err(make_schema_error());
+                            }
+                        };
+                        println!(
+                            "index_document: Bool value extracted: {}. Setting term_buffer.",
+                            bool_val
+                        );
                         term_buffer.set_bool(bool_val);
+                        println!(
+                        "index_document: Subscribing to postings_writer for doc_id: {}, field: {:?}.",
+                        doc_id,
+                        field_entry.name()
+                    );
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
+                        println!(
+                        "index_document: Recording fieldnorms for field {:?} with num_vals: {}.",
+                        field_entry.name(),
+                        num_vals
+                    );
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::Bytes(_) => {
+                    println!(
+                        "index_document: Handling FieldType::Bytes for field {:?}.",
+                        field_entry.name()
+                    );
                     let mut num_vals = 0;
                     for value in values {
+                        println!(
+                            "index_document: Processing Bytes value for field {:?}: {:?}",
+                            field_entry.name(),
+                            value
+                        );
                         let value = value.as_value();
                         num_vals += 1;
-                        let bytes = value.as_bytes().ok_or_else(make_schema_error)?;
+                        let bytes = match value.as_bytes() {
+                            Some(val) => val,
+                            None => {
+                                println!(
+                                "index_document: Error converting value to bytes for field {:?}.",
+                                field_entry.name()
+                            );
+                                return Err(make_schema_error());
+                            }
+                        };
+                        println!(
+                            "index_document: Bytes value extracted: {:?}. Setting term_buffer.",
+                            bytes
+                        );
                         term_buffer.set_bytes(bytes);
+                        println!(
+                        "index_document: Subscribing to postings_writer for doc_id: {}, field: {:?}.",
+                        doc_id,
+                        field_entry.name()
+                    );
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
+                        println!(
+                        "index_document: Recording fieldnorms for field {:?} with num_vals: {}.",
+                        field_entry.name(),
+                        num_vals
+                    );
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::JsonObject(json_options) => {
+                    println!(
+                    "index_document: Handling FieldType::JsonObject for field {:?} with options {:?}.",
+                    field_entry.name(),
+                    json_options
+                );
                     let text_analyzer =
                         &mut self.per_field_text_analyzers[field.field_id() as usize];
+                    println!(
+                        "index_document: Retrieved TextAnalyzer for field {:?}.",
+                        field_entry.name()
+                    );
 
                     self.json_positions_per_path.clear();
+                    println!("index_document: Cleared json_positions_per_path.");
+
                     self.json_path_writer
                         .set_expand_dots(json_options.is_expand_dots_enabled());
-                    for json_value in values {
-                        self.json_path_writer.clear();
+                    println!(
+                        "index_document: Set expand_dots to {} in json_path_writer.",
+                        json_options.is_expand_dots_enabled()
+                    );
 
-                        #[allow(clippy::too_many_arguments)]
-                        index_json_value(
+                    for json_value in values {
+                        println!(
+                            "index_document: Processing JSON value for field {:?}: {:?}",
+                            field_entry.name(),
+                            json_value
+                        );
+                        self.json_path_writer.clear();
+                        println!("index_document: Cleared json_path_writer for new JSON value.");
+
+                        crate::json_utils::index_json_value_nested(
                             doc_id,
                             json_value,
                             text_analyzer,
@@ -321,25 +633,77 @@ impl SegmentWriter {
                             postings_writer,
                             ctx,
                             &mut self.json_positions_per_path,
+                            true,
+                        );
+                        // #[allow(clippy::too_many_arguments)]
+                        // index_json_value(
+                        //     doc_id,
+                        //     json_value,
+                        //     text_analyzer,
+                        //     term_buffer,
+                        //     &mut self.json_path_writer,
+                        //     postings_writer,
+                        //     ctx,
+                        //     &mut self.json_positions_per_path,
+                        // );
+                        println!(
+                            "index_document: Completed indexing JSON value for field {:?}.",
+                            field_entry.name()
                         );
                     }
                 }
                 FieldType::IpAddr(_) => {
+                    println!(
+                        "index_document: Handling FieldType::IpAddr for field {:?}.",
+                        field_entry.name()
+                    );
                     let mut num_vals = 0;
                     for value in values {
+                        println!(
+                            "index_document: Processing IpAddr value for field {:?}: {:?}",
+                            field_entry.name(),
+                            value
+                        );
                         let value = value.as_value();
-
                         num_vals += 1;
-                        let ip_addr = value.as_ip_addr().ok_or_else(make_schema_error)?;
+                        let ip_addr = match value.as_ip_addr() {
+                            Some(val) => val,
+                            None => {
+                                println!(
+                                "index_document: Error converting value to IpAddr for field {:?}.",
+                                field_entry.name()
+                            );
+                                return Err(make_schema_error());
+                            }
+                        };
+                        println!(
+                            "index_document: IpAddr value extracted: {}. Setting term_buffer.",
+                            ip_addr
+                        );
                         term_buffer.set_ip_addr(ip_addr);
+                        println!(
+                        "index_document: Subscribing to postings_writer for doc_id: {}, field: {:?}.",
+                        doc_id,
+                        field_entry.name()
+                    );
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
+                        println!(
+                        "index_document: Recording fieldnorms for field {:?} with num_vals: {}.",
+                        field_entry.name(),
+                        num_vals
+                    );
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
             }
         }
+
+        println!(
+            "index_document: Successfully indexed document with doc_id: {}",
+            doc_id
+        );
         Ok(())
     }
 

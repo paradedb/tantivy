@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::BitOr;
 
 use serde::{Deserialize, Serialize};
@@ -5,6 +6,50 @@ use serde::{Deserialize, Serialize};
 use super::text_options::{FastFieldTextOptions, TokenizerName};
 use crate::schema::flags::{FastFlag, SchemaFlagList, StoredFlag};
 use crate::schema::{TextFieldIndexing, TextOptions};
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum ObjectMappingType {
+    /// A normal “object” type, flattened by default. (Equivalent to ES “object”).
+    #[default]
+    Default,
+    /// A nested type. Each item in an array is indexed as a separate sub-document.
+    Nested,
+}
+
+impl BitOr for ObjectMappingType {
+    type Output = ObjectMappingType;
+
+    fn bitor(self, other: ObjectMappingType) -> ObjectMappingType {
+        match (self, other) {
+            (ObjectMappingType::Nested, _) | (_, ObjectMappingType::Nested) => {
+                ObjectMappingType::Nested
+            }
+            _ => ObjectMappingType::Default,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NestedOptions {
+    /// If true, fields in the nested object are also added to the parent doc as flattened fields.
+    #[serde(default)]
+    pub include_in_parent: bool,
+
+    /// If true, fields in the nested object are also added to the *root* doc as flattened fields.
+    #[serde(default)]
+    pub include_in_root: bool,
+}
+
+impl BitOr for NestedOptions {
+    type Output = NestedOptions;
+
+    fn bitor(self, other: NestedOptions) -> NestedOptions {
+        NestedOptions {
+            include_in_parent: self.include_in_parent || other.include_in_parent,
+            include_in_root: self.include_in_root || other.include_in_root,
+        }
+    }
+}
 
 /// The `JsonObjectOptions` make it possible to
 /// configure how a json object field should be indexed and stored.
@@ -42,6 +87,19 @@ pub struct JsonObjectOptions {
     /// `root.child.with.dot:hello`
     #[serde(default)]
     expand_dots_enabled: bool,
+
+    /// Plain vs. nested object handling.
+    #[serde(default)]
+    pub object_mapping_type: ObjectMappingType,
+
+    /// If this is a nested type, here is where we store nested-specific options.
+    #[serde(default)]
+    pub nested_options: NestedOptions,
+
+    /// A map of subfield names to their own indexing/mapping options,
+    /// which enables arbitrary recursive nesting.
+    #[serde(default)]
+    pub subfields: HashMap<String, JsonObjectOptions>,
 }
 
 impl JsonObjectOptions {
@@ -94,6 +152,14 @@ impl JsonObjectOptions {
     #[inline]
     pub fn is_expand_dots_enabled(&self) -> bool {
         self.expand_dots_enabled
+    }
+
+    pub fn is_include_in_parent(&self) -> bool {
+        self.nested_options.include_in_parent
+    }
+
+    pub fn is_include_in_root(&self) -> bool {
+        self.nested_options.include_in_root
     }
 
     /// Sets `expands_dots` to true.
@@ -154,6 +220,57 @@ impl JsonObjectOptions {
         self.indexing = Some(indexing);
         self
     }
+
+    #[must_use]
+    pub fn set_nested(mut self, include_in_parent: bool, include_in_root: bool) -> Self {
+        self.object_mapping_type = ObjectMappingType::Nested;
+        self.nested_options = NestedOptions {
+            include_in_parent,
+            include_in_root,
+        };
+        self
+    }
+
+    pub fn unset_indexing_options(&mut self) -> &mut Self {
+        self.indexing = None;
+        self
+    }
+
+    /// Convenience method to mark `include_in_parent = true`.
+    #[must_use]
+    pub fn set_include_in_parent(mut self) -> Self {
+        self.nested_options.include_in_parent = true;
+        self
+    }
+
+    /// Convenience method to mark `include_in_root = true`.
+    #[must_use]
+    pub fn set_include_in_root(mut self) -> Self {
+        self.nested_options.include_in_root = true;
+        self
+    }
+
+    #[must_use]
+    pub fn add_subfield<S: Into<String>>(mut self, name: S, opts: JsonObjectOptions) -> Self {
+        self.subfields.insert(name.into(), opts);
+        self
+    }
+
+    /// Returns a mutable reference to the subfield mapping with `subfield_name`,
+    /// creating a default entry if it did not exist.
+    ///
+    /// Useful if you want to build up a nested mapping in steps:
+    /// ```ignore
+    /// json_opts
+    ///     .subfield_mut("vehicle")
+    ///     .set_nested(None)
+    ///     .add_subfield("make", JsonObjectOptions::default().set_indexing_options(...))
+    ///     .add_subfield("model", JsonObjectOptions::default());
+    /// ```
+    pub fn subfield_mut<S: Into<String>>(&mut self, subfield_name: S) -> &mut JsonObjectOptions {
+        let key = subfield_name.into();
+        self.subfields.entry(key).or_default()
+    }
 }
 
 impl From<StoredFlag> for JsonObjectOptions {
@@ -163,6 +280,7 @@ impl From<StoredFlag> for JsonObjectOptions {
             indexing: None,
             fast: FastFieldTextOptions::default(),
             expand_dots_enabled: false,
+            ..Default::default()
         }
     }
 }
@@ -174,6 +292,7 @@ impl From<FastFlag> for JsonObjectOptions {
             indexing: None,
             fast: FastFieldTextOptions::IsEnabled(true),
             expand_dots_enabled: false,
+            ..Default::default()
         }
     }
 }
@@ -184,16 +303,24 @@ impl From<()> for JsonObjectOptions {
     }
 }
 
-impl<T: Into<JsonObjectOptions>> BitOr<T> for JsonObjectOptions {
+impl BitOr for JsonObjectOptions {
     type Output = JsonObjectOptions;
 
-    fn bitor(self, other: T) -> Self {
-        let other: JsonObjectOptions = other.into();
+    fn bitor(mut self, other: JsonObjectOptions) -> JsonObjectOptions {
+        for (other_key, other_val) in other.subfields {
+            self.subfields
+                .entry(other_key)
+                .and_modify(|self_val| *self_val = std::mem::take(self_val) | other_val.clone())
+                .or_insert(other_val);
+        }
         JsonObjectOptions {
+            stored: self.stored || other.stored,
             indexing: self.indexing.or(other.indexing),
-            stored: self.stored | other.stored,
             fast: self.fast | other.fast,
-            expand_dots_enabled: self.expand_dots_enabled | other.expand_dots_enabled,
+            expand_dots_enabled: self.expand_dots_enabled || other.expand_dots_enabled,
+            object_mapping_type: self.object_mapping_type | other.object_mapping_type,
+            nested_options: self.nested_options | other.nested_options,
+            subfields: self.subfields,
         }
     }
 }
@@ -216,6 +343,7 @@ impl From<TextOptions> for JsonObjectOptions {
             indexing: text_options.get_indexing_options().cloned(),
             fast: text_options.fast,
             expand_dots_enabled: false,
+            ..Default::default()
         }
     }
 }
@@ -224,6 +352,105 @@ impl From<TextOptions> for JsonObjectOptions {
 mod tests {
     use super::*;
     use crate::schema::{FAST, STORED, TEXT};
+
+    #[test]
+    fn test_json_options_builder_methods() {
+        // 1) Create a top-level JsonObjectOptions that is nested. We'll configure it with stored,
+        //    fast, indexing, etc.
+        let mut opts = JsonObjectOptions::default()
+            .set_stored()
+            .set_nested(true, false)
+            .set_fast(Some("my_tokenizer"))
+            .set_indexing_options(TextFieldIndexing::default())
+            // 2) Add a subfield "vehicle" which is ALSO nested
+            .add_subfield(
+                "vehicle",
+                JsonObjectOptions::default()
+                    .set_nested(true, false)
+                    // Add sub-subfields "make" and "model"
+                    .add_subfield(
+                        "make",
+                        JsonObjectOptions::default()
+                            .set_indexing_options(TextFieldIndexing::default()),
+                    )
+                    .add_subfield(
+                        "model",
+                        JsonObjectOptions::default()
+                            .set_stored()
+                            .set_indexing_options(TextFieldIndexing::default()),
+                    ),
+            )
+            // 3) Add another subfield "last_name" which is just a flattened object
+            .add_subfield(
+                "last_name",
+                JsonObjectOptions::default().set_indexing_options(TextFieldIndexing::default()),
+            );
+
+        // 4) Verify top-level settings
+        assert!(opts.is_stored());
+        assert!(opts.is_indexed());
+        assert!(opts.is_fast());
+        assert_eq!(opts.object_mapping_type, ObjectMappingType::Nested);
+        assert!(opts.nested_options.include_in_parent);
+        assert!(!opts.nested_options.include_in_root);
+
+        // 5) Check that "vehicle" subfield is nested
+        assert!(opts.subfields.contains_key("vehicle"));
+        let vehicle_opts = &opts.subfields["vehicle"];
+        assert_eq!(vehicle_opts.object_mapping_type, ObjectMappingType::Nested);
+        assert!(!vehicle_opts.nested_options.include_in_root);
+        assert!(vehicle_opts.nested_options.include_in_parent);
+
+        // 6) Check "vehicle.make"
+        let make_opts = &vehicle_opts.subfields["make"];
+        assert!(make_opts.is_indexed());
+        assert!(!make_opts.is_stored());
+
+        // 7) Check "vehicle.model"
+        let model_opts = &vehicle_opts.subfields["model"];
+        assert!(model_opts.is_stored());
+        assert!(model_opts.is_indexed());
+
+        // 8) Check "last_name" subfield
+        assert!(opts.subfields.contains_key("last_name"));
+        let last_name_opts = &opts.subfields["last_name"];
+        assert!(last_name_opts.is_indexed());
+        assert!(!last_name_opts.is_stored());
+
+        // 9) Use `subfield_mut` to mutate deeply nested fields.
+        {
+            // First get a mutable ref to "vehicle"
+            let vehicle_mut = opts.subfield_mut("vehicle");
+            // Then a mutable ref to "vehicle.make"
+            let make_mut = vehicle_mut.subfield_mut("make");
+            make_mut.unset_indexing_options();
+        }
+
+        // 10) Now confirm that "vehicle.make" is no longer indexed
+        //
+        let make_opts_after = &opts.subfields["vehicle"].subfields["make"];
+        assert!(!make_opts_after.is_indexed());
+    }
+
+    #[test]
+    fn test_json_options_bit_or() {
+        let opts1 = JsonObjectOptions::default().set_stored().add_subfield(
+            "child",
+            JsonObjectOptions::default().set_indexing_options(TextFieldIndexing::default()),
+        );
+        let opts2 = JsonObjectOptions::default()
+            .set_fast(None)
+            .add_subfield("child", JsonObjectOptions::default().set_stored());
+
+        let combined = opts1 | opts2;
+        // top-level merges
+        assert!(combined.is_stored());
+        assert!(combined.is_fast());
+        // child merges
+        let child_opts = combined.subfields.get("child").unwrap();
+        assert!(child_opts.is_indexed());
+        assert!(child_opts.is_stored());
+    }
 
     #[test]
     fn test_json_options() {

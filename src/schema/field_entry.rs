@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use super::ip_options::IpAddrOptions;
-use super::nested_options::NestedOptions;
-use super::NestedJsonObjectOptions;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::{
     is_valid_field_name, DateOptions, FacetOptions, FieldType, JsonObjectOptions, NumericOptions,
@@ -82,20 +80,6 @@ impl FieldEntry {
         Self::new(field_name, FieldType::JsonObject(json_object_options))
     }
 
-    /// Creates a new nested field entry.
-    pub fn new_nested(field_name: String, nested_opts: NestedOptions) -> FieldEntry {
-        Self::new(field_name, FieldType::Nested(nested_opts))
-    }
-
-    pub fn new_nested_json(field_name: String, nested_opts: NestedJsonObjectOptions) -> FieldEntry {
-        // If you want a single place to control `is_indexed`, `is_stored`, etc.,
-        // do that here based on `nested_opts` + `text_opts`.
-        FieldEntry {
-            name: field_name,
-            field_type: FieldType::NestedJson(nested_opts),
-        }
-    }
-
     /// Returns the name of the field
     pub fn name(&self) -> &str {
         &self.name
@@ -145,8 +129,6 @@ impl FieldEntry {
             FieldType::Bytes(ref options) => options.is_stored(),
             FieldType::JsonObject(ref options) => options.is_stored(),
             FieldType::IpAddr(ref options) => options.is_stored(),
-            FieldType::Nested(ref options) => options.is_stored(),
-            FieldType::NestedJson(ref options) => options.is_stored(),
         }
     }
 }

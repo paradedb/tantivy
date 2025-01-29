@@ -9,9 +9,10 @@ use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 use super::ip_options::IpAddrOptions;
-use super::{IntoIpv6Addr, NestedJsonObjectOptions, NestedOptions};
+use super::IntoIpv6Addr;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::facet_options::FacetOptions;
+use crate::schema::json_object_options::ObjectMappingType;
 use crate::schema::{
     DateOptions, Facet, IndexRecordOption, JsonObjectOptions, NumericOptions, OwnedValue,
     TextFieldIndexing, TextOptions,
@@ -189,10 +190,6 @@ pub enum FieldType {
     JsonObject(JsonObjectOptions),
     /// IpAddr field
     IpAddr(IpAddrOptions),
-    /// Nested field
-    Nested(NestedOptions),
-    /// NestedJson field
-    NestedJson(NestedJsonObjectOptions),
 }
 
 impl FieldType {
@@ -209,7 +206,6 @@ impl FieldType {
             FieldType::Bytes(_) => Type::Bytes,
             FieldType::JsonObject(_) => Type::Json,
             FieldType::IpAddr(_) => Type::IpAddr,
-            FieldType::Nested(_) | FieldType::NestedJson(_) => Type::Json,
         }
     }
 
@@ -235,7 +231,13 @@ impl FieldType {
 
     /// returns true if this field is "nested"
     pub fn is_nested(&self) -> bool {
-        matches!(self, FieldType::Nested(_))
+        matches!(
+            self,
+            FieldType::JsonObject(JsonObjectOptions {
+                object_mapping_type: ObjectMappingType::Nested,
+                ..
+            })
+        )
     }
 
     /// returns true if the field is indexed.
@@ -251,8 +253,6 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.is_indexed(),
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_indexed(),
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_indexed(),
-            FieldType::Nested(ref nested_options) => nested_options.is_indexed(),
-            FieldType::NestedJson(ref nested_options) => nested_options.is_indexed(),
         }
     }
 
@@ -290,8 +290,6 @@ impl FieldType {
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_fast(),
             FieldType::Facet(_) => true,
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_fast(),
-            FieldType::Nested(ref nested_options) => nested_options.is_fast(),
-            FieldType::NestedJson(ref nested_options) => nested_options.is_fast(),
         }
     }
 
@@ -311,8 +309,6 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.fieldnorms(),
             FieldType::JsonObject(ref _json_object_options) => false,
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.fieldnorms(),
-            FieldType::Nested(ref nested_options) => nested_options.fieldnorms(),
-            FieldType::NestedJson(ref nested_options) => nested_options.fieldnorms(),
         }
     }
 
@@ -359,20 +355,6 @@ impl FieldType {
                 .map(TextFieldIndexing::index_option),
             FieldType::IpAddr(ref ip_addr_options) => {
                 if ip_addr_options.is_indexed() {
-                    Some(IndexRecordOption::Basic)
-                } else {
-                    None
-                }
-            }
-            FieldType::Nested(ref nested_options) => {
-                if nested_options.is_indexed() {
-                    Some(IndexRecordOption::Basic)
-                } else {
-                    None
-                }
-            }
-            FieldType::NestedJson(ref nested_options) => {
-                if nested_options.is_indexed() {
                     Some(IndexRecordOption::Basic)
                 } else {
                     None
@@ -479,15 +461,6 @@ impl FieldType {
 
                         Ok(OwnedValue::IpAddr(ip_addr.into_ipv6_addr()))
                     }
-                    FieldType::Nested(_) => Err(ValueParsingError::TypeError {
-                        expected: "a nested object",
-                        json: JsonValue::String(field_text),
-                    }),
-
-                    FieldType::NestedJson(_) => Err(ValueParsingError::TypeError {
-                        expected: "a nested json object",
-                        json: JsonValue::String(field_text),
-                    }),
                 }
             }
             JsonValue::Number(field_val_num) => match self {
@@ -545,14 +518,6 @@ impl FieldType {
                 }),
                 FieldType::IpAddr(_) => Err(ValueParsingError::TypeError {
                     expected: "a string with an ip addr",
-                    json: JsonValue::Number(field_val_num),
-                }),
-                FieldType::Nested(_) => Err(ValueParsingError::TypeError {
-                    expected: "a nested object",
-                    json: JsonValue::Number(field_val_num),
-                }),
-                FieldType::NestedJson(_) => Err(ValueParsingError::TypeError {
-                    expected: "a nested json object",
                     json: JsonValue::Number(field_val_num),
                 }),
             },
