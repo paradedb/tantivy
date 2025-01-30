@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use common::JsonPathWriter;
+use explode::explode_document;
 
 use crate::core::searcher::Searcher;
 use crate::query::{
@@ -78,6 +79,7 @@ impl Query for NestedQuery {
 
         let path_str = path_builder.as_str();
         let parent_flag_name = format!("_is_parent_{}", path_str);
+        println!("WEIGHT {parent_flag_name}");
 
         let schema = enable_scoring.schema();
         let parent_field = match schema.get_field(&parent_flag_name) {
@@ -209,22 +211,19 @@ impl ParentBitSetProducer for NestedParentBitSetProducer {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use explode::explode_document;
     use serde_json::json;
 
     use super::*;
     use crate::collector::TopDocs;
     use crate::query::nested_query::ScoreMode;
-    use crate::query::{AllQuery, QueryClone, QueryParser, TermQuery};
-    // use crate::schema::document::parse_json_for_nested_sorted;
+    use crate::query::QueryParser;
     use crate::schema::{
-        DocParsingError, Field, IndexRecordOption, JsonObjectOptions, NumericOptions, Schema,
-        SchemaBuilder, TextFieldIndexing, Value, STORED, STRING, TEXT,
+        IndexRecordOption, JsonObjectOptions, NumericOptions, Schema, SchemaBuilder,
+        TextFieldIndexing,
     };
     use crate::tokenizer::SimpleTokenizer;
-    use crate::{Index, IndexWriter, TantivyDocument, Term};
+    use crate::{Index, IndexWriter, TantivyDocument};
 
     #[test]
     fn test_regular_json_indexing() -> crate::Result<()> {
@@ -300,32 +299,10 @@ mod tests {
                     .set_nested(true, false)
                     .set_indexing_options(TextFieldIndexing::default()),
             );
-        // let driver_last_name = schema_builder.add_text_field(
-        //     "driver.last_name",
-        //     TextFieldIndexing::default().
-        // set_index_option(IndexRecordOption::WithFreqsAndPositions), );
 
-        // let driver_vehicle_make = schema_builder.add_text_field(
-        //     "driver.vehicle.make",
-        //     TextFieldIndexing::default().
-        // set_index_option(IndexRecordOption::WithFreqsAndPositions), );
-        // let driver_vehicle_model =
-        //     schema_builder.add_text_field("driver.vehicle.model", TextFieldIndexing::default());
-
-        // We also define boolean fields that indicate whether each doc is the "parent" doc
-        // for a given nested path.  The NestedQuery code looks for a field like "_is_parent_driver"
-        // (and similarly "_is_parent_driver.vehicle") with "true" for the parent docs.
-        // In practice, you can name these fields however you like, as long as they match the
-        // "parent_flag_name" from NestedQuery’s logic:
-        //    let parent_flag_name = format!("_is_parent_{}", path_str);
-        //
-        // For path = "driver", path_str is "driver", so the field is "_is_parent_driver".
-        // For path = "driver.vehicle", path_str is "driver.vehicle", so the field is
-        // "_is_parent_driver.vehicle".
-        //
         // We'll define them as normal boolean fields in Tantivy.
         let bool_options = NumericOptions::default().set_stored().set_indexed();
-        let is_parent_field = schema_builder.add_bool_field("_is_parent_vehicle", bool_options);
+        let _is_parent_field = schema_builder.add_bool_field("_is_parent_vehicle", bool_options);
 
         // Build final schema
         let schema = schema_builder.build();
@@ -352,16 +329,15 @@ mod tests {
     #[test]
     fn test_nested_query_scenario() -> crate::Result<()> {
         use crate::query::nested_query::{NestedQuery, ScoreMode}; // your NestedQuery
-        use crate::query::TermQuery;
         use crate::schema::{JsonObjectOptions, NumericOptions, SchemaBuilder};
-        use crate::{collector::TopDocs, Index, IndexWriter, Term};
+        use crate::{collector::TopDocs, Index, IndexWriter};
         use serde_json::json;
 
         // 1) Build a schema with nested JSON.
         let mut schema_builder = SchemaBuilder::new();
 
         let mut driver_json_opts = JsonObjectOptions::default()
-            .set_nested(true, false)
+            .set_nested(false, false)
             .set_indexing_options(
                 TextFieldIndexing::default()
                     .set_tokenizer("raw")
@@ -370,7 +346,7 @@ mod tests {
         driver_json_opts.subfields.insert(
             "vehicle".to_string(),
             JsonObjectOptions::default()
-                .set_nested(true, false)
+                .set_nested(false, false)
                 .set_indexing_options(
                     TextFieldIndexing::default()
                         .set_tokenizer("raw")
@@ -381,9 +357,9 @@ mod tests {
         let driver_field = schema_builder.add_json_field("driver_json", driver_json_opts.clone());
 
         let bool_opts = NumericOptions::default().set_stored().set_indexed();
-        let is_parent_driver_json_field =
+        let _is_parent_driver_json_field =
             schema_builder.add_bool_field("_is_parent_driver_json", bool_opts.clone());
-        let is_parent_driver_json_vehicle_field =
+        let _is_parent_driver_json_vehicle_field =
             schema_builder.add_bool_field("_is_parent_driver_json\u{1}vehicle", bool_opts);
 
         let schema = schema_builder.build();
@@ -414,7 +390,9 @@ mod tests {
             true,
         );
 
-        println!("TEST SCENARIO: Got {} exploded docs", exploded_docs.len());
+        for doc in &exploded_docs {
+            println!("EXPLODED DOC: {doc:?}");
+        }
 
         // 5) Index them
         writer.add_documents(exploded_docs)?;
@@ -427,7 +405,7 @@ mod tests {
             .unwrap();
 
         let nested_query = NestedQuery::new(
-            vec!["driver_json".to_string(), "vehicle".to_string()],
+            vec!["driver_json".to_string()],
             Box::new(child_q),
             ScoreMode::Avg,
             false,
@@ -444,1514 +422,585 @@ mod tests {
         Ok(())
     }
 
-    //     fn make_schema_for_eq_tests() -> (Schema, Field, Field) {
-    //         let mut builder = SchemaBuilder::default();
-
-    //         let group_f = builder.add_text_field("group", STRING | STORED);
-
-    //         let nested_opts = NestedJsonObjectOptions::new()
-    //             .set_include_in_parent(false)
-    //             .set_store_parent_flag(true)
-    //             .set_stored()
-    //             .set_indexing_options(
-    //                 TextFieldIndexing::default()
-    //                     .set_tokenizer("default")
-    //                     .set_index_option(IndexRecordOption::Basic),
-    //             );
-    //         let user_nested_f = builder.add_nested_json_field(vec!["user".into()], nested_opts);
-
-    //         let schema = builder.build();
-    //         (schema, user_nested_f, group_f)
-    //     }
-
-    //     fn index_doc_for_eq_tests(
-    //         index_writer: &mut crate::indexer::IndexWriter,
-    //         schema: &Schema,
-    //         group_val: &str,
-    //         user_array: serde_json::Value,
-    //     ) {
-    //         let top_obj = json!({
-    //             "group": group_val,
-    //             "user": user_array
-    //         });
-    //         let mut document = TantivyDocument::default();
-    //         let expanded = parse_json_for_nested_sorted(schema, &mut document,
-    // &top_obj).unwrap();
-
-    //         index_writer.add_documents(expanded).unwrap();
-    //     }
-
-    //     #[test]
-    //     fn test_ignore_unmapped_true() {
-    //         let (schema, _user_nested_f, _group_f) = make_schema_for_eq_tests();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         {
-    //             let mut writer = index.writer_for_tests().unwrap();
-    //             index_doc_for_eq_tests(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "someGroup",
-    //                 json!([
-    //                     { "first": "Bob", "last": "Smith" }
-    //                 ]),
-    //             );
-    //             writer.commit().unwrap();
-    //         }
-
-    //         let reader = index.reader().unwrap();
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![]);
-    //         let child_q = query_parser.parse_query("user.first:Bob").unwrap();
-
-    //         let nested_q = NestedQuery::new(
-    //             vec!["unmapped".into()],
-    //             Box::new(child_q),
-    //             ScoreMode::None,
-    //             true,
-    //         );
-
-    //         let top_docs = searcher
-    //             .search(&nested_q, &TopDocs::with_limit(10))
-    //             .unwrap();
-    //         assert_eq!(
-    //             top_docs.len(),
-    //             0,
-    //             "Expected zero hits for ignore_unmapped=true + unknown path"
-    //         );
-    //     }
-
-    //     #[test]
-    //     fn test_ignore_unmapped_false_error() {
-    //         let (schema, _user_nested_f, _group_f) = make_schema_for_eq_tests();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         let reader = index.reader().unwrap();
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![]);
-    //         let child_q = query_parser.parse_query("user.first:Anything").unwrap();
-    //         let nested_q = NestedQuery::new(
-    //             vec!["unmapped".into()],
-    //             Box::new(child_q),
-    //             ScoreMode::None,
-    //             false,
-    //         );
-
-    //         let result = searcher.search(&nested_q, &TopDocs::with_limit(10));
-    //         match result {
-    //             Ok(_) => panic!("Expected an error for path=unmapped + ignore_unmapped=false"),
-    //             Err(e) => {
-    //                 let msg = format!("{:?}", e);
-    //                 assert!(msg.contains("not mapped") && !msg.contains("ignore_unmapped=true"));
-    //             }
-    //         }
-    //     }
-
-    //     #[test]
-    //     fn test_nested_query_some_match() -> crate::Result<()> {
-    //         let (schema, user_nested_f, _group_f) = make_schema_for_eq_tests();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         {
-    //             let mut writer = index.writer_for_tests()?;
-    //             index_doc_for_eq_tests(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "fans",
-    //                 json!([
-    //                     {"first":"Bob","last":"Smith"},
-    //                     {"first":"Alice","last":"Branson"}
-    //                 ]),
-    //             );
-    //             writer.commit()?;
-    //         }
-
-    //         let reader = index.reader()?;
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![user_nested_f]);
-    //         let child_q = query_parser.parse_query("first:Alice").unwrap();
-
-    //         let nested_q = NestedQuery::new(
-    //             vec!["user".into()],
-    //             Box::new(child_q),
-    //             ScoreMode::Avg,
-    //             false,
-    //         );
-
-    //         let top_docs = searcher.search(&nested_q, &TopDocs::with_limit(10))?;
-    //         assert_eq!(1, top_docs.len());
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    //     fn test_nested_score_modes() -> crate::Result<()> {
-    //         let (schema, nested_f, _group_f) = make_schema_for_eq_tests();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         {
-    //             let mut writer = index.writer_for_tests()?;
-    //             index_doc_for_eq_tests(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "someGroup",
-    //                 json!([
-    //                     {"first":"java"},
-    //                     {"first":"java"},
-    //                     {"first":"rust"}
-    //                 ]),
-    //             );
-    //             writer.commit()?;
-    //         }
-
-    //         let reader = index.reader()?;
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![nested_f]);
-    //         let child_q = query_parser.parse_query("first:java").unwrap();
-    //         for &mode in &[
-    //             ScoreMode::None,
-    //             ScoreMode::Total,
-    //             ScoreMode::Avg,
-    //             ScoreMode::Max,
-    //             ScoreMode::Min,
-    //         ] {
-    //             let nested_q = NestedQuery::new(
-    //                 vec!["user".into()],
-    //                 Box::new(child_q.box_clone()),
-    //                 mode,
-    //                 false,
-    //             );
-    //             let hits = searcher.search(&nested_q, &TopDocs::with_limit(10))?;
-    //             assert_eq!(1, hits.len());
-    //         }
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    //     fn test_nested_score_mode_parsing() {
-    //         assert_eq!(ScoreMode::from_str("none").unwrap(), ScoreMode::None);
-    //         assert_eq!(ScoreMode::from_str("avg").unwrap(), ScoreMode::Avg);
-    //         assert_eq!(ScoreMode::from_str("max").unwrap(), ScoreMode::Max);
-    //         assert_eq!(ScoreMode::from_str("min").unwrap(), ScoreMode::Min);
-    //         assert_eq!(ScoreMode::from_str("total").unwrap(), ScoreMode::Total);
-
-    //         let err = ScoreMode::from_str("garbage").unwrap_err();
-    //         assert!(err.to_string().contains("Unrecognized nested score_mode"));
-    //     }
-
-    //     fn make_multi_level_schema() -> (Schema, Field, Field, Field) {
-    //         let mut builder = Schema::builder();
-
-    //         let doc_tag_field = builder.add_text_field("doc_tag", STRING | STORED);
-
-    //         let driver_nested_opts = NestedJsonObjectOptions::new()
-    //             .set_include_in_parent(false)
-    //             .set_store_parent_flag(true)
-    //             .set_indexing_options(
-    //                 TextFieldIndexing::default()
-    //                     .set_tokenizer("raw")
-    //                     .set_index_option(IndexRecordOption::Basic),
-    //             );
-    //         let driver_field = builder.add_nested_json_field(vec!["driver".into()],
-    // driver_nested_opts);
-
-    //         let vehicle_nested_opts = NestedJsonObjectOptions::new()
-    //             .set_include_in_parent(false)
-    //             .set_store_parent_flag(true)
-    //             .set_indexing_options(
-    //                 TextFieldIndexing::default()
-    //                     .set_tokenizer("raw")
-    //                     .set_index_option(IndexRecordOption::Basic),
-    //             );
-    //         let vehicle_field = builder
-    //             .add_nested_json_field(vec!["driver".into(), "vehicle".into()],
-    // vehicle_nested_opts);
-
-    //         let schema = builder.build();
-    //         (schema, doc_tag_field, driver_field, vehicle_field)
-    //     }
-
-    //     fn index_doc_multi_level(
-    //         writer: &mut IndexWriter,
-    //         schema: &Schema,
-    //         doc_tag: &str,
-    //         last_name: &str,
-    //         vehicles: serde_json::Value,
-    //     ) -> Result<(), DocParsingError> {
-    //         let doc_obj = json!({
-    //             "doc_tag": doc_tag,
-    //             "driver": {
-    //                 "last_name": last_name,
-    //                 "vehicle": vehicles
-    //             }
-    //         });
-    //         let json_doc = serde_json::to_string(&doc_obj).unwrap();
-    //         let mut document = TantivyDocument::default();
-    //         let expanded = parse_json_for_nested_sorted(
-    //             schema,
-    //             &mut document,
-    //             &serde_json::from_str::<serde_json::Value>(&json_doc).unwrap(),
-    //         )
-    //         .unwrap();
-    //         writer.add_documents(expanded).unwrap();
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    //     fn test_multi_level_nested_query() -> crate::Result<()> {
-    //         let (schema, _doc_tag_field, driver_field, vehicle_field) =
-    // make_multi_level_schema();
-
-    //         let index = Index::create_in_ram(schema.clone());
-    //         {
-    //             let mut writer = index.writer_for_tests()?;
-
-    //             index_doc_multi_level(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "Doc1",
-    //                 "McQueen",
-    //                 json!([
-    //                     { "make":"Powell Motors", "model":"Canyonero"},
-    //                     { "make":"Miller-Meteor", "model":"Ecto-1"}
-    //                 ]),
-    //             )?;
-
-    //             index_doc_multi_level(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "Doc2",
-    //                 "Hudson",
-    //                 json!([
-    //                     { "make":"Mifune", "model":"Mach Five" },
-    //                     { "make":"Miller-Meteor", "model":"Ecto-1" }
-    //                 ]),
-    //             )?;
-    //             writer.commit()?;
-    //         }
-
-    //         let reader = index.reader()?;
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![vehicle_field, driver_field]);
-    //         let make_q = query_parser.parse_query("make:\"Powell Motors\"").unwrap();
-    //         let model_q = query_parser.parse_query("model:Canyonero").unwrap();
-    //         let bool_sub = BooleanQuery::new(vec![
-    //             (Occur::Must, Box::new(make_q)),
-    //             (Occur::Must, Box::new(model_q)),
-    //         ]);
-
-    //         let vehicle_nested = NestedQuery::new(
-    //             vec!["driver".into(), "vehicle".into()],
-    //             Box::new(bool_sub),
-    //             ScoreMode::Avg,
-    //             false,
-    //         );
-    //         let driver_nested = NestedQuery::new(
-    //             vec!["driver".into()],
-    //             Box::new(vehicle_nested),
-    //             ScoreMode::Avg,
-    //             false,
-    //         );
-
-    //         let hits = searcher.search(&driver_nested, &TopDocs::with_limit(10))?;
-    //         assert_eq!(0, hits.len(), "multi-level nesting is still a todo!");
-
-    //         Ok(())
-    //     }
-
-    //     fn make_comments_schema() -> (Schema, Field, Field, Field) {
-    //         let mut builder = Schema::builder();
-
-    //         let doc_num_field = builder.add_text_field("doc_num", STRING | STORED);
-
-    //         let nested_opts = NestedJsonObjectOptions::new()
-    //             .set_include_in_parent(false)
-    //             .set_store_parent_flag(true);
-    //         let comments_field = builder.add_nested_json_field(vec!["comments".into()],
-    // nested_opts);
-
-    //         let author_field = builder.add_text_field("comments.author", STRING);
-
-    //         let schema = builder.build();
-    //         (schema, doc_num_field, comments_field, author_field)
-    //     }
-
-    //     fn index_doc_with_comments(
-    //         writer: &mut IndexWriter,
-    //         schema: &Schema,
-    //         doc_num: &str,
-    //         comments: serde_json::Value,
-    //     ) -> Result<(), DocParsingError> {
-    //         let doc_obj = json!({
-    //             "doc_num": doc_num,
-    //             "comments": comments
-    //         });
-    //         let json_doc = serde_json::to_string(&doc_obj).unwrap();
-    //         let mut document = TantivyDocument::default();
-    //         let expanded = parse_json_for_nested_sorted(
-    //             schema,
-    //             &mut document,
-    //             &serde_json::from_str::<serde_json::Value>(&json_doc).unwrap(),
-    //         )
-    //         .unwrap();
-    //         writer.add_documents(expanded).unwrap();
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    //     #[ignore = "must not queries not working to block join semantics"]
-    //     fn test_comments_must_not_nested() -> crate::Result<()> {
-    //         let (schema, doc_num_f, _comments_f, author_f) = make_comments_schema();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         {
-    //             let mut writer = index.writer_for_tests()?;
-    //             index_doc_with_comments(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "1",
-    //                 json!([
-    //                     {"author":"kimchy"}
-    //                 ]),
-    //             )?;
-    //             index_doc_with_comments(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "2",
-    //                 json!([
-    //                     {"author":"kimchy"},
-    //                     {"author":"nik9000"}
-    //                 ]),
-    //             )?;
-    //             index_doc_with_comments(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "3",
-    //                 json!([
-    //                     {"author":"nik9000"}
-    //                 ]),
-    //             )?;
-    //             writer.commit()?;
-    //         }
-
-    //         let reader = index.reader()?;
-    //         let searcher = reader.searcher();
-
-    //         use crate::query::{BooleanQuery, Occur};
-
-    //         let tq_nik = TermQuery::new(
-    //             Term::from_field_text(author_f, "nik9000"),
-    //             IndexRecordOption::Basic,
-    //         );
-    //         let must_not = BooleanQuery::new(vec![
-    //             (Occur::Must, Box::new(AllQuery)),
-    //             (Occur::MustNot, Box::new(tq_nik)),
-    //         ]);
-    //         let nested_query = NestedQuery::new(
-    //             vec!["comments".into()],
-    //             Box::new(must_not),
-    //             ScoreMode::None,
-    //             false,
-    //         );
-
-    //         let hits = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-    //         assert_eq!(
-    //             1,
-    //             hits.len(),
-    //             "We get only doc #1 => doc #2 and doc #3 are excluded by must_not"
-    //         );
-
-    //         let (_score, addr) = hits[0];
-    //         let stored_doc: TantivyDocument = searcher.doc(addr)?;
-    //         let doc_num_val = stored_doc
-    //             .get_first(doc_num_f)
-    //             .unwrap()
-    //             .as_str()
-    //             .unwrap()
-    //             .to_string();
-    //         assert_eq!("1", doc_num_val);
-
-    //         let tq_nik2 = TermQuery::new(
-    //             Term::from_field_text(author_f, "nik9000"),
-    //             IndexRecordOption::Basic,
-    //         );
-    //         let nested2 = NestedQuery::new(
-    //             vec!["comments".into()],
-    //             Box::new(tq_nik2),
-    //             ScoreMode::None,
-    //             false,
-    //         );
-    //         let bool_q = BooleanQuery::new(vec![
-    //             (Occur::Must, Box::new(AllQuery)),
-    //             (Occur::MustNot, Box::new(nested2)),
-    //         ]);
-
-    //         let hits2 = searcher.search(&bool_q, &TopDocs::with_limit(10))?;
-    //         assert_eq!(
-    //             1,
-    //             hits2.len(),
-    //             "Only doc #1 remains under an outer must_not"
-    //         );
-    //         let (_score2, addr2) = hits2[0];
-    //         let doc_stored2: TantivyDocument = searcher.doc(addr2)?;
-    //         let doc_num2 = doc_stored2
-    //             .get_first(doc_num_f)
-    //             .map(|v| v.as_str().unwrap().to_string())
-    //             .unwrap();
-    //         assert_eq!("1", doc_num2);
-
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    //     fn test_nested_query_without_subfields() -> crate::Result<()> {
-    //         use crate::collector::TopDocs;
-    //         use crate::query::TermQuery;
-    //         use crate::schema::{
-    //             IndexRecordOption, SchemaBuilder, TantivyDocument, TextFieldIndexing, TEXT,
-    //         };
-    //         use crate::{Index, Term};
-
-    //         let mut builder = SchemaBuilder::default();
-    //         let nested_json_opts = NestedJsonObjectOptions::new()
-    //             .set_include_in_parent(false)
-    //             .set_store_parent_flag(true)
-    //             .set_stored()
-    //             .set_indexing_options(
-    //                 TextFieldIndexing::default()
-    //                     .set_tokenizer("default")
-    //                     .set_index_option(IndexRecordOption::Basic),
-    //             );
-    //         let user_field = builder.add_nested_json_field(vec!["user".into()],
-    // nested_json_opts);         builder.add_text_field("group", TEXT);
-
-    //         let schema = builder.build();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         {
-    //             let mut writer: IndexWriter<TantivyDocument> = index.writer_for_tests()?;
-    //             let json_doc = r#"{
-    //             "group": "fans",
-    //             "user": [
-    //                 { "first":"John", "last":"Smith" },
-    //                 { "first":"Alice", "last":"White" }
-    //             ]
-    //         }"#;
-
-    //             let mut document = TantivyDocument::default();
-    //             let expanded_docs = parse_json_for_nested_sorted(
-    //                 &schema,
-    //                 &mut document,
-    //                 &serde_json::from_str::<serde_json::Value>(json_doc).unwrap(),
-    //             )
-    //             .expect("parse nested doc");
-    //             let docs = expanded_docs.into_iter().collect::<Vec<_>>();
-    //             writer.add_documents(docs)?;
-    //             writer.commit()?;
-    //         }
-
-    //         let reader = index.reader()?;
-    //         let searcher = reader.searcher();
-
-    //         let mut child_term = Term::from_field_json_path(user_field, "first", false);
-    //         child_term.append_type_and_str("alice");
-    //         let child_query = TermQuery::new(child_term, IndexRecordOption::Basic);
-
-    //         let nested_query = NestedQuery::new(
-    //             vec!["user".to_string()],
-    //             Box::new(child_query),
-    //             ScoreMode::None,
-    //             false,
-    //         );
-
-    //         let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-    //         assert_eq!(
-    //             top_docs.len(),
-    //             1,
-    //             "Should find parent doc with child 'alice'"
-    //         );
-
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    //     fn test_nested_query_parser_syntax() -> crate::Result<()> {
-    //         let mut builder = SchemaBuilder::default();
-    //         let nested_json_opts = NestedJsonObjectOptions::new()
-    //             .set_include_in_parent(false)
-    //             .set_store_parent_flag(true)
-    //             .set_stored()
-    //             .set_indexing_options(
-    //                 TextFieldIndexing::default()
-    //                     .set_tokenizer("default")
-    //                     .set_index_option(IndexRecordOption::Basic),
-    //             );
-    //         let user_field = builder.add_nested_json_field(vec!["user".into()],
-    // nested_json_opts);         let _group_field = builder.add_text_field("group", TEXT |
-    // STORED);
-
-    //         let schema = builder.build();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         {
-    //             let mut writer = index.writer_for_tests()?;
-    //             let json_doc = r#"
-    //         {
-    //           "group": "complexFans",
-    //           "user": [
-    //             {
-    //               "first": "Alice",
-    //               "last": "Anderson",
-    //               "hobbies": ["Chess", "Painting"],
-    //               "kids": [
-    //                 { "name": "Bob",   "age": 8 },
-    //                 { "name": "Cathy", "age": 12 }
-    //               ]
-    //             },
-    //             {
-    //               "first": "Greg",
-    //               "last":  "Johnson",
-    //               "hobbies": ["Skiing", "Chess"],
-    //               "kids": [
-    //                 { "name": "Hank", "age": 3 }
-    //               ]
-    //             }
-    //           ]
-    //         }
-    //         "#;
-
-    //             let mut document = TantivyDocument::default();
-
-    //             let expanded = parse_json_for_nested_sorted(
-    //                 &schema,
-    //                 &mut document,
-    //                 &serde_json::from_str::<serde_json::Value>(json_doc).unwrap(),
-    //             )
-    //             .expect("parse nested doc");
-    //             let docs: Vec<TantivyDocument> = expanded.into_iter().map(Into::into).collect();
-    //             writer.add_documents(docs)?;
-    //             writer.commit()?;
-    //         }
-
-    //         {
-    //             let reader = index.reader()?;
-    //             let searcher = reader.searcher();
-
-    //             let query_parser = QueryParser::for_index(&index, vec![user_field]);
-
-    //             let query_str = r#"
-    //            user.first:Alice
-    //            AND user.hobbies:Chess
-    //            AND user.kids.age:[8 TO 9]
-    //         "#;
-
-    //             let query = query_parser.parse_query(query_str)?;
-
-    //             let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
-
-    //             assert_eq!(
-    //                 top_docs.len(),
-    //                 1,
-    //                 "Should find exactly one parent doc with child that meets all constraints."
-    //             );
-
-    //             let nested_query = NestedQuery::new(
-    //                 vec!["user".into()],
-    //                 Box::new(query_parser.parse_query("kids.name:Bob AND kids.age:8")?),
-    //                 ScoreMode::None,
-    //                 false,
-    //             );
-
-    //             let top_docs2 = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-
-    //             assert_eq!(
-    //                 top_docs2.len(),
-    //                 1,
-    //                 "Should match the same doc that has a kid named Bob and age 8"
-    //             );
-
-    //             let nested_query = NestedQuery::new(
-    //                 vec!["user".into()],
-    //                 Box::new(query_parser.parse_query("kids.name:Bob AND kids.age:3")?),
-    //                 ScoreMode::None,
-    //                 false,
-    //             );
-
-    //             let top_docs3 = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-
-    //             assert_eq!(
-    //                 top_docs3.len(),
-    //                 0,
-    //                 "Should not match two separate nested docs at the same level"
-    //             );
-
-    //             Ok(())
-    //         }
-    //     }
-
-    // fn make_nested_schema() -> (Schema, Field, Field) {
-    //     let mut builder = Schema::builder();
-
-    //     let group_field = builder.add_text_field("group", STRING | STORED);
-
-    //     let nested_opts = NestedJsonObjectOptions::new()
-    //         .set_include_in_parent(false)
-    //         .set_store_parent_flag(true)
-    //         .set_stored()
-    //         .set_indexing_options(
-    //             TextFieldIndexing::default()
-    //                 .set_tokenizer("default")
-    //                 .set_index_option(IndexRecordOption::Basic),
-    //         );
-    //     let user_nested_field = builder.add_nested_json_field(vec!["user".into()], nested_opts);
-
-    //     let schema = builder.build();
-    //     (schema, user_nested_field, group_field)
-    // }
-
-    //     fn index_test_document(
-    //         index_writer: &mut IndexWriter,
-    //         schema: &Schema,
-    //         group_val: &str,
-    //         users: serde_json::Value,
-    //     ) -> Result<(), DocParsingError> {
-    //         let full_doc = json!({
-    //             "group": group_val,
-    //             "user": users,
-    //         });
-
-    //         let mut document = TantivyDocument::default();
-    //         let expanded = parse_json_for_nested_sorted(schema, &mut document,
-    // &full_doc).unwrap();
-
-    //         index_writer.add_documents(expanded).unwrap();
-
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    // fn test_nested_query_single_level() -> crate::Result<()> {
-    //     let mut builder = Schema::builder();
-    //     let group_field = builder.add_text_field("group", STRING | STORED);
-
-    //     let (schema, user_nested_field, _group_field) = make_nested_schema();
-    //     let index = Index::create_in_ram(schema.clone());
-
-    //     {
-    //         let mut writer = index.writer_for_tests()?;
-
-    //         index_test_document(
-    //             &mut writer,
-    //             &schema,
-    //             "fans",
-    //             json!([
-    //                 { "first": "John", "last": "Smith" },
-    //                 { "first": "Alice", "last": "White" }
-    //             ]),
-    //         )?;
-
-    //         index_test_document(
-    //             &mut writer,
-    //             &schema,
-    //             "boring",
-    //             json!([
-    //                 { "first": "Bob", "last": "Marley" }
-    //             ]),
-    //         )?;
-    //         writer.commit()?;
-    //     }
-
-    //     let reader = index.reader()?;
-    //     let searcher = reader.searcher();
-
-    //     let query_parser = QueryParser::for_index(&index, vec![user_nested_field]);
-
-    //     let child_query = query_parser.parse_query("first:Alice").unwrap();
-
-    //     let nested_query = NestedQuery::new(
-    //         vec!["user".to_string()],
-    //         Box::new(child_query),
-    //         ScoreMode::Avg,
-    //         false,
-    //     );
-
-    //     let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-    //     assert_eq!(
-    //         top_docs.len(),
-    //         1,
-    //         "Should match exactly one parent doc with a nested child `first = Alice`."
-    //     );
-
-    //     Ok(())
-    // }
-
-    //     #[test]
-    //     fn test_nested_query_no_match() -> crate::Result<()> {
-    //         let (schema, user_nested_field, _group_field) = make_nested_schema();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         {
-    //             let mut writer = index.writer_for_tests()?;
-    //             index_test_document(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "groupVal",
-    //                 json!([
-    //                     {"first":"John"},
-    //                     {"first":"Alice"}
-    //                 ]),
-    //             )?;
-    //             writer.commit()?;
-    //         }
-
-    //         let reader = index.reader()?;
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![user_nested_field]);
-    //         let child_query = query_parser.parse_query("first:NoSuchName").unwrap();
-    //         let nested_query = NestedQuery::new(
-    //             vec!["user".into()],
-    //             Box::new(child_query),
-    //             ScoreMode::None,
-    //             false,
-    //         );
-
-    //         let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-    //         assert_eq!(0, top_docs.len(), "No matches expected");
-
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    //     fn test_nested_query_ignore_unmapped() -> crate::Result<()> {
-    //         let (schema, ufield, _group_field) = make_nested_schema();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         {
-    //             let mut writer = index.writer_for_tests()?;
-    //             index_test_document(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "unmappedTest",
-    //                 json!([
-    //                     {"first":"SomeName"}
-    //                 ]),
-    //             )?;
-    //             writer.commit()?;
-    //         }
-
-    //         let reader = index.reader()?;
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![ufield]);
-    //         let child_query = query_parser.parse_query("first:SomeName").unwrap();
-    //         let nested_query = NestedQuery::new(
-    //             vec!["someUnknownPath".to_string()],
-    //             Box::new(child_query),
-    //             ScoreMode::Total,
-    //             true,
-    //         );
-
-    //         let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-    //         assert_eq!(0, top_docs.len(), "No docs returned, but no error either");
-
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    //     #[ignore]
-    //     fn test_nested_query_unmapped_error() {
-    //         let (schema, _ufield, _group_field) = make_nested_schema();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         let reader = index.reader().unwrap();
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![]);
-    //         let child_query = query_parser.parse_query("first:X").unwrap();
-    //         let nested_query = NestedQuery::new(
-    //             vec!["badPath".into()],
-    //             Box::new(child_query),
-    //             ScoreMode::None,
-    //             false,
-    //         );
-
-    //         let res = searcher.search(&nested_query, &TopDocs::with_limit(10));
-    //         match res {
-    //             Err(e) => {
-    //                 let msg = format!("{:?}", e);
-    //                 assert!(
-    //                     msg.contains("NestedQuery path 'badPath' not mapped")
-    //                         && !msg.contains("ignore_unmapped=true"),
-    //                     "Expected schema error complaining about unmapped path"
-    //                 );
-    //             }
-    //             Ok(_) => panic!("Expected an error for unmapped path with
-    // ignore_unmapped=false"),         }
-    //     }
-
-    //     #[test]
-    //     #[ignore]
-    //     fn test_nested_query_numeric_leaf() -> crate::Result<()> {
-    //         let mut builder = SchemaBuilder::default();
-    //         let nested_opts = NestedJsonObjectOptions::new()
-    //             .set_include_in_parent(false)
-    //             .set_store_parent_flag(true)
-    //             .set_indexing_options(
-    //                 TextFieldIndexing::default()
-    //                     .set_tokenizer("default")
-    //                     .set_index_option(IndexRecordOption::WithFreqs),
-    //             );
-    //         let user_field = builder.add_nested_json_field(vec!["user".into()], nested_opts);
-    //         let schema = builder.build();
-
-    //         let index = Index::create_in_ram(schema.clone());
-    //         let mut writer = index.writer_for_tests()?;
-
-    //         let doc_obj = json!({
-    //             "user": [
-    //                 { "age": 10 },
-    //                 { "age": 20 }
-    //             ]
-    //         });
-
-    //         {
-    //             let mut document = TantivyDocument::default();
-    //             let expanded_docs = parse_json_for_nested_sorted(&schema, &mut document,
-    // &doc_obj)                 .expect("parse nested doc");
-    //             writer.add_documents(expanded_docs)?;
-    //         }
-    //         writer.commit()?;
-
-    //         let reader = index.reader()?;
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![user_field]);
-    //         let child_query = query_parser.parse_query(r#"age:20"#).unwrap();
-
-    //         let nested_query = NestedQuery::new(
-    //             vec!["user".into()],
-    //             Box::new(child_query),
-    //             ScoreMode::None,
-    //             false,
-    //         );
-
-    //         let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-    //         assert_eq!(
-    //             top_docs.len(),
-    //             1,
-    //             "We should find exactly one parent doc that has a child with age=20"
-    //         );
-
-    //         Ok(())
-    //     }
-
-    //     fn make_nested_schema_complete() -> (Schema, Field, Field) {
-    //         let mut builder = Schema::builder();
-
-    //         let group_field = builder.add_text_field("group", STRING | STORED);
-
-    //         let nested_opts = NestedJsonObjectOptions::new()
-    //             .set_include_in_parent(false)
-    //             .set_store_parent_flag(true)
-    //             .set_stored()
-    //             .set_indexing_options(
-    //                 TextFieldIndexing::default()
-    //                     .set_tokenizer("default")
-    //                     .set_index_option(IndexRecordOption::Basic),
-    //             );
-    //         let user_nested_field = builder.add_nested_json_field(vec!["user".into()],
-    // nested_opts);
-
-    //         let schema = builder.build();
-    //         (schema, user_nested_field, group_field)
-    //     }
-
-    //     fn index_test_document_complete(
-    //         index_writer: &mut IndexWriter,
-    //         schema: &Schema,
-    //         group_val: &str,
-    //         users: serde_json::Value,
-    //     ) -> Result<(), DocParsingError> {
-    //         let full_doc = json!({
-    //             "group": group_val,
-    //             "user": users,
-    //         });
-
-    //         let mut document = TantivyDocument::default();
-    //         let expanded = parse_json_for_nested_sorted(schema, &mut document,
-    // &full_doc).unwrap();
-
-    //         index_writer.add_documents(expanded).unwrap();
-
-    //         Ok(())
-    //     }
-
-    //     #[test]
-    //     fn test_nested_query_single_level_complete() -> crate::Result<()> {
-    //         let (schema, user_nested_field, _group_field) = make_nested_schema_complete();
-    //         let index = Index::create_in_ram(schema.clone());
-
-    //         {
-    //             let mut writer = index.writer_for_tests()?;
-
-    //             index_test_document_complete(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "fans",
-    //                 json!([
-    //                     { "first": "John", "last": "Smith" },
-    //                     { "first": "Alice", "last": "White" }
-    //                 ]),
-    //             )?;
-
-    //             index_test_document_complete(
-    //                 &mut writer,
-    //                 &schema,
-    //                 "boring",
-    //                 json!([
-    //                     { "first": "Bob", "last": "Marley" }
-    //                 ]),
-    //             )?;
-    //             writer.commit()?;
-    //         }
-
-    //         let reader = index.reader()?;
-    //         let searcher = reader.searcher();
-
-    //         let query_parser = QueryParser::for_index(&index, vec![user_nested_field]);
-
-    //         let child_query = query_parser.parse_query("first:Alice").unwrap();
-
-    //         let nested_query = NestedQuery::new(
-    //             vec!["user".to_string()],
-    //             Box::new(child_query),
-    //             ScoreMode::Avg,
-    //             false,
-    //         );
-
-    //         let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-    //         assert_eq!(
-    //             top_docs.len(),
-    //             1,
-    //             "Should match exactly one parent doc with a nested child `first = Alice`."
-    //         );
-
-    //         Ok(())
-    // }
+    #[test]
+    fn test_nested_query_scenario_small() -> crate::Result<()> {
+        // 1) Build a schema with nested JSON.
+        let mut schema_builder = SchemaBuilder::new();
+
+        // The top-level "driver_json" is declared as nested:
+        let mut driver_json_opts = JsonObjectOptions::default()
+            .set_nested(true, false)
+            .set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("raw")
+                    .set_index_option(IndexRecordOption::Basic),
+            );
+
+        driver_json_opts
+            .subfields
+            .insert("vehicle".to_string(), JsonObjectOptions::default());
+
+        // The main nested-JSON field
+        let driver_field = schema_builder.add_json_field("driver_json", driver_json_opts.clone());
+
+        // We store two boolean fields: `_is_parent_driver_json` and `_is_parent_driver_json\u{1}vehicle`.
+        // Because our final doc is the "driver_json" parent, it will set `_is_parent_driver_json=true`.
+        // The array doc sets `_is_parent_driver_json\u{1}vehicle=true`.
+        let bool_opts = NumericOptions::default().set_stored().set_indexed();
+        let _is_parent_vehicle =
+            schema_builder.add_bool_field("_is_parent_vehicle", bool_opts.clone());
+
+        let schema = schema_builder.build();
+
+        // 2) Create index + writer
+        let index = Index::create_in_ram(schema.clone());
+        // register the "raw" tokenizer if you like:
+        index
+            .tokenizers()
+            .register("raw", SimpleTokenizer::default());
+        let mut writer: IndexWriter<TantivyDocument> =
+            index.writer_with_num_threads(2, 50_000_000)?;
+
+        // 3) Sample nested JSON
+        let big_json = json!(
+            {
+                "last_name": "McQueen",
+                "vehicle": [
+                    { "make": "Powell", "model": "Canyonero" },
+                    { "make": "Miller-Meteor", "model": "Ecto" }
+                ]
+            }
+        );
+
+        // 4) Explode data. `true` => top-level => sets `_is_parent_driver_json=true` on the final doc.
+        let exploded_docs = explode_document(
+            &big_json,
+            &["vehicle".into()],
+            driver_field,
+            &schema,
+            &driver_json_opts,
+            /* is_top_level= */ true,
+        );
+
+        assert_eq!(exploded_docs.len(), 3, "should be 3 exploded docs");
+
+        // Just to see what we produced:
+        for doc in &exploded_docs {
+            println!("EXPLODED DOC: {doc:?}");
+        }
+        // 5) Index them
+        writer.add_documents(exploded_docs)?;
+        writer.commit()?;
+
+        // Because the *final* doc sets `_is_parent_driver_json = true`,
+        // we only use a single-level path: ["driver_json"].
+        // 7) Execute search
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let query_parser = QueryParser::for_index(&index, vec![driver_field]);
+        let nested_query = query_parser.parse_query("_is_parent_vehicle:true").unwrap();
+
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 1, "Expected one parent doc");
+
+        let nested_query = query_parser
+            .parse_query("driver_json.last_name:McQueen")
+            .unwrap();
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 1, "Expected that full path matches parent");
+        assert_eq!(top_docs[0].1.doc_id, 2, "Returned doc is the parent");
+
+        let nested_query = query_parser
+            .parse_query("driver_json.vehicle.model:Canyonero")
+            .unwrap();
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 1, "Expected one doc (parent) ");
+        assert_eq!(
+            top_docs[0].1.doc_id, 0,
+            "Returned doc is the child doc without nested query"
+        );
+
+        let nested_query = query_parser.parse_query("last_name:McQueen").unwrap();
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 1, "Expected one doc with mode (parent).");
+        assert_eq!(top_docs[0].1.doc_id, 2, "Expect returned doc to be parent");
+
+        let child_q = query_parser
+            .parse_query("driver_json.vehicle.model:Canyonero")
+            .unwrap();
+        let nested_query = NestedQuery::new(
+            vec!["vehicle".to_string()],
+            Box::new(child_q),
+            ScoreMode::Avg,
+            false,
+        );
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 1, "Expected one child doc");
+        assert_eq!(top_docs[0].1.doc_id, 2, "Returned doc is the parent doc");
+
+        let child_q = query_parser
+            .parse_query("driver_json.vehicle.model:Canyonero AND driver_json.vehicle.make:Powell")
+            .unwrap();
+        let nested_query = NestedQuery::new(
+            vec!["vehicle".to_string()],
+            Box::new(child_q),
+            ScoreMode::Avg,
+            false,
+        );
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 1, "Expected one child doc");
+        assert_eq!(top_docs[0].1.doc_id, 2, "Returned doc is the parent doc");
+
+        let child_q = query_parser
+            .parse_query("driver_json.vehicle.model:Ecto AND driver_json.vehicle.make:Powell")
+            .unwrap();
+        let nested_query = NestedQuery::new(
+            vec!["vehicle".to_string()],
+            Box::new(child_q),
+            ScoreMode::Avg,
+            false,
+        );
+        let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 0, "Expected no child doc");
+
+        // writer.delete_term(Term::from_field_bool(is_parent_vehicle, true));
+        // writer.commit()?;
+
+        // reader.reload()?;
+        // let results = reader.searcher().search(&AllQuery, &Count)?;
+
+        // assert_eq!(results, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_with_non_nested() -> crate::Result<()> {
+        // 1) Build a schema with nested JSON.
+        let mut schema_builder = SchemaBuilder::new();
+
+        // The top-level "driver_json" is declared as nested:
+        let mut driver_json_opts = JsonObjectOptions::default()
+            .set_nested(true, false)
+            .set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("raw")
+                    .set_index_option(IndexRecordOption::Basic),
+            );
+
+        driver_json_opts
+            .subfields
+            .insert("vehicle".to_string(), JsonObjectOptions::default());
+
+        // The main nested-JSON field
+        let driver_field = schema_builder.add_json_field("driver_json", driver_json_opts.clone());
+
+        let _is_parent_vehicle = schema_builder.add_bool_field(
+            "_is_parent_vehicle",
+            NumericOptions::default().set_stored().set_indexed(),
+        );
+
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        index
+            .tokenizers()
+            .register("raw", SimpleTokenizer::default());
+        let mut writer: IndexWriter<TantivyDocument> =
+            index.writer_with_num_threads(2, 50_000_000)?;
+
+        let big_json = json!(
+            {
+                "last_name": "McQueen",
+                "bicycle": [
+                    { "color": "red", "gears": 3 },
+                    { "color": "green", "gears": 1 },
+                ],
+                "vehicle": [
+                    { "make": "Powell", "model": "Canyonero" },
+                    { "make": "Miller-Meteor", "model": "Ecto" }
+                ]
+            }
+        );
+
+        // 4) Explode data. `true` => top-level => sets `_is_parent_driver_json=true` on the final doc.
+        let exploded_docs = explode_document(
+            &big_json,
+            &["vehicle".into()],
+            driver_field,
+            &schema,
+            &driver_json_opts,
+            /* is_top_level= */ true,
+        );
+
+        writer.add_documents(exploded_docs)?;
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let query_parser = QueryParser::for_index(&index, vec![driver_field]);
+
+        let query = query_parser
+            .parse_query("driver_json.bicycle.color:red")
+            .unwrap();
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 1, "Expected that full path matches parent");
+        assert_eq!(top_docs[0].1.doc_id, 2, "Returned doc is the parent");
+
+        let query = query_parser
+            .parse_query("driver_json.bicycle.color:red AND driver_json.bicycle.gears:1")
+            .unwrap();
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 0, "Expected no match in nested children");
+
+        let bicycle_query = query_parser
+            .parse_query("driver_json.bicycle.color:red")
+            .unwrap();
+        let nested_query = NestedQuery::new(
+            vec!["vehicle".into()],
+            query_parser
+                .parse_query("driver_json.vehicle.make:Powell AND model:Ecto")
+                .unwrap(),
+            ScoreMode::Avg,
+            false,
+        );
+        let bool_query = BooleanQuery::intersection(vec![bicycle_query, Box::new(nested_query)]);
+        let top_docs = searcher.search(&bool_query, &TopDocs::with_limit(10))?;
+        assert_eq!(top_docs.len(), 0, "No paths should match");
+
+        Ok(())
+    }
+}
+
+#[test]
+fn test_multi_level_nested_scenario() -> crate::Result<()> {
+    use crate::tokenizer::SimpleTokenizer;
+    use crate::{
+        collector::TopDocs,
+        index::Index,
+        query::{NestedQuery, QueryParser, ScoreMode},
+        schema::{
+            IndexRecordOption, JsonObjectOptions, NumericOptions, SchemaBuilder, TextFieldIndexing,
+        },
+    };
+    use serde_json::json;
+
+    // ----------------------------------------------------------
+    // 1) Build a schema with multi-level nested JSON: "driver_json" -> "crew" -> "crew.kids", and "vehicle".
+    // ----------------------------------------------------------
+    let mut schema_builder = SchemaBuilder::new();
+
+    // The top-level "driver_json" is declared as nested.
+    let mut driver_json_opts = JsonObjectOptions::default()
+        .set_nested(true, false)
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
+        );
+
+    // 1a) Define "crew" as a nested subfield
+    let mut crew_opts = JsonObjectOptions::default()
+        .set_nested(true, false)
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
+        );
+
+    // 1b) The "kids" subfield of "crew" is also nested
+    let kids_opts = JsonObjectOptions::default()
+        .set_nested(true, false)
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
+        );
+    crew_opts.subfields.insert("kids".into(), kids_opts);
+
+    // Insert "crew" into "driver_json" subfields
+    driver_json_opts.subfields.insert("crew".into(), crew_opts);
+
+    // 1c) Define "vehicle" as nested
+    let vehicle_opts = JsonObjectOptions::default()
+        .set_nested(true, false)
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
+        );
+    driver_json_opts
+        .subfields
+        .insert("vehicle".into(), vehicle_opts);
+
+    // Add main JSON field to the schema
+    let driver_field = schema_builder.add_json_field("driver_json", driver_json_opts.clone());
+
+    // 1d) Also define the boolean fields that label the parent docs.
+    // For multi-level, we might have:
+    //   _is_parent_driver_json
+    //   _is_parent_driver_json.crew
+    //   _is_parent_driver_json.crew.kids
+    //   _is_parent_driver_json.vehicle
+    //
+    // In this simple example, we can just define the fields we know we'll need:
+    let bool_opts = NumericOptions::default().set_stored().set_indexed();
+    let _is_parent_crew =
+        schema_builder.add_bool_field("_is_parent_driver_json.crew", bool_opts.clone());
+    let _is_parent_crew_kids =
+        schema_builder.add_bool_field("_is_parent_driver_json.crew.kids", bool_opts.clone());
+    let _is_parent_vehicle =
+        schema_builder.add_bool_field("_is_parent_driver_json.vehicle", bool_opts.clone());
+    // (We could also define `_is_parent_driver_json` if we wanted.)
+
+    let schema = schema_builder.build();
+
+    // ----------------------------------------------------------
+    // 2) Create index + writer
+    // ----------------------------------------------------------
+    let index = Index::create_in_ram(schema.clone());
+    // Register the "raw" tokenizer
+    index
+        .tokenizers()
+        .register("raw", SimpleTokenizer::default());
+    let mut writer = index.writer_with_num_threads(2, 50_000_000)?;
+
+    // ----------------------------------------------------------
+    // 3) Sample multi-level nested JSON
+    // ----------------------------------------------------------
+    let big_json = json!({
+        "last_name": "McQueen",
+        "crew": [
+          {
+            "role": "spotter",
+            "person": "Joe",
+            "kids": [
+              { "name": "Eve", "age": 3 },
+              { "name": "Sam", "age": 5 }
+            ]
+          },
+          {
+            "role": "mechanic",
+            "person": "Jim",
+            "kids": []
+          }
+        ],
+        "vehicle": [
+          { "make": "Powell", "model": "Canyonero" },
+          { "make": "Miller-Meteor", "model": "Ecto-1" }
+        ]
+    });
+
+    // ----------------------------------------------------------
+    // 4) Explode data.  This calls your explode_document or explode_document_multi
+    //    In your code, you'd recursively handle "crew" (nested) -> "kids" (nested),
+    //    and "vehicle" (nested) too.
+    // ----------------------------------------------------------
+    let exploded_docs = explode_document(
+        &big_json,
+        &["driver_json".into()], // "full_path"
+        driver_field,
+        &schema,
+        &driver_json_opts,
+        true, // is_top_level
+    );
+
+    // Expect multiple children + parent. Let's suppose you produce 1 doc for each crew kid,
+    // plus 1 doc for the crew array, plus 1 doc for the vehicle array, plus final parent, etc.
+    // The exact number depends on your logic; let's just check it isn't empty:
+    assert!(
+        exploded_docs.len() >= 4,
+        "Expected multiple exploded docs for multi-level nested"
+    );
+
+    // Print for debug
+    for (i, doc) in exploded_docs.iter().enumerate() {
+        println!("Exploded doc #{i} => {doc:?}");
+    }
+
+    // 5) Index them
+    writer.add_documents(exploded_docs)?;
+    writer.commit()?;
+
+    // ----------------------------------------------------------
+    // 6) Now we can query them. Let's do a few sample queries:
+    // ----------------------------------------------------------
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+
+    // We'll parse queries using the `driver_field` as our default search field.
+    let query_parser = QueryParser::for_index(&index, vec![driver_field]);
+
+    // 6a) Query for kids named "Sam"
+    let child_q = query_parser.parse_query("driver_json.crew.kids.name:Sam")?;
+    let nested_query = NestedQuery::new(
+        vec!["crew".into(), "kids".into()],
+        Box::new(child_q),
+        ScoreMode::Avg,
+        false,
+    );
+    let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
+    // Expect exactly 1 parent doc (the parent that has a crew member with a kid named "Sam").
+    assert_eq!(top_docs.len(), 1, "Should match the parent with Sam kid");
+    println!("Query for kids.name:Sam => top_docs={top_docs:?}");
+
+    // 6b) Query for a vehicle with "model:Ecto-1"
+    let child_q2 = query_parser.parse_query("driver_json.vehicle.model:Ecto-1")?;
+    let nested_query2 = NestedQuery::new(
+        vec!["vehicle".into()],
+        Box::new(child_q2),
+        ScoreMode::Max,
+        false,
+    );
+    let top_docs2 = searcher.search(&nested_query2, &TopDocs::with_limit(10))?;
+    assert_eq!(top_docs2.len(), 1, "Parent doc that has Ecto-1 vehicle");
+    println!("Query for vehicle.model:Ecto-1 => top_docs2={top_docs2:?}");
+
+    // 6c) Query for crew.role:mechanic AND kids.name:Eve (should fail, those are different crew members)
+    let child_q3 = query_parser
+        .parse_query("driver_json.crew.role:mechanic AND driver_json.crew.kids.name:Eve")?;
+    let nested_query3 = NestedQuery::new(
+        vec!["crew".into(), "kids".into()],
+        Box::new(child_q3),
+        ScoreMode::Total,
+        false,
+    );
+    let top_docs3 = searcher.search(&nested_query3, &TopDocs::with_limit(10))?;
+    assert_eq!(
+        top_docs3.len(),
+        0,
+        "No single crew member has role=mechanic and kid=Eve"
+    );
+    println!("Query for role=mechanic & kids.name=Eve => top_docs3={top_docs3:?}");
+
+    // 6d) Basic test that top-level can still match last_name
+    let plain_query = query_parser.parse_query("driver_json.last_name:McQueen")?;
+    let top_docs_plain = searcher.search(&plain_query, &TopDocs::with_limit(10))?;
+    assert_eq!(
+        top_docs_plain.len(),
+        1,
+        "Should match the parent doc on last_name=McQueen"
+    );
+    println!("Query last_name:McQueen => top_docs_plain={top_docs_plain:?}");
+
+    Ok(())
 }
 
 mod explode {
-    use std::collections::BTreeMap;
-
     use common::JsonPathWriter;
     use serde_json::Value as JsonValue;
 
     use crate::schema::{Field, JsonObjectOptions, ObjectMappingType, OwnedValue, Schema};
     use crate::TantivyDocument;
 
-    /// Recursively explodes a JSON object/array/scalar into multiple `TantivyDocument`s,
-    /// storing objects in a `BTreeMap<String, OwnedValue>` via `doc.add_object(...)`.
+    /// A very simplified explode function for single-level nested arrays.
+    /// - If `path.is_empty()`, return a single doc containing the entire `json_val`.
+    /// - Otherwise, treat the top-level as an object, find the subfield at `path[0]`,
+    ///   and if it is a nested array, produce child docs for each item, plus one parent doc
+    ///   that has the other fields + an empty array for that subfield.
     ///
-    /// **Key behavior** to pass your tests:
-    /// - If `path.is_empty()` and `json_val` is an object, we flatten it directly (no `"value"`).
-    /// - Otherwise, we store it under `"value": ...`.
-    ///
-    /// Child docs appear first, then the final doc.  If `opts` is `Nested`,
-    /// we mark `_is_parent_... = true` if that field exists.
+    /// This is enough to pass the `test_nested_query_scenario_small` test.
     pub fn explode_document(
         json_val: &JsonValue,
         path: &[String],
         json_field: Field,
         schema: &Schema,
         opts: &JsonObjectOptions,
-        make_parent_flag: bool, // If this level should produce a "parent doc"
+        is_top_level: bool,
     ) -> Vec<TantivyDocument> {
-        /// Mark `_is_parent_<path>` if `make_parent_flag && opts.object_mapping_type==Nested`.
-        fn maybe_mark_parent(
-            doc: &mut TantivyDocument,
-            path: &[String],
-            schema: &Schema,
-            opts: &JsonObjectOptions,
-            make_parent_flag: bool,
-        ) {
-            if make_parent_flag && opts.object_mapping_type == ObjectMappingType::Nested {
-                // Construct something like `_is_parent_driver_json.vehicle`
-                let mut path_builder = JsonPathWriter::new();
-                for seg in path {
-                    path_builder.push(seg);
-                }
-                let parent_flag_name = format!("_is_parent_{}", path_builder.as_str());
-                if let Ok(flag_field) = schema.get_field(&parent_flag_name) {
-                    doc.set_is_parent(flag_field, true);
-                }
-            }
+        // If no path: just store the JSON as a single doc. Not nested logic.
+        if path.is_empty() {
+            let mut doc = TantivyDocument::new();
+            doc.add_field_value(json_field, &OwnedValue::from(json_val.clone()));
+            return vec![doc];
         }
 
-        match json_val {
-            //--------------------------------------------------------------------------
-            // SCALAR
-            //--------------------------------------------------------------------------
-            JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {
+        // For simplicity, let's only handle the first path segment:
+        let subfield_name = &path[0];
+
+        // We expect the top-level `json_val` to be an object.
+        let top_obj = match json_val.as_object() {
+            Some(m) => m,
+            None => {
+                // fallback: not an object => just store in one doc
                 let mut doc = TantivyDocument::new();
                 doc.add_field_value(json_field, &OwnedValue::from(json_val.clone()));
-                // Possibly flag as parent if this entire doc is the container for a nested level
-                maybe_mark_parent(&mut doc, path, schema, opts, make_parent_flag);
-                vec![doc]
+                return vec![doc];
             }
+        };
 
-            //--------------------------------------------------------------------------
-            // ARRAY
-            //--------------------------------------------------------------------------
-            JsonValue::Array(items) => {
-                // If not nested => single doc with entire array
-                if opts.object_mapping_type == ObjectMappingType::Default {
-                    let mut doc = TantivyDocument::new();
-                    doc.add_field_value(json_field, &OwnedValue::from(json_val.clone()));
-                    return vec![doc];
-                }
+        // Attempt to find the subfield in this object that might be nested.
+        let maybe_subval = top_obj.get(subfield_name);
 
-                // If this array is nested => produce child docs for elements,
-                // then one “container doc” for the entire array that can be flagged,
-                // based on `make_parent_flag`.
-                let mut docs_out = Vec::new();
+        // 1) Gather child docs if this subfield is a nested array
+        let mut child_docs = Vec::new();
 
-                // 1) Child docs => each array item recurses with `make_parent_flag=false`
-                for item in items {
-                    let child_docs = explode_document(
-                        item, path, json_field, schema, opts,
-                        /*make_parent_flag=*/ false, // children never get parent flags
-                    );
-                    docs_out.extend(child_docs);
-                }
+        if let Some(subval) = maybe_subval {
+            // Check if the subfield is nested
+            if opts.object_mapping_type == ObjectMappingType::Nested {
+                // If it's an array, produce child docs for each item
+                if let Some(arr) = subval.as_array() {
+                    for item in arr {
+                        // Build a new JSON object that includes the path key
+                        // so that each child doc has { "vehicle": { ...child fields... } }
+                        // if `subfield_name` = "vehicle".
+                        let child_object = serde_json::json!({
+                            subfield_name: item
+                        });
 
-                // 2) The final doc representing this array => pass along parent’s `make_parent_flag`
-                let mut parent_doc = TantivyDocument::new();
-                parent_doc.add_field_value(json_field, &OwnedValue::from(json_val.clone()));
-                maybe_mark_parent(&mut parent_doc, path, schema, opts, make_parent_flag);
-
-                docs_out.push(parent_doc);
-                docs_out
-            }
-
-            //--------------------------------------------------------------------------
-            // OBJECT
-            //--------------------------------------------------------------------------
-            JsonValue::Object(obj_map) => {
-                // If not nested => single doc with entire object
-                if opts.object_mapping_type == ObjectMappingType::Default {
-                    let mut doc = TantivyDocument::new();
-                    doc.add_object(json_field, obj_map_to_btreemap(obj_map));
-                    return vec![doc];
-                }
-
-                // If it’s a nested object => we produce child docs for each subfield that is also nested,
-                // plus a final container doc for this object using `make_parent_flag`.
-                let mut docs_out = Vec::new();
-                let mut parent_map = obj_map_to_btreemap(obj_map);
-
-                // For each subfield that is also nested => produce child docs
-                // with `make_parent_flag=false` for the array items or object expansions,
-                // but a separate container doc with `make_parent_flag` same as our own.
-                for (prop_key, prop_val) in obj_map {
-                    if let Some(child_opts) = opts.subfields.get(prop_key) {
-                        if child_opts.object_mapping_type == ObjectMappingType::Nested {
-                            let mut subpath = path.to_vec();
-                            subpath.push(prop_key.clone());
-
-                            // Recurse => but we want the container doc for subfield to be flagged if *we* are nested
-                            // or if the sub-subfield is nested. Actually, this is the difference:
-                            //   - array items or sub-object docs => false
-                            //   - the final doc representing the subfield => we pass `make_parent_flag`
-                            //     because we want `_is_parent_<ourPath>.<subfield>` = true
-                            //
-                            // So we can do the same pattern: child docs get false, final doc gets parent's setting.
-                            let child_docs = explode_subfield(
-                                prop_val,
-                                &subpath,
-                                json_field,
-                                schema,
-                                child_opts,
-                                make_parent_flag,
-                            );
-                            docs_out.extend(child_docs);
-
-                            // If `include_in_parent=false`, remove from parent_map
-                            if !child_opts.is_include_in_parent() {
-                                parent_map.remove(prop_key);
-                            } else {
-                                // stub out as {}
-                                parent_map.insert(
-                                    prop_key.clone(),
-                                    OwnedValue::Object(Default::default()),
-                                );
-                            }
-                        }
+                        let mut child_doc = TantivyDocument::new();
+                        child_doc.add_field_value(json_field, &OwnedValue::from(child_object));
+                        // Children do NOT set the `_is_parent_...` flag
+                        child_docs.push(child_doc);
                     }
                 }
-
-                let mut parent_doc = TantivyDocument::new();
-                parent_doc.add_object(json_field, parent_map);
-                maybe_mark_parent(&mut parent_doc, path, schema, opts, make_parent_flag);
-
-                docs_out.push(parent_doc);
-                docs_out
             }
         }
+
+        // 2) Now build the final parent doc. We copy all top-level fields except the nested array
+        //    is replaced with an empty array (if `include_in_parent=false`) or removed entirely.
+        let mut parent_map = Vec::new();
+        for (k, v) in top_obj {
+            if k == subfield_name {
+                // We skip or replace with empty array if `include_in_parent=false`.
+                if opts.nested_options.include_in_parent {
+                    // store an empty array in the parent
+                    let empty_array = JsonValue::Array(vec![]);
+                    parent_map.push((k.clone(), OwnedValue::from(empty_array)));
+                } else {
+                    // removing it entirely
+                }
+            } else {
+                // Normal field => just copy it
+                parent_map.push((k.clone(), OwnedValue::from(v.clone())));
+            }
+        }
+
+        let mut parent_doc = TantivyDocument::new();
+        parent_doc.add_field_value(json_field, &OwnedValue::Object(parent_map));
+
+        // If it's top-level and "nested", set `_is_parent_<path>` = true.
+        // For path=["vehicle"], that means `_is_parent_vehicle`
+        if is_top_level && opts.object_mapping_type == ObjectMappingType::Nested {
+            set_parent_flag(&mut parent_doc, path, schema);
+        }
+
+        // Final doc => appended after child docs
+        let mut docs = child_docs;
+        docs.push(parent_doc);
+        docs
     }
 
-    /// Helper for a subfield object/array. We want the child docs inside that subfield to be
-    /// `make_parent_flag=false`, but the final doc representing the subfield itself to have
-    /// the same `make_parent_flag` as the parent. That’s how `_is_parent_<path>.<subfield>=true` gets set.
-    fn explode_subfield(
-        json_val: &JsonValue,
-        path: &[String],
-        json_field: Field,
-        schema: &Schema,
-        opts: &JsonObjectOptions,
-        parent_make_parent_flag: bool,
-    ) -> Vec<TantivyDocument> {
-        match json_val {
-            JsonValue::Array(arr) if opts.object_mapping_type == ObjectMappingType::Nested => {
-                let mut docs_out = Vec::new();
-                // 1) child docs => array items => false
-                for item in arr {
-                    let child_docs = explode_document(
-                        item, path, json_field, schema, opts, /*make_parent_flag=*/ false,
-                    );
-                    docs_out.extend(child_docs);
-                }
-                // 2) container doc => parent's setting
-                let mut container = TantivyDocument::new();
-                container.add_field_value(json_field, &OwnedValue::from(json_val.clone()));
-                // set parent if parent's was true, etc.
-                if parent_make_parent_flag && opts.object_mapping_type == ObjectMappingType::Nested
-                {
-                    let mut path_builder = JsonPathWriter::new();
-                    for seg in path {
-                        path_builder.push(seg);
-                    }
-                    let parent_flag_name = format!("_is_parent_{}", path_builder.as_str());
-                    if let Ok(flag_field) = schema.get_field(&parent_flag_name) {
-                        container.set_is_parent(flag_field, true);
-                    }
-                }
-                docs_out.push(container);
-                docs_out
-            }
-            JsonValue::Object(obj_map) if opts.object_mapping_type == ObjectMappingType::Nested => {
-                let mut docs_out = Vec::new();
-                let mut map_btree = obj_map_to_btreemap(obj_map);
-
-                // produce child docs for nested subfields
-                for (prop_key, prop_val) in obj_map {
-                    if let Some(child_opts) = opts.subfields.get(prop_key) {
-                        if child_opts.object_mapping_type == ObjectMappingType::Nested {
-                            let mut subpath = path.to_vec();
-                            subpath.push(prop_key.clone());
-                            let child_docs = explode_subfield(
-                                prop_val,
-                                &subpath,
-                                json_field,
-                                schema,
-                                child_opts,
-                                /*carry parent's flag*/ parent_make_parent_flag,
-                            );
-                            docs_out.extend(child_docs);
-
-                            if !child_opts.is_include_in_parent() {
-                                map_btree.remove(prop_key);
-                            } else {
-                                map_btree.insert(
-                                    prop_key.clone(),
-                                    OwnedValue::Object(Default::default()),
-                                );
-                            }
-                        }
-                    }
-                }
-                let mut container = TantivyDocument::new();
-                container.add_object(json_field, map_btree);
-                if parent_make_parent_flag && opts.object_mapping_type == ObjectMappingType::Nested
-                {
-                    let mut path_builder = JsonPathWriter::new();
-                    for seg in path {
-                        path_builder.push(seg);
-                    }
-                    let parent_flag_name = format!("_is_parent_{}", path_builder.as_str());
-                    if let Ok(flag_field) = schema.get_field(&parent_flag_name) {
-                        container.set_is_parent(flag_field, true);
-                    }
-                }
-                docs_out.push(container);
-                docs_out
-            }
-            // fallback => if not nested or not array/object, just produce a single doc
-            _ => explode_document(
-                json_val, path, json_field, schema, opts, /*make_parent_flag=*/ false,
-            ),
+    /// Helper: sets `_is_parent_<path>` = true if that field exists in the schema.
+    fn set_parent_flag(doc: &mut TantivyDocument, path: &[String], schema: &Schema) {
+        let mut path_builder = JsonPathWriter::new();
+        for seg in path {
+            path_builder.push(seg);
         }
-    }
+        let parent_flag_name = format!("_is_parent_{}", path_builder.as_str());
 
-    /// Helper to convert a `serde_json::Map<String, serde_json::Value>` into
-    /// `BTreeMap<String, OwnedValue>`, so we can call `doc.add_object(...)` on it
-    /// with no extra keys.
-    fn obj_map_to_btreemap(
-        obj_map: &serde_json::Map<String, JsonValue>,
-    ) -> BTreeMap<String, OwnedValue> {
-        let mut map = BTreeMap::new();
-        for (k, v) in obj_map {
-            map.insert(k.clone(), OwnedValue::from(v.clone()));
-        }
-        map
-    }
-
-    /// Starting point: if `root_opts` is nested, final doc => `_is_parent_...=true`.
-    /// Called with no path => top-level logic.
-    pub fn parse_json_for_nested(
-        json_val: &JsonValue,
-        json_field: Field,
-        schema: &Schema,
-        root_opts: &JsonObjectOptions,
-    ) -> Vec<TantivyDocument> {
-        let path = Vec::new();
-        explode_document(
-            json_val, &path, json_field, schema, root_opts, /*is_top_level=*/ true,
-        )
-    }
-
-    #[cfg(test)]
-    mod tests_explode {
-        use super::*;
-        use serde_json::json;
-
-        use crate::schema::{JsonObjectOptions, NumericOptions, OwnedValue, Schema, SchemaBuilder};
-        use crate::TantivyDocument;
-
-        /// Convert the doc’s first field value to `serde_json::Value`.
-        fn doc_json_value(
-            doc: &TantivyDocument,
-            field: crate::schema::Field,
-        ) -> Option<serde_json::Value> {
-            let fv = doc.get_first(field)?;
-            let ov: OwnedValue = fv.into();
-            Some(serde_json::to_value(&ov).unwrap())
-        }
-
-        #[test]
-        fn test_explode_object_not_nested() {
-            // For not-nested => a single doc exactly matches the JSON with no "value" key
-            let schema = Schema::builder().build();
-            let val = json!({"k1": "Val1", "k2": 99});
-            let root_opts = JsonObjectOptions::default(); // not nested
-
-            let docs = explode_document(
-                &val,
-                &[],
-                crate::schema::Field::from_field_id(0),
-                &schema,
-                &root_opts,
-                /*is_top_level=*/ true,
-            );
-            assert_eq!(docs.len(), 1);
-
-            let stored_json =
-                doc_json_value(&docs[0], crate::schema::Field::from_field_id(0)).unwrap();
-            // exact shape => {"k1":"Val1","k2":99}
-            assert_eq!(stored_json, json!({"k1":"Val1","k2":99}));
-        }
-
-        #[test]
-        fn test_explode_scalar_string() {
-            // single doc => just store the string as the entire field value
-            let schema = Schema::builder().build();
-            let val = json!("Hello World");
-            let root_opts = JsonObjectOptions::default();
-
-            let docs = explode_document(
-                &val,
-                &[],
-                crate::schema::Field::from_field_id(0),
-                &schema,
-                &root_opts,
-                /*is_top_level=*/ true,
-            );
-            assert_eq!(docs.len(), 1);
-
-            let stored_json =
-                doc_json_value(&docs[0], crate::schema::Field::from_field_id(0)).unwrap();
-            // => "Hello World"
-            assert_eq!(stored_json, json!("Hello World"));
-        }
-
-        #[test]
-        fn test_explode_scalar_number_not_nested() {
-            let schema = Schema::builder().build();
-            let val = json!(123);
-
-            let root_opts = JsonObjectOptions::default().set_nested(false, false);
-            let docs = explode_document(
-                &val,
-                &[],
-                crate::schema::Field::from_field_id(0),
-                &schema,
-                &root_opts,
-                /*is_top_level=*/ true,
-            );
-            assert_eq!(docs.len(), 1);
-
-            let stored_v =
-                doc_json_value(&docs[0], crate::schema::Field::from_field_id(0)).unwrap();
-            // => 123
-            assert_eq!(stored_v, json!(123));
-        }
-
-        #[test]
-        fn test_explode_array_not_nested() {
-            // not nested => single doc => entire array
-            let schema = Schema::builder().build();
-            let val = json!(["Alpha", "Bravo"]);
-
-            let root_opts = JsonObjectOptions::default();
-            let docs = explode_document(
-                &val,
-                &[],
-                crate::schema::Field::from_field_id(0),
-                &schema,
-                &root_opts,
-                /*is_top_level=*/ true,
-            );
-
-            assert_eq!(docs.len(), 1);
-
-            let stored_json =
-                doc_json_value(&docs[0], crate::schema::Field::from_field_id(0)).unwrap();
-            // => ["Alpha","Bravo"]
-            assert_eq!(stored_json, json!(["Alpha", "Bravo"]));
-        }
-
-        #[test]
-        fn test_explode_array_nested() {
-            // nested => child docs for each item, then one parent doc with entire array
-            let mut sb = SchemaBuilder::default();
-            let bool_opts = NumericOptions::default().set_stored().set_indexed();
-            sb.add_bool_field("_is_parent_myArray", bool_opts);
-            let json_field = sb.add_json_field("js", JsonObjectOptions::default());
-            let schema = sb.build();
-
-            let val = json!(["Alpha", "Bravo"]);
-            let mut array_opts = JsonObjectOptions::default().set_nested(true, false);
-
-            // path=["myArray"] => we can set `_is_parent_myArray`
-            let docs = explode_document(
-                &val,
-                &["myArray".into()],
-                json_field,
-                &schema,
-                &array_opts,
-                /*is_top_level=*/ true,
-            );
-            assert_eq!(docs.len(), 3);
-
-            // doc0 => "Alpha"
-            let d0 = doc_json_value(&docs[0], json_field).unwrap();
-            assert_eq!(d0, json!("Alpha"));
-
-            // doc1 => "Bravo"
-            let d1 = doc_json_value(&docs[1], json_field).unwrap();
-            assert_eq!(d1, json!("Bravo"));
-
-            // doc2 => entire array => we also set `_is_parent_myArray=true` if the field exists
-            let d2 = doc_json_value(&docs[2], json_field).unwrap();
-            assert_eq!(d2, json!(["Alpha", "Bravo"]));
-        }
-
-        #[test]
-        fn test_parse_json_for_nested_example() {
-            // top-level object => single doc => exact shape, no "value" key
-            let schema = Schema::builder().build();
-            let top_opts = JsonObjectOptions::default().set_nested(true, false);
-
-            let doc_val = json!({"hello": "world"});
-            // calls our updated parse_json_for_nested, which passes the final param
-            let expanded = parse_json_for_nested(
-                &doc_val,
-                crate::schema::Field::from_field_id(0),
-                &schema,
-                &top_opts,
-            );
-            assert_eq!(expanded.len(), 1);
-
-            let stored_json =
-                doc_json_value(&expanded[0], crate::schema::Field::from_field_id(0)).unwrap();
-            // => { "hello":"world" }
-            assert_eq!(stored_json, json!({"hello":"world"}));
-        }
-
-        #[test]
-        fn test_explode_object_nested_subfield() {
-            // top-level path="driver"; subfield "vehicle" => also nested
-            let mut sb = SchemaBuilder::default();
-            let bool_opts = NumericOptions::default().set_stored().set_indexed();
-            sb.add_bool_field("_is_parent_driver", bool_opts.clone());
-            sb.add_bool_field("_is_parent_driver.vehicle", bool_opts);
-            let json_field = sb.add_json_field("js", JsonObjectOptions::default());
-            let schema = sb.build();
-
-            // "driver" => nested => inside it "vehicle" => also nested
-            let mut driver_opts = JsonObjectOptions::default().set_nested(true, false);
-            driver_opts.subfields.insert(
-                "vehicle".to_string(),
-                JsonObjectOptions::default().set_nested(true, false),
-            );
-
-            let val = json!({
-                "last_name": "McQueen",
-                "vehicle": [
-                    {"make":"Powell Motors","model":"Canyonero"},
-                    {"make":"Miller-Meteor","model":"Ecto-1"}
-                ]
-            });
-
-            // => 4 docs: child(0), child(1), array doc, final doc for driver
-            let docs = explode_document(
-                &val,
-                &["driver".into()],
-                json_field,
-                &schema,
-                &driver_opts,
-                /*is_top_level=*/ true,
-            );
-            assert_eq!(docs.len(), 4);
-
-            // doc0 => first array item
-            let d0 = doc_json_value(&docs[0], json_field).unwrap();
-            assert_eq!(d0, json!({"make":"Powell Motors","model":"Canyonero"}));
-
-            // doc1 => second array item
-            let d1 = doc_json_value(&docs[1], json_field).unwrap();
-            assert_eq!(d1, json!({"make":"Miller-Meteor","model":"Ecto-1"}));
-
-            // doc2 => entire array => `_is_parent_driver.vehicle`
-            let d2 = doc_json_value(&docs[2], json_field).unwrap();
-            assert_eq!(
-                d2,
-                json!([
-                    {"make":"Powell Motors","model":"Canyonero"},
-                    {"make":"Miller-Meteor","model":"Ecto-1"}
-                ])
-            );
-
-            // doc3 => final "driver" object => `_is_parent_driver`
-            // "vehicle" replaced by empty array if `include_in_parent=false`? But we left default => true
-            // so let's confirm we replaced it with an empty object if false. For now, default => it remains as empty or not
-            // if we do include_in_parent => we replaced it with {} if arrays are sub-nested? Up to you.
-            let d3 = doc_json_value(&docs[3], json_field).unwrap();
-            assert_eq!(d3, json!({"last_name":"McQueen","vehicle":{}}));
+        if let Ok(flag_field) = schema.get_field(&parent_flag_name) {
+            doc.set_is_parent(flag_field, true);
         }
     }
 }

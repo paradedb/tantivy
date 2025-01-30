@@ -8,7 +8,7 @@ use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::segment_serializer::SegmentSerializer;
-use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
+use crate::json_utils::IndexingPositionsPerPath;
 use crate::postings::{
     compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
     PerFieldPostingsWriter, PostingsWriter,

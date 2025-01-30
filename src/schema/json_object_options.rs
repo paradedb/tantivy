@@ -71,6 +71,7 @@ pub struct JsonObjectOptions {
     ///
     /// By default, if an object key contains a `.`, we keep it as a `.` it as is.
     /// On the search side, users will then have to escape this `.` in the query parser
+    ///
     /// or when referring to a column name.
     ///
     /// For instance:
