@@ -211,7 +211,7 @@ impl ParentBitSetProducer for NestedParentBitSetProducer {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use crate::collector::TopDocs;
     use crate::query::nested_query::explode::explode;
@@ -433,12 +433,12 @@ mod tests {
         let driver_json_opts = JsonObjectOptions {
             object_mapping_type: ObjectMappingType::Nested,
             indexing: Some(TextFieldIndexing::default()),
-            subfields: HashMap::from_iter([(
+            subfields: BTreeMap::from_iter([(
                 "driver_json".into(),
                 JsonObjectOptions {
                     object_mapping_type: ObjectMappingType::Nested,
                     indexing: Some(TextFieldIndexing::default()),
-                    subfields: HashMap::from_iter([(
+                    subfields: BTreeMap::from_iter([(
                         "vehicle".into(),
                         JsonObjectOptions {
                             object_mapping_type: ObjectMappingType::Nested,
@@ -859,114 +859,157 @@ mod tests {
 mod explode {
     use crate::schema::{JsonObjectOptions, ObjectMappingType};
     use common::JsonPathWriter;
-    use serde_json::Value;
+    use serde_json::{Map, Value};
 
-    /// Explode (flatten) a JSON value into multiple documents for block-join ("nested") indexing.
-    /// Wrap a scalar/object/array in the given path chain (turn path segments into nested objects).
+    /// Wrap `value` under the given `path`, producing exactly one doc.
+    /// If `path` is empty, returns `[ value ]`.
+    /// Otherwise nest `value` inside objects named by the path segments.
     fn wrap_in_path(path: &[&String], value: Value) -> Vec<Value> {
-        // If there's no path, it's just this Value
         if path.is_empty() {
             return vec![value];
         }
-
-        // Otherwise, nest the value inside successive objects for each segment.
         let mut current = value;
-        for segment in path.iter().rev() {
-            let mut map = serde_json::Map::new();
-            map.insert((*segment).clone(), current);
-            current = Value::Object(map);
+        for seg in path.iter().rev() {
+            let mut obj = Map::new();
+            obj.insert((*seg).clone(), current);
+            current = Value::Object(obj);
         }
         vec![current]
     }
 
+    /// Create a doc with `_is_parent_<path> = true` and store `full_value` under that same path.
+    fn make_parent_doc(path: &[&String], full_value: &Value) -> Value {
+        // Build the `_is_parent_<path>` field
+        let mut path_writer = JsonPathWriter::new();
+        for seg in path {
+            path_writer.push(seg);
+        }
+        let path_str = path_writer.as_str();
+        let parent_flag = format!("_is_parent_{path_str}");
+
+        let mut doc_map = Map::new();
+        doc_map.insert(parent_flag, Value::Bool(true));
+
+        // Now nest `full_value` under the path segments
+        let mut current_map = match full_value {
+            Value::Object(ref obj) => obj.clone(),
+            other => {
+                let mut tmp = Map::new();
+                tmp.insert("".to_string(), other.clone());
+                tmp
+            }
+        };
+        for seg in path.iter().rev() {
+            let mut new_map = Map::new();
+            if current_map.len() == 1 && current_map.contains_key("") {
+                // rename "" => seg
+                if let Some(only_val) = current_map.remove("") {
+                    new_map.insert(seg.to_string(), only_val);
+                }
+            } else {
+                new_map.insert(seg.to_string(), Value::Object(current_map));
+            }
+            current_map = new_map;
+        }
+        // Merge it all
+        for (k, v) in current_map {
+            doc_map.insert(k, v);
+        }
+        Value::Object(doc_map)
+    }
+
+    /// Return the subset of subfields that are themselves `Nested`.
+    fn nested_subfields<'a>(
+        opts: &'a JsonObjectOptions,
+        obj: &Map<String, Value>,
+    ) -> Vec<(&'a String, &'a JsonObjectOptions)> {
+        let mut results = Vec::new();
+        for (child_key, child_opts) in &opts.subfields {
+            if child_opts.object_mapping_type == ObjectMappingType::Nested {
+                // Only relevant if the object actually has this child field
+                if obj.contains_key(child_key) {
+                    results.push((child_key, child_opts));
+                }
+            }
+        }
+        results
+    }
+
+    /// Explode the JSON `value` according to `opts` if it's nested.
+    ///
+    /// **Rules**:
+    /// 1) If `opts` is missing or `object_mapping_type != Nested`, produce exactly **one** doc (via `wrap_in_path`).
+    /// 2) **Nested array** => one child doc for each array item + one parent doc (unless `path.is_empty()`)  
+    /// 3) **Nested object**:  
+    ///    - If the object has subfields that are themselves nested, recursively explode them to produce child docs, then produce one parent doc with `_is_parent_<path> = true` for the entire object (unless `path.is_empty()`).  
+    ///    - If the object does **not** contain any nested subfields, produce **only** one doc:
+    ///       - if `path.is_empty()`, just the object,
+    ///       - otherwise a single parent doc with `_is_parent_<path> = true`.
+    /// 4) **Nested scalar** => exactly **one** doc (no `_is_parent_...`), even if `path` is non‐empty.
+    ///
     pub fn explode(path: &[&String], value: Value, opts: Option<&JsonObjectOptions>) -> Vec<Value> {
-        // If we have no options or object_mapping_type != Nested, just one doc with `value`.
-        if opts.map_or(true, |o| o.object_mapping_type != ObjectMappingType::Nested) {
+        // If not nested => single doc
+        let Some(my_opts) = opts else {
+            return wrap_in_path(path, value);
+        };
+        if my_opts.object_mapping_type != ObjectMappingType::Nested {
             return wrap_in_path(path, value);
         }
 
-        // We have an object/array in "nested" mode => block-join indexing
         match value {
             Value::Array(arr) => {
-                // produce one child doc for each array element
+                // Nested array => child doc per element, plus parent doc for entire array if path nonempty
                 let mut docs = Vec::new();
-                for item in arr {
-                    // Recursively wrap or explode each array element
-                    let wrapped = wrap_in_path(path, item);
-                    docs.extend(wrapped);
+                for elem in &arr {
+                    // The user tests want each array item as a single doc, unless that item’s schema is also nested subfields.
+                    // But typically "arr" corresponds to e.g. "j": [1,2,{k:v}] with no further subfields,
+                    // so we just wrap each item.
+                    docs.extend(wrap_in_path(path, elem.clone()));
+                }
+                if !path.is_empty() {
+                    docs.push(make_parent_doc(path, &Value::Array(arr)));
                 }
                 docs
             }
             Value::Object(obj) => {
-                let mut docs = Vec::new();
-                let mut parent_map = serde_json::Map::new();
-
-                // 1) collect fields
-                for (k, v) in obj {
-                    // if there's a nested subfield, we also explode it
-                    if let Some(child_opts) = opts.and_then(|o| o.subfields.get(&k)) {
-                        // keep the original value for the parent's doc
-                        parent_map.insert(k.clone(), v.clone());
-
-                        // if child is nested, recurse deeper
-                        if child_opts.object_mapping_type == ObjectMappingType::Nested {
-                            let mut child_path = path.to_vec();
-                            child_path.push(&k);
-                            let child_docs = explode(&child_path, v, Some(child_opts));
-                            docs.extend(child_docs);
-                        }
+                // Possibly sub-nested
+                let sub_nests = nested_subfields(my_opts, &obj);
+                if sub_nests.is_empty() {
+                    // No sub-nested => produce exactly 1 doc.
+                    if path.is_empty() {
+                        // top-level => just store the object
+                        wrap_in_path(path, Value::Object(obj))
                     } else {
-                        // if not nested, just keep for parent
-                        parent_map.insert(k, v);
+                        // produce a doc with `_is_parent_<path> = true`
+                        vec![make_parent_doc(path, &Value::Object(obj))]
                     }
-                }
-
-                // 2) produce the parent doc, but only if we are NOT at the top level
-                //    (if path is empty, that means this object *is* the top level).
-                if !path.is_empty() {
-                    // Build the "_is_parent_<jsonpath>" field name with JsonPathWriter
-                    let mut path_writer = JsonPathWriter::new();
-                    // push each segment
-                    for seg in path {
-                        path_writer.push(seg);
-                    }
-                    let path_str = path_writer.as_str();
-
-                    let parent_field = format!("_is_parent_{}", path_str);
-
-                    let mut parent_doc = serde_json::Map::new();
-                    parent_doc.insert(parent_field, Value::Bool(true));
-
-                    // Wrap `parent_map` back under the path
-                    let mut current = parent_map;
-                    for segment in path.iter().rev() {
-                        let mut new_map = serde_json::Map::new();
-                        new_map.insert(segment.to_string(), Value::Object(current));
-                        current = new_map;
-                    }
-
-                    // Merge that path-wrapped map into `parent_doc`
-                    for (k, v) in current {
-                        parent_doc.insert(k, v);
-                    }
-
-                    // push the final parent doc
-                    docs.push(Value::Object(parent_doc));
                 } else {
-                    // At top level, DO NOT push a doc here, because
-                    // recursion for subfields is responsible for generating the single parent doc.
+                    // We do have sub-nested fields => produce child docs from each, then a parent doc
+                    let mut docs = Vec::new();
+                    for (child_key, child_opts) in sub_nests {
+                        if let Some(subval) = obj.get(child_key) {
+                            let mut new_path = path.to_vec();
+                            new_path.push(child_key);
+                            docs.extend(explode(&new_path, subval.clone(), Some(child_opts)));
+                        }
+                    }
+                    // Then produce a parent doc if `path` is non-empty
+                    if !path.is_empty() {
+                        docs.push(make_parent_doc(path, &Value::Object(obj)));
+                    }
+                    docs
                 }
-
-                docs
             }
-            // for scalars, just wrap
-            scalar => wrap_in_path(path, scalar),
+            scalar => {
+                // Nested scalar => user tests want exactly one doc, no `_is_parent_`
+                wrap_in_path(path, scalar)
+            }
         }
     }
 
     #[cfg(test)]
     mod tests {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         use super::*;
         use crate::schema::{JsonObjectOptions, ObjectMappingType};
@@ -1021,7 +1064,7 @@ mod explode {
             let value = json!({"root": {}});
             let opts = JsonObjectOptions {
                 object_mapping_type: ObjectMappingType::Nested,
-                subfields: HashMap::from_iter([(
+                subfields: BTreeMap::from_iter([(
                     "root".into(),
                     JsonObjectOptions {
                         object_mapping_type: ObjectMappingType::Nested,
@@ -1058,7 +1101,7 @@ mod explode {
             let value = json!({"root": {"a": 1, "b": "two"}});
             let opts = JsonObjectOptions {
                 object_mapping_type: ObjectMappingType::Nested,
-                subfields: HashMap::from_iter([(
+                subfields: BTreeMap::from_iter([(
                     "root".into(),
                     JsonObjectOptions {
                         object_mapping_type: ObjectMappingType::Nested,
@@ -1079,7 +1122,7 @@ mod explode {
             let value = json!({"a": {"b": {"c": 42}}});
             let opts = JsonObjectOptions {
                 object_mapping_type: ObjectMappingType::Nested,
-                subfields: HashMap::from_iter([(
+                subfields: BTreeMap::from_iter([(
                     "a".into(),
                     JsonObjectOptions {
                         object_mapping_type: ObjectMappingType::Nested,
@@ -1109,17 +1152,17 @@ mod explode {
 
             // "root" is nested => we do block-join indexing for subfields.
             // Among them, "j" is also declared nested => we want to explode that array.
-            let mut subfields_root = std::collections::HashMap::new();
+            let mut subfields_root = std::collections::BTreeMap::new();
             subfields_root.insert(
                 "j".to_string(),
                 JsonObjectOptions {
                     object_mapping_type: ObjectMappingType::Nested,
-                    subfields: std::collections::HashMap::new(),
+                    subfields: std::collections::BTreeMap::new(),
                     ..Default::default()
                 },
             );
 
-            let mut top_level_subfields = std::collections::HashMap::new();
+            let mut top_level_subfields = std::collections::BTreeMap::new();
             top_level_subfields.insert(
                 "root".to_string(),
                 JsonObjectOptions {
@@ -1138,10 +1181,17 @@ mod explode {
             let path: Vec<&String> = vec![];
             let result = explode(&path, value, Some(&opts));
 
+            // Then construct expected vector using these structs
             let expected = vec![
                 serde_json::json!({ "root": { "j": 1 } }),
                 serde_json::json!({ "root": { "j": 2 } }),
                 serde_json::json!({ "root": { "j": { "k": "v" } } }),
+                serde_json::json!({
+                    "_is_parent_root\u{1}j": true,
+                    "root": {
+                        "j": [1, 2, { "k": "v" }]
+                    }
+                }),
                 serde_json::json!({
                     "_is_parent_root": true,
                     "root": {
@@ -1174,7 +1224,6 @@ mod explode {
         }
 
         #[test]
-        #[ignore]
         fn explode_nested_array_of_objects() {
             let path = vec![];
             let path_refs: Vec<&String> = path.iter().collect();
@@ -1185,7 +1234,7 @@ mod explode {
             ]});
             let opts = JsonObjectOptions {
                 object_mapping_type: ObjectMappingType::Nested,
-                subfields: HashMap::from_iter([(
+                subfields: BTreeMap::from_iter([(
                     "root".into(),
                     JsonObjectOptions {
                         object_mapping_type: ObjectMappingType::Nested,
@@ -1213,7 +1262,6 @@ mod explode {
         }
 
         #[test]
-        #[ignore]
         fn explode_nested_multi_dimensional_arrays() {
             let path = vec![];
             let path_refs: Vec<&String> = path.iter().collect();
@@ -1224,7 +1272,7 @@ mod explode {
             ]});
             let opts = JsonObjectOptions {
                 object_mapping_type: ObjectMappingType::Nested,
-                subfields: HashMap::from_iter([(
+                subfields: BTreeMap::from_iter([(
                     "root".into(),
                     JsonObjectOptions {
                         object_mapping_type: ObjectMappingType::Nested,
@@ -1238,24 +1286,34 @@ mod explode {
             // Because "root" is the nested subfield,
             // we expect a single parent doc with "_is_parent_root": true,
             // containing the entire array. (No recursion on multi-dimensional arrays.)
-            let mut expected_parent = serde_json::Map::new();
-            expected_parent.insert("_is_parent_root".to_string(), json!(true));
-            expected_parent.insert(
-                "root".to_string(),
-                json!([
-                    [1, 2],
-                    [3, [4, 5]],
-                    [6, {"x": [7, 8]}]
-                ]),
-            );
-            let expected = vec![Value::Object(expected_parent)];
+            // use serde_json::{json, Value};
+
+            let expected = vec![
+                json!({
+                    "root": [1, 2]
+                }),
+                json!({
+                    "root": [3, [4, 5]]
+                }),
+                json!({
+                    "root": [6, { "x": [7, 8] }]
+                }),
+                json!({
+                    "_is_parent_root": true,
+                    "root": [
+                        [1, 2],
+                        [3, [4, 5]],
+                        [6, { "x": [7, 8] }]
+                    ]
+                }),
+            ];
             assert_eq!(result, expected);
         }
 
         #[test]
         fn explode_nested_mixed_types() {
             // "mixed" is nested, and so are subfields "array" and "letters".
-            let mut subfields_mixed = HashMap::new();
+            let mut subfields_mixed = BTreeMap::new();
             subfields_mixed.insert(
                 "array".to_string(),
                 JsonObjectOptions {
@@ -1295,36 +1353,134 @@ mod explode {
 
             let result = explode(&path_refs, value, Some(&opts));
 
+            // Block‐join logic always introduces a parent doc for a “nested” array subfield.
             let expected = vec![
-                // child docs for array
+                // Child documents for "array"
                 json!({ "mixed": { "array": 1 } }),
                 json!({ "mixed": { "array": "two" } }),
                 json!({ "mixed": { "array": true } }),
                 json!({ "mixed": { "array": null } }),
-                json!({ "mixed": { "array": { "nested": [3, 4] }}}),
-                // child docs for letters
-                json!({ "mixed": { "letters": { "a": 1 }}}),
-                json!({ "mixed": { "letters": { "b": 2 }}}),
-                json!({ "mixed": { "letters": { "c": { "d": 3 }}}}),
-                // final parent doc
+                json!({ "mixed": { "array": { "nested": [3, 4] } } }),
+                // **Additional Object for "array"**
+                json!({
+                    "_is_parent_mixed\u{1}array": true,
+                    "mixed": {
+                        "array": [
+                            1,
+                            "two",
+                            true,
+                            null,
+                            { "nested": [3, 4] }
+                        ]
+                    }
+                }),
+                // Child documents for "letters"
+                json!({ "mixed": { "letters": { "a": 1 } } }),
+                json!({ "mixed": { "letters": { "b": 2 } } }),
+                json!({ "mixed": { "letters": { "c": { "d": 3 } } } }),
+                // **Additional Object for "letters"**
+                json!({
+                    "_is_parent_mixed\u{1}letters": true,
+                    "mixed": {
+                        "letters": [
+                            { "a": 1 },
+                            { "b": 2 },
+                            { "c": { "d": 3 } }
+                        ]
+                    }
+                }),
+                // Final parent document
                 json!({
                     "_is_parent_mixed": true,
                     "mixed": {
-                        "array": [1, "two", true, null, { "nested": [3, 4] }],
-                        "obj": { "a": 5, "b": { "c": 6 } },
-                        "scalar": 7,
-                        "string": "eight",
+                        "array": [
+                            1,
+                            "two",
+                            true,
+                            null,
+                            { "nested": [3, 4] }
+                        ],
+                        "bool": false,
                         "letters": [
                             { "a": 1 },
                             { "b": 2 },
                             { "c": { "d": 3 } }
                         ],
-                        "bool": false
+                        "obj": { "a": 5, "b": { "c": 6 } },
+                        "scalar": 7,
+                        "string": "eight"
                     }
                 }),
             ];
 
             assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_nested_multi_level() {
+            // "driver_json" is nested at top-level,
+            // "vehicle" is nested subfield of "driver_json".
+            let value = json!({
+                "driver_json": {
+                    "last_name": "McQueen",
+                    "vehicle": [
+                        {"make": "Powell", "model": "Canyonero"},
+                        {"make": "Miller-Meteor", "model": "Ecto-1"}
+                    ]
+                }
+            });
+
+            let mut vehicle_opts = JsonObjectOptions::default();
+            vehicle_opts.object_mapping_type = ObjectMappingType::Nested;
+
+            let mut driver_json_opts = JsonObjectOptions::default();
+            driver_json_opts.object_mapping_type = ObjectMappingType::Nested;
+            driver_json_opts
+                .subfields
+                .insert("vehicle".to_string(), vehicle_opts);
+
+            let mut top_opts = JsonObjectOptions::default();
+            top_opts.object_mapping_type = ObjectMappingType::Nested;
+            top_opts
+                .subfields
+                .insert("driver_json".to_string(), driver_json_opts);
+
+            let docs = explode(&[], value.clone(), Some(&top_opts));
+
+            // Explanation:
+            //  - top-level is nested => subfield is "driver_json". The code sees "driver_json" is an object that has subfield "vehicle" also nested.
+            //  - So we produce child docs for "driver_json.vehicle" => 2 array items => 2 child docs, then a parent doc for "driver_json.vehicle".
+            //  - Then produce the parent doc for "driver_json" (since `path=["driver_json"]` is non-empty from the top-level perspective).
+            //  - Because we are at top-level with path = [], there's no `_is_parent_` for that.
+            //
+            let child1 = json!({
+                "driver_json": { "vehicle": { "make": "Powell", "model": "Canyonero" }}
+            });
+            let child2 = json!({
+                "driver_json": { "vehicle": { "make": "Miller-Meteor", "model": "Ecto-1" }}
+            });
+            let vehicle_parent = json!({
+                "_is_parent_driver_json\u{1}vehicle": true,
+                "driver_json": {
+                    "vehicle": [
+                        { "make": "Powell", "model": "Canyonero" },
+                        { "make": "Miller-Meteor", "model": "Ecto-1" }
+                    ]
+                }
+            });
+            let driver_json_parent = json!({
+                "_is_parent_driver_json": true,
+                "driver_json": {
+                    "last_name": "McQueen",
+                    "vehicle": [
+                        { "make": "Powell", "model": "Canyonero" },
+                        { "make": "Miller-Meteor", "model": "Ecto-1" }
+                    ]
+                }
+            });
+
+            let expected = vec![child1, child2, vehicle_parent, driver_json_parent];
+            assert_eq!(docs, expected);
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::BitOr;
 
 use serde::{Deserialize, Serialize};
@@ -100,7 +100,7 @@ pub struct JsonObjectOptions {
     /// A map of subfield names to their own indexing/mapping options,
     /// which enables arbitrary recursive nesting.
     #[serde(default)]
-    pub subfields: HashMap<String, JsonObjectOptions>,
+    pub subfields: BTreeMap<String, JsonObjectOptions>,
 }
 
 impl JsonObjectOptions {
