@@ -55,12 +55,12 @@ impl BitOr for NestedOptions {
 /// configure how a json object field should be indexed and stored.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct JsonObjectOptions {
-    stored: bool,
+    pub stored: bool,
     // If set to some, int, date, f64 and text will be indexed.
     // Text will use the TextFieldIndexing setting for indexing.
-    indexing: Option<TextFieldIndexing>,
+    pub indexing: Option<TextFieldIndexing>,
     // Store all field as fast fields with an optional tokenizer for text.
-    fast: FastFieldTextOptions,
+    pub fast: FastFieldTextOptions,
     /// tantivy will generate paths to the different nodes of the json object
     /// both in:
     /// - the inverted index (for the terms)
@@ -87,7 +87,7 @@ pub struct JsonObjectOptions {
     /// and it can be search using the following query:
     /// `root.child.with.dot:hello`
     #[serde(default)]
-    expand_dots_enabled: bool,
+    pub expand_dots_enabled: bool,
 
     /// Plain vs. nested object handling.
     #[serde(default)]
