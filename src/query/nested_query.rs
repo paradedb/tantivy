@@ -79,7 +79,6 @@ impl Query for NestedQuery {
 
         let path_str = path_builder.as_str();
         let parent_flag_name = format!("_is_parent_{}", path_str);
-        println!("WEIGHT {parent_flag_name}");
 
         let schema = enable_scoring.schema();
         let parent_field = match schema.get_field(&parent_flag_name) {
@@ -89,8 +88,8 @@ impl Query for NestedQuery {
             }
             Err(_) => {
                 return Err(TantivyError::SchemaError(format!(
-                    "NestedQuery path '{:?}' not mapped (no field '{}'), and ignore_unmapped=false",
-                    self.path, parent_flag_name
+                    "NestedQuery path '{}' not mapped, and ignore_unmapped=false",
+                    self.path.join(".")
                 )));
             }
         };
@@ -437,12 +436,10 @@ mod tests {
                 "driver_json".into(),
                 JsonObjectOptions {
                     object_mapping_type: ObjectMappingType::Nested,
-                    indexing: Some(TextFieldIndexing::default()),
                     subfields: BTreeMap::from_iter([(
                         "vehicle".into(),
                         JsonObjectOptions {
                             object_mapping_type: ObjectMappingType::Nested,
-                            indexing: Some(TextFieldIndexing::default()),
                             ..Default::default()
                         },
                     )]),
@@ -473,11 +470,8 @@ mod tests {
         }});
 
         let exploded_docs = explode(&[], big_json, Some(&driver_json_opts));
-        assert_eq!(exploded_docs.len(), 3, "should be 3 exploded docs");
+        assert_eq!(exploded_docs.len(), 4, "should be 4 exploded docs");
 
-        // for doc in &exploded_docs {
-        //     println!("EXPLODED DOC: {doc:?}");
-        // }
         writer.add_documents(
             exploded_docs
                 .into_iter()
@@ -505,14 +499,18 @@ mod tests {
             .parse_query("driver_json.last_name:McQueen")
             .unwrap();
         let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-        assert_eq!(top_docs.len(), 1, "Expected to match parent doc");
-        assert_eq!(top_docs[0].1.doc_id, 2, "Returned doc is the parent");
+        assert_eq!(top_docs.len(), 1, "Expected to match only parent doc");
+        assert_eq!(top_docs[0].1.doc_id, 3, "Returned doc is the parent");
 
         let nested_query = query_parser
             .parse_query("driver_json.vehicle.model:Canyonero")
             .unwrap();
         let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
-        assert_eq!(top_docs.len(), 2, "Expected two docs (child + parent) ");
+        assert_eq!(
+            top_docs.len(),
+            3,
+            "Expected two docs (child + parent + grandparent) "
+        );
         assert_eq!(top_docs[0].1.doc_id, 0,);
         assert_eq!(top_docs[1].1.doc_id, 2,);
 
@@ -520,11 +518,10 @@ mod tests {
         let top_docs = searcher.search(&nested_query, &TopDocs::with_limit(10))?;
         assert_eq!(top_docs.len(), 1, "Expected one doc with the parent data.");
         assert_eq!(
-            top_docs[0].1.doc_id, 2,
-            "Parent doc is the last doc (doc_id=2)"
+            top_docs[0].1.doc_id, 3,
+            "Parent doc is the last doc (doc_id=3)"
         );
 
-        // Now test with an actual NestedQuery
         let child_q = query_parser
             .parse_query("driver_json.vehicle.model:Canyonero")
             .unwrap();
@@ -541,33 +538,38 @@ mod tests {
             false,
         );
         let top_docs = searcher.search(&nested_q, &TopDocs::with_limit(10))?;
-        // Because "vehicle" is nested in the schema, we match the parent doc
         assert_eq!(
             top_docs.len(),
             1,
             "Expected one parent doc from the child match"
         );
-        assert_eq!(top_docs[0].1.doc_id, 2, "Returned doc is the parent doc");
+        assert_eq!(top_docs[0].1.doc_id, 3, "Returned doc is the parent doc");
 
         let child_q = query_parser
             .parse_query("driver_json.vehicle.model:Canyonero AND driver_json.vehicle.make:Powell")
             .unwrap();
         let nested_q = NestedQuery::new(
-            vec!["vehicle".to_string()],
+            vec!["driver_json".to_string()],
             Box::new(child_q),
             ScoreMode::Avg,
             false,
         );
         let top_docs = searcher.search(&nested_q, &TopDocs::with_limit(10))?;
         assert_eq!(top_docs.len(), 1, "Still the same parent doc");
-        assert_eq!(top_docs[0].1.doc_id, 2, "Parent doc is #2");
+        assert_eq!(top_docs[0].1.doc_id, 3, "Parent doc is #2");
 
         let child_q = query_parser
             .parse_query("driver_json.vehicle.model:Ecto AND driver_json.vehicle.make:Powell")
             .unwrap();
-        let nested_q = NestedQuery::new(
-            vec!["vehicle".to_string()],
+        let inner_nested_q = NestedQuery::new(
+            vec!["driver_json".into(), "vehicle".to_string()],
             Box::new(child_q),
+            ScoreMode::Avg,
+            false,
+        );
+        let nested_q = NestedQuery::new(
+            vec!["driver_json".to_string()],
+            Box::new(inner_nested_q),
             ScoreMode::Avg,
             false,
         );
