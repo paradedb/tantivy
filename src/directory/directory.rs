@@ -266,6 +266,11 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
             "load_metas not implemented".to_string(),
         ))
     }
+    /// Returns true if this directory supports garbage collection.  The default assumption is
+    /// `true`
+    fn supports_garbage_collection(&self) -> bool {
+        true
+    }
 }
 
 /// DirectoryClone
