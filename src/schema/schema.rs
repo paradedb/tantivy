@@ -264,12 +264,16 @@ impl SchemaBuilder {
         }
     }
 
-    pub fn add_json_field_auto_nested<T: Into<JsonObjectOptions>>(
+    pub fn add_nested_json_field<T: Into<JsonObjectOptions>>(
         &mut self,
         field_name_str: &str,
         field_options: T,
     ) -> Field {
-        let field_options: JsonObjectOptions = field_options.into();
+        let json_options: JsonObjectOptions = field_options.into();
+        let field_options = json_options
+            .clone()
+            .add_subfield(field_name_str, json_options);
+
         // Add the main JSON field as usual
         let field_entry = FieldEntry::new_json(field_name_str.to_string(), field_options.clone());
         let added_field = self.add_field(field_entry);
