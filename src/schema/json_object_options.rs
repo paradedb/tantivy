@@ -104,6 +104,12 @@ pub struct JsonObjectOptions {
 }
 
 impl JsonObjectOptions {
+    pub fn nested() -> Self {
+        JsonObjectOptions {
+            object_mapping_type: ObjectMappingType::Nested,
+            ..Default::default()
+        }
+    }
     /// Returns `true` if the json object should be stored.
     #[inline]
     pub fn is_stored(&self) -> bool {
@@ -223,12 +229,8 @@ impl JsonObjectOptions {
     }
 
     #[must_use]
-    pub fn set_nested(mut self, include_in_parent: bool, include_in_root: bool) -> Self {
+    pub fn set_nested(mut self) -> Self {
         self.object_mapping_type = ObjectMappingType::Nested;
-        self.nested_options = NestedOptions {
-            include_in_parent,
-            include_in_root,
-        };
         self
     }
 
@@ -257,20 +259,8 @@ impl JsonObjectOptions {
         self
     }
 
-    /// Returns a mutable reference to the subfield mapping with `subfield_name`,
-    /// creating a default entry if it did not exist.
-    ///
-    /// Useful if you want to build up a nested mapping in steps:
-    /// ```ignore
-    /// json_opts
-    ///     .subfield_mut("vehicle")
-    ///     .set_nested(None)
-    ///     .add_subfield("make", JsonObjectOptions::default().set_indexing_options(...))
-    ///     .add_subfield("model", JsonObjectOptions::default());
-    /// ```
-    pub fn subfield_mut<S: Into<String>>(&mut self, subfield_name: S) -> &mut JsonObjectOptions {
-        let key = subfield_name.into();
-        self.subfields.entry(key).or_default()
+    pub fn subfields(&self) -> &BTreeMap<String, JsonObjectOptions> {
+        &self.subfields
     }
 }
 
@@ -358,16 +348,14 @@ mod tests {
     fn test_json_options_builder_methods() {
         // 1) Create a top-level JsonObjectOptions that is nested. We'll configure it with stored,
         //    fast, indexing, etc.
-        let mut opts = JsonObjectOptions::default()
+        let opts = JsonObjectOptions::nested()
             .set_stored()
-            .set_nested(true, false)
             .set_fast(Some("my_tokenizer"))
             .set_indexing_options(TextFieldIndexing::default())
             // 2) Add a subfield "vehicle" which is ALSO nested
             .add_subfield(
                 "vehicle",
-                JsonObjectOptions::default()
-                    .set_nested(true, false)
+                JsonObjectOptions::nested()
                     // Add sub-subfields "make" and "model"
                     .add_subfield(
                         "make",
@@ -417,20 +405,6 @@ mod tests {
         let last_name_opts = &opts.subfields["last_name"];
         assert!(last_name_opts.is_indexed());
         assert!(!last_name_opts.is_stored());
-
-        // 9) Use `subfield_mut` to mutate deeply nested fields.
-        {
-            // First get a mutable ref to "vehicle"
-            let vehicle_mut = opts.subfield_mut("vehicle");
-            // Then a mutable ref to "vehicle.make"
-            let make_mut = vehicle_mut.subfield_mut("make");
-            make_mut.unset_indexing_options();
-        }
-
-        // 10) Now confirm that "vehicle.make" is no longer indexed
-        //
-        let make_opts_after = &opts.subfields["vehicle"].subfields["make"];
-        assert!(!make_opts_after.is_indexed());
     }
 
     #[test]

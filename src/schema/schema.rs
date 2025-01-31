@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use common::JsonPathWriter;
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -234,6 +235,55 @@ impl SchemaBuilder {
         );
         let field_entry = FieldEntry::new_json(field_name.to_string(), field_options.into());
         self.add_field(field_entry)
+    }
+
+    /// Here’s a helper method that adds all nested `_is_parent_...` boolean fields
+    /// and recursively registers subfields.
+    fn register_nested_subfields(
+        &mut self,
+        path_writer: &mut JsonPathWriter,
+        json_opts: &JsonObjectOptions,
+    ) {
+        // Only add `_is_parent_<current path>` if *this* object is nested.
+        // (If you want to add `_is_parent_` for non-nested objects too, remove the `if`.)
+        if matches!(json_opts.object_mapping_type, ObjectMappingType::Nested) {
+            let is_parent_field = format!("_is_parent_{}", path_writer.as_str());
+            println!("PARENT: _is_parent_{}", path_writer.as_str());
+            self.add_bool_field(&is_parent_field, NumericOptions::default().set_indexed());
+        }
+
+        // Recurse through *all* subfields, because even a non-nested
+        // subfield might contain nested grandchildren.
+        for (subfield_name, subfield_options) in json_opts.subfields() {
+            path_writer.push(subfield_name);
+
+            // Recurse unconditionally.
+            self.register_nested_subfields(path_writer, subfield_options);
+
+            path_writer.pop();
+        }
+    }
+
+    pub fn add_json_field_auto_nested<T: Into<JsonObjectOptions>>(
+        &mut self,
+        field_name_str: &str,
+        field_options: T,
+    ) -> Field {
+        let field_options: JsonObjectOptions = field_options.into();
+        // Add the main JSON field as usual
+        let field_entry = FieldEntry::new_json(field_name_str.to_string(), field_options.clone());
+        let added_field = self.add_field(field_entry);
+
+        // Regardless of whether top-level is nested, push the path,
+        // then recursively handle everything. Only objects with `object_mapping_type = Nested`
+        // will add `_is_parent_...` fields inside the recursion.
+        let mut path_writer = JsonPathWriter::with_expand_dots(false);
+        self.register_nested_subfields(&mut path_writer, &field_options);
+
+        // optionally pop the top-level if you like:
+        path_writer.pop();
+
+        added_field
     }
 
     /// Adds a field entry to the schema in build.
