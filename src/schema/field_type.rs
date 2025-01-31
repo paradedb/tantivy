@@ -12,7 +12,6 @@ use super::ip_options::IpAddrOptions;
 use super::IntoIpv6Addr;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::facet_options::FacetOptions;
-use crate::schema::json_object_options::ObjectMappingType;
 use crate::schema::{
     DateOptions, Facet, IndexRecordOption, JsonObjectOptions, NumericOptions, OwnedValue,
     TextFieldIndexing, TextOptions,
@@ -231,13 +230,10 @@ impl FieldType {
 
     /// returns true if this field is "nested"
     pub fn is_nested(&self) -> bool {
-        matches!(
-            self,
-            FieldType::JsonObject(JsonObjectOptions {
-                object_mapping_type: ObjectMappingType::Nested,
-                ..
-            })
-        )
+        match self {
+            FieldType::JsonObject(opts) => opts.is_nested(),
+            _ => false,
+        }
     }
 
     /// returns true if the field is indexed.

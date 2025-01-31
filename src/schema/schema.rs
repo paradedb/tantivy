@@ -246,7 +246,7 @@ impl SchemaBuilder {
     ) {
         // Only add `_is_parent_<current path>` if *this* object is nested.
         // (If you want to add `_is_parent_` for non-nested objects too, remove the `if`.)
-        if matches!(json_opts.object_mapping_type, ObjectMappingType::Nested) {
+        if json_opts.is_nested() {
             let is_parent_field = format!("_is_parent_{}", path_writer.as_str());
             println!("PARENT: _is_parent_{}", path_writer.as_str());
             self.add_bool_field(&is_parent_field, NumericOptions::default().set_indexed());
