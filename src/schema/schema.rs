@@ -236,6 +236,10 @@ impl SchemaBuilder {
         let field_entry = FieldEntry::new_json(field_name_str.to_string(), field_options.clone());
         let added_field = self.add_field(field_entry);
 
+        if self.fields_map.get("_is_parent").is_none() {
+            self.add_bool_field("_is_parent", NumericOptions::default().set_indexed());
+        }
+
         // Regardless of whether top-level is nested, push the path,
         // then recursively handle everything. Only objects with `object_mapping_type = Nested`
         // will add `_is_parent_...` fields inside the recursion.

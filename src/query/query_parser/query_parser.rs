@@ -542,12 +542,6 @@ impl QueryParser {
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         let field_name = field_entry.name();
-        if field_type.is_nested() {
-            // return Err(QueryParserError::UnsupportedQuery(format!(
-            //     "Cannot run direct text search on a `nested` field. Field: {}, Query: {}",
-            //     field_name, phrase
-            // )));
-        }
         if !field_type.is_indexed() {
             return Err(QueryParserError::FieldNotIndexed(field_name.to_string()));
         }

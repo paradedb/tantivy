@@ -137,6 +137,10 @@ impl CompactDoc {
         opts: &JsonObjectOptions,
     ) -> crate::Result<Vec<Self>> {
         let field_name = schema.get_field_name(field);
+        let parent_field = schema
+            .get_field("_is_parent")
+            .expect("must be configured with _is_parent field to support nesting");
+        self.add_bool(parent_field, true);
         explode_tantivy_docs(self, schema, field_name, value, opts)
     }
 
