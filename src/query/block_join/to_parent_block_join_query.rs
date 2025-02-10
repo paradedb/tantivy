@@ -40,8 +40,6 @@ impl FromStr for ScoreMode {
 
 impl ScoreMode {
     fn combine(&self, child_score: f32, accum: f32, _count: u32) -> f32 {
-        
-
         match self {
             ScoreMode::None => 0.0,
             ScoreMode::Total => accum + child_score,
@@ -52,8 +50,6 @@ impl ScoreMode {
     }
 
     fn finalize_score(&self, sumval: f32, count: u32) -> f32 {
-        
-
         match self {
             ScoreMode::None => 0.0,
             ScoreMode::Total => sumval,
@@ -61,8 +57,6 @@ impl ScoreMode {
                 if count == 0 {
                     0.0
                 } else {
-                    
-
                     sumval / count as f32
                 }
             }
@@ -290,15 +284,11 @@ impl DocSet for ToParentBlockJoinScorer {
             // We do lazy init here:
             self.advance_doc()
         } else {
-            
-
             self.current_parent.get()
         }
     }
 
     fn size_hint(&self) -> u32 {
-        
-
         self.parents.len() as u32
     }
 }
@@ -312,8 +302,6 @@ impl Scorer for ToParentBlockJoinScorer {
             let cnt = self.child_count.get();
 
             let final_score = self.score_mode.finalize_score(sumval, cnt);
-
-            
 
             final_score * self.boost
         }
@@ -379,6 +367,11 @@ impl ToParentBlockJoinScorer {
 
             // Advance child
             child_doc = child_scorer.advance();
+        }
+
+        // Skip if child is exactly at parent
+        if child_doc == parent_doc {
+            child_scorer.advance();
         }
 
         parent_doc
