@@ -256,7 +256,6 @@ impl SchemaBuilder {
     pub fn add_field(&mut self, field_entry: FieldEntry) -> Field {
         if field_entry.is_nested() {
             self.has_nested = true;
-        } else {
         }
 
         let field = Field::from_field_id(self.fields.len() as u32);
@@ -274,12 +273,12 @@ impl SchemaBuilder {
     /// Finalize the creation of a `Schema`
     /// This will consume your `SchemaBuilder`
     pub fn build(self) -> Schema {
-        let schema = Schema(Arc::new(InnerSchema {
+        
+        Schema(Arc::new(InnerSchema {
             fields: self.fields,
             fields_map: self.fields_map,
             has_nested: self.has_nested,
-        }));
-        schema
+        }))
     }
 }
 
@@ -360,8 +359,8 @@ impl Schema {
 
     /// Returns the number of fields in the schema.
     pub fn num_fields(&self) -> usize {
-        let count = self.0.fields.len();
-        count
+        
+        self.0.fields.len()
     }
 
     /// Return the list of all the `Field`s.

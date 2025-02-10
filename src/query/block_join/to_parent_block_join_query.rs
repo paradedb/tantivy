@@ -40,35 +40,35 @@ impl FromStr for ScoreMode {
 
 impl ScoreMode {
     fn combine(&self, child_score: f32, accum: f32, _count: u32) -> f32 {
-        let result = match self {
+        
+
+        match self {
             ScoreMode::None => 0.0,
             ScoreMode::Total => accum + child_score,
             ScoreMode::Avg => accum + child_score,
             ScoreMode::Max => accum.max(child_score),
             ScoreMode::Min => accum.min(child_score),
-        };
-
-        result
+        }
     }
 
     fn finalize_score(&self, sumval: f32, count: u32) -> f32 {
-        let final_score = match self {
+        
+
+        match self {
             ScoreMode::None => 0.0,
             ScoreMode::Total => sumval,
             ScoreMode::Avg => {
                 if count == 0 {
                     0.0
                 } else {
-                    let avg = sumval / count as f32;
+                    
 
-                    avg
+                    sumval / count as f32
                 }
             }
             ScoreMode::Max => sumval,
             ScoreMode::Min => sumval,
-        };
-
-        final_score
+        }
     }
 }
 
@@ -290,16 +290,16 @@ impl DocSet for ToParentBlockJoinScorer {
             // We do lazy init here:
             self.advance_doc()
         } else {
-            let current = self.current_parent.get();
+            
 
-            current
+            self.current_parent.get()
         }
     }
 
     fn size_hint(&self) -> u32 {
-        let size = self.parents.len() as u32;
+        
 
-        size
+        self.parents.len() as u32
     }
 }
 
@@ -313,9 +313,9 @@ impl Scorer for ToParentBlockJoinScorer {
 
             let final_score = self.score_mode.finalize_score(sumval, cnt);
 
-            let boosted_score = final_score * self.boost;
+            
 
-            boosted_score
+            final_score * self.boost
         }
     }
 }

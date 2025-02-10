@@ -517,7 +517,7 @@ pub mod explode {
         Ok(exploded_docs
             .into_iter()
             .map(|value| {
-                TantivyDocument::from_json_object(&schema, value.as_object().unwrap().clone())
+                TantivyDocument::from_json_object(schema, value.as_object().unwrap().clone())
                     .unwrap()
             })
             .collect())

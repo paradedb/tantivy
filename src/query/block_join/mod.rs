@@ -68,36 +68,26 @@ mod scorer_tests {
         }
     }
 
-    /// This test emulates the Java testScoreNone scenario:
-    /// We build 10 "blocks."  Block i has i child docs, then 1 parent doc (with docType="parent").
-    /// The child query matches all child docs, but ScoreMode::None => the parent's score is 0.0,
-    /// and the doc iteration returns only the parent docs in order.
     #[test]
     fn test_score_none() -> Result<()> {
-        // 1) Build schema
         let mut sb = SchemaBuilder::default();
         let value_f = sb.add_text_field("value", STRING | STORED);
         let doctype_f = sb.add_text_field("docType", STRING);
         let schema = sb.build();
 
-        // 2) Create index
         let ram = RamDirectory::create();
         let index = Index::create(ram, schema.clone(), IndexSettings::default())?;
 
-        // 3) Index 10 blocks: block i has i child docs + 1 parent
         {
             let mut writer = index.writer_for_tests()?;
             for i in 0..10 {
                 let mut block_docs = Vec::new();
-                // Add i child docs
                 for j in 0..i {
-                    // child: "value" => j
                     let child_doc = doc! {
                         value_f => j.to_string(),
                     };
                     block_docs.push(child_doc);
                 }
-                // parent doc
                 let parent_doc = doc! {
                     doctype_f => "parent",
                     value_f   => i.to_string(),
@@ -108,31 +98,23 @@ mod scorer_tests {
             writer.commit()?;
         }
 
-        // 4) Create a searcher
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        // 5) "parents filter"
         let parent_bits = Arc::new(ParentBitsForScorerTest::new(doctype_f));
 
-        // 6) Child query => matches all docs. We only want to match child docs, but it's okay to use AllQuery
-        //    Because the block-join logic enforces the docType=parent is not in child query (not indexed).
         let child_query = AllQuery;
 
-        // 7) Wrap with ToParentBlockJoinQuery => ScoreMode::None
         let join_q = ToParentBlockJoinQuery::new(
             Box::new(child_query),
             parent_bits.clone(),
             ScoreMode::None,
         );
 
-        // 8) Search for top 20 hits
         let top_docs = searcher.search(&join_q, &TopDocs::with_limit(20))?;
 
-        // Expect 10 parent docs
         assert_eq!(10, top_docs.len(), "We should find exactly 10 parents.");
 
-        // Scores must be zero with ScoreMode::None
         for (score, _addr) in &top_docs {
             assert!(
                 (*score - 0.0).abs() < f32::EPSILON,
@@ -140,8 +122,6 @@ mod scorer_tests {
             );
         }
 
-        // Optionally, confirm the "value" field is in ascending order
-        // i.e. the parent blocks should appear in the same order we inserted them
         let mut last_i: i64 = -1;
         for (_, addr) in &top_docs {
             let val_str = doc_string_field(&searcher, *addr, value_f);
@@ -184,9 +164,6 @@ mod test {
     use crate::{doc, IndexWriter, Term};
     use crate::{Result, SegmentReader, TERMINATED};
 
-    // --------------------------------------------------------------------------
-    // A small helper for building test doc arrays (resumes vs children).
-    // --------------------------------------------------------------------------
     fn make_resume(name_f: Field, country_f: Field, name: &str, country: &str) -> TantivyDocument {
         doc! {
             name_f => name,
@@ -208,9 +185,6 @@ mod test {
         }
     }
 
-    // --------------------------------------------------------------------------
-    // A test-specific "parent filter" that marks docType="resume" as parent.
-    // --------------------------------------------------------------------------
     pub struct ResumeParentBitSetProducer {
         doc_type_field: Field,
     }
@@ -226,7 +200,6 @@ mod test {
             let max_doc = reader.max_doc();
             let mut bitset = BitSet::with_max_value(max_doc);
 
-            // Inverted index
             let inverted = reader.inverted_index(self.doc_type_field)?;
             let term = crate::Term::from_field_text(self.doc_type_field, "resume");
             if let Some(mut postings) = inverted.read_postings(&term, IndexRecordOption::Basic)? {
@@ -244,16 +217,10 @@ mod test {
     fn strset<T: IntoIterator<Item = String>>(items: T) -> HashSet<String> {
         items.into_iter().collect()
     }
-
-    // --------------------------------------------------------------------------
-    // Now the test functions follow
-    // --------------------------------------------------------------------------
-
     /// This test checks that if we have a child filter that matches zero child docs,
     /// then ToParentBlockJoinQuery should produce no parent documents.
     #[test]
     fn test_empty_child_filter() -> crate::Result<()> {
-        // 1) Set up the schema and index as before
         let mut sb = SchemaBuilder::default();
         let skill_f = sb.add_text_field("skill", STRING | STORED);
         let year_f = sb.add_i64_field("year", FAST | STORED);
@@ -297,14 +264,11 @@ mod test {
             writer.commit()?;
         }
 
-        // 2) Build the searcher
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        // 3) Build a ParentBitSetProducer: which docs are parents?
         let parent_bits = Arc::new(ResumeParentBitSetProducer::new(doctype_f));
 
-        // 4) Child filter: skill=java AND year in [2006..2011]
         let q_java = TermQuery::new(
             Term::from_field_text(skill_f, "java"),
             IndexRecordOption::Basic,
@@ -317,11 +281,9 @@ mod test {
 
         let child_bq = BooleanQuery::intersection(vec![Box::new(q_java), Box::new(q_year)]);
 
-        // 5) Wrap that child query in a ToParentBlockJoinQuery
         let join_q =
             ToParentBlockJoinQuery::new(Box::new(child_bq), parent_bits.clone(), ScoreMode::Avg);
 
-        // 6) Search and confirm we get two parents (Lisa, Frank)
         let top_docs = searcher.search(&join_q, &TopDocs::with_limit(10))?;
         assert_eq!(
             2,
@@ -329,7 +291,6 @@ mod test {
             "Expected 2 parents from the child->parent join!"
         );
 
-        // Optionally verify that those parents are Lisa and Frank
         let found_names: HashSet<String> = top_docs
             .iter()
             .map(|(_, addr)| doc_string_field(&searcher, *addr, name_f))
@@ -426,24 +387,18 @@ mod test {
 
     #[test]
     fn test_simple() -> Result<()> {
-        // 1) Define a custom TextOptions with the raw tokenizer.
         let raw_stored_indexed = TextOptions::default().set_stored().set_indexing_options(
             TextFieldIndexing::default()
                 .set_tokenizer("raw")
                 .set_index_option(IndexRecordOption::Basic),
         );
 
-        // 2) Build schema, specifying raw tokenizer for skill, docType, country
-        //    while "year" is i64, "name" is just stored text, etc.
         let mut sb = SchemaBuilder::default();
 
-        // skill => raw tokenizer (stored, indexed)
         let skill_f = sb.add_text_field("skill", raw_stored_indexed.clone());
 
-        // year => i64
         let year_f = sb.add_i64_field("year", FAST | STORED);
 
-        // docType => raw tokenizer (not stored in this example—unless you want it)
         let doc_type_options = TextOptions::default().set_indexing_options(
             TextFieldIndexing::default()
                 .set_tokenizer("raw")
@@ -451,19 +406,14 @@ mod test {
         );
         let doctype_f = sb.add_text_field("docType", doc_type_options);
 
-        // name => just stored text (for retrieval), no indexing
         let name_f = sb.add_text_field("name", STORED);
 
-        // country => raw tokenizer (stored + indexed)
         let country_f = sb.add_text_field("country", raw_stored_indexed);
 
         let schema = sb.build();
 
-        // 3) Create the index, add documents in parent-child blocks
         let _ram = RamDirectory::create();
-        // Create index as before
-        //
-        // Create our custom TokenizerManager
+
         let my_tokenizers = TokenizerManager::default();
         my_tokenizers.register("raw", TextAnalyzer::from(RawTokenizer::default()));
         let index = Index::builder()
@@ -497,14 +447,12 @@ mod test {
             writer.commit()?;
         }
 
-        // 4) Build a searcher
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
         // Create a "parent bitset" for docs with docType="resume"
         let parent_bits = Arc::new(ResumeParentBitSetProducer::new(doctype_f));
 
-        // child => skill=java, year in [2006..2011]
         let q_java = TermQuery::new(
             Term::from_field_text(skill_f, "java"),
             IndexRecordOption::Basic,
@@ -515,13 +463,11 @@ mod test {
         );
         let child_bq = BooleanQuery::intersection(vec![Box::new(q_java.clone()), Box::new(q_year)]);
 
-        // parent => country="United Kingdom"
         let parent_q = TermQuery::new(
             Term::from_field_text(country_f, "United Kingdom"),
             IndexRecordOption::Basic,
         );
 
-        // 5) child->parent join
         let child_join =
             ToParentBlockJoinQuery::new(Box::new(child_bq), parent_bits.clone(), ScoreMode::Avg);
         let and_query = BooleanQuery::intersection(vec![Box::new(parent_q), Box::new(child_join)]);
@@ -530,7 +476,6 @@ mod test {
         let name_val = doc_string_field(&searcher, top_docs[0].1, name_f);
         assert_eq!("Lisa", name_val);
 
-        // 6) Now parent->child join
         let up_join = ToChildBlockJoinQuery::new(
             Box::new(TermQuery::new(
                 Term::from_field_text(country_f, "United Kingdom"),
@@ -538,7 +483,7 @@ mod test {
             )),
             parent_bits.clone(),
         );
-        // child => skill=java
+
         let child_again = BooleanQuery::intersection(vec![Box::new(up_join), Box::new(q_java)]);
         let child_hits = searcher.search(&child_again, &TopDocs::with_limit(10))?;
         assert_eq!(1, child_hits.len());

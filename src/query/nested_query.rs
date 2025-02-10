@@ -742,18 +742,6 @@ mod tests {
 
     #[test]
     fn test_nested_must_not_clause() -> crate::Result<()> {
-        //
-        // 1) Create a nested schema for "comments".
-        //
-        //    Each doc JSON looks like:
-        //       {
-        //         "comments": [
-        //           {"author": "kimchy"},
-        //           ...
-        //         ]
-        //       }
-        //    ... so we declare "comments" as a nested array, each item has sub-fields like "author".
-        //
         let posts_opts = JsonObjectOptions::nested()
             .set_indexing_options(TextFieldIndexing::default().set_tokenizer("raw"))
             .add_subfield("comments", JsonObjectOptions::nested());
@@ -765,16 +753,6 @@ mod tests {
         let index = Index::create_in_ram(schema.clone());
         let mut writer: IndexWriter<TantivyDocument> =
             index.writer_with_num_threads(1, 50_000_000)?;
-
-        //
-        // 2) Insert sample docs:
-        //
-        //    Doc #1 => { "comments": [ { "author": "kimchy" } ] }
-        //    Doc #2 => { "comments": [ { "author": "kimchy" }, { "author": "nik9000" } ] }
-        //    Doc #3 => { "comments": [ { "author": "nik9000" } ] }
-        //
-        //    Because "comments" is a nested field, we need to use add_nested_object to explode them.
-        //
 
         // --- Doc #1
         {
@@ -824,12 +802,6 @@ mod tests {
 
         writer.commit()?;
 
-        //
-        // 3) Perform queries
-        //
-        //    For convenience, we can parse terms (like "comments.author:nik9000") via QueryParser,
-        //    and also parse "*:*" for AllQuery. Then we’ll combine them with BooleanQuery and NestedQuery.
-        //
         let reader = index.reader()?;
         let searcher = reader.searcher();
         let query_parser = QueryParser::for_index(&index, vec![posts_field]);

@@ -124,11 +124,11 @@ fn compute_deleted_bitset(
                 segment_id,
                 doc_id,
             } => {
-                if *segment_id == segment_reader.segment_id() {
-                    if doc_opstamps.is_deleted(*doc_id, *opstamp) {
-                        alive_bitset.remove(*doc_id);
-                        might_have_changed = true;
-                    }
+                if *segment_id == segment_reader.segment_id()
+                    && doc_opstamps.is_deleted(*doc_id, *opstamp)
+                {
+                    alive_bitset.remove(*doc_id);
+                    might_have_changed = true;
                 }
             }
         }

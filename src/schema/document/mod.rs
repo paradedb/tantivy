@@ -160,7 +160,6 @@
 mod de;
 mod default_document;
 mod existing_type_impls;
-// mod nested_json_sorted_expansion;
 mod owned_value;
 mod se;
 mod value;
@@ -168,7 +167,6 @@ mod value;
 use std::collections::BTreeMap;
 use std::mem;
 
-// pub use nested_json_sorted_expansion::parse_json_for_nested_sorted;
 pub(crate) use self::de::BinaryDocumentDeserializer;
 pub use self::de::{
     ArrayAccess, DeserializeError, DocumentDeserialize, DocumentDeserializer, ObjectAccess,
