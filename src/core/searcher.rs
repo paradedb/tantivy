@@ -5,9 +5,9 @@ use std::{fmt, io};
 use crate::collector::Collector;
 use crate::core::Executor;
 use crate::index::{SegmentId, SegmentReader};
-use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
+use crate::query::{Bm25StatisticsProvider, BooleanQuery, EnableScoring, Query, TermQuery};
 use crate::schema::document::DocumentDeserialize;
-use crate::schema::{Schema, Term};
+use crate::schema::{IndexRecordOption, Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
 use crate::{DocAddress, Index, Opstamp, TrackedObject};
@@ -224,7 +224,18 @@ impl Searcher {
         executor: &Executor,
         enabled_scoring: EnableScoring,
     ) -> crate::Result<C::Fruit> {
-        let weight = query.weight(enabled_scoring)?;
+        let schema = self.schema();
+        let weight = if schema.has_nested() {
+            let is_parent_field = schema
+                .get_field("_is_parent")
+                .expect("schema with nested fields must have internal 'is_parent' field");
+            let is_parent_term = Term::from_field_bool(is_parent_field, true);
+            let is_parent_query = TermQuery::new(is_parent_term, IndexRecordOption::Basic);
+            BooleanQuery::intersection(vec![Box::new(is_parent_query), query.box_clone()])
+                .weight(enabled_scoring)?
+        } else {
+            query.weight(enabled_scoring)?
+        };
         let segment_readers = self.segment_readers();
         let fruits = executor.map(
             |(segment_ord, segment_reader)| {

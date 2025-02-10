@@ -34,7 +34,7 @@ use crate::TantivyError;
 pub struct SchemaBuilder {
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>,
-    nested_paths: HashMap<Vec<String>, Field>,
+    has_nested: bool,
 }
 
 impl SchemaBuilder {
@@ -254,6 +254,13 @@ impl SchemaBuilder {
 
     /// Adds a field entry to the schema in build.
     pub fn add_field(&mut self, field_entry: FieldEntry) -> Field {
+        if field_entry.is_nested() {
+            println!("IS NESTED: {}", field_entry.name());
+            self.has_nested = true;
+        } else {
+            println!("NOT NESTED: {}", field_entry.name());
+        }
+
         let field = Field::from_field_id(self.fields.len() as u32);
         let field_name = field_entry.name().to_string();
         if let Some(_previous_value) = self.fields_map.insert(field_name.clone(), field) {
@@ -272,7 +279,7 @@ impl SchemaBuilder {
         let schema = Schema(Arc::new(InnerSchema {
             fields: self.fields,
             fields_map: self.fields_map,
-            nested_paths: self.nested_paths,
+            has_nested: self.has_nested,
         }));
         schema
     }
@@ -282,7 +289,7 @@ impl SchemaBuilder {
 struct InnerSchema {
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>, // transient
-    nested_paths: HashMap<Vec<String>, Field>,
+    has_nested: bool,
 }
 
 impl PartialEq for InnerSchema {
@@ -368,12 +375,8 @@ impl Schema {
             .map(|(field_id, field_entry)| (Field::from_field_id(field_id as u32), field_entry))
     }
 
-    pub fn nested_fields(&self) -> impl Iterator<Item = (&Vec<String>, Field, &FieldEntry)> {
-        self.0
-            .nested_paths
-            .iter()
-            .enumerate()
-            .map(|(i, (path, field))| (path, *field, &self.0.fields[i]))
+    pub fn has_nested(&self) -> bool {
+        self.0.has_nested
     }
 
     /// Creates a new builder.
@@ -386,17 +389,6 @@ impl Schema {
         match self.0.fields_map.get(field_name) {
             Some(field) => Ok(*field),
             None => Err(TantivyError::FieldNotFound(field_name.to_string())),
-        }
-    }
-
-    pub fn get_nested_field(&self, path: &[String]) -> Option<(Field, FieldEntry)> {
-        let path_vec: Vec<String> = path.to_vec();
-        match self.0.nested_paths.get(&path_vec) {
-            Some(&f) => {
-                let field_entry = self.0.fields[f.field_id() as usize].clone();
-                Some((f, field_entry))
-            }
-            None => None,
         }
     }
 
@@ -494,7 +486,7 @@ impl<'de> Deserialize<'de> for Schema {
                 let mut schema = SchemaBuilder {
                     fields: Vec::with_capacity(seq.size_hint().unwrap_or(0)),
                     fields_map: HashMap::with_capacity(seq.size_hint().unwrap_or(0)),
-                    nested_paths: HashMap::new(),
+                    has_nested: false,
                 };
 
                 while let Some(value) = seq.next_element()? {

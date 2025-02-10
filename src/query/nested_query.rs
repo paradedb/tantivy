@@ -211,11 +211,12 @@ impl ParentBitSetProducer for NestedParentBitSetProducer {
 #[cfg(test)]
 mod tests {
     use crate::collector::TopDocs;
-    use crate::query::{BooleanQuery, NestedQuery, QueryParser, ScoreMode};
+    use crate::query::{AllQuery, BooleanQuery, NestedQuery, QueryClone, QueryParser, ScoreMode};
     use crate::schema::{
         IndexRecordOption, JsonObjectOptions, Schema, SchemaBuilder, TextFieldIndexing,
     };
     use crate::{doc, Index, IndexWriter, TantivyDocument};
+    use query_grammar::Occur;
     use serde_json::json;
 
     #[test]
@@ -333,17 +334,12 @@ mod tests {
             .parse_query("driver_json.vehicle.model:Canyonero")
             .unwrap();
         let top_docs = searcher.search(&non_nested_query, &TopDocs::with_limit(10))?;
-        assert_eq!(
-            top_docs.len(),
-            3,
-            "Expected 3  docs (child + parent + grandparent) "
-        );
-        assert_eq!(top_docs[0].1.doc_id, 0,);
-        assert_eq!(top_docs[1].1.doc_id, 2,);
+        assert_eq!(top_docs.len(), 1, "Expected 1 parent doc");
+        assert_eq!(top_docs[0].1.doc_id, 3);
 
         let parent_query = query_parser.parse_query("last_name:McQueen").unwrap();
         let top_docs = searcher.search(&parent_query, &TopDocs::with_limit(10))?;
-        assert_eq!(top_docs.len(), 1, "Expected one doc with the parent data.");
+        assert_eq!(top_docs.len(), 1, "Expected one doc with parent data");
         assert_eq!(
             top_docs[0].1.doc_id, 3,
             "Parent doc is the last doc (doc_id=3)"
@@ -562,11 +558,7 @@ mod tests {
         let child_q1 = query_parser
             .parse_query("driver_json.crew.role:mechanic AND driver_json.crew.kids.name:Eve")?;
         let top_docs1 = searcher.search(&child_q1, &TopDocs::with_limit(10))?;
-        assert_eq!(
-            2,
-            top_docs1.len(),
-            "Parent and grandparent match non-nested query"
-        );
+        assert_eq!(1, top_docs1.len(), "Grandparent matches non-nested query");
 
         let child_q2 = query_parser
             .parse_query("driver_json.crew.role:mechanic AND driver_json.crew.kids.name:Eve")?;
@@ -609,6 +601,339 @@ mod tests {
         let plain_q = query_parser.parse_query("driver_json.last_name:McQueen")?;
         let top_docs_plain = searcher.search(&plain_q, &TopDocs::with_limit(10))?;
         assert_eq!(1, top_docs_plain.len(), "Should match on last_name=McQueen");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_query_two_docs() -> crate::Result<()> {
+        let driver_json_opts = JsonObjectOptions::nested()
+            .set_indexing_options(TextFieldIndexing::default())
+            .add_subfield(
+                "driver",
+                JsonObjectOptions::nested().add_subfield("vehicle", JsonObjectOptions::nested()),
+            );
+
+        let mut schema_builder = SchemaBuilder::new();
+        println!("OPTS: {:#?}", driver_json_opts);
+        let driver_field =
+            schema_builder.add_nested_json_field("nested_data", driver_json_opts.clone());
+
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+
+        let doc1 = json!({
+            "driver": {
+                "last_name": "McQueen",
+                "vehicle": [
+                    { "make": "Powell Motors", "model": "Canyonero" },
+                    { "make": "Miller-Meteor", "model": "Ecto-1" }
+                ]
+            }
+        });
+
+        let doc2 = json!({
+            "driver": {
+                "last_name": "Hudson",
+                "vehicle": [
+                    { "make": "Mifune", "model": "Mach Five" },
+                    { "make": "Miller-Meteor", "model": "Ecto-1" }
+                ]
+            }
+        });
+
+        let mut writer: IndexWriter<TantivyDocument> =
+            index.writer_with_num_threads(2, 50_000_000)?;
+        {
+            let mut parent_doc1 = TantivyDocument::default();
+            let mut exploded_children = parent_doc1
+                .add_nested_object(&schema, driver_field, doc1, &driver_json_opts)
+                .unwrap();
+            exploded_children.push(parent_doc1);
+
+            writer.add_documents(exploded_children)?;
+        }
+
+        {
+            let mut parent_doc2 = TantivyDocument::default();
+            let mut exploded_children = parent_doc2
+                .add_nested_object(&schema, driver_field, doc2, &driver_json_opts)
+                .unwrap();
+            exploded_children.push(parent_doc2);
+
+            writer.add_documents(exploded_children)?;
+        }
+
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let query_parser = QueryParser::for_index(&index, vec![driver_field]);
+
+        let child_query_a = query_parser.parse_query(
+            "nested_data.driver.vehicle.make:powell AND nested_data.driver.vehicle.model:canyonero",
+        )?;
+        let nested_query_a = NestedQuery::new(
+            vec!["nested_data".to_string()],
+            Box::new(NestedQuery::new(
+                vec!["nested_data".to_string(), "driver".to_string()],
+                Box::new(NestedQuery::new(
+                    vec![
+                        "nested_data".to_string(),
+                        "driver".to_string(),
+                        "vehicle".to_string(),
+                    ],
+                    Box::new(child_query_a),
+                    ScoreMode::Avg,
+                    false,
+                )),
+                ScoreMode::Avg,
+                false,
+            )),
+            ScoreMode::Avg,
+            false,
+        );
+
+        let top_docs_a = searcher.search(&nested_query_a, &TopDocs::with_limit(10))?;
+
+        assert_eq!(
+            1,
+            top_docs_a.len(),
+            "Only doc #1 should match Powell + Canyonero"
+        );
+
+        let child_query_b = query_parser.parse_query(
+            "nested_data.driver.vehicle.make:miller AND nested_data.driver.vehicle.model:ecto",
+        )?;
+        let nested_query_b = NestedQuery::new(
+            vec!["nested_data".to_string()],
+            Box::new(NestedQuery::new(
+                vec!["nested_data".to_string(), "driver".to_string()],
+                Box::new(NestedQuery::new(
+                    vec![
+                        "nested_data".to_string(),
+                        "driver".to_string(),
+                        "vehicle".to_string(),
+                    ],
+                    Box::new(child_query_b),
+                    ScoreMode::Avg,
+                    false,
+                )),
+                ScoreMode::Avg,
+                false,
+            )),
+            ScoreMode::Avg,
+            false,
+        );
+
+        let top_docs_b = searcher.search(&nested_query_b, &TopDocs::with_limit(10))?;
+        assert_eq!(
+            2,
+            top_docs_b.len(),
+            "Both doc #1 and doc #2 should match Miller-Meteor / Ecto-1"
+        );
+
+        let plain_query = query_parser.parse_query("driver.last_name:Hudson")?;
+        let top_docs_plain = searcher.search(&plain_query, &TopDocs::with_limit(10))?;
+        assert_eq!(1, top_docs_plain.len(), "One doc with last_name=Hudson");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_must_not_clause() -> crate::Result<()> {
+        //
+        // 1) Create a nested schema for "comments".
+        //
+        //    Each doc JSON looks like:
+        //       {
+        //         "comments": [
+        //           {"author": "kimchy"},
+        //           ...
+        //         ]
+        //       }
+        //    ... so we declare "comments" as a nested array, each item has sub-fields like "author".
+        //
+        let posts_opts = JsonObjectOptions::nested()
+            .set_indexing_options(TextFieldIndexing::default().set_tokenizer("raw"))
+            .add_subfield("comments", JsonObjectOptions::nested());
+
+        let mut schema_builder = SchemaBuilder::new();
+        let posts_field = schema_builder.add_nested_json_field("posts", posts_opts.clone());
+
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        let mut writer: IndexWriter<TantivyDocument> =
+            index.writer_with_num_threads(1, 50_000_000)?;
+
+        //
+        // 2) Insert sample docs:
+        //
+        //    Doc #1 => { "comments": [ { "author": "kimchy" } ] }
+        //    Doc #2 => { "comments": [ { "author": "kimchy" }, { "author": "nik9000" } ] }
+        //    Doc #3 => { "comments": [ { "author": "nik9000" } ] }
+        //
+        //    Because "comments" is a nested field, we need to use add_nested_object to explode them.
+        //
+
+        // --- Doc #1
+        {
+            let doc1_json = json!({
+                "comments": [
+                    {"author": "kimchy"}
+                ]
+            });
+            let mut parent_doc1 = TantivyDocument::default();
+            let mut exploded1 = parent_doc1
+                .add_nested_object(&schema, posts_field, doc1_json, &posts_opts)
+                .unwrap();
+            exploded1.push(parent_doc1);
+            writer.add_documents(exploded1)?;
+        }
+
+        // --- Doc #2
+        {
+            let doc2_json = json!({
+                "comments": [
+                    {"author": "kimchy"},
+                    {"author": "nik9000"}
+                ]
+            });
+            let mut parent_doc2 = TantivyDocument::default();
+            let mut exploded2 = parent_doc2
+                .add_nested_object(&schema, posts_field, doc2_json, &posts_opts)
+                .unwrap();
+            exploded2.push(parent_doc2);
+            writer.add_documents(exploded2)?;
+        }
+
+        // --- Doc #3
+        {
+            let doc3_json = json!({
+                "comments": [
+                    {"author": "nik9000"}
+                ]
+            });
+            let mut parent_doc3 = TantivyDocument::default();
+            let mut exploded3 = parent_doc3
+                .add_nested_object(&schema, posts_field, doc3_json, &posts_opts)
+                .unwrap();
+            exploded3.push(parent_doc3);
+            writer.add_documents(exploded3)?;
+        }
+
+        writer.commit()?;
+
+        //
+        // 3) Perform queries
+        //
+        //    For convenience, we can parse terms (like "comments.author:nik9000") via QueryParser,
+        //    and also parse "*:*" for AllQuery. Then we’ll combine them with BooleanQuery and NestedQuery.
+        //
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let query_parser = QueryParser::for_index(&index, vec![posts_field]);
+
+        // ========================================================
+        // (A) Nested "must_not => nik9000" at the child level
+        //
+        // This picks any doc that has at least one child subdoc
+        // *not* matching "author=nik9000".
+        //
+        // We do that by building a BooleanQuery with:
+        //   MUST: [AllQuery] (i.e., any subdoc)
+        //   MUST_NOT: [nik9000]
+        //
+        // Then we wrap that in NestedQuery(path=["comments"]).
+        // So a doc matches if it has at least one comment child where
+        // "author != nik9000".
+        //
+        // Expect: Doc #1 (kimchy) and Doc #2 (kimchy + nik9000).
+        //         Doc #2 qualifies via the "kimchy" subdocument.
+        //         Doc #3 does NOT qualify because its only subdoc is "nik9000".
+        // ========================================================
+
+        let nested_inner = NestedQuery::new(
+            vec!["posts".into()],
+            Box::new(NestedQuery::new(
+                vec!["posts".into(), "comments".into()],
+                Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, AllQuery.box_clone()),
+                    (
+                        Occur::MustNot,
+                        query_parser
+                            .parse_query("posts.comments.author:nik9000")?
+                            .box_clone(),
+                    ),
+                ])),
+                ScoreMode::Avg,
+                false,
+            )),
+            ScoreMode::Avg,
+            false,
+        );
+
+        let top_docs_inner = searcher.search(&nested_inner, &TopDocs::with_limit(10))?;
+        let doc_ids_inner: Vec<u32> = top_docs_inner
+            .iter()
+            .map(|(_, docaddr)| docaddr.doc_id)
+            .collect();
+
+        // We expect doc_ids_inner to have 2 hits (Doc #1 and #2).
+        // The actual doc_id values in the segment can vary, so we check len().
+        assert_eq!(
+            2,
+            doc_ids_inner.len(),
+            "Docs #1 and #2 should match must_not => 'nik9000' at child-level"
+        );
+
+        // ========================================================
+        // (B) Place the must_not at the *outer* level
+        //
+        // We want to exclude any doc that has ANY child subdoc with "author=nik9000".
+        // So we do:
+        //   MUST: [AllQuery]   // match all docs
+        //   MUST_NOT: [ NestedQuery(path=["comments"], child=TermQuery(nik9000)) ]
+        //
+        // That means "throw away any doc that has a comment subdoc with 'nik9000'."
+        //
+        // Expect: Only Doc #1 remains. (Docs #2 and #3 both contain 'nik9000' subdocs.)
+        // ========================================================
+        let bool_outer = BooleanQuery::new(vec![
+            (Occur::Must, AllQuery.box_clone()),
+            (
+                Occur::MustNot,
+                Box::new(NestedQuery::new(
+                    vec!["posts".into()],
+                    NestedQuery::new(
+                        vec!["posts".into(), "comments".into()],
+                        query_parser
+                            .parse_query("posts.comments.author:nik9000")?
+                            .box_clone(),
+                        ScoreMode::Avg,
+                        false,
+                    )
+                    .box_clone(),
+                    ScoreMode::Avg,
+                    false,
+                )),
+            ),
+        ]);
+
+        let top_docs_outer = searcher.search(&bool_outer, &TopDocs::with_limit(10))?;
+        let doc_ids_outer: Vec<u32> = top_docs_outer
+            .iter()
+            .map(|(_, docaddr)| docaddr.doc_id)
+            .collect();
+
+        // We expect only 1 doc to remain: the doc that has no "nik9000" at all.
+        // That’s doc #1 in our data set.
+        assert_eq!(
+            1,
+            doc_ids_outer.len(),
+            "Only doc #1 remains, because docs #2 and #3 contain 'nik9000'"
+        );
 
         Ok(())
     }

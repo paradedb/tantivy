@@ -486,6 +486,8 @@ pub mod explode {
             Some(&opts.clone().add_subfield(field_name, opts.clone())),
         );
 
+        println!("EXPLODED DOCS: {exploded_docs:#?}");
+
         let exploded_parent = match exploded_docs.pop() {
             Some(Value::Object(obj)) => obj,
             _ => unreachable!("constructed as an object"),
