@@ -615,7 +615,6 @@ mod tests {
             );
 
         let mut schema_builder = SchemaBuilder::new();
-        println!("OPTS: {:#?}", driver_json_opts);
         let driver_field =
             schema_builder.add_nested_json_field("nested_data", driver_json_opts.clone());
 

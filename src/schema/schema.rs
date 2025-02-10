@@ -255,10 +255,8 @@ impl SchemaBuilder {
     /// Adds a field entry to the schema in build.
     pub fn add_field(&mut self, field_entry: FieldEntry) -> Field {
         if field_entry.is_nested() {
-            println!("IS NESTED: {}", field_entry.name());
             self.has_nested = true;
         } else {
-            println!("NOT NESTED: {}", field_entry.name());
         }
 
         let field = Field::from_field_id(self.fields.len() as u32);
