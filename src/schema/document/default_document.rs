@@ -160,7 +160,6 @@ impl CompactDoc {
     }
 
     /// Add a (field, leaf value) to the document.
-
     /// Leaf values don't have nested values.
     pub fn add_leaf_field_value<'a, T: Into<ReferenceValueLeaf<'a>>>(
         &mut self,

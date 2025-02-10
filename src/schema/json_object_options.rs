@@ -670,6 +670,7 @@ pub mod explode {
     }
 
     #[cfg(test)]
+    #[allow(clippy::approx_constant)]
     mod tests {
         use std::collections::BTreeMap;
 
@@ -1081,20 +1082,15 @@ pub mod explode {
                 }
             });
 
-            let mut vehicle_opts = JsonObjectOptions::default();
-            vehicle_opts.object_mapping_type = ObjectMappingType::Nested;
+            let vehicle_opts = JsonObjectOptions::default().set_nested();
 
-            let mut driver_json_opts = JsonObjectOptions::default();
-            driver_json_opts.object_mapping_type = ObjectMappingType::Nested;
-            driver_json_opts
-                .subfields
-                .insert("vehicle".to_string(), vehicle_opts);
+            let driver_json_opts = JsonObjectOptions::default()
+                .set_nested()
+                .add_subfield("vehicle", vehicle_opts);
 
-            let mut top_opts = JsonObjectOptions::default();
-            top_opts.object_mapping_type = ObjectMappingType::Nested;
-            top_opts
-                .subfields
-                .insert("driver_json".to_string(), driver_json_opts);
+            let top_opts = JsonObjectOptions::default()
+                .set_nested()
+                .add_subfield("driver_json", driver_json_opts);
 
             let docs = explode(&[], value.clone(), Some(&top_opts));
 

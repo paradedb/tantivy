@@ -236,7 +236,7 @@ impl SchemaBuilder {
         let field_entry = FieldEntry::new_json(field_name_str.to_string(), field_options.clone());
         let added_field = self.add_field(field_entry);
 
-        if self.fields_map.get("_is_parent").is_none() {
+        if !self.fields_map.contains_key("_is_parent") {
             self.add_bool_field("_is_parent", NumericOptions::default().set_indexed());
         }
 
@@ -273,7 +273,6 @@ impl SchemaBuilder {
     /// Finalize the creation of a `Schema`
     /// This will consume your `SchemaBuilder`
     pub fn build(self) -> Schema {
-        
         Schema(Arc::new(InnerSchema {
             fields: self.fields,
             fields_map: self.fields_map,
@@ -359,7 +358,6 @@ impl Schema {
 
     /// Returns the number of fields in the schema.
     pub fn num_fields(&self) -> usize {
-        
         self.0.fields.len()
     }
 
