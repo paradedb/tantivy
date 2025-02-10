@@ -1,12 +1,11 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::ParentBitSetProducer;
 use crate::core::searcher::Searcher;
 use crate::index::SegmentId;
 use crate::query::{EmptyScorer, EnableScoring, Explanation, Query, QueryClone, Scorer, Weight};
 use crate::{DocId, DocSet, Result, Score, SegmentReader, TERMINATED};
-
-use super::ParentBitSetProducer;
 
 /// A query that returns all matching child documents for one specific
 /// parent document (by parent segment ID + doc_id).

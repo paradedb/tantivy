@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 use common::BitSet;
 
+use super::ParentBitSetProducer;
 use crate::core::searcher::Searcher;
 use crate::query::{EmptyScorer, EnableScoring, Explanation, Query, QueryClone, Scorer, Weight};
 use crate::schema::Term;
 use crate::{DocAddress, DocId, DocSet, Result, Score, SegmentReader, TERMINATED};
-
-use super::ParentBitSetProducer;
 
 pub struct ToChildBlockJoinQuery {
     parent_query: Box<dyn Query>,

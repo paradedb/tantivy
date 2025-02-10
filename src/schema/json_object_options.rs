@@ -466,12 +466,11 @@ mod tests {
 }
 
 pub mod explode {
-    use crate::{
-        schema::{DocParsingError, JsonObjectOptions, ObjectMappingType, Schema},
-        Result, TantivyDocument,
-    };
     use common::JsonPathWriter;
     use serde_json::{json, Map, Value};
+
+    use crate::schema::{DocParsingError, JsonObjectOptions, ObjectMappingType, Schema};
+    use crate::{Result, TantivyDocument};
 
     pub fn explode_tantivy_docs(
         parent: &mut TantivyDocument,
@@ -600,15 +599,19 @@ pub mod explode {
     /// Explode the JSON `value` according to `opts` if it's nested.
     ///
     /// **Rules**:
-    /// 1) If `opts` is missing or `object_mapping_type != Nested`, produce exactly **one** doc (via `wrap_in_path`).
-    /// 2) **Nested array** => one child doc for each array item + one parent doc (unless `path.is_empty()`)  
-    /// 3) **Nested object**:  
-    ///    - If the object has subfields that are themselves nested, recursively explode them to produce child docs, then produce one parent doc with `_is_parent_<path> = true` for the entire object (unless `path.is_empty()`).  
+    /// 1) If `opts` is missing or `object_mapping_type != Nested`, produce exactly **one** doc (via
+    ///    `wrap_in_path`).
+    /// 2) **Nested array** => one child doc for each array item + one parent doc (unless
+    ///    `path.is_empty()`)
+    /// 3) **Nested object**:
+    ///    - If the object has subfields that are themselves nested, recursively explode them to
+    ///      produce child docs, then produce one parent doc with `_is_parent_<path> = true` for the
+    ///      entire object (unless `path.is_empty()`).
     ///    - If the object does **not** contain any nested subfields, produce **only** one doc:
     ///       - if `path.is_empty()`, just the object,
     ///       - otherwise a single parent doc with `_is_parent_<path> = true`.
-    /// 4) **Nested scalar** => exactly **one** doc (no `_is_parent_...`), even if `path` is non‐empty.
-    ///
+    /// 4) **Nested scalar** => exactly **one** doc (no `_is_parent_...`), even if `path` is
+    ///    non‐empty.
     pub fn explode(path: &[&str], value: Value, opts: Option<&JsonObjectOptions>) -> Vec<Value> {
         // If not nested => single doc
         let Some(my_opts) = opts else {
@@ -620,11 +623,13 @@ pub mod explode {
 
         match value {
             Value::Array(arr) => {
-                // Nested array => child doc per element, plus parent doc for entire array if path nonempty
+                // Nested array => child doc per element, plus parent doc for entire array if path
+                // nonempty
                 let mut docs = Vec::new();
                 for elem in &arr {
-                    // The user tests want each array item as a single doc, unless that item’s schema is also nested subfields.
-                    // But typically "arr" corresponds to e.g. "j": [1,2,{k:v}] with no further subfields,
+                    // The user tests want each array item as a single doc, unless that item’s
+                    // schema is also nested subfields. But typically "arr"
+                    // corresponds to e.g. "j": [1,2,{k:v}] with no further subfields,
                     // so we just wrap each item.
                     docs.extend(wrap_in_path(path, elem.clone()));
                 }
@@ -646,7 +651,8 @@ pub mod explode {
                         vec![make_parent_doc(path, &Value::Object(obj))]
                     }
                 } else {
-                    // We do have sub-nested fields => produce child docs from each, then a parent doc
+                    // We do have sub-nested fields => produce child docs from each, then a parent
+                    // doc
                     let mut docs = Vec::new();
                     for (child_key, child_opts) in sub_nests {
                         if let Some(subval) = obj.get(child_key) {
@@ -674,9 +680,10 @@ pub mod explode {
     mod tests {
         use std::collections::BTreeMap;
 
+        use serde_json::json;
+
         use super::*;
         use crate::schema::{JsonObjectOptions, ObjectMappingType};
-        use serde_json::json;
 
         #[test]
         fn explode_non_nested_empty_object() {

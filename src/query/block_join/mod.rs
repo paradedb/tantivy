@@ -2,11 +2,11 @@ mod parent_children_block_join_query;
 mod to_child_block_join_query;
 mod to_parent_block_join_query;
 
+pub use to_parent_block_join_query::{ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery};
+
 use crate::core::searcher::Searcher;
 use crate::schema::{Field, Value};
 use crate::{DocAddress, TantivyDocument};
-
-pub use to_parent_block_join_query::{ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery};
 
 #[allow(unused)]
 pub fn doc_string_field(searcher: &Searcher, doc_addr: DocAddress, field: Field) -> String {
@@ -23,20 +23,16 @@ pub fn doc_string_field(searcher: &Searcher, doc_addr: DocAddress, field: Field)
 
 #[cfg(test)]
 mod scorer_tests {
+    use std::sync::Arc;
+
     use common::BitSet;
 
     use crate::collector::TopDocs;
-    use crate::query::block_join::doc_string_field;
-    use crate::query::AllQuery;
-    use crate::schema::{Field, IndexRecordOption, SchemaBuilder, STORED, STRING};
-    use crate::{doc, DocSet, SegmentReader};
-    use crate::{Index, IndexSettings};
-    use std::sync::Arc;
-
     use crate::directory::RamDirectory;
-    use crate::query::{ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery};
-
-    use crate::Result;
+    use crate::query::block_join::doc_string_field;
+    use crate::query::{AllQuery, ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery};
+    use crate::schema::{Field, IndexRecordOption, SchemaBuilder, STORED, STRING};
+    use crate::{doc, DocSet, Index, IndexSettings, Result, SegmentReader};
 
     pub struct ParentBitsForScorerTest {
         doc_type_field: Field,
@@ -142,7 +138,6 @@ mod scorer_tests {
 #[cfg(test)]
 mod test {
     use std::collections::HashSet;
-
     use std::ops::Bound;
     use std::sync::Arc;
 
@@ -154,15 +149,16 @@ mod test {
     use crate::index::{Index, IndexSettings};
     use crate::query::block_join::doc_string_field;
     use crate::query::block_join::to_child_block_join_query::ToChildBlockJoinQuery;
-    use crate::query::{BooleanQuery, BoostQuery, Occur, RangeQuery, TermQuery};
-    use crate::query::{ParentBitSetProducer, ScoreMode, ToParentBlockJoinQuery};
+    use crate::query::{
+        BooleanQuery, BoostQuery, Occur, ParentBitSetProducer, RangeQuery, ScoreMode, TermQuery,
+        ToParentBlockJoinQuery,
+    };
     use crate::schema::{
         Field, IndexRecordOption, SchemaBuilder, TantivyDocument, TextFieldIndexing, TextOptions,
         FAST, STORED, STRING, TEXT,
     };
     use crate::tokenizer::{RawTokenizer, TextAnalyzer, TokenizerManager};
-    use crate::{doc, IndexWriter, Term};
-    use crate::{Result, SegmentReader, TERMINATED};
+    use crate::{doc, IndexWriter, Result, SegmentReader, Term, TERMINATED};
 
     fn make_resume(name_f: Field, country_f: Field, name: &str, country: &str) -> TantivyDocument {
         doc! {

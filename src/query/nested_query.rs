@@ -2,8 +2,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use common::JsonPathWriter;
-// use explode::explode_document;
 
+// use explode::explode_document;
 use crate::core::searcher::Searcher;
 use crate::query::{
     BooleanQuery, EnableScoring, Explanation, Occur, ParentBitSetProducer, Query, QueryClone,
@@ -210,14 +210,15 @@ impl ParentBitSetProducer for NestedParentBitSetProducer {
 
 #[cfg(test)]
 mod tests {
+    use query_grammar::Occur;
+    use serde_json::json;
+
     use crate::collector::TopDocs;
     use crate::query::{AllQuery, BooleanQuery, NestedQuery, QueryClone, QueryParser, ScoreMode};
     use crate::schema::{
         IndexRecordOption, JsonObjectOptions, Schema, SchemaBuilder, TextFieldIndexing,
     };
     use crate::{doc, Index, IndexWriter, TantivyDocument};
-    use query_grammar::Occur;
-    use serde_json::json;
 
     #[test]
     fn test_regular_json_indexing() -> crate::Result<()> {
