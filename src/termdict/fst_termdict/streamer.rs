@@ -228,7 +228,7 @@ where
     current_state: Option<A::State>,
 }
 
-impl<'a, A> TermWithStateStreamer<'a, A>
+impl<A> TermWithStateStreamer<'_, A>
 where
     A: Automaton,
     A::State: Clone,
@@ -284,6 +284,7 @@ where
         &self.current_value
     }
 
+    #[allow(clippy::should_implement_trait)]
     /// Return the next `(key, value, state)` triplet.
     pub fn next(&mut self) -> Option<(&[u8], &TermInfo, A::State)> {
         if self.advance() {

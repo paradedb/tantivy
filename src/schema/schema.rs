@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use common::JsonPathWriter;
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -20,7 +21,7 @@ use crate::TantivyError;
 ///
 /// # Examples
 ///
-/// ```
+/// ```rust
 /// use tantivy::schema::*;
 ///
 /// let mut schema_builder = Schema::builder();
@@ -33,6 +34,7 @@ use crate::TantivyError;
 pub struct SchemaBuilder {
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>,
+    has_nested: bool,
 }
 
 impl SchemaBuilder {
@@ -194,12 +196,75 @@ impl SchemaBuilder {
         self.add_field(field_entry)
     }
 
+    /// Here’s a helper method that adds all nested `_is_parent_...` boolean fields
+    /// and recursively registers subfields.
+    fn register_nested_subfields(
+        &mut self,
+        path_writer: &mut JsonPathWriter,
+        json_opts: &JsonObjectOptions,
+    ) {
+        // Only add `_is_parent_<current path>` if *this* object is nested.
+        // (If you want to add `_is_parent_` for non-nested objects too, remove the `if`.)
+        if json_opts.is_nested() {
+            let is_parent_field = format!("_is_parent_{}", path_writer.as_str());
+            self.add_bool_field(&is_parent_field, NumericOptions::default().set_indexed());
+        }
+
+        // Recurse through *all* subfields, because even a non-nested
+        // subfield might contain nested grandchildren.
+        for (subfield_name, subfield_options) in json_opts.subfields() {
+            path_writer.push(subfield_name);
+
+            // Recurse unconditionally.
+            self.register_nested_subfields(path_writer, subfield_options);
+
+            path_writer.pop();
+        }
+    }
+
+    pub fn add_nested_json_field<T: Into<JsonObjectOptions>>(
+        &mut self,
+        field_name_str: &str,
+        field_options: T,
+    ) -> Field {
+        let json_options: JsonObjectOptions = field_options.into();
+        let field_options = json_options
+            .clone()
+            .add_subfield(field_name_str, json_options);
+
+        // Add the main JSON field as usual
+        let field_entry = FieldEntry::new_json(field_name_str.to_string(), field_options.clone());
+        let added_field = self.add_field(field_entry);
+
+        if !self.fields_map.contains_key("_is_parent") {
+            self.add_bool_field("_is_parent", NumericOptions::default().set_indexed());
+        }
+
+        // Regardless of whether top-level is nested, push the path,
+        // then recursively handle everything. Only objects with `object_mapping_type = Nested`
+        // will add `_is_parent_...` fields inside the recursion.
+        let mut path_writer = JsonPathWriter::with_expand_dots(false);
+        self.register_nested_subfields(&mut path_writer, &field_options);
+
+        // optionally pop the top-level if you like:
+        path_writer.pop();
+
+        added_field
+    }
+
     /// Adds a field entry to the schema in build.
     pub fn add_field(&mut self, field_entry: FieldEntry) -> Field {
+        if field_entry.is_nested() {
+            self.has_nested = true;
+        }
+
         let field = Field::from_field_id(self.fields.len() as u32);
         let field_name = field_entry.name().to_string();
-        if let Some(_previous_value) = self.fields_map.insert(field_name, field) {
-            panic!("Field already exists in schema {}", field_entry.name());
+        if let Some(_previous_value) = self.fields_map.insert(field_name.clone(), field) {
+            panic!(
+                "SchemaBuilder::add_field panic: Field '{}' already exists in schema.",
+                field_entry.name()
+            );
         };
         self.fields.push(field_entry);
         field
@@ -211,13 +276,16 @@ impl SchemaBuilder {
         Schema(Arc::new(InnerSchema {
             fields: self.fields,
             fields_map: self.fields_map,
+            has_nested: self.has_nested,
         }))
     }
 }
+
 #[derive(Debug)]
 struct InnerSchema {
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>, // transient
+    has_nested: bool,
 }
 
 impl PartialEq for InnerSchema {
@@ -238,7 +306,7 @@ impl Eq for InnerSchema {}
 ///
 /// # Examples
 ///
-/// ```
+/// ```rust
 /// use tantivy::schema::*;
 ///
 /// let mut schema_builder = Schema::builder();
@@ -284,7 +352,8 @@ impl Schema {
 
     /// Return the field name for a given `Field`.
     pub fn get_field_name(&self, field: Field) -> &str {
-        self.get_field_entry(field).name()
+        let field_name = self.get_field_entry(field).name();
+        field_name
     }
 
     /// Returns the number of fields in the schema.
@@ -301,6 +370,10 @@ impl Schema {
             .map(|(field_id, field_entry)| (Field::from_field_id(field_id as u32), field_entry))
     }
 
+    pub fn has_nested(&self) -> bool {
+        self.0.has_nested
+    }
+
     /// Creates a new builder.
     pub fn builder() -> SchemaBuilder {
         SchemaBuilder::default()
@@ -308,11 +381,10 @@ impl Schema {
 
     /// Returns the field option associated with a given name.
     pub fn get_field(&self, field_name: &str) -> crate::Result<Field> {
-        self.0
-            .fields_map
-            .get(field_name)
-            .cloned()
-            .ok_or_else(|| TantivyError::FieldNotFound(field_name.to_string()))
+        match self.0.fields_map.get(field_name) {
+            Some(field) => Ok(*field),
+            None => Err(TantivyError::FieldNotFound(field_name.to_string())),
+        }
     }
 
     /// Searches for a full_path in the schema, returning the field name and a JSON path.
@@ -336,8 +408,8 @@ impl Schema {
                 return Some((*field, &suffix[1..]));
             }
             // JSON path may contain a dot, for now we try both variants to find the field.
-            let prefix = split_json_path(prefix).join(".");
-            if let Some(field) = self.0.fields_map.get(&prefix) {
+            let prefix_json = split_json_path(prefix).join(".");
+            if let Some(field) = self.0.fields_map.get(&prefix_json) {
                 return Some((*field, &suffix[1..]));
             }
         }
@@ -358,15 +430,20 @@ impl Schema {
 
         default_field_opt: Option<Field>,
     ) -> Option<(Field, &'a str)> {
-        let (field, json_path) = self
+        let result = self
             .find_field(full_path)
-            .or(default_field_opt.map(|field| (field, full_path)))?;
-        let field_entry = self.get_field_entry(field);
-        let is_json = field_entry.field_type().value_type() == Type::Json;
-        if !is_json && !json_path.is_empty() {
-            return None;
+            .or(default_field_opt.map(|field| (field, full_path)));
+        match result {
+            Some((field, json_path)) => {
+                let field_entry = self.get_field_entry(field);
+                let is_json = field_entry.field_type().value_type() == Type::Json;
+                if !is_json && !json_path.is_empty() {
+                    return None;
+                }
+                Some((field, json_path))
+            }
+            None => None,
         }
-        Some((field, json_path))
     }
 }
 
@@ -398,6 +475,7 @@ impl<'de> Deserialize<'de> for Schema {
                 let mut schema = SchemaBuilder {
                     fields: Vec::with_capacity(seq.size_hint().unwrap_or(0)),
                     fields_map: HashMap::with_capacity(seq.size_hint().unwrap_or(0)),
+                    has_nested: false,
                 };
 
                 while let Some(value) = seq.next_element()? {
@@ -408,7 +486,8 @@ impl<'de> Deserialize<'de> for Schema {
             }
         }
 
-        deserializer.deserialize_seq(SchemaVisitor)
+        let schema = deserializer.deserialize_seq(SchemaVisitor)?;
+        Ok(schema)
     }
 }
 
@@ -590,7 +669,8 @@ mod tests {
         }"#;
         let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
 
-        let doc_serdeser = TantivyDocument::parse_json(&schema, &doc.to_json(&schema)).unwrap();
+        let doc_to_json = doc.to_json(&schema);
+        let doc_serdeser = TantivyDocument::parse_json(&schema, &doc_to_json).unwrap();
         assert_eq!(doc, doc_serdeser);
     }
 
@@ -644,17 +724,17 @@ mod tests {
         );
         let doc =
             TantivyDocument::convert_named_doc(&schema, NamedFieldDocument(named_doc_map)).unwrap();
-        assert_eq!(
-            doc.get_all(title).map(OwnedValue::from).collect::<Vec<_>>(),
-            vec![
-                OwnedValue::from("title1".to_string()),
-                OwnedValue::from("title2".to_string())
-            ]
-        );
-        assert_eq!(
-            doc.get_all(val).map(OwnedValue::from).collect::<Vec<_>>(),
-            vec![OwnedValue::from(14u64), OwnedValue::from(-1i64)]
-        );
+
+        let title_values: Vec<_> = doc.get_all(title).map(OwnedValue::from).collect();
+        let expected_title = vec![
+            OwnedValue::from("title1".to_string()),
+            OwnedValue::from("title2".to_string()),
+        ];
+        assert_eq!(title_values, expected_title);
+
+        let val_values: Vec<_> = doc.get_all(val).map(OwnedValue::from).collect();
+        let expected_val = vec![OwnedValue::from(14u64), OwnedValue::from(-1i64)];
+        assert_eq!(val_values, expected_val);
     }
 
     #[test]
@@ -680,22 +760,21 @@ mod tests {
         let popularity_field = schema_builder.add_i64_field("popularity", popularity_options);
         let score_field = schema_builder.add_f64_field("score", score_options);
         let schema = schema_builder.build();
+
         {
             let doc = TantivyDocument::parse_json(&schema, "{}").unwrap();
             assert!(doc.field_values().next().is_none());
         }
         {
-            let doc = TantivyDocument::parse_json(
-                &schema,
-                r#"{
+            let doc_json = r#"{
                 "title": "my title",
                 "author": "fulmicoton",
                 "count": 4,
                 "popularity": 10,
                 "score": 80.5
-            }"#,
-            )
-            .unwrap();
+            }"#;
+            let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
+
             assert_eq!(
                 doc.get_first(title_field).unwrap().as_str(),
                 Some("my title")

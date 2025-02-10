@@ -425,6 +425,12 @@ impl QueryParser {
     ) -> Result<Term, QueryParserError> {
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
+        if field_type.is_nested() {
+            return Err(QueryParserError::UnsupportedQuery(format!(
+                "Range query on a nested field is not supported. Query: {}",
+                phrase
+            )));
+        }
         let field_supports_ff_range_queries = field_type.is_fast()
             && is_type_valid_for_fastfield_range_query(field_type.value_type());
 

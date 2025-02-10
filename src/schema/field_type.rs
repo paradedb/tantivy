@@ -228,6 +228,14 @@ impl FieldType {
         matches!(self, FieldType::Date(_))
     }
 
+    /// returns true if this field is "nested"
+    pub fn is_nested(&self) -> bool {
+        match self {
+            FieldType::JsonObject(opts) => opts.is_nested(),
+            _ => false,
+        }
+    }
+
     /// returns true if the field is indexed.
     pub fn is_indexed(&self) -> bool {
         match *self {

@@ -7,7 +7,8 @@ use common::{read_u32_vint_no_advance, serialize_vint_u32, BinarySerializable, D
 use serde_json::Map;
 pub use CompactDoc as TantivyDocument;
 
-use super::{ReferenceValue, ReferenceValueLeaf, Value};
+use super::json_object_options::explode::explode_tantivy_docs;
+use super::{JsonObjectOptions, ReferenceValue, ReferenceValueLeaf, Value};
 use crate::schema::document::{
     DeserializeError, Document, DocumentDeserialize, DocumentDeserializer,
 };
@@ -32,6 +33,7 @@ pub struct CompactDoc {
     pub node_data: Vec<u8>,
     /// The root (Field, Value) pairs
     field_values: Vec<FieldValueAddr>,
+    pub is_parent: bool,
 }
 
 impl Default for CompactDoc {
@@ -47,6 +49,7 @@ impl CompactDoc {
         CompactDoc {
             node_data: Vec::with_capacity(bytes),
             field_values: Vec::with_capacity(4),
+            is_parent: false,
         }
     }
 
@@ -121,6 +124,22 @@ impl CompactDoc {
     /// Add a dynamic object field
     pub fn add_object(&mut self, field: Field, object: BTreeMap<String, OwnedValue>) {
         self.add_field_value(field, &OwnedValue::from(object));
+    }
+
+    /// Add a dynamic object field
+    pub fn add_nested_object(
+        &mut self,
+        schema: &Schema,
+        field: Field,
+        value: serde_json::Value,
+        opts: &JsonObjectOptions,
+    ) -> crate::Result<Vec<Self>> {
+        let field_name = schema.get_field_name(field);
+        let parent_field = schema
+            .get_field("_is_parent")
+            .expect("must be configured with _is_parent field to support nesting");
+        self.add_bool(parent_field, true);
+        explode_tantivy_docs(self, schema, field_name, value, opts)
     }
 
     /// Add a (field, value) to the document.
@@ -324,6 +343,29 @@ impl CompactDoc {
     /// get slice from address. The returned slice is open ended
     fn get_slice(&self, addr: Addr) -> &[u8] {
         &self.node_data[addr as usize..]
+    }
+
+    pub fn set_is_parent(&mut self, field: Field, is_parent: bool) {
+        // or store a fieldvalue for the boolean
+        self.is_parent = is_parent;
+        if is_parent {
+            self.add_field_value(field, &OwnedValue::from(true));
+        }
+    }
+
+    pub fn debug_str(&self, root_field: Field, parent_flag_field: Field) -> String {
+        // Look up the JSON string in `root_field`
+        let mut json_val = "<none>".to_string();
+        let mut parent_str = String::new();
+        for (fld, val) in self.field_values() {
+            if fld == root_field {
+                json_val = format!("{val:?}");
+            }
+            if fld == parent_flag_field && val.as_bool() == Some(true) {
+                parent_str = ", is_parent=true".to_string();
+            }
+        }
+        format!("{{json={json_val}{parent_str}}}")
     }
 }
 
