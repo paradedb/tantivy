@@ -74,6 +74,7 @@ impl ColumnarWriter {
                 .iter()
                 .map(|dict| dict.mem_usage())
                 .sum::<usize>()
+            + self.dictionaries.capacity() * size_of::<DictionaryBuilder>()
     }
 
     /// Records a column type. This is useful to bypass the coercion process,

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::{io, iter};
+use std::{io, iter, mem};
 
 use super::{fieldnorm_to_id, FieldNormsSerializer};
 use crate::schema::{Field, Schema};
@@ -48,7 +48,8 @@ impl FieldNormsWriter {
             .iter()
             .flatten()
             .map(|buf| buf.capacity())
-            .sum()
+            .sum::<usize>()
+            + self.fieldnorms_buffers.capacity() * mem::size_of::<Option<Vec<u8>>>()
     }
     /// Ensure that all documents in 0..max_doc have a byte associated with them
     /// in each of the fieldnorm vectors.

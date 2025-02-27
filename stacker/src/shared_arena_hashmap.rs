@@ -160,7 +160,7 @@ impl SharedArenaHashMap {
 
     #[inline]
     pub fn mem_usage(&self) -> usize {
-        self.table.len() * mem::size_of::<KeyValue>()
+        self.table.capacity() * mem::size_of::<KeyValue>()
     }
 
     #[inline]

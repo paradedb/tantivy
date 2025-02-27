@@ -109,7 +109,7 @@ impl MemoryArena {
     /// Internally, it counts a number of `1MB` pages
     /// and therefore delivers an upperbound.
     pub fn mem_usage(&self) -> usize {
-        self.pages.len() * PAGE_SIZE
+        self.pages.len() * PAGE_SIZE + (self.pages.capacity() * size_of::<Page>())
     }
 
     /// Returns the number of bytes allocated in the arena.
