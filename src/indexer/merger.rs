@@ -15,6 +15,7 @@ use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
 use crate::index::{Segment, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
+use crate::indexer::segment_updater::CancelSentinel;
 use crate::indexer::SegmentSerializer;
 use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema, Type};
@@ -118,6 +119,7 @@ pub struct IndexMerger {
     schema: Schema,
     pub(crate) readers: Vec<SegmentReader>,
     max_doc: u32,
+    cancel: Box<dyn CancelSentinel>,
 }
 
 struct DeltaComputer {
@@ -222,9 +224,10 @@ impl IndexMerger {
         schema: Schema,
         index_settings: IndexSettings,
         segments: &[Segment],
+        cancel: Box<dyn CancelSentinel>,
     ) -> crate::Result<IndexMerger> {
         let alive_bitset = segments.iter().map(|_| None).collect_vec();
-        Self::open_with_custom_alive_set(schema, index_settings, segments, alive_bitset)
+        Self::open_with_custom_alive_set(schema, index_settings, segments, alive_bitset, cancel)
     }
 
     // Create merge with a custom delete set.
@@ -244,6 +247,7 @@ impl IndexMerger {
         index_settings: IndexSettings,
         segments: &[Segment],
         alive_bitset_opt: Vec<Option<AliveBitSet>>,
+        cancel: Box<dyn CancelSentinel>,
     ) -> crate::Result<IndexMerger> {
         let mut readers = vec![];
         for (segment, new_alive_bitset_opt) in segments.iter().zip(alive_bitset_opt) {
@@ -274,6 +278,7 @@ impl IndexMerger {
             schema,
             readers,
             max_doc,
+            cancel,
         })
     }
 
@@ -322,6 +327,9 @@ impl IndexMerger {
         let fields = FieldNormsWriter::fields_with_fieldnorm(&self.schema);
         let mut fieldnorms_data = Vec::with_capacity(self.max_doc as usize);
         for field in fields {
+            if self.cancel.wants_cancel() {
+                return Err(crate::TantivyError::Cancelled);
+            }
             fieldnorms_data.clear();
             let fieldnorms_readers: Vec<FieldNormReader> = self
                 .readers
@@ -357,6 +365,7 @@ impl IndexMerger {
             &required_columns,
             merge_row_order,
             fast_field_wrt,
+            || self.cancel.wants_cancel(),
         )?;
         Ok(())
     }
@@ -721,6 +730,9 @@ impl IndexMerger {
         let mut doc_id_and_positions = vec![];
 
         while merged_terms.advance() {
+            if self.cancel.wants_cancel() {
+                return Err(crate::TantivyError::Cancelled);
+            }
             segment_postings_containing_the_term.clear();
             let term_bytes: &[u8] = merged_terms.key();
 
@@ -799,6 +811,9 @@ impl IndexMerger {
 
                 let mut doc = segment_postings.doc();
                 while doc != TERMINATED {
+                    if self.cancel.wants_cancel() {
+                        return Err(crate::TantivyError::Cancelled);
+                    }
                     // deleted doc are skipped as they do not have a `remapped_doc_id`.
                     if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
                         // we make sure to only write the term if
@@ -859,6 +874,9 @@ impl IndexMerger {
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
         for (field, field_entry) in self.schema.fields() {
+            if self.cancel.wants_cancel() {
+                return Err(crate::TantivyError::Cancelled);
+            }
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             if field_entry.is_indexed() {
                 self.write_postings_for_field(
@@ -931,6 +949,9 @@ impl IndexMerger {
                     || store_reader.decompressor() != store_writer.compressor().into()
                 {
                     for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
+                        if self.cancel.wants_cancel() {
+                            return Err(crate::TantivyError::Cancelled);
+                        }
                         let doc_bytes = doc_bytes_res?;
                         store_writer.store_bytes(&doc_bytes)?;
                     }
