@@ -372,7 +372,7 @@ impl IndexMerger {
 
         let mut cnt = 0;
         while merged_terms.advance() {
-            // calling `wants_cancel()` could be expensive, so only do it every so often
+            // calling `wants_cancel()` could be expensive so only do it so often
             if cnt % 1000 == 0 {
                 if self.cancel.wants_cancel() {
                     return Err(crate::TantivyError::Cancelled);
@@ -459,9 +459,12 @@ impl IndexMerger {
 
                 let mut doc = segment_postings.doc();
                 while doc != TERMINATED {
-                    // if self.cancel.wants_cancel() {
-                    //     return Err(crate::TantivyError::Cancelled);
-                    // }
+                    if doc % 1000 == 0 {
+                        // calling `wants_cancel()` could be expensive so only do it so often
+                        if self.cancel.wants_cancel() {
+                            return Err(crate::TantivyError::Cancelled);
+                        }
+                    }
                     // deleted doc are skipped as they do not have a `remapped_doc_id`.
                     if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
                         // we make sure to only write the term if
