@@ -330,6 +330,8 @@ pub(crate) struct InnerSegmentUpdater {
     killed: AtomicBool,
     stamper: Stamper,
     merge_operations: MergeOperationInventory,
+
+    cached_metas: IndexMeta,
 }
 
 impl SegmentUpdater {
@@ -370,6 +372,7 @@ impl SegmentUpdater {
         let merge_thread_pool = builder.build().map_err(|_| {
             crate::TantivyError::SystemError("Failed to spawn segment merging thread".to_string())
         })?;
+        let cached_metas = index.load_metas()?;
         Ok(SegmentUpdater {
             inner: Arc::new(InnerSegmentUpdater {
                 pool,
@@ -380,6 +383,7 @@ impl SegmentUpdater {
                 killed: AtomicBool::new(false),
                 stamper,
                 merge_operations: Default::default(),
+                cached_metas,
             }),
             cancel: Box::new(cancel),
         })
@@ -515,9 +519,10 @@ impl SegmentUpdater {
         payload: Option<String>,
     ) -> FutureResult<Opstamp> {
         let segment_updater = self.clone();
+        let cached_metas = self.cached_metas.clone();
         self.schedule_task(move || {
             let segment_entries = segment_updater.purge_deletes(opstamp)?;
-            let previous_metas = segment_updater.load_meta();
+            let previous_metas = cached_metas;
             segment_updater.segment_manager.commit(segment_entries);
             segment_updater.save_metas(opstamp, payload, &previous_metas)?;
             let _ = garbage_collect_files(segment_updater.clone());
