@@ -378,6 +378,10 @@ impl Directory for ManagedDirectory {
     fn wants_cancel(&self) -> bool {
         self.directory.wants_cancel()
     }
+
+    fn log(&self, message: &str) {
+        self.directory.log(message);
+    }
 }
 
 impl Clone for ManagedDirectory {

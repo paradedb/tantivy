@@ -321,7 +321,6 @@ pub(crate) struct InnerSegmentUpdater {
     //
     // This should be up to date as all update happen through
     // the unique active `SegmentUpdater`.
-    active_index_meta: RwLock<Arc<IndexMeta>>,
     pool: ThreadPool,
     merge_thread_pool: ThreadPool,
 
@@ -371,10 +370,8 @@ impl SegmentUpdater {
         let merge_thread_pool = builder.build().map_err(|_| {
             crate::TantivyError::SystemError("Failed to spawn segment merging thread".to_string())
         })?;
-        let index_meta = index.load_metas()?;
         Ok(SegmentUpdater {
             inner: Arc::new(InnerSegmentUpdater {
-                active_index_meta: RwLock::new(Arc::new(index_meta)),
                 pool,
                 merge_thread_pool,
                 index,
@@ -488,7 +485,6 @@ impl SegmentUpdater {
                 &previous_metas,
                 directory.box_clone().borrow_mut(),
             )?;
-            self.store_meta(&index_meta);
         }
         Ok(())
     }
@@ -539,12 +535,8 @@ impl SegmentUpdater {
         })
     }
 
-    fn store_meta(&self, index_meta: &IndexMeta) {
-        *self.active_index_meta.write().unwrap() = Arc::new(index_meta.clone());
-    }
-
     fn load_meta(&self) -> Arc<IndexMeta> {
-        self.active_index_meta.read().unwrap().clone()
+        Arc::new(self.index.load_metas().expect("Failed to load meta"))
     }
 
     pub(crate) fn make_merge_operation(&self, segment_ids: &[SegmentId]) -> MergeOperation {
@@ -652,7 +644,7 @@ impl SegmentUpdater {
 
         let current_opstamp = self.stamper.stamp();
         let mut merge_candidates: Vec<MergeOperation> = merge_policy
-            .compute_merge_candidates(&uncommitted_segments)
+            .compute_merge_candidates(Some(self.index.directory()), &uncommitted_segments)
             .into_iter()
             .map(|merge_candidate| {
                 MergeOperation::new(&self.merge_operations, current_opstamp, merge_candidate.0)
@@ -661,7 +653,7 @@ impl SegmentUpdater {
 
         let commit_opstamp = self.load_meta().opstamp;
         let committed_merge_candidates = merge_policy
-            .compute_merge_candidates(&committed_segments)
+            .compute_merge_candidates(Some(self.index.directory()), &committed_segments)
             .into_iter()
             .map(|merge_candidate: MergeCandidate| {
                 MergeOperation::new(&self.merge_operations, commit_opstamp, merge_candidate.0)
