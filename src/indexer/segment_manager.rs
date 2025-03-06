@@ -7,6 +7,7 @@ use crate::error::TantivyError;
 use crate::index::{SegmentId, SegmentMeta};
 use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::SegmentEntry;
+use crate::{Directory, Index};
 
 #[derive(Default)]
 struct SegmentRegisters {
@@ -135,11 +136,15 @@ impl SegmentManager {
         registers_lock.uncommitted.clear();
     }
 
-    pub fn commit(&self, segment_entries: Vec<SegmentEntry>) {
+    pub fn commit(&self, index: &Index, segment_entries: Vec<SegmentEntry>) {
         let mut registers_lock = self.write();
         registers_lock.committed.clear();
         registers_lock.uncommitted.clear();
         for segment_entry in segment_entries {
+            index.directory().log(
+                &serde_json::to_string(&("SegmentManager::commit", &segment_entry.meta()))
+                    .expect("Failed to serialize SegmentEntry"),
+            );
             registers_lock.committed.add_segment_entry(segment_entry);
         }
     }
@@ -149,7 +154,11 @@ impl SegmentManager {
     /// Returns an error if some segments are missing, or if
     /// the `segment_ids` are not either all committed or all
     /// uncommitted.
-    pub fn start_merge(&self, segment_ids: &[SegmentId]) -> crate::Result<Vec<SegmentEntry>> {
+    pub fn start_merge(
+        &self,
+        index: &Index,
+        segment_ids: &[SegmentId],
+    ) -> crate::Result<Vec<SegmentEntry>> {
         let registers_lock = self.read();
         let mut segment_entries = vec![];
         if registers_lock.uncommitted.contains_all(segment_ids) {
@@ -158,6 +167,10 @@ impl SegmentManager {
                     "Segment id not found {}. Should never happen because of the contains all \
                      if-block.",
                 );
+                index.directory().log(&serde_json::to_string(&(
+                    "start_merge:uncommitted",
+                    segment_entry.meta(),
+                ))?);
                 segment_entries.push(segment_entry);
             }
         } else if registers_lock.committed.contains_all(segment_ids) {
@@ -166,6 +179,12 @@ impl SegmentManager {
                     "Segment id not found {}. Should never happen because of the contains all \
                      if-block.",
                 );
+
+                index.directory().log(&serde_json::to_string(&(
+                    "start_merge:committed",
+                    segment_entry.meta(),
+                ))?);
+
                 segment_entries.push(segment_entry);
             }
         } else {

@@ -272,17 +272,6 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
         ))
     }
 
-    // Allows the directory to change the writer's merge policy right before the merge happens
-    // This is useful for directories that need to change the merge policy based on how many
-    // segments were created
-    fn reconsider_merge_policy(
-        &self,
-        _metas: &IndexMeta,
-        _previous_metas: &IndexMeta,
-    ) -> Option<Box<dyn MergePolicy>> {
-        None
-    }
-
     /// Returns true if this directory supports garbage collection.  The default assumption is
     /// `true`
     fn supports_garbage_collection(&self) -> bool {

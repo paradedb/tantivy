@@ -321,6 +321,7 @@ pub(crate) struct InnerSegmentUpdater {
     //
     // This should be up to date as all update happen through
     // the unique active `SegmentUpdater`.
+    active_index_meta: RwLock<Arc<IndexMeta>>,
     pool: ThreadPool,
     merge_thread_pool: ThreadPool,
 
@@ -330,8 +331,6 @@ pub(crate) struct InnerSegmentUpdater {
     killed: AtomicBool,
     stamper: Stamper,
     merge_operations: MergeOperationInventory,
-
-    cached_metas: IndexMeta,
 }
 
 impl SegmentUpdater {
@@ -372,9 +371,10 @@ impl SegmentUpdater {
         let merge_thread_pool = builder.build().map_err(|_| {
             crate::TantivyError::SystemError("Failed to spawn segment merging thread".to_string())
         })?;
-        let cached_metas = index.load_metas()?;
+        let index_meta = index.load_metas()?;
         Ok(SegmentUpdater {
             inner: Arc::new(InnerSegmentUpdater {
+                active_index_meta: RwLock::new(Arc::new(index_meta)),
                 pool,
                 merge_thread_pool,
                 index,
@@ -383,7 +383,6 @@ impl SegmentUpdater {
                 killed: AtomicBool::new(false),
                 stamper,
                 merge_operations: Default::default(),
-                cached_metas,
             }),
             cancel: Box::new(cancel),
         })
@@ -489,6 +488,7 @@ impl SegmentUpdater {
                 &previous_metas,
                 directory.box_clone().borrow_mut(),
             )?;
+            self.store_meta(&index_meta);
         }
         Ok(())
     }
@@ -519,29 +519,25 @@ impl SegmentUpdater {
         payload: Option<String>,
     ) -> FutureResult<Opstamp> {
         let segment_updater = self.clone();
-        let cached_metas = self.cached_metas.clone();
         self.schedule_task(move || {
             let segment_entries = segment_updater.purge_deletes(opstamp)?;
-            let previous_metas = cached_metas;
-            segment_updater.segment_manager.commit(segment_entries);
+            let previous_metas = segment_updater.index.load_metas()?;
+            segment_updater
+                .segment_manager
+                .commit(&segment_updater.index, segment_entries);
             segment_updater.save_metas(opstamp, payload, &previous_metas)?;
             let _ = garbage_collect_files(segment_updater.clone());
-
-            let index_meta = segment_updater.load_meta();
-            if let Some(new_merge_policy) = segment_updater
-                .index
-                .directory()
-                .reconsider_merge_policy(&index_meta, &previous_metas)
-            {
-                segment_updater.set_merge_policy(new_merge_policy);
-            }
             segment_updater.consider_merge_options();
             Ok(opstamp)
         })
     }
 
+    fn store_meta(&self, index_meta: &IndexMeta) {
+        *self.active_index_meta.write().unwrap() = Arc::new(index_meta.clone());
+    }
+
     fn load_meta(&self) -> Arc<IndexMeta> {
-        Arc::new(self.index.load_metas().expect("Failed to load meta"))
+        self.active_index_meta.read().unwrap().clone()
     }
 
     pub(crate) fn make_merge_operation(&self, segment_ids: &[SegmentId]) -> MergeOperation {
@@ -578,7 +574,7 @@ impl SegmentUpdater {
         let segment_updater = self.clone();
         let segment_entries: Vec<SegmentEntry> = match self
             .segment_manager
-            .start_merge(merge_operation.segment_ids())
+            .start_merge(&self.index, merge_operation.segment_ids())
         {
             Ok(segment_entries) => segment_entries,
             Err(err) => {

@@ -358,15 +358,6 @@ impl Directory for ManagedDirectory {
         self.directory.load_metas(inventory)
     }
 
-    fn reconsider_merge_policy(
-        &self,
-        metas: &IndexMeta,
-        previous_metas: &IndexMeta,
-    ) -> Option<Box<dyn MergePolicy>> {
-        self.directory
-            .reconsider_merge_policy(metas, previous_metas)
-    }
-
     fn supports_garbage_collection(&self) -> bool {
         self.directory.supports_garbage_collection()
     }
