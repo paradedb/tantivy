@@ -7,7 +7,7 @@ use crate::error::TantivyError;
 use crate::index::{SegmentId, SegmentMeta};
 use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::SegmentEntry;
-use crate::{Directory, Index};
+use crate::Index;
 
 #[derive(Default)]
 struct SegmentRegisters {
@@ -136,7 +136,7 @@ impl SegmentManager {
         registers_lock.uncommitted.clear();
     }
 
-    pub fn commit(&self, index: &Index, segment_entries: Vec<SegmentEntry>) {
+    pub fn commit(&self, _index: &Index, segment_entries: Vec<SegmentEntry>) {
         let mut registers_lock = self.write();
         registers_lock.committed.clear();
         registers_lock.uncommitted.clear();
@@ -152,7 +152,7 @@ impl SegmentManager {
     /// uncommitted.
     pub fn start_merge(
         &self,
-        index: &Index,
+        _index: &Index,
         segment_ids: &[SegmentId],
     ) -> crate::Result<Vec<SegmentEntry>> {
         let registers_lock = self.read();

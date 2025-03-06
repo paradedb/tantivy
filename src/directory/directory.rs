@@ -12,7 +12,6 @@ use crate::directory::directory_lock::Lock;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use crate::directory::{FileHandle, FileSlice, WatchCallback, WatchHandle, WritePtr};
 use crate::index::SegmentMetaInventory;
-use crate::merge_policy::MergePolicy;
 use crate::IndexMeta;
 
 /// Retry the logic of acquiring locks is pretty simple.

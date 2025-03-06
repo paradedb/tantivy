@@ -16,7 +16,6 @@ use crate::directory::{
 };
 use crate::error::DataCorruption;
 use crate::index::SegmentMetaInventory;
-use crate::merge_policy::MergePolicy;
 use crate::{Directory, IndexMeta};
 
 /// Returns true if the file is "managed".
