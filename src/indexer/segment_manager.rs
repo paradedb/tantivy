@@ -141,10 +141,6 @@ impl SegmentManager {
         registers_lock.committed.clear();
         registers_lock.uncommitted.clear();
         for segment_entry in segment_entries {
-            index.directory().log(
-                &serde_json::to_string(&("SegmentManager::commit", &segment_entry.meta()))
-                    .expect("Failed to serialize SegmentEntry"),
-            );
             registers_lock.committed.add_segment_entry(segment_entry);
         }
     }
@@ -167,10 +163,6 @@ impl SegmentManager {
                     "Segment id not found {}. Should never happen because of the contains all \
                      if-block.",
                 );
-                index.directory().log(&serde_json::to_string(&(
-                    "start_merge:uncommitted",
-                    segment_entry.meta(),
-                ))?);
                 segment_entries.push(segment_entry);
             }
         } else if registers_lock.committed.contains_all(segment_ids) {
@@ -179,11 +171,6 @@ impl SegmentManager {
                     "Segment id not found {}. Should never happen because of the contains all \
                      if-block.",
                 );
-
-                index.directory().log(&serde_json::to_string(&(
-                    "start_merge:committed",
-                    segment_entry.meta(),
-                ))?);
 
                 segment_entries.push(segment_entry);
             }
