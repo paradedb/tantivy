@@ -521,7 +521,7 @@ impl SegmentUpdater {
         let segment_updater = self.clone();
         self.schedule_task(move || {
             let segment_entries = segment_updater.purge_deletes(opstamp)?;
-            let previous_metas = segment_updater.index.load_metas()?;
+            let previous_metas = segment_updater.load_meta();
             segment_updater
                 .segment_manager
                 .commit(&segment_updater.index, segment_entries);
