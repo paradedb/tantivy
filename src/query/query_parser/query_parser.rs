@@ -1,10 +1,9 @@
+use std::error::Error;
 use std::net::{AddrParseError, IpAddr};
 use std::num::{ParseFloatError, ParseIntError};
 use std::ops::Bound;
 use std::str::{FromStr, ParseBoolError};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use itertools::Itertools;
 use query_grammar::{UserInputAst, UserInputBound, UserInputLeaf, UserInputLiteral};
 use rustc_hash::FxHashMap;
@@ -12,6 +11,7 @@ use rustc_hash::FxHashMap;
 use super::logical_ast::*;
 use crate::index::Index;
 use crate::json_utils::convert_to_fast_value_and_append_to_json_term;
+use crate::query::query_parser::{Base64Parser, BytesParser};
 use crate::query::range_query::{is_type_valid_for_fastfield_range_query, RangeQuery};
 use crate::query::{
     AllQuery, BooleanQuery, BoostQuery, EmptyQuery, FuzzyTermQuery, Occur, PhrasePrefixQuery,
@@ -27,7 +27,7 @@ use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::{DateTime, Score};
 
 /// Possible error that may happen when parsing a query.
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, Error)]
 pub enum QueryParserError {
     /// Error in the query syntax
     #[error("Syntax Error: {0}")]
@@ -42,10 +42,10 @@ pub enum QueryParserError {
     /// is neither.
     #[error("Expected a valid integer: '{0:?}'")]
     ExpectedInt(#[from] ParseIntError),
-    /// The query contains a term for a bytes field, but the value is not valid
-    /// base64.
-    #[error("Expected base64: '{0:?}'")]
-    ExpectedBase64(#[from] base64::DecodeError),
+    /// The query contains a term for a bytes field, but the value cannot be
+    /// parsed.
+    #[error("Expected bytes: '{0:?}'")]
+    ExpectedBytes(Box<dyn Error>),
     /// The query contains a term for a `f64`-field, but the value
     /// is not a f64.
     #[error("Invalid query: Only excluding terms given")]
@@ -199,13 +199,14 @@ fn trim_ast(logical_ast: LogicalAst) -> Option<LogicalAst> {
 /// to consider all documents which contain the last term as a prefix, e.g. `"big bad wo"*` will
 /// match `"big bad wolf"`.
 #[derive(Clone)]
-pub struct QueryParser {
+pub struct QueryParser<B = Base64Parser> {
     schema: Schema,
     default_fields: Vec<Field>,
     conjunction_by_default: bool,
     tokenizer_manager: TokenizerManager,
     boost: FxHashMap<Field, Score>,
     fuzzy: FxHashMap<Field, Fuzzy>,
+    bytes_parser: B,
 }
 
 #[derive(Clone)]
@@ -244,7 +245,7 @@ macro_rules! try_tuple {
     }};
 }
 
-impl QueryParser {
+impl QueryParser<Base64Parser> {
     /// Creates a `QueryParser`, given
     /// * schema - index Schema
     /// * default_fields - fields used to search if no field is specifically defined in the query.
@@ -252,7 +253,7 @@ impl QueryParser {
         schema: Schema,
         default_fields: Vec<Field>,
         tokenizer_manager: TokenizerManager,
-    ) -> QueryParser {
+    ) -> Self {
         QueryParser {
             schema,
             default_fields,
@@ -260,6 +261,37 @@ impl QueryParser {
             conjunction_by_default: false,
             boost: Default::default(),
             fuzzy: Default::default(),
+            bytes_parser: Default::default(),
+        }
+    }
+
+    /// Creates a `QueryParser`, given
+    ///  * an index
+    ///  * a set of default fields used to search if no field is specifically defined in the query.
+    pub fn for_index(index: &Index, default_fields: Vec<Field>) -> Self {
+        QueryParser::new(index.schema(), default_fields, index.tokenizers().clone())
+    }
+}
+
+impl<B: BytesParser> QueryParser<B> {
+    /// Creates a `QueryParser`, given
+    /// * schema - index Schema
+    /// * default_fields - fields used to search if no field is specifically defined in the query
+    /// * bytes_parser - parser to be used read bytes values.
+    pub fn new_with_parser(
+        schema: Schema,
+        default_fields: Vec<Field>,
+        tokenizer_manager: TokenizerManager,
+        bytes_parser: B,
+    ) -> Self {
+        QueryParser {
+            schema,
+            default_fields,
+            tokenizer_manager,
+            conjunction_by_default: false,
+            boost: Default::default(),
+            fuzzy: Default::default(),
+            bytes_parser,
         }
     }
 
@@ -272,8 +304,18 @@ impl QueryParser {
     /// Creates a `QueryParser`, given
     ///  * an index
     ///  * a set of default fields used to search if no field is specifically defined in the query.
-    pub fn for_index(index: &Index, default_fields: Vec<Field>) -> QueryParser {
-        QueryParser::new(index.schema(), default_fields, index.tokenizers().clone())
+    /// * bytes_parser - parser to be used read bytes values.
+    pub fn for_index_with_parser(
+        index: &Index,
+        default_fields: Vec<Field>,
+        bytes_parser: B,
+    ) -> Self {
+        QueryParser::new_with_parser(
+            index.schema(),
+            default_fields,
+            index.tokenizers().clone(),
+            bytes_parser,
+        )
     }
 
     /// Set the default way to compose queries to a conjunction.
@@ -513,9 +555,10 @@ impl QueryParser {
                 Err(e) => Err(QueryParserError::from(e)),
             },
             FieldType::Bytes(_) => {
-                let bytes = BASE64
-                    .decode(phrase)
-                    .map_err(QueryParserError::ExpectedBase64)?;
+                let bytes = self
+                    .bytes_parser
+                    .parse(phrase)
+                    .map_err(QueryParserError::ExpectedBytes)?;
                 Ok(Term::from_field_bytes(field, &bytes))
             }
             FieldType::IpAddr(_) => {
@@ -611,9 +654,10 @@ impl QueryParser {
                 Err(e) => Err(QueryParserError::from(e)),
             },
             FieldType::Bytes(_) => {
-                let bytes = BASE64
-                    .decode(phrase)
-                    .map_err(QueryParserError::ExpectedBase64)?;
+                let bytes = self
+                    .bytes_parser
+                    .parse(phrase)
+                    .map_err(QueryParserError::ExpectedBytes)?;
                 let bytes_term = Term::from_field_bytes(field, &bytes);
                 Ok(vec![LogicalLiteral::Term(bytes_term)])
             }
@@ -1423,9 +1467,9 @@ mod test {
 
     #[test]
     fn test_parse_bytes_invalid_base64() {
-        let base64_err: QueryParserError =
+        let bytes_err: QueryParserError =
             parse_query_to_logical_ast("bytes:aa", false).unwrap_err();
-        assert!(matches!(base64_err, QueryParserError::ExpectedBase64(_)));
+        assert!(matches!(bytes_err, QueryParserError::ExpectedBytes(_)));
     }
 
     #[test]
@@ -1542,8 +1586,9 @@ mod test {
         assert_eq!(
             query_parser
                 .parse_query("boujou:\"18446744073709551615\"")
-                .unwrap_err(),
-            QueryParserError::FieldDoesNotExist("boujou".to_string())
+                .unwrap_err()
+                .to_string(),
+            QueryParserError::FieldDoesNotExist("boujou".to_string()).to_string()
         );
     }
 
@@ -1590,8 +1635,11 @@ mod test {
             .register("customtokenizer", SimpleTokenizer::default());
         let query_parser = QueryParser::for_index(&index, vec![title]);
         assert_eq!(
-            query_parser.parse_query("title:\"happy tax\"").unwrap_err(),
-            QueryParserError::FieldDoesNotHavePositionsIndexed("title".to_string())
+            query_parser
+                .parse_query("title:\"happy tax\"")
+                .unwrap_err()
+                .to_string(),
+            QueryParserError::FieldDoesNotHavePositionsIndexed("title".to_string()).to_string()
         );
     }
 
@@ -1842,20 +1890,22 @@ mod test {
     pub fn test_phrase_prefix_too_short() {
         let err = parse_query_to_logical_ast("\"wo\"*", true).unwrap_err();
         assert_eq!(
-            err,
+            err.to_string(),
             QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
                 phrase: "wo".to_owned(),
                 tokenizer: "default".to_owned()
             }
+            .to_string()
         );
 
         let err = parse_query_to_logical_ast("\"\"*", true).unwrap_err();
         assert_eq!(
-            err,
+            err.to_string(),
             QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
                 phrase: "".to_owned(),
                 tokenizer: "default".to_owned()
             }
+            .to_string()
         );
     }
 
