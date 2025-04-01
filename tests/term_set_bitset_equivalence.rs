@@ -13,7 +13,6 @@
 use proptest::prelude::*;
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use rand::Rng;
 use tantivy::collector::DocSetCollector;
 use tantivy::query::{FastFieldTermSetQuery, TermSetStrategyConfig};
 use tantivy::schema::{NumericOptions, SchemaBuilder};
@@ -349,7 +348,6 @@ mod text_equivalence {
     use proptest::prelude::*;
     use rand::prelude::*;
     use rand::rngs::StdRng;
-    use rand::Rng;
     use tantivy::collector::DocSetCollector;
     use tantivy::query::{FastFieldTermSetQuery, TermSetStrategyConfig};
     use tantivy::schema::{SchemaBuilder, STRING};
