@@ -36,7 +36,7 @@ serde_json = "1.0.79"
 fs4 = { version = "0.8.0", optional = true }
 levenshtein_automata = "0.2.1"
 uuid = { version = "1.0.0", features = ["v4", "serde"] }
-crossbeam-channel = "0.5.4"
+crossbeam-channel = "0.5.15"
 rust-stemmers = "1.2.0"
 downcast-rs = "2.0.1"
 bitpacking = { version = "0.9.2", default-features = false, features = [
