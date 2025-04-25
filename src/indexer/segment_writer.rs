@@ -353,8 +353,10 @@ impl SegmentWriter {
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
         self.index_document(&document)?;
-        let doc_writer = self.segment_serializer.get_store_writer();
-        doc_writer.store(&document, &self.schema)?;
+        if self.schema.fields().any(|(_, f)| f.is_stored()) {
+            let doc_writer = self.segment_serializer.get_store_writer();
+            doc_writer.store(&document, &self.schema)?;
+        }
         self.max_doc += 1;
         Ok(())
     }

@@ -578,7 +578,9 @@ impl IndexMerger {
         )?;
 
         debug!("write-storagefields");
-        self.write_storable_fields(serializer.get_store_writer())?;
+        if self.schema.fields().any(|(_, f)| f.is_stored()) {
+            self.write_storable_fields(serializer.get_store_writer())?;
+        }
         debug!("write-fastfields");
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
 
