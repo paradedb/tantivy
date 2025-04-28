@@ -544,9 +544,18 @@ impl SegmentUpdater {
         self.active_index_meta.read().unwrap().clone()
     }
 
-    pub(crate) fn make_merge_operation(&self, segment_ids: &[SegmentId], ignore_store: bool) -> MergeOperation {
+    pub(crate) fn make_merge_operation(
+        &self,
+        segment_ids: &[SegmentId],
+        ignore_store: bool,
+    ) -> MergeOperation {
         let commit_opstamp = self.load_meta().opstamp;
-        MergeOperation::new(&self.merge_operations, commit_opstamp, segment_ids.to_vec(), ignore_store)
+        MergeOperation::new(
+            &self.merge_operations,
+            commit_opstamp,
+            segment_ids.to_vec(),
+            ignore_store,
+        )
     }
 
     // Starts a merge operation. This function will block until the merge operation is effectively
@@ -691,7 +700,12 @@ impl SegmentUpdater {
             .compute_merge_candidates(Some(self.index.directory()), &uncommitted_segments)
             .into_iter()
             .map(|merge_candidate| {
-                MergeOperation::new(&self.merge_operations, current_opstamp, merge_candidate.0, false)
+                MergeOperation::new(
+                    &self.merge_operations,
+                    current_opstamp,
+                    merge_candidate.0,
+                    false,
+                )
             })
             .collect();
 
@@ -700,7 +714,12 @@ impl SegmentUpdater {
             .compute_merge_candidates(Some(self.index.directory()), &committed_segments)
             .into_iter()
             .map(|merge_candidate: MergeCandidate| {
-                MergeOperation::new(&self.merge_operations, commit_opstamp, merge_candidate.0, false)
+                MergeOperation::new(
+                    &self.merge_operations,
+                    commit_opstamp,
+                    merge_candidate.0,
+                    false,
+                )
             });
         merge_candidates.extend(committed_merge_candidates);
 
