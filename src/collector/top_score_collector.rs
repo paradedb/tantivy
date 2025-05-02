@@ -127,9 +127,9 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub struct TopDocs(TopCollector<Score>);
+pub struct TopDocs<A: Acceptor = AllAcceptor>(TopCollector<Score, A>);
 
-impl fmt::Debug for TopDocs {
+impl<A: Acceptor> fmt::Debug for TopDocs<A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -185,13 +185,25 @@ impl CustomScorer<u64> for ScorerByField {
     }
 }
 
-impl TopDocs {
+impl TopDocs<AllAcceptor> {
     /// Creates a top score collector, with a number of documents equal to "limit".
     ///
     /// # Panics
     /// The method panics if limit is 0
-    pub fn with_limit(limit: usize) -> TopDocs {
+    pub fn with_limit(limit: usize) -> Self {
         TopDocs(TopCollector::with_limit(limit))
+    }
+}
+
+impl<A: Acceptor> TopDocs<A> {
+    /// Creates a top score collector, with a number of documents equal to "limit".
+    ///
+    /// # Panics
+    /// The method panics if limit is 0
+    pub fn with_acceptor_and_limit(acceptor: A, limit: usize) -> Self {
+        TopDocs(TopCollector::<_, A>::with_acceptor_and_limit(
+            acceptor, limit,
+        ))
     }
 
     /// Skip the first "offset" documents when collecting.
@@ -235,7 +247,7 @@ impl TopDocs {
     /// # }
     /// ```
     #[must_use]
-    pub fn and_offset(self, offset: usize) -> TopDocs {
+    pub fn and_offset(self, offset: usize) -> Self {
         TopDocs(self.0.and_offset(offset))
     }
 
@@ -632,10 +644,10 @@ impl TopDocs {
     }
 }
 
-impl Collector for TopDocs {
+impl<A: Acceptor> Collector for TopDocs<A> {
     type Fruit = Vec<(Score, DocAddress)>;
 
-    type Child = TopScoreSegmentCollector;
+    type Child = TopScoreSegmentCollector<A>;
 
     fn for_segment(
         &self,
@@ -664,7 +676,8 @@ impl Collector for TopDocs {
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
         let heap_len = self.0.limit + self.0.offset;
-        let mut top_n: TopNComputer<_, _> = TopNComputer::new(heap_len);
+        let mut top_n: TopNComputer<_, _, _> =
+            TopNComputer::with_acceptor(heap_len, self.0.acceptor.for_segment(segment_ord));
 
         if let Some(alive_bitset) = reader.alive_bitset() {
             let mut threshold = Score::MIN;
@@ -702,9 +715,9 @@ impl Collector for TopDocs {
 }
 
 /// Segment Collector associated with `TopDocs`.
-pub struct TopScoreSegmentCollector(TopSegmentCollector<Score>);
+pub struct TopScoreSegmentCollector<A: Acceptor>(TopSegmentCollector<Score, A>);
 
-impl SegmentCollector for TopScoreSegmentCollector {
+impl<A: Acceptor> SegmentCollector for TopScoreSegmentCollector<A> {
     type Fruit = Vec<(Score, DocAddress)>;
 
     fn collect(&mut self, doc: DocId, score: Score) {
@@ -716,6 +729,39 @@ impl SegmentCollector for TopScoreSegmentCollector {
     }
 }
 
+/// A filter applied _after_ `TopDocs` has determined that a Doc is eligible to be collected,
+/// but before it is actually collected. After being accepted by this filter, a Doc might still
+/// later be eliminated by a higher-scoring Doc.
+///
+/// This late filtering allows for avoiding computing properties of the Doc until after it has been
+/// determined that it is eligible to be in the `TopN`.
+pub trait Acceptor: TopNAcceptor<DocAddress> + Send + Sync + 'static {
+    type Child: TopNAcceptor<DocId>;
+
+    fn for_segment(&self, segment_ord: SegmentOrdinal) -> Self::Child;
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AllAcceptor;
+
+impl Acceptor for AllAcceptor {
+    type Child = Self;
+
+    fn for_segment(&self, _segment_ord: SegmentOrdinal) -> Self::Child {
+        self.clone()
+    }
+}
+
+impl<T> TopNAcceptor<T> for AllAcceptor {
+    fn accept(&mut self, _doc: &T) -> bool {
+        true
+    }
+}
+
+pub trait TopNAcceptor<T>: Clone {
+    fn accept(&mut self, doc: &T) -> bool;
+}
+
 /// Fast TopN Computation
 ///
 /// Capacity of the vec is 2 * top_n.
@@ -724,16 +770,22 @@ impl SegmentCollector for TopScoreSegmentCollector {
 ///
 /// For TopN == 0, it will be relative expensive.
 #[derive(Serialize, Deserialize)]
-#[serde(from = "TopNComputerDeser<Score, D, REVERSE_ORDER>")]
-pub struct TopNComputer<Score, D, const REVERSE_ORDER: bool = true> {
+#[serde(from = "TopNComputerDeser<Score, D, A, REVERSE_ORDER>")]
+pub struct TopNComputer<
+    Score,
+    D,
+    A: TopNAcceptor<D> = AllAcceptor,
+    const REVERSE_ORDER: bool = true,
+> {
     /// The buffer reverses sort order to get top-semantics instead of bottom-semantics
     buffer: Vec<ComparableDoc<Score, D, REVERSE_ORDER>>,
     top_n: usize,
     pub(crate) threshold: Option<Score>,
+    acceptor: A,
 }
 
-impl<Score: std::fmt::Debug, D, const REVERSE_ORDER: bool> std::fmt::Debug
-    for TopNComputer<Score, D, REVERSE_ORDER>
+impl<Score: std::fmt::Debug, D, A: TopNAcceptor<D>, const REVERSE_ORDER: bool> std::fmt::Debug
+    for TopNComputer<Score, D, A, REVERSE_ORDER>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TopNComputer")
@@ -746,15 +798,16 @@ impl<Score: std::fmt::Debug, D, const REVERSE_ORDER: bool> std::fmt::Debug
 
 // Intermediate struct for TopNComputer for deserialization, to keep vec capacity
 #[derive(Deserialize)]
-struct TopNComputerDeser<Score, D, const REVERSE_ORDER: bool> {
+struct TopNComputerDeser<Score, D, A: TopNAcceptor<D>, const REVERSE_ORDER: bool> {
     buffer: Vec<ComparableDoc<Score, D, REVERSE_ORDER>>,
     top_n: usize,
     threshold: Option<Score>,
+    acceptor: A,
 }
 
 // Custom clone to keep capacity
-impl<Score: Clone, D: Clone, const REVERSE_ORDER: bool> Clone
-    for TopNComputer<Score, D, REVERSE_ORDER>
+impl<Score: Clone, D: Clone, A: TopNAcceptor<D>, const REVERSE_ORDER: bool> Clone
+    for TopNComputer<Score, D, A, REVERSE_ORDER>
 {
     fn clone(&self) -> Self {
         let mut buffer_clone = Vec::with_capacity(self.buffer.capacity());
@@ -764,12 +817,15 @@ impl<Score: Clone, D: Clone, const REVERSE_ORDER: bool> Clone
             buffer: buffer_clone,
             top_n: self.top_n,
             threshold: self.threshold.clone(),
+            acceptor: self.acceptor.clone(),
         }
     }
 }
 
-impl<Score, D, const R: bool> From<TopNComputerDeser<Score, D, R>> for TopNComputer<Score, D, R> {
-    fn from(mut value: TopNComputerDeser<Score, D, R>) -> Self {
+impl<Score, D, A: TopNAcceptor<D>, const R: bool> From<TopNComputerDeser<Score, D, A, R>>
+    for TopNComputer<Score, D, A, R>
+{
+    fn from(mut value: TopNComputerDeser<Score, D, A, R>) -> Self {
         let expected_cap = value.top_n.max(1) * 2;
         let current_cap = value.buffer.capacity();
         if current_cap < expected_cap {
@@ -782,11 +838,12 @@ impl<Score, D, const R: bool> From<TopNComputerDeser<Score, D, R>> for TopNCompu
             buffer: value.buffer,
             top_n: value.top_n,
             threshold: value.threshold,
+            acceptor: value.acceptor,
         }
     }
 }
 
-impl<Score, D, const R: bool> TopNComputer<Score, D, R>
+impl<Score, D, const R: bool> TopNComputer<Score, D, AllAcceptor, R>
 where
     Score: PartialOrd + Clone,
     D: Ord,
@@ -794,11 +851,24 @@ where
     /// Create a new `TopNComputer`.
     /// Internally it will allocate a buffer of size `2 * top_n`.
     pub fn new(top_n: usize) -> Self {
+        Self::with_acceptor(top_n, AllAcceptor)
+    }
+}
+
+impl<Score, D, A: TopNAcceptor<D>, const R: bool> TopNComputer<Score, D, A, R>
+where
+    Score: PartialOrd + Clone,
+    D: Ord,
+{
+    /// Create a new `TopNComputer`.
+    /// Internally it will allocate a buffer of size `2 * top_n`.
+    pub fn with_acceptor(top_n: usize, acceptor: A) -> Self {
         let vec_cap = top_n.max(1) * 2;
         TopNComputer {
             buffer: Vec::with_capacity(vec_cap),
             top_n,
             threshold: None,
+            acceptor,
         }
     }
 
@@ -811,6 +881,11 @@ where
                 return;
             }
         }
+
+        if !self.acceptor.accept(&doc) {
+            return;
+        }
+
         if self.buffer.len() == self.buffer.capacity() {
             let median = self.truncate_top_n();
             self.threshold = Some(median);

@@ -1,19 +1,20 @@
 use crate::collector::top_collector::{TopCollector, TopSegmentCollector};
+use crate::collector::top_score_collector::Acceptor;
 use crate::collector::{Collector, SegmentCollector};
 use crate::{DocAddress, DocId, Score, SegmentReader};
 
-pub(crate) struct CustomScoreTopCollector<TCustomScorer, TScore = Score> {
+pub(crate) struct CustomScoreTopCollector<TCustomScorer, A: Acceptor, TScore = Score> {
     custom_scorer: TCustomScorer,
-    collector: TopCollector<TScore>,
+    collector: TopCollector<TScore, A>,
 }
 
-impl<TCustomScorer, TScore> CustomScoreTopCollector<TCustomScorer, TScore>
+impl<TCustomScorer, A: Acceptor, TScore> CustomScoreTopCollector<TCustomScorer, A, TScore>
 where TScore: Clone + PartialOrd
 {
     pub(crate) fn new(
         custom_scorer: TCustomScorer,
-        collector: TopCollector<TScore>,
-    ) -> CustomScoreTopCollector<TCustomScorer, TScore> {
+        collector: TopCollector<TScore, A>,
+    ) -> CustomScoreTopCollector<TCustomScorer, A, TScore> {
         CustomScoreTopCollector {
             custom_scorer,
             collector,
@@ -43,14 +44,15 @@ pub trait CustomScorer<TScore>: Sync {
     fn segment_scorer(&self, segment_reader: &SegmentReader) -> crate::Result<Self::Child>;
 }
 
-impl<TCustomScorer, TScore> Collector for CustomScoreTopCollector<TCustomScorer, TScore>
+impl<TCustomScorer, A: Acceptor, TScore> Collector
+    for CustomScoreTopCollector<TCustomScorer, A, TScore>
 where
     TCustomScorer: CustomScorer<TScore> + Send + Sync,
     TScore: 'static + PartialOrd + Clone + Send + Sync,
 {
     type Fruit = Vec<(TScore, DocAddress)>;
 
-    type Child = CustomScoreTopSegmentCollector<TCustomScorer::Child, TScore>;
+    type Child = CustomScoreTopSegmentCollector<TCustomScorer::Child, A, TScore>;
 
     fn for_segment(
         &self,
@@ -74,16 +76,17 @@ where
     }
 }
 
-pub struct CustomScoreTopSegmentCollector<T, TScore>
+pub struct CustomScoreTopSegmentCollector<T, A, TScore>
 where
     TScore: 'static + PartialOrd + Clone + Send + Sync + Sized,
+    A: Acceptor,
     T: CustomSegmentScorer<TScore>,
 {
-    segment_collector: TopSegmentCollector<TScore>,
+    segment_collector: TopSegmentCollector<TScore, A>,
     segment_scorer: T,
 }
 
-impl<T, TScore> SegmentCollector for CustomScoreTopSegmentCollector<T, TScore>
+impl<T, A: Acceptor, TScore> SegmentCollector for CustomScoreTopSegmentCollector<T, A, TScore>
 where
     TScore: 'static + PartialOrd + Clone + Send + Sync,
     T: 'static + CustomSegmentScorer<TScore>,
