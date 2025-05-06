@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize};
 
-use super::top_score_collector::TopNComputer;
+use super::top_score_collector::{Acceptor, AllAcceptor, TopNComputer};
 use crate::index::SegmentReader;
 use crate::{DocAddress, DocId, SegmentOrdinal};
 
@@ -68,24 +68,34 @@ impl<T: PartialOrd, D: PartialOrd, const R: bool> PartialEq for ComparableDoc<T,
 
 impl<T: PartialOrd, D: PartialOrd, const R: bool> Eq for ComparableDoc<T, D, R> {}
 
-pub(crate) struct TopCollector<T> {
+pub(crate) struct TopCollector<T, A: Acceptor> {
     pub limit: usize,
     pub offset: usize,
+    pub acceptor: A,
     _marker: PhantomData<T>,
 }
 
-impl<T> TopCollector<T>
+impl<T> TopCollector<T, AllAcceptor>
 where T: PartialOrd + Clone
 {
     /// Creates a top collector, with a number of documents equal to "limit".
     ///
     /// # Panics
     /// The method panics if limit is 0
-    pub fn with_limit(limit: usize) -> TopCollector<T> {
+    pub fn with_limit(limit: usize) -> Self {
+        TopCollector::with_acceptor_and_limit(AllAcceptor, limit)
+    }
+}
+
+impl<T, A: Acceptor> TopCollector<T, A>
+where T: PartialOrd + Clone
+{
+    pub fn with_acceptor_and_limit(acceptor: A, limit: usize) -> Self {
         assert!(limit >= 1, "Limit must be strictly greater than 0.");
-        Self {
+        TopCollector {
             limit,
             offset: 0,
+            acceptor,
             _marker: PhantomData,
         }
     }
@@ -94,7 +104,7 @@ where T: PartialOrd + Clone
     ///
     /// This is equivalent to `OFFSET` in MySQL or PostgreSQL and `start` in
     /// Lucene's TopDocsCollector.
-    pub fn and_offset(mut self, offset: usize) -> TopCollector<T> {
+    pub fn and_offset(mut self, offset: usize) -> Self {
         self.offset = offset;
         self
     }
@@ -106,7 +116,8 @@ where T: PartialOrd + Clone
         if self.limit == 0 {
             return Ok(Vec::new());
         }
-        let mut top_collector: TopNComputer<_, _> = TopNComputer::new(self.limit + self.offset);
+        let mut top_collector: TopNComputer<_, _, _> =
+            TopNComputer::with_acceptor(self.limit + self.offset, self.acceptor.clone());
         for child_fruit in children {
             for (feature, doc) in child_fruit {
                 top_collector.push(feature, doc);
@@ -125,8 +136,8 @@ where T: PartialOrd + Clone
         &self,
         segment_id: SegmentOrdinal,
         _: &SegmentReader,
-    ) -> TopSegmentCollector<F> {
-        TopSegmentCollector::new(segment_id, self.limit + self.offset)
+    ) -> TopSegmentCollector<F, A> {
+        TopSegmentCollector::with_acceptor(segment_id, self.limit + self.offset, &self.acceptor)
     }
 
     /// Create a new TopCollector with the same limit and offset.
@@ -134,10 +145,11 @@ where T: PartialOrd + Clone
     /// Ideally we would use Into but the blanket implementation seems to cause the Scorer traits
     /// to fail.
     #[doc(hidden)]
-    pub(crate) fn into_tscore<TScore: PartialOrd + Clone>(self) -> TopCollector<TScore> {
+    pub(crate) fn into_tscore<TScore: PartialOrd + Clone>(self) -> TopCollector<TScore, A> {
         TopCollector {
             limit: self.limit,
             offset: self.offset,
+            acceptor: self.acceptor,
             _marker: PhantomData,
         }
     }
@@ -149,23 +161,29 @@ where T: PartialOrd + Clone
 /// The implementation is based on a repeatedly truncating on the median after K * 2 documents
 /// The theoretical complexity for collecting the top `K` out of `n` documents
 /// is `O(n + K)`.
-pub(crate) struct TopSegmentCollector<T> {
+pub(crate) struct TopSegmentCollector<T, A: Acceptor> {
     /// We reverse the order of the feature in order to
     /// have top-semantics instead of bottom semantics.
-    topn_computer: TopNComputer<T, DocId>,
+    topn_computer: TopNComputer<T, DocId, A::Child>,
     segment_ord: u32,
 }
 
-impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
-    fn new(segment_ord: SegmentOrdinal, limit: usize) -> TopSegmentCollector<T> {
-        TopSegmentCollector {
-            topn_computer: TopNComputer::new(limit),
+impl<T: PartialOrd + Clone> TopSegmentCollector<T, AllAcceptor> {
+    fn new(segment_ord: SegmentOrdinal, limit: usize) -> Self {
+        Self::with_acceptor(segment_ord, limit, &AllAcceptor)
+    }
+}
+
+impl<T: PartialOrd + Clone, A: Acceptor> TopSegmentCollector<T, A> {
+    fn with_acceptor(segment_ord: SegmentOrdinal, limit: usize, acceptor: &A) -> Self {
+        Self {
+            topn_computer: TopNComputer::with_acceptor(limit, acceptor.for_segment(segment_ord)),
             segment_ord,
         }
     }
 }
 
-impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
+impl<T: PartialOrd + Clone, A: Acceptor> TopSegmentCollector<T, A> {
     pub fn harvest(self) -> Vec<(T, DocAddress)> {
         let segment_ord = self.segment_ord;
         self.topn_computer

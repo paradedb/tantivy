@@ -98,7 +98,7 @@ mod top_collector;
 
 mod top_score_collector;
 pub use self::top_collector::ComparableDoc;
-pub use self::top_score_collector::{TopDocs, TopNComputer};
+pub use self::top_score_collector::{Acceptor, AllAcceptor, TopDocs, TopNAcceptor, TopNComputer};
 
 mod custom_score_top_collector;
 pub use self::custom_score_top_collector::{CustomScorer, CustomSegmentScorer};

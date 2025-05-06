@@ -15,7 +15,7 @@ use crate::aggregation::intermediate_agg_result::{
 };
 use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
 use crate::aggregation::AggregationError;
-use crate::collector::TopNComputer;
+use crate::collector::{AllAcceptor, TopNComputer};
 use crate::schema::OwnedValue;
 use crate::{DocAddress, DocId, SegmentOrdinal};
 
@@ -432,7 +432,7 @@ impl Eq for DocSortValuesAndFields {}
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct TopHitsTopNComputer {
     req: TopHitsAggregationReq,
-    top_n: TopNComputer<DocSortValuesAndFields, DocAddress, false>,
+    top_n: TopNComputer<DocSortValuesAndFields, DocAddress, AllAcceptor, false>,
 }
 
 impl std::cmp::PartialEq for TopHitsTopNComputer {
@@ -491,7 +491,7 @@ impl TopHitsTopNComputer {
 pub(crate) struct TopHitsSegmentCollector {
     segment_ordinal: SegmentOrdinal,
     accessor_idx: usize,
-    top_n: TopNComputer<Vec<DocValueAndOrder>, DocAddress, false>,
+    top_n: TopNComputer<Vec<DocValueAndOrder>, DocAddress, AllAcceptor, false>,
 }
 
 impl TopHitsSegmentCollector {

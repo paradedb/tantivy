@@ -1,19 +1,20 @@
 use crate::collector::top_collector::{TopCollector, TopSegmentCollector};
+use crate::collector::top_score_collector::Acceptor;
 use crate::collector::{Collector, SegmentCollector};
 use crate::{DocAddress, DocId, Result, Score, SegmentReader};
 
-pub(crate) struct TweakedScoreTopCollector<TScoreTweaker, TScore = Score> {
+pub(crate) struct TweakedScoreTopCollector<TScoreTweaker, A: Acceptor, TScore = Score> {
     score_tweaker: TScoreTweaker,
-    collector: TopCollector<TScore>,
+    collector: TopCollector<TScore, A>,
 }
 
-impl<TScoreTweaker, TScore> TweakedScoreTopCollector<TScoreTweaker, TScore>
+impl<TScoreTweaker, A: Acceptor, TScore> TweakedScoreTopCollector<TScoreTweaker, A, TScore>
 where TScore: Clone + PartialOrd
 {
     pub fn new(
         score_tweaker: TScoreTweaker,
-        collector: TopCollector<TScore>,
-    ) -> TweakedScoreTopCollector<TScoreTweaker, TScore> {
+        collector: TopCollector<TScore, A>,
+    ) -> TweakedScoreTopCollector<TScoreTweaker, A, TScore> {
         TweakedScoreTopCollector {
             score_tweaker,
             collector,
@@ -45,14 +46,15 @@ pub trait ScoreTweaker<TScore>: Sync {
     fn segment_tweaker(&self, segment_reader: &SegmentReader) -> Result<Self::Child>;
 }
 
-impl<TScoreTweaker, TScore> Collector for TweakedScoreTopCollector<TScoreTweaker, TScore>
+impl<TScoreTweaker, A: Acceptor, TScore> Collector
+    for TweakedScoreTopCollector<TScoreTweaker, A, TScore>
 where
     TScoreTweaker: ScoreTweaker<TScore> + Send + Sync,
     TScore: 'static + PartialOrd + Clone + Send + Sync,
 {
     type Fruit = Vec<(TScore, DocAddress)>;
 
-    type Child = TopTweakedScoreSegmentCollector<TScoreTweaker::Child, TScore>;
+    type Child = TopTweakedScoreSegmentCollector<TScoreTweaker::Child, A, TScore>;
 
     fn for_segment(
         &self,
@@ -76,17 +78,17 @@ where
     }
 }
 
-pub struct TopTweakedScoreSegmentCollector<TSegmentScoreTweaker, TScore>
+pub struct TopTweakedScoreSegmentCollector<TSegmentScoreTweaker, A: Acceptor, TScore>
 where
     TScore: 'static + PartialOrd + Clone + Send + Sync + Sized,
     TSegmentScoreTweaker: ScoreSegmentTweaker<TScore>,
 {
-    segment_collector: TopSegmentCollector<TScore>,
+    segment_collector: TopSegmentCollector<TScore, A>,
     segment_scorer: TSegmentScoreTweaker,
 }
 
-impl<TSegmentScoreTweaker, TScore> SegmentCollector
-    for TopTweakedScoreSegmentCollector<TSegmentScoreTweaker, TScore>
+impl<TSegmentScoreTweaker, A: Acceptor, TScore> SegmentCollector
+    for TopTweakedScoreSegmentCollector<TSegmentScoreTweaker, A, TScore>
 where
     TScore: 'static + PartialOrd + Clone + Send + Sync,
     TSegmentScoreTweaker: 'static + ScoreSegmentTweaker<TScore>,
