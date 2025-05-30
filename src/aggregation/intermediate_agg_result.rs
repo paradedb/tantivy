@@ -4,13 +4,16 @@
 
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
+use std::fmt::Formatter;
 use std::hash::Hash;
 use std::net::Ipv6Addr;
 
 use columnar::ColumnType;
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::agg_req::{Aggregation, AggregationVariants, Aggregations};
 use super::agg_result::{AggregationResult, BucketResult, MetricResult, RangeBucketEntry};
@@ -583,12 +586,77 @@ pub struct IntermediateRangeBucketResult {
     pub(crate) column_type: Option<ColumnType>,
 }
 
-#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Clone, Debug, PartialEq)]
 /// Term aggregation including error counts
 pub struct IntermediateTermBucketResult {
     pub(crate) entries: FxHashMap<IntermediateKey, IntermediateTermBucketEntry>,
     pub(crate) sum_other_doc_count: u64,
     pub(crate) doc_count_error_upper_bound: u64,
+}
+
+impl Serialize for IntermediateTermBucketResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        let mut container = serializer.serialize_map(Some(3))?;
+        container.serialize_entry("_sum_other_doc_count", &self.sum_other_doc_count)?;
+        container.serialize_entry(
+            "_doc_count_error_upper_bound",
+            &self.doc_count_error_upper_bound,
+        )?;
+
+        let entries = self.entries.iter().collect::<Vec<_>>();
+        container.serialize_entry("_entries", &entries)?;
+        container.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for IntermediateTermBucketResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        struct ContainerVisitor;
+        impl<'de> Visitor<'de> for ContainerVisitor {
+            type Value = IntermediateTermBucketResult;
+
+            fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
+                formatter.write_str("struct IntermediateTermBucketResult")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where A: MapAccess<'de> {
+                let mut entries =
+                    FxHashMap::<IntermediateKey, IntermediateTermBucketEntry>::default();
+                let mut sum_other_doc_count = 0u64;
+                let mut doc_count_error_upper_bound = 0u64;
+                while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
+                    match k.as_str() {
+                        "_sum_other_doc_count" => sum_other_doc_count = v.as_u64().unwrap(),
+                        "_doc_count_error_upper_bound" => {
+                            doc_count_error_upper_bound = v.as_u64().unwrap()
+                        }
+                        "_entries" => {
+                            let v = v.as_array().unwrap();
+
+                            entries.extend(v.iter().map(|value| {
+                                let kv = value.as_array().unwrap();
+                                let key = IntermediateKey::deserialize(&kv[0]).unwrap();
+                                let value =
+                                    IntermediateTermBucketEntry::deserialize(&kv[1]).unwrap();
+                                (key, value)
+                            }));
+                        }
+                        other => panic!("unexpected key: {other}"),
+                    }
+                }
+
+                Ok(IntermediateTermBucketResult {
+                    entries,
+                    sum_other_doc_count,
+                    doc_count_error_upper_bound,
+                })
+            }
+        }
+        deserializer.deserialize_map(ContainerVisitor)
+    }
 }
 
 impl IntermediateTermBucketResult {
