@@ -200,24 +200,56 @@ where TCollector: SegmentCollector<Fruit = Vec<(TermOrdinal, DocAddress)>> + 'st
     }
 
     fn harvest(self) -> Vec<(String, DocAddress)> {
-        let mut term_buffer = String::new();
-        self.collector
-            .harvest()
-            .into_iter()
-            .map(|(mut term_ordinal, doc)| {
-                // TODO: should use `sorted_ords_to_terms`, but would need to deal with reverse
-                // ordering.
-                // TODO: I suppose that collectors are not allowed to do IO? But fetching columns
-                // is IO?
-                if self.order.is_asc() {
-                    term_ordinal = u64::MAX - term_ordinal;
-                }
-                self.ff
-                    .ord_to_str(term_ordinal, &mut term_buffer)
-                    .expect("Failed to load term.");
-                (term_buffer.clone(), doc)
-            })
-            .collect()
+        let fruit = self.collector.harvest();
+
+        // Collect terms.
+        let mut terms = Vec::with_capacity(fruit.len());
+        let result = if self.order.is_asc() {
+            self.ff.dictionary().sorted_ords_to_term_cb(
+                fruit.iter().map(|(term_ord, _)| u64::MAX - term_ord),
+                |term| {
+                    terms.push(
+                        std::str::from_utf8(term)
+                            .expect("Failed to decode term as unicode")
+                            .to_owned(),
+                    );
+                    Ok(())
+                },
+            )
+        } else {
+            self.ff.dictionary().sorted_ords_to_term_cb(
+                fruit.iter().rev().map(|(term_ord, _)| *term_ord),
+                |term| {
+                    terms.push(
+                        std::str::from_utf8(term)
+                            .expect("Failed to decode term as unicode")
+                            .to_owned(),
+                    );
+                    Ok(())
+                },
+            )
+        };
+
+        assert!(
+            result.expect("Failed to read terms from term dictionary"),
+            "Not all terms were matched in segment."
+        );
+
+        // Zip them back with their docs.
+        if self.order.is_asc() {
+            terms
+                .into_iter()
+                .zip(fruit)
+                .map(|(term, (_, doc))| (term, doc))
+                .collect()
+        } else {
+            terms
+                .into_iter()
+                .rev()
+                .zip(fruit)
+                .map(|(term, (_, doc))| (term, doc))
+                .collect()
+        }
     }
 }
 
