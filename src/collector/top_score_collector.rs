@@ -6,7 +6,9 @@ use columnar::{ColumnValues, StrColumn};
 use serde::{Deserialize, Serialize};
 
 use super::Collector;
-use crate::collector::custom_score_top_collector::CustomScoreTopCollector;
+use crate::collector::custom_score_top_collector::{
+    CustomScoreTopCollector, CustomScoreTopSegmentCollector,
+};
 use crate::collector::top_collector::{ComparableDoc, TopCollector, TopSegmentCollector};
 use crate::collector::tweak_score_top_collector::TweakedScoreTopCollector;
 use crate::collector::{
@@ -14,7 +16,6 @@ use crate::collector::{
 };
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::query::Weight;
-use crate::termdict::TermOrdinal;
 use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 struct FastFieldConvertCollector<
@@ -84,26 +85,18 @@ where
     }
 }
 
-struct StringConvertCollector<TCollector, TCollectorChild>
-where
-    TCollector: Collector<Fruit = Vec<(TermOrdinal, DocAddress)>, Child = TCollectorChild>,
-    TCollectorChild: SegmentCollector<Fruit = Vec<(TermOrdinal, DocAddress)>>,
-{
-    pub collector: TCollector,
+struct StringConvertCollector {
+    pub collector: CustomScoreTopCollector<ScorerByField, u64>,
     pub field: String,
     order: Order,
     limit: usize,
     offset: usize,
 }
 
-impl<TCollector, TCollectorChild> Collector for StringConvertCollector<TCollector, TCollectorChild>
-where
-    TCollector: Collector<Fruit = Vec<(TermOrdinal, DocAddress)>, Child = TCollectorChild>,
-    TCollectorChild: SegmentCollector<Fruit = Vec<(TermOrdinal, DocAddress)>>,
-{
+impl Collector for StringConvertCollector {
     type Fruit = Vec<(String, DocAddress)>;
 
-    type Child = StringConvertSegmentCollector<TCollectorChild>;
+    type Child = StringConvertSegmentCollector;
 
     fn for_segment(
         &self,
@@ -182,17 +175,13 @@ where
     }
 }
 
-struct StringConvertSegmentCollector<TCollector>
-where TCollector: SegmentCollector<Fruit = Vec<(TermOrdinal, DocAddress)>> + 'static
-{
-    pub collector: TCollector,
+struct StringConvertSegmentCollector {
+    pub collector: CustomScoreTopSegmentCollector<ScorerByFastFieldReader, u64>,
     ff: StrColumn,
     order: Order,
 }
 
-impl<TCollector> SegmentCollector for StringConvertSegmentCollector<TCollector>
-where TCollector: SegmentCollector<Fruit = Vec<(TermOrdinal, DocAddress)>> + 'static
-{
+impl SegmentCollector for StringConvertSegmentCollector {
     type Fruit = Vec<(String, DocAddress)>;
 
     fn collect(&mut self, doc: DocId, score: Score) {
