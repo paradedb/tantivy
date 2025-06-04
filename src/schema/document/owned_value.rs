@@ -268,6 +268,29 @@ impl<'de> serde::Deserialize<'de> for OwnedValue {
     }
 }
 
+/// An implementation of OwnedValue which panics for OwnedValues with mismatched types.
+///
+/// TODO: I don't like having this, but it makes it much easier to experiment.
+impl PartialOrd for OwnedValue {
+    #[inline]
+    fn partial_cmp(&self, other: &OwnedValue) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (OwnedValue::Null, OwnedValue::Null) => None,
+            (OwnedValue::Str(a), OwnedValue::Str(b)) => a.partial_cmp(b),
+            (OwnedValue::PreTokStr(a), OwnedValue::PreTokStr(b)) => a.partial_cmp(b),
+            (OwnedValue::U64(a), OwnedValue::U64(b)) => a.partial_cmp(b),
+            (OwnedValue::I64(a), OwnedValue::I64(b)) => a.partial_cmp(b),
+            (OwnedValue::F64(a), OwnedValue::F64(b)) => a.partial_cmp(b),
+            (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a.partial_cmp(b),
+            (OwnedValue::Date(a), OwnedValue::Date(b)) => a.partial_cmp(b),
+            (OwnedValue::Facet(a), OwnedValue::Facet(b)) => a.partial_cmp(b),
+            (OwnedValue::Bytes(a), OwnedValue::Bytes(b)) => a.partial_cmp(b),
+            (OwnedValue::IpAddr(a), OwnedValue::IpAddr(b)) => a.partial_cmp(b),
+            x => panic!("Unsupported comparison: {x:?}"),
+        }
+    }
+}
+
 impl<'a, V: Value<'a>> From<ReferenceValue<'a, V>> for OwnedValue {
     fn from(val: ReferenceValue<'a, V>) -> OwnedValue {
         match val {
