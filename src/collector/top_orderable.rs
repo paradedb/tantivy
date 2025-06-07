@@ -304,75 +304,6 @@ pub trait TopOrderable: Clone + Sync + Send + 'static {
     fn compare(&self, a: &(Self::Output, DocAddress), b: &(Self::Output, DocAddress)) -> bool;
 }
 
-impl<F: Feature> TopOrderable for ((F, Order),) {
-    type Output = (F::Output,);
-    type SegmentOutput = (F::SegmentOutput,);
-
-    fn requires_scoring(&self) -> bool {
-        (self.0).0.requires_scoring()
-    }
-
-    fn feature_columns(
-        &self,
-        segment_reader: &SegmentReader,
-    ) -> impl Iterator<Item = crate::Result<(FeatureColumn, Order)>> {
-        let result = (self.0)
-            .0
-            .open(segment_reader, (self.0).1.clone())
-            .map(|feature_column| (feature_column, (self.0).1.clone()));
-        std::iter::once(result)
-    }
-
-    fn segment_score(
-        &mut self,
-        features: &Vec<(FeatureColumn, Order)>,
-        doc: DocId,
-        score: Score,
-    ) -> Self::SegmentOutput {
-        let (feature_column, order) = &features[0];
-        (F::get(feature_column, order.clone(), doc, score),)
-    }
-
-    fn decode(
-        &self,
-        features: &Vec<(FeatureColumn, Order)>,
-        segment_output: Vec<(Self::SegmentOutput, DocAddress)>,
-    ) -> Vec<(Self::Output, DocAddress)> {
-        let (feature_column, order) = &features[0];
-
-        let decoded_segment_output = F::decode(
-            feature_column,
-            order.clone(),
-            segment_output.iter().map(|((v,), _)| v.clone()),
-        );
-
-        decoded_segment_output
-            .into_iter()
-            .zip(segment_output)
-            .map(|(decoded, (_, doc))| ((decoded,), doc))
-            .collect()
-    }
-
-    fn compare(&self, a: &(Self::Output, DocAddress), b: &(Self::Output, DocAddress)) -> bool {
-        if (self.0).1.is_asc() {
-            match (a.0).0.partial_cmp(&(b.0).0) {
-                Some(Ordering::Less) => return true,
-                Some(Ordering::Greater) => return false,
-                Some(Ordering::Equal) | None => {}
-            }
-            a.1 < b.1
-        } else {
-            match (a.0).0.partial_cmp(&(b.0).0) {
-                Some(Ordering::Less) => return false,
-                Some(Ordering::Greater) => return true,
-                Some(Ordering::Equal) | None => {}
-            }
-            // NB: To match `TopNComputer`, DocAddress is always compared as ascending.
-            a.1 < b.1
-        }
-    }
-}
-
 pub struct TopOrderableSegmentCollector<O: TopOrderable> {
     segment_collector: TopSegmentCollector<O::SegmentOutput>,
     orderable: O,
@@ -447,6 +378,106 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
         Ok(merged)
     }
 }
+
+macro_rules! impl_top_orderable {
+    ( $( ($T:ident, $idx:tt) ),+ ) => {
+        impl<$($T: Feature),+> TopOrderable for ( $(($T, Order)),+ ,) {
+            type Output = ( $($T::Output),+ ,);
+            type SegmentOutput = ( $($T::SegmentOutput),+ ,);
+
+            fn requires_scoring(&self) -> bool {
+                // Returns true if any of the features require scoring.
+                false $(|| self.$idx.0.requires_scoring())*
+            }
+
+            fn feature_columns(
+                &self,
+                segment_reader: &SegmentReader,
+            ) -> impl Iterator<Item = crate::Result<(FeatureColumn, Order)>> {
+                // Collects all feature columns from the tuple elements.
+                [
+                    $(
+                        self.$idx.0.open(segment_reader, self.$idx.1.clone()).map(|fc| (fc, self.$idx.1.clone()))
+                    ),+
+                ]
+                .into_iter()
+            }
+
+            fn segment_score(
+                &mut self,
+                features: &Vec<(FeatureColumn, Order)>,
+                doc: DocId,
+                score: Score,
+            ) -> Self::SegmentOutput {
+                // Scores the document for each feature and returns a tuple of segment outputs.
+                (
+                    $(
+                        $T::get(&features[$idx].0, features[$idx].1.clone(), doc, score)
+                    ),+
+                    ,
+                )
+            }
+
+            fn decode(
+                &self,
+                features: &Vec<(FeatureColumn, Order)>,
+                segment_output: Vec<(Self::SegmentOutput, DocAddress)>,
+            ) -> Vec<(Self::Output, DocAddress)> {
+                // Decode each feature's values separately.
+                $(
+                    paste::paste! {
+                        let mut [<decoded_values_ $idx>] = $T::decode(
+                            &features[$idx].0,
+                            features[$idx].1.clone(),
+                            segment_output.iter().map(|(v, _)| v.$idx.clone()),
+                        ).into_iter();
+                    }
+                )*
+
+                // Zip the decoded values and doc addresses back together.
+                let mut result = Vec::with_capacity(segment_output.len());
+                for (_, doc_address) in segment_output {
+                    let output_tuple = (
+                        $(
+                            paste::paste! {
+                                [<decoded_values_ $idx>].next().unwrap()
+                            }
+                        ),+
+                        ,
+                    );
+                    result.push((output_tuple, doc_address));
+                }
+                result
+            }
+
+            fn compare(&self, a: &(Self::Output, DocAddress), b: &(Self::Output, DocAddress)) -> bool {
+                // Perform lexicographical comparison on the tuple elements.
+                $(
+                    if self.$idx.1.is_asc() {
+                        match (a.0).$idx.partial_cmp(&(b.0).$idx) {
+                            Some(Ordering::Less) => return true,
+                            Some(Ordering::Greater) => return false,
+                            Some(Ordering::Equal) | None => {} // Fall through
+                        }
+                    } else {
+                        match (a.0).$idx.partial_cmp(&(b.0).$idx) {
+                            Some(Ordering::Less) => return false,
+                            Some(Ordering::Greater) => return true,
+                            Some(Ordering::Equal) | None => {} // Fall through
+                        }
+                    }
+                )*
+
+                // Tie-breaker: DocAddress is always compared ascending.
+                a.1 < b.1
+            }
+        }
+    };
+}
+
+impl_top_orderable! { (F1, 0) }
+impl_top_orderable! { (F1, 0), (F2, 1) }
+impl_top_orderable! { (F1, 0), (F2, 1), (F3, 2) }
 
 #[cfg(test)]
 mod tests {
@@ -620,6 +651,43 @@ mod tests {
                 ((0.20983513,), DocAddress::new(1, 0)),
                 ((0.18360573,), DocAddress::new(0, 1)),
                 ((0.13353144,), DocAddress::new(0, 0)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_score_then_string() -> crate::Result<()> {
+        let index = make_index()?;
+
+        fn query(
+            index: &Index,
+            score_order: Order,
+            city_order: Order,
+        ) -> crate::Result<Vec<((Score, String), DocAddress)>> {
+            let searcher = index.reader()?.searcher();
+            let top_collector = TopDocs::with_limit(3).order_by((
+                (ScoreFeature, score_order),
+                (FieldFeature::string("city"), city_order),
+            ));
+            searcher.search(&AllQuery, &top_collector)
+        }
+
+        assert_eq!(
+            &query(&index, Order::Asc, Order::Asc)?,
+            &[
+                ((1.0, "austin".to_owned()), DocAddress::new(0, 0)),
+                ((1.0, "greenville".to_owned()), DocAddress::new(0, 1)),
+                ((1.0, "tokyo".to_owned()), DocAddress::new(1, 0)),
+            ]
+        );
+
+        assert_eq!(
+            &query(&index, Order::Asc, Order::Desc)?,
+            &[
+                ((1.0, "tokyo".to_owned()), DocAddress::new(1, 0)),
+                ((1.0, "greenville".to_owned()), DocAddress::new(0, 1)),
+                ((1.0, "austin".to_owned()), DocAddress::new(0, 0)),
             ]
         );
         Ok(())
