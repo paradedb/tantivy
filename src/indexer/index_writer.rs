@@ -2657,13 +2657,3 @@ mod tests {
         assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
     }
 }
-
-
-
-
-
-
-
-
-
-
