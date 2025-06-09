@@ -4,6 +4,7 @@
 //! `IndexWriter` is the main entry point for that, which created from
 //! [`Index::writer`](crate::Index::writer).
 
+/// Delete queue implementation for broadcasting delete operations to consumers.
 pub mod delete_queue;
 pub(crate) mod path_to_unordered_id;
 
@@ -36,7 +37,7 @@ pub use self::index_writer::{advance_deletes, IndexWriter, IndexWriterOptions};
 pub use self::log_merge_policy::LogMergePolicy;
 pub use self::merge_operation::MergeOperation;
 pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
-pub use self::operation::{AddOperation, UserOperation};
+pub use self::operation::{AddOperation, DeleteOperation, UserOperation};
 pub use self::prepared_commit::PreparedCommit;
 pub use self::segment_entry::SegmentEntry;
 pub(crate) use self::segment_serializer::SegmentSerializer;
