@@ -375,6 +375,7 @@ impl IndexMerger {
         let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
 
         let mut cnt = 0;
+        let start = std::time::Instant::now();
         while merged_terms.advance() {
             // calling `wants_cancel()` could be expensive so only do it so often
             if cnt % 1000 == 0 {
@@ -495,6 +496,7 @@ impl IndexMerger {
             field_serializer.close_term()?;
         }
         field_serializer.close()?;
+        eprintln!("time for {:?}:  {:?}", field_entry.name(), start.elapsed());
         Ok(())
     }
 
