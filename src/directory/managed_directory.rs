@@ -62,10 +62,6 @@ fn save_managed_paths(
 }
 
 impl ManagedDirectory {
-    pub fn inner(&self) -> &dyn Directory {
-        &*self.directory
-    }
-
     /// Wraps a directory as managed directory.
     pub fn wrap(directory: Box<dyn Directory>) -> crate::Result<ManagedDirectory> {
         Ok(ManagedDirectory { directory })
