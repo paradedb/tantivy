@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -294,10 +293,6 @@ impl ManagedDirectory {
 }
 
 impl Directory for ManagedDirectory {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let file_slice = self.open_read(path)?;
         Ok(Arc::new(file_slice))
