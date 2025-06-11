@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -167,6 +168,10 @@ impl RamDirectory {
 }
 
 impl Directory for RamDirectory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let file_slice = self.open_read(path)?;
         Ok(Arc::new(file_slice))

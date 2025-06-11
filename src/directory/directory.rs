@@ -113,6 +113,8 @@ pub type DirectoryPanicHandler = Arc<dyn Fn(Box<dyn Any + Send>) + Send + Sync +
 /// - The [`MMapDirectory`][crate::directory::MmapDirectory], this should be your default choice.
 /// - The [`RamDirectory`][crate::directory::RamDirectory], which should be used mostly for tests.
 pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
+    fn as_any(&self) -> &dyn Any;
+
     /// Opens a file and returns a boxed `FileHandle`.
     ///
     /// Users of `Directory` should typically call `Directory::open_read(...)`,

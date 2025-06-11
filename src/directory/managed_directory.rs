@@ -62,6 +62,10 @@ fn save_managed_paths(
 }
 
 impl ManagedDirectory {
+    pub fn inner(&self) -> &dyn Directory {
+        &*self.directory
+    }
+
     /// Wraps a directory as managed directory.
     pub fn wrap(directory: Box<dyn Directory>) -> crate::Result<ManagedDirectory> {
         Ok(ManagedDirectory { directory })
@@ -290,6 +294,10 @@ impl ManagedDirectory {
 }
 
 impl Directory for ManagedDirectory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let file_slice = self.open_read(path)?;
         Ok(Arc::new(file_slice))

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -368,6 +369,10 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
 }
 
 impl Directory for MmapDirectory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         debug!("Open Read {:?}", path);
         let full_path = self.resolve_path(path);
