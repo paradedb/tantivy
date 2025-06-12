@@ -82,38 +82,59 @@ mod tests {
         let text_field = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
+        let mut writer = index.writer(16_000_000).unwrap();
+        writer.add_document(doc! {}).unwrap();
+        writer.commit().unwrap();
         let query_parser = QueryParser::for_index(&index, vec![text_field]);
         let term_a = Term::from_field_text(text_field, "a");
         let term_b = Term::from_field_text(text_field, "b");
+        let searcher = index.reader().unwrap().searcher();
+        let segment_reader = &searcher.segment_readers()[0];
         {
             let query = query_parser.parse_query("a").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, false)], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            assert_eq!(vec![(term_a.clone(), false)], terms);
         }
         {
             let query = query_parser.parse_query("a b").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, false), (&term_b, false)], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            assert_eq!(
+                vec![(term_a.clone(), false), (term_b.clone(), false)],
+                terms
+            );
         }
         {
             let query = query_parser.parse_query("\"a b\"").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, true), (&term_b, true)], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            assert_eq!(vec![(term_a.clone(), true), (term_b.clone(), true)], terms);
         }
         {
             let query = query_parser.parse_query("a a a a a").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, false); 5], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            assert_eq!(vec![(term_a.clone(), false); 5], terms);
         }
         {
             let query = query_parser.parse_query("a -b").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, false), (&term_b, false)], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            assert_eq!(
+                vec![(term_a.clone(), false), (term_b.clone(), false)],
+                terms
+            );
         }
     }
 }
