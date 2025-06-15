@@ -2756,7 +2756,7 @@ mod tests {
                 IndexingOp::Merge,
             ],
             true,
-            false
+            false,
         )
         .unwrap();
     }
