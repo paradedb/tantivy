@@ -256,7 +256,7 @@ mod tests {
         columnar_writer.record_column_type("col", ColumnType::U64, false);
         columnar_writer.record_numerical(1, "col", 1u64);
         let mut buffer = Vec::new();
-        columnar_writer.serialize(2, &mut buffer).unwrap();
+        columnar_writer.serialize(2, None, &mut buffer).unwrap();
         let columnar = ColumnarReader::open(buffer).unwrap();
         {
             let columns = columnar.read_columns("col").unwrap();
@@ -285,7 +285,7 @@ mod tests {
         columnar_writer.record_str(1, "col1", "hello");
         columnar_writer.record_str(0, "col2", "hello");
         let mut buffer = Vec::new();
-        columnar_writer.serialize(2, &mut buffer).unwrap();
+        columnar_writer.serialize(2, None, &mut buffer).unwrap();
 
         let columnar = ColumnarReader::open(buffer).unwrap();
         {
