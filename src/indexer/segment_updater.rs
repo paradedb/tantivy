@@ -159,7 +159,7 @@ fn merge(
     let merger = IndexMerger::open(index.schema(), &segments[..], cancel, ignore_store)?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
+    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone(), true)?;
 
     let num_docs = merger.write(segment_serializer)?;
 
@@ -1337,6 +1337,7 @@ mod tests {
             )?;
             let merger = IndexMerger::open_with_custom_alive_set(
                 merged_index.schema(),
+                merged_index.settings().clone(),
                 &segments[..],
                 filter_segments,
                 Box::new(|| false),
@@ -1354,6 +1355,7 @@ mod tests {
                 Index::create(RamDirectory::default(), target_schema, target_settings)?;
             let merger = IndexMerger::open_with_custom_alive_set(
                 merged_index.schema(),
+                merged_index.settings().clone(),
                 &segments[..],
                 filter_segments,
                 Box::new(|| false),
