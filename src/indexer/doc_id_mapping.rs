@@ -224,7 +224,7 @@ mod tests_indexsorting {
 
             let query = QueryParser::for_index(&index, vec![my_text_field]).parse_query("text")?;
             let top_docs: Vec<(f32, DocAddress)> =
-                searcher.search(&query, &TopDocs::with_limit(3))?;
+                searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
             assert_eq!(
                 top_docs.iter().map(|el| el.1.doc_id).collect::<Vec<_>>(),
                 vec![3]
@@ -247,7 +247,7 @@ mod tests_indexsorting {
 
             let query = QueryParser::for_index(&index, vec![my_text_field]).parse_query("text")?;
             let top_docs: Vec<(f32, DocAddress)> =
-                searcher.search(&query, &TopDocs::with_limit(3))?;
+                searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
             assert_eq!(
                 top_docs.iter().map(|el| el.1.doc_id).collect::<Vec<_>>(),
                 vec![0]
@@ -279,7 +279,7 @@ mod tests_indexsorting {
             let query =
                 QueryParser::for_index(&index, vec![my_string_field]).parse_query("text")?;
             let top_docs: Vec<(f32, DocAddress)> =
-                searcher.search(&query, &TopDocs::with_limit(3))?;
+                searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
             assert_eq!(
                 top_docs.iter().map(|el| el.1.doc_id).collect::<Vec<_>>(),
                 vec![4]
@@ -374,7 +374,8 @@ mod tests_indexsorting {
         let searcher = index.reader()?.searcher();
 
         let query = QueryParser::for_index(&index, vec![my_string_field]).parse_query("blublub")?;
-        let top_docs: Vec<(f32, DocAddress)> = searcher.search(&query, &TopDocs::with_limit(3))?;
+        let top_docs: Vec<(f32, DocAddress)> =
+            searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
         assert_eq!(
             top_docs.iter().map(|el| el.1.doc_id).collect::<Vec<_>>(),
             vec![3]
@@ -395,7 +396,8 @@ mod tests_indexsorting {
         let searcher = reader.searcher();
 
         let query = QueryParser::for_index(&index, vec![my_string_field]).parse_query("blublub")?;
-        let top_docs: Vec<(f32, DocAddress)> = searcher.search(&query, &TopDocs::with_limit(3))?;
+        let top_docs: Vec<(f32, DocAddress)> =
+            searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
         assert_eq!(
             top_docs.iter().map(|el| el.1.doc_id).collect::<Vec<_>>(),
             vec![0]
@@ -425,7 +427,8 @@ mod tests_indexsorting {
         let searcher = index.reader()?.searcher();
 
         let query = QueryParser::for_index(&index, vec![my_string_field]).parse_query("blublub")?;
-        let top_docs: Vec<(f32, DocAddress)> = searcher.search(&query, &TopDocs::with_limit(3))?;
+        let top_docs: Vec<(f32, DocAddress)> =
+            searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
         assert_eq!(
             top_docs.iter().map(|el| el.1.doc_id).collect::<Vec<_>>(),
             vec![4]
