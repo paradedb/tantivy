@@ -441,33 +441,34 @@ fn remap_and_write(
     debug!("fastfield-serialize");
     fast_field_writers.serialize(serializer.get_fast_field_write(), doc_id_map)?;
 
+    // @rebasedming: We do not use the store, so we don't need the temp store either
     // finalize temp docstore and create version, which reflects the doc_id_map
-    if let Some(doc_id_map) = doc_id_map {
-        debug!("resort-docstore");
-        let store_write = serializer
-            .segment_mut()
-            .open_write(SegmentComponent::Store)?;
-        let settings = serializer.segment().index().settings();
-        let store_writer = StoreWriter::new(
-            store_write,
-            settings.docstore_compression,
-            settings.docstore_blocksize,
-            settings.docstore_compress_dedicated_thread,
-        )?;
-        let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
-        old_store_writer.close()?;
-        let store_read = StoreReader::open(
-            serializer
-                .segment()
-                .open_read(SegmentComponent::TempStore)?,
-            1, /* The docstore is configured to have one doc per block, and each doc is accessed
-                * only once: we don't need caching. */
-        )?;
-        for old_doc_id in doc_id_map.iter_old_doc_ids() {
-            let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
-            serializer.get_store_writer().store_bytes(&doc_bytes)?;
-        }
-    }
+    // if let Some(doc_id_map) = doc_id_map {
+    //     debug!("resort-docstore");
+    //     let store_write = serializer
+    //         .segment_mut()
+    //         .open_write(SegmentComponent::Store)?;
+    //     let settings = serializer.segment().index().settings();
+    //     let store_writer = StoreWriter::new(
+    //         store_write,
+    //         settings.docstore_compression,
+    //         settings.docstore_blocksize,
+    //         settings.docstore_compress_dedicated_thread,
+    //     )?;
+    //     let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
+    //     old_store_writer.close()?;
+    //     let store_read = StoreReader::open(
+    //         serializer
+    //             .segment()
+    //             .open_read(SegmentComponent::TempStore)?,
+    //         1, /* The docstore is configured to have one doc per block, and each doc is accessed
+    //             * only once: we don't need caching. */
+    //     )?;
+    //     for old_doc_id in doc_id_map.iter_old_doc_ids() {
+    //         let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
+    //         serializer.get_store_writer().store_bytes(&doc_bytes)?;
+    //     }
+    // }
 
     debug!("serializer-close");
     serializer.close()?;
