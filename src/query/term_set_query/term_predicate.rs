@@ -1694,7 +1694,7 @@ mod tests {
     use crate::collector::{DocSetCollector, TopDocs};
     use crate::directory::error::{DeleteError, OpenReadError, OpenWriteError};
     use crate::directory::{
-        Directory, FileHandle, RamDirectory, WatchCallback, WatchHandle, WritePtr,
+        Directory, FileHandle, InnerWritePtr, RamDirectory, WatchCallback, WatchHandle,
     };
     use crate::query::{
         AllQuery, BooleanQuery, CandidateHint, ConstScoreQuery, EnableScoring,
@@ -2775,8 +2775,8 @@ mod tests {
         fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
             self.inner.exists(path)
         }
-        fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-            self.inner.open_write(path)
+        fn open_write_inner(&self, path: &Path) -> Result<InnerWritePtr, OpenWriteError> {
+            self.inner.open_write_inner(path)
         }
         fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
             self.inner.atomic_read(path)
