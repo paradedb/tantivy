@@ -443,7 +443,10 @@ impl Directory for MmapDirectory {
         // sync_directory() is called.
 
         let writer = SafeFileWriter::new(file);
-        Ok(BufWriter::new(Box::new(writer)))
+        Ok(BufWriter::with_capacity(
+            self.bufwriter_capacity(),
+            Box::new(writer),
+        ))
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {

@@ -296,6 +296,10 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     fn log(&self, message: &str) {
         log!(Level::Info, "{message}");
     }
+
+    fn bufwriter_capacity(&self) -> usize {
+        8192
+    }
 }
 
 /// DirectoryClone

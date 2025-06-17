@@ -313,13 +313,16 @@ impl Directory for ManagedDirectory {
     fn open_write(&self, path: &Path) -> result::Result<WritePtr, OpenWriteError> {
         self.register_file_as_managed(path)
             .map_err(|io_error| OpenWriteError::wrap_io_error(io_error, path.to_path_buf()))?;
-        Ok(io::BufWriter::new(Box::new(FooterProxy::new(
-            self.directory
-                .open_write(path)?
-                .into_inner()
-                .map_err(|_| ())
-                .expect("buffer should be empty"),
-        ))))
+        Ok(io::BufWriter::with_capacity(
+            self.bufwriter_capacity(),
+            Box::new(FooterProxy::new(
+                self.directory
+                    .open_write(path)?
+                    .into_inner()
+                    .map_err(|_| ())
+                    .expect("buffer should be empty"),
+            )),
+        ))
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
@@ -379,6 +382,10 @@ impl Directory for ManagedDirectory {
 
     fn log(&self, message: &str) {
         self.directory.log(message);
+    }
+
+    fn bufwriter_capacity(&self) -> usize {
+        self.directory.bufwriter_capacity()
     }
 }
 

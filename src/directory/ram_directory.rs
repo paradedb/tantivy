@@ -206,7 +206,10 @@ impl Directory for RamDirectory {
         if exists {
             Err(OpenWriteError::FileAlreadyExists(path_buf))
         } else {
-            Ok(BufWriter::new(Box::new(vec_writer)))
+            Ok(BufWriter::with_capacity(
+                self.bufwriter_capacity(),
+                Box::new(vec_writer),
+            ))
         }
     }
 
