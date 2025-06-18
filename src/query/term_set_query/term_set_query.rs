@@ -10,7 +10,7 @@ use super::term_set_weight::{SetDfaWrapper, TermSetWeight};
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{AutomatonWeight, BooleanWeight, EnableScoring, Occur, Query, Weight};
 use crate::schema::{Field, Schema};
-use crate::Term;
+use crate::{SegmentReader, Term};
 
 fn group_terms_by_field<T: IntoIterator<Item = Term>>(terms: T) -> HashMap<Field, Vec<Term>> {
     let mut terms_map: HashMap<Field, Vec<Term>> = HashMap::new();
@@ -109,7 +109,12 @@ impl Query for TermSetQuery {
         )?))
     }
 
-    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+    fn query_terms(
+        &self,
+        _field: Field,
+        _segment_reader: &SegmentReader,
+        visitor: &mut dyn FnMut(&Term, bool),
+    ) {
         for terms in self.terms_map.values() {
             for term in terms {
                 visitor(term, false);

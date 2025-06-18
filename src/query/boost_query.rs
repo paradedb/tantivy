@@ -7,6 +7,7 @@ use crate::fastfield::AliveBitSet;
 use crate::query::{
     CandidateHint, EnableScoring, Explanation, Query, Scorer, UnpositionedScorer, Weight,
 };
+use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
 /// `BoostQuery` is a wrapper over a query used to boost its score.
@@ -52,8 +53,13 @@ impl Query for BoostQuery {
         Ok(boosted_weight)
     }
 
-    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
-        self.query.query_terms(visitor)
+    fn query_terms(
+        &self,
+        field: Field,
+        segment_reader: &SegmentReader,
+        visitor: &mut dyn FnMut(&Term, bool),
+    ) {
+        self.query.query_terms(field, segment_reader, visitor)
     }
 }
 
