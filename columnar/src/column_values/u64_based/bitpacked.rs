@@ -1,9 +1,12 @@
 use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
+
+use arc_swap::ArcSwapOption;
 
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, HasLen, OwnedBytes};
 use fastdivide::DividerU64;
 use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
@@ -14,9 +17,32 @@ use crate::{ColumnValues, RowId};
 /// fast field is required.
 #[derive(Clone)]
 pub struct BitpackedReader {
-    data: OwnedBytes,
+    data: FileSlice,
     bit_unpacker: BitUnpacker,
     stats: ColumnStats,
+    loaded_page: Arc<ArcSwapOption<(Range<usize>, OwnedBytes)>>,
+}
+
+impl BitpackedReader {
+    fn get_page(&self, doc: u32) -> (usize, OwnedBytes) {
+        let range = self.bit_unpacker.data_range(doc, self.data.len());
+
+        if let Some(ref page) = *self.loaded_page.load() {
+            if page.0 == range {
+                return (page.0.start, page.1.clone());
+            }
+        }
+
+        println!(">>> Loading page {range:?} with {}", self.data.len());
+        let page = self
+            .data
+            .slice(range.clone())
+            .read_bytes()
+            .expect("Failed to read column values.");
+        let page_offset = range.start;
+        self.loaded_page.store(Some(Arc::new((range, page.clone()))));
+        (page_offset, page)
+    }
 }
 
 #[inline(always)]
@@ -62,7 +88,12 @@ fn transform_range_before_linear_transformation(
 impl ColumnValues for BitpackedReader {
     #[inline(always)]
     fn get_val(&self, doc: u32) -> u64 {
-        self.stats.min_value + self.stats.gcd.get() * self.bit_unpacker.get(doc, &self.data)
+        let (data_offset, data_subset) = self.get_page(doc);
+        self.stats.min_value
+            + self.stats.gcd.get()
+                * self
+                    .bit_unpacker
+                    .get_from_subset(doc, data_offset, &data_subset)
     }
     #[inline]
     fn min_value(&self) -> u64 {
@@ -89,10 +120,20 @@ impl ColumnValues for BitpackedReader {
             positions.clear();
             return;
         };
-        self.bit_unpacker.get_ids_for_value_range(
+        let data_range = self
+            .bit_unpacker
+            .data_batch_range(doc_id_range.clone(), self.data.len());
+        let data_offset = data_range.start;
+        let data_subset = self
+            .data
+            .slice(data_range)
+            .read_bytes()
+            .expect("Failed to read column values.");
+        self.bit_unpacker.get_ids_for_value_range_from_subset(
             transformed_range,
             doc_id_range,
-            &self.data,
+            data_offset,
+            &data_subset,
             positions,
         );
     }
@@ -139,14 +180,15 @@ impl ColumnCodec for BitpackedCodec {
 
     /// Opens a fast field given a file.
     fn load(file_slice: FileSlice) -> io::Result<Self::ColumnValues> {
-        let mut data = file_slice.read_bytes()?;
-        let stats = ColumnStats::deserialize(&mut data)?;
+        let (stats, data) = ColumnStats::deserialize_from_tail(file_slice)?;
+
         let num_bits = num_bits(&stats);
         let bit_unpacker = BitUnpacker::new(num_bits);
         Ok(BitpackedReader {
             data,
             bit_unpacker,
             stats,
+            loaded_page: Arc::new(ArcSwapOption::from(None)),
         })
     }
 }
