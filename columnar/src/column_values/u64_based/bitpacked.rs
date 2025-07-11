@@ -73,11 +73,39 @@ impl ColumnValues for BitpackedReader {
             .read_bytes()
             .expect("Failed to read column values.");
         self.stats.min_value
-            + self.stats.gcd.get()
-                * self
-                    .bit_unpacker
-                    .get_from_subset(doc, data_offset, &data)
+            + self.stats.gcd.get() * self.bit_unpacker.get_from_subset(doc, data_offset, &data)
     }
+
+    fn get_vals(&self, indexes: &[u32], output: &mut [u64]) {
+        assert!(indexes.len() == output.len());
+        if indexes.is_empty() {
+            return;
+        }
+
+        // Read a range of data covering the given indexes.
+        // TODO: In the worst case, this is a read of the entire column: should chunk dense
+        // portions, while executing separate reads for gaps.
+        let data_range = self.bit_unpacker.data_range(
+            indexes[0]..(indexes[indexes.len() - 1] + 1),
+            self.data.len(),
+        );
+        let data_offset = data_range.start;
+        let data = self
+            .data
+            .slice(data_range)
+            .read_bytes()
+            .expect("Failed to read column values.");
+
+        // TODO: This is not unrolled the way that `get_vals` is.
+        for (out, idx) in output.iter_mut().zip(indexes.iter()) {
+            *out = {
+                self.stats.min_value
+                    + self.stats.gcd.get()
+                        * self.bit_unpacker.get_from_subset(*idx, data_offset, &data)
+            };
+        }
+    }
+
     #[inline]
     fn min_value(&self) -> u64 {
         self.stats.min_value
