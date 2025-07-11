@@ -4,7 +4,6 @@ use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 use fastdivide::DividerU64;
@@ -24,24 +23,28 @@ pub struct BitpackedReader {
 }
 
 impl BitpackedReader {
-    fn get_page(&self, doc: u32) -> (usize, OwnedBytes) {
-        let range = self.bit_unpacker.data_range(doc, self.data.len());
-
-        if let Some(ref page) = *self.loaded_page.load() {
-            if page.0 == range {
-                return (page.0.start, page.1.clone());
+    fn get_page(
+        &self,
+        data_range: Range<usize>,
+    ) -> arc_swap::Guard<Option<Arc<(Range<usize>, OwnedBytes)>>> {
+        let guard = self.loaded_page.load();
+        if let Some(ref page) = *guard {
+            if page.0 == data_range {
+                return guard;
             }
         }
 
-        println!(">>> Loading page {range:?} with {}", self.data.len());
+        println!(">>> Loading page {data_range:?} with {}", self.data.len());
         let page = self
             .data
-            .slice(range.clone())
+            .slice(data_range.clone())
             .read_bytes()
             .expect("Failed to read column values.");
-        let page_offset = range.start;
-        self.loaded_page.store(Some(Arc::new((range, page.clone()))));
-        (page_offset, page)
+        self.loaded_page
+            .store(Some(Arc::new((data_range.clone(), page))));
+
+        // Call ourselves recursively to get the now-loaded page.
+        self.get_page(data_range)
     }
 }
 
@@ -88,7 +91,9 @@ fn transform_range_before_linear_transformation(
 impl ColumnValues for BitpackedReader {
     #[inline(always)]
     fn get_val(&self, doc: u32) -> u64 {
-        let (data_offset, data_subset) = self.get_page(doc);
+        let guard = self.get_page(self.bit_unpacker.data_range(doc, self.data.len()));
+        let (data_range, data_subset) = &**(*guard).as_ref().expect("Failed to load page.");
+        let data_offset = data_range.start;
         self.stats.min_value
             + self.stats.gcd.get()
                 * self
@@ -102,24 +107,27 @@ impl ColumnValues for BitpackedReader {
             return;
         }
 
-        // Read a range of data covering the given indexes.
-        let data_range = self.bit_unpacker.data_range(
-            indexes[0]..(indexes[indexes.len() - 1] + 1),
-            self.data.len(),
-        );
-        let data_offset = data_range.start;
-        let data = self
-            .data
-            .slice(data_range)
-            .read_bytes()
-            .expect("Failed to read column values.");
-
         // TODO: This is not unrolled the way that `get_vals` is.
+        let mut guard = self.loaded_page.load();
         for (out, idx) in output.iter_mut().zip(indexes.iter()) {
+            // Load the relevant page.
+            let data_range = self.bit_unpacker.data_range(*idx, self.data.len());
+            if let Some(ref page) = *guard {
+                if page.0 != data_range {
+                    guard = self.get_page(data_range);
+                }
+            } else {
+                guard = self.get_page(data_range);
+            }
+
+            let (data_range, data_subset) = &**(*guard).as_ref().expect("Failed to load page.");
+            let data_offset = data_range.start;
             *out = {
                 self.stats.min_value
                     + self.stats.gcd.get()
-                        * self.bit_unpacker.get_from_subset(*idx, data_offset, &data)
+                        * self
+                            .bit_unpacker
+                            .get_from_subset(*idx, data_offset, &data_subset)
             };
         }
     }
@@ -149,6 +157,8 @@ impl ColumnValues for BitpackedReader {
             positions.clear();
             return;
         };
+        // TODO: This does not use the `self.loaded_page` cache, on the assumption that it is
+        // already doing dense reads. Fix that if that assumption turns out to be incorrect!
         let data_range = self
             .bit_unpacker
             .data_batch_range(doc_id_range.clone(), self.data.len());
