@@ -1,9 +1,12 @@
 use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
+
+use arc_swap::ArcSwapOption;
 
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, HasLen};
+use common::{BinarySerializable, HasLen, OwnedBytes};
 use fastdivide::DividerU64;
 use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
@@ -17,6 +20,29 @@ pub struct BitpackedReader {
     data: FileSlice,
     bit_unpacker: BitUnpacker,
     stats: ColumnStats,
+    loaded_page: Arc<ArcSwapOption<(Range<usize>, OwnedBytes)>>,
+}
+
+impl BitpackedReader {
+    fn get_page(&self, doc: u32) -> (usize, OwnedBytes) {
+        let range = self.bit_unpacker.data_range(doc, self.data.len());
+
+        if let Some(ref page) = *self.loaded_page.load() {
+            if page.0 == range {
+                return (page.0.start, page.1.clone());
+            }
+        }
+
+        println!(">>> Loading page {range:?} with {}", self.data.len());
+        let page = self
+            .data
+            .slice(range.clone())
+            .read_bytes()
+            .expect("Failed to read column values.");
+        let page_offset = range.start;
+        self.loaded_page.store(Some(Arc::new((range, page.clone()))));
+        (page_offset, page)
+    }
 }
 
 #[inline(always)]
@@ -62,18 +88,12 @@ fn transform_range_before_linear_transformation(
 impl ColumnValues for BitpackedReader {
     #[inline(always)]
     fn get_val(&self, doc: u32) -> u64 {
-        // TODO: This method is _not_ optimized, because we expect to override `get_vals`, and
-        // expect to receive calls there instead. `OnceLock` the entire file here as a fallback?
-        let range = self.bit_unpacker.data_range_slow(doc, self.data.len());
-
-        let data_offset = range.start;
-        let data = self
-            .data
-            .slice(range)
-            .read_bytes()
-            .expect("Failed to read column values.");
+        let (data_offset, data_subset) = self.get_page(doc);
         self.stats.min_value
-            + self.stats.gcd.get() * self.bit_unpacker.get_from_subset(doc, data_offset, &data)
+            + self.stats.gcd.get()
+                * self
+                    .bit_unpacker
+                    .get_from_subset(doc, data_offset, &data_subset)
     }
 
     fn get_vals(&self, indexes: &[u32], output: &mut [u64]) {
@@ -83,8 +103,6 @@ impl ColumnValues for BitpackedReader {
         }
 
         // Read a range of data covering the given indexes.
-        // TODO: In the worst case, this is a read of the entire column: should chunk dense
-        // portions, while executing separate reads for gaps.
         let data_range = self.bit_unpacker.data_range(
             indexes[0]..(indexes[indexes.len() - 1] + 1),
             self.data.len(),
@@ -133,7 +151,7 @@ impl ColumnValues for BitpackedReader {
         };
         let data_range = self
             .bit_unpacker
-            .data_range(doc_id_range.clone(), self.data.len());
+            .data_batch_range(doc_id_range.clone(), self.data.len());
         let data_offset = data_range.start;
         let data_subset = self
             .data
@@ -199,6 +217,7 @@ impl ColumnCodec for BitpackedCodec {
             data,
             bit_unpacker,
             stats,
+            loaded_page: Arc::new(ArcSwapOption::from(None)),
         })
     }
 }

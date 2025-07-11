@@ -93,20 +93,29 @@ impl BitUnpacker {
         self.num_bits as u8
     }
 
-    /// Returns a range within the data which covers the given id.
+    /// Returns a range within the data which covers the given id_range.
     ///
-    /// NOTE: Avoid use of this method if possible, as it results in tiny reads: prefer
-    /// `data_range`.
+    /// Rounds to nearby pages to reduce random reads.
     #[inline]
-    pub fn data_range_slow(&self, idx: u32, data_len: usize) -> Range<usize> {
+    pub fn data_range(&self, idx: u32, data_len: usize) -> Range<usize> {
+        // 16k
+        const PAGE_SIZE_MIN: usize = 2 << 14;
+        // A mask which rounds to the nearest PAGE_SIZE.
+        const PAGE_SIZE_MIN_MASK: usize = !(PAGE_SIZE_MIN - 1);
+
+        // Find the address in bits and bytes of the index.
         let addr_in_bits = idx * self.num_bits;
         let addr = (addr_in_bits >> 3) as usize;
-        addr..(std::cmp::min(addr + 8, data_len))
+
+        // Then round down to the nearest page. We extend the end of the page by a constant factor
+        // to overlap the next page, and ensure that we never need to read on a page boundary.
+        let page_addr = addr & PAGE_SIZE_MIN_MASK;
+        page_addr..(std::cmp::min(page_addr + PAGE_SIZE_MIN + 8, data_len))
     }
 
     /// Returns a range within the data which covers the given id_range.
     #[inline]
-    pub fn data_range(&self, id_range: Range<u32>, data_len: usize) -> Range<usize> {
+    pub fn data_batch_range(&self, id_range: Range<u32>, data_len: usize) -> Range<usize> {
         let start_in_bits = id_range.start * self.num_bits;
         let start = (start_in_bits >> 3) as usize;
         let end_in_bits = id_range.end * self.num_bits;
