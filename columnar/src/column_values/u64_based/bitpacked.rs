@@ -24,14 +24,19 @@ pub struct BitpackedReader {
 impl BitpackedReader {
     #[inline(always)]
     fn unpack_val(&self, doc: u32) -> u64 {
-        if self.blocks.len() == 0 {
+        let block_num = self.bit_unpacker.block_num(doc);
+
+        if block_num == 0 && self.blocks.len() == 0 {
             return 0;
         }
 
-        let block_num = self.bit_unpacker.block_num(doc);
         let block = self.blocks[block_num].get_or_init(|| {
             let block_range = self.bit_unpacker.block(block_num, self.data.len());
             let offset = block_range.start;
+            println!(
+                ">>> block range of block {block_num} is {block_range:?} with len {}",
+                block_range.len()
+            );
             let data = self
                 .data
                 .slice(block_range)
@@ -189,6 +194,7 @@ impl ColumnCodec for BitpackedCodec {
         let num_bits = num_bits(&stats);
         let bit_unpacker = BitUnpacker::new(num_bits);
         let block_count = bit_unpacker.block_count(data.len());
+        println!(">>> for {}, got block count {block_count}", data.len());
         Ok(BitpackedReader {
             data,
             bit_unpacker,

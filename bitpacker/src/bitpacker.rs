@@ -109,12 +109,21 @@ impl BitUnpacker {
         let addr_in_bytes = addr_in_bits >> 3;
 
         // And compute the containing BlockNumber.
-        addr_in_bytes >> (BLOCK_SIZE_MIN_POW + 1)
+        let block_num = addr_in_bytes >> (BLOCK_SIZE_MIN_POW + 1);
+        if block_num > 0 {
+            println!(
+                ">>> for idx {idx} in num bits {}, address in bits {addr_in_bits} and \
+                 {BLOCK_SIZE_MIN_POW}, address in bytes is {addr_in_bytes} and got block \
+                 {block_num}",
+                self.num_bits
+            );
+        }
+        block_num
     }
 
     /// Given a block number and dataset length, calculates a data Range for the block.
     pub fn block(&self, block: BlockNumber, data_len: usize) -> Range<usize> {
-        let block_addr = block << BLOCK_SIZE_MIN_POW;
+        let block_addr = block << (BLOCK_SIZE_MIN_POW + 1);
         // We extend the end of the block by a constant factor, so that it overlaps the next
         // block. That ensures that we never need to read on a block boundary.
         block_addr..(std::cmp::min(block_addr + BLOCK_SIZE_MIN + 8, data_len))
@@ -125,6 +134,11 @@ impl BitUnpacker {
     /// Usually only called at startup to pre-allocate structures.
     pub fn block_count(&self, data_len: usize) -> usize {
         let block_count = data_len / (BLOCK_SIZE_MIN as usize);
+        println!(
+            ">>> for {data_len} / {BLOCK_SIZE_MIN}, got block count {block_count} before mod. \
+             Remainder is: {}",
+            data_len % (BLOCK_SIZE_MIN as usize)
+        );
         if data_len % (BLOCK_SIZE_MIN as usize) == 0 {
             block_count
         } else {
@@ -157,6 +171,12 @@ impl BitUnpacker {
         let addr_in_bits = idx * self.num_bits;
         let addr = (addr_in_bits >> 3) as usize - data_offset;
         if addr + 8 > data.len() {
+            println!(
+                ">>> hit get_from_subset special case for idx {idx}, addr: {addr}=({} - \
+                 {data_offset})... with data len {}",
+                addr_in_bits >> 3,
+                data.len()
+            );
             if self.num_bits == 0 {
                 return 0;
             }
@@ -175,6 +195,7 @@ impl BitUnpacker {
         let mut bytes: [u8; 8] = [0u8; 8];
 
         let available_bytes = data.len() - addr;
+        println!(">>> in `get_slow_path`: {available_bytes}");
         // This function is meant to only be called if we did not have 8 bytes to load.
         debug_assert!(available_bytes < 8);
         bytes[..available_bytes].copy_from_slice(&data[addr..]);
