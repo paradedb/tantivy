@@ -69,6 +69,12 @@ pub struct BitUnpacker {
     mask: u64,
 }
 
+pub type BlockNumber = usize;
+
+// 16k
+const BLOCK_SIZE_MIN_POW: u8 = 14;
+const BLOCK_SIZE_MIN: usize = 2 << BLOCK_SIZE_MIN_POW;
+
 impl BitUnpacker {
     /// Creates a bit unpacker, that assumes the same bitwidth for all values.
     ///
@@ -93,29 +99,45 @@ impl BitUnpacker {
         self.num_bits as u8
     }
 
-    /// Returns a range within the data which covers the given id_range.
-    ///
-    /// Rounds to nearby pages to reduce random reads.
+    /// Calculates a block number for the given `idx`.
     #[inline]
-    pub fn data_range(&self, idx: u32, data_len: usize) -> Range<usize> {
-        // 16k
-        const PAGE_SIZE_MIN: usize = 2 << 14;
-        // A mask which rounds to the nearest PAGE_SIZE.
-        const PAGE_SIZE_MIN_MASK: usize = !(PAGE_SIZE_MIN - 1);
+    pub fn block_num(&self, idx: u32) -> BlockNumber {
+        // Find the address in bits of the index.
+        let addr_in_bits = (idx * self.num_bits) as usize;
 
-        // Find the address in bits and bytes of the index.
-        let addr_in_bits = idx * self.num_bits;
-        let addr = (addr_in_bits >> 3) as usize;
+        // Then round down to the nearest byte.
+        let addr_in_bytes = addr_in_bits >> 3;
 
-        // Then round down to the nearest page. We extend the end of the page by a constant factor
-        // to overlap the next page, and ensure that we never need to read on a page boundary.
-        let page_addr = addr & PAGE_SIZE_MIN_MASK;
-        page_addr..(std::cmp::min(page_addr + PAGE_SIZE_MIN + 8, data_len))
+        // And compute the containing BlockNumber.
+        addr_in_bytes >> (BLOCK_SIZE_MIN_POW + 1)
+    }
+
+    /// Given a block number and dataset length, calculates a data Range for the block.
+    pub fn block(&self, block: BlockNumber, data_len: usize) -> Range<usize> {
+        let block_addr = block << BLOCK_SIZE_MIN_POW;
+        // We extend the end of the block by a constant factor, so that it overlaps the next
+        // block. That ensures that we never need to read on a block boundary.
+        block_addr..(std::cmp::min(block_addr + BLOCK_SIZE_MIN + 8, data_len))
+    }
+
+    /// Calculates the number of blocks for the given data_len.
+    ///
+    /// Usually only called at startup to pre-allocate structures.
+    pub fn block_count(&self, data_len: usize) -> usize {
+        let block_count = data_len / (BLOCK_SIZE_MIN as usize);
+        if data_len % (BLOCK_SIZE_MIN as usize) == 0 {
+            block_count
+        } else {
+            block_count + 1
+        }
     }
 
     /// Returns a range within the data which covers the given id_range.
+    ///
+    /// NOTE: This method is used for batch reads which bypass blocks to avoid dealing with block
+    /// boundaries.
     #[inline]
-    pub fn data_batch_range(&self, id_range: Range<u32>, data_len: usize) -> Range<usize> {
+    pub fn block_oblivious_range(&self, id_range: Range<u32>, data_len: usize) -> Range<usize> {
         let start_in_bits = id_range.start * self.num_bits;
         let start = (start_in_bits >> 3) as usize;
         let end_in_bits = id_range.end * self.num_bits;

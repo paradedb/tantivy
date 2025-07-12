@@ -1,9 +1,8 @@
 use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::ops::{Range, RangeInclusive};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use arc_swap::ArcSwapOption;
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 use fastdivide::DividerU64;
@@ -19,32 +18,36 @@ pub struct BitpackedReader {
     data: FileSlice,
     bit_unpacker: BitUnpacker,
     stats: ColumnStats,
-    loaded_page: Arc<ArcSwapOption<(Range<usize>, OwnedBytes)>>,
+    blocks: Arc<[OnceLock<Block>]>,
 }
 
 impl BitpackedReader {
-    fn get_page(
-        &self,
-        data_range: Range<usize>,
-    ) -> arc_swap::Guard<Option<Arc<(Range<usize>, OwnedBytes)>>> {
-        let guard = self.loaded_page.load();
-        if let Some(ref page) = *guard {
-            if page.0 == data_range {
-                return guard;
-            }
+    #[inline(always)]
+    fn unpack_val(&self, doc: u32) -> u64 {
+        if self.blocks.len() == 0 {
+            return 0;
         }
 
-        let page = self
-            .data
-            .slice(data_range.clone())
-            .read_bytes()
-            .expect("Failed to read column values.");
-        self.loaded_page
-            .store(Some(Arc::new((data_range.clone(), page))));
+        let block_num = self.bit_unpacker.block_num(doc);
+        let block = self.blocks[block_num].get_or_init(|| {
+            let block_range = self.bit_unpacker.block(block_num, self.data.len());
+            let offset = block_range.start;
+            let data = self
+                .data
+                .slice(block_range)
+                .read_bytes()
+                .expect("Failed to read column values.");
+            Block { offset, data }
+        });
 
-        // Call ourselves recursively to get the now-loaded page.
-        self.get_page(data_range)
+        self.bit_unpacker
+            .get_from_subset(doc, block.offset, &block.data)
     }
+}
+
+struct Block {
+    offset: usize,
+    data: OwnedBytes,
 }
 
 #[inline(always)]
@@ -90,45 +93,7 @@ fn transform_range_before_linear_transformation(
 impl ColumnValues for BitpackedReader {
     #[inline(always)]
     fn get_val(&self, doc: u32) -> u64 {
-        let guard = self.get_page(self.bit_unpacker.data_range(doc, self.data.len()));
-        let (data_range, data_subset) = &**(*guard).as_ref().expect("Failed to load page.");
-        let data_offset = data_range.start;
-        self.stats.min_value
-            + self.stats.gcd.get()
-                * self
-                    .bit_unpacker
-                    .get_from_subset(doc, data_offset, &data_subset)
-    }
-
-    fn get_vals(&self, indexes: &[u32], output: &mut [u64]) {
-        assert!(indexes.len() == output.len());
-        if indexes.is_empty() {
-            return;
-        }
-
-        // TODO: This is not unrolled the way that `get_vals` is.
-        let mut guard = self.loaded_page.load();
-        for (out, idx) in output.iter_mut().zip(indexes.iter()) {
-            // Load the relevant page.
-            let data_range = self.bit_unpacker.data_range(*idx, self.data.len());
-            if let Some(ref page) = *guard {
-                if page.0 != data_range {
-                    guard = self.get_page(data_range);
-                }
-            } else {
-                guard = self.get_page(data_range);
-            }
-
-            let (data_range, data_subset) = &**(*guard).as_ref().expect("Failed to load page.");
-            let data_offset = data_range.start;
-            *out = {
-                self.stats.min_value
-                    + self.stats.gcd.get()
-                        * self
-                            .bit_unpacker
-                            .get_from_subset(*idx, data_offset, &data_subset)
-            };
-        }
+        self.stats.min_value + self.stats.gcd.get() * self.unpack_val(doc)
     }
 
     #[inline]
@@ -156,11 +121,12 @@ impl ColumnValues for BitpackedReader {
             positions.clear();
             return;
         };
-        // TODO: This does not use the `self.loaded_page` cache, on the assumption that it is
-        // already doing dense reads. Fix that if that assumption turns out to be incorrect!
+        // TODO: This does not use the `self.blocks` cache, because callers are usually already
+        // doing sequential, and fairly dense reads. Fix it to iterate over blocks if that
+        // assumption turns out to be incorrect!
         let data_range = self
             .bit_unpacker
-            .data_batch_range(doc_id_range.clone(), self.data.len());
+            .block_oblivious_range(doc_id_range.clone(), self.data.len());
         let data_offset = data_range.start;
         let data_subset = self
             .data
@@ -222,11 +188,15 @@ impl ColumnCodec for BitpackedCodec {
 
         let num_bits = num_bits(&stats);
         let bit_unpacker = BitUnpacker::new(num_bits);
+        let block_count = bit_unpacker.block_count(data.len());
         Ok(BitpackedReader {
             data,
             bit_unpacker,
             stats,
-            loaded_page: Arc::new(ArcSwapOption::from(None)),
+            blocks: (0..block_count)
+                .into_iter()
+                .map(|_| OnceLock::new())
+                .collect(),
         })
     }
 }
