@@ -98,8 +98,8 @@ impl BitUnpacker {
     /// Rounds to nearby pages to reduce random reads.
     #[inline]
     pub fn data_range(&self, idx: u32, data_len: usize) -> Range<usize> {
-        // 4k
-        const PAGE_SIZE_MIN: usize = 2 << 11;
+        // 16k
+        const PAGE_SIZE_MIN: usize = 2 << 14;
         // A mask which rounds to the nearest PAGE_SIZE.
         const PAGE_SIZE_MIN_MASK: usize = !(PAGE_SIZE_MIN - 1);
 

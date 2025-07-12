@@ -34,7 +34,6 @@ impl BitpackedReader {
             }
         }
 
-        println!(">>> Loading page {data_range:?} with {}", self.data.len());
         let page = self
             .data
             .slice(data_range.clone())
