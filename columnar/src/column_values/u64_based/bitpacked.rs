@@ -33,10 +33,6 @@ impl BitpackedReader {
         let block = self.blocks[block_num].get_or_init(|| {
             let block_range = self.bit_unpacker.block(block_num, self.data.len());
             let offset = block_range.start;
-            println!(
-                ">>> block range of block {block_num} is {block_range:?} with len {}",
-                block_range.len()
-            );
             let data = self
                 .data
                 .slice(block_range)
@@ -194,7 +190,6 @@ impl ColumnCodec for BitpackedCodec {
         let num_bits = num_bits(&stats);
         let bit_unpacker = BitUnpacker::new(num_bits);
         let block_count = bit_unpacker.block_count(data.len());
-        println!(">>> for {}, got block count {block_count}", data.len());
         Ok(BitpackedReader {
             data,
             bit_unpacker,
