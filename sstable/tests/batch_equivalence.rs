@@ -30,7 +30,7 @@ fn build_dict(n: usize, block_len: Option<usize>) -> Dictionary<MonotonicU64SSTa
         builder.insert(&key[..], &i).unwrap();
     }
     let bytes = builder.finish().unwrap();
-    Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes)).unwrap()
+    Dictionary::<MonotonicU64SSTable>::from_bytes_for_tests(OwnedBytes::new(bytes)).unwrap()
 }
 
 /// Build a dictionary of `n` arbitrary byte-string keys (deterministic
@@ -53,7 +53,7 @@ fn build_dict_strings(n: usize, seed: u64) -> (Dictionary<MonotonicU64SSTable>, 
     }
     let bytes = builder.finish().unwrap();
     let dict =
-        Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes)).unwrap();
+        Dictionary::<MonotonicU64SSTable>::from_bytes_for_tests(OwnedBytes::new(bytes)).unwrap();
     (dict, keys)
 }
 
@@ -131,7 +131,7 @@ fn all_inputs_before_first_key() {
     }
     let bytes = builder.finish().unwrap();
     let dict =
-        Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes)).unwrap();
+        Dictionary::<MonotonicU64SSTable>::from_bytes_for_tests(OwnedBytes::new(bytes)).unwrap();
 
     let keys: Vec<Vec<u8>> = vec![vec![0u8], vec![0, 0]];
     assert_equivalent_on_sorted(&dict, &keys);
@@ -172,7 +172,7 @@ fn all_missing_interspersed_with_dict_range() {
     }
     let bytes = builder.finish().unwrap();
     let dict =
-        Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes)).unwrap();
+        Dictionary::<MonotonicU64SSTable>::from_bytes_for_tests(OwnedBytes::new(bytes)).unwrap();
 
     let keys: Vec<Vec<u8>> = (0u64..100)
         .map(|i| (i * 2 + 1).to_be_bytes().to_vec())
@@ -194,7 +194,7 @@ fn mixed_present_and_absent_alternating() {
     }
     let bytes = builder.finish().unwrap();
     let dict =
-        Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes)).unwrap();
+        Dictionary::<MonotonicU64SSTable>::from_bytes_for_tests(OwnedBytes::new(bytes)).unwrap();
 
     let keys: Vec<Vec<u8>> = (0u64..50).map(|i| i.to_be_bytes().to_vec()).collect();
     assert_equivalent_on_sorted(&dict, &keys);
@@ -228,7 +228,7 @@ fn multiple_absent_targets_in_same_exhausted_block() {
     }
     let bytes = builder.finish().unwrap();
     let dict =
-        Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(bytes)).unwrap();
+        Dictionary::<MonotonicU64SSTable>::from_bytes_for_tests(OwnedBytes::new(bytes)).unwrap();
     let keys: Vec<Vec<u8>> = (11u64..20).map(|i| i.to_be_bytes().to_vec()).collect();
     assert_equivalent_on_sorted(&dict, &keys);
 }

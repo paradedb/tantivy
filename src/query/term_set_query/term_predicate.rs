@@ -2898,12 +2898,16 @@ mod tests {
             );
             let paged_searcher = paged_reader.searcher();
             let paged_segment = paged_searcher.segment_reader(0);
-            let _paged_col = columnar::BytesColumn::from(
+            let paged_col = columnar::BytesColumn::from(
                 paged_segment
                     .fast_fields()
                     .str("dict_key")
                     .unwrap()
                     .unwrap(),
+            );
+            assert_eq!(
+                paged_col.dictionary().sstable_slice.storage_block_len(),
+                Some(TEST_STORAGE_PAGE_LEN)
             );
 
             let mut max_terms_per_block = 0usize;
