@@ -1623,7 +1623,6 @@ dependencies = [
 name = "tantivy-columnar"
 version = "0.3.0"
 dependencies = [
- "arc-swap",
  "binggan",
  "downcast-rs",
  "fastdivide",
