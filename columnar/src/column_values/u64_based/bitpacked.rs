@@ -33,6 +33,7 @@ impl BitpackedReader {
         let block = self.blocks[block_num].get_or_init(|| {
             let block_range = self.bit_unpacker.block(block_num, self.data.len());
             let offset = block_range.start;
+            println!(">>> from {:?}: {block_range: >32?} for unpackval", self.data);
             let data = self
                 .data
                 .slice(block_range)
@@ -129,6 +130,7 @@ impl ColumnValues for BitpackedReader {
             .bit_unpacker
             .block_oblivious_range(doc_id_range.clone(), self.data.len());
         let data_offset = data_range.start;
+        println!(">>> from {:?}: {data_range: >32?} for get_row_ids_for_value_range", self.data);
         let data_subset = self
             .data
             .slice(data_range)
