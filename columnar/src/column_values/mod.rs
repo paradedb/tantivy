@@ -10,6 +10,7 @@ use std::fmt::Debug;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
+use arrow_array::builder::UInt64Builder;
 use downcast_rs::DowncastSync;
 pub use monotonic_mapping::{MonotonicallyMappableToU64, StrictlyMonotonicFn};
 pub use monotonic_mapping_u128::MonotonicallyMappableToU128;
@@ -32,6 +33,7 @@ pub use u128_based::{
 };
 pub use u64_based::{
     load_u64_based_column_values, serialize_u64_based_column_values, CodecType, ALL_U64_CODEC_TYPES,
+    BitpackedReader
 };
 pub use vec_column::VecColumn;
 
@@ -172,6 +174,32 @@ pub trait ColumnValues<T: PartialOrd = u64>: Send + Sync + DowncastSync {
     }
 }
 downcast_rs::impl_downcast!(sync ColumnValues<T> where T: PartialOrd);
+
+pub trait ColumnValuesU64Ext {
+    fn get_vals_arrow_u64(&self, indexes: &[u32], builder: &mut UInt64Builder);
+}
+
+impl<CV: ColumnValues<u64>> ColumnValuesU64Ext for CV {
+    /// Allows to push down multiple fetch calls, to avoid dynamic dispatch overhead.
+    /// The slightly weird `Option<T>` in output allows pushdown to full columns.
+    ///
+    /// idx and output should have the same length
+    ///
+    /// # Panics
+    ///
+    /// May panic if `idx` is greater than the column length.
+    fn get_vals_arrow_u64(&self, indexes: &[u32], builder: &mut UInt64Builder) {
+        for idx_x4 in indexes.chunks_exact(4) {
+            builder.append_value(self.get_val(idx_x4[0]));
+            builder.append_value(self.get_val(idx_x4[1]));
+            builder.append_value(self.get_val(idx_x4[2]));
+            builder.append_value(self.get_val(idx_x4[3]));
+        }
+        for idx in indexes.chunks_exact(4).remainder() {
+            builder.append_value(self.get_val(*idx));
+        }
+    }
+}
 
 /// Empty column of values.
 pub struct EmptyColumnValues;

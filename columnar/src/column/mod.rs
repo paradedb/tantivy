@@ -6,6 +6,7 @@ use std::io::Write;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
+use arrow_array::builder::{ArrayBuilder, UInt64Builder};
 use common::BinarySerializable;
 pub use dictionary_encoded::{BytesColumn, StrColumn};
 pub use serialize::{
@@ -15,7 +16,7 @@ pub use serialize::{
 
 use crate::column_index::{ColumnIndex, Set};
 use crate::column_values::monotonic_mapping::StrictlyMonotonicMappingToInternal;
-use crate::column_values::{monotonic_map_column, ColumnValues};
+use crate::column_values::{monotonic_map_column, ColumnValues, BitpackedReader, ColumnValuesU64Ext};
 use crate::{Cardinality, DocId, EmptyColumnValues, MonotonicallyMappableToU64, RowId};
 
 #[derive(Clone)]
@@ -171,6 +172,41 @@ impl<T: PartialOrd + Copy + Debug + Send + Sync + 'static> Column<T> {
             column: self,
             default_value,
         })
+    }
+}
+
+impl Column<u64> {
+    /// Load the first value for each docid in the provided slice.
+    #[inline]
+    pub fn first_vals_arrow(&self, docids: &[DocId], builder: &mut Box<dyn ArrayBuilder>) {
+        let builder = builder.as_any_mut().downcast_mut::<UInt64Builder>().expect("Only `UInt64Builder` is supported");
+        let values = self.values.clone().downcast_arc::<BitpackedReader>().unwrap_or_else(|_| {
+            panic!("Only `BitpackedReader` is supported")
+        });
+        match &self.index {
+            ColumnIndex::Empty { .. } => {}
+            ColumnIndex::Full => values.get_vals_arrow_u64(docids, builder),
+            ColumnIndex::Optional(optional_index) => {
+                for docid in docids {
+                    if let Some(value) = optional_index.rank_if_exists(*docid).map(|rowid| values.get_val(rowid)) {
+                        builder.append_value(value);
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+            ColumnIndex::Multivalued(multivalued_index) => {
+                for docid in docids {
+                    let range = multivalued_index.range(*docid);
+                    let is_empty = range.start == range.end;
+                    if !is_empty {
+                        builder.append_value(values.get_val(range.start));
+                    } else {
+                        builder.append_null();
+                    }
+                }
+            }
+        }
     }
 }
 
