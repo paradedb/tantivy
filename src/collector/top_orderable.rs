@@ -13,9 +13,7 @@ pub trait Feature: Clone + Sync + Send + 'static {
     type Output: Clone + PartialOrd + Sync + Send + 'static;
     type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static;
 
-    fn requires_scoring(&self) -> bool {
-        false
-    }
+    const IS_SCORE: bool;
 
     fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn>;
     fn get(column: &FeatureColumn, order: Order, doc: DocId, score: Score) -> Self::SegmentOutput;
@@ -33,9 +31,7 @@ impl Feature for ScoreFeature {
     type Output = Score;
     type SegmentOutput = Score;
 
-    fn requires_scoring(&self) -> bool {
-        true
-    }
+    const IS_SCORE: bool = true;
 
     fn open(&self, _segment_reader: &SegmentReader, _order: Order) -> crate::Result<FeatureColumn> {
         Ok(FeatureColumn::Score)
@@ -89,6 +85,8 @@ impl FieldFeature<String> {
 impl Feature for FieldFeature<String> {
     type Output = String;
     type SegmentOutput = u64;
+
+    const IS_SCORE: bool = false;
 
     fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn> {
         FeatureColumn::open_field(segment_reader, &self.field, self.field_type, order)
@@ -206,6 +204,8 @@ impl FieldFeature<DateTime> {
 impl<F: FastValue> Feature for FieldFeature<F> {
     type Output = F;
     type SegmentOutput = u64;
+
+    const IS_SCORE: bool = false;
 
     fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn> {
         FeatureColumn::open_field(segment_reader, &self.field, self.field_type, order)
@@ -387,7 +387,7 @@ macro_rules! impl_top_orderable {
 
             fn requires_scoring(&self) -> bool {
                 // Returns true if any of the features require scoring.
-                false $(|| self.$idx.0.requires_scoring())*
+                false $(|| $T::IS_SCORE)*
             }
 
             fn feature_columns(
