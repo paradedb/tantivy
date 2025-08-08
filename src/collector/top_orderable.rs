@@ -139,6 +139,27 @@ pub trait Feature: Sync + Send + 'static {
 
 struct ErasedFeature<F: Feature>(F);
 
+/// A (partial) implementation of PartialOrd for OwnedValue.
+///
+/// Intended for use within columns of homogenous types, and so will panic for OwnedValues with
+/// mismatched types.
+fn owned_value_partial_cmp(a: &OwnedValue, b: &OwnedValue) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (OwnedValue::Null, OwnedValue::Null) => None,
+        (OwnedValue::Str(a), OwnedValue::Str(b)) => a.partial_cmp(b),
+        (OwnedValue::PreTokStr(a), OwnedValue::PreTokStr(b)) => a.partial_cmp(b),
+        (OwnedValue::U64(a), OwnedValue::U64(b)) => a.partial_cmp(b),
+        (OwnedValue::I64(a), OwnedValue::I64(b)) => a.partial_cmp(b),
+        (OwnedValue::F64(a), OwnedValue::F64(b)) => a.partial_cmp(b),
+        (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a.partial_cmp(b),
+        (OwnedValue::Date(a), OwnedValue::Date(b)) => a.partial_cmp(b),
+        (OwnedValue::Facet(a), OwnedValue::Facet(b)) => a.partial_cmp(b),
+        (OwnedValue::Bytes(a), OwnedValue::Bytes(b)) => a.partial_cmp(b),
+        (OwnedValue::IpAddr(a), OwnedValue::IpAddr(b)) => a.partial_cmp(b),
+        x => panic!("Unsupported comparison: {x:?}"),
+    }
+}
+
 impl Feature for Arc<dyn Feature<Output = OwnedValue, SegmentOutput = u64>> {
     type Output = OwnedValue;
     type SegmentOutput = u64;
@@ -174,7 +195,7 @@ impl Feature for Arc<dyn Feature<Output = OwnedValue, SegmentOutput = u64>> {
     }
 
     fn compare(&self, a: &Self::Output, b: &Self::Output) -> Option<Ordering> {
-        a.partial_cmp(b)
+        owned_value_partial_cmp(a, b)
     }
 }
 
@@ -278,7 +299,7 @@ impl Feature for ErasedFeature<ScoreFeature> {
     }
 
     fn compare(&self, a: &Self::Output, b: &Self::Output) -> Option<Ordering> {
-        a.partial_cmp(b)
+        owned_value_partial_cmp(a, b)
     }
 }
 
@@ -351,7 +372,7 @@ impl Feature for FieldFeature<String> {
         _score: Score,
     ) -> Self::SegmentOutput {
         let FeatureColumn::String(_, sort_column) = column else {
-            panic!("Field columns were not aligned to field definitions.");
+            panic!("Field column type does not match field definition type.");
         };
         let value = sort_column.get_val(doc);
         if order.is_desc() {
@@ -459,7 +480,7 @@ impl Feature for ErasedFeature<FieldFeature<String>> {
     }
 
     fn compare(&self, a: &Self::Output, b: &Self::Output) -> Option<Ordering> {
-        a.partial_cmp(b)
+        owned_value_partial_cmp(a, b)
     }
 }
 
@@ -556,7 +577,7 @@ impl<F: FastValue> Feature for FieldFeature<F> {
         _score: Score,
     ) -> Self::SegmentOutput {
         let FeatureColumn::Numeric(sort_column) = column else {
-            panic!("Field columns were not aligned to field definitions.");
+            panic!("Field column type does not match field definition type.");
         };
         let value = sort_column.get_val(doc);
         if order.is_desc() {
@@ -629,7 +650,7 @@ impl<F: FastValue> Feature for ErasedFeature<FieldFeature<F>> {
     }
 
     fn compare(&self, a: &Self::Output, b: &Self::Output) -> Option<Ordering> {
-        a.partial_cmp(b)
+        owned_value_partial_cmp(a, b)
     }
 }
 
