@@ -105,8 +105,10 @@ impl Default for MemoryArena {
 impl MemoryArena {
     
     pub fn reset(&mut self) {
-        self.pages.clear();
-        self.pages.push(Page::new(0));
+        for page in &mut self.pages {
+            page.len = 0;
+            page.data.fill(0);
+        }
     }
     
     /// Returns an estimate in number of bytes
