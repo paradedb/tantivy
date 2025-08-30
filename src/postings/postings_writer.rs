@@ -36,6 +36,33 @@ fn json_term_suffix(key: &[u8]) -> &[u8] {
     &key[9..]
 }
 
+fn make_field_partition(
+    term_offsets: &[(Field, OrderedPathId, &[u8], Addr)],
+) -> Vec<(Field, Range<usize>)> {
+    let len = term_offsets.len();
+    if len == 0 {
+        return Vec::new();
+    }
+
+    // term_offsets is already sorted by Field, so we can scan once.
+    let mut field_offsets: Vec<(Field, Range<usize>)> = Vec::new();
+    field_offsets.reserve(16);
+
+    let mut start_idx = 0usize;
+    let mut current_field = term_offsets[0].0;
+
+    for i in 1..len {
+        let f = term_offsets[i].0;
+        if f != current_field {
+            field_offsets.push((current_field, start_idx..i));
+            current_field = f;
+            start_idx = i;
+        }
+    }
+    field_offsets.push((current_field, start_idx..len));
+    field_offsets
+}
+
 /// Serialize the inverted index.
 /// It pushes all term, one field at a time, towards the
 /// postings serializer.
@@ -51,10 +78,10 @@ pub(crate) fn serialize_postings(
         ctx.path_to_unordered_id.unordered_id_to_ordered_id();
 
     let num_fields = schema.num_fields();
-    let mut is_json_field = vec![false; num_fields as usize];
+    let mut is_json_field = vec![false; num_fields];
     for i in 0..num_fields {
         let f = Field::from_field_id(i as u32);
-        is_json_field[i as usize] =
+        is_json_field[i] =
             schema.get_field_entry(f).field_type().value_type() == Type::Json;
     }
 
@@ -103,33 +130,6 @@ pub(crate) fn serialize_postings(
 
     IndexingContext::checkin(ctx);
     Ok(())
-}
-
-fn make_field_partition(
-    term_offsets: &[(Field, OrderedPathId, &[u8], Addr)],
-) -> Vec<(Field, Range<usize>)> {
-    let len = term_offsets.len();
-    if len == 0 {
-        return Vec::new();
-    }
-
-    // term_offsets is already sorted by Field, so we can scan once.
-    let mut field_offsets: Vec<(Field, Range<usize>)> = Vec::new();
-    field_offsets.reserve(16);
-
-    let mut start_idx = 0usize;
-    let mut current_field = term_offsets[0].0;
-
-    for i in 1..len {
-        let f = term_offsets[i].0;
-        if f != current_field {
-            field_offsets.push((current_field, start_idx..i));
-            current_field = f;
-            start_idx = i;
-        }
-    }
-    field_offsets.push((current_field, start_idx..len));
-    field_offsets
 }
 
 #[derive(Default, Debug)]
