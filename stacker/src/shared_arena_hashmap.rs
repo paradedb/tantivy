@@ -40,7 +40,9 @@ impl KeyValue {
     fn is_empty(&self) -> bool {
         self.key_value_addr.is_null()
     }
+
     #[inline]
+    #[allow(dead_code)]
     fn is_not_empty_ref(&self) -> bool {
         !self.key_value_addr.is_null()
     }
