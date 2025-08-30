@@ -1,4 +1,3 @@
-use std::iter::{Cloned, Filter};
 use std::mem;
 
 use super::{Addr, MemoryArena};
@@ -88,7 +87,7 @@ impl LinearProbing {
     }
 }
 
-type IterNonEmpty<'a> = Filter<Cloned<std::slice::Iter<'a, KeyValue>>, fn(&KeyValue) -> bool>;
+type IterNonEmpty<'a> = std::slice::Iter<'a, KeyValue>;
 
 pub struct Iter<'a> {
     hashmap: &'a SharedArenaHashMap,
@@ -100,12 +99,16 @@ impl<'a> Iterator for Iter<'a> {
     type Item = (&'a [u8], Addr);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(move |kv| {
-            let (key, offset): (&'a [u8], Addr) = self
-                .hashmap
-                .get_key_value(kv.key_value_addr, self.memory_arena);
-            (key, offset)
-        })
+        loop {
+            let next = self.inner.next()?;
+            if next.is_not_empty_ref() {
+                return Some(self.hashmap.get_key_value(next.key_value_addr, self.memory_arena));
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
     }
 }
 
@@ -135,6 +138,11 @@ impl SharedArenaHashMap {
             mask: table_size_power_of_2 - 1,
             len: 0,
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.table.fill(KeyValue::default());
+        self.len = 0;
     }
 
     #[inline]
@@ -235,11 +243,7 @@ impl SharedArenaHashMap {
     #[inline]
     pub fn iter<'a>(&'a self, memory_arena: &'a MemoryArena) -> Iter<'a> {
         Iter {
-            inner: self
-                .table
-                .iter()
-                .cloned()
-                .filter(KeyValue::is_not_empty_ref),
+            inner: self.table.iter(),
             hashmap: self,
             memory_arena,
         }
