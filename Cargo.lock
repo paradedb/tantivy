@@ -1772,6 +1772,8 @@ dependencies = [
  "fixedbitset",
  "likely_stable",
  "murmurhash32",
+ "once_cell",
+ "parking_lot",
  "proptest",
  "rand",
  "rand_distr",

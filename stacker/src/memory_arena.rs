@@ -22,9 +22,16 @@
 //!
 //! Instead, you store and access your data via `.write(...)` and `.read(...)`, which under the hood
 //! stores your object using `ptr::write_unaligned` and `ptr::read_unaligned`.
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::{mem, ptr};
 
-const NUM_BITS_PAGE_ADDR: usize = 20;
+// Tanty's default is 20 bits, or 1MB.  Tantivy uses the memory arena during indexing and generally
+// assumes long-running indexing threads.  We (pg_search) do indexing on the main thread and our
+// indexing patterns are typically 1 document per segment.  :(  Using half tantivy's default memory
+// saves quite a bit of indexing overhead
+const NUM_BITS_PAGE_ADDR: usize = 19;
 const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR; // pages are 1 MB large
 
 /// Represents a pointer into the `MemoryArena`
@@ -93,24 +100,38 @@ pub struct MemoryArena {
     pages: Vec<Page>,
 }
 
+static ARENA_POOL: Lazy<Arc<Mutex<Vec<MemoryArena>>>> = Lazy::new(|| Default::default());
+
 impl Default for MemoryArena {
     fn default() -> MemoryArena {
-        let first_page = Page::new(0);
-        MemoryArena {
-            pages: vec![first_page],
-        }
+        ARENA_POOL.lock().pop().unwrap_or_else(|| {
+            let first_page = Page::new(0);
+            MemoryArena {
+                pages: vec![first_page],
+            }
+        })
+    }
+}
+
+impl Drop for MemoryArena {
+    fn drop(&mut self) {
+        self.reset();
+        ARENA_POOL.lock().push(MemoryArena {
+            pages: std::mem::replace(&mut self.pages, Vec::new()),
+        })
     }
 }
 
 impl MemoryArena {
-    
     pub fn reset(&mut self) {
         for page in &mut self.pages {
             page.len = 0;
-            page.data.fill(0);
+
+            // NB:  we don't bother zeroing the page data.  setting the length to zero is enough
+            // page.data.fill(0);
         }
     }
-    
+
     /// Returns an estimate in number of bytes
     /// of resident memory consumed by the `MemoryArena`.
     ///
