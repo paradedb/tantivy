@@ -292,7 +292,7 @@ impl SharedArenaHashMap {
         loop {
             let bucket = probe.next_probe();
             let kv: KeyValue = self.table[bucket];
-            if kv.is_empty() {
+            if !self.used[bucket] {
                 return None;
             } else if kv.hash == hash {
                 if let Some(val_addr) =
@@ -336,11 +336,9 @@ impl SharedArenaHashMap {
         let mut probe = self.probe(hash);
         let mut bucket = probe.next_probe();
         let mut kv: KeyValue = self.table[bucket];
-        if !self.used[bucket] {
-            kv = KeyValue::default();
-        }
+        let mut used = self.used[bucket];
         loop {
-            if kv.is_empty() {
+            if !used {
                 // The key does not exist yet.
                 let val = updater(None);
                 let num_bytes = std::mem::size_of::<u16>() + key.len() + std::mem::size_of::<V>();
@@ -370,9 +368,7 @@ impl SharedArenaHashMap {
             // This allows fetching the next bucket before the loop jmp
             bucket = probe.next_probe();
             kv = self.table[bucket];
-            if !self.used[bucket] {
-                kv = KeyValue::default();
-            }
+            used = self.used[bucket];
         }
     }
 }

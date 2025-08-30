@@ -98,6 +98,7 @@ pub fn load<Item: Copy + 'static>(data: &[u8]) -> Item {
 /// The `MemoryArena`
 pub struct MemoryArena {
     pages: Vec<Page>,
+    capacity: usize,
 }
 
 static ARENA_POOL: Lazy<Arc<Mutex<Vec<MemoryArena>>>> = Lazy::new(|| Default::default());
@@ -108,6 +109,7 @@ impl Default for MemoryArena {
             let first_page = Page::new(0);
             MemoryArena {
                 pages: vec![first_page],
+                capacity: 1,
             }
         })
     }
@@ -115,21 +117,24 @@ impl Default for MemoryArena {
 
 impl Drop for MemoryArena {
     fn drop(&mut self) {
-        self.reset();
-        ARENA_POOL.lock().push(MemoryArena {
-            pages: std::mem::replace(&mut self.pages, Vec::new()),
-        })
+        let my_pages = std::mem::replace(&mut self.pages, Vec::new());
+        let my_capacity = self.capacity;
+        let mut recycled = MemoryArena {
+            pages: my_pages,
+            capacity: my_capacity,
+        };
+
+        recycled.reset();
+        ARENA_POOL.lock().push(recycled);
     }
 }
 
 impl MemoryArena {
     pub fn reset(&mut self) {
-        for page in &mut self.pages {
-            page.len = 0;
-
-            // NB:  we don't bother zeroing the page data.  setting the length to zero is enough
-            // page.data.fill(0);
+        unsafe {
+            self.pages.set_len(1);
         }
+        self.pages[0].len = 0;
     }
 
     /// Returns an estimate in number of bytes
@@ -200,11 +205,27 @@ impl MemoryArena {
     /// Add a page and allocate len on it.
     /// Return the address
     fn add_page(&mut self, len: usize) -> Addr {
-        let new_page_id = self.pages.len();
-        let mut page = Page::new(new_page_id);
-        page.len = len;
-        self.pages.push(page);
-        Addr::new(new_page_id, 0)
+        let npages = self.pages.len();
+
+        if npages + 1 < self.capacity {
+            // we have a hidden, pre-allocated page
+
+            unsafe {
+                // make it live
+                self.pages.set_len(npages + 1);
+                let page = self.pages.get_unchecked_mut(npages);
+                page.len = len;
+                Addr::new(page.page_id, 0)
+            }
+        } else {
+            // must allocate a new page and add it to the arena
+            let new_page_id = self.pages.len();
+            let mut page = Page::new(new_page_id);
+            page.len = len;
+            self.pages.push(page);
+            self.capacity += 1;
+            Addr::new(new_page_id, 0)
+        }
     }
 
     /// Allocates `len` bytes and returns the allocated address.
