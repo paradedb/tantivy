@@ -32,7 +32,7 @@ use std::{mem, ptr};
 // indexing patterns are typically 1 document per segment.  :(  Using half tantivy's default memory
 // saves quite a bit of indexing overhead
 const NUM_BITS_PAGE_ADDR: usize = 19;
-const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR; // pages are 1 MB large
+const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR; // pages are 512k large
 
 /// Represents a pointer into the `MemoryArena`
 /// .
