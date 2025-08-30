@@ -13,53 +13,31 @@ use crate::postings::{
 use crate::schema::{Field, Schema, Term, Type};
 use crate::tokenizer::{Token, TokenStream, MAX_TOKEN_LEN};
 use crate::DocId;
-use rayon::prelude::*;
 
 const POSITION_GAP: u32 = 1;
-
-#[inline]
-fn json_unordered_id_from_key(key: &[u8]) -> u32 {
-    // Bytes 5..9 contain the unordered path id for JSON terms
-    debug_assert!(key.len() >= 9);
-    u32::from_be_bytes([key[5], key[6], key[7], key[8]])
-}
-
-#[inline]
-fn nonjson_term_suffix(key: &[u8]) -> &[u8] {
-    // After the 5-byte header
-    &key[5..]
-}
-
-#[inline]
-fn json_term_suffix(key: &[u8]) -> &[u8] {
-    // Skip the 4-byte unordered path id after the 5-byte header
-    &key[9..]
-}
 
 fn make_field_partition(
     term_offsets: &[(Field, OrderedPathId, &[u8], Addr)],
 ) -> Vec<(Field, Range<usize>)> {
-    let len = term_offsets.len();
-    if len == 0 {
-        return Vec::new();
-    }
-
-    // term_offsets is already sorted by Field, so we can scan once.
-    let mut field_offsets: Vec<(Field, Range<usize>)> = Vec::new();
-    field_offsets.reserve(16);
-
-    let mut start_idx = 0usize;
-    let mut current_field = term_offsets[0].0;
-
-    for i in 1..len {
-        let f = term_offsets[i].0;
-        if f != current_field {
-            field_offsets.push((current_field, start_idx..i));
-            current_field = f;
-            start_idx = i;
+    let term_offsets_it = term_offsets
+        .iter()
+        .map(|(field, _, _, _)| *field)
+        .enumerate();
+    let mut prev_field_opt = None;
+    let mut fields = vec![];
+    let mut offsets = vec![];
+    for (offset, field) in term_offsets_it {
+        if Some(field) != prev_field_opt {
+            prev_field_opt = Some(field);
+            fields.push(field);
+            offsets.push(offset);
         }
     }
-    field_offsets.push((current_field, start_idx..len));
+    offsets.push(term_offsets.len());
+    let mut field_offsets = vec![];
+    for i in 0..fields.len() {
+        field_offsets.push((fields[i], offsets[i]..offsets[i + 1]));
+    }
     field_offsets
 }
 
@@ -73,47 +51,31 @@ pub(crate) fn serialize_postings(
     fieldnorm_readers: FieldNormReaders,
     serializer: &mut InvertedIndexSerializer,
 ) -> crate::Result<()> {
-    // 1) Precompute path-id remap and per-field JSON mask (one schema lookup per field)
+    // Replace unordered ids by ordered ids to be able to sort
     let unordered_id_to_ordered_id: Vec<OrderedPathId> =
         ctx.path_to_unordered_id.unordered_id_to_ordered_id();
 
-    let num_fields = schema.num_fields();
-    let mut is_json_field = vec![false; num_fields];
-    for i in 0..num_fields {
-        let f = Field::from_field_id(i as u32);
-        is_json_field[i] =
-            schema.get_field_entry(f).field_type().value_type() == Type::Json;
-    }
-
-    // 2) Collect term offsets without extra schema work per term
-    //    (We still use Term::wrap to get the Field exactly as Tantivy expects.)
     let mut term_offsets: Vec<(Field, OrderedPathId, &[u8], Addr)> =
         Vec::with_capacity(ctx.term_index.len());
-
-    for (key, addr) in ctx.term_index.iter() {
+    term_offsets.extend(ctx.term_index.iter().map(|(key, addr)| {
         let field = Term::wrap(key).field();
-        let field_idx = field.field_id() as usize;
-
-        if is_json_field.get(field_idx).copied().unwrap_or(false) {
-            let unordered_id = json_unordered_id_from_key(key) as usize;
-            // SAFETY: In correct data this mapping must exist. Using direct index to match original behavior.
-            let path_id = unordered_id_to_ordered_id[unordered_id];
-            term_offsets.push((field, path_id, json_term_suffix(key), addr));
+        if schema.get_field_entry(field).field_type().value_type() == Type::Json {
+            let byte_range_path = 5..5 + 4;
+            let unordered_id = u32::from_be_bytes(key[byte_range_path.clone()].try_into().unwrap());
+            let path_id = unordered_id_to_ordered_id[unordered_id as usize];
+            (field, path_id, &key[byte_range_path.end..], addr)
         } else {
-            term_offsets.push((field, OrderedPathId::from(0u32), nonjson_term_suffix(key), addr));
+            (field, 0.into(), &key[5..], addr)
         }
-    }
-
-    // 3) Sort by (field, path, term) — parallelized
-    term_offsets.par_sort_unstable_by(|(f1, p1, b1, _), (f2, p2, b2, _)| {
-        f1.cmp(f2).then_with(|| p1.cmp(p2)).then_with(|| b1.cmp(b2))
-    });
-
-    // 4) Partition by field (single linear pass)
+    }));
+    // Sort by field, path, and term
+    term_offsets.sort_unstable_by(
+        |(field1, path_id1, bytes1, _), (field2, path_id2, bytes2, _)| {
+            (field1, path_id1, bytes1).cmp(&(field2, path_id2, bytes2))
+        },
+    );
     let ordered_id_to_path = ctx.path_to_unordered_id.ordered_id_to_path();
     let field_offsets = make_field_partition(&term_offsets);
-
-    // 5) Serialize per field
     for (field, byte_offsets) in field_offsets {
         let postings_writer = per_field_postings_writers.get_for_field(field);
         let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
@@ -129,6 +91,7 @@ pub(crate) fn serialize_postings(
     }
 
     IndexingContext::checkin(ctx);
+
     Ok(())
 }
 
