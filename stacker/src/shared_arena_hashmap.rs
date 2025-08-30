@@ -1,8 +1,8 @@
-use std::mem;
-
 use super::{Addr, MemoryArena};
 use crate::fastcpy::fast_short_slice_copy;
 use crate::memory_arena::store;
+use fixedbitset::{FixedBitSet, Ones};
+use std::mem;
 
 /// Returns the actual memory size in bytes
 /// required to create a table with a given capacity.
@@ -61,7 +61,7 @@ impl KeyValue {
 /// So one MemoryArena can be shared with multiple SharedArenaHashMap.
 pub struct SharedArenaHashMap {
     table: Vec<KeyValue>,
-    used: fixedbitset::FixedBitSet,
+    used: FixedBitSet,
     mask: usize,
     len: usize,
 }
@@ -89,7 +89,7 @@ impl LinearProbing {
 }
 
 pub struct Iter<'a> {
-    used: fixedbitset::Ones<'a>,
+    used: Ones<'a>,
     hashmap: &'a SharedArenaHashMap,
     memory_arena: &'a MemoryArena,
 }
@@ -100,7 +100,10 @@ impl<'a> Iterator for Iter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.used.next()?;
         let kv = unsafe { self.hashmap.table.get_unchecked(next) };
-        Some(self.hashmap.get_key_value(kv.key_value_addr, self.memory_arena))
+        Some(
+            self.hashmap
+                .get_key_value(kv.key_value_addr, self.memory_arena),
+        )
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -131,7 +134,7 @@ impl SharedArenaHashMap {
 
         SharedArenaHashMap {
             table,
-            used: fixedbitset::FixedBitSet::with_capacity(table_size_power_of_2),
+            used: FixedBitSet::with_capacity(table_size_power_of_2),
             mask: table_size_power_of_2 - 1,
             len: 0,
         }
@@ -139,7 +142,6 @@ impl SharedArenaHashMap {
 
     pub fn reset(&mut self) {
         // NB:  thanks to `self.used` we don't need to reset the contents of the table
-        //      we'll never
         // self.table.fill(KeyValue::default());
         self.used.clear();
         self.len = 0;
@@ -256,11 +258,10 @@ impl SharedArenaHashMap {
         let new_len = (self.table.len() * 2).max(1 << 3);
         let mask = new_len - 1;
         self.mask = mask;
-        let new_table = vec![KeyValue::default(); new_len];
-        let new_used = fixedbitset::FixedBitSet::with_capacity(new_len);
 
-        let old_table = mem::replace(&mut self.table, new_table);
-        let old_used = mem::replace(&mut self.used, new_used);
+        // assign a new table and used bitset, taking the old ones so we can use them for resizing
+        let old_table = mem::replace(&mut self.table, vec![KeyValue::default(); new_len]);
+        let old_used = mem::replace(&mut self.used, FixedBitSet::with_capacity(new_len));
 
         for idx in old_used.ones() {
             let key_value = unsafe { old_table.get_unchecked(idx) };
@@ -269,7 +270,9 @@ impl SharedArenaHashMap {
                 let bucket = probe.next_probe();
                 if self.table[bucket].is_empty() {
                     self.table[bucket] = *key_value;
-                    unsafe { self.used.set_unchecked(bucket, true); }
+                    unsafe {
+                        self.used.set_unchecked(bucket, true);
+                    }
                     break;
                 }
             }
@@ -279,7 +282,9 @@ impl SharedArenaHashMap {
     /// Get a value associated to a key.
     #[inline]
     pub fn get<V>(&self, key: &[u8], memory_arena: &MemoryArena) -> Option<V>
-    where V: Copy + 'static {
+    where
+        V: Copy + 'static,
+    {
         let hash = self.get_hash(key);
         let mut probe = self.probe(hash);
         loop {
