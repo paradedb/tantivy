@@ -1,10 +1,11 @@
 use std::borrow::BorrowMut;
 use std::collections::HashSet;
 use std::io::Write;
-use std::ops::{Deref};
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc};
+use std::sync::Arc;
+
 use parking_lot::RwLock;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -69,8 +70,7 @@ pub trait CancelSentinel: Send + Sync + 'static {
 }
 
 impl<F: Fn() -> bool + Send + Sync + 'static> CancelSentinel for F
-where
-    F: Clone,
+where F: Clone
 {
     fn box_clone(&self) -> Box<dyn CancelSentinel> {
         Box::new(self.clone())
@@ -431,10 +431,14 @@ impl SegmentUpdater {
         let (scheduled_result, sender) = FutureResult::create(
             "A segment_updater future did not succeed. This should never happen.",
         );
-        self.pools.as_ref().expect("thread pools should have been configured").pool.spawn(|| {
-            let task_result = task();
-            let _ = sender.send(task_result);
-        });
+        self.pools
+            .as_ref()
+            .expect("thread pools should have been configured")
+            .pool
+            .spawn(|| {
+                let task_result = task();
+                let _ = sender.send(task_result);
+            });
         scheduled_result
     }
 
@@ -625,38 +629,48 @@ impl SegmentUpdater {
             FutureResult::create("Merge operation failed.");
 
         let cancel = self.cancel.box_clone();
-        let merge_errors = self.pools.as_ref().expect("thread pools should have been configured").merge_errors.clone();
-        self.pools.as_ref().expect("thread pools should have been configured").merge_thread_pool.spawn(move || {
-            // The fact that `merge_operation` is moved here is important.
-            // Its lifetime is used to track how many merging thread are currently running,
-            // as well as which segment is currently in merge and therefore should not be
-            // candidate for another merge.
-            match merge(
-                &segment_updater.index,
-                segment_entries,
-                merge_operation.target_opstamp(),
-                cancel,
-                false,
-            ) {
-                Ok(after_merge_segment_entry) => {
-                    let res = segment_updater.end_merge(merge_operation, after_merge_segment_entry);
-                    let _send_result = merging_future_send.send(res);
-                }
-                Err(merge_error) => {
-                    warn!(
-                        "Merge of {:?} was cancelled: {:?}",
-                        merge_operation.segment_ids().to_vec(),
-                        merge_error
-                    );
-                    if cfg!(test) {
-                        panic!("{merge_error:?}");
+        let merge_errors = self
+            .pools
+            .as_ref()
+            .expect("thread pools should have been configured")
+            .merge_errors
+            .clone();
+        self.pools
+            .as_ref()
+            .expect("thread pools should have been configured")
+            .merge_thread_pool
+            .spawn(move || {
+                // The fact that `merge_operation` is moved here is important.
+                // Its lifetime is used to track how many merging thread are currently running,
+                // as well as which segment is currently in merge and therefore should not be
+                // candidate for another merge.
+                match merge(
+                    &segment_updater.index,
+                    segment_entries,
+                    merge_operation.target_opstamp(),
+                    cancel,
+                    false,
+                ) {
+                    Ok(after_merge_segment_entry) => {
+                        let res =
+                            segment_updater.end_merge(merge_operation, after_merge_segment_entry);
+                        let _send_result = merging_future_send.send(res);
                     }
+                    Err(merge_error) => {
+                        warn!(
+                            "Merge of {:?} was cancelled: {:?}",
+                            merge_operation.segment_ids().to_vec(),
+                            merge_error
+                        );
+                        if cfg!(test) {
+                            panic!("{merge_error:?}");
+                        }
 
-                    merge_errors.write().push(merge_error.clone());
-                    let _send_result = merging_future_send.send(Err(merge_error));
+                        merge_errors.write().push(merge_error.clone());
+                        let _send_result = merging_future_send.send(Err(merge_error));
+                    }
                 }
-            }
-        });
+            });
 
         scheduled_result
     }

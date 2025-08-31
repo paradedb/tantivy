@@ -22,10 +22,11 @@
 //!
 //! Instead, you store and access your data via `.write(...)` and `.read(...)`, which under the hood
 //! stores your object using `ptr::write_unaligned` and `ptr::read_unaligned`.
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::{mem, ptr};
+
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 
 // Tanty's default is 20 bits, or 1MB.  Tantivy uses the memory arena during indexing and generally
 // assumes long-running indexing threads.  We (pg_search) do indexing on the main thread and our

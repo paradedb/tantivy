@@ -1,5 +1,6 @@
-use stacker::{ArenaHashMap, MemoryArena};
 use std::cell::RefCell;
+
+use stacker::{ArenaHashMap, MemoryArena};
 
 use crate::indexer::path_to_unordered_id::PathToUnorderedId;
 
