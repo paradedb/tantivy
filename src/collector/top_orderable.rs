@@ -98,7 +98,7 @@ where C: TopNCompare
 /// by a fast field (`FieldFeature`).
 pub trait Feature: Sync + Send + 'static {
     /// The output type of the feature, which is the type that will be returned to the user.
-    type Output: std::fmt::Debug + Clone + Sync + Send + 'static;
+    type Output: Clone + Sync + Send + 'static;
     /// The segment output type of the feature, which is the type that will be used for
     /// comparisons within a segment.
     type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static;
@@ -142,10 +142,12 @@ struct ErasedFeature<F: Feature>(F);
 /// A (partial) implementation of PartialOrd for OwnedValue.
 ///
 /// Intended for use within columns of homogenous types, and so will panic for OwnedValues with
-/// mismatched types.
+/// mismatched types. The one exception is Null, for which we do define all comparisons.
 fn owned_value_partial_cmp(a: &OwnedValue, b: &OwnedValue) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (OwnedValue::Null, OwnedValue::Null) => None,
+        (OwnedValue::Null, _) => Some(std::cmp::Ordering::Less),
+        (_, OwnedValue::Null) => Some(std::cmp::Ordering::Greater),
         (OwnedValue::Str(a), OwnedValue::Str(b)) => a.partial_cmp(b),
         (OwnedValue::PreTokStr(a), OwnedValue::PreTokStr(b)) => a.partial_cmp(b),
         (OwnedValue::U64(a), OwnedValue::U64(b)) => a.partial_cmp(b),
@@ -335,7 +337,7 @@ impl Feature for FieldFeature<String> {
         false
     }
 
-    fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn> {
+    fn open(&self, segment_reader: &SegmentReader, _order: Order) -> crate::Result<FeatureColumn> {
         // We interpret this field as u64, regardless of its type, that way,
         // we avoid needless conversion. Regardless of the fast field type, the
         // mapping is monotonic, so it is sufficient to compute our top-K docs.
@@ -354,10 +356,7 @@ impl Feature for FieldFeature<String> {
                 field_name: self.field.to_owned(),
             })?
             .open()?;
-        let mut default_value = 0u64;
-        if order.is_asc() {
-            default_value = u64::MAX;
-        }
+        let default_value = u64::MAX;
         Ok(FeatureColumn::String(
             dynamic_column,
             sort_column.first_or_default_col(default_value),
@@ -405,18 +404,26 @@ impl Feature for FieldFeature<String> {
         };
         ordinals.sort_unstable_by_key(|(_, ord)| *ord);
 
+        // Handle trailing nulls.
+        let end_idx = if matches!(ordinals.last(), Some((_, u64::MAX))) {
+            ordinals.partition_point(|(_, ord)| *ord < u64::MAX)
+        } else {
+            ordinals.len()
+        };
+
         // Collect terms.
         let mut terms = Vec::with_capacity(ordinals.len());
-        let result =
-            ff.dictionary()
-                .sorted_ords_to_term_cb(ordinals.iter().map(|(_, ord)| *ord), |term| {
-                    terms.push(
-                        std::str::from_utf8(term)
-                            .expect("Failed to decode term as unicode")
-                            .to_owned(),
-                    );
-                    Ok(())
-                });
+        let result = ff.dictionary().sorted_ords_to_term_cb(
+            ordinals[0..end_idx].iter().map(|(_, ord)| *ord),
+            |term| {
+                terms.push(
+                    std::str::from_utf8(term)
+                        .expect("Failed to decode term as unicode")
+                        .to_owned(),
+                );
+                Ok(())
+            },
+        );
         assert!(
             result.expect("Failed to read terms from term dictionary"),
             "Not all terms were matched in segment."
@@ -424,7 +431,7 @@ impl Feature for FieldFeature<String> {
 
         // Rearrange back to row order.
         let mut result = Vec::with_capacity(terms.len());
-        result.resize_with(terms.len(), || None);
+        result.resize_with(ordinals.len(), || None);
         for ((idx, _), term) in ordinals.into_iter().zip(terms.into_iter()) {
             result[idx] = Some(term);
         }
@@ -668,7 +675,7 @@ pub enum FeatureColumn {
 }
 
 pub trait TopOrderable: Sync + Send + 'static {
-    type Output: std::fmt::Debug + Clone + Sync + Send + 'static;
+    type Output: Clone + Sync + Send + 'static;
     type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static;
     type SegmentComparator: TopNCompare<Accepted = Self::SegmentOutput>;
 
@@ -1212,22 +1219,17 @@ mod tests {
         assert_query(
             &index,
             Order::Asc,
-            3,
+            4,
             0,
             vec![
+                (None, 3),
                 (Some("austin".to_owned()), 0),
                 (Some("greenville".to_owned()), 1),
                 (Some("tokyo".to_owned()), 2),
             ],
         )?;
 
-        assert_query(
-            &index,
-            Order::Asc,
-            1,
-            0,
-            vec![(Some("austin".to_owned()), 0)],
-        )?;
+        assert_query(&index, Order::Asc, 1, 0, vec![(None, 3)])?;
 
         assert_query(
             &index,
@@ -1235,20 +1237,21 @@ mod tests {
             2,
             1,
             vec![
+                (Some("austin".to_owned()), 0),
                 (Some("greenville".to_owned()), 1),
-                (Some("tokyo".to_owned()), 2),
             ],
         )?;
 
         assert_query(
             &index,
             Order::Desc,
-            3,
+            4,
             0,
             vec![
                 (Some("tokyo".to_owned()), 2),
                 (Some("greenville".to_owned()), 1),
                 (Some("austin".to_owned()), 0),
+                (None, 3),
             ],
         )?;
 
@@ -1371,7 +1374,7 @@ mod tests {
             let searcher = index.reader()?.searcher();
             let ids = id_mapping(&searcher);
 
-            let top_collector = TopDocs::with_limit(3).order_by((
+            let top_collector = TopDocs::with_limit(4).order_by((
                 (ScoreFeature, score_order),
                 (FieldFeature::string("city"), city_order),
             ));
@@ -1385,6 +1388,7 @@ mod tests {
         assert_eq!(
             &query(&index, Order::Asc, Order::Asc)?,
             &[
+                ((1.0, None), 3),
                 ((1.0, Some("austin".to_owned())), 0),
                 ((1.0, Some("greenville".to_owned())), 1),
                 ((1.0, Some("tokyo".to_owned())), 2),
@@ -1397,6 +1401,7 @@ mod tests {
                 ((1.0, Some("tokyo".to_owned())), 2),
                 ((1.0, Some("greenville".to_owned())), 1),
                 ((1.0, Some("austin".to_owned())), 0),
+                ((1.0, None), 3),
             ]
         );
         Ok(())
