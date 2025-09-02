@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use columnar::{ColumnType, ColumnValues, DynamicColumn, MonotonicallyMappableToU64};
+use columnar::{Column, ColumnType, ColumnValues, DynamicColumn, MonotonicallyMappableToU64};
 
 use crate::collector::{Collector, ComparableDoc, SegmentCollector};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
@@ -107,7 +107,7 @@ pub trait Feature: Sync + Send + 'static {
     fn is_score(&self) -> bool;
 
     /// Open a FeatureColumn for this Feature.
-    fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn>;
+    fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn>;
 
     /// Get the value for this Feature from its associated FeatureColumn at the given DocId.
     fn get(
@@ -162,17 +162,17 @@ fn owned_value_partial_cmp(a: &OwnedValue, b: &OwnedValue) -> Option<std::cmp::O
     }
 }
 
-impl Feature for Arc<dyn Feature<Output = OwnedValue, SegmentOutput = u64>> {
+impl Feature for Arc<dyn Feature<Output = OwnedValue, SegmentOutput = Option<u64>>> {
     type Output = OwnedValue;
-    type SegmentOutput = u64;
+    type SegmentOutput = Option<u64>;
 
     fn is_score(&self) -> bool {
         self.deref().is_score()
     }
 
     /// Open a FeatureColumn for this Feature.
-    fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn> {
-        self.deref().open(segment_reader, order)
+    fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
+        self.deref().open(segment_reader)
     }
 
     /// Get the value for this Feature from its associated FeatureColumn at the given DocId.
@@ -207,7 +207,7 @@ pub struct ScoreFeature;
 
 impl ScoreFeature {
     /// Erase the type of the feature, and return it as a boxed trait object.
-    pub fn erased(self) -> Arc<dyn Feature<Output = OwnedValue, SegmentOutput = u64>> {
+    pub fn erased(self) -> Arc<dyn Feature<Output = OwnedValue, SegmentOutput = Option<u64>>> {
         Arc::new(ErasedFeature(self))
     }
 }
@@ -220,7 +220,7 @@ impl Feature for ScoreFeature {
         true
     }
 
-    fn open(&self, _segment_reader: &SegmentReader, _order: Order) -> crate::Result<FeatureColumn> {
+    fn open(&self, _segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         Ok(FeatureColumn::Score)
     }
 
@@ -258,15 +258,15 @@ impl Feature for ScoreFeature {
 
 impl Feature for ErasedFeature<ScoreFeature> {
     type Output = OwnedValue;
-    type SegmentOutput = u64;
+    type SegmentOutput = Option<u64>;
 
     fn is_score(&self) -> bool {
         true
     }
 
     /// Open a FeatureColumn for this Feature.
-    fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn> {
-        self.0.open(segment_reader, order)
+    fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
+        self.0.open(segment_reader)
     }
 
     /// Get the value for this Feature from its associated FeatureColumn at the given DocId.
@@ -277,7 +277,7 @@ impl Feature for ErasedFeature<ScoreFeature> {
         doc: DocId,
         score: Score,
     ) -> Self::SegmentOutput {
-        (self.0.get(column, order, doc, score) as f64).to_u64()
+        Some((self.0.get(column, order, doc, score) as f64).to_u64())
     }
 
     /// Decode SegmentOutputs into Outputs.
@@ -290,12 +290,18 @@ impl Feature for ErasedFeature<ScoreFeature> {
         if order.is_asc() {
             segment_output
                 .into_iter()
-                .map(|v| OwnedValue::F64(-(f64::from_u64(v))))
+                .map(|v| match v {
+                    Some(v) => OwnedValue::F64(-(f64::from_u64(v))),
+                    None => OwnedValue::Null,
+                })
                 .collect()
         } else {
             segment_output
                 .into_iter()
-                .map(|v| OwnedValue::F64(f64::from_u64(v)))
+                .map(|v| match v {
+                    Some(v) => OwnedValue::F64(f64::from_u64(v)),
+                    None => OwnedValue::Null,
+                })
                 .collect()
         }
     }
@@ -324,7 +330,7 @@ impl FieldFeature<String> {
     }
 
     /// Erase the type of the feature, and return it as a boxed trait object.
-    pub fn erased(self) -> Arc<dyn Feature<Output = OwnedValue, SegmentOutput = u64>> {
+    pub fn erased(self) -> Arc<dyn Feature<Output = OwnedValue, SegmentOutput = Option<u64>>> {
         Arc::new(ErasedFeature(self))
     }
 }
@@ -337,7 +343,7 @@ impl Feature for FieldFeature<String> {
         false
     }
 
-    fn open(&self, segment_reader: &SegmentReader, _order: Order) -> crate::Result<FeatureColumn> {
+    fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         // We interpret this field as u64, regardless of its type, that way,
         // we avoid needless conversion. Regardless of the fast field type, the
         // mapping is monotonic, so it is sufficient to compute our top-K docs.
@@ -450,15 +456,15 @@ impl Feature for FieldFeature<String> {
 
 impl Feature for ErasedFeature<FieldFeature<String>> {
     type Output = OwnedValue;
-    type SegmentOutput = u64;
+    type SegmentOutput = Option<u64>;
 
     fn is_score(&self) -> bool {
         self.0.is_score()
     }
 
     /// Open a FeatureColumn for this Feature.
-    fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn> {
-        self.0.open(segment_reader, order)
+    fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
+        self.0.open(segment_reader)
     }
 
     /// Get the value for this Feature from its associated FeatureColumn at the given DocId.
@@ -469,7 +475,7 @@ impl Feature for ErasedFeature<FieldFeature<String>> {
         doc: DocId,
         score: Score,
     ) -> Self::SegmentOutput {
-        self.0.get(column, order, doc, score)
+        Some(self.0.get(column, order, doc, score))
     }
 
     /// Decode SegmentOutputs into Outputs.
@@ -480,7 +486,14 @@ impl Feature for ErasedFeature<FieldFeature<String>> {
         segment_output: Vec<Self::SegmentOutput>,
     ) -> Vec<Self::Output> {
         self.0
-            .decode(column, order, segment_output)
+            .decode(
+                column,
+                order,
+                segment_output
+                    .into_iter()
+                    .map(|s| s.expect("An erased String feature never produces None."))
+                    .collect(),
+            )
             .into_iter()
             .map(|s| match s {
                 Some(s) => OwnedValue::Str(s),
@@ -546,20 +559,20 @@ impl FieldFeature<DateTime> {
 
 impl<F: FastValue> FieldFeature<F> {
     /// Erase the type of the feature, and return it as a boxed trait object.
-    pub fn erased(self) -> Arc<dyn Feature<Output = OwnedValue, SegmentOutput = u64>> {
+    pub fn erased(self) -> Arc<dyn Feature<Output = OwnedValue, SegmentOutput = Option<u64>>> {
         Arc::new(ErasedFeature(self))
     }
 }
 
 impl<F: FastValue> Feature for FieldFeature<F> {
     type Output = Option<F>;
-    type SegmentOutput = u64;
+    type SegmentOutput = Option<u64>;
 
     fn is_score(&self) -> bool {
         false
     }
 
-    fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn> {
+    fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         // We interpret this field as u64, regardless of its type, that way,
         // we avoid needless conversion. Regardless of the fast field type, the
         // mapping is monotonic, so it is sufficient to compute our top-K docs.
@@ -570,13 +583,7 @@ impl<F: FastValue> Feature for FieldFeature<F> {
             sort_column_opt.ok_or_else(|| FastFieldNotAvailableError {
                 field_name: self.field.to_owned(),
             })?;
-        let mut default_value = 0u64;
-        if order.is_asc() {
-            default_value = u64::MAX;
-        }
-        Ok(FeatureColumn::Numeric(
-            sort_column.first_or_default_col(default_value),
-        ))
+        Ok(FeatureColumn::Numeric(sort_column))
     }
 
     fn get(
@@ -589,11 +596,11 @@ impl<F: FastValue> Feature for FieldFeature<F> {
         let FeatureColumn::Numeric(sort_column) = column else {
             panic!("Field column type does not match field definition type.");
         };
-        let value = sort_column.get_val(doc);
+        let value = sort_column.first(doc);
         if order.is_desc() {
             value
         } else {
-            u64::MAX - value
+            value.map(|v| u64::MAX - v)
         }
     }
 
@@ -603,16 +610,15 @@ impl<F: FastValue> Feature for FieldFeature<F> {
         order: Order,
         segment_output: Vec<Self::SegmentOutput>,
     ) -> Vec<Self::Output> {
-        // TODO: NULL handling.
         if order.is_desc() {
             segment_output
                 .into_iter()
-                .map(|v| Some(F::from_u64(v)))
+                .map(|v| v.map(F::from_u64))
                 .collect()
         } else {
             segment_output
                 .into_iter()
-                .map(|o| Some(F::from_u64(u64::MAX - o)))
+                .map(|o| o.map(|v| F::from_u64(u64::MAX - v)))
                 .collect()
         }
     }
@@ -624,15 +630,15 @@ impl<F: FastValue> Feature for FieldFeature<F> {
 
 impl<F: FastValue> Feature for ErasedFeature<FieldFeature<F>> {
     type Output = OwnedValue;
-    type SegmentOutput = u64;
+    type SegmentOutput = Option<u64>;
 
     fn is_score(&self) -> bool {
         self.0.is_score()
     }
 
     /// Open a FeatureColumn for this Feature.
-    fn open(&self, segment_reader: &SegmentReader, order: Order) -> crate::Result<FeatureColumn> {
-        self.0.open(segment_reader, order)
+    fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
+        self.0.open(segment_reader)
     }
 
     /// Get the value for this Feature from its associated FeatureColumn at the given DocId.
@@ -654,11 +660,20 @@ impl<F: FastValue> Feature for ErasedFeature<FieldFeature<F>> {
         segment_output: Vec<Self::SegmentOutput>,
     ) -> Vec<Self::Output> {
         if order.is_desc() {
-            segment_output.into_iter().map(OwnedValue::U64).collect()
+            segment_output
+                .into_iter()
+                .map(|v| match v {
+                    Some(v) => OwnedValue::U64(v),
+                    None => OwnedValue::Null,
+                })
+                .collect()
         } else {
             segment_output
                 .into_iter()
-                .map(|o| OwnedValue::U64(u64::MAX - o))
+                .map(|v| match v {
+                    Some(v) => OwnedValue::U64(u64::MAX - v),
+                    None => OwnedValue::Null,
+                })
                 .collect()
         }
     }
@@ -670,7 +685,7 @@ impl<F: FastValue> Feature for ErasedFeature<FieldFeature<F>> {
 
 pub enum FeatureColumn {
     Score,
-    Numeric(Arc<dyn ColumnValues<u64>>),
+    Numeric(Column<u64>),
     String(DynamicColumn, Arc<dyn ColumnValues<u64>>),
 }
 
@@ -953,7 +968,7 @@ macro_rules! impl_top_orderable {
                 segment_reader: &SegmentReader,
             ) -> crate::Result<Self::SegmentComparator> {
                 Ok(($(
-                    (self.$idx.0.clone(), self.$idx.0.open(segment_reader, self.$idx.1.clone())?, self.$idx.1.clone())
+                    (self.$idx.0.clone(), self.$idx.0.open(segment_reader)?, self.$idx.1.clone())
                 ),+,))
             }
 
@@ -964,7 +979,7 @@ macro_rules! impl_top_orderable {
                 // Collects all feature columns from the tuple elements.
                 [
                     $(
-                        self.$idx.0.open(segment_reader, self.$idx.1.clone()).map(|fc| (fc, self.$idx.1.clone()))
+                        self.$idx.0.open(segment_reader).map(|fc| (fc, self.$idx.1.clone()))
                     ),+
                 ]
                 .into_iter()
@@ -1071,8 +1086,8 @@ pub trait TopNCompare {
     type Accepted: Clone + PartialOrd;
 
     /// Given the current threshold of accepted values and a candidate doc_id/score, compare the
-    /// candidate value to the threshold, and convert the candidate to Accepted if it is greater-than
-    /// the threshold.
+    /// candidate value to the threshold, and convert the candidate to Accepted if it is
+    /// greater-than the threshold.
     fn accept(
         &self,
         threshold_value: &Self::Accepted,
