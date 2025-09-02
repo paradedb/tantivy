@@ -98,7 +98,7 @@ where C: TopNCompare
 /// by a fast field (`FieldFeature`).
 pub trait Feature: Sync + Send + 'static {
     /// The output type of the feature, which is the type that will be returned to the user.
-    type Output: Clone + Sync + Send + 'static;
+    type Output: std::fmt::Debug + Clone + Sync + Send + 'static;
     /// The segment output type of the feature, which is the type that will be used for
     /// comparisons within a segment.
     type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static;
@@ -668,7 +668,7 @@ pub enum FeatureColumn {
 }
 
 pub trait TopOrderable: Sync + Send + 'static {
-    type Output: Clone + Sync + Send + 'static;
+    type Output: std::fmt::Debug + Clone + Sync + Send + 'static;
     type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static;
     type SegmentComparator: TopNCompare<Accepted = Self::SegmentOutput>;
 
@@ -783,10 +783,13 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
             segment_fruits,
             |a: &(O::Output, DocAddress), b: &(O::Output, DocAddress)| self.orderable.compare(a, b),
         )
-        .skip(self.offset)
-        .take(self.limit)
-        .collect();
-        Ok(merged)
+        .collect::<Vec<_>>();
+
+        Ok(merged
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .collect())
     }
 }
 
@@ -1079,6 +1082,8 @@ pub trait TopNCompare {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use proptest::prelude::*;
 
     use super::{FieldFeature, ScoreFeature};
@@ -1087,10 +1092,11 @@ mod tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, QueryParser};
     use crate::schema::{Schema, FAST, TEXT};
-    use crate::{DocAddress, Document, Index, Order, Score};
+    use crate::{DocAddress, Document, Index, Order, Score, Searcher};
 
     fn make_index() -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
+        let id = schema_builder.add_u64_field("id", FAST);
         let city = schema_builder.add_text_field("city", TEXT | FAST);
         let catchphrase = schema_builder.add_text_field("catchphrase", TEXT);
         let altitude = schema_builder.add_f64_field("altitude", FAST);
@@ -1111,11 +1117,13 @@ mod tests {
             &index,
             vec![
                 doc!(
+                    id => 0_u64,
                     city => "austin",
                     catchphrase => "Hills, Barbeque, Glow",
                     altitude => 149.0,
                 ),
                 doc!(
+                    id => 1_u64,
                     city => "greenville",
                     catchphrase => "Grow, Glow, Glow",
                     altitude => 27.0,
@@ -1125,6 +1133,7 @@ mod tests {
         create_segment(
             &index,
             vec![doc!(
+                id => 2_u64,
                 city => "tokyo",
                 catchphrase => "Glow, Glow, Glow",
                 altitude => 40.0,
@@ -1133,11 +1142,29 @@ mod tests {
         create_segment(
             &index,
             vec![doc!(
+                id => 3_u64,
                 catchphrase => "No, No, No",
                 altitude => 0.0,
             )],
         )?;
         Ok(index)
+    }
+
+    // NOTE: You cannot determine the SegmentIds that will be generated for Segments
+    // ahead of time, so DocAddresses must be mapped back to a unique id for each Searcher.
+    fn id_mapping(searcher: &Searcher) -> HashMap<DocAddress, u64> {
+        searcher
+            .search(&AllQuery, &DocSetCollector)
+            .unwrap()
+            .into_iter()
+            .map(|doc_address| {
+                let column = searcher.segment_readers()[doc_address.segment_ord as usize]
+                    .fast_fields()
+                    .u64("id")
+                    .unwrap();
+                (doc_address, column.first(doc_address.doc_id).unwrap())
+            })
+            .collect()
     }
 
     #[test]
@@ -1149,9 +1176,10 @@ mod tests {
             order: Order,
             limit: usize,
             offset: usize,
-            expected: Vec<(Option<String>, DocAddress)>,
+            expected: Vec<(Option<String>, u64)>,
         ) -> crate::Result<()> {
             let searcher = index.reader()?.searcher();
+            let ids = id_mapping(&searcher);
 
             // Try as primitive.
             let top_collector = TopDocs::with_limit(limit)
@@ -1160,7 +1188,7 @@ mod tests {
             let actual = searcher
                 .search(&AllQuery, &top_collector)?
                 .into_iter()
-                .map(|((s,), doc)| (s, doc))
+                .map(|((s,), doc)| (s, ids[&doc]))
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected);
 
@@ -1171,14 +1199,11 @@ mod tests {
             let actual = searcher
                 .search(&AllQuery, &top_collector)?
                 .into_iter()
-                .map(|(_, doc)| doc)
+                .map(|(_, doc)| ids[&doc])
                 .collect::<Vec<_>>();
             assert_eq!(
                 actual,
-                expected
-                    .iter()
-                    .map(|(_, doc)| *doc)
-                    .collect::<Vec<DocAddress>>()
+                expected.iter().map(|(_, doc)| *doc).collect::<Vec<u64>>()
             );
 
             Ok(())
@@ -1190,9 +1215,9 @@ mod tests {
             3,
             0,
             vec![
-                (Some("austin".to_owned()), DocAddress::new(0, 0)),
-                (Some("greenville".to_owned()), DocAddress::new(0, 1)),
-                (Some("tokyo".to_owned()), DocAddress::new(1, 0)),
+                (Some("austin".to_owned()), 0),
+                (Some("greenville".to_owned()), 1),
+                (Some("tokyo".to_owned()), 2),
             ],
         )?;
 
@@ -1201,7 +1226,7 @@ mod tests {
             Order::Asc,
             1,
             0,
-            vec![(Some("austin".to_owned()), DocAddress::new(0, 0))],
+            vec![(Some("austin".to_owned()), 0)],
         )?;
 
         assert_query(
@@ -1210,8 +1235,8 @@ mod tests {
             2,
             1,
             vec![
-                (Some("greenville".to_owned()), DocAddress::new(0, 1)),
-                (Some("tokyo".to_owned()), DocAddress::new(1, 0)),
+                (Some("greenville".to_owned()), 1),
+                (Some("tokyo".to_owned()), 2),
             ],
         )?;
 
@@ -1221,9 +1246,9 @@ mod tests {
             3,
             0,
             vec![
-                (Some("tokyo".to_owned()), DocAddress::new(1, 0)),
-                (Some("greenville".to_owned()), DocAddress::new(0, 1)),
-                (Some("austin".to_owned()), DocAddress::new(0, 0)),
+                (Some("tokyo".to_owned()), 2),
+                (Some("greenville".to_owned()), 1),
+                (Some("austin".to_owned()), 0),
             ],
         )?;
 
@@ -1233,8 +1258,8 @@ mod tests {
             2,
             1,
             vec![
-                (Some("greenville".to_owned()), DocAddress::new(0, 1)),
-                (Some("austin".to_owned()), DocAddress::new(0, 0)),
+                (Some("greenville".to_owned()), 1),
+                (Some("austin".to_owned()), 0),
             ],
         )?;
 
@@ -1243,7 +1268,7 @@ mod tests {
             Order::Desc,
             1,
             0,
-            vec![(Some("tokyo".to_owned()), DocAddress::new(1, 0))],
+            vec![(Some("tokyo".to_owned()), 2)],
         )?;
 
         Ok(())
@@ -1256,9 +1281,10 @@ mod tests {
         fn assert_query(
             index: &Index,
             order: Order,
-            expected: Vec<(Option<f64>, DocAddress)>,
+            expected: Vec<(Option<f64>, u64)>,
         ) -> crate::Result<()> {
             let searcher = index.reader()?.searcher();
+            let ids = id_mapping(&searcher);
 
             // Try as primitive.
             let top_collector =
@@ -1266,7 +1292,7 @@ mod tests {
             let actual = searcher
                 .search(&AllQuery, &top_collector)?
                 .into_iter()
-                .map(|((f,), doc)| (f, doc))
+                .map(|((f,), doc)| (f, ids[&doc]))
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected);
 
@@ -1276,14 +1302,11 @@ mod tests {
             let actual = searcher
                 .search(&AllQuery, &top_collector)?
                 .into_iter()
-                .map(|(_, doc)| doc)
+                .map(|(_, doc)| ids[&doc])
                 .collect::<Vec<_>>();
             assert_eq!(
                 actual,
-                expected
-                    .iter()
-                    .map(|(_, doc)| *doc)
-                    .collect::<Vec<DocAddress>>()
+                expected.iter().map(|(_, id)| *id).collect::<Vec<u64>>()
             );
 
             Ok(())
@@ -1292,21 +1315,13 @@ mod tests {
         assert_query(
             &index,
             Order::Asc,
-            vec![
-                (Some(0.0), DocAddress::new(2, 0)),
-                (Some(27.0), DocAddress::new(0, 1)),
-                (Some(40.0), DocAddress::new(1, 0)),
-            ],
+            vec![(Some(0.0), 3), (Some(27.0), 1), (Some(40.0), 2)],
         )?;
 
         assert_query(
             &index,
             Order::Desc,
-            vec![
-                (Some(149.0), DocAddress::new(0, 0)),
-                (Some(40.0), DocAddress::new(1, 0)),
-                (Some(27.0), DocAddress::new(0, 1)),
-            ],
+            vec![(Some(149.0), 0), (Some(40.0), 2), (Some(27.0), 1)],
         )?;
 
         Ok(())
@@ -1316,31 +1331,30 @@ mod tests {
     fn test_order_by_score() -> crate::Result<()> {
         let index = make_index()?;
 
-        fn query(index: &Index, order: Order) -> crate::Result<Vec<((Score,), DocAddress)>> {
+        fn query(index: &Index, order: Order) -> crate::Result<Vec<((Score,), u64)>> {
             let searcher = index.reader()?.searcher();
+            let ids = id_mapping(&searcher);
+
             let top_collector = TopDocs::with_limit(4).order_by(((ScoreFeature, order),));
             let field = index.schema().get_field("catchphrase").unwrap();
             let query_parser = QueryParser::for_index(&index, vec![field]);
             let text_query = query_parser.parse_query("glow")?;
-            searcher.search(&text_query, &top_collector)
+
+            Ok(searcher
+                .search(&text_query, &top_collector)?
+                .into_iter()
+                .map(|(score, doc)| (score, ids[&doc]))
+                .collect())
         }
 
         assert_eq!(
             &query(&index, Order::Asc)?,
-            &[
-                ((0.35667497,), DocAddress::new(0, 0)),
-                ((0.4904281,), DocAddress::new(0, 1)),
-                ((0.5604893,), DocAddress::new(1, 0)),
-            ]
+            &[((0.35667497,), 0), ((0.4904281,), 1), ((0.5604893,), 2),]
         );
 
         assert_eq!(
             &query(&index, Order::Desc)?,
-            &[
-                ((0.5604893,), DocAddress::new(1, 0)),
-                ((0.4904281,), DocAddress::new(0, 1)),
-                ((0.35667497,), DocAddress::new(0, 0)),
-            ]
+            &[((0.5604893,), 2), ((0.4904281,), 1), ((0.35667497,), 0),]
         );
         Ok(())
     }
@@ -1353,30 +1367,36 @@ mod tests {
             index: &Index,
             score_order: Order,
             city_order: Order,
-        ) -> crate::Result<Vec<((Score, Option<String>), DocAddress)>> {
+        ) -> crate::Result<Vec<((Score, Option<String>), u64)>> {
             let searcher = index.reader()?.searcher();
+            let ids = id_mapping(&searcher);
+
             let top_collector = TopDocs::with_limit(3).order_by((
                 (ScoreFeature, score_order),
                 (FieldFeature::string("city"), city_order),
             ));
-            searcher.search(&AllQuery, &top_collector)
+            Ok(searcher
+                .search(&AllQuery, &top_collector)?
+                .into_iter()
+                .map(|(f, doc)| (f, ids[&doc]))
+                .collect())
         }
 
         assert_eq!(
             &query(&index, Order::Asc, Order::Asc)?,
             &[
-                ((1.0, Some("austin".to_owned())), DocAddress::new(0, 0)),
-                ((1.0, Some("greenville".to_owned())), DocAddress::new(0, 1)),
-                ((1.0, Some("tokyo".to_owned())), DocAddress::new(1, 0)),
+                ((1.0, Some("austin".to_owned())), 0),
+                ((1.0, Some("greenville".to_owned())), 1),
+                ((1.0, Some("tokyo".to_owned())), 2),
             ]
         );
 
         assert_eq!(
             &query(&index, Order::Asc, Order::Desc)?,
             &[
-                ((1.0, Some("tokyo".to_owned())), DocAddress::new(1, 0)),
-                ((1.0, Some("greenville".to_owned())), DocAddress::new(0, 1)),
-                ((1.0, Some("austin".to_owned())), DocAddress::new(0, 0)),
+                ((1.0, Some("tokyo".to_owned())), 2),
+                ((1.0, Some("greenville".to_owned())), 1),
+                ((1.0, Some("austin".to_owned())), 0),
             ]
         );
         Ok(())
@@ -1420,8 +1440,6 @@ mod tests {
                 ))?;
             let all_results = searcher.search(&AllQuery, &DocSetCollector)?.into_iter().map(|doc_address| {
                 // Get the term for this address.
-                // NOTE: We can't determine the SegmentIds that will be generated for Segments
-                // ahead of time, so we can't pre-compute the expected `DocAddress`es.
                 let column = searcher.segment_readers()[doc_address.segment_ord as usize].fast_fields().str("city").unwrap().unwrap();
                 let value = column.term_ords(doc_address.doc_id).next().map(|term_ord| {
                     let mut city = Vec::new();
