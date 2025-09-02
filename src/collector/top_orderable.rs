@@ -328,7 +328,7 @@ impl FieldFeature<String> {
 }
 
 impl Feature for FieldFeature<String> {
-    type Output = String;
+    type Output = Option<String>;
     type SegmentOutput = u64;
 
     fn is_score(&self) -> bool {
@@ -424,9 +424,9 @@ impl Feature for FieldFeature<String> {
 
         // Rearrange back to row order.
         let mut result = Vec::with_capacity(terms.len());
-        result.resize_with(terms.len(), || String::new());
+        result.resize_with(terms.len(), || None);
         for ((idx, _), term) in ordinals.into_iter().zip(terms.into_iter()) {
-            result[idx] = term;
+            result[idx] = Some(term);
         }
 
         if order.is_desc() {
@@ -475,7 +475,10 @@ impl Feature for ErasedFeature<FieldFeature<String>> {
         self.0
             .decode(column, order, segment_output)
             .into_iter()
-            .map(OwnedValue::Str)
+            .map(|s| match s {
+                Some(s) => OwnedValue::Str(s),
+                None => OwnedValue::Null,
+            })
             .collect()
     }
 
@@ -542,7 +545,7 @@ impl<F: FastValue> FieldFeature<F> {
 }
 
 impl<F: FastValue> Feature for FieldFeature<F> {
-    type Output = F;
+    type Output = Option<F>;
     type SegmentOutput = u64;
 
     fn is_score(&self) -> bool {
@@ -593,12 +596,16 @@ impl<F: FastValue> Feature for FieldFeature<F> {
         order: Order,
         segment_output: Vec<Self::SegmentOutput>,
     ) -> Vec<Self::Output> {
+        // TODO: NULL handling.
         if order.is_desc() {
-            segment_output.into_iter().map(F::from_u64).collect()
+            segment_output
+                .into_iter()
+                .map(|v| Some(F::from_u64(v)))
+                .collect()
         } else {
             segment_output
                 .into_iter()
-                .map(|o| F::from_u64(u64::MAX - o))
+                .map(|o| Some(F::from_u64(u64::MAX - o)))
                 .collect()
         }
     }
@@ -1077,6 +1084,7 @@ mod tests {
     use super::{FieldFeature, ScoreFeature};
     use crate::collector::top_collector::ComparableDoc;
     use crate::collector::{DocSetCollector, TopDocs};
+    use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, QueryParser};
     use crate::schema::{Schema, FAST, TEXT};
     use crate::{DocAddress, Document, Index, Order, Score};
@@ -1091,6 +1099,7 @@ mod tests {
 
         fn create_segment(index: &Index, docs: Vec<impl Document>) -> crate::Result<()> {
             let mut index_writer = index.writer_for_tests()?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
             for doc in docs {
                 index_writer.add_document(doc)?;
             }
@@ -1140,7 +1149,7 @@ mod tests {
             order: Order,
             limit: usize,
             offset: usize,
-            expected: Vec<(String, DocAddress)>,
+            expected: Vec<(Option<String>, DocAddress)>,
         ) -> crate::Result<()> {
             let searcher = index.reader()?.searcher();
 
@@ -1181,9 +1190,9 @@ mod tests {
             3,
             0,
             vec![
-                ("austin".to_owned(), DocAddress::new(0, 0)),
-                ("greenville".to_owned(), DocAddress::new(0, 1)),
-                ("tokyo".to_owned(), DocAddress::new(1, 0)),
+                (Some("austin".to_owned()), DocAddress::new(0, 0)),
+                (Some("greenville".to_owned()), DocAddress::new(0, 1)),
+                (Some("tokyo".to_owned()), DocAddress::new(1, 0)),
             ],
         )?;
 
@@ -1192,7 +1201,7 @@ mod tests {
             Order::Asc,
             1,
             0,
-            vec![("austin".to_owned(), DocAddress::new(0, 0))],
+            vec![(Some("austin".to_owned()), DocAddress::new(0, 0))],
         )?;
 
         assert_query(
@@ -1201,8 +1210,8 @@ mod tests {
             2,
             1,
             vec![
-                ("greenville".to_owned(), DocAddress::new(0, 1)),
-                ("tokyo".to_owned(), DocAddress::new(1, 0)),
+                (Some("greenville".to_owned()), DocAddress::new(0, 1)),
+                (Some("tokyo".to_owned()), DocAddress::new(1, 0)),
             ],
         )?;
 
@@ -1212,9 +1221,9 @@ mod tests {
             3,
             0,
             vec![
-                ("tokyo".to_owned(), DocAddress::new(1, 0)),
-                ("greenville".to_owned(), DocAddress::new(0, 1)),
-                ("austin".to_owned(), DocAddress::new(0, 0)),
+                (Some("tokyo".to_owned()), DocAddress::new(1, 0)),
+                (Some("greenville".to_owned()), DocAddress::new(0, 1)),
+                (Some("austin".to_owned()), DocAddress::new(0, 0)),
             ],
         )?;
 
@@ -1224,8 +1233,8 @@ mod tests {
             2,
             1,
             vec![
-                ("greenville".to_owned(), DocAddress::new(0, 1)),
-                ("austin".to_owned(), DocAddress::new(0, 0)),
+                (Some("greenville".to_owned()), DocAddress::new(0, 1)),
+                (Some("austin".to_owned()), DocAddress::new(0, 0)),
             ],
         )?;
 
@@ -1234,7 +1243,7 @@ mod tests {
             Order::Desc,
             1,
             0,
-            vec![("tokyo".to_owned(), DocAddress::new(1, 0))],
+            vec![(Some("tokyo".to_owned()), DocAddress::new(1, 0))],
         )?;
 
         Ok(())
@@ -1247,7 +1256,7 @@ mod tests {
         fn assert_query(
             index: &Index,
             order: Order,
-            expected: Vec<(f64, DocAddress)>,
+            expected: Vec<(Option<f64>, DocAddress)>,
         ) -> crate::Result<()> {
             let searcher = index.reader()?.searcher();
 
@@ -1284,9 +1293,9 @@ mod tests {
             &index,
             Order::Asc,
             vec![
-                (0.0, DocAddress::new(2, 0)),
-                (27.0, DocAddress::new(0, 1)),
-                (40.0, DocAddress::new(1, 0)),
+                (Some(0.0), DocAddress::new(2, 0)),
+                (Some(27.0), DocAddress::new(0, 1)),
+                (Some(40.0), DocAddress::new(1, 0)),
             ],
         )?;
 
@@ -1294,9 +1303,9 @@ mod tests {
             &index,
             Order::Desc,
             vec![
-                (149.0, DocAddress::new(0, 0)),
-                (40.0, DocAddress::new(1, 0)),
-                (27.0, DocAddress::new(0, 1)),
+                (Some(149.0), DocAddress::new(0, 0)),
+                (Some(40.0), DocAddress::new(1, 0)),
+                (Some(27.0), DocAddress::new(0, 1)),
             ],
         )?;
 
@@ -1309,7 +1318,7 @@ mod tests {
 
         fn query(index: &Index, order: Order) -> crate::Result<Vec<((Score,), DocAddress)>> {
             let searcher = index.reader()?.searcher();
-            let top_collector = TopDocs::with_limit(3).order_by(((ScoreFeature, order),));
+            let top_collector = TopDocs::with_limit(4).order_by(((ScoreFeature, order),));
             let field = index.schema().get_field("catchphrase").unwrap();
             let query_parser = QueryParser::for_index(&index, vec![field]);
             let text_query = query_parser.parse_query("glow")?;
@@ -1344,7 +1353,7 @@ mod tests {
             index: &Index,
             score_order: Order,
             city_order: Order,
-        ) -> crate::Result<Vec<((Score, String), DocAddress)>> {
+        ) -> crate::Result<Vec<((Score, Option<String>), DocAddress)>> {
             let searcher = index.reader()?.searcher();
             let top_collector = TopDocs::with_limit(3).order_by((
                 (ScoreFeature, score_order),
@@ -1356,18 +1365,18 @@ mod tests {
         assert_eq!(
             &query(&index, Order::Asc, Order::Asc)?,
             &[
-                ((1.0, "austin".to_owned()), DocAddress::new(0, 0)),
-                ((1.0, "greenville".to_owned()), DocAddress::new(0, 1)),
-                ((1.0, "tokyo".to_owned()), DocAddress::new(1, 0)),
+                ((1.0, Some("austin".to_owned())), DocAddress::new(0, 0)),
+                ((1.0, Some("greenville".to_owned())), DocAddress::new(0, 1)),
+                ((1.0, Some("tokyo".to_owned())), DocAddress::new(1, 0)),
             ]
         );
 
         assert_eq!(
             &query(&index, Order::Asc, Order::Desc)?,
             &[
-                ((1.0, "tokyo".to_owned()), DocAddress::new(1, 0)),
-                ((1.0, "greenville".to_owned()), DocAddress::new(0, 1)),
-                ((1.0, "austin".to_owned()), DocAddress::new(0, 0)),
+                ((1.0, Some("tokyo".to_owned())), DocAddress::new(1, 0)),
+                ((1.0, Some("greenville".to_owned())), DocAddress::new(0, 1)),
+                ((1.0, Some("austin".to_owned())), DocAddress::new(0, 0)),
             ]
         );
         Ok(())
@@ -1414,10 +1423,12 @@ mod tests {
                 // NOTE: We can't determine the SegmentIds that will be generated for Segments
                 // ahead of time, so we can't pre-compute the expected `DocAddress`es.
                 let column = searcher.segment_readers()[doc_address.segment_ord as usize].fast_fields().str("city").unwrap().unwrap();
-                let term_ord = column.term_ords(doc_address.doc_id).next().unwrap();
-                let mut city = Vec::new();
-                column.dictionary().ord_to_term(term_ord, &mut city).unwrap();
-                (String::try_from(city).unwrap(), doc_address)
+                let value = column.term_ords(doc_address.doc_id).next().map(|term_ord| {
+                    let mut city = Vec::new();
+                    column.dictionary().ord_to_term(term_ord, &mut city).unwrap();
+                    String::try_from(city).unwrap()
+                });
+                (value, doc_address)
             });
 
             // Using the TopDocs collector should always be equivalent to sorting, skipping the
