@@ -1071,7 +1071,7 @@ pub trait TopNCompare {
     type Accepted: Clone + PartialOrd;
 
     /// Given the current threshold of accepted values and a candidate doc_id/score, compare the
-    /// candidate value to the threshold, and convert the candidate to Accepted if it is TODO-than
+    /// candidate value to the threshold, and convert the candidate to Accepted if it is greater-than
     /// the threshold.
     fn accept(
         &self,
@@ -1081,9 +1081,7 @@ pub trait TopNCompare {
         doc_id: DocId,
     ) -> Option<Self::Accepted>;
 
-    /// Given the current threshold of accepted values and a candidate doc_id/score, compare the
-    /// candidate value to the threshold, and convert the candidate to Accepted if it is TODO-than
-    /// the threshold.
+    /// Get an Accepted value for the given Score and DocId.
     fn get(&self, score: Score, doc_id: DocId) -> Self::Accepted;
 }
 
