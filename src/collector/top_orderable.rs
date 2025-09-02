@@ -1121,6 +1121,13 @@ mod tests {
                 altitude => 40.0,
             )],
         )?;
+        create_segment(
+            &index,
+            vec![doc!(
+                catchphrase => "No, No, No",
+                altitude => 0.0,
+            )],
+        )?;
         Ok(index)
     }
 
@@ -1277,9 +1284,9 @@ mod tests {
             &index,
             Order::Asc,
             vec![
+                (0.0, DocAddress::new(2, 0)),
                 (27.0, DocAddress::new(0, 1)),
                 (40.0, DocAddress::new(1, 0)),
-                (149.0, DocAddress::new(0, 0)),
             ],
         )?;
 
@@ -1312,18 +1319,18 @@ mod tests {
         assert_eq!(
             &query(&index, Order::Asc)?,
             &[
-                ((0.13353144,), DocAddress::new(0, 0)),
-                ((0.18360573,), DocAddress::new(0, 1)),
-                ((0.20983513,), DocAddress::new(1, 0)),
+                ((0.35667497,), DocAddress::new(0, 0)),
+                ((0.4904281,), DocAddress::new(0, 1)),
+                ((0.5604893,), DocAddress::new(1, 0)),
             ]
         );
 
         assert_eq!(
             &query(&index, Order::Desc)?,
             &[
-                ((0.20983513,), DocAddress::new(1, 0)),
-                ((0.18360573,), DocAddress::new(0, 1)),
-                ((0.13353144,), DocAddress::new(0, 0)),
+                ((0.5604893,), DocAddress::new(1, 0)),
+                ((0.4904281,), DocAddress::new(0, 1)),
+                ((0.35667497,), DocAddress::new(0, 0)),
             ]
         );
         Ok(())
