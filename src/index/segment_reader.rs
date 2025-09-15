@@ -310,8 +310,6 @@ impl SegmentReader {
 
         let postings_file_opt = self.postings_composite().open_read(field);
 
-        println!(">>> opening `merge_optimized_inverted_index` for {}. Will use {postings_file_opt:?}.", self.segment_id);
-
         if postings_file_opt.is_none() || record_option_opt.is_none() {
             // no documents in the segment contained this field.
             // As a result, no data is associated with the inverted index.
@@ -335,6 +333,7 @@ impl SegmentReader {
                 ))
             })?;
 
+
         let positions_file = self.positions_composite().open_read(field).ok_or_else(|| {
             let error_msg = format!(
                 "Failed to open field {:?}'s positions in the composite file. Has the schema been \
@@ -343,6 +342,8 @@ impl SegmentReader {
             );
             DataCorruption::comment_only(error_msg)
         })?;
+
+        println!(">>> opening `merge_optimized_inverted_index` for {}. Will use {positions_file:?} for positions.", self.segment_id);
 
         let inv_idx_reader = Arc::new(MergeOptimizedInvertedIndexReader::new(
             TermDictionary::open(termdict_file)?,
