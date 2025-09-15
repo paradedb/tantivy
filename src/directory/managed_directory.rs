@@ -306,6 +306,7 @@ impl Directory for ManagedDirectory {
             path.display()
         );
         let (reader, _) = file_slice.split_from_end(FOOTER_LEN);
+        println!(">>> blindly opening {path:?} after stripping {FOOTER_LEN}");
         // NB:  We do not read/validate the footer here -- we blindly skip it entirely
         Ok(reader)
     }
