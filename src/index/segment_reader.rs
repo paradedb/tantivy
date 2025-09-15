@@ -310,6 +310,8 @@ impl SegmentReader {
 
         let postings_file_opt = self.postings_composite().open_read(field);
 
+        println!(">>> opening `merge_optimized_inverted_index` for {}. Will use {postings_file_opt:?}.", self.segment_id);
+
         if postings_file_opt.is_none() || record_option_opt.is_none() {
             // no documents in the segment contained this field.
             // As a result, no data is associated with the inverted index.

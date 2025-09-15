@@ -139,10 +139,17 @@ impl<'a> BorrowedPositionReader<'a> {
             let offset_in_block = (offset as usize) % COMPRESSION_BLOCK_SIZE;
             let remaining_in_block = COMPRESSION_BLOCK_SIZE - offset_in_block;
             if remaining_in_block >= output.len() {
+                let inslice = &self.block_decoder.output_array()[offset_in_block..];
+                if output.len() > inslice.len() {
+                    println!(">>> about to slice [..{}] in {}: {:#?}", output.len(), inslice.len(), std::backtrace::Backtrace::force_capture());
+                }
                 output.copy_from_slice(
-                    &self.block_decoder.output_array()[offset_in_block..][..output.len()],
+                    &inslice[..output.len()],
                 );
                 break;
+            }
+            if remaining_in_block > output.len() {
+                println!(">>> about to slice [..{remaining_in_block}] in {}: {:#?}", output.len(), std::backtrace::Backtrace::force_capture());
             }
             output[..remaining_in_block]
                 .copy_from_slice(&self.block_decoder.output_array()[offset_in_block..]);
