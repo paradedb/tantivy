@@ -309,7 +309,6 @@ impl IndexMerger {
         fieldnorm_reader: Option<FieldNormReader>,
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
-        println!(">>> writing postings for field {indexed_field:?}");
         debug_time!("write-postings-for-field");
         let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
         let mut delta_computer = DeltaComputer::new();
@@ -513,6 +512,7 @@ impl IndexMerger {
             }
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             if field_entry.is_indexed() {
+                println!(">>> writing postings for field {field:?}, {field_entry:?}");
                 self.write_postings_for_field(
                     field,
                     field_entry.field_type(),
