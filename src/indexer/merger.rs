@@ -476,7 +476,13 @@ impl IndexMerger {
                         // we make sure to only write the term if
                         // there is at least one document.
                         let term_freq = if has_term_freq {
-                            segment_postings.positions(&mut positions_buffer);
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                segment_postings.positions(&mut positions_buffer);
+                            }));
+                            if let Err(payload) = result {
+                                println!(">>> paniced on old doc id {doc} in {} which will become {remapped_doc_id}", self.readers[segment_ord].segment_id());
+                                std::panic::resume_unwind(payload);
+                            }
                             segment_postings.term_freq()
                         } else {
                             // The positions_buffer may contain positions from the previous term
