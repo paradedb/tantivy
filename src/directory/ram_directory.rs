@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -232,6 +233,10 @@ impl Directory for RamDirectory {
 
     fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle> {
         Ok(self.fs.write().unwrap().watch(watch_callback))
+    }
+
+    fn list_managed_files(&self) -> crate::Result<HashSet<PathBuf>> {
+        Ok(self.fs.read().unwrap().fs.keys().cloned().collect())
     }
 
     fn sync_directory(&self) -> io::Result<()> {
