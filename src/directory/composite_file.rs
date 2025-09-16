@@ -132,10 +132,14 @@ impl CompositeFile {
             file_addrs.push(file_addr);
         }
         offsets.push(footer_start);
+        let data_len = data.len();
         for i in 0..num_fields {
             let file_addr = file_addrs[i];
             let start_offset = offsets[i];
             let end_offset = offsets[i + 1];
+            if end_offset >= data_len {
+                panic!("Invalid footer in {data:?}: offset is past end of slice: {end_offset}");
+            }
             field_index.insert(file_addr, start_offset..end_offset);
         }
 
