@@ -298,7 +298,7 @@ impl Directory for ManagedDirectory {
     fn open_read(&self, path: &Path) -> result::Result<FileSlice, OpenReadError> {
         let file_slice = self.directory.open_read(path)?;
         // TODO: Temporarily validating the footer.
-        let (footer, data) = Footer::extract_footer(file_slice)
+        let (_footer, data) = Footer::extract_footer(file_slice)
             .map_err(|io_error| OpenReadError::wrap_io_error(io_error, path.to_path_buf()))?;
         Ok(data)
     }
