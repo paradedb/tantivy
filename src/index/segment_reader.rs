@@ -342,12 +342,6 @@ impl SegmentReader {
             DataCorruption::comment_only(error_msg)
         })?;
 
-        println!(
-            ">>> opening `merge_optimized_inverted_index` for {}. Will use {positions_file:?} for \
-             positions for field {field:?}.",
-            self.segment_id
-        );
-
         let inv_idx_reader = Arc::new(MergeOptimizedInvertedIndexReader::new(
             TermDictionary::open(termdict_file)?,
             postings_file,
@@ -560,7 +554,6 @@ impl SegmentReader {
     fn positions_composite(&self) -> &CompositeFile {
         self.positions_composite.get_or_init(move || {
             if let Ok(positions_file) = &self.open_read(SegmentComponent::Positions) {
-                println!(">>> opening positions composite for {}", self.segment_id);
                 CompositeFile::open(&positions_file)
                     .expect("should be able to open positions composite component")
             } else {
