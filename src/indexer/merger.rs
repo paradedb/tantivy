@@ -476,11 +476,16 @@ impl IndexMerger {
                         // we make sure to only write the term if
                         // there is at least one document.
                         let term_freq = if has_term_freq {
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                segment_postings.positions(&mut positions_buffer);
-                            }));
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    segment_postings.positions(&mut positions_buffer);
+                                }));
                             if let Err(payload) = result {
-                                println!(">>> paniced on old doc id {doc} in {} which will become {remapped_doc_id}", self.readers[segment_ord].segment_id());
+                                println!(
+                                    ">>> paniced on old doc id {doc} in {} which will become \
+                                     {remapped_doc_id}",
+                                    self.readers[segment_ord].segment_id()
+                                );
                                 std::panic::resume_unwind(payload);
                             }
                             segment_postings.term_freq()
@@ -518,7 +523,6 @@ impl IndexMerger {
             }
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             if field_entry.is_indexed() {
-                println!(">>> writing postings for field {field:?}, {field_entry:?}");
                 self.write_postings_for_field(
                     field,
                     field_entry.field_type(),

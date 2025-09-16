@@ -300,7 +300,6 @@ impl Directory for ManagedDirectory {
         // TODO: Temporarily validating the footer.
         let (footer, data) = Footer::extract_footer(file_slice)
             .map_err(|io_error| OpenReadError::wrap_io_error(io_error, path.to_path_buf()))?;
-        println!(">>> opened {path:?} and got footer {footer:?}");
         Ok(data)
     }
 
@@ -310,7 +309,6 @@ impl Directory for ManagedDirectory {
     ) -> result::Result<Box<dyn TerminatingWrite>, OpenWriteError> {
         self.register_file_as_managed(path)
             .map_err(|io_error| OpenWriteError::wrap_io_error(io_error, path.to_path_buf()))?;
-        println!(">>> wrapping {path:?} in footer proxy: {:#?}", std::backtrace::Backtrace::force_capture());
         Ok(Box::new(FooterProxy::new(
             self.directory
                 .open_write(path)?
