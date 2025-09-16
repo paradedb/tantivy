@@ -33,6 +33,7 @@ impl Footer {
         self.crc
     }
     pub fn append_footer<W: io::Write>(&self, write: &mut W) -> io::Result<()> {
+        println!(">>> appending footer {self:?}");
         // 24 bytes
         BinarySerializable::serialize(&self.version.major, write)?;
         BinarySerializable::serialize(&self.version.minor, write)?;
