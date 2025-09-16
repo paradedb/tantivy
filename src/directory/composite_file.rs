@@ -73,14 +73,13 @@ impl<W: TerminatingWrite + Write> CompositeWrite<W> {
         VInt(self.offsets.len() as u64).serialize(&mut self.write)?;
 
         let mut prev_offset = 0;
-        for (file_addr, offset) in &self.offsets {
+        for (file_addr, offset) in self.offsets {
             VInt(offset - prev_offset).serialize(&mut self.write)?;
             file_addr.serialize(&mut self.write)?;
-            prev_offset = *offset;
+            prev_offset = offset;
         }
 
         let footer_len = (self.write.written_bytes() - footer_offset) as u32;
-        println!(">>> serialized {footer_len} bytes of CompositeFile footer for {:?}", self.offsets);
         footer_len.serialize(&mut self.write)?;
         self.write.terminate()
     }
@@ -132,18 +131,12 @@ impl CompositeFile {
             file_addrs.push(file_addr);
         }
         offsets.push(footer_start);
-        let data_len = data.len();
         for i in 0..num_fields {
             let file_addr = file_addrs[i];
             let start_offset = offsets[i];
             let end_offset = offsets[i + 1];
-            if end_offset >= data_len {
-                panic!("Invalid footer in {data:?}: offset is past end of slice: {end_offset}");
-            }
             field_index.insert(file_addr, start_offset..end_offset);
         }
-
-        println!(">>> loaded {footer_len} bytes of CompositeFile footer for {:?}", field_index);
 
         Ok(CompositeFile {
             data: data.slice_to(footer_start),
