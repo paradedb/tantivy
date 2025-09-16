@@ -112,6 +112,7 @@ impl CompositeFile {
         let end = data.len();
         let footer_len_data = data.slice_from(end - 4).read_bytes()?;
         let footer_len = u32::deserialize(&mut footer_len_data.as_slice())? as usize;
+        println!(">>> in CompositeFile: {data:?}, got {end} - 4 - {footer_len}");
         let footer_start = end - 4 - footer_len;
         let footer_data = data
             .slice(footer_start..footer_start + footer_len)
