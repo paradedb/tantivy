@@ -560,6 +560,7 @@ impl SegmentReader {
     fn positions_composite(&self) -> &CompositeFile {
         self.positions_composite.get_or_init(move || {
             if let Ok(positions_file) = &self.open_read(SegmentComponent::Positions) {
+                println!(">>> opening positions composite");
                 CompositeFile::open(&positions_file)
                     .expect("should be able to open positions composite component")
             } else {
