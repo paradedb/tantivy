@@ -333,7 +333,6 @@ impl SegmentReader {
                 ))
             })?;
 
-
         let positions_file = self.positions_composite().open_read(field).ok_or_else(|| {
             let error_msg = format!(
                 "Failed to open field {:?}'s positions in the composite file. Has the schema been \
@@ -343,7 +342,11 @@ impl SegmentReader {
             DataCorruption::comment_only(error_msg)
         })?;
 
-        println!(">>> opening `merge_optimized_inverted_index` for {}. Will use {positions_file:?} for positions.", self.segment_id);
+        println!(
+            ">>> opening `merge_optimized_inverted_index` for {}. Will use {positions_file:?} for \
+             positions.",
+            self.segment_id
+        );
 
         let inv_idx_reader = Arc::new(MergeOptimizedInvertedIndexReader::new(
             TermDictionary::open(termdict_file)?,
