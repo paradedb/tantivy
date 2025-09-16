@@ -141,16 +141,24 @@ impl<'a> BorrowedPositionReader<'a> {
             if remaining_in_block >= output.len() {
                 let inslice = &self.block_decoder.output_array()[offset_in_block..];
                 if output.len() > inslice.len() {
-                    //            about to slice inslice [..4]  in 2 ...  ( 1,   3,        3,                 125                )
-                    println!(">>> about to slice inslice [..{}] in {} ... ({i}, {offset}, {offset_in_block}, {remaining_in_block}): {:#?}", output.len(), inslice.len(), std::backtrace::Backtrace::force_capture());
+                    println!(
+                        ">>> about to slice inslice [..{}] in {} ... ({i}, {offset}, \
+                         {offset_in_block}, {remaining_in_block}): {:#?}",
+                        output.len(),
+                        inslice.len(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
                 }
-                output.copy_from_slice(
-                    &inslice[..output.len()],
-                );
+                output.copy_from_slice(&inslice[..output.len()]);
                 break;
             }
             if remaining_in_block > output.len() {
-                println!(">>> about to slice [..{remaining_in_block}] in {} ... ({i}, {offset}, {offset_in_block}, {remaining_in_block}): {:#?}", output.len(), std::backtrace::Backtrace::force_capture());
+                println!(
+                    ">>> about to slice [..{remaining_in_block}] in {} ... ({i}, {offset}, \
+                     {offset_in_block}, {remaining_in_block}): {:#?}",
+                    output.len(),
+                    std::backtrace::Backtrace::force_capture()
+                );
             }
             output[..remaining_in_block]
                 .copy_from_slice(&self.block_decoder.output_array()[offset_in_block..]);
