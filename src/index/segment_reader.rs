@@ -344,7 +344,7 @@ impl SegmentReader {
 
         println!(
             ">>> opening `merge_optimized_inverted_index` for {}. Will use {positions_file:?} for \
-             positions.",
+             positions for field {field:?}.",
             self.segment_id
         );
 
