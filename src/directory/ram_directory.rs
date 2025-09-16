@@ -58,7 +58,8 @@ impl Write for VecWriter {
     fn flush(&mut self) -> io::Result<()> {
         self.is_flushed = true;
         let mut fs = self.shared_directory.fs.write().unwrap();
-        fs.write(self.path.clone(), self.data.get_ref());
+        let existed = fs.write(self.path.clone(), self.data.get_ref());
+        assert!(!existed, "Flushed twice to the same path.");
         Ok(())
     }
 }
