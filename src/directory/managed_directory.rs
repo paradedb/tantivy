@@ -87,6 +87,9 @@ impl ManagedDirectory {
                     io_err @ Err(OpenReadError::IoError { .. }) => {
                         Err(io_err.err().unwrap().into())
                     }
+                    Err(OpenReadError::Corrupt(path)) => {
+                        todo!(">>> corrupt: {path:?}")
+                    }
                     Err(OpenReadError::IncompatibleIndex(incompatibility)) => {
                         // For the moment, this should never happen  `meta.json`
                         // do not have any footer and cannot detect incompatibility.
@@ -296,6 +299,9 @@ impl Directory for ManagedDirectory {
     }
 
     fn open_read(&self, path: &Path) -> result::Result<FileSlice, OpenReadError> {
+        if !self.validate_checksum(path)? {
+            return Err(OpenReadError::Corrupt(path.to_owned()))
+        }
         let file_slice = self.directory.open_read(path)?;
         // TODO: Temporarily validating the footer.
         let (_footer, data) = Footer::extract_footer(file_slice)
