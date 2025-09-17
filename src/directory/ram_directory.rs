@@ -50,6 +50,7 @@ impl Write for VecWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.is_flushed = false;
         self.data.write_all(buf)?;
+        println!(">>> wrote {} to {:?}", buf.len(), self.path);
         Ok(buf.len())
     }
 
@@ -79,7 +80,9 @@ struct InnerDirectory {
 
 impl InnerDirectory {
     fn write(&mut self, path: PathBuf, data: &[u8]) {
-        self.fs.entry(path).or_default().extend_from_slice(data)
+        let file = self.fs.entry(path.clone()).or_default();
+        file.extend_from_slice(data);
+        println!(">>> flushing {} (new len {}) to {:?}", data.len(), file.len(), path);
     }
 
     fn overwrite(&mut self, path: PathBuf, data: &[u8]) -> bool {
