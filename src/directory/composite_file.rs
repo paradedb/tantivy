@@ -101,6 +101,7 @@ pub struct CompositeFile {
 impl std::fmt::Debug for CompositeFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompositeFile")
+            .field("data", &self.data)
             .field("offsets_index", &self.offsets_index)
             .finish()
     }
