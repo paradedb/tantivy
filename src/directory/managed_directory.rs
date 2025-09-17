@@ -302,6 +302,7 @@ impl Directory for ManagedDirectory {
         if !self.validate_checksum(path)? {
             return Err(OpenReadError::Corrupt(path.to_owned()))
         }
+        println!(">>> opening {path:?} for read");
         let file_slice = self.directory.open_read(path)?;
         // TODO: Temporarily validating the footer.
         let (_footer, data) = Footer::extract_footer(file_slice)
