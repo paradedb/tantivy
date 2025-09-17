@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, Cursor, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::{fmt, result};
@@ -18,7 +18,7 @@ use crate::directory::{
 struct VecWriter {
     path: PathBuf,
     shared_directory: RamDirectory,
-    data: Cursor<Vec<u8>>,
+    data: Vec<u8>,
     is_flushed: bool,
 }
 
@@ -26,7 +26,7 @@ impl VecWriter {
     fn new(path_buf: PathBuf, shared_directory: RamDirectory) -> VecWriter {
         VecWriter {
             path: path_buf,
-            data: Cursor::new(Vec::new()),
+            data: Vec::new(),
             shared_directory,
             is_flushed: true,
         }
@@ -56,9 +56,8 @@ impl Write for VecWriter {
     fn flush(&mut self) -> io::Result<()> {
         if !self.is_flushed {
             let mut fs = self.shared_directory.fs.write().unwrap();
-            fs.write(self.path.clone(), self.data.get_ref());
-            self.data.set_position(0);
-            self.data.get_mut().clear();
+            fs.write(self.path.clone(), &self.data);
+            self.data.clear();
             self.is_flushed = true;
         }
         Ok(())
