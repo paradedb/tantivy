@@ -9,7 +9,7 @@ use crc32fast::Hasher;
 
 use crate::core::MANAGED_FILEPATH;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
-use crate::directory::footer::{Footer, FooterProxy, FOOTER_LEN};
+use crate::directory::footer::{Footer, FooterProxy};
 use crate::directory::{
     DirectoryLock, DirectoryPanicHandler, FileHandle, FileSlice, GarbageCollectionResult, Lock,
     TerminatingWrite, WatchCallback, WatchHandle, MANAGED_LOCK, META_LOCK,
@@ -297,17 +297,10 @@ impl Directory for ManagedDirectory {
 
     fn open_read(&self, path: &Path) -> result::Result<FileSlice, OpenReadError> {
         let file_slice = self.directory.open_read(path)?;
-        debug_assert!(
-            {
-                use common::HasLen;
-                file_slice.len() >= FOOTER_LEN
-            },
-            "{} is too short",
-            path.display()
-        );
-        let (reader, _) = file_slice.split_from_end(FOOTER_LEN);
-        // NB:  We do not read/validate the footer here -- we blindly skip it entirely
-        Ok(reader)
+        // TODO: Temporarily validating the footer.
+        let (_footer, data) = Footer::extract_footer(file_slice)
+            .map_err(|io_error| OpenReadError::wrap_io_error(io_error, path.to_path_buf()))?;
+        Ok(data)
     }
 
     fn open_write_inner(
