@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::{fmt, result};
 
-use common::HasLen;
-
 use super::FileHandle;
 use crate::core::META_FILEPATH;
 use crate::directory::error::{DeleteError, OpenReadError, OpenWriteError};
@@ -56,10 +54,13 @@ impl Write for VecWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.is_flushed = true;
-        let mut fs = self.shared_directory.fs.write().unwrap();
-        let existed = fs.write(self.path.clone(), self.data.get_ref());
-        assert!(!existed, "Flushed twice to the same path.");
+        if !self.is_flushed {
+            let mut fs = self.shared_directory.fs.write().unwrap();
+            fs.write(self.path.clone(), self.data.get_ref());
+            self.data.set_position(0);
+            self.data.get_mut().clear();
+            self.is_flushed = true;
+        }
         Ok(())
     }
 }
@@ -72,21 +73,24 @@ impl TerminatingWrite for VecWriter {
 
 #[derive(Default)]
 struct InnerDirectory {
-    fs: HashMap<PathBuf, FileSlice>,
+    fs: HashMap<PathBuf, Vec<u8>>,
     watch_router: WatchCallbackList,
 }
 
 impl InnerDirectory {
-    fn write(&mut self, path: PathBuf, data: &[u8]) -> bool {
-        let data = FileSlice::from(data.to_vec());
-        self.fs.insert(path, data).is_some()
+    fn write(&mut self, path: PathBuf, data: &[u8]) {
+        self.fs.entry(path).or_default().extend_from_slice(data)
+    }
+
+    fn overwrite(&mut self, path: PathBuf, data: &[u8]) -> bool {
+        self.fs.insert(path, data.to_vec()).is_some()
     }
 
     fn open_read(&self, path: &Path) -> Result<FileSlice, OpenReadError> {
         self.fs
             .get(path)
+            .map(|bytes| FileSlice::from(bytes.clone()))
             .ok_or_else(|| OpenReadError::FileDoesNotExist(PathBuf::from(path)))
-            .cloned()
     }
 
     fn delete(&mut self, path: &Path) -> result::Result<(), DeleteError> {
@@ -160,7 +164,7 @@ impl RamDirectory {
         let wlock = self.fs.write().unwrap();
         for (path, file) in wlock.fs.iter() {
             let mut dest_wrt = dest.open_write(path)?;
-            dest_wrt.write_all(file.read_bytes()?.as_slice())?;
+            dest_wrt.write_all(file)?;
             dest_wrt.terminate()?;
         }
         Ok(())
@@ -202,7 +206,7 @@ impl Directory for RamDirectory {
         let mut fs = self.fs.write().unwrap();
         let path_buf = PathBuf::from(path);
         let vec_writer = VecWriter::new(path_buf.clone(), self.clone());
-        let exists = fs.write(path_buf.clone(), &[]);
+        let exists = fs.overwrite(path_buf.clone(), &[]);
         // force the creation of the file to mimic the MMap directory.
         if exists {
             Err(OpenWriteError::FileAlreadyExists(path_buf))
@@ -224,7 +228,7 @@ impl Directory for RamDirectory {
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
         let path_buf = PathBuf::from(path);
-        self.fs.write().unwrap().write(path_buf, data);
+        self.fs.write().unwrap().overwrite(path_buf, data);
         if path == *META_FILEPATH {
             drop(self.fs.write().unwrap().watch_router.broadcast());
         }
