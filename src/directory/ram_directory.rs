@@ -48,6 +48,7 @@ impl Drop for VecWriter {
 
 impl Write for VecWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        println!(">>> write path to RamDirectory: {:#?}", std::backtrace::Backtrace::force_capture());
         self.is_flushed = false;
         self.data.write_all(buf)?;
         Ok(buf.len())
