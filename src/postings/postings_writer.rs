@@ -234,7 +234,6 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
         for (_field, _path_id, term, addr) in term_addrs {
             Self::serialize_one_term(term, *addr, &mut buffer_lender, ctx, serializer)?;
         }
-        println!();
         Ok(())
     }
 
