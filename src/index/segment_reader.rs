@@ -230,6 +230,8 @@ impl SegmentReader {
 
         let termdict_file: FileSlice =
             self.termdict_composite().open_read(field).ok_or_else(|| {
+                println!(">>> for field {field:?}, have {record_option:?} and {postings_file:?}: about to fail because {:?} does not have an entry for it.", self.termdict_composite());
+
                 DataCorruption::comment_only(format!(
                     "Failed to open field {:?}'s term dictionary in the composite file for {}. Has the \
                      schema been modified?",

@@ -60,7 +60,6 @@ impl<W: TerminatingWrite + Write> CompositeWrite<W> {
         let offset = self.write.written_bytes();
         let file_addr = FileAddr::new(field, idx);
         assert!(!self.offsets.iter().any(|el| el.0 == file_addr));
-        println!(">>> adding field {field:?} at {idx}: offset is {offset}");
         self.offsets.push((file_addr, offset));
         &mut self.write
     }
@@ -164,13 +163,9 @@ impl CompositeFile {
     /// Returns the `FileSlice` associated with
     /// a given `Field` and stored in a `CompositeFile`.
     pub fn open_read_with_idx(&self, field: Field, idx: usize) -> Option<FileSlice> {
-        let res = self.offsets_index
+        self.offsets_index
             .get(&FileAddr { field, idx })
-            .map(|byte_range| self.data.slice(byte_range.clone()));
-        if res.is_none() {
-            println!(">>> did not find field {field:?} at {idx} in {self:?}");
-        }
-        res
+            .map(|byte_range| self.data.slice(byte_range.clone()))
     }
 
     pub fn space_usage(&self) -> PerFieldSpaceUsage {
