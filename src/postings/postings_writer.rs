@@ -77,6 +77,7 @@ pub(crate) fn serialize_postings(
     let ordered_id_to_path = ctx.path_to_unordered_id.ordered_id_to_path();
     let field_offsets = make_field_partition(&term_offsets);
     for (field, byte_offsets) in field_offsets {
+        println!(">>> serializing postings writer for {field:?}");
         let postings_writer = per_field_postings_writers.get_for_field(field);
         let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
         let mut field_serializer =

@@ -19,7 +19,6 @@ struct VecWriter {
     path: PathBuf,
     shared_directory: RamDirectory,
     data: Vec<u8>,
-    is_flushed: bool,
 }
 
 impl VecWriter {
@@ -28,14 +27,13 @@ impl VecWriter {
             path: path_buf,
             data: Vec::new(),
             shared_directory,
-            is_flushed: true,
         }
     }
 }
 
 impl Drop for VecWriter {
     fn drop(&mut self) {
-        if !self.is_flushed {
+        if !self.data.is_empty() {
             println!(
                 "You forgot to flush {:?} before its writer got Drop. Do not rely on drop. This \
                  also occurs when the indexer crashed, so you may want to check the logs for the \
@@ -48,17 +46,15 @@ impl Drop for VecWriter {
 
 impl Write for VecWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.is_flushed = false;
         self.data.write_all(buf)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if !self.is_flushed {
+        if !self.data.is_empty() {
             let mut fs = self.shared_directory.fs.write().unwrap();
             fs.write(self.path.clone(), &self.data);
             self.data.clear();
-            self.is_flushed = true;
         }
         Ok(())
     }
