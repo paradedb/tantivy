@@ -48,7 +48,6 @@ impl Drop for VecWriter {
 
 impl Write for VecWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        println!(">>> write path to RamDirectory: {:#?}", std::backtrace::Backtrace::force_capture());
         self.is_flushed = false;
         self.data.write_all(buf)?;
         Ok(buf.len())
@@ -81,7 +80,6 @@ impl InnerDirectory {
     fn write(&mut self, path: PathBuf, data: &[u8]) {
         let file = self.fs.entry(path.clone()).or_default();
         file.extend_from_slice(data);
-        println!(">>> flushing {} (new len {}) to {:?}", data.len(), file.len(), path);
     }
 
     fn overwrite(&mut self, path: PathBuf, data: &[u8]) -> bool {

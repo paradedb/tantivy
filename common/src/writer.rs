@@ -1,14 +1,14 @@
 use std::io::{self, BufWriter, Write};
 
 pub struct CountingWriter<W> {
-    underlying: W,
+    underlying: Option<W>,
     written_bytes: u64,
 }
 
 impl<W: Write> CountingWriter<W> {
     pub fn wrap(underlying: W) -> CountingWriter<W> {
         CountingWriter {
-            underlying,
+            underlying: Some(underlying),
             written_bytes: 0,
         }
     }
@@ -21,36 +21,44 @@ impl<W: Write> CountingWriter<W> {
     /// Returns the underlying write object.
     /// Note that this method does not trigger any flushing.
     #[inline]
-    pub fn finish(self) -> W {
-        self.underlying
+    pub fn finish(mut self) -> W {
+        self.underlying.take().unwrap()
+    }
+}
+
+impl<W> Drop for CountingWriter<W> {
+    fn drop(&mut self) {
+        if self.underlying.is_some() {
+            println!(">>> drop! terminate/finish not called at {:#?}", std::backtrace::Backtrace::force_capture());
+        }
     }
 }
 
 impl<W: Write> Write for CountingWriter<W> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written_size = self.underlying.write(buf)?;
+        let written_size = self.underlying.as_mut().unwrap().write(buf)?;
         self.written_bytes += written_size as u64;
         Ok(written_size)
     }
 
     #[inline]
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.underlying.write_all(buf)?;
+        self.underlying.as_mut().unwrap().write_all(buf)?;
         self.written_bytes += buf.len() as u64;
         Ok(())
     }
 
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
-        self.underlying.flush()
+        self.underlying.as_mut().unwrap().flush()
     }
 }
 
 impl<W: TerminatingWrite> TerminatingWrite for CountingWriter<W> {
     #[inline]
     fn terminate_ref(&mut self, token: AntiCallToken) -> io::Result<()> {
-        self.underlying.terminate_ref(token)
+        self.underlying.take().unwrap().terminate_ref(token)
     }
 }
 
