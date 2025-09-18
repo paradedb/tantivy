@@ -66,7 +66,7 @@ impl<W: Write> Write for CountingWriter<W> {
 impl<W: TerminatingWrite> TerminatingWrite for CountingWriter<W> {
     #[inline]
     fn terminate_ref(&mut self, token: AntiCallToken) -> io::Result<()> {
-        self.flush();
+        self.flush()?;
         self.underlying.take().unwrap().terminate_ref(token)
     }
 }
