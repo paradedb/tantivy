@@ -36,7 +36,7 @@ impl BinarySerializable for FileAddr {
 
 /// A `CompositeWrite` is used to write a `CompositeFile`.
 pub struct CompositeWrite<W = WritePtr> {
-    write: CountingWriter<W>,
+    write: Option<CountingWriter<W>>,
     offsets: Vec<(FileAddr, u64)>,
 }
 
@@ -45,7 +45,7 @@ impl<W: TerminatingWrite + Write> CompositeWrite<W> {
     /// in a given write.
     pub fn wrap(w: W) -> CompositeWrite<W> {
         CompositeWrite {
-            write: CountingWriter::wrap(w),
+            write: Some(CountingWriter::wrap(w)),
             offsets: Vec::new(),
         }
     }
@@ -57,11 +57,11 @@ impl<W: TerminatingWrite + Write> CompositeWrite<W> {
 
     /// Start writing a new field.
     pub fn for_field_with_idx(&mut self, field: Field, idx: usize) -> &mut CountingWriter<W> {
-        let offset = self.write.written_bytes();
+        let offset = self.write.as_ref().unwrap().written_bytes();
         let file_addr = FileAddr::new(field, idx);
         assert!(!self.offsets.iter().any(|el| el.0 == file_addr));
         self.offsets.push((file_addr, offset));
-        &mut self.write
+        self.write.as_mut().unwrap()
     }
 
     /// Close the composite file
@@ -69,19 +69,28 @@ impl<W: TerminatingWrite + Write> CompositeWrite<W> {
     /// An index of the different field offsets
     /// will be written as a footer.
     pub fn close(mut self) -> io::Result<()> {
-        let footer_offset = self.write.written_bytes();
-        VInt(self.offsets.len() as u64).serialize(&mut self.write)?;
+        let mut write = self.write.take().unwrap();
+        let footer_offset = write.written_bytes();
+        VInt(self.offsets.len() as u64).serialize(&mut write)?;
 
         let mut prev_offset = 0;
-        for (file_addr, offset) in self.offsets {
-            VInt(offset - prev_offset).serialize(&mut self.write)?;
-            file_addr.serialize(&mut self.write)?;
+        for (file_addr, offset) in self.offsets.drain(..) {
+            VInt(offset - prev_offset).serialize(&mut write)?;
+            file_addr.serialize(&mut write)?;
             prev_offset = offset;
         }
 
-        let footer_len = (self.write.written_bytes() - footer_offset) as u32;
-        footer_len.serialize(&mut self.write)?;
-        self.write.terminate()
+        let footer_len = (write.written_bytes() - footer_offset) as u32;
+        footer_len.serialize(&mut write)?;
+        write.terminate()
+    }
+}
+
+impl<W> Drop for CompositeWrite<W> {
+    fn drop(&mut self) {
+        if self.write.is_some() {
+            println!(">>> drop! close not called at {:#?}", std::backtrace::Backtrace::force_capture());
+        }
     }
 }
 

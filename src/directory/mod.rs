@@ -16,7 +16,6 @@ pub mod error;
 
 mod composite_file;
 
-use std::io::BufWriter;
 use std::path::PathBuf;
 
 pub use common::file_slice::{FileHandle, FileSlice};
