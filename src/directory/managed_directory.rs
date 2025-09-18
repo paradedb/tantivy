@@ -315,13 +315,7 @@ impl Directory for ManagedDirectory {
     ) -> result::Result<Box<dyn TerminatingWrite>, OpenWriteError> {
         self.register_file_as_managed(path)
             .map_err(|io_error| OpenWriteError::wrap_io_error(io_error, path.to_path_buf()))?;
-        Ok(Box::new(FooterProxy::new(
-            self.directory
-                .open_write(path)?
-                .into_inner()
-                .map_err(|_| ())
-                .expect("buffer should be empty"),
-        )))
+        Ok(Box::new(FooterProxy::new(self.directory.open_write(path)?)))
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
