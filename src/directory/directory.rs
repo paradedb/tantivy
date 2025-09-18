@@ -176,10 +176,7 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     ///
     /// The file may not previously exist.
     fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-        Ok(io::BufWriter::with_capacity(
-            self.bufwriter_capacity(),
-            self.open_write_inner(path)?,
-        ))
+        self.open_write_inner(path)
     }
 
     /// Reads the full content file that has been written using
