@@ -77,7 +77,7 @@ pub(crate) fn serialize_postings(
     let ordered_id_to_path = ctx.path_to_unordered_id.ordered_id_to_path();
     let field_offsets = make_field_partition(&term_offsets);
     for (field, byte_offsets) in field_offsets {
-        println!(">>> serializing postings writer for {field:?}");
+        println!(">>> serializing {} terms to postings writer for {field:?}", term_offsets[byte_offsets.clone()].len());
         let postings_writer = per_field_postings_writers.get_for_field(field);
         let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
         let mut field_serializer =
@@ -190,6 +190,7 @@ impl<Rec: Recorder> SpecializedPostingsWriter<Rec> {
         ctx: &IndexingContext,
         serializer: &mut FieldSerializer,
     ) -> io::Result<()> {
+        println!(">>> serializing term {term:?}");
         let recorder: Rec = ctx.term_index.read(addr);
         let term_doc_freq = recorder.term_doc_freq().unwrap_or(0u32);
         serializer.new_term(term, term_doc_freq, recorder.has_term_freq())?;
@@ -234,6 +235,7 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
         for (_field, _path_id, term, addr) in term_addrs {
             Self::serialize_one_term(term, *addr, &mut buffer_lender, ctx, serializer)?;
         }
+        println!();
         Ok(())
     }
 
