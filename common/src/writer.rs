@@ -24,6 +24,8 @@ impl<W: Write> CountingWriter<W> {
     /// Note that this method does not trigger any flushing.
     #[inline]
     pub fn finish(mut self) -> W {
+        // NOTE: This does not actually flush, because the underlying impl is still alive.
+        self.flushed = false;
         self.underlying.take().unwrap()
     }
 }
