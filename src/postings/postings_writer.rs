@@ -190,7 +190,6 @@ impl<Rec: Recorder> SpecializedPostingsWriter<Rec> {
         ctx: &IndexingContext,
         serializer: &mut FieldSerializer,
     ) -> io::Result<()> {
-        println!(">>> serializing term {term:?}");
         let recorder: Rec = ctx.term_index.read(addr);
         let term_doc_freq = recorder.term_doc_freq().unwrap_or(0u32);
         serializer.new_term(term, term_doc_freq, recorder.has_term_freq())?;
