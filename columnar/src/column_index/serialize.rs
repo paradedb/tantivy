@@ -60,6 +60,7 @@ pub fn serialize_column_index(
             serialize_multivalued_index(&multivalued_index, &mut output)?
         }
     }
+    output.flush()?;
     let column_index_num_bytes = output.written_bytes() as u32;
     Ok(column_index_num_bytes)
 }
