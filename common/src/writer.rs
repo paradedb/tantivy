@@ -1,17 +1,15 @@
 use std::io::{self, BufWriter, Write};
 
 pub struct CountingWriter<W> {
-    underlying: Option<W>,
+    underlying: W,
     written_bytes: u64,
-    flushed: bool,
 }
 
 impl<W: Write> CountingWriter<W> {
     pub fn wrap(underlying: W) -> CountingWriter<W> {
         CountingWriter {
-            underlying: Some(underlying),
+            underlying,
             written_bytes: 0,
-            flushed: true,
         }
     }
 
@@ -23,53 +21,36 @@ impl<W: Write> CountingWriter<W> {
     /// Returns the underlying write object.
     /// Note that this method does not trigger any flushing.
     #[inline]
-    pub fn finish(mut self) -> W {
-        // NOTE: This does not actually flush, because the underlying impl is still alive.
-        self.flushed = true;
-        self.underlying.take().unwrap()
-    }
-}
-
-impl<W> Drop for CountingWriter<W> {
-    fn drop(&mut self) {
-        if !self.flushed {
-            println!(">>> drop! not flushed at {:#?}", std::backtrace::Backtrace::force_capture());
-        }
+    pub fn finish(self) -> W {
+        self.underlying
     }
 }
 
 impl<W: Write> Write for CountingWriter<W> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.flushed = false;
-        let written_size = self.underlying.as_mut().unwrap().write(buf)?;
+        let written_size = self.underlying.write(buf)?;
         self.written_bytes += written_size as u64;
         Ok(written_size)
     }
 
     #[inline]
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.flushed = false;
-        self.underlying.as_mut().unwrap().write_all(buf)?;
+        self.underlying.write_all(buf)?;
         self.written_bytes += buf.len() as u64;
         Ok(())
     }
 
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
-        let res = self.underlying.as_mut().unwrap().flush();
-        if res.is_ok() {
-            self.flushed = true;
-        }
-        res
+        self.underlying.flush()
     }
 }
 
 impl<W: TerminatingWrite> TerminatingWrite for CountingWriter<W> {
     #[inline]
     fn terminate_ref(&mut self, token: AntiCallToken) -> io::Result<()> {
-        self.flush()?;
-        self.underlying.take().unwrap().terminate_ref(token)
+        self.underlying.terminate_ref(token)
     }
 }
 
