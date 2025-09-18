@@ -3,6 +3,7 @@ use std::io::{self, BufWriter, Write};
 pub struct CountingWriter<W> {
     underlying: Option<W>,
     written_bytes: u64,
+    flushed: bool,
 }
 
 impl<W: Write> CountingWriter<W> {
@@ -10,6 +11,7 @@ impl<W: Write> CountingWriter<W> {
         CountingWriter {
             underlying: Some(underlying),
             written_bytes: 0,
+            flushed: true,
         }
     }
 
@@ -28,8 +30,8 @@ impl<W: Write> CountingWriter<W> {
 
 impl<W> Drop for CountingWriter<W> {
     fn drop(&mut self) {
-        if self.underlying.is_some() {
-            println!(">>> drop! terminate/finish not called at {:#?}", std::backtrace::Backtrace::force_capture());
+        if !self.flushed {
+            println!(">>> drop! not flushed at {:#?}", std::backtrace::Backtrace::force_capture());
         }
     }
 }
@@ -37,6 +39,7 @@ impl<W> Drop for CountingWriter<W> {
 impl<W: Write> Write for CountingWriter<W> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.flushed = false;
         let written_size = self.underlying.as_mut().unwrap().write(buf)?;
         self.written_bytes += written_size as u64;
         Ok(written_size)
@@ -44,6 +47,7 @@ impl<W: Write> Write for CountingWriter<W> {
 
     #[inline]
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.flushed = false;
         self.underlying.as_mut().unwrap().write_all(buf)?;
         self.written_bytes += buf.len() as u64;
         Ok(())
@@ -51,7 +55,11 @@ impl<W: Write> Write for CountingWriter<W> {
 
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
-        self.underlying.as_mut().unwrap().flush()
+        let res = self.underlying.as_mut().unwrap().flush();
+        if res.is_ok() {
+            self.flushed = true;
+        }
+        res
     }
 }
 
