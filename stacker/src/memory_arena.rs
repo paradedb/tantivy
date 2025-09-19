@@ -394,4 +394,20 @@ mod tests {
             PAGE_SIZE * (1 << (32 - NUM_BITS_PAGE_ADDR))
         );
     }
+    #[test]
+    #[should_panic]
+    fn test_cannot_allocate_more_than_4GB() {
+        use super::NUM_BITS_PAGE_ADDR;
+
+        let mut arena = MemoryArena::default();
+        for i in 0..MAX_PAGES + 1 {
+            let addr = arena.allocate_space(PAGE_SIZE - 1); // -1 to ensure we don't cross page boundary
+            assert_eq!(addr.page_id(), i);
+        }
+        assert_eq!(arena.pages.len(), 1 << (32 - NUM_BITS_PAGE_ADDR));
+        assert_eq!(
+            arena.mem_usage(),
+            PAGE_SIZE * (1 << (32 - NUM_BITS_PAGE_ADDR))
+        );
+    }
 }
