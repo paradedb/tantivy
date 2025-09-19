@@ -16,6 +16,7 @@ pub mod error;
 
 mod composite_file;
 
+use std::io::BufWriter;
 use std::path::PathBuf;
 
 pub use common::file_slice::{FileHandle, FileSlice};
@@ -52,7 +53,7 @@ pub use self::mmap_directory::MmapDirectory;
 ///
 /// `WritePtr` are required to implement both Write
 /// and Seek.
-pub type WritePtr = Box<dyn TerminatingWrite>;
+pub type WritePtr = BufWriter<Box<dyn TerminatingWrite>>;
 
 #[cfg(test)]
 mod tests;

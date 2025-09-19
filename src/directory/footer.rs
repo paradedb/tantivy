@@ -138,14 +138,6 @@ impl<W: TerminatingWrite> TerminatingWrite for FooterProxy<W> {
     }
 }
 
-impl<W: TerminatingWrite> Drop for FooterProxy<W> {
-    fn drop(&mut self) {
-        if self.writer.is_some() {
-            println!(">>> drop! terminate not called at {:#?}", std::backtrace::Backtrace::force_capture());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
