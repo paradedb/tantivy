@@ -154,8 +154,6 @@ pub enum OpenReadError {
     /// The file does not exist.
     #[error("Files does not exist: {0:?}")]
     FileDoesNotExist(PathBuf),
-    #[error("File is corrupt: {0:?}")]
-    Corrupt(PathBuf),
     /// Any kind of io::Error.
     #[error(
         "IoError: '{io_error:?}' happened while opening the following file for Read: {filepath}."

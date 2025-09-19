@@ -9,7 +9,7 @@ use crc32fast::Hasher;
 
 use crate::core::MANAGED_FILEPATH;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
-use crate::directory::footer::{Footer, FooterProxy};
+use crate::directory::footer::{Footer, FooterProxy, FOOTER_LEN};
 use crate::directory::{
     DirectoryLock, DirectoryPanicHandler, FileHandle, FileSlice, GarbageCollectionResult, Lock,
     TerminatingWrite, WatchCallback, WatchHandle, MANAGED_LOCK, META_LOCK,
@@ -86,9 +86,6 @@ impl ManagedDirectory {
                     Err(OpenReadError::FileDoesNotExist(_)) => Ok(HashSet::new()),
                     io_err @ Err(OpenReadError::IoError { .. }) => {
                         Err(io_err.err().unwrap().into())
-                    }
-                    Err(OpenReadError::Corrupt(path)) => {
-                        todo!(">>> corrupt: {path:?}")
                     }
                     Err(OpenReadError::IncompatibleIndex(incompatibility)) => {
                         // For the moment, this should never happen  `meta.json`
@@ -299,14 +296,18 @@ impl Directory for ManagedDirectory {
     }
 
     fn open_read(&self, path: &Path) -> result::Result<FileSlice, OpenReadError> {
-        if !self.validate_checksum(path)? {
-            return Err(OpenReadError::Corrupt(path.to_owned()))
-        }
         let file_slice = self.directory.open_read(path)?;
-        // TODO: Temporarily validating the footer.
-        let (_footer, data) = Footer::extract_footer(file_slice)
-            .map_err(|io_error| OpenReadError::wrap_io_error(io_error, path.to_path_buf()))?;
-        Ok(data)
+        debug_assert!(
+            {
+                use common::HasLen;
+                file_slice.len() >= FOOTER_LEN
+            },
+            "{} is too short",
+            path.display()
+        );
+        let (reader, _) = file_slice.split_from_end(FOOTER_LEN);
+        // NB:  We do not read/validate the footer here -- we blindly skip it entirely
+        Ok(reader)
     }
 
     fn open_write_inner(
@@ -315,7 +316,13 @@ impl Directory for ManagedDirectory {
     ) -> result::Result<Box<dyn TerminatingWrite>, OpenWriteError> {
         self.register_file_as_managed(path)
             .map_err(|io_error| OpenWriteError::wrap_io_error(io_error, path.to_path_buf()))?;
-        Ok(Box::new(FooterProxy::new(self.directory.open_write(path)?)))
+        Ok(Box::new(FooterProxy::new(
+            self.directory
+                .open_write(path)?
+                .into_inner()
+                .map_err(|_| ())
+                .expect("buffer should be empty"),
+        )))
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {

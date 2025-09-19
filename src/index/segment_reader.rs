@@ -231,16 +231,14 @@ impl SegmentReader {
         let termdict_file: FileSlice =
             self.termdict_composite().open_read(field).ok_or_else(|| {
                 DataCorruption::comment_only(format!(
-                    "Failed to open field {:?}'s term dictionary in the composite file for {}. Has the \
+                    "Failed to open field {:?}'s term dictionary in the composite file. Has the \
                      schema been modified?",
-                    field_entry.name(),
-                    self.segment_id,
+                    field_entry.name()
                 ))
             })?;
 
         // not all queries require positions.
         // we can defer opening the file until needed
-        let segment_id = self.segment_id;
         let positions_file_opener = {
             let path = self.relative_path(SegmentComponent::Positions);
             let directory = self.index.directory().clone();
@@ -255,10 +253,9 @@ impl SegmentReader {
 
                 composite_file.open_read(field).ok_or_else(|| {
                     let error_msg = format!(
-                        "Failed to open field {:?}'s positions in the composite file for {}. Has the \
+                        "Failed to open field {:?}'s positions in the composite file. Has the \
                          schema been modified?",
-                        field_entry.name(),
-                        segment_id,
+                        field_entry.name()
                     );
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -330,19 +327,17 @@ impl SegmentReader {
         let termdict_file: FileSlice =
             self.termdict_composite().open_read(field).ok_or_else(|| {
                 DataCorruption::comment_only(format!(
-                    "Failed to open field {:?}'s term dictionary in the composite file for {}. Has the \
+                    "Failed to open field {:?}'s term dictionary in the composite file. Has the \
                      schema been modified?",
-                    field_entry.name(),
-                     self.segment_id,
+                    field_entry.name()
                 ))
             })?;
 
         let positions_file = self.positions_composite().open_read(field).ok_or_else(|| {
             let error_msg = format!(
-                "Failed to open field {:?}'s positions in the composite file for {}. Has the schema been \
+                "Failed to open field {:?}'s positions in the composite file. Has the schema been \
                  modified?",
-                field_entry.name(),
-                self.segment_id,
+                field_entry.name()
             );
             DataCorruption::comment_only(error_msg)
         })?;
