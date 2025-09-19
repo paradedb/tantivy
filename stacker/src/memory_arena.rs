@@ -38,7 +38,7 @@ const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR; // pages are 512k large
 // We use 32-bits addresses.
 // - 19 bits for the in-page addressing
 // - 13 bits for the page id.
-// This limits us to 2^13 - 1=8192 for the page id.
+// This limits us to 2^13 - 1=8191 for the page id.
 const MAX_PAGES: usize = 1 << (32 - NUM_BITS_PAGE_ADDR);
 
 /// Represents a pointer into the `MemoryArena`
