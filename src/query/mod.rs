@@ -13,6 +13,7 @@ mod exist_query;
 mod explanation;
 mod fuzzy_query;
 mod intersection;
+mod json_query_parser;
 mod more_like_this;
 mod phrase_prefix_query;
 mod phrase_query;
@@ -49,6 +50,7 @@ pub use self::explanation::{does_not_match, Explanation};
 pub(crate) use self::fuzzy_query::DfaWrapper;
 pub use self::fuzzy_query::FuzzyTermQuery;
 pub use self::intersection::{intersect_scorers, Intersection};
+pub use self::json_query_parser::parse_query;
 pub use self::more_like_this::{
     MoreLikeThis, MoreLikeThisQuery, MoreLikeThisQueryBuilder, ScoreTerm,
 };
