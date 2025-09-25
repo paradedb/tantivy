@@ -2,18 +2,18 @@ use crate::collector::top_collector::{TopCollector, TopSegmentCollector};
 use crate::collector::{Collector, SegmentCollector};
 use crate::{DocAddress, DocId, Result, Score, SegmentReader};
 
-pub(crate) struct TweakedScoreTopCollector<TScoreTweaker, TScore = Score> {
+pub(crate) struct TweakedScoreTopCollector<TScoreTweaker, TScore = Score, D = DocId, const REVERSE_ORDER: bool = true> {
     score_tweaker: TScoreTweaker,
-    collector: TopCollector<TScore>,
+    collector: TopCollector<TScore, D, REVERSE_ORDER>,
 }
 
-impl<TScoreTweaker, TScore> TweakedScoreTopCollector<TScoreTweaker, TScore>
-where TScore: Clone + PartialOrd
+impl<TScoreTweaker, TScore, D, const REVERSE_ORDER: bool> TweakedScoreTopCollector<TScoreTweaker, TScore, D, REVERSE_ORDER>
+where TScore: Clone + PartialOrd, D: Ord + Clone
 {
     pub fn new(
         score_tweaker: TScoreTweaker,
-        collector: TopCollector<TScore>,
-    ) -> TweakedScoreTopCollector<TScoreTweaker, TScore> {
+        collector: TopCollector<TScore, D, REVERSE_ORDER>,
+    ) -> TweakedScoreTopCollector<TScoreTweaker, TScore, D, REVERSE_ORDER> {
         TweakedScoreTopCollector {
             score_tweaker,
             collector,
