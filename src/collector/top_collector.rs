@@ -71,7 +71,7 @@ impl<T: PartialOrd, D: PartialOrd, const R: bool> Eq for ComparableDoc<T, D, R> 
 pub(crate) struct TopCollector<T> {
     pub limit: usize,
     pub offset: usize,
-    pub threshold: Option<ComparableDoc<T, DocAddress, true>>,
+    pub threshold: Option<ComparableDoc<T, DocId, true>>,
     _marker: PhantomData<T>,
 }
 
@@ -101,7 +101,7 @@ where T: PartialOrd + Clone,
         self
     }
 
-    pub fn and_threshold(mut self, threshold: ComparableDoc<T, DocAddress, true>) -> TopCollector<T> {
+    pub fn and_threshold(mut self, threshold: ComparableDoc<T, DocId, true>) -> TopCollector<T> {
         self.threshold = Some(threshold);
         self
     }
@@ -113,7 +113,7 @@ where T: PartialOrd + Clone,
         if self.limit == 0 {
             return Ok(Vec::new());
         }
-        let mut top_collector: TopNComputer<_, _> = TopNComputer::new(self.limit + self.offset).with_threshold(self.threshold.clone());
+        let mut top_collector: TopNComputer<_, _> = TopNComputer::new(self.limit + self.offset);
         for child_fruit in children {
             for (feature, doc) in child_fruit {
                 top_collector.push(feature, doc);
@@ -128,12 +128,17 @@ where T: PartialOrd + Clone,
             .collect())
     }
 
-    pub(crate) fn for_segment<F: PartialOrd + Clone>(
+    pub(crate) fn for_segment(
         &self,
         segment_id: SegmentOrdinal,
         _: &SegmentReader,
-    ) -> TopSegmentCollector<F> {
-        TopSegmentCollector::new(segment_id, self.limit + self.offset)
+    ) -> TopSegmentCollector<T> {
+        let collector = TopSegmentCollector::new(segment_id, self.limit + self.offset);
+        if let Some(threshold) = self.threshold.clone() {
+            collector.with_threshold(threshold.feature)
+        } else {
+            collector
+        }
     }
 
     /// Create a new TopCollector with the same limit and offset.
@@ -172,9 +177,9 @@ impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
         }
     }
 
-    fn with_threshold(self, threshold: Option<ComparableDoc<T, DocId, true>>) -> Self {
+    fn with_threshold(self, feature: T) -> Self {
         TopSegmentCollector {
-            topn_computer: self.topn_computer.with_threshold(threshold),
+            topn_computer: self.topn_computer.with_threshold(Some(ComparableDoc { feature, doc: 0 })),
             segment_ord: self.segment_ord,
         }
     }
