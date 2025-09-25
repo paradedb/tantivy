@@ -870,6 +870,15 @@ where
         }
     }
 
+    pub fn new_with_threshold(top_n: usize, threshold: ComparableDoc<Score, D, R>) -> Self {
+        let vec_cap = top_n.max(1) * 2;
+        TopNComputer {
+            buffer: Vec::with_capacity(vec_cap),
+            top_n,
+            threshold: Some(threshold),
+        }
+    }
+
     /// Push a new document to the top n.
     /// If the document is below the current threshold, it will be ignored.
     #[inline]

@@ -68,14 +68,15 @@ impl<T: PartialOrd, D: PartialOrd, const R: bool> PartialEq for ComparableDoc<T,
 
 impl<T: PartialOrd, D: PartialOrd, const R: bool> Eq for ComparableDoc<T, D, R> {}
 
-pub(crate) struct TopCollector<T> {
+pub(crate) struct TopCollector<T, D> {
     pub limit: usize,
     pub offset: usize,
+    pub threshold: Option<ComparableDoc<T, D, const REVERSE_ORDER: bool = true>>,
     _marker: PhantomData<T>,
 }
 
-impl<T> TopCollector<T>
-where T: PartialOrd + Clone
+impl<T, D> TopCollector<T, D>
+where T: PartialOrd + Clone, D: Ord + Clone,
 {
     /// Creates a top collector, with a number of documents equal to "limit".
     ///
@@ -96,6 +97,11 @@ where T: PartialOrd + Clone
     /// Lucene's TopDocsCollector.
     pub fn and_offset(mut self, offset: usize) -> TopCollector<T> {
         self.offset = offset;
+        self
+    }
+
+    pub fn and_threshold(mut self, threshold: ComparableDoc<T, D, const REVERSE_ORDER: bool = true>) -> TopCollector<T> {
+        self.threshold = threshold;
         self
     }
 
