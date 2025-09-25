@@ -113,7 +113,7 @@ where T: PartialOrd + Clone, D: Ord + Clone,
         if self.limit == 0 {
             return Ok(Vec::new());
         }
-        let mut top_collector: TopNComputer<_, _> = TopNComputer::new(self.limit + self.offset);
+        let mut top_collector: TopNComputer<_, _> = TopNComputer::new(self.limit + self.offset).with_threshold(self.threshold);
         for child_fruit in children {
             for (feature, doc) in child_fruit {
                 top_collector.push(feature, doc);

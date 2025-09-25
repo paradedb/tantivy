@@ -870,12 +870,11 @@ where
         }
     }
 
-    pub fn new_with_threshold(top_n: usize, threshold: ComparableDoc<Score, D, R>) -> Self {
-        let vec_cap = top_n.max(1) * 2;
+    pub fn with_threshold(mut self, threshold: Option<ComparableDoc<Score, D, R>>) -> Self {
         TopNComputer {
-            buffer: Vec::with_capacity(vec_cap),
-            top_n,
-            threshold: Some(threshold),
+            buffer: self.buffer,
+            top_n: self.top_n,
+            threshold,
         }
     }
 
