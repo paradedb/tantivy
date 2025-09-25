@@ -171,6 +171,13 @@ impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
             segment_ord,
         }
     }
+
+    fn with_threshold(self, threshold: Option<ComparableDoc<T, DocId, true>>) -> Self {
+        TopSegmentCollector {
+            topn_computer: self.topn_computer.with_threshold(threshold),
+            segment_ord: self.segment_ord,
+        }
+    }
 }
 
 impl<T: PartialOrd + Clone> TopSegmentCollector<T> {

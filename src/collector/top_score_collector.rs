@@ -870,7 +870,7 @@ where
         }
     }
 
-    pub fn with_threshold(mut self, threshold: Option<ComparableDoc<Score, D, R>>) -> Self {
+    pub fn with_threshold(self, threshold: Option<ComparableDoc<Score, D, R>>) -> Self {
         TopNComputer {
             buffer: self.buffer,
             top_n: self.top_n,
