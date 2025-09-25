@@ -491,7 +491,15 @@ impl Feature for ErasedFeature<FieldFeature<String>> {
             .decode(
                 column,
                 order,
-                segment_output.into_iter().map(|s| (s.expect("An erased String feature never produces None."), None)).collect(),
+                segment_output
+                    .into_iter()
+                    .map(|s| {
+                        (
+                            s.expect("An erased String feature never produces None."),
+                            None,
+                        )
+                    })
+                    .collect(),
             )
             .into_iter()
             .map(|(s, _)| match s {
