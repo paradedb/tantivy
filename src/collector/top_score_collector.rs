@@ -128,7 +128,7 @@ where
 /// # Ok(())
 /// # }
 /// ```
-pub struct TopDocs(TopCollector<Score, DocId, true>);
+pub struct TopDocs(TopCollector<Score>);
 
 impl fmt::Debug for TopDocs {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

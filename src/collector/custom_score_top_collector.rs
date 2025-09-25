@@ -2,18 +2,18 @@ use crate::collector::top_collector::{TopCollector, TopSegmentCollector};
 use crate::collector::{Collector, SegmentCollector};
 use crate::{DocAddress, DocId, Score, SegmentReader};
 
-pub(crate) struct CustomScoreTopCollector<TCustomScorer, TScore = Score, D = DocId, const REVERSE_ORDER: bool = true> {
+pub(crate) struct CustomScoreTopCollector<TCustomScorer, TScore = Score> {
     custom_scorer: TCustomScorer,
-    collector: TopCollector<TScore, D, REVERSE_ORDER>,
+    collector: TopCollector<TScore>,
 }
 
-impl<TCustomScorer, TScore, D, const REVERSE_ORDER: bool> CustomScoreTopCollector<TCustomScorer, TScore, D, REVERSE_ORDER>
-where TScore: Clone + PartialOrd, D: Ord + Clone
+impl<TCustomScorer, TScore> CustomScoreTopCollector<TCustomScorer, TScore>
+where TScore: Clone + PartialOrd
 {
     pub(crate) fn new(
         custom_scorer: TCustomScorer,
-        collector: TopCollector<TScore, D, REVERSE_ORDER>,
-    ) -> CustomScoreTopCollector<TCustomScorer, TScore, D, REVERSE_ORDER> {
+        collector: TopCollector<TScore>,
+    ) -> CustomScoreTopCollector<TCustomScorer, TScore> {
         CustomScoreTopCollector {
             custom_scorer,
             collector,

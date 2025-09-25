@@ -68,21 +68,21 @@ impl<T: PartialOrd, D: PartialOrd, const R: bool> PartialEq for ComparableDoc<T,
 
 impl<T: PartialOrd, D: PartialOrd, const R: bool> Eq for ComparableDoc<T, D, R> {}
 
-pub(crate) struct TopCollector<T, D, const REVERSE_ORDER: bool = true> {
+pub(crate) struct TopCollector<T> {
     pub limit: usize,
     pub offset: usize,
-    pub threshold: Option<ComparableDoc<T, D, REVERSE_ORDER>>,
+    pub threshold: Option<ComparableDoc<T, DocAddress, true>>,
     _marker: PhantomData<T>,
 }
 
-impl<T, D, const REVERSE_ORDER: bool> TopCollector<T, D, REVERSE_ORDER>
-where T: PartialOrd + Clone, D: Ord + Clone,
+impl<T> TopCollector<T>
+where T: PartialOrd + Clone,
 {
     /// Creates a top collector, with a number of documents equal to "limit".
     ///
     /// # Panics
     /// The method panics if limit is 0
-    pub fn with_limit(limit: usize) -> TopCollector<T, D, REVERSE_ORDER> {
+    pub fn with_limit(limit: usize) -> TopCollector<T> {
         assert!(limit >= 1, "Limit must be strictly greater than 0.");
         Self {
             limit,
@@ -96,12 +96,12 @@ where T: PartialOrd + Clone, D: Ord + Clone,
     ///
     /// This is equivalent to `OFFSET` in MySQL or PostgreSQL and `start` in
     /// Lucene's TopDocsCollector.
-    pub fn and_offset(mut self, offset: usize) -> TopCollector<T, D, REVERSE_ORDER> {
+    pub fn and_offset(mut self, offset: usize) -> TopCollector<T> {
         self.offset = offset;
         self
     }
 
-    pub fn and_threshold(mut self, threshold: ComparableDoc<T, D, REVERSE_ORDER>) -> TopCollector<T, D, REVERSE_ORDER> {
+    pub fn and_threshold(mut self, threshold: ComparableDoc<T, DocAddress, true>) -> TopCollector<T> {
         self.threshold = Some(threshold);
         self
     }
@@ -113,7 +113,7 @@ where T: PartialOrd + Clone, D: Ord + Clone,
         if self.limit == 0 {
             return Ok(Vec::new());
         }
-        let mut top_collector: TopNComputer<_, _> = TopNComputer::new(self.limit + self.offset).with_threshold(self.threshold);
+        let mut top_collector: TopNComputer<_, _> = TopNComputer::new(self.limit + self.offset).with_threshold(self.threshold.clone());
         for child_fruit in children {
             for (feature, doc) in child_fruit {
                 top_collector.push(feature, doc);
@@ -141,7 +141,7 @@ where T: PartialOrd + Clone, D: Ord + Clone,
     /// Ideally we would use Into but the blanket implementation seems to cause the Scorer traits
     /// to fail.
     #[doc(hidden)]
-    pub(crate) fn into_tscore<TScore: PartialOrd + Clone>(self) -> TopCollector<TScore, D, REVERSE_ORDER> {
+    pub(crate) fn into_tscore<TScore: PartialOrd + Clone>(self) -> TopCollector<TScore> {
         TopCollector {
             limit: self.limit,
             offset: self.offset,
