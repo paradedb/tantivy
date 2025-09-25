@@ -71,7 +71,7 @@ impl<T: PartialOrd, D: PartialOrd, const R: bool> Eq for ComparableDoc<T, D, R> 
 pub(crate) struct TopCollector<T> {
     pub limit: usize,
     pub offset: usize,
-    pub threshold: Option<ComparableDoc<T, DocId, true>>,
+    pub threshold: Option<T>,
     _marker: PhantomData<T>,
 }
 
@@ -101,10 +101,10 @@ where T: PartialOrd + Clone,
         self
     }
 
-    pub fn and_threshold(mut self, threshold: ComparableDoc<T, DocId, true>) -> TopCollector<T> {
-        self.threshold = Some(threshold);
-        self
-    }
+    // pub fn and_threshold(mut self, threshold: T) -> TopCollector<T> {
+    //     self.threshold = Some(ComparableDoc { feature: threshold, doc: 0 });
+    //     self
+    // }
 
     pub fn merge_fruits(
         &self,
@@ -135,7 +135,7 @@ where T: PartialOrd + Clone,
     ) -> TopSegmentCollector<T> {
         let collector = TopSegmentCollector::new(segment_id, self.limit + self.offset);
         if let Some(threshold) = self.threshold.clone() {
-            collector.with_threshold(threshold.feature)
+            collector.with_threshold(threshold)
         } else {
             collector
         }
