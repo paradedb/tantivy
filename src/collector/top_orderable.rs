@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use columnar::{Column, ColumnType, ColumnValues, DynamicColumn, MonotonicallyMappableToU64};
 
-use crate::collector::{Collector, ComparableDoc, SegmentCollector};
+use crate::collector::{default_collect_segment, Collector, ComparableDoc, SegmentCollector};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
+use crate::query::Weight;
 use crate::schema::OwnedValue;
 use crate::{DateTime, DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
 
@@ -83,12 +84,12 @@ where C: TopNCompare
     }
 
     /// Returns the top n elements in sorted order.
-    pub fn into_sorted_vec(mut self) -> Vec<ComparableDoc<C::Accepted, DocId, R>> {
+    pub fn into_sorted_vec(mut self) -> (Vec<ComparableDoc<C::Accepted, DocId, R>>, Option<C::Accepted>) {
         if self.buffer.len() > self.top_n {
             self.truncate_top_n();
         }
         self.buffer.sort_unstable();
-        self.buffer
+        (self.buffer, self.threshold.map(|t| t.feature))
     }
 }
 
@@ -728,19 +729,21 @@ pub struct TopOrderableSegmentCollector<O: TopOrderable> {
 }
 
 impl<O: TopOrderable> SegmentCollector for TopOrderableSegmentCollector<O> {
-    type Fruit = Vec<(O::Output, DocAddress)>;
+    type Fruit = (Vec<(O::Output, DocAddress)>, Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>);
 
     #[inline]
     fn collect(&mut self, doc: DocId, score: Score) {
         self.topn_computer.push(score, doc);
     }
 
-    fn harvest(self) -> Vec<(O::Output, DocAddress)> {
+    fn harvest(self) -> (Vec<(O::Output, DocAddress)>, Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>) {
         let segment_ord = self.segment_ord;
         // TODO: Switch to unsorted, a-la https://github.com/quickwit-oss/tantivy/pull/2646
-        let harvested = self
+        let (harvested, threshold) = self
             .topn_computer
-            .into_sorted_vec()
+            .into_sorted_vec();
+
+        let harvested = harvested
             .into_iter()
             .map(|comparable_doc| {
                 (
@@ -752,7 +755,9 @@ impl<O: TopOrderable> SegmentCollector for TopOrderableSegmentCollector<O> {
                 )
             })
             .collect();
-        self.orderable.decode(&self.features, harvested)
+
+        let decoded = self.orderable.decode(&self.features, harvested);
+        (decoded, threshold)
     }
 }
 
@@ -800,9 +805,9 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
         self.orderable.requires_scoring()
     }
 
-    fn merge_fruits(&self, segment_fruits: Vec<Self::Fruit>) -> crate::Result<Self::Fruit> {
+    fn merge_fruits(&self, segment_fruits: Vec<(Self::Fruit, Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>)>) -> crate::Result<Self::Fruit> {
         let merged = itertools::kmerge_by(
-            segment_fruits,
+            segment_fruits.into_iter().map(|(fruits, _)| fruits),
             |a: &(O::Output, DocAddress), b: &(O::Output, DocAddress)| self.orderable.compare(a, b),
         )
         .collect::<Vec<_>>();
@@ -812,6 +817,16 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
             .skip(self.offset)
             .take(self.limit)
             .collect())
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: u32,
+        reader: &SegmentReader,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        let (fruits, threshold) = default_collect_segment(self, weight, segment_ord, reader)?;
+        Ok((fruits, threshold))
     }
 }
 

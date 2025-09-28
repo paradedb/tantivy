@@ -762,8 +762,16 @@ impl Collector for TopDocs {
                 )
             })
             .collect();
+
+        // self.on_collected();
         Ok(fruit)
     }
+
+    // fn on_collected(&self) {
+    //     let collector = self.0;
+    //     let old_threshold = collector.threshold.clone();
+    //     let new_threshold =
+    // }
 }
 
 /// Segment Collector associated with `TopDocs`.
