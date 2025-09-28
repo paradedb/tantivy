@@ -76,7 +76,7 @@ pub(crate) struct TopCollector<T> {
 }
 
 impl<T> TopCollector<T>
-where T: PartialOrd + Clone,
+where T: PartialOrd + Clone
 {
     /// Creates a top collector, with a number of documents equal to "limit".
     ///
@@ -179,7 +179,9 @@ impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
 
     fn with_threshold(self, feature: T) -> Self {
         TopSegmentCollector {
-            topn_computer: self.topn_computer.with_threshold(Some(ComparableDoc { feature, doc: 0 })),
+            topn_computer: self
+                .topn_computer
+                .with_threshold(Some(ComparableDoc { feature, doc: 0 })),
             segment_ord: self.segment_ord,
         }
     }

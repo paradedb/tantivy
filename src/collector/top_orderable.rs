@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use columnar::{Column, ColumnType, ColumnValues, DynamicColumn, MonotonicallyMappableToU64};
 
@@ -84,7 +84,12 @@ where C: TopNCompare
     }
 
     /// Returns the top n elements in sorted order.
-    pub fn into_sorted_vec(mut self) -> (Vec<ComparableDoc<C::Accepted, DocId, R>>, Option<C::Accepted>) {
+    pub fn into_sorted_vec(
+        mut self,
+    ) -> (
+        Vec<ComparableDoc<C::Accepted, DocId, R>>,
+        Option<C::Accepted>,
+    ) {
         if self.buffer.len() > self.top_n {
             self.truncate_top_n();
         }
@@ -729,19 +734,25 @@ pub struct TopOrderableSegmentCollector<O: TopOrderable> {
 }
 
 impl<O: TopOrderable> SegmentCollector for TopOrderableSegmentCollector<O> {
-    type Fruit = (Vec<(O::Output, DocAddress)>, Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>);
+    type Fruit = (
+        Vec<(O::Output, DocAddress)>,
+        Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>,
+    );
 
     #[inline]
     fn collect(&mut self, doc: DocId, score: Score) {
         self.topn_computer.push(score, doc);
     }
 
-    fn harvest(self) -> (Vec<(O::Output, DocAddress)>, Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>) {
+    fn harvest(
+        self,
+    ) -> (
+        Vec<(O::Output, DocAddress)>,
+        Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>,
+    ) {
         let segment_ord = self.segment_ord;
         // TODO: Switch to unsorted, a-la https://github.com/quickwit-oss/tantivy/pull/2646
-        let (harvested, threshold) = self
-            .topn_computer
-            .into_sorted_vec();
+        let (harvested, threshold) = self.topn_computer.into_sorted_vec();
 
         let harvested = harvested
             .into_iter()
@@ -765,6 +776,8 @@ pub(crate) struct TopOrderableCollector<O: TopOrderable> {
     orderable: Arc<O>,
     limit: usize,
     offset: usize,
+    threshold:
+        Arc<Mutex<Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>>>,
 }
 
 impl<O: TopOrderable> TopOrderableCollector<O> {
@@ -773,6 +786,7 @@ impl<O: TopOrderable> TopOrderableCollector<O> {
             orderable: Arc::new(orderable),
             limit,
             offset,
+            threshold: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -805,7 +819,13 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
         self.orderable.requires_scoring()
     }
 
-    fn merge_fruits(&self, segment_fruits: Vec<(Self::Fruit, Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>)>) -> crate::Result<Self::Fruit> {
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<(
+            Self::Fruit,
+            Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>,
+        )>,
+    ) -> crate::Result<Self::Fruit> {
         let merged = itertools::kmerge_by(
             segment_fruits.into_iter().map(|(fruits, _)| fruits),
             |a: &(O::Output, DocAddress), b: &(O::Output, DocAddress)| self.orderable.compare(a, b),
@@ -825,8 +845,23 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
         segment_ord: u32,
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
-        let (fruits, threshold) = default_collect_segment(self, weight, segment_ord, reader)?;
-        Ok((fruits, threshold))
+        let (fruits, new_threshold) = default_collect_segment(self, weight, segment_ord, reader)?;
+        let mut old_threshold = self.threshold.lock().unwrap();
+
+        match (old_threshold.as_mut(), new_threshold) {
+            (Some(o), Some(n)) => {
+                if *o < n {
+                    *old_threshold = Some(n.clone());
+                }
+            }
+            (None, Some(n)) => {
+                *old_threshold = Some(n.clone());
+            }
+            _ => {
+                // Do nothing
+            }
+        }
+        Ok((fruits, None))
     }
 }
 
