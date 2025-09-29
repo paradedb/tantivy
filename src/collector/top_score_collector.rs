@@ -762,16 +762,8 @@ impl Collector for TopDocs {
                 )
             })
             .collect();
-
-        // self.on_collected();
         Ok(fruit)
     }
-
-    // fn on_collected(&self) {
-    //     let collector = self.0;
-    //     let old_threshold = collector.threshold.clone();
-    //     let new_threshold =
-    // }
 }
 
 /// Segment Collector associated with `TopDocs`.
@@ -875,14 +867,6 @@ where
             buffer: Vec::with_capacity(vec_cap),
             top_n,
             threshold: None,
-        }
-    }
-
-    pub fn with_threshold(self, threshold: Option<ComparableDoc<Score, D, R>>) -> Self {
-        TopNComputer {
-            buffer: self.buffer,
-            top_n: self.top_n,
-            threshold,
         }
     }
 

@@ -71,7 +71,6 @@ impl<T: PartialOrd, D: PartialOrd, const R: bool> Eq for ComparableDoc<T, D, R> 
 pub(crate) struct TopCollector<T> {
     pub limit: usize,
     pub offset: usize,
-    pub threshold: Option<T>,
     _marker: PhantomData<T>,
 }
 
@@ -87,7 +86,6 @@ where T: PartialOrd + Clone
         Self {
             limit,
             offset: 0,
-            threshold: None,
             _marker: PhantomData,
         }
     }
@@ -100,11 +98,6 @@ where T: PartialOrd + Clone
         self.offset = offset;
         self
     }
-
-    // pub fn and_threshold(mut self, threshold: T) -> TopCollector<T> {
-    //     self.threshold = Some(ComparableDoc { feature: threshold, doc: 0 });
-    //     self
-    // }
 
     pub fn merge_fruits(
         &self,
@@ -128,17 +121,12 @@ where T: PartialOrd + Clone
             .collect())
     }
 
-    pub(crate) fn for_segment(
+    pub(crate) fn for_segment<F: PartialOrd + Clone>(
         &self,
         segment_id: SegmentOrdinal,
         _: &SegmentReader,
-    ) -> TopSegmentCollector<T> {
-        let collector = TopSegmentCollector::new(segment_id, self.limit + self.offset);
-        if let Some(threshold) = self.threshold.clone() {
-            collector.with_threshold(threshold)
-        } else {
-            collector
-        }
+    ) -> TopSegmentCollector<F> {
+        TopSegmentCollector::new(segment_id, self.limit + self.offset)
     }
 
     /// Create a new TopCollector with the same limit and offset.
@@ -150,7 +138,6 @@ where T: PartialOrd + Clone
         TopCollector {
             limit: self.limit,
             offset: self.offset,
-            threshold: None,
             _marker: PhantomData,
         }
     }
@@ -174,15 +161,6 @@ impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
         TopSegmentCollector {
             topn_computer: TopNComputer::new(limit),
             segment_ord,
-        }
-    }
-
-    fn with_threshold(self, feature: T) -> Self {
-        TopSegmentCollector {
-            topn_computer: self
-                .topn_computer
-                .with_threshold(Some(ComparableDoc { feature, doc: 0 })),
-            segment_ord: self.segment_ord,
         }
     }
 }
