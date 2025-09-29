@@ -114,10 +114,10 @@ where C: TopNCompare
 /// by a fast field (`FieldFeature`).
 pub trait Feature: Sync + Send + 'static {
     /// The output type of the feature, which is the type that will be returned to the user.
-    type Output: Clone + Sync + Send + 'static;
+    type Output: Clone + Sync + Send + 'static + std::fmt::Debug;
     /// The segment output type of the feature, which is the type that will be used for
     /// comparisons within a segment.
-    type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static;
+    type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static + std::fmt::Debug;
 
     /// True if this Feature is, or is derived from a bm25 Score.
     fn is_score(&self) -> bool;
@@ -706,8 +706,8 @@ pub enum FeatureColumn {
 }
 
 pub trait TopOrderable: Sync + Send + 'static {
-    type Output: Clone + Sync + Send + 'static;
-    type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static;
+    type Output: Clone + Sync + Send + 'static + std::fmt::Debug;
+    type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static + std::fmt::Debug;
     type SegmentComparator: TopNCompare<Accepted = Self::SegmentOutput>;
 
     /// True if scores are required for any of the FeatureColumns.
@@ -847,6 +847,9 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
             |a: &(O::Output, DocAddress), b: &(O::Output, DocAddress)| self.orderable.compare(a, b),
         )
         .collect::<Vec<_>>();
+
+        // clear the threshold
+        *self.threshold.lock().unwrap() = None;
 
         Ok(merged
             .into_iter()
@@ -1149,7 +1152,7 @@ impl_top_orderable! { (F1, 0), (F2, 1), (F3, 2) }
 
 pub trait TopNCompare {
     // TODO: Remove the Clone bound.
-    type Accepted: Clone + PartialOrd;
+    type Accepted: Clone + PartialOrd + std::fmt::Debug;
 
     /// Given the current threshold of accepted values and a candidate doc_id/score, compare the
     /// candidate value to the threshold, and convert the candidate to Accepted if it is
