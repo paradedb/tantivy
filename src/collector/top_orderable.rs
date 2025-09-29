@@ -36,6 +36,16 @@ where C: TopNCompare
         }
     }
 
+    pub fn with_threshold(self, threshold: C::Accepted) -> Self {
+        Self {
+            threshold: Some(ComparableDoc {
+                feature: threshold,
+                doc: 0,
+            }),
+            ..self
+        }
+    }
+
     /// Push a new document to the top n.
     /// If the document is below the current threshold, it will be ignored.
     #[inline]
@@ -801,12 +811,18 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
         segment_ord: SegmentOrdinal,
         segment_reader: &SegmentReader,
     ) -> crate::Result<Self::Child> {
+        let mut topn_computer = LazyTopNComputer::new(
+            self.orderable.segment_comparator(segment_reader)?,
+            self.limit + self.offset,
+        );
+
+        if let Some(threshold) = self.threshold.lock().unwrap().as_ref() {
+            topn_computer = topn_computer.with_threshold(threshold.clone());
+        }
+
         Ok(TopOrderableSegmentCollector {
             segment_ord,
-            topn_computer: LazyTopNComputer::new(
-                self.orderable.segment_comparator(segment_reader)?,
-                self.limit + self.offset,
-            ),
+            topn_computer,
             orderable: self.orderable.clone(),
             features: self
                 .orderable
