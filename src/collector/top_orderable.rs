@@ -122,6 +122,9 @@ pub trait Feature: Sync + Send + 'static {
     /// True if this Feature is, or is derived from a bm25 Score.
     fn is_score(&self) -> bool;
 
+    /// True if this Feature is a string feature.
+    fn is_string(&self) -> bool;
+
     /// Open a FeatureColumn for this Feature.
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn>;
 
@@ -186,6 +189,10 @@ impl Feature for Arc<dyn Feature<Output = OwnedValue, SegmentOutput = Option<u64
         self.deref().is_score()
     }
 
+    fn is_string(&self) -> bool {
+        self.deref().is_string()
+    }
+
     /// Open a FeatureColumn for this Feature.
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         self.deref().open(segment_reader)
@@ -236,6 +243,10 @@ impl Feature for ScoreFeature {
         true
     }
 
+    fn is_string(&self) -> bool {
+        false
+    }
+
     fn open(&self, _segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         Ok(FeatureColumn::Score)
     }
@@ -278,6 +289,10 @@ impl Feature for ErasedFeature<ScoreFeature> {
 
     fn is_score(&self) -> bool {
         true
+    }
+
+    fn is_string(&self) -> bool {
+        false
     }
 
     /// Open a FeatureColumn for this Feature.
@@ -357,6 +372,10 @@ impl Feature for FieldFeature<String> {
 
     fn is_score(&self) -> bool {
         false
+    }
+
+    fn is_string(&self) -> bool {
+        true
     }
 
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
@@ -478,6 +497,10 @@ impl Feature for ErasedFeature<FieldFeature<String>> {
         self.0.is_score()
     }
 
+    fn is_string(&self) -> bool {
+        self.0.is_string()
+    }
+
     /// Open a FeatureColumn for this Feature.
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         self.0.open(segment_reader)
@@ -588,6 +611,10 @@ impl<F: FastValue> Feature for FieldFeature<F> {
         false
     }
 
+    fn is_string(&self) -> bool {
+        false
+    }
+
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         // We interpret this field as u64, regardless of its type, that way,
         // we avoid needless conversion. Regardless of the fast field type, the
@@ -650,6 +677,10 @@ impl<F: FastValue> Feature for ErasedFeature<FieldFeature<F>> {
 
     fn is_score(&self) -> bool {
         self.0.is_score()
+    }
+
+    fn is_string(&self) -> bool {
+        self.0.is_string()
     }
 
     /// Open a FeatureColumn for this Feature.
@@ -734,6 +765,9 @@ pub trait TopOrderable: Sync + Send + 'static {
 
     /// Compare the Output types, falling back to the DocAddress if necessary.
     fn compare(&self, a: &(Self::Output, DocAddress), b: &(Self::Output, DocAddress)) -> bool;
+
+    /// Returns true if any of the features are string fields.
+    fn has_string_fields(&self) -> bool;
 }
 
 pub struct TopOrderableSegmentCollector<O: TopOrderable> {
@@ -816,8 +850,12 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
             self.limit + self.offset,
         );
 
-        if let Some(threshold) = self.threshold.lock().unwrap().as_ref() {
-            topn_computer = topn_computer.with_threshold(threshold.clone());
+        // sharing thresholds does not work for string fields because they use term ordinals
+        // which are not comparable across segments
+        if !self.orderable.has_string_fields() {
+            if let Some(threshold) = self.threshold.lock().unwrap().as_ref() {
+                topn_computer = topn_computer.with_threshold(threshold.clone());
+            }
         }
 
         Ok(TopOrderableSegmentCollector {
@@ -865,21 +903,25 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
         let (fruits, new_threshold) = default_collect_segment(self, weight, segment_ord, reader)?;
-        let mut old_threshold = self.threshold.lock().unwrap();
 
-        match (old_threshold.as_mut(), new_threshold) {
-            (Some(o), Some(n)) => {
-                if *o < n {
+        if !self.orderable.has_string_fields() {
+            let mut old_threshold = self.threshold.lock().unwrap();
+            match (old_threshold.as_mut(), new_threshold) {
+                (Some(o), Some(n)) => {
+                    if *o < n {
+                        *old_threshold = Some(n.clone());
+                    }
+                }
+                (None, Some(n)) => {
                     *old_threshold = Some(n.clone());
                 }
-            }
-            (None, Some(n)) => {
-                *old_threshold = Some(n.clone());
-            }
-            _ => {
-                // Do nothing
+                _ => {
+                    // Do nothing
+                }
             }
         }
+
+        // at this point we've already consumed the threshold so it can be discarded
         Ok((fruits, None))
     }
 }
@@ -1030,6 +1072,10 @@ macro_rules! impl_top_orderable {
             fn requires_scoring(&self) -> bool {
                 // Returns true if any of the features are the score.
                 false $(|| self.$idx.0.is_score())*
+            }
+
+            fn has_string_fields(&self) -> bool {
+                false $(|| self.$idx.0.is_string())*
             }
 
             fn segment_comparator(
