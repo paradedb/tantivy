@@ -135,11 +135,11 @@ impl Snippet {
         }
     }
 
-    fn set_limit(&mut self, limit: usize) {
+    pub fn set_limit(&mut self, limit: usize) {
         self.limit = Some(limit);
     }
 
-    fn set_offset(&mut self, offset: usize) {
+    pub fn set_offset(&mut self, offset: usize) {
         self.offset = Some(offset);
     }
 
