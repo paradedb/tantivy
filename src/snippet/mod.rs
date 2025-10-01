@@ -118,6 +118,8 @@ pub struct Snippet {
     highlighted: Vec<Range<usize>>,
     snippet_prefix: String,
     snippet_postfix: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 impl Snippet {
@@ -128,7 +130,17 @@ impl Snippet {
             highlighted,
             snippet_prefix: DEFAULT_SNIPPET_PREFIX.to_string(),
             snippet_postfix: DEFAULT_SNIPPET_POSTFIX.to_string(),
+            limit: None,
+            offset: None,
         }
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        self.limit = Some(limit);
+    }
+
+    fn set_offset(&mut self, offset: usize) {
+        self.offset = Some(offset);
     }
 
     /// Create a new, empty, `Snippet`.
@@ -138,12 +150,14 @@ impl Snippet {
             highlighted: Vec::new(),
             snippet_prefix: String::new(),
             snippet_postfix: String::new(),
+            limit: None,
+            offset: None,
         }
     }
 
     /// Returns `true` if the snippet is empty.
     pub fn is_empty(&self) -> bool {
-        self.highlighted.len() == 0
+        self.highlighted().is_empty()
     }
 
     /// Returns a highlighted html from the `Snippet`.
@@ -151,7 +165,7 @@ impl Snippet {
         let mut html = String::new();
         let mut start_from: usize = 0;
 
-        for item in collapse_overlapped_ranges(&self.highlighted) {
+        for item in collapse_overlapped_ranges(self.highlighted()) {
             html.push_str(&encode_minimal(&self.fragment[start_from..item.start]));
             html.push_str(&self.snippet_prefix);
             html.push_str(&encode_minimal(&self.fragment[item.clone()]));
@@ -171,7 +185,9 @@ impl Snippet {
 
     /// Returns a list of highlighted positions from the `Snippet`.
     pub fn highlighted(&self) -> &[Range<usize>] {
-        &self.highlighted
+        let offset = self.offset.unwrap_or(0);
+        let limit = self.limit.unwrap_or(self.highlighted.len()).min(self.highlighted.len() - offset);
+        &self.highlighted[offset..offset + limit]
     }
 
     /// Sets highlighted prefix and postfix.
