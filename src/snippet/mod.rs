@@ -214,6 +214,9 @@ fn search_fragments(
     let mut fragment = FragmentCandidate::new(0);
     let mut fragments: Vec<FragmentCandidate> = vec![];
 
+    let mut skip = offset.unwrap_or(0);
+    let mut consumed = 0;
+
     // Process all fragments first, without applying offset/limit to token stream
     while let Some(next) = token_stream.next() {
         if (next.offset_to - fragment.start_offset) > max_num_chars {
@@ -222,19 +225,25 @@ fn search_fragments(
             };
             fragment = FragmentCandidate::new(next.offset_from);
         }
-        fragment.try_add_token(next, terms);
+
+        if skip == 0 {
+            if let Some(limit) = limit {
+                if consumed >= limit {
+                    break;
+                }
+            }
+
+            fragment.try_add_token(next, terms);
+            consumed += 1;
+        }
+
+        skip = skip.saturating_sub(1);
     }
     if fragment.score > 0.0 {
         fragments.push(fragment)
     }
 
-    let start = offset.unwrap_or(0);
-    let end = limit.map(|l| start + l).unwrap_or(fragments.len());
-
-    fragments.into_iter()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
+    fragments
 }
 
 /// Returns a Snippet
