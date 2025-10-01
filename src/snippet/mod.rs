@@ -74,7 +74,7 @@ const DEFAULT_SNIPPET_POSTFIX: &str = "</b>";
 
 #[derive(Debug)]
 pub(crate) struct FragmentCandidate {
-    score: Score,
+    scores: Vec<Score>,
     start_offset: usize,
     stop_offset: usize,
     highlighted: Vec<Range<usize>>,
@@ -88,7 +88,7 @@ impl FragmentCandidate {
     /// stop_offset is set to start_offset, which is taken as a param.
     fn new(start_offset: usize) -> FragmentCandidate {
         FragmentCandidate {
-            score: 0.0,
+            scores: vec![],
             start_offset,
             stop_offset: start_offset,
             highlighted: vec![],
@@ -104,9 +104,18 @@ impl FragmentCandidate {
         self.stop_offset = token.offset_to;
 
         if let Some(&score) = terms.get(&token.text.to_lowercase()) {
-            self.score += score;
+            self.scores.push(score);
             self.highlighted.push(token.offset_from..token.offset_to);
         }
+    }
+
+    fn score(&self) -> Score {
+        self.scores.iter().sum()
+    }
+
+    fn len(&self) -> usize {
+        assert_eq!(self.scores.len(), self.highlighted.len());
+        self.scores.len()
     }
 }
 
@@ -214,36 +223,66 @@ fn search_fragments(
     let mut fragment = FragmentCandidate::new(0);
     let mut fragments: Vec<FragmentCandidate> = vec![];
 
-    let mut skip = offset.unwrap_or(0);
-    let mut consumed = 0;
-
     // Process all fragments first, without applying offset/limit to token stream
     while let Some(next) = token_stream.next() {
         if (next.offset_to - fragment.start_offset) > max_num_chars {
-            if fragment.score > 0.0 {
+            if fragment.score() > 0.0 {
                 fragments.push(fragment)
             };
             fragment = FragmentCandidate::new(next.offset_from);
         }
 
-        if skip == 0 {
-            if let Some(limit) = limit {
-                if consumed >= limit {
-                    break;
-                }
-            }
-
-            fragment.try_add_token(next, terms);
-            consumed += 1;
-        }
-
-        skip = skip.saturating_sub(1);
+        fragment.try_add_token(next, terms);
     }
-    if fragment.score > 0.0 {
+    if fragment.score() > 0.0 {
         fragments.push(fragment)
     }
 
-    fragments
+    // Skip the first offset snippets, and take the next limit snippets
+    // across all FragmentCandidates
+    let offset_count = offset.unwrap_or(0);
+    let limit_count = limit.unwrap_or(usize::MAX);
+
+    let mut remaining_offset = offset_count;
+    let mut remaining_limit = limit_count;
+    let mut filtered_fragments = Vec::new();
+
+    for mut fragment in fragments {
+        if remaining_limit == 0 {
+            break;
+        }
+
+        let num_snippets = fragment.len();
+
+        if remaining_offset >= num_snippets {
+            remaining_offset -= num_snippets;
+            continue;
+        }
+
+        let skip_from_this_fragment = remaining_offset;
+        let take_from_this_fragment = std::cmp::min(
+            num_snippets - skip_from_this_fragment,
+            remaining_limit
+        );
+
+        fragment.scores = fragment.scores.into_iter()
+            .skip(skip_from_this_fragment)
+            .take(take_from_this_fragment)
+            .collect();
+        fragment.highlighted = fragment.highlighted.into_iter()
+            .skip(skip_from_this_fragment)
+            .take(take_from_this_fragment)
+            .collect();
+
+        remaining_offset = 0; // We've consumed all remaining offset
+        remaining_limit -= take_from_this_fragment;
+
+        if !fragment.scores.is_empty() && !fragment.highlighted.is_empty() {
+            filtered_fragments.push(fragment);
+        }
+    }
+
+    filtered_fragments
 }
 
 /// Returns a Snippet
@@ -253,8 +292,8 @@ fn search_fragments(
 fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str) -> Snippet {
     let best_fragment_opt = fragments.iter().max_by(|left, right| {
         let cmp_score = left
-            .score
-            .partial_cmp(&right.score)
+            .score()
+            .partial_cmp(&right.score())
             .unwrap_or(Ordering::Equal);
         if cmp_score == Ordering::Equal {
             (right.start_offset, right.stop_offset).cmp(&(left.start_offset, left.stop_offset))
@@ -508,6 +547,7 @@ impl SnippetGenerator {
 
     /// Generates a snippet for the given text.
     pub fn snippet(&self, text: &str) -> Snippet {
+        eprintln!("limit: {:?}, offset: {:?}", self.limit, self.offset);
         let fragment_candidates = search_fragments(
             &mut self.tokenizer.clone(),
             text,
@@ -516,6 +556,7 @@ impl SnippetGenerator {
             self.limit,
             self.offset,
         );
+        eprintln!("fragment_candidates: {:?}", fragment_candidates);
         select_best_fragment_combination(&fragment_candidates[..], text)
     }
 }
