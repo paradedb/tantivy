@@ -185,8 +185,10 @@ impl Snippet {
 
     /// Returns a list of highlighted positions from the `Snippet`.
     pub fn highlighted(&self) -> &[Range<usize>] {
-        let offset = self.offset.unwrap_or(0);
-        let limit = self.limit.unwrap_or(self.highlighted.len()).min(self.highlighted.len() - offset);
+        let len = self.highlighted.len();
+        let offset = self.offset.unwrap_or(0).min(len);
+        let remaining = len.saturating_sub(offset);
+        let limit = self.limit.unwrap_or(remaining).min(remaining);
         &self.highlighted[offset..offset + limit]
     }
 
