@@ -118,8 +118,6 @@ pub struct Snippet {
     highlighted: Vec<Range<usize>>,
     snippet_prefix: String,
     snippet_postfix: String,
-    limit: Option<usize>,
-    offset: Option<usize>,
 }
 
 impl Snippet {
@@ -130,17 +128,7 @@ impl Snippet {
             highlighted,
             snippet_prefix: DEFAULT_SNIPPET_PREFIX.to_string(),
             snippet_postfix: DEFAULT_SNIPPET_POSTFIX.to_string(),
-            limit: None,
-            offset: None,
         }
-    }
-
-    pub fn set_limit(&mut self, limit: usize) {
-        self.limit = Some(limit);
-    }
-
-    pub fn set_offset(&mut self, offset: usize) {
-        self.offset = Some(offset);
     }
 
     /// Create a new, empty, `Snippet`.
@@ -150,14 +138,12 @@ impl Snippet {
             highlighted: Vec::new(),
             snippet_prefix: String::new(),
             snippet_postfix: String::new(),
-            limit: None,
-            offset: None,
         }
     }
 
     /// Returns `true` if the snippet is empty.
     pub fn is_empty(&self) -> bool {
-        self.highlighted().is_empty()
+        self.highlighted.is_empty()
     }
 
     /// Returns a highlighted html from the `Snippet`.
@@ -165,7 +151,7 @@ impl Snippet {
         let mut html = String::new();
         let mut start_from: usize = 0;
 
-        for item in collapse_overlapped_ranges(self.highlighted()) {
+        for item in collapse_overlapped_ranges(&self.highlighted) {
             html.push_str(&encode_minimal(&self.fragment[start_from..item.start]));
             html.push_str(&self.snippet_prefix);
             html.push_str(&encode_minimal(&self.fragment[item.clone()]));
@@ -185,11 +171,7 @@ impl Snippet {
 
     /// Returns a list of highlighted positions from the `Snippet`.
     pub fn highlighted(&self) -> &[Range<usize>] {
-        let len = self.highlighted.len();
-        let offset = self.offset.unwrap_or(0).min(len);
-        let remaining = len.saturating_sub(offset);
-        let limit = self.limit.unwrap_or(remaining).min(remaining);
-        &self.highlighted[offset..offset + limit]
+        &self.highlighted
     }
 
     /// Sets highlighted prefix and postfix.
@@ -225,10 +207,14 @@ fn search_fragments(
     text: &str,
     terms: &BTreeMap<String, Score>,
     max_num_chars: usize,
+    limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Vec<FragmentCandidate> {
     let mut token_stream = tokenizer.token_stream(text);
     let mut fragment = FragmentCandidate::new(0);
     let mut fragments: Vec<FragmentCandidate> = vec![];
+
+    // Process all fragments first, without applying offset/limit to token stream
     while let Some(next) = token_stream.next() {
         if (next.offset_to - fragment.start_offset) > max_num_chars {
             if fragment.score > 0.0 {
@@ -242,7 +228,13 @@ fn search_fragments(
         fragments.push(fragment)
     }
 
-    fragments
+    let start = offset.unwrap_or(0);
+    let end = limit.map(|l| start + l).unwrap_or(fragments.len());
+
+    fragments.into_iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
 }
 
 /// Returns a Snippet
@@ -397,6 +389,8 @@ pub struct SnippetGenerator {
     tokenizer: TextAnalyzer,
     field: Field,
     max_num_chars: usize,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 impl SnippetGenerator {
@@ -412,8 +406,19 @@ impl SnippetGenerator {
             tokenizer,
             field,
             max_num_chars,
+            limit: None,
+            offset: None,
         }
     }
+
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = Some(limit);
+    }
+
+    pub fn set_offset(&mut self, offset: usize) {
+        self.offset = Some(offset);
+    }
+
     /// Creates a new snippet generator
     pub fn create(
         searcher: &Searcher,
@@ -456,6 +461,8 @@ impl SnippetGenerator {
             tokenizer,
             field,
             max_num_chars: DEFAULT_MAX_NUM_CHARS,
+            limit: None,
+            offset: None,
         })
     }
 
@@ -497,6 +504,8 @@ impl SnippetGenerator {
             text,
             &self.terms_text,
             self.max_num_chars,
+            self.limit,
+            self.offset,
         );
         select_best_fragment_combination(&fragment_candidates[..], text)
     }
