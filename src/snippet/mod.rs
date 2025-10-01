@@ -595,11 +595,13 @@ Survey in 2016, 2017, and 2018."#;
             TEST_TEXT,
             &terms,
             100,
+            None,
+            None,
         );
         assert_eq!(fragments.len(), 7);
         {
             let first = &fragments[0];
-            assert_eq!(first.score, 1.9);
+            assert_eq!(first.score(), 1.9);
             assert_eq!(first.stop_offset, 89);
         }
         let snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
@@ -627,10 +629,12 @@ Survey in 2016, 2017, and 2018."#;
                 TEST_TEXT,
                 &terms,
                 20,
+                None,
+                None,
             );
             {
                 let first = &fragments[0];
-                assert_eq!(first.score, 1.0);
+                assert_eq!(first.score(), 1.0);
                 assert_eq!(first.stop_offset, 17);
             }
             let snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
@@ -646,11 +650,13 @@ Survey in 2016, 2017, and 2018."#;
                 TEST_TEXT,
                 &terms,
                 20,
+                None,
+                None,
             );
             // assert_eq!(fragments.len(), 7);
             {
                 let first = &fragments[0];
-                assert_eq!(first.score, 0.9);
+                assert_eq!(first.score(), 0.9);
                 assert_eq!(first.stop_offset, 17);
             }
             let snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
@@ -666,12 +672,12 @@ Survey in 2016, 2017, and 2018."#;
         terms.insert(String::from("c"), 1.0);
 
         let fragments =
-            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3);
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3, None, None);
 
         assert_eq!(fragments.len(), 1);
         {
             let first = &fragments[0];
-            assert_eq!(first.score, 1.0);
+            assert_eq!(first.score(), 1.0);
             assert_eq!(first.start_offset, 4);
             assert_eq!(first.stop_offset, 7);
         }
@@ -689,12 +695,12 @@ Survey in 2016, 2017, and 2018."#;
         terms.insert(String::from("f"), 1.0);
 
         let fragments =
-            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3);
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3, None, None);
 
         assert_eq!(fragments.len(), 2);
         {
             let first = &fragments[0];
-            assert_eq!(first.score, 1.0);
+            assert_eq!(first.score(), 1.0);
             assert_eq!(first.stop_offset, 11);
             assert_eq!(first.start_offset, 8);
         }
@@ -713,12 +719,12 @@ Survey in 2016, 2017, and 2018."#;
         terms.insert(String::from("a"), 0.9);
 
         let fragments =
-            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 7);
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 7, None, None);
 
         assert_eq!(fragments.len(), 2);
         {
             let first = &fragments[0];
-            assert_eq!(first.score, 0.9);
+            assert_eq!(first.score(), 0.9);
             assert_eq!(first.stop_offset, 7);
             assert_eq!(first.start_offset, 0);
         }
@@ -736,7 +742,7 @@ Survey in 2016, 2017, and 2018."#;
         terms.insert(String::from("z"), 1.0);
 
         let fragments =
-            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3);
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3, None, None);
 
         assert_eq!(fragments.len(), 0);
 
@@ -752,7 +758,7 @@ Survey in 2016, 2017, and 2018."#;
 
         let terms = BTreeMap::new();
         let fragments =
-            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3);
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3, None, None);
         assert_eq!(fragments.len(), 0);
 
         let snippet = select_best_fragment_combination(&fragments[..], text);
@@ -866,12 +872,14 @@ Survey in 2016, 2017, and 2018."#;
             text,
             &terms,
             3,
+            None,
+            None,
         );
 
         assert_eq!(fragments.len(), 1);
         {
             let first = &fragments[0];
-            assert_eq!(first.score, 1.9);
+            assert_eq!(first.score(), 1.9);
             assert_eq!(first.start_offset, 0);
             assert_eq!(first.stop_offset, 3);
         }
@@ -889,6 +897,8 @@ Survey in 2016, 2017, and 2018."#;
             TEST_TEXT,
             &terms,
             100,
+            None,
+            None,
         );
         let mut snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
         assert_eq!(
