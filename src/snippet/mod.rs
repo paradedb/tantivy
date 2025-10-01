@@ -271,7 +271,7 @@ fn search_fragments(
             .take(take_from_this_fragment)
             .collect();
 
-        remaining_offset = 0; // We've consumed all remaining offset
+        remaining_offset = 0;
         remaining_limit -= take_from_this_fragment;
 
         if !fragment.is_empty() {
@@ -544,7 +544,6 @@ impl SnippetGenerator {
 
     /// Generates a snippet for the given text.
     pub fn snippet(&self, text: &str) -> Snippet {
-        eprintln!("limit: {:?}, offset: {:?}", self.limit, self.offset);
         let fragment_candidates = search_fragments(
             &mut self.tokenizer.clone(),
             text,
@@ -553,7 +552,6 @@ impl SnippetGenerator {
             self.limit,
             self.offset,
         );
-        eprintln!("fragment_candidates: {:?}", fragment_candidates);
         select_best_fragment_combination(&fragment_candidates[..], text)
     }
 }
