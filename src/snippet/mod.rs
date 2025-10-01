@@ -74,10 +74,9 @@ const DEFAULT_SNIPPET_POSTFIX: &str = "</b>";
 
 #[derive(Debug)]
 pub(crate) struct FragmentCandidate {
-    scores: Vec<Score>,
     start_offset: usize,
     stop_offset: usize,
-    highlighted: Vec<Range<usize>>,
+    highlighted: Vec<(Range<usize>, Score)>,
 }
 
 impl FragmentCandidate {
@@ -88,7 +87,6 @@ impl FragmentCandidate {
     /// stop_offset is set to start_offset, which is taken as a param.
     fn new(start_offset: usize) -> FragmentCandidate {
         FragmentCandidate {
-            scores: vec![],
             start_offset,
             stop_offset: start_offset,
             highlighted: vec![],
@@ -104,18 +102,21 @@ impl FragmentCandidate {
         self.stop_offset = token.offset_to;
 
         if let Some(&score) = terms.get(&token.text.to_lowercase()) {
-            self.scores.push(score);
-            self.highlighted.push(token.offset_from..token.offset_to);
+            self.highlighted
+                .push((token.offset_from..token.offset_to, score));
         }
     }
 
     fn score(&self) -> Score {
-        self.scores.iter().sum()
+        self.highlighted.iter().map(|(_, score)| score).sum()
     }
 
     fn len(&self) -> usize {
-        assert_eq!(self.scores.len(), self.highlighted.len());
-        self.scores.len()
+        self.highlighted.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.highlighted.is_empty()
     }
 }
 
@@ -260,16 +261,12 @@ fn search_fragments(
         }
 
         let skip_from_this_fragment = remaining_offset;
-        let take_from_this_fragment = std::cmp::min(
-            num_snippets - skip_from_this_fragment,
-            remaining_limit
-        );
+        let take_from_this_fragment =
+            std::cmp::min(num_snippets - skip_from_this_fragment, remaining_limit);
 
-        fragment.scores = fragment.scores.into_iter()
-            .skip(skip_from_this_fragment)
-            .take(take_from_this_fragment)
-            .collect();
-        fragment.highlighted = fragment.highlighted.into_iter()
+        fragment.highlighted = fragment
+            .highlighted
+            .into_iter()
             .skip(skip_from_this_fragment)
             .take(take_from_this_fragment)
             .collect();
@@ -277,7 +274,7 @@ fn search_fragments(
         remaining_offset = 0; // We've consumed all remaining offset
         remaining_limit -= take_from_this_fragment;
 
-        if !fragment.scores.is_empty() && !fragment.highlighted.is_empty() {
+        if !fragment.is_empty() {
             filtered_fragments.push(fragment);
         }
     }
@@ -306,7 +303,7 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
         let highlighted = fragment
             .highlighted
             .iter()
-            .map(|item| item.start - fragment.start_offset..item.end - fragment.start_offset)
+            .map(|(item, _)| item.start - fragment.start_offset..item.end - fragment.start_offset)
             .collect();
         Snippet::new(fragment_text, highlighted)
     } else {
