@@ -16,6 +16,12 @@ use crate::schema::Schema;
 use crate::tokenizer::TokenizerManager;
 use crate::{DocId, SegmentReader, TantivyError};
 
+pub trait SerializableQuery: Query + erased_serde::Serialize
+{
+    fn clone_box(&self) -> Box<dyn SerializableQuery>;
+}
+erased_serde::serialize_trait_object!(SerializableQuery);
+
 /// Filter aggregation creates a single bucket containing documents that match a query.
 ///
 /// # Usage
@@ -60,7 +66,7 @@ pub enum FilterQuery {
     /// - Extension query types
     ///
     /// Note: This variant cannot be serialized to JSON (only QueryString can be serialized)
-    CustomQuery(Box<dyn Query>),
+    CustomQuery(Box<dyn SerializableQuery>),
 }
 
 impl Clone for FilterQuery {
@@ -69,7 +75,7 @@ impl Clone for FilterQuery {
             FilterQuery::QueryString(query_string) => {
                 FilterQuery::QueryString(query_string.clone())
             }
-            FilterQuery::CustomQuery(query) => FilterQuery::CustomQuery(query.box_clone()),
+            FilterQuery::CustomQuery(query) => FilterQuery::CustomQuery(query.clone_box()),
         }
     }
 }
@@ -85,7 +91,7 @@ impl FilterAggregation {
 
     /// Create a new filter aggregation with a direct Query object
     /// This enables custom query types to be used directly
-    pub fn new_with_query(query: Box<dyn Query>) -> Self {
+    pub fn new_with_query(query: Box<dyn SerializableQuery>) -> Self {
         Self {
             query: FilterQuery::CustomQuery(query),
         }
@@ -107,7 +113,7 @@ impl FilterAggregation {
             }
             FilterQuery::CustomQuery(query) => {
                 // Return a clone of the direct query
-                Ok(query.box_clone())
+                Ok(query.clone_box())
             }
         }
     }
@@ -127,7 +133,7 @@ impl FilterAggregation {
                 .map_err(|e| TantivyError::InvalidArgument(e.to_string())),
             FilterQuery::CustomQuery(query) => {
                 // Return a clone of the direct query, ignoring the parser
-                Ok(query.box_clone())
+                Ok(query.clone_box())
             }
         }
     }
@@ -150,12 +156,8 @@ impl Serialize for FilterAggregation {
                 // Serialize the query string directly
                 query_string.serialize(serializer)
             }
-            FilterQuery::CustomQuery(_) => {
-                // Custom queries cannot be serialized
-                Err(serde::ser::Error::custom(
-                    "Custom Query objects cannot be serialized. Use query strings for \
-                     serialization support.",
-                ))
+            FilterQuery::CustomQuery(query) => {
+                erased_serde::serialize(query, serializer)
             }
         }
     }
