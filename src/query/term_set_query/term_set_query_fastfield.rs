@@ -102,7 +102,9 @@ impl Weight for FastFieldTermSetWeight {
             let docset = TermSetDocSet::new(ip_addr_column, values);
             Ok(Box::new(ConstScorer::new(docset, boost)))
         } else {
-            // Numeric types
+            // Numeric types.
+            //
+            // NOTE: Keep in sync with `TermSetQuery::specialized_weight`.
             let mut values = HashSet::new();
             for term in &self.terms {
                 let value = term.value();
@@ -111,6 +113,8 @@ impl Weight for FastFieldTermSetWeight {
                 } else if let Some(val) = value.as_i64() {
                     val.to_u64()
                 } else if let Some(val) = value.as_f64() {
+                    val.to_u64()
+                } else if let Some(val) = value.as_bool() {
                     val.to_u64()
                 } else if let Some(val) = value.as_date() {
                     val.to_u64()
