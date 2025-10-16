@@ -120,7 +120,7 @@ impl Weight for FastFieldTermSetWeight {
                     val.to_u64()
                 } else {
                     return Err(crate::TantivyError::InvalidArgument(format!(
-                        "Expected term with u64, i64, f64 or date, but got {:?}",
+                        "Expected term with u64, i64, f64, bool, or date, but got {:?}",
                         term
                     )));
                 };
