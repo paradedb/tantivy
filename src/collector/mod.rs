@@ -173,38 +173,7 @@ pub trait Collector: Sync + Send {
         segment_ord: u32,
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
-        let mut segment_collector = self.for_segment(segment_ord, reader)?;
-
-        match (reader.alive_bitset(), self.requires_scoring()) {
-            (Some(alive_bitset), true) => {
-                weight.for_each(reader, &mut |doc, score| {
-                    if alive_bitset.is_alive(doc) {
-                        segment_collector.collect(doc, score);
-                    }
-                })?;
-            }
-            (Some(alive_bitset), false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
-                    for doc in docs.iter().cloned() {
-                        if alive_bitset.is_alive(doc) {
-                            segment_collector.collect(doc, 0.0);
-                        }
-                    }
-                })?;
-            }
-            (None, true) => {
-                weight.for_each(reader, &mut |doc, score| {
-                    segment_collector.collect(doc, score);
-                })?;
-            }
-            (None, false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
-                    segment_collector.collect_block(docs);
-                })?;
-            }
-        }
-
-        Ok(segment_collector.harvest())
+        default_collect_segment(self, weight, segment_ord, reader)
     }
 }
 
@@ -496,6 +465,46 @@ where
 }
 
 impl_downcast!(Fruit);
+
+pub(crate) fn default_collect_segment<TCollector: Collector + ?Sized>(
+    collector: &TCollector,
+    weight: &dyn Weight,
+    segment_ord: u32,
+    reader: &SegmentReader,
+) -> crate::Result<<TCollector::Child as SegmentCollector>::Fruit> {
+    let mut segment_collector = collector.for_segment(segment_ord, reader)?;
+
+    match (reader.alive_bitset(), collector.requires_scoring()) {
+        (Some(alive_bitset), true) => {
+            weight.for_each(reader, &mut |doc, score| {
+                if alive_bitset.is_alive(doc) {
+                    segment_collector.collect(doc, score);
+                }
+            })?;
+        }
+        (Some(alive_bitset), false) => {
+            weight.for_each_no_score(reader, &mut |docs| {
+                for doc in docs.iter().cloned() {
+                    if alive_bitset.is_alive(doc) {
+                        segment_collector.collect(doc, 0.0);
+                    }
+                }
+            })?;
+        }
+        (None, true) => {
+            weight.for_each(reader, &mut |doc, score| {
+                segment_collector.collect(doc, score);
+            })?;
+        }
+        (None, false) => {
+            weight.for_each_no_score(reader, &mut |docs| {
+                segment_collector.collect_block(docs);
+            })?;
+        }
+    }
+
+    Ok(segment_collector.harvest())
+}
 
 #[cfg(test)]
 pub(crate) mod tests;
