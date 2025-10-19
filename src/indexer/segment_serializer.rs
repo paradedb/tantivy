@@ -77,6 +77,7 @@ impl SegmentSerializer {
     }
 
     /// Finalize the segment serialization.
+    #[inline(never)]
     pub fn close(mut self) -> crate::Result<()> {
         if let Some(fieldnorms_serializer) = self.extract_fieldnorms_serializer() {
             fieldnorms_serializer.close()?;

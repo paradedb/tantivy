@@ -76,6 +76,7 @@ impl Segment {
     }
 
     /// Open one of the component file for a *regular* read.
+    #[inline(never)]
     pub fn open_read(&self, component: SegmentComponent) -> Result<FileSlice, OpenReadError> {
         let path = self.relative_path(component);
         self.index.directory().open_read(&path)

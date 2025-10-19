@@ -205,6 +205,7 @@ impl IndexMerger {
         })
     }
 
+    #[inline(never)]
     fn write_fieldnorms(
         &self,
         mut fieldnorms_serializer: FieldNormsSerializer,
@@ -233,6 +234,7 @@ impl IndexMerger {
         Ok(())
     }
 
+    #[inline(never)]
     fn write_fast_fields(
         &self,
         fast_field_wrt: &mut WritePtr,
@@ -498,6 +500,7 @@ impl IndexMerger {
         Ok(())
     }
 
+    #[inline(never)]
     fn write_postings(
         &self,
         serializer: &mut InvertedIndexSerializer,
@@ -522,6 +525,7 @@ impl IndexMerger {
         Ok(())
     }
 
+    #[inline(never)]
     fn write_storable_fields(&self, store_writer: &mut StoreWriter) -> crate::Result<()> {
         debug_time!("write-storable-fields");
         debug!("write-storable-field");

@@ -19,6 +19,7 @@ pub struct FieldNormReaders {
 
 impl FieldNormReaders {
     /// Creates a field norm reader.
+    #[inline(never)]
     pub fn open(file: FileSlice) -> crate::Result<FieldNormReaders> {
         let data = CompositeFile::open(&file)?;
         Ok(FieldNormReaders {
