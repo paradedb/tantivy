@@ -6,7 +6,7 @@ use std::ops::Range;
 use super::file_slice::FileSlice;
 use super::{HasLen, OwnedBytes};
 
-const DEFAULT_BUFFER_MAX_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+const DEFAULT_BUFFER_MAX_SIZE: usize = 4 * 1024 * 1024; // 4 MB
 
 /// A buffered reader for a FileSlice.
 ///
