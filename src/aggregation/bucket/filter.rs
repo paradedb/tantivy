@@ -20,6 +20,7 @@ pub trait SerializableQuery: Query + erased_serde::Serialize
 {
     fn clone_box(&self) -> Box<dyn SerializableQuery>;
 }
+
 erased_serde::serialize_trait_object!(SerializableQuery);
 
 /// Filter aggregation creates a single bucket containing documents that match a query.
