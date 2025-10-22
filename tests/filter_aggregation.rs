@@ -733,6 +733,36 @@ fn test_filter_with_base_query() -> tantivy::Result<()> {
 
 #[test]
 fn test_direct_query_object() -> tantivy::Result<()> {
+    use tantivy::aggregation::bucket::SerializableQuery;
+    use tantivy::query::{EnableScoring, Query, Weight};
+
+    #[derive(Debug, Clone)]
+    struct SerializableTermQuery(TermQuery);
+    impl SerializableQuery for SerializableTermQuery {
+        fn clone_box(&self) -> Box<dyn SerializableQuery> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl Query for SerializableTermQuery {
+        fn weight(&self, enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+            self.0.weight(enable_scoring)
+        }
+    }
+
+    impl SerializableTermQuery {
+        pub fn new(term_query: TermQuery) -> Self {
+            Self(term_query)
+        }
+    }
+
+    impl serde::Serialize for SerializableTermQuery {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where S: serde::Serializer {
+            "todo".serialize(serializer)
+        }
+    }
+
     let index = create_standard_test_index()?;
     let schema = index.schema();
 
@@ -742,18 +772,15 @@ fn test_direct_query_object() -> tantivy::Result<()> {
     let term_query = TermQuery::new(term, IndexRecordOption::Basic);
 
     // Use it in FilterAggregation
-    let filter_agg = FilterAggregation::new_with_query(Box::new(term_query));
+    let filter_agg =
+        FilterAggregation::new_with_query(Box::new(SerializableTermQuery::new(term_query)));
 
-    // Verify it cannot be serialized
+    // Verify it can be serialized
     let serialization_result = serde_json::to_string(&filter_agg);
     assert!(
-        serialization_result.is_err(),
-        "Direct queries should not serialize"
+        serialization_result.is_ok(),
+        "Direct queries should serialize"
     );
-    assert!(serialization_result
-        .unwrap_err()
-        .to_string()
-        .contains("Custom Query objects cannot be serialized"));
 
     Ok(())
 }

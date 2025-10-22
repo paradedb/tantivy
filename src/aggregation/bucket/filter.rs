@@ -16,8 +16,7 @@ use crate::schema::Schema;
 use crate::tokenizer::TokenizerManager;
 use crate::{DocId, SegmentReader, TantivyError};
 
-pub trait SerializableQuery: Query + erased_serde::Serialize
-{
+pub trait SerializableQuery: Query + erased_serde::Serialize {
     fn clone_box(&self) -> Box<dyn SerializableQuery>;
 }
 erased_serde::serialize_trait_object!(SerializableQuery);
@@ -37,9 +36,38 @@ erased_serde::serialize_trait_object!(SerializableQuery);
 ///     tantivy::Term::from_field_text(tantivy::schema::Field::from_field_id(0), "electronics"),
 ///     tantivy::schema::IndexRecordOption::Basic
 /// );
-/// let filter_agg = FilterAggregation::new_with_query(Box::new(term_query));
-/// ```
-///
+/// use tantivy::aggregation::bucket::SerializableQuery;
+/// use tantivy::query::{Query, EnableScoring, Weight};
+
+/// #[derive(Debug, Clone)]
+/// struct SerializableTermQuery(TermQuery);
+/// impl SerializableQuery for SerializableTermQuery {
+///     fn clone_box(&self) -> Box<dyn SerializableQuery> {
+///         Box::new(self.clone())
+///     }
+/// }
+
+/// impl Query for SerializableTermQuery {
+///     fn weight(&self, enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+///         self.0.weight(enable_scoring)
+///     }
+/// }
+
+/// impl SerializableTermQuery {
+///     pub fn new(term_query: TermQuery) -> Self {
+///         Self(term_query)
+///     }
+/// }
+
+/// impl serde::Serialize for SerializableTermQuery {
+///     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+///     where S: serde::Serializer {
+///         "todo".serialize(serializer)
+///     }
+/// }
+/// let filter_agg =
+/// FilterAggregation::new_with_query(Box::new(SerializableTermQuery::new(term_query))); ```
+/// 
 /// # Result
 /// The filter aggregation returns a single bucket with:
 /// - `doc_count`: Number of documents matching the filter
@@ -156,9 +184,7 @@ impl Serialize for FilterAggregation {
                 // Serialize the query string directly
                 query_string.serialize(serializer)
             }
-            FilterQuery::CustomQuery(query) => {
-                erased_serde::serialize(query, serializer)
-            }
+            FilterQuery::CustomQuery(query) => erased_serde::serialize(query, serializer),
         }
     }
 }
