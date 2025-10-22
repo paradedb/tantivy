@@ -25,8 +25,36 @@ erased_serde::serialize_trait_object!(SerializableQuery);
 ///
 /// # Usage
 /// ```rust
+/// use tantivy::aggregation::bucket::SerializableQuery;
 /// use tantivy::aggregation::bucket::filter::FilterAggregation;
-/// use tantivy::query::TermQuery;
+/// use tantivy::query::{Query, EnableScoring, TermQuery, Weight};
+///
+/// #[derive(Debug, Clone)]
+/// struct SerializableTermQuery(TermQuery);
+/// impl SerializableQuery for SerializableTermQuery {
+///     fn clone_box(&self) -> Box<dyn SerializableQuery> {
+///         Box::new(self.clone())
+///     }
+/// }
+///
+/// impl Query for SerializableTermQuery {
+///     fn weight(&self, enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+///         self.0.weight(enable_scoring)
+///     }
+/// }
+///
+/// impl SerializableTermQuery {
+///     pub fn new(term_query: TermQuery) -> Self {
+///         Self(term_query)
+///     }
+/// }
+///
+/// impl serde::Serialize for SerializableTermQuery {
+///     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+///     where S: serde::Serializer {
+///         "todo".serialize(serializer)
+///     }
+/// }
 ///
 /// // Query strings are parsed using Tantivy's standard QueryParser
 /// let filter_agg = FilterAggregation::new("category:electronics AND price:[100 TO 500]".to_string());
@@ -36,37 +64,9 @@ erased_serde::serialize_trait_object!(SerializableQuery);
 ///     tantivy::Term::from_field_text(tantivy::schema::Field::from_field_id(0), "electronics"),
 ///     tantivy::schema::IndexRecordOption::Basic
 /// );
-/// use tantivy::aggregation::bucket::SerializableQuery;
-/// use tantivy::query::{Query, EnableScoring, Weight};
-
-/// #[derive(Debug, Clone)]
-/// struct SerializableTermQuery(TermQuery);
-/// impl SerializableQuery for SerializableTermQuery {
-///     fn clone_box(&self) -> Box<dyn SerializableQuery> {
-///         Box::new(self.clone())
-///     }
-/// }
-
-/// impl Query for SerializableTermQuery {
-///     fn weight(&self, enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
-///         self.0.weight(enable_scoring)
-///     }
-/// }
-
-/// impl SerializableTermQuery {
-///     pub fn new(term_query: TermQuery) -> Self {
-///         Self(term_query)
-///     }
-/// }
-
-/// impl serde::Serialize for SerializableTermQuery {
-///     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-///     where S: serde::Serializer {
-///         "todo".serialize(serializer)
-///     }
-/// }
-/// let filter_agg =
-/// FilterAggregation::new_with_query(Box::new(SerializableTermQuery::new(term_query))); ```
+///
+/// let filter_agg = FilterAggregation::new_with_query(Box::new(SerializableTermQuery::new(term_query)));
+/// ```
 ///
 /// # Result
 /// The filter aggregation returns a single bucket with:
