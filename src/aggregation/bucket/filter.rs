@@ -67,7 +67,7 @@ erased_serde::serialize_trait_object!(SerializableQuery);
 /// }
 /// let filter_agg =
 /// FilterAggregation::new_with_query(Box::new(SerializableTermQuery::new(term_query))); ```
-/// 
+///
 /// # Result
 /// The filter aggregation returns a single bucket with:
 /// - `doc_count`: Number of documents matching the filter
