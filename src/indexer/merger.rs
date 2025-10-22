@@ -12,14 +12,16 @@ use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
+use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
 use crate::index::{Segment, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
+use crate::indexer::segment_updater::CancelSentinel;
 use crate::indexer::SegmentSerializer;
 use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
-use crate::{DocAddress, DocId, InvertedIndexReader};
+use crate::{DocAddress, DocId};
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
 ///
@@ -80,6 +82,8 @@ pub struct IndexMerger {
     schema: Schema,
     pub(crate) readers: Vec<SegmentReader>,
     max_doc: u32,
+    cancel: Box<dyn CancelSentinel>,
+    ignore_store: bool,
 }
 
 struct DeltaComputer {
@@ -145,9 +149,14 @@ fn extract_fast_field_required_columns(schema: &Schema) -> Vec<(String, ColumnTy
 }
 
 impl IndexMerger {
-    pub fn open(schema: Schema, segments: &[Segment]) -> crate::Result<IndexMerger> {
+    pub fn open(
+        schema: Schema,
+        segments: &[Segment],
+        cancel: Box<dyn CancelSentinel>,
+        ignore_store: bool,
+    ) -> crate::Result<IndexMerger> {
         let alive_bitset = segments.iter().map(|_| None).collect_vec();
-        Self::open_with_custom_alive_set(schema, segments, alive_bitset)
+        Self::open_with_custom_alive_set(schema, segments, alive_bitset, cancel, ignore_store)
     }
 
     // Create merge with a custom delete set.
@@ -166,6 +175,8 @@ impl IndexMerger {
         schema: Schema,
         segments: &[Segment],
         alive_bitset_opt: Vec<Option<AliveBitSet>>,
+        cancel: Box<dyn CancelSentinel>,
+        ignore_store: bool,
     ) -> crate::Result<IndexMerger> {
         let mut readers = vec![];
         for (segment, new_alive_bitset_opt) in segments.iter().zip(alive_bitset_opt) {
@@ -189,6 +200,8 @@ impl IndexMerger {
             schema,
             readers,
             max_doc,
+            cancel,
+            ignore_store,
         })
     }
 
@@ -200,6 +213,9 @@ impl IndexMerger {
         let fields = FieldNormsWriter::fields_with_fieldnorm(&self.schema);
         let mut fieldnorms_data = Vec::with_capacity(self.max_doc as usize);
         for field in fields {
+            if self.cancel.wants_cancel() {
+                return Err(crate::TantivyError::Cancelled);
+            }
             fieldnorms_data.clear();
             let fieldnorms_readers: Vec<FieldNormReader> = self
                 .readers
@@ -235,6 +251,7 @@ impl IndexMerger {
             &required_columns,
             merge_row_order,
             fast_field_wrt,
+            || self.cancel.wants_cancel(),
         )?;
         Ok(())
     }
@@ -297,10 +314,10 @@ impl IndexMerger {
 
         let mut max_term_ords: Vec<TermOrdinal> = Vec::new();
 
-        let field_readers: Vec<Arc<InvertedIndexReader>> = self
+        let field_readers: Vec<Arc<MergeOptimizedInvertedIndexReader>> = self
             .readers
             .iter()
-            .map(|reader| reader.inverted_index(indexed_field))
+            .map(|reader| reader.merge_optimized_inverted_index(indexed_field))
             .collect::<crate::Result<Vec<_>>>()?;
 
         let mut field_term_streams = Vec::new();
@@ -357,7 +374,16 @@ impl IndexMerger {
 
         let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
 
+        let mut cnt = 0;
         while merged_terms.advance() {
+            // calling `wants_cancel()` could be expensive so only do it so often
+            if cnt % 1000 == 0 {
+                if self.cancel.wants_cancel() {
+                    return Err(crate::TantivyError::Cancelled);
+                }
+            }
+            cnt += 1;
+
             segment_postings_containing_the_term.clear();
             let term_bytes: &[u8] = merged_terms.key();
 
@@ -366,7 +392,8 @@ impl IndexMerger {
             // Let's compute the list of non-empty posting lists
             for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
                 let segment_reader = &self.readers[segment_ord];
-                let inverted_index: &InvertedIndexReader = &field_readers[segment_ord];
+                let inverted_index: &MergeOptimizedInvertedIndexReader =
+                    &field_readers[segment_ord];
                 let segment_postings = inverted_index
                     .read_postings_from_terminfo(&term_info, segment_postings_option)?;
                 let alive_bitset_opt = segment_reader.alive_bitset();
@@ -436,6 +463,12 @@ impl IndexMerger {
 
                 let mut doc = segment_postings.doc();
                 while doc != TERMINATED {
+                    if doc % 1000 == 0 {
+                        // calling `wants_cancel()` could be expensive so only do it so often
+                        if self.cancel.wants_cancel() {
+                            return Err(crate::TantivyError::Cancelled);
+                        }
+                    }
                     // deleted doc are skipped as they do not have a `remapped_doc_id`.
                     if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
                         // we make sure to only write the term if
@@ -472,6 +505,9 @@ impl IndexMerger {
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
         for (field, field_entry) in self.schema.fields() {
+            if self.cancel.wants_cancel() {
+                return Err(crate::TantivyError::Cancelled);
+            }
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             if field_entry.is_indexed() {
                 self.write_postings_for_field(
@@ -510,6 +546,9 @@ impl IndexMerger {
                     || store_reader.decompressor() != store_writer.compressor().into()
             {
                 for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
+                    if self.cancel.wants_cancel() {
+                        return Err(crate::TantivyError::Cancelled);
+                    }
                     let doc_bytes = doc_bytes_res?;
                     store_writer.store_bytes(&doc_bytes)?;
                 }
@@ -543,7 +582,9 @@ impl IndexMerger {
         )?;
 
         debug!("write-storagefields");
-        self.write_storable_fields(serializer.get_store_writer())?;
+        if !self.ignore_store {
+            self.write_storable_fields(serializer.get_store_writer())?;
+        }
         debug!("write-fastfields");
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
 
@@ -635,6 +676,163 @@ mod tests {
             let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.merge(&segment_ids).wait()?;
             index_writer.wait_merging_threads()?;
+        }
+        {
+            reader.reload()?;
+            let searcher = reader.searcher();
+            let get_doc_ids = |terms: Vec<Term>| {
+                let query = BooleanQuery::new_multiterms_query(terms);
+                searcher
+                    .search(&query, &TEST_COLLECTOR_WITH_SCORE)
+                    .map(|top_docs| top_docs.docs().to_vec())
+            };
+            {
+                assert_eq!(
+                    get_doc_ids(vec![Term::from_field_text(text_field, "a")])?,
+                    vec![
+                        DocAddress::new(0, 1),
+                        DocAddress::new(0, 2),
+                        DocAddress::new(0, 4)
+                    ]
+                );
+                assert_eq!(
+                    get_doc_ids(vec![Term::from_field_text(text_field, "af")])?,
+                    vec![DocAddress::new(0, 0), DocAddress::new(0, 3)]
+                );
+                assert_eq!(
+                    get_doc_ids(vec![Term::from_field_text(text_field, "g")])?,
+                    vec![DocAddress::new(0, 4)]
+                );
+                assert_eq!(
+                    get_doc_ids(vec![Term::from_field_text(text_field, "b")])?,
+                    vec![
+                        DocAddress::new(0, 0),
+                        DocAddress::new(0, 1),
+                        DocAddress::new(0, 2),
+                        DocAddress::new(0, 3),
+                        DocAddress::new(0, 4)
+                    ]
+                );
+                assert_eq!(
+                    get_doc_ids(vec![Term::from_field_date_for_search(
+                        date_field,
+                        DateTime::from_utc(curr_time)
+                    )])?,
+                    vec![DocAddress::new(0, 0), DocAddress::new(0, 3)]
+                );
+            }
+            {
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 0))?;
+                assert_eq!(
+                    doc.get_first(text_field).unwrap().as_value().as_str(),
+                    Some("af b")
+                );
+            }
+            {
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 1))?;
+                assert_eq!(
+                    doc.get_first(text_field).unwrap().as_value().as_str(),
+                    Some("a b c")
+                );
+            }
+            {
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 2))?;
+                assert_eq!(
+                    doc.get_first(text_field).unwrap().as_value().as_str(),
+                    Some("a b c d")
+                );
+            }
+            {
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 3))?;
+                assert_eq!(doc.get_first(text_field).unwrap().as_str(), Some("af b"));
+            }
+            {
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 4))?;
+                assert_eq!(doc.get_first(text_field).unwrap().as_str(), Some("a b c g"));
+            }
+
+            {
+                let get_fast_vals = |terms: Vec<Term>| {
+                    let query = BooleanQuery::new_multiterms_query(terms);
+                    searcher.search(&query, &FastFieldTestCollector::for_field("score"))
+                };
+                let get_fast_vals_bytes = |terms: Vec<Term>| {
+                    let query = BooleanQuery::new_multiterms_query(terms);
+                    searcher.search(
+                        &query,
+                        &BytesFastFieldTestCollector::for_field("score_bytes"),
+                    )
+                };
+                assert_eq!(
+                    get_fast_vals(vec![Term::from_field_text(text_field, "a")])?,
+                    vec![5, 7, 13]
+                );
+                assert_eq!(
+                    get_fast_vals_bytes(vec![Term::from_field_text(text_field, "a")])?,
+                    vec![0, 0, 0, 5, 0, 0, 0, 7, 0, 0, 0, 13]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // NB:  this is the same as `test_index_merger_no_deletes` above, but using `merge_foreground()`
+    #[test]
+    fn test_foreground_merge() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let text_fieldtype = schema::TextOptions::default()
+            .set_indexing_options(
+                TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
+            )
+            .set_stored();
+        let text_field = schema_builder.add_text_field("text", text_fieldtype);
+        let date_field = schema_builder.add_date_field("date", INDEXED);
+        let score_fieldtype = schema::NumericOptions::default().set_fast();
+        let score_field = schema_builder.add_u64_field("score", score_fieldtype);
+        let bytes_score_field = schema_builder.add_bytes_field("score_bytes", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        let reader = index.reader()?;
+        let curr_time = OffsetDateTime::now_utc();
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            // writing the segment
+            index_writer.add_document(doc!(
+                text_field => "af b",
+                score_field => 3u64,
+                date_field => DateTime::from_utc(curr_time),
+                bytes_score_field => 3u32.to_be_bytes().as_ref()
+            ))?;
+            index_writer.add_document(doc!(
+                text_field => "a b c",
+                score_field => 5u64,
+                bytes_score_field => 5u32.to_be_bytes().as_ref()
+            ))?;
+            index_writer.add_document(doc!(
+                text_field => "a b c d",
+                score_field => 7u64,
+                bytes_score_field => 7u32.to_be_bytes().as_ref()
+            ))?;
+            index_writer.commit()?;
+            // writing the segment
+            index_writer.add_document(doc!(
+                text_field => "af b",
+                date_field => DateTime::from_utc(curr_time),
+                score_field => 11u64,
+                bytes_score_field => 11u32.to_be_bytes().as_ref()
+            ))?;
+            index_writer.add_document(doc!(
+                text_field => "a b c g",
+                score_field => 13u64,
+                bytes_score_field => 13u32.to_be_bytes().as_ref()
+            ))?;
+            index_writer.commit()?;
+        }
+        {
+            let segment_ids = index
+                .searchable_segment_ids()
+                .expect("Searchable segments failed.");
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.merge_foreground(&segment_ids, false)?;
         }
         {
             reader.reload()?;
@@ -1032,12 +1230,15 @@ mod tests {
             // Test removing all docs
             index_writer.delete_term(Term::from_field_text(text_field, "g"));
             index_writer.commit()?;
-            let segment_ids = index.searchable_segment_ids()?;
+            let _segment_ids = index.searchable_segment_ids()?;
             reader.reload()?;
 
             let searcher = reader.searcher();
-            assert!(segment_ids.is_empty());
-            assert!(searcher.segment_readers().is_empty());
+            // In Tantivy upstream, this test results in 0 segments after delete.
+            // However, due to our custom, visibility rules, we leave the segment.
+            // See committed_segment_metas in segment_manager.rs.
+            // assert!(segment_ids.is_empty());
+            // assert!(searcher.segment_readers().is_empty());
             assert_eq!(searcher.num_docs(), 0);
         }
         Ok(())

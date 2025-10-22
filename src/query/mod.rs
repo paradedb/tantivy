@@ -22,9 +22,9 @@ mod range_query;
 mod regex_query;
 mod reqopt_scorer;
 mod scorer;
-mod set_query;
 mod size_hint;
 mod term_query;
+mod term_set_query;
 mod union;
 mod weight;
 
@@ -45,14 +45,15 @@ pub use self::disjunction_max_query::DisjunctionMaxQuery;
 pub use self::empty_query::{EmptyQuery, EmptyScorer, EmptyWeight};
 pub use self::exclude::Exclude;
 pub use self::exist_query::ExistsQuery;
-pub use self::explanation::Explanation;
+pub use self::explanation::{does_not_match, Explanation};
 #[cfg(test)]
 pub(crate) use self::fuzzy_query::DfaWrapper;
 pub use self::fuzzy_query::FuzzyTermQuery;
 pub use self::intersection::{intersect_scorers, Intersection};
-pub use self::more_like_this::{MoreLikeThisQuery, MoreLikeThisQueryBuilder};
+pub use self::more_like_this::{MoreLikeThis, MoreLikeThisQuery, MoreLikeThisQueryBuilder};
 pub use self::phrase_prefix_query::PhrasePrefixQuery;
 pub use self::phrase_query::regex_phrase_query::{wildcard_query_to_regex_str, RegexPhraseQuery};
+pub use self::phrase_query::regex_phrase_weight::RegexPhraseWeight;
 pub use self::phrase_query::PhraseQuery;
 pub use self::query::{EnableScoring, Query, QueryClone};
 pub use self::query_parser::{QueryParser, QueryParserError};
@@ -61,9 +62,9 @@ pub use self::regex_query::RegexQuery;
 pub use self::reqopt_scorer::RequiredOptionalScorer;
 pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner};
 pub use self::scorer::Scorer;
-pub use self::set_query::TermSetQuery;
 pub use self::term_query::TermQuery;
-pub use self::union::BufferedUnionScorer;
+pub use self::term_set_query::*;
+pub use self::union::{BufferedUnionScorer, SimpleUnion};
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
 pub use self::weight::Weight;
@@ -80,38 +81,61 @@ mod tests {
         let text_field = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
+        let mut writer = index.writer(16_000_000).unwrap();
+        writer.add_document(doc! {}).unwrap();
+        writer.commit().unwrap();
         let query_parser = QueryParser::for_index(&index, vec![text_field]);
         let term_a = Term::from_field_text(text_field, "a");
         let term_b = Term::from_field_text(text_field, "b");
+        let searcher = index.reader().unwrap().searcher();
+        let segment_reader = &searcher.segment_readers()[0];
         {
             let query = query_parser.parse_query("a").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, false)], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            assert_eq!(vec![(term_a.clone(), false)], terms);
         }
         {
             let query = query_parser.parse_query("a b").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, false), (&term_b, false)], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            assert_eq!(
+                vec![(term_a.clone(), false), (term_b.clone(), false)],
+                terms
+            );
         }
         {
             let query = query_parser.parse_query("\"a b\"").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, true), (&term_b, true)], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            assert_eq!(vec![(term_a.clone(), true), (term_b.clone(), true)], terms);
         }
         {
             let query = query_parser.parse_query("a a a a a").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, false); 1], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            // With the new query_terms signature that includes segment_reader,
+            // duplicate terms are deduplicated
+            assert_eq!(vec![(term_a.clone(), false)], terms);
         }
         {
             let query = query_parser.parse_query("a -b").unwrap();
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, pos| terms.push((term, pos)));
-            assert_eq!(vec![(&term_a, false), (&term_b, false)], terms);
+            query.query_terms(text_field, &segment_reader, &mut |term, pos| {
+                terms.push((term.clone(), pos))
+            });
+            assert_eq!(
+                vec![(term_a.clone(), false), (term_b.clone(), false)],
+                terms
+            );
         }
     }
 }

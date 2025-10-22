@@ -4,7 +4,8 @@ mod block_search;
 
 pub(crate) use self::block_search::branchless_binary_search;
 
-mod block_segment_postings;
+pub(crate) mod block_segment_postings;
+
 pub(crate) mod compression;
 mod indexing_context;
 mod json_postings_writer;
@@ -15,10 +16,10 @@ mod postings_writer;
 mod recorder;
 mod segment_postings;
 mod serializer;
-mod skip;
+pub(crate) mod skip;
 mod term_info;
 
-pub(crate) use loaded_postings::LoadedPostings;
+pub use loaded_postings::LoadedPostings;
 pub(crate) use stacker::compute_table_memory_size;
 
 pub use self::block_segment_postings::BlockSegmentPostings;
@@ -491,10 +492,12 @@ pub(crate) mod tests {
         }
         let searcher = index.reader()?.searcher();
 
-        // finally, check that it's empty
+        // In Tantivy upstream, this test results in 0 segments after delete.
+        // However, due to our custom, visibility rules, we leave the segment.
+        // See committed_segment_metas in segment_manager.rs.
         {
-            let searchable_segment_ids = index.searchable_segment_ids()?;
-            assert!(searchable_segment_ids.is_empty());
+            let _searchable_segment_ids = index.searchable_segment_ids()?;
+            // assert!(searchable_segment_ids.is_empty());
             assert_eq!(searcher.num_docs(), 0);
         }
         Ok(())

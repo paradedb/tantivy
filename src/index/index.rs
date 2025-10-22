@@ -30,22 +30,30 @@ fn load_metas(
     directory: &dyn Directory,
     inventory: &SegmentMetaInventory,
 ) -> crate::Result<IndexMeta> {
-    let meta_data = directory.atomic_read(&META_FILEPATH)?;
-    let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
-        error!("Meta data is not valid utf8.");
-        DataCorruption::new(
-            META_FILEPATH.to_path_buf(),
-            "Meta file does not contain valid utf8 file.".to_string(),
-        )
-    })?;
-    IndexMeta::deserialize(&meta_string, inventory)
-        .map_err(|e| {
-            DataCorruption::new(
-                META_FILEPATH.to_path_buf(),
-                format!("Meta file cannot be deserialized. {e:?}. Content: {meta_string:?}"),
-            )
-        })
-        .map_err(From::from)
+    match directory.load_metas(inventory) {
+        Ok(metas) => Ok(metas),
+        Err(crate::TantivyError::InternalError(_)) => {
+            let meta_data = directory.atomic_read(&META_FILEPATH)?;
+            let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
+                error!("Meta data is not valid utf8.");
+                DataCorruption::new(
+                    META_FILEPATH.to_path_buf(),
+                    "Meta file does not contain valid utf8 file.".to_string(),
+                )
+            })?;
+            IndexMeta::deserialize(&meta_string, inventory)
+                .map_err(|e| {
+                    DataCorruption::new(
+                        META_FILEPATH.to_path_buf(),
+                        format!(
+                            "Meta file cannot be deserialized. {e:?}. Content: {meta_string:?}"
+                        ),
+                    )
+                })
+                .map_err(From::from)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Save the index meta file.
@@ -60,16 +68,14 @@ fn save_new_metas(
     index_settings: IndexSettings,
     directory: &dyn Directory,
 ) -> crate::Result<()> {
-    save_metas(
-        &IndexMeta {
-            index_settings,
-            segments: Vec::new(),
-            schema,
-            opstamp: 0u64,
-            payload: None,
-        },
-        directory,
-    )?;
+    let empty_metas = IndexMeta {
+        index_settings,
+        segments: Vec::new(),
+        schema,
+        opstamp: 0u64,
+        payload: None,
+    };
+    save_metas(&empty_metas, &empty_metas, directory)?;
     directory.sync_directory()?;
     Ok(())
 }
@@ -582,7 +588,7 @@ impl Index {
         num_threads: usize,
         overall_memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter<D>> {
-        let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
+        let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads.max(1);
         let options = IndexWriterOptions::builder()
             .num_worker_threads(num_threads)
             .memory_budget_per_thread(memory_arena_in_bytes_per_thread)
@@ -655,9 +661,11 @@ impl Index {
 
     /// Creates a new segment.
     pub fn new_segment(&self) -> Segment {
-        let segment_meta = self
-            .inventory
-            .new_segment_meta(SegmentId::generate_random(), 0);
+        self.new_segment_with_id(SegmentId::generate_random())
+    }
+
+    pub fn new_segment_with_id(&self, segment_id: SegmentId) -> Segment {
+        let segment_meta = self.inventory.new_segment_meta(segment_id, 0);
         self.segment(segment_meta)
     }
 
@@ -688,7 +696,7 @@ impl Index {
 
     /// Returns the set of corrupted files
     pub fn validate_checksum(&self) -> crate::Result<HashSet<PathBuf>> {
-        let managed_files = self.directory.list_managed_files();
+        let managed_files = self.directory.list_managed_files()?;
         let active_segments_files: HashSet<PathBuf> = self
             .searchable_segment_metas()?
             .iter()

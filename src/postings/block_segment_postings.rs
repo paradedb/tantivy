@@ -2,7 +2,7 @@ use std::io;
 
 use common::VInt;
 
-use crate::directory::{FileSlice, OwnedBytes};
+use crate::directory::OwnedBytes;
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::{BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_SIZE};
 use crate::postings::{BlockInfo, FreqReadingOption, SkipReader};
@@ -10,7 +10,7 @@ use crate::query::Bm25Weight;
 use crate::schema::IndexRecordOption;
 use crate::{DocId, Score, TERMINATED};
 
-fn max_score<I: Iterator<Item = Score>>(mut it: I) -> Option<Score> {
+pub(crate) fn max_score<I: Iterator<Item = Score>>(mut it: I) -> Option<Score> {
     it.next().map(|first| it.fold(first, Score::max))
 }
 
@@ -33,7 +33,7 @@ pub struct BlockSegmentPostings {
     skip_reader: SkipReader,
 }
 
-fn decode_bitpacked_block(
+pub(crate) fn decode_bitpacked_block(
     doc_decoder: &mut BlockDecoder,
     freq_decoder_opt: Option<&mut BlockDecoder>,
     data: &[u8],
@@ -53,7 +53,7 @@ fn decode_bitpacked_block(
     }
 }
 
-fn decode_vint_block(
+pub(crate) fn decode_vint_block(
     doc_decoder: &mut BlockDecoder,
     freq_decoder_opt: Option<&mut BlockDecoder>,
     data: &[u8],
@@ -96,11 +96,10 @@ impl BlockSegmentPostings {
     /// term frequency blocks.
     pub(crate) fn open(
         doc_freq: u32,
-        data: FileSlice,
+        bytes: OwnedBytes,
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
-        let bytes = data.read_bytes()?;
         let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
         let skip_reader = match skip_data_opt {
             Some(skip_data) => {

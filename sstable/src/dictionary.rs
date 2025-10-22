@@ -57,7 +57,7 @@ impl Dictionary<VoidSSTable> {
             dictionary_writer.insert(term, &()).unwrap();
         }
         dictionary_writer.finish().unwrap();
-        Dictionary::from_bytes(OwnedBytes::new(buffer)).unwrap()
+        Dictionary::from_bytes_for_tests(OwnedBytes::new(buffer)).unwrap()
     }
 }
 
@@ -150,7 +150,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         }
     }
 
-    pub(crate) fn sstable_delta_reader_block(
+    pub fn sstable_delta_reader_block(
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
@@ -323,7 +323,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     }
 
     /// Creates a term dictionary from the supplied bytes.
-    pub fn from_bytes(owned_bytes: OwnedBytes) -> io::Result<Self> {
+    pub fn from_bytes_for_tests(owned_bytes: OwnedBytes) -> io::Result<Self> {
         Dictionary::open(FileSlice::new(Arc::new(owned_bytes)))
     }
 

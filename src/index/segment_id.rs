@@ -21,6 +21,14 @@ use uuid::Uuid;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SegmentId(Uuid);
 
+impl Default for SegmentId {
+    fn default() -> Self {
+        Self(Uuid::from_bytes(uuid::Bytes::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])))
+    }
+}
+
 #[cfg(test)]
 static AUTO_INC_COUNTER: Lazy<atomic::AtomicUsize> = Lazy::new(atomic::AtomicUsize::default);
 
@@ -68,11 +76,25 @@ impl SegmentId {
         self.0.as_simple().to_string()
     }
 
+    /// Returns the bytes of a segment uuid
+    pub fn uuid_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+
+    /// Returns only the first four bytes of a segment uuid
+    pub fn short_uuid_bytes(&self) -> &[u8] {
+        &self.0.as_bytes()[0..4]
+    }
+
     /// Build a `SegmentId` string from the full uuid string.
     ///
     /// E.g. "a5c4dfcbdfe645089129e308e26d5523"
     pub fn from_uuid_string(uuid_string: &str) -> Result<SegmentId, SegmentIdParseError> {
         FromStr::from_str(uuid_string)
+    }
+
+    pub fn from_bytes(uuid_bytes: [u8; 16]) -> SegmentId {
+        SegmentId(Uuid::from_bytes(uuid::Bytes::from(uuid_bytes)))
     }
 }
 

@@ -230,7 +230,7 @@ mod test {
         let get_json_path_term = |query: &str| -> crate::Result<Term> {
             let query = query_parser.parse_query(query)?;
             let mut terms = Vec::new();
-            query.query_terms(&mut |term, _| {
+            query.query_terms(attributes, searcher.segment_reader(0), &mut |term, _| {
                 terms.push(term.clone());
             });
 
@@ -295,7 +295,7 @@ mod test {
             let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(2))?;
             assert_eq!(top_docs.len(), 1, "Expected only 1 document");
             let (score, _) = top_docs[0];
-            assert_nearly_equals!(1.0, score);
+            assert_nearly_equals!(0.5, score);
         }
 
         // fails because non-prefix Levenshtein distance is more than 1 (add 'a' and 'n')

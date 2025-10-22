@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -13,14 +14,22 @@ use crate::store::Compressor;
 use crate::{Inventory, Opstamp, TrackedObject};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct DeleteMeta {
-    num_deleted_docs: u32,
-    opstamp: Opstamp,
+pub struct DeleteMeta {
+    pub num_deleted_docs: u32,
+    pub opstamp: Opstamp,
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct SegmentMetaInventory {
+pub struct SegmentMetaInventory {
     inventory: Inventory<InnerSegmentMeta>,
+}
+
+impl Debug for SegmentMetaInventory {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SegmentMetaInventory")
+            .field("inventory", &self.inventory.list())
+            .finish()
+    }
 }
 
 impl SegmentMetaInventory {
@@ -50,7 +59,7 @@ impl SegmentMetaInventory {
 /// how many are deleted, etc.
 #[derive(Clone)]
 pub struct SegmentMeta {
-    tracked: TrackedObject<InnerSegmentMeta>,
+    pub tracked: TrackedObject<InnerSegmentMeta>,
 }
 
 impl fmt::Debug for SegmentMeta {
@@ -210,15 +219,15 @@ impl SegmentMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct InnerSegmentMeta {
-    segment_id: SegmentId,
-    max_doc: u32,
-    deletes: Option<DeleteMeta>,
+pub struct InnerSegmentMeta {
+    pub segment_id: SegmentId,
+    pub max_doc: u32,
+    pub deletes: Option<DeleteMeta>,
     /// If you want to avoid the SegmentComponent::TempStore file to be covered by
     /// garbage collection and deleted, set this to true. This is used during merge.
     #[serde(skip)]
     #[serde(default = "default_temp_store")]
-    pub(crate) include_temp_doc_store: Arc<AtomicBool>,
+    pub include_temp_doc_store: Arc<AtomicBool>,
 }
 fn default_temp_store() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))

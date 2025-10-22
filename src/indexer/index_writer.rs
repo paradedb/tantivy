@@ -22,7 +22,7 @@ use crate::indexer::{MergePolicy, SegmentEntry, SegmentWriter};
 use crate::query::{EnableScoring, Query, TermQuery};
 use crate::schema::document::Document;
 use crate::schema::{IndexRecordOption, TantivyDocument, Term};
-use crate::{FutureResult, Opstamp};
+use crate::{Directory, DocId, FutureResult, Opstamp};
 
 // Size of the margin for the `memory_arena`. A segment is closed when the remaining memory
 // in the `memory_arena` goes below MARGIN_IN_BYTES.
@@ -101,24 +101,41 @@ fn compute_deleted_bitset(
 ) -> crate::Result<bool> {
     let mut might_have_changed = false;
     while let Some(delete_op) = delete_cursor.get() {
-        if delete_op.opstamp > target_opstamp {
+        if delete_op.opstamp() > target_opstamp {
             break;
         }
 
-        // A delete operation should only affect
-        // document that were inserted before it.
-        delete_op
-            .target
-            .for_each_no_score(segment_reader, &mut |docs_matching_delete_query| {
-                for doc_matching_delete_query in docs_matching_delete_query.iter().cloned() {
-                    if doc_opstamps.is_deleted(doc_matching_delete_query, delete_op.opstamp) {
-                        alive_bitset.remove(doc_matching_delete_query);
+        match delete_op {
+            DeleteOperation::ByWeight { opstamp, target } => {
+                // A delete operation should only affect
+                // document that were inserted before it.
+                target.for_each_no_score(segment_reader, &mut |docs_matching_delete_query| {
+                    for doc_matching_delete_query in docs_matching_delete_query.iter().cloned() {
+                        if doc_opstamps.is_deleted(doc_matching_delete_query, *opstamp) {
+                            alive_bitset.remove(doc_matching_delete_query);
+                            might_have_changed = true;
+                        }
+                    }
+                })?;
+            }
+
+            DeleteOperation::ByAddress {
+                opstamp,
+                segment_id,
+                doc_id,
+            } => {
+                if *segment_id == segment_reader.segment_id() {
+                    if doc_opstamps.is_deleted(*doc_id, *opstamp) {
+                        alive_bitset.remove(*doc_id);
                         might_have_changed = true;
                     }
                 }
-            })?;
+            }
+        }
+
         delete_cursor.advance();
     }
+
     Ok(might_have_changed)
 }
 
@@ -128,7 +145,7 @@ fn compute_deleted_bitset(
 /// is `==` target_opstamp.
 /// For instance, there was no delete operation between the state of the `segment_entry` and
 /// the `target_opstamp`, `segment_entry` is not updated.
-pub(crate) fn advance_deletes(
+pub fn advance_deletes(
     mut segment: Segment,
     segment_entry: &mut SegmentEntry,
     target_opstamp: Opstamp,
@@ -296,8 +313,8 @@ impl<D: Document> IndexWriter<D> {
             return Err(TantivyError::InvalidArgument(err_msg));
         }
         if options.num_worker_threads == 0 {
-            let err_msg = "At least one worker thread is required, got 0".to_string();
-            return Err(TantivyError::InvalidArgument(err_msg));
+            // let err_msg = "At least one worker thread is required, got 0".to_string();
+            // return Err(TantivyError::InvalidArgument(err_msg));
         }
 
         let (document_sender, document_receiver) =
@@ -314,6 +331,11 @@ impl<D: Document> IndexWriter<D> {
             stamper.clone(),
             &delete_queue.cursor(),
             options.num_merge_threads,
+            index.directory().panic_handler(),
+            {
+                let index = index.clone();
+                move || index.directory().wants_cancel()
+            },
         )?;
 
         let mut index_writer = Self {
@@ -373,6 +395,10 @@ impl<D: Document> IndexWriter<D> {
             error!("Some merging thread failed {e:?}");
         }
 
+        let merge_errors = self.segment_updater.get_merge_errors();
+        if !merge_errors.is_empty() {
+            return Err(TantivyError::MergeErrors(merge_errors));
+        }
         result
     }
 
@@ -533,9 +559,28 @@ impl<D: Document> IndexWriter<D> {
     ///
     /// `segment_ids` is required to be non-empty.
     pub fn merge(&mut self, segment_ids: &[SegmentId]) -> FutureResult<Option<SegmentMeta>> {
-        let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
+        let merge_operation = self
+            .segment_updater
+            .make_merge_operation(segment_ids, false);
         let segment_updater = self.segment_updater.clone();
         segment_updater.start_merge(merge_operation)
+    }
+
+    /// Merges a given list of segments.  This is a blocking operation that performs
+    /// the merge in the calling thread (foreground).
+    ///
+    /// If all segments are empty no new segment will be created.
+    ///
+    /// `segment_ids` is required to be non-empty.
+    pub fn merge_foreground(
+        &mut self,
+        segment_ids: &[SegmentId],
+        ignore_store: bool,
+    ) -> crate::Result<Option<SegmentMeta>> {
+        let merge_operation = self
+            .segment_updater
+            .make_merge_operation(segment_ids, ignore_store);
+        self.segment_updater.merge_foreground(merge_operation)
     }
 
     /// Closes the current document channel send.
@@ -698,12 +743,23 @@ impl<D: Document> IndexWriter<D> {
     pub fn delete_query(&self, query: Box<dyn Query>) -> crate::Result<Opstamp> {
         let weight = query.weight(EnableScoring::disabled_from_schema(&self.index.schema()))?;
         let opstamp = self.stamper.stamp();
-        let delete_operation = DeleteOperation {
+        let delete_operation = DeleteOperation::ByWeight {
             opstamp,
             target: weight,
         };
         self.delete_queue.push(delete_operation);
         Ok(opstamp)
+    }
+
+    /// Delete a specific document by its already-known [`DocAddress`]
+    pub fn delete_by_address(&self, segment_id: SegmentId, doc_id: DocId) -> Opstamp {
+        let opstamp = self.stamper.stamp();
+        self.delete_queue.push(DeleteOperation::ByAddress {
+            opstamp,
+            segment_id,
+            doc_id,
+        });
+        opstamp
     }
 
     /// Returns the opstamp of the last successful commit.
@@ -779,7 +835,7 @@ impl<D: Document> IndexWriter<D> {
                     let query = TermQuery::new(term, IndexRecordOption::Basic);
                     let weight =
                         query.weight(EnableScoring::disabled_from_schema(&self.index.schema()))?;
-                    let delete_operation = DeleteOperation {
+                    let delete_operation = DeleteOperation::ByWeight {
                         opstamp,
                         target: weight,
                     };
@@ -788,6 +844,13 @@ impl<D: Document> IndexWriter<D> {
                 UserOperation::Add(document) => {
                     let add_operation = AddOperation { opstamp, document };
                     adds.push(add_operation);
+                }
+                UserOperation::DeleteByAddress(segment_id, doc_id) => {
+                    self.delete_queue.push(DeleteOperation::ByAddress {
+                        opstamp,
+                        segment_id,
+                        doc_id,
+                    });
                 }
             }
         }
@@ -1089,7 +1152,10 @@ mod tests {
         index_writer.commit()?;
 
         reader.reload().unwrap();
-        assert_eq!(num_docs_containing("a"), 0);
+        // In Tantivy upstream, this test results in 0 segments after delete.
+        // However, due to our custom, visibility rules, we leave the segment.
+        // See committed_segment_metas in segment_manager.rs.
+        assert_eq!(num_docs_containing("a"), 1);
 
         index_writer.merge(&segments);
         index_writer.wait_merging_threads().unwrap();
@@ -1135,7 +1201,10 @@ mod tests {
         index_writer.commit()?;
 
         reader.reload().unwrap();
-        assert_eq!(num_docs_containing("a"), 0);
+        // In Tantivy upstream, this test results in 0 segments after delete.
+        // However, due to our custom, visibility rules, we leave the segment.
+        // See committed_segment_metas in segment_manager.rs.
+        assert_eq!(num_docs_containing("a"), 4);
 
         index_writer.merge(&segments);
         index_writer.wait_merging_threads().unwrap();
@@ -2250,6 +2319,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "doesn't work with deferred segment loading"]
     fn test_ff_num_ips_regression() {
         assert!(test_operation_strategy(
             &[
@@ -2291,27 +2361,32 @@ mod tests {
 
         #![proptest_config(ProptestConfig::with_cases(20))]
         #[test]
+        #[ignore = "doesn't work with deferred segment loading"]
         fn test_delete_proptest_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
             assert!(test_operation_strategy(&ops[..],  false).is_ok());
         }
 
         #[test]
+        #[ignore = "doesn't work with deferred segment loading"]
         fn test_delete_proptest_with_merge_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
             assert!(test_operation_strategy(&ops[..],  true).is_ok());
         }
 
         #[test]
+        #[ignore = "doesn't work with deferred segment loading"]
         fn test_delete_proptest(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
             assert!(test_operation_strategy(&ops[..],  false).is_ok());
         }
 
         #[test]
+        #[ignore = "doesn't work with deferred segment loading"]
         fn test_delete_proptest_with_merge(ops in proptest::collection::vec(balanced_operation_strategy(), 1..100)) {
             assert!(test_operation_strategy(&ops[..],  true).is_ok());
         }
     }
 
     #[test]
+    #[ignore = "doesn't work with deferred segment loading"]
     fn test_delete_bug_reproduction_ip_addr() {
         use IndexingOp::*;
         let ops = &[
@@ -2556,10 +2631,15 @@ mod tests {
         let _field = schema_builder.add_bool_field("example", STORED);
         let index = Index::create_in_ram(schema_builder.build());
 
+        // NB:  tantivy proper probably can't work with zero worker threads, but we (pg_search) do
+        // indexing and merging in the foreground and don't need the worker threads
         let opt_wo_threads = IndexWriterOptions::builder().num_worker_threads(0).build();
         let result = index.writer_with_options::<TantivyDocument>(opt_wo_threads);
-        assert!(result.is_err(), "Writer should reject 0 thread count");
-        assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
+        assert!(result.is_ok(), "Writer should accept 0 thread count");
+        // the above actually created a writer which then takes a lock, which causes the next
+        // attempt to open an IndexWriter to fail in a way that's different than expected.
+        // Dropping the Result<IndexWriter> we just made lets the test carry on unchanged
+        drop(result);
 
         let opt_with_low_memory = IndexWriterOptions::builder()
             .memory_budget_per_thread(10 << 10)

@@ -6,7 +6,6 @@ target
 target/debug
 .vscode
 target/release
-Cargo.lock
 benchmark
 .DS_Store
 *.bk
@@ -15,3 +14,7 @@ trace.dat
 cargo-timing*
 control
 variable
+
+# for `sample record -p`
+profile.json
+profile.json.gz

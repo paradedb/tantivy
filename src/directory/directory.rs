@@ -1,12 +1,20 @@
+use std::any::Any;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io, thread};
 
+use log::Level;
+
 use crate::directory::directory_lock::Lock;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
-use crate::directory::{FileHandle, FileSlice, WatchCallback, WatchHandle, WritePtr};
+use crate::directory::{
+    FileHandle, FileSlice, TerminatingWrite, WatchCallback, WatchHandle, WritePtr,
+};
+use crate::index::SegmentMetaInventory;
+use crate::IndexMeta;
 
 /// Retry the logic of acquiring locks is pretty simple.
 /// We just retry `n` times after a given `duratio`, both
@@ -56,7 +64,7 @@ impl<T: Send + Sync + 'static> From<Box<T>> for DirectoryLock {
 impl Drop for DirectoryLockGuard {
     fn drop(&mut self) {
         if let Err(e) = self.directory.delete(&self.path) {
-            error!("Failed to remove the lock file. {e:?}");
+            error!("Failed to remove the lock file. {:?}", e);
         }
     }
 }
@@ -97,6 +105,8 @@ fn retry_policy(is_blocking: bool) -> RetryPolicy {
     }
 }
 
+pub type DirectoryPanicHandler = Arc<dyn Fn(Box<dyn Any + Send>) + Send + Sync + 'static>;
+
 /// Write-once read many (WORM) abstraction for where
 /// tantivy's data should be stored.
 ///
@@ -135,6 +145,10 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// Returns true if and only if the file exists
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError>;
 
+    /// Returns a boxed `TerminatingWrite` object, to be passed into `open_write`
+    /// which wraps it in a `BufWriter`
+    fn open_write_inner(&self, path: &Path) -> Result<Box<dyn TerminatingWrite>, OpenWriteError>;
+
     /// Opens a writer for the *virtual file* associated with
     /// a [`Path`].
     ///
@@ -161,7 +175,12 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// panic! if `flush` was not called.
     ///
     /// The file may not previously exist.
-    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError>;
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        Ok(io::BufWriter::with_capacity(
+            self.bufwriter_capacity(),
+            self.open_write_inner(path)?,
+        ))
+    }
 
     /// Reads the full content file that has been written using
     /// [`Directory::atomic_write()`].
@@ -223,6 +242,75 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// `OnCommitWithDelay` `ReloadPolicy`. Not implementing watch in a `Directory` only prevents
     /// the `OnCommitWithDelay` `ReloadPolicy` to work properly.
     fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle>;
+
+    /// Allows the directory to list managed files, overriding the ManagedDirectory's default
+    /// list_managed_files
+    fn list_managed_files(&self) -> crate::Result<HashSet<PathBuf>> {
+        Err(crate::TantivyError::InternalError(
+            "list_managed_files not implemented".to_string(),
+        ))
+    }
+
+    /// Allows the directory to register a file as managed, overriding the ManagedDirectory's
+    /// default register_file_as_managed
+    fn register_files_as_managed(
+        &self,
+        _files: Vec<PathBuf>,
+        _overwrite: bool,
+    ) -> crate::Result<()> {
+        Err(crate::TantivyError::InternalError(
+            "register_files_as_managed not implemented".to_string(),
+        ))
+    }
+
+    /// Allows the directory to save IndexMeta, overriding the SegmentUpdater's default save_meta
+    fn save_metas(
+        &self,
+        _metas: &IndexMeta,
+        _previous_metas: &IndexMeta,
+        _payload: &mut (dyn Any + '_),
+    ) -> crate::Result<()> {
+        Err(crate::TantivyError::InternalError(
+            "save_meta not implemented".to_string(),
+        ))
+    }
+
+    /// Allows the directory to load IndexMeta, overriding the SegmentUpdater's default load_meta
+    fn load_metas(&self, _inventory: &SegmentMetaInventory) -> crate::Result<IndexMeta> {
+        Err(crate::TantivyError::InternalError(
+            "load_metas not implemented".to_string(),
+        ))
+    }
+
+    /// Returns true if this directory supports garbage collection.  The default assumption is
+    /// `true`
+    fn supports_garbage_collection(&self) -> bool {
+        true
+    }
+
+    /// Return a panic handler to be assigned to the various thread pools that may be created
+    ///
+    /// The default is [`None`], which indicates that an unhandled panic from a thread pool will
+    /// abort the process
+    fn panic_handler(&self) -> Option<DirectoryPanicHandler> {
+        None
+    }
+
+    /// Returns true if this directory is in a position of requiring that tantivy cancel
+    /// whatever operation(s) it might be doing  Typically this is just for the background
+    /// merge processes but could be used for anything
+    fn wants_cancel(&self) -> bool {
+        false
+    }
+
+    /// Send a logging message to the Directory to handle in its own way
+    fn log(&self, message: &str) {
+        log!(Level::Info, "{message}");
+    }
+
+    fn bufwriter_capacity(&self) -> usize {
+        8192
+    }
 }
 
 /// DirectoryClone
