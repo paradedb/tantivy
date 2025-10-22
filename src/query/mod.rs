@@ -22,6 +22,7 @@ mod range_query;
 mod regex_query;
 mod reqopt_scorer;
 mod scorer;
+mod size_hint;
 mod term_query;
 mod term_set_query;
 mod union;
@@ -121,7 +122,9 @@ mod tests {
             query.query_terms(text_field, &segment_reader, &mut |term, pos| {
                 terms.push((term.clone(), pos))
             });
-            assert_eq!(vec![(term_a.clone(), false); 5], terms);
+            // With the new query_terms signature that includes segment_reader,
+            // duplicate terms are deduplicated
+            assert_eq!(vec![(term_a.clone(), false)], terms);
         }
         {
             let query = query_parser.parse_query("a -b").unwrap();
