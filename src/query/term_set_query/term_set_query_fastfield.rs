@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 
 use columnar::{Column, ColumnType, MonotonicallyMappableToU64};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{
@@ -14,17 +14,19 @@ use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term, TERMINATED}
 #[derive(Debug, Clone)]
 /// `FastFieldTermSetQuery` is the same as [TermSetQuery] but only uses the fast field.
 pub struct FastFieldTermSetQuery {
-    terms_map: HashMap<crate::schema::Field, Vec<Term>>,
+    terms_map: FxHashMap<crate::schema::Field, Vec<Term>>,
 }
 
 impl FastFieldTermSetQuery {
     /// Create a new `FastFieldTermSetQuery`.
     pub fn new<T: IntoIterator<Item = Term>>(terms: T) -> Self {
-        let mut terms_map: HashMap<_, Vec<_>> = HashMap::new();
+        let mut terms_map: FxHashMap<_, Vec<_>> = FxHashMap::default();
         for term in terms {
             terms_map.entry(term.field()).or_default().push(term);
         }
 
+        // TODO: Immediately construct HashSet. Although this is not the hot path: usually the
+        // Weight is created directly.
         for terms in terms_map.values_mut() {
             terms.sort_unstable();
             terms.dedup();
@@ -89,7 +91,8 @@ impl Weight for FastFieldTermSetWeight {
                 "unsupported type for fast fields TermSet {field_type:?}",
             )))
         } else if field_type.is_ip_addr() {
-            let mut values = HashSet::new();
+            let mut values =
+                FxHashSet::with_capacity_and_hasher(self.terms.len(), Default::default());
             for term in &self.terms {
                 values.insert(term.value().as_ip_addr().unwrap());
             }
@@ -105,7 +108,8 @@ impl Weight for FastFieldTermSetWeight {
             // Numeric types.
             //
             // NOTE: Keep in sync with `TermSetQuery::specialized_weight`.
-            let mut values = HashSet::new();
+            let mut values =
+                FxHashSet::with_capacity_and_hasher(self.terms.len(), Default::default());
             for term in &self.terms {
                 let value = term.value();
                 let val_u64 = if let Some(val) = value.as_u64() {
@@ -163,7 +167,7 @@ impl Weight for FastFieldTermSetWeight {
 #[derive(Clone)]
 pub(crate) struct TermSetDocSet<T: Copy + Eq + std::hash::Hash> {
     column: Column<T>,
-    values: HashSet<T>,
+    values: FxHashSet<T>,
     doc_id: DocId,
     max_doc: DocId,
 }
@@ -171,7 +175,7 @@ pub(crate) struct TermSetDocSet<T: Copy + Eq + std::hash::Hash> {
 impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync + 'static>
     TermSetDocSet<T>
 {
-    pub fn new(column: Column<T>, values: HashSet<T>) -> Self {
+    pub fn new(column: Column<T>, values: FxHashSet<T>) -> Self {
         let max_doc = column.num_docs();
         let mut doc_set = Self {
             column,
