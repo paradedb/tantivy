@@ -25,13 +25,6 @@ impl FastFieldTermSetQuery {
             terms_map.entry(term.field()).or_default().push(term);
         }
 
-        // TODO: Immediately construct HashSet. Although this is not the hot path: usually the
-        // Weight is created directly.
-        for terms in terms_map.values_mut() {
-            terms.sort_unstable();
-            terms.dedup();
-        }
-
         FastFieldTermSetQuery { terms_map }
     }
 }
@@ -39,10 +32,10 @@ impl FastFieldTermSetQuery {
 impl Query for FastFieldTermSetQuery {
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
-        for (&field, sorted_terms) in &self.terms_map {
+        for (&field, terms) in &self.terms_map {
             sub_queries.push((
                 Occur::Should,
-                Box::new(FastFieldTermSetWeight::new(field, sorted_terms.clone())),
+                Box::new(FastFieldTermSetWeight::new(field, terms.clone())),
             ));
         }
         Ok(Box::new(BooleanWeight::new(

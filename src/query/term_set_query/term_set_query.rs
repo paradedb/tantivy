@@ -23,11 +23,6 @@ impl TermSetQuery {
             terms_map.entry(term.field()).or_default().push(term);
         }
 
-        for terms in terms_map.values_mut() {
-            terms.sort_unstable();
-            terms.dedup();
-        }
-
         TermSetQuery { terms_map }
     }
 
@@ -37,7 +32,7 @@ impl TermSetQuery {
     ) -> crate::Result<BooleanWeight<DoNothingCombiner>> {
         let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
 
-        for (&field, sorted_terms) in self.terms_map.iter() {
+        for (&field, terms) in self.terms_map.iter() {
             let field_entry = schema.get_field_entry(field);
             let field_type = field_entry.field_type();
             if !field_type.is_indexed() {
@@ -60,18 +55,20 @@ impl TermSetQuery {
             if field_type.is_fast() && supported_for_ff {
                 sub_queries.push((
                     Occur::Should,
-                    Box::new(FastFieldTermSetWeight::new(field, sorted_terms.to_vec())),
+                    Box::new(FastFieldTermSetWeight::new(field, terms.to_vec())),
                 ));
             } else {
+                let mut sorted_terms: Vec<(&[u8], u64)> = terms
+                    .iter()
+                    .map(|key| (key.serialized_value_bytes(), 0))
+                    .collect::<Vec<_>>();
+                sorted_terms.sort_unstable();
+                sorted_terms.dedup();
                 // In practice this won't fail because:
                 // - we are writing to memory, so no IoError
-                // - Terms are ordered
-                let map = Map::from_iter(
-                    sorted_terms
-                        .iter()
-                        .map(|key| (key.serialized_value_bytes(), 0)),
-                )
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                // - `sorted_terms` are ordered
+                let map = Map::from_iter(sorted_terms.into_iter())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
                 sub_queries.push((
                     Occur::Should,
