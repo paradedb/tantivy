@@ -95,16 +95,7 @@ impl FastFieldTermSetWeight {
             // NOTE: Keep in sync with `TermSetQuery::specialized_weight`.
             let mut values = FxHashSet::default();
             for term in terms_iter {
-                let value = term.value();
-                let val_u64 = if let Some(val) = value.as_u64() {
-                    val
-                } else if let Some(val) = value.as_i64() {
-                    val.to_u64()
-                } else if let Some(val) = value.as_f64() {
-                    val.to_u64()
-                } else if let Some(val) = value.as_date() {
-                    val.to_u64()
-                } else {
+                let Some(val_u64) = term.value().as_u64_lenient() else {
                     return Err(crate::TantivyError::InvalidArgument(format!(
                         "Expected term with u64, i64, f64, or date, but got {:?}",
                         term
