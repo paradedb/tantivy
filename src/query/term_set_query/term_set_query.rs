@@ -9,6 +9,10 @@ use crate::query::{AutomatonWeight, BooleanWeight, EnableScoring, Occur, Query, 
 use crate::schema::{Field, Schema, Type};
 use crate::{SegmentReader, Term};
 
+/// The term set query will use the fast field implementation if the number of terms is larger than
+/// this threshold.
+const TERM_SET_FAST_FIELD_CARDINALITY_THRESHOLD: usize = 1024;
+
 /// A Term Set Query matches all of the documents containing any of the Term provided
 #[derive(Debug, Clone)]
 pub struct TermSetQuery {
@@ -57,7 +61,13 @@ impl TermSetQuery {
                 _ => false,
             };
 
-            if field_type.is_fast() && supported_for_ff {
+            // NOTE: At this point, the terms have not been deduped, and so this threshold may not
+            // be perfectly accurate. But in the case of very large input sets, it's worth avoiding
+            // sorting/deduping the terms until after we've determined their type.
+            if field_type.is_fast()
+                && supported_for_ff
+                && terms.len() > TERM_SET_FAST_FIELD_CARDINALITY_THRESHOLD
+            {
                 sub_queries.push((
                     Occur::Should,
                     Box::new(FastFieldTermSetWeight::new(field, terms.to_vec())),
