@@ -33,7 +33,10 @@ impl Query for FastFieldTermSetQuery {
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
         for (&field, terms) in &self.terms_map {
-            sub_queries.push((Occur::Should, Box::new(FastFieldTermSetWeight::new(field, terms)?)));
+            sub_queries.push((
+                Occur::Should,
+                Box::new(FastFieldTermSetWeight::new(field, terms)?),
+            ));
         }
         Ok(Box::new(BooleanWeight::new(
             sub_queries,
@@ -149,7 +152,8 @@ impl Weight for FastFieldTermSetWeight {
             TermSet::Ipv6Addr(values) => {
                 if !field_type.is_ip_addr() {
                     return Err(crate::TantivyError::InvalidArgument(format!(
-                        "fast fields TermSet for field `{field_name}` contains IP addresses, but the field type is {field_type:?}"
+                        "fast fields TermSet for field `{field_name}` contains IP addresses, but \
+                         the field type is {field_type:?}"
                     )));
                 }
                 let Some(ip_addr_column): Option<Column<Ipv6Addr>> =
@@ -163,7 +167,8 @@ impl Weight for FastFieldTermSetWeight {
             TermSet::U64(values) => {
                 if field_type.is_ip_addr() {
                     return Err(crate::TantivyError::InvalidArgument(format!(
-                        "fast fields TermSet for field `{field_name}` contains numeric values, but the field type is {field_type:?}"
+                        "fast fields TermSet for field `{field_name}` contains numeric values, \
+                         but the field type is {field_type:?}"
                     )));
                 }
                 let fast_field_reader = reader.fast_fields();
