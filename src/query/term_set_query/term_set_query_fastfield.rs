@@ -33,10 +33,7 @@ impl Query for FastFieldTermSetQuery {
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
         for (&field, terms) in &self.terms_map {
-            sub_queries.push((
-                Occur::Should,
-                Box::new(FastFieldTermSetWeight::new(field, terms.clone())),
-            ));
+            sub_queries.push((Occur::Should, Box::new(FastFieldTermSetWeight::new(field, terms)?)));
         }
         Ok(Box::new(BooleanWeight::new(
             sub_queries,
@@ -49,61 +46,52 @@ impl Query for FastFieldTermSetQuery {
 // --- FastFieldTermSetWeight ---
 
 #[derive(Clone, Debug)]
+enum TermSet {
+    U64(FxHashSet<u64>),
+    Ipv6Addr(FxHashSet<Ipv6Addr>),
+}
+
+#[derive(Clone, Debug)]
 pub struct FastFieldTermSetWeight {
     field: crate::schema::Field,
-    terms: Vec<Term>,
+    term_set: Option<TermSet>,
 }
 
 impl FastFieldTermSetWeight {
-    pub fn new(field: crate::schema::Field, terms: Vec<Term>) -> Self {
-        Self { field, terms }
-    }
-}
+    pub fn new<'a>(
+        field: crate::schema::Field,
+        terms: impl IntoIterator<Item = &'a Term>,
+    ) -> crate::Result<Self> {
+        let mut terms_iter = terms.into_iter().peekable();
 
-impl Weight for FastFieldTermSetWeight {
-    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
-        if self.terms.is_empty() {
-            return Ok(Box::new(EmptyScorer));
+        if terms_iter.peek().is_none() {
+            return Ok(Self {
+                field,
+                term_set: None,
+            });
         }
 
-        let field_entry = reader.schema().get_field_entry(self.field);
-        let field_type = field_entry.field_type();
-        let field_name = field_entry.name();
-
-        if field_type.is_json() {
-            // TODO: Handle JSON fields.
-            Err(crate::TantivyError::InvalidArgument(format!(
-                "unsupported type for fast fields TermSet {field_type:?}",
-            )))
-        } else if field_type.is_str() {
-            // TODO: Handle Str fields. They are superficially simple, because we can convert all
-            // input terms to TermOrdinals, and then use the numeric codepath. But it would require
-            // a batch operation for looking up many terms, because otherwise each term lookup would
-            // involve decompressing a term dictionary block (some of them repeatedly).
-            Err(crate::TantivyError::InvalidArgument(format!(
-                "unsupported type for fast fields TermSet {field_type:?}",
-            )))
-        } else if field_type.is_ip_addr() {
-            let mut values =
-                FxHashSet::with_capacity_and_hasher(self.terms.len(), Default::default());
-            for term in &self.terms {
-                values.insert(term.value().as_ip_addr().unwrap());
+        let first_term_value = terms_iter.peek().unwrap().value();
+        let term_set = if first_term_value.as_ip_addr().is_some() {
+            let mut values = FxHashSet::default();
+            for term in terms_iter {
+                let value = term.value();
+                if let Some(val) = value.as_ip_addr() {
+                    values.insert(val);
+                } else {
+                    return Err(crate::TantivyError::InvalidArgument(format!(
+                        "Expected term with ip address, but got {:?}",
+                        term
+                    )));
+                }
             }
-
-            let Some(ip_addr_column): Option<Column<Ipv6Addr>> =
-                reader.fast_fields().column_opt(field_name)?
-            else {
-                return Ok(Box::new(EmptyScorer));
-            };
-            let docset = TermSetDocSet::new(ip_addr_column, values);
-            Ok(Box::new(ConstScorer::new(docset, boost)))
+            TermSet::Ipv6Addr(values)
         } else {
             // Numeric types.
             //
             // NOTE: Keep in sync with `TermSetQuery::specialized_weight`.
-            let mut values =
-                FxHashSet::with_capacity_and_hasher(self.terms.len(), Default::default());
-            for term in &self.terms {
+            let mut values = FxHashSet::default();
+            for term in terms_iter {
                 let value = term.value();
                 let val_u64 = if let Some(val) = value.as_u64() {
                     val
@@ -121,22 +109,79 @@ impl Weight for FastFieldTermSetWeight {
                 };
                 values.insert(val_u64);
             }
+            TermSet::U64(values)
+        };
 
-            let fast_field_reader = reader.fast_fields();
-            let Some((column, _col_type)) = fast_field_reader.u64_lenient_for_type(
-                Some(&[
-                    ColumnType::U64,
-                    ColumnType::I64,
-                    ColumnType::F64,
-                    ColumnType::DateTime,
-                ]),
-                field_name,
-            )?
-            else {
-                return Ok(Box::new(EmptyScorer));
-            };
-            let docset = TermSetDocSet::new(column, values);
-            Ok(Box::new(ConstScorer::new(docset, boost)))
+        Ok(Self {
+            field,
+            term_set: Some(term_set),
+        })
+    }
+}
+
+impl Weight for FastFieldTermSetWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        let Some(term_set) = &self.term_set else {
+            return Ok(Box::new(EmptyScorer));
+        };
+
+        let field_entry = reader.schema().get_field_entry(self.field);
+        let field_type = field_entry.field_type();
+        let field_name = field_entry.name();
+
+        if field_type.is_json() {
+            // TODO: Handle JSON fields.
+            return Err(crate::TantivyError::InvalidArgument(format!(
+                "unsupported type for fast fields TermSet {field_type:?}",
+            )));
+        } else if field_type.is_str() {
+            // TODO: Handle Str fields. They are superficially simple, because we can convert all
+            // input terms to TermOrdinals, and then use the numeric codepath. But it would require
+            // a batch operation for looking up many terms, because otherwise each term lookup would
+            // involve decompressing a term dictionary block (some of them repeatedly). And those
+            // lookups would need to happen per-segment, unlike with numeric types.
+            return Err(crate::TantivyError::InvalidArgument(format!(
+                "unsupported type for fast fields TermSet {field_type:?}",
+            )));
+        }
+
+        match term_set {
+            TermSet::Ipv6Addr(values) => {
+                if !field_type.is_ip_addr() {
+                    return Err(crate::TantivyError::InvalidArgument(format!(
+                        "fast fields TermSet for field `{field_name}` contains IP addresses, but the field type is {field_type:?}"
+                    )));
+                }
+                let Some(ip_addr_column): Option<Column<Ipv6Addr>> =
+                    reader.fast_fields().column_opt(field_name)?
+                else {
+                    return Ok(Box::new(EmptyScorer));
+                };
+                let docset = TermSetDocSet::new(ip_addr_column, values.clone());
+                Ok(Box::new(ConstScorer::new(docset, boost)))
+            }
+            TermSet::U64(values) => {
+                if field_type.is_ip_addr() {
+                    return Err(crate::TantivyError::InvalidArgument(format!(
+                        "fast fields TermSet for field `{field_name}` contains numeric values, but the field type is {field_type:?}"
+                    )));
+                }
+                let fast_field_reader = reader.fast_fields();
+                let Some((column, _col_type)) = fast_field_reader.u64_lenient_for_type(
+                    Some(&[
+                        ColumnType::U64,
+                        ColumnType::I64,
+                        ColumnType::F64,
+                        ColumnType::DateTime,
+                    ]),
+                    field_name,
+                )?
+                else {
+                    return Ok(Box::new(EmptyScorer));
+                };
+                let docset = TermSetDocSet::new(column, values.clone());
+                Ok(Box::new(ConstScorer::new(docset, boost)))
+            }
         }
     }
 

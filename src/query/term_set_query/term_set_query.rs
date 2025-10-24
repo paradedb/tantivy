@@ -70,7 +70,7 @@ impl TermSetQuery {
             {
                 sub_queries.push((
                     Occur::Should,
-                    Box::new(FastFieldTermSetWeight::new(field, terms.to_vec())),
+                    Box::new(FastFieldTermSetWeight::new(field, terms.iter())?),
                 ));
             } else {
                 let mut sorted_terms: Vec<(&[u8], u64)> = terms
