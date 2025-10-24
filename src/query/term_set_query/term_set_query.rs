@@ -41,9 +41,14 @@ impl TermSetQuery {
             }
 
             let supported_for_ff = match field_type.value_type() {
-                Type::U64 | Type::I64 | Type::F64 | Type::Bool | Type::Date | Type::IpAddr => {
+                Type::U64 | Type::I64 | Type::F64 | Type::Date | Type::IpAddr => {
                     // NOTE: Keep in sync with `FastFieldTermSetWeight::scorer`.
                     true
+                }
+                Type::Bool => {
+                    // Guaranteed to be low cardinality, so always more efficient to use posting
+                    // lists.
+                    false
                 }
                 Type::Json | Type::Str => {
                     // Explicitly not supported yet: see `term_set_query_fastfield.rs`.

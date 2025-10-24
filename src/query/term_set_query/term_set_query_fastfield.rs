@@ -111,13 +111,11 @@ impl Weight for FastFieldTermSetWeight {
                     val.to_u64()
                 } else if let Some(val) = value.as_f64() {
                     val.to_u64()
-                } else if let Some(val) = value.as_bool() {
-                    val.to_u64()
                 } else if let Some(val) = value.as_date() {
                     val.to_u64()
                 } else {
                     return Err(crate::TantivyError::InvalidArgument(format!(
-                        "Expected term with u64, i64, f64, bool, or date, but got {:?}",
+                        "Expected term with u64, i64, f64, or date, but got {:?}",
                         term
                     )));
                 };
@@ -130,7 +128,6 @@ impl Weight for FastFieldTermSetWeight {
                     ColumnType::U64,
                     ColumnType::I64,
                     ColumnType::F64,
-                    ColumnType::Bool,
                     ColumnType::DateTime,
                 ]),
                 field_name,
@@ -316,26 +313,6 @@ mod tests {
 
         let count = searcher.search(&query, &Count)?;
         assert_eq!(count, 2);
-
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_term_set_query_fast_field_bool() -> crate::Result<()> {
-        let index = create_test_index()?;
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        let bool_field_fast = index.schema().get_field("bool_fast").unwrap();
-
-        let query = FastFieldTermSetQuery::new(vec![Term::from_field_bool(bool_field_fast, true)]);
-
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 2);
-
-        let query = FastFieldTermSetQuery::new(vec![Term::from_field_bool(bool_field_fast, false)]);
-
-        let count = searcher.search(&query, &Count)?;
-        assert_eq!(count, 1);
 
         Ok(())
     }
