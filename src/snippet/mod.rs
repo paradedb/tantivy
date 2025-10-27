@@ -366,6 +366,7 @@ fn select_top_fragments(
     fragments: &[FragmentCandidate],
     text: &str,
     snippets_limit: usize,
+    snippets_offset: usize,
 ) -> Vec<Snippet> {
     if fragments.is_empty() {
         return vec![];
@@ -389,13 +390,14 @@ fn select_top_fragments(
         }
     });
 
-    // Take top N snippets (or all if snippets_limit == 0)
-    let take_count = if snippets_limit == 0 {
+    // Apply offset and take top N snippets (or all if snippets_limit == 0)
+    let start = snippets_offset.min(indexed_fragments.len());
+    let end = if snippets_limit == 0 {
         indexed_fragments.len()
     } else {
-        snippets_limit.min(indexed_fragments.len())
+        (start + snippets_limit).min(indexed_fragments.len())
     };
-    let selected = &indexed_fragments[..take_count];
+    let selected = &indexed_fragments[start..end];
 
     // Re-sort by original position in document
     let mut selected_sorted: Vec<(usize, &FragmentCandidate)> = selected.to_vec();
@@ -542,6 +544,7 @@ pub struct SnippetGenerator {
     matches_limit: Option<usize>,
     matches_offset: Option<usize>,
     snippets_limit: usize,
+    snippets_offset: usize,
 }
 
 impl SnippetGenerator {
@@ -560,6 +563,7 @@ impl SnippetGenerator {
             matches_limit: None,
             matches_offset: None,
             snippets_limit: 1,
+            snippets_offset: 0,
         }
     }
 
@@ -616,6 +620,7 @@ impl SnippetGenerator {
             matches_limit: None,
             matches_offset: None,
             snippets_limit: 1,
+            snippets_offset: 0,
         })
     }
 
@@ -628,6 +633,11 @@ impl SnippetGenerator {
     /// Set to 0 to return all snippets (unlimited).
     pub fn set_snippets_limit(&mut self, snippets_limit: usize) {
         self.snippets_limit = snippets_limit;
+    }
+
+    /// Sets the offset for the snippets to return. Default is 0.
+    pub fn set_snippets_offset(&mut self, snippets_offset: usize) {
+        self.snippets_offset = snippets_offset;
     }
 
     #[cfg(test)]
@@ -686,7 +696,12 @@ impl SnippetGenerator {
             self.matches_limit,
             self.matches_offset,
         );
-        select_top_fragments(&fragment_candidates[..], text, self.snippets_limit)
+        select_top_fragments(
+            &fragment_candidates[..],
+            text,
+            self.snippets_limit,
+            self.snippets_offset,
+        )
     }
 
     /// Generates multiple snippets for the given `Document`.
@@ -1244,7 +1259,7 @@ Survey in 2016, 2017, and 2018."#;
         assert_eq!(fragments.len(), 4);
 
         // Test getting top 2 snippets
-        let snippets = select_top_fragments(&fragments[..], text, 2);
+        let snippets = select_top_fragments(&fragments[..], text, 2, 0);
         assert_eq!(snippets.len(), 2);
 
         // Both snippets should contain "rust" (higher score 1.0) since we're taking top 2
@@ -1270,7 +1285,7 @@ Survey in 2016, 2017, and 2018."#;
         );
 
         // Test getting all snippets (num_snippets = 0)
-        let snippets = select_top_fragments(&fragments[..], text, 0);
+        let snippets = select_top_fragments(&fragments[..], text, 0, 0);
         assert_eq!(snippets.len(), 4);
 
         // Verify they are in document order
@@ -1301,7 +1316,7 @@ Survey in 2016, 2017, and 2018."#;
         assert_eq!(fragments.len(), 2);
 
         // Request 10 snippets, should only get 2
-        let snippets = select_top_fragments(&fragments[..], text, 10);
+        let snippets = select_top_fragments(&fragments[..], text, 10, 0);
         assert_eq!(snippets.len(), 2);
     }
 
@@ -1323,7 +1338,7 @@ Survey in 2016, 2017, and 2018."#;
         );
 
         // Request top 2 snippets
-        let snippets = select_top_fragments(&fragments[..], text, 2);
+        let snippets = select_top_fragments(&fragments[..], text, 2, 0);
         assert_eq!(snippets.len(), 2);
 
         // The fragment with "rust rust" should have highest score (2.0)
@@ -1351,12 +1366,38 @@ Survey in 2016, 2017, and 2018."#;
         );
 
         // All snippets have same score (1.0), so position should be tie-breaker
-        let snippets = select_top_fragments(&fragments[..], text, 2);
+        let snippets = select_top_fragments(&fragments[..], text, 2, 0);
         assert_eq!(snippets.len(), 2);
 
         // Should get first two occurrences
         assert_eq!(snippets[0].fragment(), "a rust b c");
         assert_eq!(snippets[1].fragment(), "d e f rust");
+    }
+
+    #[test]
+    fn test_snippets_with_offset() {
+        let text = "a rust b c d rust e f g rust h i j";
+
+        let mut terms = BTreeMap::new();
+        terms.insert(String::from("rust"), 1.0);
+
+        let fragments = search_fragments(
+            &mut From::from(SimpleTokenizer::default()),
+            text,
+            &terms,
+            10,
+            None,
+            None,
+        );
+
+        // All snippets have same score (1.0)
+        // Request 2 snippets, with offset 1
+        let snippets = select_top_fragments(&fragments[..], text, 2, 1);
+        assert_eq!(snippets.len(), 2);
+
+        // Should get second and third occurrences
+        assert_eq!(snippets[0].fragment(), "d rust e f");
+        assert_eq!(snippets[1].fragment(), "g rust h i");
     }
 
     #[test]
@@ -1377,7 +1418,7 @@ Survey in 2016, 2017, and 2018."#;
         // No matching terms, no fragments
         assert_eq!(fragments.len(), 0);
 
-        let snippets = select_top_fragments(&fragments[..], text, 5);
+        let snippets = select_top_fragments(&fragments[..], text, 5, 0);
         assert_eq!(snippets.len(), 0);
     }
 
