@@ -1403,7 +1403,8 @@ Survey in 2016, 2017, and 2018."#;
         snippet_generator.set_number_of_fragments(3);
         snippet_generator.set_max_num_chars(30);
 
-        let text = "The rust programming language is great. Rust is fast. Rust is safe. The rust compiler is helpful.";
+        let text = "The rust programming language is great. Rust is fast. Rust is safe. The rust \
+                    compiler is helpful.";
         let snippets = snippet_generator.snippets(text);
 
         // Should get 3 fragments
@@ -1514,13 +1515,12 @@ Survey in 2016, 2017, and 2018."#;
         snippet_generator.set_number_of_fragments(3);
         snippet_generator.set_max_num_chars(50);
 
-        let text =
-            "rust is at the beginning. Lorem ipsum dolor sit amet consectetur adipiscing elit. \
-                    Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. \
-                    Here is rust in the middle of the document with more text around it. \
-                    Ut enim ad minim veniam quis nostrud exercitation ullamco laboris. \
-                    Nisi ut aliquip ex ea commodo consequat duis aute irure dolor. \
-                    And finally rust appears at the end of this long document.";
+        let text = "rust is at the beginning. Lorem ipsum dolor sit amet consectetur adipiscing \
+                    elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Here \
+                    is rust in the middle of the document with more text around it. Ut enim ad \
+                    minim veniam quis nostrud exercitation ullamco laboris. Nisi ut aliquip ex ea \
+                    commodo consequat duis aute irure dolor. And finally rust appears at the end \
+                    of this long document.";
         let snippets = snippet_generator.snippets(text);
 
         // Should get 3 fragments for the 3 matches
