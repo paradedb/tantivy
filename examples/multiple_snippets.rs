@@ -61,7 +61,7 @@ fn main() -> tantivy::Result<()> {
     println!("\n=== Multiple Snippets (New Feature) ===\n");
 
     // Configure to return multiple snippets
-    snippet_generator.set_number_of_fragments(3); // Get up to 3 snippets
+    snippet_generator.set_snippets_limit(3); // Get up to 3 snippets
     snippet_generator.set_max_num_chars(80); // Smaller fragments
 
     for (score, doc_address) in top_docs {

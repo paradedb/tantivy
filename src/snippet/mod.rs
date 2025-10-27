@@ -74,7 +74,7 @@
 //! # let searcher = reader.searcher();
 //! let mut snippet_generator = SnippetGenerator::create(&searcher, &*query, text_field)?;
 //! snippet_generator.set_max_num_chars(50);
-//! snippet_generator.set_number_of_fragments(3); // Get up to 3 snippets
+//! snippet_generator.set_snippets_limit(3); // Get up to 3 snippets
 //!
 //! let snippets = snippet_generator.snippets_from_doc(&doc);
 //! // Returns multiple snippets, one for each match location
@@ -89,8 +89,8 @@
 //! You can also specify the maximum number of characters for the snippets generated with the
 //! `set_max_num_chars` method. By default, this limit is set to 150.
 //!
-//! To get multiple snippets instead of just one, use `set_number_of_fragments()` to specify
-//! how many fragments to return (default is 1). Set to 0 to return all matching fragments.
+//! To get multiple snippets instead of just one, use `set_snippets_limit()` to specify
+//! how many snippets to return (default is 1). Set to 0 to return all matching snippets.
 //!
 //! SnippetGenerator needs to be created from the `Searcher` and the query, and the field on which
 //! the `SnippetGenerator` should generate the snippets.
@@ -257,8 +257,8 @@ fn search_fragments(
     text: &str,
     terms: &BTreeMap<String, Score>,
     max_num_chars: usize,
-    fragment_limit: Option<usize>,
-    fragment_offset: Option<usize>,
+    matches_limit: Option<usize>,
+    matches_offset: Option<usize>,
 ) -> Vec<FragmentCandidate> {
     let mut token_stream = tokenizer.token_stream(text);
     let mut fragment = FragmentCandidate::new(0);
@@ -279,14 +279,14 @@ fn search_fragments(
         fragments.push(fragment)
     }
 
-    if fragment_offset.is_none() && fragment_limit.is_none() {
+    if matches_offset.is_none() && matches_limit.is_none() {
         return fragments;
     }
 
     // Skip the first offset snippets, and take the next limit snippets
     // across all FragmentCandidates
-    let offset_count = fragment_offset.unwrap_or(0);
-    let limit_count = fragment_limit.unwrap_or(fragments.len());
+    let offset_count = matches_offset.unwrap_or(0);
+    let limit_count = matches_limit.unwrap_or(fragments.len());
 
     let mut remaining_offset = offset_count;
     let mut remaining_limit = limit_count;
@@ -359,13 +359,13 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
 
 /// Returns multiple Snippets
 ///
-/// Takes a vector of `FragmentCandidate`s, the text, and the number of fragments to return.
-/// Selects the top N fragments by score, with position used as a tie-breaker.
-/// Returns fragments sorted by their position in the document.
+/// Takes a vector of `FragmentCandidate`s, the text, and the number of snippets to return.
+/// Selects the top N snippets by score, with position used as a tie-breaker.
+/// Returns snippets sorted by their position in the document.
 fn select_top_fragments(
     fragments: &[FragmentCandidate],
     text: &str,
-    num_fragments: usize,
+    snippets_limit: usize,
 ) -> Vec<Snippet> {
     if fragments.is_empty() {
         return vec![];
@@ -389,11 +389,11 @@ fn select_top_fragments(
         }
     });
 
-    // Take top N fragments (or all if num_fragments == 0)
-    let take_count = if num_fragments == 0 {
+    // Take top N snippets (or all if snippets_limit == 0)
+    let take_count = if snippets_limit == 0 {
         indexed_fragments.len()
     } else {
-        num_fragments.min(indexed_fragments.len())
+        snippets_limit.min(indexed_fragments.len())
     };
     let selected = &indexed_fragments[..take_count];
 
@@ -539,9 +539,9 @@ pub struct SnippetGenerator {
     tokenizer: TextAnalyzer,
     field: Field,
     max_num_chars: usize,
-    fragment_limit: Option<usize>,
-    fragment_offset: Option<usize>,
-    num_fragments: usize,
+    matches_limit: Option<usize>,
+    matches_offset: Option<usize>,
+    snippets_limit: usize,
 }
 
 impl SnippetGenerator {
@@ -557,18 +557,18 @@ impl SnippetGenerator {
             tokenizer,
             field,
             max_num_chars,
-            fragment_limit: None,
-            fragment_offset: None,
-            num_fragments: 1,
+            matches_limit: None,
+            matches_offset: None,
+            snippets_limit: 1,
         }
     }
 
-    pub fn set_limit(&mut self, limit: usize) {
-        self.fragment_limit = Some(limit);
+    pub fn set_matches_limit(&mut self, limit: usize) {
+        self.matches_limit = Some(limit);
     }
 
-    pub fn set_offset(&mut self, offset: usize) {
-        self.fragment_offset = Some(offset);
+    pub fn set_matches_offset(&mut self, offset: usize) {
+        self.matches_offset = Some(offset);
     }
 
     /// Creates a new snippet generator
@@ -613,9 +613,9 @@ impl SnippetGenerator {
             tokenizer,
             field,
             max_num_chars: DEFAULT_MAX_NUM_CHARS,
-            fragment_limit: None,
-            fragment_offset: None,
-            num_fragments: 1,
+            matches_limit: None,
+            matches_offset: None,
+            snippets_limit: 1,
         })
     }
 
@@ -624,10 +624,10 @@ impl SnippetGenerator {
         self.max_num_chars = max_num_chars;
     }
 
-    /// Sets the number of fragments to return. Default is 1.
-    /// Set to 0 to return all fragments (unlimited).
-    pub fn set_number_of_fragments(&mut self, num_fragments: usize) {
-        self.num_fragments = num_fragments;
+    /// Sets the number of snippets to return. Default is 1.
+    /// Set to 0 to return all snippets (unlimited).
+    pub fn set_snippets_limit(&mut self, snippets_limit: usize) {
+        self.snippets_limit = snippets_limit;
     }
 
     #[cfg(test)]
@@ -663,19 +663,19 @@ impl SnippetGenerator {
             text,
             &self.terms_text,
             self.max_num_chars,
-            self.fragment_limit,
-            self.fragment_offset,
+            self.matches_limit,
+            self.matches_offset,
         );
         select_best_fragment_combination(&fragment_candidates[..], text)
     }
 
     /// Generates multiple snippets for the given text.
     ///
-    /// Returns up to `num_fragments` snippets, sorted by their position in the document.
-    /// The fragments are selected based on their score (sum of TF-IDF scores of matching terms),
-    /// with position used as a tie-breaker (earlier fragments preferred).
+    /// Returns up to `snippets_limit` snippets, sorted by their position in the document.
+    /// The snippets are selected based on their score (sum of TF-IDF scores of matching terms),
+    /// with position used as a tie-breaker (earlier snippets preferred).
     ///
-    /// If `num_fragments` is set to 0 (via `set_number_of_fragments`), all matching fragments
+    /// If `snippets_limit` is set to 0 (via `set_snippets_limit`), all matching snippets
     /// are returned.
     pub fn snippets(&self, text: &str) -> Vec<Snippet> {
         let fragment_candidates = search_fragments(
@@ -683,10 +683,10 @@ impl SnippetGenerator {
             text,
             &self.terms_text,
             self.max_num_chars,
-            self.fragment_limit,
-            self.fragment_offset,
+            self.matches_limit,
+            self.matches_offset,
         );
-        select_top_fragments(&fragment_candidates[..], text, self.num_fragments)
+        select_top_fragments(&fragment_candidates[..], text, self.snippets_limit)
     }
 
     /// Generates multiple snippets for the given `Document`.
@@ -694,7 +694,7 @@ impl SnippetGenerator {
     /// This method extracts the text associated with the `SnippetGenerator`'s field
     /// and computes multiple snippets.
     ///
-    /// Returns up to `num_fragments` snippets, sorted by their position in the document.
+    /// Returns up to `num_snippets` snippets, sorted by their position in the document.
     pub fn snippets_from_doc<D: Document>(&self, doc: &D) -> Vec<Snippet> {
         let mut text = String::new();
         for (field, value) in doc.iter_fields_and_values() {
@@ -1115,8 +1115,8 @@ Survey in 2016, 2017, and 2018."#;
             TEST_TEXT,
             &terms,
             100,
-            Some(2),
-            Some(1),
+            Some(2), // matches_limit
+            Some(1), // matches_offset
         );
         assert_eq!(fragments.len(), 2);
         {
@@ -1243,7 +1243,7 @@ Survey in 2016, 2017, and 2018."#;
         // Should have 4 fragments, each containing one match
         assert_eq!(fragments.len(), 4);
 
-        // Test getting top 2 fragments
+        // Test getting top 2 snippets
         let snippets = select_top_fragments(&fragments[..], text, 2);
         assert_eq!(snippets.len(), 2);
 
@@ -1269,7 +1269,7 @@ Survey in 2016, 2017, and 2018."#;
             None,
         );
 
-        // Test getting all fragments (num_fragments = 0)
+        // Test getting all snippets (num_snippets = 0)
         let snippets = select_top_fragments(&fragments[..], text, 0);
         assert_eq!(snippets.len(), 4);
 
@@ -1300,7 +1300,7 @@ Survey in 2016, 2017, and 2018."#;
         // Only 2 fragments available
         assert_eq!(fragments.len(), 2);
 
-        // Request 10 fragments, should only get 2
+        // Request 10 snippets, should only get 2
         let snippets = select_top_fragments(&fragments[..], text, 10);
         assert_eq!(snippets.len(), 2);
     }
@@ -1322,7 +1322,7 @@ Survey in 2016, 2017, and 2018."#;
             None,
         );
 
-        // Request top 2 fragments
+        // Request top 2 snippets
         let snippets = select_top_fragments(&fragments[..], text, 2);
         assert_eq!(snippets.len(), 2);
 
@@ -1350,7 +1350,7 @@ Survey in 2016, 2017, and 2018."#;
             None,
         );
 
-        // All fragments have same score (1.0), so position should be tie-breaker
+        // All snippets have same score (1.0), so position should be tie-breaker
         let snippets = select_top_fragments(&fragments[..], text, 2);
         assert_eq!(snippets.len(), 2);
 
@@ -1399,8 +1399,8 @@ Survey in 2016, 2017, and 2018."#;
         let mut snippet_generator =
             SnippetGenerator::create(&searcher, &*query, text_field).unwrap();
 
-        // Set to return 3 fragments
-        snippet_generator.set_number_of_fragments(3);
+        // Set to return 3 snippets
+        snippet_generator.set_snippets_limit(3);
         snippet_generator.set_max_num_chars(30);
 
         let text = "The rust programming language is great. Rust is fast. Rust is safe. The rust \
@@ -1441,8 +1441,8 @@ Survey in 2016, 2017, and 2018."#;
         let mut snippet_generator =
             SnippetGenerator::create(&searcher, &*query, text_field).unwrap();
 
-        // Set to return unlimited fragments
-        snippet_generator.set_number_of_fragments(0);
+        // Set to return unlimited snippets
+        snippet_generator.set_snippets_limit(0);
         snippet_generator.set_max_num_chars(15);
 
         let text = "rust a b c rust d e f rust g h i rust j k l";
@@ -1512,7 +1512,7 @@ Survey in 2016, 2017, and 2018."#;
         let mut snippet_generator =
             SnippetGenerator::create(&searcher, &*query, text_field).unwrap();
 
-        snippet_generator.set_number_of_fragments(3);
+        snippet_generator.set_snippets_limit(3);
         snippet_generator.set_max_num_chars(50);
 
         let text = "rust is at the beginning. Lorem ipsum dolor sit amet consectetur adipiscing \
@@ -1535,5 +1535,57 @@ Survey in 2016, 2017, and 2018."#;
         assert!(snippets[2].fragment().contains("end"));
 
         Ok(())
+    }
+
+    fn snippet_generator_for_text(text: &str, query: &str) -> SnippetGenerator {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_for_tests().unwrap();
+        index_writer.add_document(doc!(text_field => text)).unwrap();
+        index_writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let query_parser = QueryParser::for_index(&index, vec![text_field]);
+        let query = query_parser.parse_query(query).unwrap();
+        SnippetGenerator::create(&searcher, &*query, text_field).unwrap()
+    }
+
+    #[test]
+    fn test_snippets_limit_less_than_fragments() {
+        let text = "rust a rust b rust c rust d";
+        let mut snippet_generator = snippet_generator_for_text(text, "rust");
+
+        // Request 4 snippets, but limit matches to 2, with an offset of 1.
+        snippet_generator.set_snippets_limit(4);
+        snippet_generator.set_max_num_chars(10);
+        snippet_generator.set_matches_limit(2);
+        snippet_generator.set_matches_offset(1);
+
+        let snippets = snippet_generator.snippets(text);
+
+        // We get 2 snippets, corresponding to the 2nd and 3rd matches.
+        assert_eq!(snippets.len(), 2);
+        assert_eq!(snippets[0].to_html(), "<b>rust</b> b");
+        assert_eq!(snippets[1].to_html(), "<b>rust</b> c");
+    }
+
+    #[test]
+    fn test_snippets_offset_changes_selection() {
+        let text = "rust rust a b c rust d e f";
+        let mut snippet_generator = snippet_generator_for_text(text, "rust");
+
+        // Request 1 snippet, but skip the first two matches.
+        snippet_generator.set_snippets_limit(1);
+        snippet_generator.set_max_num_chars(15);
+        snippet_generator.set_matches_offset(2);
+
+        let snippets = snippet_generator.snippets(text);
+
+        // We should get 1 snippet.
+        assert_eq!(snippets.len(), 1);
+        // And it should be the one from the 3rd match, not the first fragment which has 2 matches.
+        assert_eq!(snippets[0].to_html(), "<b>rust</b> d e f");
+        assert!(!snippets[0].fragment().contains("rust rust"));
     }
 }
