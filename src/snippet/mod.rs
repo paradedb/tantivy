@@ -110,18 +110,13 @@ use crate::tokenizer::{TextAnalyzer, Token};
 use crate::{Score, Searcher, Term};
 
 /// The sort order for snippets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SnippetSortOrder {
     /// Sort by relevance score (descending). Snippets with the same score are sorted by position.
+    #[default]
     Score,
     /// Sort by position in the document (ascending).
     Position,
-}
-
-impl Default for SnippetSortOrder {
-    fn default() -> Self {
-        SnippetSortOrder::Score
-    }
 }
 
 const DEFAULT_MAX_NUM_CHARS: usize = 150;
