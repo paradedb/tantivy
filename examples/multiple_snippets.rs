@@ -61,8 +61,12 @@ fn main() -> tantivy::Result<()> {
     println!("\n=== Multiple Snippets (New Feature) ===\n");
 
     // Configure to return multiple snippets
-    snippet_generator.set_snippets_limit(3); // Get up to 3 snippets
-    snippet_generator.set_max_num_chars(80); // Smaller fragments
+    // Get up to 3 snippets
+    snippet_generator.set_snippets_limit(3);
+    // Smaller fragments
+    snippet_generator.set_max_num_chars(80);
+    // By default, multiple snippets are sorted by score. You can change this to sort by position.
+    // snippet_generator.set_sort_order(SnippetSortOrder::Position);
 
     for (score, doc_address) in top_docs {
         let doc = searcher.doc::<TantivyDocument>(doc_address)?;

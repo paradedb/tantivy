@@ -51,13 +51,14 @@
 //!
 //! ## Example: Multiple Snippets
 //!
-//! For long documents with matches in different locations, you can retrieve multiple snippets:
+//! For long documents with matches in different locations, you can retrieve multiple snippets.
+//! By default, snippets are sorted by score. You can change this to sort by position.
 //!
 //! ```rust
 //! # use tantivy::query::QueryParser;
 //! # use tantivy::schema::{Schema, TEXT};
 //! # use tantivy::{doc, Index};
-//! use tantivy::snippet::SnippetGenerator;
+//! use tantivy::snippet::{SnippetGenerator, SnippetSortOrder};
 //!
 //! # fn main() -> tantivy::Result<()> {
 //! #    let mut schema_builder = Schema::builder();
@@ -75,6 +76,7 @@
 //! let mut snippet_generator = SnippetGenerator::create(&searcher, &*query, text_field)?;
 //! snippet_generator.set_max_num_chars(50);
 //! snippet_generator.set_snippets_limit(3); // Get up to 3 snippets
+//! snippet_generator.set_sort_order(SnippetSortOrder::Position); // Sort by position
 //!
 //! let snippets = snippet_generator.snippets_from_doc(&doc);
 //! // Returns multiple snippets, one for each match location
@@ -106,6 +108,21 @@ use crate::schema::document::{Document, Value};
 use crate::schema::Field;
 use crate::tokenizer::{TextAnalyzer, Token};
 use crate::{Score, Searcher, Term};
+
+/// The sort order for snippets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SnippetSortOrder {
+    /// Sort by relevance score (descending). Snippets with the same score are sorted by position.
+    Score,
+    /// Sort by position in the document (ascending).
+    Position,
+}
+
+impl Default for SnippetSortOrder {
+    fn default() -> Self {
+        SnippetSortOrder::Score
+    }
+}
 
 const DEFAULT_MAX_NUM_CHARS: usize = 150;
 
@@ -360,53 +377,64 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
 /// Returns multiple Snippets
 ///
 /// Takes a vector of `FragmentCandidate`s, the text, and the number of snippets to return.
-/// Selects the top N snippets by score, with position used as a tie-breaker.
-/// Returns snippets sorted by their position in the document.
+/// Selects snippets based on the `sort_order` and returns them in that order, after pagination.
 fn select_top_fragments(
     fragments: &[FragmentCandidate],
     text: &str,
     snippets_limit: usize,
     snippets_offset: usize,
+    sort_order: SnippetSortOrder,
 ) -> Vec<Snippet> {
     if fragments.is_empty() {
         return vec![];
     }
 
-    // Create a vector of (index, fragment) pairs to track original positions
-    let mut indexed_fragments: Vec<(usize, &FragmentCandidate)> =
-        fragments.iter().enumerate().collect();
-
-    // Sort by score (descending), then by position (ascending) for tie-breaking
-    indexed_fragments.sort_by(|(_, left), (_, right)| {
-        let cmp_score = right
-            .score()
-            .partial_cmp(&left.score())
-            .unwrap_or(Ordering::Equal);
-        if cmp_score == Ordering::Equal {
-            // Tie-breaker: earlier position first
-            left.start_offset.cmp(&right.start_offset)
+    let mut all_fragments: Vec<&FragmentCandidate> = fragments.iter().collect();
+    // If the offset and limit select less than the entire result set, we use `select_nth` to
+    // prune the suffix before sorting.
+    let relevant_prefix_count =
+        if snippets_limit > 0 && snippets_limit + snippets_offset < all_fragments.len() {
+            Some(snippets_limit + snippets_offset)
         } else {
-            cmp_score
+            None
+        };
+    let mut relevant_fragments = &mut all_fragments[..];
+
+    // Sort by the specified order to apply pagination consistently.
+    match sort_order {
+        SnippetSortOrder::Score => {
+            let sort_by = |a: &&FragmentCandidate, b: &&FragmentCandidate| {
+                b.score()
+                    .partial_cmp(&a.score())
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.start_offset.cmp(&b.start_offset))
+            };
+            if let Some(prefix_count) = relevant_prefix_count {
+                let (prefix, _, _) =
+                    relevant_fragments.select_nth_unstable_by(prefix_count, sort_by);
+                relevant_fragments = prefix;
+            }
+            relevant_fragments.sort_unstable_by(sort_by);
         }
-    });
+        SnippetSortOrder::Position => {
+            let sort_by_key = |fragment: &&FragmentCandidate| fragment.start_offset;
+            if let Some(prefix_count) = relevant_prefix_count {
+                let (prefix, _, _) =
+                    relevant_fragments.select_nth_unstable_by_key(prefix_count, sort_by_key);
+                relevant_fragments = prefix;
+            }
+            relevant_fragments.sort_unstable_by_key(sort_by_key);
+        }
+    }
 
-    // Apply offset and take top N snippets (or all if snippets_limit == 0)
-    let start = snippets_offset.min(indexed_fragments.len());
-    let end = if snippets_limit == 0 {
-        indexed_fragments.len()
-    } else {
-        (start + snippets_limit).min(indexed_fragments.len())
-    };
-    let selected = &indexed_fragments[start..end];
-
-    // Re-sort by original position in document
-    let mut selected_sorted: Vec<(usize, &FragmentCandidate)> = selected.to_vec();
-    selected_sorted.sort_by_key(|(idx, _)| *idx);
+    // Apply offset the offset.
+    let start = snippets_offset.min(relevant_fragments.len());
+    let selected = &relevant_fragments[start..];
 
     // Convert to Snippets
-    selected_sorted
+    selected
         .iter()
-        .map(|(_, fragment)| {
+        .map(|&fragment| {
             let fragment_text = &text[fragment.start_offset..fragment.stop_offset];
             let highlighted = fragment
                 .highlighted
@@ -545,6 +573,7 @@ pub struct SnippetGenerator {
     matches_offset: Option<usize>,
     snippets_limit: usize,
     snippets_offset: usize,
+    sort_order: SnippetSortOrder,
 }
 
 impl SnippetGenerator {
@@ -564,6 +593,7 @@ impl SnippetGenerator {
             matches_offset: None,
             snippets_limit: 1,
             snippets_offset: 0,
+            sort_order: SnippetSortOrder::default(),
         }
     }
 
@@ -621,6 +651,7 @@ impl SnippetGenerator {
             matches_offset: None,
             snippets_limit: 1,
             snippets_offset: 0,
+            sort_order: SnippetSortOrder::default(),
         })
     }
 
@@ -638,6 +669,11 @@ impl SnippetGenerator {
     /// Sets the offset for the snippets to return. Default is 0.
     pub fn set_snippets_offset(&mut self, snippets_offset: usize) {
         self.snippets_offset = snippets_offset;
+    }
+
+    /// Sets the sort order for snippets. Default is by score.
+    pub fn set_sort_order(&mut self, sort_order: SnippetSortOrder) {
+        self.sort_order = sort_order;
     }
 
     #[cfg(test)]
@@ -681,9 +717,9 @@ impl SnippetGenerator {
 
     /// Generates multiple snippets for the given text.
     ///
-    /// Returns up to `snippets_limit` snippets, sorted by their position in the document.
-    /// The snippets are selected based on their score (sum of TF-IDF scores of matching terms),
-    /// with position used as a tie-breaker (earlier snippets preferred).
+    /// Returns up to `snippets_limit` snippets, sorted according to the `sort_order` setting.
+    /// The `snippets_offset` and `snippets_limit` parameters are applied to this sorted
+    /// list of snippets, allowing for consistent paging through the results.
     ///
     /// If `snippets_limit` is set to 0 (via `set_snippets_limit`), all matching snippets
     /// are returned.
@@ -701,6 +737,7 @@ impl SnippetGenerator {
             text,
             self.snippets_limit,
             self.snippets_offset,
+            self.sort_order,
         )
     }
 
@@ -709,7 +746,9 @@ impl SnippetGenerator {
     /// This method extracts the text associated with the `SnippetGenerator`'s field
     /// and computes multiple snippets.
     ///
-    /// Returns up to `num_snippets` snippets, sorted by their position in the document.
+    /// Returns up to `snippets_limit` snippets, sorted according to the `sort_order` setting.
+    /// The `snippets_offset` and `snippets_limit` parameters are applied to this sorted
+    /// list of snippets, allowing for consistent paging through the results.
     pub fn snippets_from_doc<D: Document>(&self, doc: &D) -> Vec<Snippet> {
         let mut text = String::new();
         for (field, value) in doc.iter_fields_and_values() {
@@ -741,7 +780,7 @@ mod tests {
     };
     use crate::query::QueryParser;
     use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, TEXT};
-    use crate::snippet::SnippetGenerator;
+    use crate::snippet::{SnippetGenerator, SnippetSortOrder};
     use crate::tokenizer::{NgramTokenizer, SimpleTokenizer};
     use crate::Index;
 
@@ -1259,12 +1298,13 @@ Survey in 2016, 2017, and 2018."#;
         assert_eq!(fragments.len(), 4);
 
         // Test getting top 2 snippets
-        let snippets = select_top_fragments(&fragments[..], text, 2, 0);
+        let snippets = select_top_fragments(&fragments[..], text, 2, 0, SnippetSortOrder::Position);
         assert_eq!(snippets.len(), 2);
 
-        // Both snippets should contain "rust" (higher score 1.0) since we're taking top 2
+        // The first snippet should contain "rust"
         assert!(snippets[0].to_html().contains("<b>rust</b>"));
-        assert!(snippets[1].to_html().contains("<b>rust</b>"));
+        // The second snippet should contain "language"
+        assert!(snippets[1].to_html().contains("<b>language</b>"));
     }
 
     #[test]
@@ -1285,7 +1325,7 @@ Survey in 2016, 2017, and 2018."#;
         );
 
         // Test getting all snippets (num_snippets = 0)
-        let snippets = select_top_fragments(&fragments[..], text, 0, 0);
+        let snippets = select_top_fragments(&fragments[..], text, 0, 0, SnippetSortOrder::Position);
         assert_eq!(snippets.len(), 4);
 
         // Verify they are in document order
@@ -1316,7 +1356,8 @@ Survey in 2016, 2017, and 2018."#;
         assert_eq!(fragments.len(), 2);
 
         // Request 10 snippets, should only get 2
-        let snippets = select_top_fragments(&fragments[..], text, 10, 0);
+        let snippets =
+            select_top_fragments(&fragments[..], text, 10, 0, SnippetSortOrder::Position);
         assert_eq!(snippets.len(), 2);
     }
 
@@ -1338,7 +1379,7 @@ Survey in 2016, 2017, and 2018."#;
         );
 
         // Request top 2 snippets
-        let snippets = select_top_fragments(&fragments[..], text, 2, 0);
+        let snippets = select_top_fragments(&fragments[..], text, 2, 0, SnippetSortOrder::Score);
         assert_eq!(snippets.len(), 2);
 
         // The fragment with "rust rust" should have highest score (2.0)
@@ -1366,7 +1407,7 @@ Survey in 2016, 2017, and 2018."#;
         );
 
         // All snippets have same score (1.0), so position should be tie-breaker
-        let snippets = select_top_fragments(&fragments[..], text, 2, 0);
+        let snippets = select_top_fragments(&fragments[..], text, 2, 0, SnippetSortOrder::Position);
         assert_eq!(snippets.len(), 2);
 
         // Should get first two occurrences
@@ -1392,7 +1433,7 @@ Survey in 2016, 2017, and 2018."#;
 
         // All snippets have same score (1.0)
         // Request 2 snippets, with offset 1
-        let snippets = select_top_fragments(&fragments[..], text, 2, 1);
+        let snippets = select_top_fragments(&fragments[..], text, 2, 1, SnippetSortOrder::Position);
         assert_eq!(snippets.len(), 2);
 
         // Should get second and third occurrences
@@ -1418,50 +1459,81 @@ Survey in 2016, 2017, and 2018."#;
         // No matching terms, no fragments
         assert_eq!(fragments.len(), 0);
 
-        let snippets = select_top_fragments(&fragments[..], text, 5, 0);
+        let snippets = select_top_fragments(&fragments[..], text, 5, 0, SnippetSortOrder::Position);
         assert_eq!(snippets.len(), 0);
     }
 
+    fn check_paging_consistency(
+        fragments: &[super::FragmentCandidate],
+        text: &str,
+        sort_order: super::SnippetSortOrder,
+        expected_order: Vec<&str>,
+    ) {
+        // Get all snippets, sorted by the given order, to establish the ground truth.
+        let all_snippets: Vec<_> = select_top_fragments(fragments, text, 0, 0, sort_order)
+            .into_iter()
+            .map(|s| s.to_html())
+            .collect();
+
+        assert_eq!(all_snippets, expected_order);
+
+        // Now, page through the snippets and check if we get the same sequence.
+        let mut paged_snippets = Vec::new();
+        for i in 0..all_snippets.len() {
+            let page: Vec<_> = select_top_fragments(fragments, text, 1, i, sort_order)
+                .into_iter()
+                .map(|s| s.to_html())
+                .collect();
+            assert_eq!(page.len(), 1);
+            paged_snippets.push(page[0].clone());
+        }
+
+        assert_eq!(paged_snippets, all_snippets);
+    }
+
     #[test]
-    fn test_snippet_generator_multiple_fragments() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
-        {
-            let mut index_writer = index.writer_for_tests()?;
-            let doc = doc!(text_field => "The rust programming language is great. Rust is fast. Rust is safe. The rust compiler is helpful.");
-            index_writer.add_document(doc)?;
-            index_writer.commit()?;
-        }
-        let searcher = index.reader()?.searcher();
-        let query_parser = QueryParser::for_index(&index, vec![text_field]);
-        let query = query_parser.parse_query("rust")?;
-        let mut snippet_generator =
-            SnippetGenerator::create(&searcher, &*query, text_field).unwrap();
+    fn test_snippet_generator_paging_is_consistent() {
+        // Scores where a > b > c > d
+        let terms = btreemap! {
+            String::from("a") => 4.0,
+            String::from("b") => 3.0,
+            String::from("c") => 2.0,
+            String::from("d") => 1.0,
+        };
 
-        // Set to return 3 snippets
-        snippet_generator.set_snippets_limit(3);
-        snippet_generator.set_max_num_chars(30);
+        // Text where terms do not appear in score order.
+        let text = "d c b a c d a b";
 
-        let text = "The rust programming language is great. Rust is fast. Rust is safe. The rust \
-                    compiler is helpful.";
-        let snippets = snippet_generator.snippets(text);
+        let fragments = search_fragments(
+            &mut From::from(SimpleTokenizer::default()),
+            text,
+            &terms,
+            1, // max_num_chars
+            None,
+            None,
+        );
 
-        // Should get 3 fragments
-        assert_eq!(snippets.len(), 3);
+        // Test position-based sorting and paging
+        check_paging_consistency(
+            &fragments,
+            text,
+            super::SnippetSortOrder::Position,
+            vec![
+                "<b>d</b>", "<b>c</b>", "<b>b</b>", "<b>a</b>", "<b>c</b>", "<b>d</b>", "<b>a</b>",
+                "<b>b</b>",
+            ],
+        );
 
-        // Each should contain "rust" or "Rust"
-        for snippet in &snippets {
-            let html = snippet.to_html();
-            assert!(
-                html.to_lowercase().contains("rust"),
-                "Snippet should contain 'rust': {}",
-                html
-            );
-        }
-
-        Ok(())
+        // Test score-based sorting and paging
+        check_paging_consistency(
+            &fragments,
+            text,
+            super::SnippetSortOrder::Score,
+            vec![
+                "<b>a</b>", "<b>a</b>", "<b>b</b>", "<b>b</b>", "<b>c</b>", "<b>c</b>", "<b>d</b>",
+                "<b>d</b>",
+            ],
+        );
     }
 
     #[test]
@@ -1555,6 +1627,7 @@ Survey in 2016, 2017, and 2018."#;
 
         snippet_generator.set_snippets_limit(3);
         snippet_generator.set_max_num_chars(50);
+        snippet_generator.set_sort_order(SnippetSortOrder::Position);
 
         let text = "rust is at the beginning. Lorem ipsum dolor sit amet consectetur adipiscing \
                     elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Here \
@@ -1602,6 +1675,7 @@ Survey in 2016, 2017, and 2018."#;
         snippet_generator.set_max_num_chars(10);
         snippet_generator.set_matches_limit(2);
         snippet_generator.set_matches_offset(1);
+        snippet_generator.set_sort_order(SnippetSortOrder::Position);
 
         let snippets = snippet_generator.snippets(text);
 
@@ -1620,6 +1694,7 @@ Survey in 2016, 2017, and 2018."#;
         snippet_generator.set_snippets_limit(1);
         snippet_generator.set_max_num_chars(15);
         snippet_generator.set_matches_offset(2);
+        snippet_generator.set_sort_order(SnippetSortOrder::Position);
 
         let snippets = snippet_generator.snippets(text);
 
