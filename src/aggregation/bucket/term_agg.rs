@@ -658,6 +658,7 @@ pub(crate) fn cut_off_buckets<T: GetDocCount + Debug>(
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::net::IpAddr;
     use std::str::FromStr;
 
