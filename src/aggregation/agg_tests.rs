@@ -6,7 +6,7 @@ use crate::aggregation::buf_collector::DOC_BLOCK_SIZE;
 use crate::aggregation::collector::AggregationCollector;
 use crate::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use crate::aggregation::tests::{get_test_index_2_segments, get_test_index_from_values_and_terms};
-use crate::aggregation::DistributedAggregationCollector;
+use crate::aggregation::{AggregationLimitsGuard, DistributedAggregationCollector};
 use crate::query::{AllQuery, TermQuery};
 use crate::schema::{IndexRecordOption, Schema, FAST};
 use crate::{Index, IndexWriter, Term};

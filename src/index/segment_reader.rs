@@ -20,6 +20,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
+use crate::tokenizer::TokenizerManager;
 use crate::{Directory, DocId, Index, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -601,6 +602,11 @@ impl SegmentReader {
 
             intersect_alive_bitset(physical_alive_bitset, self.custom_alive_bitset.clone())
         })
+    }
+
+    /// Returns the tokenizer manager for the index.
+    pub fn tokenizers(&self) -> &TokenizerManager {
+        &self.index.tokenizers()
     }
 }
 
