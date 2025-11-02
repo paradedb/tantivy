@@ -278,6 +278,7 @@ fn search_fragments(
 
     // Process all fragments first, without applying offset/limit to token stream
     while let Some(next) = token_stream.next() {
+        eprintln!("next: {:?}", next);
         if (next.offset_to - fragment.start_offset) > max_num_chars {
             if fragment.score() > 0.0 {
                 fragments.push(fragment)
