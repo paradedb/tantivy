@@ -33,13 +33,10 @@ pub trait CharacterFilter: 'static + Send + Sync {
     /// will be passed to the tokenizer.
     fn filter(&self, text: &str) -> String;
 
-    /// Return a boxed version of this character filter for dynamic dispatch.
     fn box_clone(&self) -> Box<dyn CharacterFilter>;
 }
 
-/// A boxable character filter that can be stored in a vector.
 pub trait BoxableCharacterFilter: CharacterFilter + Send + Sync {
-    /// Create a boxed clone of this character filter.
     fn box_clone(&self) -> Box<dyn CharacterFilter>;
 }
 
@@ -49,5 +46,4 @@ impl<T: CharacterFilter + Clone> BoxableCharacterFilter for T {
     }
 }
 
-// Re-export for convenience
 pub use super::html_strip::HtmlStripCharacterFilter;

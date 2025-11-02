@@ -57,7 +57,7 @@ impl Clone for TextAnalyzer {
                 .map(|f| f.box_clone())
                 .collect(),
             tokenizer: self.tokenizer.box_clone(),
-            filtered_buffer: String::new(), // Fresh buffer for each clone
+            filtered_buffer: String::new(),
         }
     }
 }
