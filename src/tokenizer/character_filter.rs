@@ -1,23 +1,3 @@
-//! Character filters preprocess text before tokenization.
-//!
-//! Unlike token filters that operate on individual tokens, character filters
-//! operate on the raw character stream and can add, remove, or modify characters.
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use tantivy::tokenizer::*;
-//!
-//! let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
-//!     .char_filter(Some(HtmlStripCharacterFilter::default()))
-//!     .filter(RemoveLongFilter::limit(40))
-//!     .filter(LowerCaser)
-//!     .build();
-//!
-//! let mut stream = analyzer.token_stream("<b>Hello World</b>");
-//! // Tokens: ["hello", "world"]
-//! ```
-
 // Note: This module cannot use super::tokenizer::TextAnalyzer due to circular dependencies
 
 /// A character filter preprocesses text before tokenization.

@@ -16,7 +16,7 @@
 //!     .filter(LowerCaser)
 //!     .build();
 //!
-//! let mut stream = analyzer.token_stream("<b>Hello</b> &amp; <i>World</i>");
+//! let stream = analyzer.token_stream("<b>Hello</b> &amp; <i>World</i>");
 //! // Tokens: ["hello", "&", "world"]
 //! ```
 
