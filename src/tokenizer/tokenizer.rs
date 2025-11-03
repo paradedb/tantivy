@@ -99,6 +99,10 @@ impl TextAnalyzer {
             self.tokenizer.token_stream(&self.filtered_buffer)
         }
     }
+
+    pub fn char_filters(&self) -> &[Box<dyn CharacterFilter>] {
+        &self.character_filters
+    }
 }
 
 /// Builder helper for [`TextAnalyzer`]
@@ -122,8 +126,10 @@ impl<T: Tokenizer> TextAnalyzerBuilder<T> {
     ///     .filter(LowerCaser)
     ///     .build();
     /// ```
-    pub fn char_filter<C: CharacterFilter>(mut self, char_filter: C) -> Self {
-        self.character_filters.push(Box::new(char_filter));
+    pub fn char_filter<C: CharacterFilter>(mut self, char_filter: Option<C>) -> Self {
+        if let Some(filter) = char_filter {
+            self.character_filters.push(Box::new(filter));
+        }
         self
     }
 
