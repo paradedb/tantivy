@@ -9,7 +9,7 @@
 //! use tantivy::tokenizer::*;
 //!
 //! let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
-//!     .char_filter(HtmlStripCharacterFilter::default())
+//!     .char_filter(Some(HtmlStripCharacterFilter::default()))
 //!     .filter(RemoveLongFilter::limit(40))
 //!     .filter(LowerCaser)
 //!     .build();

@@ -12,7 +12,7 @@
 //! use tantivy::tokenizer::*;
 //!
 //! let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
-//!     .char_filter(HtmlStripCharacterFilter::default())
+//!     .char_filter(Some(HtmlStripCharacterFilter::default()))
 //!     .filter(LowerCaser)
 //!     .build();
 //!
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn test_with_tokenizer() {
         let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
-            .char_filter(HtmlStripCharacterFilter::default())
+            .char_filter(Some(HtmlStripCharacterFilter::default()))
             .build();
 
         let mut stream = analyzer.token_stream("<b>Hello World</b>");

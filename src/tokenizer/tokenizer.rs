@@ -122,7 +122,7 @@ impl<T: Tokenizer> TextAnalyzerBuilder<T> {
     /// use tantivy::tokenizer::*;
     ///
     /// let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
-    ///     .char_filter(HtmlStripCharacterFilter::default())
+    ///     .char_filter(Some(HtmlStripCharacterFilter::default()))
     ///     .filter(LowerCaser)
     ///     .build();
     /// ```
