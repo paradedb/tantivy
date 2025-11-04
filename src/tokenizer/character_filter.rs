@@ -15,15 +15,3 @@ pub trait CharacterFilter: 'static + Send + Sync {
 
     fn box_clone(&self) -> Box<dyn CharacterFilter>;
 }
-
-pub trait BoxableCharacterFilter: CharacterFilter + Send + Sync {
-    fn box_clone(&self) -> Box<dyn CharacterFilter>;
-}
-
-impl<T: CharacterFilter + Clone> BoxableCharacterFilter for T {
-    fn box_clone(&self) -> Box<dyn CharacterFilter> {
-        Box::new(self.clone())
-    }
-}
-
-pub use super::html_strip::HtmlStripCharacterFilter;

@@ -29,17 +29,9 @@ use super::character_filter::CharacterFilter;
 /// Character filter that strips HTML elements and decodes HTML entities.
 ///
 /// Supports an `escaped_tags` list to skip stripping specific tags.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct HtmlStripCharacterFilter {
     escaped_tags: HashSet<String>,
-}
-
-impl Default for HtmlStripCharacterFilter {
-    fn default() -> Self {
-        Self {
-            escaped_tags: HashSet::new(),
-        }
-    }
 }
 
 impl HtmlStripCharacterFilter {
@@ -70,7 +62,7 @@ fn strip_html(text: &str, escaped_tags: &HashSet<String>) -> String {
     while let Some(ch) = chars.next() {
         if ch == '<' {
             let mut tag_buf = String::from("<");
-            while let Some(c) = chars.next() {
+            for c in chars.by_ref() {
                 tag_buf.push(c);
                 if c == '>' {
                     break;
@@ -115,7 +107,7 @@ fn strip_html(text: &str, escaped_tags: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tokenizer::{SimpleTokenizer, TextAnalyzer, Token};
+    use crate::tokenizer::{SimpleTokenizer, TextAnalyzer};
 
     #[test]
     fn test_basic_strip_and_decode() {
