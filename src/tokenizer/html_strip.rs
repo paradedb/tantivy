@@ -20,9 +20,9 @@
 //! // Tokens: ["hello", "&", "world"]
 //! ```
 
-use std::collections::HashSet;
-
+use fst::Set;
 use html_escape::{decode_html_entities, encode_text};
+use std::collections::HashSet;
 
 use super::character_filter::CharacterFilter;
 
@@ -45,7 +45,8 @@ impl HtmlStripCharacterFilter {
 
 impl CharacterFilter for HtmlStripCharacterFilter {
     fn filter(&self, text: &str) -> String {
-        let stripped = strip_html(text, &self.escaped_tags);
+        let escaped_tags_fst = Set::from_iter(self.escaped_tags.iter().map(|t| t.as_str())).expect("should be able to build fst from escaped_tags");
+        let stripped = strip_html(text, &escaped_tags_fst);
         decode_html_entities(&stripped).to_string()
     }
 
@@ -55,49 +56,69 @@ impl CharacterFilter for HtmlStripCharacterFilter {
 }
 
 /// Remove HTML tags while skipping whitelisted tags in `escaped_tags`.
-fn strip_html(text: &str, escaped_tags: &HashSet<String>) -> String {
+pub fn strip_html(text: &str, escaped_tags_fst: &Set<Vec<u8>>) -> String {
+    let fst = escaped_tags_fst.as_fst();
     let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
+    let mut chars = text.chars();
 
     while let Some(ch) = chars.next() {
-        if ch == '<' {
-            let mut tag_buf = String::from("<");
-            for c in chars.by_ref() {
-                tag_buf.push(c);
-                if c == '>' {
-                    break;
-                }
-            }
-
-            // collect tag name (e.g. "b" from "<b>", "div" from "</div class='x'>")
-            let mut tag_name = String::new();
-            let mut tag_chars = tag_buf.chars().peekable();
-
-            // skip initial '<' or '</'
-            if tag_chars.peek() == Some(&'<') {
-                tag_chars.next();
-                if tag_chars.peek() == Some(&'/') {
-                    tag_chars.next();
-                }
-            }
-
-            // collect until space, '>', or '/'
-            while let Some(&c) = tag_chars.peek() {
-                if c.is_whitespace() || c == '>' || c == '/' {
-                    break;
-                }
-                tag_name.push(c);
-                tag_chars.next();
-            }
-
-            let tag_name = tag_name.to_ascii_lowercase();
-
-            // if this tag is in escaped_tags, output it escaped
-            if escaped_tags.contains(&tag_name) {
-                result.push_str(&encode_text(&tag_buf));
-            }
-        } else {
+        if ch != '<' {
             result.push(ch);
+            continue;
+        }
+
+        // we're inside a tag now
+        let mut tag_buf = String::from("<");
+        let mut current_node = fst.root();
+        let mut is_valid_path = true;
+        let mut is_final = false;
+        let mut in_tag_name = false;
+        let mut after_slash = false;
+
+        // consume characters until '>' or end-of-input
+        while let Some(c) = chars.next() {
+            tag_buf.push(c);
+
+            if c == '>' {
+                break;
+            }
+
+            // skip initial '<' and optional '/'
+            if !in_tag_name {
+                if c == '/' && !after_slash {
+                    after_slash = true;
+                    continue;
+                }
+                if c.is_ascii_alphabetic() {
+                    in_tag_name = true;
+                } else {
+                    continue;
+                }
+            }
+
+            // walk the tag name directly through the FST
+            let lc = c.to_ascii_lowercase();
+            if lc.is_whitespace() || lc == '>' || lc == '/' {
+                in_tag_name = false;
+                continue;
+            }
+
+            let byte = lc as u8;
+            if let Some(trans) = current_node.transitions().find(|t| t.inp == byte) {
+                current_node = fst.node(trans.addr);
+                if current_node.is_final() {
+                    is_final = true;
+                }
+            } else {
+                is_valid_path = false;
+                // no point continuing traversal; tag isn't whitelisted
+                // but keep consuming until '>' so we don’t break parsing
+            }
+        }
+
+        if is_valid_path && is_final {
+            // this tag is in escaped_tags_fst, escape it literally
+            result.push_str(&encode_text(&tag_buf));
         }
     }
 
