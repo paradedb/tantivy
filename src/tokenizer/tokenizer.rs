@@ -2,12 +2,14 @@
 /// text in `tantivy`.
 use tokenizer_api::{BoxTokenStream, TokenFilter, Tokenizer};
 
+use crate::tokenizer::character_filter::CharacterFilter;
 use crate::tokenizer::empty_tokenizer::EmptyTokenizer;
 
 /// `TextAnalyzer` tokenizes an input text into tokens and modifies the resulting `TokenStream`.
-#[derive(Clone)]
 pub struct TextAnalyzer {
+    character_filters: Vec<Box<dyn CharacterFilter>>,
     tokenizer: Box<dyn BoxableTokenizer>,
+    filtered_buffer: String,
 }
 
 impl Tokenizer for Box<dyn BoxableTokenizer> {
@@ -46,6 +48,20 @@ impl<T: Tokenizer> BoxableTokenizer for T {
     }
 }
 
+impl Clone for TextAnalyzer {
+    fn clone(&self) -> Self {
+        TextAnalyzer {
+            character_filters: self
+                .character_filters
+                .iter()
+                .map(|f| f.box_clone())
+                .collect(),
+            tokenizer: self.tokenizer.box_clone(),
+            filtered_buffer: String::new(),
+        }
+    }
+}
+
 impl Default for TextAnalyzer {
     fn default() -> TextAnalyzer {
         TextAnalyzer::from(EmptyTokenizer)
@@ -61,21 +77,62 @@ impl<T: Tokenizer + Clone> From<T> for TextAnalyzer {
 impl TextAnalyzer {
     /// Create a new TextAnalyzerBuilder
     pub fn builder<T: Tokenizer>(tokenizer: T) -> TextAnalyzerBuilder<T> {
-        TextAnalyzerBuilder { tokenizer }
+        TextAnalyzerBuilder {
+            tokenizer,
+            character_filters: vec![],
+        }
     }
 
     /// Creates a token stream for a given `str`.
     pub fn token_stream<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
-        self.tokenizer.token_stream(text)
+        if self.character_filters.is_empty() {
+            self.tokenizer.token_stream(text)
+        } else {
+            // Apply character filters to the buffer
+            self.filtered_buffer.clear();
+            self.filtered_buffer.push_str(text);
+            for filter in &self.character_filters {
+                let filtered = filter.filter(&self.filtered_buffer);
+                self.filtered_buffer.clear();
+                self.filtered_buffer.push_str(&filtered);
+            }
+            self.tokenizer.token_stream(&self.filtered_buffer)
+        }
+    }
+
+    pub fn char_filters(&self) -> &[Box<dyn CharacterFilter>] {
+        &self.character_filters
     }
 }
 
 /// Builder helper for [`TextAnalyzer`]
 pub struct TextAnalyzerBuilder<T = Box<dyn BoxableTokenizer>> {
     tokenizer: T,
+    character_filters: Vec<Box<dyn CharacterFilter>>,
 }
 
 impl<T: Tokenizer> TextAnalyzerBuilder<T> {
+    /// Appends a character filter to the current builder.
+    ///
+    /// Character filters preprocess text before tokenization.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tantivy::tokenizer::*;
+    ///
+    /// let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+    ///     .char_filter(Some(HtmlStripCharacterFilter::default()))
+    ///     .filter(LowerCaser)
+    ///     .build();
+    /// ```
+    pub fn char_filter<C: CharacterFilter>(mut self, char_filter: Option<C>) -> Self {
+        if let Some(filter) = char_filter {
+            self.character_filters.push(Box::new(filter));
+        }
+        self
+    }
+
     /// Appends a token filter to the current builder.
     ///
     /// # Example
@@ -92,6 +149,7 @@ impl<T: Tokenizer> TextAnalyzerBuilder<T> {
     pub fn filter<F: TokenFilter>(self, token_filter: F) -> TextAnalyzerBuilder<F::Tokenizer<T>> {
         TextAnalyzerBuilder {
             tokenizer: token_filter.transform(self.tokenizer),
+            character_filters: self.character_filters,
         }
     }
 
@@ -101,6 +159,7 @@ impl<T: Tokenizer> TextAnalyzerBuilder<T> {
         let boxed_tokenizer = Box::new(self.tokenizer);
         TextAnalyzerBuilder {
             tokenizer: boxed_tokenizer,
+            character_filters: self.character_filters,
         }
     }
 
@@ -115,7 +174,9 @@ impl<T: Tokenizer> TextAnalyzerBuilder<T> {
     /// Finalize building the TextAnalyzer
     pub fn build(self) -> TextAnalyzer {
         TextAnalyzer {
+            character_filters: self.character_filters,
             tokenizer: Box::new(self.tokenizer),
+            filtered_buffer: String::new(),
         }
     }
 }
