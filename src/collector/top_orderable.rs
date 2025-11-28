@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use columnar::{Column, ColumnType, ColumnValues, DynamicColumn, MonotonicallyMappableToU64};
 
-use crate::collector::{Collector, ComparableDoc, SegmentCollector};
+use crate::collector::{default_collect_segment, Collector, ComparableDoc, SegmentCollector};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
+use crate::query::Weight;
 use crate::schema::OwnedValue;
 use crate::{DateTime, DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
 
@@ -32,6 +33,16 @@ where C: TopNCompare
             buffer: Vec::with_capacity(vec_cap),
             top_n,
             threshold: None,
+        }
+    }
+
+    pub fn with_threshold(self, threshold: C::Accepted) -> Self {
+        Self {
+            threshold: Some(ComparableDoc {
+                feature: threshold,
+                doc: 0,
+            }),
+            ..self
         }
     }
 
@@ -83,12 +94,17 @@ where C: TopNCompare
     }
 
     /// Returns the top n elements in sorted order.
-    pub fn into_sorted_vec(mut self) -> Vec<ComparableDoc<C::Accepted, DocId, R>> {
+    pub fn into_sorted_vec(
+        mut self,
+    ) -> (
+        Vec<ComparableDoc<C::Accepted, DocId, R>>,
+        Option<C::Accepted>,
+    ) {
         if self.buffer.len() > self.top_n {
             self.truncate_top_n();
         }
         self.buffer.sort_unstable();
-        self.buffer
+        (self.buffer, self.threshold.map(|t| t.feature))
     }
 }
 
@@ -98,13 +114,16 @@ where C: TopNCompare
 /// by a fast field (`FieldFeature`).
 pub trait Feature: Sync + Send + 'static {
     /// The output type of the feature, which is the type that will be returned to the user.
-    type Output: Clone + Sync + Send + 'static;
+    type Output: Clone + Sync + Send + 'static + std::fmt::Debug;
     /// The segment output type of the feature, which is the type that will be used for
     /// comparisons within a segment.
-    type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static;
+    type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static + std::fmt::Debug;
 
     /// True if this Feature is, or is derived from a bm25 Score.
     fn is_score(&self) -> bool;
+
+    /// True if this Feature is a string feature.
+    fn is_string(&self) -> bool;
 
     /// Open a FeatureColumn for this Feature.
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn>;
@@ -170,6 +189,10 @@ impl Feature for Arc<dyn Feature<Output = OwnedValue, SegmentOutput = Option<u64
         self.deref().is_score()
     }
 
+    fn is_string(&self) -> bool {
+        self.deref().is_string()
+    }
+
     /// Open a FeatureColumn for this Feature.
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         self.deref().open(segment_reader)
@@ -220,6 +243,10 @@ impl Feature for ScoreFeature {
         true
     }
 
+    fn is_string(&self) -> bool {
+        false
+    }
+
     fn open(&self, _segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         Ok(FeatureColumn::Score)
     }
@@ -262,6 +289,10 @@ impl Feature for ErasedFeature<ScoreFeature> {
 
     fn is_score(&self) -> bool {
         true
+    }
+
+    fn is_string(&self) -> bool {
+        false
     }
 
     /// Open a FeatureColumn for this Feature.
@@ -341,6 +372,10 @@ impl Feature for FieldFeature<String> {
 
     fn is_score(&self) -> bool {
         false
+    }
+
+    fn is_string(&self) -> bool {
+        true
     }
 
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
@@ -462,6 +497,10 @@ impl Feature for ErasedFeature<FieldFeature<String>> {
         self.0.is_score()
     }
 
+    fn is_string(&self) -> bool {
+        self.0.is_string()
+    }
+
     /// Open a FeatureColumn for this Feature.
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         self.0.open(segment_reader)
@@ -572,6 +611,10 @@ impl<F: FastValue> Feature for FieldFeature<F> {
         false
     }
 
+    fn is_string(&self) -> bool {
+        false
+    }
+
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         // We interpret this field as u64, regardless of its type, that way,
         // we avoid needless conversion. Regardless of the fast field type, the
@@ -636,6 +679,10 @@ impl<F: FastValue> Feature for ErasedFeature<FieldFeature<F>> {
         self.0.is_score()
     }
 
+    fn is_string(&self) -> bool {
+        self.0.is_string()
+    }
+
     /// Open a FeatureColumn for this Feature.
     fn open(&self, segment_reader: &SegmentReader) -> crate::Result<FeatureColumn> {
         self.0.open(segment_reader)
@@ -690,8 +737,8 @@ pub enum FeatureColumn {
 }
 
 pub trait TopOrderable: Sync + Send + 'static {
-    type Output: Clone + Sync + Send + 'static;
-    type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static;
+    type Output: Clone + Sync + Send + 'static + std::fmt::Debug;
+    type SegmentOutput: Clone + PartialOrd + Sync + Send + 'static + std::fmt::Debug;
     type SegmentComparator: TopNCompare<Accepted = Self::SegmentOutput>;
 
     /// True if scores are required for any of the FeatureColumns.
@@ -718,6 +765,9 @@ pub trait TopOrderable: Sync + Send + 'static {
 
     /// Compare the Output types, falling back to the DocAddress if necessary.
     fn compare(&self, a: &(Self::Output, DocAddress), b: &(Self::Output, DocAddress)) -> bool;
+
+    /// Returns true if any of the features are string fields.
+    fn has_string_fields(&self) -> bool;
 }
 
 pub struct TopOrderableSegmentCollector<O: TopOrderable> {
@@ -728,19 +778,27 @@ pub struct TopOrderableSegmentCollector<O: TopOrderable> {
 }
 
 impl<O: TopOrderable> SegmentCollector for TopOrderableSegmentCollector<O> {
-    type Fruit = Vec<(O::Output, DocAddress)>;
+    type Fruit = (
+        Vec<(O::Output, DocAddress)>,
+        Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>,
+    );
 
     #[inline]
     fn collect(&mut self, doc: DocId, score: Score) {
         self.topn_computer.push(score, doc);
     }
 
-    fn harvest(self) -> Vec<(O::Output, DocAddress)> {
+    fn harvest(
+        self,
+    ) -> (
+        Vec<(O::Output, DocAddress)>,
+        Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>,
+    ) {
         let segment_ord = self.segment_ord;
         // TODO: Switch to unsorted, a-la https://github.com/quickwit-oss/tantivy/pull/2646
-        let harvested = self
-            .topn_computer
-            .into_sorted_vec()
+        let (harvested, threshold) = self.topn_computer.into_sorted_vec();
+
+        let harvested = harvested
             .into_iter()
             .map(|comparable_doc| {
                 (
@@ -752,7 +810,9 @@ impl<O: TopOrderable> SegmentCollector for TopOrderableSegmentCollector<O> {
                 )
             })
             .collect();
-        self.orderable.decode(&self.features, harvested)
+
+        let decoded = self.orderable.decode(&self.features, harvested);
+        (decoded, threshold)
     }
 }
 
@@ -760,6 +820,8 @@ pub(crate) struct TopOrderableCollector<O: TopOrderable> {
     orderable: Arc<O>,
     limit: usize,
     offset: usize,
+    threshold:
+        Arc<Mutex<Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>>>,
 }
 
 impl<O: TopOrderable> TopOrderableCollector<O> {
@@ -768,6 +830,7 @@ impl<O: TopOrderable> TopOrderableCollector<O> {
             orderable: Arc::new(orderable),
             limit,
             offset,
+            threshold: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -782,12 +845,22 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
         segment_ord: SegmentOrdinal,
         segment_reader: &SegmentReader,
     ) -> crate::Result<Self::Child> {
+        let mut topn_computer = LazyTopNComputer::new(
+            self.orderable.segment_comparator(segment_reader)?,
+            self.limit + self.offset,
+        );
+
+        // sharing thresholds does not work for string fields because they use term ordinals
+        // which are not comparable across segments
+        if !self.orderable.has_string_fields() {
+            if let Some(threshold) = self.threshold.lock().unwrap().as_ref() {
+                topn_computer = topn_computer.with_threshold(threshold.clone());
+            }
+        }
+
         Ok(TopOrderableSegmentCollector {
             segment_ord,
-            topn_computer: LazyTopNComputer::new(
-                self.orderable.segment_comparator(segment_reader)?,
-                self.limit + self.offset,
-            ),
+            topn_computer,
             orderable: self.orderable.clone(),
             features: self
                 .orderable
@@ -800,18 +873,56 @@ impl<O: TopOrderable> Collector for TopOrderableCollector<O> {
         self.orderable.requires_scoring()
     }
 
-    fn merge_fruits(&self, segment_fruits: Vec<Self::Fruit>) -> crate::Result<Self::Fruit> {
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<(
+            Self::Fruit,
+            Option<<<O as TopOrderable>::SegmentComparator as TopNCompare>::Accepted>,
+        )>,
+    ) -> crate::Result<Self::Fruit> {
         let merged = itertools::kmerge_by(
-            segment_fruits,
+            segment_fruits.into_iter().map(|(fruits, _)| fruits),
             |a: &(O::Output, DocAddress), b: &(O::Output, DocAddress)| self.orderable.compare(a, b),
         )
         .collect::<Vec<_>>();
+
+        // clear the threshold
+        *self.threshold.lock().unwrap() = None;
 
         Ok(merged
             .into_iter()
             .skip(self.offset)
             .take(self.limit)
             .collect())
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: u32,
+        reader: &SegmentReader,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        let (fruits, new_threshold) = default_collect_segment(self, weight, segment_ord, reader)?;
+
+        if !self.orderable.has_string_fields() {
+            let mut old_threshold = self.threshold.lock().unwrap();
+            match (old_threshold.as_mut(), new_threshold) {
+                (Some(o), Some(n)) => {
+                    if *o < n {
+                        *old_threshold = Some(n.clone());
+                    }
+                }
+                (None, Some(n)) => {
+                    *old_threshold = Some(n.clone());
+                }
+                _ => {
+                    // Do nothing
+                }
+            }
+        }
+
+        // at this point we've already consumed the threshold so it can be discarded
+        Ok((fruits, None))
     }
 }
 
@@ -963,6 +1074,10 @@ macro_rules! impl_top_orderable {
                 false $(|| self.$idx.0.is_score())*
             }
 
+            fn has_string_fields(&self) -> bool {
+                false $(|| self.$idx.0.is_string())*
+            }
+
             fn segment_comparator(
                 &self,
                 segment_reader: &SegmentReader,
@@ -1083,7 +1198,7 @@ impl_top_orderable! { (F1, 0), (F2, 1), (F3, 2) }
 
 pub trait TopNCompare {
     // TODO: Remove the Clone bound.
-    type Accepted: Clone + PartialOrd;
+    type Accepted: Clone + PartialOrd + std::fmt::Debug;
 
     /// Given the current threshold of accepted values and a candidate doc_id/score, compare the
     /// candidate value to the threshold, and convert the candidate to Accepted if it is
