@@ -3,7 +3,7 @@ use crate::TantivyError;
 
 /// Tokenize the text by splitting words into n-grams of the given size(s)
 ///
-/// With this tokenizer, the `position` is always 0.
+/// With this tokenizer, the `position` of the token corresponds to the character index of the start of the n-gram.
 /// Beware however, in presence of multiple value for the same field,
 /// the position will be `POSITION_GAP * index of value`.
 ///
@@ -11,7 +11,7 @@ use crate::TantivyError;
 ///
 /// | Term     | he  | hel | el  | ell | ll  | llo | lo |
 /// |----------|-----|-----|-----|-----|-----|-----|----|
-/// | Position | 0   | 0   | 0   | 0   | 0   | 0   | 0  |
+/// | Position | 0   | 0   | 1   | 1   | 2   | 2   | 3  |
 /// | Offsets  | 0,2 | 0,3 | 1,3 | 1,4 | 2,4 | 2,5 | 3,5|
 ///
 /// Example 2: `hello` would be tokenized as (min_gram: 2, max_gram: 5, prefix_only: **true**)
@@ -39,42 +39,49 @@ use crate::TantivyError;
 /// {
 ///     let token = stream.next().unwrap();
 ///     assert_eq!(token.text, "he");
+///     assert_eq!(token.position, 0);
 ///     assert_eq!(token.offset_from, 0);
 ///     assert_eq!(token.offset_to, 2);
 /// }
 /// {
 ///   let token = stream.next().unwrap();
 ///     assert_eq!(token.text, "hel");
+///     assert_eq!(token.position, 0);
 ///     assert_eq!(token.offset_from, 0);
 ///     assert_eq!(token.offset_to, 3);
 /// }
 /// {
 ///   let token = stream.next().unwrap();
 ///     assert_eq!(token.text, "el");
+///     assert_eq!(token.position, 1);
 ///     assert_eq!(token.offset_from, 1);
 ///     assert_eq!(token.offset_to, 3);
 /// }
 /// {
 ///   let token = stream.next().unwrap();
 ///     assert_eq!(token.text, "ell");
+///     assert_eq!(token.position, 1);
 ///     assert_eq!(token.offset_from, 1);
 ///     assert_eq!(token.offset_to, 4);
 /// }
 /// {
 ///   let token = stream.next().unwrap();
 ///     assert_eq!(token.text, "ll");
+///     assert_eq!(token.position, 2);
 ///     assert_eq!(token.offset_from, 2);
 ///     assert_eq!(token.offset_to, 4);
 /// }
 /// {
 ///   let token = stream.next().unwrap();
 ///     assert_eq!(token.text, "llo");
+///     assert_eq!(token.position, 2);
 ///     assert_eq!(token.offset_from, 2);
 ///     assert_eq!(token.offset_to, 5);
 /// }
 /// {
 ///   let token = stream.next().unwrap();
 ///   assert_eq!(token.text, "lo");
+///   assert_eq!(token.position, 3);
 ///   assert_eq!(token.offset_from, 3);
 ///   assert_eq!(token.offset_to, 5);
 /// }
@@ -161,11 +168,11 @@ impl Tokenizer for NgramTokenizer {
 
 impl TokenStream for NgramTokenStream<'_> {
     fn advance(&mut self) -> bool {
-        if let Some((offset_from, offset_to)) = self.ngram_charidx_iterator.next() {
+        if let Some((offset_from, offset_to, position)) = self.ngram_charidx_iterator.next() {
             if self.prefix_only && offset_from > 0 {
                 return false;
             }
-            self.token.position = 0;
+            self.token.position = position;
             self.token.offset_from = offset_from;
             self.token.offset_to = offset_to;
             self.token.text.clear();
@@ -202,10 +209,11 @@ struct StutteringIterator<T> {
     memory: Vec<usize>,
     cursor: usize,
     gram_len: usize,
+    position: usize,
 }
 
 impl<T> StutteringIterator<T>
-where T: Iterator<Item = usize>
+where T: Iterator<Item = usize>,
 {
     pub fn new(mut underlying: T, min_gram: usize, max_gram: usize) -> StutteringIterator<T> {
         assert!(min_gram > 0);
@@ -219,6 +227,7 @@ where T: Iterator<Item = usize>
                 memory,
                 cursor: 0,
                 gram_len: 0,
+                position: 0,
             }
         } else {
             StutteringIterator {
@@ -228,17 +237,19 @@ where T: Iterator<Item = usize>
                 memory,
                 cursor: 0,
                 gram_len: min_gram,
+                position: 0,
             }
         }
     }
 }
 
 impl<T> Iterator for StutteringIterator<T>
-where T: Iterator<Item = usize>
+where T: Iterator<Item = usize>,
 {
-    type Item = (usize, usize);
+    // start_offset, end_offset, position
+    type Item = (usize, usize, usize);
 
-    fn next(&mut self) -> Option<(usize, usize)> {
+    fn next(&mut self) -> Option<(usize, usize, usize)> {
         if self.gram_len > self.max_gram {
             // we have exhausted all options
             // starting at `self.memory[self.cursor]`.
@@ -254,6 +265,7 @@ where T: Iterator<Item = usize>
             if self.cursor >= self.memory.len() {
                 self.cursor = 0;
             }
+            self.position += 1;
         }
         if self.max_gram < self.min_gram {
             return None;
@@ -261,7 +273,7 @@ where T: Iterator<Item = usize>
         let start = self.memory[self.cursor % self.memory.len()];
         let stop = self.memory[(self.cursor + self.gram_len) % self.memory.len()];
         self.gram_len += 1;
-        Some((start, stop))
+        Some((start, stop, self.position))
     }
 }
 
@@ -365,13 +377,13 @@ mod tests {
         assert_eq!(tokens.len(), 9);
         assert_token(&tokens[0], 0, "h", 0, 1);
         assert_token(&tokens[1], 0, "he", 0, 2);
-        assert_token(&tokens[2], 0, "e", 1, 2);
-        assert_token(&tokens[3], 0, "el", 1, 3);
-        assert_token(&tokens[4], 0, "l", 2, 3);
-        assert_token(&tokens[5], 0, "ll", 2, 4);
-        assert_token(&tokens[6], 0, "l", 3, 4);
-        assert_token(&tokens[7], 0, "lo", 3, 5);
-        assert_token(&tokens[8], 0, "o", 4, 5);
+        assert_token(&tokens[2], 1, "e", 1, 2);
+        assert_token(&tokens[3], 1, "el", 1, 3);
+        assert_token(&tokens[4], 2, "l", 2, 3);
+        assert_token(&tokens[5], 2, "ll", 2, 4);
+        assert_token(&tokens[6], 3, "l", 3, 4);
+        assert_token(&tokens[7], 3, "lo", 3, 5);
+        assert_token(&tokens[8], 4, "o", 4, 5);
     }
 
     #[test]
@@ -383,8 +395,8 @@ mod tests {
         );
         assert_eq!(tokens.len(), 3);
         assert_token(&tokens[0], 0, "hel", 0, 3);
-        assert_token(&tokens[1], 0, "ell", 1, 4);
-        assert_token(&tokens[2], 0, "llo", 2, 5);
+        assert_token(&tokens[1], 1, "ell", 1, 4);
+        assert_token(&tokens[2], 2, "llo", 2, 5);
     }
 
     #[test]
@@ -411,13 +423,13 @@ mod tests {
         assert_eq!(tokens.len(), 9);
         assert_token(&tokens[0], 0, "h", 0, 1);
         assert_token(&tokens[1], 0, "hε", 0, 3);
-        assert_token(&tokens[2], 0, "ε", 1, 3);
-        assert_token(&tokens[3], 0, "εl", 1, 4);
-        assert_token(&tokens[4], 0, "l", 3, 4);
-        assert_token(&tokens[5], 0, "ll", 3, 5);
-        assert_token(&tokens[6], 0, "l", 4, 5);
-        assert_token(&tokens[7], 0, "lo", 4, 6);
-        assert_token(&tokens[8], 0, "o", 5, 6);
+        assert_token(&tokens[2], 1, "ε", 1, 3);
+        assert_token(&tokens[3], 1, "εl", 1, 4);
+        assert_token(&tokens[4], 2, "l", 3, 4);
+        assert_token(&tokens[5], 2, "ll", 3, 5);
+        assert_token(&tokens[6], 3, "l", 4, 5);
+        assert_token(&tokens[7], 3, "lo", 4, 6);
+        assert_token(&tokens[8], 4, "o", 5, 6);
     }
 
     #[test]
@@ -468,23 +480,23 @@ mod tests {
     #[test]
     fn test_stuterring_iterator() {
         let mut it = StutteringIterator::new(0..10, 1, 2);
-        assert_eq!(it.next(), Some((0, 1)));
-        assert_eq!(it.next(), Some((0, 2)));
-        assert_eq!(it.next(), Some((1, 2)));
-        assert_eq!(it.next(), Some((1, 3)));
-        assert_eq!(it.next(), Some((2, 3)));
-        assert_eq!(it.next(), Some((2, 4)));
-        assert_eq!(it.next(), Some((3, 4)));
-        assert_eq!(it.next(), Some((3, 5)));
-        assert_eq!(it.next(), Some((4, 5)));
-        assert_eq!(it.next(), Some((4, 6)));
-        assert_eq!(it.next(), Some((5, 6)));
-        assert_eq!(it.next(), Some((5, 7)));
-        assert_eq!(it.next(), Some((6, 7)));
-        assert_eq!(it.next(), Some((6, 8)));
-        assert_eq!(it.next(), Some((7, 8)));
-        assert_eq!(it.next(), Some((7, 9)));
-        assert_eq!(it.next(), Some((8, 9)));
+        assert_eq!(it.next(), Some((0, 1, 0)));
+        assert_eq!(it.next(), Some((0, 2, 0)));
+        assert_eq!(it.next(), Some((1, 2, 1)));
+        assert_eq!(it.next(), Some((1, 3, 1)));
+        assert_eq!(it.next(), Some((2, 3, 2)));
+        assert_eq!(it.next(), Some((2, 4, 2)));
+        assert_eq!(it.next(), Some((3, 4, 3)));
+        assert_eq!(it.next(), Some((3, 5, 3)));
+        assert_eq!(it.next(), Some((4, 5, 4)));
+        assert_eq!(it.next(), Some((4, 6, 4)));
+        assert_eq!(it.next(), Some((5, 6, 5)));
+        assert_eq!(it.next(), Some((5, 7, 5)));
+        assert_eq!(it.next(), Some((6, 7, 6)));
+        assert_eq!(it.next(), Some((6, 8, 6)));
+        assert_eq!(it.next(), Some((7, 8, 7)));
+        assert_eq!(it.next(), Some((7, 9, 7)));
+        assert_eq!(it.next(), Some((8, 9, 8)));
         assert_eq!(it.next(), None);
     }
 }
