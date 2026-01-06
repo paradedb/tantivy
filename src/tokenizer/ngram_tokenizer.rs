@@ -3,8 +3,8 @@ use crate::TantivyError;
 
 /// Tokenize the text by splitting words into n-grams of the given size(s)
 ///
-/// With this tokenizer, the `position` of the token corresponds to the character index of the start of the n-gram.
-/// Beware however, in presence of multiple value for the same field,
+/// With this tokenizer, the `position` of the token corresponds to the character index of the start
+/// of the n-gram. Beware however, in presence of multiple value for the same field,
 /// the position will be `POSITION_GAP * index of value`.
 ///
 /// Example 1: `hello` would be tokenized as (min_gram: 2, max_gram: 3, prefix_only: false)
@@ -213,8 +213,7 @@ struct StutteringIterator<T> {
 }
 
 impl<T> StutteringIterator<T>
-where
-    T: Iterator<Item = usize>,
+where T: Iterator<Item = usize>
 {
     pub fn new(mut underlying: T, min_gram: usize, max_gram: usize) -> StutteringIterator<T> {
         assert!(min_gram > 0);
@@ -245,8 +244,7 @@ where
 }
 
 impl<T> Iterator for StutteringIterator<T>
-where
-    T: Iterator<Item = usize>,
+where T: Iterator<Item = usize>
 {
     // start_offset, end_offset, position
     type Item = (usize, usize, usize);
