@@ -194,6 +194,41 @@ impl SchemaBuilder {
         self.add_field(field_entry)
     }
 
+    /// Adds an arbitrary precision decimal field to the schema.
+    ///
+    /// Decimal fields support Postgres-style precision and scale:
+    /// - `DecimalOptions::default()` - unlimited precision
+    /// - `DecimalOptions::with_precision(p)` - precision only (scale=0)
+    /// - `DecimalOptions::with_precision_and_scale(p, s)` - both specified
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use tantivy::schema::*;
+    ///
+    /// let mut schema_builder = Schema::builder();
+    ///
+    /// // Unlimited precision decimal
+    /// schema_builder.add_decimal_field("amount", INDEXED | FAST | STORED);
+    ///
+    /// // Fixed precision/scale (like NUMERIC(10,2))
+    /// let price_opts = DecimalOptions::with_precision_and_scale(10, 2)
+    ///     .set_indexed()
+    ///     .set_fast()
+    ///     .set_stored();
+    /// schema_builder.add_decimal_field("price", price_opts);
+    ///
+    /// let schema = schema_builder.build();
+    /// ```
+    pub fn add_decimal_field<T: Into<DecimalOptions>>(
+        &mut self,
+        field_name: &str,
+        field_options: T,
+    ) -> Field {
+        let field_entry = FieldEntry::new_decimal(field_name.to_string(), field_options.into());
+        self.add_field(field_entry)
+    }
+
     /// Adds a field entry to the schema in build.
     pub fn add_field(&mut self, field_entry: FieldEntry) -> Field {
         let field = Field::from_field_id(self.fields.len() as u32);

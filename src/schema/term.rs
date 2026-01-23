@@ -8,6 +8,7 @@ use common::JsonPathWriter;
 use serde::{Deserialize, Serialize};
 
 use super::date_time_options::DATE_TIME_PRECISION_INDEXED;
+use super::DecimalValue;
 use super::{Field, Schema};
 use crate::fastfield::FastValue;
 use crate::json_utils::split_json_path;
@@ -204,6 +205,14 @@ impl Term {
     /// Builds a term bytes.
     pub fn from_field_bytes(field: Field, bytes: &[u8]) -> Term {
         Term::with_bytes_and_field_and_payload(Type::Bytes, field, bytes)
+    }
+
+    /// Builds a term given a field and a `DecimalValue`
+    ///
+    /// The decimal value is stored as its lexicographically sortable byte representation.
+    pub fn from_field_decimal(field: Field, decimal: &DecimalValue) -> Term {
+        let bytes = decimal.as_bytes();
+        Term::with_bytes_and_field_and_payload(Type::Decimal, field, &bytes)
     }
 
     /// Removes the value_bytes and set the type code.
@@ -421,6 +430,17 @@ where B: AsRef<[u8]>
         Some(self.raw_value_bytes_payload())
     }
 
+    /// Returns the decimal value associated with the term.
+    ///
+    /// Returns `None` if the field is not of decimal type
+    /// or if the bytes are not a valid decimal encoding.
+    pub fn as_decimal(&self) -> Option<DecimalValue> {
+        if self.typ() != Type::Decimal {
+            return None;
+        }
+        DecimalValue::from_bytes(self.raw_value_bytes_payload()).ok()
+    }
+
     /// Returns a `Ipv6Addr` value from the term.
     pub fn as_ip_addr(&self) -> Option<Ipv6Addr> {
         if self.typ() != Type::IpAddr {
@@ -528,6 +548,9 @@ where B: AsRef<[u8]>
             }
             Type::IpAddr => {
                 write_opt(f, self.as_ip_addr())?;
+            }
+            Type::Decimal => {
+                write_opt(f, self.as_decimal())?;
             }
         }
         Ok(())

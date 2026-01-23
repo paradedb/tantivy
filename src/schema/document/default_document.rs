@@ -8,6 +8,7 @@ use serde_json::Map;
 pub use CompactDoc as TantivyDocument;
 
 use super::{ReferenceValue, ReferenceValueLeaf, Value};
+use crate::schema::DecimalValue;
 use crate::schema::document::{
     DeserializeError, Document, DocumentDeserialize, DocumentDeserializer,
 };
@@ -254,6 +255,9 @@ impl CompactDoc {
             }
             ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
             ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
+            ReferenceValueLeaf::Decimal(decimal) => {
+                write_bytes_into(&mut self.node_data, decimal.to_string().as_bytes())
+            }
         };
         ValueAddr { type_id, val_addr }
     }
@@ -472,6 +476,14 @@ impl<'a> CompactDocValue<'a> {
                 self.container,
                 addr,
             )?)),
+            ValueType::Decimal => {
+                // Decimal is stored as a string representation
+                let str_ref = self.container.extract_str(addr);
+                let decimal = DecimalValue::from_str(str_ref).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                Ok(ReferenceValueLeaf::Decimal(decimal).into())
+            }
         }
     }
 }
@@ -540,8 +552,10 @@ pub enum ValueType {
     PreTokStr = 10,
     /// Object
     Object = 11,
-    /// Pre-tokenized str type,
+    /// Array type
     Array = 12,
+    /// Arbitrary precision decimal value.
+    Decimal = 13,
 }
 
 impl BinarySerializable for ValueType {
@@ -552,7 +566,7 @@ impl BinarySerializable for ValueType {
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let num = u8::deserialize(reader)?;
-        let type_id = if (0..=12).contains(&num) {
+        let type_id = if (0..=13).contains(&num) {
             unsafe { std::mem::transmute::<u8, ValueType>(num) }
         } else {
             return Err(io::Error::new(
@@ -587,6 +601,7 @@ impl<'a> From<&ReferenceValueLeaf<'a>> for ValueType {
             ReferenceValueLeaf::PreTokStr(_) => ValueType::PreTokStr,
             ReferenceValueLeaf::Facet(_) => ValueType::Facet,
             ReferenceValueLeaf::Bytes(_) => ValueType::Bytes,
+            ReferenceValueLeaf::Decimal(_) => ValueType::Decimal,
         }
     }
 }

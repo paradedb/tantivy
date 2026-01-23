@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 
+use super::decimal_options::DecimalOptions;
+use super::DecimalValue;
 use super::ip_options::IpAddrOptions;
 use super::IntoIpv6Addr;
 use crate::schema::bytes_options::BytesOptions;
@@ -71,6 +73,8 @@ pub enum Type {
     Json = b'j',
     /// IpAddr
     IpAddr = b'p',
+    /// Arbitrary precision decimal number.
+    Decimal = b'n',
 }
 
 impl From<ColumnType> for Type {
@@ -88,7 +92,7 @@ impl From<ColumnType> for Type {
     }
 }
 
-const ALL_TYPES: [Type; 10] = [
+const ALL_TYPES: [Type; 11] = [
     Type::Str,
     Type::U64,
     Type::I64,
@@ -99,6 +103,7 @@ const ALL_TYPES: [Type; 10] = [
     Type::Bytes,
     Type::Json,
     Type::IpAddr,
+    Type::Decimal,
 ];
 
 impl Type {
@@ -139,6 +144,7 @@ impl Type {
             Type::Bytes => "Bytes",
             Type::Json => "Json",
             Type::IpAddr => "IpAddr",
+            Type::Decimal => "Decimal",
         }
     }
 
@@ -157,6 +163,7 @@ impl Type {
             b'b' => Some(Type::Bytes),
             b'j' => Some(Type::Json),
             b'p' => Some(Type::IpAddr),
+            b'n' => Some(Type::Decimal),
             _ => None,
         }
     }
@@ -189,6 +196,8 @@ pub enum FieldType {
     JsonObject(JsonObjectOptions),
     /// IpAddr field
     IpAddr(IpAddrOptions),
+    /// Arbitrary precision decimal field
+    Decimal(DecimalOptions),
 }
 
 impl FieldType {
@@ -205,6 +214,7 @@ impl FieldType {
             FieldType::Bytes(_) => Type::Bytes,
             FieldType::JsonObject(_) => Type::Json,
             FieldType::IpAddr(_) => Type::IpAddr,
+            FieldType::Decimal(_) => Type::Decimal,
         }
     }
 
@@ -228,6 +238,11 @@ impl FieldType {
         matches!(self, FieldType::Date(_))
     }
 
+    /// returns true if this is a decimal field
+    pub fn is_decimal(&self) -> bool {
+        matches!(self, FieldType::Decimal(_))
+    }
+
     /// returns true if the field is indexed.
     pub fn is_indexed(&self) -> bool {
         match *self {
@@ -241,6 +256,7 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.is_indexed(),
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_indexed(),
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_indexed(),
+            FieldType::Decimal(ref decimal_options) => decimal_options.is_indexed(),
         }
     }
 
@@ -278,6 +294,7 @@ impl FieldType {
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_fast(),
             FieldType::Facet(_) => true,
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_fast(),
+            FieldType::Decimal(ref decimal_options) => decimal_options.is_fast(),
         }
     }
 
@@ -297,6 +314,7 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.fieldnorms(),
             FieldType::JsonObject(ref _json_object_options) => false,
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.fieldnorms(),
+            FieldType::Decimal(ref decimal_options) => decimal_options.fieldnorms(),
         }
     }
 
@@ -343,6 +361,13 @@ impl FieldType {
                 .map(TextFieldIndexing::index_option),
             FieldType::IpAddr(ref ip_addr_options) => {
                 if ip_addr_options.is_indexed() {
+                    Some(IndexRecordOption::Basic)
+                } else {
+                    None
+                }
+            }
+            FieldType::Decimal(ref decimal_options) => {
+                if decimal_options.is_indexed() {
                     Some(IndexRecordOption::Basic)
                 } else {
                     None
@@ -449,6 +474,18 @@ impl FieldType {
 
                         Ok(OwnedValue::IpAddr(ip_addr.into_ipv6_addr()))
                     }
+                    FieldType::Decimal(ref decimal_options) => {
+                        let decimal_value = DecimalValue::with_precision_scale(
+                            &field_text,
+                            decimal_options.precision(),
+                            decimal_options.scale(),
+                        )
+                        .map_err(|err| ValueParsingError::ParseError {
+                            error: err.to_string(),
+                            json: JsonValue::String(field_text),
+                        })?;
+                        Ok(OwnedValue::Decimal(decimal_value))
+                    }
                 }
             }
             JsonValue::Number(field_val_num) => match self {
@@ -508,6 +545,20 @@ impl FieldType {
                     expected: "a string with an ip addr",
                     json: JsonValue::Number(field_val_num),
                 }),
+                FieldType::Decimal(ref decimal_options) => {
+                    // Numbers can be converted to decimal
+                    let num_str = field_val_num.to_string();
+                    let decimal_value = DecimalValue::with_precision_scale(
+                        &num_str,
+                        decimal_options.precision(),
+                        decimal_options.scale(),
+                    )
+                    .map_err(|err| ValueParsingError::ParseError {
+                        error: err.to_string(),
+                        json: JsonValue::Number(field_val_num),
+                    })?;
+                    Ok(OwnedValue::Decimal(decimal_value))
+                }
             },
             JsonValue::Object(json_map) => match self {
                 FieldType::Str(_) => {

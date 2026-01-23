@@ -10,6 +10,7 @@ use time::OffsetDateTime;
 
 use super::existing_type_impls::can_be_rfc3339_date_time;
 use super::ReferenceValueLeaf;
+use crate::schema::DecimalValue;
 use crate::schema::document::{
     ArrayAccess, DeserializeError, ObjectAccess, ReferenceValue, Value, ValueDeserialize,
     ValueDeserializer, ValueVisitor,
@@ -49,6 +50,8 @@ pub enum OwnedValue {
     Object(Vec<(String, Self)>),
     /// IpV6 Address. Internally there is no IpV4, it needs to be converted to `Ipv6Addr`.
     IpAddr(Ipv6Addr),
+    /// Arbitrary precision decimal value.
+    Decimal(DecimalValue),
 }
 
 impl AsRef<OwnedValue> for OwnedValue {
@@ -79,6 +82,7 @@ impl OwnedValue {
             OwnedValue::Array(_) => 10,
             OwnedValue::Object(_) => 11,
             OwnedValue::IpAddr(_) => 12,
+            OwnedValue::Decimal(_) => 13,
         }
     }
 }
@@ -102,6 +106,8 @@ impl<'a> Value<'a> for &'a OwnedValue {
             OwnedValue::IpAddr(val) => ReferenceValueLeaf::IpAddr(*val).into(),
             OwnedValue::Array(array) => ReferenceValue::Array(array.iter()),
             OwnedValue::Object(object) => ReferenceValue::Object(ObjectMapIter(object.iter())),
+            // Decimal values are stored as their lexicographically sortable byte encoding
+            OwnedValue::Decimal(val) => ReferenceValueLeaf::Decimal(val.clone()).into(),
         }
     }
 }
@@ -159,6 +165,10 @@ impl ValueDeserialize for OwnedValue {
                 val: PreTokenizedString,
             ) -> Result<Self::Value, DeserializeError> {
                 Ok(OwnedValue::PreTokStr(val))
+            }
+
+            fn visit_decimal(&self, val: DecimalValue) -> Result<Self::Value, DeserializeError> {
+                Ok(OwnedValue::Decimal(val))
             }
 
             fn visit_array<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
@@ -223,6 +233,7 @@ impl serde::Serialize for OwnedValue {
                 }
             }
             OwnedValue::Array(ref array) => array.serialize(serializer),
+            OwnedValue::Decimal(ref decimal) => serializer.serialize_str(&decimal.to_string()),
         }
     }
 }
@@ -310,6 +321,7 @@ impl<'a, V: Value<'a>> From<ReferenceValue<'a, V>> for OwnedValue {
                 ReferenceValueLeaf::IpAddr(val) => OwnedValue::IpAddr(val),
                 ReferenceValueLeaf::Bool(val) => OwnedValue::Bool(val),
                 ReferenceValueLeaf::PreTokStr(val) => OwnedValue::PreTokStr(*val.clone()),
+                ReferenceValueLeaf::Decimal(val) => OwnedValue::Decimal(val),
             },
             ReferenceValue::Array(val) => {
                 OwnedValue::Array(val.map(|v| v.as_value().into()).collect())
@@ -391,6 +403,12 @@ impl From<Vec<u8>> for OwnedValue {
 impl From<PreTokenizedString> for OwnedValue {
     fn from(pretokenized_string: PreTokenizedString) -> OwnedValue {
         OwnedValue::PreTokStr(pretokenized_string)
+    }
+}
+
+impl From<DecimalValue> for OwnedValue {
+    fn from(decimal: DecimalValue) -> OwnedValue {
+        OwnedValue::Decimal(decimal)
     }
 }
 

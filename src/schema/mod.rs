@@ -121,6 +121,7 @@ mod field_type;
 
 mod bytes_options;
 mod date_time_options;
+mod decimal_options;
 mod field;
 mod flags;
 mod index_record_option;
@@ -134,6 +135,10 @@ use columnar::ColumnType;
 
 pub use self::bytes_options::BytesOptions;
 pub use self::date_time_options::{DateOptions, DateTimePrecision, DATE_TIME_PRECISION_INDEXED};
+pub use self::decimal_options::DecimalOptions;
+// Re-export Decimal from decimal-bytes crate
+pub use decimal_bytes::Decimal as DecimalValue;
+pub use decimal_bytes::DecimalError;
 pub use self::document::{DocParsingError, Document, OwnedValue, TantivyDocument, Value};
 pub(crate) use self::facet::FACET_SEP_BYTE;
 pub use self::facet::{Facet, FacetParseError};
@@ -172,6 +177,8 @@ pub(crate) fn value_type_to_column_type(typ: Type) -> Option<ColumnType> {
         Type::Bytes => Some(ColumnType::Bytes),
         Type::IpAddr => Some(ColumnType::IpAddr),
         Type::Json => None,
+        // Decimal values are stored as lexicographically-sortable bytes
+        Type::Decimal => Some(ColumnType::Bytes),
     }
 }
 

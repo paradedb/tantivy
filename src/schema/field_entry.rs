@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::decimal_options::DecimalOptions;
 use super::ip_options::IpAddrOptions;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::{
@@ -80,6 +81,11 @@ impl FieldEntry {
         Self::new(field_name, FieldType::JsonObject(json_object_options))
     }
 
+    /// Creates a field entry for an arbitrary precision decimal field
+    pub fn new_decimal(field_name: String, decimal_options: DecimalOptions) -> FieldEntry {
+        Self::new(field_name, FieldType::Decimal(decimal_options))
+    }
+
     /// Returns the name of the field
     pub fn name(&self) -> &str {
         &self.name
@@ -129,6 +135,7 @@ impl FieldEntry {
             FieldType::Bytes(ref options) => options.is_stored(),
             FieldType::JsonObject(ref options) => options.is_stored(),
             FieldType::IpAddr(ref options) => options.is_stored(),
+            FieldType::Decimal(ref options) => options.is_stored(),
         }
     }
 }

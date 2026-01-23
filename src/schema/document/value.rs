@@ -3,6 +3,7 @@ use std::net::Ipv6Addr;
 
 use common::DateTime;
 
+use crate::schema::DecimalValue;
 use crate::tokenizer::PreTokenizedString;
 
 /// A single field value.
@@ -136,6 +137,8 @@ pub enum ReferenceValueLeaf<'a> {
     Bool(bool),
     /// Pre-tokenized str type,
     PreTokStr(Box<PreTokenizedString>),
+    /// Arbitrary precision decimal value.
+    Decimal(DecimalValue),
 }
 
 impl From<u64> for ReferenceValueLeaf<'_> {
@@ -201,6 +204,13 @@ impl From<PreTokenizedString> for ReferenceValueLeaf<'_> {
     }
 }
 
+impl From<DecimalValue> for ReferenceValueLeaf<'_> {
+    #[inline]
+    fn from(val: DecimalValue) -> Self {
+        ReferenceValueLeaf::Decimal(val)
+    }
+}
+
 impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<'a, T> {
     #[inline]
     fn from(value: ReferenceValueLeaf<'a>) -> Self {
@@ -219,6 +229,9 @@ impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<
             ReferenceValueLeaf::Bool(val) => ReferenceValue::Leaf(ReferenceValueLeaf::Bool(val)),
             ReferenceValueLeaf::PreTokStr(val) => {
                 ReferenceValue::Leaf(ReferenceValueLeaf::PreTokStr(val))
+            }
+            ReferenceValueLeaf::Decimal(val) => {
+                ReferenceValue::Leaf(ReferenceValueLeaf::Decimal(val))
             }
         }
     }
@@ -326,6 +339,16 @@ impl<'a> ReferenceValueLeaf<'a> {
     /// If the Value is a facet, returns the associated facet. Returns None otherwise.
     pub fn as_facet(&self) -> Option<&'a str> {
         if let Self::Facet(val) = self {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    /// If the Value is a decimal, returns the associated decimal. Returns None otherwise.
+    pub fn as_decimal(&self) -> Option<&DecimalValue> {
+        if let Self::Decimal(val) = self {
             Some(val)
         } else {
             None

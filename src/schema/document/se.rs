@@ -133,6 +133,13 @@ where W: Write
                     self.write_type_code(type_codes::EXT_CODE)?;
                     self.serialize_with_type_code(type_codes::TOK_STR_EXT_CODE, &*val)
                 }
+                ReferenceValueLeaf::Decimal(val) => {
+                    // Serialize as string for storage
+                    self.serialize_with_type_code(
+                        type_codes::DECIMAL_CODE,
+                        &Cow::<str>::Owned(val.to_string()),
+                    )
+                }
             },
             ReferenceValue::Array(elements) => {
                 self.write_type_code(type_codes::ARRAY_CODE)?;

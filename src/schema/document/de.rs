@@ -20,6 +20,7 @@ use common::{u64_to_f64, BinarySerializable, DateTime, VInt};
 
 use super::se::BinaryObjectSerializer;
 use super::{OwnedValue, Value};
+use crate::schema::DecimalValue;
 use crate::schema::document::type_codes;
 use crate::schema::{Facet, Field};
 use crate::store::DocStoreVersion;
@@ -166,6 +167,8 @@ pub enum ValueType {
     /// A JSON object value. Deprecated.
     #[deprecated(note = "We keep this for backwards compatibility, use Object instead")]
     JSONObject,
+    /// An arbitrary precision decimal value.
+    Decimal,
 }
 
 /// A value visitor for deserializing a document value.
@@ -244,6 +247,12 @@ pub trait ValueVisitor {
         _val: PreTokenizedString,
     ) -> Result<Self::Value, DeserializeError> {
         Err(DeserializeError::UnsupportedType(ValueType::PreTokStr))
+    }
+
+    #[inline]
+    /// Called when the deserializer visits a decimal value.
+    fn visit_decimal(&self, _val: DecimalValue) -> Result<Self::Value, DeserializeError> {
+        Err(DeserializeError::UnsupportedType(ValueType::Decimal))
     }
 
     #[inline]
@@ -394,6 +403,7 @@ where R: Read
             type_codes::NULL_CODE => ValueType::Null,
             type_codes::ARRAY_CODE => ValueType::Array,
             type_codes::OBJECT_CODE => ValueType::Object,
+            type_codes::DECIMAL_CODE => ValueType::Decimal,
             #[expect(deprecated)]
             type_codes::JSON_OBJ_CODE => ValueType::JSONObject,
             _ => {
@@ -538,6 +548,13 @@ where R: Read
             ValueType::PreTokStr => {
                 let val = self.deserialize_pre_tokenized_string()?;
                 visitor.visit_pre_tokenized_string(val)
+            }
+            ValueType::Decimal => {
+                // Decimal is stored as a string
+                let val_str = self.deserialize_string()?;
+                let decimal = DecimalValue::from_str(&val_str)
+                    .map_err(|e| DeserializeError::Custom(e.to_string()))?;
+                visitor.visit_decimal(decimal)
             }
             ValueType::Array => {
                 let access =
