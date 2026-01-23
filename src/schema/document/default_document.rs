@@ -255,7 +255,7 @@ impl CompactDoc {
             ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
             ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
             ReferenceValueLeaf::Decimal(decimal) => {
-                write_bytes_into(&mut self.node_data, decimal.to_string().as_bytes())
+                write_bytes_into(&mut self.node_data, decimal.as_bytes())
             }
         };
         ValueAddr { type_id, val_addr }
@@ -476,9 +476,9 @@ impl<'a> CompactDocValue<'a> {
                 addr,
             )?)),
             ValueType::Decimal => {
-                // Decimal is stored as a string representation
-                let str_ref = self.container.extract_str(addr);
-                let decimal = DecimalValue::from_str(str_ref)
+                // Decimal is stored as raw bytes
+                let bytes = self.container.extract_bytes(addr);
+                let decimal = DecimalValue::from_bytes(bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 Ok(ReferenceValueLeaf::Decimal(decimal).into())
             }

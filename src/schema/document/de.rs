@@ -129,6 +129,9 @@ pub trait ValueDeserializer<'de> {
     /// Attempts to deserialize a pre-tokenized string value from the deserializer.
     fn deserialize_pre_tokenized_string(self) -> Result<PreTokenizedString, DeserializeError>;
 
+    /// Attempts to deserialize a decimal value from the deserializer.
+    fn deserialize_decimal(self) -> Result<DecimalValue, DeserializeError>;
+
     /// Attempts to deserialize the value using a given visitor.
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>
     where V: ValueVisitor;
@@ -504,6 +507,13 @@ where R: Read
             .map_err(DeserializeError::from)
     }
 
+    fn deserialize_decimal(self) -> Result<DecimalValue, DeserializeError> {
+        self.validate_type(ValueType::Decimal)?;
+        let bytes = <Vec<u8> as BinarySerializable>::deserialize(self.reader)
+            .map_err(DeserializeError::from)?;
+        DecimalValue::from_bytes(&bytes).map_err(|e| DeserializeError::Custom(e.to_string()))
+    }
+
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>
     where V: ValueVisitor {
         match self.value_type {
@@ -549,11 +559,8 @@ where R: Read
                 visitor.visit_pre_tokenized_string(val)
             }
             ValueType::Decimal => {
-                // Decimal is stored as a string
-                let val_str = self.deserialize_string()?;
-                let decimal = DecimalValue::from_str(&val_str)
-                    .map_err(|e| DeserializeError::Custom(e.to_string()))?;
-                visitor.visit_decimal(decimal)
+                let val = self.deserialize_decimal()?;
+                visitor.visit_decimal(val)
             }
             ValueType::Array => {
                 let access =

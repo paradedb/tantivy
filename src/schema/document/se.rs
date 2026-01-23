@@ -134,10 +134,10 @@ where W: Write
                     self.serialize_with_type_code(type_codes::TOK_STR_EXT_CODE, &*val)
                 }
                 ReferenceValueLeaf::Decimal(val) => {
-                    // Serialize as string for storage
+                    // Serialize as raw bytes for efficient storage
                     self.serialize_with_type_code(
                         type_codes::DECIMAL_CODE,
-                        &Cow::<str>::Owned(val.to_string()),
+                        &Cow::Borrowed(val.as_bytes()),
                     )
                 }
             },
