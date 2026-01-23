@@ -128,7 +128,12 @@ impl Weight for FastFieldRangeWeight {
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                     )
                 }
-                Type::Bool | Type::Facet | Type::Bytes | Type::Json | Type::IpAddr => {
+                Type::Bool
+                | Type::Facet
+                | Type::Bytes
+                | Type::Json
+                | Type::IpAddr
+                | Type::Decimal => {
                     Err(crate::TantivyError::InvalidArgument(format!(
                         "unsupported value bytes type in json term value_bytes {:?}",
                         term_value.typ()
@@ -170,6 +175,24 @@ impl Weight for FastFieldRangeWeight {
             let fast_field_reader = reader.fast_fields();
             let Some((column, _col_type)) =
                 fast_field_reader.u64_lenient_for_type(None, &field_name)?
+            else {
+                return Ok(Box::new(EmptyScorer));
+            };
+            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound))
+        } else if field_type.is_decimal() {
+            // Decimal values are stored as lexicographically sortable bytes in a bytes column
+            let Some(bytes_column) = reader.fast_fields().bytes(&field_name)? else {
+                return Ok(Box::new(EmptyScorer));
+            };
+            let dict = bytes_column.dictionary();
+
+            let bounds = self.bounds.map_bound(get_value_bytes);
+            // Get term ids for terms using bytes dictionary
+            let (lower_bound, upper_bound) =
+                dict.term_bounds_to_ord(bounds.lower_bound, bounds.upper_bound)?;
+            let fast_field_reader = reader.fast_fields();
+            let Some((column, _col_type)) =
+                fast_field_reader.u64_lenient_for_type(Some(&[ColumnType::Bytes]), &field_name)?
             else {
                 return Ok(Box::new(EmptyScorer));
             };
@@ -435,7 +458,8 @@ pub(crate) fn maps_to_u64_fastfield(typ: Type) -> bool {
     match typ {
         Type::U64 | Type::I64 | Type::F64 | Type::Bool | Type::Date => true,
         Type::IpAddr => false,
-        Type::Str | Type::Facet | Type::Bytes | Type::Json => false,
+        // Decimal is stored as bytes, not u64
+        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Decimal => false,
     }
 }
 

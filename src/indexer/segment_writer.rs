@@ -372,6 +372,25 @@ impl SegmentWriter {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
+                FieldType::Decimal(_) => {
+                    let mut num_vals = 0;
+                    for value in values {
+                        let value = value.as_value();
+
+                        num_vals += 1;
+                        // Decimal values are stored as lexicographically sortable bytes
+                        let decimal_val = value
+                            .as_leaf()
+                            .and_then(|leaf| leaf.as_decimal())
+                            .ok_or_else(make_schema_error)?;
+                        let bytes = decimal_val.as_bytes();
+                        term_buffer.set_bytes(&bytes);
+                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
+                    }
+                    if field_entry.has_fieldnorms() {
+                        self.fieldnorms_writer.record(doc_id, field, num_vals);
+                    }
+                }
             }
         }
         Ok(())

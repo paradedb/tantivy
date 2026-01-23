@@ -200,6 +200,11 @@ impl FastFieldsWriter {
                             .record_str(doc_id, field_name, &token.text);
                     }
                 }
+                ReferenceValueLeaf::Decimal(val) => {
+                    // Store decimal values as their lexicographically sortable byte encoding
+                    let bytes = val.as_bytes();
+                    self.columnar_writer.record_bytes(doc_id, field_name, &bytes);
+                }
             },
             ReferenceValue::Array(val) => {
                 // TODO: Check this is the correct behaviour we want.
@@ -337,6 +342,9 @@ fn record_json_value_to_columnar_writer<'a, V: Value<'a>>(
                 unimplemented!(
                     "Pre-tokenized string support in dynamic fields is not yet implemented"
                 )
+            }
+            ReferenceValueLeaf::Decimal(_) => {
+                unimplemented!("Decimal support in dynamic fields is not yet implemented")
             }
         },
         ReferenceValue::Array(elements) => {

@@ -19,7 +19,9 @@ pub(crate) fn is_type_valid_for_fastfield_range_query(typ: Type) -> bool {
         | Type::Bool
         | Type::Date
         | Type::Json
-        | Type::IpAddr => true,
+        | Type::IpAddr
+        // Decimal values are stored as lexicographically sortable bytes, enabling range queries
+        | Type::Decimal => true,
         Type::Facet | Type::Bytes => false,
     }
 }

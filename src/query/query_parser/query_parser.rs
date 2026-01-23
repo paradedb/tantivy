@@ -20,8 +20,8 @@ use crate::query::{
     PhraseQuery, Query, RegexQuery, TermQuery, TermSetQuery,
 };
 use crate::schema::{
-    Facet, FacetParseError, Field, FieldType, IndexRecordOption, IntoIpv6Addr, JsonObjectOptions,
-    Schema, Term, TextFieldIndexing, Type,
+    DecimalValue, Facet, FacetParseError, Field, FieldType, IndexRecordOption, IntoIpv6Addr,
+    JsonObjectOptions, Schema, Term, TextFieldIndexing, Type,
 };
 use crate::time::format_description::well_known::Rfc3339;
 use crate::time::OffsetDateTime;
@@ -524,6 +524,15 @@ impl QueryParser {
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
                 Ok(Term::from_field_ip_addr(field, ip_v6))
             }
+            FieldType::Decimal(ref decimal_options) => {
+                let decimal = DecimalValue::with_precision_scale(
+                    phrase,
+                    decimal_options.precision(),
+                    decimal_options.scale(),
+                )
+                .map_err(|e| QueryParserError::SyntaxError(e.to_string()))?;
+                Ok(Term::from_field_decimal(field, &decimal))
+            }
         }
     }
 
@@ -623,6 +632,16 @@ impl QueryParser {
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
                 let term = Term::from_field_ip_addr(field, ip_v6);
                 Ok(vec![LogicalLiteral::Term(term)])
+            }
+            FieldType::Decimal(ref decimal_options) => {
+                let decimal = DecimalValue::with_precision_scale(
+                    phrase,
+                    decimal_options.precision(),
+                    decimal_options.scale(),
+                )
+                .map_err(|e| QueryParserError::SyntaxError(e.to_string()))?;
+                let decimal_term = Term::from_field_decimal(field, &decimal);
+                Ok(vec![LogicalLiteral::Term(decimal_term)])
             }
         }
     }
