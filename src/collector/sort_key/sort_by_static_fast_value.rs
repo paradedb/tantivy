@@ -73,6 +73,27 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
             typ: PhantomData,
         })
     }
+
+    fn segment_bounds(
+        &self,
+        segment_reader: &SegmentReader,
+    ) -> crate::Result<
+        Option<(
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+        )>,
+    > {
+        let sort_column_opt = segment_reader.fast_fields().u64_lenient(&self.field)?;
+        let (sort_column, _sort_column_type) =
+            sort_column_opt.ok_or_else(|| FastFieldNotAvailableError {
+                field_name: self.field.clone(),
+            })?;
+        let min_value = sort_column.min_value();
+        let max_value = sort_column.max_value();
+        // For Option<u64>, None represents missing values which sort last
+        // So bounds are (Some(min), Some(max)) if column has values
+        Ok(Some((Some(min_value), Some(max_value))))
+    }
 }
 
 pub struct SortByFastValueSegmentSortKeyComputer<T> {

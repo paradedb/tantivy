@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 use crate::collector::sort_key::{Comparator, SegmentSortKeyComputer, SortKeyComputer};
 use crate::collector::{Collector, SegmentCollector, TopNComputer};
@@ -6,22 +7,68 @@ use crate::query::Weight;
 use crate::schema::Schema;
 use crate::{DocAddress, DocId, Result, Score, SegmentReader};
 
-pub(crate) struct TopBySortKeyCollector<TSortKeyComputer> {
+pub(crate) struct TopBySortKeyCollector<TSortKeyComputer>
+where
+    TSortKeyComputer: SortKeyComputer + Send + Sync,
+{
     sort_key_computer: TSortKeyComputer,
     doc_range: Range<usize>,
+    // Optional threshold for segment pruning. When set, segments whose bounds
+    // don't overlap with the threshold can be skipped.
+    // Uses Arc<Mutex<>> for interior mutability to allow threshold updates during sequential processing
+    threshold: Arc<Mutex<Option<<<TSortKeyComputer as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>>,
 }
 
-impl<TSortKeyComputer> TopBySortKeyCollector<TSortKeyComputer> {
+impl<TSortKeyComputer> TopBySortKeyCollector<TSortKeyComputer>
+where
+    TSortKeyComputer: SortKeyComputer + Send + Sync,
+{
     pub fn new(sort_key_computer: TSortKeyComputer, doc_range: Range<usize>) -> Self {
         TopBySortKeyCollector {
             sort_key_computer,
             doc_range,
+            threshold: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Sets the threshold for segment pruning. Segments whose bounds don't overlap
+    /// with this threshold will be skipped.
+    pub fn with_threshold(
+        mut self,
+        threshold: Option<<<TSortKeyComputer as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>,
+    ) -> Self {
+        *self.threshold.lock().unwrap() = threshold;
+        self
+    }
+
+    /// Helper method to check if a segment should be skipped based on threshold
+    fn should_skip_segment(
+        &self,
+        reader: &SegmentReader,
+        threshold: &<<TSortKeyComputer as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+    ) -> bool {
+        if let Ok(Some((min_bound, max_bound))) = self.sort_key_computer.segment_bounds(reader) {
+            let comparator = self.sort_key_computer.comparator();
+
+            // Compare the segment's best possible value against the threshold
+            let max_cmp = comparator.compare(&max_bound, threshold);
+            let min_cmp = comparator.compare(&min_bound, threshold);
+
+            // Skip if both bounds are worse than threshold
+            if max_cmp == std::cmp::Ordering::Less && min_cmp == std::cmp::Ordering::Less {
+                return true;
+            }
+            if max_cmp == std::cmp::Ordering::Greater && min_cmp == std::cmp::Ordering::Greater {
+                return true;
+            }
+        }
+        false
     }
 }
 
 impl<TSortKeyComputer> Collector for TopBySortKeyCollector<TSortKeyComputer>
-where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
+where
+    TSortKeyComputer: SortKeyComputer + Send + Sync + 'static,
 {
     type Fruit = Vec<(TSortKeyComputer::SortKey, DocAddress)>;
 
@@ -65,11 +112,28 @@ where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
         segment_ord: u32,
         reader: &SegmentReader,
     ) -> crate::Result<Vec<(TSortKeyComputer::SortKey, DocAddress)>> {
-        let k = self.doc_range.end;
-        let docs = self
-            .sort_key_computer
-            .collect_segment_top_k(k, weight, reader, segment_ord)?;
-        Ok(docs)
+        // Check threshold and skip segment if it can't contribute
+        if let Some(ref threshold) = *self.threshold.lock().unwrap() {
+            if self.should_skip_segment(reader, threshold) {
+                return Ok(Vec::new());
+            }
+        }
+
+        // Process segment
+        let mut segment_collector = self.for_segment(segment_ord, reader)?;
+        crate::collector::default_collect_segment_impl(&mut segment_collector, weight, reader, self.requires_scoring())?;
+
+        // Extract threshold from TopNComputer's threshold field (set when buffer reaches capacity)
+        let threshold_key = segment_collector.topn_computer.threshold.clone();
+
+        let results = segment_collector.harvest();
+
+        // Update threshold for adaptive pruning of subsequent segments
+        if let Some(threshold_key) = threshold_key {
+            *self.threshold.lock().unwrap() = Some(threshold_key);
+        }
+
+        Ok(results)
     }
 }
 

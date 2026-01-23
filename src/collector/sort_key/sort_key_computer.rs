@@ -136,6 +136,24 @@ pub trait SortKeyComputer: Sync {
 
     /// Builds a child sort key computer for a specific segment.
     fn segment_sort_key_computer(&self, segment_reader: &SegmentReader) -> Result<Self::Child>;
+
+    /// Returns the min and max segment sort key bounds for a segment, if available.
+    /// This is used for segment pruning - segments whose bounds don't overlap with
+    /// the current threshold can be skipped entirely.
+    ///
+    /// Returns `None` if bounds cannot be determined (e.g., for score-based sorting).
+    /// Returns `Some((min, max))` where min and max are the segment-level sort keys.
+    fn segment_bounds(
+        &self,
+        _segment_reader: &SegmentReader,
+    ) -> Result<
+        Option<(
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+        )>,
+    > {
+        Ok(None)
+    }
 }
 
 impl<HeadSortKeyComputer, TailSortKeyComputer> SortKeyComputer
@@ -168,6 +186,20 @@ where
         self.0.check_schema(schema)?;
         self.1.check_schema(schema)?;
         Ok(())
+    }
+
+    fn segment_bounds(
+        &self,
+        segment_reader: &SegmentReader,
+    ) -> Result<
+        Option<(
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+        )>,
+    > {
+        // For tuple sort keys, we can't easily determine bounds without processing
+        // Return None to indicate bounds are not available
+        Ok(None)
     }
 
     /// Indicates whether the sort key actually uses the similarity score (by default BM25).

@@ -181,6 +181,7 @@ pub trait Collector: Sync + Send {
         default_collect_segment_impl(&mut segment_collector, weight, reader, with_scoring)?;
         Ok(segment_collector.harvest())
     }
+
 }
 
 pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
