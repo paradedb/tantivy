@@ -69,7 +69,7 @@ query-grammar = { version = "0.25.0", path = "./query-grammar", package = "tanti
 tantivy-bitpacker = { version = "0.9", path = "./bitpacker" }
 common = { version = "0.10", path = "./common/", package = "tantivy-common" }
 tokenizer-api = { version = "0.6", path = "./tokenizer-api", package = "tantivy-tokenizer-api" }
-decimal-bytes = { git = "https://github.com/paradedb/decimal-bytes.git", rev = "3291fb8284e848fb0f0624c7aac9a2d59f04cf48" }
+decimal-bytes = { git = "https://github.com/paradedb/decimal-bytes.git", rev = "88d0236a1fae0a23cc989de2d44f30af32f14c67" }
 sketches-ddsketch = { version = "0.3.0", features = ["use_serde"] }
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 futures-util = { version = "0.3.28", optional = true }
