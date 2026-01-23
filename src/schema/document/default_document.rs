@@ -8,12 +8,11 @@ use serde_json::Map;
 pub use CompactDoc as TantivyDocument;
 
 use super::{ReferenceValue, ReferenceValueLeaf, Value};
-use crate::schema::DecimalValue;
 use crate::schema::document::{
     DeserializeError, Document, DocumentDeserialize, DocumentDeserializer,
 };
 use crate::schema::field_type::ValueParsingError;
-use crate::schema::{Facet, Field, NamedFieldDocument, OwnedValue, Schema};
+use crate::schema::{DecimalValue, Facet, Field, NamedFieldDocument, OwnedValue, Schema};
 use crate::tokenizer::PreTokenizedString;
 
 #[repr(C, packed)]
@@ -479,9 +478,8 @@ impl<'a> CompactDocValue<'a> {
             ValueType::Decimal => {
                 // Decimal is stored as a string representation
                 let str_ref = self.container.extract_str(addr);
-                let decimal = DecimalValue::from_str(str_ref).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                })?;
+                let decimal = DecimalValue::from_str(str_ref)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 Ok(ReferenceValueLeaf::Decimal(decimal).into())
             }
         }

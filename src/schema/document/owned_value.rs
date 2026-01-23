@@ -10,12 +10,11 @@ use time::OffsetDateTime;
 
 use super::existing_type_impls::can_be_rfc3339_date_time;
 use super::ReferenceValueLeaf;
-use crate::schema::DecimalValue;
 use crate::schema::document::{
     ArrayAccess, DeserializeError, ObjectAccess, ReferenceValue, Value, ValueDeserialize,
     ValueDeserializer, ValueVisitor,
 };
-use crate::schema::Facet;
+use crate::schema::{DecimalValue, Facet};
 use crate::tokenizer::PreTokenizedString;
 use crate::DateTime;
 

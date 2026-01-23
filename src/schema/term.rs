@@ -8,8 +8,7 @@ use common::JsonPathWriter;
 use serde::{Deserialize, Serialize};
 
 use super::date_time_options::DATE_TIME_PRECISION_INDEXED;
-use super::DecimalValue;
-use super::{Field, Schema};
+use super::{DecimalValue, Field, Schema};
 use crate::fastfield::FastValue;
 use crate::json_utils::split_json_path;
 use crate::schema::{Facet, Type};

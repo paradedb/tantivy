@@ -20,9 +20,8 @@ use common::{u64_to_f64, BinarySerializable, DateTime, VInt};
 
 use super::se::BinaryObjectSerializer;
 use super::{OwnedValue, Value};
-use crate::schema::DecimalValue;
 use crate::schema::document::type_codes;
-use crate::schema::{Facet, Field};
+use crate::schema::{DecimalValue, Facet, Field};
 use crate::store::DocStoreVersion;
 use crate::tokenizer::PreTokenizedString;
 
