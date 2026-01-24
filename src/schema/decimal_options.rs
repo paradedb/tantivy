@@ -198,28 +198,10 @@ impl<T: Into<DecimalOptions>> BitOr<T> for DecimalOptions {
     fn bitor(self, other: T) -> DecimalOptions {
         let other = other.into();
         DecimalOptions {
-            // For precision/scale, take the more restrictive value if both are set
-            // For precision: smaller is more restrictive
-            // For scale: the one closer to zero is more restrictive (allows less precision)
-            precision: match (self.precision, other.precision) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            },
-            scale: match (self.scale, other.scale) {
-                (Some(a), Some(b)) => {
-                    // Take the scale that's closer to zero (more restrictive)
-                    if a.abs() <= b.abs() {
-                        Some(a)
-                    } else {
-                        Some(b)
-                    }
-                }
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            },
+            // Precision/scale come from explicit configuration, not flag composition.
+            // Keep self's values if set, otherwise take other's.
+            precision: self.precision.or(other.precision),
+            scale: self.scale.or(other.scale),
             indexed: self.indexed | other.indexed,
             fieldnorms: self.fieldnorms | other.fieldnorms,
             stored: self.stored | other.stored,
