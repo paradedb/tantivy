@@ -165,7 +165,28 @@ pub fn is_valid_field_name(field_name: &str) -> bool {
     !field_name.is_empty() && !field_name.starts_with('-')
 }
 
+/// Converts a value type to the corresponding column type for columnar storage.
+///
+/// For Decimal fields with a defined scale, values are stored as I64 (fixed-point)
+/// to enable efficient columnar compression (including BUFF). For unlimited precision
+/// decimals, values are stored as Bytes.
+///
+/// Note: This function doesn't consider field options. Use
+/// [`value_type_to_column_type_with_options`] for full Decimal support.
+#[allow(dead_code)]
 pub(crate) fn value_type_to_column_type(typ: Type) -> Option<ColumnType> {
+    value_type_to_column_type_with_options(typ, None)
+}
+
+/// Converts a value type to the corresponding column type, considering field options.
+///
+/// For Decimal fields:
+/// - With defined scale: stored as I64 for efficient columnar compression
+/// - Without scale (unlimited precision): stored as Bytes
+pub(crate) fn value_type_to_column_type_with_options(
+    typ: Type,
+    field_type: Option<&FieldType>,
+) -> Option<ColumnType> {
     match typ {
         Type::Str => Some(ColumnType::Str),
         Type::U64 => Some(ColumnType::U64),
@@ -177,8 +198,16 @@ pub(crate) fn value_type_to_column_type(typ: Type) -> Option<ColumnType> {
         Type::Bytes => Some(ColumnType::Bytes),
         Type::IpAddr => Some(ColumnType::IpAddr),
         Type::Json => None,
-        // Decimal values are stored as lexicographically-sortable bytes
-        Type::Decimal => Some(ColumnType::Bytes),
+        Type::Decimal => {
+            // If scale is defined, store as I64 for efficient columnar compression
+            if let Some(FieldType::Decimal(opts)) = field_type {
+                if opts.scale().is_some() {
+                    return Some(ColumnType::I64);
+                }
+            }
+            // Fallback to bytes for unlimited precision decimals
+            Some(ColumnType::Bytes)
+        }
     }
 }
 

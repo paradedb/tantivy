@@ -6,7 +6,9 @@ use tokenizer_api::Token;
 
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::schema::document::{Document, ReferenceValue, ReferenceValueLeaf, Value};
-use crate::schema::{value_type_to_column_type, Field, FieldType, Schema, Type};
+use crate::schema::{
+    value_type_to_column_type_with_options, DecimalValue, Field, FieldType, Schema, Type,
+};
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::{DocId, TantivyError};
 
@@ -14,12 +16,82 @@ use crate::{DocId, TantivyError};
 /// This is mostly to guard us from a stack overflow triggered by malicious input.
 const JSON_DEPTH_LIMIT: usize = 20;
 
+/// Converts a Decimal value to a fixed-point i64 representation.
+///
+/// The conversion multiplies the decimal value by 10^scale to get the integer part.
+/// For example, with scale=3, the value 123.456 becomes 123456.
+///
+/// # Arguments
+/// * `decimal` - The decimal value to convert
+/// * `scale` - The number of decimal places (can be negative for large numbers)
+///
+/// # Panics
+/// May panic if the result overflows i64.
+fn decimal_to_fixed_point(decimal: &DecimalValue, scale: i32) -> i64 {
+    // Get string representation and parse
+    let s = decimal.to_string();
+
+    // Handle special cases
+    if s == "NaN" || s == "Infinity" || s == "-Infinity" {
+        // For special values, use sentinel values
+        return match s.as_str() {
+            "NaN" => i64::MIN,         // NaN sorts lowest
+            "-Infinity" => i64::MIN + 1, // -Infinity next
+            "Infinity" => i64::MAX,    // Infinity sorts highest
+            _ => 0,
+        };
+    }
+
+    // Parse the decimal string to extract integer and fractional parts
+    let negative = s.starts_with('-');
+    let s = if negative { &s[1..] } else { &s };
+
+    let (int_part, frac_part) = if let Some(dot_pos) = s.find('.') {
+        (&s[..dot_pos], &s[dot_pos + 1..])
+    } else {
+        (s, "")
+    };
+
+    // Parse integer part
+    let int_value: i64 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().unwrap_or(0)
+    };
+
+    // Calculate the fixed-point value
+    let scale_factor = 10i64.pow(scale.unsigned_abs());
+    let result = if scale >= 0 {
+        // Positive scale: multiply by scale factor and add fractional part
+        let frac_value = if frac_part.is_empty() {
+            0i64
+        } else {
+            // Pad or truncate fractional part to match scale
+            let frac_str: String = if frac_part.len() < scale as usize {
+                format!("{:0<width$}", frac_part, width = scale as usize)
+            } else {
+                frac_part[..scale as usize].to_string()
+            };
+            frac_str.parse().unwrap_or(0)
+        };
+        int_value * scale_factor + frac_value
+    } else {
+        // Negative scale: divide by scale factor (rounding)
+        int_value / scale_factor
+    };
+
+    if negative { -result } else { result }
+}
+
 /// The `FastFieldsWriter` groups all of the fast field writers.
 pub struct FastFieldsWriter {
     columnar_writer: ColumnarWriter,
     fast_field_names: Vec<Option<String>>, //< TODO see if we can hash the field name hash too.
     per_field_tokenizer: Vec<Option<TextAnalyzer>>,
     date_precisions: Vec<DateTimePrecision>,
+    /// For Decimal fields with defined scale, store as fixed-point i64 for columnar compression.
+    /// None means unlimited precision (stored as bytes).
+    decimal_scales: Vec<Option<i32>>,
     expand_dots: Vec<bool>,
     num_docs: DocId,
     // Buffer that we recycle to avoid allocation.
@@ -45,6 +117,7 @@ impl FastFieldsWriter {
             std::iter::repeat_with(DateTimePrecision::default)
                 .take(schema.num_fields())
                 .collect();
+        let mut decimal_scales: Vec<Option<i32>> = vec![None; schema.num_fields()];
         let mut expand_dots = vec![false; schema.num_fields()];
         let mut per_field_tokenizer: Vec<Option<TextAnalyzer>> = vec![None; schema.num_fields()];
         // TODO see other types
@@ -56,6 +129,10 @@ impl FastFieldsWriter {
             let value_type = field_entry.field_type().value_type();
             if let FieldType::Date(date_options) = field_entry.field_type() {
                 date_precisions[field_id.field_id() as usize] = date_options.get_precision();
+            }
+            if let FieldType::Decimal(decimal_options) = field_entry.field_type() {
+                // Store scale for fixed-point conversion if defined
+                decimal_scales[field_id.field_id() as usize] = decimal_options.scale();
             }
             if let FieldType::JsonObject(json_object_options) = field_entry.field_type() {
                 if let Some(tokenizer_name) = json_object_options.get_fast_field_tokenizer_name() {
@@ -82,7 +159,9 @@ impl FastFieldsWriter {
             }
 
             let sort_values_within_row = value_type == Type::Facet;
-            if let Some(column_type) = value_type_to_column_type(value_type) {
+            if let Some(column_type) =
+                value_type_to_column_type_with_options(value_type, Some(field_entry.field_type()))
+            {
                 columnar_writer.record_column_type(
                     field_entry.name(),
                     column_type,
@@ -96,6 +175,7 @@ impl FastFieldsWriter {
             per_field_tokenizer,
             num_docs: 0u32,
             date_precisions,
+            decimal_scales,
             expand_dots,
             json_path_buffer: JsonPathWriter::default(),
         })
@@ -201,9 +281,19 @@ impl FastFieldsWriter {
                     }
                 }
                 ReferenceValueLeaf::Decimal(val) => {
-                    // Store decimal values as their lexicographically sortable byte encoding
-                    let bytes = val.as_bytes();
-                    self.columnar_writer.record_bytes(doc_id, field_name, bytes);
+                    if let Some(scale) = self.decimal_scales[field.field_id() as usize] {
+                        // Convert to fixed-point i64 for efficient columnar compression
+                        let fixed_point = decimal_to_fixed_point(&val, scale);
+                        self.columnar_writer.record_numerical(
+                            doc_id,
+                            field_name,
+                            NumericalValue::I64(fixed_point),
+                        );
+                    } else {
+                        // Unlimited precision: store as sortable bytes
+                        let bytes = val.as_bytes();
+                        self.columnar_writer.record_bytes(doc_id, field_name, bytes);
+                    }
                 }
             },
             ReferenceValue::Array(val) => {

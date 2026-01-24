@@ -1,5 +1,7 @@
 mod bitpacked;
 mod blockwise_linear;
+#[cfg(feature = "buff-compression")]
+mod buff;
 mod line;
 mod linear;
 mod stats_collector;
@@ -16,6 +18,8 @@ use crate::column_values::monotonic_mapping::{
 };
 pub use crate::column_values::u64_based::bitpacked::BitpackedCodec;
 pub use crate::column_values::u64_based::blockwise_linear::BlockwiseLinearCodec;
+#[cfg(feature = "buff-compression")]
+pub use crate::column_values::u64_based::buff::BuffCodec;
 pub use crate::column_values::u64_based::linear::LinearCodec;
 pub use crate::column_values::u64_based::stats_collector::StatsCollector;
 use crate::column_values::{ColumnStats, monotonic_map_column};
@@ -87,13 +91,27 @@ pub enum CodecType {
     Linear = 1u8,
     /// Same as [`CodecType::Linear`], but encodes in blocks of 512 elements.
     BlockwiseLinear = 2u8,
+    /// BUFF (Byte-sliced) codec for bounded floating-point data.
+    /// Uses byte-sliced storage for efficient compression and fast queries.
+    #[cfg(feature = "buff-compression")]
+    Buff = 3u8,
 }
 
 /// List of all available u64-base codecs.
+#[cfg(not(feature = "buff-compression"))]
 pub const ALL_U64_CODEC_TYPES: [CodecType; 3] = [
     CodecType::Bitpacked,
     CodecType::Linear,
     CodecType::BlockwiseLinear,
+];
+
+/// List of all available u64-base codecs (including BUFF).
+#[cfg(feature = "buff-compression")]
+pub const ALL_U64_CODEC_TYPES: [CodecType; 4] = [
+    CodecType::Bitpacked,
+    CodecType::Linear,
+    CodecType::BlockwiseLinear,
+    CodecType::Buff,
 ];
 
 impl CodecType {
@@ -106,6 +124,8 @@ impl CodecType {
             0u8 => Some(CodecType::Bitpacked),
             1u8 => Some(CodecType::Linear),
             2u8 => Some(CodecType::BlockwiseLinear),
+            #[cfg(feature = "buff-compression")]
+            3u8 => Some(CodecType::Buff),
             _ => None,
         }
     }
@@ -120,6 +140,8 @@ impl CodecType {
             CodecType::BlockwiseLinear => {
                 load_specific_codec::<BlockwiseLinearCodec, T>(file_slice)
             }
+            #[cfg(feature = "buff-compression")]
+            CodecType::Buff => load_specific_codec::<BuffCodec, T>(file_slice),
         }
     }
 }
@@ -142,6 +164,8 @@ impl CodecType {
             CodecType::Bitpacked => BitpackedCodec::boxed_estimator(),
             CodecType::Linear => LinearCodec::boxed_estimator(),
             CodecType::BlockwiseLinear => BlockwiseLinearCodec::boxed_estimator(),
+            #[cfg(feature = "buff-compression")]
+            CodecType::Buff => BuffCodec::boxed_estimator(),
         }
     }
 }

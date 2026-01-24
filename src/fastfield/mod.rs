@@ -30,6 +30,69 @@ pub use self::writer::FastFieldsWriter;
 use crate::schema::Type;
 use crate::DateTime;
 
+/// Converts a fixed-point i64 value back to a DecimalValue.
+///
+/// This is the inverse of the conversion done when writing Decimal values
+/// with a defined scale to fast fields.
+///
+/// # Arguments
+/// * `fixed_point` - The fixed-point i64 value from the fast field
+/// * `scale` - The scale (number of decimal places) used during encoding
+///
+/// # Returns
+/// A string representation of the decimal value.
+///
+/// # Example
+/// ```ignore
+/// // For a decimal 123.456 stored with scale=3:
+/// // fixed_point = 123456
+/// let result = fixed_point_to_decimal_string(123456, 3);
+/// assert_eq!(result, "123.456");
+/// ```
+pub fn fixed_point_to_decimal_string(fixed_point: i64, scale: i32) -> String {
+    // Handle special sentinel values
+    if fixed_point == i64::MIN {
+        return "NaN".to_string();
+    }
+    if fixed_point == i64::MIN + 1 {
+        return "-Infinity".to_string();
+    }
+    if fixed_point == i64::MAX {
+        return "Infinity".to_string();
+    }
+
+    if scale <= 0 {
+        // Negative or zero scale: multiply by 10^|scale|
+        let multiplier = 10i64.pow((-scale) as u32);
+        return (fixed_point * multiplier).to_string();
+    }
+
+    // Positive scale: divide and format with decimal point
+    let scale_factor = 10i64.pow(scale as u32);
+    let negative = fixed_point < 0;
+    let abs_fixed = fixed_point.abs();
+
+    let int_part = abs_fixed / scale_factor;
+    let frac_part = abs_fixed % scale_factor;
+
+    if frac_part == 0 {
+        if negative {
+            format!("-{}", int_part)
+        } else {
+            int_part.to_string()
+        }
+    } else {
+        let frac_str = format!("{:0>width$}", frac_part, width = scale as usize);
+        // Trim trailing zeros
+        let frac_str = frac_str.trim_end_matches('0');
+        if negative {
+            format!("-{}.{}", int_part, frac_str)
+        } else {
+            format!("{}.{}", int_part, frac_str)
+        }
+    }
+}
+
 mod alive_bitset;
 mod error;
 mod facet_reader;
@@ -1302,5 +1365,167 @@ mod tests {
             .unwrap();
         let vals: Vec<i64> = column.values_for_doc(0u32).collect();
         assert_eq!(&vals, &[33]);
+    }
+
+    #[test]
+    fn test_decimal_fastfield_with_scale() {
+        use std::str::FromStr;
+
+        use crate::schema::{DecimalOptions, DecimalValue, OwnedValue};
+
+        let mut schema_builder = Schema::builder();
+        // Create a decimal field with precision 10 and scale 3 (3 decimal places)
+        let decimal_options = DecimalOptions::default()
+            .set_fast()
+            .set_precision(10)
+            .set_scale(3);
+        let decimal_field = schema_builder.add_decimal_field("price", decimal_options);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+
+        // Add documents with decimal values
+        let values = ["123.456", "0.001", "-99.999", "1000.0", "0.0"];
+        for val_str in &values {
+            let decimal = DecimalValue::from_str(val_str).unwrap();
+            let mut doc = TantivyDocument::default();
+            doc.add_field_value(decimal_field, &OwnedValue::Decimal(decimal));
+            index_writer.add_document(doc).unwrap();
+        }
+        index_writer.commit().unwrap();
+
+        let searcher = index.reader().unwrap().searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let fast_fields = segment_reader.fast_fields();
+
+        // Read as i64 column (fixed-point representation)
+        let col = fast_fields.decimal_i64("price").unwrap();
+
+        // Verify values using fixed_point_to_decimal_string
+        let scale = 3;
+        for (doc_id, expected_str) in values.iter().enumerate() {
+            if let Some(fixed_point) = col.first(doc_id as u32) {
+                let result = super::fixed_point_to_decimal_string(fixed_point, scale);
+                // Parse both to compare (handle trailing zeros)
+                let expected = DecimalValue::from_str(expected_str).unwrap();
+                let result_decimal = DecimalValue::from_str(&result).unwrap();
+                assert_eq!(
+                    expected.to_string(),
+                    result_decimal.to_string(),
+                    "Mismatch at doc {}: expected {}, got {}",
+                    doc_id,
+                    expected_str,
+                    result
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_decimal_fastfield_without_scale() {
+        use std::str::FromStr;
+
+        use crate::schema::{DecimalOptions, DecimalValue, OwnedValue};
+
+        let mut schema_builder = Schema::builder();
+        // Create a decimal field without scale (unlimited precision)
+        let decimal_options = DecimalOptions::default().set_fast();
+        let decimal_field = schema_builder.add_decimal_field("amount", decimal_options);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+
+        // Add documents with decimal values
+        let values = ["12345678901234567890.123456789", "-0.000001", "0"];
+        for val_str in &values {
+            let decimal = DecimalValue::from_str(val_str).unwrap();
+            let mut doc = TantivyDocument::default();
+            doc.add_field_value(decimal_field, &OwnedValue::Decimal(decimal));
+            index_writer.add_document(doc).unwrap();
+        }
+        index_writer.commit().unwrap();
+
+        let searcher = index.reader().unwrap().searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let fast_fields = segment_reader.fast_fields();
+
+        // Read as bytes column (unlimited precision)
+        let col = fast_fields.decimal_bytes("amount").unwrap();
+
+        // Verify the column exists and has documents
+        // Note: bytes column access for decimals uses raw bytes storage
+        assert!(
+            col.num_rows() > 0,
+            "Decimal bytes column should have documents"
+        );
+    }
+
+    #[test]
+    fn test_fixed_point_to_decimal_string() {
+        // Test basic conversion
+        assert_eq!(super::fixed_point_to_decimal_string(123456, 3), "123.456");
+        assert_eq!(super::fixed_point_to_decimal_string(1000, 3), "1");
+        assert_eq!(super::fixed_point_to_decimal_string(1, 3), "0.001");
+        assert_eq!(super::fixed_point_to_decimal_string(-99999, 3), "-99.999");
+        assert_eq!(super::fixed_point_to_decimal_string(0, 3), "0");
+
+        // Test with different scales
+        assert_eq!(super::fixed_point_to_decimal_string(12345, 2), "123.45");
+        assert_eq!(super::fixed_point_to_decimal_string(12345, 4), "1.2345");
+        assert_eq!(super::fixed_point_to_decimal_string(12345, 0), "12345");
+
+        // Test negative scale (multiplication)
+        assert_eq!(super::fixed_point_to_decimal_string(123, -2), "12300");
+
+        // Test special values
+        assert_eq!(super::fixed_point_to_decimal_string(i64::MIN, 3), "NaN");
+        assert_eq!(
+            super::fixed_point_to_decimal_string(i64::MIN + 1, 3),
+            "-Infinity"
+        );
+        assert_eq!(
+            super::fixed_point_to_decimal_string(i64::MAX, 3),
+            "Infinity"
+        );
+    }
+
+    #[test]
+    fn test_decimal_fastfield_precision_preservation() {
+        use std::str::FromStr;
+
+        use crate::schema::{DecimalOptions, DecimalValue, OwnedValue};
+
+        let mut schema_builder = Schema::builder();
+        // High precision field
+        let decimal_options = DecimalOptions::default()
+            .set_fast()
+            .set_precision(18)
+            .set_scale(6);
+        let decimal_field = schema_builder.add_decimal_field("high_precision", decimal_options);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+
+        // Add a value that requires high precision
+        let decimal = DecimalValue::from_str("123456789012.123456").unwrap();
+        let mut doc = TantivyDocument::default();
+        doc.add_field_value(decimal_field, &OwnedValue::Decimal(decimal));
+        index_writer.add_document(doc).unwrap();
+        index_writer.commit().unwrap();
+
+        let searcher = index.reader().unwrap().searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let fast_fields = segment_reader.fast_fields();
+        let col = fast_fields.decimal_i64("high_precision").unwrap();
+
+        // Verify the fixed-point representation
+        let fixed_point = col.first(0).unwrap();
+        let result = super::fixed_point_to_decimal_string(fixed_point, 6);
+
+        // The value should be preserved within the scale
+        assert_eq!(result, "123456789012.123456");
     }
 }

@@ -222,6 +222,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "buff-rs"
+version = "0.1.0"
+source = "git+ssh://git@github.com/paradedb/buff-rs?rev=b32cd979f3271c16045cac5e8f5ad981eb2fb787#b32cd979f3271c16045cac5e8f5ad981eb2fb787"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1769,6 +1777,7 @@ name = "tantivy-columnar"
 version = "0.6.0"
 dependencies = [
  "binggan",
+ "buff-rs",
  "downcast-rs",
  "fastdivide",
  "itertools 0.14.0",

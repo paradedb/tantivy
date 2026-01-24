@@ -377,6 +377,63 @@ impl FastFieldReaders {
     pub fn bool(&self, field_name: &str) -> crate::Result<Column<bool>> {
         self.column(field_name)
     }
+
+    /// Returns the `i64` column for a Decimal field with defined scale.
+    ///
+    /// Decimal fields with a defined scale are stored as fixed-point i64 values.
+    /// To convert back to decimal, use `fixed_point_to_decimal(value, scale)`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let col = fast_fields.decimal_i64("price")?;
+    /// let scale = schema.get_field_entry(field).field_type().decimal_options().scale().unwrap();
+    /// let value = col.first(doc_id).map(|v| fixed_point_to_decimal(v, scale));
+    /// ```
+    ///
+    /// If the field is not a Decimal fast field with defined scale, this method returns an Error.
+    pub fn decimal_i64(&self, field_name: &str) -> crate::Result<Column<i64>> {
+        self.column(field_name)
+    }
+
+    /// Returns the bytes column for a Decimal field without defined scale.
+    ///
+    /// Decimal fields without a defined scale are stored as lexicographically-sortable
+    /// byte arrays using the `decimal-bytes` encoding.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let col = fast_fields.decimal_bytes("price")?;
+    /// if let Some(bytes) = col.first(doc_id) {
+    ///     let decimal = DecimalValue::from_bytes(bytes);
+    /// }
+    /// ```
+    ///
+    /// If the field is not a Decimal fast field without scale (unlimited precision),
+    /// this method returns an Error.
+    pub fn decimal_bytes(&self, field_name: &str) -> crate::Result<BytesColumn> {
+        let Some(resolved_name) = self.resolve_field(field_name)? else {
+            return Err(TantivyError::SchemaError(format!(
+                "Field `{field_name}` is not configured as a fast field."
+            )));
+        };
+        let dynamic_column_handle = self
+            .columnar
+            .read_columns(&resolved_name)?
+            .into_iter()
+            .find(|handle| handle.column_type() == ColumnType::Bytes)
+            .ok_or_else(|| {
+                TantivyError::SchemaError(format!(
+                    "Field `{field_name}` is not a bytes fast field."
+                ))
+            })?;
+        let dynamic_column = dynamic_column_handle.open()?;
+        match dynamic_column {
+            DynamicColumn::Bytes(col) => Ok(col),
+            _ => Err(TantivyError::SchemaError(format!(
+                "Field `{field_name}` is not a bytes column."
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
