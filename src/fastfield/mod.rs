@@ -1528,4 +1528,372 @@ mod tests {
         // The value should be preserved within the scale
         assert_eq!(result, "123456789012.123456");
     }
+
+    // BUFF compression integration tests
+    #[cfg(feature = "columnar-buff-compression")]
+    mod buff_tests {
+        use super::*;
+
+        /// Test BUFF codec round-trip with u64 fast field
+        #[test]
+        fn test_buff_u64_fastfield_roundtrip() {
+            let path = Path::new("test_buff_u64");
+            let directory: RamDirectory = RamDirectory::create();
+
+            let mut schema_builder = Schema::builder();
+            let u64_field = schema_builder.add_u64_field("value", FAST);
+            let schema = schema_builder.build();
+
+            // Test data with various patterns
+            let values: Vec<u64> = vec![
+                100, 200, 300, 400, 500, // Sequential-ish
+                1000, 2000, 3000, // GCD pattern
+                42, 17, 99, 1, 0, // Random small values
+                u64::MAX / 2,
+                u64::MAX / 2 + 1, // Large values
+            ];
+
+            {
+                let mut write: WritePtr = directory.open_write(path).unwrap();
+                let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
+                for &val in &values {
+                    let mut doc = TantivyDocument::default();
+                    doc.add_u64(u64_field, val);
+                    fast_field_writers.add_document(&doc).unwrap();
+                }
+                fast_field_writers.serialize(&mut write, None).unwrap();
+                write.terminate().unwrap();
+            }
+
+            let file = directory.open_read(path).unwrap();
+            let fast_field_readers = FastFieldReaders::open(file, schema).unwrap();
+            let col = fast_field_readers
+                .u64("value")
+                .unwrap()
+                .first_or_default_col(0);
+
+            // Verify round-trip
+            for (doc_id, &expected) in values.iter().enumerate() {
+                assert_eq!(
+                    col.get_val(doc_id as u32),
+                    expected,
+                    "Mismatch at doc {}: expected {}, got {}",
+                    doc_id,
+                    expected,
+                    col.get_val(doc_id as u32)
+                );
+            }
+        }
+
+        /// Test BUFF codec with i64 fast field (signed values)
+        #[test]
+        fn test_buff_i64_fastfield_roundtrip() {
+            let path = Path::new("test_buff_i64");
+            let directory: RamDirectory = RamDirectory::create();
+
+            let mut schema_builder = Schema::builder();
+            let i64_field = schema_builder.add_i64_field("value", FAST);
+            let schema = schema_builder.build();
+
+            // Test data with positive, negative, and edge values
+            let values: Vec<i64> = vec![
+                0,
+                1,
+                -1,
+                100,
+                -100,
+                1000,
+                -1000,
+                i64::MAX / 2,
+                i64::MIN / 2,
+                12345,
+                -12345,
+            ];
+
+            {
+                let mut write: WritePtr = directory.open_write(path).unwrap();
+                let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
+                for &val in &values {
+                    let mut doc = TantivyDocument::default();
+                    doc.add_i64(i64_field, val);
+                    fast_field_writers.add_document(&doc).unwrap();
+                }
+                fast_field_writers.serialize(&mut write, None).unwrap();
+                write.terminate().unwrap();
+            }
+
+            let file = directory.open_read(path).unwrap();
+            let fast_field_readers = FastFieldReaders::open(file, schema).unwrap();
+            let col = fast_field_readers
+                .i64("value")
+                .unwrap()
+                .first_or_default_col(0);
+
+            // Verify round-trip
+            for (doc_id, &expected) in values.iter().enumerate() {
+                assert_eq!(
+                    col.get_val(doc_id as u32),
+                    expected,
+                    "Mismatch at doc {}: expected {}, got {}",
+                    doc_id,
+                    expected,
+                    col.get_val(doc_id as u32)
+                );
+            }
+        }
+
+        /// Test BUFF codec with f64 fast field
+        #[test]
+        fn test_buff_f64_fastfield_roundtrip() {
+            let path = Path::new("test_buff_f64");
+            let directory: RamDirectory = RamDirectory::create();
+
+            let mut schema_builder = Schema::builder();
+            let f64_field = schema_builder.add_f64_field("value", FAST);
+            let schema = schema_builder.build();
+
+            // Test data - financial-style bounded precision values (BUFF's sweet spot)
+            let values: Vec<f64> = vec![
+                0.0, 1.0, -1.0, 99.99, -99.99, 123.456, 1000.001, 0.001, -0.001, 9999.9999,
+            ];
+
+            {
+                let mut write: WritePtr = directory.open_write(path).unwrap();
+                let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
+                for &val in &values {
+                    let mut doc = TantivyDocument::default();
+                    doc.add_f64(f64_field, val);
+                    fast_field_writers.add_document(&doc).unwrap();
+                }
+                fast_field_writers.serialize(&mut write, None).unwrap();
+                write.terminate().unwrap();
+            }
+
+            let file = directory.open_read(path).unwrap();
+            let fast_field_readers = FastFieldReaders::open(file, schema).unwrap();
+            let col = fast_field_readers
+                .f64("value")
+                .unwrap()
+                .first_or_default_col(0.0);
+
+            // Verify round-trip (note: f64 has inherent precision limits)
+            for (doc_id, &expected) in values.iter().enumerate() {
+                let actual = col.get_val(doc_id as u32);
+                assert!(
+                    (actual - expected).abs() < 1e-10,
+                    "Mismatch at doc {}: expected {}, got {}",
+                    doc_id,
+                    expected,
+                    actual
+                );
+            }
+        }
+
+        /// Test range queries on BUFF-compressed columns
+        #[test]
+        fn test_buff_range_query() {
+            let mut schema_builder = Schema::builder();
+            let num_field = schema_builder.add_u64_field("num", FAST | INDEXED);
+            let schema = schema_builder.build();
+            let index = Index::create_in_ram(schema);
+
+            {
+                let mut writer = index.writer_for_tests().unwrap();
+                // Add values that would benefit from BUFF compression
+                for i in 0..1000u64 {
+                    writer.add_document(doc!(num_field => i * 100)).unwrap();
+                }
+                writer.commit().unwrap();
+            }
+
+            let reader = index.reader().unwrap();
+            let searcher = reader.searcher();
+            let segment = &searcher.segment_readers()[0];
+            let field = segment
+                .fast_fields()
+                .u64("num")
+                .unwrap()
+                .first_or_default_col(0);
+
+            // Test various ranges
+            let test_range = |range: RangeInclusive<u64>, expected_count: usize| {
+                let mut positions = Vec::new();
+                field.get_row_ids_for_value_range(range.clone(), 0..1000, &mut positions);
+                assert_eq!(
+                    positions.len(),
+                    expected_count,
+                    "Range {:?} should match {} docs, got {}",
+                    range,
+                    expected_count,
+                    positions.len()
+                );
+            };
+
+            // Exact value match
+            test_range(0..=0, 1);
+            test_range(100..=100, 1);
+            test_range(99900..=99900, 1);
+
+            // Range matches
+            test_range(0..=900, 10); // 0, 100, 200, ..., 900
+            test_range(50000..=50500, 6); // 50000, 50100, 50200, 50300, 50400, 50500
+
+            // No matches
+            test_range(1..=99, 0);
+            test_range(100001..=200000, 0);
+        }
+
+        /// Test BUFF with large dataset (100k values)
+        #[test]
+        fn test_buff_large_dataset() {
+            let path = Path::new("test_buff_large");
+            let directory: RamDirectory = RamDirectory::create();
+
+            let mut schema_builder = Schema::builder();
+            let u64_field = schema_builder.add_u64_field("value", FAST);
+            let schema = schema_builder.build();
+
+            // Generate 100k values with GCD pattern (common in financial data)
+            let values: Vec<u64> = (0..100_000u64).map(|i| i * 1000).collect();
+
+            {
+                let mut write: WritePtr = directory.open_write(path).unwrap();
+                let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
+                for &val in &values {
+                    let mut doc = TantivyDocument::default();
+                    doc.add_u64(u64_field, val);
+                    fast_field_writers.add_document(&doc).unwrap();
+                }
+                fast_field_writers.serialize(&mut write, None).unwrap();
+                write.terminate().unwrap();
+            }
+
+            let file = directory.open_read(path).unwrap();
+            let fast_field_readers = FastFieldReaders::open(file, schema).unwrap();
+            let col = fast_field_readers
+                .u64("value")
+                .unwrap()
+                .first_or_default_col(0);
+
+            // Verify all values
+            assert_eq!(col.num_vals(), 100_000);
+            assert_eq!(col.min_value(), 0);
+            assert_eq!(col.max_value(), 99_999_000);
+
+            // Spot check some values
+            assert_eq!(col.get_val(0), 0);
+            assert_eq!(col.get_val(1), 1000);
+            assert_eq!(col.get_val(50_000), 50_000_000);
+            assert_eq!(col.get_val(99_999), 99_999_000);
+
+            // Verify random access
+            for i in (0..100_000).step_by(1000) {
+                assert_eq!(
+                    col.get_val(i),
+                    (i as u64) * 1000,
+                    "Mismatch at doc {}",
+                    i
+                );
+            }
+        }
+
+        /// Test BUFF with decimal field using scale (fixed-point representation)
+        #[test]
+        fn test_buff_decimal_fastfield_with_scale() {
+            use std::str::FromStr;
+
+            use crate::schema::{DecimalOptions, DecimalValue, OwnedValue};
+
+            let mut schema_builder = Schema::builder();
+            let decimal_options = DecimalOptions::default()
+                .set_fast()
+                .set_precision(10)
+                .set_scale(3);
+            let decimal_field = schema_builder.add_decimal_field("price", decimal_options);
+            let schema = schema_builder.build();
+
+            let index = Index::create_in_ram(schema);
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+
+            // Financial data - exactly what BUFF is designed for
+            let values = [
+                "99.99", "100.00", "100.01", "150.50", "200.00", "0.01", "999.999",
+            ];
+            for val_str in &values {
+                let decimal = DecimalValue::from_str(val_str).unwrap();
+                let mut doc = TantivyDocument::default();
+                doc.add_field_value(decimal_field, &OwnedValue::Decimal(decimal));
+                index_writer.add_document(doc).unwrap();
+            }
+            index_writer.commit().unwrap();
+
+            let searcher = index.reader().unwrap().searcher();
+            let segment_reader = searcher.segment_reader(0);
+            let fast_fields = segment_reader.fast_fields();
+
+            // Read as i64 column (fixed-point representation)
+            let col = fast_fields.decimal_i64("price").unwrap();
+
+            // Verify values
+            let scale = 3;
+            for (doc_id, expected_str) in values.iter().enumerate() {
+                if let Some(fixed_point) = col.first(doc_id as u32) {
+                    let result = crate::fastfield::fixed_point_to_decimal_string(fixed_point, scale);
+                    let expected = DecimalValue::from_str(expected_str).unwrap();
+                    let result_decimal = DecimalValue::from_str(&result).unwrap();
+                    assert_eq!(
+                        expected.to_string(),
+                        result_decimal.to_string(),
+                        "Mismatch at doc {}: expected {}, got {}",
+                        doc_id,
+                        expected_str,
+                        result
+                    );
+                }
+            }
+        }
+
+        /// Test BUFF with permutation data (shuffled values)
+        #[test]
+        fn test_buff_permutation_data() {
+            let path = Path::new("test_buff_perm");
+            let directory: RamDirectory = RamDirectory::create();
+
+            let mut schema_builder = Schema::builder();
+            let u64_field = schema_builder.add_u64_field("value", FAST);
+            let schema = schema_builder.build();
+
+            // Shuffled permutation - challenging for compression
+            let permutation = generate_permutation();
+
+            {
+                let mut write: WritePtr = directory.open_write(path).unwrap();
+                let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
+                for &val in &permutation {
+                    let mut doc = TantivyDocument::default();
+                    doc.add_u64(u64_field, val);
+                    fast_field_writers.add_document(&doc).unwrap();
+                }
+                fast_field_writers.serialize(&mut write, None).unwrap();
+                write.terminate().unwrap();
+            }
+
+            let file = directory.open_read(path).unwrap();
+            let fast_field_readers = FastFieldReaders::open(file, schema).unwrap();
+            let col = fast_field_readers
+                .u64("value")
+                .unwrap()
+                .first_or_default_col(0);
+
+            // Verify all values
+            for (doc_id, &expected) in permutation.iter().enumerate() {
+                assert_eq!(
+                    col.get_val(doc_id as u32),
+                    expected,
+                    "Mismatch at doc {}",
+                    doc_id
+                );
+            }
+        }
+    }
 }

@@ -1,9 +1,12 @@
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-use binggan::{InputGroup, black_box};
+use binggan::{black_box, InputGroup};
+use common::file_slice::FileSlice;
 use rand::prelude::*;
-use tantivy_columnar::column_values::{CodecType, serialize_and_load_u64_based_column_values};
+use tantivy_columnar::column_values::{
+    load_u64_based_column_values, serialize_u64_based_column_values, CodecType,
+};
 use tantivy_columnar::*;
 
 // Warning: this generates the same permutation at each call
@@ -20,8 +23,37 @@ fn generate_permutation_gcd() -> Vec<u64> {
     permutation
 }
 
+// Generate bounded precision data (financial-style, good for BUFF)
+fn generate_bounded_precision() -> Vec<u64> {
+    let mut data: Vec<u64> = (0u64..100_000u64)
+        .map(|i| {
+            // Simulate prices: $10.00 to $1000.00 with 2 decimal places
+            // Stored as cents: 1000 to 100000
+            1000 + (i % 99000)
+        })
+        .collect();
+    data.shuffle(&mut StdRng::from_seed([1u8; 32]));
+    data
+}
+
+/// Helper function to serialize and load column values with a specific codec
 pub fn serialize_and_load(column: &[u64], codec_type: CodecType) -> Arc<dyn ColumnValues<u64>> {
-    serialize_and_load_u64_based_column_values(&column, &[codec_type])
+    let mut buffer = Vec::new();
+    serialize_u64_based_column_values(&column, &[codec_type], &mut buffer).unwrap();
+    load_u64_based_column_values::<u64>(FileSlice::from(buffer)).unwrap()
+}
+
+/// Returns list of available codecs (includes BUFF when feature is enabled)
+#[allow(unused_mut)] // mut is needed when buff-compression feature is enabled
+fn get_all_codecs() -> Vec<(&'static str, CodecType)> {
+    let mut codecs = vec![
+        ("Bitpacked", CodecType::Bitpacked),
+        ("Linear", CodecType::Linear),
+        ("BlockwiseLinear", CodecType::BlockwiseLinear),
+    ];
+    #[cfg(feature = "buff-compression")]
+    codecs.push(("BUFF", CodecType::Buff));
+    codecs
 }
 
 const FIFTY_PERCENT_RANGE: RangeInclusive<u64> = 1..=50;
@@ -155,7 +187,109 @@ fn bench_range() {
     group.run();
 }
 
+/// Benchmark codec comparison across different data patterns
+fn bench_codec_comparison() {
+    let permutation = generate_permutation();
+    let permutation_gcd = generate_permutation_gcd();
+    let bounded_precision = generate_bounded_precision();
+
+    println!("\n=== Codec Comparison Benchmark ===\n");
+
+    // Build inputs for each codec and data pattern
+    let codecs = get_all_codecs();
+
+    // Test 1: Random permutation data
+    {
+        let inputs: Vec<_> = codecs
+            .iter()
+            .map(|(name, codec)| {
+                let col = serialize_and_load(&permutation, *codec);
+                (format!("perm_{}", name), col)
+            })
+            .collect();
+
+        let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> =
+            InputGroup::new_with_inputs(inputs);
+
+        group.register("fullscan", |col: &Arc<dyn ColumnValues<u64>>| {
+            let mut sum = 0u64;
+            for i in 0..col.num_vals() {
+                sum = sum.wrapping_add(col.get_val(i));
+            }
+            black_box(sum);
+        });
+
+        group.register("random_access", |col: &Arc<dyn ColumnValues<u64>>| {
+            let mut sum = 0u64;
+            let mut rng = StdRng::from_seed([42u8; 32]);
+            for _ in 0..1000 {
+                let idx = rng.gen_range(0..col.num_vals());
+                sum = sum.wrapping_add(col.get_val(idx));
+            }
+            black_box(sum);
+        });
+
+        group.run();
+    }
+
+    // Test 2: GCD pattern data
+    {
+        let inputs: Vec<_> = codecs
+            .iter()
+            .map(|(name, codec)| {
+                let col = serialize_and_load(&permutation_gcd, *codec);
+                (format!("gcd_{}", name), col)
+            })
+            .collect();
+
+        let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> =
+            InputGroup::new_with_inputs(inputs);
+
+        group.register("fullscan_gcd", |col: &Arc<dyn ColumnValues<u64>>| {
+            let mut sum = 0u64;
+            for i in 0..col.num_vals() {
+                sum = sum.wrapping_add(col.get_val(i));
+            }
+            black_box(sum);
+        });
+
+        group.run();
+    }
+
+    // Test 3: Bounded precision data (BUFF's sweet spot)
+    {
+        let inputs: Vec<_> = codecs
+            .iter()
+            .map(|(name, codec)| {
+                let col = serialize_and_load(&bounded_precision, *codec);
+                (format!("bounded_{}", name), col)
+            })
+            .collect();
+
+        let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> =
+            InputGroup::new_with_inputs(inputs);
+
+        group.register("fullscan_bounded", |col: &Arc<dyn ColumnValues<u64>>| {
+            let mut sum = 0u64;
+            for i in 0..col.num_vals() {
+                sum = sum.wrapping_add(col.get_val(i));
+            }
+            black_box(sum);
+        });
+
+        group.register("range_query_bounded", |col: &Arc<dyn ColumnValues<u64>>| {
+            let mut positions = Vec::new();
+            // Query for values in the "middle" range
+            col.get_row_ids_for_value_range(40000..=60000, 0..col.num_vals(), &mut positions);
+            black_box(positions.len());
+        });
+
+        group.run();
+    }
+}
+
 fn main() {
     bench_access();
     bench_range();
+    bench_codec_comparison();
 }

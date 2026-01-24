@@ -203,3 +203,7 @@ harness = false
 [[bench]]
 name = "bool_queries_with_range"
 harness = false
+
+[[example]]
+name = "buff_compression"
+required-features = ["columnar-buff-compression"]
