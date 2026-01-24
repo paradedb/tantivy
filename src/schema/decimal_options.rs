@@ -39,50 +39,28 @@ pub const MIN_SCALE: i32 = -1000;
 ///
 /// Values exceeding precision/scale will be truncated/rounded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(from = "DecimalOptionsDeser")]
 pub struct DecimalOptions {
     /// Maximum total number of significant digits.
     /// None means unlimited (up to MAX_PRECISION).
+    #[serde(default)]
     precision: Option<u32>,
     /// Number of digits after the decimal point.
     /// Negative values round to the left of the decimal point.
     /// None means unlimited (up to MAX_SCALE).
+    #[serde(default)]
     scale: Option<i32>,
     /// Whether the field is indexed.
+    #[serde(default)]
     indexed: bool,
     /// Whether field norms are stored.
+    #[serde(default)]
     fieldnorms: bool,
     /// Whether the field is a fast field.
+    #[serde(default)]
     fast: bool,
     /// Whether the field is stored.
+    #[serde(default)]
     stored: bool,
-}
-
-/// For backward compatibility, interpret missing fieldnorms as true if indexed.
-#[derive(Deserialize)]
-struct DecimalOptionsDeser {
-    #[serde(default)]
-    precision: Option<u32>,
-    #[serde(default)]
-    scale: Option<i32>,
-    indexed: bool,
-    #[serde(default)]
-    fieldnorms: Option<bool>,
-    fast: bool,
-    stored: bool,
-}
-
-impl From<DecimalOptionsDeser> for DecimalOptions {
-    fn from(deser: DecimalOptionsDeser) -> Self {
-        DecimalOptions {
-            precision: deser.precision,
-            scale: deser.scale,
-            indexed: deser.indexed,
-            fieldnorms: deser.fieldnorms.unwrap_or(deser.indexed),
-            fast: deser.fast,
-            stored: deser.stored,
-        }
-    }
 }
 
 impl DecimalOptions {
@@ -424,13 +402,19 @@ mod tests {
     }
 
     #[test]
-    fn test_decimal_options_deser_if_fieldnorm_missing_indexed_true() {
+    fn test_decimal_options_deser_with_defaults() {
+        // All fields use serde defaults when missing
+        let json = r#"{}"#;
+        let opts: DecimalOptions = serde_json::from_str(json).unwrap();
+        assert_eq!(opts, DecimalOptions::default());
+    }
+
+    #[test]
+    fn test_decimal_options_deser_partial() {
         let json = r#"{
             "precision": 10,
             "scale": 2,
-            "indexed": true,
-            "fast": false,
-            "stored": false
+            "indexed": true
         }"#;
         let opts: DecimalOptions = serde_json::from_str(json).unwrap();
         assert_eq!(
@@ -439,27 +423,6 @@ mod tests {
                 precision: Some(10),
                 scale: Some(2),
                 indexed: true,
-                fieldnorms: true,
-                fast: false,
-                stored: false
-            }
-        );
-    }
-
-    #[test]
-    fn test_decimal_options_deser_if_fieldnorm_missing_indexed_false() {
-        let json = r#"{
-            "indexed": false,
-            "stored": false,
-            "fast": false
-        }"#;
-        let opts: DecimalOptions = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            &opts,
-            &DecimalOptions {
-                precision: None,
-                scale: None,
-                indexed: false,
                 fieldnorms: false,
                 fast: false,
                 stored: false
