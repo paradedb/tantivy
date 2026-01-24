@@ -29,6 +29,7 @@ tantivy-fst = { git = "https://github.com/paradedb/fst.git" }
 memmap2 = { version = "0.9.0", optional = true }
 lz4_flex = { version = "0.11", default-features = false, optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
+buff-rs = { workspace = true, optional = true }
 tempfile = { version = "3.12.0", optional = true }
 log = "0.4.16"
 serde = { version = "1.0.219", features = ["derive"] }
@@ -131,6 +132,9 @@ zstd-compression = ["zstd"]
 # enable zstd-compression in columnar (and sstable)
 columnar-zstd-compression = ["columnar/zstd-compression"]
 
+# enable buff compression for numeric columns in columnar
+columnar-buff-compression = ["buff-rs", "columnar/buff-compression"]
+
 failpoints = ["fail", "fail/failpoints"]
 unstable = []                            # useful for benches.
 
@@ -152,6 +156,9 @@ members = [
   "tokenizer-api",
   "columnar",
 ]
+
+[workspace.dependencies]
+buff-rs = { git = "ssh://git@github.com/paradedb/buff-rs", rev = "b32cd979f3271c16045cac5e8f5ad981eb2fb787", default-features = false }
 
 # Following the "fail" crate best practises, we isolate
 # tests that define specific behavior in fail check points

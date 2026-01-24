@@ -18,7 +18,7 @@ common = { version= "0.10", path = "../common", package = "tantivy-common" }
 tantivy-bitpacker = { version= "0.9", path = "../bitpacker/" }
 serde = "1.0.152"
 downcast-rs = "2.0.1"
-buff-rs = { git = "ssh://git@github.com/paradedb/buff-rs", rev = "b32cd979f3271c16045cac5e8f5ad981eb2fb787", optional = true }
+buff-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1"

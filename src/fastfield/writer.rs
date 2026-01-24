@@ -35,9 +35,9 @@ fn decimal_to_fixed_point(decimal: &DecimalValue, scale: i32) -> i64 {
     if s == "NaN" || s == "Infinity" || s == "-Infinity" {
         // For special values, use sentinel values
         return match s.as_str() {
-            "NaN" => i64::MIN,         // NaN sorts lowest
+            "NaN" => i64::MIN,           // NaN sorts lowest
             "-Infinity" => i64::MIN + 1, // -Infinity next
-            "Infinity" => i64::MAX,    // Infinity sorts highest
+            "Infinity" => i64::MAX,      // Infinity sorts highest
             _ => 0,
         };
     }
@@ -80,7 +80,11 @@ fn decimal_to_fixed_point(decimal: &DecimalValue, scale: i32) -> i64 {
         int_value / scale_factor
     };
 
-    if negative { -result } else { result }
+    if negative {
+        -result
+    } else {
+        result
+    }
 }
 
 /// The `FastFieldsWriter` groups all of the fast field writers.

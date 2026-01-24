@@ -17,8 +17,8 @@ use buff_rs::BuffCodec as ExternalBuffCodec;
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, OwnedBytes};
 
-use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 use crate::ColumnValues;
+use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 
 /// Default scale for BUFF encoding (3 decimal places).
 /// This determines the precision of the encoding.

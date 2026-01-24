@@ -1700,6 +1700,7 @@ dependencies = [
  "binggan",
  "bitpacking",
  "bon",
+ "buff-rs",
  "byteorder",
  "census",
  "crc32fast",
