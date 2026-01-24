@@ -384,7 +384,7 @@ impl SegmentWriter {
                             .and_then(|leaf| leaf.as_decimal())
                             .ok_or_else(make_schema_error)?;
                         let bytes = decimal_val.as_bytes();
-                        term_buffer.set_bytes(&bytes);
+                        term_buffer.set_bytes(bytes);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {

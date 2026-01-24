@@ -203,8 +203,7 @@ impl FastFieldsWriter {
                 ReferenceValueLeaf::Decimal(val) => {
                     // Store decimal values as their lexicographically sortable byte encoding
                     let bytes = val.as_bytes();
-                    self.columnar_writer
-                        .record_bytes(doc_id, field_name, &bytes);
+                    self.columnar_writer.record_bytes(doc_id, field_name, bytes);
                 }
             },
             ReferenceValue::Array(val) => {
