@@ -1,11 +1,11 @@
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-use binggan::{black_box, InputGroup};
+use binggan::{InputGroup, black_box};
 use common::file_slice::FileSlice;
 use rand::prelude::*;
 use tantivy_columnar::column_values::{
-    load_u64_based_column_values, serialize_u64_based_column_values, CodecType,
+    CodecType, load_u64_based_column_values, serialize_u64_based_column_values,
 };
 use tantivy_columnar::*;
 
@@ -208,8 +208,7 @@ fn bench_codec_comparison() {
             })
             .collect();
 
-        let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> =
-            InputGroup::new_with_inputs(inputs);
+        let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> = InputGroup::new_with_inputs(inputs);
 
         group.register("fullscan", |col: &Arc<dyn ColumnValues<u64>>| {
             let mut sum = 0u64;
@@ -242,8 +241,7 @@ fn bench_codec_comparison() {
             })
             .collect();
 
-        let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> =
-            InputGroup::new_with_inputs(inputs);
+        let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> = InputGroup::new_with_inputs(inputs);
 
         group.register("fullscan_gcd", |col: &Arc<dyn ColumnValues<u64>>| {
             let mut sum = 0u64;
@@ -266,8 +264,7 @@ fn bench_codec_comparison() {
             })
             .collect();
 
-        let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> =
-            InputGroup::new_with_inputs(inputs);
+        let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> = InputGroup::new_with_inputs(inputs);
 
         group.register("fullscan_bounded", |col: &Arc<dyn ColumnValues<u64>>| {
             let mut sum = 0u64;

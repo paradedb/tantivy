@@ -1,14 +1,18 @@
 // # BUFF Compression Example
 //
 // This example demonstrates how to use BUFF (Byte-sliced) compression for
-// numeric fast fields. BUFF is particularly effective for bounded-precision
-// numeric data like financial values, sensor readings, and metrics.
+// numeric fast fields, including Decimal types with aggregations.
+// BUFF is particularly effective for bounded-precision numeric data like
+// financial values, sensor readings, and metrics.
 //
 // Run with:
 //   cargo run --example buff_compression --features columnar-buff-compression
 // ---
 
-use tantivy::schema::{Schema, FAST, STORED};
+use std::str::FromStr;
+
+use tantivy::fastfield::fixed_point_to_decimal_string;
+use tantivy::schema::{DecimalOptions, DecimalValue, OwnedValue, Schema, FAST, STORED};
 use tantivy::{Index, IndexWriter, TantivyDocument};
 
 fn main() -> tantivy::Result<()> {
@@ -19,12 +23,22 @@ fn main() -> tantivy::Result<()> {
     // - price: f64 field for stock price (ideal for BUFF - bounded precision)
     // - volume: u64 field for trading volume
     // - change_percent: f64 field for daily change percentage
+    // - exact_price: Decimal field for precise financial calculations
 
     let mut schema_builder = Schema::builder();
     let ticker_field = schema_builder.add_text_field("ticker", STORED);
     let price_field = schema_builder.add_f64_field("price", FAST | STORED);
     let volume_field = schema_builder.add_u64_field("volume", FAST | STORED);
     let change_field = schema_builder.add_f64_field("change_percent", FAST | STORED);
+
+    // Decimal field with precision 12 and scale 4 (4 decimal places)
+    // This stores exact decimal values without floating-point rounding errors
+    let decimal_options = DecimalOptions::default()
+        .set_fast()
+        .set_stored()
+        .set_precision(12)
+        .set_scale(4);
+    let exact_price_field = schema_builder.add_decimal_field("exact_price", decimal_options);
 
     let schema = schema_builder.build();
 
@@ -43,26 +57,29 @@ fn main() -> tantivy::Result<()> {
 
     let mut index_writer: IndexWriter = index.writer(50_000_000)?;
 
-    // Sample stock data
+    // Sample stock data with exact decimal prices
     let stocks = vec![
-        ("AAPL", 185.92, 45_000_000u64, 1.25),
-        ("GOOGL", 141.80, 22_000_000u64, -0.83),
-        ("MSFT", 378.91, 18_000_000u64, 0.42),
-        ("AMZN", 178.25, 35_000_000u64, 2.15),
-        ("TSLA", 248.50, 95_000_000u64, -1.67),
-        ("META", 505.75, 12_000_000u64, 0.98),
-        ("NVDA", 875.28, 42_000_000u64, 3.45),
-        ("AMD", 162.33, 55_000_000u64, -0.22),
-        ("INTC", 43.21, 28_000_000u64, -2.10),
-        ("NFLX", 628.90, 8_000_000u64, 1.05),
+        ("AAPL", 185.92, 45_000_000u64, 1.25, "185.9200"),
+        ("GOOGL", 141.80, 22_000_000u64, -0.83, "141.8000"),
+        ("MSFT", 378.91, 18_000_000u64, 0.42, "378.9100"),
+        ("AMZN", 178.25, 35_000_000u64, 2.15, "178.2500"),
+        ("TSLA", 248.50, 95_000_000u64, -1.67, "248.5000"),
+        ("META", 505.75, 12_000_000u64, 0.98, "505.7500"),
+        ("NVDA", 875.28, 42_000_000u64, 3.45, "875.2800"),
+        ("AMD", 162.33, 55_000_000u64, -0.22, "162.3300"),
+        ("INTC", 43.21, 28_000_000u64, -2.10, "43.2100"),
+        ("NFLX", 628.90, 8_000_000u64, 1.05, "628.9000"),
     ];
 
-    for (ticker, price, volume, change) in &stocks {
+    for (ticker, price, volume, change, exact_price) in &stocks {
         let mut doc = TantivyDocument::default();
         doc.add_text(ticker_field, ticker);
         doc.add_f64(price_field, *price);
         doc.add_u64(volume_field, *volume);
         doc.add_f64(change_field, *change);
+        // Add exact decimal price (no floating-point rounding)
+        let decimal = DecimalValue::from_str(exact_price).unwrap();
+        doc.add_field_value(exact_price_field, &OwnedValue::Decimal(decimal));
         index_writer.add_document(doc)?;
     }
 
@@ -72,11 +89,16 @@ fn main() -> tantivy::Result<()> {
         let mut doc = TantivyDocument::default();
         doc.add_text(ticker_field, format!("SYM{:05}", i));
         // Prices between $10 and $1000 with 2 decimal precision
-        doc.add_f64(price_field, 10.0 + (i as f64 % 990.0) + (i as f64 % 100.0) / 100.0);
+        let price_f64 = 10.0 + (i as f64 % 990.0) + (i as f64 % 100.0) / 100.0;
+        doc.add_f64(price_field, price_f64);
         // Volume between 1M and 100M
         doc.add_u64(volume_field, 1_000_000 + (i as u64 * 9900));
         // Change between -5% and +5%
         doc.add_f64(change_field, -5.0 + (i as f64 % 1000.0) / 100.0);
+        // Exact decimal price with 4 decimal places
+        let exact_price_str = format!("{:.4}", price_f64);
+        let decimal = DecimalValue::from_str(&exact_price_str).unwrap();
+        doc.add_field_value(exact_price_field, &OwnedValue::Decimal(decimal));
         index_writer.add_document(doc)?;
     }
 
@@ -161,11 +183,7 @@ fn main() -> tantivy::Result<()> {
         mid_price_docs.len()
     );
     for doc_id in mid_price_docs.iter().take(5) {
-        println!(
-            "  Doc {}: price = ${:.2}",
-            doc_id,
-            prices.get_val(*doc_id)
-        );
+        println!("  Doc {}: price = ${:.2}", doc_id, prices.get_val(*doc_id));
     }
     if mid_price_docs.len() > 5 {
         println!("  ... and {} more", mid_price_docs.len() - 5);
@@ -186,11 +204,81 @@ fn main() -> tantivy::Result<()> {
         println!("  Doc {}: ${:.2}", i, price);
     }
 
+    // # Decimal Field Aggregation
+    //
+    // Demonstrate precise aggregations on Decimal fields
+    // Unlike f64, Decimal fields preserve exact precision for financial calculations
+
+    println!("\n=== Decimal Field Aggregation (Exact Precision) ===\n");
+
+    // Access the decimal fast field (stored as i64 fixed-point)
+    let exact_prices = fast_fields.decimal_i64("exact_price")?;
+    let scale = 4; // We defined scale=4 in schema
+
+    // Compute aggregations on the first 10 stocks
+    let mut sum: i64 = 0;
+    let mut min: i64 = i64::MAX;
+    let mut max: i64 = i64::MIN;
+    let mut count: u32 = 0;
+
+    for doc_id in 0..10u32 {
+        if let Some(fixed_point) = exact_prices.first(doc_id) {
+            sum += fixed_point;
+            min = min.min(fixed_point);
+            max = max.max(fixed_point);
+            count += 1;
+        }
+    }
+
+    println!("Aggregation results for first 10 stocks (exact precision):");
+    println!("  Sum:     ${}", fixed_point_to_decimal_string(sum, scale));
+    println!("  Min:     ${}", fixed_point_to_decimal_string(min, scale));
+    println!("  Max:     ${}", fixed_point_to_decimal_string(max, scale));
+    println!(
+        "  Average: ${:.4}",
+        (sum as f64 / count as f64) / 10000.0 // Convert from scale=4 to dollars
+    );
+    println!("  Count:   {}", count);
+
+    // Compare with f64 to show precision difference
+    println!("\n=== Precision Comparison: Decimal vs f64 ===\n");
+
+    // Sum the first 10 f64 prices
+    let mut f64_sum = 0.0f64;
+    for doc_id in 0..10u32 {
+        f64_sum += prices.get_val(doc_id);
+    }
+
+    // The f64 sum may have tiny rounding errors
+    // The Decimal sum is exact
+    println!("f64 price sum:     ${:.4}", f64_sum);
+    println!(
+        "Decimal price sum: ${}",
+        fixed_point_to_decimal_string(sum, scale)
+    );
+    println!("\nNote: Decimal maintains exact precision for financial calculations,");
+    println!("while f64 may introduce tiny floating-point rounding errors.");
+
+    // Show individual decimal values
+    println!("\n=== Individual Decimal Values (First 5) ===\n");
+    println!("{:<8} {:>15}", "Doc ID", "Exact Price");
+    println!("{}", "-".repeat(25));
+    for doc_id in 0..5u32 {
+        if let Some(fixed_point) = exact_prices.first(doc_id) {
+            println!(
+                "Doc {:>3}  ${:>12}",
+                doc_id,
+                fixed_point_to_decimal_string(fixed_point, scale)
+            );
+        }
+    }
+
     println!("\n=== BUFF Compression Benefits ===\n");
     println!("BUFF compression is particularly effective for:");
     println!("  - Financial data with fixed decimal precision");
     println!("  - Sensor readings with bounded ranges");
     println!("  - Metrics with known precision requirements");
+    println!("  - Decimal fields with defined scale (stored as fixed-point i64)");
     println!();
     println!("The codec automatically optimizes storage based on:");
     println!("  - Value distribution and range");

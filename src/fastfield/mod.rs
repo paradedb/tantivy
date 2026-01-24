@@ -1546,9 +1546,19 @@ mod tests {
 
             // Test data with various patterns
             let values: Vec<u64> = vec![
-                100, 200, 300, 400, 500, // Sequential-ish
-                1000, 2000, 3000, // GCD pattern
-                42, 17, 99, 1, 0, // Random small values
+                100,
+                200,
+                300,
+                400,
+                500, // Sequential-ish
+                1000,
+                2000,
+                3000, // GCD pattern
+                42,
+                17,
+                99,
+                1,
+                0, // Random small values
                 u64::MAX / 2,
                 u64::MAX / 2 + 1, // Large values
             ];
@@ -1788,12 +1798,7 @@ mod tests {
 
             // Verify random access
             for i in (0..100_000).step_by(1000) {
-                assert_eq!(
-                    col.get_val(i),
-                    (i as u64) * 1000,
-                    "Mismatch at doc {}",
-                    i
-                );
+                assert_eq!(col.get_val(i), (i as u64) * 1000, "Mismatch at doc {}", i);
             }
         }
 
@@ -1838,7 +1843,8 @@ mod tests {
             let scale = 3;
             for (doc_id, expected_str) in values.iter().enumerate() {
                 if let Some(fixed_point) = col.first(doc_id as u32) {
-                    let result = crate::fastfield::fixed_point_to_decimal_string(fixed_point, scale);
+                    let result =
+                        crate::fastfield::fixed_point_to_decimal_string(fixed_point, scale);
                     let expected = DecimalValue::from_str(expected_str).unwrap();
                     let result_decimal = DecimalValue::from_str(&result).unwrap();
                     assert_eq!(
@@ -1894,6 +1900,274 @@ mod tests {
                     doc_id
                 );
             }
+        }
+
+        /// Test BUFF with Decimal aggregation - verify precision and scale are preserved
+        #[test]
+        fn test_buff_decimal_aggregation_precision() {
+            use std::str::FromStr;
+
+            use crate::schema::{DecimalOptions, DecimalValue, OwnedValue};
+
+            let mut schema_builder = Schema::builder();
+            // Decimal field with precision 12 and scale 4 (4 decimal places)
+            let decimal_options = DecimalOptions::default()
+                .set_fast()
+                .set_precision(12)
+                .set_scale(4);
+            let price_field = schema_builder.add_decimal_field("price", decimal_options);
+            let schema = schema_builder.build();
+
+            let index = Index::create_in_ram(schema);
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+
+            // Add documents with precise decimal values
+            // These values should preserve full precision after round-trip
+            let values = [
+                "123.4567",      // Full precision
+                "0.0001",        // Minimum positive at scale=4
+                "99999999.9999", // Large value at scale=4
+                "-50.5050",      // Negative value
+                "100.0000",      // Exact cents
+                "0.1234",        // Small fraction
+                "9999.9999",     // Medium value
+            ];
+
+            for val_str in &values {
+                let decimal = DecimalValue::from_str(val_str).unwrap();
+                let mut doc = TantivyDocument::default();
+                doc.add_field_value(price_field, &OwnedValue::Decimal(decimal));
+                index_writer.add_document(doc).unwrap();
+            }
+            index_writer.commit().unwrap();
+
+            let searcher = index.reader().unwrap().searcher();
+            let segment_reader = searcher.segment_reader(0);
+            let fast_fields = segment_reader.fast_fields();
+
+            // Read as i64 column (fixed-point representation)
+            let col = fast_fields.decimal_i64("price").unwrap();
+
+            // Verify each value preserves precision
+            let scale = 4;
+            for (doc_id, expected_str) in values.iter().enumerate() {
+                if let Some(fixed_point) = col.first(doc_id as u32) {
+                    let result =
+                        crate::fastfield::fixed_point_to_decimal_string(fixed_point, scale);
+                    let expected = DecimalValue::from_str(expected_str).unwrap();
+                    let result_decimal = DecimalValue::from_str(&result).unwrap();
+
+                    // Compare string representations (handles trailing zeros)
+                    assert_eq!(
+                        expected.to_string(),
+                        result_decimal.to_string(),
+                        "Precision lost at doc {}: expected {}, got {}",
+                        doc_id,
+                        expected_str,
+                        result
+                    );
+                }
+            }
+
+            // Compute aggregations manually on the fixed-point values
+            let mut sum: i64 = 0;
+            let mut min: i64 = i64::MAX;
+            let mut max: i64 = i64::MIN;
+            let count = col.num_docs();
+
+            for doc_id in 0..count {
+                if let Some(val) = col.first(doc_id) {
+                    sum += val;
+                    min = min.min(val);
+                    max = max.max(val);
+                }
+            }
+
+            // Verify aggregation results maintain precision
+            // Sum: 123.4567 + 0.0001 + 99999999.9999 + (-50.5050) + 100.0000 + 0.1234 + 9999.9999
+            // In fixed-point (scale=4):
+            //   1234567 + 1 + 999999999999 + (-505050) + 1000000 + 1234 + 99999999 = 1000101730750
+            let expected_sum_fixed = 1000101730750i64;
+            assert_eq!(sum, expected_sum_fixed, "Sum aggregation precision lost");
+
+            // Min: -50.5050
+            let expected_min_fixed = -505050i64; // -50.5050 * 10^4
+            assert_eq!(min, expected_min_fixed, "Min aggregation precision lost");
+
+            // Max: 99999999.9999
+            let expected_max_fixed = 999999999999i64; // 99999999.9999 * 10^4
+            assert_eq!(max, expected_max_fixed, "Max aggregation precision lost");
+
+            // Convert sum back to decimal string and verify
+            // 1000101730750 / 10^4 = 100010173.0750
+            let sum_decimal = crate::fastfield::fixed_point_to_decimal_string(sum, scale);
+            assert_eq!(
+                sum_decimal, "100010173.075",
+                "Sum decimal conversion failed"
+            );
+        }
+
+        /// Test BUFF with different Decimal scales
+        #[test]
+        fn test_buff_decimal_different_scales() {
+            use std::str::FromStr;
+
+            use crate::schema::{DecimalOptions, DecimalValue, OwnedValue};
+
+            // Test scale = 2 (like currency cents)
+            {
+                let mut schema_builder = Schema::builder();
+                let decimal_options = DecimalOptions::default()
+                    .set_fast()
+                    .set_precision(10)
+                    .set_scale(2);
+                let amount_field = schema_builder.add_decimal_field("amount", decimal_options);
+                let schema = schema_builder.build();
+
+                let index = Index::create_in_ram(schema);
+                let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+
+                let values = ["99.99", "100.00", "0.01", "12345.67"];
+                for val_str in &values {
+                    let decimal = DecimalValue::from_str(val_str).unwrap();
+                    let mut doc = TantivyDocument::default();
+                    doc.add_field_value(amount_field, &OwnedValue::Decimal(decimal));
+                    index_writer.add_document(doc).unwrap();
+                }
+                index_writer.commit().unwrap();
+
+                let searcher = index.reader().unwrap().searcher();
+                let col = searcher
+                    .segment_reader(0)
+                    .fast_fields()
+                    .decimal_i64("amount")
+                    .unwrap();
+
+                // Verify values at scale=2
+                for (doc_id, expected_str) in values.iter().enumerate() {
+                    if let Some(fixed_point) = col.first(doc_id as u32) {
+                        let result =
+                            crate::fastfield::fixed_point_to_decimal_string(fixed_point, 2);
+                        let expected = DecimalValue::from_str(expected_str).unwrap();
+                        let result_decimal = DecimalValue::from_str(&result).unwrap();
+                        assert_eq!(
+                            expected.to_string(),
+                            result_decimal.to_string(),
+                            "Scale=2 precision lost"
+                        );
+                    }
+                }
+            }
+
+            // Test scale = 6 (like crypto/high-precision)
+            {
+                let mut schema_builder = Schema::builder();
+                let decimal_options = DecimalOptions::default()
+                    .set_fast()
+                    .set_precision(15)
+                    .set_scale(6);
+                let rate_field = schema_builder.add_decimal_field("rate", decimal_options);
+                let schema = schema_builder.build();
+
+                let index = Index::create_in_ram(schema);
+                let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+
+                let values = ["0.000001", "123.456789", "999999.999999"];
+                for val_str in &values {
+                    let decimal = DecimalValue::from_str(val_str).unwrap();
+                    let mut doc = TantivyDocument::default();
+                    doc.add_field_value(rate_field, &OwnedValue::Decimal(decimal));
+                    index_writer.add_document(doc).unwrap();
+                }
+                index_writer.commit().unwrap();
+
+                let searcher = index.reader().unwrap().searcher();
+                let col = searcher
+                    .segment_reader(0)
+                    .fast_fields()
+                    .decimal_i64("rate")
+                    .unwrap();
+
+                // Verify values at scale=6
+                for (doc_id, expected_str) in values.iter().enumerate() {
+                    if let Some(fixed_point) = col.first(doc_id as u32) {
+                        let result =
+                            crate::fastfield::fixed_point_to_decimal_string(fixed_point, 6);
+                        let expected = DecimalValue::from_str(expected_str).unwrap();
+                        let result_decimal = DecimalValue::from_str(&result).unwrap();
+                        assert_eq!(
+                            expected.to_string(),
+                            result_decimal.to_string(),
+                            "Scale=6 precision lost"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Test BUFF decimal with large dataset for aggregation accuracy
+        #[test]
+        fn test_buff_decimal_large_aggregation() {
+            use std::str::FromStr;
+
+            use crate::schema::{DecimalOptions, DecimalValue, OwnedValue};
+
+            let mut schema_builder = Schema::builder();
+            let decimal_options = DecimalOptions::default()
+                .set_fast()
+                .set_precision(10)
+                .set_scale(2);
+            let price_field = schema_builder.add_decimal_field("price", decimal_options);
+            let schema = schema_builder.build();
+
+            let index = Index::create_in_ram(schema);
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+
+            // Add 1000 documents with varying prices
+            let mut expected_sum: i64 = 0;
+            for i in 0..1000u64 {
+                // Prices from $10.00 to $109.99
+                let price_cents = 1000 + i;
+                expected_sum += price_cents as i64;
+
+                let price_str = format!("{}.{:02}", price_cents / 100, price_cents % 100);
+                let decimal = DecimalValue::from_str(&price_str).unwrap();
+                let mut doc = TantivyDocument::default();
+                doc.add_field_value(price_field, &OwnedValue::Decimal(decimal));
+                index_writer.add_document(doc).unwrap();
+            }
+            index_writer.commit().unwrap();
+
+            let searcher = index.reader().unwrap().searcher();
+            let col = searcher
+                .segment_reader(0)
+                .fast_fields()
+                .decimal_i64("price")
+                .unwrap();
+
+            // Compute sum from fast field
+            let mut actual_sum: i64 = 0;
+            for doc_id in 0..col.num_docs() {
+                if let Some(val) = col.first(doc_id) {
+                    actual_sum += val;
+                }
+            }
+
+            // Verify sum matches expected (sum of 1000..2000 = 1500 * 1000 = 1,500,000 cents)
+            assert_eq!(
+                actual_sum, expected_sum,
+                "Large dataset aggregation sum mismatch"
+            );
+
+            // Verify average: expected = 1499.5 cents = $14.995
+            let expected_avg = expected_sum as f64 / 1000.0;
+            let actual_avg = actual_sum as f64 / col.num_docs() as f64;
+            assert!(
+                (actual_avg - expected_avg).abs() < 0.001,
+                "Average mismatch: expected {}, got {}",
+                expected_avg,
+                actual_avg
+            );
         }
     }
 }

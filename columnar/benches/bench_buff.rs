@@ -7,11 +7,11 @@
 
 use std::sync::Arc;
 
-use binggan::{black_box, InputGroup};
+use binggan::{InputGroup, black_box};
 use common::file_slice::FileSlice;
 use rand::prelude::*;
 use tantivy_columnar::column_values::{
-    load_u64_based_column_values, serialize_u64_based_column_values, CodecType, ColumnValues,
+    CodecType, ColumnValues, load_u64_based_column_values, serialize_u64_based_column_values,
 };
 
 /// Helper function to serialize and load column values with a specific codec
@@ -313,6 +313,110 @@ fn bench_aggregations() {
     group.run();
 }
 
+/// Benchmark with decimal-like data (fixed-point representation)
+/// This simulates how Decimal fields are stored with a defined scale
+fn bench_decimal_aggregations() {
+    let codecs = get_all_codecs();
+
+    // Generate decimal-like data (prices in cents, like scale=2)
+    // Values: $10.00 to $999.99 stored as 1000 to 99999 cents
+    let decimal_data: Vec<u64> = (0..100_000)
+        .map(|i| 1000 + (i % 98999)) // Prices from $10.00 to $999.99
+        .collect();
+
+    let columns: Vec<_> = codecs
+        .iter()
+        .map(|(name, codec)| {
+            let col = serialize_and_load(&decimal_data, *codec);
+            (format!("decimal_{}", name), col)
+        })
+        .collect();
+
+    let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> = InputGroup::new_with_inputs(columns);
+
+    // Sum aggregation (common for financial totals)
+    group.register("decimal_sum", |col: &Arc<dyn ColumnValues<u64>>| {
+        let mut sum = 0u64;
+        for i in 0..col.num_vals() {
+            sum = sum.wrapping_add(col.get_val(i));
+        }
+        black_box(sum);
+    });
+
+    // Average (requires sum and count)
+    group.register("decimal_average", |col: &Arc<dyn ColumnValues<u64>>| {
+        let mut sum = 0u64;
+        let count = col.num_vals();
+        for i in 0..count {
+            sum = sum.wrapping_add(col.get_val(i));
+        }
+        let avg = sum as f64 / count as f64;
+        black_box(avg);
+    });
+
+    // Min/Max (common for price ranges)
+    group.register("decimal_min_max", |col: &Arc<dyn ColumnValues<u64>>| {
+        let mut min = u64::MAX;
+        let mut max = 0u64;
+        for i in 0..col.num_vals() {
+            let val = col.get_val(i);
+            min = min.min(val);
+            max = max.max(val);
+        }
+        black_box((min, max));
+    });
+
+    // Range query (find prices between $50.00 and $100.00 = 5000-10000 cents)
+    group.register("decimal_range", |col: &Arc<dyn ColumnValues<u64>>| {
+        let mut positions = Vec::new();
+        col.get_row_ids_for_value_range(5000..=10000, 0..col.num_vals(), &mut positions);
+        black_box(positions.len());
+    });
+
+    group.run();
+}
+
+/// Benchmark high-precision decimal data (scale=6, like crypto)
+fn bench_high_precision_decimal() {
+    let codecs = get_all_codecs();
+
+    // Generate high-precision data (6 decimal places)
+    // Values: 0.000001 to 999.999999 stored as 1 to 999999999
+    let high_precision_data: Vec<u64> = (0..100_000)
+        .map(|i| 1 + (i as u64 * 9999)) // Spread across the range
+        .collect();
+
+    let columns: Vec<_> = codecs
+        .iter()
+        .map(|(name, codec)| {
+            let col = serialize_and_load(&high_precision_data, *codec);
+            (format!("highprec_{}", name), col)
+        })
+        .collect();
+
+    let mut group: InputGroup<Arc<dyn ColumnValues<u64>>> = InputGroup::new_with_inputs(columns);
+
+    group.register("highprec_sum", |col: &Arc<dyn ColumnValues<u64>>| {
+        let mut sum = 0u64;
+        for i in 0..col.num_vals() {
+            sum = sum.wrapping_add(col.get_val(i));
+        }
+        black_box(sum);
+    });
+
+    group.register("highprec_scan", |col: &Arc<dyn ColumnValues<u64>>| {
+        let mut count = 0u32;
+        for i in 0..col.num_vals() {
+            if col.get_val(i) > 500_000_000 {
+                count += 1;
+            }
+        }
+        black_box(count);
+    });
+
+    group.run();
+}
+
 fn main() {
     println!("=== BUFF Codec Benchmark Suite ===\n");
 
@@ -334,4 +438,12 @@ fn main() {
     // Run aggregation benchmarks
     println!("\n=== Aggregation Benchmarks ===\n");
     bench_aggregations();
+
+    // Run decimal aggregation benchmarks
+    println!("\n=== Decimal Aggregation Benchmarks ===\n");
+    bench_decimal_aggregations();
+
+    // Run high-precision decimal benchmarks
+    println!("\n=== High-Precision Decimal Benchmarks ===\n");
+    bench_high_precision_decimal();
 }

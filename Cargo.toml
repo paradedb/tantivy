@@ -39,10 +39,12 @@ levenshtein_automata = "0.2.1"
 uuid = { version = "1.0.0", features = ["v4", "serde"] }
 crossbeam-channel = "0.5.4"
 rust-stemmers = { version = "1.2.0", optional = true }
-tantivy-stemmers = { version = "0.4.0", default-features = false, features = ["polish_yarovoy"] }
+tantivy-stemmers = { version = "0.4.0", default-features = false, features = [
+  "polish_yarovoy",
+] }
 downcast-rs = "2.0.1"
 bitpacking = { version = "0.9.3", default-features = false, features = [
-    "bitpacker4x",
+  "bitpacker4x",
 ] }
 census = "0.4.2"
 rustc-hash = "2.0.0"
@@ -121,7 +123,14 @@ debug-assertions = true
 overflow-checks = true
 
 [features]
-default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer"]
+default = [
+  "mmap",
+  "stopwords",
+  "lz4-compression",
+  "columnar-zstd-compression",
+  "columnar-buff-compression",
+  "stemmer",
+]
 stemmer = ["rust-stemmers"]
 mmap = ["fs4", "tempfile", "memmap2"]
 stopwords = []
@@ -203,6 +212,11 @@ harness = false
 [[bench]]
 name = "bool_queries_with_range"
 harness = false
+
+[[bench]]
+name = "decimal_bench"
+harness = false
+required-features = ["columnar-buff-compression"]
 
 [[example]]
 name = "buff_compression"
