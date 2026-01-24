@@ -38,7 +38,7 @@ pub const MIN_SCALE: i32 = -1000;
 /// - `NUMERIC(2, -3)` rounds to nearest 1000, stores values like 12000, 99000
 ///
 /// Values exceeding precision/scale will be truncated/rounded.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(from = "DecimalOptionsDeser")]
 pub struct DecimalOptions {
     /// Maximum total number of significant digits.
@@ -81,19 +81,6 @@ impl From<DecimalOptionsDeser> for DecimalOptions {
             fieldnorms: deser.fieldnorms.unwrap_or(deser.indexed),
             fast: deser.fast,
             stored: deser.stored,
-        }
-    }
-}
-
-impl Default for DecimalOptions {
-    fn default() -> Self {
-        DecimalOptions {
-            precision: None,
-            scale: None,
-            indexed: false,
-            fieldnorms: false,
-            fast: false,
-            stored: false,
         }
     }
 }
