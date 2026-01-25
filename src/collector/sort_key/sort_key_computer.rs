@@ -190,7 +190,7 @@ where
 
     fn segment_bounds(
         &self,
-        segment_reader: &SegmentReader,
+        _segment_reader: &SegmentReader,
     ) -> Result<
         Option<(
             <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,

@@ -438,6 +438,19 @@ where
             comparator: self.comparator(),
         })
     }
+
+    fn segment_bounds(
+        &self,
+        segment_reader: &crate::SegmentReader,
+    ) -> crate::Result<
+        Option<(
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+        )>,
+    > {
+        // Delegate to the inner sort key computer's segment_bounds
+        self.0.segment_bounds(segment_reader)
+    }
 }
 
 impl<TSortKeyComputer> SortKeyComputer for (TSortKeyComputer, Order)
@@ -475,6 +488,19 @@ where
             segment_sort_key_computer: child,
             comparator: self.comparator(),
         })
+    }
+
+    fn segment_bounds(
+        &self,
+        segment_reader: &crate::SegmentReader,
+    ) -> crate::Result<
+        Option<(
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+        )>,
+    > {
+        // Delegate to the inner sort key computer's segment_bounds
+        self.0.segment_bounds(segment_reader)
     }
 }
 
