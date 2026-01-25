@@ -27,6 +27,12 @@ pub const MAX_SCALE: i32 = 16383;
 /// PostgreSQL allows down to -1000.
 pub const MIN_SCALE: i32 = -1000;
 
+/// Maximum precision that can be stored using Decimal64 (fixed 8 bytes with embedded scale).
+/// Decimal64 uses 8 bits for scale and 56 bits for signed value.
+/// 56-bit signed range: -2^55 to 2^55-1 ≈ ±3.6 × 10^16
+/// So we can safely store up to 16 significant digits.
+pub const MAX_I64_PRECISION: u32 = 16;
+
 /// Define how a decimal field should be handled by tantivy.
 ///
 /// Supports PostgreSQL-style precision and scale:
@@ -128,6 +134,25 @@ impl DecimalOptions {
     #[inline]
     pub fn is_stored(&self) -> bool {
         self.stored
+    }
+
+    /// Returns true if the decimal values with this precision/scale can be
+    /// safely stored using Decimal64 (8 bytes with embedded scale).
+    ///
+    /// Decimal64 uses 56 bits for the value, which can hold ~3.6×10^16,
+    /// meaning we can safely store decimals with up to 16 significant digits.
+    /// If the precision exceeds this, the decimal should be stored as bytes instead.
+    ///
+    /// # Returns
+    ///
+    /// - `true` if both precision and scale are defined AND precision <= 16
+    /// - `false` if precision is None, scale is None, or precision > 16
+    #[inline]
+    pub fn fits_in_i64(&self) -> bool {
+        match (self.precision, self.scale) {
+            (Some(precision), Some(_scale)) => precision <= MAX_I64_PRECISION,
+            _ => false,
+        }
     }
 
     /// Set the precision limit.
@@ -410,5 +435,42 @@ mod tests {
                 stored: false
             }
         );
+    }
+
+    #[test]
+    fn test_decimal_options_fits_in_i64() {
+        // Small precision (≤16) with scale should fit in Decimal64
+        let opts = DecimalOptions::with_precision_and_scale(10, 2);
+        assert!(opts.fits_in_i64());
+
+        let opts = DecimalOptions::with_precision_and_scale(16, 5);
+        assert!(opts.fits_in_i64());
+
+        // Precision exactly at boundary (16 digits)
+        let opts = DecimalOptions::with_precision_and_scale(16, 0);
+        assert!(opts.fits_in_i64());
+
+        // Large precision (>16) should NOT fit in Decimal64
+        let opts = DecimalOptions::with_precision_and_scale(17, 2);
+        assert!(!opts.fits_in_i64());
+
+        let opts = DecimalOptions::with_precision_and_scale(30, 10);
+        assert!(!opts.fits_in_i64());
+
+        // Unlimited precision (None) should NOT fit in Decimal64
+        let opts = DecimalOptions::default();
+        assert!(!opts.fits_in_i64());
+
+        // Precision without scale should NOT fit in Decimal64 (scale is required)
+        let opts = DecimalOptions {
+            precision: Some(10),
+            scale: None,
+            ..Default::default()
+        };
+        assert!(!opts.fits_in_i64());
+
+        // Negative scale still counts - precision is what matters
+        let opts = DecimalOptions::with_precision_and_scale(15, -3);
+        assert!(opts.fits_in_i64());
     }
 }

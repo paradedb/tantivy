@@ -1498,10 +1498,10 @@ mod tests {
         use crate::schema::{DecimalOptions, DecimalValue, OwnedValue};
 
         let mut schema_builder = Schema::builder();
-        // High precision field
+        // High precision field (up to 16 digits with Decimal64)
         let decimal_options = DecimalOptions::default()
             .set_fast()
-            .set_precision(18)
+            .set_precision(16)
             .set_scale(6);
         let decimal_field = schema_builder.add_decimal_field("high_precision", decimal_options);
         let schema = schema_builder.build();
@@ -1509,8 +1509,8 @@ mod tests {
         let index = Index::create_in_ram(schema);
         let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
 
-        // Add a value that requires high precision
-        let decimal = DecimalValue::from_str("123456789012.123456").unwrap();
+        // Add a value that uses high precision (16 digits total: 10 + 6)
+        let decimal = DecimalValue::from_str("1234567890.123456").unwrap();
         let mut doc = TantivyDocument::default();
         doc.add_field_value(decimal_field, &OwnedValue::Decimal(decimal));
         index_writer.add_document(doc).unwrap();
@@ -1526,7 +1526,7 @@ mod tests {
         let result = super::fixed_point_to_decimal_string(fixed_point, 6);
 
         // The value should be preserved within the scale
-        assert_eq!(result, "123456789012.123456");
+        assert_eq!(result, "1234567890.123456");
     }
 
     // BUFF compression integration tests

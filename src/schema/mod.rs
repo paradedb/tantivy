@@ -167,9 +167,9 @@ pub fn is_valid_field_name(field_name: &str) -> bool {
 
 /// Converts a value type to the corresponding column type for columnar storage.
 ///
-/// For Decimal fields with a defined scale, values are stored as I64 (fixed-point)
-/// to enable efficient columnar compression (including BUFF). For unlimited precision
-/// decimals, values are stored as Bytes.
+/// For Decimal fields with precision ≤ 16 and defined scale, values are stored as I64
+/// (fixed-point) to enable efficient columnar compression (including BUFF). For decimals
+/// with precision > 16 or unlimited precision, values are stored as Bytes.
 ///
 /// Note: This function doesn't consider field options. Use
 /// [`value_type_to_column_type_with_options`] for full Decimal support.
@@ -181,8 +181,8 @@ pub(crate) fn value_type_to_column_type(typ: Type) -> Option<ColumnType> {
 /// Converts a value type to the corresponding column type, considering field options.
 ///
 /// For Decimal fields:
-/// - With defined scale: stored as I64 for efficient columnar compression
-/// - Without scale (unlimited precision): stored as Bytes
+/// - With precision ≤ 16 and defined scale: stored as I64 for efficient columnar compression
+/// - With precision > 16 or unlimited precision: stored as Bytes
 pub(crate) fn value_type_to_column_type_with_options(
     typ: Type,
     field_type: Option<&FieldType>,
@@ -199,13 +199,14 @@ pub(crate) fn value_type_to_column_type_with_options(
         Type::IpAddr => Some(ColumnType::IpAddr),
         Type::Json => None,
         Type::Decimal => {
-            // If scale is defined, store as I64 for efficient columnar compression
+            // Only use I64 storage if the decimal precision fits in Decimal64 (≤16 digits).
+            // Large precision decimals fall back to bytes encoding.
             if let Some(FieldType::Decimal(opts)) = field_type {
-                if opts.scale().is_some() {
+                if opts.fits_in_i64() {
                     return Some(ColumnType::I64);
                 }
             }
-            // Fallback to bytes for unlimited precision decimals
+            // Fallback to bytes for unlimited precision or large precision decimals
             Some(ColumnType::Bytes)
         }
     }

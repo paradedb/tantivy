@@ -6,6 +6,7 @@
 //! - Reading decimal values
 //! - Aggregations (sum, min, max, avg)
 //! - Range queries on decimal data
+//! - Precision threshold behavior (i64 vs bytes storage)
 //!
 //! Run with:
 //!   cargo bench --bench decimal_bench --features columnar-buff-compression
@@ -13,37 +14,39 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use binggan::{InputGroup, black_box};
+use binggan::{black_box, InputGroup};
 use tantivy::fastfield::fixed_point_to_decimal_string;
 use tantivy::schema::{DecimalOptions, DecimalValue, OwnedValue, Schema, FAST, STORED};
 use tantivy::{Index, IndexWriter, TantivyDocument};
 
-/// Generate test decimal values (prices with 4 decimal places)
-fn generate_decimal_values(n: usize) -> Vec<String> {
+/// Generate decimal values with specified scale
+/// Values range from 10.xxx to 999.xxx where xxx has `scale` decimal places
+fn generate_decimal_values_with_scale(n: usize, scale: i32) -> Vec<String> {
     (0..n)
         .map(|i| {
-            // Prices from $10.0000 to $999.9999
             let dollars = 10 + (i % 990);
-            let cents = i % 10000;
-            format!("{}.{:04}", dollars, cents)
+            let fraction = i % (10usize.pow(scale as u32));
+            format!("{}.{:0>width$}", dollars, fraction, width = scale as usize)
         })
         .collect()
+}
+
+/// Generate test decimal values (prices with 4 decimal places)
+fn generate_decimal_values(n: usize) -> Vec<String> {
+    generate_decimal_values_with_scale(n, 4)
 }
 
 /// Generate high-precision decimal values (6 decimal places, like crypto)
 fn generate_high_precision_values(n: usize) -> Vec<String> {
-    (0..n)
-        .map(|i| {
-            // Values from 0.000001 to 999.999999
-            let whole = i % 1000;
-            let fraction = (i * 7) % 1_000_000;
-            format!("{}.{:06}", whole, fraction)
-        })
-        .collect()
+    generate_decimal_values_with_scale(n, 6)
 }
 
 /// Create an index with decimal field and return (index, field, scale)
-fn create_decimal_index(values: &[String], precision: u32, scale: i32) -> (Index, tantivy::schema::Field, i32) {
+fn create_decimal_index(
+    values: &[String],
+    precision: u32,
+    scale: i32,
+) -> (Index, tantivy::schema::Field, i32) {
     let mut schema_builder = Schema::builder();
     let decimal_options = DecimalOptions::default()
         .set_fast()
@@ -75,10 +78,8 @@ fn bench_decimal_indexing() {
 
     for &size in &sizes {
         let values = generate_decimal_values(size);
-        
-        let inputs: Vec<_> = vec![
-            (format!("index_decimal_{}", size), values.clone()),
-        ];
+
+        let inputs: Vec<_> = vec![(format!("index_decimal_{}", size), values.clone())];
 
         let mut group: InputGroup<Vec<String>> = InputGroup::new_with_inputs(inputs);
 
@@ -358,9 +359,143 @@ fn bench_decimal_vs_f64() {
     group_f64.run();
 }
 
+/// Benchmark comparing i64 storage (precision <= 16) vs bytes storage (precision > 16)
+fn bench_precision_threshold() {
+    println!("\n--- Precision Threshold: i64 vs Bytes Storage ---\n");
+    println!("Decimals with precision <= 16 use Decimal64 storage (BUFF eligible)");
+    println!("Decimals with precision > 16 use bytes storage (lexicographically sortable)\n");
+
+    let n = 50_000usize;
+    let values: Vec<String> = (0..n)
+        .map(|i| {
+            let base = 100 + (i % 900);
+            let frac = i % 10000;
+            format!("{}.{:04}", base, frac)
+        })
+        .collect();
+
+    // Precision 16 (uses Decimal64)
+    let (index_i64, _field_i64, _) = {
+        let mut schema_builder = Schema::builder();
+        let opts = DecimalOptions::default()
+            .set_fast()
+            .set_stored()
+            .set_precision(16) // Fits in Decimal64
+            .set_scale(4);
+        let field = schema_builder.add_decimal_field("amount", opts);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
+        for val_str in &values {
+            let decimal = DecimalValue::from_str(val_str).unwrap();
+            let mut doc = TantivyDocument::default();
+            doc.add_field_value(field, &OwnedValue::Decimal(decimal));
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        (index, field, 4)
+    };
+
+    // Precision 30 (uses bytes - too large for Decimal64)
+    let (index_bytes, _field_bytes, _) = {
+        let mut schema_builder = Schema::builder();
+        let opts = DecimalOptions::default()
+            .set_fast()
+            .set_stored()
+            .set_precision(30) // Too large for Decimal64
+            .set_scale(4);
+        let field = schema_builder.add_decimal_field("amount", opts);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
+        for val_str in &values {
+            let decimal = DecimalValue::from_str(val_str).unwrap();
+            let mut doc = TantivyDocument::default();
+            doc.add_field_value(field, &OwnedValue::Decimal(decimal));
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        (index, field, 4)
+    };
+
+    // Unlimited precision (uses bytes)
+    let (index_unlimited, _field_unlimited, _) = {
+        let mut schema_builder = Schema::builder();
+        let opts = DecimalOptions::default().set_fast().set_stored();
+        // No precision/scale set - unlimited
+        let field = schema_builder.add_decimal_field("amount", opts);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
+        for val_str in &values {
+            let decimal = DecimalValue::from_str(val_str).unwrap();
+            let mut doc = TantivyDocument::default();
+            doc.add_field_value(field, &OwnedValue::Decimal(decimal));
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        (index, field, 0)
+    };
+
+    // Compare storage sizes
+    let size_i64 = index_i64
+        .reader()
+        .unwrap()
+        .searcher()
+        .segment_reader(0)
+        .fast_fields()
+        .decimal_i64("amount")
+        .map(|_| "i64 column")
+        .unwrap_or("bytes fallback");
+
+    let size_bytes = index_bytes
+        .reader()
+        .unwrap()
+        .searcher()
+        .segment_reader(0)
+        .fast_fields()
+        .bytes("amount")
+        .map(|_| "bytes column")
+        .unwrap_or("unknown");
+
+    let size_unlimited = index_unlimited
+        .reader()
+        .unwrap()
+        .searcher()
+        .segment_reader(0)
+        .fast_fields()
+        .bytes("amount")
+        .map(|_| "bytes column")
+        .unwrap_or("unknown");
+
+    println!("Storage mode by precision:");
+    println!(
+        "  Precision 16 (fits Decimal64):  {} - eligible for BUFF compression",
+        size_i64
+    );
+    println!(
+        "  Precision 30 (exceeds Decimal64): {} - lexicographic encoding",
+        size_bytes
+    );
+    println!(
+        "  Unlimited precision:              {} - lexicographic encoding",
+        size_unlimited
+    );
+    println!();
+    println!("Note: Only precision <= 16 with defined scale uses Decimal64 storage,");
+    println!("      which enables BUFF compression and fast integer aggregations.");
+}
+
 fn main() {
     println!("=== Decimal Field Benchmark Suite ===\n");
 
+    // Show precision threshold behavior (i64 vs bytes storage)
+    bench_precision_threshold();
+
+    // Core benchmarks
     bench_decimal_indexing();
     bench_decimal_reading();
     bench_decimal_aggregations();

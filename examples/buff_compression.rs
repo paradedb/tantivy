@@ -285,5 +285,74 @@ fn main() -> tantivy::Result<()> {
     println!("  - GCD (Greatest Common Divisor) patterns");
     println!("  - Byte-sliced storage for efficient queries");
 
+    // # Precision Threshold Demonstration
+    //
+    // Show how precision affects storage mode
+    println!("\n=== Precision Threshold: Decimal64 vs Bytes Storage ===\n");
+    println!("Decimal storage mode depends on precision:");
+    println!("  - Precision <= 16: stored as Decimal64 (BUFF eligible)");
+    println!("  - Precision > 16:  stored as bytes (lexicographically sortable)");
+    println!();
+
+    // Create a schema with high precision decimal (uses bytes)
+    let mut large_schema_builder = Schema::builder();
+    let large_decimal_options = DecimalOptions::default()
+        .set_fast()
+        .set_stored()
+        .set_precision(30) // > 16, so uses bytes storage
+        .set_scale(10);
+    let large_decimal_field =
+        large_schema_builder.add_decimal_field("large_amount", large_decimal_options);
+    let large_schema = large_schema_builder.build();
+
+    let large_index = Index::create_in_ram(large_schema);
+    let mut large_writer: IndexWriter = large_index.writer(50_000_000)?;
+
+    // Add some large precision values
+    let large_values = [
+        "123456789012345678901234.5678901234", // 24 digits before decimal
+        "987654321098765432109876.5432109876",
+        "111111111111111111111111.1111111111",
+    ];
+
+    for val_str in &large_values {
+        let decimal = DecimalValue::from_str(val_str).unwrap();
+        let mut doc = TantivyDocument::default();
+        doc.add_field_value(large_decimal_field, &OwnedValue::Decimal(decimal));
+        large_writer.add_document(doc)?;
+    }
+    large_writer.commit()?;
+
+    let large_reader = large_index.reader()?;
+    let large_searcher = large_reader.searcher();
+    let large_fast_fields = large_searcher.segment_reader(0).fast_fields();
+
+    // Large precision decimals use bytes storage (not Decimal64)
+    // So we need to access them via the bytes column
+    println!("High-precision decimal (precision=30) example:");
+    println!("  These values use bytes storage, NOT Decimal64.");
+    println!("  This preserves full precision but doesn't benefit from BUFF.");
+    println!();
+
+    // Try to get i64 column (will fail for bytes storage)
+    match large_fast_fields.decimal_i64("large_amount") {
+        Ok(_) => println!("  Storage: Decimal64 (unexpected for precision > 16)"),
+        Err(_) => println!("  Storage: bytes (correct for precision > 16)"),
+    }
+
+    // Access via bytes column
+    match large_fast_fields.bytes("large_amount") {
+        Ok(Some(_bytes_col)) => {
+            println!("  Bytes column found - large precision decimals preserved exactly.");
+        }
+        _ => println!("  Note: Access pattern differs for bytes vs i64 storage."),
+    }
+
+    println!();
+    println!("Summary:");
+    println!("  - Use precision <= 16 for BUFF compression benefits (fast aggregations)");
+    println!("  - Use precision > 16 when exact values exceed 16 digits");
+    println!("  - Unlimited precision (no precision/scale set) always uses bytes");
+
     Ok(())
 }

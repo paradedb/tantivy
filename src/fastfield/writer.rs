@@ -135,8 +135,11 @@ impl FastFieldsWriter {
                 date_precisions[field_id.field_id() as usize] = date_options.get_precision();
             }
             if let FieldType::Decimal(decimal_options) = field_entry.field_type() {
-                // Store scale for fixed-point conversion if defined
-                decimal_scales[field_id.field_id() as usize] = decimal_options.scale();
+                // Only use Decimal64 storage if the decimal fits in 56 bits.
+                // Large precision decimals (> 16 digits) fall back to bytes encoding.
+                if decimal_options.fits_in_i64() {
+                    decimal_scales[field_id.field_id() as usize] = decimal_options.scale();
+                }
             }
             if let FieldType::JsonObject(json_object_options) = field_entry.field_type() {
                 if let Some(tokenizer_name) = json_object_options.get_fast_field_tokenizer_name() {
