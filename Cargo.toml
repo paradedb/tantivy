@@ -72,7 +72,7 @@ query-grammar = { version = "0.25.0", path = "./query-grammar", package = "tanti
 tantivy-bitpacker = { version = "0.9", path = "./bitpacker" }
 common = { version = "0.10", path = "./common/", package = "tantivy-common" }
 tokenizer-api = { version = "0.6", path = "./tokenizer-api", package = "tantivy-tokenizer-api" }
-decimal-bytes = "0.1"
+decimal-bytes = "0.2"
 sketches-ddsketch = { version = "0.3.0", features = ["use_serde"] }
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 futures-util = { version = "0.3.28", optional = true }
@@ -167,7 +167,7 @@ members = [
 ]
 
 [workspace.dependencies]
-buff-rs = { git = "ssh://git@github.com/paradedb/buff-rs", rev = "b32cd979f3271c16045cac5e8f5ad981eb2fb787", default-features = false }
+buff-rs = { version = "0.2.0", default-features = false }
 
 # Following the "fail" crate best practises, we isolate
 # tests that define specific behavior in fail check points

@@ -223,8 +223,9 @@ dependencies = [
 
 [[package]]
 name = "buff-rs"
-version = "0.1.0"
-source = "git+ssh://git@github.com/paradedb/buff-rs?rev=b32cd979f3271c16045cac5e8f5ad981eb2fb787#b32cd979f3271c16045cac5e8f5ad981eb2fb787"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51fdba4473fd149906816243cc968b1ed14a51c8f063c82f58365c56a532ee5f"
 dependencies = [
  "thiserror",
 ]
@@ -487,9 +488,9 @@ dependencies = [
 
 [[package]]
 name = "decimal-bytes"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a264fa78748c17b0c53e52aa17601b6817483b8885ce5062627d25eec104b3d5"
+checksum = "60ac550fa1b8a4c65d273edd2a552812b46a7d8f21d8514d60aeea75bfaca575"
 dependencies = [
  "serde",
  "thiserror",
