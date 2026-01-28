@@ -10,7 +10,7 @@ use crate::index::Segment;
 use crate::positions::PositionSerializer;
 use crate::postings::compression::{BlockEncoder, VIntEncoder, COMPRESSION_BLOCK_SIZE};
 use crate::postings::skip::SkipSerializer;
-use crate::query::Bm25Weight;
+use crate::query::{Bm25Weight, DEFAULT_BM25_B, DEFAULT_BM25_K1};
 use crate::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use crate::termdict::TermDictionaryBuilder;
 use crate::{DocId, Score};
@@ -361,6 +361,8 @@ impl PostingsSerializer {
             term_doc_freq as u64,
             num_docs_in_segment,
             self.avg_fieldnorm,
+            DEFAULT_BM25_K1,
+            DEFAULT_BM25_B,
         ));
     }
 

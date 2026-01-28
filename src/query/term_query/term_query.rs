@@ -102,9 +102,12 @@ impl TermQuery {
                 statistics_provider,
                 ..
             } => Bm25Weight::for_terms(statistics_provider, std::slice::from_ref(&self.term))?,
-            EnableScoring::Disabled { .. } => {
-                Bm25Weight::new(Explanation::new("<no score>", 1.0f32), 1.0f32)
-            }
+            EnableScoring::Disabled { .. } => Bm25Weight::new(
+                Explanation::new("<no score>", 1.0f32),
+                1.0f32,
+                crate::query::DEFAULT_BM25_K1,
+                crate::query::DEFAULT_BM25_B,
+            ),
         };
         let scoring_enabled = enable_scoring.is_scoring_enabled();
         let index_record_option = if scoring_enabled {

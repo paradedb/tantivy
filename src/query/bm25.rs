@@ -5,8 +5,16 @@ use crate::query::Explanation;
 use crate::schema::Field;
 use crate::{Score, Searcher, Term};
 
-const K1: Score = 1.2;
-const B: Score = 0.75;
+/// Default BM25 k1 parameter (term saturation).
+///
+/// Higher values increase the influence of term frequency.
+pub const DEFAULT_BM25_K1: Score = 1.2;
+
+/// Default BM25 b parameter (length normalization).
+///
+/// Higher values increase the penalty for longer documents.
+/// Set to 0.0 to disable length normalization entirely.
+pub const DEFAULT_BM25_B: Score = 0.75;
 
 /// An interface to compute the statistics needed in BM25 scoring.
 ///
@@ -22,6 +30,21 @@ pub trait Bm25StatisticsProvider {
 
     /// The number of documents containing the given term.
     fn doc_freq(&self, term: &Term) -> crate::Result<u64>;
+
+    /// BM25 k1 parameter (term saturation). Default: [`DEFAULT_BM25_K1`]
+    ///
+    /// Higher values increase the influence of term frequency.
+    fn k1(&self) -> Score {
+        DEFAULT_BM25_K1
+    }
+
+    /// BM25 b parameter (length normalization). Default: [`DEFAULT_BM25_B`]
+    ///
+    /// Higher values increase the penalty for longer documents.
+    /// Set to 0.0 to disable length normalization entirely.
+    fn b(&self) -> Score {
+        DEFAULT_BM25_B
+    }
 }
 
 impl Bm25StatisticsProvider for Searcher {
@@ -55,15 +78,15 @@ pub(crate) fn idf(doc_freq: u64, doc_count: u64) -> Score {
     (1.0 + x).ln()
 }
 
-fn cached_tf_component(fieldnorm: u32, average_fieldnorm: Score) -> Score {
-    K1 * (1.0 - B + B * fieldnorm as Score / average_fieldnorm)
+fn cached_tf_component(fieldnorm: u32, average_fieldnorm: Score, k1: Score, b: Score) -> Score {
+    k1 * (1.0 - b + b * fieldnorm as Score / average_fieldnorm)
 }
 
-fn compute_tf_cache(average_fieldnorm: Score) -> Arc<[Score; 256]> {
+fn compute_tf_cache(average_fieldnorm: Score, k1: Score, b: Score) -> Arc<[Score; 256]> {
     let mut cache: [Score; 256] = [0.0; 256];
     for (fieldnorm_id, cache_mut) in cache.iter_mut().enumerate() {
         let fieldnorm = FieldNormReader::id_to_fieldnorm(fieldnorm_id as u8);
-        *cache_mut = cached_tf_component(fieldnorm, average_fieldnorm);
+        *cache_mut = cached_tf_component(fieldnorm, average_fieldnorm, k1, b);
     }
     Arc::new(cache)
 }
@@ -75,6 +98,8 @@ pub struct Bm25Weight {
     weight: Score,
     cache: Arc<[Score; 256]>,
     average_fieldnorm: Score,
+    k1: Score,
+    b: Score,
 }
 
 impl Bm25Weight {
@@ -88,6 +113,8 @@ impl Bm25Weight {
             weight: self.weight * boost,
             cache: self.cache.clone(),
             average_fieldnorm: self.average_fieldnorm,
+            k1: self.k1,
+            b: self.b,
         }
     }
 
@@ -109,6 +136,8 @@ impl Bm25Weight {
         let total_num_tokens = statistics.total_num_tokens(field)?;
         let total_num_docs = statistics.total_num_docs()?;
         let average_fieldnorm = total_num_tokens as Score / total_num_docs as Score;
+        let k1 = statistics.k1();
+        let b = statistics.b();
 
         if terms.len() == 1 {
             let term_doc_freq = statistics.doc_freq(&terms[0])?;
@@ -116,6 +145,8 @@ impl Bm25Weight {
                 term_doc_freq,
                 total_num_docs,
                 average_fieldnorm,
+                k1,
+                b,
             ))
         } else {
             let mut idf_sum: Score = 0.0;
@@ -124,7 +155,7 @@ impl Bm25Weight {
                 idf_sum += idf(term_doc_freq, total_num_docs);
             }
             let idf_explain = Explanation::new("idf", idf_sum);
-            Ok(Bm25Weight::new(idf_explain, average_fieldnorm))
+            Ok(Bm25Weight::new(idf_explain, average_fieldnorm, k1, b))
         }
     }
 
@@ -133,6 +164,8 @@ impl Bm25Weight {
         term_doc_freq: u64,
         total_num_docs: u64,
         avg_fieldnorm: Score,
+        k1: Score,
+        b: Score,
     ) -> Bm25Weight {
         let idf = idf(term_doc_freq, total_num_docs);
         let mut idf_explain =
@@ -142,35 +175,53 @@ impl Bm25Weight {
             term_doc_freq as Score,
         );
         idf_explain.add_const("N, total number of docs", total_num_docs as Score);
-        Bm25Weight::new(idf_explain, avg_fieldnorm)
+        Bm25Weight::new(idf_explain, avg_fieldnorm, k1, b)
     }
+
     /// Construct a [Bm25Weight] for a single term.
     /// This method does not carry the [Explanation] for the idf.
     pub fn for_one_term_without_explain(
         term_doc_freq: u64,
         total_num_docs: u64,
         avg_fieldnorm: Score,
+        k1: Score,
+        b: Score,
     ) -> Bm25Weight {
         let idf = idf(term_doc_freq, total_num_docs);
-        Bm25Weight::new_without_explain(idf, avg_fieldnorm)
+        Bm25Weight::new_without_explain(idf, avg_fieldnorm, k1, b)
     }
 
-    pub(crate) fn new(idf_explain: Explanation, average_fieldnorm: Score) -> Bm25Weight {
-        let weight = idf_explain.value() * (1.0 + K1);
+    pub(crate) fn new(
+        idf_explain: Explanation,
+        average_fieldnorm: Score,
+        k1: Score,
+        b: Score,
+    ) -> Bm25Weight {
+        let weight = idf_explain.value() * (1.0 + k1);
         Bm25Weight {
             idf_explain: Some(idf_explain),
             weight,
-            cache: compute_tf_cache(average_fieldnorm),
+            cache: compute_tf_cache(average_fieldnorm, k1, b),
             average_fieldnorm,
+            k1,
+            b,
         }
     }
-    pub(crate) fn new_without_explain(idf: f32, average_fieldnorm: Score) -> Bm25Weight {
-        let weight = idf * (1.0 + K1);
+
+    pub(crate) fn new_without_explain(
+        idf: f32,
+        average_fieldnorm: Score,
+        k1: Score,
+        b: Score,
+    ) -> Bm25Weight {
+        let weight = idf * (1.0 + k1);
         Bm25Weight {
             idf_explain: None,
             weight,
-            cache: compute_tf_cache(average_fieldnorm),
+            cache: compute_tf_cache(average_fieldnorm, k1, b),
             average_fieldnorm,
+            k1,
+            b,
         }
     }
 
@@ -208,8 +259,8 @@ impl Bm25Weight {
         );
 
         tf_explanation.add_const("freq, occurrences of term within document", term_freq);
-        tf_explanation.add_const("k1, term saturation parameter", K1);
-        tf_explanation.add_const("b, length normalization parameter", B);
+        tf_explanation.add_const("k1, term saturation parameter", self.k1);
+        tf_explanation.add_const("b, length normalization parameter", self.b);
         tf_explanation.add_const(
             "dl, length of field",
             FieldNormReader::id_to_fieldnorm(fieldnorm_id) as Score,
@@ -217,7 +268,7 @@ impl Bm25Weight {
         tf_explanation.add_const("avgdl, average length of field", self.average_fieldnorm);
 
         let mut explanation = Explanation::new("TermQuery, product of...", score);
-        explanation.add_detail(Explanation::new("(K1+1)", K1 + 1.0));
+        explanation.add_detail(Explanation::new("(K1+1)", self.k1 + 1.0));
         if let Some(idf_explain) = &self.idf_explain {
             explanation.add_detail(idf_explain.clone());
         }

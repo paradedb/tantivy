@@ -307,7 +307,7 @@ mod tests {
 
     use crate::query::score_combiner::SumCombiner;
     use crate::query::term_query::TermScorer;
-    use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
+    use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer, DEFAULT_BM25_B, DEFAULT_BM25_K1};
     use crate::{DocId, DocSet, Score, TERMINATED};
 
     struct Float(Score);
@@ -475,6 +475,8 @@ mod tests {
                     postings.len() as u64,
                     max_doc as u64,
                     average_fieldnorm,
+                    DEFAULT_BM25_K1,
+                    DEFAULT_BM25_B,
                 );
                 TermScorer::create_for_test(postings, &fieldnorms_expanded[..], bm25_weight)
             })
