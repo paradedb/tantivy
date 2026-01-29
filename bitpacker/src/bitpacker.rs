@@ -450,4 +450,22 @@ mod test {
             }
         }
     }
+
+    #[test]
+    fn test_block_oblivious_range_overflow() {
+        let bitunpacker = BitUnpacker::new(64);
+        // Using IDs that would cause a 32-bit overflow:
+        // start_doc * 64 bits = 4,294,967,232 (< 2^32)
+        // end_doc * 64 bits = 4,294,967,360 (> 2^32)
+        let start_doc = 67_108_863;
+        let end_doc = 67_108_865;
+        let data_len = 1_000_000_000;
+        let range = bitunpacker.block_oblivious_range(start_doc..end_doc, data_len);
+        assert!(
+            range.start <= range.end,
+            "Range start ({}) must be <= end ({})",
+            range.start,
+            range.end
+        );
+    }
 }
