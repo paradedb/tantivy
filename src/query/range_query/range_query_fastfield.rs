@@ -174,7 +174,7 @@ impl Weight for FastFieldRangeWeight {
                 return Ok(Box::new(EmptyScorer));
             };
             search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound))
-        } else if field_type.value_type() == Type::Bytes {
+        } else if field_type.is_bytes() {
             let Some(bytes_column): Option<BytesColumn> =
                 reader.fast_fields().bytes(&field_name)?
             else {
@@ -1427,8 +1427,10 @@ mod tests {
         use crate::schema::BytesOptions;
 
         let mut schema_builder = Schema::builder();
-        let bytes_field = schema_builder
-            .add_bytes_field("data", BytesOptions::default().set_fast().set_indexed());
+        let bytes_field = schema_builder.add_bytes_field(
+            "data",
+            BytesOptions::default().set_fast().set_indexed(),
+        );
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema.clone());
         let mut index_writer: IndexWriter = index.writer_for_tests()?;
@@ -1460,10 +1462,7 @@ mod tests {
         let upper = Term::from_field_bytes(bytes_field, &[0x01, 0x00]);
         let range_query = RangeQuery::new(Bound::Included(lower), Bound::Included(upper));
         let count = searcher.search(&range_query, &Count)?;
-        assert_eq!(
-            count, 3,
-            "Expected 3 documents in range [0x00,0x20] to [0x01,0x00]"
-        );
+        assert_eq!(count, 3, "Expected 3 documents in range [0x00,0x20] to [0x01,0x00]");
 
         // Test: Range query > [0x01, 0x00] (exclusive lower bound)
         // Should match: [0x01, 0x10], [0x02, 0x00]
