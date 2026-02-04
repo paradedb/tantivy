@@ -6,8 +6,8 @@ use std::net::Ipv6Addr;
 use std::ops::{Bound, RangeInclusive};
 
 use columnar::{
-    Cardinality, Column, ColumnType, MonotonicallyMappableToU128, MonotonicallyMappableToU64,
-    NumericalType, StrColumn,
+    BytesColumn, Cardinality, Column, ColumnType, MonotonicallyMappableToU128,
+    MonotonicallyMappableToU64, NumericalType, StrColumn,
 };
 use common::bounds::{BoundsRange, TransformBound};
 
@@ -162,6 +162,25 @@ impl Weight for FastFieldRangeWeight {
                 return Ok(Box::new(EmptyScorer));
             };
             let dict = str_dict_column.dictionary();
+
+            let bounds = self.bounds.map_bound(get_value_bytes);
+            // Get term ids for terms
+            let (lower_bound, upper_bound) =
+                dict.term_bounds_to_ord(bounds.lower_bound, bounds.upper_bound)?;
+            let fast_field_reader = reader.fast_fields();
+            let Some((column, _col_type)) =
+                fast_field_reader.u64_lenient_for_type(None, &field_name)?
+            else {
+                return Ok(Box::new(EmptyScorer));
+            };
+            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound))
+        } else if field_type.value_type() == Type::Bytes {
+            let Some(bytes_column): Option<BytesColumn> =
+                reader.fast_fields().bytes(&field_name)?
+            else {
+                return Ok(Box::new(EmptyScorer));
+            };
+            let dict = bytes_column.dictionary();
 
             let bounds = self.bounds.map_bound(get_value_bytes);
             // Get term ids for terms
