@@ -68,3 +68,101 @@ impl SegmentSortKeyComputer for ByBytesColumnSegmentSortKeyComputer {
         Some(bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SortByBytes;
+    use crate::collector::TopDocs;
+    use crate::query::AllQuery;
+    use crate::schema::{BytesOptions, Schema, FAST, INDEXED};
+    use crate::{Index, IndexWriter, Order, TantivyDocument};
+
+    #[test]
+    fn test_sort_by_bytes_asc() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let bytes_field = schema_builder
+            .add_bytes_field("data", BytesOptions::default().set_fast().set_indexed());
+        let id_field = schema_builder.add_u64_field("id", FAST | INDEXED);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+
+        // Insert documents with byte values in non-sorted order
+        let test_data: Vec<(u64, Vec<u8>)> = vec![
+            (1, vec![0x02, 0x00]),
+            (2, vec![0x00, 0x10]),
+            (3, vec![0x01, 0x00]),
+            (4, vec![0x00, 0x20]),
+        ];
+
+        for (id, bytes) in &test_data {
+            let mut doc = TantivyDocument::new();
+            doc.add_u64(id_field, *id);
+            doc.add_bytes(bytes_field, bytes);
+            index_writer.add_document(doc)?;
+        }
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // Sort ascending by bytes
+        let top_docs =
+            TopDocs::with_limit(10).order_by((SortByBytes::for_field("data"), Order::Asc));
+        let results: Vec<(Option<Vec<u8>>, _)> = searcher.search(&AllQuery, &top_docs)?;
+
+        // Expected order: [0x00,0x10], [0x00,0x20], [0x01,0x00], [0x02,0x00]
+        let sorted_bytes: Vec<Option<Vec<u8>>> = results.into_iter().map(|(b, _)| b).collect();
+        assert_eq!(
+            sorted_bytes,
+            vec![
+                Some(vec![0x00, 0x10]),
+                Some(vec![0x00, 0x20]),
+                Some(vec![0x01, 0x00]),
+                Some(vec![0x02, 0x00]),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sort_by_bytes_desc() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let bytes_field = schema_builder
+            .add_bytes_field("data", BytesOptions::default().set_fast().set_indexed());
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+
+        let test_data: Vec<Vec<u8>> = vec![vec![0x00, 0x10], vec![0x02, 0x00], vec![0x01, 0x00]];
+
+        for bytes in &test_data {
+            let mut doc = TantivyDocument::new();
+            doc.add_bytes(bytes_field, bytes);
+            index_writer.add_document(doc)?;
+        }
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // Sort descending by bytes
+        let top_docs =
+            TopDocs::with_limit(10).order_by((SortByBytes::for_field("data"), Order::Desc));
+        let results: Vec<(Option<Vec<u8>>, _)> = searcher.search(&AllQuery, &top_docs)?;
+
+        // Expected order (descending): [0x02,0x00], [0x01,0x00], [0x00,0x10]
+        let sorted_bytes: Vec<Option<Vec<u8>>> = results.into_iter().map(|(b, _)| b).collect();
+        assert_eq!(
+            sorted_bytes,
+            vec![
+                Some(vec![0x02, 0x00]),
+                Some(vec![0x01, 0x00]),
+                Some(vec![0x00, 0x10]),
+            ]
+        );
+
+        Ok(())
+    }
+}
