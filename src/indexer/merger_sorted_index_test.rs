@@ -389,7 +389,6 @@ mod tests {
             }
         }
 
-        // Merge segments into one
         {
             let segment_ids = index.searchable_segment_ids().unwrap();
             let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
@@ -401,8 +400,8 @@ mod tests {
 
     fn build_bytes_sorted_index(order: Order, segments: Vec<Vec<Option<&[u8]>>>) -> Index {
         let mut schema_builder = schema::Schema::builder();
-        let bytes_field =
-            schema_builder.add_bytes_field("bytes", BytesOptions::default().set_fast().set_indexed());
+        let bytes_field = schema_builder
+            .add_bytes_field("bytes", BytesOptions::default().set_fast().set_indexed());
         let schema = schema_builder.build();
 
         let index_builder = Index::builder().schema(schema).settings(IndexSettings {
@@ -428,7 +427,6 @@ mod tests {
             }
         }
 
-        // Merge segments into one
         {
             let segment_ids = index.searchable_segment_ids().unwrap();
             let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
@@ -462,7 +460,11 @@ mod tests {
         let searcher = reader.searcher();
         assert_eq!(searcher.segment_readers().len(), 1);
         let segment_reader = searcher.segment_readers().last().unwrap();
-        let bytes_col = segment_reader.fast_fields().bytes("bytes").unwrap().unwrap();
+        let bytes_col = segment_reader
+            .fast_fields()
+            .bytes("bytes")
+            .unwrap()
+            .unwrap();
         let mut values = Vec::new();
         for doc in 0..segment_reader.max_doc() {
             if let Some(ord) = bytes_col.ords().first(doc) {
@@ -571,12 +573,7 @@ mod tests {
         let values = collect_str_values(&index);
         assert_eq!(
             values,
-            vec![
-                None,
-                None,
-                Some("b".to_string()),
-                Some("c".to_string())
-            ]
+            vec![None, None, Some("b".to_string()), Some("c".to_string())]
         );
     }
 
@@ -598,26 +595,18 @@ mod tests {
         {
             let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             // Segment 1 (with a delete)
-            index_writer
-                .add_document(doc!(str_field => "z"))
-                .unwrap();
+            index_writer.add_document(doc!(str_field => "z")).unwrap();
             index_writer
                 .add_document(doc!(str_field => "deleteme"))
                 .unwrap();
             index_writer.delete_term(Term::from_field_text(str_field, "deleteme"));
             index_writer.commit().unwrap();
 
-            // Segment 2
-            index_writer
-                .add_document(doc!(str_field => "a"))
-                .unwrap();
-            index_writer
-                .add_document(doc!(str_field => "m"))
-                .unwrap();
+            index_writer.add_document(doc!(str_field => "a")).unwrap();
+            index_writer.add_document(doc!(str_field => "m")).unwrap();
             index_writer.commit().unwrap();
         }
 
-        // Merge segments into one
         {
             let segment_ids = index.searchable_segment_ids().unwrap();
             let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
@@ -658,7 +647,10 @@ mod tests {
     fn test_merge_sorted_index_bytes_desc() {
         let index = build_bytes_sorted_index(
             Order::Desc,
-            vec![vec![Some(&[0x02][..]), None], vec![Some(&[0x01][..]), Some(&[0x00][..])]],
+            vec![
+                vec![Some(&[0x02][..]), None],
+                vec![Some(&[0x01][..]), Some(&[0x00][..])],
+            ],
         );
         let values = collect_bytes_values(&index);
         assert_eq!(
@@ -675,22 +667,14 @@ mod tests {
             vec![vec![Some(&[0x01][..]), Some(&[0x02][..])], vec![None, None]],
         );
         let values = collect_bytes_values(&index);
-        assert_eq!(
-            values,
-            vec![
-                None,
-                None,
-                Some(vec![0x01]),
-                Some(vec![0x02])
-            ]
-        );
+        assert_eq!(values, vec![None, None, Some(vec![0x01]), Some(vec![0x02])]);
     }
 
     #[test]
     fn test_merge_sorted_index_bytes_with_deletes() {
         let mut schema_builder = schema::Schema::builder();
-        let bytes_field =
-            schema_builder.add_bytes_field("bytes", BytesOptions::default().set_fast().set_indexed());
+        let bytes_field = schema_builder
+            .add_bytes_field("bytes", BytesOptions::default().set_fast().set_indexed());
         let schema = schema_builder.build();
 
         let index_builder = Index::builder().schema(schema).settings(IndexSettings {
@@ -714,14 +698,12 @@ mod tests {
             index_writer.delete_term(Term::from_field_bytes(bytes_field, &[0x01]));
             index_writer.commit().unwrap();
 
-            // Segment 2
             index_writer
                 .add_document(doc!(bytes_field => vec![0x00]))
                 .unwrap();
             index_writer.commit().unwrap();
         }
 
-        // Merge segments into one
         {
             let segment_ids = index.searchable_segment_ids().unwrap();
             let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
@@ -730,10 +712,7 @@ mod tests {
         }
 
         let values = collect_bytes_values(&index);
-        assert_eq!(
-            values,
-            vec![Some(vec![0x00]), Some(vec![0x02])]
-        );
+        assert_eq!(values, vec![Some(vec![0x00]), Some(vec![0x02])]);
     }
 
     // #[test]

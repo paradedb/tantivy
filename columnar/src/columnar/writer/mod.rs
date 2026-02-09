@@ -93,7 +93,6 @@ impl ColumnarWriter {
                     .get::<NumericalColumnWriter>(sort_field.as_bytes())
             })
         else {
-            // Try Str/Bytes columns
             let str_or_bytes_column_opt = self
                 .str_field_hash_map
                 .get::<StrOrBytesColumnWriter>(sort_field.as_bytes())
@@ -105,8 +104,7 @@ impl ColumnarWriter {
                 return Vec::new();
             };
 
-            let dictionary_builder =
-                &self.dictionaries[str_or_bytes_column.dictionary_id as usize];
+            let dictionary_builder = &self.dictionaries[str_or_bytes_column.dictionary_id as usize];
             let term_id_mapping = dictionary_builder.build_term_id_mapping(&self.arena);
 
             let mut doc_sort_keys: Vec<(Option<u32>, RowId)> =
@@ -115,8 +113,7 @@ impl ColumnarWriter {
             let mut current_doc_opt: Option<RowId> = None;
             let mut symbols_buffer = Vec::new();
 
-            for op in
-                str_or_bytes_column.operation_iterator(&self.arena, None, &mut symbols_buffer)
+            for op in str_or_bytes_column.operation_iterator(&self.arena, None, &mut symbols_buffer)
             {
                 match op {
                     ColumnOperation::NewDoc(doc) => {
@@ -137,16 +134,11 @@ impl ColumnarWriter {
                     }
                 }
             }
-            // fill remaining docs with None
             doc_sort_keys.extend((start_doc_check_fill..num_docs).map(|doc| (None, doc)));
 
             doc_sort_keys.sort_by(|(left_key, _), (right_key, _)| {
                 let cmp = left_key.cmp(right_key);
-                if reversed {
-                    cmp.reverse()
-                } else {
-                    cmp
-                }
+                if reversed { cmp.reverse() } else { cmp }
             });
             return doc_sort_keys
                 .into_iter()

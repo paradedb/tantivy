@@ -51,10 +51,7 @@ impl DictionaryBuilder {
         UnorderedId(unordered_id)
     }
 
-    fn build_sorted_terms<'a>(
-        &'a self,
-        arena: &'a MemoryArena,
-    ) -> Vec<(&'a [u8], UnorderedId)> {
+    fn build_sorted_terms<'a>(&'a self, arena: &'a MemoryArena) -> Vec<(&'a [u8], UnorderedId)> {
         let mut terms: Vec<(&[u8], UnorderedId)> = self
             .dict
             .iter(arena)
