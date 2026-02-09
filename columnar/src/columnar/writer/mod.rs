@@ -93,7 +93,65 @@ impl ColumnarWriter {
                     .get::<NumericalColumnWriter>(sort_field.as_bytes())
             })
         else {
-            return Vec::new();
+            // Try Str/Bytes columns
+            let str_or_bytes_column_opt = self
+                .str_field_hash_map
+                .get::<StrOrBytesColumnWriter>(sort_field.as_bytes())
+                .or_else(|| {
+                    self.bytes_field_hash_map
+                        .get::<StrOrBytesColumnWriter>(sort_field.as_bytes())
+                });
+            let Some(str_or_bytes_column) = str_or_bytes_column_opt else {
+                return Vec::new();
+            };
+
+            let dictionary_builder =
+                &self.dictionaries[str_or_bytes_column.dictionary_id as usize];
+            let term_id_mapping = dictionary_builder.build_term_id_mapping(&self.arena);
+
+            let mut doc_sort_keys: Vec<(Option<u32>, RowId)> =
+                Vec::with_capacity(num_docs as usize);
+            let mut start_doc_check_fill = 0;
+            let mut current_doc_opt: Option<RowId> = None;
+            let mut symbols_buffer = Vec::new();
+
+            for op in
+                str_or_bytes_column.operation_iterator(&self.arena, None, &mut symbols_buffer)
+            {
+                match op {
+                    ColumnOperation::NewDoc(doc) => {
+                        current_doc_opt = Some(doc);
+                    }
+                    ColumnOperation::Value(unordered_id) => {
+                        if let Some(current_doc) = current_doc_opt {
+                            // Fill up missing docs since last doc with None
+                            doc_sort_keys
+                                .extend((start_doc_check_fill..current_doc).map(|doc| (None, doc)));
+                            start_doc_check_fill = current_doc + 1;
+                            // handle multi values (first value only)
+                            current_doc_opt = None;
+
+                            let ordered_id = term_id_mapping.to_ord(unordered_id).0;
+                            doc_sort_keys.push((Some(ordered_id), current_doc));
+                        }
+                    }
+                }
+            }
+            // fill remaining docs with None
+            doc_sort_keys.extend((start_doc_check_fill..num_docs).map(|doc| (None, doc)));
+
+            doc_sort_keys.sort_by(|(left_key, _), (right_key, _)| {
+                let cmp = left_key.cmp(right_key);
+                if reversed {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
+            });
+            return doc_sort_keys
+                .into_iter()
+                .map(|(_sort_key, doc)| doc)
+                .collect();
         };
         let mut symbols_buffer = Vec::new();
         let mut values = Vec::new();

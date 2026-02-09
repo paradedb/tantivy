@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use columnar::{
-    ColumnType, ColumnValues, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder,
-    StackMergeOrder,
+    Column, ColumnType, ColumnValues, ColumnarReader, Dictionary, MergeRowOrder, RowAddr,
+    ShuffleMergeOrder, StackMergeOrder,
 };
 use common::ReadOnlyBitSet;
 use itertools::Itertools;
@@ -19,10 +19,44 @@ use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::indexer::SegmentSerializer;
 use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
-use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
+use crate::schema::{value_type_to_column_type, Field, FieldType, Schema, Type};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::{DocAddress, DocId, IndexSettings, IndexSortByField, Order, SegmentOrdinal};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortFieldKind {
+    Numeric,
+    StrBytes,
+}
+
+enum SortFieldAccessor {
+    Numeric(Arc<dyn ColumnValues>),
+    StrBytes {
+        ords: Column<u64>,
+        cache: Arc<Vec<Box<[u8]>>>,
+    },
+}
+
+impl SortFieldAccessor {
+    fn numeric_value(&self, doc_id: DocId) -> u64 {
+        match self {
+            SortFieldAccessor::Numeric(col) => col.get_val(doc_id),
+            SortFieldAccessor::StrBytes { .. } => {
+                unreachable!("numeric_value called on StrBytes accessor")
+            }
+        }
+    }
+
+    fn bytes_value(&self, doc_id: DocId) -> Option<&[u8]> {
+        match self {
+            SortFieldAccessor::StrBytes { ords, cache } => ords
+                .first(doc_id)
+                .and_then(|ord| cache.get(ord as usize).map(|bytes| bytes.as_ref())),
+            SortFieldAccessor::Numeric(_) => unreachable!("bytes_value called on numeric accessor"),
+        }
+    }
+}
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
 ///
@@ -82,6 +116,7 @@ fn estimate_total_num_tokens(readers: &[SegmentReader], field: Field) -> crate::
 pub struct IndexMerger {
     index_settings: IndexSettings,
     schema: Schema,
+    sort_by_field_type: Option<Type>,
     pub(crate) readers: Vec<SegmentReader>,
     max_doc: u32,
     cancel: Box<dyn CancelSentinel>,
@@ -199,8 +234,17 @@ impl IndexMerger {
         }
 
         let max_doc = readers.iter().map(|reader| reader.num_docs()).sum();
+        let sort_by_field_type = if let Some(sort_by_field) = index_settings.sort_by_field.as_ref()
+        {
+            let schema_field = schema.get_field(&sort_by_field.field)?;
+            let field_entry = schema.get_field_entry(schema_field);
+            Some(field_entry.field_type().value_type())
+        } else {
+            None
+        };
         if let Some(sort_by_field) = index_settings.sort_by_field.as_ref() {
-            readers = Self::sort_readers_by_min_sort_field(readers, sort_by_field)?;
+            let field_type = sort_by_field_type.expect("sort_by_field_type must be set");
+            readers = Self::sort_readers_by_min_sort_field(readers, sort_by_field, field_type)?;
         }
         // sort segments by their natural sort setting
         if max_doc >= MAX_DOC_LIMIT {
@@ -213,6 +257,7 @@ impl IndexMerger {
         Ok(IndexMerger {
             index_settings,
             schema,
+            sort_by_field_type,
             readers,
             max_doc,
             cancel,
@@ -220,16 +265,37 @@ impl IndexMerger {
         })
     }
 
+    fn sort_by_field_type(&self, sort_by_field: &IndexSortByField) -> crate::Result<Type> {
+        if let Some(field_type) = self.sort_by_field_type {
+            return Ok(field_type);
+        }
+        let schema_field = self.schema.get_field(&sort_by_field.field)?;
+        let field_entry = self.schema.get_field_entry(schema_field);
+        Ok(field_entry.field_type().value_type())
+    }
+
     fn sort_readers_by_min_sort_field(
         readers: Vec<SegmentReader>,
         sort_by_field: &IndexSortByField,
+        field_type: Type,
     ) -> crate::Result<Vec<SegmentReader>> {
+        if matches!(field_type, Type::Str | Type::Bytes) {
+            // Ordinals are per-segment; do not reorder readers for Str/Bytes.
+            return Ok(readers);
+        }
+
         // presort the readers by their min_values, so that when they are disjunct, we can use
         // the regular merge logic (implicitly sorted)
         let mut readers_with_min_sort_values = readers
             .into_iter()
             .map(|reader| {
-                let accessor = Self::get_sort_field_accessor(&reader, sort_by_field)?;
+                let (value_accessor, _column_type) = reader
+                    .fast_fields()
+                    .u64_lenient(&sort_by_field.field)?
+                    .ok_or_else(|| FastFieldNotAvailableError {
+                        field_name: sort_by_field.field.to_string(),
+                    })?;
+                let accessor = value_accessor.first_or_default_col(0u64);
                 Ok((reader, accessor.min_value()))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -301,12 +367,21 @@ impl IndexMerger {
         &self,
         sort_by_field: &IndexSortByField,
     ) -> crate::Result<bool> {
-        let reader_ordinal_and_field_accessors =
+        let field_type = self.sort_by_field_type(sort_by_field)?;
+        // Disjunct shortcut is invalid for Str/Bytes because ords are per-segment.
+        if matches!(field_type, Type::Str | Type::Bytes) {
+            return Ok(false);
+        }
+
+        let (_kind, reader_ordinal_and_field_accessors) =
             self.get_reader_with_sort_field_accessor(sort_by_field)?;
 
         let everything_is_in_order = reader_ordinal_and_field_accessors
             .into_iter()
-            .map(|(_, col)| Arc::new(col))
+            .filter_map(|(_, col)| match col {
+                SortFieldAccessor::Numeric(col) => Some(col),
+                _ => None,
+            })
             .tuple_windows()
             .all(|(field_accessor1, field_accessor2)| {
                 if sort_by_field.order.is_asc() {
@@ -318,10 +393,55 @@ impl IndexMerger {
         Ok(everything_is_in_order)
     }
 
-    pub(crate) fn get_sort_field_accessor(
+    fn get_str_bytes_accessor(
         reader: &SegmentReader,
         sort_by_field: &IndexSortByField,
-    ) -> crate::Result<Arc<dyn ColumnValues>> {
+        field_type: Type,
+    ) -> crate::Result<SortFieldAccessor> {
+        let not_available = || -> crate::TantivyError {
+            FastFieldNotAvailableError {
+                field_name: sort_by_field.field.to_string(),
+            }
+            .into()
+        };
+        match field_type {
+            Type::Str => {
+                let str_col = reader
+                    .fast_fields()
+                    .str(&sort_by_field.field)?
+                    .ok_or_else(not_available)?;
+                Self::build_str_bytes_accessor(str_col.ords().clone(), str_col.dictionary())
+            }
+            Type::Bytes => {
+                let bytes_col = reader
+                    .fast_fields()
+                    .bytes(&sort_by_field.field)?
+                    .ok_or_else(not_available)?;
+                Self::build_str_bytes_accessor(bytes_col.ords().clone(), bytes_col.dictionary())
+            }
+            _ => Err(not_available()),
+        }
+    }
+
+    fn build_str_bytes_accessor(
+        ords: Column<u64>,
+        dictionary: &Dictionary,
+    ) -> crate::Result<SortFieldAccessor> {
+        let mut cache: Vec<Box<[u8]>> = Vec::with_capacity(dictionary.num_terms());
+        let mut stream = dictionary.stream()?;
+        while stream.advance() {
+            cache.push(stream.key().to_vec().into_boxed_slice());
+        }
+        Ok(SortFieldAccessor::StrBytes {
+            ords,
+            cache: Arc::new(cache),
+        })
+    }
+
+    fn get_numeric_accessor(
+        reader: &SegmentReader,
+        sort_by_field: &IndexSortByField,
+    ) -> crate::Result<SortFieldAccessor> {
         reader.schema().get_field(&sort_by_field.field)?;
         let (value_accessor, _column_type) = reader
             .fast_fields()
@@ -329,27 +449,39 @@ impl IndexMerger {
             .ok_or_else(|| FastFieldNotAvailableError {
                 field_name: sort_by_field.field.to_string(),
             })?;
-        Ok(value_accessor.first_or_default_col(0u64))
+        Ok(SortFieldAccessor::Numeric(
+            value_accessor.first_or_default_col(0u64),
+        ))
     }
     /// Collecting value_accessors into a vec to bind the lifetime.
-    pub(crate) fn get_reader_with_sort_field_accessor(
+    fn get_reader_with_sort_field_accessor(
         &self,
         sort_by_field: &IndexSortByField,
-    ) -> crate::Result<Vec<(SegmentOrdinal, Arc<dyn ColumnValues>)>> {
+    ) -> crate::Result<(SortFieldKind, Vec<(SegmentOrdinal, SortFieldAccessor)>)> {
+        let field_type = self.sort_by_field_type(sort_by_field)?;
+
+        let kind = if matches!(field_type, Type::Str | Type::Bytes) {
+            SortFieldKind::StrBytes
+        } else {
+            SortFieldKind::Numeric
+        };
+
         let reader_ordinal_and_field_accessors = self
             .readers
             .iter()
             .enumerate()
-            .map(|(reader_ordinal, _)| reader_ordinal as SegmentOrdinal)
-            .map(|reader_ordinal: SegmentOrdinal| {
-                let value_accessor = Self::get_sort_field_accessor(
-                    &self.readers[reader_ordinal as usize],
-                    sort_by_field,
-                )?;
-                Ok((reader_ordinal, value_accessor))
+            .map(|(reader_ordinal, reader)| {
+                let reader_ordinal = reader_ordinal as SegmentOrdinal;
+                let accessor = match kind {
+                    SortFieldKind::Numeric => Self::get_numeric_accessor(reader, sort_by_field)?,
+                    SortFieldKind::StrBytes => {
+                        Self::get_str_bytes_accessor(reader, sort_by_field, field_type)?
+                    }
+                };
+                Ok((reader_ordinal, accessor))
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        Ok(reader_ordinal_and_field_accessors)
+        Ok((kind, reader_ordinal_and_field_accessors))
     }
 
     /// Generates the doc_id mapping where position in the vec=new
@@ -360,7 +492,7 @@ impl IndexMerger {
         &self,
         sort_by_field: &IndexSortByField,
     ) -> crate::Result<SegmentDocIdMapping> {
-        let reader_ordinal_and_field_accessors =
+        let (kind, reader_ordinal_and_field_accessors) =
             self.get_reader_with_sort_field_accessor(sort_by_field)?;
         // Loading the field accessor on demand causes a 15x regression
 
@@ -384,23 +516,54 @@ impl IndexMerger {
         let mut sorted_doc_ids: Vec<DocAddress> = Vec::with_capacity(total_num_new_docs);
 
         // create iterator tuple of (old doc_id, reader) in order of the new doc_ids
-        sorted_doc_ids.extend(
-            doc_id_reader_pair
-                .into_iter()
-                .kmerge_by(|a, b| {
-                    let val1 = a.2.get_val(a.0);
-                    let val2 = b.2.get_val(b.0);
-                    if sort_by_field.order == Order::Asc {
-                        val1 < val2
-                    } else {
-                        val1 > val2
-                    }
-                })
-                .map(|(doc_id, &segment_ord, _)| DocAddress {
-                    doc_id,
-                    segment_ord,
-                }),
-        );
+        let asc = sort_by_field.order == Order::Asc;
+        match kind {
+            SortFieldKind::Numeric => {
+                sorted_doc_ids.extend(
+                    doc_id_reader_pair
+                        .into_iter()
+                        .kmerge_by(|a, b| {
+                            let val1 = a.2.numeric_value(a.0);
+                            let val2 = b.2.numeric_value(b.0);
+                            if asc {
+                                val1 < val2
+                            } else {
+                                val1 > val2
+                            }
+                        })
+                        .map(|(doc_id, &segment_ord, _)| DocAddress {
+                            doc_id,
+                            segment_ord,
+                        }),
+                );
+            }
+            SortFieldKind::StrBytes => {
+                sorted_doc_ids.extend(
+                    doc_id_reader_pair
+                        .into_iter()
+                        .kmerge_by(|a, b| {
+                            let val1 = a.2.bytes_value(a.0);
+                            let val2 = b.2.bytes_value(b.0);
+                            match (val1, val2) {
+                                (None, None) => false,
+                                (None, Some(_)) => asc,
+                                (Some(_), None) => !asc,
+                                (Some(left), Some(right)) => {
+                                    if asc {
+                                        left < right
+                                    } else {
+                                        left > right
+                                    }
+                                }
+                            }
+                        })
+                        .map(|(doc_id, &segment_ord, _)| DocAddress {
+                            doc_id,
+                            segment_ord,
+                        }),
+                );
+            }
+        }
 
         let alive_bitsets: Vec<Option<ReadOnlyBitSet>> = self
             .readers
