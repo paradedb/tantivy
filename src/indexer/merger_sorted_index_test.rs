@@ -1,5 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
+    use proptest::prelude::*;
+
     use crate::collector::TopDocs;
     use crate::fastfield::AliveBitSet;
     use crate::index::Index;
@@ -362,6 +366,19 @@ mod tests {
     // ---- Str/Bytes sort_by helpers ----
 
     fn build_str_sorted_index(order: Order, segments: Vec<Vec<Option<&str>>>) -> Index {
+        let segments = segments
+            .into_iter()
+            .map(|segment| {
+                segment
+                    .into_iter()
+                    .map(|value| value.map(str::to_owned))
+                    .collect()
+            })
+            .collect();
+        build_str_sorted_index_owned(order, segments)
+    }
+
+    fn build_str_sorted_index_owned(order: Order, segments: Vec<Vec<Option<String>>>) -> Index {
         let mut schema_builder = schema::Schema::builder();
         let str_field = schema_builder.add_text_field("str", STRING | FAST);
         let schema = schema_builder.build();
@@ -399,6 +416,19 @@ mod tests {
     }
 
     fn build_bytes_sorted_index(order: Order, segments: Vec<Vec<Option<&[u8]>>>) -> Index {
+        let segments = segments
+            .into_iter()
+            .map(|segment| {
+                segment
+                    .into_iter()
+                    .map(|value| value.map(<[u8]>::to_vec))
+                    .collect()
+            })
+            .collect();
+        build_bytes_sorted_index_owned(order, segments)
+    }
+
+    fn build_bytes_sorted_index_owned(order: Order, segments: Vec<Vec<Option<Vec<u8>>>>) -> Index {
         let mut schema_builder = schema::Schema::builder();
         let bytes_field = schema_builder
             .add_bytes_field("bytes", BytesOptions::default().set_fast().set_indexed());
@@ -419,7 +449,7 @@ mod tests {
                 for value in segment {
                     let mut doc = TantivyDocument::new();
                     if let Some(val) = value {
-                        doc.add_bytes(bytes_field, val);
+                        doc.add_bytes(bytes_field, &val);
                     }
                     index_writer.add_document(doc).unwrap();
                 }
@@ -476,6 +506,37 @@ mod tests {
             }
         }
         values
+    }
+
+    fn compare_option_values<T: Ord>(
+        left: &Option<T>,
+        right: &Option<T>,
+        order: Order,
+    ) -> Ordering {
+        match (left, right) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => {
+                if order.is_asc() {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (Some(_), None) => {
+                if order.is_asc() {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (Some(left), Some(right)) => {
+                if order.is_asc() {
+                    left.cmp(right)
+                } else {
+                    right.cmp(left)
+                }
+            }
+        }
     }
 
     // ---- Single-segment sort ----
@@ -713,6 +774,41 @@ mod tests {
 
         let values = collect_bytes_values(&index);
         assert_eq!(values, vec![Some(vec![0x00]), Some(vec![0x02])]);
+    }
+
+    proptest! {
+        #[test]
+        fn test_merge_sorted_index_str_matches_sorted_input(
+            order in prop_oneof![Just(Order::Asc), Just(Order::Desc)],
+            segments in proptest::collection::vec(
+                proptest::collection::vec(proptest::option::of("[a-z]{0,8}"), 1..8),
+                1..6,
+            )
+        ) {
+            let index = build_str_sorted_index_owned(order, segments.clone());
+            let values = collect_str_values(&index);
+            let mut expected: Vec<Option<String>> = segments.into_iter().flatten().collect();
+            expected.sort_by(|left, right| compare_option_values(left, right, order));
+            prop_assert_eq!(values, expected);
+        }
+
+        #[test]
+        fn test_merge_sorted_index_bytes_matches_sorted_input(
+            order in prop_oneof![Just(Order::Asc), Just(Order::Desc)],
+            segments in proptest::collection::vec(
+                proptest::collection::vec(
+                    proptest::option::of(proptest::collection::vec(any::<u8>(), 0..8)),
+                    1..8,
+                ),
+                1..6,
+            )
+        ) {
+            let index = build_bytes_sorted_index_owned(order, segments.clone());
+            let values = collect_bytes_values(&index);
+            let mut expected: Vec<Option<Vec<u8>>> = segments.into_iter().flatten().collect();
+            expected.sort_by(|left, right| compare_option_values(left, right, order));
+            prop_assert_eq!(values, expected);
+        }
     }
 
     // #[test]
