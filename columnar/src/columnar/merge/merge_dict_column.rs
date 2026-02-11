@@ -35,8 +35,12 @@ pub fn merge_bytes_or_str_column(
 
 /// Computes a per-segment mapping from old term ordinal to merged term ordinal.
 ///
+/// Performs a streaming k-way merge of per-segment term dictionaries (SSTable-backed) to build
+/// a unified ordering. For each segment, the output is a `Vec<TermOrdinal>` where index `i`
+/// holds the merged global ordinal corresponding to segment-local ordinal `i`.
+///
 /// This is used by index sorting to compare terms from different segments without materializing
-/// term bytes in memory.
+/// term bytes in memory — only ordinals are compared.
 #[doc(hidden)]
 pub fn compute_merged_term_ord_mapping(
     bytes_columns: &[BytesColumn],

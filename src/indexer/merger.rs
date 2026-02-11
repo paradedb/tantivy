@@ -24,6 +24,13 @@ use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::{DocAddress, DocId, IndexSettings, IndexSortByField, Order, SegmentOrdinal};
 
+/// Per-segment accessor for Str/Bytes sort fields during index merging.
+///
+/// Each segment stores its own term dictionary with segment-local ordinals. To compare terms
+/// across segments we compute a merged global dictionary and map each segment's local ordinals
+/// to the corresponding merged ordinal via `merged_term_ord_mapping`. This avoids materializing
+/// the actual term bytes during the merge sort — ordinal comparison is sufficient because the
+/// merged dictionary preserves lexicographic order.
 struct StrBytesSortFieldAccessor {
     ords: Column<u64>,
     merged_term_ord_mapping: Vec<TermOrdinal>,
@@ -39,6 +46,13 @@ impl StrBytesSortFieldAccessor {
     }
 }
 
+/// Owned per-segment sort-field accessors, kept alive for the duration of the merge.
+///
+/// - `Numeric`: direct column value access — all numeric/datetime types share a single u64 column
+///   interface, so segments can be compared directly by value.
+/// - `StrBytes`: ordinal-based access — each segment's local term ordinals are remapped to merged
+///   global ordinals so that cross-segment lexicographic comparison works without loading term
+///   bytes.
 enum ReaderSortFieldAccessors {
     Numeric(Vec<(SegmentOrdinal, Arc<dyn ColumnValues>)>),
     StrBytes(Vec<(SegmentOrdinal, StrBytesSortFieldAccessor)>),
@@ -255,7 +269,8 @@ impl IndexMerger {
         field_type: Type,
     ) -> crate::Result<Vec<SegmentReader>> {
         if matches!(field_type, Type::Str | Type::Bytes) {
-            // Ordinals are per-segment; do not reorder readers for Str/Bytes.
+            // Ordinals are per-segment and not directly comparable, so the "disjunct min/max"
+            // shortcut that works for numeric fields does not apply here.
             return Ok(readers);
         }
 
@@ -383,6 +398,12 @@ impl IndexMerger {
         }
     }
 
+    /// Builds per-segment [`StrBytesSortFieldAccessor`]s for Str/Bytes sort fields.
+    ///
+    /// 1. Extracts each segment's `BytesColumn` (term dictionary + ordinal column).
+    /// 2. Computes a merged dictionary across all segments via [`compute_merged_term_ord_mapping`],
+    ///    producing a per-segment mapping from local term ordinal → merged global ordinal.
+    /// 3. Wraps each segment's ordinal column and mapping into a `StrBytesSortFieldAccessor`.
     fn get_str_bytes_accessors(
         &self,
         sort_by_field: &IndexSortByField,
@@ -443,6 +464,10 @@ impl IndexMerger {
             .collect::<crate::Result<Vec<_>>>()
     }
     /// Builds owned per-segment sort accessors so they stay alive during merge.
+    ///
+    /// Dispatches on the sort field's value type: numeric types use direct column value access,
+    /// while Str/Bytes types go through the ordinal-remapping path (see
+    /// [`StrBytesSortFieldAccessor`]).
     fn get_reader_with_sort_field_accessor(
         &self,
         sort_by_field: &IndexSortByField,
@@ -505,7 +530,11 @@ impl IndexMerger {
 
         let mut sorted_doc_ids: Vec<DocAddress> = Vec::with_capacity(total_num_new_docs);
 
-        // create iterator tuple of (old doc_id, reader) in order of the new doc_ids
+        // K-way merge of alive doc ids across segments, ordered by the sort field.
+        //
+        // Numeric: compare raw u64 column values directly.
+        // Str/Bytes: compare merged global ordinals obtained via `remapped_term_ord`.
+        //   Documents without a value map to `None` — first in ascending, last in descending.
         let asc = sort_by_field.order == Order::Asc;
         match sort_field_accessors {
             ReaderSortFieldAccessors::Numeric(reader_ordinal_and_field_accessors) => {
