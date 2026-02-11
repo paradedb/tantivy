@@ -17,7 +17,6 @@ use rand::SeedableRng;
 use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
     AntiCallToken, Directory, FileHandle, OwnedBytes, TerminatingWrite, WatchCallback, WatchHandle,
-    WritePtr,
 };
 use tantivy::indexer::{merge_filtered_segments, NoMergePolicy};
 use tantivy::schema::{Schema, TEXT};
@@ -100,7 +99,7 @@ impl Directory for NullDirectory {
         Ok(true)
     }
 
-    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+    fn open_write_inner(&self, path: &Path) -> Result<Box<dyn TerminatingWrite>, OpenWriteError> {
         let path_buf = path.to_path_buf();
         if path.to_string_lossy().ends_with(".fieldnorm") {
             let writer = InMemoryWriter {
@@ -108,9 +107,9 @@ impl Directory for NullDirectory {
                 buffer: Vec::new(),
                 blobs: Arc::clone(&self.blobs),
             };
-            Ok(io::BufWriter::new(Box::new(writer)))
+            Ok(Box::new(writer))
         } else {
-            Ok(io::BufWriter::new(Box::new(NullWriter)))
+            Ok(Box::new(NullWriter))
         }
     }
 
@@ -213,9 +212,14 @@ fn main() {
         group.register("merge", move |_| {
             let output_dir = NullDirectory::default();
             let filter_doc_ids = vec![None; segments.len()];
-            let merged_index =
-                merge_filtered_segments(&segments, settings.clone(), filter_doc_ids, output_dir)
-                    .unwrap();
+            let merged_index = merge_filtered_segments(
+                &segments,
+                settings.clone(),
+                filter_doc_ids,
+                output_dir,
+                Box::new(|| false),
+            )
+            .unwrap();
             black_box(merged_index);
         });
 
