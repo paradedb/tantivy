@@ -111,9 +111,20 @@ impl SegmentMeta {
     /// is by removing all files that have been created by tantivy
     /// and are not used by any segment anymore.
     pub fn list_files(&self) -> HashSet<PathBuf> {
-        SegmentComponent::iterator()
-            .map(|component| self.relative_path(*component))
-            .collect::<HashSet<PathBuf>>()
+        if self
+            .tracked
+            .include_temp_doc_store
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            SegmentComponent::iterator()
+                .map(|component| self.relative_path(*component))
+                .collect::<HashSet<PathBuf>>()
+        } else {
+            SegmentComponent::iterator()
+                .filter(|comp| *comp != &SegmentComponent::TempStore)
+                .map(|component| self.relative_path(*component))
+                .collect::<HashSet<PathBuf>>()
+        }
     }
 
     /// Returns the relative path of a component of our segment.
