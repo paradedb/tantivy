@@ -869,20 +869,16 @@ mod tests {
 
     #[test]
     fn test_merge_sorted_index_u64_asc_null_before_zero() {
-        let index = build_u64_sorted_index(
-            Order::Asc,
-            vec![vec![None, Some(0)], vec![None, Some(0)]],
-        );
+        let index =
+            build_u64_sorted_index(Order::Asc, vec![vec![None, Some(0)], vec![None, Some(0)]]);
         let values = collect_u64_values(&index);
         assert_eq!(values, vec![None, None, Some(0), Some(0)]);
     }
 
     #[test]
     fn test_merge_sorted_index_u64_desc_null_after_zero() {
-        let index = build_u64_sorted_index(
-            Order::Desc,
-            vec![vec![Some(0), None], vec![Some(0), None]],
-        );
+        let index =
+            build_u64_sorted_index(Order::Desc, vec![vec![Some(0), None], vec![Some(0), None]]);
         let values = collect_u64_values(&index);
         assert_eq!(values, vec![Some(0), Some(0), None, None]);
     }
@@ -896,10 +892,7 @@ mod tests {
             vec![vec![None, Some(1), Some(2)], vec![Some(3), Some(4)]],
         );
         let values = collect_u64_values(&index);
-        assert_eq!(
-            values,
-            vec![None, Some(1), Some(2), Some(3), Some(4)]
-        );
+        assert_eq!(values, vec![None, Some(1), Some(2), Some(3), Some(4)]);
     }
 
     #[test]
@@ -911,10 +904,7 @@ mod tests {
             vec![vec![Some(4), Some(3)], vec![Some(2), Some(1), None]],
         );
         let values = collect_u64_values(&index);
-        assert_eq!(
-            values,
-            vec![Some(4), Some(3), Some(2), Some(1), None]
-        );
+        assert_eq!(values, vec![Some(4), Some(3), Some(2), Some(1), None]);
     }
 
     #[test]
@@ -925,10 +915,7 @@ mod tests {
             vec![vec![None, Some(1), Some(2)], vec![None, Some(3), Some(4)]],
         );
         let values = collect_u64_values(&index);
-        assert_eq!(
-            values,
-            vec![None, None, Some(1), Some(2), Some(3), Some(4)]
-        );
+        assert_eq!(values, vec![None, None, Some(1), Some(2), Some(3), Some(4)]);
     }
 
     #[test]
@@ -939,10 +926,7 @@ mod tests {
             vec![vec![Some(4), Some(3), None], vec![Some(2), Some(1), None]],
         );
         let values = collect_u64_values(&index);
-        assert_eq!(
-            values,
-            vec![Some(4), Some(3), Some(2), Some(1), None, None]
-        );
+        assert_eq!(values, vec![Some(4), Some(3), Some(2), Some(1), None, None]);
     }
 
     #[test]
@@ -953,10 +937,7 @@ mod tests {
             vec![vec![None, Some(1), Some(3)], vec![None, Some(2), Some(4)]],
         );
         let values = collect_u64_values(&index);
-        assert_eq!(
-            values,
-            vec![None, None, Some(1), Some(2), Some(3), Some(4)]
-        );
+        assert_eq!(values, vec![None, None, Some(1), Some(2), Some(3), Some(4)]);
     }
 
     #[test]
@@ -967,10 +948,7 @@ mod tests {
             vec![vec![Some(4), Some(2), None], vec![Some(3), Some(1), None]],
         );
         let values = collect_u64_values(&index);
-        assert_eq!(
-            values,
-            vec![Some(4), Some(3), Some(2), Some(1), None, None]
-        );
+        assert_eq!(values, vec![Some(4), Some(3), Some(2), Some(1), None, None]);
     }
 
     #[test]
@@ -987,7 +965,17 @@ mod tests {
         let values = collect_u64_values(&index);
         assert_eq!(
             values,
-            vec![None, None, None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
+            vec![
+                None,
+                None,
+                None,
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6)
+            ]
         );
     }
 

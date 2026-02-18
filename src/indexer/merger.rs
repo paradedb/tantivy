@@ -637,7 +637,8 @@ impl IndexMerger {
                     &reader_ordinal_and_field_accessors,
                     |a, b| {
                         // Column::first() returns Option<u64>: None for NULLs, Some for values.
-                        // Option's Ord puts None < Some, giving NULL-first in ASC, NULL-last in DESC.
+                        // Option's Ord puts None < Some, giving NULL-first in ASC, NULL-last in
+                        // DESC.
                         let val1 = a.2.first(a.0);
                         let val2 = b.2.first(b.0);
                         if asc {
@@ -1117,13 +1118,12 @@ impl IndexMerger {
 
 #[cfg(test)]
 mod tests {
-    use super::{DisjunctSortStatus, IndexMerger};
-
     use columnar::Column;
     use proptest::prop_oneof;
     use proptest::strategy::Strategy;
     use schema::FAST;
 
+    use super::{DisjunctSortStatus, IndexMerger};
     use crate::collector::tests::{
         BytesFastFieldTestCollector, FastFieldTestCollector, TEST_COLLECTOR_WITH_SCORE,
     };
