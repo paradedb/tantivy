@@ -33,6 +33,11 @@ impl OwnedBytes {
         }
     }
 
+    /// Returns a reference to the inner Arc that holds the backing data.
+    pub fn inner_arc(&self) -> &Arc<dyn Deref<Target = [u8]> + Sync + Send> {
+        &self.box_stable_deref
+    }
+
     /// creates a fileslice that is just a view over a slice of the data.
     #[must_use]
     #[inline]
