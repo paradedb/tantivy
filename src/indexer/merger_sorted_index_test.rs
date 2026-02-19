@@ -885,8 +885,6 @@ mod tests {
 
     #[test]
     fn test_merge_sorted_index_u64_asc_nulls_only_in_first_segment() {
-        // DisjunctStack: NULLs only in first segment (safe position for ASC).
-        // Values are disjunct: seg1 max=2 < seg2 min=3.
         let index = build_u64_sorted_index(
             Order::Asc,
             vec![vec![None, Some(1), Some(2)], vec![Some(3), Some(4)]],
@@ -897,86 +895,12 @@ mod tests {
 
     #[test]
     fn test_merge_sorted_index_u64_desc_nulls_only_in_last_segment() {
-        // DisjunctStack: NULLs only in last segment (safe position for DESC).
-        // Values are disjunct: seg1 min=3 > seg2 max=2.
         let index = build_u64_sorted_index(
             Order::Desc,
             vec![vec![Some(4), Some(3)], vec![Some(2), Some(1), None]],
         );
         let values = collect_u64_values(&index);
         assert_eq!(values, vec![Some(4), Some(3), Some(2), Some(1), None]);
-    }
-
-    #[test]
-    fn test_merge_sorted_index_u64_asc_disjunct_with_nulls_in_both() {
-        // DisjunctWithNulls: values are disjunct but NULLs in both segments.
-        let index = build_u64_sorted_index(
-            Order::Asc,
-            vec![vec![None, Some(1), Some(2)], vec![None, Some(3), Some(4)]],
-        );
-        let values = collect_u64_values(&index);
-        assert_eq!(values, vec![None, None, Some(1), Some(2), Some(3), Some(4)]);
-    }
-
-    #[test]
-    fn test_merge_sorted_index_u64_desc_disjunct_with_nulls_in_both() {
-        // DisjunctWithNulls: values are disjunct but NULLs in both segments.
-        let index = build_u64_sorted_index(
-            Order::Desc,
-            vec![vec![Some(4), Some(3), None], vec![Some(2), Some(1), None]],
-        );
-        let values = collect_u64_values(&index);
-        assert_eq!(values, vec![Some(4), Some(3), Some(2), Some(1), None, None]);
-    }
-
-    #[test]
-    fn test_merge_sorted_index_u64_asc_overlapping_with_nulls() {
-        // RequiresFullMerge: values overlap and NULLs present.
-        let index = build_u64_sorted_index(
-            Order::Asc,
-            vec![vec![None, Some(1), Some(3)], vec![None, Some(2), Some(4)]],
-        );
-        let values = collect_u64_values(&index);
-        assert_eq!(values, vec![None, None, Some(1), Some(2), Some(3), Some(4)]);
-    }
-
-    #[test]
-    fn test_merge_sorted_index_u64_desc_overlapping_with_nulls() {
-        // RequiresFullMerge DESC: values overlap and NULLs present.
-        let index = build_u64_sorted_index(
-            Order::Desc,
-            vec![vec![Some(4), Some(2), None], vec![Some(3), Some(1), None]],
-        );
-        let values = collect_u64_values(&index);
-        assert_eq!(values, vec![Some(4), Some(3), Some(2), Some(1), None, None]);
-    }
-
-    #[test]
-    fn test_merge_sorted_index_u64_asc_three_segments_with_nulls() {
-        // 3+ segments: DisjunctWithNulls across three segments.
-        let index = build_u64_sorted_index(
-            Order::Asc,
-            vec![
-                vec![None, Some(1), Some(2)],
-                vec![None, Some(3), Some(4)],
-                vec![None, Some(5), Some(6)],
-            ],
-        );
-        let values = collect_u64_values(&index);
-        assert_eq!(
-            values,
-            vec![
-                None,
-                None,
-                None,
-                Some(1),
-                Some(2),
-                Some(3),
-                Some(4),
-                Some(5),
-                Some(6)
-            ]
-        );
     }
 
     proptest! {

@@ -58,16 +58,6 @@ enum ReaderSortFieldAccessors {
     StrBytes(Vec<(SegmentOrdinal, StrBytesSortFieldAccessor)>),
 }
 
-/// Result of checking whether sorted segments can be stacked.
-enum DisjunctSortStatus {
-    /// Values are disjunct and NULLs are already in the right position. Just stack.
-    DisjunctStack,
-    /// Values are disjunct but NULLs need to be grouped (first for ASC, last for DESC).
-    DisjunctWithNulls(Vec<(SegmentOrdinal, Column<u64>)>),
-    /// Values overlap. Full k-way merge required.
-    RequiresFullMerge,
-}
-
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
 ///
 /// We do not allow segments with more than
@@ -202,18 +192,6 @@ impl IndexMerger {
             .sum()
     }
 
-    fn has_deletes(&self) -> bool {
-        self.readers.iter().any(SegmentReader::has_deletes)
-    }
-
-    fn stacked_mapping_type(&self) -> MappingType {
-        if self.has_deletes() {
-            MappingType::StackedWithDeletes
-        } else {
-            MappingType::Stacked
-        }
-    }
-
     fn collect_alive_bitsets(&self) -> Vec<Option<ReadOnlyBitSet>> {
         self.readers
             .iter()
@@ -225,9 +203,11 @@ impl IndexMerger {
             .collect()
     }
 
+    /// Column cardinality metadata (`Optional`) covers all docs including deleted ones.
+    /// A segment can report `Optional` but have zero live NULLs if every NULL doc was
+    /// deleted. We scan alive docs to distinguish this case, because deleted NULLs
+    /// are excluded from the merge and shouldn't block the disjunct-stack path.
     fn segment_has_live_nulls(&self, segment_ord: SegmentOrdinal, col: &Column<u64>) -> bool {
-        // Cardinality is defined over all docs in the segment. With deletes present, scan
-        // alive docs to avoid treating deleted NULLs as live NULLs.
         if col.get_cardinality() != columnar::Cardinality::Optional {
             return false;
         }
@@ -400,21 +380,21 @@ impl IndexMerger {
         Ok(())
     }
 
-    /// Checks if the readers are disjunct for their sort property and determines
-    /// the best merge strategy.
+    /// Checks if segments can use the fast disjunct-stack path (byte concatenation)
+    /// instead of a full k-way merge.
     ///
-    /// Returns:
-    /// - `DisjunctStack` if segments can be directly stacked (no NULLs to reorder)
-    /// - `DisjunctWithNulls` if values are disjunct but NULLs need grouping
-    /// - `RequiresFullMerge` if values overlap and need a full k-way merge
-    fn disjunct_sort_status(
+    /// Stacking preserves per-segment order but doesn't reposition docs across segments.
+    /// NULLs must sort first (ASC) or last (DESC) globally, but stacking can't move a
+    /// NULL from segment 2 before values in segment 1. So any live NULL forces a full
+    /// k-way merge to place NULLs correctly.
+    fn is_disjunct_and_sorted_on_sort_property(
         &self,
         sort_by_field: &IndexSortByField,
-    ) -> crate::Result<DisjunctSortStatus> {
+    ) -> crate::Result<bool> {
         let field_type = self.sort_by_field_type(sort_by_field)?;
         // Disjunct shortcut is invalid for Str/Bytes because ords are per-segment.
         if matches!(field_type, Type::Str | Type::Bytes) {
-            return Ok(DisjunctSortStatus::RequiresFullMerge);
+            return Ok(false);
         }
 
         let reader_ordinal_and_field_accessors = self.get_numeric_accessors(sort_by_field)?;
@@ -434,40 +414,14 @@ impl IndexMerger {
             });
 
         if !values_disjunct {
-            return Ok(DisjunctSortStatus::RequiresFullMerge);
+            return Ok(false);
         }
 
         let has_live_nulls = reader_ordinal_and_field_accessors
             .iter()
             .any(|(segment_ord, col)| self.segment_has_live_nulls(*segment_ord, col));
 
-        if !has_live_nulls {
-            return Ok(DisjunctSortStatus::DisjunctStack);
-        }
-
-        // Values are disjunct but some segments have NULLs.
-        // ASC: NULLs only in the first segment can be stacked directly.
-        // DESC: NULLs only in the last segment can be stacked directly.
-        let nulls_in_safe_position = if asc {
-            reader_ordinal_and_field_accessors
-                .iter()
-                .skip(1)
-                .all(|(segment_ord, col)| !self.segment_has_live_nulls(*segment_ord, col))
-        } else {
-            reader_ordinal_and_field_accessors
-                .iter()
-                .rev()
-                .skip(1)
-                .all(|(segment_ord, col)| !self.segment_has_live_nulls(*segment_ord, col))
-        };
-
-        if nulls_in_safe_position {
-            Ok(DisjunctSortStatus::DisjunctStack)
-        } else {
-            Ok(DisjunctSortStatus::DisjunctWithNulls(
-                reader_ordinal_and_field_accessors,
-            ))
-        }
+        Ok(!has_live_nulls)
     }
 
     fn get_str_bytes_column(
@@ -532,6 +486,10 @@ impl IndexMerger {
         Ok(accessors)
     }
 
+    /// Returns the full `Column<u64>` so callers can use `Column::first()` which
+    /// returns `Option<u64>` — `None` for NULLs, `Some` for real values. This
+    /// distinction is required for correct NULL ordering during merge sort and
+    /// for detecting live NULLs in the disjunct-stack check.
     fn get_numeric_accessor(
         reader: &SegmentReader,
         sort_by_field: &IndexSortByField,
@@ -543,8 +501,6 @@ impl IndexMerger {
             .ok_or_else(|| FastFieldNotAvailableError {
                 field_name: sort_by_field.field.to_string(),
             })?;
-        // Return the full Column<u64> (not first_or_default_col) so callers can
-        // distinguish NULLs (None) from real values via Column::first().
         Ok(value_accessor)
     }
 
@@ -694,53 +650,11 @@ impl IndexMerger {
                 }),
         );
 
-        let mapping_type = self.stacked_mapping_type();
-        let alive_bitsets = self.collect_alive_bitsets();
-        Ok(SegmentDocIdMapping::new(
-            mapping,
-            mapping_type,
-            alive_bitsets,
-        ))
-    }
-
-    /// Stacks disjunct segments while grouping NULLs at the correct end.
-    /// ASC: all NULLs from all segments first, then stacked non-NULL values.
-    /// DESC: stacked non-NULL values first, then all NULLs from all segments.
-    fn get_doc_id_from_disjunct_with_nulls(
-        &self,
-        accessors: Vec<(SegmentOrdinal, Column<u64>)>,
-        asc: bool,
-    ) -> crate::Result<SegmentDocIdMapping> {
-        let total_num_new_docs = self.total_num_new_docs();
-        let mut mapping: Vec<DocAddress> = Vec::with_capacity(total_num_new_docs);
-        let mut has_null_docs = false;
-        // Two passes: ASC iterates [true, false] (nulls first, then values),
-        // DESC iterates [false, true] (values first, then nulls).
-        for take_nulls in [asc, !asc] {
-            for (segment_ord, col) in &accessors {
-                let reader = &self.readers[*segment_ord as usize];
-                for doc_id in reader.doc_ids_alive() {
-                    let is_null = col.first(doc_id).is_none();
-                    if is_null == take_nulls {
-                        if is_null {
-                            has_null_docs = true;
-                        }
-                        mapping.push(DocAddress {
-                            segment_ord: *segment_ord,
-                            doc_id,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Shuffled if NULLs were reordered across segments. If all NULLs turned out to be
-        // deleted (disjunct_sort_status used metadata that includes dead docs), fall back to
-        // Stacked so the docstore can still be concatenated without decompression.
-        let mapping_type = if has_null_docs {
-            MappingType::Shuffled
+        let has_deletes = self.readers.iter().any(SegmentReader::has_deletes);
+        let mapping_type = if has_deletes {
+            MappingType::StackedWithDeletes
         } else {
-            self.stacked_mapping_type()
+            MappingType::Stacked
         };
         let alive_bitsets = self.collect_alive_bitsets();
         Ok(SegmentDocIdMapping::new(
@@ -1077,13 +991,10 @@ impl IndexMerger {
     pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
         let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
         {
-            match self.disjunct_sort_status(sort_by_field)? {
-                DisjunctSortStatus::DisjunctStack => self.get_doc_id_from_concatenated_data()?,
-                DisjunctSortStatus::DisjunctWithNulls(accessors) => self
-                    .get_doc_id_from_disjunct_with_nulls(accessors, sort_by_field.order.is_asc())?,
-                DisjunctSortStatus::RequiresFullMerge => {
-                    self.generate_doc_id_mapping_with_sort_by_field(sort_by_field)?
-                }
+            if self.is_disjunct_and_sorted_on_sort_property(sort_by_field)? {
+                self.get_doc_id_from_concatenated_data()?
+            } else {
+                self.generate_doc_id_mapping_with_sort_by_field(sort_by_field)?
             }
         } else {
             self.get_doc_id_from_concatenated_data()?
@@ -1123,13 +1034,11 @@ mod tests {
     use proptest::strategy::Strategy;
     use schema::FAST;
 
-    use super::{DisjunctSortStatus, IndexMerger};
     use crate::collector::tests::{
         BytesFastFieldTestCollector, FastFieldTestCollector, TEST_COLLECTOR_WITH_SCORE,
     };
     use crate::collector::{Count, FacetCollector};
     use crate::index::{Index, SegmentId};
-    use crate::indexer::segment_updater::CancelSentinel;
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, BooleanQuery, EnableScoring, Scorer, TermQuery};
     use crate::schema::{
@@ -1141,19 +1050,6 @@ mod tests {
         assert_nearly_equals, schema, DateTime, DocAddress, DocId, DocSet, IndexSettings,
         IndexSortByField, IndexWriter, Order, Searcher,
     };
-
-    #[derive(Clone)]
-    struct TestCancelSentinel;
-
-    impl CancelSentinel for TestCancelSentinel {
-        fn box_clone(&self) -> Box<dyn CancelSentinel> {
-            Box::new(self.clone())
-        }
-
-        fn wants_cancel(&self) -> bool {
-            false
-        }
-    }
 
     #[test]
     fn test_index_merger_no_deletes() -> crate::Result<()> {
@@ -2369,96 +2265,5 @@ mod tests {
         // this is the first time I write a unit test for a constant.
         assert!(((super::MAX_DOC_LIMIT - 1) as i32) >= 0);
         assert!((super::MAX_DOC_LIMIT as i32) < 0);
-    }
-
-    #[test]
-    fn disjunct_sort_status_asc_ignores_deleted_nulls_outside_safe_position() -> crate::Result<()> {
-        let mut schema_builder = schema::Schema::builder();
-        let label = schema_builder.add_text_field("label", schema::STRING);
-        let int_field = schema_builder
-            .add_u64_field("intval", NumericOptions::default().set_fast().set_indexed());
-        let schema = schema_builder.build();
-
-        let index = Index::builder()
-            .schema(schema)
-            .settings(IndexSettings {
-                sort_by_field: Some(IndexSortByField {
-                    field: "intval".to_string(),
-                    order: Order::Asc,
-                }),
-                ..Default::default()
-            })
-            .create_in_ram()?;
-
-        let mut writer: IndexWriter = index.writer_for_tests()?;
-        writer.add_document(doc!(label => "seg1-v1", int_field => 1u64))?;
-        writer.commit()?;
-        writer.add_document(doc!(label => "delete-null"))?;
-        writer.add_document(doc!(label => "seg2-v2", int_field => 2u64))?;
-        writer.commit()?;
-        writer.delete_term(Term::from_field_text(label, "delete-null"));
-        writer.commit()?;
-
-        let segments = index.searchable_segments()?;
-        let merger = IndexMerger::open(
-            index.schema(),
-            index.settings().clone(),
-            &segments,
-            Box::new(TestCancelSentinel),
-            true,
-        )?;
-
-        let sort_by_field = index.settings().sort_by_field.as_ref().unwrap();
-        assert!(matches!(
-            merger.disjunct_sort_status(sort_by_field)?,
-            DisjunctSortStatus::DisjunctStack
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn disjunct_sort_status_desc_ignores_deleted_nulls_outside_safe_position() -> crate::Result<()>
-    {
-        let mut schema_builder = schema::Schema::builder();
-        let label = schema_builder.add_text_field("label", schema::STRING);
-        let int_field = schema_builder
-            .add_u64_field("intval", NumericOptions::default().set_fast().set_indexed());
-        let schema = schema_builder.build();
-
-        let index = Index::builder()
-            .schema(schema)
-            .settings(IndexSettings {
-                sort_by_field: Some(IndexSortByField {
-                    field: "intval".to_string(),
-                    order: Order::Desc,
-                }),
-                ..Default::default()
-            })
-            .create_in_ram()?;
-
-        let mut writer: IndexWriter = index.writer_for_tests()?;
-        writer.add_document(doc!(label => "delete-null"))?;
-        writer.add_document(doc!(label => "seg1-v2", int_field => 2u64))?;
-        writer.commit()?;
-        writer.add_document(doc!(label => "seg2-v1", int_field => 1u64))?;
-        writer.commit()?;
-        writer.delete_term(Term::from_field_text(label, "delete-null"));
-        writer.commit()?;
-
-        let segments = index.searchable_segments()?;
-        let merger = IndexMerger::open(
-            index.schema(),
-            index.settings().clone(),
-            &segments,
-            Box::new(TestCancelSentinel),
-            true,
-        )?;
-
-        let sort_by_field = index.settings().sort_by_field.as_ref().unwrap();
-        assert!(matches!(
-            merger.disjunct_sort_status(sort_by_field)?,
-            DisjunctSortStatus::DisjunctStack
-        ));
-        Ok(())
     }
 }
