@@ -83,7 +83,7 @@ impl DocSet for ContiguousDocSet {
     }
 
     fn cost(&self) -> u64 {
-        self.end.saturating_sub(self.start) as u64
+        self.size_hint() as u64
     }
 }
 

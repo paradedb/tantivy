@@ -511,8 +511,7 @@ fn search_on_u64_ff(
 ///    matching DocIds. The result is a half-open range `[start, end)` where `start` is the first
 ///    match and `end` is one past the last match.
 ///
-/// 3. **ContiguousDocSet**: Wraps the `[start, end)` range as a `DocSet`. Cost is proportional to
-///    matching docs, not total segment size.
+/// 3. **ContiguousDocSet**: Wraps the `[start, end)` range as a `DocSet`.
 ///
 /// Only `Full` and `Optional` cardinalities are supported. `Multivalued` columns
 /// have multiple values per doc and cannot be binary-searched.
