@@ -76,7 +76,7 @@ pub type TermOrdinal = u64;
 /// The inner `Vec<fsst::Symbol>` holds the exact mapping of byte-codes to
 /// string segments learned during indexing. Because the dictionary is shared
 /// identically across all blocks in a single `SSTable`, it is wrapped in an `Arc`.
-pub type DecompressorSymbols = Option<std::sync::Arc<Vec<fsst::Symbol>>>;
+pub type DecompressorSymbols = Option<std::sync::Arc<(Vec<fsst::Symbol>, Vec<u8>)>>;
 
 const DEFAULT_KEY_CAPACITY: usize = 50;
 const SSTABLE_VERSION: u32 = 4;
@@ -244,7 +244,22 @@ where TValueReader: ValueReader
         self.key[common_prefix_len..].copy_from_slice(suffix);
 
         if let Some(decompressor) = self.delta_reader.decompressor() {
-            self.decompressed_key = decompressor.decompress(&self.key);
+            // We reserve capacity to avoid heap allocation thrashing, and use `decompress_into`
+            // to achieve high-performance, zero-allocation (amortized) decompression.
+            // Maximum possible decompressed size in FSST is exactly 8x the compressed size.
+            if self.decompressed_key.capacity() < self.key.len() * 8 {
+                self.decompressed_key
+                    .reserve((self.key.len() * 8) - self.decompressed_key.capacity());
+            }
+
+            self.decompressed_key.clear();
+            let spare_capacity = self.decompressed_key.spare_capacity_mut();
+            let len = decompressor.decompress_into(&self.key, spare_capacity);
+
+            // SAFETY: `decompress_into` guarantees it initialized `len` bytes
+            unsafe {
+                self.decompressed_key.set_len(len);
+            }
         }
 
         Ok(true)
@@ -284,6 +299,7 @@ where W: io::Write
     first_ordinal_of_the_block: u64,
     compressor: Option<fsst::Compressor>,
     previous_compressed_key: Vec<u8>,
+    compressed_key: Vec<u8>,
 }
 
 impl<W, TValueWriter> Writer<W, TValueWriter>
@@ -318,7 +334,7 @@ where
             if flat_sample.len() < 2048 {
                 None
             } else {
-                Some(fsst::Compressor::train(&flat_sample))
+                Some(fsst::Compressor::train(&sample.to_vec()))
             }
         };
         Self::with_compressor(wrt, compressor)
@@ -334,6 +350,7 @@ where
             first_ordinal_of_the_block: 0u64,
             compressor,
             previous_compressed_key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
+            compressed_key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
         }
     }
 
@@ -396,22 +413,34 @@ where
         self.previous_key[keep_len..].copy_from_slice(&key[keep_len..]);
 
         // If an FSST compressor is available, we compress the entire key before delta-encoding.
-        // This fully-compressed delta scheme (from COMPRESSED_DELTA.md) allows `DeltaReader`
+        // This fully-compressed delta scheme allows `DeltaReader`
         // to maintain a compressed buffer and advance extremely quickly without performing
         // any decompression during simple iteration.
         if let Some(compressor) = &self.compressor {
-            let compressed_key = compressor.compress(key);
+            self.compressed_key.clear();
+            if self.compressed_key.capacity() < key.len() * 2 {
+                self.compressed_key
+                    .reserve((key.len() * 2) - self.compressed_key.capacity());
+            }
+
+            // SAFETY: We ensured the buffer has at least key.len() * 2 capacity
+            unsafe {
+                compressor.compress_into(key, &mut self.compressed_key);
+            }
 
             // FSST is a greedy compressor, so the compressed bytes of a prefix may differ
             // from the prefix of the compressed string. Therefore, we must compute the
             // `keep_len` by comparing the newly compressed key against the previously compressed
             // key.
             let keep_compressed_len =
-                common_prefix_len(&self.previous_compressed_key, &compressed_key);
+                common_prefix_len(&self.previous_compressed_key, &self.compressed_key);
 
-            self.delta_writer
-                .write_suffix(keep_compressed_len, &compressed_key[keep_compressed_len..]);
-            self.previous_compressed_key = compressed_key;
+            self.delta_writer.write_suffix(
+                keep_compressed_len,
+                &self.compressed_key[keep_compressed_len..],
+            );
+
+            std::mem::swap(&mut self.previous_compressed_key, &mut self.compressed_key);
         } else {
             self.delta_writer.write_suffix(keep_len, &key[keep_len..]);
         }
@@ -461,7 +490,7 @@ where
         let fst_len: u64 = self.index_builder.serialize(&mut wrt)?;
         wrt.write_all(&fst_len.to_le_bytes())?;
 
-        // FSST_MIGRATION_DESIGN.md: Because FSST uses a relatively large dictionary (~2.3KB),
+        // Because FSST uses a relatively large dictionary (~2.3KB),
         // storing a local dictionary per 4KB block adds unacceptable overhead. Thus, if a
         // compressor was used for this SSTable, we serialize its dictionary globally here
         // in the SSTable footer. It will be loaded once per SSTable by `Dictionary::open`.
@@ -469,11 +498,15 @@ where
         if let Some(compressor) = self.compressor {
             fsst_dict_offset = wrt.written_bytes() as u64;
             let symbols = compressor.symbol_table();
-            let n_symbols = (symbols.len() - 256) as u32;
+            let lengths = compressor.symbol_lengths();
+            let n_symbols = symbols.len() as u32;
             wrt.write_all(&n_symbols.to_le_bytes())?;
-            for symbol in &symbols[256..] {
+            for i in 0..symbols.len() {
+                let symbol = symbols[i];
+                let len = lengths[i] as usize;
                 let mut buf = [0u8; 8];
-                buf[..symbol.len()].copy_from_slice(symbol.as_slice());
+                let bytes = symbol.to_u64().to_le_bytes();
+                buf[..len].copy_from_slice(&bytes[..len]);
                 wrt.write_all(&buf)?;
             }
         }

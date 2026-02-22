@@ -102,7 +102,7 @@ impl BlockReader {
                 ));
             }
 
-            // PERF: Per NEW_DESIGN.md, we no longer decompress the entire block upfront.
+            // We do not decompress the entire block upfront.
             // We just slice the raw (potentially FSST-compressed) bytes into `self.buffer`
             // and defer string-level decompression to `Reader::advance()`/`key()`.
             // This drastically reduces memory allocations and enables zero-allocation term
@@ -120,7 +120,7 @@ impl BlockReader {
     }
 
     #[inline(always)]
-    pub fn decompressor_symbols(&self) -> Option<&Arc<Vec<fsst::Symbol>>> {
+    pub fn decompressor_symbols(&self) -> Option<&Arc<(Vec<fsst::Symbol>, Vec<u8>)>> {
         self.decompressor_symbols.as_ref()
     }
 

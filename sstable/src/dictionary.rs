@@ -310,7 +310,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             fsst_dict_offset = u64::deserialize(&mut footer_bytes)?;
         }
 
-        // FSST_MIGRATION_DESIGN.md: Load the global FSST dictionary from the footer if present.
+        // Load the global FSST dictionary from the footer if present.
         // This is shared identically by all blocks in this SSTable to avoid redundant memory
         // overhead that would occur with a dictionary per 4KB block.
         let mut decompressor_symbols = None;
@@ -321,18 +321,18 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             let mut dict_bytes = dict_owned_bytes.as_slice();
 
             let n_symbols = u32::deserialize(&mut dict_bytes)?;
-            let mut loaded_symbols = Vec::with_capacity(256 + n_symbols as usize);
-            // Populate escape bytes
-            for i in 0..=255 {
-                loaded_symbols.push(fsst::Symbol::from_u8(i as u8));
-            }
+            let mut loaded_symbols = Vec::with_capacity(n_symbols as usize);
+            let mut loaded_lengths = Vec::with_capacity(n_symbols as usize);
+
             for _ in 0..n_symbols {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&dict_bytes[..8]);
                 dict_bytes = &dict_bytes[8..];
-                loaded_symbols.push(fsst::Symbol::from_slice(&buf));
+                let symbol = fsst::Symbol::from_slice(&buf);
+                loaded_symbols.push(symbol);
+                loaded_lengths.push(symbol.len() as u8);
             }
-            decompressor_symbols = Some(Arc::new(loaded_symbols));
+            decompressor_symbols = Some(Arc::new((loaded_symbols, loaded_lengths)));
         }
 
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
@@ -423,7 +423,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         key: K,
         sstable_reader: &mut Reader<TSSTable::ValueReader>,
     ) -> io::Result<TermOrdHit> {
-        // PERF: In `COMPRESSED_DELTA.md`, we shifted to a fully compressed delta-encoding scheme.
+        // We use a fully compressed delta-encoding scheme.
         // Because FSST does not preserve lexicographical order and the compressed form of a prefix
         // does not match the prefix of a compressed full string, we cannot rely on the
         // `common_prefix_len` for optimizations anymore. Therefore, `decode_up_to_or_next` must

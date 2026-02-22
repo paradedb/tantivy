@@ -11,7 +11,7 @@ description = "sstables for tantivy"
 
 [dependencies]
 common = {version= "0.10", path="../common", package="tantivy-common"}
-fsst-rs = "0.1"
+fsst-rs = "0.5"
 futures-util = "0.3.30"
 itertools = "0.14.0"
 tantivy-bitpacker = { version= "0.9", path="../bitpacker" }

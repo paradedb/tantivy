@@ -214,7 +214,7 @@ where TValueReader: value::ValueReader
     pub fn decompressor(&self) -> Option<fsst::Decompressor<'_>> {
         self.block_reader
             .decompressor_symbols()
-            .map(|s| fsst::Decompressor::new(s))
+            .map(|arc| fsst::Decompressor::new(&arc.0, &arc.1))
     }
 
     #[inline(always)]
