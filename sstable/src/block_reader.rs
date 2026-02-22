@@ -10,6 +10,7 @@ pub struct BlockReader {
     next_readers: std::vec::IntoIter<OwnedBytes>,
     offset: usize,
     decompressor_symbols: crate::DecompressorSymbols,
+    is_compressed: bool,
 }
 
 impl BlockReader {
@@ -23,6 +24,7 @@ impl BlockReader {
             next_readers: Vec::new().into_iter(),
             offset: 0,
             decompressor_symbols,
+            is_compressed: false,
         }
     }
 
@@ -38,6 +40,7 @@ impl BlockReader {
             next_readers,
             offset: 0,
             decompressor_symbols,
+            is_compressed: false,
         }
     }
 
@@ -90,24 +93,30 @@ impl BlockReader {
                     "failed to read block content",
                 ));
             }
-            if compress == 1 {
-                if let Some(symbols) = self.decompressor_symbols.as_ref() {
-                    let decompressor = fsst::Decompressor::new(symbols);
-                    self.buffer = decompressor.decompress(&self.reader[..block_len]);
-                    self.reader.advance(block_len);
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "fsst compression used but no dictionary was loaded",
-                    ));
-                }
-            } else {
-                self.buffer.resize(block_len, 0u8);
-                self.reader.read_exact(&mut self.buffer[..])?;
+
+            self.is_compressed = compress == 1;
+            if self.is_compressed && self.decompressor_symbols.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "fsst compression used but no dictionary was loaded",
+                ));
             }
+
+            self.buffer.resize(block_len, 0u8);
+            self.reader.read_exact(&mut self.buffer[..])?;
 
             return Ok(true);
         }
+    }
+
+    #[inline(always)]
+    pub fn is_compressed(&self) -> bool {
+        self.is_compressed
+    }
+
+    #[inline(always)]
+    pub fn decompressor_symbols(&self) -> Option<&Arc<Vec<fsst::Symbol>>> {
+        self.decompressor_symbols.as_ref()
     }
 
     #[inline(always)]

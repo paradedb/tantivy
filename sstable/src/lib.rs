@@ -218,7 +218,7 @@ where TValueReader: ValueReader
         }
         let common_prefix_len = self.delta_reader.common_prefix_len();
         let suffix = self.delta_reader.suffix();
-        let new_len = self.delta_reader.common_prefix_len() + suffix.len();
+        let new_len = common_prefix_len + suffix.len();
         self.key.resize(new_len, 0u8);
         self.key[common_prefix_len..].copy_from_slice(suffix);
         Ok(true)

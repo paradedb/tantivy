@@ -55,31 +55,12 @@ where
 
         let block_len = buffer.len() + self.block.len();
 
-        if let Some(compressor) = self.compressor.as_ref() {
-            buffer.extend_from_slice(&self.block);
-            self.block.clear();
-
-            let compressed = compressor.compress(&buffer);
-
-            // verify compression had a positive impact
-            if compressed.len() < buffer.len() {
-                self.write
-                    .write_all(&(compressed.len() as u32 + 1).to_le_bytes())?;
-                self.write.write_all(&[1])?;
-                self.write.write_all(&compressed[..])?;
-            } else {
-                self.write
-                    .write_all(&(block_len as u32 + 1).to_le_bytes())?;
-                self.write.write_all(&[0])?;
-                self.write.write_all(&buffer[..])?;
-            }
-        } else {
-            self.write
-                .write_all(&(block_len as u32 + 1).to_le_bytes())?;
-            self.write.write_all(&[0])?;
-            self.write.write_all(&buffer[..])?;
-            self.write.write_all(&self.block[..])?;
-        }
+        self.write
+            .write_all(&(block_len as u32 + 1).to_le_bytes())?;
+        self.write
+            .write_all(&[if self.compressor.is_some() { 1 } else { 0 }])?;
+        self.write.write_all(&buffer[..])?;
+        self.write.write_all(&self.block[..])?;
 
         let end_offset = self.write.written_bytes() as usize;
         self.block.clear();
@@ -101,9 +82,16 @@ where
 
     pub(crate) fn write_suffix(&mut self, common_prefix_len: usize, suffix: &[u8]) {
         let keep_len = common_prefix_len;
-        let add_len = suffix.len();
-        self.encode_keep_add(keep_len, add_len);
-        self.block.extend_from_slice(suffix);
+        if let Some(compressor) = &self.compressor {
+            let compressed = compressor.compress(suffix);
+            let add_len = compressed.len();
+            self.encode_keep_add(keep_len, add_len);
+            self.block.extend_from_slice(&compressed);
+        } else {
+            let add_len = suffix.len();
+            self.encode_keep_add(keep_len, add_len);
+            self.block.extend_from_slice(suffix);
+        }
     }
 
     pub(crate) fn write_value(&mut self, value: &TValueWriter::Value) {
@@ -128,6 +116,7 @@ pub struct DeltaReader<TValueReader> {
     value_reader: TValueReader,
     block_reader: BlockReader,
     idx: usize,
+    decompressed_suffix: Vec<u8>,
 }
 
 impl<TValueReader> DeltaReader<TValueReader>
@@ -140,6 +129,7 @@ where TValueReader: value::ValueReader
             suffix_range: 0..0,
             value_reader: TValueReader::default(),
             block_reader: BlockReader::new(reader, decompressor),
+            decompressed_suffix: Vec::new(),
         }
     }
 
@@ -153,6 +143,7 @@ where TValueReader: value::ValueReader
             suffix_range: 0..0,
             value_reader: TValueReader::default(),
             block_reader: BlockReader::from_multiple_blocks(reader, decompressor),
+            decompressed_suffix: Vec::new(),
         }
     }
 
@@ -221,8 +212,16 @@ where TValueReader: value::ValueReader
     }
 
     #[inline(always)]
-    pub fn suffix(&self) -> &[u8] {
-        self.block_reader.buffer_from_to(self.suffix_range.clone())
+    pub fn suffix(&mut self) -> &[u8] {
+        let raw = self.block_reader.buffer_from_to(self.suffix_range.clone());
+        if self.block_reader.is_compressed() {
+            if let Some(symbols) = self.block_reader.decompressor_symbols() {
+                let decompressor = fsst::Decompressor::new(symbols);
+                self.decompressed_suffix = decompressor.decompress(raw);
+                return &self.decompressed_suffix;
+            }
+        }
+        raw
     }
 
     #[inline(always)]
