@@ -2,8 +2,7 @@ use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 
 use common::{CountingWriter, OwnedBytes};
-#[cfg(feature = "zstd-compression")]
-use zstd::bulk::Compressor;
+use fsst::Compressor;
 
 use super::value::ValueWriter;
 use super::{BlockReader, value, vint};
@@ -21,6 +20,7 @@ where W: io::Write
     // Only here to avoid allocations.
     stateless_buffer: Vec<u8>,
     block_len: usize,
+    compressor: Option<Compressor>,
 }
 
 impl<W, TValueWriter> DeltaWriter<W, TValueWriter>
@@ -28,13 +28,14 @@ where
     W: io::Write,
     TValueWriter: ValueWriter,
 {
-    pub fn new(wrt: W) -> Self {
+    pub fn new(wrt: W, compressor: Option<Compressor>) -> Self {
         DeltaWriter {
             block: Vec::with_capacity(BLOCK_LEN * 2),
             write: CountingWriter::wrap(BufWriter::new(wrt)),
             value_writer: TValueWriter::default(),
             stateless_buffer: Vec::new(),
             block_len: BLOCK_LEN,
+            compressor,
         }
     }
 
@@ -54,28 +55,23 @@ where
 
         let block_len = buffer.len() + self.block.len();
 
-        if cfg!(feature = "zstd-compression") && block_len > 2048 {
-            #[cfg(feature = "zstd-compression")]
-            {
-                buffer.extend_from_slice(&self.block);
-                self.block.clear();
+        if let Some(compressor) = self.compressor.as_ref() {
+            buffer.extend_from_slice(&self.block);
+            self.block.clear();
 
-                let max_len = zstd::zstd_safe::compress_bound(buffer.len());
-                self.block.reserve(max_len);
-                Compressor::new(3)?.compress_to_buffer(buffer, &mut self.block)?;
+            let compressed = compressor.compress(&buffer);
 
-                // verify compression had a positive impact
-                if self.block.len() < buffer.len() {
-                    self.write
-                        .write_all(&(self.block.len() as u32 + 1).to_le_bytes())?;
-                    self.write.write_all(&[1])?;
-                    self.write.write_all(&self.block[..])?;
-                } else {
-                    self.write
-                        .write_all(&(block_len as u32 + 1).to_le_bytes())?;
-                    self.write.write_all(&[0])?;
-                    self.write.write_all(&buffer[..])?;
-                }
+            // verify compression had a positive impact
+            if compressed.len() < buffer.len() {
+                self.write
+                    .write_all(&(compressed.len() as u32 + 1).to_le_bytes())?;
+                self.write.write_all(&[1])?;
+                self.write.write_all(&compressed[..])?;
+            } else {
+                self.write
+                    .write_all(&(block_len as u32 + 1).to_le_bytes())?;
+                self.write.write_all(&[0])?;
+                self.write.write_all(&buffer[..])?;
             }
         } else {
             self.write
@@ -137,28 +133,31 @@ pub struct DeltaReader<TValueReader> {
 impl<TValueReader> DeltaReader<TValueReader>
 where TValueReader: value::ValueReader
 {
-    pub fn new(reader: OwnedBytes) -> Self {
+    pub fn new(reader: OwnedBytes, decompressor: crate::DecompressorSymbols) -> Self {
         DeltaReader {
             idx: 0,
             common_prefix_len: 0,
             suffix_range: 0..0,
             value_reader: TValueReader::default(),
-            block_reader: BlockReader::new(reader),
+            block_reader: BlockReader::new(reader, decompressor),
         }
     }
 
-    pub fn from_multiple_blocks(reader: Vec<OwnedBytes>) -> Self {
+    pub fn from_multiple_blocks(
+        reader: Vec<OwnedBytes>,
+        decompressor: crate::DecompressorSymbols,
+    ) -> Self {
         DeltaReader {
             idx: 0,
             common_prefix_len: 0,
             suffix_range: 0..0,
             value_reader: TValueReader::default(),
-            block_reader: BlockReader::from_multiple_blocks(reader),
+            block_reader: BlockReader::from_multiple_blocks(reader, decompressor),
         }
     }
 
     pub fn empty() -> Self {
-        DeltaReader::new(OwnedBytes::empty())
+        DeltaReader::new(OwnedBytes::empty(), None)
     }
 
     fn deserialize_vint(&mut self) -> u64 {

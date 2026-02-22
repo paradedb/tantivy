@@ -691,6 +691,33 @@ impl IndexMerger {
             max_term_ords.push(terms.num_terms() as u64);
         }
 
+        let mut total_terms = 0;
+        for max_term_ord in &max_term_ords {
+            total_terms += max_term_ord;
+        }
+        let sample_target = 1000u64.min(total_terms);
+        let mut sample_bytes = Vec::new();
+        if total_terms > 0 {
+            for (i, field_reader) in field_readers.iter().enumerate() {
+                let segment_terms = max_term_ords[i];
+                if segment_terms == 0 {
+                    continue;
+                }
+                let segment_sample_target = (sample_target * segment_terms) / total_terms;
+                if segment_sample_target == 0 {
+                    continue;
+                }
+                let step = (segment_terms / segment_sample_target).max(1);
+                let ords: Vec<u64> = (0..segment_terms).step_by(step as usize).collect();
+                let terms_dict = field_reader.terms();
+                terms_dict.sorted_ords_to_term_cb(ords.into_iter(), |bytes| {
+                    sample_bytes.push(bytes.to_vec());
+                    Ok(())
+                })?;
+            }
+        }
+        let sample_slices: Vec<&[u8]> = sample_bytes.iter().map(|b| b.as_slice()).collect();
+
         let mut merged_terms = TermMerger::new(field_term_streams);
 
         // map from segment doc ids to the resulting merged segment doc id.
@@ -725,8 +752,12 @@ impl IndexMerger {
         //
         // This stacking applies only when the index is not sorted, in that case the
         // doc_ids are kmerged by their sort property
-        let mut field_serializer =
-            serializer.new_field(indexed_field, total_num_tokens, fieldnorm_reader)?;
+        let mut field_serializer = serializer.new_field(
+            indexed_field,
+            total_num_tokens,
+            fieldnorm_reader,
+            &sample_slices,
+        )?;
 
         let field_entry = self.schema.get_field_entry(indexed_field);
 

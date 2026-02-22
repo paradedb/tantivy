@@ -180,7 +180,36 @@ fn serialize_merged_dict(
     merge_row_order: &MergeRowOrder,
     output: &mut impl Write,
 ) -> io::Result<TermOrdinalMapping> {
-    let mut sstable_builder = sstable::VoidSSTable::writer(output);
+    let mut total_terms = 0;
+    for bytes_column in bytes_columns.iter().flatten() {
+        total_terms += bytes_column.dictionary.num_terms() as u64;
+    }
+
+    let sample_target = 1000u64.min(total_terms);
+    let mut sample_bytes = Vec::new();
+    if total_terms > 0 {
+        for bytes_column in bytes_columns.iter().flatten() {
+            let segment_terms = bytes_column.dictionary.num_terms() as u64;
+            if segment_terms == 0 {
+                continue;
+            }
+            let segment_sample_target = (sample_target * segment_terms) / total_terms;
+            if segment_sample_target == 0 {
+                continue;
+            }
+            let step = (segment_terms / segment_sample_target).max(1);
+            let ords: Vec<u64> = (0..segment_terms).step_by(step as usize).collect();
+            bytes_column
+                .dictionary
+                .sorted_ords_to_term_cb(ords.into_iter(), |bytes| {
+                    sample_bytes.push(bytes.to_vec());
+                    Ok(())
+                })?;
+        }
+    }
+    let sample_slices: Vec<&[u8]> = sample_bytes.iter().map(|b| b.as_slice()).collect();
+
+    let mut sstable_builder = sstable::VoidSSTable::writer_with_sample(output, &sample_slices);
     let term_ord_mapping = match merge_row_order {
         MergeRowOrder::Stack(_) => merge_dict_and_compute_term_ord_mapping(
             bytes_columns,

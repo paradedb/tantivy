@@ -71,7 +71,20 @@ impl DictionaryBuilder {
         let terms = self.build_sorted_terms(arena);
         // TODO Remove the allocation.
         let mut unordered_to_ord: Vec<OrderedId> = vec![OrderedId(0u32); terms.len()];
-        let mut sstable_builder = sstable::VoidSSTable::writer(wrt);
+
+        let mut sample = Vec::new();
+        let mut sample_bytes = 0;
+        let step = (terms.len() / 1000).max(1);
+        for i in (0..terms.len()).step_by(step) {
+            let term = terms[i].0;
+            sample.push(term);
+            sample_bytes += term.len();
+            if sample_bytes > 65536 {
+                break;
+            }
+        }
+
+        let mut sstable_builder = sstable::VoidSSTable::writer_with_sample(wrt, &sample);
         for (ord, (key, unordered_id)) in terms.into_iter().enumerate() {
             let ordered_id = OrderedId(ord as u32);
             sstable_builder.insert(key, &())?;

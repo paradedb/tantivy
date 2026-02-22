@@ -58,4 +58,3 @@ name = "bench_optional_index"
 harness = false
 
 [features]
-zstd-compression = ["sstable/zstd-compression"]

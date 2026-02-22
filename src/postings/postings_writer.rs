@@ -80,10 +80,27 @@ pub(crate) fn serialize_postings(
     let ordered_id_to_path = ctx.path_to_unordered_id.ordered_id_to_path();
     let field_offsets = make_field_partition(&term_offsets);
     for (field, byte_offsets) in field_offsets {
+        let terms_for_field = &term_offsets[byte_offsets.clone()];
+        let mut sample = Vec::new();
+        let mut sample_bytes = 0;
+        let step = (terms_for_field.len() / 1000).max(1);
+        for i in (0..terms_for_field.len()).step_by(step) {
+            let term = terms_for_field[i].2;
+            sample.push(term);
+            sample_bytes += term.len();
+            if sample_bytes > 65536 {
+                break;
+            }
+        }
+
         let postings_writer = per_field_postings_writers.get_for_field(field);
         let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
-        let mut field_serializer =
-            serializer.new_field(field, postings_writer.total_num_tokens(), fieldnorm_reader)?;
+        let mut field_serializer = serializer.new_field(
+            field,
+            postings_writer.total_num_tokens(),
+            fieldnorm_reader,
+            &sample,
+        )?;
         postings_writer.serialize(
             &term_offsets[byte_offsets],
             &ordered_id_to_path,

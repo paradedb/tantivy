@@ -111,7 +111,7 @@ mod tests {
         let mut w = Vec::new();
         assert!(VoidSSTable::merge(sstables, &mut w, VoidMerge).is_ok());
         let w = OwnedBytes::new(w);
-        let mut reader = VoidSSTable::reader(w);
+        let mut reader = VoidSSTable::reader(w, None);
         for k in merged {
             assert!(reader.advance().unwrap());
             assert_eq!(reader.key(), k.as_bytes());
@@ -135,7 +135,7 @@ mod tests {
         let mut w = Vec::new();
         assert!(MonotonicU64SSTable::merge(sstables, &mut w, U64Merge).is_ok());
         let w = OwnedBytes::new(w);
-        let mut reader = MonotonicU64SSTable::reader(w);
+        let mut reader = MonotonicU64SSTable::reader(w, None);
         for (k, v) in merged {
             assert!(reader.advance().unwrap());
             assert_eq!(reader.key(), k.as_bytes());
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn test_merge_simple_reproduce() {
         let sstable_data = write_sstable(&["a"]);
-        let mut reader = VoidSSTable::reader(sstable_data);
+        let mut reader = VoidSSTable::reader(sstable_data, None);
         assert!(reader.advance().unwrap());
         assert_eq!(reader.key(), b"a");
         assert!(!reader.advance().unwrap());

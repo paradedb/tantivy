@@ -1,28 +1,35 @@
 use std::io::{self, Read};
 use std::ops::Range;
+use std::sync::Arc;
 
 use common::OwnedBytes;
-#[cfg(feature = "zstd-compression")]
-use zstd::bulk::Decompressor;
 
 pub struct BlockReader {
     buffer: Vec<u8>,
     reader: OwnedBytes,
     next_readers: std::vec::IntoIter<OwnedBytes>,
     offset: usize,
+    decompressor_symbols: crate::DecompressorSymbols,
 }
 
 impl BlockReader {
-    pub fn new(reader: OwnedBytes) -> BlockReader {
+    pub fn new(
+        reader: OwnedBytes,
+        decompressor_symbols: crate::DecompressorSymbols,
+    ) -> BlockReader {
         BlockReader {
             buffer: Vec::new(),
             reader,
             next_readers: Vec::new().into_iter(),
             offset: 0,
+            decompressor_symbols,
         }
     }
 
-    pub fn from_multiple_blocks(readers: Vec<OwnedBytes>) -> BlockReader {
+    pub fn from_multiple_blocks(
+        readers: Vec<OwnedBytes>,
+        decompressor_symbols: crate::DecompressorSymbols,
+    ) -> BlockReader {
         let mut next_readers = readers.into_iter();
         let reader = next_readers.next().unwrap_or_else(OwnedBytes::empty);
         BlockReader {
@@ -30,6 +37,7 @@ impl BlockReader {
             reader,
             next_readers,
             offset: 0,
+            decompressor_symbols,
         }
     }
 
@@ -83,21 +91,14 @@ impl BlockReader {
                 ));
             }
             if compress == 1 {
-                #[cfg(feature = "zstd-compression")]
-                {
-                    let required_capacity =
-                        Decompressor::upper_bound(&self.reader[..block_len]).unwrap_or(1024 * 1024);
-                    self.buffer.reserve(required_capacity);
-                    Decompressor::new()?
-                        .decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
-
+                if let Some(symbols) = self.decompressor_symbols.as_ref() {
+                    let decompressor = fsst::Decompressor::new(symbols);
+                    self.buffer = decompressor.decompress(&self.reader[..block_len]);
                     self.reader.advance(block_len);
-                }
-
-                if cfg!(not(feature = "zstd-compression")) {
+                } else {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
-                        "zstd-compression feature is not enabled",
+                        "fsst compression used but no dictionary was loaded",
                     ));
                 }
             } else {

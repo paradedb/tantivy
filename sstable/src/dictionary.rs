@@ -45,6 +45,7 @@ pub struct Dictionary<TSSTable: SSTable = VoidSSTable> {
     pub sstable_index: SSTableIndex,
     num_bytes: ByteCount,
     num_terms: u64,
+    decompressor_symbols: crate::DecompressorSymbols,
     phantom_data: PhantomData<TSSTable>,
 }
 
@@ -91,12 +92,19 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(TSSTable::writer(wrt))
     }
 
+    pub fn builder_with_sample<W: io::Write>(
+        wrt: W,
+        sample: &[&[u8]],
+    ) -> io::Result<crate::Writer<W, TSSTable::ValueWriter>> {
+        Ok(TSSTable::writer_with_sample(wrt, sample))
+    }
+
     pub(crate) fn sstable_reader_block(
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<Reader<TSSTable::ValueReader>> {
         let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
-        Ok(TSSTable::reader(data))
+        Ok(TSSTable::reader(data, self.decompressor_symbols.clone()))
     }
 
     pub(crate) async fn sstable_delta_reader_for_key_range_async(
@@ -110,7 +118,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         if match_all {
             let slice = self.file_slice_for_range(key_range, limit);
             let data = slice.read_bytes_async().await?;
-            Ok(TSSTable::delta_reader(data))
+            Ok(TSSTable::delta_reader(
+                data,
+                self.decompressor_symbols.clone(),
+            ))
         } else {
             let blocks = stream::iter(self.get_block_iterator_for_range_and_automaton(
                 key_range,
@@ -125,7 +136,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 .buffered(5)
                 .try_collect::<Vec<_>>()
                 .await?;
-            Ok(DeltaReader::from_multiple_blocks(data))
+            Ok(DeltaReader::from_multiple_blocks(
+                data,
+                self.decompressor_symbols.clone(),
+            ))
         }
     }
 
@@ -139,7 +153,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         if match_all {
             let slice = self.file_slice_for_range(key_range, limit);
             let data = slice.read_bytes()?;
-            Ok(TSSTable::delta_reader(data))
+            Ok(TSSTable::delta_reader(
+                data,
+                self.decompressor_symbols.clone(),
+            ))
         } else {
             // if operations are sync, we assume latency is almost null, and there is no point in
             // merging across holes
@@ -147,7 +164,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             let data = blocks
                 .map(|block_addr| self.sstable_slice.read_bytes_slice(block_addr.byte_range))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(DeltaReader::from_multiple_blocks(data))
+            Ok(DeltaReader::from_multiple_blocks(
+                data,
+                self.decompressor_symbols.clone(),
+            ))
         }
     }
 
@@ -156,7 +176,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         block_addr: BlockAddr,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
-        Ok(TSSTable::delta_reader(data))
+        Ok(TSSTable::delta_reader(
+            data,
+            self.decompressor_symbols.clone(),
+        ))
     }
 
     pub(crate) async fn sstable_delta_reader_block_async(
@@ -167,7 +190,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             .sstable_slice
             .read_bytes_slice_async(block_addr.byte_range)
             .await?;
-        Ok(TSSTable::delta_reader(data))
+        Ok(TSSTable::delta_reader(
+            data,
+            self.decompressor_symbols.clone(),
+        ))
     }
 
     /// This function returns a file slice covering a set of sstable blocks
@@ -280,11 +306,54 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
         let num_bytes = term_dictionary_file.num_bytes();
-        let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
-        let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes()?;
-        let index_offset = u64::deserialize(&mut footer_len_bytes)?;
-        let num_terms = u64::deserialize(&mut footer_len_bytes)?;
-        let version = u32::deserialize(&mut footer_len_bytes)?;
+        let (_, version_slice) = term_dictionary_file.clone().split_from_end(4);
+        let mut version_bytes: OwnedBytes = version_slice.read_bytes()?;
+        let version = u32::deserialize(&mut version_bytes)?;
+
+        let footer_len = match version {
+            2 | 3 => 20, // index_offset (8), num_terms (8), version (4)
+            4 => 28,     // index_offset (8), num_terms (8), fsst_dict_offset (8), version (4)
+            _ => {
+                return Err(io::Error::other(format!(
+                    "Unsupported sstable version, expected one of [2, 3, 4], found {version}"
+                )));
+            }
+        };
+
+        // Re-read with full footer length
+        let (mut main_slice, footer_slice) = term_dictionary_file.split_from_end(footer_len);
+        let mut footer_bytes: OwnedBytes = footer_slice.read_bytes()?;
+
+        let index_offset = u64::deserialize(&mut footer_bytes)?;
+        let num_terms = u64::deserialize(&mut footer_bytes)?;
+
+        let mut fsst_dict_offset = 0u64;
+        if version == 4 {
+            fsst_dict_offset = u64::deserialize(&mut footer_bytes)?;
+        }
+
+        let mut decompressor_symbols = None;
+        if fsst_dict_offset > 0 {
+            let (new_main_slice, dict_slice) = main_slice.split(fsst_dict_offset as usize);
+            main_slice = new_main_slice;
+            let dict_owned_bytes = dict_slice.read_bytes()?;
+            let mut dict_bytes = dict_owned_bytes.as_slice();
+
+            let n_symbols = u32::deserialize(&mut dict_bytes)?;
+            let mut loaded_symbols = Vec::with_capacity(256 + n_symbols as usize);
+            // Populate escape bytes
+            for i in 0..=255 {
+                loaded_symbols.push(fsst::Symbol::from_u8(i as u8));
+            }
+            for _ in 0..n_symbols {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&dict_bytes[..8]);
+                dict_bytes = &dict_bytes[8..];
+                loaded_symbols.push(fsst::Symbol::from_slice(&buf));
+            }
+            decompressor_symbols = Some(Arc::new(loaded_symbols));
+        }
+
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
         let sstable_index_bytes = index_slice.read_bytes()?;
 
@@ -294,7 +363,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                     io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
                 })?,
             ),
-            3 => {
+            3 | 4 => {
                 let (sstable_index_bytes, mut footerv3_len_bytes) = sstable_index_bytes.rsplit(8);
                 let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
                 if store_offset != 0 {
@@ -311,7 +380,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             }
             _ => {
                 return Err(io::Error::other(format!(
-                    "Unsupported sstable version, expected one of [2, 3], found {version}"
+                    "Unsupported sstable version, expected one of [2, 3, 4], found {version}"
                 )));
             }
         };
@@ -321,6 +390,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             sstable_index,
             num_bytes,
             num_terms,
+            decompressor_symbols,
             phantom_data: PhantomData,
         })
     }

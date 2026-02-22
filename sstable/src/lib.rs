@@ -66,8 +66,20 @@ use crate::value::{RangeValueReader, RangeValueWriter};
 
 pub type TermOrdinal = u64;
 
+/// A shared, optional dictionary of symbols used for FSST decompression.
+///
+/// This is `Option` because a block or SSTable might not be compressed at all
+/// (e.g. if the original input sample was too small to warrant the overhead
+/// of training the FSST compressor). When `None`, the block readers will read
+/// the raw bytes without attempting decompression.
+///
+/// The inner `Vec<fsst::Symbol>` holds the exact mapping of byte-codes to
+/// string segments learned during indexing. Because the dictionary is shared
+/// identically across all blocks in a single `SSTable`, it is wrapped in an `Arc`.
+pub type DecompressorSymbols = Option<std::sync::Arc<Vec<fsst::Symbol>>>;
+
 const DEFAULT_KEY_CAPACITY: usize = 50;
-const SSTABLE_VERSION: u32 = 3;
+const SSTABLE_VERSION: u32 = 4;
 
 /// Given two byte string returns the length of
 /// the longest common prefix.
@@ -90,35 +102,49 @@ pub trait SSTable: Sized {
     type ValueWriter: ValueWriter<Value = Self::Value>;
 
     fn delta_writer<W: io::Write>(write: W) -> DeltaWriter<W, Self::ValueWriter> {
-        DeltaWriter::new(write)
+        DeltaWriter::new(write, None)
     }
 
     fn writer<W: io::Write>(wrt: W) -> Writer<W, Self::ValueWriter> {
         Writer::new(wrt)
     }
 
-    fn delta_reader(reader: OwnedBytes) -> DeltaReader<Self::ValueReader> {
-        DeltaReader::new(reader)
+    fn writer_with_sample<W: io::Write>(wrt: W, sample: &[&[u8]]) -> Writer<W, Self::ValueWriter> {
+        Writer::with_sample(wrt, sample)
     }
 
-    fn reader(reader: OwnedBytes) -> Reader<Self::ValueReader> {
+    fn delta_reader(
+        reader: OwnedBytes,
+        decompressor_symbols: DecompressorSymbols,
+    ) -> DeltaReader<Self::ValueReader> {
+        DeltaReader::new(reader, decompressor_symbols)
+    }
+
+    fn reader(
+        reader: OwnedBytes,
+        decompressor_symbols: DecompressorSymbols,
+    ) -> Reader<Self::ValueReader> {
         Reader {
             key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
-            delta_reader: Self::delta_reader(reader),
+            delta_reader: Self::delta_reader(reader, decompressor_symbols),
         }
     }
 
     /// Returns an empty static reader.
     fn create_empty_reader() -> Reader<Self::ValueReader> {
-        Self::reader(OwnedBytes::empty())
+        Self::reader(OwnedBytes::empty(), None)
     }
 
     fn merge<W: io::Write, M: ValueMerger<Self::Value>>(
-        io_readers: Vec<OwnedBytes>,
+        io_readers: Vec<OwnedBytes>, /* Warning: this function signature might need updating if
+                                      * merge expects decompressors */
         w: W,
         merger: M,
     ) -> io::Result<()> {
-        let readers: Vec<_> = io_readers.into_iter().map(Self::reader).collect();
+        let readers: Vec<_> = io_readers
+            .into_iter()
+            .map(|r| Self::reader(r, None))
+            .collect();
         let writer = Self::writer(w);
         merge::merge_sstable::<Self, _, _>(readers, writer, merger)
     }
@@ -224,6 +250,7 @@ where W: io::Write
     delta_writer: DeltaWriter<W, TValueWriter>,
     num_terms: u64,
     first_ordinal_of_the_block: u64,
+    compressor: Option<fsst::Compressor>,
 }
 
 impl<W, TValueWriter> Writer<W, TValueWriter>
@@ -239,14 +266,40 @@ where
         Ok(Self::new(wrt))
     }
 
+    #[doc(hidden)]
+    pub fn create_with_sample(wrt: W, sample: &[&[u8]]) -> io::Result<Self> {
+        Ok(Self::with_sample(wrt, sample))
+    }
+
     /// Creates a new `TermDictionaryBuilder`.
     pub fn new(wrt: W) -> Self {
+        Self::with_compressor(wrt, None)
+    }
+
+    /// Creates a new `TermDictionaryBuilder` with an FSST compressor trained on the sample.
+    pub fn with_sample(wrt: W, sample: &[&[u8]]) -> Self {
+        let compressor = if sample.is_empty() || sample.iter().all(|s| s.is_empty()) {
+            None
+        } else {
+            let flat_sample: Vec<u8> = sample.iter().flat_map(|s| s.iter().copied()).collect();
+            if flat_sample.len() < 2048 {
+                None
+            } else {
+                Some(fsst::Compressor::train(&flat_sample))
+            }
+        };
+        Self::with_compressor(wrt, compressor)
+    }
+
+    /// Creates a new `TermDictionaryBuilder` with the given FSST compressor.
+    pub fn with_compressor(wrt: W, compressor: Option<fsst::Compressor>) -> Self {
         Writer {
             previous_key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
             num_terms: 0u64,
             index_builder: SSTableIndexBuilder::default(),
-            delta_writer: DeltaWriter::new(wrt),
+            delta_writer: DeltaWriter::new(wrt, compressor.clone()),
             first_ordinal_of_the_block: 0u64,
+            compressor,
         }
     }
 
@@ -352,8 +405,23 @@ where
 
         let fst_len: u64 = self.index_builder.serialize(&mut wrt)?;
         wrt.write_all(&fst_len.to_le_bytes())?;
+
+        let mut fsst_dict_offset = 0u64;
+        if let Some(compressor) = self.compressor {
+            fsst_dict_offset = wrt.written_bytes() as u64;
+            let symbols = compressor.symbol_table();
+            let n_symbols = (symbols.len() - 256) as u32;
+            wrt.write_all(&n_symbols.to_le_bytes())?;
+            for symbol in &symbols[256..] {
+                let mut buf = [0u8; 8];
+                buf[..symbol.len()].copy_from_slice(symbol.as_slice());
+                wrt.write_all(&buf)?;
+            }
+        }
+
         wrt.write_all(&offset.to_le_bytes())?;
         wrt.write_all(&self.num_terms.to_le_bytes())?;
+        wrt.write_all(&fsst_dict_offset.to_le_bytes())?;
 
         SSTABLE_VERSION.serialize(&mut wrt)?;
 
@@ -403,7 +471,7 @@ mod test {
             assert!(sstable_writer.finish().is_ok());
         }
         let buffer = OwnedBytes::new(buffer);
-        let mut sstable_reader = VoidSSTable::reader(buffer);
+        let mut sstable_reader = VoidSSTable::reader(buffer, None);
         assert!(sstable_reader.advance().unwrap());
         assert_eq!(sstable_reader.key(), &long_key[..]);
         assert!(sstable_reader.advance().unwrap());
@@ -435,11 +503,12 @@ mod test {
                 0, 0, 0, 0, 0, 0, 0, 0, // fst length
                 16, 0, 0, 0, 0, 0, 0, 0, // index start offset
                 3, 0, 0, 0, 0, 0, 0, 0, // num term
-                3, 0, 0, 0, // version
+                0, 0, 0, 0, 0, 0, 0, 0, // fsst_dict_offset
+                4, 0, 0, 0, // version
             ]
         );
         let buffer = OwnedBytes::new(buffer);
-        let mut sstable_reader = VoidSSTable::reader(buffer);
+        let mut sstable_reader = VoidSSTable::reader(buffer, None);
         assert!(sstable_reader.advance().unwrap());
         assert_eq!(sstable_reader.key(), &[17u8]);
         assert!(sstable_reader.advance().unwrap());
@@ -506,7 +575,7 @@ mod test {
         writer.insert(b"gogo", &4324234234234234u64)?;
         writer.finish()?;
         let buffer = OwnedBytes::new(buffer);
-        let mut reader = MonotonicU64SSTable::reader(buffer);
+        let mut reader = MonotonicU64SSTable::reader(buffer, None);
         assert!(reader.advance()?);
         assert_eq!(reader.key(), b"abcd");
         assert_eq!(reader.value(), &1u64);

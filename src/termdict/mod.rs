@@ -115,6 +115,15 @@ impl TermDictionary {
         self.0.term_ord(key)
     }
 
+    /// Converts an iterator of ordinals to an iterator of term.
+    pub fn sorted_ords_to_term_cb<F: FnMut(&[u8]) -> io::Result<()>>(
+        &self,
+        ords: impl Iterator<Item = TermOrdinal>,
+        cb: F,
+    ) -> io::Result<bool> {
+        self.0.sorted_ords_to_term_cb(ords, cb)
+    }
+
     /// Stores the term associated with a given term ordinal in
     /// a `bytes` buffer.
     ///
@@ -199,6 +208,15 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     /// Creates a new `TermDictionaryBuilder`
     pub fn create(w: W) -> io::Result<Self> {
         InnerTermDictBuilder::create(w).map(TermDictionaryBuilder)
+    }
+
+    /// Creates a new `TermDictionaryBuilder` with a sample
+    ///
+    /// When the `quickwit` feature is enabled, this sample is used to train an FSST compressor for
+    /// block-level string compression in the `sstable` backend. When the default `fst` backend
+    /// is used, the sample is ignored.
+    pub fn create_with_sample(w: W, sample: &[&[u8]]) -> io::Result<Self> {
+        InnerTermDictBuilder::create_with_sample(w, sample).map(TermDictionaryBuilder)
     }
 
     /// Inserts a `(key, value)` pair in the term dictionary.

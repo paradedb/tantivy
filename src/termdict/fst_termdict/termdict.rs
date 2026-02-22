@@ -40,6 +40,11 @@ where W: Write
         })
     }
 
+    /// Creates a new `TermDictionaryBuilder` with a sample.
+    pub fn create_with_sample(w: W, _sample: &[&[u8]]) -> io::Result<Self> {
+        Self::create(w)
+    }
+
     /// Inserts a `(key, value)` pair in the term dictionary.
     ///
     /// *Keys have to be inserted in order.*
@@ -156,6 +161,22 @@ impl TermDictionary {
     /// Returns the ordinal associated with a given term.
     pub fn term_ord<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermOrdinal>> {
         Ok(self.fst_index.get(key))
+    }
+
+    /// Converts an iterator of ordinals to an iterator of term.
+    pub fn sorted_ords_to_term_cb<F: FnMut(&[u8]) -> io::Result<()>>(
+        &self,
+        ords: impl Iterator<Item = TermOrdinal>,
+        mut cb: F,
+    ) -> io::Result<bool> {
+        let mut bytes = Vec::new();
+        for ord in ords {
+            if !self.ord_to_term(ord, &mut bytes)? {
+                return Ok(false);
+            }
+            cb(&bytes)?;
+        }
+        Ok(true)
     }
 
     /// Stores the term associated with a given term ordinal in

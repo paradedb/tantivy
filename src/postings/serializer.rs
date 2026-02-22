@@ -75,6 +75,7 @@ impl InvertedIndexSerializer {
         field: Field,
         total_num_tokens: u64,
         fieldnorm_reader: Option<FieldNormReader>,
+        sample: &[&[u8]],
     ) -> io::Result<FieldSerializer<'_>> {
         let field_entry: &FieldEntry = self.schema.get_field_entry(field);
         let term_dictionary_write = self.terms_write.for_field(field);
@@ -88,6 +89,7 @@ impl InvertedIndexSerializer {
             postings_write,
             positions_write,
             fieldnorm_reader,
+            sample,
         )
     }
 
@@ -120,12 +122,14 @@ impl<'a> FieldSerializer<'a> {
         postings_write: &'a mut CountingWriter<WritePtr>,
         positions_write: &'a mut CountingWriter<WritePtr>,
         fieldnorm_reader: Option<FieldNormReader>,
+        sample: &[&[u8]],
     ) -> io::Result<FieldSerializer<'a>> {
         total_num_tokens.serialize(postings_write)?;
         let index_record_option = field_type
             .index_record_option()
             .unwrap_or(IndexRecordOption::Basic);
-        let term_dictionary_builder = TermDictionaryBuilder::create(term_dictionary_write)?;
+        let term_dictionary_builder =
+            TermDictionaryBuilder::create_with_sample(term_dictionary_write, sample)?;
         let average_fieldnorm = fieldnorm_reader
             .as_ref()
             .map(|ff_reader| total_num_tokens as Score / ff_reader.num_docs() as Score)
