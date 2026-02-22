@@ -107,21 +107,18 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(TSSTable::reader(data, self.decompressor_symbols.clone()))
     }
 
-    pub(crate) async fn sstable_delta_reader_for_key_range_async(
+    pub(crate) async fn sstable_reader_for_key_range_async(
         &self,
         key_range: impl RangeBounds<[u8]>,
         limit: Option<u64>,
         automaton: &impl Automaton,
         merge_holes_under_bytes: usize,
-    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
+    ) -> io::Result<Reader<TSSTable::ValueReader>> {
         let match_all = automaton.will_always_match(&automaton.start());
         if match_all {
             let slice = self.file_slice_for_range(key_range, limit);
             let data = slice.read_bytes_async().await?;
-            Ok(TSSTable::delta_reader(
-                data,
-                self.decompressor_symbols.clone(),
-            ))
+            Ok(TSSTable::reader(data, self.decompressor_symbols.clone()))
         } else {
             let blocks = stream::iter(self.get_block_iterator_for_range_and_automaton(
                 key_range,
@@ -136,27 +133,24 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 .buffered(5)
                 .try_collect::<Vec<_>>()
                 .await?;
-            Ok(DeltaReader::from_multiple_blocks(
+            Ok(Reader::from_multiple_blocks(
                 data,
                 self.decompressor_symbols.clone(),
             ))
         }
     }
 
-    pub(crate) fn sstable_delta_reader_for_key_range(
+    pub(crate) fn sstable_reader_for_key_range(
         &self,
         key_range: impl RangeBounds<[u8]>,
         limit: Option<u64>,
         automaton: &impl Automaton,
-    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
+    ) -> io::Result<Reader<TSSTable::ValueReader>> {
         let match_all = automaton.will_always_match(&automaton.start());
         if match_all {
             let slice = self.file_slice_for_range(key_range, limit);
             let data = slice.read_bytes()?;
-            Ok(TSSTable::delta_reader(
-                data,
-                self.decompressor_symbols.clone(),
-            ))
+            Ok(TSSTable::reader(data, self.decompressor_symbols.clone()))
         } else {
             // if operations are sync, we assume latency is almost null, and there is no point in
             // merging across holes
@@ -164,36 +158,22 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             let data = blocks
                 .map(|block_addr| self.sstable_slice.read_bytes_slice(block_addr.byte_range))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(DeltaReader::from_multiple_blocks(
+            Ok(Reader::from_multiple_blocks(
                 data,
                 self.decompressor_symbols.clone(),
             ))
         }
     }
 
-    pub fn sstable_delta_reader_block(
+    pub(crate) async fn sstable_reader_block_async(
         &self,
         block_addr: BlockAddr,
-    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
-        let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
-        Ok(TSSTable::delta_reader(
-            data,
-            self.decompressor_symbols.clone(),
-        ))
-    }
-
-    pub(crate) async fn sstable_delta_reader_block_async(
-        &self,
-        block_addr: BlockAddr,
-    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
+    ) -> io::Result<Reader<TSSTable::ValueReader>> {
         let data = self
             .sstable_slice
             .read_bytes_slice_async(block_addr.byte_range)
             .await?;
-        Ok(TSSTable::delta_reader(
-            data,
-            self.decompressor_symbols.clone(),
-        ))
+        Ok(TSSTable::reader(data, self.decompressor_symbols.clone()))
     }
 
     /// This function returns a file slice covering a set of sstable blocks
@@ -429,9 +409,9 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     fn decode_up_to_key<K: AsRef<[u8]>>(
         &self,
         key: K,
-        sstable_delta_reader: &mut DeltaReader<TSSTable::ValueReader>,
+        sstable_reader: &mut Reader<TSSTable::ValueReader>,
     ) -> io::Result<Option<TermOrdinal>> {
-        self.decode_up_to_or_next(key, sstable_delta_reader)
+        self.decode_up_to_or_next(key, sstable_reader)
             .map(|hit| hit.into_exact())
     }
     /// Decode a DeltaReader up to key, returning the number of terms traversed
@@ -440,45 +420,18 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     fn decode_up_to_or_next<K: AsRef<[u8]>>(
         &self,
         key: K,
-        sstable_delta_reader: &mut DeltaReader<TSSTable::ValueReader>,
+        sstable_reader: &mut Reader<TSSTable::ValueReader>,
     ) -> io::Result<TermOrdHit> {
         let mut term_ord = 0;
         let key_bytes = key.as_ref();
-        let mut ok_bytes = 0;
-        while sstable_delta_reader.advance()? {
-            let prefix_len = sstable_delta_reader.common_prefix_len();
-            let suffix = sstable_delta_reader.suffix();
 
-            match prefix_len.cmp(&ok_bytes) {
-                Ordering::Less => return Ok(TermOrdHit::Next(term_ord)), /* popped bytes already matched => too far */
-                Ordering::Equal => (),
-                Ordering::Greater => {
-                    // the ok prefix is less than current entry prefix => continue to next elem
-                    term_ord += 1;
-                    continue;
-                }
+        while sstable_reader.advance()? {
+            let current_key = sstable_reader.key();
+            match current_key.cmp(key_bytes) {
+                Ordering::Less => term_ord += 1,
+                Ordering::Equal => return Ok(TermOrdHit::Exact(term_ord)),
+                Ordering::Greater => return Ok(TermOrdHit::Next(term_ord)),
             }
-
-            // we have ok_bytes byte of common prefix, check if this key adds more
-            for (key_byte, suffix_byte) in key_bytes[ok_bytes..].iter().zip(suffix) {
-                match suffix_byte.cmp(key_byte) {
-                    Ordering::Less => break,          // byte too small
-                    Ordering::Equal => ok_bytes += 1, // new matching
-                    // byte
-                    Ordering::Greater => return Ok(TermOrdHit::Next(term_ord)), // too far
-                }
-            }
-
-            if ok_bytes == key_bytes.len() {
-                if prefix_len + suffix.len() == ok_bytes {
-                    return Ok(TermOrdHit::Exact(term_ord));
-                } else {
-                    // current key is a prefix of current element, not a match
-                    return Ok(TermOrdHit::Next(term_ord));
-                }
-            }
-
-            term_ord += 1;
         }
 
         Ok(TermOrdHit::Next(term_ord))
@@ -493,8 +446,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         };
 
         let first_ordinal = block_addr.first_ordinal;
-        let mut sstable_delta_reader = self.sstable_delta_reader_block(block_addr)?;
-        self.decode_up_to_key(key_bytes, &mut sstable_delta_reader)
+        let mut sstable_reader = self.sstable_reader_block(block_addr)?;
+        self.decode_up_to_key(key_bytes, &mut sstable_reader)
             .map(|opt| opt.map(|ord| ord + first_ordinal))
     }
 
@@ -509,8 +462,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         };
 
         let first_ordinal = block_addr.first_ordinal;
-        let mut sstable_delta_reader = self.sstable_delta_reader_block(block_addr)?;
-        self.decode_up_to_or_next(key_bytes, &mut sstable_delta_reader)
+        let mut sstable_reader = self.sstable_reader_block(block_addr)?;
+        self.decode_up_to_or_next(key_bytes, &mut sstable_reader)
             .map(|opt| opt.map(|ord| ord + first_ordinal))
     }
 
@@ -568,14 +521,14 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         let first_ordinal = block_addr.first_ordinal;
 
         // then search inside that block only
-        let mut sstable_delta_reader = self.sstable_delta_reader_block(block_addr)?;
+        let mut sstable_reader = self.sstable_reader_block(block_addr)?;
         for _ in first_ordinal..=ord {
-            if !sstable_delta_reader.advance()? {
+            if !sstable_reader.advance()? {
                 return Ok(false);
             }
-            bytes.truncate(sstable_delta_reader.common_prefix_len());
-            bytes.extend_from_slice(sstable_delta_reader.suffix());
         }
+        bytes.clear();
+        bytes.extend_from_slice(sstable_reader.key());
         Ok(true)
     }
 
@@ -592,23 +545,19 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         };
 
         // Open the block for the first ordinal.
-        let mut bytes = Vec::new();
         let mut current_block_addr = self.sstable_index.get_block_with_ord(ord);
-        let mut current_sstable_delta_reader =
-            self.sstable_delta_reader_block(current_block_addr.clone())?;
+        let mut current_sstable_reader = self.sstable_reader_block(current_block_addr.clone())?;
         let mut current_block_ordinal = current_block_addr.first_ordinal;
 
         loop {
             // move to the ord inside the current block
             while current_block_ordinal <= ord {
-                if !current_sstable_delta_reader.advance()? {
+                if !current_sstable_reader.advance()? {
                     return Ok(false);
                 }
-                bytes.truncate(current_sstable_delta_reader.common_prefix_len());
-                bytes.extend_from_slice(current_sstable_delta_reader.suffix());
                 current_block_ordinal += 1;
             }
-            cb(&bytes)?;
+            cb(current_sstable_reader.key())?;
 
             // fetch the next ordinal
             let Some(next_ord) = ords.next() else {
@@ -627,9 +576,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 if new_block_addr != current_block_addr {
                     current_block_addr = new_block_addr;
                     current_block_ordinal = current_block_addr.first_ordinal;
-                    current_sstable_delta_reader =
-                        self.sstable_delta_reader_block(current_block_addr.clone())?;
-                    bytes.clear();
+                    current_sstable_reader =
+                        self.sstable_reader_block(current_block_addr.clone())?;
                 }
                 ord = next_ord;
             } else {
@@ -657,7 +605,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// Lookups the value corresponding to the key.
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TSSTable::Value>> {
         if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref()) {
-            let sstable_reader = self.sstable_delta_reader_block(block_addr)?;
+            let sstable_reader = self.sstable_reader_block(block_addr)?;
             return self.do_get(key, sstable_reader);
         }
         Ok(None)
@@ -666,7 +614,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// Lookups the value corresponding to the key.
     pub async fn get_async<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TSSTable::Value>> {
         if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref()) {
-            let sstable_reader = self.sstable_delta_reader_block_async(block_addr).await?;
+            let sstable_reader = self.sstable_reader_block_async(block_addr).await?;
             return self.do_get(key, sstable_reader);
         }
         Ok(None)
@@ -675,7 +623,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     fn do_get<K: AsRef<[u8]>>(
         &self,
         key: K,
-        mut reader: DeltaReader<TSSTable::ValueReader>,
+        mut reader: Reader<TSSTable::ValueReader>,
     ) -> io::Result<Option<TSSTable::Value>> {
         if let Some(_ord) = self.decode_up_to_key(key, &mut reader)? {
             Ok(Some(reader.value().clone()))

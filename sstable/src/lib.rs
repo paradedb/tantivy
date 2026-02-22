@@ -126,6 +126,7 @@ pub trait SSTable: Sized {
     ) -> Reader<Self::ValueReader> {
         Reader {
             key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
+            decompressed_key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
             delta_reader: Self::delta_reader(reader, decompressor_symbols),
         }
     }
@@ -206,12 +207,32 @@ impl SSTable for VecU32ValueSSTable {
 /// SSTable reader.
 pub struct Reader<TValueReader> {
     key: Vec<u8>,
+    decompressed_key: Vec<u8>,
     delta_reader: DeltaReader<TValueReader>,
 }
 
 impl<TValueReader> Reader<TValueReader>
 where TValueReader: ValueReader
 {
+    pub fn empty() -> Self {
+        Reader {
+            key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
+            decompressed_key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
+            delta_reader: DeltaReader::empty(),
+        }
+    }
+
+    pub fn from_multiple_blocks(
+        reader: Vec<common::OwnedBytes>,
+        decompressor_symbols: crate::DecompressorSymbols,
+    ) -> Self {
+        Reader {
+            key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
+            decompressed_key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
+            delta_reader: DeltaReader::from_multiple_blocks(reader, decompressor_symbols),
+        }
+    }
+
     pub fn advance(&mut self) -> io::Result<bool> {
         if !self.delta_reader.advance()? {
             return Ok(false);
@@ -221,12 +242,21 @@ where TValueReader: ValueReader
         let new_len = common_prefix_len + suffix.len();
         self.key.resize(new_len, 0u8);
         self.key[common_prefix_len..].copy_from_slice(suffix);
+
+        if let Some(decompressor) = self.delta_reader.decompressor() {
+            self.decompressed_key = decompressor.decompress(&self.key);
+        }
+
         Ok(true)
     }
 
     #[inline(always)]
     pub fn key(&self) -> &[u8] {
-        &self.key
+        if self.delta_reader.decompressor().is_some() {
+            &self.decompressed_key
+        } else {
+            &self.key
+        }
     }
 
     #[inline(always)]
@@ -235,10 +265,12 @@ where TValueReader: ValueReader
     }
 }
 
-impl<TValueReader> AsRef<[u8]> for Reader<TValueReader> {
+impl<TValueReader> AsRef<[u8]> for Reader<TValueReader>
+where TValueReader: ValueReader
+{
     #[inline(always)]
     fn as_ref(&self) -> &[u8] {
-        &self.key
+        self.key()
     }
 }
 
@@ -251,6 +283,7 @@ where W: io::Write
     num_terms: u64,
     first_ordinal_of_the_block: u64,
     compressor: Option<fsst::Compressor>,
+    previous_compressed_key: Vec<u8>,
 }
 
 impl<W, TValueWriter> Writer<W, TValueWriter>
@@ -300,6 +333,7 @@ where
             delta_writer: DeltaWriter::new(wrt, compressor.clone()),
             first_ordinal_of_the_block: 0u64,
             compressor,
+            previous_compressed_key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
         }
     }
 
@@ -360,7 +394,18 @@ where
         );
         self.previous_key.resize(key.len(), 0u8);
         self.previous_key[keep_len..].copy_from_slice(&key[keep_len..]);
-        self.delta_writer.write_suffix(keep_len, &key[keep_len..]);
+
+        if let Some(compressor) = &self.compressor {
+            let compressed_key = compressor.compress(key);
+            let keep_compressed_len =
+                common_prefix_len(&self.previous_compressed_key, &compressed_key);
+            self.delta_writer
+                .write_suffix(keep_compressed_len, &compressed_key[keep_compressed_len..]);
+            self.previous_compressed_key = compressed_key;
+        } else {
+            self.delta_writer.write_suffix(keep_len, &key[keep_len..]);
+        }
+
         Ok(())
     }
 

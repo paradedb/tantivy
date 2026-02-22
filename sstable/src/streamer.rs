@@ -5,7 +5,7 @@ use tantivy_fst::Automaton;
 use tantivy_fst::automaton::AlwaysMatch;
 
 use crate::dictionary::Dictionary;
-use crate::{DeltaReader, SSTable, TermOrdinal};
+use crate::{Reader, SSTable, TermOrdinal};
 
 /// `StreamerBuilder` is a helper object used to define
 /// a range of terms that should be streamed.
@@ -80,25 +80,25 @@ where
         self
     }
 
-    fn delta_reader(&self) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
+    fn reader(&self) -> io::Result<Reader<TSSTable::ValueReader>> {
         let key_range = (
             bound_as_byte_slice(&self.lower),
             bound_as_byte_slice(&self.upper),
         );
         self.term_dict
-            .sstable_delta_reader_for_key_range(key_range, self.limit, &self.automaton)
+            .sstable_reader_for_key_range(key_range, self.limit, &self.automaton)
     }
 
-    async fn delta_reader_async(
+    async fn reader_async(
         &self,
         merge_holes_under_bytes: usize,
-    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
+    ) -> io::Result<Reader<TSSTable::ValueReader>> {
         let key_range = (
             bound_as_byte_slice(&self.lower),
             bound_as_byte_slice(&self.upper),
         );
         self.term_dict
-            .sstable_delta_reader_for_key_range_async(
+            .sstable_reader_for_key_range_async(
                 key_range,
                 self.limit,
                 &self.automaton,
@@ -107,9 +107,9 @@ where
             .await
     }
 
-    fn into_stream_given_delta_reader(
+    fn into_stream_given_reader(
         self,
-        delta_reader: DeltaReader<<TSSTable as SSTable>::ValueReader>,
+        reader: Reader<<TSSTable as SSTable>::ValueReader>,
     ) -> io::Result<Streamer<'a, TSSTable, A>> {
         let start_state = self.automaton.start();
         let start_key = bound_as_byte_slice(&self.lower);
@@ -127,7 +127,7 @@ where
         Ok(Streamer {
             automaton: self.automaton,
             states: vec![start_state],
-            delta_reader,
+            reader,
             key: Vec::new(),
             term_ord: first_term.checked_sub(1),
             lower_bound: self.lower,
@@ -147,15 +147,15 @@ where
         self,
         merge_holes_under_bytes: usize,
     ) -> io::Result<Streamer<'a, TSSTable, A>> {
-        let delta_reader = self.delta_reader_async(merge_holes_under_bytes).await?;
-        self.into_stream_given_delta_reader(delta_reader)
+        let reader = self.reader_async(merge_holes_under_bytes).await?;
+        self.into_stream_given_reader(reader)
     }
 
     /// Creates the stream corresponding to the range
     /// of terms defined using the `StreamerBuilder`.
     pub fn into_stream(self) -> io::Result<Streamer<'a, TSSTable, A>> {
-        let delta_reader = self.delta_reader()?;
-        self.into_stream_given_delta_reader(delta_reader)
+        let reader = self.reader()?;
+        self.into_stream_given_reader(reader)
     }
 }
 
@@ -169,7 +169,7 @@ where
 {
     automaton: A,
     states: Vec<A::State>,
-    delta_reader: crate::DeltaReader<TSSTable::ValueReader>,
+    reader: crate::Reader<TSSTable::ValueReader>,
     key: Vec<u8>,
     term_ord: Option<TermOrdinal>,
     lower_bound: Bound<Vec<u8>>,
@@ -185,7 +185,7 @@ where TSSTable: SSTable
         Streamer {
             automaton: AlwaysMatch,
             states: Vec::new(),
-            delta_reader: DeltaReader::empty(),
+            reader: Reader::empty(),
             key: Vec::new(),
             term_ord: None,
             lower_bound: Bound::Unbounded,
@@ -205,21 +205,30 @@ where
     /// Before the first call to `.advance()`, the stream
     /// is an uninitialized state.
     pub fn advance(&mut self) -> bool {
-        while self.delta_reader.advance().unwrap() {
+        while self.reader.advance().unwrap() {
             self.term_ord = Some(
                 self.term_ord
                     .map(|term_ord| term_ord + 1u64)
                     .unwrap_or(0u64),
             );
-            let common_prefix_len = self.delta_reader.common_prefix_len();
+
+            let next_key = self.reader.key();
+            let common_prefix_len = self
+                .key
+                .iter()
+                .zip(next_key.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+
             self.states.truncate(common_prefix_len + 1);
             self.key.truncate(common_prefix_len);
             let mut state: A::State = self.states.last().unwrap().clone();
-            for &b in self.delta_reader.suffix() {
+            for &b in &next_key[common_prefix_len..] {
                 state = self.automaton.accept(&state, b);
                 self.states.push(state.clone());
             }
-            self.key.extend_from_slice(self.delta_reader.suffix());
+            self.key.extend_from_slice(&next_key[common_prefix_len..]);
+
             let match_lower_bound = match &self.lower_bound {
                 Bound::Unbounded => true,
                 Bound::Included(lower_bound_key) => lower_bound_key[..] <= self.key[..],
@@ -277,7 +286,7 @@ where
     /// Calling `.value()` before the first call to `.advance()` returns
     /// `V::default()`.
     pub fn value(&self) -> &TSSTable::Value {
-        self.delta_reader.value()
+        self.reader.value()
     }
 
     /// Return the next `(key, value)` pair.
