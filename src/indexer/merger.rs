@@ -695,6 +695,10 @@ impl IndexMerger {
         for max_term_ord in &max_term_ords {
             total_terms += max_term_ord;
         }
+
+        // To train the global FSST compression dictionary for the merged segment without buffering
+        // all merged terms in memory, we extract a proportional sample (up to ~1000 terms)
+        // of specific evenly-spaced terms directly from the input segments' dictionaries.
         let sample_target = 1000u64.min(total_terms);
         let mut sample_bytes = Vec::new();
         if total_terms > 0 {
@@ -707,9 +711,11 @@ impl IndexMerger {
                 if segment_sample_target == 0 {
                     continue;
                 }
+                // Generate evenly spaced ordinals to sample from this segment
                 let step = (segment_terms / segment_sample_target).max(1);
                 let ords: Vec<u64> = (0..segment_terms).step_by(step as usize).collect();
                 let terms_dict = field_reader.terms();
+                // Extract only these specific terms directly from the blocks
                 terms_dict.sorted_ords_to_term_cb(ords.into_iter(), |bytes| {
                     sample_bytes.push(bytes.to_vec());
                     Ok(())

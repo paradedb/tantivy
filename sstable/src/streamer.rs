@@ -213,6 +213,11 @@ where
             );
 
             let next_key = self.reader.key();
+            // Since we implemented the fully compressed delta-encoding scheme,
+            // the `common_prefix_len` emitted by the `DeltaReader` is the compressed
+            // prefix length, which cannot be used for the uncompressed Automaton state machine!
+            // We must lazily decompress the key via `self.reader.key()` and calculate the
+            // uncompressed `common_prefix_len` ourselves.
             let common_prefix_len = self
                 .key
                 .iter()

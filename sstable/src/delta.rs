@@ -174,6 +174,11 @@ where TValueReader: value::ValueReader
         self.common_prefix_len = keep;
         let suffix_start = self.block_reader.offset();
         self.suffix_range = suffix_start..(suffix_start + add);
+
+        // Advance the BlockReader offset by `add` bytes, allowing `advance()`
+        // to effortlessly skip over the term suffix in a few CPU cycles.
+        // Zero memory allocation or decompression occurs here! Decompression
+        // is deferred lazily to `Reader::advance` and `Reader::key()`.
         self.block_reader.advance(add);
         true
     }
@@ -206,7 +211,7 @@ where TValueReader: value::ValueReader
     }
 
     #[inline(always)]
-    pub fn decompressor(&self) -> Option<fsst::Decompressor> {
+    pub fn decompressor(&self) -> Option<fsst::Decompressor<'_>> {
         self.block_reader
             .decompressor_symbols()
             .map(|s| fsst::Decompressor::new(s))

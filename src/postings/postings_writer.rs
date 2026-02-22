@@ -81,6 +81,10 @@ pub(crate) fn serialize_postings(
     let field_offsets = make_field_partition(&term_offsets);
     for (field, byte_offsets) in field_offsets {
         let terms_for_field = &term_offsets[byte_offsets.clone()];
+
+        // Take a uniform random sample of terms (e.g., up to ~1000 terms or 64KB) from this field's
+        // in-memory collected terms. This sample will be used to initialize the `sstable::Writer`
+        // and train a global FSST compression dictionary for this block.
         let mut sample = Vec::new();
         let mut sample_bytes = 0;
         let step = (terms_for_field.len() / 1000).max(1);

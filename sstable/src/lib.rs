@@ -395,10 +395,20 @@ where
         self.previous_key.resize(key.len(), 0u8);
         self.previous_key[keep_len..].copy_from_slice(&key[keep_len..]);
 
+        // If an FSST compressor is available, we compress the entire key before delta-encoding.
+        // This fully-compressed delta scheme (from COMPRESSED_DELTA.md) allows `DeltaReader`
+        // to maintain a compressed buffer and advance extremely quickly without performing
+        // any decompression during simple iteration.
         if let Some(compressor) = &self.compressor {
             let compressed_key = compressor.compress(key);
+
+            // FSST is a greedy compressor, so the compressed bytes of a prefix may differ
+            // from the prefix of the compressed string. Therefore, we must compute the
+            // `keep_len` by comparing the newly compressed key against the previously compressed
+            // key.
             let keep_compressed_len =
                 common_prefix_len(&self.previous_compressed_key, &compressed_key);
+
             self.delta_writer
                 .write_suffix(keep_compressed_len, &compressed_key[keep_compressed_len..]);
             self.previous_compressed_key = compressed_key;
@@ -451,6 +461,10 @@ where
         let fst_len: u64 = self.index_builder.serialize(&mut wrt)?;
         wrt.write_all(&fst_len.to_le_bytes())?;
 
+        // FSST_MIGRATION_DESIGN.md: Because FSST uses a relatively large dictionary (~2.3KB),
+        // storing a local dictionary per 4KB block adds unacceptable overhead. Thus, if a
+        // compressor was used for this SSTable, we serialize its dictionary globally here
+        // in the SSTable footer. It will be loaded once per SSTable by `Dictionary::open`.
         let mut fsst_dict_offset = 0u64;
         if let Some(compressor) = self.compressor {
             fsst_dict_offset = wrt.written_bytes() as u64;

@@ -72,6 +72,9 @@ impl DictionaryBuilder {
         // TODO Remove the allocation.
         let mut unordered_to_ord: Vec<OrderedId> = vec![OrderedId(0u32); terms.len()];
 
+        // Generate a random proportional sample of terms to train the global FSST compression
+        // dictionary. We pick uniformly up to ~1000 terms (max 64KB) to get a representative
+        // distribution of prefixes and suffixes.
         let mut sample = Vec::new();
         let mut sample_bytes = 0;
         let step = (terms.len() / 1000).max(1);

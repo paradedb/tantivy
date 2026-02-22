@@ -16,9 +16,7 @@ use tantivy_fst::automaton::AlwaysMatch;
 
 use crate::sstable_index_v3::SSTableIndexV3Empty;
 use crate::streamer::{Streamer, StreamerBuilder};
-use crate::{
-    BlockAddr, DeltaReader, Reader, SSTable, SSTableIndex, SSTableIndexV3, TermOrdinal, VoidSSTable,
-};
+use crate::{BlockAddr, Reader, SSTable, SSTableIndex, SSTableIndexV3, TermOrdinal, VoidSSTable};
 
 /// An SSTable is a sorted map that associates sorted `&[u8]` keys
 /// to any kind of typed values.
@@ -312,6 +310,9 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             fsst_dict_offset = u64::deserialize(&mut footer_bytes)?;
         }
 
+        // FSST_MIGRATION_DESIGN.md: Load the global FSST dictionary from the footer if present.
+        // This is shared identically by all blocks in this SSTable to avoid redundant memory
+        // overhead that would occur with a dictionary per 4KB block.
         let mut decompressor_symbols = None;
         if fsst_dict_offset > 0 {
             let (new_main_slice, dict_slice) = main_slice.split(fsst_dict_offset as usize);
@@ -422,6 +423,12 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         key: K,
         sstable_reader: &mut Reader<TSSTable::ValueReader>,
     ) -> io::Result<TermOrdHit> {
+        // PERF: In `COMPRESSED_DELTA.md`, we shifted to a fully compressed delta-encoding scheme.
+        // Because FSST does not preserve lexicographical order and the compressed form of a prefix
+        // does not match the prefix of a compressed full string, we cannot rely on the
+        // `common_prefix_len` for optimizations anymore. Therefore, `decode_up_to_or_next` must
+        // fully decompress the entire reconstructed `compressed_key` into a temporary buffer on
+        // every iteration via `sstable_reader.key()` to perform a standard Ord comparison.
         let mut term_ord = 0;
         let key_bytes = key.as_ref();
 
@@ -433,7 +440,6 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 Ordering::Greater => return Ok(TermOrdHit::Next(term_ord)),
             }
         }
-
         Ok(TermOrdHit::Next(term_ord))
     }
 

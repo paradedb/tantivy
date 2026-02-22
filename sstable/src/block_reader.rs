@@ -102,6 +102,11 @@ impl BlockReader {
                 ));
             }
 
+            // PERF: Per NEW_DESIGN.md, we no longer decompress the entire block upfront.
+            // We just slice the raw (potentially FSST-compressed) bytes into `self.buffer`
+            // and defer string-level decompression to `Reader::advance()`/`key()`.
+            // This drastically reduces memory allocations and enables zero-allocation term
+            // skipping.
             self.buffer.resize(block_len, 0u8);
             self.reader.read_exact(&mut self.buffer[..])?;
 

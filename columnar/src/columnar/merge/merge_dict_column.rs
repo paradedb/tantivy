@@ -180,6 +180,11 @@ fn serialize_merged_dict(
     merge_row_order: &MergeRowOrder,
     output: &mut impl Write,
 ) -> io::Result<TermOrdinalMapping> {
+    // In order to train a global FSST compression dictionary for the merged segment,
+    // we need a representative sample of strings. We cannot buffer all merged strings
+    // in memory. Instead, we compute a proportional sample size for each input segment
+    // and extract specific evenly-spaced terms directly from their blocks using
+    // `sorted_ords_to_term_cb`.
     let mut total_terms = 0;
     for bytes_column in bytes_columns.iter().flatten() {
         total_terms += bytes_column.dictionary.num_terms() as u64;
@@ -197,8 +202,11 @@ fn serialize_merged_dict(
             if segment_sample_target == 0 {
                 continue;
             }
+            // Generate a list of evenly spaced ordinals to sample from this segment
             let step = (segment_terms / segment_sample_target).max(1);
             let ords: Vec<u64> = (0..segment_terms).step_by(step as usize).collect();
+
+            // Efficiently extract the exact terms at those ordinals to train the FSST compressor
             bytes_column
                 .dictionary
                 .sorted_ords_to_term_cb(ords.into_iter(), |bytes| {
@@ -209,6 +217,7 @@ fn serialize_merged_dict(
     }
     let sample_slices: Vec<&[u8]> = sample_bytes.iter().map(|b| b.as_slice()).collect();
 
+    // Initialize the writer with the sampled slices so it can train the FSST global dictionary.
     let mut sstable_builder = sstable::VoidSSTable::writer_with_sample(output, &sample_slices);
     let term_ord_mapping = match merge_row_order {
         MergeRowOrder::Stack(_) => merge_dict_and_compute_term_ord_mapping(
