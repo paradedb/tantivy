@@ -468,6 +468,7 @@ where
             );
             self.first_ordinal_of_the_block = self.num_terms;
             self.previous_key.clear();
+            self.previous_compressed_key.clear();
         }
         Ok(())
     }
