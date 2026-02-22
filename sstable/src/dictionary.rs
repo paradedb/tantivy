@@ -321,8 +321,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             let mut dict_bytes = dict_owned_bytes.as_slice();
 
             let n_symbols = u32::deserialize(&mut dict_bytes)?;
-            let mut loaded_symbols = Vec::with_capacity(n_symbols as usize);
-            let mut loaded_lengths = Vec::with_capacity(n_symbols as usize);
+            let mut loaded_symbols = Vec::with_capacity(255);
+            let mut loaded_lengths = Vec::with_capacity(255);
 
             for _ in 0..n_symbols {
                 let mut buf = [0u8; 8];
@@ -332,6 +332,18 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 loaded_symbols.push(symbol);
                 loaded_lengths.push(symbol.len() as u8);
             }
+
+            // Pad the array to exactly 255 elements.
+            // fsst-rs `decompress_into` uses `get_unchecked` on the symbol table using bytes from
+            // the compressed stream. If the data is corrupted or mismatched (e.g. from an old
+            // or different segment during merging), it will cause an out-of-bounds memory read
+            // panic/UB. Padding to 255 ensures any valid `u8` (excluding escape `255`) resolves
+            // safely to dummy data.
+            while loaded_symbols.len() < 255 {
+                loaded_symbols.push(fsst::Symbol::from_slice(&[0; 8]));
+                loaded_lengths.push(1);
+            }
+
             decompressor_symbols = Some(Arc::new((loaded_symbols, loaded_lengths)));
         }
 
