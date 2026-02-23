@@ -59,22 +59,26 @@ impl SSTableIndex {
         self.locate_with_key(key).and_then(|id| self.get_block(id))
     }
 
-    pub(crate) fn locate_with_ord(&self, ord: TermOrdinal) -> usize {
-        let pos = self
-            .blocks
+    pub(crate) fn locate_with_ord(&self, lower_bound_block: usize, ord: TermOrdinal) -> usize {
+        let pos = self.blocks[lower_bound_block..]
             .binary_search_by_key(&ord, |block| block.block_addr.first_ordinal);
 
         match pos {
-            Ok(pos) => pos,
+            Ok(pos) => lower_bound_block + pos,
             // Err(0) can't happen as the sstable starts with ordinal zero
-            Err(pos) => pos - 1,
+            Err(pos) => lower_bound_block + pos.saturating_sub(1),
         }
     }
 
     /// Get the [`BlockAddr`] of the block containing the `ord`-th term.
-    pub(crate) fn get_block_with_ord(&self, ord: TermOrdinal) -> BlockAddr {
+    pub(crate) fn get_block_with_ord(
+        &self,
+        lower_bound_block: usize,
+        ord: TermOrdinal,
+    ) -> (usize, BlockAddr) {
         // locate_with_ord always returns an index within range
-        self.get_block(self.locate_with_ord(ord)).unwrap()
+        let id = self.locate_with_ord(lower_bound_block, ord);
+        (id, self.get_block(id).unwrap())
     }
 
     pub(crate) fn get_block_for_automaton<'a>(

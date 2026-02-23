@@ -225,7 +225,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             let second_block_id = first_block_id.map(|id| id + 1).unwrap_or(0);
             if let Some(block_addr) = self.sstable_index.get_block(second_block_id) {
                 let ordinal_limit = block_addr.first_ordinal + limit;
-                let last_block_limit = self.sstable_index.locate_with_ord(ordinal_limit);
+                // TODO: use a known lower bound block here to optimize search
+                let last_block_limit = self.sstable_index.locate_with_ord(0, ordinal_limit);
                 if let Some(last_block_id) = last_block_id {
                     Some(last_block_id.min(last_block_limit))
                 } else {
@@ -535,7 +536,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// the buffer may be modified.
     pub fn ord_to_term(&self, ord: TermOrdinal, bytes: &mut Vec<u8>) -> io::Result<bool> {
         // find block in which the term would be
-        let block_addr = self.sstable_index.get_block_with_ord(ord);
+        // TODO: use a known lower bound block here to optimize search
+        let (_block_id, block_addr) = self.sstable_index.get_block_with_ord(0, ord);
         let first_ordinal = block_addr.first_ordinal;
 
         // then search inside that block only
@@ -563,7 +565,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         };
 
         // Open the block for the first ordinal.
-        let mut current_block_addr = self.sstable_index.get_block_with_ord(ord);
+        let (mut current_block_id, mut current_block_addr) =
+            self.sstable_index.get_block_with_ord(0, ord);
         let mut current_sstable_reader = self.sstable_reader_block(current_block_addr.clone())?;
         let mut current_block_ordinal = current_block_addr.first_ordinal;
 
@@ -590,8 +593,11 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 panic!("Ordinals were not sorted: received {next_ord} after {ord}");
             } else if next_ord > ord {
                 // check if block changed for new term_ord
-                let new_block_addr = self.sstable_index.get_block_with_ord(next_ord);
-                if new_block_addr != current_block_addr {
+                let (new_block_id, new_block_addr) = self
+                    .sstable_index
+                    .get_block_with_ord(current_block_id, next_ord);
+                if new_block_id != current_block_id {
+                    current_block_id = new_block_id;
                     current_block_addr = new_block_addr;
                     current_block_ordinal = current_block_addr.first_ordinal;
                     current_sstable_reader =
@@ -607,7 +613,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// Returns the number of terms in the dictionary.
     pub fn term_info_from_ord(&self, term_ord: TermOrdinal) -> io::Result<Option<TSSTable::Value>> {
         // find block in which the term would be
-        let block_addr = self.sstable_index.get_block_with_ord(term_ord);
+        // TODO: use a known lower bound block here to optimize search
+        let (_block_id, block_addr) = self.sstable_index.get_block_with_ord(0, term_ord);
         let first_ordinal = block_addr.first_ordinal;
 
         // then search inside that block only
@@ -765,7 +772,7 @@ mod tests {
         let dictionary = Dictionary::<MonotonicU64SSTable>::open(slice).unwrap();
 
         // if the last block is id 0, tests are meaningless
-        assert_ne!(dictionary.sstable_index.locate_with_ord(u64::MAX), 0);
+        assert_ne!(dictionary.sstable_index.locate_with_ord(0, u64::MAX), 0);
         assert_eq!(dictionary.num_terms(), 0x3ffff);
         (dictionary, table)
     }
@@ -908,7 +915,7 @@ mod tests {
     fn test_ord_term_conversion() {
         let (dic, slice) = make_test_sstable();
 
-        let block = dic.sstable_index.get_block_with_ord(100_000);
+        let (_block_id, block) = dic.sstable_index.get_block_with_ord(0, 100_000);
         slice.restrict(block.byte_range);
 
         let mut res = Vec::new();
@@ -934,7 +941,11 @@ mod tests {
 
         // end of a block
         let ordinal = block.first_ordinal - 1;
-        let new_range = dic.sstable_index.get_block_with_ord(ordinal).byte_range;
+        let new_range = dic
+            .sstable_index
+            .get_block_with_ord(0, ordinal)
+            .1
+            .byte_range;
         slice.restrict(new_range);
         assert!(dic.ord_to_term(ordinal, &mut res).unwrap());
         assert_eq!(res, format!("{ordinal:05X}").into_bytes());
@@ -944,7 +955,7 @@ mod tests {
 
         // before first block
         // 1st block must be loaded for key-related operations
-        let block = dic.sstable_index.get_block_with_ord(0);
+        let (_block_id, block) = dic.sstable_index.get_block_with_ord(0, 0);
         slice.restrict(block.byte_range);
 
         assert!(dic.get(b"$$$").unwrap().is_none());
@@ -953,7 +964,11 @@ mod tests {
         // after last block
         // last block must be loaded for ord related operations
         let ordinal = 0x40000 + 10;
-        let new_range = dic.sstable_index.get_block_with_ord(ordinal).byte_range;
+        let new_range = dic
+            .sstable_index
+            .get_block_with_ord(0, ordinal)
+            .1
+            .byte_range;
         slice.restrict(new_range);
         assert!(!dic.ord_to_term(ordinal, &mut res).unwrap());
         assert!(dic.term_info_from_ord(ordinal).unwrap().is_none());

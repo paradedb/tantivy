@@ -49,20 +49,33 @@ impl SSTableIndex {
         }
     }
 
-    pub(crate) fn locate_with_ord(&self, ord: TermOrdinal) -> u64 {
+    pub(crate) fn locate_with_ord(&self, lower_bound_block: u64, ord: TermOrdinal) -> u64 {
         match self {
-            SSTableIndex::V2(v2_index) => v2_index.locate_with_ord(ord) as u64,
-            SSTableIndex::V3(v3_index) => v3_index.locate_with_ord(ord),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.locate_with_ord(ord),
+            SSTableIndex::V2(v2_index) => v2_index.locate_with_ord(
+                lower_bound_block
+                    .try_into()
+                    .expect("lower bound block should fit in usize"),
+                ord,
+            ) as u64,
+            SSTableIndex::V3(v3_index) => v3_index.locate_with_ord(lower_bound_block, ord),
+            SSTableIndex::V3Empty(v3_empty) => v3_empty.locate_with_ord(lower_bound_block, ord),
         }
     }
 
     /// Get the [`BlockAddr`] of the block containing the `ord`-th term.
-    pub fn get_block_with_ord(&self, ord: TermOrdinal) -> BlockAddr {
+    pub fn get_block_with_ord(&self, lower_bound_block: u64, ord: TermOrdinal) -> (u64, BlockAddr) {
         match self {
-            SSTableIndex::V2(v2_index) => v2_index.get_block_with_ord(ord),
-            SSTableIndex::V3(v3_index) => v3_index.get_block_with_ord(ord),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.get_block_with_ord(ord),
+            SSTableIndex::V2(v2_index) => {
+                let (id, addr) = v2_index.get_block_with_ord(
+                    lower_bound_block
+                        .try_into()
+                        .expect("lower bound block should fit in usize"),
+                    ord,
+                );
+                (id as u64, addr)
+            }
+            SSTableIndex::V3(v3_index) => v3_index.get_block_with_ord(lower_bound_block, ord),
+            SSTableIndex::V3Empty(v3_empty) => v3_empty.get_block_with_ord(lower_bound_block, ord),
         }
     }
 
@@ -151,13 +164,20 @@ impl SSTableIndexV3 {
         self.locate_with_key(key).and_then(|id| self.get_block(id))
     }
 
-    pub(crate) fn locate_with_ord(&self, ord: TermOrdinal) -> u64 {
-        self.block_addr_store.binary_search_ord(ord).0
+    pub(crate) fn locate_with_ord(&self, lower_bound_block: u64, ord: TermOrdinal) -> u64 {
+        self.block_addr_store
+            .binary_search_ord(lower_bound_block, ord)
+            .0
     }
 
     /// Get the [`BlockAddr`] of the block containing the `ord`-th term.
-    pub(crate) fn get_block_with_ord(&self, ord: TermOrdinal) -> BlockAddr {
-        self.block_addr_store.binary_search_ord(ord).1
+    pub(crate) fn get_block_with_ord(
+        &self,
+        lower_bound_block: u64,
+        ord: TermOrdinal,
+    ) -> (u64, BlockAddr) {
+        self.block_addr_store
+            .binary_search_ord(lower_bound_block, ord)
     }
 
     pub(crate) fn get_block_for_automaton<'a>(
@@ -248,13 +268,17 @@ impl SSTableIndexV3Empty {
         Some(self.block_addr.clone())
     }
 
-    pub(crate) fn locate_with_ord(&self, _ord: TermOrdinal) -> u64 {
+    pub(crate) fn locate_with_ord(&self, _lower_bound_block: u64, _ord: TermOrdinal) -> u64 {
         0
     }
 
     /// Get the [`BlockAddr`] of the block containing the `ord`-th term.
-    pub(crate) fn get_block_with_ord(&self, _ord: TermOrdinal) -> BlockAddr {
-        self.block_addr.clone()
+    pub(crate) fn get_block_with_ord(
+        &self,
+        _lower_bound_block: u64,
+        _ord: TermOrdinal,
+    ) -> (u64, BlockAddr) {
+        (0, self.block_addr.clone())
     }
 }
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -461,7 +485,12 @@ impl BlockAddrBlockMetadata {
         })
     }
 
-    fn bisect_for_ord(&self, data: &[u8], target_ord: TermOrdinal) -> (u64, BlockAddr) {
+    fn bisect_for_ord(
+        &self,
+        data: &[u8],
+        inner_lower_bound: u16,
+        target_ord: TermOrdinal,
+    ) -> (u64, BlockAddr) {
         let inner_target_ord = target_ord - self.ref_block_addr.first_ordinal;
         let num_bits = self.num_bits() as usize;
         let range_start_nbits = self.range_start_nbits as usize;
@@ -474,11 +503,12 @@ impl BlockAddrBlockMetadata {
                 - self.ordinal_shift as u64
         };
 
-        let inner_offset = match binary_search(self.block_len as u64, |index| {
-            get_ord(index).cmp(&inner_target_ord)
+        let search_len = (self.block_len - inner_lower_bound) as u64;
+        let inner_offset = match binary_search(search_len, |index_offset| {
+            get_ord(inner_lower_bound as u64 + index_offset).cmp(&inner_target_ord)
         }) {
-            Ok(inner_offset) => inner_offset + 1,
-            Err(inner_offset) => inner_offset,
+            Ok(inner_offset) => inner_lower_bound as u64 + inner_offset + 1,
+            Err(inner_offset) => inner_lower_bound as u64 + inner_offset,
         };
         // we can unwrap because inner_offset <= self.block_len
         (
@@ -591,7 +621,7 @@ impl BlockAddrStore {
         )
     }
 
-    fn binary_search_ord(&self, ord: TermOrdinal) -> (u64, BlockAddr) {
+    fn binary_search_ord(&self, lower_bound_block: u64, ord: TermOrdinal) -> (u64, BlockAddr) {
         let max_block =
             (self.block_meta_bytes.len() / BlockAddrBlockMetadata::SIZE_IN_BYTES) as u64;
         let get_first_ordinal = |block_id| {
@@ -600,21 +630,31 @@ impl BlockAddrStore {
                 .unwrap()
                 .first_ordinal
         };
-        let store_block_id =
-            binary_search(max_block, |block_id| get_first_ordinal(block_id).cmp(&ord));
-        let store_block_id = match store_block_id {
-            Ok(store_block_id) => {
+        let lower_bound_store_block = lower_bound_block / STORE_BLOCK_LEN as u64;
+        let num_store_blocks = max_block - lower_bound_store_block;
+        let store_block_offset = binary_search(num_store_blocks, |block_id_offset| {
+            get_first_ordinal(lower_bound_store_block + block_id_offset).cmp(&ord)
+        });
+        let store_block_id = match store_block_offset {
+            Ok(store_block_offset) => {
+                let store_block_id = lower_bound_store_block + store_block_offset;
                 let block_id = store_block_id * STORE_BLOCK_LEN as u64;
                 // we can unwrap because store_block_id < max_block
                 return (block_id, self.get(block_id).unwrap());
             }
-            Err(store_block_id) => store_block_id - 1,
+            Err(store_block_offset) => lower_bound_store_block + store_block_offset - 1,
         };
 
         // we can unwrap because store_block_id < max_block
         let block_addr_block_data = self.get_block_meta(store_block_id as usize).unwrap();
+        let inner_lower_bound = if store_block_id == lower_bound_store_block {
+            (lower_bound_block % STORE_BLOCK_LEN as u64) as u16
+        } else {
+            0
+        };
         let (inner_offset, block_addr) = block_addr_block_data.bisect_for_ord(
             &self.addr_bytes[block_addr_block_data.offset as usize..],
+            inner_lower_bound,
             ord,
         );
         (
@@ -852,11 +892,19 @@ mod tests {
         assert_eq!(sstable_index.locate_with_key(b"ccc").unwrap(), 2);
         assert!(sstable_index.locate_with_key(b"e").is_none());
 
-        assert_eq!(sstable_index.locate_with_ord(0), 0);
-        assert_eq!(sstable_index.locate_with_ord(1), 0);
-        assert_eq!(sstable_index.locate_with_ord(4), 0);
-        assert_eq!(sstable_index.locate_with_ord(5), 1);
-        assert_eq!(sstable_index.locate_with_ord(100), 3);
+        assert_eq!(sstable_index.locate_with_ord(0, 0), 0);
+        assert_eq!(sstable_index.locate_with_ord(0, 1), 0);
+        assert_eq!(sstable_index.locate_with_ord(0, 4), 0);
+        assert_eq!(sstable_index.locate_with_ord(0, 5), 1);
+        assert_eq!(sstable_index.locate_with_ord(0, 100), 3);
+
+        // Test with non-zero lower_bound_block
+        assert_eq!(sstable_index.locate_with_ord(1, 5), 1);
+        assert_eq!(sstable_index.locate_with_ord(1, 10), 2);
+        assert_eq!(sstable_index.locate_with_ord(1, 100), 3);
+        assert_eq!(sstable_index.locate_with_ord(2, 10), 2);
+        assert_eq!(sstable_index.locate_with_ord(2, 100), 3);
+        assert_eq!(sstable_index.locate_with_ord(3, 100), 3);
     }
 
     #[test]
