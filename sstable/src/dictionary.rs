@@ -335,11 +335,11 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             }
 
             // Pad the array to exactly 255 elements.
-            // fsst-rs `decompress_into` uses `get_unchecked` on the symbol table using bytes from
-            // the compressed stream. If the data is corrupted or mismatched (e.g. from an old
-            // or different segment during merging), it will cause an out-of-bounds memory read
-            // panic/UB. Padding to 255 ensures any valid `u8` (excluding escape `255`) resolves
-            // safely to dummy data.
+            // WORKAROUND: fsst-rs `decompress_into` uses `get_unchecked` on the symbol table using
+            // bytes from the compressed stream. If the data is corrupted or mismatched
+            // (e.g. from an old or different segment during merging), it will cause an
+            // out-of-bounds memory read panic/UB. Padding to 255 ensures any valid `u8`
+            // (excluding escape `255`) resolves safely to dummy data. See: https://github.com/spiraldb/fsst/pull/165
             while loaded_symbols.len() < 255 {
                 loaded_symbols.push(fsst::Symbol::from_slice(&[0; 8]));
                 loaded_lengths.push(1);

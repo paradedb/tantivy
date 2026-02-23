@@ -247,9 +247,14 @@ where TValueReader: ValueReader
             // We reserve capacity to avoid heap allocation thrashing, and use `decompress_into`
             // to achieve high-performance, zero-allocation (amortized) decompression.
             // Maximum possible decompressed size in FSST is exactly 8x the compressed size.
-            if self.decompressed_key.capacity() < self.key.len() * 8 {
+            //
+            // WORKAROUND: `fsst-rs` v0.5.6 has a bug where `decompress_into` panics if the
+            // remaining buffer capacity is 8 or fewer bytes. We must pad the required
+            // capacity by at least 8 extra bytes. See: https://github.com/spiraldb/fsst/pull/165
+            let required_capacity = (self.key.len() * 8) + 8;
+            if self.decompressed_key.capacity() < required_capacity {
                 self.decompressed_key
-                    .reserve((self.key.len() * 8) - self.decompressed_key.capacity());
+                    .reserve(required_capacity - self.decompressed_key.capacity());
             }
 
             self.decompressed_key.clear();
@@ -418,12 +423,17 @@ where
         // any decompression during simple iteration.
         if let Some(compressor) = &self.compressor {
             self.compressed_key.clear();
-            if self.compressed_key.capacity() < key.len() * 2 {
+            // WORKAROUND: `fsst-rs` v0.5.6 has a bug where `compress_into` can write out-of-bounds
+            // if the buffer capacity exactly matches the compressed size. We must pad the capacity
+            // by at least 16 extra bytes to ensure memory safety on the final loops.
+            // See: https://github.com/spiraldb/fsst/pull/165
+            let required_capacity = (key.len() * 2) + 16;
+            if self.compressed_key.capacity() < required_capacity {
                 self.compressed_key
-                    .reserve((key.len() * 2) - self.compressed_key.capacity());
+                    .reserve(required_capacity - self.compressed_key.capacity());
             }
 
-            // SAFETY: We ensured the buffer has at least key.len() * 2 capacity
+            // SAFETY: We ensured the buffer has at least key.len() * 2 capacity + 16 bytes padding
             unsafe {
                 compressor.compress_into(key, &mut self.compressed_key);
             }
