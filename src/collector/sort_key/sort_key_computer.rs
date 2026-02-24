@@ -420,6 +420,15 @@ where
         SortKeyComputer4::Comparator,
     );
 
+    fn comparator(&self) -> Self::Comparator {
+        (
+            self.0.comparator(),
+            self.1.comparator(),
+            self.2.comparator(),
+            self.3.comparator(),
+        )
+    }
+
     fn segment_sort_key_computer(&self, segment_reader: &SegmentReader) -> Result<Self::Child> {
         let sort_key_computer1 = self.0.segment_sort_key_computer(segment_reader)?;
         let sort_key_computer2 = self.1.segment_sort_key_computer(segment_reader)?;
@@ -503,6 +512,16 @@ where
         SortKeyComputer4::Comparator,
         SortKeyComputer5::Comparator,
     );
+
+    fn comparator(&self) -> Self::Comparator {
+        (
+            self.0.comparator(),
+            self.1.comparator(),
+            self.2.comparator(),
+            self.3.comparator(),
+            self.4.comparator(),
+        )
+    }
 
     fn segment_sort_key_computer(&self, segment_reader: &SegmentReader) -> Result<Self::Child> {
         let sort_key_computer1 = self.0.segment_sort_key_computer(segment_reader)?;
