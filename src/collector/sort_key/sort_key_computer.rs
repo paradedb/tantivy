@@ -453,14 +453,14 @@ where
 }
 
 impl<SortKeyComputer1, SortKeyComputer2, SortKeyComputer3, SortKeyComputer4, SortKeyComputer5>
-SortKeyComputer
-for (
-    SortKeyComputer1,
-    SortKeyComputer2,
-    SortKeyComputer3,
-    SortKeyComputer4,
-    SortKeyComputer5,
-)
+    SortKeyComputer
+    for (
+        SortKeyComputer1,
+        SortKeyComputer2,
+        SortKeyComputer3,
+        SortKeyComputer4,
+        SortKeyComputer5,
+    )
 where
     SortKeyComputer1: SortKeyComputer,
     SortKeyComputer2: SortKeyComputer,
@@ -468,17 +468,22 @@ where
     SortKeyComputer4: SortKeyComputer,
     SortKeyComputer5: SortKeyComputer,
 {
-
     type Child = MappedSegmentSortKeyComputer<
         <(
             SortKeyComputer1,
-            (SortKeyComputer2, (SortKeyComputer3, (SortKeyComputer4, SortKeyComputer5))),
+            (
+                SortKeyComputer2,
+                (SortKeyComputer3, (SortKeyComputer4, SortKeyComputer5)),
+            ),
         ) as SortKeyComputer>::Child,
         (
             SortKeyComputer1::SortKey,
             (
                 SortKeyComputer2::SortKey,
-                (SortKeyComputer3::SortKey, (SortKeyComputer4::SortKey, SortKeyComputer5::SortKey)),
+                (
+                    SortKeyComputer3::SortKey,
+                    (SortKeyComputer4::SortKey, SortKeyComputer5::SortKey),
+                ),
             ),
         ),
         Self::SortKey,
@@ -508,7 +513,10 @@ where
         Ok(MappedSegmentSortKeyComputer {
             sort_key_computer: (
                 sort_key_computer1,
-                (sort_key_computer2, (sort_key_computer3, (sort_key_computer4, sort_key_computer5))),
+                (
+                    sort_key_computer2,
+                    (sort_key_computer3, (sort_key_computer4, sort_key_computer5)),
+                ),
             ),
             map: |(sort_key1, (sort_key2, (sort_key3, (sort_key4, sort_key5))))| {
                 (sort_key1, sort_key2, sort_key3, sort_key4, sort_key5)
@@ -532,7 +540,6 @@ where
             || self.3.requires_scoring()
             || self.4.requires_scoring()
     }
-
 }
 
 impl<F, SegmentF, TSortKey> SortKeyComputer for F

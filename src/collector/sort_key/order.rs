@@ -402,9 +402,25 @@ where
     }
 }
 
-impl<Type1, Type2, Type3, Type4, Type5, Comparator1, Comparator2, Comparator3, Comparator4, Comparator5>
-Comparator<(Type1, (Type2, (Type3, (Type4, Type5))))>
-for (Comparator1, Comparator2, Comparator3, Comparator4, Comparator5)
+impl<
+        Type1,
+        Type2,
+        Type3,
+        Type4,
+        Type5,
+        Comparator1,
+        Comparator2,
+        Comparator3,
+        Comparator4,
+        Comparator5,
+    > Comparator<(Type1, (Type2, (Type3, (Type4, Type5))))>
+    for (
+        Comparator1,
+        Comparator2,
+        Comparator3,
+        Comparator4,
+        Comparator5,
+    )
 where
     Comparator1: Comparator<Type1>,
     Comparator2: Comparator<Type2>,
@@ -427,9 +443,25 @@ where
     }
 }
 
-impl<Type1, Type2, Type3, Type4, Type5, Comparator1, Comparator2, Comparator3, Comparator4, Comparator5>
-Comparator<(Type1, Type2, Type3, Type4, Type5)>
-for (Comparator1, Comparator2, Comparator3, Comparator4, Comparator5)
+impl<
+        Type1,
+        Type2,
+        Type3,
+        Type4,
+        Type5,
+        Comparator1,
+        Comparator2,
+        Comparator3,
+        Comparator4,
+        Comparator5,
+    > Comparator<(Type1, Type2, Type3, Type4, Type5)>
+    for (
+        Comparator1,
+        Comparator2,
+        Comparator3,
+        Comparator4,
+        Comparator5,
+    )
 where
     Comparator1: Comparator<Type1>,
     Comparator2: Comparator<Type2>,
