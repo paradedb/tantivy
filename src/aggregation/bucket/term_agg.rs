@@ -797,10 +797,7 @@ impl<TermMap: TermAggregationMap, C: SubAggCache> SegmentAggregationCollector
         let old_mem = self.parent_buckets[bucket as usize].get_memory_consumption();
         let replacement = TermMap::new(0, &mut self.bucket_id_provider);
         let new_mem = replacement.get_memory_consumption();
-        let bucket = std::mem::replace(
-            &mut self.parent_buckets[bucket as usize],
-            replacement,
-        );
+        let bucket = std::mem::replace(&mut self.parent_buckets[bucket as usize], replacement);
         // Update tracked memory: remove old bucket's memory, add replacement's
         self.total_mem_consumption = self.total_mem_consumption - old_mem + new_mem;
         let term_req = &self.terms_req_data;
