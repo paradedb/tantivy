@@ -387,16 +387,19 @@ pub(crate) fn build_segment_term_collector(
     // Decide which bucket storage is best suited for this aggregation.
     if is_top_level && max_term_id < MAX_NUM_TERMS_FOR_VEC && !has_sub_aggregations {
         let term_buckets = VecTermBucketsNoAgg::new(max_term_id + 1, &mut bucket_id_provider);
+        let initial_mem = term_buckets.get_memory_consumption();
         let collector: SegmentTermCollector<_, HighCardSubAggBuffer> = SegmentTermCollector {
             parent_buckets: vec![term_buckets],
             sub_agg: None,
             bucket_id_provider,
             max_term_id,
             terms_req_data,
+            total_mem_consumption: initial_mem,
         };
         Ok(Box::new(collector))
     } else if is_top_level && max_term_id < MAX_NUM_TERMS_FOR_VEC {
         let term_buckets = VecTermBuckets::new(max_term_id + 1, &mut bucket_id_provider);
+        let initial_mem = term_buckets.get_memory_consumption();
         let sub_agg = sub_agg_collector.map(LowCardBufferedSubAggs::new);
         let collector: SegmentTermCollector<_, LowCardSubAggBuffer> = SegmentTermCollector {
             parent_buckets: vec![term_buckets],
@@ -404,11 +407,13 @@ pub(crate) fn build_segment_term_collector(
             bucket_id_provider,
             max_term_id,
             terms_req_data,
+            total_mem_consumption: initial_mem,
         };
         Ok(Box::new(collector))
     } else if max_term_id < 8_000_000 && is_top_level {
         let term_buckets: PagedTermMap =
             PagedTermMap::new(max_term_id + 1, &mut bucket_id_provider);
+        let initial_mem = term_buckets.get_memory_consumption();
         // Build sub-aggregation blueprint (flat pairs)
         let sub_agg = sub_agg_collector.map(BufferedSubAggs::new);
         let collector: SegmentTermCollector<PagedTermMap, HighCardSubAggBuffer> =
@@ -418,10 +423,12 @@ pub(crate) fn build_segment_term_collector(
                 bucket_id_provider,
                 max_term_id,
                 terms_req_data,
+                total_mem_consumption: initial_mem,
             };
         Ok(Box::new(collector))
     } else {
         let term_buckets: HashMapTermBuckets = HashMapTermBuckets::default();
+        let initial_mem = term_buckets.get_memory_consumption();
         // Build sub-aggregation blueprint (flat pairs)
         let sub_agg = sub_agg_collector.map(BufferedSubAggs::new);
         let collector: SegmentTermCollector<HashMapTermBuckets, HighCardSubAggBuffer> =
@@ -431,6 +438,7 @@ pub(crate) fn build_segment_term_collector(
                 bucket_id_provider,
                 max_term_id,
                 terms_req_data,
+                total_mem_consumption: initial_mem,
             };
         Ok(Box::new(collector))
     }
@@ -761,6 +769,9 @@ struct SegmentTermCollector<TermMap: TermAggregationMap, B: SubAggBuffer> {
     bucket_id_provider: BucketIdProvider,
     max_term_id: u64,
     terms_req_data: TermsAggReqData,
+    /// Tracks the total memory consumption of all parent_buckets incrementally,
+    /// avoiding O(N) iteration on every collect() call.
+    total_mem_consumption: usize,
 }
 
 pub(crate) fn get_agg_name_and_property(name: &str) -> (&str, &str) {
@@ -779,10 +790,12 @@ impl<TermMap: TermAggregationMap, B: SubAggBuffer> SegmentAggregationCollector
     ) -> crate::Result<()> {
         // TODO: avoid prepare_max_bucket here and handle empty buckets.
         self.prepare_max_bucket(bucket, agg_data)?;
-        let bucket = std::mem::replace(
-            &mut self.parent_buckets[bucket as usize],
-            TermMap::new(0, &mut self.bucket_id_provider),
-        );
+        let old_mem = self.parent_buckets[bucket as usize].get_memory_consumption();
+        let replacement = TermMap::new(0, &mut self.bucket_id_provider);
+        let new_mem = replacement.get_memory_consumption();
+        let bucket = std::mem::replace(&mut self.parent_buckets[bucket as usize], replacement);
+        // Update tracked memory: remove old bucket's memory, add replacement's
+        self.total_mem_consumption = self.total_mem_consumption - old_mem + new_mem;
         let term_req = &self.terms_req_data;
         let name = term_req.name.clone();
 
@@ -851,6 +864,7 @@ impl<TermMap: TermAggregationMap, B: SubAggBuffer> SegmentAggregationCollector
 
         let mem_delta = self.get_memory_consumption(parent_bucket_id) - mem_pre;
         if mem_delta > 0 {
+            self.total_mem_consumption += mem_delta;
             agg_data
                 .context
                 .limits
@@ -879,6 +893,7 @@ impl<TermMap: TermAggregationMap, B: SubAggBuffer> SegmentAggregationCollector
         while self.parent_buckets.len() <= max_bucket as usize {
             let term_buckets: TermMap =
                 TermMap::new(self.max_term_id, &mut self.bucket_id_provider);
+            self.total_mem_consumption += term_buckets.get_memory_consumption();
             self.parent_buckets.push(term_buckets);
         }
         Ok(())
