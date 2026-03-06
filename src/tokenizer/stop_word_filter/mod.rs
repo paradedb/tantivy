@@ -134,9 +134,9 @@ impl<T: TokenStream> TokenStream for StopWordFilterStream<T> {
 #[cfg(test)]
 mod tests {
     use crate::tokenizer::tests::assert_token;
-    use crate::tokenizer::{SimpleTokenizer, StopWordFilter, TextAnalyzer, Token};
     #[cfg(all(feature = "stemmer", feature = "stopwords"))]
     use crate::tokenizer::Language;
+    use crate::tokenizer::{SimpleTokenizer, StopWordFilter, TextAnalyzer, Token};
 
     #[test]
     fn test_stop_word() {
