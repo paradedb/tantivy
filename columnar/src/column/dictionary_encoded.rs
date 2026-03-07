@@ -66,6 +66,77 @@ impl BytesColumn {
     pub fn dictionary(&self) -> &Dictionary<VoidSSTable> {
         self.dictionary.as_ref()
     }
+
+    /// High-level convenience method: Finds the exact contiguous DocId range
+    /// matching a range of byte slices in a sorted dictionary-encoded column.
+    ///
+    /// **Warning:** This method assumes the column is **sorted** by value.
+    /// If the column is not sorted, the result is undefined and will be incorrect.
+    ///
+    /// The `docid_range` allows restricting the binary search space.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the column cardinality is `Multivalued`.
+    pub fn binary_search_range(
+        &self,
+        docid_range: Option<std::ops::Range<u32>>,
+        lower_bound: std::ops::Bound<&[u8]>,
+        upper_bound: std::ops::Bound<&[u8]>,
+        is_descending: bool,
+    ) -> io::Result<std::ops::Range<u32>> {
+        use sstable::TermOrdHit;
+
+        let dict = self.dictionary();
+        let max_ord = dict.num_terms() as u64;
+
+        if max_ord == 0 {
+            return Ok(0..0);
+        }
+
+        // Resolve lower bound to a starting ordinal
+        let start_ord = match lower_bound {
+            std::ops::Bound::Included(key) => match dict.term_ord_or_next(key)? {
+                TermOrdHit::Exact(ord) | TermOrdHit::Next(ord) => ord,
+            },
+            std::ops::Bound::Excluded(key) => match dict.term_ord_or_next(key)? {
+                TermOrdHit::Exact(ord) => ord + 1,
+                TermOrdHit::Next(ord) => ord,
+            },
+            std::ops::Bound::Unbounded => 0,
+        };
+
+        // Resolve upper bound to an ending ordinal
+        let end_ord = match upper_bound {
+            std::ops::Bound::Included(key) => match dict.term_ord_or_next(key)? {
+                TermOrdHit::Exact(ord) => ord,
+                TermOrdHit::Next(ord) => {
+                    if ord == 0 {
+                        return Ok(0..0);
+                    }
+                    ord - 1
+                }
+            },
+            std::ops::Bound::Excluded(key) => match dict.term_ord_or_next(key)? {
+                TermOrdHit::Exact(ord) | TermOrdHit::Next(ord) => {
+                    if ord == 0 {
+                        return Ok(0..0);
+                    }
+                    ord - 1
+                }
+            },
+            std::ops::Bound::Unbounded => max_ord - 1,
+        };
+
+        if start_ord > end_ord {
+            return Ok(0..0);
+        }
+
+        // Delegate to the numeric ordinal column
+        Ok(self
+            .ords()
+            .binary_search_range(docid_range, &(start_ord..=end_ord), is_descending))
+    }
 }
 
 #[derive(Clone)]

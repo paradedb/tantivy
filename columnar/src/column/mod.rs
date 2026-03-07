@@ -166,7 +166,149 @@ impl<T: PartialOrd + Copy + Debug + Send + Sync + 'static> Column<T> {
             default_value,
         })
     }
-}
+
+    /// Binary search for the boundary between NULLs and non-NULLs.
+    ///
+    /// In a sorted `Optional` column, documents without values (NULLs) cluster
+    /// at one end of the segment. This method returns the boundary:
+    /// - If `is_descending = false` (Ascending): NULLs are at the start. Returns the first DocId
+    ///   WITH a value.
+    /// - If `is_descending = true` (Descending): NULLs are at the end. Returns the first DocId
+    ///   WITHOUT a value.
+    pub fn binary_search_null_boundary(&self, lo: u32, hi: u32, is_descending: bool) -> u32 {
+        let mut lo = lo;
+        let mut hi = hi;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let has_value = self.first(mid).is_some();
+            if is_descending {
+                if has_value {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            } else {
+                if has_value {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+        }
+        lo
+    }
+
+    /// Binary search on a sorted column for the boundary of a value range.
+    ///
+    /// Returns a DocId forming one side of a half-open range `[start, end)`:
+    /// - `strict = false` (inclusive): first doc whose value is at or past `target`.
+    /// - `strict = true` (exclusive): first doc whose value is strictly past `target`.
+    ///
+    /// **Safety / Panics:**
+    /// The caller MUST guarantee that `[lo, hi)` contains only non-NULL docs
+    /// (typically by first finding the boundary via `binary_search_null_boundary`).
+    /// If a NULL is encountered in the range, this method will panic.
+    pub fn binary_search_sorted(
+        &self,
+        lo: u32,
+        hi: u32,
+        target: T,
+        is_descending: bool,
+        strict: bool,
+    ) -> u32 {
+        let mut lo = lo;
+        let mut hi = hi;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let val = self.first(mid).expect("doc in non-NULL range has no value");
+
+            let go_right = match (is_descending, strict) {
+                (false, false) => val < target,
+                (false, true) => val <= target,
+                (true, false) => val > target,
+                (true, true) => val >= target,
+            };
+
+            if go_right {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+        /// High-level convenience method: Finds the exact matching contiguous
+        /// DocId range for a given `value_range` in a sorted column.
+        ///
+        /// **Warning:** This method assumes the column is **sorted** by value.
+        /// If the column is not sorted, the result is undefined and will be incorrect.
+        ///
+        /// The `docid_range` allows restricting the binary search space (e.g. if you already
+        /// know the matches must be within a specific DocId window). Pass `None`
+        /// to search the entire column.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the column cardinality is `Multivalued`, as multivalued columns
+        /// cannot be strictly sorted by row id to document id mapping in the same way.
+        pub fn binary_search_range(
+            &self,
+            docid_range: Option<Range<u32>>,
+            value_range: &RangeInclusive<T>,
+            is_descending: bool,
+        ) -> Range<u32> {
+            let num_docs = self.num_docs();
+            let docid_range = docid_range.unwrap_or(0..num_docs);
+            
+            if num_docs == 0 || docid_range.start >= docid_range.end {
+                return 0..0;
+            }
+            
+            let lo = docid_range.start;
+            let hi = docid_range.end.min(num_docs);
+    
+            let (non_null_start, non_null_end) = match self.get_cardinality() {
+                Cardinality::Full => (lo, hi),
+                Cardinality::Optional => {
+                    if is_descending {
+                        let end = self.binary_search_null_boundary(lo, hi, true);
+                        (lo, end)
+                    } else {
+                        let start = self.binary_search_null_boundary(lo, hi, false);
+                        (start, hi)
+                    }
+                }
+                Cardinality::Multivalued => panic!("binary_search_range is not supported on Multivalued columns"),
+            };
+    
+            if non_null_start >= non_null_end {
+                return 0..0;
+            }
+    
+            let (start_target, end_target) = if is_descending {
+                (*value_range.end(), *value_range.start())
+            } else {
+                (*value_range.start(), *value_range.end())
+            };
+    
+            let start_doc = self.binary_search_sorted(
+                non_null_start,
+                non_null_end,
+                start_target,
+                is_descending,
+                false,
+            );
+            let end_doc = self.binary_search_sorted(
+                non_null_start,
+                non_null_end,
+                end_target,
+                is_descending,
+                true,
+            );
+    
+            start_doc..end_doc
+        }}
 
 impl BinarySerializable for Cardinality {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> std::io::Result<()> {
