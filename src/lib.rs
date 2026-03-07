@@ -219,7 +219,7 @@ pub use common::{f64_to_u64, i64_to_u64, u64_to_f64, u64_to_i64, HasLen};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
-pub use self::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+pub use self::docset::{DocSet, SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 pub use crate::core::{json_utils, Executor, Searcher, SearcherGeneration};
 pub use crate::directory::Directory;
 pub use crate::index::{
