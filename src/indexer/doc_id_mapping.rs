@@ -16,7 +16,7 @@ pub enum MappingType {
 
 /// Struct to provide mapping from new doc_id to old doc_id and segment.
 #[derive(Clone)]
-pub(crate) struct SegmentDocIdMapping {
+pub struct SegmentDocIdMapping {
     pub(crate) new_doc_id_to_old_doc_addr: Vec<DocAddress>,
     pub(crate) alive_bitsets: Vec<Option<ReadOnlyBitSet>>,
     mapping_type: MappingType,

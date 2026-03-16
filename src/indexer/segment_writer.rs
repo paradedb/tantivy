@@ -479,6 +479,14 @@ fn remap_and_write(
         }
     }
 
+    // Serialize plugin writers
+    debug!("plugin-serialize");
+    let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
+    for (_, writer) in plugin_writers.iter_mut() {
+        writer.serialize(serializer.segment_mut(), doc_id_map)?;
+    }
+    *serializer.plugin_writers_mut() = plugin_writers;
+
     debug!("serializer-close");
     serializer.close()?;
 

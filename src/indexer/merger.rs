@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::plugin::{PluginMergeContext, SegmentPlugin};
 use columnar::{
     compute_merged_term_ord_mapping, BytesColumn, Column, ColumnType, ColumnarReader,
     MergeRowOrder, RowAddr, ShuffleMergeOrder, StackMergeOrder,
@@ -120,6 +121,7 @@ pub struct IndexMerger {
     max_doc: u32,
     cancel: Box<dyn CancelSentinel>,
     ignore_store: bool,
+    plugins: Vec<Arc<dyn SegmentPlugin>>,
 }
 
 struct DeltaComputer {
@@ -238,6 +240,11 @@ impl IndexMerger {
         )
     }
 
+    /// Set plugins for this merger. Called by the segment updater before writing.
+    pub fn set_plugins(&mut self, plugins: Vec<Arc<dyn SegmentPlugin>>) {
+        self.plugins = plugins;
+    }
+
     // Create merge with a custom delete set.
     // For every Segment, a delete bitset can be provided, which
     // will be merged with the existing bit set. Make sure the index
@@ -282,6 +289,12 @@ impl IndexMerger {
             );
             return Err(crate::TantivyError::InvalidArgument(err_msg));
         }
+        // Get plugins from the first segment's index (all segments share the same index config)
+        let plugins = if let Some(first_segment) = segments.first() {
+            first_segment.index().plugins().to_vec()
+        } else {
+            Vec::new()
+        };
         Ok(IndexMerger {
             index_settings,
             schema,
@@ -289,6 +302,7 @@ impl IndexMerger {
             max_doc,
             cancel,
             ignore_store,
+            plugins,
         })
     }
 
@@ -1018,6 +1032,20 @@ impl IndexMerger {
         if !self.ignore_store {
             self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
         }
+
+        // Merge plugin data (before fast fields, which consumes doc_id_mapping)
+        debug!("write-plugins");
+        for plugin in &self.plugins {
+            plugin.merge(PluginMergeContext {
+                readers: &self.readers,
+                doc_id_mapping: &doc_id_mapping,
+                target_segment: serializer.segment_mut(),
+                schema: &self.schema,
+                settings: &self.index_settings,
+                cancel: &*self.cancel,
+            })?;
+        }
+
         debug!("write-fastfields");
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
 
