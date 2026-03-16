@@ -12,7 +12,7 @@ use tantivy::plugin::{
     PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
     SegmentPlugin,
 };
-use tantivy::schema::{Schema, TantivyDocument, STORED, TEXT};
+use tantivy::schema::{Schema, STORED, TEXT};
 use tantivy::{DocId, Index, IndexWriter, Segment};
 
 /// A simple plugin that writes a document count to a custom file.
@@ -33,18 +33,18 @@ impl SegmentPlugin for DocCountPlugin {
 
     fn open_reader(&self, ctx: &PluginReaderContext) -> tantivy::Result<Arc<dyn PluginReader>> {
         let component = SegmentComponent::Custom("doccount".to_string());
-        match ctx.segment.open_read(component) {
-            Ok(file_slice) => {
-                let data = file_slice.read_bytes()?;
-                if data.len() >= 4 {
-                    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    Ok(Arc::new(DocCountReader { count }))
-                } else {
-                    Ok(Arc::new(DocCountReader { count: 0 }))
-                }
-            }
-            Err(_) => Ok(Arc::new(DocCountReader { count: 0 })),
-        }
+        let file_slice = ctx
+            .segment_reader
+            .open_read(component)
+            .map_err(|e| tantivy::TantivyError::InternalError(format!("doccount open_read: {e}")))?;
+        let data = file_slice.read_bytes()?;
+        assert!(
+            data.len() >= 4,
+            "doccount file too short: {} bytes",
+            data.len()
+        );
+        let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        Ok(Arc::new(DocCountReader { count }))
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> tantivy::Result<()> {
@@ -66,12 +66,7 @@ struct DocCountWriter {
 }
 
 impl PluginWriter for DocCountWriter {
-    fn add_document(
-        &mut self,
-        _doc_id: DocId,
-        _doc: &TantivyDocument,
-        _schema: &Schema,
-    ) -> tantivy::Result<()> {
+    fn add_document(&mut self, _doc_id: DocId) -> tantivy::Result<()> {
         self.count += 1;
         Ok(())
     }
@@ -147,10 +142,20 @@ fn test_plugin_full_lifecycle() -> tantivy::Result<()> {
     writer.add_document(tantivy::doc!(text_field => "baz qux"))?;
     writer.commit()?;
 
-    // Read and verify plugin data
+    // Read back the plugin data from the segment reader
     let reader = index.reader()?;
     let searcher = reader.searcher();
     assert_eq!(searcher.num_docs(), 3);
+
+    // There should be exactly one segment
+    let segment_readers = searcher.segment_readers();
+    assert_eq!(segment_readers.len(), 1);
+
+    // Verify the plugin reader returns the correct document count
+    let doc_count_reader: Arc<DocCountReader> = segment_readers[0]
+        .plugin_reader::<DocCountReader>("doc_count")?
+        .expect("doc_count plugin reader should exist");
+    assert_eq!(doc_count_reader.count(), 3);
 
     Ok(())
 }

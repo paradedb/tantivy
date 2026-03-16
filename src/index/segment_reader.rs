@@ -194,6 +194,7 @@ impl SegmentReader {
         let ctx = PluginReaderContext {
             segment: &segment,
             schema: &self.schema,
+            segment_reader: self,
         };
         let reader = plugin.open_reader(&ctx)?;
 
@@ -625,7 +626,8 @@ impl SegmentReader {
         PathBuf::from(path)
     }
 
-    fn open_read(&self, component: SegmentComponent) -> Result<FileSlice, OpenReadError> {
+    /// Opens one of the component files for reading.
+    pub fn open_read(&self, component: SegmentComponent) -> Result<FileSlice, OpenReadError> {
         let path = self.relative_path(component);
         self.index.directory().open_read(&path)
     }

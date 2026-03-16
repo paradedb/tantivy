@@ -14,7 +14,7 @@ use crate::index::{IndexSettings, SegmentReader};
 use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::schema::Schema;
-use crate::{DocId, Segment, TantivyDocument};
+use crate::{DocId, Segment};
 
 /// A pluggable segment component that participates in writing, reading, and merging.
 ///
@@ -65,15 +65,11 @@ pub trait SegmentPlugin: Send + Sync + 'static {
 pub trait PluginWriter: Send + Any {
     /// Called for each document during indexing. Default no-op.
     ///
-    /// Custom plugins use this to extract data from documents.
-    /// Built-in components (postings, fast fields) may ignore this and use
-    /// their own specialized paths.
-    fn add_document(
-        &mut self,
-        _doc_id: DocId,
-        _doc: &TantivyDocument,
-        _schema: &Schema,
-    ) -> crate::Result<()> {
+    /// Receives only the `DocId` because the `Document` trait is not
+    /// dyn-compatible (it has generic associated types) and `SegmentWriter`
+    /// is generic over `D: Document`. Plugins that need document data
+    /// should read it back from the store or fast fields after serialization.
+    fn add_document(&mut self, _doc_id: DocId) -> crate::Result<()> {
         Ok(())
     }
 
@@ -122,6 +118,8 @@ pub struct PluginReaderContext<'a> {
     pub segment: &'a Segment,
     /// The index schema.
     pub schema: &'a Schema,
+    /// The segment reader, for accessing existing component data.
+    pub segment_reader: &'a SegmentReader,
 }
 
 /// Context provided to [`SegmentPlugin::merge`].
