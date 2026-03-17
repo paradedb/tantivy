@@ -117,12 +117,12 @@ impl SegmentMeta {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             SegmentComponent::iterator()
-                .map(|component| self.relative_path(*component))
+                .map(|component| self.relative_path(component.clone()))
                 .collect::<HashSet<PathBuf>>()
         } else {
             SegmentComponent::iterator()
                 .filter(|comp| *comp != &SegmentComponent::TempStore)
-                .map(|component| self.relative_path(*component))
+                .map(|component| self.relative_path(component.clone()))
                 .collect::<HashSet<PathBuf>>()
         }
     }
@@ -142,6 +142,7 @@ impl SegmentMeta {
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
+            SegmentComponent::Custom(ext) => format!(".{ext}"),
         });
         PathBuf::from(path)
     }

@@ -168,10 +168,8 @@ mod macros;
 mod future_result;
 
 // Re-exports
-pub use columnar;
 pub use common::{ByteCount, DateTime};
-pub use query_grammar;
-pub use time;
+pub use {columnar, query_grammar, time};
 
 pub use crate::error::TantivyError;
 pub use crate::future_result::FutureResult;
@@ -197,6 +195,7 @@ pub mod index;
 pub mod positions;
 pub mod postings;
 
+pub mod plugin;
 /// Module containing the different query implementations.
 pub mod query;
 pub mod schema;
@@ -229,6 +228,10 @@ pub use crate::index::{
     Segment, SegmentMeta, SegmentReader,
 };
 pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
+pub use crate::plugin::{
+    PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
+    SegmentPlugin,
+};
 pub use crate::schema::{Document, TantivyDocument, Term};
 
 /// Index format version.

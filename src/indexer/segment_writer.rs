@@ -5,19 +5,19 @@ use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
-use crate::fastfield::FastFieldsWriter;
-use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
-use crate::index::{Segment, SegmentComponent};
+use crate::fastfield::FastFieldsPluginWriter;
+use crate::fieldnorm::FieldNormsPluginWriter;
+use crate::index::Segment;
 use crate::indexer::indexing_term::IndexingTerm;
 use crate::indexer::segment_serializer::SegmentSerializer;
 use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
 use crate::postings::{
-    compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
-    PerFieldPostingsWriter, PostingsWriter,
+    compute_table_memory_size, IndexingContext, IndexingPosition, PerFieldPostingsWriter,
+    PostingsPluginWriter, PostingsWriter,
 };
 use crate::schema::document::{Document, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
-use crate::store::{StoreReader, StoreWriter};
+use crate::store::StorePluginWriter;
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, Opstamp, TantivyError};
 
@@ -66,8 +66,6 @@ pub struct SegmentWriter {
     pub(crate) ctx: IndexingContext,
     pub(crate) per_field_postings_writers: PerFieldPostingsWriter,
     pub(crate) segment_serializer: SegmentSerializer,
-    pub(crate) fast_field_writers: FastFieldsWriter,
-    pub(crate) fieldnorms_writer: FieldNormsWriter,
     pub(crate) json_path_writer: JsonPathWriter,
     pub(crate) json_positions_per_path: IndexingPositionsPerPath,
     pub(crate) doc_opstamps: Vec<Opstamp>,
@@ -94,7 +92,6 @@ impl SegmentWriter {
     ) -> crate::Result<Self> {
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
-        let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
         let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
@@ -124,14 +121,9 @@ impl SegmentWriter {
             max_doc: 0,
             ctx: IndexingContext::new(table_size),
             per_field_postings_writers,
-            fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
             json_path_writer: JsonPathWriter::default(),
             json_positions_per_path: IndexingPositionsPerPath::default(),
             segment_serializer,
-            fast_field_writers: FastFieldsWriter::from_schema_and_tokenizer_manager(
-                &schema,
-                tokenizer_manager_fast_field,
-            )?,
             doc_opstamps: Vec::with_capacity(1_000),
             per_field_text_analyzers,
             term_buffer: IndexingTerm::with_capacity(16),
@@ -145,7 +137,11 @@ impl SegmentWriter {
     /// Finalize consumes the `SegmentWriter`, so that it cannot
     /// be used afterwards.
     pub fn finalize(mut self) -> crate::Result<Vec<u64>> {
-        self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
+        let max_doc = self.max_doc;
+        self.segment_serializer
+            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+            .expect("fieldnorms plugin")
+            .fill_up_to_max_doc(max_doc);
         let mapping: Option<DocIdMapping> = self
             .segment_serializer
             .segment()
@@ -155,16 +151,23 @@ impl SegmentWriter {
             .clone()
             .map(|sort_by_field| get_doc_id_mapping_from_field(sort_by_field, &self))
             .transpose()?;
-        remap_and_write(
-            self.schema,
-            &self.per_field_postings_writers,
-            self.ctx,
-            self.fast_field_writers,
-            &self.fieldnorms_writer,
-            self.segment_serializer,
-            mapping.as_ref(),
-            self.ignore_store,
-        )?;
+
+        // Transfer per_field_postings_writers and ctx to the PostingsPluginWriter
+        // so they can be consumed during plugin-based serialization.
+        {
+            let postings_plugin = self
+                .segment_serializer
+                .get_plugin_writer::<PostingsPluginWriter>("postings")
+                .expect("postings plugin");
+            postings_plugin.per_field_postings_writers = Some(std::mem::replace(
+                &mut self.per_field_postings_writers,
+                PerFieldPostingsWriter::empty(),
+            ));
+            postings_plugin.ctx =
+                Some(std::mem::replace(&mut self.ctx, IndexingContext::default()));
+        }
+
+        remap_and_write(self.segment_serializer, mapping.as_ref())?;
         let doc_opstamps = remap_doc_opstamps(self.doc_opstamps, mapping.as_ref());
         Ok(doc_opstamps)
     }
@@ -172,10 +175,7 @@ impl SegmentWriter {
     /// Returns an estimation of the current memory usage of the segment writer.
     /// If the mem usage exceeds the `memory_budget`, the segment be serialized.
     pub fn mem_usage(&self) -> usize {
-        self.ctx.mem_usage()
-            + self.fieldnorms_writer.mem_usage()
-            + self.fast_field_writers.mem_usage()
-            + self.segment_serializer.mem_usage()
+        self.ctx.mem_usage() + self.segment_serializer.mem_usage()
     }
 
     fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
@@ -250,7 +250,9 @@ impl SegmentWriter {
                         );
                     }
                     if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer
+                        self.segment_serializer
+                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .expect("fieldnorms plugin")
                             .record(doc_id, field, indexing_position.num_tokens);
                     }
                 }
@@ -265,7 +267,10 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
+                        self.segment_serializer
+                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .expect("fieldnorms plugin")
+                            .record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::Date(_) => {
@@ -280,7 +285,10 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
+                        self.segment_serializer
+                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .expect("fieldnorms plugin")
+                            .record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::I64(_) => {
@@ -294,7 +302,10 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
+                        self.segment_serializer
+                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .expect("fieldnorms plugin")
+                            .record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::F64(_) => {
@@ -307,7 +318,10 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
+                        self.segment_serializer
+                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .expect("fieldnorms plugin")
+                            .record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::Bool(_) => {
@@ -320,7 +334,10 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
+                        self.segment_serializer
+                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .expect("fieldnorms plugin")
+                            .record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::Bytes(_) => {
@@ -333,7 +350,10 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
+                        self.segment_serializer
+                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .expect("fieldnorms plugin")
+                            .record(doc_id, field, num_vals);
                     }
                 }
                 FieldType::JsonObject(json_options) => {
@@ -369,7 +389,10 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
+                        self.segment_serializer
+                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .expect("fieldnorms plugin")
+                            .record(doc_id, field, num_vals);
                     }
                 }
             }
@@ -385,11 +408,23 @@ impl SegmentWriter {
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {
         let AddOperation { document, opstamp } = add_operation;
+        let doc_id = self.max_doc;
         self.doc_opstamps.push(opstamp);
-        self.fast_field_writers.add_document(&document)?;
+        self.segment_serializer
+            .get_plugin_writer::<FastFieldsPluginWriter>("fast_fields")
+            .expect("fast_fields plugin")
+            .writer_mut()
+            .add_document(&document)?;
         self.index_document(&document)?;
-        let doc_writer = self.segment_serializer.get_store_writer();
-        doc_writer.store(&document, &self.schema)?;
+        if !self.ignore_store {
+            self.segment_serializer
+                .get_plugin_writer::<StorePluginWriter>("store")
+                .expect("store plugin")
+                .store(&document, &self.schema)?;
+        }
+        for (_, writer) in self.segment_serializer.plugin_writers_mut().iter_mut() {
+            writer.add_document(doc_id)?;
+        }
         self.max_doc += 1;
         Ok(())
     }
@@ -415,76 +450,53 @@ impl SegmentWriter {
     }
 }
 
-/// This method is used as a trick to workaround the borrow checker
 /// Writes a view of a segment by pushing information
-/// to the `SegmentSerializer`.
+/// to the `SegmentSerializer` via the plugin writers.
 ///
 /// `doc_id_map` is used to map to the new doc_id order.
+///
+/// Plugin writers are serialized in phase order:
+/// - Phase 0: FieldNorms
+/// - Phase 1: Postings (reads back fieldnorms from disk)
+/// - Phase 2+: FastFields, Store, custom plugins
 fn remap_and_write(
-    schema: Schema,
-    per_field_postings_writers: &PerFieldPostingsWriter,
-    ctx: IndexingContext,
-    fast_field_writers: FastFieldsWriter,
-    fieldnorms_writer: &FieldNormsWriter,
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
-    ignore_store: bool,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
-    if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
-        fieldnorms_writer.serialize(fieldnorms_serializer, doc_id_map)?;
-    }
-    let fieldnorm_data = serializer
-        .segment()
-        .open_read(SegmentComponent::FieldNorms)?;
-    let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
-    serialize_postings(
-        ctx,
-        schema,
-        per_field_postings_writers,
-        fieldnorm_readers,
-        doc_id_map,
-        serializer.get_postings_serializer(),
-    )?;
-    debug!("fastfield-serialize");
-    fast_field_writers.serialize(serializer.get_fast_field_write(), doc_id_map)?;
 
-    // finalize temp docstore and create version, which reflects the doc_id_map
-    if !ignore_store {
-        if let Some(doc_id_map) = doc_id_map {
-            debug!("resort-docstore");
-            let store_write = serializer
-                .segment_mut()
-                .open_write(SegmentComponent::Store)?;
-            let settings = serializer.segment().index().settings();
-            let store_writer = StoreWriter::new(
-                store_write,
-                settings.docstore_compression,
-                settings.docstore_blocksize,
-                settings.docstore_compress_dedicated_thread,
-            )?;
-            let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
-            old_store_writer.close()?;
-            let store_read = StoreReader::open(
-                serializer
-                    .segment()
-                    .open_read(SegmentComponent::TempStore)?,
-                1, /* The docstore is configured to have one doc per block, and each doc is
-                    * accessed only once: we don't need caching. */
-            )?;
-            for old_doc_id in doc_id_map.iter_old_doc_ids() {
-                let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
-                serializer.get_store_writer().store_bytes(&doc_bytes)?;
-            }
-        }
+    // Sort plugin writers by phase and serialize in order.
+    // We need to take them out so we can pass &mut Segment from the serializer.
+    let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
+
+    // Collect (index, phase) so we can process in phase order
+    let mut indexed: Vec<(usize, u32)> = plugin_writers
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            // Determine phase from the name
+            let phase = match name.as_str() {
+                "fieldnorms" => 0,
+                "postings" => 1,
+                _ => 2,
+            };
+            (i, phase)
+        })
+        .collect();
+    indexed.sort_by_key(|&(_, phase)| phase);
+
+    for (i, _phase) in indexed {
+        let (_, writer) = &mut plugin_writers[i];
+        writer.serialize(serializer.segment_mut(), doc_id_map)?;
     }
+
+    *serializer.plugin_writers_mut() = plugin_writers;
 
     debug!("serializer-close");
     serializer.close()?;
 
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
