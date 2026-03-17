@@ -2,14 +2,12 @@ use std::sync::Arc;
 
 use crate::plugin::{PluginMergeContext, SegmentPlugin};
 use columnar::{
-    compute_merged_term_ord_mapping, BytesColumn, Column, ColumnType, ColumnarReader,
-    MergeRowOrder, RowAddr, ShuffleMergeOrder, StackMergeOrder,
+    compute_merged_term_ord_mapping, BytesColumn, Column,
 };
 use common::ReadOnlyBitSet;
 use itertools::Itertools;
 use measure_time::debug_time;
 
-use crate::directory::WritePtr;
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
@@ -20,7 +18,7 @@ use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::indexer::SegmentSerializer;
 use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
-use crate::schema::{value_type_to_column_type, Field, FieldType, Schema, Type};
+use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::{DocAddress, DocId, IndexSettings, IndexSortByField, Order, SegmentOrdinal};
@@ -146,44 +144,6 @@ impl DeltaComputer {
         }
         &self.buffer[..positions.len()]
     }
-}
-
-fn convert_to_merge_order(
-    columnars: &[&ColumnarReader],
-    doc_id_mapping: SegmentDocIdMapping,
-) -> MergeRowOrder {
-    match doc_id_mapping.mapping_type() {
-        MappingType::Stacked => MergeRowOrder::Stack(StackMergeOrder::stack(columnars)),
-        MappingType::StackedWithDeletes | MappingType::Shuffled => {
-            // RUST/LLVM is amazing. The following conversion is actually a no-op:
-            // no allocation, no copy.
-            let new_row_id_to_old_row_id: Vec<RowAddr> = doc_id_mapping
-                .new_doc_id_to_old_doc_addr
-                .into_iter()
-                .map(|doc_addr| RowAddr {
-                    segment_ord: doc_addr.segment_ord,
-                    row_id: doc_addr.doc_id,
-                })
-                .collect();
-            MergeRowOrder::Shuffled(ShuffleMergeOrder {
-                new_row_id_to_old_row_id,
-                alive_bitsets: doc_id_mapping.alive_bitsets,
-            })
-        }
-    }
-}
-
-fn extract_fast_field_required_columns(schema: &Schema) -> Vec<(String, ColumnType)> {
-    schema
-        .fields()
-        .map(|(_, field_entry)| field_entry)
-        .filter(|field_entry| field_entry.is_fast())
-        .filter_map(|field_entry| {
-            let column_name = field_entry.name().to_string();
-            let column_type = value_type_to_column_type(field_entry.field_type().value_type())?;
-            Some((column_name, column_type))
-        })
-        .collect()
 }
 
 impl IndexMerger {
@@ -341,29 +301,6 @@ impl IndexMerger {
             .into_iter()
             .map(|(reader, _)| reader)
             .collect())
-    }
-
-    fn write_fast_fields(
-        &self,
-        fast_field_wrt: &mut WritePtr,
-        doc_id_mapping: SegmentDocIdMapping,
-    ) -> crate::Result<()> {
-        debug_time!("write-fast-fields");
-        let required_columns = extract_fast_field_required_columns(&self.schema);
-        let columnars: Vec<&ColumnarReader> = self
-            .readers
-            .iter()
-            .map(|reader| reader.fast_fields().columnar())
-            .collect();
-        let merge_row_order = convert_to_merge_order(&columnars[..], doc_id_mapping);
-        columnar::merge_columnar(
-            &columnars[..],
-            &required_columns,
-            merge_row_order,
-            fast_field_wrt,
-            || self.cancel.wants_cancel(),
-        )?;
-        Ok(())
     }
 
     /// Checks if segments can use the fast disjunct-stack path (byte concatenation)
@@ -1015,8 +952,8 @@ impl IndexMerger {
             self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
         }
 
-        // Phase 2+: Merge remaining plugin data (custom plugins, etc.)
-        debug!("write-plugins");
+        // Phase 2+: Merge remaining plugin data (fast fields, custom plugins, etc.)
+        debug!("write-plugins-phase2");
         for plugin in self.plugins.iter().filter(|p| p.write_phase() >= 2) {
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
@@ -1027,9 +964,6 @@ impl IndexMerger {
                 cancel: &*self.cancel,
             })?;
         }
-
-        debug!("write-fastfields");
-        self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
 
         debug!("close-serializer");
         serializer.close()?;

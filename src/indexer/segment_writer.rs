@@ -5,7 +5,7 @@ use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
-use crate::fastfield::FastFieldsWriter;
+use crate::fastfield::FastFieldsPluginWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsPluginWriter};
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::indexing_term::IndexingTerm;
@@ -66,7 +66,6 @@ pub struct SegmentWriter {
     pub(crate) ctx: IndexingContext,
     pub(crate) per_field_postings_writers: PerFieldPostingsWriter,
     pub(crate) segment_serializer: SegmentSerializer,
-    pub(crate) fast_field_writers: FastFieldsWriter,
     pub(crate) json_path_writer: JsonPathWriter,
     pub(crate) json_positions_per_path: IndexingPositionsPerPath,
     pub(crate) doc_opstamps: Vec<Opstamp>,
@@ -93,7 +92,6 @@ impl SegmentWriter {
     ) -> crate::Result<Self> {
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
-        let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
         let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
@@ -126,10 +124,6 @@ impl SegmentWriter {
             json_path_writer: JsonPathWriter::default(),
             json_positions_per_path: IndexingPositionsPerPath::default(),
             segment_serializer,
-            fast_field_writers: FastFieldsWriter::from_schema_and_tokenizer_manager(
-                &schema,
-                tokenizer_manager_fast_field,
-            )?,
             doc_opstamps: Vec::with_capacity(1_000),
             per_field_text_analyzers,
             term_buffer: IndexingTerm::with_capacity(16),
@@ -161,7 +155,6 @@ impl SegmentWriter {
             self.schema,
             &self.per_field_postings_writers,
             self.ctx,
-            self.fast_field_writers,
             self.segment_serializer,
             mapping.as_ref(),
             self.ignore_store,
@@ -174,7 +167,6 @@ impl SegmentWriter {
     /// If the mem usage exceeds the `memory_budget`, the segment be serialized.
     pub fn mem_usage(&self) -> usize {
         self.ctx.mem_usage()
-            + self.fast_field_writers.mem_usage()
             + self.segment_serializer.mem_usage()
     }
 
@@ -411,7 +403,11 @@ impl SegmentWriter {
         let AddOperation { document, opstamp } = add_operation;
         let doc_id = self.max_doc;
         self.doc_opstamps.push(opstamp);
-        self.fast_field_writers.add_document(&document)?;
+        self.segment_serializer
+            .get_plugin_writer::<FastFieldsPluginWriter>("fast_fields")
+            .expect("fast_fields plugin")
+            .writer_mut()
+            .add_document(&document)?;
         self.index_document(&document)?;
         let doc_writer = self.segment_serializer.get_store_writer();
         doc_writer.store(&document, &self.schema)?;
@@ -452,7 +448,6 @@ fn remap_and_write(
     schema: Schema,
     per_field_postings_writers: &PerFieldPostingsWriter,
     ctx: IndexingContext,
-    fast_field_writers: FastFieldsWriter,
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
     ignore_store: bool,
@@ -479,8 +474,16 @@ fn remap_and_write(
         doc_id_map,
         serializer.get_postings_serializer(),
     )?;
+
+    // Phase 2: Serialize fast fields via plugin writer
     debug!("fastfield-serialize");
-    fast_field_writers.serialize(serializer.get_fast_field_write(), doc_id_map)?;
+    {
+        let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
+        if let Some((_, writer)) = plugin_writers.iter_mut().find(|(n, _)| n == "fast_fields") {
+            writer.serialize(serializer.segment_mut(), doc_id_map)?;
+        }
+        *serializer.plugin_writers_mut() = plugin_writers;
+    }
 
     // finalize temp docstore and create version, which reflects the doc_id_map
     if !ignore_store {
@@ -512,10 +515,13 @@ fn remap_and_write(
         }
     }
 
-    // Serialize plugin writers
+    // Serialize remaining plugin writers (skip fieldnorms and fast_fields, already serialized)
     debug!("plugin-serialize");
     let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
-    for (_, writer) in plugin_writers.iter_mut() {
+    for (name, writer) in plugin_writers.iter_mut() {
+        if name == "fieldnorms" || name == "fast_fields" {
+            continue;
+        }
         writer.serialize(serializer.segment_mut(), doc_id_map)?;
     }
     *serializer.plugin_writers_mut() = plugin_writers;

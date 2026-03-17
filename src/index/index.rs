@@ -25,6 +25,7 @@ use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
+use crate::fastfield::FastFieldsPlugin;
 use crate::fieldnorm::FieldNormsPlugin;
 use crate::plugin::SegmentPlugin;
 use crate::SegmentReader;
@@ -452,7 +453,7 @@ impl Index {
 
     /// Returns the set of built-in segment plugins.
     fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
-        vec![Arc::new(FieldNormsPlugin)]
+        vec![Arc::new(FieldNormsPlugin), Arc::new(FastFieldsPlugin)]
     }
 
     /// Setter for the tokenizer manager.

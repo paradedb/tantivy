@@ -1,8 +1,5 @@
 use std::sync::Arc;
 
-use common::TerminatingWrite;
-
-use crate::directory::WritePtr;
 use crate::index::{Segment, SegmentComponent};
 use crate::plugin::{PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::postings::InvertedIndexSerializer;
@@ -13,10 +10,9 @@ use crate::store::StoreWriter;
 pub struct SegmentSerializer {
     segment: Segment,
     pub(crate) store_writer: StoreWriter,
-    fast_field_write: WritePtr,
     postings_serializer: InvertedIndexSerializer,
     /// Plugin writers, stored as (name, writer) pairs.
-    /// Includes built-in plugins (fieldnorms, etc.) and custom plugins.
+    /// Includes built-in plugins (fieldnorms, fast_fields, etc.) and custom plugins.
     plugin_writers: Vec<(String, Box<dyn PluginWriter>)>,
 }
 
@@ -62,8 +58,6 @@ impl SegmentSerializer {
             )?
         };
 
-        let fast_field_write = segment.open_write(SegmentComponent::FastFields)?;
-
         let postings_serializer = InvertedIndexSerializer::open(&mut segment)?;
 
         // Create plugin writers (includes built-in plugins like FieldNormsPlugin)
@@ -86,7 +80,6 @@ impl SegmentSerializer {
         Ok(SegmentSerializer {
             segment,
             store_writer,
-            fast_field_write,
             postings_serializer,
             plugin_writers,
         })
@@ -115,22 +108,25 @@ impl SegmentSerializer {
         &mut self.postings_serializer
     }
 
-    /// Accessor to the `FastFieldSerializer`.
-    pub fn get_fast_field_write(&mut self) -> &mut WritePtr {
-        &mut self.fast_field_write
-    }
-
     /// Accessor to the `StoreWriter`.
     pub fn get_store_writer(&mut self) -> &mut StoreWriter {
         &mut self.store_writer
     }
 
-    /// Get a plugin writer by name and downcast to the expected type.
+    /// Get a plugin writer by name and downcast to the expected type (mutable).
     pub fn get_plugin_writer<T: 'static>(&mut self, name: &str) -> Option<&mut T> {
         self.plugin_writers
             .iter_mut()
             .find(|(n, _)| n == name)
             .and_then(|(_, w)| w.as_any_mut().downcast_mut::<T>())
+    }
+
+    /// Get a plugin writer by name and downcast to the expected type (immutable).
+    pub fn get_plugin_writer_ref<T: 'static>(&self, name: &str) -> Option<&T> {
+        self.plugin_writers
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, w)| w.as_any().downcast_ref::<T>())
     }
 
     /// Access the plugin writers for iteration.
@@ -140,7 +136,6 @@ impl SegmentSerializer {
 
     /// Finalize the segment serialization.
     pub fn close(self) -> crate::Result<()> {
-        self.fast_field_write.terminate()?;
         self.postings_serializer.close()?;
         self.store_writer.close()?;
         for (_, writer) in self.plugin_writers {
