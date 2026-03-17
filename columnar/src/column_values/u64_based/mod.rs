@@ -15,7 +15,10 @@ use crate::column_values::monotonic_mapping::{
     StrictlyMonotonicMappingInverter, StrictlyMonotonicMappingToInternal,
 };
 pub use crate::column_values::u64_based::bitpacked::BitpackedCodec;
-pub use crate::column_values::u64_based::blockwise_linear::BlockwiseLinearCodec;
+pub use crate::column_values::u64_based::blockwise_linear::{
+    BlockwiseLinearCodec, BlockwiseLinearReader,
+};
+pub use crate::column_values::u64_based::line::Line;
 pub use crate::column_values::u64_based::linear::LinearCodec;
 pub use crate::column_values::u64_based::stats_collector::StatsCollector;
 use crate::column_values::{ColumnStats, monotonic_map_column};

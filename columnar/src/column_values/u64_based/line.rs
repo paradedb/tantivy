@@ -17,8 +17,10 @@ const MID_POINT: u64 = (1u64 << 32) - 1u64;
 /// `y = m * x >> 32 + b`
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Line {
-    pub(crate) slope: u64,
-    pub(crate) intercept: u64,
+    /// Fixed-point slope with 32 fractional bits.
+    pub slope: u64,
+    /// Intercept (y-offset) of the line.
+    pub intercept: u64,
 }
 
 /// Compute the line slope.
@@ -61,13 +63,14 @@ fn compute_slope(y0: u64, y1: u64, num_vals: NonZeroU32) -> u64 {
 }
 
 impl Line {
+    /// Evaluate the line at position `x`.
     #[inline(always)]
     pub fn eval(&self, x: u32) -> u64 {
         let linear_part = ((x as u64).wrapping_mul(self.slope) >> 32) as i32 as u64;
         self.intercept.wrapping_add(linear_part)
     }
 
-    // Intercept is only computed from provided positions
+    /// Train a line from explicit first/last values and sampled positions.
     pub fn train_from(
         first_val: u64,
         last_val: u64,

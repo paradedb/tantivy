@@ -167,6 +167,7 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
     }
 }
 
+/// Codec that encodes column values using per-block linear interpolation with bitpacked residuals.
 pub struct BlockwiseLinearCodec;
 
 impl ColumnCodec<u64> for BlockwiseLinearCodec {
@@ -228,10 +229,60 @@ impl DerefMut for BlockWithData {
     }
 }
 
+/// Reader for blockwise-linear encoded column values.
 #[derive(Clone)]
 pub struct BlockwiseLinearReader {
     blocks: Arc<[BlockWithData]>,
     stats: ColumnStats,
+}
+
+impl BlockwiseLinearReader {
+    /// Construct a `BlockwiseLinearReader` from pre-parsed metadata.
+    ///
+    /// Each block is described by a `(Line, bit_width, FileSlice)` tuple where
+    /// the `FileSlice` points to the bitpacked data for that block.
+    ///
+    /// This allows external callers to cache the parsed metadata (e.g. in shared
+    /// memory) and reconstruct the reader without re-parsing the varint footer.
+    pub fn from_parts(
+        stats: ColumnStats,
+        blocks: impl IntoIterator<Item = (Line, u8, FileSlice)>,
+    ) -> Self {
+        let blocks: Arc<[BlockWithData]> = blocks
+            .into_iter()
+            .map(|(line, bit_width, file_slice)| BlockWithData {
+                block: Block {
+                    line,
+                    bit_unpacker: BitUnpacker::new(bit_width),
+                    data_start_offset: 0,
+                },
+                file_slice,
+                data: Default::default(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .into();
+        Self { blocks, stats }
+    }
+
+    /// Decompose this reader into its stats and per-block metadata.
+    ///
+    /// Returns `(ColumnStats, Vec<(Line, bit_width, FileSlice)>)`.
+    /// This is the inverse of [`from_parts`](Self::from_parts).
+    pub fn into_parts(self) -> (ColumnStats, Vec<(Line, u8, FileSlice)>) {
+        let parts = self
+            .blocks
+            .iter()
+            .map(|bwd| {
+                (
+                    bwd.block.line,
+                    bwd.block.bit_unpacker.bit_width(),
+                    bwd.file_slice.clone(),
+                )
+            })
+            .collect();
+        (self.stats, parts)
+    }
 }
 
 impl ColumnValues for BlockwiseLinearReader {
