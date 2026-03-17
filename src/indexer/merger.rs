@@ -6,20 +6,14 @@ use columnar::{
 };
 use common::ReadOnlyBitSet;
 use itertools::Itertools;
-use measure_time::debug_time;
 
-use crate::docset::{DocSet, TERMINATED};
-use crate::error::DataCorruption;
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
-use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
-use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
-use crate::index::{Segment, SegmentComponent, SegmentReader};
+use crate::index::{Segment, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::indexer::SegmentSerializer;
-use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
-use crate::schema::{Field, FieldType, Schema, Type};
-use crate::termdict::{TermMerger, TermOrdinal};
+use crate::schema::{Schema, Type};
+use crate::termdict::TermOrdinal;
 use crate::{DocAddress, DocId, IndexSettings, IndexSortByField, Order, SegmentOrdinal};
 
 /// Per-segment accessor for Str/Bytes sort fields during index merging.
@@ -61,56 +55,6 @@ enum ReaderSortFieldAccessors {
 /// We do not allow segments with more than
 pub const MAX_DOC_LIMIT: u32 = 1 << 31;
 
-fn estimate_total_num_tokens_in_single_segment(
-    reader: &SegmentReader,
-    field: Field,
-) -> crate::Result<u64> {
-    // There are no deletes. We can simply use the exact value saved into the posting list.
-    // Note that this value is not necessarily exact as it could have been the result of a merge
-    // between segments themselves containing deletes.
-    if !reader.has_deletes() {
-        return Ok(reader.inverted_index(field)?.total_num_tokens());
-    }
-
-    // When there are deletes, we use an approximation either
-    // by using the fieldnorm.
-    if let Some(fieldnorm_reader) = reader.fieldnorms_readers().get_field(field)? {
-        let mut count: [usize; 256] = [0; 256];
-        for doc in reader.doc_ids_alive() {
-            let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
-            count[fieldnorm_id as usize] += 1;
-        }
-        let total_num_tokens = count
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(fieldnorm_ord, count)| {
-                count as u64 * u64::from(FieldNormReader::id_to_fieldnorm(fieldnorm_ord as u8))
-            })
-            .sum::<u64>();
-        return Ok(total_num_tokens);
-    }
-
-    // There are no fieldnorms available.
-    // Here we just do a pro-rata with the overall number of tokens an the ratio of
-    // documents alive.
-    let segment_num_tokens = reader.inverted_index(field)?.total_num_tokens();
-    if reader.max_doc() == 0 {
-        // That supposedly never happens, but let's be a bit defensive here.
-        return Ok(0u64);
-    }
-    let ratio = reader.num_docs() as f64 / reader.max_doc() as f64;
-    Ok((segment_num_tokens as f64 * ratio) as u64)
-}
-
-fn estimate_total_num_tokens(readers: &[SegmentReader], field: Field) -> crate::Result<u64> {
-    let mut total_num_tokens: u64 = 0;
-    for reader in readers {
-        total_num_tokens += estimate_total_num_tokens_in_single_segment(reader, field)?;
-    }
-    Ok(total_num_tokens)
-}
-
 pub struct IndexMerger {
     index_settings: IndexSettings,
     schema: Schema,
@@ -119,30 +63,6 @@ pub struct IndexMerger {
     cancel: Box<dyn CancelSentinel>,
     ignore_store: bool,
     plugins: Vec<Arc<dyn SegmentPlugin>>,
-}
-
-struct DeltaComputer {
-    buffer: Vec<u32>,
-}
-
-impl DeltaComputer {
-    fn new() -> DeltaComputer {
-        DeltaComputer {
-            buffer: vec![0u32; 512],
-        }
-    }
-
-    fn compute_delta(&mut self, positions: &[u32]) -> &[u32] {
-        if positions.len() > self.buffer.len() {
-            self.buffer.resize(positions.len(), 0u32);
-        }
-        let mut last_pos = 0u32;
-        for (cur_pos, dest) in positions.iter().cloned().zip(self.buffer.iter_mut()) {
-            *dest = cur_pos - last_pos;
-            last_pos = cur_pos;
-        }
-        &self.buffer[..positions.len()]
-    }
 }
 
 impl IndexMerger {
@@ -586,253 +506,6 @@ impl IndexMerger {
         ))
     }
 
-    fn write_postings_for_field(
-        &self,
-        indexed_field: Field,
-        _field_type: &FieldType,
-        serializer: &mut InvertedIndexSerializer,
-        fieldnorm_reader: Option<FieldNormReader>,
-        doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<()> {
-        debug_time!("write-postings-for-field");
-        let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
-        let mut delta_computer = DeltaComputer::new();
-
-        let mut max_term_ords: Vec<TermOrdinal> = Vec::new();
-
-        let field_readers: Vec<Arc<MergeOptimizedInvertedIndexReader>> = self
-            .readers
-            .iter()
-            .map(|reader| reader.merge_optimized_inverted_index(indexed_field))
-            .collect::<crate::Result<Vec<_>>>()?;
-
-        let mut field_term_streams = Vec::new();
-        for field_reader in &field_readers {
-            let terms = field_reader.terms();
-            field_term_streams.push(terms.stream()?);
-            max_term_ords.push(terms.num_terms() as u64);
-        }
-
-        let mut merged_terms = TermMerger::new(field_term_streams);
-
-        // map from segment doc ids to the resulting merged segment doc id.
-
-        let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = self
-            .readers
-            .iter()
-            .map(|reader| {
-                let mut segment_local_map = vec![];
-                segment_local_map.resize(reader.max_doc() as usize, None);
-                segment_local_map
-            })
-            .collect();
-        for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
-            let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
-            segment_map[old_doc_addr.doc_id as usize] = Some(new_doc_id as DocId);
-        }
-
-        // Note that the total number of tokens is not exact.
-        // It is only used as a parameter in the BM25 formula.
-        let total_num_tokens: u64 = estimate_total_num_tokens(&self.readers, indexed_field)?;
-
-        // Create the total list of doc ids
-        // by stacking the doc ids from the different segment.
-        //
-        // In the new segments, the doc id from the different
-        // segment are stacked so that :
-        // - Segment 0's doc ids become doc id [0, seg.max_doc]
-        // - Segment 1's doc ids become  [seg0.max_doc, seg0.max_doc + seg.max_doc]
-        // - Segment 2's doc ids become  [seg0.max_doc + seg1.max_doc, seg0.max_doc + seg1.max_doc +
-        //   seg2.max_doc]
-        //
-        // This stacking applies only when the index is not sorted, in that case the
-        // doc_ids are kmerged by their sort property
-        let mut field_serializer =
-            serializer.new_field(indexed_field, total_num_tokens, fieldnorm_reader)?;
-
-        let field_entry = self.schema.get_field_entry(indexed_field);
-
-        // ... set segment postings option the new field.
-        let segment_postings_option = field_entry.field_type().get_index_record_option().expect(
-            "Encountered a field that is not supposed to be
-                         indexed. Have you modified the schema?",
-        );
-
-        let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
-        let mut doc_id_and_positions = vec![];
-
-        let mut cnt = 0;
-        while merged_terms.advance() {
-            // calling `wants_cancel()` could be expensive so only do it so often
-            if cnt % 1000 == 0 {
-                if self.cancel.wants_cancel() {
-                    return Err(crate::TantivyError::Cancelled);
-                }
-            }
-            cnt += 1;
-
-            segment_postings_containing_the_term.clear();
-            let term_bytes: &[u8] = merged_terms.key();
-
-            let mut total_doc_freq = 0;
-
-            // Let's compute the list of non-empty posting lists
-            for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
-                let segment_reader = &self.readers[segment_ord];
-                let inverted_index: &MergeOptimizedInvertedIndexReader =
-                    &field_readers[segment_ord];
-                let segment_postings = inverted_index
-                    .read_postings_from_terminfo(&term_info, segment_postings_option)?;
-                let alive_bitset_opt = segment_reader.alive_bitset();
-                let doc_freq = if let Some(alive_bitset) = alive_bitset_opt {
-                    segment_postings.doc_freq_given_deletes(alive_bitset)
-                } else {
-                    segment_postings.doc_freq()
-                };
-                if doc_freq > 0u32 {
-                    total_doc_freq += doc_freq;
-                    segment_postings_containing_the_term.push((segment_ord, segment_postings));
-                }
-            }
-
-            // At this point, `segment_postings` contains the posting list
-            // of all of the segments containing the given term (and that are non-empty)
-            //
-            // These segments are non-empty and advance has already been called.
-            if total_doc_freq == 0u32 {
-                // All docs that used to contain the term have been deleted. The `term` will be
-                // entirely removed.
-                continue;
-            }
-
-            // This should never happen as we early exited for total_doc_freq == 0.
-            assert!(!segment_postings_containing_the_term.is_empty());
-
-            let has_term_freq = {
-                let has_term_freq = !segment_postings_containing_the_term[0]
-                    .1
-                    .block_cursor
-                    .freqs()
-                    .is_empty();
-                for (_, postings) in &segment_postings_containing_the_term[1..] {
-                    // This may look at a strange way to test whether we have term freq or not.
-                    // With JSON object, the schema is not sufficient to know whether a term
-                    // has its term frequency encoded or not:
-                    // strings may have term frequencies, while number terms never have one.
-                    //
-                    // Ideally, we should have burnt one bit of two in the `TermInfo`.
-                    // However, we preferred not changing the codec too much and detect this
-                    // instead by
-                    // - looking at the size of the skip data for bitpacked blocks
-                    // - observing the absence of remaining data after reading the docs for vint
-                    // blocks.
-                    //
-                    // Overall the reliable way to know if we have actual frequencies loaded or not
-                    // is to check whether the actual decoded array is empty or not.
-                    if has_term_freq == postings.block_cursor.freqs().is_empty() {
-                        return Err(DataCorruption::comment_only(
-                            "Term freqs are inconsistent across segments",
-                        )
-                        .into());
-                    }
-                }
-                has_term_freq
-            };
-
-            field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
-
-            // We can now serialize this postings, by pushing each document to the
-            // postings serializer.
-            for (segment_ord, mut segment_postings) in
-                segment_postings_containing_the_term.drain(..)
-            {
-                let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
-
-                let mut doc = segment_postings.doc();
-                while doc != TERMINATED {
-                    if doc % 1000 == 0 {
-                        // calling `wants_cancel()` could be expensive so only do it so often
-                        if self.cancel.wants_cancel() {
-                            return Err(crate::TantivyError::Cancelled);
-                        }
-                    }
-                    // deleted doc are skipped as they do not have a `remapped_doc_id`.
-                    if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
-                        // we make sure to only write the term if
-                        // there is at least one document.
-                        let term_freq = if has_term_freq {
-                            segment_postings.positions(&mut positions_buffer);
-                            segment_postings.term_freq()
-                        } else {
-                            // The positions_buffer may contain positions from the previous term
-                            // Existence of positions depend on the value type in JSON fields.
-                            // https://github.com/quickwit-oss/tantivy/issues/2283
-                            positions_buffer.clear();
-                            0u32
-                        };
-
-                        // if doc_id_mapping exists, the doc_ids are reordered, they are
-                        // not just stacked. The field serializer expects monotonically increasing
-                        // doc_ids, so we collect and sort them first, before writing.
-                        //
-                        // I think this is not strictly necessary, it would be possible to
-                        // avoid the loading into a vec via some form of kmerge, but then the merge
-                        // logic would deviate much more from the stacking case (unsorted index)
-                        if !doc_id_mapping.is_trivial() {
-                            doc_id_and_positions.push((
-                                remapped_doc_id,
-                                term_freq,
-                                positions_buffer.to_vec(),
-                            ));
-                        } else {
-                            let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                            field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
-                        }
-                    }
-
-                    doc = segment_postings.advance();
-                }
-            }
-            if !doc_id_mapping.is_trivial() {
-                doc_id_and_positions.sort_unstable_by_key(|&(doc_id, _, _)| doc_id);
-
-                for (doc_id, term_freq, positions) in &doc_id_and_positions {
-                    let delta_positions = delta_computer.compute_delta(positions);
-                    field_serializer.write_doc(*doc_id, *term_freq, delta_positions);
-                }
-                doc_id_and_positions.clear();
-            }
-            // closing the term.
-            field_serializer.close_term()?;
-        }
-        field_serializer.close()?;
-        Ok(())
-    }
-
-    fn write_postings(
-        &self,
-        serializer: &mut InvertedIndexSerializer,
-        fieldnorm_readers: FieldNormReaders,
-        doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<()> {
-        for (field, field_entry) in self.schema.fields() {
-            if self.cancel.wants_cancel() {
-                return Err(crate::TantivyError::Cancelled);
-            }
-            let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
-            if field_entry.is_indexed() {
-                self.write_postings_for_field(
-                    field,
-                    field_entry.field_type(),
-                    serializer,
-                    fieldnorm_reader,
-                    doc_id_mapping,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     /// Writes the merged segment by pushing information
     /// to the `SegmentSerializer`.
     ///
@@ -849,38 +522,19 @@ impl IndexMerger {
         } else {
             self.get_doc_id_from_concatenated_data()?
         };
-        // Phase 0: Merge fieldnorms via plugin (must happen before postings)
-        debug!("write-fieldnorms-plugin");
-        for plugin in self.plugins.iter().filter(|p| p.write_phase() == 0) {
-            plugin.merge(PluginMergeContext {
-                readers: &self.readers,
-                doc_id_mapping: &doc_id_mapping,
-                target_segment: serializer.segment_mut(),
-                schema: &self.schema,
-                settings: &self.index_settings,
-                cancel: &*self.cancel,
-            })?;
-        }
 
+        // Merge all plugins in phase order.
+        // Phase 0: FieldNorms
         // Phase 1: Postings (reads back fieldnorms written above)
-        debug!("write-postings");
-        let fieldnorm_data = serializer
-            .segment()
-            .open_read(SegmentComponent::FieldNorms)?;
-        let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
-        self.write_postings(
-            serializer.get_postings_serializer(),
-            fieldnorm_readers,
-            &doc_id_mapping,
-        )?;
+        // Phase 2+: FastFields, Store, custom plugins
+        let mut sorted_plugins: Vec<&Arc<dyn SegmentPlugin>> = self.plugins.iter().collect();
+        sorted_plugins.sort_by_key(|p| p.write_phase());
 
-        // Phase 2+: Merge remaining plugin data (fast fields, store, custom plugins, etc.)
-        // Skip the "store" plugin when ignore_store is set.
-        debug!("write-plugins-phase2");
-        for plugin in self.plugins.iter().filter(|p| p.write_phase() >= 2) {
+        for plugin in sorted_plugins {
             if self.ignore_store && plugin.name() == "store" {
                 continue;
             }
+            debug!("merge-plugin: {} (phase {})", plugin.name(), plugin.write_phase());
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
                 doc_id_mapping: &doc_id_mapping,

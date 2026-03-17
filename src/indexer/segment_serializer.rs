@@ -2,15 +2,14 @@ use std::sync::Arc;
 
 use crate::index::Segment;
 use crate::plugin::{PluginWriter, PluginWriterContext, SegmentPlugin};
-use crate::postings::InvertedIndexSerializer;
 
 /// Segment serializer is in charge of laying out on disk
 /// the data accumulated and sorted by the `SegmentWriter`.
 pub struct SegmentSerializer {
     segment: Segment,
-    postings_serializer: InvertedIndexSerializer,
     /// Plugin writers, stored as (name, writer) pairs.
-    /// Includes built-in plugins (fieldnorms, fast_fields, store, etc.) and custom plugins.
+    /// Includes built-in plugins (fieldnorms, postings, fast_fields, store, etc.)
+    /// and custom plugins.
     plugin_writers: Vec<(String, Box<dyn PluginWriter>)>,
 }
 
@@ -26,15 +25,14 @@ impl SegmentSerializer {
 
     /// Creates a new `SegmentSerializer` with explicit plugins.
     pub fn for_segment_with_plugins(
-        mut segment: Segment,
+        segment: Segment,
         is_in_merge: bool,
         plugins: &[Arc<dyn SegmentPlugin>],
     ) -> crate::Result<SegmentSerializer> {
         let settings = segment.index().settings().clone();
 
-        let postings_serializer = InvertedIndexSerializer::open(&mut segment)?;
-
-        // Create plugin writers (includes built-in plugins like FieldNormsPlugin, StorePlugin)
+        // Create plugin writers (includes built-in plugins like FieldNormsPlugin,
+        // PostingsPlugin, FastFieldsPlugin, StorePlugin)
         let schema = segment.schema();
         let directory: &dyn crate::Directory = segment.index().directory();
         let plugin_writers = plugins
@@ -53,7 +51,6 @@ impl SegmentSerializer {
 
         Ok(SegmentSerializer {
             segment,
-            postings_serializer,
             plugin_writers,
         })
     }
@@ -72,11 +69,6 @@ impl SegmentSerializer {
 
     pub fn segment_mut(&mut self) -> &mut Segment {
         &mut self.segment
-    }
-
-    /// Accessor to the `PostingsSerializer`.
-    pub fn get_postings_serializer(&mut self) -> &mut InvertedIndexSerializer {
-        &mut self.postings_serializer
     }
 
     /// Get a plugin writer by name and downcast to the expected type (mutable).
@@ -102,7 +94,6 @@ impl SegmentSerializer {
 
     /// Finalize the segment serialization.
     pub fn close(self) -> crate::Result<()> {
-        self.postings_serializer.close()?;
         for (_, writer) in self.plugin_writers {
             writer.close()?;
         }

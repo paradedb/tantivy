@@ -28,6 +28,7 @@ use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::fastfield::FastFieldsPlugin;
 use crate::fieldnorm::FieldNormsPlugin;
 use crate::plugin::SegmentPlugin;
+use crate::postings::PostingsPlugin;
 use crate::store::StorePlugin;
 use crate::SegmentReader;
 
@@ -456,6 +457,7 @@ impl Index {
     fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
         vec![
             Arc::new(FieldNormsPlugin),
+            Arc::new(PostingsPlugin),
             Arc::new(FastFieldsPlugin),
             Arc::new(StorePlugin),
         ]

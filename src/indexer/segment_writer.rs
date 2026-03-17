@@ -6,14 +6,14 @@ use tokenizer_api::BoxTokenStream;
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
 use crate::fastfield::FastFieldsPluginWriter;
-use crate::fieldnorm::{FieldNormReaders, FieldNormsPluginWriter};
-use crate::index::{Segment, SegmentComponent};
+use crate::fieldnorm::FieldNormsPluginWriter;
+use crate::index::Segment;
 use crate::indexer::indexing_term::IndexingTerm;
 use crate::indexer::segment_serializer::SegmentSerializer;
 use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
 use crate::postings::{
-    compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
-    PerFieldPostingsWriter, PostingsWriter,
+    compute_table_memory_size, IndexingContext, IndexingPosition,
+    PerFieldPostingsWriter, PostingsPluginWriter, PostingsWriter,
 };
 use crate::schema::document::{Document, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
@@ -151,10 +151,26 @@ impl SegmentWriter {
             .clone()
             .map(|sort_by_field| get_doc_id_mapping_from_field(sort_by_field, &self))
             .transpose()?;
+
+        // Transfer per_field_postings_writers and ctx to the PostingsPluginWriter
+        // so they can be consumed during plugin-based serialization.
+        {
+            let postings_plugin = self
+                .segment_serializer
+                .get_plugin_writer::<PostingsPluginWriter>("postings")
+                .expect("postings plugin");
+            postings_plugin.per_field_postings_writers =
+                Some(std::mem::replace(
+                    &mut self.per_field_postings_writers,
+                    PerFieldPostingsWriter::empty(),
+                ));
+            postings_plugin.ctx = Some(std::mem::replace(
+                &mut self.ctx,
+                IndexingContext::default(),
+            ));
+        }
+
         remap_and_write(
-            self.schema,
-            &self.per_field_postings_writers,
-            self.ctx,
             self.segment_serializer,
             mapping.as_ref(),
         )?;
@@ -442,61 +458,53 @@ impl SegmentWriter {
     }
 }
 
-/// This method is used as a trick to workaround the borrow checker
 /// Writes a view of a segment by pushing information
-/// to the `SegmentSerializer`.
+/// to the `SegmentSerializer` via the plugin writers.
 ///
 /// `doc_id_map` is used to map to the new doc_id order.
+///
+/// Plugin writers are serialized in phase order:
+/// - Phase 0: FieldNorms
+/// - Phase 1: Postings (reads back fieldnorms from disk)
+/// - Phase 2+: FastFields, Store, custom plugins
 fn remap_and_write(
-    schema: Schema,
-    per_field_postings_writers: &PerFieldPostingsWriter,
-    ctx: IndexingContext,
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
-    // Phase 0: Serialize fieldnorms via plugin writer
-    {
-        let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
-        if let Some((_, writer)) = plugin_writers.iter_mut().find(|(n, _)| n == "fieldnorms") {
-            writer.serialize(serializer.segment_mut(), doc_id_map)?;
-        }
-        *serializer.plugin_writers_mut() = plugin_writers;
-    }
-    // Phase 1: Read back fieldnorms for postings
-    let fieldnorm_data = serializer
-        .segment()
-        .open_read(SegmentComponent::FieldNorms)?;
-    let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
-    serialize_postings(
-        ctx,
-        schema,
-        per_field_postings_writers,
-        fieldnorm_readers,
-        doc_id_map,
-        serializer.get_postings_serializer(),
-    )?;
 
-    // Phase 2: Serialize remaining plugin writers (fast_fields, store, custom plugins)
-    // Skip fieldnorms which was already serialized in phase 0.
-    debug!("plugin-serialize-phase2");
-    {
-        let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
-        for (name, writer) in plugin_writers.iter_mut() {
-            if name == "fieldnorms" {
-                continue;
-            }
-            writer.serialize(serializer.segment_mut(), doc_id_map)?;
-        }
-        *serializer.plugin_writers_mut() = plugin_writers;
+    // Sort plugin writers by phase and serialize in order.
+    // We need to take them out so we can pass &mut Segment from the serializer.
+    let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
+
+    // Collect (index, phase) so we can process in phase order
+    let mut indexed: Vec<(usize, u32)> = plugin_writers
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            // Determine phase from the name
+            let phase = match name.as_str() {
+                "fieldnorms" => 0,
+                "postings" => 1,
+                _ => 2,
+            };
+            (i, phase)
+        })
+        .collect();
+    indexed.sort_by_key(|&(_, phase)| phase);
+
+    for (i, _phase) in indexed {
+        let (_, writer) = &mut plugin_writers[i];
+        writer.serialize(serializer.segment_mut(), doc_id_map)?;
     }
+
+    *serializer.plugin_writers_mut() = plugin_writers;
 
     debug!("serializer-close");
     serializer.close()?;
 
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
