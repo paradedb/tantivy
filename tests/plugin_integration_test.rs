@@ -130,9 +130,16 @@ fn test_plugin_full_lifecycle() -> tantivy::Result<()> {
         .plugin(plugin)
         .create_in_ram()?;
 
-    // Verify plugin is registered
-    assert_eq!(index.plugins().len(), 1);
-    assert_eq!(index.plugins()[0].name(), "doc_count");
+    // Verify plugins are registered (built-in + custom)
+    assert!(index.plugins().len() >= 2);
+    assert!(
+        index.plugins().iter().any(|p| p.name() == "doc_count"),
+        "doc_count plugin should be registered"
+    );
+    assert!(
+        index.plugins().iter().any(|p| p.name() == "fieldnorms"),
+        "fieldnorms built-in plugin should be registered"
+    );
 
     // Index some documents
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;

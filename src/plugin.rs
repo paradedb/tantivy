@@ -10,6 +10,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::directory::Directory;
 use crate::index::{IndexSettings, SegmentReader};
 use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
 use crate::indexer::segment_updater::CancelSentinel;
@@ -110,6 +111,11 @@ pub struct PluginWriterContext<'a> {
     pub settings: &'a IndexSettings,
     /// Whether this writer is being created for a merge operation.
     pub is_in_merge: bool,
+    /// The directory for reading/writing files. Plugins can use this to open
+    /// file handles directly (e.g., `directory.open_write(&path)`).
+    /// The `Directory::open_write` trait method takes `&self`, so no mutable
+    /// segment reference is needed.
+    pub directory: &'a dyn Directory,
 }
 
 /// Context provided to [`SegmentPlugin::open_reader`].

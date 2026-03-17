@@ -3,7 +3,6 @@ use std::sync::Arc;
 use common::TerminatingWrite;
 
 use crate::directory::WritePtr;
-use crate::fieldnorm::FieldNormsSerializer;
 use crate::index::{Segment, SegmentComponent};
 use crate::plugin::{PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::postings::InvertedIndexSerializer;
@@ -15,9 +14,9 @@ pub struct SegmentSerializer {
     segment: Segment,
     pub(crate) store_writer: StoreWriter,
     fast_field_write: WritePtr,
-    fieldnorms_serializer: Option<FieldNormsSerializer>,
     postings_serializer: InvertedIndexSerializer,
     /// Plugin writers, stored as (name, writer) pairs.
+    /// Includes built-in plugins (fieldnorms, etc.) and custom plugins.
     plugin_writers: Vec<(String, Box<dyn PluginWriter>)>,
 }
 
@@ -65,13 +64,11 @@ impl SegmentSerializer {
 
         let fast_field_write = segment.open_write(SegmentComponent::FastFields)?;
 
-        let fieldnorms_write = segment.open_write(SegmentComponent::FieldNorms)?;
-        let fieldnorms_serializer = FieldNormsSerializer::from_write(fieldnorms_write)?;
-
         let postings_serializer = InvertedIndexSerializer::open(&mut segment)?;
 
-        // Create plugin writers
+        // Create plugin writers (includes built-in plugins like FieldNormsPlugin)
         let schema = segment.schema();
+        let directory: &dyn crate::Directory = segment.index().directory();
         let plugin_writers = plugins
             .iter()
             .map(|p| {
@@ -80,6 +77,7 @@ impl SegmentSerializer {
                     schema: &schema,
                     settings: &settings,
                     is_in_merge,
+                    directory,
                 };
                 Ok((p.name().to_string(), p.create_writer(&ctx)?))
             })
@@ -89,7 +87,6 @@ impl SegmentSerializer {
             segment,
             store_writer,
             fast_field_write,
-            fieldnorms_serializer: Some(fieldnorms_serializer),
             postings_serializer,
             plugin_writers,
         })
@@ -123,13 +120,6 @@ impl SegmentSerializer {
         &mut self.fast_field_write
     }
 
-    /// Extract the field norm serializer.
-    ///
-    /// Note the fieldnorms serializer can only be extracted once.
-    pub fn extract_fieldnorms_serializer(&mut self) -> Option<FieldNormsSerializer> {
-        self.fieldnorms_serializer.take()
-    }
-
     /// Accessor to the `StoreWriter`.
     pub fn get_store_writer(&mut self) -> &mut StoreWriter {
         &mut self.store_writer
@@ -149,10 +139,7 @@ impl SegmentSerializer {
     }
 
     /// Finalize the segment serialization.
-    pub fn close(mut self) -> crate::Result<()> {
-        if let Some(fieldnorms_serializer) = self.extract_fieldnorms_serializer() {
-            fieldnorms_serializer.close()?;
-        }
+    pub fn close(self) -> crate::Result<()> {
         self.fast_field_write.terminate()?;
         self.postings_serializer.close()?;
         self.store_writer.close()?;

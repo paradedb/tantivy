@@ -13,7 +13,7 @@ use crate::directory::WritePtr;
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
-use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
+use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
 use crate::index::{Segment, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
@@ -341,34 +341,6 @@ impl IndexMerger {
             .into_iter()
             .map(|(reader, _)| reader)
             .collect())
-    }
-
-    fn write_fieldnorms(
-        &self,
-        mut fieldnorms_serializer: FieldNormsSerializer,
-        doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<()> {
-        let fields = FieldNormsWriter::fields_with_fieldnorm(&self.schema);
-        let mut fieldnorms_data = Vec::with_capacity(self.max_doc as usize);
-        for field in fields {
-            if self.cancel.wants_cancel() {
-                return Err(crate::TantivyError::Cancelled);
-            }
-            fieldnorms_data.clear();
-            let fieldnorms_readers: Vec<FieldNormReader> = self
-                .readers
-                .iter()
-                .map(|reader| reader.get_fieldnorms_reader(field))
-                .collect::<Result<_, _>>()?;
-            for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
-                let fieldnorms_reader = &fieldnorms_readers[old_doc_addr.segment_ord as usize];
-                let fieldnorm_id = fieldnorms_reader.fieldnorm_id(old_doc_addr.doc_id);
-                fieldnorms_data.push(fieldnorm_id);
-            }
-            fieldnorms_serializer.serialize_field(field, &fieldnorms_data[..])?;
-        }
-        fieldnorms_serializer.close()?;
-        Ok(())
     }
 
     fn write_fast_fields(
@@ -1013,10 +985,20 @@ impl IndexMerger {
         } else {
             self.get_doc_id_from_concatenated_data()?
         };
-        debug!("write-fieldnorms");
-        if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
-            self.write_fieldnorms(fieldnorms_serializer, &doc_id_mapping)?;
+        // Phase 0: Merge fieldnorms via plugin (must happen before postings)
+        debug!("write-fieldnorms-plugin");
+        for plugin in self.plugins.iter().filter(|p| p.write_phase() == 0) {
+            plugin.merge(PluginMergeContext {
+                readers: &self.readers,
+                doc_id_mapping: &doc_id_mapping,
+                target_segment: serializer.segment_mut(),
+                schema: &self.schema,
+                settings: &self.index_settings,
+                cancel: &*self.cancel,
+            })?;
         }
+
+        // Phase 1: Postings (reads back fieldnorms written above)
         debug!("write-postings");
         let fieldnorm_data = serializer
             .segment()
@@ -1033,9 +1015,9 @@ impl IndexMerger {
             self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
         }
 
-        // Merge plugin data (before fast fields, which consumes doc_id_mapping)
+        // Phase 2+: Merge remaining plugin data (custom plugins, etc.)
         debug!("write-plugins");
-        for plugin in &self.plugins {
+        for plugin in self.plugins.iter().filter(|p| p.write_phase() >= 2) {
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
                 doc_id_mapping: &doc_id_mapping,

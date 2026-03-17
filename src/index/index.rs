@@ -25,6 +25,7 @@ use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
+use crate::fieldnorm::FieldNormsPlugin;
 use crate::plugin::SegmentPlugin;
 use crate::SegmentReader;
 
@@ -243,7 +244,7 @@ impl IndexBuilder {
         let mut index = Index::open(dir)?;
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
-            index.plugins = self.plugins;
+            index.plugins.extend(self.plugins);
             Ok(index)
         } else {
             Err(TantivyError::SchemaError(
@@ -310,7 +311,7 @@ impl IndexBuilder {
         let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
-        index.plugins = self.plugins;
+        index.plugins.extend(self.plugins);
         Ok(index)
     }
 }
@@ -445,8 +446,13 @@ impl Index {
             fast_field_tokenizers: TokenizerManager::default(),
             executor: Executor::single_thread(),
             inventory,
-            plugins: Vec::new(),
+            plugins: Self::builtin_plugins(),
         }
+    }
+
+    /// Returns the set of built-in segment plugins.
+    fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
+        vec![Arc::new(FieldNormsPlugin)]
     }
 
     /// Setter for the tokenizer manager.
