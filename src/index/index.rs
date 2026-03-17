@@ -28,6 +28,7 @@ use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::fastfield::FastFieldsPlugin;
 use crate::fieldnorm::FieldNormsPlugin;
 use crate::plugin::SegmentPlugin;
+use crate::store::StorePlugin;
 use crate::SegmentReader;
 
 fn load_metas(
@@ -453,7 +454,11 @@ impl Index {
 
     /// Returns the set of built-in segment plugins.
     fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
-        vec![Arc::new(FieldNormsPlugin), Arc::new(FastFieldsPlugin)]
+        vec![
+            Arc::new(FieldNormsPlugin),
+            Arc::new(FastFieldsPlugin),
+            Arc::new(StorePlugin),
+        ]
     }
 
     /// Setter for the tokenizer manager.

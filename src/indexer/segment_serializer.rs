@@ -1,18 +1,16 @@
 use std::sync::Arc;
 
-use crate::index::{Segment, SegmentComponent};
+use crate::index::Segment;
 use crate::plugin::{PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::postings::InvertedIndexSerializer;
-use crate::store::StoreWriter;
 
 /// Segment serializer is in charge of laying out on disk
 /// the data accumulated and sorted by the `SegmentWriter`.
 pub struct SegmentSerializer {
     segment: Segment,
-    pub(crate) store_writer: StoreWriter,
     postings_serializer: InvertedIndexSerializer,
     /// Plugin writers, stored as (name, writer) pairs.
-    /// Includes built-in plugins (fieldnorms, fast_fields, etc.) and custom plugins.
+    /// Includes built-in plugins (fieldnorms, fast_fields, store, etc.) and custom plugins.
     plugin_writers: Vec<(String, Box<dyn PluginWriter>)>,
 }
 
@@ -32,35 +30,11 @@ impl SegmentSerializer {
         is_in_merge: bool,
         plugins: &[Arc<dyn SegmentPlugin>],
     ) -> crate::Result<SegmentSerializer> {
-        // If the segment is going to be sorted, we stream the docs first to a temporary file.
-        // In the merge case this is not necessary because we can kmerge the already sorted
-        // segments
-        let remapping_required = segment.index().settings().sort_by_field.is_some() && !is_in_merge;
         let settings = segment.index().settings().clone();
-        let store_writer = if remapping_required {
-            let store_write = segment.open_write(SegmentComponent::TempStore)?;
-            StoreWriter::new(
-                store_write,
-                crate::store::Compressor::None,
-                // We want fast random access on the docs, so we choose a small block size.
-                // If this is zero, the skip index will contain too many checkpoints and
-                // therefore will be relatively slow.
-                16000,
-                settings.docstore_compress_dedicated_thread,
-            )?
-        } else {
-            let store_write = segment.open_write(SegmentComponent::Store)?;
-            StoreWriter::new(
-                store_write,
-                settings.docstore_compression,
-                settings.docstore_blocksize,
-                settings.docstore_compress_dedicated_thread,
-            )?
-        };
 
         let postings_serializer = InvertedIndexSerializer::open(&mut segment)?;
 
-        // Create plugin writers (includes built-in plugins like FieldNormsPlugin)
+        // Create plugin writers (includes built-in plugins like FieldNormsPlugin, StorePlugin)
         let schema = segment.schema();
         let directory: &dyn crate::Directory = segment.index().directory();
         let plugin_writers = plugins
@@ -79,7 +53,6 @@ impl SegmentSerializer {
 
         Ok(SegmentSerializer {
             segment,
-            store_writer,
             postings_serializer,
             plugin_writers,
         })
@@ -87,12 +60,10 @@ impl SegmentSerializer {
 
     /// The memory used (inclusive childs)
     pub fn mem_usage(&self) -> usize {
-        self.store_writer.mem_usage()
-            + self
-                .plugin_writers
-                .iter()
-                .map(|(_, w)| w.mem_usage())
-                .sum::<usize>()
+        self.plugin_writers
+            .iter()
+            .map(|(_, w)| w.mem_usage())
+            .sum::<usize>()
     }
 
     pub fn segment(&self) -> &Segment {
@@ -106,11 +77,6 @@ impl SegmentSerializer {
     /// Accessor to the `PostingsSerializer`.
     pub fn get_postings_serializer(&mut self) -> &mut InvertedIndexSerializer {
         &mut self.postings_serializer
-    }
-
-    /// Accessor to the `StoreWriter`.
-    pub fn get_store_writer(&mut self) -> &mut StoreWriter {
-        &mut self.store_writer
     }
 
     /// Get a plugin writer by name and downcast to the expected type (mutable).
@@ -137,7 +103,6 @@ impl SegmentSerializer {
     /// Finalize the segment serialization.
     pub fn close(self) -> crate::Result<()> {
         self.postings_serializer.close()?;
-        self.store_writer.close()?;
         for (_, writer) in self.plugin_writers {
             writer.close()?;
         }

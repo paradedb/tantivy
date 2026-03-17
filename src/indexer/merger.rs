@@ -19,7 +19,6 @@ use crate::indexer::segment_updater::CancelSentinel;
 use crate::indexer::SegmentSerializer;
 use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{Field, FieldType, Schema, Type};
-use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::{DocAddress, DocId, IndexSettings, IndexSortByField, Order, SegmentOrdinal};
 
@@ -834,78 +833,6 @@ impl IndexMerger {
         Ok(())
     }
 
-    fn write_storable_fields(
-        &self,
-        store_writer: &mut StoreWriter,
-        doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<()> {
-        debug_time!("write-storable-fields");
-        debug!("write-storable-field");
-
-        if !doc_id_mapping.is_trivial() {
-            debug!("non-trivial-doc-id-mapping");
-
-            let store_readers: Vec<_> = self
-                .readers
-                .iter()
-                .map(|reader| reader.get_store_reader(50))
-                .collect::<Result<_, _>>()?;
-
-            let mut document_iterators: Vec<_> = store_readers
-                .iter()
-                .enumerate()
-                .map(|(i, store)| store.iter_raw(self.readers[i].alive_bitset()))
-                .collect();
-
-            for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
-                let doc_bytes_it = &mut document_iterators[old_doc_addr.segment_ord as usize];
-                if let Some(doc_bytes_res) = doc_bytes_it.next() {
-                    let doc_bytes = doc_bytes_res?;
-                    store_writer.store_bytes(&doc_bytes)?;
-                } else {
-                    return Err(DataCorruption::comment_only(format!(
-                        "unexpected missing document in docstore on merge, doc address \
-                         {old_doc_addr:?}",
-                    ))
-                    .into());
-                }
-            }
-        } else {
-            debug!("trivial-doc-id-mapping");
-            for reader in &self.readers {
-                let store_reader = reader.get_store_reader(1)?;
-                if reader.has_deletes()
-                    // If there is not enough data in the store, we avoid stacking in order to
-                    // avoid creating many small blocks in the doc store. Once we have 5 full blocks,
-                    // we start stacking. In the worst case 2/7 of the blocks would be very small.
-                    // [segment 1 - {1 doc}][segment 2 - {fullblock * 5}{1doc}]
-                    // => 5 * full blocks, 2 * 1 document blocks
-                    //
-                    // In a more realistic scenario the segments are of the same size, so 1/6 of
-                    // the doc stores would be on average half full, given total randomness (which
-                    // is not the case here, but not sure how it behaves exactly).
-                    //
-                    // https://github.com/quickwit-oss/tantivy/issues/1053
-                    //
-                    // take 7 in order to not walk over all checkpoints.
-                    || store_reader.block_checkpoints().take(7).count() < 6
-                    || store_reader.decompressor() != store_writer.compressor().into()
-                {
-                    for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
-                        if self.cancel.wants_cancel() {
-                            return Err(crate::TantivyError::Cancelled);
-                        }
-                        let doc_bytes = doc_bytes_res?;
-                        store_writer.store_bytes(&doc_bytes)?;
-                    }
-                } else {
-                    store_writer.stack(store_reader)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Writes the merged segment by pushing information
     /// to the `SegmentSerializer`.
     ///
@@ -947,14 +874,13 @@ impl IndexMerger {
             &doc_id_mapping,
         )?;
 
-        debug!("write-storagefields");
-        if !self.ignore_store {
-            self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
-        }
-
-        // Phase 2+: Merge remaining plugin data (fast fields, custom plugins, etc.)
+        // Phase 2+: Merge remaining plugin data (fast fields, store, custom plugins, etc.)
+        // Skip the "store" plugin when ignore_store is set.
         debug!("write-plugins-phase2");
         for plugin in self.plugins.iter().filter(|p| p.write_phase() >= 2) {
+            if self.ignore_store && plugin.name() == "store" {
+                continue;
+            }
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
                 doc_id_mapping: &doc_id_mapping,

@@ -17,7 +17,7 @@ use crate::postings::{
 };
 use crate::schema::document::{Document, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
-use crate::store::{StoreReader, StoreWriter};
+use crate::store::StorePluginWriter;
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, Opstamp, TantivyError};
 
@@ -157,7 +157,6 @@ impl SegmentWriter {
             self.ctx,
             self.segment_serializer,
             mapping.as_ref(),
-            self.ignore_store,
         )?;
         let doc_opstamps = remap_doc_opstamps(self.doc_opstamps, mapping.as_ref());
         Ok(doc_opstamps)
@@ -409,8 +408,12 @@ impl SegmentWriter {
             .writer_mut()
             .add_document(&document)?;
         self.index_document(&document)?;
-        let doc_writer = self.segment_serializer.get_store_writer();
-        doc_writer.store(&document, &self.schema)?;
+        if !self.ignore_store {
+            self.segment_serializer
+                .get_plugin_writer::<StorePluginWriter>("store")
+                .expect("store plugin")
+                .store(&document, &self.schema)?;
+        }
         for (_, writer) in self.segment_serializer.plugin_writers_mut().iter_mut() {
             writer.add_document(doc_id)?;
         }
@@ -450,7 +453,6 @@ fn remap_and_write(
     ctx: IndexingContext,
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
-    ignore_store: bool,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
     // Phase 0: Serialize fieldnorms via plugin writer
@@ -475,56 +477,19 @@ fn remap_and_write(
         serializer.get_postings_serializer(),
     )?;
 
-    // Phase 2: Serialize fast fields via plugin writer
-    debug!("fastfield-serialize");
+    // Phase 2: Serialize remaining plugin writers (fast_fields, store, custom plugins)
+    // Skip fieldnorms which was already serialized in phase 0.
+    debug!("plugin-serialize-phase2");
     {
         let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
-        if let Some((_, writer)) = plugin_writers.iter_mut().find(|(n, _)| n == "fast_fields") {
+        for (name, writer) in plugin_writers.iter_mut() {
+            if name == "fieldnorms" {
+                continue;
+            }
             writer.serialize(serializer.segment_mut(), doc_id_map)?;
         }
         *serializer.plugin_writers_mut() = plugin_writers;
     }
-
-    // finalize temp docstore and create version, which reflects the doc_id_map
-    if !ignore_store {
-        if let Some(doc_id_map) = doc_id_map {
-            debug!("resort-docstore");
-            let store_write = serializer
-                .segment_mut()
-                .open_write(SegmentComponent::Store)?;
-            let settings = serializer.segment().index().settings();
-            let store_writer = StoreWriter::new(
-                store_write,
-                settings.docstore_compression,
-                settings.docstore_blocksize,
-                settings.docstore_compress_dedicated_thread,
-            )?;
-            let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
-            old_store_writer.close()?;
-            let store_read = StoreReader::open(
-                serializer
-                    .segment()
-                    .open_read(SegmentComponent::TempStore)?,
-                1, /* The docstore is configured to have one doc per block, and each doc is
-                    * accessed only once: we don't need caching. */
-            )?;
-            for old_doc_id in doc_id_map.iter_old_doc_ids() {
-                let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
-                serializer.get_store_writer().store_bytes(&doc_bytes)?;
-            }
-        }
-    }
-
-    // Serialize remaining plugin writers (skip fieldnorms and fast_fields, already serialized)
-    debug!("plugin-serialize");
-    let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
-    for (name, writer) in plugin_writers.iter_mut() {
-        if name == "fieldnorms" || name == "fast_fields" {
-            continue;
-        }
-        writer.serialize(serializer.segment_mut(), doc_id_map)?;
-    }
-    *serializer.plugin_writers_mut() = plugin_writers;
 
     debug!("serializer-close");
     serializer.close()?;
