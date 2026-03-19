@@ -19,6 +19,7 @@ enum StemmerAlgorithm {
 #[allow(missing_docs)]
 pub enum Language {
     Arabic,
+    Czech,
     Danish,
     Dutch,
     English,
@@ -44,6 +45,9 @@ impl Language {
         use self::Language::*;
         match self {
             Arabic => StemmerAlgorithm::Frostem(Algorithm::Arabic),
+            Czech => {
+                StemmerAlgorithm::Tantivy(tantivy_stemmers::algorithms::czech_dolamic_aggressive)
+            }
             Danish => StemmerAlgorithm::Frostem(Algorithm::Danish),
             Dutch => StemmerAlgorithm::Frostem(Algorithm::Dutch),
             English => StemmerAlgorithm::Frostem(Algorithm::English),
