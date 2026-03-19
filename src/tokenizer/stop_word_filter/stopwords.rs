@@ -1521,7 +1521,7 @@ pub const NORWEGIAN: &[&str] = &[
     "vart",
 ];
 
-// Source: https://github.com/stopwords-iso/stopwords-cs (MIT license)
+// Source: https://github.com/stopwords-iso/stopwords-cs/blob/08a7a251f35c8ef6fd666513c8c0b5feb8ee30a9/stopwords-cs.txt (MIT license)
 pub const CZECH: &[&str] = &[
     "a",
     "aby",
@@ -3075,4 +3075,3 @@ pub const SWEDISH: &[&str] = &[
     "era",
     "vilkas",
 ];
-
