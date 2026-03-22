@@ -1,6 +1,5 @@
 use std::io;
 use std::io::Write;
-use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, OnceLock};
 
 use common::file_slice::FileSlice;
@@ -19,7 +18,6 @@ const BLOCK_SIZE: u32 = 512u32;
 struct Block {
     line: Line,
     bit_unpacker: BitUnpacker,
-    data_start_offset: usize,
 }
 
 impl BinarySerializable for Block {
@@ -35,7 +33,6 @@ impl BinarySerializable for Block {
         Ok(Block {
             line,
             bit_unpacker: BitUnpacker::new(bit_width),
-            data_start_offset: 0,
         })
     }
 }
@@ -148,7 +145,6 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
             blocks.push(Block {
                 line,
                 bit_unpacker: BitUnpacker::new(bit_width),
-                data_start_offset: 0,
             });
         }
 
@@ -177,61 +173,61 @@ impl ColumnCodec<u64> for BlockwiseLinearCodec {
     fn load(file_slice: FileSlice) -> io::Result<Self::ColumnValues> {
         let (stats, body) = ColumnStats::deserialize_from_tail(file_slice)?;
 
-        let (_, footer) = body.clone().split_from_end(4);
+        let (_, footer_len_bytes) = body.clone().split_from_end(4);
 
-        let footer_len: u32 = footer.read_bytes()?.as_slice().deserialize()?;
-        let (data, footer) = body.split_from_end(footer_len as usize + 4);
+        let footer_len: u32 = footer_len_bytes.read_bytes()?.as_slice().deserialize()?;
+        let (data, footer_file) = body.split_from_end(footer_len as usize + 4);
 
-        let mut footer = footer.read_bytes()?;
-        let num_blocks = compute_num_blocks(stats.num_rows);
+        let footer_bytes = footer_file.read_bytes()?;
+        let mut footer_cursor: &[u8] = footer_bytes.as_slice();
+        let num_blocks = compute_num_blocks(stats.num_rows) as usize;
 
-        let mut start_offset = 0;
-        let mut blocks = Vec::with_capacity(num_blocks as usize);
+        let mut lines = Vec::with_capacity(num_blocks);
+        let mut bit_unpackers = Vec::with_capacity(num_blocks);
+        let mut data_file_slices: Vec<(FileSlice, OnceLock<OwnedBytes>)> =
+            Vec::with_capacity(num_blocks);
+        let mut start_offset = 0usize;
 
         for _ in 0..num_blocks {
-            let mut block = Block::deserialize(&mut footer)?;
-            let len = (block.bit_unpacker.bit_width() as usize) * BLOCK_SIZE as usize / 8;
+            let line = Line::deserialize(&mut footer_cursor)?;
+            let bit_width = u8::deserialize(&mut footer_cursor)?;
+            let len = (bit_width as usize) * BLOCK_SIZE as usize / 8;
 
-            block.data_start_offset = start_offset;
-            blocks.push(BlockWithData {
-                block,
-                file_slice: data.slice(start_offset..(start_offset + len).min(data.len())),
-                data: Default::default(),
-            });
+            lines.push(line);
+            bit_unpackers.push(BitUnpacker::new(bit_width));
+            data_file_slices.push((
+                data.slice(start_offset..(start_offset + len).min(data.len())),
+                OnceLock::new(),
+            ));
 
             start_offset += len;
         }
+
         Ok(BlockwiseLinearReader {
-            blocks: blocks.into_boxed_slice().into(),
+            lines: lines.into(),
+            bit_unpackers: bit_unpackers.into(),
+            data_file_slices: data_file_slices.into(),
             stats,
         })
     }
 }
 
-struct BlockWithData {
-    block: Block,
-    file_slice: FileSlice,
-    data: OnceLock<OwnedBytes>,
-}
-
-impl Deref for BlockWithData {
-    type Target = Block;
-
-    fn deref(&self) -> &Self::Target {
-        &self.block
-    }
-}
-
-impl DerefMut for BlockWithData {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.block
-    }
-}
-
-#[derive(Clone)]
 pub struct BlockwiseLinearReader {
-    blocks: Arc<[BlockWithData]>,
+    lines: Arc<[Line]>,
+    bit_unpackers: Arc<[BitUnpacker]>,
+    data_file_slices: Arc<[(FileSlice, OnceLock<OwnedBytes>)]>,
     stats: ColumnStats,
+}
+
+impl Clone for BlockwiseLinearReader {
+    fn clone(&self) -> Self {
+        BlockwiseLinearReader {
+            lines: self.lines.clone(),
+            bit_unpackers: self.bit_unpackers.clone(),
+            data_file_slices: self.data_file_slices.clone(),
+            stats: self.stats.clone(),
+        }
+    }
 }
 
 impl ColumnValues for BlockwiseLinearReader {
@@ -239,14 +235,10 @@ impl ColumnValues for BlockwiseLinearReader {
     fn get_val(&self, idx: u32) -> u64 {
         let block_id = (idx / BLOCK_SIZE) as usize;
         let idx_within_block = idx % BLOCK_SIZE;
-        let block = &self.blocks[block_id];
-        let interpoled_val: u64 = block.line.eval(idx_within_block);
-        let block_bytes = block
-            .data
-            .get_or_init(|| block.file_slice.read_bytes().unwrap());
-        let bitpacked_diff = block.bit_unpacker.get(idx_within_block, block_bytes);
-        // TODO optimize me! the line parameters could be tweaked to include the multiplication and
-        // remove the dependency.
+        let interpoled_val: u64 = self.lines[block_id].eval(idx_within_block);
+        let (file_slice, data) = &self.data_file_slices[block_id];
+        let block_bytes = data.get_or_init(|| file_slice.read_bytes().unwrap());
+        let bitpacked_diff = self.bit_unpackers[block_id].get(idx_within_block, block_bytes);
         self.stats.min_value
             + self
                 .stats
