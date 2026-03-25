@@ -189,6 +189,7 @@ pub mod error;
 pub mod tokenizer;
 
 pub mod aggregation;
+pub mod bqvec;
 pub mod collector;
 pub mod directory;
 pub mod fastfield;
