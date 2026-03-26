@@ -240,11 +240,6 @@ impl BqVecPluginWriter {
 }
 
 impl PluginWriter for BqVecPluginWriter {
-    fn add_document(&mut self, _doc_id: DocId) -> crate::Result<()> {
-        // No-op: vectors are ingested via ingest_vectors() before this is called.
-        Ok(())
-    }
-
     fn serialize(
         &mut self,
         segment: &mut Segment,
