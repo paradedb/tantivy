@@ -75,6 +75,8 @@ futures-util = { version = "0.3.28", optional = true }
 futures-channel = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
 parking_lot = "0.12.4"
+rand = "0.9"
+rand_distr = "0.5"
 typetag = "0.2.21"
 
 [target.'cfg(windows)'.dependencies]
