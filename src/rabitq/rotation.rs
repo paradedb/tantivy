@@ -64,8 +64,7 @@ pub trait Rotator: Send + Sync {
 
     /// Deserialize rotator state from bytes
     fn deserialize(dim: usize, padded_dim: usize, data: &[u8]) -> Result<Self, RabitqError>
-    where
-        Self: Sized;
+    where Self: Sized;
 }
 
 /// Matrix-based rotator using Gram-Schmidt orthogonalization.

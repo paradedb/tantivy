@@ -627,9 +627,7 @@ impl QueryParser {
                 let term = Term::from_field_ip_addr(field, ip_v6);
                 Ok(vec![LogicalLiteral::Term(term)])
             }
-            FieldType::Vector(_) => Err(QueryParserError::FieldNotIndexed(
-                field_name.to_string(),
-            )),
+            FieldType::Vector(_) => Err(QueryParserError::FieldNotIndexed(field_name.to_string())),
         }
     }
 

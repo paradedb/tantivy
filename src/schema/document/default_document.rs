@@ -32,6 +32,9 @@ pub struct CompactDoc {
     pub node_data: Vec<u8>,
     /// The root (Field, Value) pairs
     field_values: Vec<FieldValueAddr>,
+    /// Owned vector storage. Vector values are stored here so that
+    /// `&[f32]` references can be returned with proper alignment.
+    vectors: Vec<Vec<f32>>,
 }
 
 impl Default for CompactDoc {
@@ -47,6 +50,7 @@ impl CompactDoc {
         CompactDoc {
             node_data: Vec::with_capacity(bytes),
             field_values: Vec::with_capacity(4),
+            vectors: Vec::new(),
         }
     }
 
@@ -255,11 +259,12 @@ impl CompactDoc {
             ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
             ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
             ReferenceValueLeaf::Vector(vec) => {
-                // SAFETY: f32 slice to u8 slice is always valid
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(vec.as_ptr() as *const u8, vec.len() * std::mem::size_of::<f32>())
-                };
-                write_bytes_into(&mut self.node_data, bytes)
+                // Store the vector data in the side vec and save its index
+                // in node_data. This avoids alignment issues when reading
+                // back as &[f32].
+                let idx = self.vectors.len() as u32;
+                self.vectors.push(vec.to_vec());
+                write_into(&mut self.node_data, idx)
             }
         };
         ValueAddr { type_id, val_addr }
@@ -480,15 +485,9 @@ impl<'a> CompactDocValue<'a> {
                 addr,
             )?)),
             ValueType::Vector => {
-                let bytes = self.container.extract_bytes(addr);
-                // SAFETY: bytes were originally written from a &[f32] slice
-                let floats: &[f32] = unsafe {
-                    std::slice::from_raw_parts(
-                        bytes.as_ptr() as *const f32,
-                        bytes.len() / std::mem::size_of::<f32>(),
-                    )
-                };
-                Ok(ReferenceValueLeaf::Vector(floats).into())
+                let idx = self.container.read_from::<u32>(addr)?;
+                let vec = &self.container.vectors[idx as usize];
+                Ok(ReferenceValueLeaf::Vector(vec.as_slice()).into())
             }
         }
     }

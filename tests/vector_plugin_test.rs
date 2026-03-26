@@ -439,9 +439,10 @@ impl SegmentPlugin for VectorPlugin {
 
     fn open_reader(&self, ctx: &PluginReaderContext) -> tantivy::Result<Arc<dyn PluginReader>> {
         let component = SegmentComponent::Custom("vec".to_string());
-        let file_slice = ctx.segment_reader.open_read(component).map_err(|e| {
-            tantivy::TantivyError::InternalError(format!("vectors open_read: {e}"))
-        })?;
+        let file_slice = ctx
+            .segment_reader
+            .open_read(component)
+            .map_err(|e| tantivy::TantivyError::InternalError(format!("vectors open_read: {e}")))?;
         let data = file_slice.read_bytes()?;
         let index_data = deserialize_vector_index(&data);
         Ok(Arc::new(VectorPluginReader { data: index_data }))
@@ -453,8 +454,7 @@ impl SegmentPlugin for VectorPlugin {
 
         for (new_doc_id, old_doc_addr) in ctx.doc_id_mapping.iter_old_doc_addrs().enumerate() {
             let segment_reader = &ctx.readers[old_doc_addr.segment_ord as usize];
-            if let Ok(Some(reader)) =
-                segment_reader.plugin_reader::<VectorPluginReader>("vectors")
+            if let Ok(Some(reader)) = segment_reader.plugin_reader::<VectorPluginReader>("vectors")
             {
                 let old_doc_id = old_doc_addr.doc_id as usize;
                 if old_doc_id < reader.data.vectors.len() {
@@ -474,7 +474,12 @@ impl SegmentPlugin for VectorPlugin {
         // Build ordered vector list (fill missing doc_ids with zero vectors)
         let zero_vec = vec![0.0f32; dims];
         let vectors: Vec<Vec<f32>> = (0..max_doc)
-            .map(|d| all_vectors.get(&d).cloned().unwrap_or_else(|| zero_vec.clone()))
+            .map(|d| {
+                all_vectors
+                    .get(&d)
+                    .cloned()
+                    .unwrap_or_else(|| zero_vec.clone())
+            })
             .collect();
 
         // Cluster
@@ -626,48 +631,24 @@ fn make_test_data() -> Vec<(&'static str, Vec<f32>)> {
     // Cluster C: vectors pointing roughly in the -x direction
     vec![
         // Cluster A (positive x)
-        (
-            "alpha one",
-            vec![1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ),
-        (
-            "alpha two",
-            vec![0.9, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ),
+        ("alpha one", vec![1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ("alpha two", vec![0.9, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         (
             "alpha three",
             vec![0.8, 0.15, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0],
         ),
-        (
-            "alpha four",
-            vec![0.95, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ),
+        ("alpha four", vec![0.95, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         // Cluster B (positive y)
-        (
-            "beta one",
-            vec![0.1, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ),
-        (
-            "beta two",
-            vec![0.2, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ),
+        ("beta one", vec![0.1, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ("beta two", vec![0.2, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         (
             "beta three",
             vec![0.15, 0.85, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0],
         ),
-        (
-            "beta four",
-            vec![0.05, 0.95, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ),
+        ("beta four", vec![0.05, 0.95, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         // Cluster C (negative x)
-        (
-            "gamma one",
-            vec![-1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ),
-        (
-            "gamma two",
-            vec![-0.9, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ),
+        ("gamma one", vec![-1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ("gamma two", vec![-0.9, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         (
             "gamma three",
             vec![-0.8, 0.15, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -788,7 +769,14 @@ fn test_vector_plugin_with_data() -> tantivy::Result<()> {
 
     // Serialize and deserialize
     let mut buf = Vec::new();
-    serialize_vector_index(&centroids, &cluster_doc_ids, &vectors, VECTOR_DIMS, &mut buf).unwrap();
+    serialize_vector_index(
+        &centroids,
+        &cluster_doc_ids,
+        &vectors,
+        VECTOR_DIMS,
+        &mut buf,
+    )
+    .unwrap();
     let index_data = deserialize_vector_index(&buf);
 
     assert_eq!(index_data.centroids.len(), num_clusters);
@@ -847,7 +835,14 @@ fn test_vector_cluster_pruning_reduces_candidates() {
     }
 
     let mut buf = Vec::new();
-    serialize_vector_index(&centroids, &cluster_doc_ids, &vectors, VECTOR_DIMS, &mut buf).unwrap();
+    serialize_vector_index(
+        &centroids,
+        &cluster_doc_ids,
+        &vectors,
+        VECTOR_DIMS,
+        &mut buf,
+    )
+    .unwrap();
     let index_data = deserialize_vector_index(&buf);
 
     let query = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
@@ -931,7 +926,14 @@ fn test_vector_doc_id_intersection_with_text_filter() {
     }
 
     let mut buf = Vec::new();
-    serialize_vector_index(&centroids, &cluster_doc_ids, &vectors, VECTOR_DIMS, &mut buf).unwrap();
+    serialize_vector_index(
+        &centroids,
+        &cluster_doc_ids,
+        &vectors,
+        VECTOR_DIMS,
+        &mut buf,
+    )
+    .unwrap();
     let index_data = deserialize_vector_index(&buf);
 
     // Simulate text filter: "alpha" matches doc_ids 0,1,2,3
@@ -966,8 +968,8 @@ fn test_vector_doc_id_intersection_with_text_filter() {
     results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
 
     // Results should be alpha docs scored by similarity to the beta-direction query.
-    // Doc 1 (alpha two: [0.9, 0.2, ...]) has more y-component than doc 3 (alpha four: [0.95, 0.05, ...])
-    // so doc 1 should rank higher.
+    // Doc 1 (alpha two: [0.9, 0.2, ...]) has more y-component than doc 3 (alpha four: [0.95, 0.05,
+    // ...]) so doc 1 should rank higher.
     if results.len() >= 2 {
         // The doc with more y-component should rank higher
         let top = &results[0];

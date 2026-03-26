@@ -20,12 +20,17 @@ const NUM_SCALARS: usize = 8;
 const SCALAR_BYTES: usize = NUM_SCALARS * 4; // 32 bytes
 
 /// Total bytes per record for the given padded dimensionality and extended bits.
+///
+/// Must match the packed sizes produced by the quantizer in `quantizer.rs`.
 pub fn bytes_per_record(padded_dims: usize, ex_bits: usize) -> usize {
     let binary_bytes = padded_dims.div_ceil(8);
-    let ex_bytes = if ex_bits > 0 {
-        (padded_dims * ex_bits).div_ceil(8)
-    } else {
-        0
+    // Match the quantizer's C++-compatible packing sizes.
+    let ex_bytes = match ex_bits {
+        0 => padded_dims / 16 * 2,
+        1 => padded_dims / 16 * 2,
+        2 => padded_dims / 16 * 4,
+        6 => padded_dims / 16 * 12,
+        _ => (padded_dims * ex_bits).div_ceil(8),
     };
     binary_bytes + ex_bytes + SCALAR_BYTES
 }
@@ -50,10 +55,13 @@ pub fn pack(qv: &QuantizedVector) -> Vec<u8> {
 /// Unpack a flat byte record into a [`QuantizedVector`].
 pub fn unpack(bytes: &[u8], padded_dims: usize, ex_bits: usize) -> QuantizedVector {
     let binary_bytes = padded_dims.div_ceil(8);
-    let ex_bytes = if ex_bits > 0 {
-        (padded_dims * ex_bits).div_ceil(8)
-    } else {
-        0
+    // Must match the quantizer's C++-compatible packing sizes.
+    let ex_bytes = match ex_bits {
+        0 => padded_dims / 16 * 2,
+        1 => padded_dims / 16 * 2,
+        2 => padded_dims / 16 * 4,
+        6 => padded_dims / 16 * 12,
+        _ => (padded_dims * ex_bits).div_ceil(8),
     };
 
     let mut pos = 0;
@@ -64,7 +72,12 @@ pub fn unpack(bytes: &[u8], padded_dims: usize, ex_bits: usize) -> QuantizedVect
     pos += ex_bytes;
 
     let read_f32 = |pos: &mut usize| -> f32 {
-        let val = f32::from_le_bytes([bytes[*pos], bytes[*pos + 1], bytes[*pos + 2], bytes[*pos + 3]]);
+        let val = f32::from_le_bytes([
+            bytes[*pos],
+            bytes[*pos + 1],
+            bytes[*pos + 2],
+            bytes[*pos + 3],
+        ]);
         *pos += 4;
         val
     };
@@ -131,8 +144,8 @@ mod tests {
     #[test]
     fn test_pack_unpack_with_ex_bits() {
         let qv = QuantizedVector {
-            binary_code_packed: vec![0xFF; 4],   // 32 dims / 8
-            ex_code_packed: vec![0x12; 24],       // 32 * 6 / 8 = 24 bytes
+            binary_code_packed: vec![0xFF; 4], // 32 dims / 8
+            ex_code_packed: vec![0x12; 24],    // 32 * 6 / 8 = 24 bytes
             ex_bits: 6,
             dim: 32,
             delta: 1.0,

@@ -5,8 +5,7 @@
 
 use super::quantizer::QuantizedVector;
 use super::rotation::DynamicRotator;
-use super::simd;
-use super::Metric;
+use super::{simd, Metric};
 
 /// Precomputed query state for efficient distance estimation.
 ///
@@ -31,12 +30,7 @@ impl RaBitQQuery {
     /// Prepare a query for distance estimation.
     ///
     /// Rotates the query vector and precomputes constants.
-    pub fn new(
-        query: &[f32],
-        rotator: &DynamicRotator,
-        ex_bits: usize,
-        metric: Metric,
-    ) -> Self {
+    pub fn new(query: &[f32], rotator: &DynamicRotator, ex_bits: usize, metric: Metric) -> Self {
         let rotated_query = rotator.rotate(query);
         let sum_query: f32 = rotated_query.iter().sum();
         let c1 = -0.5f32;
@@ -76,8 +70,7 @@ impl RaBitQQuery {
             for (&code, &q_val) in ex_code.iter().zip(self.rotated_query.iter()) {
                 ex_dot += (code as f32) * q_val;
             }
-            let total_term =
-                self.binary_scale * binary_dot + ex_dot + self.kbx_sum_q;
+            let total_term = self.binary_scale * binary_dot + ex_dot + self.kbx_sum_q;
             distance = qv.f_add_ex + g_add + qv.f_rescale_ex * total_term;
         }
 
@@ -90,11 +83,7 @@ impl RaBitQQuery {
     /// Estimate distance from a packed byte record.
     ///
     /// Convenience method that unpacks the record first.
-    pub fn estimate_distance_from_record(
-        &self,
-        record: &[u8],
-        padded_dims: usize,
-    ) -> f32 {
+    pub fn estimate_distance_from_record(&self, record: &[u8], padded_dims: usize) -> f32 {
         let qv = super::record::unpack(record, padded_dims, self.ex_bits);
         self.estimate_distance(&qv, 0.0)
     }
@@ -135,12 +124,8 @@ mod tests {
             &config,
             Metric::L2,
         );
-        let qv_other = quantize_with_centroid(
-            &rotator.rotate(&other),
-            &zero_centroid,
-            &config,
-            Metric::L2,
-        );
+        let qv_other =
+            quantize_with_centroid(&rotator.rotate(&other), &zero_centroid, &config, Metric::L2);
 
         let query = RaBitQQuery::new(&vector, &rotator, 0, Metric::L2);
         let dist_self = query.estimate_distance(&qv_self, 0.0);
@@ -162,12 +147,8 @@ mod tests {
         let zero_centroid = vec![0.0f32; padded];
 
         let query_vec: Vec<f32> = (0..dims).map(|i| (i as f32) / dims as f32).collect();
-        let similar_vec: Vec<f32> = (0..dims)
-            .map(|i| (i as f32) / dims as f32 + 0.01)
-            .collect();
-        let dissimilar_vec: Vec<f32> = (0..dims)
-            .map(|i| -((i as f32) / dims as f32))
-            .collect();
+        let similar_vec: Vec<f32> = (0..dims).map(|i| (i as f32) / dims as f32 + 0.01).collect();
+        let dissimilar_vec: Vec<f32> = (0..dims).map(|i| -((i as f32) / dims as f32)).collect();
 
         let qv_similar = quantize_with_centroid(
             &rotator.rotate(&similar_vec),

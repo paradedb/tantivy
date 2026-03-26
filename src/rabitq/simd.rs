@@ -2524,8 +2524,8 @@ pub fn pack_ex_code_2bit_cpp_compat(ex_code: &[u16], packed: &mut [u8], dim: usi
             | ((codes[14] as u32) << 16)
             | ((codes[15] as u32) << 24);
 
-        // Combine with C++ bit arrangement: compact = (code3 << 6) | (code2 << 4) | (code1 << 2) | code0
-        // This creates an interleaved pattern where:
+        // Combine with C++ bit arrangement: compact = (code3 << 6) | (code2 << 4) | (code1 << 2) |
+        // code0 This creates an interleaved pattern where:
         // - bits 0-1, 8-9, 16-17, 24-25: from code0 (codes 0,1,2,3)
         // - bits 2-3, 10-11, 18-19, 26-27: from code1 (codes 4,5,6,7)
         // - bits 4-5, 12-13, 20-21, 28-29: from code2 (codes 8,9,10,11)
@@ -2680,7 +2680,8 @@ pub fn pack_ex_code_6bit_cpp_compat(ex_code: &[u16], packed: &mut [u8], dim: usi
             | ((codes[15] as u32) << 24);
 
         // Pack upper 2 bits (bits 4-5):
-        // compact2 = ((code2_3 & MASK_2) << 2) | (code2_2 & MASK_2) | ((code2_1 & MASK_2) >> 2) | ((code2_0 & MASK_2) >> 4)
+        // compact2 = ((code2_3 & MASK_2) << 2) | (code2_2 & MASK_2) | ((code2_1 & MASK_2) >> 2) |
+        // ((code2_0 & MASK_2) >> 4)
         let compact2 = ((code2_3 & MASK_2) << 2)
             | (code2_2 & MASK_2)
             | ((code2_1 & MASK_2) >> 2)
@@ -3208,7 +3209,8 @@ pub fn select_excode_ipfunc(ex_bits: usize) -> ExIpFunc {
         2 => ip_packed_ex2_f32, // 3-bit total
         6 => ip_packed_ex6_f32, // 7-bit total
         _ => panic!(
-            "Unsupported ex_bits: {}. Only 0 (1-bit total), 2 (3-bit total), and 6 (7-bit total) are supported.",
+            "Unsupported ex_bits: {}. Only 0 (1-bit total), 2 (3-bit total), and 6 (7-bit total) \
+             are supported.",
             ex_bits
         ),
     }

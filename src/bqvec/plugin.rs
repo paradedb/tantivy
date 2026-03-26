@@ -62,7 +62,10 @@ impl BqVecPluginBuilder {
 
     /// Build the plugin.
     pub fn build(self) -> BqVecPlugin {
-        assert!(!self.fields.is_empty(), "at least one vector field required");
+        assert!(
+            !self.fields.is_empty(),
+            "at least one vector field required"
+        );
         BqVecPlugin {
             fields: self.fields,
         }
@@ -316,8 +319,7 @@ impl BqVecFieldReader {
         let header = file_slice.read_bytes_slice(0..HEADER_LEN)?;
         let bytes_per_record =
             u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let num_records =
-            u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let num_records = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
 
         let expected = HEADER_LEN + num_records * bytes_per_record;
         if file_slice.len() < expected {

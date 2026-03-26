@@ -141,10 +141,7 @@ where W: Write
                             val.len() * std::mem::size_of::<f32>(),
                         )
                     };
-                    self.serialize_with_type_code(
-                        type_codes::VECTOR_CODE,
-                        &Cow::Borrowed(bytes),
-                    )
+                    self.serialize_with_type_code(type_codes::VECTOR_CODE, &Cow::Borrowed(bytes))
                 }
             },
             ReferenceValue::Array(elements) => {

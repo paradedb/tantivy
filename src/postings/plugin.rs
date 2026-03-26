@@ -25,8 +25,8 @@ use crate::plugin::{
     SegmentPlugin,
 };
 use crate::postings::{
-    serialize_postings, IndexingContext, InvertedIndexSerializer,
-    PerFieldPostingsWriter, Postings, SegmentPostings,
+    serialize_postings, IndexingContext, InvertedIndexSerializer, PerFieldPostingsWriter, Postings,
+    SegmentPostings,
 };
 use crate::schema::{Field, FieldType, Schema};
 use crate::termdict::{TermMerger, TermOrdinal};
@@ -277,8 +277,8 @@ fn write_postings_for_field(
         for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
             let segment_reader = &readers[segment_ord];
             let inverted_index: &MergeOptimizedInvertedIndexReader = &field_readers[segment_ord];
-            let segment_postings = inverted_index
-                .read_postings_from_terminfo(&term_info, segment_postings_option)?;
+            let segment_postings =
+                inverted_index.read_postings_from_terminfo(&term_info, segment_postings_option)?;
             let alive_bitset_opt = segment_reader.alive_bitset();
             let doc_freq = if let Some(alive_bitset) = alive_bitset_opt {
                 segment_postings.doc_freq_given_deletes(alive_bitset)
@@ -316,9 +316,7 @@ fn write_postings_for_field(
 
         field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
 
-        for (segment_ord, mut segment_postings) in
-            segment_postings_containing_the_term.drain(..)
-        {
+        for (segment_ord, mut segment_postings) in segment_postings_containing_the_term.drain(..) {
             let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
 
             let mut doc = segment_postings.doc();
@@ -461,10 +459,9 @@ impl PluginWriter for PostingsPluginWriter {
                 .ctx
                 .take()
                 .expect("PostingsPluginWriter: ctx not set at serialize time");
-            let per_field_postings_writers = self
-                .per_field_postings_writers
-                .as_ref()
-                .expect("PostingsPluginWriter: per_field_postings_writers not set at serialize time");
+            let per_field_postings_writers = self.per_field_postings_writers.as_ref().expect(
+                "PostingsPluginWriter: per_field_postings_writers not set at serialize time",
+            );
 
             serialize_postings(
                 ctx,

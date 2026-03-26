@@ -33,10 +33,9 @@ impl SegmentPlugin for DocCountPlugin {
 
     fn open_reader(&self, ctx: &PluginReaderContext) -> tantivy::Result<Arc<dyn PluginReader>> {
         let component = SegmentComponent::Custom("doccount".to_string());
-        let file_slice = ctx
-            .segment_reader
-            .open_read(component)
-            .map_err(|e| tantivy::TantivyError::InternalError(format!("doccount open_read: {e}")))?;
+        let file_slice = ctx.segment_reader.open_read(component).map_err(|e| {
+            tantivy::TantivyError::InternalError(format!("doccount open_read: {e}"))
+        })?;
         let data = file_slice.read_bytes()?;
         assert!(
             data.len() >= 4,

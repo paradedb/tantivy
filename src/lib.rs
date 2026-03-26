@@ -168,10 +168,8 @@ mod macros;
 mod future_result;
 
 // Re-exports
-pub use columnar;
 pub use common::{ByteCount, DateTime};
-pub use query_grammar;
-pub use time;
+pub use {columnar, query_grammar, time};
 
 pub use crate::error::TantivyError;
 pub use crate::future_result::FutureResult;
@@ -199,11 +197,11 @@ pub mod positions;
 pub mod postings;
 pub mod rabitq;
 
+pub mod plugin;
 /// Module containing the different query implementations.
 pub mod query;
 pub mod schema;
 pub mod space_usage;
-pub mod plugin;
 pub mod store;
 pub mod termdict;
 

@@ -2,8 +2,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 use super::math::{dot, l2_norm_sqr, subtract};
-use super::simd;
-use super::Metric;
+use super::{simd, Metric};
 
 const K_TIGHT_START: [f64; 9] = [0.0, 0.15, 0.20, 0.52, 0.59, 0.71, 0.75, 0.77, 0.81];
 const K_EPS: f64 = 1e-5;

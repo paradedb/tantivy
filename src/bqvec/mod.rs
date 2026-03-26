@@ -42,6 +42,8 @@
 //! ```
 
 mod plugin;
+#[cfg(test)]
+mod tests;
 
 pub use self::plugin::{
     BqVecFieldReader, BqVecPlugin, BqVecPluginBuilder, BqVecPluginReader, BqVecPluginWriter,
