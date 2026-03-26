@@ -227,6 +227,9 @@ pub(crate) fn index_json_value<'a, V: Value<'a>>(
             ReferenceValueLeaf::IpAddr(_) => {
                 unimplemented!("IP address support in dynamic fields is not yet implemented")
             }
+            ReferenceValueLeaf::Vector(_) => {
+                // Vector values are not indexed in the inverted index; handled by the vector plugin.
+            }
         },
         ReferenceValue::Array(elements) => {
             for val in elements {

@@ -254,6 +254,13 @@ impl CompactDoc {
             }
             ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
             ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
+            ReferenceValueLeaf::Vector(vec) => {
+                // SAFETY: f32 slice to u8 slice is always valid
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(vec.as_ptr() as *const u8, vec.len() * std::mem::size_of::<f32>())
+                };
+                write_bytes_into(&mut self.node_data, bytes)
+            }
         };
         ValueAddr { type_id, val_addr }
     }
@@ -472,6 +479,17 @@ impl<'a> CompactDocValue<'a> {
                 self.container,
                 addr,
             )?)),
+            ValueType::Vector => {
+                let bytes = self.container.extract_bytes(addr);
+                // SAFETY: bytes were originally written from a &[f32] slice
+                let floats: &[f32] = unsafe {
+                    std::slice::from_raw_parts(
+                        bytes.as_ptr() as *const f32,
+                        bytes.len() / std::mem::size_of::<f32>(),
+                    )
+                };
+                Ok(ReferenceValueLeaf::Vector(floats).into())
+            }
         }
     }
 }
@@ -542,6 +560,8 @@ pub enum ValueType {
     Object = 11,
     /// Pre-tokenized str type,
     Array = 12,
+    /// Vector of f32 values
+    Vector = 13,
 }
 
 impl BinarySerializable for ValueType {
@@ -552,7 +572,7 @@ impl BinarySerializable for ValueType {
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let num = u8::deserialize(reader)?;
-        let type_id = if (0..=12).contains(&num) {
+        let type_id = if (0..=13).contains(&num) {
             unsafe { std::mem::transmute::<u8, ValueType>(num) }
         } else {
             return Err(io::Error::new(
@@ -587,6 +607,7 @@ impl<'a> From<&ReferenceValueLeaf<'a>> for ValueType {
             ReferenceValueLeaf::PreTokStr(_) => ValueType::PreTokStr,
             ReferenceValueLeaf::Facet(_) => ValueType::Facet,
             ReferenceValueLeaf::Bytes(_) => ValueType::Bytes,
+            ReferenceValueLeaf::Vector(_) => ValueType::Vector,
         }
     }
 }

@@ -90,6 +90,12 @@ pub trait Value<'a>: Send + Sync + Debug {
     }
 
     #[inline]
+    /// If the Value is a vector, returns the associated f32 slice. Returns None otherwise.
+    fn as_vector(&self) -> Option<&'a [f32]> {
+        self.as_leaf().and_then(|leaf| leaf.as_vector())
+    }
+
+    #[inline]
     /// Returns the iterator over the array if the Value is an array.
     fn as_array(&self) -> Option<Self::ArrayIter> {
         if let ReferenceValue::Array(val) = self.as_value() {
@@ -136,6 +142,8 @@ pub enum ReferenceValueLeaf<'a> {
     Bool(bool),
     /// Pre-tokenized str type,
     PreTokStr(Box<PreTokenizedString>),
+    /// Dense vector of f32 values.
+    Vector(&'a [f32]),
 }
 
 impl From<u64> for ReferenceValueLeaf<'_> {
@@ -201,6 +209,20 @@ impl From<PreTokenizedString> for ReferenceValueLeaf<'_> {
     }
 }
 
+impl<'a> From<&'a Vec<f32>> for ReferenceValueLeaf<'a> {
+    #[inline]
+    fn from(value: &'a Vec<f32>) -> Self {
+        ReferenceValueLeaf::Vector(value)
+    }
+}
+
+impl<'a> From<&'a [f32]> for ReferenceValueLeaf<'a> {
+    #[inline]
+    fn from(value: &'a [f32]) -> Self {
+        ReferenceValueLeaf::Vector(value)
+    }
+}
+
 impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<'a, T> {
     #[inline]
     fn from(value: ReferenceValueLeaf<'a>) -> Self {
@@ -219,6 +241,9 @@ impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<
             ReferenceValueLeaf::Bool(val) => ReferenceValue::Leaf(ReferenceValueLeaf::Bool(val)),
             ReferenceValueLeaf::PreTokStr(val) => {
                 ReferenceValue::Leaf(ReferenceValueLeaf::PreTokStr(val))
+            }
+            ReferenceValueLeaf::Vector(val) => {
+                ReferenceValue::Leaf(ReferenceValueLeaf::Vector(val))
             }
         }
     }
@@ -326,6 +351,16 @@ impl<'a> ReferenceValueLeaf<'a> {
     /// If the Value is a facet, returns the associated facet. Returns None otherwise.
     pub fn as_facet(&self) -> Option<&'a str> {
         if let Self::Facet(val) = self {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    /// If the Value is a vector, returns the associated f32 slice. Returns None otherwise.
+    pub fn as_vector(&self) -> Option<&'a [f32]> {
+        if let Self::Vector(val) = self {
             Some(val)
         } else {
             None

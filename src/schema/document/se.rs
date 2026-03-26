@@ -133,6 +133,19 @@ where W: Write
                     self.write_type_code(type_codes::EXT_CODE)?;
                     self.serialize_with_type_code(type_codes::TOK_STR_EXT_CODE, &*val)
                 }
+                ReferenceValueLeaf::Vector(val) => {
+                    // SAFETY: f32 slice to u8 slice is always valid
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            val.as_ptr() as *const u8,
+                            val.len() * std::mem::size_of::<f32>(),
+                        )
+                    };
+                    self.serialize_with_type_code(
+                        type_codes::VECTOR_CODE,
+                        &Cow::Borrowed(bytes),
+                    )
+                }
             },
             ReferenceValue::Array(elements) => {
                 self.write_type_code(type_codes::ARRAY_CODE)?;

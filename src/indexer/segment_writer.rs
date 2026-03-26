@@ -403,6 +403,10 @@ impl SegmentWriter {
                         .record(doc_id, field, num_vals);
                     }
                 }
+                FieldType::Vector(_) => {
+                    // Vector fields are handled by the BqVecPlugin, not the
+                    // standard indexing pipeline. Skip them here.
+                }
             }
         }
         Ok(())
