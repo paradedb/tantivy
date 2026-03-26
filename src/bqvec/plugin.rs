@@ -3,7 +3,8 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use common::{OwnedBytes, TerminatingWrite};
+use common::file_slice::FileSlice;
+use common::{HasLen, OwnedBytes, TerminatingWrite};
 
 use crate::index::SegmentComponent;
 use crate::indexer::doc_id_mapping::DocIdMapping;
@@ -63,12 +64,10 @@ impl BqVecPlugin {
         self.staging.lock().unwrap().push_back(bq_bytes);
     }
 
-    /// Number of bytes per binary quantized vector (`dimensions / 8`).
     pub fn bytes_per_vector(&self) -> usize {
         self.bytes_per_vector
     }
 
-    /// Number of dimensions.
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
@@ -95,8 +94,7 @@ impl SegmentPlugin for BqVecPlugin {
 
     fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
         let file_slice = ctx.segment_reader.open_read(component())?;
-        let data = file_slice.read_bytes()?;
-        BqVecPluginReader::from_bytes(data).map(|r| Arc::new(r) as Arc<dyn PluginReader>)
+        BqVecPluginReader::open(file_slice).map(|r| Arc::new(r) as Arc<dyn PluginReader>)
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
@@ -131,7 +129,8 @@ impl SegmentPlugin for BqVecPlugin {
         for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
             let reader = &source_readers[old_doc_addr.segment_ord as usize];
             if (old_doc_addr.doc_id as usize) < reader.num_vectors() {
-                write.write_all(reader.vector(old_doc_addr.doc_id))?;
+                let vec_bytes = reader.vector(old_doc_addr.doc_id)?;
+                write.write_all(&vec_bytes)?;
             } else {
                 write.write_all(&zero)?;
             }
@@ -243,36 +242,42 @@ impl PluginWriter for BqVecPluginWriter {
     }
 }
 
-/// Reader providing O(1) access to binary quantized vectors via mmap.
 pub struct BqVecPluginReader {
-    /// Raw segment bytes (header + vectors). Backed by mmap.
-    data: OwnedBytes,
+    /// File slice positioned at the start of vector data (past the header).
+    /// Each `vector()` call reads only the requested range from the
+    /// underlying directory, so a postgres-backed directory fetches only
+    /// the blocks that contain the requested vector.
+    data: FileSlice,
     dimensions: usize,
     num_vectors: usize,
     bytes_per_vector: usize,
 }
 
 impl BqVecPluginReader {
-    fn from_bytes(data: OwnedBytes) -> crate::Result<Self> {
-        if data.len() < HEADER_LEN {
+    fn open(file_slice: FileSlice) -> crate::Result<Self> {
+        if file_slice.len() < HEADER_LEN {
             return Err(crate::TantivyError::InternalError(format!(
                 "bqvec file too short: {} bytes",
-                data.len()
+                file_slice.len()
             )));
         }
+        // Read only the 8-byte header.
+        let header = file_slice.read_bytes_slice(0..HEADER_LEN)?;
         let dimensions =
-            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
         let num_vectors =
-            u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         let bytes_per_vector = dimensions / 8;
 
         let expected = HEADER_LEN + num_vectors * bytes_per_vector;
-        if data.len() < expected {
+        if file_slice.len() < expected {
             return Err(crate::TantivyError::InternalError(format!(
                 "bqvec file truncated: expected {expected} bytes, got {}",
-                data.len()
+                file_slice.len()
             )));
         }
+        // Slice past the header so vector offsets are doc_id * bytes_per_vector.
+        let data = file_slice.slice_from(HEADER_LEN);
         Ok(Self {
             data,
             dimensions,
@@ -281,26 +286,24 @@ impl BqVecPluginReader {
         })
     }
 
-    /// O(1) access to the binary quantized vector for `doc_id`.
+    /// Read the binary quantized vector for `doc_id`.
     ///
-    /// Returns a `bytes_per_vector`-length slice backed by mmap — no copies.
+    /// Only the bytes for this single vector are read from the underlying
+    /// directory — no bulk load of the entire file.
     #[inline]
-    pub fn vector(&self, doc_id: DocId) -> &[u8] {
-        let offset = HEADER_LEN + (doc_id as usize) * self.bytes_per_vector;
-        &self.data[offset..offset + self.bytes_per_vector]
+    pub fn vector(&self, doc_id: DocId) -> std::io::Result<OwnedBytes> {
+        let offset = (doc_id as usize) * self.bytes_per_vector;
+        self.data.read_bytes_slice(offset..offset + self.bytes_per_vector)
     }
 
-    /// Number of dimensions (bits per vector).
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
 
-    /// Number of stored vectors.
     pub fn num_vectors(&self) -> usize {
         self.num_vectors
     }
 
-    /// Bytes per vector (`dimensions / 8`).
     pub fn bytes_per_vector(&self) -> usize {
         self.bytes_per_vector
     }
@@ -309,5 +312,279 @@ impl BqVecPluginReader {
 impl PluginReader for BqVecPluginReader {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::bqvec::{BqVecPlugin, BqVecPluginReader};
+    use crate::plugin::SegmentPlugin;
+    use crate::schema::{Schema, STORED, TEXT};
+    use crate::IndexWriter;
+    use crate::Index;
+
+    fn make_schema() -> (Schema, crate::schema::Field) {
+        let mut builder = Schema::builder();
+        let text = builder.add_text_field("text", TEXT | STORED);
+        (builder.build(), text)
+    }
+
+    fn assert_vector(bq: &BqVecPluginReader, doc_id: u32, expected: &[u8]) {
+        let actual = bq.vector(doc_id).unwrap();
+        assert_eq!(&*actual, expected, "vector mismatch for doc_id={doc_id}");
+    }
+
+    #[test]
+    fn test_bqvec_index_and_read() -> crate::Result<()> {
+        let (schema, text_field) = make_schema();
+
+        let dims = 64;
+        let plugin = Arc::new(BqVecPlugin::new(dims));
+        let index = Index::builder()
+            .schema(schema)
+            .plugin(plugin.clone() as Arc<dyn SegmentPlugin>)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+
+        plugin.stage_vector(vec![0xFF; 8]);
+        writer.add_document(crate::doc!(text_field => "hello"))?;
+
+        plugin.stage_vector(vec![0x00; 8]);
+        writer.add_document(crate::doc!(text_field => "world"))?;
+
+        plugin.stage_vector(vec![0xAA; 8]);
+        writer.add_document(crate::doc!(text_field => "foo"))?;
+
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segments = searcher.segment_readers();
+        assert_eq!(segments.len(), 1);
+
+        let bq: Arc<BqVecPluginReader> = segments[0]
+            .plugin_reader::<BqVecPluginReader>("bqvec")?
+            .expect("bqvec reader should exist");
+
+        assert_eq!(bq.dimensions(), 64);
+        assert_eq!(bq.num_vectors(), 3);
+        assert_eq!(bq.bytes_per_vector(), 8);
+
+        assert_vector(&bq, 0, &[0xFF; 8]);
+        assert_vector(&bq, 1, &[0x00; 8]);
+        assert_vector(&bq, 2, &[0xAA; 8]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bqvec_zero_fill_when_no_vector_staged() -> crate::Result<()> {
+        let (schema, text_field) = make_schema();
+
+        let dims = 16;
+        let plugin = Arc::new(BqVecPlugin::new(dims));
+        let index = Index::builder()
+            .schema(schema)
+            .plugin(plugin.clone() as Arc<dyn SegmentPlugin>)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+
+        plugin.stage_vector(vec![0xAB, 0xCD]);
+        plugin.stage_vector(vec![0x00, 0x00]);
+        plugin.stage_vector(vec![0x12, 0x34]);
+
+        writer.add_document(crate::doc!(text_field => "a"))?;
+        writer.add_document(crate::doc!(text_field => "b"))?;
+        writer.add_document(crate::doc!(text_field => "c"))?;
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let seg = &searcher.segment_readers()[0];
+        let bq: Arc<BqVecPluginReader> = seg
+            .plugin_reader::<BqVecPluginReader>("bqvec")?
+            .unwrap();
+
+        assert_vector(&bq, 0, &[0xAB, 0xCD]);
+        assert_vector(&bq, 1, &[0x00, 0x00]);
+        assert_vector(&bq, 2, &[0x12, 0x34]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bqvec_auto_zero_fill() -> crate::Result<()> {
+        let (schema, text_field) = make_schema();
+
+        let dims = 16;
+        let plugin = Arc::new(BqVecPlugin::new(dims));
+        let index = Index::builder()
+            .schema(schema)
+            .plugin(plugin.clone() as Arc<dyn SegmentPlugin>)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+
+        writer.add_document(crate::doc!(text_field => "a"))?;
+        writer.add_document(crate::doc!(text_field => "b"))?;
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let seg = &searcher.segment_readers()[0];
+        let bq: Arc<BqVecPluginReader> = seg
+            .plugin_reader::<BqVecPluginReader>("bqvec")?
+            .unwrap();
+
+        assert_eq!(bq.num_vectors(), 2);
+        assert_vector(&bq, 0, &[0x00, 0x00]);
+        assert_vector(&bq, 1, &[0x00, 0x00]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bqvec_merge() -> crate::Result<()> {
+        let (schema, text_field) = make_schema();
+
+        let dims = 32;
+        let plugin = Arc::new(BqVecPlugin::new(dims));
+        let index = Index::builder()
+            .schema(schema)
+            .plugin(plugin.clone() as Arc<dyn SegmentPlugin>)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+
+        plugin.stage_vector(vec![0x11; 4]);
+        writer.add_document(crate::doc!(text_field => "a"))?;
+        plugin.stage_vector(vec![0x22; 4]);
+        writer.add_document(crate::doc!(text_field => "b"))?;
+        writer.commit()?;
+
+        plugin.stage_vector(vec![0x33; 4]);
+        writer.add_document(crate::doc!(text_field => "c"))?;
+        writer.commit()?;
+
+        let segment_ids = index.searchable_segment_ids()?;
+        assert_eq!(segment_ids.len(), 2);
+        writer.merge(&segment_ids).wait()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 3);
+
+        let segments = searcher.segment_readers();
+        assert_eq!(segments.len(), 1);
+
+        let bq: Arc<BqVecPluginReader> = segments[0]
+            .plugin_reader::<BqVecPluginReader>("bqvec")?
+            .unwrap();
+
+        assert_eq!(bq.num_vectors(), 3);
+        assert_vector(&bq, 0, &[0x11; 4]);
+        assert_vector(&bq, 1, &[0x22; 4]);
+        assert_vector(&bq, 2, &[0x33; 4]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bqvec_merge_with_deletes() -> crate::Result<()> {
+        let (schema, text_field) = make_schema();
+
+        let dims = 24;
+        let plugin = Arc::new(BqVecPlugin::new(dims));
+        let index = Index::builder()
+            .schema(schema)
+            .plugin(plugin.clone() as Arc<dyn SegmentPlugin>)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+
+        plugin.stage_vector(vec![0xAA; 3]);
+        writer.add_document(crate::doc!(text_field => "keep_a"))?;
+        plugin.stage_vector(vec![0xBB; 3]);
+        writer.add_document(crate::doc!(text_field => "deleteme"))?;
+        writer.commit()?;
+
+        plugin.stage_vector(vec![0xCC; 3]);
+        writer.add_document(crate::doc!(text_field => "keep_b"))?;
+        writer.commit()?;
+
+        writer.delete_term(crate::Term::from_field_text(text_field, "deleteme"));
+        writer.commit()?;
+
+        let segment_ids = index.searchable_segment_ids()?;
+        assert_eq!(segment_ids.len(), 2);
+        writer.merge(&segment_ids).wait()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 2);
+
+        let segments = searcher.segment_readers();
+        assert_eq!(segments.len(), 1);
+
+        let bq: Arc<BqVecPluginReader> = segments[0]
+            .plugin_reader::<BqVecPluginReader>("bqvec")?
+            .unwrap();
+
+        assert_eq!(bq.num_vectors(), 2);
+        assert_vector(&bq, 0, &[0xAA; 3]);
+        assert_vector(&bq, 1, &[0xCC; 3]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bqvec_large_dimensions() -> crate::Result<()> {
+        let (schema, text_field) = make_schema();
+
+        let dims = 768;
+        let plugin = Arc::new(BqVecPlugin::new(dims));
+        let index = Index::builder()
+            .schema(schema)
+            .plugin(plugin.clone() as Arc<dyn SegmentPlugin>)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+
+        let vec0: Vec<u8> = (0..96).map(|i| i as u8).collect();
+        let vec1: Vec<u8> = (0..96).map(|i| (255 - i) as u8).collect();
+
+        plugin.stage_vector(vec0.clone());
+        writer.add_document(crate::doc!(text_field => "doc0"))?;
+        plugin.stage_vector(vec1.clone());
+        writer.add_document(crate::doc!(text_field => "doc1"))?;
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let seg = &searcher.segment_readers()[0];
+        let bq: Arc<BqVecPluginReader> = seg
+            .plugin_reader::<BqVecPluginReader>("bqvec")?
+            .unwrap();
+
+        assert_eq!(bq.dimensions(), 768);
+        assert_eq!(bq.bytes_per_vector(), 96);
+        assert_vector(&bq, 0, &vec0);
+        assert_vector(&bq, 1, &vec1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bqvec_plugin_metadata() {
+        let plugin = BqVecPlugin::new(128);
+        assert_eq!(plugin.name(), "bqvec");
+        assert_eq!(plugin.extensions(), vec!["bqvec"]);
+        assert_eq!(plugin.write_phase(), 2);
+        assert_eq!(plugin.dimensions(), 128);
+        assert_eq!(plugin.bytes_per_vector(), 16);
     }
 }
