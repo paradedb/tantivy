@@ -5,6 +5,7 @@ use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
+use crate::bqvec::BqVecPluginWriter;
 use crate::fastfield::FastFieldsPluginWriter;
 use crate::fieldnorm::FieldNormsPluginWriter;
 use crate::index::Segment;
@@ -433,6 +434,12 @@ impl SegmentWriter {
                 .get_plugin_writer::<StorePluginWriter>("store")
                 .expect("store plugin")
                 .store(&document, &self.schema)?;
+        }
+        if let Some(bqvec_writer) = self
+            .segment_serializer
+            .get_plugin_writer::<BqVecPluginWriter>("bqvec")
+        {
+            bqvec_writer.ingest_vectors(&document, &self.schema);
         }
         for (_, writer) in self.segment_serializer.plugin_writers_mut().iter_mut() {
             writer.add_document(doc_id)?;
