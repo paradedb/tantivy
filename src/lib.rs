@@ -188,6 +188,7 @@ pub mod tokenizer;
 
 pub mod aggregation;
 pub mod bqvec;
+pub mod cluster;
 pub mod collector;
 pub mod directory;
 pub mod fastfield;
