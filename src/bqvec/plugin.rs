@@ -359,7 +359,7 @@ pub struct BqVecPluginReader {
 }
 
 impl BqVecPluginReader {
-    fn open(file_slice: FileSlice, known_fields: &[Field]) -> crate::Result<Self> {
+    pub(crate) fn open(file_slice: FileSlice, known_fields: &[Field]) -> crate::Result<Self> {
         let composite = CompositeFile::open(&file_slice)?;
         let mut field_readers = HashMap::new();
         for &field in known_fields {

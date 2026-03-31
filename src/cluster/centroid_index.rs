@@ -140,6 +140,10 @@ impl CentroidIndex {
     pub fn dimension(&self) -> usize {
         self.dims
     }
+
+    pub fn metric(&self) -> MetricKind {
+        self.metric
+    }
 }
 
 #[cfg(test)]

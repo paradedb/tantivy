@@ -26,7 +26,7 @@ pub fn bytes_per_record(padded_dims: usize, ex_bits: usize) -> usize {
     let binary_bytes = padded_dims.div_ceil(8);
     // Match the quantizer's C++-compatible packing sizes.
     let ex_bytes = match ex_bits {
-        0 => padded_dims / 16 * 2,
+        0 => 0,
         1 => padded_dims / 16 * 2,
         2 => padded_dims / 16 * 4,
         6 => padded_dims / 16 * 12,
@@ -57,7 +57,7 @@ pub fn unpack(bytes: &[u8], padded_dims: usize, ex_bits: usize) -> QuantizedVect
     let binary_bytes = padded_dims.div_ceil(8);
     // Must match the quantizer's C++-compatible packing sizes.
     let ex_bytes = match ex_bits {
-        0 => padded_dims / 16 * 2,
+        0 => 0,
         1 => padded_dims / 16 * 2,
         2 => padded_dims / 16 * 4,
         6 => padded_dims / 16 * 12,
