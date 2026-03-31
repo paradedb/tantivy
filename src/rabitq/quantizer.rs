@@ -179,8 +179,8 @@ pub fn quantize_with_centroid(
     // Use C++-compatible packing format for ex_code (Phase 4 optimization)
     // This enables direct SIMD operations without unpacking overhead
     let ex_code_packed_size = match ex_bits {
-        0 => dim / 16 * 2,  // 1-bit total (binary only), but allocate for consistency
-        1 => dim / 16 * 2,  // 2-bit total (1-bit ex-code) - not commonly used
+        0 => 0,
+        1 => dim / 16 * 2,
         2 => dim / 16 * 4,  // 3-bit total (2-bit ex-code)
         6 => dim / 16 * 12, // 7-bit total (6-bit ex-code)
         _ => (dim * ex_bits).div_ceil(8), // Fallback for other bit configs

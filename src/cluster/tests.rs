@@ -1,0 +1,303 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use crate::bqvec::{BqVecPlugin, BqVecPluginReader};
+use crate::cluster::kmeans::KMeansConfig;
+use crate::cluster::plugin::{
+    ClusterConfig, ClusterFieldConfig, ClusterPlugin, ClusterPluginReader, ClusterPluginWriter,
+};
+use crate::cluster::sampler::{VectorSampler, VectorSamplerFactory};
+use crate::index::SegmentReader;
+use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
+use crate::plugin::SegmentPlugin;
+use crate::rabitq::{self, DynamicRotator, Metric, RabitqConfig, RotatorType};
+use crate::schema::{Field, Schema, STORED, TEXT};
+use crate::{DocId, Index, IndexWriter};
+
+const DIMS: usize = 32;
+const THRESHOLD: u32 = 3;
+
+struct InMemorySampler {
+    vectors: Vec<Vec<f32>>,
+}
+
+impl VectorSampler for InMemorySampler {
+    fn sample_vectors(
+        &self,
+        _field: Field,
+        doc_ids: &[DocId],
+    ) -> crate::Result<Vec<Option<Vec<f32>>>> {
+        Ok(doc_ids
+            .iter()
+            .map(|&id| self.vectors.get(id as usize).cloned())
+            .collect())
+    }
+
+    fn dims(&self, _field: Field) -> usize {
+        self.vectors.first().map_or(0, |v| v.len())
+    }
+}
+
+struct InMemorySamplerFactory {
+    vectors: Arc<Mutex<Vec<Vec<f32>>>>,
+}
+
+impl VectorSamplerFactory for InMemorySamplerFactory {
+    fn create_sampler(
+        &self,
+        _readers: &[SegmentReader],
+        _doc_id_mapping: &SegmentDocIdMapping,
+    ) -> crate::Result<Box<dyn VectorSampler>> {
+        let vecs = self.vectors.lock().unwrap().clone();
+        Ok(Box::new(InMemorySampler { vectors: vecs }))
+    }
+}
+
+fn make_schema() -> (Schema, Field, Field) {
+    let mut builder = Schema::builder();
+    let text = builder.add_text_field("text", TEXT | STORED);
+    let vec = builder.add_vector_field("embedding", DIMS);
+    (builder.build(), text, vec)
+}
+
+fn make_rotator() -> Arc<DynamicRotator> {
+    Arc::new(DynamicRotator::new(DIMS, RotatorType::MatrixRotator, 42))
+}
+
+fn make_bqvec_plugin(vec_field: Field, rotator: &Arc<DynamicRotator>) -> Arc<BqVecPlugin> {
+    let config = RabitqConfig::new(1);
+    let padded_dims = rotator.padded_dim();
+    let rotator_clone = rotator.clone();
+    Arc::new(
+        BqVecPlugin::builder()
+            .vector_field(
+                vec_field,
+                rabitq::bytes_per_record(padded_dims, 0),
+                Arc::new(move |v: &[f32]| rabitq::encode(&rotator_clone, &config, Metric::L2, v)),
+            )
+            .build(),
+    )
+}
+
+fn make_cluster_plugin(
+    vec_field: Field,
+    rotator: &Arc<DynamicRotator>,
+    sampler_factory: Arc<dyn VectorSamplerFactory>,
+) -> Arc<ClusterPlugin> {
+    let padded_dims = rotator.padded_dim();
+    Arc::new(ClusterPlugin::new(ClusterConfig {
+        clustering_threshold: THRESHOLD,
+        sample_ratio: 1.0, // sample everything for test reproducibility
+        sample_cap: 100_000,
+        kmeans: KMeansConfig {
+            niter: 20,
+            nredo: 1,
+            seed: 42,
+            ..Default::default()
+        },
+        num_clusters_fn: Arc::new(|n| (n / 2).max(1).min(4)),
+        fields: vec![ClusterFieldConfig {
+            field: vec_field,
+            dims: DIMS,
+            padded_dims,
+            ex_bits: 0,
+            metric: Metric::L2,
+            rotator: rotator.clone(),
+        }],
+        sampler_factory,
+    }))
+}
+
+fn make_vectors(n: usize) -> Vec<Vec<f32>> {
+    (0..n)
+        .map(|i| {
+            let base = if i % 2 == 0 { 1.0 } else { -1.0 };
+            (0..DIMS)
+                .map(|d| base * (d as f32 + i as f32 * 0.1) / DIMS as f32)
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn test_cluster_flush_below_threshold() -> crate::Result<()> {
+    let (schema, text_field, vec_field) = make_schema();
+    let rotator = make_rotator();
+    let vectors = make_vectors(2); // below threshold of 3
+    let shared_vecs = Arc::new(Mutex::new(vectors.clone()));
+
+    let bqvec = make_bqvec_plugin(vec_field, &rotator);
+    let cluster = make_cluster_plugin(
+        vec_field,
+        &rotator,
+        Arc::new(InMemorySamplerFactory {
+            vectors: shared_vecs,
+        }),
+    );
+
+    let index = Index::builder()
+        .schema(schema)
+        .plugin(bqvec as Arc<dyn SegmentPlugin>)
+        .plugin(cluster as Arc<dyn SegmentPlugin>)
+        .create_in_ram()?;
+
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+    for (i, v) in vectors.iter().enumerate() {
+        writer.add_document(crate::doc!(text_field => format!("doc{i}"), vec_field => v.clone()))?;
+    }
+    writer.commit()?;
+
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let seg = &searcher.segment_readers()[0];
+
+    let cluster_reader: Arc<ClusterPluginReader> = seg
+        .plugin_reader::<ClusterPluginReader>("cluster")?
+        .expect("cluster reader should exist");
+
+    let field_reader = cluster_reader.field_reader(vec_field).expect("field reader");
+    assert!(!field_reader.is_clustered(), "below threshold, should not be clustered");
+
+    Ok(())
+}
+
+#[test]
+fn test_cluster_flush_above_threshold() -> crate::Result<()> {
+    let (schema, text_field, vec_field) = make_schema();
+    let rotator = make_rotator();
+    let vectors = make_vectors(8); // above threshold of 3
+    let shared_vecs = Arc::new(Mutex::new(vectors.clone()));
+
+    let bqvec = make_bqvec_plugin(vec_field, &rotator);
+    let cluster = make_cluster_plugin(
+        vec_field,
+        &rotator,
+        Arc::new(InMemorySamplerFactory {
+            vectors: shared_vecs,
+        }),
+    );
+
+    let index = Index::builder()
+        .schema(schema)
+        .plugin(bqvec as Arc<dyn SegmentPlugin>)
+        .plugin(cluster as Arc<dyn SegmentPlugin>)
+        .create_in_ram()?;
+
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+    for (i, v) in vectors.iter().enumerate() {
+        writer.add_document(crate::doc!(text_field => format!("doc{i}"), vec_field => v.clone()))?;
+    }
+    writer.commit()?;
+
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let seg = &searcher.segment_readers()[0];
+
+    let cluster_reader: Arc<ClusterPluginReader> = seg
+        .plugin_reader::<ClusterPluginReader>("cluster")?
+        .expect("cluster reader should exist");
+
+    let field_reader = cluster_reader.field_reader(vec_field).expect("field reader");
+    assert!(field_reader.is_clustered(), "above threshold, should be clustered");
+    assert!(field_reader.num_clusters() > 0);
+
+    // Every doc should be assigned to a valid cluster
+    for doc_id in 0..8u32 {
+        let c = field_reader.doc_cluster(doc_id);
+        assert!((c as usize) < field_reader.num_clusters());
+    }
+
+    // Cluster doc lists should contain all docs exactly once
+    let mut all_docs: Vec<DocId> = Vec::new();
+    for c in 0..field_reader.num_clusters() {
+        all_docs.extend_from_slice(field_reader.cluster_docs(c));
+    }
+    all_docs.sort();
+    assert_eq!(all_docs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+
+    // Centroid search should return results
+    let query: Vec<f32> = (0..DIMS).map(|d| d as f32 / DIMS as f32).collect();
+    let results = field_reader.search_centroids(&query, 4);
+    assert!(!results.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn test_cluster_merge_with_bq_assignment() -> crate::Result<()> {
+    let (schema, text_field, vec_field) = make_schema();
+    let rotator = make_rotator();
+    let vectors = make_vectors(8);
+    let shared_vecs = Arc::new(Mutex::new(vectors.clone()));
+
+    let bqvec = make_bqvec_plugin(vec_field, &rotator);
+    let cluster = make_cluster_plugin(
+        vec_field,
+        &rotator,
+        Arc::new(InMemorySamplerFactory {
+            vectors: shared_vecs,
+        }),
+    );
+
+    let index = Index::builder()
+        .schema(schema)
+        .plugin(bqvec as Arc<dyn SegmentPlugin>)
+        .plugin(cluster as Arc<dyn SegmentPlugin>)
+        .create_in_ram()?;
+
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+
+    // Segment 1: first 4 docs
+    for (i, v) in vectors[..4].iter().enumerate() {
+        writer.add_document(crate::doc!(text_field => format!("doc{i}"), vec_field => v.clone()))?;
+    }
+    writer.commit()?;
+
+    // Segment 2: next 4 docs
+    for (i, v) in vectors[4..].iter().enumerate() {
+        writer.add_document(crate::doc!(text_field => format!("doc{}", i + 4), vec_field => v.clone()))?;
+    }
+    writer.commit()?;
+
+    // Force merge
+    let segment_ids = index.searchable_segment_ids()?;
+    assert_eq!(segment_ids.len(), 2);
+    writer.merge(&segment_ids).wait()?;
+
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    assert_eq!(searcher.num_docs(), 8);
+
+    let segments = searcher.segment_readers();
+    assert_eq!(segments.len(), 1);
+
+    // Verify BQ records exist
+    let bq: Arc<BqVecPluginReader> = segments[0]
+        .plugin_reader::<BqVecPluginReader>("bqvec")?
+        .unwrap();
+    assert_eq!(bq.field_reader(vec_field).unwrap().num_records(), 8);
+
+    // Verify cluster data
+    let cluster_reader: Arc<ClusterPluginReader> = segments[0]
+        .plugin_reader::<ClusterPluginReader>("cluster")?
+        .expect("cluster reader should exist after merge");
+
+    let field_reader = cluster_reader.field_reader(vec_field).expect("field reader");
+    assert!(field_reader.is_clustered());
+    assert!(field_reader.num_clusters() > 0);
+
+    // All 8 docs should appear in cluster lists
+    let mut all_docs: Vec<DocId> = Vec::new();
+    for c in 0..field_reader.num_clusters() {
+        all_docs.extend_from_slice(field_reader.cluster_docs(c));
+    }
+    all_docs.sort();
+    assert_eq!(all_docs, (0..8).collect::<Vec<DocId>>());
+
+    // Search centroids: query near positive vectors should find the right cluster
+    let query: Vec<f32> = (0..DIMS).map(|d| d as f32 / DIMS as f32).collect();
+    let results = field_reader.search_centroids(&query, 2);
+    assert!(!results.is_empty());
+
+    Ok(())
+}
