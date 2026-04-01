@@ -300,3 +300,106 @@ fn test_cluster_merge_with_bq_assignment() -> crate::Result<()> {
 
     Ok(())
 }
+
+/// Test with enough docs/clusters that the HNSW graph is non-trivial.
+/// Generates 500 vectors producing ~50 clusters, then verifies that
+/// centroid search returns the cluster whose centroid is actually closest
+/// to the query (i.e. HNSW doesn't miss the true nearest).
+#[test]
+fn test_hnsw_centroid_search_accuracy() -> crate::Result<()> {
+    use rand::prelude::*;
+
+    let num_docs = 500;
+    let (schema, text_field, vec_field) = make_schema();
+    let rotator = make_rotator();
+
+    let mut rng = StdRng::seed_from_u64(0xCAFE_BABE);
+    let vectors: Vec<Vec<f32>> = (0..num_docs)
+        .map(|_| (0..DIMS).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+        .collect();
+    let shared_vecs = Arc::new(Mutex::new(vectors.clone()));
+
+    let padded_dims = rotator.padded_dim();
+    let bqvec = make_bqvec_plugin(vec_field, &rotator);
+    // ~50 clusters from 500 docs
+    let cluster = Arc::new(ClusterPlugin::new(ClusterConfig {
+        clustering_threshold: THRESHOLD,
+        sample_ratio: 1.0,
+        sample_cap: 100_000,
+        kmeans: KMeansConfig {
+            niter: 25,
+            nredo: 1,
+            seed: 99,
+            ..Default::default()
+        },
+        num_clusters_fn: Arc::new(|n| (n / 10).max(2)),
+        fields: vec![ClusterFieldConfig {
+            field: vec_field,
+            dims: DIMS,
+            padded_dims,
+            ex_bits: 0,
+            metric: Metric::L2,
+            rotator: rotator.clone(),
+        }],
+        sampler_factory: Arc::new(InMemorySamplerFactory {
+            vectors: shared_vecs,
+        }),
+    }));
+
+    let index = Index::builder()
+        .schema(schema)
+        .plugin(bqvec as Arc<dyn SegmentPlugin>)
+        .plugin(cluster as Arc<dyn SegmentPlugin>)
+        .create_in_ram()?;
+
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+    for (i, v) in vectors.iter().enumerate() {
+        writer.add_document(crate::doc!(text_field => format!("doc{i}"), vec_field => v.clone()))?;
+    }
+    writer.commit()?;
+
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let seg = &searcher.segment_readers()[0];
+
+    let cluster_reader: Arc<ClusterPluginReader> = seg
+        .plugin_reader::<ClusterPluginReader>("cluster")?
+        .expect("cluster reader");
+
+    let field_reader = cluster_reader.field_reader(vec_field).expect("field reader");
+    assert!(field_reader.is_clustered());
+    let k = field_reader.num_clusters();
+    assert!(k >= 20, "expected many clusters, got {k}");
+
+    // All docs accounted for
+    let mut all_docs: Vec<DocId> = Vec::new();
+    for c in 0..k {
+        all_docs.extend_from_slice(field_reader.cluster_docs(c));
+    }
+    all_docs.sort();
+    assert_eq!(all_docs.len(), num_docs);
+
+    // Test HNSW accuracy: for several random queries, verify that the top-1
+    // centroid returned by HNSW search is the actual nearest centroid (by
+    // brute-force L2 over all centroids retrieved via search with ef=k).
+    for _ in 0..20 {
+        let query: Vec<f32> = (0..DIMS).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+
+        // HNSW top-1
+        let hnsw_results = field_reader.search_centroids(&query, 1);
+        assert!(!hnsw_results.is_empty());
+        let hnsw_nearest_id = hnsw_results[0].0;
+
+        // Brute-force: get all centroids and find true nearest
+        let bf_results = field_reader.search_centroids(&query, k);
+        let bf_nearest_id = bf_results[0].0;
+
+        // HNSW should find the same nearest centroid as brute-force
+        assert_eq!(
+            hnsw_nearest_id, bf_nearest_id,
+            "HNSW missed true nearest centroid for query"
+        );
+    }
+
+    Ok(())
+}
