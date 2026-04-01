@@ -59,8 +59,17 @@ impl IntermediateSum {
     pub fn merge_fruits(&mut self, other: IntermediateSum) {
         self.stats.merge_fruits(other.stats);
     }
-    /// Computes the final minimum value.
+    /// Computes the final sum value.
+    ///
+    /// Returns `None` when no values were collected (all documents had
+    /// missing/NULL values for the field), matching the behavior of
+    /// `IntermediateMin`, `IntermediateMax`, and `IntermediateAvg`.
     pub fn finalize(&self) -> Option<f64> {
-        Some(self.stats.finalize().sum)
+        let stats = self.stats.finalize();
+        if stats.count == 0 {
+            None
+        } else {
+            Some(stats.sum)
+        }
     }
 }
