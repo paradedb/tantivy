@@ -9,9 +9,12 @@ const K_EPS: f64 = 1e-5;
 const K_NENUM: f64 = 10.0;
 const K_CONST_EPSILON: f32 = 1.9;
 
-/// Configuration for RaBitQ quantisation.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RabitqConfig {
+    /// Bits per dimension for quantization (1-16). 1 bit = binary quantization
+    /// only (fastest, least accurate). Higher values add extended codes that
+    /// refine the approximation: ex_bits = total_bits - 1. For example,
+    /// total_bits=7 gives 1-bit binary code + 6-bit extended code per dimension.
     pub total_bits: usize,
     /// Precomputed constant scaling factor for faster quantization.
     /// If None, compute optimal t for each vector (slower but more accurate).

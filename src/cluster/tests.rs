@@ -14,7 +14,9 @@ use crate::rabitq::{self, DynamicRotator, Metric, RabitqConfig, RotatorType};
 use crate::schema::{Field, Schema, STORED, TEXT};
 use crate::{DocId, Index, IndexWriter};
 
+/// Vector dimensionality for test data. Kept small for fast tests.
 const DIMS: usize = 32;
+/// Minimum doc count to trigger clustering. Tests use 2 docs (below) and 8 docs (above).
 const THRESHOLD: u32 = 3;
 
 struct InMemorySampler {
@@ -109,13 +111,10 @@ fn make_cluster_plugin(
 }
 
 fn make_vectors(n: usize) -> Vec<Vec<f32>> {
+    use rand::prelude::*;
+    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF);
     (0..n)
-        .map(|i| {
-            let base = if i % 2 == 0 { 1.0 } else { -1.0 };
-            (0..DIMS)
-                .map(|d| base * (d as f32 + i as f32 * 0.1) / DIMS as f32)
-                .collect()
-        })
+        .map(|_| (0..DIMS).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
         .collect()
 }
 
