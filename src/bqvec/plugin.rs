@@ -20,7 +20,7 @@ use crate::{DocId, Segment};
 /// Per-field header length: [bytes_per_record: u32 LE] [num_records: u32 LE].
 const HEADER_LEN: usize = 8;
 
-fn component() -> SegmentComponent {
+pub(crate) fn component() -> SegmentComponent {
     SegmentComponent::Custom("bqvec".to_string())
 }
 

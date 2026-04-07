@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use common::file_slice::FileSlice;
 
-use crate::bqvec::{BqVecFieldReader, BqVecPluginReader};
+use crate::bqvec::{bqvec_component, BqVecFieldReader, BqVecPluginReader};
 use crate::cluster::centroid_index::CentroidIndex;
 use crate::cluster::kmeans::{run_kmeans_with_config, KMeansConfig};
 use crate::cluster::sampler::VectorSamplerFactory;
@@ -16,19 +16,16 @@ use crate::plugin::{
     PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
     SegmentPlugin,
 };
+use crate::postings::{BlockSegmentPostings, PostingsSerializer, SegmentPostings};
 use crate::rabitq::math::l2_distance_sqr;
 use crate::rabitq::rotation::DynamicRotator;
 use crate::rabitq::{self, Metric, RaBitQQuery};
 use crate::schema::document::{Document, Value};
-use crate::schema::{Field, FieldType, Schema};
+use crate::schema::{Field, FieldType, IndexRecordOption, Schema};
 use crate::{DocId, Segment};
 
 fn component() -> SegmentComponent {
     SegmentComponent::Custom("cluster".to_string())
-}
-
-fn bqvec_component() -> SegmentComponent {
-    SegmentComponent::Custom("bqvec".to_string())
 }
 
 #[derive(Clone)]
@@ -63,11 +60,15 @@ impl ClusterPlugin {
     }
 }
 
+struct ClusterPostingsList {
+    doc_freq: u32,
+    data: Vec<u8>,
+}
+
 struct ClusterData {
     centroid_index: CentroidIndex,
     per_doc_cluster: Vec<u16>,
-    cluster_offsets: Vec<u32>,
-    cluster_doc_ids: Vec<DocId>,
+    cluster_postings: Vec<ClusterPostingsList>,
     num_clusters: usize,
     dims: usize,
 }
@@ -76,6 +77,25 @@ fn sample_indices(total: usize, ratio: f32, cap: usize) -> Vec<usize> {
     let target = ((total as f32 * ratio) as usize).min(cap).max(1).min(total);
     let step = total / target;
     (0..total).step_by(step.max(1)).take(target).collect()
+}
+
+fn encode_posting_list(sorted_doc_ids: &[DocId]) -> ClusterPostingsList {
+    let doc_freq = sorted_doc_ids.len() as u32;
+    let mut buffer = Vec::new();
+    if doc_freq > 0 {
+        let mut serializer = PostingsSerializer::new(0.0, IndexRecordOption::Basic, None);
+        serializer.new_term(doc_freq, false);
+        for &doc_id in sorted_doc_ids {
+            serializer.write_doc(doc_id, 1);
+        }
+        serializer
+            .close_term(doc_freq, &mut buffer)
+            .expect("in-memory serialization should not fail");
+    }
+    ClusterPostingsList {
+        doc_freq,
+        data: buffer,
+    }
 }
 
 fn build_cluster_data(
@@ -91,31 +111,21 @@ fn build_cluster_data(
 
     let per_doc_cluster: Vec<u16> = assignments.iter().map(|&c| c as u16).collect();
 
-    let mut cluster_counts = vec![0u32; num_clusters];
-    for &c in assignments {
-        cluster_counts[c] += 1;
-    }
-    let mut cluster_offsets = Vec::with_capacity(num_clusters + 1);
-    cluster_offsets.push(0u32);
-    for &count in &cluster_counts {
-        let prev = *cluster_offsets.last().unwrap();
-        cluster_offsets.push(prev + count);
-    }
-
-    let mut cluster_doc_ids = vec![0 as DocId; num_docs];
-    let mut write_pos = cluster_offsets.clone();
+    let mut cluster_doc_lists: Vec<Vec<DocId>> = vec![Vec::new(); num_clusters];
     for doc_id in 0..num_docs {
         let c = assignments[doc_id];
-        let pos = write_pos[c] as usize;
-        cluster_doc_ids[pos] = doc_id as DocId;
-        write_pos[c] += 1;
+        cluster_doc_lists[c].push(doc_id as DocId);
     }
+
+    let cluster_postings: Vec<ClusterPostingsList> = cluster_doc_lists
+        .iter()
+        .map(|doc_ids| encode_posting_list(doc_ids))
+        .collect();
 
     ClusterData {
         centroid_index,
         per_doc_cluster,
-        cluster_offsets,
-        cluster_doc_ids,
+        cluster_postings,
         num_clusters,
         dims,
     }
@@ -219,11 +229,16 @@ fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Resul
     for &cluster_id in &data.per_doc_cluster {
         w.write_all(&cluster_id.to_le_bytes())?;
     }
-    for &offset in &data.cluster_offsets {
-        w.write_all(&offset.to_le_bytes())?;
+
+    // Cluster postings header: (doc_freq: u32, byte_len: u32) per cluster
+    for posting in &data.cluster_postings {
+        w.write_all(&posting.doc_freq.to_le_bytes())?;
+        w.write_all(&(posting.data.len() as u32).to_le_bytes())?;
     }
-    for &doc_id in &data.cluster_doc_ids {
-        w.write_all(&doc_id.to_le_bytes())?;
+
+    // Cluster postings data: concatenated posting list bytes
+    for posting in &data.cluster_postings {
+        w.write_all(&posting.data)?;
     }
 
     Ok(())
@@ -425,11 +440,17 @@ impl PluginReader for ClusterPluginReader {
     }
 }
 
+struct ClusterPostingsMeta {
+    doc_freq: u32,
+    byte_offset: usize,
+    byte_len: usize,
+}
+
 pub struct ClusterFieldReader {
     centroid_index: Option<CentroidIndex>,
     per_doc_cluster: Vec<u16>,
-    cluster_offsets: Vec<u32>,
-    cluster_doc_ids: Vec<DocId>,
+    postings_meta: Vec<ClusterPostingsMeta>,
+    postings_data: FileSlice,
 }
 
 impl ClusterFieldReader {
@@ -452,8 +473,8 @@ impl ClusterFieldReader {
             return Ok(Self {
                 centroid_index: None,
                 per_doc_cluster: Vec::new(),
-                cluster_offsets: Vec::new(),
-                cluster_doc_ids: Vec::new(),
+                postings_meta: Vec::new(),
+                postings_data: FileSlice::empty(),
             });
         }
 
@@ -477,35 +498,33 @@ impl ClusterFieldReader {
             offset += 2;
         }
 
-        let mut cluster_offsets = Vec::with_capacity(num_clusters + 1);
-        for _ in 0..=num_clusters {
-            let v = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
+        // Read postings header: (doc_freq: u32, byte_len: u32) per cluster
+        let mut postings_meta = Vec::with_capacity(num_clusters);
+        let mut cumulative_offset = 0usize;
+        for _ in 0..num_clusters {
+            let doc_freq = u32::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
             ]);
-            cluster_offsets.push(v);
             offset += 4;
+            let byte_len = u32::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]) as usize;
+            offset += 4;
+            postings_meta.push(ClusterPostingsMeta {
+                doc_freq,
+                byte_offset: cumulative_offset,
+                byte_len,
+            });
+            cumulative_offset += byte_len;
         }
 
-        let mut cluster_doc_ids = Vec::with_capacity(num_docs);
-        for _ in 0..num_docs {
-            let v = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]);
-            cluster_doc_ids.push(v as DocId);
-            offset += 4;
-        }
+        let postings_data = file_slice.slice_from(offset);
 
         Ok(Self {
             centroid_index: Some(centroid_index),
             per_doc_cluster,
-            cluster_offsets,
-            cluster_doc_ids,
+            postings_meta,
+            postings_data,
         })
     }
 
@@ -520,10 +539,21 @@ impl ClusterFieldReader {
         }
     }
 
-    pub fn cluster_docs(&self, cluster_id: usize) -> &[DocId] {
-        let start = self.cluster_offsets[cluster_id] as usize;
-        let end = self.cluster_offsets[cluster_id + 1] as usize;
-        &self.cluster_doc_ids[start..end]
+    pub fn cluster_postings(&self, cluster_id: usize) -> crate::Result<SegmentPostings> {
+        let meta = &self.postings_meta[cluster_id];
+        if meta.doc_freq == 0 {
+            return Ok(SegmentPostings::empty());
+        }
+        let bytes = self
+            .postings_data
+            .read_bytes_slice(meta.byte_offset..meta.byte_offset + meta.byte_len)?;
+        let block_postings = BlockSegmentPostings::open(
+            meta.doc_freq,
+            bytes,
+            IndexRecordOption::Basic,
+            IndexRecordOption::Basic,
+        )?;
+        Ok(SegmentPostings::from_block_postings(block_postings, None))
     }
 
     pub fn doc_cluster(&self, doc_id: DocId) -> u16 {

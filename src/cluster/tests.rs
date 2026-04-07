@@ -7,12 +7,27 @@ use crate::cluster::plugin::{
     ClusterConfig, ClusterFieldConfig, ClusterPlugin, ClusterPluginReader, ClusterPluginWriter,
 };
 use crate::cluster::sampler::{VectorSampler, VectorSamplerFactory};
+use crate::docset::DocSet;
 use crate::index::SegmentReader;
 use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
 use crate::plugin::SegmentPlugin;
 use crate::rabitq::{self, DynamicRotator, Metric, RabitqConfig, RotatorType};
 use crate::schema::{Field, Schema, STORED, TEXT};
-use crate::{DocId, Index, IndexWriter};
+use crate::{DocId, Index, IndexWriter, TERMINATED};
+
+fn collect_postings_doc_ids(
+    reader: &crate::cluster::plugin::ClusterFieldReader,
+    cluster_id: usize,
+) -> Vec<DocId> {
+    let mut postings = reader.cluster_postings(cluster_id).unwrap();
+    let mut doc_ids = Vec::new();
+    let mut doc = postings.doc();
+    while doc != TERMINATED {
+        doc_ids.push(doc);
+        doc = postings.advance();
+    }
+    doc_ids
+}
 
 /// Vector dimensionality for test data. Kept small for fast tests.
 const DIMS: usize = 32;
@@ -209,7 +224,7 @@ fn test_cluster_flush_above_threshold() -> crate::Result<()> {
     // Cluster doc lists should contain all docs exactly once
     let mut all_docs: Vec<DocId> = Vec::new();
     for c in 0..field_reader.num_clusters() {
-        all_docs.extend_from_slice(field_reader.cluster_docs(c));
+        all_docs.extend(collect_postings_doc_ids(field_reader, c));
     }
     all_docs.sort();
     assert_eq!(all_docs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
@@ -288,7 +303,7 @@ fn test_cluster_merge_with_bq_assignment() -> crate::Result<()> {
     // All 8 docs should appear in cluster lists
     let mut all_docs: Vec<DocId> = Vec::new();
     for c in 0..field_reader.num_clusters() {
-        all_docs.extend_from_slice(field_reader.cluster_docs(c));
+        all_docs.extend(collect_postings_doc_ids(field_reader, c));
     }
     all_docs.sort();
     assert_eq!(all_docs, (0..8).collect::<Vec<DocId>>());
@@ -374,7 +389,7 @@ fn test_hnsw_centroid_search_accuracy() -> crate::Result<()> {
     // All docs accounted for
     let mut all_docs: Vec<DocId> = Vec::new();
     for c in 0..k {
-        all_docs.extend_from_slice(field_reader.cluster_docs(c));
+        all_docs.extend(collect_postings_doc_ids(field_reader, c));
     }
     all_docs.sort();
     assert_eq!(all_docs.len(), num_docs);

@@ -49,3 +49,4 @@ pub use self::plugin::{
     BqVecFieldReader, BqVecPlugin, BqVecPluginBuilder, BqVecPluginReader, BqVecPluginWriter,
     EncodeFn,
 };
+pub(crate) use self::plugin::component as bqvec_component;
