@@ -2,6 +2,7 @@ use std::fmt;
 use std::ops::Bound;
 
 use super::term_weight::TermWeight;
+use crate::index::Bm25Params;
 use crate::query::bm25::Bm25Weight;
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
 use crate::query::{EnableScoring, Explanation, Query, RangeQuery, Weight};
@@ -103,7 +104,11 @@ impl TermQuery {
                 ..
             } => Bm25Weight::for_terms(statistics_provider, std::slice::from_ref(&self.term))?,
             EnableScoring::Disabled { .. } => {
-                Bm25Weight::new(Explanation::new("<no score>", 1.0f32), 1.0f32)
+                Bm25Weight::new(
+                    Explanation::new("<no score>", 1.0f32),
+                    1.0f32,
+                    Bm25Params::default(),
+                )
             }
         };
         let scoring_enabled = enable_scoring.is_scoring_enabled();

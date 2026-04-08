@@ -240,6 +240,33 @@ fn is_true(val: &bool) -> bool {
     *val
 }
 
+/// BM25 scoring parameters.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Bm25Params {
+    pub k1: f32,
+    pub b: f32,
+}
+
+impl Default for Bm25Params {
+    fn default() -> Self {
+        Self { k1: 1.2, b: 0.75 }
+    }
+}
+
+impl Bm25Params {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl PartialEq for Bm25Params {
+    fn eq(&self, other: &Self) -> bool {
+        self.k1.to_bits() == other.k1.to_bits() && self.b.to_bits() == other.b.to_bits()
+    }
+}
+
+impl Eq for Bm25Params {}
+
 /// Search Index Settings.
 ///
 /// Contains settings which are applied on the whole
