@@ -1,23 +1,23 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::bqvec::{BqVecPlugin, BqVecPluginReader};
-use crate::cluster::kmeans::KMeansConfig;
-use crate::cluster::plugin::{
+use crate::vector::bqvec::{BqVecPlugin, BqVecPluginReader};
+use crate::vector::cluster::kmeans::KMeansConfig;
+use crate::vector::cluster::plugin::{
     ClusterConfig, ClusterFieldConfig, ClusterPlugin, ClusterPluginReader, ClusterPluginWriter,
     ProbeConfig,
 };
-use crate::cluster::sampler::{VectorSampler, VectorSamplerFactory};
+use crate::vector::cluster::sampler::{VectorSampler, VectorSamplerFactory};
 use crate::docset::DocSet;
 use crate::index::SegmentReader;
 use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
 use crate::plugin::SegmentPlugin;
-use crate::rabitq::{self, DynamicRotator, Metric, RabitqConfig, RotatorType};
+use crate::vector::rabitq::{self, DynamicRotator, Metric, RabitqConfig, RotatorType};
 use crate::schema::{Field, Schema, STORED, TEXT};
 use crate::{DocId, Index, IndexWriter, TERMINATED};
 
 fn collect_postings_doc_ids(
-    reader: &crate::cluster::plugin::ClusterFieldReader,
+    reader: &crate::vector::cluster::plugin::ClusterFieldReader,
     cluster_id: usize,
 ) -> Vec<DocId> {
     let mut postings = reader.cluster_postings(cluster_id).unwrap();

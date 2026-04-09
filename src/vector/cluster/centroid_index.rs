@@ -1,8 +1,8 @@
 use usearch::ffi::{IndexOptions, MetricKind, ScalarKind};
 use usearch::Index;
 
-use crate::rabitq::math::l2_distance_sqr;
-use crate::rabitq::Metric;
+use crate::vector::rabitq::math::l2_distance_sqr;
+use crate::vector::rabitq::Metric;
 
 fn metric_to_usearch(metric: Metric) -> MetricKind {
     match metric {
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn kmeans_then_centroid_index() {
-        use crate::cluster::kmeans::{run_kmeans_with_config, KMeansConfig};
+        use crate::vector::cluster::kmeans::{run_kmeans_with_config, KMeansConfig};
 
         let mut data = Vec::new();
         for _ in 0..50 {

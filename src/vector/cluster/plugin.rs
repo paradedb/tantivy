@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use common::file_slice::FileSlice;
 
-use crate::bqvec::{bqvec_component, BqVecFieldReader, BqVecPluginReader};
-use crate::cluster::centroid_index::CentroidIndex;
-use crate::cluster::kmeans::{run_kmeans_with_config, KMeansConfig};
-use crate::cluster::sampler::VectorSamplerFactory;
+use crate::vector::bqvec::{bqvec_component, BqVecFieldReader, BqVecPluginReader};
+use crate::vector::cluster::centroid_index::CentroidIndex;
+use crate::vector::cluster::kmeans::{run_kmeans_with_config, KMeansConfig};
+use crate::vector::cluster::sampler::VectorSamplerFactory;
 use crate::directory::{CompositeFile, CompositeWrite};
 use crate::index::SegmentComponent;
 use crate::indexer::doc_id_mapping::DocIdMapping;
@@ -17,9 +17,9 @@ use crate::plugin::{
     SegmentPlugin,
 };
 use crate::postings::{BlockSegmentPostings, PostingsSerializer, SegmentPostings};
-use crate::rabitq::math::l2_distance_sqr;
-use crate::rabitq::rotation::DynamicRotator;
-use crate::rabitq::{self, Metric, RaBitQQuery};
+use crate::vector::rabitq::math::l2_distance_sqr;
+use crate::vector::rabitq::rotation::DynamicRotator;
+use crate::vector::rabitq::{self, Metric, RaBitQQuery};
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema};
 use crate::{DocId, Segment};
@@ -167,7 +167,7 @@ fn cluster_from_vectors(
 }
 
 fn cluster_from_merge(
-    sampler: &dyn crate::cluster::sampler::VectorSampler,
+    sampler: &dyn crate::vector::cluster::sampler::VectorSampler,
     bqvec_reader: &BqVecFieldReader,
     field_config: &ClusterFieldConfig,
     config: &ClusterConfig,

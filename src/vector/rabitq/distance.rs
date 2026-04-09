@@ -101,9 +101,9 @@ use super::simd as _simd_used;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rabitq::quantizer::{quantize_with_centroid, RabitqConfig};
-    use crate::rabitq::rotation::DynamicRotator;
-    use crate::rabitq::RotatorType;
+    use crate::vector::rabitq::quantizer::{quantize_with_centroid, RabitqConfig};
+    use crate::vector::rabitq::rotation::DynamicRotator;
+    use crate::vector::rabitq::RotatorType;
 
     #[test]
     fn test_distance_estimation_self_is_minimal() {

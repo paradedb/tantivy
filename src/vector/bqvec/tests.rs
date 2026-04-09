@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use crate::bqvec::{BqVecPlugin, BqVecPluginReader};
+use crate::vector::bqvec::{BqVecPlugin, BqVecPluginReader};
 use crate::plugin::SegmentPlugin;
-use crate::rabitq::{self, DynamicRotator, Metric, RabitqConfig, RotatorType};
+use crate::vector::rabitq::{self, DynamicRotator, Metric, RabitqConfig, RotatorType};
 use crate::schema::{Schema, STORED, TEXT};
 use crate::{Index, IndexWriter};
 

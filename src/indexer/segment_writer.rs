@@ -5,8 +5,8 @@ use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
-use crate::bqvec::BqVecPluginWriter;
-use crate::cluster::plugin::ClusterPluginWriter;
+use crate::vector::bqvec::BqVecPluginWriter;
+use crate::vector::cluster::plugin::ClusterPluginWriter;
 use crate::fastfield::FastFieldsPluginWriter;
 use crate::fieldnorm::FieldNormsPluginWriter;
 use crate::index::Segment;

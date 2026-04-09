@@ -188,7 +188,7 @@ impl SchemaBuilder {
     ///
     /// Vector fields store fixed-dimensional `f32` vectors per document.
     /// They are not indexed or stored via the standard tantivy pipeline;
-    /// instead a [`BqVecPlugin`](crate::bqvec::BqVecPlugin) handles
+    /// instead a [`BqVecPlugin`](crate::vector::bqvec::BqVecPlugin) handles
     /// storage and retrieval.
     pub fn add_vector_field(&mut self, field_name: &str, dimensions: usize) -> Field {
         let field_entry =

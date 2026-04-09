@@ -3,7 +3,7 @@
 //! Stateless functions for encoding f32 vectors into compact binary-quantized
 //! records and estimating distances from those records at query time.
 //!
-//! This module is used alongside [`BqVecPlugin`](crate::bqvec::BqVecPlugin)
+//! This module is used alongside [`BqVecPlugin`](crate::vector::bqvec::BqVecPlugin)
 //! which handles the segment storage lifecycle.
 
 pub mod distance;
@@ -62,7 +62,7 @@ impl From<std::io::Error> for RabitqError {
 /// Encode a full-precision vector into a quantized byte record.
 ///
 /// Rotates the vector, quantizes against zero centroid, and packs into
-/// a fixed-size byte record suitable for [`BqVecPlugin`](crate::bqvec::BqVecPlugin).
+/// a fixed-size byte record suitable for [`BqVecPlugin`](crate::vector::bqvec::BqVecPlugin).
 pub fn encode(
     rotator: &DynamicRotator,
     config: &RabitqConfig,

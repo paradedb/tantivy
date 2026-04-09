@@ -187,8 +187,6 @@ pub mod error;
 pub mod tokenizer;
 
 pub mod aggregation;
-pub mod bqvec;
-pub mod cluster;
 pub mod collector;
 pub mod directory;
 pub mod fastfield;
@@ -196,7 +194,7 @@ pub mod fieldnorm;
 pub mod index;
 pub mod positions;
 pub mod postings;
-pub mod rabitq;
+pub mod vector;
 
 pub mod plugin;
 /// Module containing the different query implementations.
