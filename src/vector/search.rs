@@ -231,57 +231,19 @@ mod tests {
     use crate::vector::bqvec::BqVecPlugin;
     use crate::vector::cluster::kmeans::KMeansConfig;
     use crate::vector::cluster::plugin::{ClusterConfig, ClusterFieldConfig, ClusterPlugin, ProbeConfig};
-    use crate::vector::cluster::sampler::{VectorSampler, VectorSamplerFactory};
+    use crate::vector::cluster::sampler::test_utils::InMemorySamplerFactory;
     use crate::collector::TopDocs;
     use crate::docset::{DocSet, TERMINATED};
-    use crate::index::SegmentReader;
-    use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
     use crate::plugin::SegmentPlugin;
     use crate::query::{EnableScoring, Query, TermQuery};
     use crate::vector::rabitq::rotation::DynamicRotator;
     use crate::vector::rabitq::{self, Metric, RabitqConfig, RotatorType};
     use crate::schema::{Field, IndexRecordOption, Schema, Term, STORED, STRING, TEXT};
     use crate::vector::search::{VectorQuery, VectorQueryConfig};
-    use crate::{DocId, Index, IndexWriter};
+    use crate::{Index, IndexWriter};
 
     const DIMS: usize = 32;
     const CLUSTER_THRESHOLD: u32 = 3;
-
-    struct InMemorySampler {
-        vectors: Vec<Vec<f32>>,
-    }
-
-    impl VectorSampler for InMemorySampler {
-        fn sample_vectors(
-            &self,
-            _field: Field,
-            doc_ids: &[DocId],
-        ) -> crate::Result<Vec<Option<Vec<f32>>>> {
-            Ok(doc_ids
-                .iter()
-                .map(|&id| self.vectors.get(id as usize).cloned())
-                .collect())
-        }
-
-        fn dims(&self, _field: Field) -> usize {
-            self.vectors.first().map_or(0, |v| v.len())
-        }
-    }
-
-    struct InMemorySamplerFactory {
-        vectors: Arc<Mutex<Vec<Vec<f32>>>>,
-    }
-
-    impl VectorSamplerFactory for InMemorySamplerFactory {
-        fn create_sampler(
-            &self,
-            _readers: &[SegmentReader],
-            _doc_id_mapping: &SegmentDocIdMapping,
-        ) -> crate::Result<Box<dyn VectorSampler>> {
-            let vecs = self.vectors.lock().unwrap().clone();
-            Ok(Box::new(InMemorySampler { vectors: vecs }))
-        }
-    }
 
     fn make_rotator() -> Arc<DynamicRotator> {
         Arc::new(DynamicRotator::new(DIMS, RotatorType::MatrixRotator, 42))

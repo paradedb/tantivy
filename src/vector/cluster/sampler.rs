@@ -34,3 +34,46 @@ pub trait VectorSamplerFactory: Send + Sync {
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<Box<dyn VectorSampler>>;
 }
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    pub struct InMemorySampler {
+        vectors: Vec<Vec<f32>>,
+    }
+
+    impl VectorSampler for InMemorySampler {
+        fn sample_vectors(
+            &self,
+            _field: Field,
+            doc_ids: &[DocId],
+        ) -> crate::Result<Vec<Option<Vec<f32>>>> {
+            Ok(doc_ids
+                .iter()
+                .map(|&id| self.vectors.get(id as usize).cloned())
+                .collect())
+        }
+
+        fn dims(&self, _field: Field) -> usize {
+            self.vectors.first().map_or(0, |v| v.len())
+        }
+    }
+
+    pub struct InMemorySamplerFactory {
+        pub vectors: Arc<Mutex<Vec<Vec<f32>>>>,
+    }
+
+    impl VectorSamplerFactory for InMemorySamplerFactory {
+        fn create_sampler(
+            &self,
+            _readers: &[SegmentReader],
+            _doc_id_mapping: &SegmentDocIdMapping,
+        ) -> crate::Result<Box<dyn VectorSampler>> {
+            let vecs = self.vectors.lock().unwrap().clone();
+            Ok(Box::new(InMemorySampler { vectors: vecs }))
+        }
+    }
+}

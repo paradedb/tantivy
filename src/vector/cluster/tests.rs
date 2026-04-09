@@ -7,10 +7,9 @@ use crate::vector::cluster::plugin::{
     ClusterConfig, ClusterFieldConfig, ClusterPlugin, ClusterPluginReader, ClusterPluginWriter,
     ProbeConfig,
 };
-use crate::vector::cluster::sampler::{VectorSampler, VectorSamplerFactory};
+use crate::vector::cluster::sampler::test_utils::InMemorySamplerFactory;
+use crate::vector::cluster::sampler::VectorSamplerFactory;
 use crate::docset::DocSet;
-use crate::index::SegmentReader;
-use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
 use crate::plugin::SegmentPlugin;
 use crate::vector::rabitq::{self, DynamicRotator, Metric, RabitqConfig, RotatorType};
 use crate::schema::{Field, Schema, STORED, TEXT};
@@ -30,46 +29,8 @@ fn collect_postings_doc_ids(
     doc_ids
 }
 
-/// Vector dimensionality for test data. Kept small for fast tests.
 const DIMS: usize = 32;
-/// Minimum doc count to trigger clustering. Tests use 2 docs (below) and 8 docs (above).
 const THRESHOLD: u32 = 3;
-
-struct InMemorySampler {
-    vectors: Vec<Vec<f32>>,
-}
-
-impl VectorSampler for InMemorySampler {
-    fn sample_vectors(
-        &self,
-        _field: Field,
-        doc_ids: &[DocId],
-    ) -> crate::Result<Vec<Option<Vec<f32>>>> {
-        Ok(doc_ids
-            .iter()
-            .map(|&id| self.vectors.get(id as usize).cloned())
-            .collect())
-    }
-
-    fn dims(&self, _field: Field) -> usize {
-        self.vectors.first().map_or(0, |v| v.len())
-    }
-}
-
-struct InMemorySamplerFactory {
-    vectors: Arc<Mutex<Vec<Vec<f32>>>>,
-}
-
-impl VectorSamplerFactory for InMemorySamplerFactory {
-    fn create_sampler(
-        &self,
-        _readers: &[SegmentReader],
-        _doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<Box<dyn VectorSampler>> {
-        let vecs = self.vectors.lock().unwrap().clone();
-        Ok(Box::new(InMemorySampler { vectors: vecs }))
-    }
-}
 
 fn make_schema() -> (Schema, Field, Field) {
     let mut builder = Schema::builder();
