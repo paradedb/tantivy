@@ -563,4 +563,66 @@ impl ClusterFieldReader {
     pub fn num_clusters(&self) -> usize {
         self.centroid_index.as_ref().map_or(0, |ci| ci.len())
     }
+
+    /// Adaptive cluster probing: fetch candidate centroids from HNSW, then
+    /// lazily select which clusters to actually scan based on a distance-ratio
+    /// cutoff. This avoids the two-step pattern of calling `search_centroids`
+    /// then `cluster_postings` separately with a hardcoded n_probe.
+    ///
+    /// The key insight is that the HNSW centroid search is cheap (microseconds
+    /// even for thousands of centroids), while scanning a cluster's posting
+    /// list is expensive. So we over-fetch centroids up to `max_probe`, but
+    /// only materialize posting lists for clusters whose centroid distance
+    /// is within `distance_ratio` of the nearest centroid's distance.
+    ///
+    /// For example, with distance_ratio=1.5: if the nearest centroid is at
+    /// distance 10, we stop once we hit a centroid farther than 15 — those
+    /// clusters are unlikely to contain true nearest neighbors.
+    pub fn probe_clusters(
+        &self,
+        query: &[f32],
+        config: &ProbeConfig,
+    ) -> crate::Result<Vec<(u32, SegmentPostings)>> {
+        // Over-fetch centroid candidates from HNSW — this is cheap
+        let candidates = self.search_centroids(query, config.max_probe);
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+        let nearest_dist = candidates[0].1;
+        let mut result = Vec::new();
+        for (i, &(cluster_id, dist)) in candidates.iter().enumerate() {
+            // Always probe at least min_probe clusters, then apply the
+            // distance-ratio cutoff: if this centroid is much farther than
+            // the nearest, remaining clusters won't help.
+            if i >= config.min_probe
+                && nearest_dist > 0.0
+                && dist / nearest_dist > config.distance_ratio
+            {
+                break;
+            }
+            result.push((cluster_id, self.cluster_postings(cluster_id as usize)?));
+        }
+        Ok(result)
+    }
+}
+
+pub struct ProbeConfig {
+    pub max_probe: usize,
+    pub distance_ratio: f32,
+    pub min_probe: usize,
+}
+
+impl ProbeConfig {
+    pub fn new(max_probe: usize, distance_ratio: f32) -> Self {
+        Self {
+            max_probe,
+            distance_ratio,
+            min_probe: 1,
+        }
+    }
+
+    pub fn with_min_probe(mut self, min_probe: usize) -> Self {
+        self.min_probe = min_probe;
+        self
+    }
 }

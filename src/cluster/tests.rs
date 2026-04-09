@@ -5,6 +5,7 @@ use crate::bqvec::{BqVecPlugin, BqVecPluginReader};
 use crate::cluster::kmeans::KMeansConfig;
 use crate::cluster::plugin::{
     ClusterConfig, ClusterFieldConfig, ClusterPlugin, ClusterPluginReader, ClusterPluginWriter,
+    ProbeConfig,
 };
 use crate::cluster::sampler::{VectorSampler, VectorSamplerFactory};
 use crate::docset::DocSet;
@@ -415,6 +416,111 @@ fn test_hnsw_centroid_search_accuracy() -> crate::Result<()> {
             "HNSW missed true nearest centroid for query"
         );
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_probe_clusters_adaptive() -> crate::Result<()> {
+    use rand::prelude::*;
+
+    let num_docs = 500;
+    let (schema, text_field, vec_field) = make_schema();
+    let rotator = make_rotator();
+
+    let mut rng = StdRng::seed_from_u64(0xBEEF_CAFE);
+    let vectors: Vec<Vec<f32>> = (0..num_docs)
+        .map(|_| (0..DIMS).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+        .collect();
+    let shared_vecs = Arc::new(Mutex::new(vectors.clone()));
+
+    let padded_dims = rotator.padded_dim();
+    let bqvec = make_bqvec_plugin(vec_field, &rotator);
+    let cluster = Arc::new(ClusterPlugin::new(ClusterConfig {
+        clustering_threshold: THRESHOLD,
+        sample_ratio: 1.0,
+        sample_cap: 100_000,
+        kmeans: KMeansConfig {
+            niter: 25,
+            nredo: 1,
+            seed: 99,
+            ..Default::default()
+        },
+        num_clusters_fn: Arc::new(|n| (n / 10).max(2)),
+        fields: vec![ClusterFieldConfig {
+            field: vec_field,
+            dims: DIMS,
+            padded_dims,
+            ex_bits: 0,
+            metric: Metric::L2,
+            rotator: rotator.clone(),
+        }],
+        sampler_factory: Arc::new(InMemorySamplerFactory {
+            vectors: shared_vecs,
+        }),
+    }));
+
+    let index = Index::builder()
+        .schema(schema)
+        .plugin(bqvec as Arc<dyn SegmentPlugin>)
+        .plugin(cluster as Arc<dyn SegmentPlugin>)
+        .create_in_ram()?;
+
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+    for (i, v) in vectors.iter().enumerate() {
+        writer.add_document(crate::doc!(text_field => format!("doc{i}"), vec_field => v.clone()))?;
+    }
+    writer.commit()?;
+
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let seg = &searcher.segment_readers()[0];
+
+    let cluster_reader: Arc<ClusterPluginReader> = seg
+        .plugin_reader::<ClusterPluginReader>("cluster")?
+        .expect("cluster reader");
+
+    let field_reader = cluster_reader.field_reader(vec_field).expect("field reader");
+    let k = field_reader.num_clusters();
+    assert!(k >= 20);
+
+    let query: Vec<f32> = (0..DIMS).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+
+    // Tight ratio should prune clusters
+    let tight = ProbeConfig::new(k, 1.2);
+    let tight_results = field_reader.probe_clusters(&query, &tight)?;
+    assert!(!tight_results.is_empty());
+    assert!(
+        tight_results.len() < k,
+        "tight ratio should prune: got {} out of {k}",
+        tight_results.len()
+    );
+
+    // Loose ratio should return max_probe clusters
+    let loose = ProbeConfig::new(k, 1000.0);
+    let loose_results = field_reader.probe_clusters(&query, &loose)?;
+    assert_eq!(loose_results.len(), k);
+
+    // min_probe is respected even with very tight ratio
+    let min3 = ProbeConfig::new(k, 1.0).with_min_probe(3);
+    let min3_results = field_reader.probe_clusters(&query, &min3)?;
+    assert!(min3_results.len() >= 3);
+
+    // Returned postings contain valid doc IDs
+    for (_, postings) in tight_results {
+        let mut postings = postings;
+        let mut doc = postings.doc();
+        while doc != TERMINATED {
+            assert!((doc as usize) < num_docs);
+            doc = postings.advance();
+        }
+    }
+
+    // First cluster matches search_centroids nearest
+    let centroids = field_reader.search_centroids(&query, 1);
+    let probe = ProbeConfig::new(k, 1.5);
+    let probe_results = field_reader.probe_clusters(&query, &probe)?;
+    assert_eq!(probe_results[0].0, centroids[0].0);
 
     Ok(())
 }
