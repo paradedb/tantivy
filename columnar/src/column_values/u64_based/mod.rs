@@ -1,5 +1,6 @@
 mod bitpacked;
 mod blockwise_linear;
+mod blockwise_linear_v2;
 mod line;
 mod linear;
 mod stats_collector;
@@ -16,6 +17,9 @@ use crate::column_values::monotonic_mapping::{
 };
 pub use crate::column_values::u64_based::bitpacked::BitpackedCodec;
 pub use crate::column_values::u64_based::blockwise_linear::BlockwiseLinearCodec;
+pub use crate::column_values::u64_based::blockwise_linear_v2::{
+    BlockwiseLinearV2Codec, BlockwiseLinearV2Reader,
+};
 pub use crate::column_values::u64_based::linear::LinearCodec;
 pub use crate::column_values::u64_based::stats_collector::StatsCollector;
 use crate::column_values::{ColumnStats, monotonic_map_column};
@@ -87,13 +91,16 @@ pub enum CodecType {
     Linear = 1u8,
     /// Same as [`CodecType::Linear`], but encodes in blocks of 512 elements.
     BlockwiseLinear = 2u8,
+    /// Same as [`CodecType::BlockwiseLinear`], but with a fixed-size footer for O(1) block access.
+    BlockwiseLinearV2 = 3u8,
 }
 
 /// List of all available u64-base codecs.
-pub const ALL_U64_CODEC_TYPES: [CodecType; 3] = [
+pub const ALL_U64_CODEC_TYPES: [CodecType; 4] = [
     CodecType::Bitpacked,
     CodecType::Linear,
     CodecType::BlockwiseLinear,
+    CodecType::BlockwiseLinearV2,
 ];
 
 impl CodecType {
@@ -106,6 +113,7 @@ impl CodecType {
             0u8 => Some(CodecType::Bitpacked),
             1u8 => Some(CodecType::Linear),
             2u8 => Some(CodecType::BlockwiseLinear),
+            3u8 => Some(CodecType::BlockwiseLinearV2),
             _ => None,
         }
     }
@@ -119,6 +127,9 @@ impl CodecType {
             CodecType::Linear => load_specific_codec::<LinearCodec, T>(file_slice),
             CodecType::BlockwiseLinear => {
                 load_specific_codec::<BlockwiseLinearCodec, T>(file_slice)
+            }
+            CodecType::BlockwiseLinearV2 => {
+                load_specific_codec::<BlockwiseLinearV2Codec, T>(file_slice)
             }
         }
     }
@@ -142,6 +153,7 @@ impl CodecType {
             CodecType::Bitpacked => BitpackedCodec::boxed_estimator(),
             CodecType::Linear => LinearCodec::boxed_estimator(),
             CodecType::BlockwiseLinear => BlockwiseLinearCodec::boxed_estimator(),
+            CodecType::BlockwiseLinearV2 => BlockwiseLinearV2Codec::boxed_estimator(),
         }
     }
 }

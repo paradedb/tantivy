@@ -39,6 +39,7 @@ pub use block_accessor::ColumnBlockAccessor;
 pub use column::{BytesColumn, Column, StrColumn};
 pub use column_index::ColumnIndex;
 pub use column_values::{
+    BlockwiseLinearV2Codec, BlockwiseLinearV2Reader, CodecType, ColumnCodec, ColumnStats,
     ColumnValues, EmptyColumnValues, MonotonicallyMappableToU64, MonotonicallyMappableToU128,
 };
 pub use columnar::{
