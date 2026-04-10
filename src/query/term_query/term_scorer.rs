@@ -132,12 +132,11 @@ impl Scorer for TermScorer {
 mod tests {
     use proptest::prelude::*;
 
-    use crate::index::SegmentId;
+    use crate::index::{Bm25Params, SegmentId};
     use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
     use crate::merge_policy::NoMergePolicy;
     use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
     use crate::query::term_query::TermScorer;
-    use crate::index::Bm25Params;
     use crate::query::{Bm25Weight, EnableScoring, Scorer, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, TEXT};
     use crate::{
