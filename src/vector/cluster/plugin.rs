@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use common::file_slice::FileSlice;
 
-use crate::vector::bqvec::{bqvec_component, BqVecFieldReader, BqVecPluginReader};
+use crate::vector::bqvec::bqvec_component;
 use crate::vector::cluster::centroid_index::CentroidIndex;
 use crate::vector::cluster::kmeans::{run_kmeans_with_config, KMeansConfig};
 use crate::vector::cluster::sampler::VectorSamplerFactory;
@@ -19,7 +19,7 @@ use crate::plugin::{
 use crate::postings::{BlockSegmentPostings, PostingsSerializer, SegmentPostings};
 use crate::vector::rabitq::math::l2_distance_sqr;
 use crate::vector::rabitq::rotation::DynamicRotator;
-use crate::vector::rabitq::{self, Metric, RaBitQQuery};
+use crate::vector::rabitq::{self, Metric, RabitqConfig};
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema};
 use crate::{DocId, Segment};
@@ -131,11 +131,17 @@ fn build_cluster_data(
     }
 }
 
+struct ClusterResult {
+    data: ClusterData,
+    centroids: Vec<Vec<f32>>,
+    assignments: Vec<usize>,
+}
+
 fn cluster_from_vectors(
     vectors: &[Vec<f32>],
     config: &ClusterConfig,
     field_config: &ClusterFieldConfig,
-) -> crate::Result<ClusterData> {
+) -> crate::Result<ClusterResult> {
     let num_docs = vectors.len();
     let sample_ids = sample_indices(num_docs, config.sample_ratio, config.sample_cap);
     let sampled: Vec<Vec<f32>> = sample_ids.iter().map(|&i| vectors[i].clone()).collect();
@@ -158,21 +164,22 @@ fn cluster_from_vectors(
         assignments[doc_id] = best_cluster;
     }
 
-    Ok(build_cluster_data(
-        result.centroids,
-        &assignments,
-        num_docs,
-        field_config.metric,
-    ))
+    let centroids = result.centroids.clone();
+    let data = build_cluster_data(result.centroids, &assignments, num_docs, field_config.metric);
+
+    Ok(ClusterResult {
+        data,
+        centroids,
+        assignments,
+    })
 }
 
 fn cluster_from_merge(
     sampler: &dyn crate::vector::cluster::sampler::VectorSampler,
-    bqvec_reader: &BqVecFieldReader,
     field_config: &ClusterFieldConfig,
     config: &ClusterConfig,
     num_docs: usize,
-) -> crate::Result<ClusterData> {
+) -> crate::Result<ClusterResult> {
     let sample_ids = sample_indices(num_docs, config.sample_ratio, config.sample_cap);
     let sample_doc_ids: Vec<DocId> = sample_ids.iter().map(|&i| i as DocId).collect();
     let sampled_vecs = sampler.sample_vectors(field_config.field, &sample_doc_ids)?;
@@ -188,33 +195,32 @@ fn cluster_from_merge(
     let k = k.min(valid_vecs.len()).max(1);
     let result = run_kmeans_with_config(&valid_vecs, k, config.kmeans.clone());
 
-    let centroid_queries: Vec<RaBitQQuery> = result
-        .centroids
-        .iter()
-        .map(|c| rabitq::prepare_query(&field_config.rotator, c, field_config.ex_bits, field_config.metric))
-        .collect();
-
+    // Assign docs to clusters using exact distances via sampler
     let mut assignments = vec![0usize; num_docs];
     for doc_id in 0..num_docs {
-        let record = bqvec_reader.record(doc_id as DocId)?;
-        let mut best_cluster = 0;
-        let mut best_dist = f32::INFINITY;
-        for (ci, query) in centroid_queries.iter().enumerate() {
-            let dist = query.estimate_distance_from_record(&record, field_config.padded_dims, 0.0);
-            if dist < best_dist {
-                best_dist = dist;
-                best_cluster = ci;
+        let vecs = sampler.sample_vectors(field_config.field, &[doc_id as DocId])?;
+        if let Some(vec) = vecs.into_iter().next().flatten() {
+            let mut best_cluster = 0;
+            let mut best_dist = f32::INFINITY;
+            for (ci, centroid) in result.centroids.iter().enumerate() {
+                let dist = l2_distance_sqr(&vec, centroid);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_cluster = ci;
+                }
             }
+            assignments[doc_id] = best_cluster;
         }
-        assignments[doc_id] = best_cluster;
     }
 
-    Ok(build_cluster_data(
-        result.centroids,
-        &assignments,
-        num_docs,
-        field_config.metric,
-    ))
+    let centroids = result.centroids.clone();
+    let data = build_cluster_data(result.centroids, &assignments, num_docs, field_config.metric);
+
+    Ok(ClusterResult {
+        data,
+        centroids,
+        assignments,
+    })
 }
 
 fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Result<()> {
@@ -289,16 +295,47 @@ impl SegmentPlugin for ClusterPlugin {
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
         let num_docs = ctx.doc_id_mapping.iter_old_doc_addrs().count();
 
-        let write = ctx.target_segment.open_write(component())?;
-        let mut composite = CompositeWrite::wrap(write);
+        let cluster_write = ctx.target_segment.open_write(component())?;
+        let mut cluster_composite = CompositeWrite::wrap(cluster_write);
+
+        let bqvec_write = ctx.target_segment.open_write(bqvec_component())?;
+        let mut bqvec_composite = CompositeWrite::wrap(bqvec_write);
+
+        let rabitq_config = RabitqConfig::new(1);
 
         if (num_docs as u32) < self.config.clustering_threshold {
             for field_cfg in &self.config.fields {
-                let w = composite.for_field(field_cfg.field);
-                serialize_empty(w)?;
-                w.flush()?;
+                let cw = cluster_composite.for_field(field_cfg.field);
+                serialize_empty(cw)?;
+                cw.flush()?;
+
+                // Re-encode BQ records against zero centroid via sampler
+                let bytes_per_record =
+                    rabitq::bytes_per_record(field_cfg.padded_dims, field_cfg.ex_bits);
+                let bw = bqvec_composite.for_field(field_cfg.field);
+                bw.write_all(&(bytes_per_record as u32).to_le_bytes())?;
+                bw.write_all(&(num_docs as u32).to_le_bytes())?;
+
+                let sampler = self.config.sampler_factory.create_sampler(
+                    ctx.readers,
+                    ctx.doc_id_mapping,
+                )?;
+                let zero = vec![0.0f32; field_cfg.dims];
+                for doc_id in 0..num_docs {
+                    let vecs =
+                        sampler.sample_vectors(field_cfg.field, &[doc_id as DocId])?;
+                    let vec = vecs.into_iter().next().flatten().unwrap_or_else(|| {
+                        vec![0.0f32; field_cfg.dims]
+                    });
+                    let record = rabitq::encode(
+                        &field_cfg.rotator, &rabitq_config, field_cfg.metric, &vec, &zero,
+                    );
+                    bw.write_all(&record)?;
+                }
+                bw.flush()?;
             }
-            composite.close()?;
+            cluster_composite.close()?;
+            bqvec_composite.close()?;
             return Ok(());
         }
 
@@ -307,31 +344,42 @@ impl SegmentPlugin for ClusterPlugin {
             .sampler_factory
             .create_sampler(ctx.readers, ctx.doc_id_mapping)?;
 
-        let bqvec_file = ctx.target_segment.open_read(bqvec_component())?;
-        let bqvec_fields: Vec<Field> = self.config.fields.iter().map(|f| f.field).collect();
-        let bqvec_reader = BqVecPluginReader::open(bqvec_file, &bqvec_fields)?;
-
         for field_cfg in &self.config.fields {
-            let bqvec_field_reader = bqvec_reader.field_reader(field_cfg.field).ok_or_else(|| {
-                crate::TantivyError::InternalError(format!(
-                    "bqvec field reader missing for cluster merge"
-                ))
-            })?;
-
-            let data = cluster_from_merge(
+            let result = cluster_from_merge(
                 sampler.as_ref(),
-                bqvec_field_reader,
                 field_cfg,
                 &self.config,
                 num_docs,
             )?;
 
-            let w = composite.for_field(field_cfg.field);
-            serialize_cluster_data(&data, w)?;
-            w.flush()?;
+            let cw = cluster_composite.for_field(field_cfg.field);
+            serialize_cluster_data(&result.data, cw)?;
+            cw.flush()?;
+
+            // Re-encode BQ records against new cluster centroids
+            let bytes_per_record =
+                rabitq::bytes_per_record(field_cfg.padded_dims, field_cfg.ex_bits);
+            let bw = bqvec_composite.for_field(field_cfg.field);
+            bw.write_all(&(bytes_per_record as u32).to_le_bytes())?;
+            bw.write_all(&(num_docs as u32).to_le_bytes())?;
+
+            for doc_id in 0..num_docs {
+                let vecs =
+                    sampler.sample_vectors(field_cfg.field, &[doc_id as DocId])?;
+                let vec = vecs.into_iter().next().flatten().unwrap_or_else(|| {
+                    vec![0.0f32; field_cfg.dims]
+                });
+                let centroid = &result.centroids[result.assignments[doc_id]];
+                let record = rabitq::encode(
+                    &field_cfg.rotator, &rabitq_config, field_cfg.metric, &vec, centroid,
+                );
+                bw.write_all(&record)?;
+            }
+            bw.flush()?;
         }
 
-        composite.close()?;
+        cluster_composite.close()?;
+        bqvec_composite.close()?;
         Ok(())
     }
 }
@@ -378,28 +426,60 @@ impl PluginWriter for ClusterPluginWriter {
         segment: &mut Segment,
         _doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
-        let write = segment.open_write(component())?;
-        let mut composite = CompositeWrite::wrap(write);
+        let cluster_write = segment.open_write(component())?;
+        let mut cluster_composite = CompositeWrite::wrap(cluster_write);
+
+        let bqvec_write = segment.open_write(bqvec_component())?;
+        let mut bqvec_composite = CompositeWrite::wrap(bqvec_write);
+
+        let rabitq_config = RabitqConfig::new(1);
 
         for field_cfg in &self.config.fields {
-            let w = composite.for_field(field_cfg.field);
-
             let vectors = self.per_field_vectors.get(&field_cfg.field);
             let num_docs = vectors.map_or(0, |v| v.len());
 
+            let cw = cluster_composite.for_field(field_cfg.field);
+
+            let bytes_per_record = rabitq::bytes_per_record(field_cfg.padded_dims, field_cfg.ex_bits);
+            let bw = bqvec_composite.for_field(field_cfg.field);
+            bw.write_all(&(bytes_per_record as u32).to_le_bytes())?;
+            bw.write_all(&(num_docs as u32).to_le_bytes())?;
+
             if (num_docs as u32) < self.config.clustering_threshold || num_docs == 0 {
-                serialize_empty(w)?;
-                w.flush()?;
+                serialize_empty(cw)?;
+                cw.flush()?;
+                // Write BQ records against zero centroid
+                let zero = vec![0.0f32; field_cfg.dims];
+                if let Some(vectors) = vectors {
+                    for vec in vectors {
+                        let record = rabitq::encode(
+                            &field_cfg.rotator, &rabitq_config, field_cfg.metric, vec, &zero,
+                        );
+                        bw.write_all(&record)?;
+                    }
+                }
+                bw.flush()?;
                 continue;
             }
 
             let vectors = vectors.unwrap();
-            let data = cluster_from_vectors(vectors, &self.config, field_cfg)?;
-            serialize_cluster_data(&data, w)?;
-            w.flush()?;
+            let result = cluster_from_vectors(vectors, &self.config, field_cfg)?;
+            serialize_cluster_data(&result.data, cw)?;
+            cw.flush()?;
+
+            // Write BQ records against cluster centroids
+            for (doc_id, vec) in vectors.iter().enumerate() {
+                let centroid = &result.centroids[result.assignments[doc_id]];
+                let record = rabitq::encode(
+                    &field_cfg.rotator, &rabitq_config, field_cfg.metric, vec, centroid,
+                );
+                bw.write_all(&record)?;
+            }
+            bw.flush()?;
         }
 
-        composite.close()?;
+        cluster_composite.close()?;
+        bqvec_composite.close()?;
         Ok(())
     }
 

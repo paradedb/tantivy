@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -86,32 +87,65 @@ struct VectorWeight {
     filter_weight: Option<Box<dyn Weight>>,
 }
 
+struct CandidateResult {
+    scorer: Box<dyn Scorer>,
+    centroid_dists: HashMap<u16, f32>,
+}
+
 impl VectorWeight {
-    fn build_candidate_scorer(
+    fn build_candidates(
         &self,
         cluster_reader: &ClusterFieldReader,
         max_doc: u32,
-    ) -> crate::Result<Box<dyn Scorer>> {
+    ) -> crate::Result<CandidateResult> {
         if !cluster_reader.is_clustered() {
-            return Ok(Box::new(AllScorer::new(max_doc)));
+            return Ok(CandidateResult {
+                scorer: Box::new(AllScorer::new(max_doc)),
+                centroid_dists: HashMap::new(),
+            });
+        }
+
+        let centroid_results =
+            cluster_reader.search_centroids(&self.query_vector, self.config.probe.max_probe);
+        if centroid_results.is_empty() {
+            return Ok(CandidateResult {
+                scorer: Box::new(AllScorer::new(max_doc)),
+                centroid_dists: HashMap::new(),
+            });
+        }
+
+        let mut centroid_dists = HashMap::new();
+        for &(cluster_id, dist) in &centroid_results {
+            centroid_dists.insert(cluster_id as u16, dist);
         }
 
         let probed = cluster_reader.probe_clusters(&self.query_vector, &self.config.probe)?;
         if probed.is_empty() {
-            return Ok(Box::new(AllScorer::new(max_doc)));
+            return Ok(CandidateResult {
+                scorer: Box::new(AllScorer::new(max_doc)),
+                centroid_dists,
+            });
         }
 
-        if probed.len() == 1 {
+        let scorer: Box<dyn Scorer> = if probed.len() == 1 {
             let (_, postings) = probed.into_iter().next().unwrap();
-            return Ok(Box::new(ConstScorer::new(postings, 1.0)));
-        }
+            Box::new(ConstScorer::new(postings, 1.0))
+        } else {
+            let scorers: Vec<ConstScorer<SegmentPostings>> = probed
+                .into_iter()
+                .map(|(_, postings)| ConstScorer::new(postings, 1.0))
+                .collect();
+            Box::new(BufferedUnionScorer::build(
+                scorers,
+                DoNothingCombiner::default,
+                max_doc,
+            ))
+        };
 
-        let scorers: Vec<ConstScorer<SegmentPostings>> = probed
-            .into_iter()
-            .map(|(_, postings)| ConstScorer::new(postings, 1.0))
-            .collect();
-        let union = BufferedUnionScorer::build(scorers, DoNothingCombiner::default, max_doc);
-        Ok(Box::new(union))
+        Ok(CandidateResult {
+            scorer,
+            centroid_dists,
+        })
     }
 }
 
@@ -139,18 +173,18 @@ impl Weight for VectorWeight {
             crate::TantivyError::InternalError("cluster field reader not found".into())
         })?;
 
-        let candidates = self.build_candidate_scorer(cluster_field, reader.max_doc())?;
+        let result = self.build_candidates(cluster_field, reader.max_doc())?;
 
         let doc_set: Box<dyn DocSet> = match &self.filter_weight {
             Some(filter_weight) => {
                 let filter_scorer = filter_weight.scorer(reader, 1.0)?;
                 Box::new(Intersection::with_two_sets(
-                    candidates,
+                    result.scorer,
                     filter_scorer,
                     reader.max_doc(),
                 ))
             }
-            None => candidates,
+            None => result.scorer,
         };
 
         let rabitq_query = RaBitQQuery::new(
@@ -163,9 +197,11 @@ impl Weight for VectorWeight {
         Ok(Box::new(VectorScorer {
             doc_set,
             bq_plugin: bq_plugin.clone(),
+            cluster_plugin: cluster_plugin.clone(),
             field,
             rabitq_query,
             padded_dims: self.config.padded_dims,
+            centroid_dists: result.centroid_dists,
         }))
     }
 
@@ -177,9 +213,11 @@ impl Weight for VectorWeight {
 struct VectorScorer {
     doc_set: Box<dyn DocSet>,
     bq_plugin: Arc<BqVecPluginReader>,
+    cluster_plugin: Arc<ClusterPluginReader>,
     field: Field,
     rabitq_query: RaBitQQuery,
     padded_dims: usize,
+    centroid_dists: HashMap<u16, f32>,
 }
 
 impl DocSet for VectorScorer {
@@ -210,14 +248,21 @@ impl Scorer for VectorScorer {
             Some(r) => r,
             None => return f32::MIN,
         };
+        let g_add = self
+            .cluster_plugin
+            .field_reader(self.field)
+            .filter(|cr| cr.is_clustered())
+            .map(|cr| {
+                let cluster_id = cr.doc_cluster(doc);
+                self.centroid_dists.get(&cluster_id).copied().unwrap_or(0.0)
+            })
+            .unwrap_or(0.0);
         match bq_reader.record(doc) {
             Ok(record) => {
                 // Negate so that TopDocs (descending sort) ranks closer vectors higher.
-                // BQ estimate_distance returns lower = closer, but tantivy's
-                // collector expects higher score = better.
                 -self
                     .rabitq_query
-                    .estimate_distance_from_record(&record, self.padded_dims, 0.0)
+                    .estimate_distance_from_record(&record, self.padded_dims, g_add)
             }
             Err(_) => f32::MIN,
         }

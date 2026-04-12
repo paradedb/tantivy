@@ -98,17 +98,7 @@ impl SegmentPlugin for BqVecPlugin {
     }
 
     fn create_writer(&self, _ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
-        let per_field: Vec<FieldWriterState> = self
-            .fields
-            .iter()
-            .map(|cfg| FieldWriterState {
-                field: cfg.field,
-                bytes_per_record: cfg.bytes_per_record,
-                encode_fn: cfg.encode_fn.clone(),
-                buf: Vec::new(),
-            })
-            .collect();
-        Ok(Box::new(BqVecPluginWriter { per_field }))
+        Ok(Box::new(BqVecNoopWriter))
     }
 
     fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
@@ -118,66 +108,53 @@ impl SegmentPlugin for BqVecPlugin {
             .map(|r| Arc::new(r) as Arc<dyn PluginReader>)
     }
 
-    fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
-        let source_readers: Vec<Arc<BqVecPluginReader>> = ctx
-            .readers
-            .iter()
-            .map(|r| {
-                r.plugin_reader::<BqVecPluginReader>("bqvec")
-                    .and_then(|opt| {
-                        opt.ok_or_else(|| {
-                            crate::TantivyError::InternalError(
-                                "bqvec reader missing during merge".into(),
-                            )
-                        })
-                    })
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-
-        let num_new_docs = ctx.doc_id_mapping.iter_old_doc_addrs().count();
-
-        let write = ctx.target_segment.open_write(component())?;
-        let mut composite = CompositeWrite::wrap(write);
-
-        for cfg in &self.fields {
-            let field = cfg.field;
-            let bytes_per_record = cfg.bytes_per_record;
-
-            let w = composite.for_field(field);
-
-            // Write per-field header.
-            w.write_all(&(bytes_per_record as u32).to_le_bytes())?;
-            w.write_all(&(num_new_docs as u32).to_le_bytes())?;
-
-            // Write records in new doc_id order.
-            let zero = vec![0u8; bytes_per_record];
-            for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                let reader = &source_readers[old_doc_addr.segment_ord as usize];
-                if let Some(field_reader) = reader.field_reader(field) {
-                    if (old_doc_addr.doc_id as usize) < field_reader.num_records() {
-                        let rec = field_reader.record(old_doc_addr.doc_id)?;
-                        w.write_all(&rec)?;
-                    } else {
-                        w.write_all(&zero)?;
-                    }
-                } else {
-                    w.write_all(&zero)?;
-                }
-            }
-            w.flush()?;
-        }
-
-        composite.close()?;
+    fn merge(&self, _ctx: PluginMergeContext) -> crate::Result<()> {
+        // ClusterPlugin handles .bqvec writing during merge
         Ok(())
     }
 }
 
-/// Per-field writer state held inside [`BqVecPluginWriter`].
+struct BqVecNoopWriter;
+
+impl PluginWriter for BqVecNoopWriter {
+    fn serialize(
+        &mut self,
+        _segment: &mut Segment,
+        _doc_id_map: Option<&DocIdMapping>,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> crate::Result<()> {
+        Ok(())
+    }
+
+    fn mem_usage(&self) -> usize {
+        0
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Writer that accumulates fixed-size records during indexing.
+///
+/// Deprecated: ClusterPlugin now handles BQ encoding. This writer is kept
+/// for backward compatibility but its `ingest_vectors` is unused when
+/// ClusterPlugin manages the vector fields.
+pub struct BqVecPluginWriter {
+    per_field: Vec<FieldWriterState>,
+}
+
 struct FieldWriterState {
     field: Field,
     bytes_per_record: usize,
     encode_fn: EncodeFn,
-    /// Flat buffer: `buf.len() == num_docs * bytes_per_record`.
     buf: Vec<u8>,
 }
 
@@ -185,14 +162,6 @@ impl FieldWriterState {
     fn num_records(&self) -> usize {
         self.buf.len() / self.bytes_per_record
     }
-}
-
-/// Writer that accumulates fixed-size records during indexing.
-///
-/// Vectors are ingested from documents via [`ingest_vectors`](Self::ingest_vectors),
-/// which extracts vector field values and runs the per-field encode function.
-pub struct BqVecPluginWriter {
-    per_field: Vec<FieldWriterState>,
 }
 
 impl BqVecPluginWriter {
