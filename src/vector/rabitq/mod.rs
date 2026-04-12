@@ -61,17 +61,18 @@ impl From<std::io::Error> for RabitqError {
 
 /// Encode a full-precision vector into a quantized byte record.
 ///
-/// Rotates the vector, quantizes against zero centroid, and packs into
-/// a fixed-size byte record suitable for [`BqVecPlugin`](crate::vector::bqvec::BqVecPlugin).
+/// Rotates the vector, quantizes against the given centroid, and packs into
+/// a fixed-size byte record. Pass a zero-vector centroid for unclustered encoding.
 pub fn encode(
     rotator: &DynamicRotator,
     config: &RabitqConfig,
     metric: Metric,
     vector: &[f32],
+    centroid: &[f32],
 ) -> Vec<u8> {
     let rotated = rotator.rotate(vector);
-    let zero_centroid = vec![0.0f32; rotated.len()];
-    let qv = quantizer::quantize_with_centroid(&rotated, &zero_centroid, config, metric);
+    let rotated_centroid = rotator.rotate(centroid);
+    let qv = quantizer::quantize_with_centroid(&rotated, &rotated_centroid, config, metric);
     record::pack(&qv)
 }
 

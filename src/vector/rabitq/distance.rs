@@ -82,10 +82,16 @@ impl RaBitQQuery {
 
     /// Estimate distance from a packed byte record.
     ///
-    /// Convenience method that unpacks the record first.
-    pub fn estimate_distance_from_record(&self, record: &[u8], padded_dims: usize) -> f32 {
+    /// `g_add` is the centroid correction term (query-to-centroid distance for
+    /// centroid-residual quantization, or `0.0` for zero-centroid encoding).
+    pub fn estimate_distance_from_record(
+        &self,
+        record: &[u8],
+        padded_dims: usize,
+        g_add: f32,
+    ) -> f32 {
         let qv = super::record::unpack(record, padded_dims, self.ex_bits);
-        self.estimate_distance(&qv, 0.0)
+        self.estimate_distance(&qv, g_add)
     }
 
     /// Access the rotated query vector.

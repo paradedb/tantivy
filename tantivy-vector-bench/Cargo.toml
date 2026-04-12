@@ -10,3 +10,4 @@ crate-type = ["cdylib"]
 [dependencies]
 tantivy = { path = ".." }
 pyo3 = { version = "0.23", features = ["extension-module"] }
+parquet = { version = "55", default-features = false }

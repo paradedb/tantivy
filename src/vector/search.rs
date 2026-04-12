@@ -217,7 +217,7 @@ impl Scorer for VectorScorer {
                 // collector expects higher score = better.
                 -self
                     .rabitq_query
-                    .estimate_distance_from_record(&record, self.padded_dims)
+                    .estimate_distance_from_record(&record, self.padded_dims, 0.0)
             }
             Err(_) => f32::MIN,
         }
@@ -284,7 +284,10 @@ mod tests {
                 .vector_field(
                     vec_field,
                     rabitq::bytes_per_record(padded_dims, 0),
-                    Arc::new(move |v: &[f32]| rabitq::encode(&rotator_enc, &config, Metric::L2, v)),
+                    Arc::new(move |v: &[f32]| {
+                        let zero = vec![0.0f32; v.len()];
+                        rabitq::encode(&rotator_enc, &config, Metric::L2, v, &zero)
+                    }),
                 )
                 .build(),
         );

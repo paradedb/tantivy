@@ -200,7 +200,7 @@ fn cluster_from_merge(
         let mut best_cluster = 0;
         let mut best_dist = f32::INFINITY;
         for (ci, query) in centroid_queries.iter().enumerate() {
-            let dist = query.estimate_distance_from_record(&record, field_config.padded_dims);
+            let dist = query.estimate_distance_from_record(&record, field_config.padded_dims, 0.0);
             if dist < best_dist {
                 best_dist = dist;
                 best_cluster = ci;

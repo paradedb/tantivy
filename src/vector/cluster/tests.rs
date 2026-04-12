@@ -52,7 +52,10 @@ fn make_bqvec_plugin(vec_field: Field, rotator: &Arc<DynamicRotator>) -> Arc<BqV
             .vector_field(
                 vec_field,
                 rabitq::bytes_per_record(padded_dims, 0),
-                Arc::new(move |v: &[f32]| rabitq::encode(&rotator_clone, &config, Metric::L2, v)),
+                Arc::new(move |v: &[f32]| {
+                    let zero = vec![0.0f32; v.len()];
+                    rabitq::encode(&rotator_clone, &config, Metric::L2, v, &zero)
+                }),
             )
             .build(),
     )

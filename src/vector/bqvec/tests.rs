@@ -23,7 +23,10 @@ fn make_plugin(vec_field: crate::schema::Field, rotator: &Arc<DynamicRotator>) -
             .vector_field(
                 vec_field,
                 rabitq::bytes_per_record(padded_dims, 0),
-                Arc::new(move |v: &[f32]| rabitq::encode(&rotator_clone, &config, Metric::L2, v)),
+                Arc::new(move |v: &[f32]| {
+                    let zero = vec![0.0f32; v.len()];
+                    rabitq::encode(&rotator_clone, &config, Metric::L2, v, &zero)
+                }),
             )
             .build(),
     )
@@ -113,8 +116,8 @@ fn test_e2e_distance_ordering() -> crate::Result<()> {
 
     let rec0 = field_reader.record(0)?;
     let rec1 = field_reader.record(1)?;
-    let dist_similar = query.estimate_distance_from_record(&rec0, padded_dims);
-    let dist_dissimilar = query.estimate_distance_from_record(&rec1, padded_dims);
+    let dist_similar = query.estimate_distance_from_record(&rec0, padded_dims, 0.0);
+    let dist_dissimilar = query.estimate_distance_from_record(&rec1, padded_dims, 0.0);
 
     assert!(
         dist_similar < dist_dissimilar,
