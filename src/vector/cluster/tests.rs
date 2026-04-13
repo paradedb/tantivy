@@ -51,7 +51,7 @@ fn make_bqvec_plugin(vec_field: Field, rotator: &Arc<DynamicRotator>) -> Arc<BqV
         BqVecPlugin::builder()
             .vector_field(
                 vec_field,
-                rabitq::bytes_per_record(padded_dims, 0),
+                rabitq::bytes_per_record(padded_dims, 6),
                 Arc::new(move |v: &[f32]| {
                     let zero = vec![0.0f32; v.len()];
                     rabitq::encode(&rotator_clone, &config, Metric::L2, v, &zero)
@@ -82,7 +82,7 @@ fn make_cluster_plugin(
             field: vec_field,
             dims: DIMS,
             padded_dims,
-            ex_bits: 0,
+            ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
         }],
@@ -317,7 +317,7 @@ fn test_hnsw_centroid_search_accuracy() -> crate::Result<()> {
             field: vec_field,
             dims: DIMS,
             padded_dims,
-            ex_bits: 0,
+            ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
         }],
@@ -415,7 +415,7 @@ fn test_probe_clusters_adaptive() -> crate::Result<()> {
             field: vec_field,
             dims: DIMS,
             padded_dims,
-            ex_bits: 0,
+            ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
         }],

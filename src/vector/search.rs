@@ -328,7 +328,7 @@ mod tests {
             BqVecPlugin::builder()
                 .vector_field(
                     vec_field,
-                    rabitq::bytes_per_record(padded_dims, 0),
+                    rabitq::bytes_per_record(padded_dims, 6),
                     Arc::new(move |v: &[f32]| {
                         let zero = vec![0.0f32; v.len()];
                         rabitq::encode(&rotator_enc, &config, Metric::L2, v, &zero)
@@ -353,7 +353,7 @@ mod tests {
                 field: vec_field,
                 dims: DIMS,
                 padded_dims,
-                ex_bits: 0,
+                ex_bits: 6,
                 metric: Metric::L2,
                 rotator: rotator.clone(),
             }],
@@ -397,7 +397,7 @@ mod tests {
         VectorQueryConfig {
             field: t.vec_field,
             padded_dims: t.rotator.padded_dim(),
-            ex_bits: 0,
+            ex_bits: 6,
             metric: Metric::L2,
             rotator: t.rotator.clone(),
             probe: ProbeConfig::new(max_probe, distance_ratio),

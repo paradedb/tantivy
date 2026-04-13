@@ -68,14 +68,21 @@ def main():
         total_inserted = 0
         t_index_start = time.time()
 
+        COMMIT_EVERY = 100_000
         for shard in range(num_shards):
             shard_count = 0
+            since_commit = 0
             t0 = time.time()
             for ids, embs in iter_train_batches(shard):
                 count = idx.insert(ids, embs)
                 shard_count += count
                 total_inserted += count
-            idx.commit()
+                since_commit += count
+                if since_commit >= COMMIT_EVERY:
+                    idx.commit()
+                    since_commit = 0
+            if since_commit > 0:
+                idx.commit()
             elapsed = time.time() - t0
             vps = shard_count / elapsed if elapsed > 0 else 0
             print(

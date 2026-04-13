@@ -31,7 +31,7 @@ fn make_plugins(
         BqVecPlugin::builder()
             .vector_field(
                 vec_field,
-                rabitq::bytes_per_record(padded_dims, 0),
+                rabitq::bytes_per_record(padded_dims, 6),
                 Arc::new(move |v: &[f32]| {
                     let zero = vec![0.0f32; v.len()];
                     rabitq::encode(&rotator_clone, &config, Metric::L2, v, &zero)
@@ -55,7 +55,7 @@ fn make_plugins(
             field: vec_field,
             dims: DIMS,
             padded_dims,
-            ex_bits: 0,
+            ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
         }],
@@ -104,7 +104,7 @@ fn test_e2e_index_and_read() -> crate::Result<()> {
     assert_eq!(field_reader.num_records(), 8);
 
     let padded_dims = rotator.padded_dim();
-    let expected_size = rabitq::bytes_per_record(padded_dims, 0);
+    let expected_size = rabitq::bytes_per_record(padded_dims, 6);
     assert_eq!(field_reader.bytes_per_record(), expected_size);
 
     let rec0 = field_reader.record(0)?;
@@ -137,7 +137,7 @@ fn test_e2e_distance_ordering() -> crate::Result<()> {
         BqVecPlugin::builder()
             .vector_field(
                 vec_field,
-                rabitq::bytes_per_record(padded_dims, 0),
+                rabitq::bytes_per_record(padded_dims, 6),
                 Arc::new(move |v: &[f32]| {
                     let zero = vec![0.0f32; v.len()];
                     rabitq::encode(&rotator_clone, &config, Metric::L2, v, &zero)
@@ -156,7 +156,7 @@ fn test_e2e_distance_ordering() -> crate::Result<()> {
             field: vec_field,
             dims,
             padded_dims,
-            ex_bits: 0,
+            ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
         }],
@@ -181,7 +181,7 @@ fn test_e2e_distance_ordering() -> crate::Result<()> {
     let bq: Arc<BqVecPluginReader> = seg.plugin_reader::<BqVecPluginReader>("bqvec")?.unwrap();
     let field_reader = bq.field_reader(vec_field).unwrap();
 
-    let query = crate::vector::rabitq::RaBitQQuery::new(&base, &rotator, 0, Metric::L2);
+    let query = crate::vector::rabitq::RaBitQQuery::new(&base, &rotator, 6, Metric::L2);
     let rec0 = field_reader.record(0)?;
     let rec1 = field_reader.record(2)?;
     let dist_similar = query.estimate_distance_from_record(&rec0, padded_dims, 0.0);

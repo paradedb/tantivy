@@ -301,7 +301,7 @@ impl SegmentPlugin for ClusterPlugin {
         let bqvec_write = ctx.target_segment.open_write(bqvec_component())?;
         let mut bqvec_composite = CompositeWrite::wrap(bqvec_write);
 
-        let rabitq_config = RabitqConfig::new(1);
+        let rabitq_config = RabitqConfig::new(7);
 
         if (num_docs as u32) < self.config.clustering_threshold {
             for field_cfg in &self.config.fields {
@@ -432,7 +432,7 @@ impl PluginWriter for ClusterPluginWriter {
         let bqvec_write = segment.open_write(bqvec_component())?;
         let mut bqvec_composite = CompositeWrite::wrap(bqvec_write);
 
-        let rabitq_config = RabitqConfig::new(1);
+        let rabitq_config = RabitqConfig::new(7);
 
         for field_cfg in &self.config.fields {
             let vectors = self.per_field_vectors.get(&field_cfg.field);

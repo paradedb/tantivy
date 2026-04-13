@@ -167,7 +167,7 @@ impl TantivyVectorIndex {
             BqVecPlugin::builder()
                 .vector_field(
                     vec_field,
-                    rabitq::bytes_per_record(padded_dims, 0),
+                    rabitq::bytes_per_record(padded_dims, 6),
                     Arc::new(move |v: &[f32]| {
                         let zero = vec![0.0f32; v.len()];
                         rabitq::encode(&rotator_enc, &config, metric, v, &zero)
@@ -191,7 +191,7 @@ impl TantivyVectorIndex {
                 field: vec_field,
                 dims: dim,
                 padded_dims,
-                ex_bits: 0,
+                ex_bits: 6,
                 metric,
                 rotator: rotator.clone(),
             }],
@@ -281,7 +281,7 @@ impl TantivyVectorIndex {
             BqVecPlugin::builder()
                 .vector_field(
                     vec_field,
-                    rabitq::bytes_per_record(padded_dims, 0),
+                    rabitq::bytes_per_record(padded_dims, 6),
                     Arc::new(move |v: &[f32]| {
                         let zero = vec![0.0f32; v.len()];
                         rabitq::encode(&rotator_enc, &config, metric, v, &zero)
@@ -300,7 +300,7 @@ impl TantivyVectorIndex {
                 field: vec_field,
                 dims: dim,
                 padded_dims,
-                ex_bits: 0,
+                ex_bits: 6,
                 metric,
                 rotator: rotator.clone(),
             }],
@@ -347,7 +347,7 @@ impl TantivyVectorIndex {
         let config = VectorQueryConfig {
             field: self.vec_field,
             padded_dims: self.rotator.padded_dim(),
-            ex_bits: 0,
+            ex_bits: 6,
             metric: self.metric,
             rotator: self.rotator.clone(),
             probe: ProbeConfig::new(max_probe, distance_ratio),
