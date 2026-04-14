@@ -268,23 +268,17 @@ impl Weight for VectorWeight {
             let probed =
                 cluster_field.probe_clusters(&self.query_vector, &self.config.probe)?;
 
-            // Collect (cluster_id, doc_ids) per cluster, then sort clusters
-            // by min doc ID so a single filter scorer can seek forward
-            let mut cluster_docs: Vec<(u16, f32, Vec<DocId>)> = Vec::new();
+            // Collect probed cluster IDs with their g_add and sort by min doc ID
+            // so a single filter scorer can seek forward
+            let mut cluster_info: Vec<(u32, u16, f32)> = Vec::new();
             for (cluster_id, mut postings) in probed {
                 let cid = cluster_id as u16;
                 let g_add = result.centroid_dists.get(&cid).copied().unwrap_or(0.0);
-                let mut doc_ids = Vec::new();
-                let mut doc = postings.doc();
-                while doc != TERMINATED {
-                    doc_ids.push(doc);
-                    doc = postings.advance();
-                }
-                if !doc_ids.is_empty() {
-                    cluster_docs.push((cid, g_add, doc_ids));
+                let first_doc = postings.doc();
+                if first_doc != TERMINATED {
+                    cluster_info.push((cluster_id, cid, g_add));
                 }
             }
-            cluster_docs.sort_unstable_by_key(|(_, _, ids)| ids[0]);
 
             let mut filter_scorer: Option<Box<dyn Scorer>> = self
                 .filter_weight
@@ -292,125 +286,108 @@ impl Weight for VectorWeight {
                 .map(|fw| fw.scorer(reader, 1.0))
                 .transpose()?;
 
-            for (_cid, g_add, ref doc_ids) in &cluster_docs {
-                let g_add = *g_add;
+            for &(cluster_id, _cid, g_add) in &cluster_info {
+                // Try pre-stored batch data first
+                if let Ok(Some((doc_ids, meta, raw))) =
+                    cluster_field.cluster_batch_raw(cluster_id as usize)
+                {
+                    let num_docs = meta.num_docs as usize;
+                    let num_batches = meta.num_batches as usize;
+                    let db = cluster_field.dim_bytes();
 
-                // Process in batches of 32
-                for chunk in doc_ids.chunks(BATCH_SIZE) {
-                    // Filter check: seek forward for each doc in batch.
-                    // Doc IDs within a cluster are sorted. Across sorted clusters,
-                    // some IDs may be behind the filter's current position — skip those.
-                    let mut matched = [false; BATCH_SIZE];
-                    let mut any_match = false;
-                    for (i, &did) in chunk.iter().enumerate() {
-                        if let Some(ref mut fs) = filter_scorer {
-                            let cur = fs.doc();
-                            if cur == TERMINATED {
-                                break;
-                            }
-                            if cur <= did {
-                                if fs.seek(did) == did {
-                                    matched[i] = true;
-                                    any_match = true;
+                    // Layout: doc_ids | transposed_codes | f_add | f_rescale | f_error
+                    let doc_id_bytes = num_docs * 4;
+                    let codes_bytes = num_batches * db * BATCH_SIZE;
+                    let scalars_per_batch = BATCH_SIZE;
+                    let total_scalars = num_batches * scalars_per_batch;
+
+                    let codes_start = doc_id_bytes;
+                    let f_add_start = codes_start + codes_bytes;
+                    let f_rescale_start = f_add_start + total_scalars * 4;
+                    let f_error_start = f_rescale_start + total_scalars * 4;
+
+                    for batch_idx in 0..num_batches {
+                        let batch_start = batch_idx * BATCH_SIZE;
+                        let batch_end = (batch_start + BATCH_SIZE).min(num_docs);
+                        let batch_doc_ids = &doc_ids[batch_start..batch_end];
+
+                        // Filter check
+                        let mut matched = [true; BATCH_SIZE];
+                        let mut any_match = batch_doc_ids.len() > 0;
+                        if filter_scorer.is_some() {
+                            any_match = false;
+                            matched = [false; BATCH_SIZE];
+                            for (i, &did) in batch_doc_ids.iter().enumerate() {
+                                if let Some(ref mut fs) = filter_scorer {
+                                    let cur = fs.doc();
+                                    if cur != TERMINATED && cur <= did && fs.seek(did) == did {
+                                        matched[i] = true;
+                                        any_match = true;
+                                    }
                                 }
                             }
-                            // else: filter already past this doc, not a match
-                        } else {
-                            matched[i] = true;
-                            any_match = true;
                         }
-                    }
-                    if !any_match {
-                        continue;
-                    }
-
-                // Read binary codes + scalars for this batch
-                let mut codes: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
-                let mut f_add_batch = [0.0f32; BATCH_SIZE];
-                let mut f_rescale_batch = [0.0f32; BATCH_SIZE];
-                let mut f_error_batch = [0.0f32; BATCH_SIZE];
-
-                for (i, &did) in chunk.iter().enumerate() {
-                    if let Ok(record) = bq_reader.record(did) {
-                        codes.push(record[..dim_bytes].to_vec());
-                        let read_f32 = |off: usize| -> f32 {
-                            f32::from_le_bytes([
-                                record[scalar_off + off],
-                                record[scalar_off + off + 1],
-                                record[scalar_off + off + 2],
-                                record[scalar_off + off + 3],
-                            ])
-                        };
-                        f_add_batch[i] = read_f32(8);
-                        f_rescale_batch[i] = read_f32(12);
-                        f_error_batch[i] = read_f32(16);
-                    } else {
-                        codes.push(vec![0u8; dim_bytes]);
-                    }
-                }
-                while codes.len() < BATCH_SIZE {
-                    codes.push(vec![0u8; dim_bytes]);
-                }
-
-                // Transpose + SIMD batch accumulate
-                let code_refs: Vec<&[u8]> =
-                    codes.iter().map(|c| c.as_slice()).collect();
-                let mut transposed = vec![0u8; dim_bytes * BATCH_SIZE];
-                fastscan::pack_batch_simple(&code_refs, dim_bytes, &mut transposed);
-
-                let mut accu = [0u32; BATCH_SIZE];
-                fastscan::accumulate_batch(
-                    &transposed,
-                    rabitq_query.lut().lut_u8(),
-                    dim_bytes,
-                    &mut accu,
-                );
-
-                let mut binary_dots = [0.0f32; BATCH_SIZE];
-                fastscan::denormalize_batch(
-                    &accu,
-                    rabitq_query.lut().delta(),
-                    rabitq_query.lut().sum_vl(),
-                    &mut binary_dots,
-                );
-
-                let mut distances = [0.0f32; BATCH_SIZE];
-                let mut lower_bounds = [0.0f32; BATCH_SIZE];
-                fastscan::compute_batch_distances(
-                    &binary_dots,
-                    &f_add_batch,
-                    &f_rescale_batch,
-                    &f_error_batch,
-                    g_add,
-                    rabitq_query.k1x_sum_q(),
-                    &mut distances,
-                    &mut lower_bounds,
-                );
-
-                let raw_threshold = -neg_threshold;
-                for (i, &did) in chunk.iter().enumerate() {
-                    if !matched[i] {
-                        continue;
-                    }
-                    if lower_bounds[i] >= raw_threshold {
-                        continue;
-                    }
-                    let distance = if ex_bits > 0 {
-                        if let Ok(record) = bq_reader.record(did) {
-                            rabitq_query.estimate_distance_from_record(
-                                &record, padded_dims, g_add,
-                            )
-                        } else {
+                        if !any_match {
                             continue;
                         }
-                    } else {
-                        distances[i]
-                    };
-                    let score = -distance;
-                    if score > neg_threshold {
-                        neg_threshold = callback(did, score);
+
+                        // Read pre-transposed codes directly (zero copy from mmap)
+                        let tc_off = codes_start + batch_idx * db * BATCH_SIZE;
+                        let transposed = &raw[tc_off..tc_off + db * BATCH_SIZE];
+
+                        let mut accu = [0u32; BATCH_SIZE];
+                        fastscan::accumulate_batch(
+                            transposed,
+                            rabitq_query.lut().lut_u8(),
+                            db,
+                            &mut accu,
+                        );
+
+                        let mut binary_dots = [0.0f32; BATCH_SIZE];
+                        fastscan::denormalize_batch(
+                            &accu,
+                            rabitq_query.lut().delta(),
+                            rabitq_query.lut().sum_vl(),
+                            &mut binary_dots,
+                        );
+
+                        // Read pre-stored scalars
+                        let scalar_off_base = batch_idx * scalars_per_batch;
+                        let read_f32_arr = |start: usize, idx: usize| -> f32 {
+                            let off = start + (scalar_off_base + idx) * 4;
+                            f32::from_le_bytes([raw[off], raw[off+1], raw[off+2], raw[off+3]])
+                        };
+
+                        let mut distances = [0.0f32; BATCH_SIZE];
+                        let mut lower_bounds = [0.0f32; BATCH_SIZE];
+                        for i in 0..BATCH_SIZE {
+                            let fa = read_f32_arr(f_add_start, i);
+                            let fr = read_f32_arr(f_rescale_start, i);
+                            let fe = read_f32_arr(f_error_start, i);
+                            let binary_term = binary_dots[i] + rabitq_query.k1x_sum_q();
+                            distances[i] = fa + g_add + fr * binary_term;
+                            lower_bounds[i] = distances[i] - fe.abs();
+                        }
+
+                        let raw_threshold = -neg_threshold;
+                        for (i, &did) in batch_doc_ids.iter().enumerate() {
+                            if !matched[i] { continue; }
+                            if lower_bounds[i] >= raw_threshold { continue; }
+                            let distance = if ex_bits > 0 {
+                                if let Ok(record) = bq_reader.record(did) {
+                                    rabitq_query.estimate_distance_from_record(
+                                        &record, padded_dims, g_add,
+                                    )
+                                } else { continue; }
+                            } else {
+                                distances[i]
+                            };
+                            let score = -distance;
+                            if score > neg_threshold {
+                                neg_threshold = callback(did, score);
+                            }
+                        }
                     }
-                }
                 }
             }
             return Ok(());

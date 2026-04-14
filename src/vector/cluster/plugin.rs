@@ -65,10 +65,20 @@ struct ClusterPostingsList {
     data: Vec<u8>,
 }
 
+struct ClusterBatchData {
+    doc_ids: Vec<DocId>,
+    transposed_codes: Vec<u8>,
+    f_add: Vec<f32>,
+    f_rescale: Vec<f32>,
+    f_error: Vec<f32>,
+    num_batches: u32,
+}
+
 struct ClusterData {
     centroid_index: CentroidIndex,
     per_doc_cluster: Vec<u16>,
     cluster_postings: Vec<ClusterPostingsList>,
+    cluster_batch_data: Vec<ClusterBatchData>,
     num_clusters: usize,
     dims: usize,
 }
@@ -126,6 +136,7 @@ fn build_cluster_data(
         centroid_index,
         per_doc_cluster,
         cluster_postings,
+        cluster_batch_data: Vec::new(),
         num_clusters,
         dims,
     }
@@ -223,6 +234,68 @@ fn cluster_from_merge(
     })
 }
 
+fn build_cluster_batch_data(
+    docs: &[(DocId, Vec<u8>)],
+    dim_bytes: usize,
+    scalar_off: usize,
+) -> ClusterBatchData {
+    use crate::vector::rabitq::fastscan::{pack_batch_simple, BATCH_SIZE};
+
+    let num_docs = docs.len();
+    let num_batches = num_docs.div_ceil(BATCH_SIZE);
+
+    let mut doc_ids = Vec::with_capacity(num_docs);
+    let mut transposed_codes = Vec::new();
+    let mut f_add = Vec::new();
+    let mut f_rescale = Vec::new();
+    let mut f_error = Vec::new();
+
+    for chunk in docs.chunks(BATCH_SIZE) {
+        let mut codes: Vec<Vec<u8>> = chunk.iter().map(|(_, rec)| rec[..dim_bytes].to_vec()).collect();
+        while codes.len() < BATCH_SIZE {
+            codes.push(vec![0u8; dim_bytes]);
+        }
+
+        let code_refs: Vec<&[u8]> = codes.iter().map(|c| c.as_slice()).collect();
+        let mut batch_transposed = vec![0u8; dim_bytes * BATCH_SIZE];
+        pack_batch_simple(&code_refs, dim_bytes, &mut batch_transposed);
+        transposed_codes.extend_from_slice(&batch_transposed);
+
+        let mut batch_f_add = vec![0.0f32; BATCH_SIZE];
+        let mut batch_f_rescale = vec![0.0f32; BATCH_SIZE];
+        let mut batch_f_error = vec![0.0f32; BATCH_SIZE];
+        for (i, (_, rec)) in chunk.iter().enumerate() {
+            let read_f32 = |off: usize| -> f32 {
+                f32::from_le_bytes([
+                    rec[scalar_off + off],
+                    rec[scalar_off + off + 1],
+                    rec[scalar_off + off + 2],
+                    rec[scalar_off + off + 3],
+                ])
+            };
+            batch_f_add[i] = read_f32(8);
+            batch_f_rescale[i] = read_f32(12);
+            batch_f_error[i] = read_f32(16);
+        }
+        f_add.extend_from_slice(&batch_f_add);
+        f_rescale.extend_from_slice(&batch_f_rescale);
+        f_error.extend_from_slice(&batch_f_error);
+
+        for (did, _) in chunk {
+            doc_ids.push(*did);
+        }
+    }
+
+    ClusterBatchData {
+        doc_ids,
+        transposed_codes,
+        f_add,
+        f_rescale,
+        f_error,
+        num_batches: num_batches as u32,
+    }
+}
+
 fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Result<()> {
     w.write_all(&(data.num_clusters as u32).to_le_bytes())?;
     w.write_all(&(data.per_doc_cluster.len() as u32).to_le_bytes())?;
@@ -245,6 +318,35 @@ fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Resul
     // Cluster postings data: concatenated posting list bytes
     for posting in &data.cluster_postings {
         w.write_all(&posting.data)?;
+    }
+
+    // Batch data header: (num_batches: u32, num_docs: u32, batch_data_len: u32) per cluster
+    for batch in &data.cluster_batch_data {
+        w.write_all(&batch.num_batches.to_le_bytes())?;
+        w.write_all(&(batch.doc_ids.len() as u32).to_le_bytes())?;
+        let data_len = batch.transposed_codes.len()
+            + batch.f_add.len() * 4
+            + batch.f_rescale.len() * 4
+            + batch.f_error.len() * 4
+            + batch.doc_ids.len() * 4;
+        w.write_all(&(data_len as u32).to_le_bytes())?;
+    }
+
+    // Batch data: per cluster
+    for batch in &data.cluster_batch_data {
+        for &did in &batch.doc_ids {
+            w.write_all(&did.to_le_bytes())?;
+        }
+        w.write_all(&batch.transposed_codes)?;
+        for &v in &batch.f_add {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        for &v in &batch.f_rescale {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        for &v in &batch.f_error {
+            w.write_all(&v.to_le_bytes())?;
+        }
     }
 
     Ok(())
@@ -463,19 +565,36 @@ impl PluginWriter for ClusterPluginWriter {
             }
 
             let vectors = vectors.unwrap();
-            let result = cluster_from_vectors(vectors, &self.config, field_cfg)?;
-            serialize_cluster_data(&result.data, cw)?;
-            cw.flush()?;
+            let mut result = cluster_from_vectors(vectors, &self.config, field_cfg)?;
 
-            // Write BQ records against cluster centroids
+            // Encode BQ records and collect per-cluster batch data
+            let dim_bytes = field_cfg.padded_dims / 8;
+            let ex_b = rabitq::record::ex_bytes(field_cfg.padded_dims, field_cfg.ex_bits);
+            let scalar_off = dim_bytes + ex_b;
+
+            let mut per_cluster_docs: Vec<Vec<(DocId, Vec<u8>)>> =
+                vec![Vec::new(); result.data.num_clusters];
+
             for (doc_id, vec) in vectors.iter().enumerate() {
                 let centroid = &result.centroids[result.assignments[doc_id]];
                 let record = rabitq::encode(
                     &field_cfg.rotator, &rabitq_config, field_cfg.metric, vec, centroid,
                 );
                 bw.write_all(&record)?;
+
+                let cluster_id = result.assignments[doc_id];
+                per_cluster_docs[cluster_id].push((doc_id as DocId, record));
             }
             bw.flush()?;
+
+            // Build batch data per cluster
+            result.data.cluster_batch_data = per_cluster_docs
+                .iter()
+                .map(|docs| build_cluster_batch_data(docs, dim_bytes, scalar_off))
+                .collect();
+
+            serialize_cluster_data(&result.data, cw)?;
+            cw.flush()?;
         }
 
         cluster_composite.close()?;
@@ -526,11 +645,21 @@ struct ClusterPostingsMeta {
     byte_len: usize,
 }
 
+pub struct ClusterBatchMeta {
+    pub num_batches: u32,
+    pub num_docs: u32,
+    pub byte_offset: usize,
+    pub byte_len: usize,
+}
+
 pub struct ClusterFieldReader {
     centroid_index: Option<CentroidIndex>,
     per_doc_cluster: Vec<u16>,
     postings_meta: Vec<ClusterPostingsMeta>,
     postings_data: FileSlice,
+    batch_meta: Vec<ClusterBatchMeta>,
+    batch_data: FileSlice,
+    dim_bytes: usize,
 }
 
 impl ClusterFieldReader {
@@ -555,6 +684,9 @@ impl ClusterFieldReader {
                 per_doc_cluster: Vec::new(),
                 postings_meta: Vec::new(),
                 postings_data: FileSlice::empty(),
+                batch_meta: Vec::new(),
+                batch_data: FileSlice::empty(),
+                dim_bytes: 0,
             });
         }
 
@@ -598,13 +730,52 @@ impl ClusterFieldReader {
             cumulative_offset += byte_len;
         }
 
-        let postings_data = file_slice.slice_from(offset);
+        let postings_end = offset + cumulative_offset;
+        let postings_data = file_slice.slice(offset..postings_end);
+        offset = postings_end;
+
+        // Read batch data header: (num_batches: u32, num_docs: u32, data_len: u32) per cluster
+        let mut batch_meta = Vec::with_capacity(num_clusters);
+        let mut batch_cumulative = 0usize;
+        if offset + num_clusters * 12 <= data.len() {
+            for _ in 0..num_clusters {
+                let nb = u32::from_le_bytes([
+                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                ]);
+                offset += 4;
+                let nd = u32::from_le_bytes([
+                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                ]);
+                offset += 4;
+                let bl = u32::from_le_bytes([
+                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                ]) as usize;
+                offset += 4;
+                batch_meta.push(ClusterBatchMeta {
+                    num_batches: nb,
+                    num_docs: nd,
+                    byte_offset: batch_cumulative,
+                    byte_len: bl,
+                });
+                batch_cumulative += bl;
+            }
+        }
+        let batch_data = if batch_cumulative > 0 {
+            file_slice.slice(offset..offset + batch_cumulative)
+        } else {
+            FileSlice::empty()
+        };
+
+        let dim_bytes = dims / 8;
 
         Ok(Self {
             centroid_index: Some(centroid_index),
             per_doc_cluster,
             postings_meta,
             postings_data,
+            batch_meta,
+            batch_data,
+            dim_bytes,
         })
     }
 
@@ -642,6 +813,38 @@ impl ClusterFieldReader {
 
     pub fn num_clusters(&self) -> usize {
         self.centroid_index.as_ref().map_or(0, |ci| ci.len())
+    }
+
+    pub fn has_batch_data(&self, cluster_id: usize) -> bool {
+        cluster_id < self.batch_meta.len() && self.batch_meta[cluster_id].num_batches > 0
+    }
+
+    pub fn cluster_batch_raw(
+        &self,
+        cluster_id: usize,
+    ) -> crate::Result<Option<(Vec<DocId>, &ClusterBatchMeta, common::OwnedBytes)>> {
+        if cluster_id >= self.batch_meta.len() {
+            return Ok(None);
+        }
+        let meta = &self.batch_meta[cluster_id];
+        if meta.num_batches == 0 {
+            return Ok(None);
+        }
+        let raw = self
+            .batch_data
+            .read_bytes_slice(meta.byte_offset..meta.byte_offset + meta.byte_len)?;
+        // First num_docs × 4 bytes are doc_ids
+        let num_docs = meta.num_docs as usize;
+        let mut doc_ids = Vec::with_capacity(num_docs);
+        for i in 0..num_docs {
+            let off = i * 4;
+            doc_ids.push(u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]));
+        }
+        Ok(Some((doc_ids, meta, raw)))
+    }
+
+    pub fn dim_bytes(&self) -> usize {
+        self.dim_bytes
     }
 
     /// Adaptive cluster probing: fetch candidate centroids from HNSW, then
