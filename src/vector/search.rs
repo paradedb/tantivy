@@ -370,14 +370,46 @@ impl Weight for VectorWeight {
                         }
 
                         let raw_threshold = -neg_threshold;
+                        let binary_bytes = padded_dims / 8;
+                        let ex_b = rabitq::record::ex_bytes(padded_dims, ex_bits);
+                        let rec_scalar_off = binary_bytes + ex_b;
+
                         for (i, &did) in batch_doc_ids.iter().enumerate() {
                             if !matched[i] { continue; }
                             if lower_bounds[i] >= raw_threshold { continue; }
                             let distance = if ex_bits > 0 {
                                 if let Ok(record) = bq_reader.record(did) {
-                                    rabitq_query.estimate_distance_from_record(
-                                        &record, padded_dims, g_add,
-                                    )
+                                    // Reuse binary_dots[i] from Stage 1, only read
+                                    // ex-code + f_add_ex/f_rescale_ex from record
+                                    let ex_code_packed =
+                                        &record[binary_bytes..binary_bytes + ex_b];
+                                    let ex_dot = fastscan::ip_packed_ex_f32(
+                                        rabitq_query.rotated_query(),
+                                        ex_code_packed,
+                                        padded_dims,
+                                        ex_bits,
+                                    );
+                                    let f_add_ex = f32::from_le_bytes([
+                                        record[rec_scalar_off + 24],
+                                        record[rec_scalar_off + 25],
+                                        record[rec_scalar_off + 26],
+                                        record[rec_scalar_off + 27],
+                                    ]);
+                                    let f_rescale_ex = f32::from_le_bytes([
+                                        record[rec_scalar_off + 28],
+                                        record[rec_scalar_off + 29],
+                                        record[rec_scalar_off + 30],
+                                        record[rec_scalar_off + 31],
+                                    ]);
+                                    let total_term = rabitq_query.binary_scale()
+                                        * binary_dots[i]
+                                        + ex_dot
+                                        + rabitq_query.kbx_sum_q();
+                                    let dist = f_add_ex + g_add + f_rescale_ex * total_term;
+                                    match self.config.metric {
+                                        Metric::L2 => dist,
+                                        Metric::InnerProduct => -dist,
+                                    }
                                 } else { continue; }
                             } else {
                                 distances[i]

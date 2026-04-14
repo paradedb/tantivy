@@ -196,6 +196,14 @@ impl RaBitQQuery {
     pub fn k1x_sum_q(&self) -> f32 {
         self.k1x_sum_q
     }
+
+    pub fn kbx_sum_q(&self) -> f32 {
+        self.kbx_sum_q
+    }
+
+    pub fn binary_scale(&self) -> f32 {
+        self.binary_scale
+    }
 }
 
 // Suppress unused import warning — simd is used indirectly via QuantizedVector::unpack_*
