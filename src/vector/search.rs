@@ -208,6 +208,86 @@ impl Weight for VectorWeight {
     fn explain(&self, _reader: &SegmentReader, _doc: DocId) -> crate::Result<Explanation> {
         Ok(Explanation::new("VectorQuery", 0.0))
     }
+
+    fn for_each_pruning(
+        &self,
+        threshold: Score,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) -> crate::Result<()> {
+        let field = self.config.field;
+
+        let bq_plugin: Arc<BqVecPluginReader> = reader
+            .plugin_reader::<BqVecPluginReader>("bqvec")?
+            .ok_or_else(|| {
+                crate::TantivyError::InternalError("bqvec plugin reader not found".into())
+            })?;
+        let bq_reader = bq_plugin.field_reader(field).ok_or_else(|| {
+            crate::TantivyError::InternalError("bqvec field reader not found".into())
+        })?;
+
+        let cluster_plugin: Arc<ClusterPluginReader> = reader
+            .plugin_reader::<ClusterPluginReader>("cluster")?
+            .ok_or_else(|| {
+                crate::TantivyError::InternalError("cluster plugin reader not found".into())
+            })?;
+        let cluster_field = cluster_plugin.field_reader(field).ok_or_else(|| {
+            crate::TantivyError::InternalError("cluster field reader not found".into())
+        })?;
+
+        let result = self.build_candidates(cluster_field, reader.max_doc())?;
+
+        let mut doc_set: Box<dyn DocSet> = match &self.filter_weight {
+            Some(filter_weight) => {
+                let filter_scorer = filter_weight.scorer(reader, 1.0)?;
+                Box::new(Intersection::with_two_sets(
+                    result.scorer,
+                    filter_scorer,
+                    reader.max_doc(),
+                ))
+            }
+            None => result.scorer,
+        };
+
+        let rabitq_query = RaBitQQuery::new(
+            &self.query_vector,
+            &self.config.rotator,
+            self.config.ex_bits,
+            self.config.metric,
+        );
+
+        // Threshold is a negated distance (higher = better).
+        // Convert to raw distance threshold for pruning (lower = better).
+        let mut neg_threshold = threshold;
+        let mut doc = doc_set.doc();
+        while doc != TERMINATED {
+            let g_add = if cluster_field.is_clustered() {
+                let cluster_id = cluster_field.doc_cluster(doc);
+                result.centroid_dists.get(&cluster_id).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
+            if let Ok(record) = bq_reader.record(doc) {
+                // raw_threshold: distances below this are interesting.
+                // neg_threshold is -distance, so raw_threshold = -neg_threshold.
+                let raw_threshold = -neg_threshold;
+                if let Some(distance) = rabitq_query.estimate_distance_pruned(
+                    &record,
+                    self.config.padded_dims,
+                    g_add,
+                    raw_threshold,
+                ) {
+                    let score = -distance;
+                    if score > neg_threshold {
+                        neg_threshold = callback(doc, score);
+                    }
+                }
+            }
+            doc = doc_set.advance();
+        }
+        Ok(())
+    }
 }
 
 struct VectorScorer {

@@ -49,6 +49,12 @@ pub fn unpack_binary_code(packed: &[u8], binary_code: &mut [u8], dim: usize) {
     }
 }
 
+pub fn unpack_binary_code_from_packed(packed: &[u8], dim: usize) -> Vec<u8> {
+    let mut binary_code = vec![0u8; dim];
+    unpack_binary_code(packed, &mut binary_code, dim);
+    binary_code
+}
+
 /// Pack extended codes (ex_bits per element) into bytes
 ///
 /// # Arguments

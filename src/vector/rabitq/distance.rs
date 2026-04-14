@@ -94,6 +94,65 @@ impl RaBitQQuery {
         self.estimate_distance(&qv, g_add)
     }
 
+    /// Two-stage distance estimation with lower-bound pruning.
+    ///
+    /// Stage 1: compute distance using only 1-bit binary codes (cheap).
+    /// If `stage1_distance - f_error >= threshold`, the vector can't beat
+    /// the current k-th best, so return `None` (pruned).
+    /// Stage 2: refine with extended codes (expensive, only for survivors).
+    ///
+    /// `threshold` is the raw distance threshold (not negated). For L2,
+    /// a vector is pruned if its lower bound >= threshold.
+    pub fn estimate_distance_pruned(
+        &self,
+        record: &[u8],
+        padded_dims: usize,
+        g_add: f32,
+        threshold: f32,
+    ) -> Option<f32> {
+        let binary_bytes = padded_dims.div_ceil(8);
+        let ex_bytes = super::record::ex_bytes(padded_dims, self.ex_bits);
+
+        // Read binary code + scalars (skip extended codes for now)
+        let binary_code_packed = &record[..binary_bytes];
+        let scalar_offset = binary_bytes + ex_bytes;
+        let read_f32 = |off: usize| -> f32 {
+            f32::from_le_bytes([
+                record[scalar_offset + off],
+                record[scalar_offset + off + 1],
+                record[scalar_offset + off + 2],
+                record[scalar_offset + off + 3],
+            ])
+        };
+        let f_add = read_f32(8);     // 3rd scalar (after delta, vl)
+        let f_rescale = read_f32(12); // 4th scalar
+        let f_error = read_f32(16);   // 5th scalar
+
+        // Stage 1: binary-only distance
+        let binary_code = super::simd::unpack_binary_code_from_packed(binary_code_packed, padded_dims);
+        let mut binary_dot = 0.0f32;
+        for (&bit, &q_val) in binary_code.iter().zip(self.rotated_query.iter()) {
+            binary_dot += (bit as f32) * q_val;
+        }
+        let binary_term = binary_dot + self.k1x_sum_q;
+        let stage1_distance = f_add + g_add + f_rescale * binary_term;
+
+        // Lower-bound check: if lower bound >= threshold, prune
+        let lower_bound = stage1_distance - f_error.abs();
+        if lower_bound >= threshold {
+            return None;
+        }
+
+        // Stage 2: full estimation with extended codes
+        if self.ex_bits > 0 {
+            let qv = super::record::unpack(record, padded_dims, self.ex_bits);
+            let distance = self.estimate_distance(&qv, g_add);
+            Some(distance)
+        } else {
+            Some(stage1_distance)
+        }
+    }
+
     /// Access the rotated query vector.
     pub fn rotated_query(&self) -> &[f32] {
         &self.rotated_query

@@ -21,18 +21,21 @@ const SCALAR_BYTES: usize = NUM_SCALARS * 4; // 32 bytes
 
 /// Total bytes per record for the given padded dimensionality and extended bits.
 ///
-/// Must match the packed sizes produced by the quantizer in `quantizer.rs`.
-pub fn bytes_per_record(padded_dims: usize, ex_bits: usize) -> usize {
-    let binary_bytes = padded_dims.div_ceil(8);
-    // Match the quantizer's C++-compatible packing sizes.
-    let ex_bytes = match ex_bits {
+/// Extended code byte count for a given dimension and ex_bits configuration.
+pub fn ex_bytes(padded_dims: usize, ex_bits: usize) -> usize {
+    match ex_bits {
         0 => 0,
         1 => padded_dims / 16 * 2,
         2 => padded_dims / 16 * 4,
         6 => padded_dims / 16 * 12,
         _ => (padded_dims * ex_bits).div_ceil(8),
-    };
-    binary_bytes + ex_bytes + SCALAR_BYTES
+    }
+}
+
+/// Must match the packed sizes produced by the quantizer in `quantizer.rs`.
+pub fn bytes_per_record(padded_dims: usize, ex_bits: usize) -> usize {
+    let binary_bytes = padded_dims.div_ceil(8);
+    binary_bytes + ex_bytes(padded_dims, ex_bits) + SCALAR_BYTES
 }
 
 /// Pack a [`QuantizedVector`] into a flat byte record.
