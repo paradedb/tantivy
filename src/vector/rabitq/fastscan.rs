@@ -153,6 +153,15 @@ pub fn accumulate_batch(
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                return accumulate_batch_avx2(packed_codes, lut_u8, dim_bytes, results);
+            }
+        }
+    }
+
     accumulate_batch_scalar(packed_codes, lut_u8, dim_bytes, results);
 }
 
@@ -249,6 +258,83 @@ unsafe fn accumulate_batch_neon(
     for i in 0..8 { out[16 + i] = tmp[i] as u32; }
     vst1q_u16(tmp.as_mut_ptr(), accu3);
     for i in 0..8 { out[24 + i] = tmp[i] as u32; }
+
+    results.copy_from_slice(&out);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_batch_avx2(
+    packed_codes: &[u8],
+    lut_u8: &[u8],
+    dim_bytes: usize,
+    results: &mut [u32; BATCH_SIZE],
+) {
+    use std::arch::x86_64::*;
+
+    let mask_lo = _mm256_set1_epi8(0x0F);
+
+    // 2 AVX2 registers × 32 bytes = 32 vectors × u16 accumulators
+    // Each 256-bit register holds 16 u16 values
+    let mut accu0 = _mm256_setzero_si256(); // vecs 0-15
+    let mut accu1 = _mm256_setzero_si256(); // vecs 16-31
+
+    for col in 0..dim_bytes {
+        let codebook_hi = col * 2;
+        let codebook_lo = col * 2 + 1;
+
+        // AVX2 vpshufb operates on two 128-bit lanes independently,
+        // so we need to broadcast the 16-byte LUT to both lanes
+        let lut_hi_128 = _mm_loadu_si128(lut_u8.as_ptr().add(codebook_hi * 16) as *const _);
+        let lut_hi = _mm256_broadcastsi128_si256(lut_hi_128);
+
+        let col_offset = col * BATCH_SIZE;
+
+        // Load 32 bytes (one per vector for this column)
+        let codes = _mm256_loadu_si256(packed_codes.as_ptr().add(col_offset) as *const _);
+
+        // Extract high nibbles: shift right 4, mask
+        let hi = _mm256_and_si256(_mm256_srli_epi16(codes, 4), mask_lo);
+
+        // Shuffle lookup for high nibble
+        let val_hi = _mm256_shuffle_epi8(lut_hi, hi);
+
+        // Accumulate: widen u8 → u16 by adding to zero-extended values
+        // Split into low/high 128-bit halves, zero-extend u8→u16, accumulate
+        let val_hi_lo = _mm256_unpacklo_epi8(val_hi, _mm256_setzero_si256());
+        let val_hi_hi = _mm256_unpackhi_epi8(val_hi, _mm256_setzero_si256());
+        accu0 = _mm256_add_epi16(accu0, val_hi_lo);
+        accu1 = _mm256_add_epi16(accu1, val_hi_hi);
+
+        // Low nibble (second codebook)
+        if codebook_lo * 16 + 15 < lut_u8.len() {
+            let lut_lo_128 = _mm_loadu_si128(lut_u8.as_ptr().add(codebook_lo * 16) as *const _);
+            let lut_lo = _mm256_broadcastsi128_si256(lut_lo_128);
+            let lo = _mm256_and_si256(codes, mask_lo);
+            let val_lo = _mm256_shuffle_epi8(lut_lo, lo);
+            let val_lo_lo = _mm256_unpacklo_epi8(val_lo, _mm256_setzero_si256());
+            let val_lo_hi = _mm256_unpackhi_epi8(val_lo, _mm256_setzero_si256());
+            accu0 = _mm256_add_epi16(accu0, val_lo_lo);
+            accu1 = _mm256_add_epi16(accu1, val_lo_hi);
+        }
+    }
+
+    // Store results: extract u16 lanes to u32
+    // accu0 holds: lane0=[v0..v7 as u16], lane1=[v16..v23 as u16]
+    // accu1 holds: lane0=[v8..v15 as u16], lane1=[v24..v31 as u16]
+    let mut out = [0u32; BATCH_SIZE];
+    let mut tmp0 = [0u16; 16];
+    let mut tmp1 = [0u16; 16];
+    _mm256_storeu_si256(tmp0.as_mut_ptr() as *mut _, accu0);
+    _mm256_storeu_si256(tmp1.as_mut_ptr() as *mut _, accu1);
+    // lane0 of accu0: vecs 0-7
+    for i in 0..8 { out[i] = tmp0[i] as u32; }
+    // lane1 of accu0: vecs 16-23
+    for i in 0..8 { out[16 + i] = tmp0[8 + i] as u32; }
+    // lane0 of accu1: vecs 8-15
+    for i in 0..8 { out[8 + i] = tmp1[i] as u32; }
+    // lane1 of accu1: vecs 24-31
+    for i in 0..8 { out[24 + i] = tmp1[8 + i] as u32; }
 
     results.copy_from_slice(&out);
 }
