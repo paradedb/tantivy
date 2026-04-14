@@ -154,7 +154,7 @@ impl TantivyVectorIndex {
         total_bits: usize,
     ) -> PyResult<Self> {
         let metric = parse_metric(metric)?;
-        let rotator = Arc::new(DynamicRotator::new(dim, RotatorType::MatrixRotator, 42));
+        let rotator = Arc::new(DynamicRotator::new(dim, RotatorType::FhtKacRotator, 42));
         let padded_dims = rotator.padded_dim();
 
         let mut schema_builder = Schema::builder();
@@ -269,7 +269,7 @@ impl TantivyVectorIndex {
     #[pyo3(signature = (dim, metric, data_dir, total_bits=7))]
     fn open(dim: usize, metric: &str, data_dir: &str, total_bits: usize) -> PyResult<Self> {
         let metric = parse_metric(metric)?;
-        let rotator = Arc::new(DynamicRotator::new(dim, RotatorType::MatrixRotator, 42));
+        let rotator = Arc::new(DynamicRotator::new(dim, RotatorType::FhtKacRotator, 42));
         let padded_dims = rotator.padded_dim();
         let ex_bits = total_bits.saturating_sub(1);
 
