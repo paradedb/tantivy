@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::io;
 use std::io::Write;
 use std::ops::{Range, RangeInclusive};
@@ -166,25 +167,54 @@ impl ColumnCodec<u64> for BlockwiseLinearV2Codec {
             footer,
             data,
             stats,
+            cache: BlockCache::new(),
         })
+    }
+}
+
+struct CachedBlock {
+    block_id: u32,
+    line: Line,
+    bit_unpacker: BitUnpacker,
+    data: OwnedBytes,
+}
+
+struct BlockCache(UnsafeCell<CachedBlock>);
+unsafe impl Send for BlockCache {}
+unsafe impl Sync for BlockCache {}
+
+impl Clone for BlockCache {
+    fn clone(&self) -> Self {
+        BlockCache::new()
+    }
+}
+
+impl BlockCache {
+    fn new() -> Self {
+        BlockCache(UnsafeCell::new(CachedBlock {
+            block_id: u32::MAX,
+            line: Line { slope: 0, intercept: 0 },
+            bit_unpacker: BitUnpacker::new(0),
+            data: OwnedBytes::empty(),
+        }))
     }
 }
 
 #[derive(Clone)]
 pub struct BlockwiseLinearV2Reader {
-    /// Block metadata footer, kept as FileSlice for lazy access.
     footer: FileSlice,
     data: FileSlice,
     stats: ColumnStats,
+    cache: BlockCache,
 }
 
 impl BlockwiseLinearV2Reader {
-    /// Reconstructs a reader from pre-cached parts, bypassing `load()`.
     pub fn from_parts(footer: FileSlice, data: FileSlice, stats: ColumnStats) -> Self {
         Self {
             footer,
             data,
             stats,
+            cache: BlockCache::new(),
         }
     }
 
@@ -213,19 +243,25 @@ impl BlockwiseLinearV2Reader {
 impl ColumnValues for BlockwiseLinearV2Reader {
     #[inline(always)]
     fn get_val(&self, idx: u32) -> u64 {
-        let block_id = (idx / BLOCK_SIZE) as usize;
+        let block_id = idx / BLOCK_SIZE;
         let idx_within_block = idx % BLOCK_SIZE;
-        let (line, bit_width, data_start) = self.block_meta(block_id);
-        let interpoled_val: u64 = line.eval(idx_within_block);
-        let data_len = (bit_width as usize) * BLOCK_SIZE as usize / 8;
-        let data_end = (data_start + data_len).min(self.data.len());
-        let data = self
-            .data
-            .slice(data_start..data_end)
-            .read_bytes()
-            .expect("failed to read block data");
-        let bit_unpacker = BitUnpacker::new(bit_width);
-        let bitpacked_diff = bit_unpacker.get(idx_within_block, &data);
+        // SAFETY: single-threaded access per Postgres backend / per segment in tantivy.
+        let cache = unsafe { &mut *self.cache.0.get() };
+        if cache.block_id != block_id {
+            let (line, bit_width, data_start) = self.block_meta(block_id as usize);
+            let data_len = (bit_width as usize) * BLOCK_SIZE as usize / 8;
+            let data_end = (data_start + data_len).min(self.data.len());
+            cache.block_id = block_id;
+            cache.line = line;
+            cache.bit_unpacker = BitUnpacker::new(bit_width);
+            cache.data = self
+                .data
+                .slice(data_start..data_end)
+                .read_bytes()
+                .expect("failed to read block data");
+        }
+        let interpoled_val: u64 = cache.line.eval(idx_within_block);
+        let bitpacked_diff = cache.bit_unpacker.get(idx_within_block, &cache.data);
         self.stats.min_value
             + self
                 .stats
