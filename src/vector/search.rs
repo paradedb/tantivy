@@ -260,142 +260,172 @@ impl Weight for VectorWeight {
         let padded_dims = self.config.padded_dims;
         let dim_bytes = padded_dims / 8;
         let ex_bits = self.config.ex_bits;
+        let ex_b = rabitq::record::ex_bytes(padded_dims, ex_bits);
+        let scalar_off = dim_bytes + ex_b;
 
-        // Use batch path for unfiltered clustered search
-        if self.filter_weight.is_none() && cluster_field.is_clustered() {
+        if cluster_field.is_clustered() {
             let mut neg_threshold = threshold;
             let probed =
                 cluster_field.probe_clusters(&self.query_vector, &self.config.probe)?;
 
+            // Collect (cluster_id, doc_ids) per cluster, then sort clusters
+            // by min doc ID so a single filter scorer can seek forward
+            let mut cluster_docs: Vec<(u16, f32, Vec<DocId>)> = Vec::new();
             for (cluster_id, mut postings) in probed {
-                let g_add = result
-                    .centroid_dists
-                    .get(&(cluster_id as u16))
-                    .copied()
-                    .unwrap_or(0.0);
-
-                // Collect doc IDs from this cluster's posting list
+                let cid = cluster_id as u16;
+                let g_add = result.centroid_dists.get(&cid).copied().unwrap_or(0.0);
                 let mut doc_ids = Vec::new();
                 let mut doc = postings.doc();
                 while doc != TERMINATED {
                     doc_ids.push(doc);
                     doc = postings.advance();
                 }
+                if !doc_ids.is_empty() {
+                    cluster_docs.push((cid, g_add, doc_ids));
+                }
+            }
+            cluster_docs.sort_unstable_by_key(|(_, _, ids)| ids[0]);
+
+            let mut filter_scorer: Option<Box<dyn Scorer>> = self
+                .filter_weight
+                .as_ref()
+                .map(|fw| fw.scorer(reader, 1.0))
+                .transpose()?;
+
+            for (_cid, g_add, ref doc_ids) in &cluster_docs {
+                let g_add = *g_add;
 
                 // Process in batches of 32
                 for chunk in doc_ids.chunks(BATCH_SIZE) {
-                    // Read binary codes + scalars for this batch
-                    let mut codes: Vec<Vec<u8>> = Vec::with_capacity(chunk.len());
-                    let mut f_add_batch = vec![0.0f32; BATCH_SIZE];
-                    let mut f_rescale_batch = vec![0.0f32; BATCH_SIZE];
-                    let mut f_error_batch = vec![0.0f32; BATCH_SIZE];
-
+                    // Filter check: seek forward for each doc in batch.
+                    // Doc IDs within a cluster are sorted. Across sorted clusters,
+                    // some IDs may be behind the filter's current position — skip those.
+                    let mut matched = [false; BATCH_SIZE];
+                    let mut any_match = false;
                     for (i, &did) in chunk.iter().enumerate() {
-                        if let Ok(record) = bq_reader.record(did) {
-                            codes.push(record[..dim_bytes].to_vec());
-                            let ex_b = rabitq::record::ex_bytes(padded_dims, ex_bits);
-                            let scalar_off = dim_bytes + ex_b;
-                            let read_f32 = |off: usize| -> f32 {
-                                f32::from_le_bytes([
-                                    record[scalar_off + off],
-                                    record[scalar_off + off + 1],
-                                    record[scalar_off + off + 2],
-                                    record[scalar_off + off + 3],
-                                ])
-                            };
-                            f_add_batch[i] = read_f32(8);
-                            f_rescale_batch[i] = read_f32(12);
-                            f_error_batch[i] = read_f32(16);
+                        if let Some(ref mut fs) = filter_scorer {
+                            let cur = fs.doc();
+                            if cur == TERMINATED {
+                                break;
+                            }
+                            if cur <= did {
+                                if fs.seek(did) == did {
+                                    matched[i] = true;
+                                    any_match = true;
+                                }
+                            }
+                            // else: filter already past this doc, not a match
                         } else {
-                            codes.push(vec![0u8; dim_bytes]);
+                            matched[i] = true;
+                            any_match = true;
                         }
                     }
-                    // Pad missing codes
-                    while codes.len() < BATCH_SIZE {
+                    if !any_match {
+                        continue;
+                    }
+
+                // Read binary codes + scalars for this batch
+                let mut codes: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
+                let mut f_add_batch = [0.0f32; BATCH_SIZE];
+                let mut f_rescale_batch = [0.0f32; BATCH_SIZE];
+                let mut f_error_batch = [0.0f32; BATCH_SIZE];
+
+                for (i, &did) in chunk.iter().enumerate() {
+                    if let Ok(record) = bq_reader.record(did) {
+                        codes.push(record[..dim_bytes].to_vec());
+                        let read_f32 = |off: usize| -> f32 {
+                            f32::from_le_bytes([
+                                record[scalar_off + off],
+                                record[scalar_off + off + 1],
+                                record[scalar_off + off + 2],
+                                record[scalar_off + off + 3],
+                            ])
+                        };
+                        f_add_batch[i] = read_f32(8);
+                        f_rescale_batch[i] = read_f32(12);
+                        f_error_batch[i] = read_f32(16);
+                    } else {
                         codes.push(vec![0u8; dim_bytes]);
                     }
+                }
+                while codes.len() < BATCH_SIZE {
+                    codes.push(vec![0u8; dim_bytes]);
+                }
 
-                    // Transpose to column-major
-                    let code_refs: Vec<&[u8]> =
-                        codes.iter().map(|c| c.as_slice()).collect();
-                    let mut transposed = vec![0u8; dim_bytes * BATCH_SIZE];
-                    fastscan::pack_batch_simple(&code_refs, dim_bytes, &mut transposed);
+                // Transpose + SIMD batch accumulate
+                let code_refs: Vec<&[u8]> =
+                    codes.iter().map(|c| c.as_slice()).collect();
+                let mut transposed = vec![0u8; dim_bytes * BATCH_SIZE];
+                fastscan::pack_batch_simple(&code_refs, dim_bytes, &mut transposed);
 
-                    // SIMD batch accumulate
-                    let mut accu = [0u32; BATCH_SIZE];
-                    fastscan::accumulate_batch(
-                        &transposed,
-                        rabitq_query.lut().lut_u8(),
-                        dim_bytes,
-                        &mut accu,
-                    );
+                let mut accu = [0u32; BATCH_SIZE];
+                fastscan::accumulate_batch(
+                    &transposed,
+                    rabitq_query.lut().lut_u8(),
+                    dim_bytes,
+                    &mut accu,
+                );
 
-                    let mut binary_dots = [0.0f32; BATCH_SIZE];
-                    fastscan::denormalize_batch(
-                        &accu,
-                        rabitq_query.lut().delta(),
-                        rabitq_query.lut().sum_vl(),
-                        &mut binary_dots,
-                    );
+                let mut binary_dots = [0.0f32; BATCH_SIZE];
+                fastscan::denormalize_batch(
+                    &accu,
+                    rabitq_query.lut().delta(),
+                    rabitq_query.lut().sum_vl(),
+                    &mut binary_dots,
+                );
 
-                    let mut distances = [0.0f32; BATCH_SIZE];
-                    let mut lower_bounds = [0.0f32; BATCH_SIZE];
-                    fastscan::compute_batch_distances(
-                        &binary_dots,
-                        &f_add_batch,
-                        &f_rescale_batch,
-                        &f_error_batch,
-                        g_add,
-                        rabitq_query.k1x_sum_q(),
-                        &mut distances,
-                        &mut lower_bounds,
-                    );
+                let mut distances = [0.0f32; BATCH_SIZE];
+                let mut lower_bounds = [0.0f32; BATCH_SIZE];
+                fastscan::compute_batch_distances(
+                    &binary_dots,
+                    &f_add_batch,
+                    &f_rescale_batch,
+                    &f_error_batch,
+                    g_add,
+                    rabitq_query.k1x_sum_q(),
+                    &mut distances,
+                    &mut lower_bounds,
+                );
 
-                    // Check each vector in the batch
-                    let raw_threshold = -neg_threshold;
-                    for (i, &did) in chunk.iter().enumerate() {
-                        if lower_bounds[i] >= raw_threshold {
-                            continue; // pruned by lower bound
-                        }
-                        // Survivor: refine with extended codes
-                        let distance = if ex_bits > 0 {
-                            if let Ok(record) = bq_reader.record(did) {
-                                rabitq_query.estimate_distance_from_record(
-                                    &record, padded_dims, g_add,
-                                )
-                            } else {
-                                continue;
-                            }
-                        } else {
-                            distances[i]
-                        };
-                        let score = -distance;
-                        if score > neg_threshold {
-                            neg_threshold = callback(did, score);
-                        }
+                let raw_threshold = -neg_threshold;
+                for (i, &did) in chunk.iter().enumerate() {
+                    if !matched[i] {
+                        continue;
                     }
+                    if lower_bounds[i] >= raw_threshold {
+                        continue;
+                    }
+                    let distance = if ex_bits > 0 {
+                        if let Ok(record) = bq_reader.record(did) {
+                            rabitq_query.estimate_distance_from_record(
+                                &record, padded_dims, g_add,
+                            )
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        distances[i]
+                    };
+                    let score = -distance;
+                    if score > neg_threshold {
+                        neg_threshold = callback(did, score);
+                    }
+                }
                 }
             }
             return Ok(());
         }
 
-        // Fallback: per-doc path for filtered or unclustered search
+        // Unclustered fallback: per-doc scalar path
         let mut neg_threshold = threshold;
         let mut doc = doc_set.doc();
         while doc != TERMINATED {
-            let g_add = if cluster_field.is_clustered() {
-                let cluster_id = cluster_field.doc_cluster(doc);
-                result.centroid_dists.get(&cluster_id).copied().unwrap_or(0.0)
-            } else {
-                0.0
-            };
-
             if let Ok(record) = bq_reader.record(doc) {
                 let raw_threshold = -neg_threshold;
                 if let Some(distance) = rabitq_query.estimate_distance_pruned(
                     &record,
                     padded_dims,
-                    g_add,
+                    0.0,
                     raw_threshold,
                 ) {
                     let score = -distance;
