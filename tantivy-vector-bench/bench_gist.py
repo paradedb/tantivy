@@ -59,15 +59,27 @@ def main():
     cache_gt = os.path.join(CACHE_DIR, "gist_1m_gt.pkl")
 
     # Load data (with caching)
-    if os.path.exists(cache_vecs):
-        print("Loading cached vectors...", flush=True)
-        with open(cache_vecs, "rb") as f:
-            base = pickle.load(f)
+    if os.path.exists(cache_queries) and os.path.exists(cache_gt):
+        print("Loading cached queries + ground truth...", flush=True)
         with open(cache_queries, "rb") as f:
             queries = pickle.load(f)
         with open(cache_gt, "rb") as f:
             gt = pickle.load(f)
+        # Only load base vectors if we need to index
+        total_bits = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+        data_dir = os.path.join(CACHE_DIR, f"index_gist_{total_bits}b")
+        if os.path.exists(os.path.join(data_dir, "meta.json")):
+            base = []  # not needed, index is persisted
+        elif os.path.exists(cache_vecs):
+            print("Loading cached base vectors...", flush=True)
+            with open(cache_vecs, "rb") as f:
+                base = pickle.load(f)
+        else:
+            base = None  # will trigger full load below
     else:
+        base = None
+
+    if base is None:
         print("Loading GIST-1M from fvecs...", flush=True)
         t0 = time.time()
         base = read_fvecs(f"{GIST_DIR}/gist_base.fvecs")
@@ -88,34 +100,40 @@ def main():
         with open(cache_gt, "wb") as f:
             pickle.dump(gt, f)
 
-    num_vecs = len(base)
+    num_vecs = len(base) if base else 0
     num_queries = len(queries)
-    print(f"\nGIST-1M: {num_vecs} vectors, {num_queries} queries, dim={DIM}", flush=True)
+    print(f"\nGIST-1M: {num_vecs} base vectors, {num_queries} queries, dim={DIM}", flush=True)
 
     # Index
-    data_dir = tempfile.mkdtemp(prefix="tantivy_gist_")
-    print(f"\nIndexing {num_vecs} vectors...", flush=True)
-    total_bits = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+    if not isinstance(total_bits, int):
+        total_bits = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+    data_dir = os.path.join(CACHE_DIR, f"index_gist_{total_bits}b")
+    skip_indexing = os.path.exists(os.path.join(data_dir, "meta.json"))
     print(f"total_bits={total_bits}", flush=True)
-    idx = TantivyVectorIndex(DIM, "l2", data_dir, data_dir,
-        num_shards=1, vectors_per_shard=num_vecs, num_clusters_per_1k=4,
-        total_bits=total_bits)
+    if skip_indexing:
+        print(f"  (index exists at {data_dir}, skipping indexing)", flush=True)
+        idx = TantivyVectorIndex.open(DIM, "l2", data_dir, total_bits)
+    else:
+        print(f"\nIndexing {num_vecs} vectors...", flush=True)
+        idx = TantivyVectorIndex(DIM, "l2", data_dir, data_dir,
+            num_shards=1, vectors_per_shard=num_vecs, num_clusters_per_1k=4,
+            total_bits=total_bits)
 
-    COMMIT_EVERY = 100_000
-    t0 = time.time()
-    since_commit = 0
-    for start in range(0, num_vecs, 5000):
-        end = min(start + 5000, num_vecs)
-        idx.insert(list(range(start, end)), base[start:end])
-        since_commit += end - start
-        if since_commit >= COMMIT_EVERY:
+        COMMIT_EVERY = 100_000
+        t0 = time.time()
+        since_commit = 0
+        for start in range(0, num_vecs, 5000):
+            end = min(start + 5000, num_vecs)
+            idx.insert(list(range(start, end)), base[start:end])
+            since_commit += end - start
+            if since_commit >= COMMIT_EVERY:
+                idx.commit()
+                since_commit = 0
+        if since_commit > 0:
             idx.commit()
-            since_commit = 0
-    if since_commit > 0:
-        idx.commit()
-    idx.finalize()
-    t_index = time.time() - t0
-    print(f"Indexed in {t_index:.1f}s ({num_vecs/t_index:.0f} vec/s)", flush=True)
+        idx.finalize()
+        t_index = time.time() - t0
+        print(f"Indexed in {t_index:.1f}s ({num_vecs/t_index:.0f} vec/s)", flush=True)
 
     # Benchmark
     print(f"\nBenchmark (top-{K}, {num_queries} queries):", flush=True)
@@ -133,8 +151,8 @@ def main():
         avg_recall = total_recall / num_queries
         print(f"{nprobe:>8} | {qps:>10.0f} | {avg_recall*100:>9.1f}%", flush=True)
 
-    shutil.rmtree(data_dir, ignore_errors=True)
-    print("\nDone.")
+    print(f"\nIndex at {data_dir}")
+    print("Done.")
 
 
 if __name__ == "__main__":

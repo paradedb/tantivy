@@ -131,6 +131,7 @@ fn parse_metric(s: &str) -> PyResult<Metric> {
 struct TantivyVectorIndex {
     index: Index,
     writer: Option<IndexWriter<TantivyDocument>>,
+    cached_reader: Option<tantivy::IndexReader>,
     vec_field: Field,
     text_field: Field,
     id_field: Field,
@@ -230,6 +231,7 @@ impl TantivyVectorIndex {
             metric,
             rotator,
             total_bits,
+            cached_reader: None,
         })
     }
 
@@ -328,6 +330,7 @@ impl TantivyVectorIndex {
         Ok(Self {
             index,
             writer: None,
+            cached_reader: None,
             vec_field,
             text_field,
             id_field,
@@ -339,14 +342,17 @@ impl TantivyVectorIndex {
 
     #[pyo3(signature = (query, k=100, max_probe=10, distance_ratio=2.0))]
     fn search(
-        &self,
+        &mut self,
         query: Vec<f32>,
         k: usize,
         max_probe: usize,
         distance_ratio: f32,
     ) -> PyResult<Vec<i64>> {
-        let reader = self.index.reader()
-            .map_err(|e| PyRuntimeError::new_err(format!("reader failed: {e}")))?;
+        if self.cached_reader.is_none() {
+            self.cached_reader = Some(self.index.reader()
+                .map_err(|e| PyRuntimeError::new_err(format!("reader failed: {e}")))?);
+        }
+        let reader = self.cached_reader.as_ref().unwrap();
         let searcher = reader.searcher();
 
         let config = VectorQueryConfig {

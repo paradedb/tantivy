@@ -25,6 +25,7 @@ fn make_options(dims: usize, metric: MetricKind) -> IndexOptions {
 
 pub struct CentroidIndex {
     pub(crate) centroid_ids: Vec<u32>,
+    centroids: Vec<Vec<f32>>,
     index: Index,
     dims: usize,
     metric: MetricKind,
@@ -52,6 +53,7 @@ impl CentroidIndex {
 
         Self {
             centroid_ids,
+            centroids,
             index,
             dims,
             metric,
@@ -63,8 +65,8 @@ impl CentroidIndex {
         if n == 0 {
             return vec![];
         }
-        if n == 1 {
-            return self.brute_force_search(query, 1);
+        if n <= 1024 {
+            return self.brute_force_search(query, ef_search.min(n));
         }
 
         let limit = ef_search.min(n);
@@ -82,14 +84,8 @@ impl CentroidIndex {
         let mut results: Vec<(u32, f32)> = self
             .centroid_ids
             .iter()
-            .enumerate()
-            .map(|(idx, &cid)| {
-                let mut vec = vec![0.0f32; self.dims];
-                self.index
-                    .get(idx as u64, &mut vec)
-                    .expect("failed to get vector");
-                (cid, l2_distance_sqr(query, &vec))
-            })
+            .zip(self.centroids.iter())
+            .map(|(&cid, centroid)| (cid, l2_distance_sqr(query, centroid)))
             .collect();
 
         results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
@@ -121,8 +117,18 @@ impl CentroidIndex {
             crate::TantivyError::InternalError(format!("usearch load failed: {e}"))
         })?;
 
+        // Extract centroids from usearch index for brute-force path
+        let centroids: Vec<Vec<f32>> = (0..centroid_ids.len())
+            .map(|i| {
+                let mut v = vec![0.0f32; dims];
+                index.get(i as u64, &mut v).expect("failed to get centroid");
+                v
+            })
+            .collect();
+
         Ok(Self {
             centroid_ids,
+            centroids,
             index,
             dims,
             metric,
