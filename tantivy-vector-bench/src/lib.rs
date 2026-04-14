@@ -136,12 +136,13 @@ struct TantivyVectorIndex {
     id_field: Field,
     metric: Metric,
     rotator: Arc<DynamicRotator>,
+    total_bits: usize,
 }
 
 #[pymethods]
 impl TantivyVectorIndex {
     #[new]
-    #[pyo3(signature = (dim, metric, data_dir, parquet_dir, num_shards=10, vectors_per_shard=1_000_000, num_clusters_per_1k=1))]
+    #[pyo3(signature = (dim, metric, data_dir, parquet_dir, num_shards=10, vectors_per_shard=1_000_000, num_clusters_per_1k=1, total_bits=7))]
     fn new(
         dim: usize,
         metric: &str,
@@ -150,6 +151,7 @@ impl TantivyVectorIndex {
         num_shards: usize,
         vectors_per_shard: usize,
         num_clusters_per_1k: usize,
+        total_bits: usize,
     ) -> PyResult<Self> {
         let metric = parse_metric(metric)?;
         let rotator = Arc::new(DynamicRotator::new(dim, RotatorType::MatrixRotator, 42));
@@ -191,7 +193,7 @@ impl TantivyVectorIndex {
                 field: vec_field,
                 dims: dim,
                 padded_dims,
-                ex_bits: 6,
+                ex_bits: total_bits.saturating_sub(1),
                 metric,
                 rotator: rotator.clone(),
             }],
@@ -227,6 +229,7 @@ impl TantivyVectorIndex {
             id_field,
             metric,
             rotator,
+            total_bits,
         })
     }
 
@@ -263,11 +266,12 @@ impl TantivyVectorIndex {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (dim, metric, data_dir))]
-    fn open(dim: usize, metric: &str, data_dir: &str) -> PyResult<Self> {
+    #[pyo3(signature = (dim, metric, data_dir, total_bits=7))]
+    fn open(dim: usize, metric: &str, data_dir: &str, total_bits: usize) -> PyResult<Self> {
         let metric = parse_metric(metric)?;
         let rotator = Arc::new(DynamicRotator::new(dim, RotatorType::MatrixRotator, 42));
         let padded_dims = rotator.padded_dim();
+        let ex_bits = total_bits.saturating_sub(1);
 
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT | STORED);
@@ -281,7 +285,7 @@ impl TantivyVectorIndex {
             BqVecPlugin::builder()
                 .vector_field(
                     vec_field,
-                    rabitq::bytes_per_record(padded_dims, 6),
+                    rabitq::bytes_per_record(padded_dims, ex_bits),
                     Arc::new(move |v: &[f32]| {
                         let zero = vec![0.0f32; v.len()];
                         rabitq::encode(&rotator_enc, &config, metric, v, &zero)
@@ -300,7 +304,7 @@ impl TantivyVectorIndex {
                 field: vec_field,
                 dims: dim,
                 padded_dims,
-                ex_bits: 6,
+                ex_bits,
                 metric,
                 rotator: rotator.clone(),
             }],
@@ -329,6 +333,7 @@ impl TantivyVectorIndex {
             id_field,
             metric,
             rotator,
+            total_bits,
         })
     }
 
@@ -347,7 +352,7 @@ impl TantivyVectorIndex {
         let config = VectorQueryConfig {
             field: self.vec_field,
             padded_dims: self.rotator.padded_dim(),
-            ex_bits: 6,
+            ex_bits: self.total_bits.saturating_sub(1),
             metric: self.metric,
             rotator: self.rotator.clone(),
             probe: ProbeConfig::new(max_probe, distance_ratio),
