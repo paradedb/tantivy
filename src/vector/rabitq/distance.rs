@@ -3,6 +3,7 @@
 //! Precompute query constants once, then estimate distance per document
 //! using only the quantized record (binary code + correction scalars).
 
+use super::fastscan::QueryLut;
 use super::quantizer::QuantizedVector;
 use super::rotation::DynamicRotator;
 use super::{simd, Metric};
@@ -24,6 +25,8 @@ pub struct RaBitQQuery {
     ex_bits: usize,
     /// The distance metric.
     metric: Metric,
+    /// Precomputed lookup table for fast binary dot product.
+    lut: QueryLut,
 }
 
 impl RaBitQQuery {
@@ -35,6 +38,7 @@ impl RaBitQQuery {
         let sum_query: f32 = rotated_query.iter().sum();
         let c1 = -0.5f32;
         let cb = -((1u32 << ex_bits) as f32 - 0.5);
+        let lut = QueryLut::new(&rotated_query);
 
         Self {
             rotated_query,
@@ -43,6 +47,7 @@ impl RaBitQQuery {
             binary_scale: (1u32 << ex_bits) as f32,
             ex_bits,
             metric,
+            lut,
         }
     }
 
@@ -54,12 +59,8 @@ impl RaBitQQuery {
     /// `g_add` is the centroid correction term. For brute-force (zero centroid),
     /// pass `0.0`.
     pub fn estimate_distance(&self, qv: &QuantizedVector, g_add: f32) -> f32 {
-        // Stage 1: binary code distance
-        let binary_code = qv.unpack_binary_code();
-        let mut binary_dot = 0.0f32;
-        for (&bit, &q_val) in binary_code.iter().zip(self.rotated_query.iter()) {
-            binary_dot += (bit as f32) * q_val;
-        }
+        // Stage 1: binary code distance via LUT
+        let binary_dot = self.lut.binary_dot(&qv.binary_code_packed);
         let binary_term = binary_dot + self.k1x_sum_q;
         let mut distance = qv.f_add + g_add + qv.f_rescale * binary_term;
 
@@ -128,12 +129,8 @@ impl RaBitQQuery {
         let f_rescale = read_f32(12); // 4th scalar
         let f_error = read_f32(16);   // 5th scalar
 
-        // Stage 1: binary-only distance
-        let binary_code = super::simd::unpack_binary_code_from_packed(binary_code_packed, padded_dims);
-        let mut binary_dot = 0.0f32;
-        for (&bit, &q_val) in binary_code.iter().zip(self.rotated_query.iter()) {
-            binary_dot += (bit as f32) * q_val;
-        }
+        // Stage 1: binary-only distance via LUT (no float multiply)
+        let binary_dot = self.lut.binary_dot(binary_code_packed);
         let binary_term = binary_dot + self.k1x_sum_q;
         let stage1_distance = f_add + g_add + f_rescale * binary_term;
 

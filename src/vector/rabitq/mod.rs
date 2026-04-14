@@ -7,6 +7,7 @@
 //! which handles the segment storage lifecycle.
 
 pub mod distance;
+pub mod fastscan;
 pub mod math;
 pub mod quantizer;
 pub mod record;
