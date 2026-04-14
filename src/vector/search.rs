@@ -236,20 +236,6 @@ impl Weight for VectorWeight {
             crate::TantivyError::InternalError("cluster field reader not found".into())
         })?;
 
-        let result = self.build_candidates(cluster_field, reader.max_doc())?;
-
-        let mut doc_set: Box<dyn DocSet> = match &self.filter_weight {
-            Some(filter_weight) => {
-                let filter_scorer = filter_weight.scorer(reader, 1.0)?;
-                Box::new(Intersection::with_two_sets(
-                    result.scorer,
-                    filter_scorer,
-                    reader.max_doc(),
-                ))
-            }
-            None => result.scorer,
-        };
-
         let rabitq_query = RaBitQQuery::new(
             &self.query_vector,
             &self.config.rotator,
@@ -265,19 +251,28 @@ impl Weight for VectorWeight {
 
         if cluster_field.is_clustered() {
             let mut neg_threshold = threshold;
-            let probed =
-                cluster_field.probe_clusters(&self.query_vector, &self.config.probe)?;
 
-            // Collect probed cluster IDs with their g_add and sort by min doc ID
-            // so a single filter scorer can seek forward
+            // Single centroid search — get distances + probed clusters in one pass
+            let centroid_results =
+                cluster_field.search_centroids(&self.query_vector, self.config.probe.max_probe);
+            let mut centroid_dists = HashMap::new();
+            for &(cluster_id, dist) in &centroid_results {
+                centroid_dists.insert(cluster_id as u16, dist);
+            }
+
+            // Apply distance-ratio pruning
+            let nearest_dist = centroid_results.first().map(|r| r.1).unwrap_or(0.0);
             let mut cluster_info: Vec<(u32, u16, f32)> = Vec::new();
-            for (cluster_id, mut postings) in probed {
-                let cid = cluster_id as u16;
-                let g_add = result.centroid_dists.get(&cid).copied().unwrap_or(0.0);
-                let first_doc = postings.doc();
-                if first_doc != TERMINATED {
-                    cluster_info.push((cluster_id, cid, g_add));
+            for (i, &(cluster_id, dist)) in centroid_results.iter().enumerate() {
+                if i >= self.config.probe.min_probe
+                    && nearest_dist > 0.0
+                    && dist / nearest_dist > self.config.probe.distance_ratio
+                {
+                    break;
                 }
+                let cid = cluster_id as u16;
+                let g_add = dist;
+                cluster_info.push((cluster_id, cid, g_add));
             }
 
             let mut filter_scorer: Option<Box<dyn Scorer>> = self
@@ -427,6 +422,7 @@ impl Weight for VectorWeight {
 
         // Unclustered fallback: per-doc scalar path
         let mut neg_threshold = threshold;
+        let mut doc_set: Box<dyn DocSet> = Box::new(AllScorer::new(reader.max_doc()));
         let mut doc = doc_set.doc();
         while doc != TERMINATED {
             if let Ok(record) = bq_reader.record(doc) {
