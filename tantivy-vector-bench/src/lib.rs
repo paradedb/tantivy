@@ -16,6 +16,7 @@ use tantivy::vector::rabitq::rotation::{DynamicRotator, RotatorType};
 use tantivy::vector::rabitq::{self, Metric, RabitqConfig};
 use tantivy::vector::search::{VectorQuery, VectorQueryConfig};
 use tantivy::indexer::NoMergePolicy;
+use tantivy::columnar;
 use tantivy::{DocId, IndexWriter, TantivyDocument};
 
 use tantivy::index::SegmentReader;
@@ -369,14 +370,18 @@ impl TantivyVectorIndex {
             .search(&vector_query, &TopDocs::with_limit(k).order_by_score())
             .map_err(|e| PyRuntimeError::new_err(format!("search failed: {e}")))?;
 
+        let mut id_columns: Vec<Option<columnar::Column<i64>>> = Vec::new();
+        for seg in searcher.segment_readers() {
+            id_columns.push(seg.fast_fields().i64("id").ok());
+        }
+
         let mut result_ids = Vec::with_capacity(top_docs.len());
         for (_, addr) in &top_docs {
-            let seg_reader = searcher.segment_reader(addr.segment_ord);
-            let id_reader = seg_reader
-                .fast_fields()
-                .i64("id")
-                .map_err(|e| PyRuntimeError::new_err(format!("fast field read: {e}")))?;
-            let global_id = id_reader.first(addr.doc_id).unwrap_or(0);
+            let global_id = id_columns
+                .get(addr.segment_ord as usize)
+                .and_then(|col| col.as_ref())
+                .and_then(|col| col.first(addr.doc_id))
+                .unwrap_or(0);
             result_ids.push(global_id);
         }
         Ok(result_ids)
