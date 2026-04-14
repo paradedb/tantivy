@@ -88,8 +88,11 @@ impl CentroidIndex {
             .map(|(&cid, centroid)| (cid, l2_distance_sqr(query, centroid)))
             .collect();
 
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        results.truncate(k);
+        if k < results.len() {
+            results.select_nth_unstable_by(k, |a, b| a.1.total_cmp(&b.1));
+            results.truncate(k);
+        }
+        results.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
         results
     }
 
