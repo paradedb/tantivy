@@ -91,8 +91,45 @@ impl RaBitQQuery {
         padded_dims: usize,
         g_add: f32,
     ) -> f32 {
-        let qv = super::record::unpack(record, padded_dims, self.ex_bits);
-        self.estimate_distance(&qv, g_add)
+        let binary_bytes = padded_dims.div_ceil(8);
+        let ex_b = super::record::ex_bytes(padded_dims, self.ex_bits);
+        let scalar_off = binary_bytes + ex_b;
+
+        let read_f32 = |off: usize| -> f32 {
+            f32::from_le_bytes([
+                record[scalar_off + off],
+                record[scalar_off + off + 1],
+                record[scalar_off + off + 2],
+                record[scalar_off + off + 3],
+            ])
+        };
+
+        // Stage 1: binary dot via LUT (zero allocation)
+        let binary_code_packed = &record[..binary_bytes];
+        let binary_dot = self.lut.binary_dot(binary_code_packed);
+        let binary_term = binary_dot + self.k1x_sum_q;
+        let f_add = read_f32(8);
+        let f_rescale = read_f32(12);
+        let mut distance = f_add + g_add + f_rescale * binary_term;
+
+        // Stage 2: extended code refinement (reads ex_code slice, no allocation)
+        if self.ex_bits > 0 && ex_b > 0 {
+            let ex_code_packed = &record[binary_bytes..binary_bytes + ex_b];
+            let ex_code = super::simd::unpack_ex_code_from_packed(ex_code_packed, padded_dims, self.ex_bits);
+            let mut ex_dot = 0.0f32;
+            for (&code, &q_val) in ex_code.iter().zip(self.rotated_query.iter()) {
+                ex_dot += (code as f32) * q_val;
+            }
+            let total_term = self.binary_scale * binary_dot + ex_dot + self.kbx_sum_q;
+            let f_add_ex = read_f32(24);
+            let f_rescale_ex = read_f32(28);
+            distance = f_add_ex + g_add + f_rescale_ex * total_term;
+        }
+
+        match self.metric {
+            Metric::L2 => distance,
+            Metric::InnerProduct => -distance,
+        }
     }
 
     /// Two-stage distance estimation with lower-bound pruning.
