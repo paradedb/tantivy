@@ -397,14 +397,152 @@ pub fn ip_packed_ex_f32(
     ex_bits: usize,
 ) -> f32 {
     match ex_bits {
-        2 => ip_packed_ex2_f32_scalar(query, packed_ex_code, padded_dim),
+        2 => ip_packed_ex2_f32(query, packed_ex_code, padded_dim),
         6 => ip_packed_ex6_f32_scalar(query, packed_ex_code, padded_dim),
         _ => {
-            // Fallback: unpack then scalar dot
             let ex_code = super::simd::unpack_ex_code_from_packed(packed_ex_code, padded_dim, ex_bits);
             ex_code.iter().zip(query.iter()).map(|(&c, &q)| (c as f32) * q).sum()
         }
     }
+}
+
+fn ip_packed_ex2_f32(query: &[f32], packed_ex_code: &[u8], padded_dim: usize) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe {
+                return ip_packed_ex2_f32_neon(query, packed_ex_code, padded_dim);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                return ip_packed_ex2_f32_avx2(query, packed_ex_code, padded_dim);
+            }
+        }
+    }
+
+    ip_packed_ex2_f32_scalar(query, packed_ex_code, padded_dim)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn ip_packed_ex2_f32_neon(
+    query: &[f32],
+    packed_ex_code: &[u8],
+    padded_dim: usize,
+) -> f32 {
+    use std::arch::aarch64::*;
+
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut sum2 = vdupq_n_f32(0.0);
+    let mut sum3 = vdupq_n_f32(0.0);
+
+    let mut query_ptr = query.as_ptr();
+    let mut code_ptr = packed_ex_code.as_ptr();
+
+    // Process 16 elements per iteration (4 bytes of 2-bit codes)
+    for _ in 0..(padded_dim / 16) {
+        let compact = std::ptr::read_unaligned(code_ptr as *const u32);
+
+        // Extract 4 groups of 4 codes (shift by 0,2,4,6 bits, mask with 0x03)
+        // Group 0: codes 0,1,2,3
+        let g0 = [
+            (compact & 0x3) as f32,
+            ((compact >> 8) & 0x3) as f32,
+            ((compact >> 16) & 0x3) as f32,
+            ((compact >> 24) & 0x3) as f32,
+        ];
+        // Group 1: codes 4,5,6,7
+        let g1 = [
+            ((compact >> 2) & 0x3) as f32,
+            ((compact >> 10) & 0x3) as f32,
+            ((compact >> 18) & 0x3) as f32,
+            ((compact >> 26) & 0x3) as f32,
+        ];
+        // Group 2: codes 8,9,10,11
+        let g2 = [
+            ((compact >> 4) & 0x3) as f32,
+            ((compact >> 12) & 0x3) as f32,
+            ((compact >> 20) & 0x3) as f32,
+            ((compact >> 28) & 0x3) as f32,
+        ];
+        // Group 3: codes 12,13,14,15
+        let g3 = [
+            ((compact >> 6) & 0x3) as f32,
+            ((compact >> 14) & 0x3) as f32,
+            ((compact >> 22) & 0x3) as f32,
+            ((compact >> 30) & 0x3) as f32,
+        ];
+
+        let cv0 = vld1q_f32(g0.as_ptr());
+        let cv1 = vld1q_f32(g1.as_ptr());
+        let cv2 = vld1q_f32(g2.as_ptr());
+        let cv3 = vld1q_f32(g3.as_ptr());
+
+        let q0 = vld1q_f32(query_ptr);
+        let q1 = vld1q_f32(query_ptr.add(4));
+        let q2 = vld1q_f32(query_ptr.add(8));
+        let q3 = vld1q_f32(query_ptr.add(12));
+
+        sum0 = vfmaq_f32(sum0, cv0, q0);
+        sum1 = vfmaq_f32(sum1, cv1, q1);
+        sum2 = vfmaq_f32(sum2, cv2, q2);
+        sum3 = vfmaq_f32(sum3, cv3, q3);
+
+        query_ptr = query_ptr.add(16);
+        code_ptr = code_ptr.add(4);
+    }
+
+    let total = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+    vaddvq_f32(total)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn ip_packed_ex2_f32_avx2(
+    query: &[f32],
+    packed_ex_code: &[u8],
+    padded_dim: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut sum = _mm256_setzero_ps();
+    let mask = _mm_set1_epi8(0b00000011);
+
+    let mut query_ptr = query.as_ptr();
+    let mut code_ptr = packed_ex_code.as_ptr();
+
+    for _ in 0..(padded_dim / 16) {
+        let compact = std::ptr::read_unaligned(code_ptr as *const i32);
+
+        let code_i32 = _mm_set_epi32(compact >> 6, compact >> 4, compact >> 2, compact);
+        let code_masked = _mm_and_si128(code_i32, mask);
+
+        // Lower 8 codes → f32, FMA with query
+        let code_f32_lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(code_masked));
+        let query_lo = _mm256_loadu_ps(query_ptr);
+        sum = _mm256_fmadd_ps(code_f32_lo, query_lo, sum);
+
+        // Upper 8 codes → f32, FMA with query
+        let code_masked_hi = _mm_unpackhi_epi64(code_masked, code_masked);
+        let code_f32_hi = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(code_masked_hi));
+        let query_hi = _mm256_loadu_ps(query_ptr.add(8));
+        sum = _mm256_fmadd_ps(code_f32_hi, query_hi, sum);
+
+        query_ptr = query_ptr.add(16);
+        code_ptr = code_ptr.add(4);
+    }
+
+    let sum_hi = _mm256_extractf128_ps(sum, 1);
+    let sum_lo = _mm256_castps256_ps128(sum);
+    let sum_128 = _mm_add_ps(sum_lo, sum_hi);
+    let sum_64 = _mm_add_ps(sum_128, _mm_movehl_ps(sum_128, sum_128));
+    let sum_32 = _mm_add_ss(sum_64, _mm_shuffle_ps(sum_64, sum_64, 0x55));
+    _mm_cvtss_f32(sum_32)
 }
 
 fn ip_packed_ex2_f32_scalar(query: &[f32], packed_ex_code: &[u8], padded_dim: usize) -> f32 {
