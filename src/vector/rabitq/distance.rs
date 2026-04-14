@@ -112,14 +112,12 @@ impl RaBitQQuery {
         let f_rescale = read_f32(12);
         let mut distance = f_add + g_add + f_rescale * binary_term;
 
-        // Stage 2: extended code refinement (reads ex_code slice, no allocation)
+        // Stage 2: extended code refinement on packed bytes (no unpack allocation)
         if self.ex_bits > 0 && ex_b > 0 {
             let ex_code_packed = &record[binary_bytes..binary_bytes + ex_b];
-            let ex_code = super::simd::unpack_ex_code_from_packed(ex_code_packed, padded_dims, self.ex_bits);
-            let mut ex_dot = 0.0f32;
-            for (&code, &q_val) in ex_code.iter().zip(self.rotated_query.iter()) {
-                ex_dot += (code as f32) * q_val;
-            }
+            let ex_dot = super::fastscan::ip_packed_ex_f32(
+                &self.rotated_query, ex_code_packed, padded_dims, self.ex_bits,
+            );
             let total_term = self.binary_scale * binary_dot + ex_dot + self.kbx_sum_q;
             let f_add_ex = read_f32(24);
             let f_rescale_ex = read_f32(28);

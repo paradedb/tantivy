@@ -385,6 +385,114 @@ pub fn batch_data_size(dim_bytes: usize) -> usize {
     binary_bytes + scalar_bytes
 }
 
+/// Compute dot product of query with packed extended codes directly,
+/// without unpacking to u16 first. Works on the C++-compatible packed format.
+///
+/// For ex_bits=2: each 4 bytes encode 16 values (2 bits each).
+/// For ex_bits=6: each 12 bytes encode 16 values (6 bits each).
+pub fn ip_packed_ex_f32(
+    query: &[f32],
+    packed_ex_code: &[u8],
+    padded_dim: usize,
+    ex_bits: usize,
+) -> f32 {
+    match ex_bits {
+        2 => ip_packed_ex2_f32_scalar(query, packed_ex_code, padded_dim),
+        6 => ip_packed_ex6_f32_scalar(query, packed_ex_code, padded_dim),
+        _ => {
+            // Fallback: unpack then scalar dot
+            let ex_code = super::simd::unpack_ex_code_from_packed(packed_ex_code, padded_dim, ex_bits);
+            ex_code.iter().zip(query.iter()).map(|(&c, &q)| (c as f32) * q).sum()
+        }
+    }
+}
+
+fn ip_packed_ex2_f32_scalar(query: &[f32], packed_ex_code: &[u8], padded_dim: usize) -> f32 {
+    let mut sum = 0.0f32;
+    let mut code_idx = 0;
+
+    for chunk in 0..(padded_dim / 16) {
+        let base = chunk * 4;
+        let compact = u32::from_le_bytes([
+            packed_ex_code[base],
+            packed_ex_code[base + 1],
+            packed_ex_code[base + 2],
+            packed_ex_code[base + 3],
+        ]);
+
+        for i in 0..4 {
+            let byte_offset = i * 8;
+            let c0 = ((compact >> byte_offset) & 0x3) as f32;
+            let c1 = ((compact >> (byte_offset + 2)) & 0x3) as f32;
+            let c2 = ((compact >> (byte_offset + 4)) & 0x3) as f32;
+            let c3 = ((compact >> (byte_offset + 6)) & 0x3) as f32;
+
+            sum += c0 * query[code_idx];
+            sum += c1 * query[code_idx + 4];
+            sum += c2 * query[code_idx + 8];
+            sum += c3 * query[code_idx + 12];
+            code_idx += 1;
+        }
+        code_idx += 12;
+    }
+    sum
+}
+
+fn ip_packed_ex6_f32_scalar(query: &[f32], packed_ex_code: &[u8], padded_dim: usize) -> f32 {
+    let mut sum = 0.0f32;
+    let mut code_idx = 0;
+
+    for chunk in 0..(padded_dim / 16) {
+        let base = chunk * 12;
+
+        let compact4 = u64::from_le_bytes([
+            packed_ex_code[base],
+            packed_ex_code[base + 1],
+            packed_ex_code[base + 2],
+            packed_ex_code[base + 3],
+            packed_ex_code[base + 4],
+            packed_ex_code[base + 5],
+            packed_ex_code[base + 6],
+            packed_ex_code[base + 7],
+        ]);
+
+        let compact2 = u32::from_le_bytes([
+            packed_ex_code[base + 8],
+            packed_ex_code[base + 9],
+            packed_ex_code[base + 10],
+            packed_ex_code[base + 11],
+        ]);
+
+        for i in 0..4 {
+            let lo_offset = i * 16;
+            let hi_offset = i * 8;
+
+            let lo0 = ((compact4 >> lo_offset) & 0xF) as u16;
+            let lo1 = ((compact4 >> (lo_offset + 4)) & 0xF) as u16;
+            let lo2 = ((compact4 >> (lo_offset + 8)) & 0xF) as u16;
+            let lo3 = ((compact4 >> (lo_offset + 12)) & 0xF) as u16;
+
+            let hi0 = ((compact2 >> hi_offset) & 0x3) as u16;
+            let hi1 = ((compact2 >> (hi_offset + 2)) & 0x3) as u16;
+            let hi2 = ((compact2 >> (hi_offset + 4)) & 0x3) as u16;
+            let hi3 = ((compact2 >> (hi_offset + 6)) & 0x3) as u16;
+
+            let c0 = (lo0 | (hi0 << 4)) as f32;
+            let c1 = (lo1 | (hi1 << 4)) as f32;
+            let c2 = (lo2 | (hi2 << 4)) as f32;
+            let c3 = (lo3 | (hi3 << 4)) as f32;
+
+            sum += c0 * query[code_idx];
+            sum += c1 * query[code_idx + 4];
+            sum += c2 * query[code_idx + 8];
+            sum += c3 * query[code_idx + 12];
+            code_idx += 1;
+        }
+        code_idx += 12;
+    }
+    sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
