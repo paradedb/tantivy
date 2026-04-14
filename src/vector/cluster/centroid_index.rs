@@ -65,6 +65,9 @@ impl CentroidIndex {
         if n == 0 {
             return vec![];
         }
+        // For small cluster counts, brute-force is faster than HNSW
+        // due to graph traversal overhead. For larger counts, HNSW
+        // visits fewer nodes (O(log n) vs O(n)).
         if n <= 1024 {
             return self.brute_force_search(query, ef_search.min(n));
         }
@@ -81,14 +84,13 @@ impl CentroidIndex {
     }
 
     fn brute_force_search(&self, query: &[f32], k: usize) -> Vec<(u32, f32)> {
-        let mut results: Vec<(u32, f32)> = self
-            .centroid_ids
-            .iter()
-            .zip(self.centroids.iter())
-            .map(|(&cid, centroid)| (cid, l2_distance_sqr(query, centroid)))
-            .collect();
+        let n = self.centroid_ids.len();
+        let mut results = Vec::with_capacity(n);
+        for i in 0..n {
+            results.push((self.centroid_ids[i], l2_distance_sqr(query, &self.centroids[i])));
+        }
 
-        if k < results.len() {
+        if k < n {
             results.select_nth_unstable_by(k, |a, b| a.1.total_cmp(&b.1));
             results.truncate(k);
         }
