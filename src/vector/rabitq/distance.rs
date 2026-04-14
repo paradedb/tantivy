@@ -150,9 +150,16 @@ impl RaBitQQuery {
         }
     }
 
-    /// Access the rotated query vector.
     pub fn rotated_query(&self) -> &[f32] {
         &self.rotated_query
+    }
+
+    pub fn lut(&self) -> &QueryLut {
+        &self.lut
+    }
+
+    pub fn k1x_sum_q(&self) -> f32 {
+        self.k1x_sum_q
     }
 }
 

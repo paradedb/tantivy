@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::vector::bqvec::BqVecPluginReader;
+use crate::vector::bqvec::{BqVecFieldReader, BqVecPluginReader};
 use crate::vector::cluster::plugin::{ClusterFieldReader, ClusterPluginReader, ProbeConfig};
 use crate::docset::{DocSet, TERMINATED};
 use crate::index::SegmentReader;
@@ -12,8 +12,9 @@ use crate::query::{
     AllScorer, BufferedUnionScorer, ConstScorer, EnableScoring, Explanation, Intersection, Query,
     Scorer, Weight,
 };
+use crate::vector::rabitq::fastscan::{self, QueryLut, BATCH_SIZE};
 use crate::vector::rabitq::rotation::DynamicRotator;
-use crate::vector::rabitq::{Metric, RaBitQQuery};
+use crate::vector::rabitq::{self, Metric, RaBitQQuery};
 use crate::schema::Field;
 use crate::{DocId, Score};
 
@@ -256,8 +257,129 @@ impl Weight for VectorWeight {
             self.config.metric,
         );
 
-        // Threshold is a negated distance (higher = better).
-        // Convert to raw distance threshold for pruning (lower = better).
+        let padded_dims = self.config.padded_dims;
+        let dim_bytes = padded_dims / 8;
+        let ex_bits = self.config.ex_bits;
+
+        // Use batch path for unfiltered clustered search
+        if self.filter_weight.is_none() && cluster_field.is_clustered() {
+            let mut neg_threshold = threshold;
+            let probed =
+                cluster_field.probe_clusters(&self.query_vector, &self.config.probe)?;
+
+            for (cluster_id, mut postings) in probed {
+                let g_add = result
+                    .centroid_dists
+                    .get(&(cluster_id as u16))
+                    .copied()
+                    .unwrap_or(0.0);
+
+                // Collect doc IDs from this cluster's posting list
+                let mut doc_ids = Vec::new();
+                let mut doc = postings.doc();
+                while doc != TERMINATED {
+                    doc_ids.push(doc);
+                    doc = postings.advance();
+                }
+
+                // Process in batches of 32
+                for chunk in doc_ids.chunks(BATCH_SIZE) {
+                    // Read binary codes + scalars for this batch
+                    let mut codes: Vec<Vec<u8>> = Vec::with_capacity(chunk.len());
+                    let mut f_add_batch = vec![0.0f32; BATCH_SIZE];
+                    let mut f_rescale_batch = vec![0.0f32; BATCH_SIZE];
+                    let mut f_error_batch = vec![0.0f32; BATCH_SIZE];
+
+                    for (i, &did) in chunk.iter().enumerate() {
+                        if let Ok(record) = bq_reader.record(did) {
+                            codes.push(record[..dim_bytes].to_vec());
+                            let ex_b = rabitq::record::ex_bytes(padded_dims, ex_bits);
+                            let scalar_off = dim_bytes + ex_b;
+                            let read_f32 = |off: usize| -> f32 {
+                                f32::from_le_bytes([
+                                    record[scalar_off + off],
+                                    record[scalar_off + off + 1],
+                                    record[scalar_off + off + 2],
+                                    record[scalar_off + off + 3],
+                                ])
+                            };
+                            f_add_batch[i] = read_f32(8);
+                            f_rescale_batch[i] = read_f32(12);
+                            f_error_batch[i] = read_f32(16);
+                        } else {
+                            codes.push(vec![0u8; dim_bytes]);
+                        }
+                    }
+                    // Pad missing codes
+                    while codes.len() < BATCH_SIZE {
+                        codes.push(vec![0u8; dim_bytes]);
+                    }
+
+                    // Transpose to column-major
+                    let code_refs: Vec<&[u8]> =
+                        codes.iter().map(|c| c.as_slice()).collect();
+                    let mut transposed = vec![0u8; dim_bytes * BATCH_SIZE];
+                    fastscan::pack_batch_simple(&code_refs, dim_bytes, &mut transposed);
+
+                    // SIMD batch accumulate
+                    let mut accu = [0u32; BATCH_SIZE];
+                    fastscan::accumulate_batch(
+                        &transposed,
+                        rabitq_query.lut().lut_u8(),
+                        dim_bytes,
+                        &mut accu,
+                    );
+
+                    let mut binary_dots = [0.0f32; BATCH_SIZE];
+                    fastscan::denormalize_batch(
+                        &accu,
+                        rabitq_query.lut().delta(),
+                        rabitq_query.lut().sum_vl(),
+                        &mut binary_dots,
+                    );
+
+                    let mut distances = [0.0f32; BATCH_SIZE];
+                    let mut lower_bounds = [0.0f32; BATCH_SIZE];
+                    fastscan::compute_batch_distances(
+                        &binary_dots,
+                        &f_add_batch,
+                        &f_rescale_batch,
+                        &f_error_batch,
+                        g_add,
+                        rabitq_query.k1x_sum_q(),
+                        &mut distances,
+                        &mut lower_bounds,
+                    );
+
+                    // Check each vector in the batch
+                    let raw_threshold = -neg_threshold;
+                    for (i, &did) in chunk.iter().enumerate() {
+                        if lower_bounds[i] >= raw_threshold {
+                            continue; // pruned by lower bound
+                        }
+                        // Survivor: refine with extended codes
+                        let distance = if ex_bits > 0 {
+                            if let Ok(record) = bq_reader.record(did) {
+                                rabitq_query.estimate_distance_from_record(
+                                    &record, padded_dims, g_add,
+                                )
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            distances[i]
+                        };
+                        let score = -distance;
+                        if score > neg_threshold {
+                            neg_threshold = callback(did, score);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Fallback: per-doc path for filtered or unclustered search
         let mut neg_threshold = threshold;
         let mut doc = doc_set.doc();
         while doc != TERMINATED {
@@ -269,12 +391,10 @@ impl Weight for VectorWeight {
             };
 
             if let Ok(record) = bq_reader.record(doc) {
-                // raw_threshold: distances below this are interesting.
-                // neg_threshold is -distance, so raw_threshold = -neg_threshold.
                 let raw_threshold = -neg_threshold;
                 if let Some(distance) = rabitq_query.estimate_distance_pruned(
                     &record,
-                    self.config.padded_dims,
+                    padded_dims,
                     g_add,
                     raw_threshold,
                 ) {
