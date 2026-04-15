@@ -275,13 +275,13 @@ impl Weight for VectorWeight {
                 cluster_info.push((cluster_id, cid, g_add));
             }
 
-            let mut filter_scorer: Option<Box<dyn Scorer>> = self
-                .filter_weight
-                .as_ref()
-                .map(|fw| fw.scorer(reader, 1.0))
-                .transpose()?;
-
             for &(cluster_id, _cid, g_add) in &cluster_info {
+                // Fresh filter scorer per cluster to avoid forward-only seek issues
+                let mut filter_scorer: Option<Box<dyn Scorer>> = self
+                    .filter_weight
+                    .as_ref()
+                    .map(|fw| fw.scorer(reader, 1.0))
+                    .transpose()?;
                 // Try pre-stored batch data first
                 if let Ok(Some((doc_ids, meta, raw))) =
                     cluster_field.cluster_batch_raw(cluster_id as usize)
