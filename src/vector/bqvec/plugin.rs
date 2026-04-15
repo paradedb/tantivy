@@ -62,10 +62,6 @@ impl BqVecPluginBuilder {
 
     /// Build the plugin.
     pub fn build(self) -> BqVecPlugin {
-        assert!(
-            !self.fields.is_empty(),
-            "at least one vector field required"
-        );
         BqVecPlugin {
             fields: self.fields,
         }
