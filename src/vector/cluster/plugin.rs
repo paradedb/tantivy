@@ -1259,6 +1259,16 @@ pub struct ProbeConfig {
     pub min_probe: usize,
 }
 
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            max_probe: 20,
+            distance_ratio: 10.0,
+            min_probe: 1,
+        }
+    }
+}
+
 impl ProbeConfig {
     pub fn new(max_probe: usize, distance_ratio: f32) -> Self {
         Self {

@@ -763,4 +763,56 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_order_by_vector_distance_api() -> crate::Result<()> {
+        use crate::query::AllQuery;
+
+        let t = build_test_index(100, true)?;
+        let reader = t.index.reader()?;
+        let searcher = reader.searcher();
+
+        // The dream API — no VectorQueryConfig needed
+        let results = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(5).order_by_vector_distance(
+                t.vectors[0].clone(),
+                t.vec_field,
+            ),
+        )?;
+
+        assert_eq!(results.len(), 5);
+        // Doc 0 should be the top result (searching for its own vector)
+        assert_eq!(results[0].1.doc_id, 0);
+        for &(score, _) in &results {
+            assert!(score.is_finite());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_vector_distance_filtered() -> crate::Result<()> {
+        let t = build_test_index(100, true)?;
+        let reader = t.index.reader()?;
+        let searcher = reader.searcher();
+
+        let term = Term::from_field_text(t.category_field, "even");
+        let filter = TermQuery::new(term, IndexRecordOption::Basic);
+
+        let results = searcher.search(
+            &filter,
+            &TopDocs::with_limit(5).order_by_vector_distance(
+                t.vectors[0].clone(),
+                t.vec_field,
+            ),
+        )?;
+
+        assert!(!results.is_empty());
+        for &(_, doc_addr) in &results {
+            assert_eq!(doc_addr.doc_id % 2, 0, "expected only even docs");
+        }
+
+        Ok(())
+    }
 }

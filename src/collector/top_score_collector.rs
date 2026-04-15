@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::Collector;
 use crate::collector::sort_key::{
     Comparator, ComparatorEnum, NaturalComparator, ReverseComparator, SortBySimilarityScore,
-    SortByStaticFastValue, SortByString,
+    SortByStaticFastValue, SortByString, SortByVectorDistance,
 };
 use crate::collector::sort_key_top_collector::TopBySortKeyCollector;
 use crate::collector::top_collector::ComparableDoc;
@@ -225,6 +225,42 @@ impl TopDocs {
     /// Order docs by decreasing BM25 similarity score.
     pub fn order_by_score(self) -> impl Collector<Fruit = Vec<(Score, DocAddress)>> {
         TopBySortKeyCollector::new(SortBySimilarityScore, self.doc_range())
+    }
+
+    /// Order docs by vector distance to a query vector.
+    ///
+    /// Uses RaBitQ quantized vector search with SIMD-accelerated
+    /// batch processing. The metric (L2 or InnerProduct) is auto-detected
+    /// from the index metadata.
+    ///
+    /// The query selects which documents to consider (use `AllQuery` for
+    /// unfiltered search, or a text/term query for filtered vector search).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use tantivy::collector::TopDocs;
+    /// # use tantivy::query::AllQuery;
+    /// # fn example(searcher: &tantivy::Searcher, query_vec: Vec<f32>, vec_field: tantivy::schema::Field) -> tantivy::Result<()> {
+    /// let results = searcher.search(
+    ///     &AllQuery,
+    ///     &TopDocs::with_limit(10).order_by_vector_distance(query_vec, vec_field),
+    /// )?;
+    /// for (score, doc_address) in results {
+    ///     println!("doc {} score {}", doc_address.doc_id, score);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn order_by_vector_distance(
+        self,
+        query_vector: Vec<f32>,
+        field: crate::schema::Field,
+    ) -> impl Collector<Fruit = Vec<(Score, DocAddress)>> {
+        TopBySortKeyCollector::new(
+            SortByVectorDistance::new(query_vector, field),
+            self.doc_range(),
+        )
     }
 
     /// Set top-K to rank documents by a given fast field.
