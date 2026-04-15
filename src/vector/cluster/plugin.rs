@@ -24,6 +24,8 @@ use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema};
 use crate::{DocId, Segment};
 
+pub const WINDOW_SIZE: usize = 122_880;
+
 fn component() -> SegmentComponent {
     SegmentComponent::Custom("cluster".to_string())
 }
@@ -206,7 +208,6 @@ fn cluster_from_merge(
     let k = k.min(valid_vecs.len()).max(1);
     let result = run_kmeans_with_config(&valid_vecs, k, config.kmeans.clone());
 
-    // Assign docs to clusters using exact distances via sampler
     let mut assignments = vec![0usize; num_docs];
     for doc_id in 0..num_docs {
         let vecs = sampler.sample_vectors(field_config.field, &[doc_id as DocId])?;
@@ -309,18 +310,15 @@ fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Resul
         w.write_all(&cluster_id.to_le_bytes())?;
     }
 
-    // Cluster postings header: (doc_freq: u32, byte_len: u32) per cluster
     for posting in &data.cluster_postings {
         w.write_all(&posting.doc_freq.to_le_bytes())?;
         w.write_all(&(posting.data.len() as u32).to_le_bytes())?;
     }
 
-    // Cluster postings data: concatenated posting list bytes
     for posting in &data.cluster_postings {
         w.write_all(&posting.data)?;
     }
 
-    // Batch data header: (num_batches: u32, num_docs: u32, batch_data_len: u32) per cluster
     for batch in &data.cluster_batch_data {
         w.write_all(&batch.num_batches.to_le_bytes())?;
         w.write_all(&(batch.doc_ids.len() as u32).to_le_bytes())?;
@@ -332,7 +330,6 @@ fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Resul
         w.write_all(&(data_len as u32).to_le_bytes())?;
     }
 
-    // Batch data: per cluster
     for batch in &data.cluster_batch_data {
         for &did in &batch.doc_ids {
             w.write_all(&did.to_le_bytes())?;
@@ -356,6 +353,40 @@ fn serialize_empty(w: &mut dyn Write) -> crate::Result<()> {
     w.write_all(&0u32.to_le_bytes())?; // num_clusters = 0
     w.write_all(&0u32.to_le_bytes())?; // num_docs = 0
     w.write_all(&0u32.to_le_bytes())?; // dims = 0
+    Ok(())
+}
+
+fn serialize_windowed_field(
+    windows: &[(u32, u32, ClusterData)],
+    w: &mut dyn Write,
+) -> crate::Result<()> {
+    let num_windows = windows.len() as u32;
+    w.write_all(&num_windows.to_le_bytes())?;
+    w.write_all(&(WINDOW_SIZE as u32).to_le_bytes())?;
+
+    for (doc_offset, num_docs, data) in windows {
+        w.write_all(&doc_offset.to_le_bytes())?;
+        w.write_all(&num_docs.to_le_bytes())?;
+        serialize_cluster_data(data, w)?;
+    }
+
+    Ok(())
+}
+
+fn serialize_windowed_empty(w: &mut dyn Write, num_docs: usize) -> crate::Result<()> {
+    let num_windows = num_docs.div_ceil(WINDOW_SIZE).max(1) as u32;
+    w.write_all(&num_windows.to_le_bytes())?;
+    w.write_all(&(WINDOW_SIZE as u32).to_le_bytes())?;
+
+    let mut offset = 0u32;
+    for _ in 0..num_windows {
+        let window_docs = (num_docs as u32).saturating_sub(offset).min(WINDOW_SIZE as u32);
+        w.write_all(&offset.to_le_bytes())?;
+        w.write_all(&window_docs.to_le_bytes())?;
+        serialize_empty(w)?;
+        offset += window_docs;
+    }
+
     Ok(())
 }
 
@@ -407,10 +438,9 @@ impl SegmentPlugin for ClusterPlugin {
             for field_cfg in &self.config.fields {
                 let rabitq_config = RabitqConfig::new(field_cfg.ex_bits + 1);
                 let cw = cluster_composite.for_field(field_cfg.field);
-                serialize_empty(cw)?;
+                serialize_windowed_empty(cw, num_docs)?;
                 cw.flush()?;
 
-                // Re-encode BQ records against zero centroid via sampler
                 let bytes_per_record =
                     rabitq::bytes_per_record(field_cfg.padded_dims, field_cfg.ex_bits);
                 let bw = bqvec_composite.for_field(field_cfg.field);
@@ -447,43 +477,112 @@ impl SegmentPlugin for ClusterPlugin {
 
         for field_cfg in &self.config.fields {
             let rabitq_config = RabitqConfig::new(field_cfg.ex_bits + 1);
+            let dim_bytes = field_cfg.padded_dims / 8;
+            let ex_b = rabitq::record::ex_bytes(field_cfg.padded_dims, field_cfg.ex_bits);
+            let scalar_off = dim_bytes + ex_b;
 
-            let result = cluster_from_merge(
-                sampler.as_ref(),
-                field_cfg,
-                &self.config,
-                num_docs,
-            )?;
-
-            let cw = cluster_composite.for_field(field_cfg.field);
-            serialize_cluster_data(&result.data, cw)?;
-            cw.flush()?;
-
-            // Re-encode BQ records against new cluster centroids
             let bytes_per_record =
                 rabitq::bytes_per_record(field_cfg.padded_dims, field_cfg.ex_bits);
             let bw = bqvec_composite.for_field(field_cfg.field);
             bw.write_all(&(bytes_per_record as u32).to_le_bytes())?;
             bw.write_all(&(num_docs as u32).to_le_bytes())?;
 
-            for doc_id in 0..num_docs {
-                let vecs =
-                    sampler.sample_vectors(field_cfg.field, &[doc_id as DocId])?;
-                let vec = vecs.into_iter().next().flatten().unwrap_or_else(|| {
-                    vec![0.0f32; field_cfg.dims]
-                });
-                let centroid = &result.centroids[result.assignments[doc_id]];
-                let record = rabitq::encode(
-                    &field_cfg.rotator, &rabitq_config, field_cfg.metric, &vec, centroid,
-                );
-                bw.write_all(&record)?;
+            let num_windows = num_docs.div_ceil(WINDOW_SIZE);
+            let mut windows: Vec<(u32, u32, ClusterData)> = Vec::with_capacity(num_windows);
+
+            for win_idx in 0..num_windows {
+                let win_start = win_idx * WINDOW_SIZE;
+                let win_end = (win_start + WINDOW_SIZE).min(num_docs);
+                let win_num_docs = win_end - win_start;
+
+                let win_sampler = WindowSampler {
+                    inner: sampler.as_ref(),
+                    doc_offset: win_start,
+                };
+
+                let result = cluster_from_merge(
+                    &win_sampler,
+                    field_cfg,
+                    &self.config,
+                    win_num_docs,
+                )?;
+
+                for local_doc_id in 0..win_num_docs {
+                    let global_doc_id = win_start + local_doc_id;
+                    let vecs =
+                        sampler.sample_vectors(field_cfg.field, &[global_doc_id as DocId])?;
+                    let vec = vecs.into_iter().next().flatten().unwrap_or_else(|| {
+                        vec![0.0f32; field_cfg.dims]
+                    });
+                    let centroid = &result.centroids[result.assignments[local_doc_id]];
+                    let record = rabitq::encode(
+                        &field_cfg.rotator, &rabitq_config, field_cfg.metric, &vec, centroid,
+                    );
+                    bw.write_all(&record)?;
+                }
+
+                let mut per_cluster_docs: Vec<Vec<(DocId, Vec<u8>)>> =
+                    vec![Vec::new(); result.data.num_clusters];
+                for local_doc_id in 0..win_num_docs {
+                    let global_doc_id = win_start + local_doc_id;
+                    let vecs =
+                        sampler.sample_vectors(field_cfg.field, &[global_doc_id as DocId])?;
+                    let vec = vecs.into_iter().next().flatten().unwrap_or_else(|| {
+                        vec![0.0f32; field_cfg.dims]
+                    });
+                    let centroid = &result.centroids[result.assignments[local_doc_id]];
+                    let record = rabitq::encode(
+                        &field_cfg.rotator, &rabitq_config, field_cfg.metric, &vec, centroid,
+                    );
+                    let cluster_id = result.assignments[local_doc_id];
+                    per_cluster_docs[cluster_id].push((local_doc_id as DocId, record));
+                }
+
+                let mut data = result.data;
+                data.cluster_batch_data = per_cluster_docs
+                    .iter()
+                    .map(|docs| build_cluster_batch_data(docs, dim_bytes, scalar_off))
+                    .collect();
+
+                windows.push((win_start as u32, win_num_docs as u32, data));
             }
+
             bw.flush()?;
+
+            let cw = cluster_composite.for_field(field_cfg.field);
+            serialize_windowed_field(&windows, cw)?;
+            cw.flush()?;
         }
 
         cluster_composite.close()?;
         bqvec_composite.close()?;
         Ok(())
+    }
+}
+
+struct WindowSampler<'a> {
+    inner: &'a (dyn crate::vector::cluster::sampler::VectorSampler + 'a),
+    doc_offset: usize,
+}
+
+unsafe impl<'a> Send for WindowSampler<'a> {}
+unsafe impl<'a> Sync for WindowSampler<'a> {}
+
+impl<'a> crate::vector::cluster::sampler::VectorSampler for WindowSampler<'a> {
+    fn sample_vectors(
+        &self,
+        field: Field,
+        doc_ids: &[DocId],
+    ) -> crate::Result<Vec<Option<Vec<f32>>>> {
+        let mapped: Vec<DocId> = doc_ids
+            .iter()
+            .map(|&id| (id as usize + self.doc_offset) as DocId)
+            .collect();
+        self.inner.sample_vectors(field, &mapped)
+    }
+
+    fn dims(&self, field: Field) -> usize {
+        self.inner.dims(field)
     }
 }
 
@@ -548,9 +647,8 @@ impl PluginWriter for ClusterPluginWriter {
             bw.write_all(&(num_docs as u32).to_le_bytes())?;
 
             if (num_docs as u32) < self.config.clustering_threshold || num_docs == 0 {
-                serialize_empty(cw)?;
+                serialize_windowed_empty(cw, num_docs)?;
                 cw.flush()?;
-                // Write BQ records against zero centroid
                 let zero = vec![0.0f32; field_cfg.dims];
                 if let Some(vectors) = vectors {
                     for vec in vectors {
@@ -565,35 +663,46 @@ impl PluginWriter for ClusterPluginWriter {
             }
 
             let vectors = vectors.unwrap();
-            let mut result = cluster_from_vectors(vectors, &self.config, field_cfg)?;
-
-            // Encode BQ records and collect per-cluster batch data
             let dim_bytes = field_cfg.padded_dims / 8;
             let ex_b = rabitq::record::ex_bytes(field_cfg.padded_dims, field_cfg.ex_bits);
             let scalar_off = dim_bytes + ex_b;
 
-            let mut per_cluster_docs: Vec<Vec<(DocId, Vec<u8>)>> =
-                vec![Vec::new(); result.data.num_clusters];
+            let num_windows = num_docs.div_ceil(WINDOW_SIZE);
+            let mut windows: Vec<(u32, u32, ClusterData)> = Vec::with_capacity(num_windows);
 
-            for (doc_id, vec) in vectors.iter().enumerate() {
-                let centroid = &result.centroids[result.assignments[doc_id]];
-                let record = rabitq::encode(
-                    &field_cfg.rotator, &rabitq_config, field_cfg.metric, vec, centroid,
-                );
-                bw.write_all(&record)?;
+            for win_idx in 0..num_windows {
+                let win_start = win_idx * WINDOW_SIZE;
+                let win_end = (win_start + WINDOW_SIZE).min(num_docs);
+                let win_vectors = &vectors[win_start..win_end];
+                let win_num_docs = win_vectors.len();
 
-                let cluster_id = result.assignments[doc_id];
-                per_cluster_docs[cluster_id].push((doc_id as DocId, record));
+                let mut result = cluster_from_vectors(win_vectors, &self.config, field_cfg)?;
+
+                let mut per_cluster_docs: Vec<Vec<(DocId, Vec<u8>)>> =
+                    vec![Vec::new(); result.data.num_clusters];
+
+                for (local_doc_id, vec) in win_vectors.iter().enumerate() {
+                    let centroid = &result.centroids[result.assignments[local_doc_id]];
+                    let record = rabitq::encode(
+                        &field_cfg.rotator, &rabitq_config, field_cfg.metric, vec, centroid,
+                    );
+                    bw.write_all(&record)?;
+
+                    let cluster_id = result.assignments[local_doc_id];
+                    per_cluster_docs[cluster_id].push((local_doc_id as DocId, record));
+                }
+
+                result.data.cluster_batch_data = per_cluster_docs
+                    .iter()
+                    .map(|docs| build_cluster_batch_data(docs, dim_bytes, scalar_off))
+                    .collect();
+
+                windows.push((win_start as u32, win_num_docs as u32, result.data));
             }
+
             bw.flush()?;
 
-            // Build batch data per cluster
-            result.data.cluster_batch_data = per_cluster_docs
-                .iter()
-                .map(|docs| build_cluster_batch_data(docs, dim_bytes, scalar_off))
-                .collect();
-
-            serialize_cluster_data(&result.data, cw)?;
+            serialize_windowed_field(&windows, cw)?;
             cw.flush()?;
         }
 
@@ -652,45 +761,62 @@ pub struct ClusterBatchMeta {
     pub byte_len: usize,
 }
 
-pub struct ClusterFieldReader {
+pub struct WindowReader {
     centroid_index: Option<CentroidIndex>,
     per_doc_cluster: Vec<u16>,
     postings_meta: Vec<ClusterPostingsMeta>,
     postings_data: FileSlice,
     batch_meta: Vec<ClusterBatchMeta>,
     batch_data: FileSlice,
-    dim_bytes: usize,
+    pub doc_offset: u32,
+    pub num_docs: u32,
+    dims: usize,
 }
 
-impl ClusterFieldReader {
-    fn open(file_slice: FileSlice, metric: Metric) -> crate::Result<Self> {
-        let data = file_slice.read_bytes()?;
-        if data.len() < 12 {
+impl WindowReader {
+    fn open(
+        file_slice: &FileSlice,
+        data: &[u8],
+        base_offset: usize,
+        doc_offset: u32,
+        num_docs_in_window: u32,
+        metric: Metric,
+    ) -> crate::Result<(Self, usize)> {
+        let mut offset = base_offset;
+
+        if data.len() < offset + 12 {
             return Err(crate::TantivyError::InternalError(
-                "cluster field section too short".into(),
+                "window cluster section too short".into(),
             ));
         }
 
         let num_clusters =
-            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let num_docs =
-            u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+                as usize;
+        let _num_docs_field =
+            u32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]])
+                as usize;
         let dims =
-            u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+            u32::from_le_bytes([data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11]])
+                as usize;
+        offset += 12;
 
         if num_clusters == 0 {
-            return Ok(Self {
-                centroid_index: None,
-                per_doc_cluster: Vec::new(),
-                postings_meta: Vec::new(),
-                postings_data: FileSlice::empty(),
-                batch_meta: Vec::new(),
-                batch_data: FileSlice::empty(),
-                dim_bytes: 0,
-            });
+            return Ok((
+                Self {
+                    centroid_index: None,
+                    per_doc_cluster: Vec::new(),
+                    postings_meta: Vec::new(),
+                    postings_data: FileSlice::empty(),
+                    batch_meta: Vec::new(),
+                    batch_data: FileSlice::empty(),
+                    doc_offset,
+                    num_docs: num_docs_in_window,
+                    dims,
+                },
+                offset,
+            ));
         }
-
-        let mut offset = 12;
 
         let ci_len =
             u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
@@ -703,6 +829,7 @@ impl ClusterFieldReader {
             CentroidIndex::load_from_bytes(ci_bytes, centroid_ids, dims, metric)?;
         offset += ci_len;
 
+        let num_docs = _num_docs_field;
         let mut per_doc_cluster = Vec::with_capacity(num_docs);
         for _ in 0..num_docs {
             let v = u16::from_le_bytes([data[offset], data[offset + 1]]);
@@ -710,7 +837,6 @@ impl ClusterFieldReader {
             offset += 2;
         }
 
-        // Read postings header: (doc_freq: u32, byte_len: u32) per cluster
         let mut postings_meta = Vec::with_capacity(num_clusters);
         let mut cumulative_offset = 0usize;
         for _ in 0..num_clusters {
@@ -734,7 +860,6 @@ impl ClusterFieldReader {
         let postings_data = file_slice.slice(offset..postings_end);
         offset = postings_end;
 
-        // Read batch data header: (num_batches: u32, num_docs: u32, data_len: u32) per cluster
         let mut batch_meta = Vec::with_capacity(num_clusters);
         let mut batch_cumulative = 0usize;
         if offset + num_clusters * 12 <= data.len() {
@@ -765,22 +890,30 @@ impl ClusterFieldReader {
         } else {
             FileSlice::empty()
         };
+        offset += batch_cumulative;
 
-        let dim_bytes = dims / 8;
-
-        Ok(Self {
-            centroid_index: Some(centroid_index),
-            per_doc_cluster,
-            postings_meta,
-            postings_data,
-            batch_meta,
-            batch_data,
-            dim_bytes,
-        })
+        Ok((
+            Self {
+                centroid_index: Some(centroid_index),
+                per_doc_cluster,
+                postings_meta,
+                postings_data,
+                batch_meta,
+                batch_data,
+                doc_offset,
+                num_docs: num_docs_in_window,
+                dims,
+            },
+            offset,
+        ))
     }
 
     pub fn is_clustered(&self) -> bool {
         self.centroid_index.is_some()
+    }
+
+    pub fn num_clusters(&self) -> usize {
+        self.centroid_index.as_ref().map_or(0, |ci| ci.len())
     }
 
     pub fn search_centroids(&self, query: &[f32], ef_search: usize) -> Vec<(u32, f32)> {
@@ -807,12 +940,8 @@ impl ClusterFieldReader {
         Ok(SegmentPostings::from_block_postings(block_postings, None))
     }
 
-    pub fn doc_cluster(&self, doc_id: DocId) -> u16 {
-        self.per_doc_cluster[doc_id as usize]
-    }
-
-    pub fn num_clusters(&self) -> usize {
-        self.centroid_index.as_ref().map_or(0, |ci| ci.len())
+    pub fn doc_cluster(&self, local_doc_id: DocId) -> u16 {
+        self.per_doc_cluster[local_doc_id as usize]
     }
 
     pub fn has_batch_data(&self, cluster_id: usize) -> bool {
@@ -833,7 +962,6 @@ impl ClusterFieldReader {
         let raw = self
             .batch_data
             .read_bytes_slice(meta.byte_offset..meta.byte_offset + meta.byte_len)?;
-        // First num_docs × 4 bytes are doc_ids
         let num_docs = meta.num_docs as usize;
         let mut doc_ids = Vec::with_capacity(num_docs);
         for i in 0..num_docs {
@@ -843,30 +971,11 @@ impl ClusterFieldReader {
         Ok(Some((doc_ids, meta, raw)))
     }
 
-    pub fn dim_bytes(&self) -> usize {
-        self.dim_bytes
-    }
-
-    /// Adaptive cluster probing: fetch candidate centroids from HNSW, then
-    /// lazily select which clusters to actually scan based on a distance-ratio
-    /// cutoff. This avoids the two-step pattern of calling `search_centroids`
-    /// then `cluster_postings` separately with a hardcoded n_probe.
-    ///
-    /// The key insight is that the HNSW centroid search is cheap (microseconds
-    /// even for thousands of centroids), while scanning a cluster's posting
-    /// list is expensive. So we over-fetch centroids up to `max_probe`, but
-    /// only materialize posting lists for clusters whose centroid distance
-    /// is within `distance_ratio` of the nearest centroid's distance.
-    ///
-    /// For example, with distance_ratio=1.5: if the nearest centroid is at
-    /// distance 10, we stop once we hit a centroid farther than 15 — those
-    /// clusters are unlikely to contain true nearest neighbors.
     pub fn probe_clusters(
         &self,
         query: &[f32],
         config: &ProbeConfig,
     ) -> crate::Result<Vec<(u32, SegmentPostings)>> {
-        // Over-fetch centroid candidates from HNSW — this is cheap
         let candidates = self.search_centroids(query, config.max_probe);
         if candidates.is_empty() {
             return Ok(vec![]);
@@ -874,9 +983,6 @@ impl ClusterFieldReader {
         let nearest_dist = candidates[0].1;
         let mut result = Vec::new();
         for (i, &(cluster_id, dist)) in candidates.iter().enumerate() {
-            // Always probe at least min_probe clusters, then apply the
-            // distance-ratio cutoff: if this centroid is much farther than
-            // the nearest, remaining clusters won't help.
             if i >= config.min_probe
                 && nearest_dist > 0.0
                 && dist / nearest_dist > config.distance_ratio
@@ -884,6 +990,182 @@ impl ClusterFieldReader {
                 break;
             }
             result.push((cluster_id, self.cluster_postings(cluster_id as usize)?));
+        }
+        Ok(result)
+    }
+}
+
+pub struct ClusterFieldReader {
+    windows: Vec<WindowReader>,
+    dim_bytes: usize,
+}
+
+impl ClusterFieldReader {
+    fn open(file_slice: FileSlice, metric: Metric) -> crate::Result<Self> {
+        let data = file_slice.read_bytes()?;
+
+        if data.len() < 8 {
+            return Err(crate::TantivyError::InternalError(
+                "cluster field section too short for windowed header".into(),
+            ));
+        }
+
+        let num_windows =
+            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let _window_size =
+            u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+
+        let mut offset = 8;
+        let mut windows = Vec::with_capacity(num_windows);
+        let mut dim_bytes = 0usize;
+
+        for _ in 0..num_windows {
+            if data.len() < offset + 8 {
+                return Err(crate::TantivyError::InternalError(
+                    "cluster field section too short for window header".into(),
+                ));
+            }
+            let win_doc_offset =
+                u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+            offset += 4;
+            let win_num_docs =
+                u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+            offset += 4;
+
+            let (win_reader, new_offset) =
+                WindowReader::open(&file_slice, &data, offset, win_doc_offset, win_num_docs, metric)?;
+            offset = new_offset;
+
+            if win_reader.dims > 0 {
+                dim_bytes = win_reader.dims / 8;
+            }
+
+            windows.push(win_reader);
+        }
+
+        Ok(Self { windows, dim_bytes })
+    }
+
+    pub fn is_clustered(&self) -> bool {
+        self.windows.iter().any(|w| w.is_clustered())
+    }
+
+    pub fn num_clusters(&self) -> usize {
+        self.windows.iter().map(|w| w.num_clusters()).sum()
+    }
+
+    pub fn num_windows(&self) -> usize {
+        self.windows.len()
+    }
+
+    pub fn window_reader(&self, idx: usize) -> &WindowReader {
+        &self.windows[idx]
+    }
+
+    pub fn doc_cluster(&self, doc_id: DocId) -> u16 {
+        let win_idx = doc_id as usize / WINDOW_SIZE;
+        let win = &self.windows[win_idx.min(self.windows.len() - 1)];
+        let local = doc_id - win.doc_offset as DocId;
+        win.doc_cluster(local)
+    }
+
+    pub fn search_centroids(&self, query: &[f32], ef_search: usize) -> Vec<(u32, f32)> {
+        if self.windows.len() == 1 {
+            return self.windows[0].search_centroids(query, ef_search);
+        }
+        let mut all = Vec::new();
+        for win in &self.windows {
+            all.extend(win.search_centroids(query, ef_search));
+        }
+        all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        all.truncate(ef_search);
+        all
+    }
+
+    pub fn cluster_postings(&self, cluster_id: usize) -> crate::Result<SegmentPostings> {
+        if self.windows.len() == 1 {
+            return self.windows[0].cluster_postings(cluster_id);
+        }
+        let mut remaining = cluster_id;
+        for win in &self.windows {
+            let nc = win.num_clusters();
+            if remaining < nc {
+                return win.cluster_postings(remaining);
+            }
+            remaining -= nc;
+        }
+        Ok(SegmentPostings::empty())
+    }
+
+    pub fn has_batch_data(&self, cluster_id: usize) -> bool {
+        if self.windows.len() == 1 {
+            return self.windows[0].has_batch_data(cluster_id);
+        }
+        let mut remaining = cluster_id;
+        for win in &self.windows {
+            let nc = win.num_clusters();
+            if remaining < nc {
+                return win.has_batch_data(remaining);
+            }
+            remaining -= nc;
+        }
+        false
+    }
+
+    pub fn cluster_batch_raw(
+        &self,
+        cluster_id: usize,
+    ) -> crate::Result<Option<(Vec<DocId>, &ClusterBatchMeta, common::OwnedBytes)>> {
+        if self.windows.len() == 1 {
+            return self.windows[0].cluster_batch_raw(cluster_id);
+        }
+        let mut remaining = cluster_id;
+        for win in &self.windows {
+            let nc = win.num_clusters();
+            if remaining < nc {
+                return win.cluster_batch_raw(remaining);
+            }
+            remaining -= nc;
+        }
+        Ok(None)
+    }
+
+    pub fn dim_bytes(&self) -> usize {
+        self.dim_bytes
+    }
+
+    pub fn probe_clusters(
+        &self,
+        query: &[f32],
+        config: &ProbeConfig,
+    ) -> crate::Result<Vec<(u32, SegmentPostings)>> {
+        if self.windows.len() == 1 {
+            return self.windows[0].probe_clusters(query, config);
+        }
+        let mut all_candidates: Vec<(usize, u32, f32)> = Vec::new();
+        for (win_idx, win) in self.windows.iter().enumerate() {
+            for (cluster_id, dist) in win.search_centroids(query, config.max_probe) {
+                all_candidates.push((win_idx, cluster_id, dist));
+            }
+        }
+        all_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        if all_candidates.is_empty() {
+            return Ok(vec![]);
+        }
+        let nearest_dist = all_candidates[0].2;
+        let mut result = Vec::new();
+        for (i, &(win_idx, cluster_id, dist)) in all_candidates.iter().enumerate() {
+            if i >= config.min_probe
+                && nearest_dist > 0.0
+                && dist / nearest_dist > config.distance_ratio
+            {
+                break;
+            }
+            result.push((
+                cluster_id,
+                self.windows[win_idx].cluster_postings(cluster_id as usize)?,
+            ));
         }
         Ok(result)
     }
