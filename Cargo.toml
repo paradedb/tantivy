@@ -79,7 +79,6 @@ rand = "0.9"
 rand_distr = "0.5"
 typetag = "0.2.21"
 matrixmultiply = "0.3"
-usearch = "2.24"
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"

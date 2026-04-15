@@ -1,90 +1,30 @@
-use usearch::ffi::{IndexOptions, MetricKind, ScalarKind};
-use usearch::Index;
-
 use crate::vector::rabitq::math::l2_distance_sqr;
 use crate::vector::rabitq::Metric;
-
-fn metric_to_usearch(metric: Metric) -> MetricKind {
-    match metric {
-        Metric::L2 => MetricKind::L2sq,
-        Metric::InnerProduct => MetricKind::IP,
-    }
-}
-
-fn make_options(dims: usize, metric: MetricKind) -> IndexOptions {
-    IndexOptions {
-        dimensions: dims,
-        metric,
-        quantization: ScalarKind::F32,
-        connectivity: 32,
-        expansion_add: 200,
-        expansion_search: 0,
-        multi: false,
-    }
-}
 
 pub struct CentroidIndex {
     pub(crate) centroid_ids: Vec<u32>,
     centroids: Vec<Vec<f32>>,
-    index: Index,
     dims: usize,
-    metric: MetricKind,
 }
 
 impl CentroidIndex {
-    pub fn build(centroids: Vec<Vec<f32>>, centroid_ids: Vec<u32>, metric: Metric) -> Self {
+    pub fn build(centroids: Vec<Vec<f32>>, centroid_ids: Vec<u32>, _metric: Metric) -> Self {
         assert_eq!(centroids.len(), centroid_ids.len());
         let dims = centroids.first().map_or(0, |v| v.len());
-        let metric = metric_to_usearch(metric);
-
-        let options = make_options(dims, metric);
-        let index = Index::new(&options).expect("failed to create usearch index");
-
-        if !centroids.is_empty() {
-            index
-                .reserve(centroids.len())
-                .expect("failed to reserve capacity");
-            for (i, centroid) in centroids.iter().enumerate() {
-                index
-                    .add(i as u64, centroid.as_slice())
-                    .expect("failed to add centroid");
-            }
-        }
-
         Self {
             centroid_ids,
             centroids,
-            index,
             dims,
-            metric,
         }
     }
 
-    pub fn search(&self, query: &[f32], ef_search: usize) -> Vec<(u32, f32)> {
+    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u32, f32)> {
         let n = self.centroid_ids.len();
         if n == 0 {
             return vec![];
         }
-        // For small cluster counts, brute-force is faster than HNSW
-        // due to graph traversal overhead. For larger counts, HNSW
-        // visits fewer nodes (O(log n) vs O(n)).
-        if n <= 1024 {
-            return self.brute_force_search(query, ef_search.min(n));
-        }
+        let k = k.min(n);
 
-        let limit = ef_search.min(n);
-        let results = self.index.search(query, limit).expect("search failed");
-
-        results
-            .keys
-            .iter()
-            .zip(results.distances.iter())
-            .map(|(&key, &dist)| (self.centroid_ids[key as usize], dist))
-            .collect()
-    }
-
-    fn brute_force_search(&self, query: &[f32], k: usize) -> Vec<(u32, f32)> {
-        let n = self.centroid_ids.len();
         let mut results = Vec::with_capacity(n);
         for i in 0..n {
             results.push((self.centroid_ids[i], l2_distance_sqr(query, &self.centroids[i])));
@@ -99,11 +39,16 @@ impl CentroidIndex {
     }
 
     pub fn save_to_bytes(&self) -> crate::Result<Vec<u8>> {
-        let len = self.index.serialized_length();
-        let mut buf = vec![0u8; len];
-        self.index.save_to_buffer(&mut buf).map_err(|e| {
-            crate::TantivyError::InternalError(format!("usearch save failed: {e}"))
-        })?;
+        let mut buf = Vec::new();
+        let n = self.centroids.len() as u32;
+        buf.extend_from_slice(&n.to_le_bytes());
+        buf.extend_from_slice(&(self.dims as u32).to_le_bytes());
+
+        for centroid in &self.centroids {
+            for &v in centroid {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         Ok(buf)
     }
 
@@ -111,32 +56,29 @@ impl CentroidIndex {
         bytes: &[u8],
         centroid_ids: Vec<u32>,
         dims: usize,
-        metric: Metric,
+        _metric: Metric,
     ) -> crate::Result<Self> {
-        let metric = metric_to_usearch(metric);
-        let options = make_options(dims, metric);
-        let index = Index::new(&options).map_err(|e| {
-            crate::TantivyError::InternalError(format!("usearch index create failed: {e}"))
-        })?;
-        index.load_from_buffer(bytes).map_err(|e| {
-            crate::TantivyError::InternalError(format!("usearch load failed: {e}"))
-        })?;
+        let mut pos = 0;
+        let n = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
+        pos += 4;
+        let _dims = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
+        pos += 4;
 
-        // Extract centroids from usearch index for brute-force path
-        let centroids: Vec<Vec<f32>> = (0..centroid_ids.len())
-            .map(|i| {
-                let mut v = vec![0.0f32; dims];
-                index.get(i as u64, &mut v).expect("failed to get centroid");
-                v
-            })
-            .collect();
+        let mut centroids = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut v = Vec::with_capacity(dims);
+            for _ in 0..dims {
+                let f = f32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]);
+                pos += 4;
+                v.push(f);
+            }
+            centroids.push(v);
+        }
 
         Ok(Self {
             centroid_ids,
             centroids,
-            index,
             dims,
-            metric,
         })
     }
 
@@ -150,10 +92,6 @@ impl CentroidIndex {
 
     pub fn dimension(&self) -> usize {
         self.dims
-    }
-
-    pub fn metric(&self) -> MetricKind {
-        self.metric
     }
 }
 
@@ -175,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn brute_force_fallback_single_centroid() {
+    fn single_centroid() {
         let centroids = vec![vec![5.0, 5.0]];
         let ids = vec![42];
         let index = CentroidIndex::build(centroids, ids, Metric::L2);
@@ -186,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn search_clamps_ef_search() {
+    fn search_clamps_k() {
         let centroids = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
         let ids = vec![1, 2];
         let index = CentroidIndex::build(centroids, ids, Metric::L2);
