@@ -198,12 +198,12 @@ fn cluster_from_vectors(
     })
 }
 
-fn cluster_from_merge(
+fn train_centroids(
     sampler: &dyn crate::vector::cluster::sampler::VectorSampler,
     field_config: &ClusterFieldConfig,
     config: &ClusterConfig,
     num_docs: usize,
-) -> crate::Result<ClusterResult> {
+) -> crate::Result<Vec<Vec<f32>>> {
     let sample_ids = sample_indices(num_docs, config.sample_ratio, config.sample_cap);
     let sample_doc_ids: Vec<DocId> = sample_ids.iter().map(|&i| i as DocId).collect();
     let sampled_vecs = sampler.sample_vectors(field_config.field, &sample_doc_ids)?;
@@ -218,32 +218,20 @@ fn cluster_from_merge(
     let k = (config.num_clusters_fn)(num_docs);
     let k = k.min(valid_vecs.len()).max(1);
     let result = run_kmeans_with_config(&valid_vecs, k, config.kmeans.clone());
+    Ok(result.centroids)
+}
 
-    let mut assignments = vec![0usize; num_docs];
-    for doc_id in 0..num_docs {
-        let vecs = sampler.sample_vectors(field_config.field, &[doc_id as DocId])?;
-        if let Some(vec) = vecs.into_iter().next().flatten() {
-            let mut best_cluster = 0;
-            let mut best_dist = f32::INFINITY;
-            for (ci, centroid) in result.centroids.iter().enumerate() {
-                let dist = l2_distance_sqr(&vec, centroid);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_cluster = ci;
-                }
-            }
-            assignments[doc_id] = best_cluster;
+fn assign_nearest_centroid(vec: &[f32], centroids: &[Vec<f32>]) -> usize {
+    let mut best = 0;
+    let mut best_dist = f32::INFINITY;
+    for (ci, centroid) in centroids.iter().enumerate() {
+        let dist = l2_distance_sqr(vec, centroid);
+        if dist < best_dist {
+            best_dist = dist;
+            best = ci;
         }
     }
-
-    let centroids = result.centroids.clone();
-    let data = build_cluster_data(result.centroids, &assignments, num_docs, field_config.metric);
-
-    Ok(ClusterResult {
-        data,
-        centroids,
-        assignments,
-    })
+    best
 }
 
 fn build_cluster_batch_data(
@@ -568,13 +556,17 @@ impl SegmentPlugin for ClusterPlugin {
                     doc_offset: win_start,
                 };
 
-                let result = cluster_from_merge(
+                let centroids = train_centroids(
                     &win_sampler,
                     field_cfg,
                     &self.config,
                     win_num_docs,
                 )?;
+                let num_clusters = centroids.len();
 
+                let mut assignments = vec![0usize; win_num_docs];
+                let mut per_cluster_docs: Vec<Vec<(DocId, Vec<u8>)>> =
+                    vec![Vec::new(); num_clusters];
                 for local_doc_id in 0..win_num_docs {
                     let global_doc_id = win_start + local_doc_id;
                     let vecs =
@@ -582,31 +574,19 @@ impl SegmentPlugin for ClusterPlugin {
                     let vec = vecs.into_iter().next().flatten().unwrap_or_else(|| {
                         vec![0.0f32; field_cfg.dims]
                     });
-                    let centroid = &result.centroids[result.assignments[local_doc_id]];
+                    let cluster_id = assign_nearest_centroid(&vec, &centroids);
+                    assignments[local_doc_id] = cluster_id;
+                    let centroid = &centroids[cluster_id];
                     let record = rabitq::encode(
                         &field_cfg.rotator, &rabitq_config, field_cfg.metric, &vec, centroid,
                     );
                     bw.write_all(&record)?;
-                }
-
-                let mut per_cluster_docs: Vec<Vec<(DocId, Vec<u8>)>> =
-                    vec![Vec::new(); result.data.num_clusters];
-                for local_doc_id in 0..win_num_docs {
-                    let global_doc_id = win_start + local_doc_id;
-                    let vecs =
-                        sampler.sample_vectors(field_cfg.field, &[global_doc_id as DocId])?;
-                    let vec = vecs.into_iter().next().flatten().unwrap_or_else(|| {
-                        vec![0.0f32; field_cfg.dims]
-                    });
-                    let centroid = &result.centroids[result.assignments[local_doc_id]];
-                    let record = rabitq::encode(
-                        &field_cfg.rotator, &rabitq_config, field_cfg.metric, &vec, centroid,
-                    );
-                    let cluster_id = result.assignments[local_doc_id];
                     per_cluster_docs[cluster_id].push((local_doc_id as DocId, record));
                 }
 
-                let mut data = result.data;
+                let mut data = build_cluster_data(
+                    centroids, &assignments, win_num_docs, field_cfg.metric,
+                );
                 data.cluster_batch_data = per_cluster_docs
                     .iter()
                     .map(|docs| build_cluster_batch_data(docs, dim_bytes, scalar_off))
