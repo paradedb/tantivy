@@ -225,10 +225,9 @@ impl SortKeyComputer for SortByVectorDistance {
                                 lower_bounds[j] = distances[j] - fe.abs();
                             }
 
-                            let threshold = top_n.threshold.unwrap_or(f32::MIN);
-                            let raw_threshold = -threshold;
                             for (j, &local_did) in batch_local_ids.iter().enumerate() {
                                 if !matched[j] { continue; }
+                                let raw_threshold = -(top_n.threshold.unwrap_or(f32::MIN));
                                 if lower_bounds[j] >= raw_threshold { continue; }
 
                                 let segment_did = (win_offset + local_did as usize) as DocId;

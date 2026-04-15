@@ -14,7 +14,6 @@ use tantivy::vector::cluster::plugin::{ClusterConfig, ClusterFieldConfig, Cluste
 use tantivy::vector::cluster::sampler::{VectorSampler, VectorSamplerFactory};
 use tantivy::vector::rabitq::rotation::{DynamicRotator, RotatorType};
 use tantivy::vector::rabitq::{self, Metric, RabitqConfig};
-use tantivy::vector::search::{VectorQuery, VectorQueryConfig};
 use tantivy::indexer::NoMergePolicy;
 use tantivy::columnar;
 use tantivy::{DocId, IndexWriter, TantivyDocument};
@@ -142,6 +141,30 @@ struct TantivyVectorIndex {
     total_bits: usize,
 }
 
+impl TantivyVectorIndex {
+    fn extract_ids(
+        &self,
+        searcher: &tantivy::Searcher,
+        top_docs: &[(tantivy::Score, tantivy::DocAddress)],
+    ) -> PyResult<Vec<i64>> {
+        let mut id_columns: Vec<Option<columnar::Column<i64>>> = Vec::new();
+        for seg in searcher.segment_readers() {
+            id_columns.push(seg.fast_fields().i64("id").ok());
+        }
+
+        let mut result_ids = Vec::with_capacity(top_docs.len());
+        for (_, addr) in top_docs {
+            let global_id = id_columns
+                .get(addr.segment_ord as usize)
+                .and_then(|col| col.as_ref())
+                .and_then(|col| col.first(addr.doc_id))
+                .unwrap_or(0);
+            result_ids.push(global_id);
+        }
+        Ok(result_ids)
+    }
+}
+
 #[pymethods]
 impl TantivyVectorIndex {
     #[new]
@@ -200,6 +223,7 @@ impl TantivyVectorIndex {
                 ex_bits: total_bits.saturating_sub(1),
                 metric,
                 rotator: rotator.clone(),
+                rotator_seed: 42,
             }],
             sampler_factory: Arc::new(ParquetSamplerFactory {
                 parquet_dir: PathBuf::from(parquet_dir),
@@ -325,6 +349,7 @@ impl TantivyVectorIndex {
                 ex_bits,
                 metric,
                 rotator: rotator.clone(),
+                rotator_seed: 42,
             }],
             sampler_factory: Arc::new(ParquetSamplerFactory {
                 parquet_dir: PathBuf::new(),
@@ -372,35 +397,19 @@ impl TantivyVectorIndex {
         let reader = self.cached_reader.as_ref().unwrap();
         let searcher = reader.searcher();
 
-        let config = VectorQueryConfig {
-            field: self.vec_field,
-            padded_dims: self.rotator.padded_dim(),
-            ex_bits: self.total_bits.saturating_sub(1),
-            metric: self.metric,
-            rotator: self.rotator.clone(),
-            probe: ProbeConfig::new(max_probe, distance_ratio),
+        let probe = ProbeConfig {
+            max_probe,
+            distance_ratio,
+            min_probe: 1,
         };
-
-        let vector_query = VectorQuery::new(query, config);
         let top_docs = searcher
-            .search(&vector_query, &TopDocs::with_limit(k).order_by_score())
+            .search(
+                &tantivy::query::AllQuery,
+                &TopDocs::with_limit(k).order_by_vector_distance_with_probe(query, self.vec_field, probe),
+            )
             .map_err(|e| PyRuntimeError::new_err(format!("search failed: {e}")))?;
 
-        let mut id_columns: Vec<Option<columnar::Column<i64>>> = Vec::new();
-        for seg in searcher.segment_readers() {
-            id_columns.push(seg.fast_fields().i64("id").ok());
-        }
-
-        let mut result_ids = Vec::with_capacity(top_docs.len());
-        for (_, addr) in &top_docs {
-            let global_id = id_columns
-                .get(addr.segment_ord as usize)
-                .and_then(|col| col.as_ref())
-                .and_then(|col| col.first(addr.doc_id))
-                .unwrap_or(0);
-            result_ids.push(global_id);
-        }
-        Ok(result_ids)
+        self.extract_ids(&searcher, &top_docs)
     }
 
     #[pyo3(signature = (query, label, k=100, max_probe=10, distance_ratio=2.0))]
@@ -425,36 +434,19 @@ impl TantivyVectorIndex {
             tantivy::schema::IndexRecordOption::Basic,
         );
 
-        let config = VectorQueryConfig {
-            field: self.vec_field,
-            padded_dims: self.rotator.padded_dim(),
-            ex_bits: self.total_bits.saturating_sub(1),
-            metric: self.metric,
-            rotator: self.rotator.clone(),
-            probe: ProbeConfig::new(max_probe, distance_ratio),
+        let probe = ProbeConfig {
+            max_probe,
+            distance_ratio,
+            min_probe: 1,
         };
-
-        let vector_query = VectorQuery::new(query, config)
-            .with_filter(Box::new(filter));
         let top_docs = searcher
-            .search(&vector_query, &TopDocs::with_limit(k).order_by_score())
+            .search(
+                &filter,
+                &TopDocs::with_limit(k).order_by_vector_distance_with_probe(query, self.vec_field, probe),
+            )
             .map_err(|e| PyRuntimeError::new_err(format!("search failed: {e}")))?;
 
-        let mut id_columns: Vec<Option<columnar::Column<i64>>> = Vec::new();
-        for seg in searcher.segment_readers() {
-            id_columns.push(seg.fast_fields().i64("id").ok());
-        }
-
-        let mut result_ids = Vec::with_capacity(top_docs.len());
-        for (_, addr) in &top_docs {
-            let global_id = id_columns
-                .get(addr.segment_ord as usize)
-                .and_then(|col| col.as_ref())
-                .and_then(|col| col.first(addr.doc_id))
-                .unwrap_or(0);
-            result_ids.push(global_id);
-        }
-        Ok(result_ids)
+        self.extract_ids(&searcher, &top_docs)
     }
 }
 

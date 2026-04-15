@@ -263,6 +263,18 @@ impl TopDocs {
         )
     }
 
+    pub fn order_by_vector_distance_with_probe(
+        self,
+        query_vector: Vec<f32>,
+        field: crate::schema::Field,
+        probe: crate::vector::cluster::plugin::ProbeConfig,
+    ) -> impl Collector<Fruit = Vec<(Score, DocAddress)>> {
+        TopBySortKeyCollector::new(
+            SortByVectorDistance::new(query_vector, field).with_probe(probe),
+            self.doc_range(),
+        )
+    }
+
     /// Set top-K to rank documents by a given fast field.
     ///
     /// If the field is not a fast field, or its field type does not match the generic type, this
