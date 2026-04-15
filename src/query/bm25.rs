@@ -278,7 +278,8 @@ mod tests {
 
         assert!(
             (score_default - score_custom).abs() > 1e-6,
-            "Custom k1/b should produce different scores: default={score_default}, custom={score_custom}"
+            "Custom k1/b should produce different scores: default={score_default}, \
+             custom={score_custom}"
         );
     }
 
