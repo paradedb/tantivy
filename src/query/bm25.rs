@@ -6,13 +6,26 @@ use crate::query::Explanation;
 use crate::schema::Field;
 use crate::{Score, Searcher, Term};
 
+/// Provides the corpus-level statistics needed by BM25 scoring.
+///
+/// The standard implementation is [`Searcher`], but you can implement this
+/// trait on your own type to supply custom statistics (e.g. cluster-wide
+/// counts in a distributed setting).
 pub trait Bm25StatisticsProvider {
+    /// Returns the total number of tokens indexed for `field` across all
+    /// segments.
     fn total_num_tokens(&self, field: Field) -> crate::Result<u64>;
+
+    /// Returns the total number of documents in the index.
     fn total_num_docs(&self) -> crate::Result<u64>;
+
+    /// Returns the number of documents containing `term`.
     fn doc_freq(&self, term: &Term) -> crate::Result<u64>;
 
-    fn bm25_params(&self, field: Field) -> Bm25Params {
-        let _ = field;
+    /// Returns the BM25 parameters (`k1`, `b`) for `field`.
+    ///
+    /// Defaults to [`Bm25Params::DEFAULT`] (`k1 = 1.2`, `b = 0.75`).
+    fn bm25_params(&self, _field: Field) -> Bm25Params {
         Bm25Params::default()
     }
 }
@@ -162,11 +175,11 @@ impl Bm25Weight {
         average_fieldnorm: Score,
         params: Bm25Params,
     ) -> Bm25Weight {
-        let weight = idf_explain.value() * (1.0 + params.k1);
+        let weight = idf_explain.value() * (1.0 + params.k1());
         Bm25Weight {
             idf_explain: Some(idf_explain),
             weight,
-            cache: compute_tf_cache(average_fieldnorm, params.k1, params.b),
+            cache: compute_tf_cache(average_fieldnorm, params.k1(), params.b()),
             average_fieldnorm,
             params,
         }
@@ -177,11 +190,11 @@ impl Bm25Weight {
         average_fieldnorm: Score,
         params: Bm25Params,
     ) -> Bm25Weight {
-        let weight = idf * (1.0 + params.k1);
+        let weight = idf * (1.0 + params.k1());
         Bm25Weight {
             idf_explain: None,
             weight,
-            cache: compute_tf_cache(average_fieldnorm, params.k1, params.b),
+            cache: compute_tf_cache(average_fieldnorm, params.k1(), params.b()),
             average_fieldnorm,
             params,
         }
@@ -216,8 +229,8 @@ impl Bm25Weight {
         );
 
         tf_explanation.add_const("freq, occurrences of term within document", term_freq);
-        tf_explanation.add_const("k1, term saturation parameter", self.params.k1);
-        tf_explanation.add_const("b, length normalization parameter", self.params.b);
+        tf_explanation.add_const("k1, term saturation parameter", self.params.k1());
+        tf_explanation.add_const("b, length normalization parameter", self.params.b());
         tf_explanation.add_const(
             "dl, length of field",
             FieldNormReader::id_to_fieldnorm(fieldnorm_id) as Score,
@@ -225,7 +238,7 @@ impl Bm25Weight {
         tf_explanation.add_const("avgdl, average length of field", self.average_fieldnorm);
 
         let mut explanation = Explanation::new("TermQuery, product of...", score);
-        explanation.add_detail(Explanation::new("(K1+1)", self.params.k1 + 1.0));
+        explanation.add_detail(Explanation::new("(K1+1)", self.params.k1() + 1.0));
         if let Some(idf_explain) = &self.idf_explain {
             explanation.add_detail(idf_explain.clone());
         }
@@ -244,5 +257,42 @@ mod tests {
     fn test_idf() {
         let score: Score = 2.0;
         assert_nearly_equals!(idf(1, 2), score.ln());
+    }
+
+    #[test]
+    fn test_custom_bm25_params_produce_different_scores() {
+        use super::Bm25Weight;
+        use crate::index::Bm25Params;
+
+        let default_params = Bm25Params::default();
+        let custom_params = Bm25Params::new(2.0, 0.3);
+
+        let w_default = Bm25Weight::for_one_term(10, 100, 50.0, default_params);
+        let w_custom = Bm25Weight::for_one_term(10, 100, 50.0, custom_params);
+
+        let fieldnorm_id = 10u8;
+        let term_freq = 5u32;
+
+        let score_default = w_default.score(fieldnorm_id, term_freq);
+        let score_custom = w_custom.score(fieldnorm_id, term_freq);
+
+        assert!(
+            (score_default - score_custom).abs() > 1e-6,
+            "Custom k1/b should produce different scores: default={score_default}, custom={score_custom}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "k1 must be non-negative")]
+    fn test_bm25_params_rejects_negative_k1() {
+        use crate::index::Bm25Params;
+        Bm25Params::new(-1.0, 0.75);
+    }
+
+    #[test]
+    #[should_panic(expected = "b must be in [0, 1]")]
+    fn test_bm25_params_rejects_b_out_of_range() {
+        use crate::index::Bm25Params;
+        Bm25Params::new(1.2, 1.5);
     }
 }
