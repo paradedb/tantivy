@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use tantivy::collector::TopDocs;
 use tantivy::index::Index;
 use tantivy::plugin::SegmentPlugin;
-use tantivy::schema::{Schema, FAST, STORED, TEXT};
+use tantivy::schema::{Schema, FAST, STORED, STRING, TEXT};
 use tantivy::vector::bqvec::BqVecPlugin;
 use tantivy::vector::cluster::kmeans::KMeansConfig;
 use tantivy::vector::cluster::plugin::{ClusterConfig, ClusterFieldConfig, ClusterPlugin, ProbeConfig};
@@ -136,6 +136,7 @@ struct TantivyVectorIndex {
     vec_field: Field,
     text_field: Field,
     id_field: Field,
+    label_field: Field,
     metric: Metric,
     rotator: Arc<DynamicRotator>,
     total_bits: usize,
@@ -162,6 +163,7 @@ impl TantivyVectorIndex {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT | STORED);
         let id_field = schema_builder.add_i64_field("id", FAST);
+        let label_field = schema_builder.add_text_field("label", STRING);
         let vec_field = schema_builder.add_vector_field("embedding", dim);
         let schema = schema_builder.build();
 
@@ -229,6 +231,7 @@ impl TantivyVectorIndex {
             vec_field,
             text_field,
             id_field,
+            label_field,
             metric,
             rotator,
             total_bits,
@@ -236,17 +239,28 @@ impl TantivyVectorIndex {
         })
     }
 
-    fn insert(&mut self, ids: Vec<i64>, vectors: Vec<Vec<f32>>) -> PyResult<usize> {
+    #[pyo3(signature = (ids, vectors, labels=None))]
+    fn insert(
+        &mut self,
+        ids: Vec<i64>,
+        vectors: Vec<Vec<f32>>,
+        labels: Option<Vec<String>>,
+    ) -> PyResult<usize> {
         let writer = self.writer.as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("writer closed after optimize"))?;
 
         let count = ids.len();
-        for (id, vec) in ids.into_iter().zip(vectors.into_iter()) {
+        for (i, (id, vec)) in ids.into_iter().zip(vectors.into_iter()).enumerate() {
+            let mut doc = tantivy::TantivyDocument::new();
+            doc.add_i64(self.id_field, id);
+            doc.add_leaf_field_value(self.vec_field, tantivy::schema::document::ReferenceValueLeaf::Vector(&vec));
+            if let Some(ref labels) = labels {
+                if i < labels.len() {
+                    doc.add_text(self.label_field, &labels[i]);
+                }
+            }
             writer
-                .add_document(tantivy::doc!(
-                    self.id_field => id,
-                    self.vec_field => vec
-                ))
+                .add_document(doc)
                 .map_err(|e| PyRuntimeError::new_err(format!("add_document failed: {e}")))?;
         }
         Ok(count)
@@ -279,6 +293,7 @@ impl TantivyVectorIndex {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT | STORED);
         let id_field = schema_builder.add_i64_field("id", FAST);
+        let label_field = schema_builder.add_text_field("label", STRING);
         let vec_field = schema_builder.add_vector_field("embedding", dim);
         let schema = schema_builder.build();
 
@@ -335,6 +350,7 @@ impl TantivyVectorIndex {
             vec_field,
             text_field,
             id_field,
+            label_field,
             metric,
             rotator,
             total_bits,
@@ -366,6 +382,60 @@ impl TantivyVectorIndex {
         };
 
         let vector_query = VectorQuery::new(query, config);
+        let top_docs = searcher
+            .search(&vector_query, &TopDocs::with_limit(k).order_by_score())
+            .map_err(|e| PyRuntimeError::new_err(format!("search failed: {e}")))?;
+
+        let mut id_columns: Vec<Option<columnar::Column<i64>>> = Vec::new();
+        for seg in searcher.segment_readers() {
+            id_columns.push(seg.fast_fields().i64("id").ok());
+        }
+
+        let mut result_ids = Vec::with_capacity(top_docs.len());
+        for (_, addr) in &top_docs {
+            let global_id = id_columns
+                .get(addr.segment_ord as usize)
+                .and_then(|col| col.as_ref())
+                .and_then(|col| col.first(addr.doc_id))
+                .unwrap_or(0);
+            result_ids.push(global_id);
+        }
+        Ok(result_ids)
+    }
+
+    #[pyo3(signature = (query, label, k=100, max_probe=10, distance_ratio=2.0))]
+    fn search_filtered(
+        &mut self,
+        query: Vec<f32>,
+        label: String,
+        k: usize,
+        max_probe: usize,
+        distance_ratio: f32,
+    ) -> PyResult<Vec<i64>> {
+        if self.cached_reader.is_none() {
+            self.cached_reader = Some(self.index.reader()
+                .map_err(|e| PyRuntimeError::new_err(format!("reader failed: {e}")))?);
+        }
+        let reader = self.cached_reader.as_ref().unwrap();
+        let searcher = reader.searcher();
+
+        let term = tantivy::Term::from_field_text(self.label_field, &label);
+        let filter = tantivy::query::TermQuery::new(
+            term,
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+
+        let config = VectorQueryConfig {
+            field: self.vec_field,
+            padded_dims: self.rotator.padded_dim(),
+            ex_bits: self.total_bits.saturating_sub(1),
+            metric: self.metric,
+            rotator: self.rotator.clone(),
+            probe: ProbeConfig::new(max_probe, distance_ratio),
+        };
+
+        let vector_query = VectorQuery::new(query, config)
+            .with_filter(Box::new(filter));
         let top_docs = searcher
             .search(&vector_query, &TopDocs::with_limit(k).order_by_score())
             .map_err(|e| PyRuntimeError::new_err(format!("search failed: {e}")))?;
