@@ -58,6 +58,7 @@ fn make_plugins(
             ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
+            rotator_seed: 42,
         }],
         sampler_factory: Arc::new(InMemorySamplerFactory { vectors: shared_vecs }),
     }));
@@ -159,6 +160,7 @@ fn test_e2e_distance_ordering() -> crate::Result<()> {
             ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
+            rotator_seed: 42,
         }],
         sampler_factory: Arc::new(InMemorySamplerFactory { vectors: shared_vecs }),
     }));

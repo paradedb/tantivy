@@ -18,7 +18,7 @@ use crate::plugin::{
 };
 use crate::postings::{BlockSegmentPostings, PostingsSerializer, SegmentPostings};
 use crate::vector::rabitq::math::l2_distance_sqr;
-use crate::vector::rabitq::rotation::DynamicRotator;
+use crate::vector::rabitq::rotation::{DynamicRotator, RotatorType};
 use crate::vector::rabitq::{self, Metric, RabitqConfig};
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema};
@@ -38,6 +38,17 @@ pub struct ClusterFieldConfig {
     pub ex_bits: usize,
     pub metric: Metric,
     pub rotator: Arc<DynamicRotator>,
+    pub rotator_seed: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct VectorFieldMeta {
+    pub dims: usize,
+    pub padded_dims: usize,
+    pub ex_bits: usize,
+    pub metric: Metric,
+    pub rotator_type: RotatorType,
+    pub rotator_seed: u64,
 }
 
 pub struct ClusterConfig {
@@ -356,13 +367,64 @@ fn serialize_empty(w: &mut dyn Write) -> crate::Result<()> {
     Ok(())
 }
 
+fn serialize_field_meta(meta: &VectorFieldMeta, w: &mut dyn Write) -> crate::Result<()> {
+    w.write_all(&(meta.dims as u32).to_le_bytes())?;
+    w.write_all(&(meta.padded_dims as u32).to_le_bytes())?;
+    w.write_all(&(meta.ex_bits as u32).to_le_bytes())?;
+    w.write_all(&[match meta.metric {
+        Metric::L2 => 0u8,
+        Metric::InnerProduct => 1u8,
+    }])?;
+    w.write_all(&[meta.rotator_type as u8])?;
+    w.write_all(&meta.rotator_seed.to_le_bytes())?;
+    Ok(())
+}
+
+fn deserialize_field_meta(data: &[u8], pos: &mut usize) -> VectorFieldMeta {
+    let read_u32 = |p: &mut usize| -> u32 {
+        let v = u32::from_le_bytes([data[*p], data[*p+1], data[*p+2], data[*p+3]]);
+        *p += 4;
+        v
+    };
+    let dims = read_u32(pos) as usize;
+    let padded_dims = read_u32(pos) as usize;
+    let ex_bits = read_u32(pos) as usize;
+    let metric = if data[*pos] == 0 { Metric::L2 } else { Metric::InnerProduct };
+    *pos += 1;
+    let rotator_type = RotatorType::from_u8(data[*pos]).unwrap_or(RotatorType::FhtKacRotator);
+    *pos += 1;
+    let rotator_seed = u64::from_le_bytes([
+        data[*pos], data[*pos+1], data[*pos+2], data[*pos+3],
+        data[*pos+4], data[*pos+5], data[*pos+6], data[*pos+7],
+    ]);
+    *pos += 8;
+    VectorFieldMeta { dims, padded_dims, ex_bits, metric, rotator_type, rotator_seed }
+}
+
+const FIELD_META_SIZE: usize = 4 + 4 + 4 + 1 + 1 + 8; // 22 bytes
+
+impl VectorFieldMeta {
+    fn from_config(cfg: &ClusterFieldConfig) -> Self {
+        Self {
+            dims: cfg.dims,
+            padded_dims: cfg.padded_dims,
+            ex_bits: cfg.ex_bits,
+            metric: cfg.metric,
+            rotator_type: cfg.rotator.rotator_type(),
+            rotator_seed: cfg.rotator_seed,
+        }
+    }
+}
+
 fn serialize_windowed_field(
     windows: &[(u32, u32, ClusterData)],
+    meta: &VectorFieldMeta,
     w: &mut dyn Write,
 ) -> crate::Result<()> {
     let num_windows = windows.len() as u32;
     w.write_all(&num_windows.to_le_bytes())?;
     w.write_all(&(WINDOW_SIZE as u32).to_le_bytes())?;
+    serialize_field_meta(meta, w)?;
 
     for (doc_offset, num_docs, data) in windows {
         w.write_all(&doc_offset.to_le_bytes())?;
@@ -373,10 +435,15 @@ fn serialize_windowed_field(
     Ok(())
 }
 
-fn serialize_windowed_empty(w: &mut dyn Write, num_docs: usize) -> crate::Result<()> {
+fn serialize_windowed_empty(
+    w: &mut dyn Write,
+    num_docs: usize,
+    meta: &VectorFieldMeta,
+) -> crate::Result<()> {
     let num_windows = num_docs.div_ceil(WINDOW_SIZE).max(1) as u32;
     w.write_all(&num_windows.to_le_bytes())?;
     w.write_all(&(WINDOW_SIZE as u32).to_le_bytes())?;
+    serialize_field_meta(meta, w)?;
 
     let mut offset = 0u32;
     for _ in 0..num_windows {
@@ -438,7 +505,8 @@ impl SegmentPlugin for ClusterPlugin {
             for field_cfg in &self.config.fields {
                 let rabitq_config = RabitqConfig::new(field_cfg.ex_bits + 1);
                 let cw = cluster_composite.for_field(field_cfg.field);
-                serialize_windowed_empty(cw, num_docs)?;
+                let meta = VectorFieldMeta::from_config(field_cfg);
+                serialize_windowed_empty(cw, num_docs, &meta)?;
                 cw.flush()?;
 
                 let bytes_per_record =
@@ -550,7 +618,8 @@ impl SegmentPlugin for ClusterPlugin {
             bw.flush()?;
 
             let cw = cluster_composite.for_field(field_cfg.field);
-            serialize_windowed_field(&windows, cw)?;
+            let meta = VectorFieldMeta::from_config(field_cfg);
+            serialize_windowed_field(&windows, &meta, cw)?;
             cw.flush()?;
         }
 
@@ -646,8 +715,9 @@ impl PluginWriter for ClusterPluginWriter {
             bw.write_all(&(bytes_per_record as u32).to_le_bytes())?;
             bw.write_all(&(num_docs as u32).to_le_bytes())?;
 
+            let meta = VectorFieldMeta::from_config(field_cfg);
             if (num_docs as u32) < self.config.clustering_threshold || num_docs == 0 {
-                serialize_windowed_empty(cw, num_docs)?;
+                serialize_windowed_empty(cw, num_docs, &meta)?;
                 cw.flush()?;
                 let zero = vec![0.0f32; field_cfg.dims];
                 if let Some(vectors) = vectors {
@@ -702,7 +772,7 @@ impl PluginWriter for ClusterPluginWriter {
 
             bw.flush()?;
 
-            serialize_windowed_field(&windows, cw)?;
+            serialize_windowed_field(&windows, &meta, cw)?;
             cw.flush()?;
         }
 
@@ -998,6 +1068,7 @@ impl WindowReader {
 pub struct ClusterFieldReader {
     windows: Vec<WindowReader>,
     dim_bytes: usize,
+    field_meta: Option<VectorFieldMeta>,
 }
 
 impl ClusterFieldReader {
@@ -1016,6 +1087,13 @@ impl ClusterFieldReader {
             u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
 
         let mut offset = 8;
+
+        // Deserialize field metadata (if present — check remaining bytes)
+        let field_meta = if offset + FIELD_META_SIZE <= data.len() {
+            Some(deserialize_field_meta(&data, &mut offset))
+        } else {
+            None
+        };
         let mut windows = Vec::with_capacity(num_windows);
         let mut dim_bytes = 0usize;
 
@@ -1043,7 +1121,7 @@ impl ClusterFieldReader {
             windows.push(win_reader);
         }
 
-        Ok(Self { windows, dim_bytes })
+        Ok(Self { windows, dim_bytes, field_meta })
     }
 
     pub fn is_clustered(&self) -> bool {
@@ -1132,6 +1210,10 @@ impl ClusterFieldReader {
 
     pub fn dim_bytes(&self) -> usize {
         self.dim_bytes
+    }
+
+    pub fn field_meta(&self) -> Option<&VectorFieldMeta> {
+        self.field_meta.as_ref()
     }
 
     pub fn probe_clusters(

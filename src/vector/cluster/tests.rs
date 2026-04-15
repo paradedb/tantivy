@@ -85,6 +85,7 @@ fn make_cluster_plugin(
             ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
+            rotator_seed: 42,
         }],
         sampler_factory,
     }))
@@ -320,6 +321,7 @@ fn test_hnsw_centroid_search_accuracy() -> crate::Result<()> {
             ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
+            rotator_seed: 42,
         }],
         sampler_factory: Arc::new(InMemorySamplerFactory {
             vectors: shared_vecs,
@@ -418,6 +420,7 @@ fn test_probe_clusters_adaptive() -> crate::Result<()> {
             ex_bits: 6,
             metric: Metric::L2,
             rotator: rotator.clone(),
+            rotator_seed: 42,
         }],
         sampler_factory: Arc::new(InMemorySamplerFactory {
             vectors: shared_vecs,
