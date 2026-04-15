@@ -11,6 +11,7 @@ use crate::vector::rabitq::rotation::DynamicRotator;
 use crate::vector::rabitq::{self, Metric, RaBitQQuery};
 use crate::{DocAddress, DocId, Score};
 
+#[derive(Clone)]
 pub struct SortByVectorDistance {
     query_vector: Vec<f32>,
     field: Field,

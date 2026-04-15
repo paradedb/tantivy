@@ -1233,6 +1233,7 @@ impl ClusterFieldReader {
     }
 }
 
+#[derive(Clone)]
 pub struct ProbeConfig {
     pub max_probe: usize,
     pub distance_ratio: f32,
