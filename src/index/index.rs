@@ -696,6 +696,11 @@ impl Index {
         &self.plugins
     }
 
+    /// Register a plugin on an already-opened index.
+    pub fn register_plugin(&mut self, plugin: Arc<dyn SegmentPlugin>) {
+        self.plugins.push(plugin);
+    }
+
     /// Accessor to the index settings
     pub fn settings(&self) -> &IndexSettings {
         &self.settings
