@@ -1243,7 +1243,7 @@ pub struct ProbeConfig {
 impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
-            max_probe: 20,
+            max_probe: 200,
             distance_ratio: 1000.0,
             min_probe: 1,
         }
