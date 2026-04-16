@@ -1244,7 +1244,7 @@ impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
             max_probe: 20,
-            distance_ratio: 10.0,
+            distance_ratio: 1000.0,
             min_probe: 1,
         }
     }
