@@ -196,6 +196,20 @@ impl SchemaBuilder {
         self.add_field(field_entry)
     }
 
+    /// Adds a vector field with an explicit distance metric.
+    pub fn add_vector_field_with_metric(
+        &mut self,
+        field_name: &str,
+        dimensions: usize,
+        metric: VectorMetric,
+    ) -> Field {
+        let field_entry = FieldEntry::new_vector(
+            field_name.to_string(),
+            VectorOptions::with_metric(dimensions, metric),
+        );
+        self.add_field(field_entry)
+    }
+
     /// Adds a json object field to the schema.
     pub fn add_json_field<T: Into<JsonObjectOptions>>(
         &mut self,
