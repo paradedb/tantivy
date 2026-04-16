@@ -56,12 +56,6 @@ impl SortKeyComputer for SortByVectorDistance {
         reader: &crate::SegmentReader,
         segment_ord: u32,
     ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
-        eprintln!(
-            "[VEC_TANTIVY] collect_segment_top_k seg={segment_ord} k={k} max_doc={} field={:?}",
-            reader.max_doc(),
-            self.field
-        );
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         let field = self.field;
 
         let bq_plugin: Arc<BqVecPluginReader> = reader
