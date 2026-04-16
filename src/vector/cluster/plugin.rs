@@ -977,6 +977,30 @@ impl WindowReader {
         cluster_id < self.batch_meta.len() && self.batch_meta[cluster_id].num_batches > 0
     }
 
+    /// Read just the doc_id prefix of a cluster's batch_data (small, ~num_docs * 4 bytes).
+    /// Cheap pre-check for filter-bitset overlap without paying the full ~63KB read.
+    pub fn cluster_doc_ids(&self, cluster_id: usize) -> crate::Result<Option<Vec<DocId>>> {
+        if cluster_id >= self.batch_meta.len() {
+            return Ok(None);
+        }
+        let meta = &self.batch_meta[cluster_id];
+        if meta.num_batches == 0 {
+            return Ok(None);
+        }
+        let num_docs = meta.num_docs as usize;
+        let prefix = self
+            .batch_data
+            .read_bytes_slice(meta.byte_offset..meta.byte_offset + num_docs * 4)?;
+        let mut doc_ids = Vec::with_capacity(num_docs);
+        for i in 0..num_docs {
+            let off = i * 4;
+            doc_ids.push(u32::from_le_bytes([
+                prefix[off], prefix[off + 1], prefix[off + 2], prefix[off + 3],
+            ]));
+        }
+        Ok(Some(doc_ids))
+    }
+
     pub fn cluster_batch_raw(
         &self,
         cluster_id: usize,
