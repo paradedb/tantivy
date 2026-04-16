@@ -173,26 +173,6 @@ impl SortKeyComputer for SortByVectorDistance {
                     }
                     let g_add = dist;
 
-                    // Filter-aware fast path: if the query has a filter, check the
-                    // cluster's doc_ids (~2KB per cluster) against the filter bitset
-                    // before paying for the full ~60KB batch_data read. For selective
-                    // filters (e.g. 1%), most probed clusters have zero matches and
-                    // we can skip them entirely.
-                    if has_window_filter {
-                        let doc_ids_opt = win
-                            .cluster_doc_ids(cluster_id as usize)
-                            .ok()
-                            .flatten();
-                        let Some(doc_ids) = doc_ids_opt else { continue };
-                        let any_match = doc_ids.iter().any(|&local_did| {
-                            let local = local_did as usize;
-                            (filter_bits[local / 64] >> (local % 64)) & 1 != 0
-                        });
-                        if !any_match {
-                            continue;
-                        }
-                    }
-
                     if let Ok(Some((local_doc_ids, batch_meta, raw))) =
                         win.cluster_batch_raw(cluster_id as usize)
                     {
