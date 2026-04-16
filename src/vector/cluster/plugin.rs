@@ -414,10 +414,27 @@ fn serialize_windowed_field(
     w.write_all(&(WINDOW_SIZE as u32).to_le_bytes())?;
     serialize_field_meta(meta, w)?;
 
+    // Pre-serialize each window's bytes so we can record byte offsets in a directory.
+    let mut window_bufs: Vec<(u32, u32, Vec<u8>)> = Vec::with_capacity(windows.len());
     for (doc_offset, num_docs, data) in windows {
+        let mut buf = Vec::new();
+        serialize_cluster_data(data, &mut buf)?;
+        window_bufs.push((*doc_offset, *num_docs, buf));
+    }
+
+    let preamble_size = 4 + 4 + FIELD_META_SIZE;
+    let dir_size = window_bufs.len() * 24;
+    let mut byte_off: u64 = (preamble_size + dir_size) as u64;
+    for (doc_offset, num_docs, buf) in &window_bufs {
+        let len = buf.len() as u64;
+        w.write_all(&byte_off.to_le_bytes())?;
+        w.write_all(&len.to_le_bytes())?;
         w.write_all(&doc_offset.to_le_bytes())?;
         w.write_all(&num_docs.to_le_bytes())?;
-        serialize_cluster_data(data, w)?;
+        byte_off += len;
+    }
+    for (_, _, buf) in window_bufs {
+        w.write_all(&buf)?;
     }
 
     Ok(())
@@ -433,13 +450,29 @@ fn serialize_windowed_empty(
     w.write_all(&(WINDOW_SIZE as u32).to_le_bytes())?;
     serialize_field_meta(meta, w)?;
 
-    let mut offset = 0u32;
+    let mut window_bufs: Vec<(u32, u32, Vec<u8>)> = Vec::with_capacity(num_windows as usize);
+    let mut doc_off = 0u32;
     for _ in 0..num_windows {
-        let window_docs = (num_docs as u32).saturating_sub(offset).min(WINDOW_SIZE as u32);
-        w.write_all(&offset.to_le_bytes())?;
-        w.write_all(&window_docs.to_le_bytes())?;
-        serialize_empty(w)?;
-        offset += window_docs;
+        let window_docs = (num_docs as u32).saturating_sub(doc_off).min(WINDOW_SIZE as u32);
+        let mut buf = Vec::new();
+        serialize_empty(&mut buf)?;
+        window_bufs.push((doc_off, window_docs, buf));
+        doc_off += window_docs;
+    }
+
+    let preamble_size = 4 + 4 + FIELD_META_SIZE;
+    let dir_size = window_bufs.len() * 24;
+    let mut byte_off: u64 = (preamble_size + dir_size) as u64;
+    for (doc_offset, num_docs, buf) in &window_bufs {
+        let len = buf.len() as u64;
+        w.write_all(&byte_off.to_le_bytes())?;
+        w.write_all(&len.to_le_bytes())?;
+        w.write_all(&doc_offset.to_le_bytes())?;
+        w.write_all(&num_docs.to_le_bytes())?;
+        byte_off += len;
+    }
+    for (_, _, buf) in window_bufs {
+        w.write_all(&buf)?;
     }
 
     Ok(())
@@ -831,6 +864,7 @@ impl WindowReader {
         doc_offset: u32,
         num_docs_in_window: u32,
         metric: Metric,
+        file_base_offset: usize,
     ) -> crate::Result<(Self, usize)> {
         let mut offset = base_offset;
 
@@ -904,7 +938,8 @@ impl WindowReader {
         }
 
         let postings_end = offset + cumulative_offset;
-        let postings_data = file_slice.slice(offset..postings_end);
+        let postings_data =
+            file_slice.slice(file_base_offset + offset..file_base_offset + postings_end);
         offset = postings_end;
 
         let mut batch_meta = Vec::with_capacity(num_clusters);
@@ -933,7 +968,9 @@ impl WindowReader {
             }
         }
         let batch_data = if batch_cumulative > 0 {
-            file_slice.slice(offset..offset + batch_cumulative)
+            file_slice.slice(
+                file_base_offset + offset..file_base_offset + offset + batch_cumulative,
+            )
         } else {
             FileSlice::empty()
         };
@@ -1042,191 +1079,147 @@ impl WindowReader {
     }
 }
 
+struct WindowDirEntry {
+    byte_offset: u64,
+    byte_len: u64,
+    doc_offset: u32,
+    num_docs: u32,
+}
+
 pub struct ClusterFieldReader {
-    windows: Vec<WindowReader>,
-    dim_bytes: usize,
+    file_slice: FileSlice,
+    metric: Metric,
     field_meta: Option<VectorFieldMeta>,
+    directory: Vec<WindowDirEntry>,
+    /// Lazily opened windows. Each window's small metadata (centroids + offsets)
+    /// is loaded on first access; the bulk batch_data and postings_data remain
+    /// FileSlices that lazy-load per-cluster.
+    windows: Vec<once_cell::sync::OnceCell<WindowReader>>,
 }
 
 impl ClusterFieldReader {
     fn open(file_slice: FileSlice, metric: Metric) -> crate::Result<Self> {
-        let data = file_slice.read_bytes()?;
-
-        if data.len() < 8 {
+        // Only read the preamble + window directory upfront.
+        let preamble_size = 4 + 4 + FIELD_META_SIZE;
+        let total_len: usize = file_slice.num_bytes().get_bytes() as usize;
+        if total_len < preamble_size {
             return Err(crate::TantivyError::InternalError(
                 "cluster field section too short for windowed header".into(),
             ));
         }
-
+        let preamble_slice = file_slice.slice(0..preamble_size);
+        let preamble = preamble_slice.read_bytes()?;
         let num_windows =
-            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            u32::from_le_bytes([preamble[0], preamble[1], preamble[2], preamble[3]]) as usize;
         let _window_size =
-            u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            u32::from_le_bytes([preamble[4], preamble[5], preamble[6], preamble[7]]) as usize;
+        let mut off = 8;
+        let field_meta = Some(deserialize_field_meta(&preamble, &mut off));
 
-        let mut offset = 8;
+        let dir_size = num_windows * 24;
+        if total_len < preamble_size + dir_size {
+            return Err(crate::TantivyError::InternalError(
+                "cluster field section too short for window directory".into(),
+            ));
+        }
+        let dir_slice = file_slice.slice(preamble_size..preamble_size + dir_size);
+        let dir_bytes = dir_slice.read_bytes()?;
 
-        // Deserialize field metadata (if present — check remaining bytes)
-        let field_meta = if offset + FIELD_META_SIZE <= data.len() {
-            Some(deserialize_field_meta(&data, &mut offset))
-        } else {
-            None
-        };
-        let mut windows = Vec::with_capacity(num_windows);
-        let mut dim_bytes = 0usize;
-
+        let mut directory = Vec::with_capacity(num_windows);
+        let mut p = 0;
         for _ in 0..num_windows {
-            if data.len() < offset + 8 {
-                return Err(crate::TantivyError::InternalError(
-                    "cluster field section too short for window header".into(),
-                ));
-            }
-            let win_doc_offset =
-                u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-            offset += 4;
-            let win_num_docs =
-                u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-            offset += 4;
-
-            let (win_reader, new_offset) =
-                WindowReader::open(&file_slice, &data, offset, win_doc_offset, win_num_docs, metric)?;
-            offset = new_offset;
-
-            if win_reader.dims > 0 {
-                dim_bytes = win_reader.dims / 8;
-            }
-
-            windows.push(win_reader);
+            let byte_offset = u64::from_le_bytes([
+                dir_bytes[p], dir_bytes[p + 1], dir_bytes[p + 2], dir_bytes[p + 3],
+                dir_bytes[p + 4], dir_bytes[p + 5], dir_bytes[p + 6], dir_bytes[p + 7],
+            ]);
+            p += 8;
+            let byte_len = u64::from_le_bytes([
+                dir_bytes[p], dir_bytes[p + 1], dir_bytes[p + 2], dir_bytes[p + 3],
+                dir_bytes[p + 4], dir_bytes[p + 5], dir_bytes[p + 6], dir_bytes[p + 7],
+            ]);
+            p += 8;
+            let doc_offset = u32::from_le_bytes([
+                dir_bytes[p], dir_bytes[p + 1], dir_bytes[p + 2], dir_bytes[p + 3],
+            ]);
+            p += 4;
+            let num_docs = u32::from_le_bytes([
+                dir_bytes[p], dir_bytes[p + 1], dir_bytes[p + 2], dir_bytes[p + 3],
+            ]);
+            p += 4;
+            directory.push(WindowDirEntry {
+                byte_offset,
+                byte_len,
+                doc_offset,
+                num_docs,
+            });
         }
 
-        Ok(Self { windows, dim_bytes, field_meta })
+        let windows: Vec<_> = (0..num_windows)
+            .map(|_| once_cell::sync::OnceCell::new())
+            .collect();
+
+        Ok(Self {
+            file_slice,
+            metric,
+            field_meta,
+            directory,
+            windows,
+        })
+    }
+
+    fn ensure_window(&self, idx: usize) -> crate::Result<&WindowReader> {
+        self.windows[idx].get_or_try_init(|| {
+            let entry = &self.directory[idx];
+            // Only read the small metadata header for this window — NOT batch_data.
+            // Read enough to cover: 12 (header) + 4 (ci_len) + ci_len bytes (centroids)
+            // + per_doc_cluster + postings_meta + batch_meta. We don't know ci_len
+            // in advance so we do a small initial read, then a follow-up if needed.
+            // For simplicity, just read the whole window section here. The bulk
+            // (batch_data, postings_data) are sliced as FileSlices and only their
+            // per-cluster ranges are read on demand at probe time.
+            // TODO: split into two reads (small header to learn sizes, then exact range).
+            let win_slice = self
+                .file_slice
+                .slice(entry.byte_offset as usize..(entry.byte_offset + entry.byte_len) as usize);
+            let data = win_slice.read_bytes()?;
+            let (reader, _) = WindowReader::open(
+                &self.file_slice,
+                &data,
+                0,
+                entry.doc_offset,
+                entry.num_docs,
+                self.metric,
+                entry.byte_offset as usize,
+            )?;
+            Ok(reader)
+        })
     }
 
     pub fn is_clustered(&self) -> bool {
-        self.windows.iter().any(|w| w.is_clustered())
+        !self.directory.is_empty()
     }
 
     pub fn num_clusters(&self) -> usize {
-        self.windows.iter().map(|w| w.num_clusters()).sum()
+        (0..self.directory.len())
+            .filter_map(|i| self.ensure_window(i).ok().map(|w| w.num_clusters()))
+            .sum()
     }
 
     pub fn num_windows(&self) -> usize {
-        self.windows.len()
+        self.directory.len()
     }
 
     pub fn window_reader(&self, idx: usize) -> &WindowReader {
-        &self.windows[idx]
-    }
-
-    pub fn doc_cluster(&self, doc_id: DocId) -> u16 {
-        let win_idx = doc_id as usize / WINDOW_SIZE;
-        let win = &self.windows[win_idx.min(self.windows.len() - 1)];
-        let local = doc_id - win.doc_offset as DocId;
-        win.doc_cluster(local)
-    }
-
-    pub fn search_centroids(&self, query: &[f32], ef_search: usize) -> Vec<(u32, f32)> {
-        if self.windows.len() == 1 {
-            return self.windows[0].search_centroids(query, ef_search);
-        }
-        let mut all = Vec::new();
-        for win in &self.windows {
-            all.extend(win.search_centroids(query, ef_search));
-        }
-        all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        all.truncate(ef_search);
-        all
-    }
-
-    pub fn cluster_postings(&self, cluster_id: usize) -> crate::Result<SegmentPostings> {
-        if self.windows.len() == 1 {
-            return self.windows[0].cluster_postings(cluster_id);
-        }
-        let mut remaining = cluster_id;
-        for win in &self.windows {
-            let nc = win.num_clusters();
-            if remaining < nc {
-                return win.cluster_postings(remaining);
-            }
-            remaining -= nc;
-        }
-        Ok(SegmentPostings::empty())
-    }
-
-    pub fn has_batch_data(&self, cluster_id: usize) -> bool {
-        if self.windows.len() == 1 {
-            return self.windows[0].has_batch_data(cluster_id);
-        }
-        let mut remaining = cluster_id;
-        for win in &self.windows {
-            let nc = win.num_clusters();
-            if remaining < nc {
-                return win.has_batch_data(remaining);
-            }
-            remaining -= nc;
-        }
-        false
-    }
-
-    pub fn cluster_batch_raw(
-        &self,
-        cluster_id: usize,
-    ) -> crate::Result<Option<(Vec<DocId>, &ClusterBatchMeta, common::OwnedBytes)>> {
-        if self.windows.len() == 1 {
-            return self.windows[0].cluster_batch_raw(cluster_id);
-        }
-        let mut remaining = cluster_id;
-        for win in &self.windows {
-            let nc = win.num_clusters();
-            if remaining < nc {
-                return win.cluster_batch_raw(remaining);
-            }
-            remaining -= nc;
-        }
-        Ok(None)
+        self.ensure_window(idx)
+            .expect("failed to load cluster window")
     }
 
     pub fn dim_bytes(&self) -> usize {
-        self.dim_bytes
+        self.field_meta.as_ref().map(|m| m.padded_dims / 8).unwrap_or(0)
     }
 
     pub fn field_meta(&self) -> Option<&VectorFieldMeta> {
         self.field_meta.as_ref()
-    }
-
-    pub fn probe_clusters(
-        &self,
-        query: &[f32],
-        config: &ProbeConfig,
-    ) -> crate::Result<Vec<(u32, SegmentPostings)>> {
-        if self.windows.len() == 1 {
-            return self.windows[0].probe_clusters(query, config);
-        }
-        let mut all_candidates: Vec<(usize, u32, f32)> = Vec::new();
-        for (win_idx, win) in self.windows.iter().enumerate() {
-            for (cluster_id, dist) in win.search_centroids(query, config.max_probe) {
-                all_candidates.push((win_idx, cluster_id, dist));
-            }
-        }
-        all_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-
-        if all_candidates.is_empty() {
-            return Ok(vec![]);
-        }
-        let nearest_dist = all_candidates[0].2;
-        let mut result = Vec::new();
-        for (i, &(win_idx, cluster_id, dist)) in all_candidates.iter().enumerate() {
-            if i >= config.min_probe
-                && nearest_dist > 0.0
-                && dist / nearest_dist > config.distance_ratio
-            {
-                break;
-            }
-            result.push((
-                cluster_id,
-                self.windows[win_idx].cluster_postings(cluster_id as usize)?,
-            ));
-        }
-        Ok(result)
     }
 }
 
