@@ -89,10 +89,10 @@ struct ClusterBatchData {
 
 struct ClusterData {
     centroid_index: CentroidIndex,
-    per_doc_cluster: Vec<u16>,
     cluster_postings: Vec<ClusterPostingsList>,
     cluster_batch_data: Vec<ClusterBatchData>,
     num_clusters: usize,
+    num_docs: usize,
     dims: usize,
 }
 
@@ -132,8 +132,6 @@ fn build_cluster_data(
     let centroid_ids: Vec<u32> = (0..num_clusters as u32).collect();
     let centroid_index = CentroidIndex::build(centroids, centroid_ids, metric);
 
-    let per_doc_cluster: Vec<u16> = assignments.iter().map(|&c| c as u16).collect();
-
     let mut cluster_doc_lists: Vec<Vec<DocId>> = vec![Vec::new(); num_clusters];
     for doc_id in 0..num_docs {
         let c = assignments[doc_id];
@@ -147,10 +145,10 @@ fn build_cluster_data(
 
     ClusterData {
         centroid_index,
-        per_doc_cluster,
         cluster_postings,
         cluster_batch_data: Vec::new(),
         num_clusters,
+        num_docs,
         dims,
     }
 }
@@ -298,16 +296,12 @@ fn build_cluster_batch_data(
 
 fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Result<()> {
     w.write_all(&(data.num_clusters as u32).to_le_bytes())?;
-    w.write_all(&(data.per_doc_cluster.len() as u32).to_le_bytes())?;
+    w.write_all(&(data.num_docs as u32).to_le_bytes())?;
     w.write_all(&(data.dims as u32).to_le_bytes())?;
 
     let ci_bytes = data.centroid_index.save_to_bytes()?;
     w.write_all(&(ci_bytes.len() as u32).to_le_bytes())?;
     w.write_all(&ci_bytes)?;
-
-    for &cluster_id in &data.per_doc_cluster {
-        w.write_all(&cluster_id.to_le_bytes())?;
-    }
 
     for posting in &data.cluster_postings {
         w.write_all(&posting.doc_freq.to_le_bytes())?;
@@ -813,7 +807,6 @@ pub struct ClusterBatchMeta {
 
 pub struct WindowReader {
     centroid_index: Option<CentroidIndex>,
-    per_doc_cluster: Vec<u16>,
     postings_meta: Vec<ClusterPostingsMeta>,
     postings_data: FileSlice,
     batch_meta: Vec<ClusterBatchMeta>,
@@ -855,7 +848,6 @@ impl WindowReader {
             return Ok((
                 Self {
                     centroid_index: None,
-                    per_doc_cluster: Vec::new(),
                     postings_meta: Vec::new(),
                     postings_data: FileSlice::empty(),
                     batch_meta: Vec::new(),
@@ -878,11 +870,6 @@ impl WindowReader {
         let centroid_index =
             CentroidIndex::load_from_bytes(ci_bytes, centroid_ids, dims, metric)?;
         offset += ci_len;
-
-        let num_docs = _num_docs_field;
-        // Skip per_doc_cluster bytes — not used at search time. Saves 2 bytes/doc allocation.
-        offset += num_docs * 2;
-        let per_doc_cluster: Vec<u16> = Vec::new();
 
         let mut postings_meta = Vec::with_capacity(num_clusters);
         let mut cumulative_offset = 0usize;
@@ -942,7 +929,6 @@ impl WindowReader {
         Ok((
             Self {
                 centroid_index: Some(centroid_index),
-                per_doc_cluster,
                 postings_meta,
                 postings_data,
                 batch_meta,
@@ -985,10 +971,6 @@ impl WindowReader {
             IndexRecordOption::Basic,
         )?;
         Ok(SegmentPostings::from_block_postings(block_postings, None))
-    }
-
-    pub fn doc_cluster(&self, local_doc_id: DocId) -> u16 {
-        self.per_doc_cluster[local_doc_id as usize]
     }
 
     pub fn has_batch_data(&self, cluster_id: usize) -> bool {
@@ -1115,13 +1097,6 @@ impl ClusterFieldReader {
 
     pub fn window_reader(&self, idx: usize) -> &WindowReader {
         &self.windows[idx]
-    }
-
-    pub fn doc_cluster(&self, doc_id: DocId) -> u16 {
-        let win_idx = doc_id as usize / WINDOW_SIZE;
-        let win = &self.windows[win_idx.min(self.windows.len() - 1)];
-        let local = doc_id - win.doc_offset as DocId;
-        win.doc_cluster(local)
     }
 
     pub fn search_centroids(&self, query: &[f32], ef_search: usize) -> Vec<(u32, f32)> {

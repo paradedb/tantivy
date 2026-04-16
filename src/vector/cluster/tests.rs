@@ -181,12 +181,6 @@ fn test_cluster_flush_above_threshold() -> crate::Result<()> {
     assert!(field_reader.is_clustered(), "above threshold, should be clustered");
     assert!(field_reader.num_clusters() > 0);
 
-    // Every doc should be assigned to a valid cluster
-    for doc_id in 0..8u32 {
-        let c = field_reader.doc_cluster(doc_id);
-        assert!((c as usize) < field_reader.num_clusters());
-    }
-
     // Cluster doc lists should contain all docs exactly once
     let mut all_docs: Vec<DocId> = Vec::new();
     for c in 0..field_reader.num_clusters() {
