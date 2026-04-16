@@ -61,6 +61,7 @@ impl SortKeyComputer for SortByVectorDistance {
             reader.max_doc(),
             self.field
         );
+        std::io::Write::flush(&mut std::io::stderr()).ok();
         let field = self.field;
 
         let bq_plugin: Arc<BqVecPluginReader> = reader
