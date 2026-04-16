@@ -63,12 +63,14 @@ pub struct ClusterConfig {
 
 pub struct ClusterPlugin {
     config: Arc<ClusterConfig>,
+    reader_cache: std::sync::RwLock<HashMap<crate::index::SegmentId, Arc<ClusterPluginReader>>>,
 }
 
 impl ClusterPlugin {
     pub fn new(config: ClusterConfig) -> Self {
         Self {
             config: Arc::new(config),
+            reader_cache: std::sync::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -466,6 +468,11 @@ impl SegmentPlugin for ClusterPlugin {
     }
 
     fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
+        let segment_id = ctx.segment_reader.segment_id();
+        if let Some(cached) = self.reader_cache.read().unwrap().get(&segment_id) {
+            return Ok(cached.clone() as Arc<dyn PluginReader>);
+        }
+
         let file_slice = ctx.segment_reader.open_read(component())?;
         let composite = CompositeFile::open(&file_slice)?;
 
@@ -477,7 +484,12 @@ impl SegmentPlugin for ClusterPlugin {
             }
         }
 
-        Ok(Arc::new(ClusterPluginReader { field_readers }))
+        let reader = Arc::new(ClusterPluginReader { field_readers });
+        self.reader_cache
+            .write()
+            .unwrap()
+            .insert(segment_id, reader.clone());
+        Ok(reader as Arc<dyn PluginReader>)
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
