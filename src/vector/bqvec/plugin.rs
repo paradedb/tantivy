@@ -64,7 +64,6 @@ impl BqVecPluginBuilder {
     pub fn build(self) -> BqVecPlugin {
         BqVecPlugin {
             fields: self.fields,
-            reader_cache: std::sync::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -76,7 +75,6 @@ impl BqVecPluginBuilder {
 /// function on the raw f32 vectors extracted from documents.
 pub struct BqVecPlugin {
     fields: Vec<VectorFieldConfig>,
-    reader_cache: std::sync::RwLock<HashMap<crate::index::SegmentId, Arc<BqVecPluginReader>>>,
 }
 
 impl BqVecPlugin {
@@ -100,18 +98,10 @@ impl SegmentPlugin for BqVecPlugin {
     }
 
     fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
-        let segment_id = ctx.segment_reader.segment_id();
-        if let Some(cached) = self.reader_cache.read().unwrap().get(&segment_id) {
-            return Ok(cached.clone() as Arc<dyn PluginReader>);
-        }
         let file_slice = ctx.segment_reader.open_read(component())?;
         let known_fields: Vec<Field> = self.fields.iter().map(|cfg| cfg.field).collect();
-        let reader = Arc::new(BqVecPluginReader::open(file_slice, &known_fields)?);
-        self.reader_cache
-            .write()
-            .unwrap()
-            .insert(segment_id, reader.clone());
-        Ok(reader as Arc<dyn PluginReader>)
+        BqVecPluginReader::open(file_slice, &known_fields)
+            .map(|r| Arc::new(r) as Arc<dyn PluginReader>)
     }
 
     fn merge(&self, _ctx: PluginMergeContext) -> crate::Result<()> {
