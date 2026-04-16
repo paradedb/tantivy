@@ -3,7 +3,9 @@ use crate::vector::rabitq::Metric;
 
 pub struct CentroidIndex {
     pub(crate) centroid_ids: Vec<u32>,
-    centroids: Vec<Vec<f32>>,
+    /// Flat layout: centroid i occupies `centroids[i*dims..(i+1)*dims]`.
+    /// Avoids the per-centroid Vec allocation and gives sequential memory access.
+    centroids: Vec<f32>,
     dims: usize,
 }
 
@@ -11,11 +13,19 @@ impl CentroidIndex {
     pub fn build(centroids: Vec<Vec<f32>>, centroid_ids: Vec<u32>, _metric: Metric) -> Self {
         assert_eq!(centroids.len(), centroid_ids.len());
         let dims = centroids.first().map_or(0, |v| v.len());
+        let mut flat = Vec::with_capacity(centroids.len() * dims);
+        for c in &centroids {
+            flat.extend_from_slice(c);
+        }
         Self {
             centroid_ids,
-            centroids,
+            centroids: flat,
             dims,
         }
+    }
+
+    fn centroid(&self, i: usize) -> &[f32] {
+        &self.centroids[i * self.dims..(i + 1) * self.dims]
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u32, f32)> {
@@ -27,7 +37,7 @@ impl CentroidIndex {
 
         let mut results = Vec::with_capacity(n);
         for i in 0..n {
-            results.push((self.centroid_ids[i], l2_distance_sqr(query, &self.centroids[i])));
+            results.push((self.centroid_ids[i], l2_distance_sqr(query, self.centroid(i))));
         }
 
         if k < n {
@@ -39,16 +49,18 @@ impl CentroidIndex {
     }
 
     pub fn save_to_bytes(&self) -> crate::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        let n = self.centroids.len() as u32;
+        let n = self.centroid_ids.len() as u32;
+        let mut buf = Vec::with_capacity(8 + self.centroids.len() * 4);
         buf.extend_from_slice(&n.to_le_bytes());
         buf.extend_from_slice(&(self.dims as u32).to_le_bytes());
-
-        for centroid in &self.centroids {
-            for &v in centroid {
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-        }
+        // SAFETY: we're casting f32 slice to u8 slice
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.centroids.as_ptr() as *const u8,
+                self.centroids.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        buf.extend_from_slice(bytes);
         Ok(buf)
     }
 
@@ -58,23 +70,15 @@ impl CentroidIndex {
         dims: usize,
         _metric: Metric,
     ) -> crate::Result<Self> {
-        let mut pos = 0;
-        let n = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
-        pos += 4;
-        let _dims = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
-        pos += 4;
-
-        let mut centroids = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut v = Vec::with_capacity(dims);
-            for _ in 0..dims {
-                let f = f32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]);
-                pos += 4;
-                v.push(f);
-            }
-            centroids.push(v);
+        let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let _stored_dims =
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        let total_floats = n * dims;
+        let payload = &bytes[8..8 + total_floats * 4];
+        let mut centroids = Vec::with_capacity(total_floats);
+        for chunk in payload.chunks_exact(4) {
+            centroids.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
-
         Ok(Self {
             centroid_ids,
             centroids,

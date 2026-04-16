@@ -880,12 +880,9 @@ impl WindowReader {
         offset += ci_len;
 
         let num_docs = _num_docs_field;
-        let mut per_doc_cluster = Vec::with_capacity(num_docs);
-        for _ in 0..num_docs {
-            let v = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            per_doc_cluster.push(v);
-            offset += 2;
-        }
+        // Skip per_doc_cluster bytes — not used at search time. Saves 2 bytes/doc allocation.
+        offset += num_docs * 2;
+        let per_doc_cluster: Vec<u16> = Vec::new();
 
         let mut postings_meta = Vec::with_capacity(num_clusters);
         let mut cumulative_offset = 0usize;
