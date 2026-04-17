@@ -948,9 +948,8 @@ fn build_allowed_term_ids_for_str(
     missing: &Option<Key>,
 ) -> crate::Result<Option<BitSet>> {
     let mut allowed: Option<BitSet> = None;
-    let missing_adjustment = if missing.is_some() { 1 } else { 0 };
-    //let missing_adjustment = 0;
-    let num_terms = str_col.dictionary().num_terms() as u32 + missing_adjustment;
+    let missing_sentinel_adjustment = if missing.is_some() { 1 } else { 0 };
+    let num_terms = str_col.dictionary().num_terms() as u32 + missing_sentinel_adjustment;
     if let Some(include) = include {
         // add matches
         allowed = Some(BitSet::with_max_value(num_terms));
