@@ -2920,9 +2920,7 @@ mod tests {
         Ok(())
     }
 
-    fn prep_index_and_agg_with_n_unique_terms_plus_one_null(
-        n: u64,
-    ) -> crate::Result<(Index, Aggregations)> {
+    fn prep_index_with_n_unique_terms_plus_one_null(n: u64) -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
         let id_field = schema_builder.add_u64_field("id", INDEXED);
         let title_field = schema_builder.add_text_field("title", TEXT | FAST);
@@ -2944,22 +2942,39 @@ mod tests {
 
         writer.commit()?;
 
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "my_bool": {
-                "terms": {
-                    "field": "title",
-                    "include": "foo",
-                    "missing": "__NULL__",
+        Ok(index)
+    }
+
+    fn agg_terms_request_for_regression_check(use_exclude: bool) -> crate::Result<Aggregations> {
+        let agg_req: Aggregations = if use_exclude {
+            serde_json::from_value(json!({
+                "my_bool": {
+                    "terms": {
+                        "field": "title",
+                        "exclude": "foo",
+                        "missing": "__NULL__",
+                    }
                 }
-            }
-        }))?;
+            }))?
+        } else {
+            serde_json::from_value(json!({
+                "my_bool": {
+                    "terms": {
+                        "field": "title",
+                        "include": "foo",
+                        "missing": "__NULL__",
+                    }
+                }
+            }))?
+        };
 
-        Ok((index, agg_req))
+        Ok(agg_req)
     }
 
     #[test]
-    fn null_bitset_bounds_check_regression_0() -> crate::Result<()> {
-        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(0)?;
+    fn null_bitset_bounds_check_regresiion_include_0() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(0)?;
+        let agg_req = agg_terms_request_for_regression_check(false)?;
 
         // this should work and not panic
         let _res = exec_request(agg_req, &index)?;
@@ -2967,8 +2982,9 @@ mod tests {
     }
 
     #[test]
-    fn null_bitset_bounds_check_regression_64() -> crate::Result<()> {
-        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(64)?;
+    fn null_bitset_bounds_check_regresiion_include_64() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(64)?;
+        let agg_req = agg_terms_request_for_regression_check(false)?;
 
         // this should work and not panic
         let _res = exec_request(agg_req, &index)?;
@@ -2976,8 +2992,9 @@ mod tests {
     }
 
     #[test]
-    fn null_bitset_bounds_check_regression_128() -> crate::Result<()> {
-        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(128)?;
+    fn null_bitset_bounds_check_regresiion_include_128() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(128)?;
+        let agg_req = agg_terms_request_for_regression_check(false)?;
 
         // this should work and not panic
         let _res = exec_request(agg_req, &index)?;
@@ -2985,8 +3002,9 @@ mod tests {
     }
 
     #[test]
-    fn null_bitset_bounds_check_regression_192() -> crate::Result<()> {
-        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(192)?;
+    fn null_bitset_bounds_check_regresiion_include_192() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(192)?;
+        let agg_req = agg_terms_request_for_regression_check(false)?;
 
         // this should work and not panic
         let _res = exec_request(agg_req, &index)?;
@@ -2994,8 +3012,59 @@ mod tests {
     }
 
     #[test]
-    fn null_bitset_bounds_check_regression_256() -> crate::Result<()> {
-        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(256)?;
+    fn null_bitset_bounds_check_regresiion_include_256() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(256)?;
+        let agg_req = agg_terms_request_for_regression_check(false)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
+        Ok(())
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regresiion_exclude_0() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(0)?;
+        let agg_req = agg_terms_request_for_regression_check(true)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
+        Ok(())
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regresiion_exclude_64() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(64)?;
+        let agg_req = agg_terms_request_for_regression_check(true)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
+        Ok(())
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regresiion_exclude_128() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(128)?;
+        let agg_req = agg_terms_request_for_regression_check(true)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
+        Ok(())
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regresiion_exclude_192() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(192)?;
+        let agg_req = agg_terms_request_for_regression_check(true)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
+        Ok(())
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regresiion_exclude_256() -> crate::Result<()> {
+        let index = prep_index_with_n_unique_terms_plus_one_null(256)?;
+        let agg_req = agg_terms_request_for_regression_check(true)?;
 
         // this should work and not panic
         let _res = exec_request(agg_req, &index)?;
