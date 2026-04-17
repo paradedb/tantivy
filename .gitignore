@@ -18,3 +18,4 @@ variable
 # for `sample record -p`
 profile.json
 profile.json.gz
+.claude/worktrees/
