@@ -164,6 +164,10 @@ impl SortKeyComputer for SortByVectorDistance {
                     win.search_centroids(&self.query_vector, self.probe.max_probe);
                 let nearest_dist = centroid_results.first().map(|r| r.1).unwrap_or(0.0);
 
+                // Decide the probe set up front (applies the outer-loop
+                // distance-ratio threshold) so we can coalesce all cluster
+                // batch reads into a small number of backing reads.
+                let mut probe: Vec<(u32, f32)> = Vec::with_capacity(centroid_results.len());
                 for (i, &(cluster_id, dist)) in centroid_results.iter().enumerate() {
                     if i >= self.probe.min_probe
                         && nearest_dist > 0.0
@@ -171,11 +175,21 @@ impl SortKeyComputer for SortByVectorDistance {
                     {
                         break;
                     }
+                    probe.push((cluster_id, dist));
+                }
+
+                // gap_tolerance: merge reads within this many bytes of each
+                // other. ~2 PG pages — amortizes pin cost with minimal wasted bandwidth.
+                const COALESCE_GAP_TOLERANCE: usize = 16 * 1024;
+                let probe_ids: Vec<u32> = probe.iter().map(|(c, _)| *c).collect();
+                let fetched = win
+                    .cluster_batch_raw_many(&probe_ids, COALESCE_GAP_TOLERANCE)
+                    .unwrap_or_else(|_| vec![None; probe_ids.len()]);
+
+                for (pi, &(_cluster_id, dist)) in probe.iter().enumerate() {
                     let g_add = dist;
 
-                    if let Ok(Some((local_doc_ids, batch_meta, raw))) =
-                        win.cluster_batch_raw(cluster_id as usize)
-                    {
+                    if let Some((local_doc_ids, batch_meta, raw)) = &fetched[pi] {
                         let num_docs = batch_meta.num_docs as usize;
                         let num_batches = batch_meta.num_batches as usize;
                         let db = dim_bytes;

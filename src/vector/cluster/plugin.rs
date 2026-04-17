@@ -948,6 +948,88 @@ impl WindowReader {
         Ok(Some((doc_ids, meta, raw)))
     }
 
+    /// Fetch raw batch bytes for a set of clusters, coalescing contiguous or
+    /// near-contiguous byte ranges in the cold section into a single backing
+    /// read. Amortizes the PG-buffer pin/unpin cycle across multiple cluster
+    /// reads at the cost of reading some unprobed-cluster bytes in between.
+    ///
+    /// `gap_tolerance`: merge two byte ranges in a single read when their gap
+    /// (bytes of unprobed clusters between them) is at most this value. A
+    /// reasonable default is one PG page (~8 KB) to ~2 pages; larger values
+    /// trade extra bandwidth for fewer reads.
+    ///
+    /// Returns a Vec aligned to the input: `out[i]` is the result for
+    /// `cluster_ids[i]`. `None` for out-of-range or empty clusters.
+    pub fn cluster_batch_raw_many(
+        &self,
+        cluster_ids: &[u32],
+        gap_tolerance: usize,
+    ) -> crate::Result<Vec<Option<(Vec<DocId>, &ClusterBatchMeta, common::OwnedBytes)>>> {
+        let n = cluster_ids.len();
+        let mut out: Vec<Option<(Vec<DocId>, &ClusterBatchMeta, common::OwnedBytes)>> =
+            (0..n).map(|_| None).collect();
+
+        // Collect (out_idx, byte_offset, byte_len) for valid clusters.
+        let mut sorted: Vec<(usize, usize, usize)> = Vec::with_capacity(n);
+        for (idx, &cid) in cluster_ids.iter().enumerate() {
+            let cid_us = cid as usize;
+            if cid_us >= self.batch_meta.len() {
+                continue;
+            }
+            let m = &self.batch_meta[cid_us];
+            if m.num_batches == 0 {
+                continue;
+            }
+            sorted.push((idx, m.byte_offset, m.byte_len));
+        }
+        if sorted.is_empty() {
+            return Ok(out);
+        }
+        sorted.sort_unstable_by_key(|x| x.1);
+
+        // Merge adjacent/near-adjacent ranges into runs.
+        // `run_of[i]` = index of the run that sorted entry i belongs to.
+        let mut runs: Vec<(usize, usize)> = Vec::new(); // (start, end)
+        let mut run_of: Vec<usize> = Vec::with_capacity(sorted.len());
+        for &(_, off, len) in &sorted {
+            if let Some(last) = runs.last_mut() {
+                if off <= last.1 + gap_tolerance {
+                    last.1 = last.1.max(off + len);
+                    run_of.push(runs.len() - 1);
+                    continue;
+                }
+            }
+            runs.push((off, off + len));
+            run_of.push(runs.len() - 1);
+        }
+
+        // One read per run.
+        let mut run_bytes: Vec<common::OwnedBytes> = Vec::with_capacity(runs.len());
+        for &(start, end) in &runs {
+            run_bytes.push(self.batch_data.read_bytes_slice(start..end)?);
+        }
+
+        // Slice each cluster's raw out of its run (zero-copy), parse doc_ids.
+        for (si, &(out_idx, off, len)) in sorted.iter().enumerate() {
+            let r = run_of[si];
+            let run_start = runs[r].0;
+            let rel = off - run_start;
+            let raw = run_bytes[r].slice(rel..rel + len);
+
+            let cid_us = cluster_ids[out_idx] as usize;
+            let meta = &self.batch_meta[cid_us];
+            let num_docs = meta.num_docs as usize;
+            let mut doc_ids = Vec::with_capacity(num_docs);
+            for i in 0..num_docs {
+                let o = i * 4;
+                doc_ids.push(u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]));
+            }
+            out[out_idx] = Some((doc_ids, meta, raw));
+        }
+
+        Ok(out)
+    }
+
 }
 
 pub struct ClusterFieldReader {
