@@ -161,7 +161,7 @@ impl SortKeyComputer for SortByVectorDistance {
                 }
 
                 let centroid_results =
-                    win.search_centroids(rabitq_query, self.probe.max_probe);
+                    win.search_centroids(&self.query_vector, self.probe.max_probe);
                 let nearest_dist = centroid_results.first().map(|r| r.1).unwrap_or(0.0);
 
                 // Decide the probe set up front (applies the outer-loop
@@ -179,9 +179,8 @@ impl SortKeyComputer for SortByVectorDistance {
                 }
 
                 // gap_tolerance: merge reads within this many bytes of each
-                // other. Aggressive value to test whether coalescing is bounded
-                // by the merge threshold or by something else downstream.
-                const COALESCE_GAP_TOLERANCE: usize = 256 * 1024;
+                // other. ~2 PG pages — amortizes pin cost with minimal wasted bandwidth.
+                const COALESCE_GAP_TOLERANCE: usize = 16 * 1024;
                 let probe_ids: Vec<u32> = probe.iter().map(|(c, _)| *c).collect();
                 let fetched = win
                     .cluster_batch_raw_many(&probe_ids, COALESCE_GAP_TOLERANCE)
