@@ -1225,7 +1225,7 @@ mod tests {
     use crate::aggregation::{AggregationLimitsGuard, DistributedAggregationCollector};
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{IntoIpv6Addr, Schema, FAST, STORED, STRING, TEXT};
+    use crate::schema::{IntoIpv6Addr, Schema, FAST, INDEXED, STRING, TEXT};
     use crate::{Index, IndexWriter};
 
     #[test]
@@ -2924,10 +2924,11 @@ mod tests {
         n: u64,
     ) -> crate::Result<(Index, Aggregations)> {
         let mut schema_builder = Schema::builder();
-        let id_field = schema_builder.add_u64_field("id", STORED);
-        let title_field = schema_builder.add_text_field("title", TEXT | STORED | FAST);
+        let id_field = schema_builder.add_u64_field("id", INDEXED);
+        let title_field = schema_builder.add_text_field("title", TEXT | FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema.clone());
+        // set to one thread to guarantee all docs end up in the same segement
         let mut writer = index.writer_with_num_threads(1, 50_000_000)?;
 
         writer.add_document(doc!(

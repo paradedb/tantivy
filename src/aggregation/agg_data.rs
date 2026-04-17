@@ -897,8 +897,12 @@ fn build_terms_or_cardinality_nodes(
                     let str_col = str_dict_column
                         .as_ref()
                         .expect("str_dict_column must exist for string column");
-                    allowed_term_ids =
-                        build_allowed_term_ids_for_str(str_col, &req.include, &req.exclude)?;
+                    allowed_term_ids = build_allowed_term_ids_for_str(
+                        str_col,
+                        &req.include,
+                        &req.exclude,
+                        missing,
+                    )?;
                 };
                 let idx_in_req_data = data.push_term_req_data(TermsAggReqData {
                     accessor,
@@ -941,9 +945,12 @@ fn build_allowed_term_ids_for_str(
     str_col: &StrColumn,
     include: &Option<IncludeExcludeParam>,
     exclude: &Option<IncludeExcludeParam>,
+    missing: &Option<Key>,
 ) -> crate::Result<Option<BitSet>> {
     let mut allowed: Option<BitSet> = None;
-    let num_terms = str_col.dictionary().num_terms() as u32;
+    let missing_adjustment = if missing.is_some() { 1 } else { 0 };
+    //let missing_adjustment = 0;
+    let num_terms = str_col.dictionary().num_terms() as u32 + missing_adjustment;
     if let Some(include) = include {
         // add matches
         allowed = Some(BitSet::with_max_value(num_terms));
