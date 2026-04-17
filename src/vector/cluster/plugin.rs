@@ -256,7 +256,9 @@ fn build_cluster_batch_data(
     }
 }
 
-fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Result<()> {
+/// Hot section: header + centroids + batch_meta. Read on every query for
+/// centroid search and to know batch offsets.
+fn serialize_cluster_hot(data: &ClusterData, w: &mut dyn Write) -> crate::Result<()> {
     w.write_all(&(data.num_clusters as u32).to_le_bytes())?;
     w.write_all(&(data.num_docs as u32).to_le_bytes())?;
     w.write_all(&(data.dims as u32).to_le_bytes())?;
@@ -276,6 +278,12 @@ fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Resul
         w.write_all(&(data_len as u32).to_le_bytes())?;
     }
 
+    Ok(())
+}
+
+/// Cold section: per-cluster batch_data. Read lazily, only for clusters
+/// selected by centroid probing during query execution.
+fn serialize_cluster_cold(data: &ClusterData, w: &mut dyn Write) -> crate::Result<()> {
     for batch in &data.cluster_batch_data {
         for &did in &batch.doc_ids {
             w.write_all(&did.to_le_bytes())?;
@@ -291,11 +299,10 @@ fn serialize_cluster_data(data: &ClusterData, w: &mut dyn Write) -> crate::Resul
             w.write_all(&v.to_le_bytes())?;
         }
     }
-
     Ok(())
 }
 
-fn serialize_empty(w: &mut dyn Write) -> crate::Result<()> {
+fn serialize_empty_hot(w: &mut dyn Write) -> crate::Result<()> {
     w.write_all(&0u32.to_le_bytes())?; // num_clusters = 0
     w.write_all(&0u32.to_le_bytes())?; // num_docs = 0
     w.write_all(&0u32.to_le_bytes())?; // dims = 0
@@ -351,20 +358,46 @@ impl VectorFieldMeta {
     }
 }
 
+/// Per-window directory entry size: doc_offset + num_docs + hot_size + cold_size.
+const WINDOW_DIR_ENTRY_SIZE: usize = 16;
+
+/// File layout:
+///   [u32 num_windows][u32 window_size][22 B field_meta]
+///   directory: [u32 doc_offset][u32 num_docs][u32 hot_size][u32 cold_size] × num_windows
+///   per window in order: hot bytes, then cold bytes
+///
+/// Reading this lets the reader pull only each window's small hot section
+/// (centroids + batch_meta) up front, leaving the much larger cold section
+/// (batch_data) to be sliced lazily per probed cluster.
 fn serialize_windowed_field(
     windows: &[(u32, u32, ClusterData)],
     meta: &VectorFieldMeta,
     w: &mut dyn Write,
 ) -> crate::Result<()> {
-    let num_windows = windows.len() as u32;
+    let mut serialized: Vec<(u32, u32, Vec<u8>, Vec<u8>)> = Vec::with_capacity(windows.len());
+    for (doc_offset, num_docs, data) in windows {
+        let mut hot = Vec::new();
+        let mut cold = Vec::new();
+        serialize_cluster_hot(data, &mut hot)?;
+        serialize_cluster_cold(data, &mut cold)?;
+        serialized.push((*doc_offset, *num_docs, hot, cold));
+    }
+
+    let num_windows = serialized.len() as u32;
     w.write_all(&num_windows.to_le_bytes())?;
     w.write_all(&(WINDOW_SIZE as u32).to_le_bytes())?;
     serialize_field_meta(meta, w)?;
 
-    for (doc_offset, num_docs, data) in windows {
+    for (doc_offset, num_docs, hot, cold) in &serialized {
         w.write_all(&doc_offset.to_le_bytes())?;
         w.write_all(&num_docs.to_le_bytes())?;
-        serialize_cluster_data(data, w)?;
+        w.write_all(&(hot.len() as u32).to_le_bytes())?;
+        w.write_all(&(cold.len() as u32).to_le_bytes())?;
+    }
+
+    for (_, _, hot, cold) in &serialized {
+        w.write_all(hot)?;
+        w.write_all(cold)?;
     }
 
     Ok(())
@@ -380,13 +413,21 @@ fn serialize_windowed_empty(
     w.write_all(&(WINDOW_SIZE as u32).to_le_bytes())?;
     serialize_field_meta(meta, w)?;
 
+    // Empty windows have hot_size = 12 (just the cluster header) and cold_size = 0.
     let mut offset = 0u32;
+    let mut window_doc_counts = Vec::with_capacity(num_windows as usize);
     for _ in 0..num_windows {
         let window_docs = (num_docs as u32).saturating_sub(offset).min(WINDOW_SIZE as u32);
+        window_doc_counts.push(window_docs);
         w.write_all(&offset.to_le_bytes())?;
         w.write_all(&window_docs.to_le_bytes())?;
-        serialize_empty(w)?;
+        w.write_all(&12u32.to_le_bytes())?; // hot_size
+        w.write_all(&0u32.to_le_bytes())?; // cold_size
         offset += window_docs;
+    }
+
+    for _ in 0..num_windows {
+        serialize_empty_hot(w)?;
     }
 
     Ok(())
@@ -762,53 +803,46 @@ pub struct WindowReader {
 }
 
 impl WindowReader {
+    /// Parse a window from its hot bytes (centroids + batch_meta) plus a
+    /// `FileSlice` for its cold section (batch_data, read lazily).
     fn open(
-        file_slice: &FileSlice,
-        data: &[u8],
-        base_offset: usize,
+        hot: &[u8],
+        cold_slice: FileSlice,
         doc_offset: u32,
         num_docs_in_window: u32,
         metric: Metric,
-    ) -> crate::Result<(Self, usize)> {
-        let mut offset = base_offset;
-
-        if data.len() < offset + 12 {
+    ) -> crate::Result<Self> {
+        if hot.len() < 12 {
             return Err(crate::TantivyError::InternalError(
-                "window cluster section too short".into(),
+                "window hot section too short".into(),
             ));
         }
 
         let num_clusters =
-            u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
-                as usize;
+            u32::from_le_bytes([hot[0], hot[1], hot[2], hot[3]]) as usize;
         let _num_docs_field =
-            u32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]])
-                as usize;
+            u32::from_le_bytes([hot[4], hot[5], hot[6], hot[7]]) as usize;
         let dims =
-            u32::from_le_bytes([data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11]])
-                as usize;
-        offset += 12;
+            u32::from_le_bytes([hot[8], hot[9], hot[10], hot[11]]) as usize;
 
         if num_clusters == 0 {
-            return Ok((
-                Self {
-                    centroid_index: None,
-                    batch_meta: Vec::new(),
-                    batch_data: FileSlice::empty(),
-                    doc_offset,
-                    num_docs: num_docs_in_window,
-                    dims,
-                },
-                offset,
-            ));
+            return Ok(Self {
+                centroid_index: None,
+                batch_meta: Vec::new(),
+                batch_data: FileSlice::empty(),
+                doc_offset,
+                num_docs: num_docs_in_window,
+                dims,
+            });
         }
 
+        let mut offset = 12;
         let ci_len =
-            u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+            u32::from_le_bytes([hot[offset], hot[offset + 1], hot[offset + 2], hot[offset + 3]])
                 as usize;
         offset += 4;
 
-        let ci_bytes = &data[offset..offset + ci_len];
+        let ci_bytes = &hot[offset..offset + ci_len];
         let centroid_ids: Vec<u32> = (0..num_clusters as u32).collect();
         let centroid_index =
             CentroidIndex::load_from_bytes(ci_bytes, centroid_ids, dims, metric)?;
@@ -816,47 +850,36 @@ impl WindowReader {
 
         let mut batch_meta = Vec::with_capacity(num_clusters);
         let mut batch_cumulative = 0usize;
-        if offset + num_clusters * 12 <= data.len() {
-            for _ in 0..num_clusters {
-                let nb = u32::from_le_bytes([
-                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                ]);
-                offset += 4;
-                let nd = u32::from_le_bytes([
-                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                ]);
-                offset += 4;
-                let bl = u32::from_le_bytes([
-                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                ]) as usize;
-                offset += 4;
-                batch_meta.push(ClusterBatchMeta {
-                    num_batches: nb,
-                    num_docs: nd,
-                    byte_offset: batch_cumulative,
-                    byte_len: bl,
-                });
-                batch_cumulative += bl;
-            }
+        for _ in 0..num_clusters {
+            let nb = u32::from_le_bytes([
+                hot[offset], hot[offset + 1], hot[offset + 2], hot[offset + 3],
+            ]);
+            offset += 4;
+            let nd = u32::from_le_bytes([
+                hot[offset], hot[offset + 1], hot[offset + 2], hot[offset + 3],
+            ]);
+            offset += 4;
+            let bl = u32::from_le_bytes([
+                hot[offset], hot[offset + 1], hot[offset + 2], hot[offset + 3],
+            ]) as usize;
+            offset += 4;
+            batch_meta.push(ClusterBatchMeta {
+                num_batches: nb,
+                num_docs: nd,
+                byte_offset: batch_cumulative,
+                byte_len: bl,
+            });
+            batch_cumulative += bl;
         }
-        let batch_data = if batch_cumulative > 0 {
-            file_slice.slice(offset..offset + batch_cumulative)
-        } else {
-            FileSlice::empty()
-        };
-        offset += batch_cumulative;
 
-        Ok((
-            Self {
-                centroid_index: Some(centroid_index),
-                batch_meta,
-                batch_data,
-                doc_offset,
-                num_docs: num_docs_in_window,
-                dims,
-            },
-            offset,
-        ))
+        Ok(Self {
+            centroid_index: Some(centroid_index),
+            batch_meta,
+            batch_data: cold_slice,
+            doc_offset,
+            num_docs: num_docs_in_window,
+            dims,
+        })
     }
 
     pub fn is_clustered(&self) -> bool {
@@ -935,51 +958,55 @@ pub struct ClusterFieldReader {
 
 impl ClusterFieldReader {
     fn open(file_slice: FileSlice, metric: Metric) -> crate::Result<Self> {
-        let data = file_slice.read_bytes()?;
-
-        if data.len() < 8 {
-            return Err(crate::TantivyError::InternalError(
-                "cluster field section too short for windowed header".into(),
-            ));
-        }
+        // Header: u32 num_windows + u32 window_size + 22 B field_meta = 30 B.
+        const HEADER_SIZE: usize = 8 + FIELD_META_SIZE;
+        let header = file_slice.read_bytes_slice(0..HEADER_SIZE)?;
 
         let num_windows =
-            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
         let _window_size =
-            u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let mut field_meta_pos = 8;
+        let field_meta = Some(deserialize_field_meta(&header, &mut field_meta_pos));
 
-        let mut offset = 8;
+        // Directory: 16 B per window.
+        let dir_start = HEADER_SIZE;
+        let dir_end = dir_start + num_windows * WINDOW_DIR_ENTRY_SIZE;
+        let dir = file_slice.read_bytes_slice(dir_start..dir_end)?;
 
-        // Deserialize field metadata (if present — check remaining bytes)
-        let field_meta = if offset + FIELD_META_SIZE <= data.len() {
-            Some(deserialize_field_meta(&data, &mut offset))
-        } else {
-            None
-        };
+        let mut entries: Vec<(u32, u32, usize, usize, usize)> = Vec::with_capacity(num_windows);
+        let mut cumulative = dir_end;
+        for i in 0..num_windows {
+            let off = i * WINDOW_DIR_ENTRY_SIZE;
+            let win_doc_offset =
+                u32::from_le_bytes([dir[off], dir[off + 1], dir[off + 2], dir[off + 3]]);
+            let win_num_docs = u32::from_le_bytes([
+                dir[off + 4], dir[off + 5], dir[off + 6], dir[off + 7],
+            ]);
+            let hot_size = u32::from_le_bytes([
+                dir[off + 8], dir[off + 9], dir[off + 10], dir[off + 11],
+            ]) as usize;
+            let cold_size = u32::from_le_bytes([
+                dir[off + 12], dir[off + 13], dir[off + 14], dir[off + 15],
+            ]) as usize;
+            entries.push((win_doc_offset, win_num_docs, cumulative, hot_size, cold_size));
+            cumulative += hot_size + cold_size;
+        }
+
         let mut windows = Vec::with_capacity(num_windows);
         let mut dim_bytes = 0usize;
-
-        for _ in 0..num_windows {
-            if data.len() < offset + 8 {
-                return Err(crate::TantivyError::InternalError(
-                    "cluster field section too short for window header".into(),
-                ));
-            }
-            let win_doc_offset =
-                u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-            offset += 4;
-            let win_num_docs =
-                u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-            offset += 4;
-
-            let (win_reader, new_offset) =
-                WindowReader::open(&file_slice, &data, offset, win_doc_offset, win_num_docs, metric)?;
-            offset = new_offset;
-
+        for (win_doc_offset, win_num_docs, win_off, hot_size, cold_size) in entries {
+            let hot = file_slice.read_bytes_slice(win_off..win_off + hot_size)?;
+            let cold_slice = if cold_size > 0 {
+                file_slice.slice((win_off + hot_size)..(win_off + hot_size + cold_size))
+            } else {
+                FileSlice::empty()
+            };
+            let win_reader =
+                WindowReader::open(&hot, cold_slice, win_doc_offset, win_num_docs, metric)?;
             if win_reader.dims > 0 {
                 dim_bytes = win_reader.dims / 8;
             }
-
             windows.push(win_reader);
         }
 
