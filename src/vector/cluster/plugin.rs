@@ -19,9 +19,11 @@ use crate::plugin::{
 use crate::vector::rabitq::math::l2_distance_sqr;
 use crate::vector::rabitq::rotation::{DynamicRotator, RotatorType};
 use crate::vector::rabitq::{self, Metric, RabitqConfig};
+use crate::index::SegmentId;
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema};
 use crate::{DocId, Segment};
+use common::OwnedBytes;
 
 pub const WINDOW_SIZE: usize = 122_880;
 
@@ -58,6 +60,29 @@ pub struct ClusterConfig {
     pub num_clusters_fn: Arc<dyn Fn(usize) -> usize + Send + Sync>,
     pub fields: Vec<ClusterFieldConfig>,
     pub sampler_factory: Arc<dyn VectorSamplerFactory>,
+    /// Optional cross-backend cache of each segment's packed hot bytes
+    /// (header + directory + concatenated per-window hot sections). When
+    /// provided, `ClusterFieldReader::open` routes hot-byte fetches through
+    /// this cache instead of issuing fresh `FileSlice::read_bytes_slice`
+    /// calls every query. Cold (batch_data) reads always go through the
+    /// `FileSlice` directly — the cache is hot-only by design.
+    pub hot_bytes_cache: Option<Arc<dyn HotBytesCache>>,
+}
+
+/// Pluggable cache for per-segment hot bytes. Implementations typically
+/// back this with OS-shared memory (e.g. PostgreSQL DSM) so the parsed
+/// state is shared across backends.
+pub trait HotBytesCache: Send + Sync {
+    /// Return the cached hot bytes for `(segment_id, field)`, computing and
+    /// inserting them via `compute_fn` on miss. Implementations are
+    /// responsible for any cross-process coordination (locking, race-free
+    /// insert, invalidation).
+    fn get_or_compute(
+        &self,
+        segment_id: &SegmentId,
+        field: Field,
+        compute_fn: &mut dyn FnMut() -> Vec<u8>,
+    ) -> OwnedBytes;
 }
 
 pub struct ClusterPlugin {
@@ -456,11 +481,18 @@ impl SegmentPlugin for ClusterPlugin {
     fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
         let file_slice = ctx.segment_reader.open_read(component())?;
         let composite = CompositeFile::open(&file_slice)?;
+        let segment_id = ctx.segment.id();
 
         let mut field_readers = HashMap::new();
         for field_cfg in &self.config.fields {
             if let Some(field_slice) = composite.open_read(field_cfg.field) {
-                let reader = ClusterFieldReader::open(field_slice, field_cfg.metric)?;
+                let reader = ClusterFieldReader::open(
+                    field_slice,
+                    field_cfg.metric,
+                    segment_id,
+                    field_cfg.field,
+                    self.config.hot_bytes_cache.as_ref(),
+                )?;
                 field_readers.insert(field_cfg.field, reader);
             }
         }
@@ -1038,26 +1070,112 @@ pub struct ClusterFieldReader {
     field_meta: Option<VectorFieldMeta>,
 }
 
+/// Header: u32 num_windows + u32 window_size + 22 B field_meta.
+const CLUSTER_FIELD_HEADER_SIZE: usize = 8 + FIELD_META_SIZE;
+
+/// Read header + directory + every window's hot section from `file_slice`
+/// into a contiguous packed buffer. Cold sections are skipped: the packed
+/// layout is `[header][directory][hot_0][hot_1]...[hot_{n-1}]`, whereas
+/// the on-disk file interleaves hot and cold per window. This packing is
+/// the unit cached by `HotBytesCache` — ~5 MB per index for Cohere 1M, vs
+/// ~130 MB for the full file.
+fn pack_hot_bytes(file_slice: &FileSlice) -> crate::Result<Vec<u8>> {
+    let header = file_slice.read_bytes_slice(0..CLUSTER_FIELD_HEADER_SIZE)?;
+    let num_windows =
+        u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+
+    let dir_end = CLUSTER_FIELD_HEADER_SIZE + num_windows * WINDOW_DIR_ENTRY_SIZE;
+    let dir = file_slice.read_bytes_slice(CLUSTER_FIELD_HEADER_SIZE..dir_end)?;
+
+    let mut file_cumulative = dir_end;
+    let mut hot_total = 0usize;
+    let mut window_info: Vec<(usize, usize, usize)> = Vec::with_capacity(num_windows);
+    for i in 0..num_windows {
+        let off = i * WINDOW_DIR_ENTRY_SIZE;
+        let hot_size = u32::from_le_bytes([
+            dir[off + 8], dir[off + 9], dir[off + 10], dir[off + 11],
+        ]) as usize;
+        let cold_size = u32::from_le_bytes([
+            dir[off + 12], dir[off + 13], dir[off + 14], dir[off + 15],
+        ]) as usize;
+        window_info.push((file_cumulative, hot_size, cold_size));
+        hot_total += hot_size;
+        file_cumulative += hot_size + cold_size;
+    }
+
+    let packed_size = dir_end + hot_total;
+    let mut packed = Vec::with_capacity(packed_size);
+    packed.extend_from_slice(&header);
+    packed.extend_from_slice(&dir);
+    for (file_off, hot_size, _) in &window_info {
+        let hot = file_slice.read_bytes_slice(*file_off..*file_off + *hot_size)?;
+        packed.extend_from_slice(&hot);
+    }
+    Ok(packed)
+}
+
 impl ClusterFieldReader {
-    fn open(file_slice: FileSlice, metric: Metric) -> crate::Result<Self> {
-        // Header: u32 num_windows + u32 window_size + 22 B field_meta = 30 B.
-        const HEADER_SIZE: usize = 8 + FIELD_META_SIZE;
-        let header = file_slice.read_bytes_slice(0..HEADER_SIZE)?;
+    fn open(
+        file_slice: FileSlice,
+        metric: Metric,
+        segment_id: SegmentId,
+        field: Field,
+        cache: Option<&Arc<dyn HotBytesCache>>,
+    ) -> crate::Result<Self> {
+        // Obtain packed hot bytes — either from the cache or by reading
+        // directly from the file. `pack_hot_bytes` is the single source of
+        // truth for the packed layout.
+        let packed: OwnedBytes = if let Some(cache) = cache {
+            let mut compute_err: crate::Result<()> = Ok(());
+            let bytes = cache.get_or_compute(&segment_id, field, &mut || {
+                match pack_hot_bytes(&file_slice) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        compute_err = Err(e);
+                        Vec::new()
+                    }
+                }
+            });
+            compute_err?;
+            bytes
+        } else {
+            OwnedBytes::new(pack_hot_bytes(&file_slice)?)
+        };
 
+        Self::parse_packed(&packed, file_slice, metric)
+    }
+
+    /// Parse the packed buffer into windowed readers. The packed layout is
+    /// produced by [`pack_hot_bytes`]. Cold `batch_data` slices are
+    /// resolved against the original `file_slice` using offsets derived
+    /// from the directory.
+    fn parse_packed(
+        packed: &[u8],
+        file_slice: FileSlice,
+        metric: Metric,
+    ) -> crate::Result<Self> {
+        if packed.len() < CLUSTER_FIELD_HEADER_SIZE {
+            return Err(crate::TantivyError::InternalError(
+                "cluster field header underflow".into(),
+            ));
+        }
         let num_windows =
-            u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            u32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]) as usize;
         let _window_size =
-            u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+            u32::from_le_bytes([packed[4], packed[5], packed[6], packed[7]]) as usize;
         let mut field_meta_pos = 8;
-        let field_meta = Some(deserialize_field_meta(&header, &mut field_meta_pos));
+        let field_meta = Some(deserialize_field_meta(packed, &mut field_meta_pos));
 
-        // Directory: 16 B per window.
-        let dir_start = HEADER_SIZE;
-        let dir_end = dir_start + num_windows * WINDOW_DIR_ENTRY_SIZE;
-        let dir = file_slice.read_bytes_slice(dir_start..dir_end)?;
+        let dir_end = CLUSTER_FIELD_HEADER_SIZE + num_windows * WINDOW_DIR_ENTRY_SIZE;
+        let dir = &packed[CLUSTER_FIELD_HEADER_SIZE..dir_end];
 
-        let mut entries: Vec<(u32, u32, usize, usize, usize)> = Vec::with_capacity(num_windows);
-        let mut cumulative = dir_end;
+        // Two cumulative offsets: one into the packed buffer (hot only),
+        // one into the original file (hot + cold interleaved).
+        let mut packed_cumulative = dir_end;
+        let mut file_cumulative = dir_end;
+
+        let mut windows = Vec::with_capacity(num_windows);
+        let mut dim_bytes = 0usize;
         for i in 0..num_windows {
             let off = i * WINDOW_DIR_ENTRY_SIZE;
             let win_doc_offset =
@@ -1071,21 +1189,20 @@ impl ClusterFieldReader {
             let cold_size = u32::from_le_bytes([
                 dir[off + 12], dir[off + 13], dir[off + 14], dir[off + 15],
             ]) as usize;
-            entries.push((win_doc_offset, win_num_docs, cumulative, hot_size, cold_size));
-            cumulative += hot_size + cold_size;
-        }
 
-        let mut windows = Vec::with_capacity(num_windows);
-        let mut dim_bytes = 0usize;
-        for (win_doc_offset, win_num_docs, win_off, hot_size, cold_size) in entries {
-            let hot = file_slice.read_bytes_slice(win_off..win_off + hot_size)?;
+            let hot = &packed[packed_cumulative..packed_cumulative + hot_size];
+            packed_cumulative += hot_size;
+
             let cold_slice = if cold_size > 0 {
-                file_slice.slice((win_off + hot_size)..(win_off + hot_size + cold_size))
+                let cold_off = file_cumulative + hot_size;
+                file_slice.slice(cold_off..cold_off + cold_size)
             } else {
                 FileSlice::empty()
             };
+            file_cumulative += hot_size + cold_size;
+
             let win_reader =
-                WindowReader::open(&hot, cold_slice, win_doc_offset, win_num_docs, metric)?;
+                WindowReader::open(hot, cold_slice, win_doc_offset, win_num_docs, metric)?;
             if win_reader.dims > 0 {
                 dim_bytes = win_reader.dims / 8;
             }

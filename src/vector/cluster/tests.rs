@@ -85,6 +85,7 @@ fn make_cluster_plugin(
             rotator_seed: 42,
         }],
         sampler_factory,
+        hot_bytes_cache: None,
     }))
 }
 
@@ -317,6 +318,7 @@ fn test_hnsw_centroid_search_accuracy() -> crate::Result<()> {
         sampler_factory: Arc::new(InMemorySamplerFactory {
             vectors: shared_vecs,
         }),
+        hot_bytes_cache: None,
     }));
 
     let index = Index::builder()

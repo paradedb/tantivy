@@ -61,6 +61,7 @@ fn make_plugins(
             rotator_seed: 42,
         }],
         sampler_factory: Arc::new(InMemorySamplerFactory { vectors: shared_vecs }),
+        hot_bytes_cache: None,
     }));
     (bqvec, cluster)
 }
@@ -163,6 +164,7 @@ fn test_e2e_distance_ordering() -> crate::Result<()> {
             rotator_seed: 42,
         }],
         sampler_factory: Arc::new(InMemorySamplerFactory { vectors: shared_vecs }),
+        hot_bytes_cache: None,
     }));
 
     let index = Index::builder()
