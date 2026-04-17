@@ -180,7 +180,7 @@ impl SortKeyComputer for SortByVectorDistance {
 
                 // gap_tolerance: merge reads within this many bytes of each
                 // other. ~2 PG pages — amortizes pin cost with minimal wasted bandwidth.
-                const COALESCE_GAP_TOLERANCE: usize = 16 * 1024;
+                const COALESCE_GAP_TOLERANCE: usize = 256 * 1024;
                 let probe_ids: Vec<u32> = probe.iter().map(|(c, _)| *c).collect();
                 let fetched = win
                     .cluster_batch_raw_many(&probe_ids, COALESCE_GAP_TOLERANCE)
