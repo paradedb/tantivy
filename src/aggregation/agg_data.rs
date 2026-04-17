@@ -901,7 +901,7 @@ fn build_terms_or_cardinality_nodes(
                         str_col,
                         &req.include,
                         &req.exclude,
-                        missing,
+                        missing.is_some(),
                     )?;
                 };
                 let idx_in_req_data = data.push_term_req_data(TermsAggReqData {
@@ -945,14 +945,14 @@ fn build_allowed_term_ids_for_str(
     str_col: &StrColumn,
     include: &Option<IncludeExcludeParam>,
     exclude: &Option<IncludeExcludeParam>,
-    missing: &Option<Key>,
+    reserve_missing_sentinel: bool,
 ) -> crate::Result<Option<BitSet>> {
     let mut allowed: Option<BitSet> = None;
-    let missing_sentinel_adjustment = if missing.is_some() { 1 } else { 0 };
-    let num_terms = str_col.dictionary().num_terms() as u32 + missing_sentinel_adjustment;
+    let missing_sentinel_adjustment = if reserve_missing_sentinel { 1 } else { 0 };
+    let allowed_capacity = str_col.dictionary().num_terms() as u32 + missing_sentinel_adjustment;
     if let Some(include) = include {
         // add matches
-        allowed = Some(BitSet::with_max_value(num_terms));
+        allowed = Some(BitSet::with_max_value(allowed_capacity));
         let allowed = allowed.as_mut().unwrap();
         for_each_matching_term_ord(str_col, include, |ord| allowed.insert(ord))?;
     };
@@ -960,7 +960,7 @@ fn build_allowed_term_ids_for_str(
     if let Some(exclude) = exclude {
         if allowed.is_none() {
             // Start with all terms allowed
-            allowed = Some(BitSet::with_max_value_and_full(num_terms));
+            allowed = Some(BitSet::with_max_value_and_full(allowed_capacity));
         }
         let allowed = allowed.as_mut().unwrap();
         for_each_matching_term_ord(str_col, exclude, |ord| allowed.remove(ord))?;
