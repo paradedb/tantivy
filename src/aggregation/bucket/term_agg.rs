@@ -146,7 +146,9 @@ pub enum IncludeExcludeParam {
 
 impl Serialize for IncludeExcludeParam {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         match self {
             IncludeExcludeParam::Regex(s) => serializer.serialize_str(s),
             IncludeExcludeParam::Values(v) => v.serialize(serializer),
@@ -157,7 +159,9 @@ impl Serialize for IncludeExcludeParam {
 // Custom deserializer to accept either a single string (regex) or an array of strings (values).
 impl<'de> Deserialize<'de> for IncludeExcludeParam {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: serde::Deserializer<'de> {
+    where
+        D: serde::Deserializer<'de>,
+    {
         use serde::de::{self, SeqAccess, Visitor};
         struct IncludeExcludeVisitor;
 
@@ -169,22 +173,30 @@ impl<'de> Deserialize<'de> for IncludeExcludeParam {
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where E: de::Error {
+            where
+                E: de::Error,
+            {
                 Ok(IncludeExcludeParam::Regex(v.to_string()))
             }
 
             fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
-            where E: de::Error {
+            where
+                E: de::Error,
+            {
                 Ok(IncludeExcludeParam::Regex(v.to_string()))
             }
 
             fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-            where E: de::Error {
+            where
+                E: de::Error,
+            {
                 Ok(IncludeExcludeParam::Regex(v))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where A: SeqAccess<'de> {
+            where
+                A: SeqAccess<'de>,
+            {
                 let mut values: Vec<String> = Vec::new();
                 while let Some(elem) = seq.next_element::<String>()? {
                     values.push(elem);
@@ -1213,7 +1225,7 @@ mod tests {
     use crate::aggregation::{AggregationLimitsGuard, DistributedAggregationCollector};
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{IntoIpv6Addr, Schema, FAST, STRING};
+    use crate::schema::{IntoIpv6Addr, Schema, FAST, STORED, STRING, TEXT};
     use crate::{Index, IndexWriter};
 
     #[test]
@@ -2905,6 +2917,87 @@ mod tests {
         assert_eq!(agg_json["tags"]["doc_count_error_upper_bound"], 0);
         assert_eq!(agg_json["tags"]["sum_other_doc_count"], 0);
 
+        Ok(())
+    }
+
+    fn prep_index_and_agg_with_n_unique_terms_plus_one_null(
+        n: u64,
+    ) -> crate::Result<(Index, Aggregations)> {
+        let mut schema_builder = Schema::builder();
+        let id_field = schema_builder.add_u64_field("id", STORED);
+        let title_field = schema_builder.add_text_field("title", TEXT | STORED | FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        let mut writer = index.writer_with_num_threads(1, 50_000_000)?;
+
+        writer.add_document(doc!(
+            id_field => 0u64,
+        ))?;
+        for i in 1u64..=n {
+            let title = format!("foo{i}");
+            writer.add_document(doc!(
+                id_field => i,
+                title_field => title,
+            ))?;
+        }
+
+        writer.commit()?;
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_bool": {
+                "terms": {
+                    "field": "title",
+                    "include": "foo",
+                    "missing": "__NULL__",
+                }
+            }
+        }))?;
+
+        Ok((index, agg_req))
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regression_0() -> crate::Result<()> {
+        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(0)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
+        Ok(())
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regression_64() -> crate::Result<()> {
+        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(64)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
+        Ok(())
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regression_128() -> crate::Result<()> {
+        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(128)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
+        Ok(())
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regression_192() -> crate::Result<()> {
+        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(192)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
+        Ok(())
+    }
+
+    #[test]
+    fn null_bitset_bounds_check_regression_256() -> crate::Result<()> {
+        let (index, agg_req) = prep_index_and_agg_with_n_unique_terms_plus_one_null(256)?;
+
+        // this should work and not panic
+        let _res = exec_request(agg_req, &index)?;
         Ok(())
     }
 }
