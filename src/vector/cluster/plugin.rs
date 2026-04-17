@@ -99,12 +99,15 @@ fn build_cluster_data(
     centroids: Vec<Vec<f32>>,
     _assignments: &[usize],
     num_docs: usize,
+    rotator: &DynamicRotator,
+    ex_bits: usize,
     metric: Metric,
 ) -> ClusterData {
     let num_clusters = centroids.len();
     let dims = centroids.first().map_or(0, |v| v.len());
     let centroid_ids: Vec<u32> = (0..num_clusters as u32).collect();
-    let centroid_index = CentroidIndex::build(centroids, centroid_ids, metric);
+    let centroid_index =
+        CentroidIndex::build(centroids, centroid_ids, rotator, ex_bits, metric);
 
     ClusterData {
         centroid_index,
@@ -149,7 +152,14 @@ fn cluster_from_vectors(
     }
 
     let centroids = result.centroids.clone();
-    let data = build_cluster_data(result.centroids, &assignments, num_docs, field_config.metric);
+    let data = build_cluster_data(
+        result.centroids,
+        &assignments,
+        num_docs,
+        &field_config.rotator,
+        field_config.ex_bits,
+        field_config.metric,
+    );
 
     Ok(ClusterResult {
         data,
@@ -573,7 +583,12 @@ impl SegmentPlugin for ClusterPlugin {
                 }
 
                 let mut data = build_cluster_data(
-                    centroids, &assignments, win_num_docs, field_cfg.metric,
+                    centroids,
+                    &assignments,
+                    win_num_docs,
+                    &field_cfg.rotator,
+                    field_cfg.ex_bits,
+                    field_cfg.metric,
                 );
                 data.cluster_batch_data = per_cluster_docs
                     .iter()
@@ -890,7 +905,11 @@ impl WindowReader {
         self.centroid_index.as_ref().map_or(0, |ci| ci.len())
     }
 
-    pub fn search_centroids(&self, query: &[f32], ef_search: usize) -> Vec<(u32, f32)> {
+    pub fn search_centroids(
+        &self,
+        query: &crate::vector::rabitq::RaBitQQuery,
+        ef_search: usize,
+    ) -> Vec<(u32, f32)> {
         match &self.centroid_index {
             Some(ci) => ci.search(query, ef_search),
             None => vec![],
@@ -1111,7 +1130,11 @@ impl ClusterFieldReader {
         &self.windows[idx]
     }
 
-    pub fn search_centroids(&self, query: &[f32], ef_search: usize) -> Vec<(u32, f32)> {
+    pub fn search_centroids(
+        &self,
+        query: &crate::vector::rabitq::RaBitQQuery,
+        ef_search: usize,
+    ) -> Vec<(u32, f32)> {
         if self.windows.len() == 1 {
             return self.windows[0].search_centroids(query, ef_search);
         }

@@ -188,7 +188,8 @@ fn test_cluster_flush_above_threshold() -> crate::Result<()> {
 
     // Centroid search should return results
     let query: Vec<f32> = (0..DIMS).map(|d| d as f32 / DIMS as f32).collect();
-    let results = field_reader.search_centroids(&query, 4);
+    let rq = rabitq::prepare_query(&rotator, &query, 6, Metric::L2);
+    let results = field_reader.search_centroids(&rq, 4);
     assert!(!results.is_empty());
 
     Ok(())
@@ -267,7 +268,8 @@ fn test_cluster_merge_with_bq_assignment() -> crate::Result<()> {
 
     // Search centroids: query near positive vectors should find the right cluster
     let query: Vec<f32> = (0..DIMS).map(|d| d as f32 / DIMS as f32).collect();
-    let results = field_reader.search_centroids(&query, 2);
+    let rq = rabitq::prepare_query(&rotator, &query, 6, Metric::L2);
+    let results = field_reader.search_centroids(&rq, 2);
     assert!(!results.is_empty());
 
     Ok(())
@@ -358,13 +360,14 @@ fn test_hnsw_centroid_search_accuracy() -> crate::Result<()> {
     for _ in 0..20 {
         let query: Vec<f32> = (0..DIMS).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
 
+        let rq = rabitq::prepare_query(&rotator, &query, 6, Metric::L2);
         // HNSW top-1
-        let hnsw_results = field_reader.search_centroids(&query, 1);
+        let hnsw_results = field_reader.search_centroids(&rq, 1);
         assert!(!hnsw_results.is_empty());
         let hnsw_nearest_id = hnsw_results[0].0;
 
         // Brute-force: get all centroids and find true nearest
-        let bf_results = field_reader.search_centroids(&query, k);
+        let bf_results = field_reader.search_centroids(&rq, k);
         let bf_nearest_id = bf_results[0].0;
 
         // HNSW should find the same nearest centroid as brute-force
