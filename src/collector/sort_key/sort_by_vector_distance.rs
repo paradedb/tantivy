@@ -317,6 +317,7 @@ impl SortKeyComputer for SortByVectorDistance {
                 }
             }
         } else {
+            eprintln!("DBG_VEC unclustered metric={:?} ex_bits={} pad={} max_doc={}", meta.metric, ex_bits, padded_dims, reader.max_doc());
             // Unclustered fallback
             let mut doc = filter_scorer.doc();
             while doc != TERMINATED {
@@ -325,14 +326,16 @@ impl SortKeyComputer for SortByVectorDistance {
                         &record, padded_dims, 0.0,
                     );
                     let score = -dist;
+                    eprintln!("DBG_VEC unclus doc={} dist={} score={}", doc, dist, score);
                     top_n.push(score, doc);
                 }
                 doc = filter_scorer.advance();
             }
         }
 
-        Ok(top_n
-            .into_vec()
+        let kept: Vec<_> = top_n.into_vec();
+        eprintln!("DBG_VEC kept {} docs: {:?}", kept.len(), kept.iter().take(8).map(|c| (c.doc, c.sort_key)).collect::<Vec<_>>());
+        Ok(kept
             .into_iter()
             .map(|cid| (cid.sort_key, DocAddress::new(segment_ord, cid.doc)))
             .collect())
