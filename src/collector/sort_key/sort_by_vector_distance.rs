@@ -298,12 +298,12 @@ impl SortKeyComputer for SortByVectorDistance {
                                             * binary_dots[j]
                                             + ex_dot
                                             + rabitq_query.kbx_sum_q();
-                                        let dist =
-                                            f_add_ex + g_add + f_rescale_ex * total_term;
-                                        match meta.metric {
-                                            Metric::L2 => dist,
-                                            Metric::InnerProduct => -dist,
-                                        }
+                                        // See `RaBitQQuery::estimate_distance`:
+                                        // for both metrics, `dist` is already
+                                        // "lower = more similar" because
+                                        // `f_rescale_ex` carries the right sign.
+                                        let _ = meta.metric;
+                                        f_add_ex + g_add + f_rescale_ex * total_term
                                     } else { continue; }
                                 } else {
                                     distances[j]

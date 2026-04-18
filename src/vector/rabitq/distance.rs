@@ -75,10 +75,14 @@ impl RaBitQQuery {
             distance = qv.f_add_ex + g_add + qv.f_rescale_ex * total_term;
         }
 
-        match self.metric {
-            Metric::L2 => distance,
-            Metric::InnerProduct => -distance,
-        }
+        // `distance` is already in "lower = more similar" form for both
+        // metrics: L2 gives true squared distance (>= 0), and InnerProduct
+        // gives an estimate whose sign comes from `f_rescale = -l2_sqr/denom`
+        // (negative), so larger inner product yields more negative distance.
+        // Returning `distance` directly preserves the contract used by the
+        // collector, which scores via `-distance` and keeps highest scores.
+        let _ = self.metric;
+        distance
     }
 
     /// Estimate distance from a packed byte record.
@@ -124,10 +128,14 @@ impl RaBitQQuery {
             distance = f_add_ex + g_add + f_rescale_ex * total_term;
         }
 
-        match self.metric {
-            Metric::L2 => distance,
-            Metric::InnerProduct => -distance,
-        }
+        // `distance` is already in "lower = more similar" form for both
+        // metrics: L2 gives true squared distance (>= 0), and InnerProduct
+        // gives an estimate whose sign comes from `f_rescale = -l2_sqr/denom`
+        // (negative), so larger inner product yields more negative distance.
+        // Returning `distance` directly preserves the contract used by the
+        // collector, which scores via `-distance` and keeps highest scores.
+        let _ = self.metric;
+        distance
     }
 
     /// Two-stage distance estimation with lower-bound pruning.
