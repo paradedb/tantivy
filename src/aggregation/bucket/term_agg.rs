@@ -2950,11 +2950,20 @@ mod tests {
         // include cases
         for i in 0..=4 {
             let index = prep_index_with_n_unique_terms_plus_one_null(i * 64)?;
+            let normal_req: Aggregations = serde_json::from_value(json!({
+                "my_bool": {
+                    "terms": {
+                        "field": "title",
+                        "missing": "__NULL__",
+                        "size": 1000,
+                    }
+                }
+            }))?;
             let include_req: Aggregations = serde_json::from_value(json!({
                 "my_bool": {
                     "terms": {
                         "field": "title",
-                        "include": "foo",
+                        "include": "foo(.*)",
                         "missing": "__NULL__",
                         "size": 1000,
                     }
@@ -2964,15 +2973,23 @@ mod tests {
                 "my_bool": {
                     "terms": {
                         "field": "title",
-                        "exclude": "foo",
+                        "exclude": "foo(.*)",
                         "missing": "__NULL__",
                         "size": 1000,
                     }
                 }
             }))?;
 
-            // these should work and not panic
+            let normal_res = exec_request(normal_req, &index)?;
+            let normal_buckets = normal_res["my_bool"]["buckets"].as_array().unwrap();
+            assert_eq!(
+                normal_buckets.len(),
+                (i * 64) as usize + 1,
+                "The normal request should return all 'foo' buckets, plus the missing term bucket",
+            );
+
             let include_res = exec_request(include_req, &index)?;
+            eprintln!("include_res: {include_res:?}");
             let include_buckets = include_res["my_bool"]["buckets"].as_array().unwrap();
             assert_eq!(
                 include_buckets.len(),
