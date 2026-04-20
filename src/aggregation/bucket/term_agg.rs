@@ -2945,43 +2945,55 @@ mod tests {
         Ok(index)
     }
 
-    fn agg_terms_request_for_regression_check(use_exclude: bool) -> crate::Result<Aggregations> {
-        let agg_req: Aggregations = if use_exclude {
-            serde_json::from_value(json!({
-                "my_bool": {
-                    "terms": {
-                        "field": "title",
-                        "exclude": "foo",
-                        "missing": "__NULL__",
-                    }
-                }
-            }))?
-        } else {
-            serde_json::from_value(json!({
-                "my_bool": {
-                    "terms": {
-                        "field": "title",
-                        "include": "foo",
-                        "missing": "__NULL__",
-                    }
-                }
-            }))?
-        };
-
-        Ok(agg_req)
-    }
-
     #[test]
     fn null_bitset_bounds_check_regression() -> crate::Result<()> {
         // include cases
         for i in 0..=4 {
             let index = prep_index_with_n_unique_terms_plus_one_null(i * 64)?;
-            let include_req = agg_terms_request_for_regression_check(false)?;
-            let exclude_req = agg_terms_request_for_regression_check(true)?;
+            let include_req: Aggregations = serde_json::from_value(json!({
+                "my_bool": {
+                    "terms": {
+                        "field": "title",
+                        "include": "foo",
+                        "missing": "__NULL__",
+                        "size": 1000,
+                    }
+                }
+            }))?;
+            let exclude_req: Aggregations = serde_json::from_value(json!({
+                "my_bool": {
+                    "terms": {
+                        "field": "title",
+                        "exclude": "foo",
+                        "missing": "__NULL__",
+                        "size": 1000,
+                    }
+                }
+            }))?;
 
-            // this should work and not panic
-            let _res = exec_request(include_req, &index)?;
-            let _res = exec_request(exclude_req, &index)?;
+            // these should work and not panic
+            let include_res = exec_request(include_req, &index)?;
+            let include_buckets = include_res["my_bool"]["buckets"].as_array().unwrap();
+            assert_eq!(
+                include_buckets.len(),
+                (i * 64) as usize,
+                "The include request should return all 'foo' buckets, and not the missing term bucket",
+            );
+            assert!(include_buckets
+                .iter()
+                .all(|b| b["key"].as_str().unwrap().starts_with("foo")));
+
+            let exclude_res = exec_request(exclude_req, &index)?;
+            let exclude_buckets = exclude_res["my_bool"]["buckets"].as_array().unwrap();
+            if i != 0 {
+                // TODO: Remove this if after fixing exclude + missing bug
+                assert_eq!(
+                    exclude_buckets.len(),
+                    1,
+                    "The exclude request should exclude all 'foo' buckets, and only the missing term bucket",
+                );
+                assert_eq!(exclude_buckets[0]["key"], "__NULL__");
+            }
         }
         Ok(())
     }
