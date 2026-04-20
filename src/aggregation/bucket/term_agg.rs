@@ -3035,16 +3035,13 @@ mod tests {
 
             let exclude_res = exec_request(exclude_req, &index)?;
             let exclude_buckets = exclude_res["my_bool"]["buckets"].as_array().unwrap();
-            if i != 0 {
-                // TODO: Remove this if after fixing exclude + missing bug
-                assert_eq!(
-                    exclude_buckets.len(),
-                    1,
-                    "The exclude request should exclude all 'foo' buckets, and only the missing \
+            assert_eq!(
+                exclude_buckets.len(),
+                1,
+                "The exclude request should exclude all 'foo' buckets, and only the missing \
                      term bucket",
-                );
-                assert_eq!(exclude_buckets[0]["key"], "__NULL__");
-            }
+            );
+            assert_eq!(exclude_buckets[0]["key"], "__NULL__");
         }
         Ok(())
     }
