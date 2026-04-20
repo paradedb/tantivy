@@ -941,6 +941,9 @@ fn build_terms_or_cardinality_nodes(
 
 /// Builds a single BitSet of allowed term ordinals for a string dictionary column according to
 /// include/exclude parameters.
+///
+/// When `reserve_missing_sentinel` is true, the bitset will have 1 additional slot for the missing
+/// term ordinal
 fn build_allowed_term_ids_for_str(
     str_col: &StrColumn,
     include: &Option<IncludeExcludeParam>,
