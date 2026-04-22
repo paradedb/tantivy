@@ -209,20 +209,6 @@ pub struct BlockwiseLinearV2Reader {
 }
 
 impl BlockwiseLinearV2Reader {
-    pub fn from_parts(footer: FileSlice, data: FileSlice, stats: ColumnStats) -> Self {
-        Self {
-            footer,
-            data,
-            stats,
-            cache: BlockCache::new(),
-        }
-    }
-
-    /// Extracts the reader's parts for external caching.
-    pub fn into_parts(self) -> (FileSlice, FileSlice, ColumnStats) {
-        (self.footer, self.data, self.stats)
-    }
-
     #[inline(always)]
     fn block_meta(&self, block_id: usize) -> (Line, u8, usize) {
         let off = block_id * BLOCK_META_SIZE;
