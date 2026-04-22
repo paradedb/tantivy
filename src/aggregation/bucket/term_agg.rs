@@ -2966,7 +2966,6 @@ mod tests {
     }
 
     #[test]
-
     fn null_bitset_bounds_check_regression() -> crate::Result<()> {
         // include cases
         for i in 0..=4 {
