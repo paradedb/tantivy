@@ -18,6 +18,16 @@ const BLOCK_SIZE: u32 = 512u32;
 /// Fixed-size footer entry: slope(8) + intercept(8) + bit_width(1) + data_offset(4) = 21 bytes.
 const BLOCK_META_SIZE: usize = 21;
 
+/// Parse a 21-byte block metadata entry into (line, bit_width, data_start_offset).
+#[inline(always)]
+fn parse_block_meta(entry: &[u8]) -> (Line, u8, usize) {
+    let slope = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+    let intercept = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+    let bit_width = entry[16];
+    let data_start = u32::from_le_bytes(entry[17..21].try_into().unwrap()) as usize;
+    (Line { slope, intercept }, bit_width, data_start)
+}
+
 fn compute_num_blocks(num_vals: u32) -> u32 {
     num_vals.div_ceil(BLOCK_SIZE)
 }
@@ -220,12 +230,7 @@ impl BlockwiseLinearV2Reader {
             .slice(off..off + BLOCK_META_SIZE)
             .read_bytes()
             .expect("failed to read block meta");
-        let slope = u64::from_le_bytes(entry[0..8].try_into().unwrap());
-        let intercept = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-        let bit_width = entry[16];
-        let data_start = u32::from_le_bytes(entry[17..21].try_into().unwrap()) as usize;
-
-        (Line { slope, intercept }, bit_width, data_start)
+        parse_block_meta(&entry)
     }
 }
 
@@ -291,20 +296,8 @@ impl ColumnValues for BlockwiseLinearV2Reader {
         for block_id in first_block..=last_block {
             // Parse block metadata from the pre-read footer bytes.
             let local_off = (block_id - first_block) * BLOCK_META_SIZE;
-            let slope =
-                u64::from_le_bytes(footer_bytes[local_off..local_off + 8].try_into().unwrap());
-            let intercept = u64::from_le_bytes(
-                footer_bytes[local_off + 8..local_off + 16]
-                    .try_into()
-                    .unwrap(),
-            );
-            let bit_width = footer_bytes[local_off + 16];
-            let data_start = u32::from_le_bytes(
-                footer_bytes[local_off + 17..local_off + 21]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let line = Line { slope, intercept };
+            let (line, bit_width, data_start) =
+                parse_block_meta(&footer_bytes[local_off..local_off + BLOCK_META_SIZE]);
 
             let data_len = (bit_width as usize) * BLOCK_SIZE as usize / 8;
             let data_end = (data_start + data_len).min(self.data.len());
