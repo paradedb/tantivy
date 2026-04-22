@@ -1,3 +1,30 @@
+//! BlockwiseLinearV2 — a u64 column codec optimised for lazy, on-demand access.
+//!
+//! Like BlockwiseLinear (V1), values are split into fixed-size blocks of 512 rows.
+//! Each block fits a linear approximation and bitpacks the residuals. The key
+//! difference is in the footer layout and load strategy:
+//!
+//! **Fixed-size footer entries (21 bytes each):**
+//!   `slope(8) + intercept(8) + bit_width(1) + data_offset(4)`
+//!
+//! The fixed entry size enables O(1) block lookup by index, which in turn allows:
+//!
+//! - **Lazy `load()`** — the footer is kept as a `FileSlice` and never eagerly
+//!   read. Block metadata is parsed on demand (21 bytes) only for accessed blocks,
+//!   giving near-zero load cost for TopK queries that touch few rows.
+//!
+//! - **Block-aware `get_row_ids_for_value_range`** — reads the footer range for
+//!   the needed blocks in one `read_bytes()` call, then one `read_bytes()` per
+//!   block. Replaces the default per-row `get_val` loop for filtered range scans.
+//!
+//! - **Single-entry `UnsafeCell` block cache in `get_val`** — sequential doc-ID
+//!   access hits the cache ~512 times per block, reducing `read_bytes` calls from
+//!   O(N) to O(N/512). Requires single-threaded access (safe in ParadeDB's
+//!   per-backend model, not suitable for upstream tantivy as-is).
+//!
+//! The footer is roughly 2–4× larger per block than V1 (~42 KB for 1M rows vs
+//! ~12–18 KB), but this is negligible relative to the data region.
+
 use std::cell::UnsafeCell;
 use std::io;
 use std::io::Write;
