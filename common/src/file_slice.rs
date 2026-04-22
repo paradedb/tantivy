@@ -260,7 +260,11 @@ impl FileSlice {
 
     /// Reads a single byte without allocating OwnedBytes.
     pub fn read_byte(&self, offset: usize) -> io::Result<u8> {
-        self.data.read_byte(self.range.start + offset)
+        if let Some(slice) = self.as_slice() {
+            Ok(slice[offset])
+        } else {
+            self.data.read_byte(self.range.start + offset)
+        }
     }
 
     /// Returns a direct reference to the underlying bytes if the implementation supports it.
