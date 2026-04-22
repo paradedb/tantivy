@@ -193,7 +193,10 @@ impl BlockCache {
     fn new() -> Self {
         BlockCache(UnsafeCell::new(CachedBlock {
             block_id: u32::MAX,
-            line: Line { slope: 0, intercept: 0 },
+            line: Line {
+                slope: 0,
+                intercept: 0,
+            },
             bit_unpacker: BitUnpacker::new(0),
             data: OwnedBytes::empty(),
         }))
@@ -288,10 +291,19 @@ impl ColumnValues for BlockwiseLinearV2Reader {
         for block_id in first_block..=last_block {
             // Parse block metadata from the pre-read footer bytes.
             let local_off = (block_id - first_block) * BLOCK_META_SIZE;
-            let slope = u64::from_le_bytes(footer_bytes[local_off..local_off + 8].try_into().unwrap());
-            let intercept = u64::from_le_bytes(footer_bytes[local_off + 8..local_off + 16].try_into().unwrap());
+            let slope =
+                u64::from_le_bytes(footer_bytes[local_off..local_off + 8].try_into().unwrap());
+            let intercept = u64::from_le_bytes(
+                footer_bytes[local_off + 8..local_off + 16]
+                    .try_into()
+                    .unwrap(),
+            );
             let bit_width = footer_bytes[local_off + 16];
-            let data_start = u32::from_le_bytes(footer_bytes[local_off + 17..local_off + 21].try_into().unwrap()) as usize;
+            let data_start = u32::from_le_bytes(
+                footer_bytes[local_off + 17..local_off + 21]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
             let line = Line { slope, intercept };
 
             let data_len = (bit_width as usize) * BLOCK_SIZE as usize / 8;
