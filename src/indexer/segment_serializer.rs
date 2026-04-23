@@ -15,10 +15,7 @@ pub struct SegmentSerializer {
 
 impl SegmentSerializer {
     /// Creates a new `SegmentSerializer`.
-    pub fn for_segment(
-        segment: Segment,
-        is_in_merge: bool,
-    ) -> crate::Result<SegmentSerializer> {
+    pub fn for_segment(segment: Segment, is_in_merge: bool) -> crate::Result<SegmentSerializer> {
         let plugins: Vec<Arc<dyn SegmentPlugin>> = segment.index().plugins().to_vec();
         Self::for_segment_with_plugins(segment, is_in_merge, &plugins)
     }

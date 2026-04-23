@@ -93,14 +93,8 @@ impl SegmentPlugin for StorePlugin {
         debug_time!("write-storable-fields");
         debug!("write-storable-fields");
 
-        let path = ctx
-            .target_segment
-            .relative_path(SegmentComponent::Store);
-        let store_write = ctx
-            .target_segment
-            .index()
-            .directory()
-            .open_write(&path)?;
+        let path = ctx.target_segment.relative_path(SegmentComponent::Store);
+        let store_write = ctx.target_segment.index().directory().open_write(&path)?;
         let settings = ctx.settings;
         let mut store_writer = StoreWriter::new(
             store_write,
