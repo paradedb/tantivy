@@ -15,21 +15,21 @@ use crate::directory::error::OpenReadError;
 use crate::directory::MmapDirectory;
 use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
 use crate::error::{DataCorruption, TantivyError};
+use crate::fastfield::FastFieldsPlugin;
+use crate::fieldnorm::FieldNormsPlugin;
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
 };
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
+use crate::plugin::SegmentPlugin;
+use crate::postings::PostingsPlugin;
 use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
-use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::fastfield::FastFieldsPlugin;
-use crate::fieldnorm::FieldNormsPlugin;
-use crate::plugin::SegmentPlugin;
-use crate::postings::PostingsPlugin;
 use crate::store::StorePlugin;
+use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::SegmentReader;
 
 fn load_metas(

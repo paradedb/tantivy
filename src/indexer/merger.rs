@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use crate::plugin::{PluginMergeContext, SegmentPlugin};
-use columnar::{
-    compute_merged_term_ord_mapping, BytesColumn, Column,
-};
+use columnar::{compute_merged_term_ord_mapping, BytesColumn, Column};
 use common::ReadOnlyBitSet;
 use itertools::Itertools;
 
@@ -12,6 +9,7 @@ use crate::index::{Segment, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::indexer::SegmentSerializer;
+use crate::plugin::{PluginMergeContext, SegmentPlugin};
 use crate::schema::{Schema, Type};
 use crate::termdict::TermOrdinal;
 use crate::{DocAddress, DocId, IndexSettings, IndexSortByField, Order, SegmentOrdinal};
@@ -534,7 +532,11 @@ impl IndexMerger {
             if self.ignore_store && plugin.name() == "store" {
                 continue;
             }
-            debug!("merge-plugin: {} (phase {})", plugin.name(), plugin.write_phase());
+            debug!(
+                "merge-plugin: {} (phase {})",
+                plugin.name(),
+                plugin.write_phase()
+            );
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
                 doc_id_mapping: &doc_id_mapping,
