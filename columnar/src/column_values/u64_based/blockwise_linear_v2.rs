@@ -31,7 +31,7 @@ use std::io::Write;
 use std::ops::{Range, RangeInclusive};
 
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, CountingWriter, DeserializeFrom, HasLen, OwnedBytes};
+use common::{BinarySerializable, CountingWriter, DeserializeFrom, FixedSize, HasLen, OwnedBytes};
 use fastdivide::DividerU64;
 use tantivy_bitpacker::{BitPacker, BitUnpacker, compute_num_bits};
 
@@ -43,16 +43,50 @@ use crate::column_values::{ColumnValues, VecColumn};
 const BLOCK_SIZE: u32 = 512u32;
 
 /// Fixed-size footer entry: slope(8) + intercept(8) + bit_width(1) + data_offset(4) = 21 bytes.
-const BLOCK_META_SIZE: usize = 21;
+#[derive(Debug, Clone, Copy)]
+struct BlockMeta {
+    line: Line,
+    bit_width: u8,
+    data_offset: u32,
+}
 
-/// Parse a 21-byte block metadata entry into (line, bit_width, data_start_offset).
+const BLOCK_META_SIZE: usize =
+    <u64 as FixedSize>::SIZE_IN_BYTES  // slope
+    + <u64 as FixedSize>::SIZE_IN_BYTES  // intercept
+    + <u8 as FixedSize>::SIZE_IN_BYTES   // bit_width
+    + <u32 as FixedSize>::SIZE_IN_BYTES; // data_offset
+
+impl BinarySerializable for BlockMeta {
+    fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+        self.line.slope.serialize(writer)?;
+        self.line.intercept.serialize(writer)?;
+        self.bit_width.serialize(writer)?;
+        self.data_offset.serialize(writer)?;
+        Ok(())
+    }
+
+    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let slope = u64::deserialize(reader)?;
+        let intercept = u64::deserialize(reader)?;
+        let bit_width = u8::deserialize(reader)?;
+        let data_offset = u32::deserialize(reader)?;
+        Ok(BlockMeta {
+            line: Line { slope, intercept },
+            bit_width,
+            data_offset,
+        })
+    }
+}
+
+impl FixedSize for BlockMeta {
+    const SIZE_IN_BYTES: usize = BLOCK_META_SIZE;
+}
+
+/// Parse a block metadata entry from a byte slice.
 #[inline(always)]
-fn parse_block_meta(entry: &[u8]) -> (Line, u8, usize) {
-    let slope = u64::from_le_bytes(entry[0..8].try_into().unwrap());
-    let intercept = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-    let bit_width = entry[16];
-    let data_start = u32::from_le_bytes(entry[17..21].try_into().unwrap()) as usize;
-    (Line { slope, intercept }, bit_width, data_start)
+fn parse_block_meta(entry: &[u8]) -> BlockMeta {
+    let mut cursor = entry;
+    BlockMeta::deserialize(&mut cursor).expect("failed to parse block meta")
 }
 
 fn compute_num_blocks(num_vals: u32) -> u32 {
@@ -168,14 +202,11 @@ impl ColumnCodecEstimator for BlockwiseLinearV2Estimator {
 
         assert_eq!(blocks.len(), num_blocks);
 
-        // Write fixed-size footer: [slope_le64 | intercept_le64 | bit_width_u8 | data_offset_le32]
+        // Write fixed-size footer.
         let mut counting_wrt = CountingWriter::wrap(wrt);
         let mut data_offset = 0u32;
         for &(line, bit_width) in &blocks {
-            counting_wrt.write_all(&line.slope.to_le_bytes())?;
-            counting_wrt.write_all(&line.intercept.to_le_bytes())?;
-            counting_wrt.write_all(&[bit_width])?;
-            counting_wrt.write_all(&data_offset.to_le_bytes())?;
+            BlockMeta { line, bit_width, data_offset }.serialize(&mut counting_wrt)?;
             data_offset += (bit_width as u32) * BLOCK_SIZE / 8;
         }
         let footer_len = counting_wrt.written_bytes();
@@ -251,7 +282,7 @@ pub struct BlockwiseLinearV2Reader {
 
 impl BlockwiseLinearV2Reader {
     #[inline(always)]
-    fn block_meta(&self, block_id: usize) -> (Line, u8, usize) {
+    fn block_meta(&self, block_id: usize) -> BlockMeta {
         let off = block_id * BLOCK_META_SIZE;
         let entry = self
             .footer
@@ -270,12 +301,13 @@ impl ColumnValues for BlockwiseLinearV2Reader {
         // SAFETY: single-threaded access per Postgres backend / per segment in tantivy.
         let cache = unsafe { &mut *self.cache.0.get() };
         if cache.block_id != block_id {
-            let (line, bit_width, data_start) = self.block_meta(block_id as usize);
-            let data_len = (bit_width as usize) * BLOCK_SIZE as usize / 8;
+            let meta = self.block_meta(block_id as usize);
+            let data_start = meta.data_offset as usize;
+            let data_len = (meta.bit_width as usize) * BLOCK_SIZE as usize / 8;
             let data_end = (data_start + data_len).min(self.data.len());
             cache.block_id = block_id;
-            cache.line = line;
-            cache.bit_unpacker = BitUnpacker::new(bit_width);
+            cache.line = meta.line;
+            cache.bit_unpacker = BitUnpacker::new(meta.bit_width);
             cache.data = self
                 .data
                 .slice(data_start..data_end)
@@ -324,17 +356,17 @@ impl ColumnValues for BlockwiseLinearV2Reader {
         for block_id in first_block..=last_block {
             // Parse block metadata from the pre-read footer bytes.
             let local_off = (block_id - first_block) * BLOCK_META_SIZE;
-            let (line, bit_width, data_start) =
-                parse_block_meta(&footer_bytes[local_off..local_off + BLOCK_META_SIZE]);
+            let meta = parse_block_meta(&footer_bytes[local_off..local_off + BLOCK_META_SIZE]);
 
-            let data_len = (bit_width as usize) * BLOCK_SIZE as usize / 8;
+            let data_start = meta.data_offset as usize;
+            let data_len = (meta.bit_width as usize) * BLOCK_SIZE as usize / 8;
             let data_end = (data_start + data_len).min(self.data.len());
             let data = self
                 .data
                 .slice(data_start..data_end)
                 .read_bytes()
                 .expect("failed to read block data");
-            let bit_unpacker = BitUnpacker::new(bit_width);
+            let bit_unpacker = BitUnpacker::new(meta.bit_width);
 
             let block_start_row = block_id as u32 * BLOCK_SIZE;
             let local_start = if block_start_row < row_id_range.start {
@@ -345,7 +377,7 @@ impl ColumnValues for BlockwiseLinearV2Reader {
             let local_end = (row_id_range.end - block_start_row).min(BLOCK_SIZE);
 
             for idx_within_block in local_start..local_end {
-                let interpoled_val = line.eval(idx_within_block);
+                let interpoled_val = meta.line.eval(idx_within_block);
                 let bitpacked_diff = bit_unpacker.get(idx_within_block, &data);
                 let val = min_value + gcd.wrapping_mul(interpoled_val.wrapping_add(bitpacked_diff));
                 if value_range.contains(&val) {
