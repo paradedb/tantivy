@@ -19,6 +19,7 @@ use crate::schema::document::{Document, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::store::StorePluginWriter;
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
+use crate::vector::cluster::plugin::ClusterPluginWriter;
 use crate::{DocId, Opstamp, TantivyError};
 
 /// Computes the initial size of the hash table.
@@ -395,6 +396,12 @@ impl SegmentWriter {
                             .record(doc_id, field, num_vals);
                     }
                 }
+                FieldType::Vector(_) => {
+                    // Vector fields are handled by the Cluster plugin
+                    // (which owns the per-doc record storage in its
+                    // `.cluster` file), not the standard indexing
+                    // pipeline. Skip them here.
+                }
             }
         }
         Ok(())
@@ -421,6 +428,12 @@ impl SegmentWriter {
                 .get_plugin_writer::<StorePluginWriter>("store")
                 .expect("store plugin")
                 .store(&document, &self.schema)?;
+        }
+        if let Some(cluster_writer) = self
+            .segment_serializer
+            .get_plugin_writer::<ClusterPluginWriter>("cluster")
+        {
+            cluster_writer.ingest_vectors(&document, &self.schema);
         }
         for (_, writer) in self.segment_serializer.plugin_writers_mut().iter_mut() {
             writer.add_document(doc_id)?;

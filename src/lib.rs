@@ -196,6 +196,7 @@ pub mod fieldnorm;
 pub mod index;
 pub mod positions;
 pub mod postings;
+pub mod vector;
 
 pub mod plugin;
 /// Module containing the different query implementations.
