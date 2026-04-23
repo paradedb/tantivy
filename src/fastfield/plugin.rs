@@ -50,9 +50,7 @@ impl SegmentPlugin for FastFieldsPlugin {
         // During merge, the merge() method handles file creation directly.
         // Only open the file during normal indexing.
         let fast_field_write = if !ctx.is_in_merge {
-            let path = ctx
-                .segment
-                .relative_path(SegmentComponent::FastFields);
+            let path = ctx.segment.relative_path(SegmentComponent::FastFields);
             let write = ctx.directory.open_write(&path)?;
             Some(write)
         } else {
@@ -66,9 +64,7 @@ impl SegmentPlugin for FastFieldsPlugin {
     }
 
     fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
-        let file = ctx
-            .segment_reader
-            .open_read(SegmentComponent::FastFields)?;
+        let file = ctx.segment_reader.open_read(SegmentComponent::FastFields)?;
         let schema = ctx.schema.clone();
         let readers = FastFieldReaders::open(file, schema)
             .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
@@ -80,11 +76,8 @@ impl SegmentPlugin for FastFieldsPlugin {
         let path = ctx
             .target_segment
             .relative_path(SegmentComponent::FastFields);
-        let mut fast_field_wrt: WritePtr = ctx
-            .target_segment
-            .index()
-            .directory()
-            .open_write(&path)?;
+        let mut fast_field_wrt: WritePtr =
+            ctx.target_segment.index().directory().open_write(&path)?;
 
         let required_columns = extract_fast_field_required_columns(ctx.schema);
         let columnars: Vec<&ColumnarReader> = ctx

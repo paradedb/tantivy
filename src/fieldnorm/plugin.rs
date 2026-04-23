@@ -42,24 +42,17 @@ impl SegmentPlugin for FieldNormsPlugin {
         // During merge, the merge() method handles file creation directly.
         // Only open the file during normal indexing.
         let serializer = if !ctx.is_in_merge {
-            let path = ctx
-                .segment
-                .relative_path(SegmentComponent::FieldNorms);
+            let path = ctx.segment.relative_path(SegmentComponent::FieldNorms);
             let write = ctx.directory.open_write(&path)?;
             Some(FieldNormsSerializer::from_write(write)?)
         } else {
             None
         };
-        Ok(Box::new(FieldNormsPluginWriter {
-            writer,
-            serializer,
-        }))
+        Ok(Box::new(FieldNormsPluginWriter { writer, serializer }))
     }
 
     fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
-        let file = ctx
-            .segment_reader
-            .open_read(SegmentComponent::FieldNorms)?;
+        let file = ctx.segment_reader.open_read(SegmentComponent::FieldNorms)?;
         let readers = FieldNormReaders::open(file)?;
         Ok(Arc::new(FieldNormsPluginReader(readers)))
     }
@@ -68,11 +61,7 @@ impl SegmentPlugin for FieldNormsPlugin {
         let path = ctx
             .target_segment
             .relative_path(SegmentComponent::FieldNorms);
-        let write = ctx
-            .target_segment
-            .index()
-            .directory()
-            .open_write(&path)?;
+        let write = ctx.target_segment.index().directory().open_write(&path)?;
         let mut serializer = FieldNormsSerializer::from_write(write)?;
 
         let schema = ctx.schema;

@@ -16,11 +16,11 @@ use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
 use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
+use crate::plugin::{PluginReader, PluginReaderContext, SegmentPlugin};
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::plugin::{PluginReader, PluginReaderContext, SegmentPlugin};
 use crate::{Directory, DocId, Index, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
