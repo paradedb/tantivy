@@ -41,12 +41,16 @@ use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnS
 use crate::column_values::{ColumnValues, VecColumn};
 
 const BLOCK_SIZE: u32 = 512u32;
+const DATA_OFFSET_UNIT: usize = (BLOCK_SIZE / 8) as usize; // 64 bytes
 
 /// Fixed-size footer entry: slope(8) + intercept(8) + bit_width(1) + data_offset(4) = 21 bytes.
+/// `data_offset` is stored in units of 64 bytes (BLOCK_SIZE / 8), not raw bytes,
+/// extending the addressable range from ~4GB to ~256GB per column per segment.
 #[derive(Debug, Clone, Copy)]
 struct BlockMeta {
     line: Line,
     bit_width: u8,
+    /// Offset into the data region in units of 64 bytes.
     data_offset: u32,
 }
 
@@ -207,7 +211,7 @@ impl ColumnCodecEstimator for BlockwiseLinearV2Estimator {
         let mut data_offset = 0u32;
         for &(line, bit_width) in &blocks {
             BlockMeta { line, bit_width, data_offset }.serialize(&mut counting_wrt)?;
-            data_offset += (bit_width as u32) * BLOCK_SIZE / 8;
+            data_offset += bit_width as u32;
         }
         let footer_len = counting_wrt.written_bytes();
         (footer_len as u32).serialize(&mut counting_wrt)?;
@@ -302,8 +306,8 @@ impl ColumnValues for BlockwiseLinearV2Reader {
         let cache = unsafe { &mut *self.cache.0.get() };
         if cache.block_id != block_id {
             let meta = self.block_meta(block_id as usize);
-            let data_start = meta.data_offset as usize;
-            let data_len = (meta.bit_width as usize) * BLOCK_SIZE as usize / 8;
+            let data_start = meta.data_offset as usize * DATA_OFFSET_UNIT;
+            let data_len = meta.bit_width as usize * DATA_OFFSET_UNIT;
             let data_end = (data_start + data_len).min(self.data.len());
             cache.block_id = block_id;
             cache.line = meta.line;
@@ -358,8 +362,8 @@ impl ColumnValues for BlockwiseLinearV2Reader {
             let local_off = (block_id - first_block) * BLOCK_META_SIZE;
             let meta = parse_block_meta(&footer_bytes[local_off..local_off + BLOCK_META_SIZE]);
 
-            let data_start = meta.data_offset as usize;
-            let data_len = (meta.bit_width as usize) * BLOCK_SIZE as usize / 8;
+            let data_start = meta.data_offset as usize * DATA_OFFSET_UNIT;
+            let data_len = meta.bit_width as usize * DATA_OFFSET_UNIT;
             let data_end = (data_start + data_len).min(self.data.len());
             let data = self
                 .data

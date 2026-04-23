@@ -247,7 +247,8 @@ mod tests {
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
-        assert_eq!(file.len(), 4476);
+        // V2 codec is selected here (BlockwiseLinearV2).
+        assert_eq!(file.len(), 4608);
         {
             let fast_field_readers = FastFieldReaders::open(file, SCHEMA.clone()).unwrap();
             let col = fast_field_readers
@@ -280,7 +281,8 @@ mod tests {
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
-        assert_eq!(file.len(), 252);
+        // V2 codec is selected here (BlockwiseLinearV2).
+        assert_eq!(file.len(), 513);
 
         {
             let fast_field_readers = FastFieldReaders::open(file, schema).unwrap();
