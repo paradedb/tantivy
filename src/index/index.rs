@@ -3,6 +3,7 @@ use std::fmt;
 #[cfg(feature = "mmap")]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::available_parallelism;
 
 use super::segment::Segment;
@@ -24,6 +25,11 @@ use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
+use crate::fastfield::FastFieldsPlugin;
+use crate::fieldnorm::FieldNormsPlugin;
+use crate::plugin::SegmentPlugin;
+use crate::postings::PostingsPlugin;
+use crate::store::StorePlugin;
 use crate::SegmentReader;
 
 fn load_metas(
@@ -112,6 +118,7 @@ pub struct IndexBuilder {
     index_settings: IndexSettings,
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
+    plugins: Vec<Arc<dyn SegmentPlugin>>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -126,6 +133,7 @@ impl IndexBuilder {
             index_settings: IndexSettings::default(),
             tokenizer_manager: TokenizerManager::default(),
             fast_field_tokenizer_manager: TokenizerManager::default(),
+            plugins: Vec::new(),
         }
     }
 
@@ -152,6 +160,16 @@ impl IndexBuilder {
     /// Set the fast field tokenizers.
     pub fn fast_field_tokenizers(mut self, tokenizers: TokenizerManager) -> Self {
         self.fast_field_tokenizer_manager = tokenizers;
+        self
+    }
+
+    /// Register a custom segment plugin.
+    ///
+    /// Plugins participate in the segment lifecycle: they create writers during indexing,
+    /// readers during search, and handle merging. See [`SegmentPlugin`] for details.
+    #[must_use]
+    pub fn plugin(mut self, plugin: Arc<dyn SegmentPlugin>) -> Self {
+        self.plugins.push(plugin);
         self
     }
 
@@ -229,6 +247,7 @@ impl IndexBuilder {
         let mut index = Index::open(dir)?;
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
+            index.plugins.extend(self.plugins);
             Ok(index)
         } else {
             Err(TantivyError::SchemaError(
@@ -295,6 +314,7 @@ impl IndexBuilder {
         let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
+        index.plugins.extend(self.plugins);
         Ok(index)
     }
 }
@@ -309,6 +329,7 @@ pub struct Index {
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
+    plugins: Vec<Arc<dyn SegmentPlugin>>,
 }
 
 impl Index {
@@ -428,7 +449,18 @@ impl Index {
             fast_field_tokenizers: TokenizerManager::default(),
             executor: Executor::single_thread(),
             inventory,
+            plugins: Self::builtin_plugins(),
         }
+    }
+
+    /// Returns the set of built-in segment plugins.
+    fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
+        vec![
+            Arc::new(FieldNormsPlugin),
+            Arc::new(PostingsPlugin),
+            Arc::new(FastFieldsPlugin),
+            Arc::new(StorePlugin),
+        ]
     }
 
     /// Setter for the tokenizer manager.
@@ -657,6 +689,11 @@ impl Index {
             num_threads = (memory_budget_in_bytes / MEMORY_BUDGET_NUM_BYTES_MIN).max(1);
         }
         self.writer_with_num_threads(num_threads, memory_budget_in_bytes)
+    }
+
+    /// Accessor to the registered segment plugins.
+    pub fn plugins(&self) -> &[Arc<dyn SegmentPlugin>] {
+        &self.plugins
     }
 
     /// Accessor to the index settings

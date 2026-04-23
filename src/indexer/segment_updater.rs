@@ -538,12 +538,20 @@ impl SegmentUpdater {
     /// This does not include lock files, or files that are obsolete
     /// but have not yet been deleted by the garbage collector.
     fn list_files(&self) -> HashSet<PathBuf> {
-        let mut files: HashSet<PathBuf> = self
-            .index
-            .list_all_segment_metas()
-            .into_iter()
+        let segment_metas: Vec<_> = self.index.list_all_segment_metas();
+        let mut files: HashSet<PathBuf> = segment_metas
+            .iter()
             .flat_map(|segment_meta| segment_meta.list_files())
             .collect();
+        // Include files from registered plugins
+        for plugin in self.index.plugins() {
+            for ext in plugin.extensions() {
+                for segment_meta in &segment_metas {
+                    let component = crate::index::SegmentComponent::Custom(ext.to_string());
+                    files.insert(segment_meta.relative_path(component));
+                }
+            }
+        }
         files.insert(META_FILEPATH.to_path_buf());
         files
     }
