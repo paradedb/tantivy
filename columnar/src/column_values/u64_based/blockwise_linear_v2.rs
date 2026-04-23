@@ -217,6 +217,7 @@ struct CachedBlock {
 }
 
 struct BlockCache(UnsafeCell<CachedBlock>);
+// SAFETY: single-threaded access per Postgres backend / per segment in tantivy.
 unsafe impl Send for BlockCache {}
 unsafe impl Sync for BlockCache {}
 
