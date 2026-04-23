@@ -10,7 +10,7 @@ use crate::index::SegmentReader;
 /// For string columns, the missing value is always represented as column_max_value + 1, but in
 /// the case where we have no values for this column, that causes the missing value to be
 /// erroneously set to 1 (which would imply we had one additional value represented as 0).
-/// This checks for that case that case and returns 0 instead.
+/// This checks for that case and returns 0 instead.
 fn missing_val_for_str_cols(column_max_value: u64, column_num_values: u32) -> u64 {
     if column_num_values == 0 {
         0
