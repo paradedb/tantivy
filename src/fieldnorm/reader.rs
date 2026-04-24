@@ -63,10 +63,7 @@ impl From<ReaderImplEnum> for FieldNormReader {
 #[derive(Clone)]
 enum ReaderImplEnum {
     FromFileSlice(FileSlice),
-    Const {
-        num_docs: u32,
-        fieldnorm_id: u8,
-    },
+    Const { num_docs: u32, fieldnorm_id: u8 },
 }
 
 impl FieldNormReader {
@@ -104,11 +101,9 @@ impl FieldNormReader {
     #[inline]
     pub fn fieldnorm_id(&self, doc_id: DocId) -> u8 {
         match &self.0 {
-            ReaderImplEnum::FromFileSlice(file_slice) => {
-                file_slice
-                    .read_byte(doc_id as usize)
-                    .expect("failed to read fieldnorm byte")
-            }
+            ReaderImplEnum::FromFileSlice(file_slice) => file_slice
+                .read_byte(doc_id as usize)
+                .expect("failed to read fieldnorm byte"),
             ReaderImplEnum::Const { fieldnorm_id, .. } => *fieldnorm_id,
         }
     }
