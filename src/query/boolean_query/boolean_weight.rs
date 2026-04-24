@@ -49,9 +49,6 @@ where
     TScoreCombiner: ScoreCombiner,
 {
     assert!(!scorers.is_empty());
-    if scorers.len() == 1 {
-        return SpecializedScorer::Other(scorers.into_iter().next().unwrap()); //< we checked the size beforehand
-    }
 
     {
         let is_all_term_queries = scorers.iter().all(|scorer| scorer.is::<TermScorer>());
@@ -64,8 +61,11 @@ where
                 .iter()
                 .all(|scorer| scorer.freq_reading_option() == FreqReadingOption::ReadFreq)
             {
-                // Block wand is only available if we read frequencies.
+                // Block wand is available when we read frequencies.
+                // block_wand handles both single and multi-scorer cases.
                 return SpecializedScorer::TermUnion(scorers);
+            } else if scorers.len() == 1 {
+                return SpecializedScorer::Other(Box::new(scorers.into_iter().next().unwrap()));
             } else {
                 return SpecializedScorer::Other(Box::new(BufferedUnionScorer::build(
                     scorers,
@@ -74,6 +74,9 @@ where
                 )));
             }
         }
+    }
+    if scorers.len() == 1 {
+        return SpecializedScorer::Other(scorers.into_iter().next().unwrap());
     }
     SpecializedScorer::Other(Box::new(BufferedUnionScorer::build(
         scorers,
@@ -519,17 +522,6 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
-        // When there is a single include clause, delegate directly to the child
-        // weight's for_each_pruning. This ensures that e.g. a BooleanQuery
-        // wrapping a single TermQuery still benefits from block-max WAND
-        // pruning (via TermWeight::for_each_pruning), rather than falling
-        // through to the generic for_each_pruning_scorer loop.
-        if self.scoring_enabled && self.weights.len() == 1 {
-            let (occur, weight) = &self.weights[0];
-            if is_include_occur(*occur) {
-                return weight.for_each_pruning(threshold, reader, callback);
-            }
-        }
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
         match scorer {
             SpecializedScorer::TermUnion(term_scorers) => {

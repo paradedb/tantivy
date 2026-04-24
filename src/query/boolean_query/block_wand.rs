@@ -150,6 +150,9 @@ pub fn block_wand(
     mut threshold: Score,
     callback: &mut dyn FnMut(u32, Score) -> Score,
 ) {
+    if scorers.len() == 1 {
+        return block_wand_single_scorer(scorers.pop().unwrap(), threshold, callback);
+    }
     let mut scorers: Vec<TermScorerWithMaxScore> = scorers
         .iter_mut()
         .map(TermScorerWithMaxScore::from)
