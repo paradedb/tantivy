@@ -9,17 +9,16 @@
 //!
 //! The fixed entry size enables O(1) block lookup by index, which in turn allows:
 //!
-//! - **Lazy `load()`** — the footer is kept as a `FileSlice` and never eagerly
-//!   read. Block metadata is parsed on demand (21 bytes) only for accessed blocks,
-//!   giving near-zero load cost for TopK queries that touch few rows.
+//! - **Lazy `load()`** — the footer is kept as a `FileSlice` and never eagerly read. Block metadata
+//!   is parsed on demand (21 bytes) only for accessed blocks, giving near-zero load cost for TopK
+//!   queries that touch few rows.
 //!
-//! - **Block-aware `get_row_ids_for_value_range`** — reads the footer range for
-//!   the needed blocks in one `read_bytes()` call, then one `read_bytes()` per
-//!   block. Replaces the default per-row `get_val` loop for filtered range scans.
+//! - **Block-aware `get_row_ids_for_value_range`** — reads the footer range for the needed blocks
+//!   in one `read_bytes()` call, then one `read_bytes()` per block. Replaces the default per-row
+//!   `get_val` loop for filtered range scans.
 //!
-//! - **Single-entry block cache in `get_val`** — sequential doc-ID access hits
-//!   the cache ~512 times per block, reducing `read_bytes` calls from O(N) to
-//!   O(N/512).
+//! - **Single-entry block cache in `get_val`** — sequential doc-ID access hits the cache ~512 times
+//!   per block, reducing `read_bytes` calls from O(N) to O(N/512).
 //!
 //! The footer is roughly 2–4× larger per block than V1 (~42 KB for 1M rows vs
 //! ~12–18 KB), but this is negligible relative to the data region.
@@ -52,8 +51,7 @@ struct BlockMeta {
     data_offset: u32,
 }
 
-const BLOCK_META_SIZE: usize =
-    <u64 as FixedSize>::SIZE_IN_BYTES  // slope
+const BLOCK_META_SIZE: usize = <u64 as FixedSize>::SIZE_IN_BYTES  // slope
     + <u64 as FixedSize>::SIZE_IN_BYTES  // intercept
     + <u8 as FixedSize>::SIZE_IN_BYTES   // bit_width
     + <u32 as FixedSize>::SIZE_IN_BYTES; // data_offset
@@ -208,7 +206,12 @@ impl ColumnCodecEstimator for BlockwiseLinearV2Estimator {
         let mut counting_wrt = CountingWriter::wrap(wrt);
         let mut data_offset = 0u32;
         for &(line, bit_width) in &blocks {
-            BlockMeta { line, bit_width, data_offset }.serialize(&mut counting_wrt)?;
+            BlockMeta {
+                line,
+                bit_width,
+                data_offset,
+            }
+            .serialize(&mut counting_wrt)?;
             data_offset += bit_width as u32;
         }
         let footer_len = counting_wrt.written_bytes();
