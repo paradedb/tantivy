@@ -17,15 +17,13 @@
 //!   the needed blocks in one `read_bytes()` call, then one `read_bytes()` per
 //!   block. Replaces the default per-row `get_val` loop for filtered range scans.
 //!
-//! - **Single-entry `UnsafeCell` block cache in `get_val`** — sequential doc-ID
-//!   access hits the cache ~512 times per block, reducing `read_bytes` calls from
-//!   O(N) to O(N/512). Requires single-threaded access (safe in ParadeDB's
-//!   per-backend model, not suitable for upstream tantivy as-is).
+//! - **Single-entry block cache in `get_val`** — sequential doc-ID access hits
+//!   the cache ~512 times per block, reducing `read_bytes` calls from O(N) to
+//!   O(N/512).
 //!
 //! The footer is roughly 2–4× larger per block than V1 (~42 KB for 1M rows vs
 //! ~12–18 KB), but this is negligible relative to the data region.
 
-use std::cell::UnsafeCell;
 use std::io;
 use std::io::Write;
 use std::ops::{Range, RangeInclusive};
@@ -251,10 +249,7 @@ struct CachedBlock {
     data: OwnedBytes,
 }
 
-struct BlockCache(UnsafeCell<CachedBlock>);
-// SAFETY: single-threaded access per Postgres backend / per segment in tantivy.
-unsafe impl Send for BlockCache {}
-unsafe impl Sync for BlockCache {}
+struct BlockCache(parking_lot::Mutex<CachedBlock>);
 
 impl Clone for BlockCache {
     fn clone(&self) -> Self {
@@ -264,7 +259,7 @@ impl Clone for BlockCache {
 
 impl BlockCache {
     fn new() -> Self {
-        BlockCache(UnsafeCell::new(CachedBlock {
+        BlockCache(parking_lot::Mutex::new(CachedBlock {
             block_id: u32::MAX,
             line: Line {
                 slope: 0,
@@ -302,8 +297,7 @@ impl ColumnValues for BlockwiseLinearV2Reader {
     fn get_val(&self, idx: u32) -> u64 {
         let block_id = idx / BLOCK_SIZE;
         let idx_within_block = idx % BLOCK_SIZE;
-        // SAFETY: single-threaded access per Postgres backend / per segment in tantivy.
-        let cache = unsafe { &mut *self.cache.0.get() };
+        let mut cache = self.cache.0.lock();
         if cache.block_id != block_id {
             let meta = self.block_meta(block_id as usize);
             let data_start = meta.data_offset as usize * DATA_OFFSET_UNIT;
