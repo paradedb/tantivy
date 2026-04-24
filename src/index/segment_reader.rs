@@ -625,8 +625,7 @@ impl SegmentReader {
             let file = self
                 .open_read(SegmentComponent::FieldNorms)
                 .expect("should be able to open field norms segment component");
-            FieldNormReaders::open(file)
-            .expect("should be able to open field norms readers")
+            FieldNormReaders::open(file).expect("should be able to open field norms readers")
         })
     }
 
