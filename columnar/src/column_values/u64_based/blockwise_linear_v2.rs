@@ -56,8 +56,20 @@ const BLOCK_META_SIZE: usize = <u64 as FixedSize>::SIZE_IN_BYTES  // slope
     + <u8 as FixedSize>::SIZE_IN_BYTES   // bit_width
     + <u32 as FixedSize>::SIZE_IN_BYTES; // data_offset
 
+impl BlockMeta {
+    /// Returns the byte range of this block's bitpacked data within the data region.
+    #[inline(always)]
+    fn data_byte_range(&self, data_region_len: usize) -> std::ops::Range<usize> {
+        let start = self.data_offset as usize * DATA_OFFSET_UNIT;
+        let end = (start + self.bit_width as usize * DATA_OFFSET_UNIT).min(data_region_len);
+        start..end
+    }
+}
+
 impl BinarySerializable for BlockMeta {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+        // We serialize slope/intercept individually instead of `line.serialize()`
+        // to ensure fixed-sized encoding (the latter uses varints).
         self.line.slope.serialize(writer)?;
         self.line.intercept.serialize(writer)?;
         self.bit_width.serialize(writer)?;
@@ -84,16 +96,15 @@ impl FixedSize for BlockMeta {
 
 /// Parse a block metadata entry from a byte slice.
 #[inline(always)]
-fn parse_block_meta(entry: &[u8]) -> BlockMeta {
-    let mut cursor = entry;
-    BlockMeta::deserialize(&mut cursor).expect("failed to parse block meta")
+fn parse_block_meta(mut entry: &[u8]) -> BlockMeta {
+    BlockMeta::deserialize(&mut entry).expect("failed to parse block meta")
 }
 
 fn compute_num_blocks(num_vals: u32) -> u32 {
     num_vals.div_ceil(BLOCK_SIZE)
 }
 
-pub struct BlockwiseLinearV2Estimator {
+pub(crate) struct BlockwiseLinearV2Estimator {
     block: Vec<u64>,
     values_num_bytes: u64,
     num_blocks: u64,
@@ -125,7 +136,7 @@ impl BlockwiseLinearV2Estimator {
             max_value = val.max(max_value);
         }
         let bit_width = compute_num_bits(max_value) as usize;
-        self.values_num_bytes += (bit_width * self.block.len() + 7) as u64 / 8;
+        self.values_num_bytes += (bit_width * self.block.len()).div_ceil(8) as u64;
         self.num_blocks += 1;
     }
 }
@@ -221,7 +232,7 @@ impl ColumnCodecEstimator for BlockwiseLinearV2Estimator {
     }
 }
 
-pub struct BlockwiseLinearV2Codec;
+pub(crate) struct BlockwiseLinearV2Codec;
 
 impl ColumnCodec<u64> for BlockwiseLinearV2Codec {
     type ColumnValues = BlockwiseLinearV2Reader;
@@ -275,7 +286,7 @@ impl BlockCache {
 }
 
 #[derive(Clone)]
-pub struct BlockwiseLinearV2Reader {
+pub(crate) struct BlockwiseLinearV2Reader {
     footer: FileSlice,
     data: FileSlice,
     stats: ColumnStats,
@@ -303,15 +314,13 @@ impl ColumnValues for BlockwiseLinearV2Reader {
         let mut cache = self.cache.0.lock();
         if cache.block_id != block_id {
             let meta = self.block_meta(block_id as usize);
-            let data_start = meta.data_offset as usize * DATA_OFFSET_UNIT;
-            let data_len = meta.bit_width as usize * DATA_OFFSET_UNIT;
-            let data_end = (data_start + data_len).min(self.data.len());
+            let range = meta.data_byte_range(self.data.len());
             cache.block_id = block_id;
             cache.line = meta.line;
             cache.bit_unpacker = BitUnpacker::new(meta.bit_width);
             cache.data = self
                 .data
-                .slice(data_start..data_end)
+                .slice(range)
                 .read_bytes()
                 .expect("failed to read block data");
         }
@@ -359,12 +368,10 @@ impl ColumnValues for BlockwiseLinearV2Reader {
             let local_off = (block_id - first_block) * BLOCK_META_SIZE;
             let meta = parse_block_meta(&footer_bytes[local_off..local_off + BLOCK_META_SIZE]);
 
-            let data_start = meta.data_offset as usize * DATA_OFFSET_UNIT;
-            let data_len = meta.bit_width as usize * DATA_OFFSET_UNIT;
-            let data_end = (data_start + data_len).min(self.data.len());
+            let range = meta.data_byte_range(self.data.len());
             let data = self
                 .data
-                .slice(data_start..data_end)
+                .slice(range)
                 .read_bytes()
                 .expect("failed to read block data");
             let bit_unpacker = BitUnpacker::new(meta.bit_width);
