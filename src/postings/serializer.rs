@@ -66,6 +66,24 @@ impl InvertedIndexSerializer {
         Ok(inv_index_serializer)
     }
 
+    /// Create an `InvertedIndexSerializer` from pre-opened file handles.
+    ///
+    /// This is used by the postings plugin to construct the serializer without
+    /// requiring `&mut Segment`.
+    pub fn from_parts(
+        terms_write: CompositeWrite<WritePtr>,
+        postings_write: CompositeWrite<WritePtr>,
+        positions_write: CompositeWrite<WritePtr>,
+        schema: Schema,
+    ) -> InvertedIndexSerializer {
+        InvertedIndexSerializer {
+            terms_write,
+            postings_write,
+            positions_write,
+            schema,
+        }
+    }
+
     /// Must be called before starting pushing terms of
     /// a given field.
     ///

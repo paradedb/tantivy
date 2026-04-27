@@ -197,6 +197,7 @@ pub mod index;
 pub mod positions;
 pub mod postings;
 
+pub mod plugin;
 /// Module containing the different query implementations.
 pub mod query;
 pub mod schema;
@@ -229,6 +230,10 @@ pub use crate::index::{
     InvertedIndexReader, Order, Segment, SegmentMeta, SegmentReader,
 };
 pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
+pub use crate::plugin::{
+    PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
+    SegmentPlugin,
+};
 pub use crate::schema::{Document, TantivyDocument, Term};
 
 /// Index format version.

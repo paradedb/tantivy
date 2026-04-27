@@ -19,6 +19,16 @@ impl PerFieldPostingsWriter {
         }
     }
 
+    /// Creates an empty `PerFieldPostingsWriter` with no fields.
+    ///
+    /// This is used as a placeholder when the real writer has been moved
+    /// (e.g., transferred to the `PostingsPluginWriter` at serialize time).
+    pub fn empty() -> Self {
+        PerFieldPostingsWriter {
+            per_field_postings_writers: Vec::new(),
+        }
+    }
+
     pub(crate) fn get_for_field(&self, field: Field) -> &dyn PostingsWriter {
         self.per_field_postings_writers[field.field_id() as usize].as_ref()
     }
