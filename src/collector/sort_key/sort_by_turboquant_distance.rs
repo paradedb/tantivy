@@ -138,13 +138,33 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                 let win_num_docs = win.num_docs as usize;
                 let win_end = (win_offset + win_num_docs) as DocId;
 
+                // Build the filter bitset first so we can drop windows
+                // that contain zero matching docs without paying for
+                // their HNSW centroid probe. Walking the filter scorer
+                // through a window is cheap: for selective range
+                // filters whose matches lie in other windows the
+                // scorer just seeks past the window in O(1).
+                let mut filter_bits = vec![0u64; bitset_words];
+                let mut filter_matched_any = !has_filter;
+                if has_filter {
+                    let mut doc = filter_scorer.doc();
+                    if doc < win_offset as DocId {
+                        doc = filter_scorer.seek(win_offset as DocId);
+                    }
+                    while doc != TERMINATED && doc < win_end {
+                        let local = (doc as usize) - win_offset;
+                        filter_bits[local / 64] |= 1u64 << (local % 64);
+                        filter_matched_any = true;
+                        doc = filter_scorer.advance();
+                    }
+                }
+                if !filter_matched_any {
+                    continue;
+                }
+
                 // Probe centroids using the raw query vector. Cluster
                 // plugin's centroid index is in unrotated input space,
-                // matching how it was built. Done up-front (before
-                // building the filter bitset) so we can use the
-                // window's nearest centroid for the cross-window skip
-                // check without paying for filter_bits unless we
-                // commit to processing this window.
+                // matching how it was built.
                 let centroid_results =
                     win.search_centroids(&self.query_vector, self.probe.max_probe);
                 let win_nearest = centroid_results
@@ -165,22 +185,6 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                         filter_scorer.seek(win_end);
                     }
                     continue;
-                }
-
-                // Build a bounded filter bitset for this window so we
-                // can cheaply test cluster-member docs without
-                // re-walking the filter scorer.
-                let mut filter_bits = vec![0u64; bitset_words];
-                if has_filter {
-                    let mut doc = filter_scorer.doc();
-                    if doc < win_offset as DocId {
-                        doc = filter_scorer.seek(win_offset as DocId);
-                    }
-                    while doc != TERMINATED && doc < win_end {
-                        let local = (doc as usize) - win_offset;
-                        filter_bits[local / 64] |= 1u64 << (local % 64);
-                        doc = filter_scorer.advance();
-                    }
                 }
 
                 // Adaptive intra-window probe iteration. The first
@@ -256,15 +260,23 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                             let off = batch_idx * batch_b;
                             let batch = &raw[off..off + batch_b];
 
-                            t9d::score_batch(batched_lut, batch, &mut scores);
-
+                            // Two-phase scoring: compute Stage 1 only first
+                            // (cheap — i8-LUT pass over the stage1_t slab),
+                            // derive a tight upper bound on the eventual
+                            // full score, and skip Stage 2 + the heap push
+                            // entirely if no doc in this 16-doc batch can
+                            // beat the current TopK threshold. Once the
+                            // heap is full this fires on the majority of
+                            // batches and saves the per-coord Stage-2
+                            // sign-XOR + f32 accumulate work plus the
+                            // s2_t slab read.
+                            let stage1 = t9d::score_batch_stage1(batched_lut, batch);
                             if let Some(threshold) = top_n.threshold {
-                                let max_score =
-                                    scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                                if max_score <= threshold {
+                                if stage1.max_score_upper_bound(batched_lut) <= threshold {
                                     continue;
                                 }
                             }
+                            t9d::score_batch_finish(batched_lut, batch, &stage1, &mut scores);
 
                             for slot in 0..(hi_slot - lo_slot) {
                                 let local_did = local_doc_ids[lo_slot + slot];
