@@ -26,35 +26,47 @@ use rustc_hash::FxHashSet;
 use crate::index::SegmentReader;
 use crate::Order;
 
-/// User-tunable thresholds. Defaults match the starting estimates in
-/// `design.md` §4 and are overridden via the `paradedb.term_set_*_ratio` GUCs
-/// at the consumer side.
+/// User-tunable density thresholds. Defaults match the starting estimates in
+/// `design.md` §4 and are overridden via the `paradedb.term_set_*_max_density`
+/// GUCs at the consumer side.
+///
+/// "Density" is a unitless ratio of *matching count over corpus count*. For
+/// gallop, that's `K' / N`; for posting/bitset on the first column, it's
+/// `K' · D / N`; for the subsequent-column branch, `K' · D / C` (or `C / N`
+/// for the hash-probe gate). Each strategy fires when its density is *below*
+/// the corresponding `_max_density` threshold.
+///
+/// We use `f64` rather than integer denominators so the bench-derived
+/// threshold values from Step 6 don't have to round to `1/N` for small `N`.
 #[derive(Clone, Debug)]
 pub struct TermSetStrategyConfig {
     /// Kill-switch: when `false`, the planner never returns `Gallop` even if
     /// every other gate would pass.
     pub gallop_enabled: bool,
-    /// `R_GALLOP`: gallop is taken when `K' < N / R_GALLOP` on a sorted segment.
-    pub gallop_ratio: u32,
-    /// `R_POSTING`: first-column posting-list direct selection threshold.
-    pub posting_ratio: u32,
-    /// `R_BITSET`: first-column bitset-from-postings selection threshold.
-    pub bitset_ratio: u32,
-    /// `R_HASH_PROBE`: subsequent-column hash-probe selection threshold.
-    pub hash_probe_ratio: u32,
-    /// `R_SUBSEQUENT_BITSET`: subsequent-column bitset-from-postings threshold.
-    pub subsequent_bitset_ratio: u32,
+    /// Gallop fires when `K' / N < gallop_max_density` on a sorted segment.
+    pub gallop_max_density: f64,
+    /// First-column `PostingListDirect` threshold: `K' · D / N` cutoff.
+    pub posting_max_density: f64,
+    /// First-column `BitsetFromPostings` threshold: `K' · D / N` cutoff.
+    pub bitset_max_density: f64,
+    /// Subsequent-column `HashProbe` gate: `C / N` cutoff (`C` = upstream
+    /// candidate-set size). Below this, the candidate set is small enough to
+    /// hash-probe rather than build a bitset.
+    pub hash_probe_max_density: f64,
+    /// Subsequent-column `BitsetFromPostings` threshold: `K' · D / C` cutoff.
+    pub subsequent_bitset_max_density: f64,
 }
 
 impl Default for TermSetStrategyConfig {
     fn default() -> Self {
         Self {
             gallop_enabled: true,
-            gallop_ratio: 64,
-            posting_ratio: 256,
-            bitset_ratio: 4,
-            hash_probe_ratio: 16,
-            subsequent_bitset_ratio: 4,
+            // 1/64, 1/256, 1/4, 1/16, 1/4 — all exact powers of 2 in f64.
+            gallop_max_density: 1.0 / 64.0,
+            posting_max_density: 1.0 / 256.0,
+            bitset_max_density: 1.0 / 4.0,
+            hash_probe_max_density: 1.0 / 16.0,
+            subsequent_bitset_max_density: 1.0 / 4.0,
         }
     }
 }
@@ -128,6 +140,7 @@ pub fn select_strategy(
 
     let candidate_eq_n = inputs.candidate_size.is_none_or(|c| c == n);
     let cardinality = column.get_cardinality();
+    let n_f = n as f64;
 
     // Step 1: try gallop (sort-dependent fast path).
     if cfg.gallop_enabled
@@ -139,8 +152,10 @@ pub fn select_strategy(
             .filter(|sbf| sbf.field == inputs.field_name)
             .map(|sbf| sbf.order)
         {
-            let r = cfg.gallop_ratio.max(1);
-            if k_prime < n / r {
+            // K' / N < gallop_max_density. Strict less-than matches the
+            // pre-refactor integer form `K' < N / R_GALLOP` at every
+            // exactly-representable density (the defaults are 1/2^k).
+            if (k_prime as f64) / n_f < cfg.gallop_max_density {
                 pruned.sort_unstable();
                 return TermSetStrategy::Gallop {
                     sort_order: order,
@@ -152,27 +167,29 @@ pub fn select_strategy(
 
     // Step 2: sort-agnostic selection.
     let d = inputs.avg_docs_per_term.unwrap_or(1) as u64;
-    let kd = (k_prime as u64).saturating_mul(d);
+    let kd = (k_prime as u64).saturating_mul(d) as f64;
 
     if let Some(c) = inputs.candidate_size.filter(|&c| c < n) {
-        // Subsequent column.
-        let hash_threshold = n / cfg.hash_probe_ratio.max(1);
-        if c < hash_threshold {
+        // Subsequent column. `c == 0` is degenerate (the upstream is empty),
+        // but guard the division anyway: with no candidates, no work to do
+        // — HashProbe is the cheapest fallthrough.
+        if c == 0 {
             return TermSetStrategy::HashProbe;
         }
-        let bitset_threshold = (c as u64) / cfg.subsequent_bitset_ratio.max(1) as u64;
-        if kd < bitset_threshold {
+        if (c as f64) / n_f < cfg.hash_probe_max_density {
+            return TermSetStrategy::HashProbe;
+        }
+        if kd / (c as f64) < cfg.subsequent_bitset_max_density {
             return TermSetStrategy::BitsetFromPostings;
         }
         TermSetStrategy::HashProbe
     } else {
         // First column, post-gallop.
-        let posting_threshold = (n as u64) / cfg.posting_ratio.max(1) as u64;
-        if kd < posting_threshold {
+        let kd_density = kd / n_f;
+        if kd_density < cfg.posting_max_density {
             return TermSetStrategy::PostingListDirect;
         }
-        let bitset_threshold = (n as u64) / cfg.bitset_ratio.max(1) as u64;
-        if kd < bitset_threshold {
+        if kd_density < cfg.bitset_max_density {
             return TermSetStrategy::BitsetFromPostings;
         }
         TermSetStrategy::LinearScan
@@ -263,16 +280,15 @@ mod tests {
 
     #[test]
     fn select_returns_bitset_from_postings_when_gallop_rejected_due_to_high_k_planner_shape_only() {
-        // Sorted ASC, but K is *too big* for gallop: K >= N / R_GALLOP.
-        // With D = 1, we want K · D < N / R_BITSET as well so Step 2 lands on
-        // BitsetFromPostings (and *not* PostingListDirect, which requires
-        // K · D < N / R_POSTING — a tighter threshold).
-        // Pick N = 4096, R_GALLOP = 64, R_POSTING = 256, R_BITSET = 4.
-        //   gallop crossover  = 4096 / 64  = 64
-        //   posting crossover = 4096 / 256 = 16
-        //   bitset crossover  = 4096 / 4   = 1024
-        // K = 200 satisfies 64 ≤ K (gallop rejected), 200 ≥ 16 (posting rejected),
-        // 200 < 1024 (bitset accepted). N rounded up to 4096 docs.
+        // Sorted ASC, but K is *too big* for gallop: K'/N >= gallop_max_density.
+        // With D = 1, we want K'·D / N < bitset_max_density as well so Step 2
+        // lands on BitsetFromPostings (and not PostingListDirect, which
+        // requires K'·D / N < posting_max_density — a tighter threshold).
+        // Defaults: gallop=1/64≈0.0156, posting=1/256≈0.00391, bitset=1/4=0.25.
+        // N = 4096, K = 200 → K/N = 200/4096 ≈ 0.0488:
+        //   0.0488 ≥ 0.0156 → gallop rejected
+        //   0.0488 ≥ 0.00391 → posting rejected
+        //   0.0488 < 0.25  → bitset accepted
         let n: u64 = 4096;
         let (index, _field, name) = build_index(
             n,
@@ -299,8 +315,8 @@ mod tests {
 
     #[test]
     fn select_returns_posting_direct_when_first_column_highly_selective_planner_shape_only() {
-        // Unsorted, K small enough that K · D < N / R_POSTING.
-        // N = 4096, R_POSTING = 256 → posting threshold = 16. K = 8 < 16.
+        // Unsorted, K small enough that K·D / N < posting_max_density.
+        // N = 4096, K = 8, D = 1 → K/N = 0.00195 < 1/256 ≈ 0.00391.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
         let (reader, column) = open_column(&index, &name);
@@ -320,9 +336,9 @@ mod tests {
 
     #[test]
     fn select_falls_back_to_linear_scan_only_when_kd_exceeds_all_thresholds() {
-        // Unsorted, K large enough that K · D >= every threshold in Step 2's
-        // first-column branch. With D = 1 and R_BITSET = 4 → bitset threshold
-        // = N / 4 = 1024. K = 2000 > 1024 → LinearScan.
+        // Unsorted, K large enough that K·D / N >= every threshold in Step 2's
+        // first-column branch. With D = 1 and bitset_max_density = 1/4 = 0.25,
+        // N = 4096 and K = 2000 → K/N ≈ 0.488 > 0.25 → LinearScan.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
         let (reader, column) = open_column(&index, &name);
@@ -342,8 +358,8 @@ mod tests {
 
     #[test]
     fn select_returns_hash_probe_when_subsequent_column_with_small_c_planner_shape_only() {
-        // Subsequent column: candidate_size = Some(c) where c < N / R_HASH_PROBE.
-        // N = 4096, R_HASH_PROBE = 16 → hash threshold = 256. C = 100 < 256.
+        // Subsequent column: C / N < hash_probe_max_density.
+        // N = 4096, C = 100 → 100/4096 ≈ 0.0244 < 1/16 = 0.0625.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
         let (reader, column) = open_column(&index, &name);
@@ -364,11 +380,10 @@ mod tests {
     #[test]
     fn select_returns_bitset_from_postings_when_subsequent_column_kd_below_threshold_planner_shape_only(
     ) {
-        // Subsequent column branch: K · D < C / R_SUBSEQUENT_BITSET.
-        // N = 4096, hash threshold = N / 16 = 256.
-        // C = 1024 ≥ 256 → past the HashProbe gate, falling into the bitset arm.
-        // bitset threshold = C / R_SUBSEQUENT_BITSET = 1024 / 4 = 256.
-        // K · D = 50 < 256 → BitsetFromPostings.
+        // Subsequent column: K·D / C < subsequent_bitset_max_density.
+        // N = 4096. C = 1024 → C/N = 0.25 ≥ hash_probe_max_density (0.0625),
+        // so the HashProbe gate is bypassed.
+        // K·D / C = 50 / 1024 ≈ 0.0488 < 1/4 = 0.25 → BitsetFromPostings.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
         let (reader, column) = open_column(&index, &name);
