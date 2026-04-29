@@ -369,6 +369,17 @@ fn main() {
                     if (k as u64) > distinct {
                         continue;
                     }
+                    // Smoke trim: K=10K cells on the unsorted groups duplicate
+                    // information already in the corresponding asc groups
+                    // (linear/posting/bitset are sort-insensitive). Drop them
+                    // in smoke to keep wall-clock under 90s after the
+                    // and_intersect cells were added. Full tier still has them.
+                    if tier != "full"
+                        && sort == Sort::None
+                        && k == 10_000
+                    {
+                        continue;
+                    }
                     let terms = sample_terms(distinct, k, 7);
                     for &strat in &strategies {
                         if !applicable(sort, strat) {
@@ -410,4 +421,127 @@ fn main() {
             }
         }
     }
+
+    // Multi-column AND-intersection cells. Probes the smart-seek win on the
+    // linear-scan path: column A is sorted (gallop), column B is unsorted
+    // (linear) — BooleanQuery::Must of two FastFieldTermSetQuerys. With the
+    // trait-default seek, column B's per-`seek(target)` walk dilutes
+    // column A's gallop selectivity; with the smart-seek override on
+    // TermSetDocSet, column B jumps directly to each target.
+    //
+    // Two corpus shapes are exercised:
+    //   - dense FK (D ≈ 100): gallop output is ~1500 contiguous ranges of
+    //     ~100 docs each. B's seeks rarely cross range boundaries, so the
+    //     smart-vs-default delta is bounded — the lower-bound case.
+    //   - sparse PK (D = 1): gallop output is 1500 *isolated* DocIds spread
+    //     across the segment. Every gallop emit forces B to skip a large
+    //     gap, which is exactly where smart seek pays off — the upper-bound
+    //     case for typical hash-join build sides.
+    run_and_intersect_cells(&mut runner);
+}
+
+/// Build the (a sorted, b unsorted) two-column AND-intersection bench cells.
+/// Extracted so the corpus-build cost is paid once per (kind) shape.
+fn run_and_intersect_cells(runner: &mut BenchRunner) {
+    for &(label, density_label) in &[("dense_fk", "D=100"), ("sparse_pk", "D=1")] {
+        let (searcher, a, b, n, a_distinct, b_distinct) = build_and_intersect_corpus(label);
+
+        let mut group = runner.new_group();
+        group.set_name(format!("and_intersect n=1M kind={label} ({density_label})"));
+        group.set_input_size(n as usize);
+
+        // Sample terms uniformly across each column's distinct value space
+        // (rather than using the contiguous prefix `0..1500`). This is the
+        // load-bearing detail for the sparse_pk cell: with a = doc_id (D=1),
+        // a contiguous prefix `0..1500` would map gallop's output to a SINGLE
+        // contiguous DocId range [0, 1500), defeating the very thing we're
+        // trying to measure (sparse, scattered gallop hits forcing many big
+        // seeks into B). Random sampling spreads the 1500 hits across the
+        // full segment so each forces a real ~N/K-doc gap-skip.
+        let a_terms: Vec<u64> = sample_terms(a_distinct, 1500, 7);
+        let b_terms: Vec<u64> = sample_terms(b_distinct, 1500, 11);
+
+        let s = searcher.clone();
+        let at = a_terms.clone();
+        let bt = b_terms.clone();
+        group.register("a=gallop b=linear", move |_| {
+            let qa = Box::new(
+                FastFieldTermSetQuery::new(at.iter().map(|v| Term::from_field_u64(a, *v)))
+                    .with_strategy_config(cfg_force_gallop()),
+            ) as Box<dyn Query>;
+            let qb = Box::new(
+                FastFieldTermSetQuery::new(bt.iter().map(|v| Term::from_field_u64(b, *v)))
+                    .with_strategy_config(cfg_force_linear()),
+            ) as Box<dyn Query>;
+            let bq = BooleanQuery::new(vec![(Occur::Must, qa), (Occur::Must, qb)]);
+            black_box(s.search(&bq, &Count).unwrap())
+        });
+
+        let s = searcher.clone();
+        let at = a_terms.clone();
+        let bt = b_terms.clone();
+        group.register("a=linear b=linear", move |_| {
+            let qa = Box::new(
+                FastFieldTermSetQuery::new(at.iter().map(|v| Term::from_field_u64(a, *v)))
+                    .with_strategy_config(cfg_force_linear()),
+            ) as Box<dyn Query>;
+            let qb = Box::new(
+                FastFieldTermSetQuery::new(bt.iter().map(|v| Term::from_field_u64(b, *v)))
+                    .with_strategy_config(cfg_force_linear()),
+            ) as Box<dyn Query>;
+            let bq = BooleanQuery::new(vec![(Occur::Must, qa), (Occur::Must, qb)]);
+            black_box(s.search(&bq, &Count).unwrap())
+        });
+
+        group.run();
+    }
+}
+
+fn build_and_intersect_corpus(
+    kind: &str,
+) -> (
+    Searcher,
+    tantivy::schema::Field,
+    tantivy::schema::Field,
+    u64,
+    u64, // a_distinct
+    u64, // b_distinct
+) {
+    let n: u64 = 1_000_000;
+    let mut sb = SchemaBuilder::new();
+    let a = sb.add_u64_field("a", NumericOptions::default().set_fast().set_indexed());
+    let b = sb.add_u64_field("b", NumericOptions::default().set_fast().set_indexed());
+    let schema = sb.build();
+    let index = Index::builder()
+        .schema(schema)
+        .settings(IndexSettings {
+            sort_by_field: Some(IndexSortByField {
+                field: "a".to_string(),
+                order: Order::Asc,
+            }),
+            ..Default::default()
+        })
+        .create_in_ram()
+        .unwrap();
+    {
+        let mut writer = index.writer_with_num_threads(1, 200_000_000).unwrap();
+        for d in 0..n {
+            // dense_fk:  a = d / 100   → ~10K distinct values, ~100 docs each (D≈100).
+            // sparse_pk: a = d         → 1M distinct values, 1 doc each (D=1).
+            // b is the same in both: an unsorted spread of ~9973 distinct values.
+            let a_val = if kind == "sparse_pk" { d } else { d / 100 };
+            writer
+                .add_document(doc!(a => a_val, b => (d * 7 + 13) % 9973))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+    }
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
+        .unwrap();
+    let a_distinct = if kind == "sparse_pk" { n } else { n.div_ceil(100) };
+    let b_distinct = 9973u64;
+    (reader.searcher(), a, b, n, a_distinct, b_distinct)
 }

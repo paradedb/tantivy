@@ -300,6 +300,36 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
         TERMINATED
     }
 
+    /// Jump the cursor directly to `target` and resume the per-doc match loop
+    /// from there. The trait default would call `advance()` in a loop and pay
+    /// one column read + one hash probe for every doc between the current
+    /// cursor and `target`; this override skips that work entirely.
+    ///
+    /// Important for multi-column AND-intersection (`BooleanQuery` of two
+    /// `TermSetQuery` filters): when one column gallops and the other lands
+    /// here, the intersection drives `seek(target)` calls toward the
+    /// gallop-emitted DocIds. Without this override, the dumb default seek
+    /// re-scans the gaps and the gallop speedup is largely diluted.
+    fn seek(&mut self, target: DocId) -> DocId {
+        debug_assert!(target >= self.doc_id || self.doc_id == TERMINATED);
+        if target >= self.max_doc {
+            self.doc_id = TERMINATED;
+            return TERMINATED;
+        }
+        let mut next_doc_id = target;
+        while next_doc_id < self.max_doc {
+            for value in self.column.values_for_doc(next_doc_id) {
+                if self.values.contains(&value) {
+                    self.doc_id = next_doc_id;
+                    return next_doc_id;
+                }
+            }
+            next_doc_id += 1;
+        }
+        self.doc_id = TERMINATED;
+        TERMINATED
+    }
+
     fn doc(&self) -> DocId {
         self.doc_id
     }
