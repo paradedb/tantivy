@@ -138,6 +138,21 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                 let win_num_docs = win.num_docs as usize;
                 let win_end = (win_offset + win_num_docs) as DocId;
 
+                // Per-window seen bitset for replicated assignment:
+                // when a doc is replicated across multiple clusters,
+                // probing more than one of them yields the same
+                // (local_doc_id, score) tuple. The TurboQuant record
+                // bytes are identical across replicas (same encoding,
+                // just placed in multiple cluster batches), so the
+                // first-seen score equals every later score. Skip
+                // already-pushed docs without re-scoring them.
+                //
+                // For non-replicated indexes every bit naturally
+                // stays unset on the second visit, so this is
+                // effectively a no-op and costs one bit test per
+                // scored doc.
+                let mut seen_bits = vec![0u64; bitset_words];
+
                 // Build the filter bitset first so we can drop windows
                 // that contain zero matching docs without paying for
                 // their HNSW centroid probe. Walking the filter scorer
@@ -280,13 +295,20 @@ impl SortKeyComputer for SortByTurboQuantDistance {
 
                             for slot in 0..(hi_slot - lo_slot) {
                                 let local_did = local_doc_ids[lo_slot + slot];
-                                if has_filter {
-                                    let local = local_did as usize;
-                                    if (filter_bits[local / 64] >> (local % 64)) & 1 == 0 {
-                                        continue;
-                                    }
+                                let local = local_did as usize;
+                                if has_filter && (filter_bits[local / 64] >> (local % 64)) & 1 == 0
+                                {
+                                    continue;
                                 }
-                                let segment_did = (win_offset + local_did as usize) as DocId;
+                                // Replication dedup: bail before the
+                                // heap push if we've already scored
+                                // this doc via another cluster.
+                                let mask = 1u64 << (local % 64);
+                                if seen_bits[local / 64] & mask != 0 {
+                                    continue;
+                                }
+                                seen_bits[local / 64] |= mask;
+                                let segment_did = (win_offset + local) as DocId;
                                 top_n.push(scores[slot], segment_did);
                             }
                         }

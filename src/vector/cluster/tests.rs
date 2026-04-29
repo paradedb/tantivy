@@ -68,6 +68,7 @@ fn test_hnsw_centroid_search_accuracy() -> crate::Result<()> {
             vectors: shared_vecs,
         }) as Arc<dyn VectorSamplerFactory>,
         defer_clustering: false,
+        replication: None,
     }));
 
     let index = Index::builder()
@@ -208,6 +209,7 @@ fn merge_records_roundtrip_through_cluster() -> crate::Result<()> {
         sampler_factory: Arc::new(InMemorySamplerFactory { vectors: shared })
             as Arc<dyn VectorSamplerFactory>,
         defer_clustering: false,
+        replication: None,
     }));
 
     let index = Index::builder()
@@ -287,6 +289,176 @@ fn merge_records_roundtrip_through_cluster() -> crate::Result<()> {
             recall >= k / 2,
             "query {qi}: recall@{k} = {recall} below sanity floor {}",
             k / 2
+        );
+    }
+
+    Ok(())
+}
+
+/// Round-trip plumbing test for SPANN-style replicated assignment.
+///
+/// Builds an index with `replication = Some(_)` and verifies the
+/// integration doesn't crash and the query path's dedup invariant
+/// holds: the same `DocAddress` never appears twice in the top-K
+/// even when the underlying assignment may have replicated docs
+/// across clusters.
+///
+/// Algorithmic correctness of `assign_replicated` itself (ε-cone,
+/// RNG, cap) is covered by unit tests in `plugin.rs::tests`.
+#[test]
+fn replicated_assignment_round_trip() -> crate::Result<()> {
+    use std::collections::HashSet;
+
+    use rand::prelude::*;
+    const N_DOCS: usize = 500;
+    const K_TOP: usize = 10;
+
+    fn build_index(
+        replication: Option<crate::vector::cluster::plugin::ReplicationConfig>,
+        vectors: &[Vec<f32>],
+    ) -> crate::Result<(Index, crate::schema::Field)> {
+        let mut schema_builder = Schema::builder();
+        let vec_field = schema_builder.add_vector_field("embedding", DIMS, VectorMetric::L2);
+        let schema = schema_builder.build();
+
+        let quantizer = TurboQuantizer::new(DIMS, Some(TRANSPOSED_BIT_WIDTH), Some(0xCAFE));
+        let rotator = Arc::new(DynamicRotator::new(DIMS, RotatorType::FhtKacRotator, 42));
+        let padded_dims = rotator.padded_dim();
+        let shared = Arc::new(Mutex::new(vectors.to_vec()));
+
+        let cluster = Arc::new(ClusterPlugin::new(ClusterConfig {
+            clustering_threshold: THRESHOLD,
+            sample_ratio: 1.0,
+            sample_cap: 100_000,
+            kmeans: KMeansConfig {
+                niter: 25,
+                nredo: 1,
+                seed: 11,
+                ..Default::default()
+            },
+            // Match the planted center count exactly so k-means
+            // doesn't split planted clusters into sub-clusters and
+            // wash out the boundary structure of the synthetic data.
+            num_clusters_fn: Arc::new(|_| 5),
+            fields: vec![ClusterFieldConfig::new(
+                vec_field,
+                DIMS,
+                padded_dims,
+                Metric::L2,
+                rotator.clone(),
+                42,
+                quantizer.clone(),
+            )],
+            sampler_factory: Arc::new(InMemorySamplerFactory { vectors: shared })
+                as Arc<dyn VectorSamplerFactory>,
+            defer_clustering: false,
+            replication,
+        }));
+
+        let index = Index::builder()
+            .schema(schema)
+            .plugin(cluster as Arc<dyn SegmentPlugin>)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+        for v in vectors {
+            let mut doc = crate::TantivyDocument::default();
+            doc.add_field_value(vec_field, &crate::schema::OwnedValue::Vector(v.clone()));
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        Ok((index, vec_field))
+    }
+
+    // Synthetic data designed to produce real boundary docs:
+    //   - 5 planted centers along the first 5 axes (e_0 .. e_4)
+    //   - For each center: ~80 docs jittered around it (interior)
+    //   - Plus ~20 boundary docs placed at midpoints between adjacent center pairs
+    //
+    // The midpoint docs are equidistant from two planted centers, so
+    // after k-means trains centroids close to those centers, the
+    // ε-cone catches the second-nearest centroid and RNG accepts it
+    // (because the two centroids are FARTHER from each other than
+    // the boundary doc is from either of them).
+    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF);
+    let make_centered = |center: usize, jitter: f32, rng: &mut StdRng| -> Vec<f32> {
+        let mut v = vec![0.0f32; DIMS];
+        v[center] = 1.0;
+        for x in &mut v {
+            *x += jitter * (rng.random::<f32>() - 0.5);
+        }
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        for x in &mut v {
+            *x /= n;
+        }
+        v
+    };
+    let make_midpoint = |a: usize, b: usize, jitter: f32, rng: &mut StdRng| -> Vec<f32> {
+        let mut v = vec![0.0f32; DIMS];
+        v[a] = 1.0;
+        v[b] = 1.0;
+        for x in &mut v {
+            *x += jitter * (rng.random::<f32>() - 0.5);
+        }
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        for x in &mut v {
+            *x /= n;
+        }
+        v
+    };
+    let n_centers = 5;
+    let interior_per_center = 80;
+    let n_interior = n_centers * interior_per_center;
+    let n_boundary = N_DOCS - n_interior; // ~100 boundary docs
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(N_DOCS);
+    for c in 0..n_centers {
+        for _ in 0..interior_per_center {
+            vectors.push(make_centered(c, 0.1, &mut rng));
+        }
+    }
+    for i in 0..n_boundary {
+        let a = i % n_centers;
+        let b = (a + 1) % n_centers;
+        vectors.push(make_midpoint(a, b, 0.05, &mut rng));
+    }
+
+    let (rep_index, rep_field) = build_index(
+        Some(crate::vector::cluster::plugin::ReplicationConfig {
+            epsilon: 0.1,
+            max_replicas: 8,
+        }),
+        &vectors,
+    )?;
+    let rep_reader = rep_index.reader()?;
+    rep_reader.reload()?;
+    let rep_searcher = rep_reader.searcher();
+
+    // Dedup invariant: every doc returned in the replicated query
+    // must be unique. If `assign_replicated` placed a doc in
+    // multiple clusters and the dedup bitset misfires, the same
+    // `DocAddress` would appear more than once in the heap.
+    let quantizer = TurboQuantizer::new(DIMS, Some(TRANSPOSED_BIT_WIDTH), Some(0xCAFE));
+    let queries: Vec<Vec<f32>> = vectors.iter().take(5).cloned().collect();
+    use crate::collector::TopDocs;
+    use crate::query::AllQuery;
+
+    for q in &queries {
+        let collector = TopDocs::with_limit(K_TOP).order_by_turboquant_distance(
+            q.clone(),
+            rep_field,
+            quantizer.clone(),
+            None,
+        );
+        let hits = rep_searcher.search(&AllQuery, &collector)?;
+        assert!(
+            !hits.is_empty(),
+            "replicated query should return at least one hit"
+        );
+        let unique: HashSet<_> = hits.iter().map(|(_, addr)| *addr).collect();
+        assert_eq!(
+            unique.len(),
+            hits.len(),
+            "replicated top-K returned duplicate DocAddresses: {hits:?}"
         );
     }
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use common::file_slice::FileSlice;
 use common::OwnedBytes;
+use smallvec::SmallVec;
 
 use crate::directory::{CompositeFile, CompositeWrite};
 use crate::index::SegmentComponent;
@@ -80,6 +81,47 @@ pub struct VectorFieldMeta {
     pub tqvec_bytes_per_record: u32,
 }
 
+/// SPANN-style replicated assignment: assign each vector to multiple
+/// nearby centroids instead of just the nearest. Recovers the recall
+/// IVF normally loses on boundary docs (those whose true neighbours
+/// straddle a Voronoi edge).
+///
+/// Algorithm per vector `p`:
+///   1. Find the nearest centroid `c_min` and its distance `d_min`.
+///   2. ε-cone: keep every centroid `c_i` with `dist(p, c_i) ≤ (1 + epsilon) · d_min`.
+///   3. RNG prune: among the ε-cone candidates, in distance order, keep `c_i` only if no
+///      already-selected `c_j` is closer to `c_i` than `p` is. Ensures replicas span different
+///      directions around `p` instead of clustering on top of each other.
+///   4. Cap at `max_replicas`.
+///
+/// Storage cost is roughly proportional to the average replication
+/// factor. With `epsilon = 0.1` and well-separated clusters, most
+/// interior docs end up at replica = 1 and the per-index average is
+/// typically 2–3×, well below the worst-case 8×.
+#[derive(Clone, Debug)]
+pub struct ReplicationConfig {
+    /// `ε` in `dist(p, c_i) ≤ (1 + ε) · dist(p, c_nearest)`.
+    /// Typical: `0.05`–`0.15`. Larger ε → more replicas → more storage.
+    pub epsilon: f32,
+    /// Hard cap on replicas per vector. Default 8 (matches SPANN paper).
+    pub max_replicas: usize,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            epsilon: 0.1,
+            max_replicas: 8,
+        }
+    }
+}
+
+/// Per-doc list of cluster ids the doc is assigned to. Single-assign
+/// callers wrap in a 1-element `SmallVec`. Replicated callers fill up
+/// to `max_replicas` entries (default 8 = inline capacity, no heap
+/// allocation in the common case).
+type Assignment = SmallVec<[u16; 8]>;
+
 pub struct ClusterConfig {
     pub clustering_threshold: u32,
     pub sample_ratio: f32,
@@ -88,6 +130,10 @@ pub struct ClusterConfig {
     pub num_clusters_fn: Arc<dyn Fn(usize) -> usize + Send + Sync>,
     pub fields: Vec<ClusterFieldConfig>,
     pub sampler_factory: Arc<dyn VectorSamplerFactory>,
+    /// `None` (default) = single-assignment IVF: each vector lives in
+    /// exactly one cluster. `Some(_)` = SPANN-style replicated
+    /// assignment with the provided ε / cap. See [`ReplicationConfig`].
+    pub replication: Option<ReplicationConfig>,
     /// When `true`, `ClusterPluginWriter::serialize` emits an empty
     /// cluster section for every field — no k-means, no encode, no
     /// transpose. The `.tqvec` file is unaffected (written by the
@@ -148,7 +194,7 @@ fn sample_indices(total: usize, ratio: f32, cap: usize) -> Vec<usize> {
 
 fn build_cluster_data(
     centroids: Vec<Vec<f32>>,
-    _assignments: &[usize],
+    _assignments: &[Assignment],
     num_docs: usize,
     metric: Metric,
 ) -> ClusterData {
@@ -169,7 +215,7 @@ fn build_cluster_data(
 struct ClusterResult {
     data: ClusterData,
     centroids: Vec<Vec<f32>>,
-    assignments: Vec<usize>,
+    assignments: Vec<Assignment>,
 }
 
 /// Two-pass build of `Vec<ClusterBatchData>` from raw vectors + an
@@ -188,7 +234,7 @@ struct ClusterResult {
 fn encode_window_into_clusters(
     win_vectors: &[Vec<f32>],
     quantizer: &TurboQuantizer,
-    assignments: &[usize],
+    assignments: &[Assignment],
     num_clusters: usize,
 ) -> Vec<ClusterBatchData> {
     let bpr = quantizer.bytes_per_record();
@@ -215,7 +261,7 @@ fn encode_window_into_clusters_from_records(
     all_records: &[u8],
     bpr: usize,
     padded_dim: usize,
-    assignments: &[usize],
+    assignments: &[Assignment],
     num_clusters: usize,
 ) -> Vec<ClusterBatchData> {
     transpose_records_into_clusters(all_records, bpr, padded_dim, assignments, num_clusters)
@@ -225,14 +271,21 @@ fn transpose_records_into_clusters(
     all_records: &[u8],
     bpr: usize,
     padded_dim: usize,
-    assignments: &[usize],
+    assignments: &[Assignment],
     num_clusters: usize,
 ) -> Vec<ClusterBatchData> {
     use crate::vector::turboquant::transposed::{self, BATCH_DOCS};
 
+    // Replicated assignment: a single local_doc_id may appear in
+    // multiple cluster_doc_ids[k] arrays. Records get duplicated into
+    // each cluster's batch automatically — the inner loop reads
+    // `all_records[did * bpr..]` per cluster's doc list, so the same
+    // record bytes get transposed N times when N replicas exist.
     let mut cluster_doc_ids: Vec<Vec<DocId>> = vec![Vec::new(); num_clusters];
-    for (local_doc_id, &cid) in assignments.iter().enumerate() {
-        cluster_doc_ids[cid].push(local_doc_id as DocId);
+    for (local_doc_id, cids) in assignments.iter().enumerate() {
+        for &cid in cids {
+            cluster_doc_ids[cid as usize].push(local_doc_id as DocId);
+        }
     }
 
     let bb = transposed::batch_bytes(padded_dim);
@@ -287,7 +340,7 @@ fn cluster_as_single(vectors: &[Vec<f32>], metric: Metric) -> ClusterResult {
     }
 
     let centroids = vec![mean];
-    let assignments = vec![0usize; num_docs];
+    let assignments: Vec<Assignment> = (0..num_docs).map(|_| smallvec::smallvec![0u16]).collect();
     let data = build_cluster_data(centroids.clone(), &assignments, num_docs, metric);
 
     ClusterResult {
@@ -310,7 +363,10 @@ fn cluster_from_vectors(
     let k = k.min(sampled.len()).max(1);
     let result = run_kmeans_with_config(&sampled, k, config.kmeans.clone());
 
-    let assignments = assign_nearest_centroids_pruned(vectors, &result.centroids);
+    let assignments = match &config.replication {
+        None => assign_single(vectors, &result.centroids),
+        Some(rc) => assign_replicated(vectors, &result.centroids, rc.epsilon, rc.max_replicas),
+    };
 
     let centroids = result.centroids.clone();
     let data = build_cluster_data(
@@ -403,6 +459,148 @@ fn assign_nearest_centroids_pruned_flat(
         }
 
         assignments[doc_id] = best;
+    }
+    assignments
+}
+
+/// Single-assignment wrapper: each `Assignment` is a 1-element
+/// `SmallVec` holding the nearest cluster id. Used when
+/// `ClusterConfig::replication` is `None` (the default).
+fn assign_single(points: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<Assignment> {
+    assign_nearest_centroids_pruned(points, centroids)
+        .into_iter()
+        .map(|cid| smallvec::smallvec![cid as u16])
+        .collect()
+}
+
+/// Flat-buffer variant of [`assign_single`]. The merge path holds
+/// rotated vectors in one contiguous `&[f32]` of length `n * dim`.
+fn assign_single_flat(points_flat: &[f32], dim: usize, centroids: &[Vec<f32>]) -> Vec<Assignment> {
+    assign_nearest_centroids_pruned_flat(points_flat, dim, centroids)
+        .into_iter()
+        .map(|cid| smallvec::smallvec![cid as u16])
+        .collect()
+}
+
+/// SPANN-style replicated assignment with ε-cone + RNG (relative
+/// neighborhood graph) pruning.
+///
+/// For each point `p`:
+///   1. Compute distance to every centroid.
+///   2. Let `d_min` be the nearest distance. Build the ε-cone candidate set `{ c_i : dist(p, c_i) ≤
+///      (1+ε) · d_min }`, sorted ascending by distance.
+///   3. Greedy RNG selection: walk candidates, keep `c_i` only if no already-selected `c_j` is
+///      closer to `c_i` than `p` is. This ensures replicas span different *directions* around `p`
+///      rather than redundantly clustering on top of each other.
+///   4. Cap at `max_replicas`.
+///
+/// The K×K centroid-centroid distance matrix is built once per call
+/// and reused for both ε-cone candidate filtering and RNG checks.
+///
+/// Worst-case per-point cost is O(K + R²) where K is the centroid
+/// count and R = `max_replicas`. With R = 8 the RNG term is negligible
+/// vs the O(K) distance comps.
+fn assign_replicated(
+    points: &[Vec<f32>],
+    centroids: &[Vec<f32>],
+    epsilon: f32,
+    max_replicas: usize,
+) -> Vec<Assignment> {
+    let n = points.len();
+    let dim = points.first().map(|p| p.len()).unwrap_or(0);
+    let mut flat = Vec::with_capacity(n * dim);
+    for p in points {
+        flat.extend_from_slice(p);
+    }
+    assign_replicated_flat(&flat, dim, centroids, epsilon, max_replicas)
+}
+
+/// Flat-buffer variant of [`assign_replicated`].
+fn assign_replicated_flat(
+    points_flat: &[f32],
+    dim: usize,
+    centroids: &[Vec<f32>],
+    epsilon: f32,
+    max_replicas: usize,
+) -> Vec<Assignment> {
+    let n = if dim == 0 { 0 } else { points_flat.len() / dim };
+    let k = centroids.len();
+    if k == 0 {
+        return vec![SmallVec::new(); n];
+    }
+    if k == 1 || max_replicas <= 1 {
+        // Degenerate: replication can't add anything, fall through to
+        // single-assign which has the triangle-inequality fast path.
+        return assign_single_flat(points_flat, dim, centroids);
+    }
+    let max_replicas = max_replicas.min(k);
+
+    // Centroid-centroid pairwise squared distances. Reused for RNG
+    // checks below; same K² matrix the single-assign pruner builds.
+    let mut cc_dist_sq = vec![0.0f32; k * k];
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let d = l2_distance_sqr(&centroids[i], &centroids[j]);
+            cc_dist_sq[i * k + j] = d;
+            cc_dist_sq[j * k + i] = d;
+        }
+    }
+
+    // Squared-space cone factor: (1+ε)² applied to d_min².
+    let cone_factor_sq = (1.0 + epsilon).powi(2);
+
+    let mut assignments: Vec<Assignment> = Vec::with_capacity(n);
+    let mut dists: Vec<f32> = Vec::with_capacity(k);
+    let mut candidates: Vec<(f32, u16)> = Vec::with_capacity(k);
+
+    for doc_id in 0..n {
+        let point = &points_flat[doc_id * dim..(doc_id + 1) * dim];
+
+        // 1. Distance from p to every centroid + nearest.
+        dists.clear();
+        let mut nearest = 0u16;
+        let mut d_min_sq = f32::INFINITY;
+        for (j, c) in centroids.iter().enumerate() {
+            let d = l2_distance_sqr(point, c);
+            dists.push(d);
+            if d < d_min_sq {
+                d_min_sq = d;
+                nearest = j as u16;
+            }
+        }
+
+        let threshold_sq = d_min_sq * cone_factor_sq;
+
+        // 2. Collect ε-cone candidates (excluding the nearest), sorted by distance ascending.
+        candidates.clear();
+        for (j, &d) in dists.iter().enumerate() {
+            if (j as u16) == nearest {
+                continue;
+            }
+            if d <= threshold_sq {
+                candidates.push((d, j as u16));
+            }
+        }
+        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 3. Greedy RNG selection.
+        let mut selected: Assignment = smallvec::smallvec![nearest];
+        for &(d_pi, ci) in &candidates {
+            if selected.len() >= max_replicas {
+                break;
+            }
+            let pass = selected.iter().all(|&cj| {
+                // RNG: keep ci only if every already-selected cj is
+                // farther from ci than p is. Equivalently: skip ci if
+                // any cj is closer to ci than p.
+                cc_dist_sq[cj as usize * k + ci as usize] > d_pi
+            });
+            if pass {
+                selected.push(ci);
+            }
+        }
+
+        assignments.push(selected);
     }
     assignments
 }
@@ -895,18 +1093,25 @@ impl SegmentPlugin for ClusterPlugin {
                 // computations once a tight upper bound is in hand;
                 // brute-force here was 56% of CPU on a 1024-dim
                 // bioasq merge profile.
-                let assignments: Vec<usize> = if num_clusters == 1 {
-                    vec![0usize; win_num_docs]
+                let assignments: Vec<Assignment> = if num_clusters == 1 {
+                    (0..win_num_docs)
+                        .map(|_| smallvec::smallvec![0u16])
+                        .collect()
                 } else {
                     let rotated_centroids: Vec<Vec<f32>> = centroids
                         .iter()
                         .map(|c| quantizer.rotator().rotate(c))
                         .collect();
-                    assign_nearest_centroids_pruned_flat(
-                        &rotated_flat,
-                        padded_dim,
-                        &rotated_centroids,
-                    )
+                    match &self.config.replication {
+                        None => assign_single_flat(&rotated_flat, padded_dim, &rotated_centroids),
+                        Some(rc) => assign_replicated_flat(
+                            &rotated_flat,
+                            padded_dim,
+                            &rotated_centroids,
+                            rc.epsilon,
+                            rc.max_replicas,
+                        ),
+                    }
                 };
 
                 // Phase 4: bucket records into target clusters and
@@ -1859,5 +2064,120 @@ impl ProbeConfig {
         self.initial_probe = initial;
         self.probe_step = step.max(1);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for assignment internals. The full round-trip
+    //! plugin lifecycle lives in `crate::vector::cluster::tests`.
+
+    use super::*;
+
+    /// Geometry test for [`assign_replicated`]: place centroids in a
+    /// hex around the origin, then probe interior / boundary / vertex
+    /// positions and assert the replication factor matches what the
+    /// ε-cone + RNG rule predicts.
+    ///
+    /// 6 centroids on a unit hexagon (60° apart). Test points:
+    ///   - Deep interior: at one centroid → replicates only to itself.
+    ///   - Boundary: midway between two adjacent centroids → replicates to those 2.
+    ///   - Center: equidistant from all 6 → ε-cone catches all 6, RNG keeps a subset.
+    #[test]
+    fn assign_replicated_hex_geometry() {
+        let centroids: Vec<Vec<f32>> = (0..6)
+            .map(|i| {
+                let theta = std::f32::consts::PI * (i as f32) / 3.0;
+                vec![theta.cos(), theta.sin()]
+            })
+            .collect();
+
+        // Interior: sit on top of centroid 0 → only c0 should be assigned.
+        let interior = centroids[0].clone();
+        let a = assign_replicated(&[interior], &centroids, 0.1, 8);
+        assert_eq!(a[0].len(), 1, "interior point should not replicate");
+        assert_eq!(a[0][0], 0);
+
+        // Boundary: midpoint of c0 and c1. With ε = 0.1, both c0 and
+        // c1 land in the cone (they're equidistant) and they pass RNG
+        // because dist(c0, c1) > dist(p, c0) when p is the midpoint.
+        let boundary = vec![
+            0.5 * (centroids[0][0] + centroids[1][0]),
+            0.5 * (centroids[0][1] + centroids[1][1]),
+        ];
+        let a = assign_replicated(&[boundary], &centroids, 0.1, 8);
+        assert_eq!(
+            a[0].len(),
+            2,
+            "boundary midpoint should replicate to two adjacent centroids, got {:?}",
+            a[0]
+        );
+        let mut got: Vec<u16> = a[0].iter().copied().collect();
+        got.sort();
+        assert_eq!(got, vec![0, 1]);
+
+        // Centre of the hex: equidistant from all 6 centroids. ε-cone
+        // accepts all of them; RNG prunes redundant pairs and should
+        // leave a subset that spans the polygon — typically 2 or 3
+        // (the directions that aren't blocked by an earlier-selected
+        // centroid). Assert ≥ 2 and ≤ all-6.
+        let centre = vec![0.0_f32, 0.0_f32];
+        let a = assign_replicated(&[centre], &centroids, 0.1, 8);
+        assert!(
+            a[0].len() >= 2 && a[0].len() <= 6,
+            "centre should replicate but RNG should prune some, got {:?}",
+            a[0]
+        );
+    }
+
+    /// `epsilon = 0` should reduce to single assignment for any point
+    /// not exactly equidistant from multiple centroids.
+    #[test]
+    fn assign_replicated_zero_epsilon_is_single() {
+        let centroids: Vec<Vec<f32>> = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![5.0, 10.0]];
+        let points: Vec<Vec<f32>> = vec![vec![1.0, 0.5], vec![9.0, 0.5], vec![5.0, 9.0]];
+        let a = assign_replicated(&points, &centroids, 0.0, 8);
+        for assignment in &a {
+            assert_eq!(
+                assignment.len(),
+                1,
+                "epsilon=0 must produce single assignment off-boundary"
+            );
+        }
+    }
+
+    /// `max_replicas = 1` always degenerates to single assignment, even
+    /// at boundary positions.
+    #[test]
+    fn assign_replicated_max_one_is_single() {
+        let centroids: Vec<Vec<f32>> = vec![vec![0.0, 0.0], vec![1.0, 0.0]];
+        let boundary = vec![0.5, 0.0];
+        let a = assign_replicated(&[boundary], &centroids, 1.0, 1);
+        assert_eq!(a[0].len(), 1);
+    }
+
+    /// RNG pruning must reject candidates that are closer to an
+    /// already-selected centroid than to the point. Construct three
+    /// nearly-collinear centroids: `c0`, `c1`, `c2` along the x-axis
+    /// at 0, 1, 2. Place the point at x=0.5. All three are within ε,
+    /// but RNG should reject `c2` because `dist(c1, c2) = 1` is less
+    /// than `dist(p, c2) = 1.5`.
+    #[test]
+    fn assign_replicated_rng_prunes_collinear() {
+        let centroids: Vec<Vec<f32>> = vec![vec![0.0, 0.0], vec![1.0, 0.0], vec![2.0, 0.0]];
+        // Place near c0 so c1 is in the ε-cone but c2 might not be.
+        // Use a wide ε so c2 IS in the cone, then RNG must prune it.
+        // d(p, c0) = 0.1, d(p, c1) = 0.9, d(p, c2) = 1.9.
+        // ε-cone with ε = 100: threshold = 0.1 × 101 = 10.1, all in.
+        // RNG: c1 selected after c0. For c2: d(c1, c2) = 1 vs d(p, c2) = 1.9 → 1 < 1.9 → prune.
+        let p = vec![0.1, 0.0];
+        let a = assign_replicated(&[p], &centroids, 100.0, 8);
+        let mut got: Vec<u16> = a[0].iter().copied().collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![0, 1],
+            "RNG should keep nearest two and prune c2 (closer to c1 than to p)"
+        );
     }
 }
