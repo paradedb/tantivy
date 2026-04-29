@@ -63,10 +63,30 @@ use super::record::{read_norm, stage1_bytes, stage2_bytes};
 /// whole batch's stage-1 codebook gather.
 pub const BATCH_DOCS: usize = 16;
 
-/// Hardcoded bit width for the transposed/SIMD path.
+/// Default bit width when callers don't specify (matches historic
+/// behavior — 3-bit stage 1 codebook + 1-bit stage 2 sign).
 pub const TRANSPOSED_BIT_WIDTH: u8 = 4;
 
-/// Codebook entries for `bit_width = 4` Stage 1 (= 2^(b-1)).
+/// Bit widths the transposed batched SIMD kernel can score directly.
+/// Both fit one stage-1 index per nibble, so the same `vqtbl1q_s8`
+/// kernel works for either:
+///   * b4: 3 bits/slot (top nibble bit = 0), 8-entry codebook
+///   * b5: 4 bits/slot (full nibble), 16-entry codebook
+pub const SUPPORTED_BIT_WIDTHS: [u8; 2] = [4, 5];
+
+#[inline]
+pub fn is_supported_bit_width(bw: u8) -> bool {
+    SUPPORTED_BIT_WIDTHS.contains(&bw)
+}
+
+/// Number of stage-1 codebook entries for the given bit width:
+/// `2^(bit_width - 1)`.
+#[inline]
+pub fn codebook_levels(bit_width: u8) -> usize {
+    1 << (bit_width - 1)
+}
+
+/// Legacy alias for the b4 codebook size (= 8).
 pub const TRANSPOSED_CODEBOOK_LEVELS: usize = 8;
 
 /// Stage-1 transposed slab bytes per batch: one 4-bit slot per
@@ -112,16 +132,29 @@ pub fn batch_gammas_offset(padded_dim: usize) -> usize {
 }
 
 /// Encode up to 16 doc-major records into one transposed batch. Inputs
-/// must all be `bit_width = 4` records of length
-/// `record::bytes_per_record(padded_dim, 4)`.
+/// must all be records of bit width `bit_width` (one of
+/// [`SUPPORTED_BIT_WIDTHS`]) and length
+/// `record::bytes_per_record(padded_dim, bit_width)`.
 ///
 /// Records beyond `records.len()` (up to 16) get zero-filled stage-1
 /// indices, zero stage-2 signs, and γ = 0. The corresponding scores
 /// are discardable, not a real measurement of any doc.
-pub fn encode_batch(records: &[&[u8]], padded_dim: usize, out: &mut [u8]) {
+///
+/// The transposed slab layout is identical for `bit_width ∈ {4, 5}`:
+/// one nibble per slot per coord, stage-1 indices packed two-per-byte.
+/// At b4 the top nibble bit is always zero (3-bit indices); at b5 the
+/// full nibble is used (4-bit indices). The downstream NEON kernel is
+/// the same for both — only the LUT row contents differ.
+pub fn encode_batch(records: &[&[u8]], padded_dim: usize, bit_width: u8, out: &mut [u8]) {
+    assert!(
+        is_supported_bit_width(bit_width),
+        "bit_width {bit_width} not supported by transposed batch encoder; supported: {:?}",
+        SUPPORTED_BIT_WIDTHS,
+    );
     assert!(records.len() <= BATCH_DOCS);
     assert_eq!(out.len(), batch_bytes(padded_dim));
 
+    let s1_bits = bit_width - 1;
     let s1_t_len = stage1_t_bytes(padded_dim);
     let s2_t_len = stage2_t_bytes(padded_dim);
     let (s1_t, rest) = out.split_at_mut(s1_t_len);
@@ -136,13 +169,13 @@ pub fn encode_batch(records: &[&[u8]], padded_dim: usize, out: &mut [u8]) {
     let mut sign_buf = vec![false; padded_dim];
 
     for (slot, rec) in records.iter().enumerate() {
-        // Stage 1: unpack the doc's 3-bit indices into one byte each,
-        // then place each coord's 4-bit nibble into the transposed
+        // Stage 1: unpack the doc's `s1_bits`-bit indices into one
+        // byte each, then place each coord's nibble into the transposed
         // slab. Doc parity decides upper vs lower nibble of the byte.
-        let s1 = stage1_bytes(rec, padded_dim, TRANSPOSED_BIT_WIDTH);
-        super::bitpack::unpack_into(s1, padded_dim, 3, &mut idx_buf);
+        let s1 = stage1_bytes(rec, padded_dim, bit_width);
+        super::bitpack::unpack_into(s1, padded_dim, s1_bits, &mut idx_buf);
         for c in 0..padded_dim {
-            let nibble = idx_buf[c] & 0x0F; // 3-bit value, top bit = 0
+            let nibble = idx_buf[c] & 0x0F;
             let byte_in_slab = c * 8 + slot / 2;
             if slot % 2 == 0 {
                 // High nibble.
@@ -153,7 +186,7 @@ pub fn encode_batch(records: &[&[u8]], padded_dim: usize, out: &mut [u8]) {
         }
 
         // Stage 2 signs (MSB-first within each coord's 2-byte slot).
-        let s2 = stage2_bytes(rec, padded_dim, TRANSPOSED_BIT_WIDTH);
+        let s2 = stage2_bytes(rec, padded_dim, bit_width);
         super::bitpack::unpack_signs_into(s2, padded_dim, &mut sign_buf);
         for c in 0..padded_dim {
             if sign_buf[c] {
@@ -163,7 +196,7 @@ pub fn encode_batch(records: &[&[u8]], padded_dim: usize, out: &mut [u8]) {
         }
 
         // γ.
-        let g = read_norm(rec, padded_dim, TRANSPOSED_BIT_WIDTH);
+        let g = read_norm(rec, padded_dim, bit_width);
         gammas[slot * 4..slot * 4 + 4].copy_from_slice(&g.to_le_bytes());
     }
 }
@@ -206,14 +239,18 @@ pub(crate) fn batch_gamma(gammas: &[u8], slot: usize) -> f32 {
 /// repacks them MSB-first into the doc-major record layout. γ is a
 /// straight `f32` copy.
 ///
-/// `out` must be at least `record::bytes_per_record(padded_dim, 4)`
-/// bytes (the only bit width the transposed layout supports).
-pub fn extract_record(batch: &[u8], slot: usize, padded_dim: usize, out: &mut [u8]) {
+/// `out` must be at least `record::bytes_per_record(padded_dim, bit_width)`
+/// bytes. `bit_width` must be one of [`SUPPORTED_BIT_WIDTHS`].
+pub fn extract_record(batch: &[u8], slot: usize, padded_dim: usize, bit_width: u8, out: &mut [u8]) {
     use super::bitpack;
     use super::record::{bytes_per_record, norm_offset, stage2_offset, write_norm};
 
-    const BIT_WIDTH: u8 = TRANSPOSED_BIT_WIDTH;
-    let bpr = bytes_per_record(padded_dim, BIT_WIDTH);
+    assert!(
+        is_supported_bit_width(bit_width),
+        "bit_width {bit_width} not supported; supported: {:?}",
+        SUPPORTED_BIT_WIDTHS,
+    );
+    let bpr = bytes_per_record(padded_dim, bit_width);
     assert!(out.len() >= bpr);
     assert!(slot < BATCH_DOCS);
 
@@ -224,7 +261,7 @@ pub fn extract_record(batch: &[u8], slot: usize, padded_dim: usize, out: &mut [u
     let gammas = &batch[s1_t_len + s2_t_len..];
 
     // Zero the packed region; bitpack uses OR-style writes.
-    let norm_off = norm_offset(padded_dim, BIT_WIDTH);
+    let norm_off = norm_offset(padded_dim, bit_width);
     for b in &mut out[..norm_off] {
         *b = 0;
     }
@@ -234,8 +271,8 @@ pub fn extract_record(batch: &[u8], slot: usize, padded_dim: usize, out: &mut [u
     for c in 0..padded_dim {
         indices[c] = batch_stage1_index(s1_t, c, slot);
     }
-    let s1_end = stage2_offset(padded_dim, BIT_WIDTH);
-    bitpack::pack_into(&indices, BIT_WIDTH - 1, &mut out[..s1_end]);
+    let s1_end = stage2_offset(padded_dim, bit_width);
+    bitpack::pack_into(&indices, bit_width - 1, &mut out[..s1_end]);
 
     // Lift stage-2 signs for `slot` from each coord, then repack.
     let mut signs = vec![false; padded_dim];
@@ -246,7 +283,7 @@ pub fn extract_record(batch: &[u8], slot: usize, padded_dim: usize, out: &mut [u
 
     // γ.
     let gamma = batch_gamma(gammas, slot);
-    write_norm(out, padded_dim, BIT_WIDTH, gamma);
+    write_norm(out, padded_dim, bit_width, gamma);
 }
 
 /// Scalar reference scorer. Computes the same inner product as
@@ -259,7 +296,11 @@ pub fn score_batch_scalar(
     out: &mut [f32; BATCH_DOCS],
 ) {
     let padded_dim = query.padded_dim();
-    assert_eq!(query.bit_width(), TRANSPOSED_BIT_WIDTH);
+    assert!(
+        is_supported_bit_width(query.bit_width()),
+        "score_batch_scalar: unsupported bit_width {}",
+        query.bit_width(),
+    );
 
     let s1_t_len = stage1_t_bytes(padded_dim);
     let s2_t_len = stage2_t_bytes(padded_dim);
@@ -321,10 +362,16 @@ pub struct BatchedQueryLut {
 
 impl BatchedQueryLut {
     pub fn new(query: &crate::vector::turboquant::TurboQuantQuery) -> Self {
-        assert_eq!(query.bit_width(), TRANSPOSED_BIT_WIDTH);
+        let bit_width = query.bit_width();
+        assert!(
+            is_supported_bit_width(bit_width),
+            "bit_width {bit_width} not supported by BatchedQueryLut; supported: {:?}",
+            SUPPORTED_BIT_WIDTHS,
+        );
         let padded_dim = query.padded_dim();
         let (s1_lut, s1_levels) = query.s1_lut_view();
-        assert_eq!(s1_levels, TRANSPOSED_CODEBOOK_LEVELS);
+        assert_eq!(s1_levels, codebook_levels(bit_width));
+        assert!(s1_levels <= 16, "stage-1 codebook must fit in one nibble");
 
         // Single global scale: max absolute value across the entire
         // s1_lut. With ‖q‖ = 1 (unit query) and cb[v] roughly the
@@ -341,6 +388,11 @@ impl BatchedQueryLut {
         let scale_global = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
         let inv = 1.0 / scale_global;
 
+        // LUT row is always 16 bytes (one nibble per slot per coord).
+        // For b4 (s1_levels = 8) we replicate the table into the upper
+        // half so corrupted indices in 8..16 still produce valid
+        // lookups; for b5 (s1_levels = 16) the entire row is real
+        // codebook entries with nothing to replicate.
         let mut lut_i8 = vec![0i8; padded_dim * 16];
         for c in 0..padded_dim {
             let base = c * 16;
@@ -348,8 +400,11 @@ impl BatchedQueryLut {
                 let q = s1_lut[c * s1_levels + v] * inv;
                 let qi = q.round().clamp(-127.0, 127.0) as i8;
                 lut_i8[base + v] = qi;
-                // Defensive replication into upper half.
-                lut_i8[base + 8 + v] = qi;
+            }
+            if s1_levels < 16 {
+                for v in 0..s1_levels {
+                    lut_i8[base + s1_levels + v] = lut_i8[base + v];
+                }
             }
         }
 
@@ -870,7 +925,7 @@ mod tests {
         let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
 
         let mut batch = vec![0u8; batch_bytes(tq.padded_dim)];
-        encode_batch(&rec_refs, tq.padded_dim, &mut batch);
+        encode_batch(&rec_refs, tq.padded_dim, tq.bit_width, &mut batch);
 
         let q = unit(d, 9_001);
         let tqq = TurboQuantQuery::new(&tq, &q);
@@ -903,7 +958,7 @@ mod tests {
         let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
 
         let mut batch = vec![0u8; batch_bytes(tq.padded_dim)];
-        encode_batch(&rec_refs, tq.padded_dim, &mut batch);
+        encode_batch(&rec_refs, tq.padded_dim, tq.bit_width, &mut batch);
 
         let q = unit(d, 9_002);
         let tqq = TurboQuantQuery::new(&tq, &q);
@@ -939,12 +994,12 @@ mod tests {
         let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
 
         let mut batch = vec![0u8; batch_bytes(tq.padded_dim)];
-        encode_batch(&rec_refs, tq.padded_dim, &mut batch);
+        encode_batch(&rec_refs, tq.padded_dim, tq.bit_width, &mut batch);
 
         let bpr = recs[0].len();
         let mut extracted = vec![0u8; bpr];
         for slot in 0..16 {
-            extract_record(&batch, slot, tq.padded_dim, &mut extracted);
+            extract_record(&batch, slot, tq.padded_dim, tq.bit_width, &mut extracted);
             assert_eq!(
                 extracted, recs[slot],
                 "slot {slot}: extracted record does not match encoder output",
@@ -966,12 +1021,12 @@ mod tests {
         let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
 
         let mut batch = vec![0u8; batch_bytes(tq.padded_dim)];
-        encode_batch(&rec_refs, tq.padded_dim, &mut batch);
+        encode_batch(&rec_refs, tq.padded_dim, tq.bit_width, &mut batch);
 
         let bpr = recs[0].len();
         let mut extracted = vec![0u8; bpr];
         for slot in 0..7 {
-            extract_record(&batch, slot, tq.padded_dim, &mut extracted);
+            extract_record(&batch, slot, tq.padded_dim, tq.bit_width, &mut extracted);
             assert_eq!(extracted, recs[slot], "populated slot {slot} mismatch");
         }
         // Padded slots: γ = 0, the all-zero indices/signs aren't
@@ -979,7 +1034,7 @@ mod tests {
         // packed record `encode_batch` would have produced for an
         // imaginary zero-gamma doc.
         for slot in 7..16 {
-            extract_record(&batch, slot, tq.padded_dim, &mut extracted);
+            extract_record(&batch, slot, tq.padded_dim, tq.bit_width, &mut extracted);
             assert!(
                 extracted[..bpr - 4].iter().all(|&b| b == 0),
                 "padded slot {slot} should have zero indices/signs"
@@ -1005,7 +1060,7 @@ mod tests {
         let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
 
         let mut batch = vec![0u8; batch_bytes(tq.padded_dim)];
-        encode_batch(&rec_refs, tq.padded_dim, &mut batch);
+        encode_batch(&rec_refs, tq.padded_dim, tq.bit_width, &mut batch);
 
         let q = unit(d, 9_004);
         let tqq = TurboQuantQuery::new(&tq, &q);
@@ -1043,7 +1098,7 @@ mod tests {
             let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
             let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
             let mut batch = vec![0u8; batch_bytes(tq.padded_dim)];
-            encode_batch(&rec_refs, tq.padded_dim, &mut batch);
+            encode_batch(&rec_refs, tq.padded_dim, tq.bit_width, &mut batch);
 
             let q = unit(d, 9_005 + trial);
             let tqq = TurboQuantQuery::new(&tq, &q);
@@ -1061,6 +1116,98 @@ mod tests {
                 "trial {trial}: upper bound {bound} < actual max {actual_max}",
             );
         }
+    }
+
+    /// b5 (4-bit codebook) round-trip: encode → batch → score must stay
+    /// close to the per-doc estimator, same as b4. Same NEON kernel,
+    /// just a fully-populated 16-entry LUT row instead of 8 entries
+    /// with a defensive replica.
+    #[test]
+    fn b5_round_trip_matches_per_doc() {
+        let d = 768;
+        let tq = TurboQuantizer::new(d, Some(5), Some(42));
+        assert_eq!(tq.bit_width, 5);
+
+        let vecs: Vec<Vec<f32>> = (0..16).map(|i| unit(d, 5_000 + i as u64)).collect();
+        let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
+        let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
+
+        let mut batch = vec![0u8; batch_bytes(tq.padded_dim)];
+        encode_batch(&rec_refs, tq.padded_dim, tq.bit_width, &mut batch);
+
+        let q = unit(d, 9_005);
+        let tqq = TurboQuantQuery::new(&tq, &q);
+        let lut = BatchedQueryLut::new(&lut_query(&tqq));
+
+        let mut batched = [0.0f32; BATCH_DOCS];
+        score_batch(&lut, &batch, &mut batched);
+
+        let mut per_doc = [0.0f32; BATCH_DOCS];
+        for (i, r) in recs.iter().enumerate() {
+            per_doc[i] = tqq.estimate_ip(r);
+        }
+
+        // SIMD scoring uses i8-quantized LUT and global scale; allow
+        // small numerical drift but the values must agree closely.
+        for slot in 0..BATCH_DOCS {
+            let diff = (batched[slot] - per_doc[slot]).abs();
+            assert!(
+                diff < 0.01,
+                "slot {slot}: batched {} vs per-doc {} (diff {})",
+                batched[slot],
+                per_doc[slot],
+                diff,
+            );
+        }
+    }
+
+    /// b5 ranking parity with per-doc ranking. With 16 docs the
+    /// orderings should match modulo near-ties.
+    #[test]
+    fn b5_ranking_matches_per_doc() {
+        let d = 768;
+        let tq = TurboQuantizer::new(d, Some(5), Some(42));
+
+        let vecs: Vec<Vec<f32>> = (0..16).map(|i| unit(d, 7_000 + i as u64)).collect();
+        let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
+        let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
+        let mut batch = vec![0u8; batch_bytes(tq.padded_dim)];
+        encode_batch(&rec_refs, tq.padded_dim, tq.bit_width, &mut batch);
+
+        let q = unit(d, 8_888);
+        let tqq = TurboQuantQuery::new(&tq, &q);
+        let lut = BatchedQueryLut::new(&lut_query(&tqq));
+
+        let mut batched = [0.0f32; BATCH_DOCS];
+        score_batch(&lut, &batch, &mut batched);
+
+        let mut per_doc = [0.0f32; BATCH_DOCS];
+        for (i, r) in recs.iter().enumerate() {
+            per_doc[i] = tqq.estimate_ip(r);
+        }
+
+        let argsort = |scores: &[f32]| -> Vec<usize> {
+            let mut idx: Vec<usize> = (0..scores.len()).collect();
+            idx.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+            idx
+        };
+        let top4_batched: Vec<usize> = argsort(&batched).into_iter().take(4).collect();
+        let top4_per_doc: Vec<usize> = argsort(&per_doc).into_iter().take(4).collect();
+
+        let overlap = top4_batched.iter().filter(|i| top4_per_doc.contains(i)).count();
+        assert!(
+            overlap >= 3,
+            "top-4 overlap {} too low: batched={:?} per_doc={:?}",
+            overlap,
+            top4_batched,
+            top4_per_doc,
+        );
+    }
+
+    /// Identity helper: BatchedQueryLut::new wants a TurboQuantQuery
+    /// reference; pass it through.
+    fn lut_query(q: &TurboQuantQuery) -> &TurboQuantQuery {
+        q
     }
 
     /// Ignored microbench: per-doc SIMD vs batched-transposed SIMD on
@@ -1108,6 +1255,7 @@ mod tests {
             encode_batch(
                 &slice,
                 tq.padded_dim,
+                tq.bit_width,
                 &mut all_batches[bi * bb..(bi + 1) * bb],
             );
         }
@@ -1177,7 +1325,7 @@ mod tests {
                 .iter()
                 .map(|v| v.as_slice())
                 .collect();
-            encode_batch(&slice, tq.padded_dim, &mut buf);
+            encode_batch(&slice, tq.padded_dim, tq.bit_width, &mut buf);
             score_batch(&lut, &buf, &mut simd_out);
             for slot in 0..(batch_end - batch_start) {
                 simd_scored.push((batch_start + slot, simd_out[slot]));

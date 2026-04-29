@@ -78,6 +78,9 @@ pub struct VectorFieldMeta {
     /// Bytes per TurboQuant-encoded record stored in the cluster
     /// batch_data, after the per-cluster doc-id prefix.
     pub tqvec_bytes_per_record: u32,
+    /// TurboQuant total bits per coordinate. One of
+    /// [`crate::vector::turboquant::transposed::SUPPORTED_BIT_WIDTHS`].
+    pub bit_width: u8,
 }
 
 pub struct ClusterConfig {
@@ -193,6 +196,7 @@ fn encode_window_into_clusters(
 ) -> Vec<ClusterBatchData> {
     let bpr = quantizer.bytes_per_record();
     let padded_dim = quantizer.padded_dim;
+    let bit_width = quantizer.bit_width;
     let win_num_docs = win_vectors.len();
 
     let mut all_records = vec![0u8; win_num_docs * bpr];
@@ -203,7 +207,14 @@ fn encode_window_into_clusters(
         );
     }
 
-    transpose_records_into_clusters(&all_records, bpr, padded_dim, assignments, num_clusters)
+    transpose_records_into_clusters(
+        &all_records,
+        bpr,
+        padded_dim,
+        bit_width,
+        assignments,
+        num_clusters,
+    )
 }
 
 /// Like `encode_window_into_clusters` but takes already-encoded
@@ -215,16 +226,25 @@ fn encode_window_into_clusters_from_records(
     all_records: &[u8],
     bpr: usize,
     padded_dim: usize,
+    bit_width: u8,
     assignments: &[usize],
     num_clusters: usize,
 ) -> Vec<ClusterBatchData> {
-    transpose_records_into_clusters(all_records, bpr, padded_dim, assignments, num_clusters)
+    transpose_records_into_clusters(
+        all_records,
+        bpr,
+        padded_dim,
+        bit_width,
+        assignments,
+        num_clusters,
+    )
 }
 
 fn transpose_records_into_clusters(
     all_records: &[u8],
     bpr: usize,
     padded_dim: usize,
+    bit_width: u8,
     assignments: &[usize],
     num_clusters: usize,
 ) -> Vec<ClusterBatchData> {
@@ -251,7 +271,12 @@ fn transpose_records_into_clusters(
                     slot_recs.push(&all_records[did * bpr..(did + 1) * bpr]);
                 }
                 let off = batch_idx * bb;
-                transposed::encode_batch(&slot_recs, padded_dim, &mut tqvec_records[off..off + bb]);
+                transposed::encode_batch(
+                    &slot_recs,
+                    padded_dim,
+                    bit_width,
+                    &mut tqvec_records[off..off + bb],
+                );
             }
             ClusterBatchData {
                 doc_ids,
@@ -514,7 +539,22 @@ fn serialize_empty_hot(w: &mut dyn Write) -> crate::Result<()> {
     Ok(())
 }
 
+/// Sentinel byte at the start of the field meta blob. Distinguishes
+/// versioned from un-versioned (v0, no bit_width field) layouts. The
+/// v0 format started with a `dims: u32` in little-endian; for any
+/// realistic `dims` the first byte is non-zero (a 256+-dim vector
+/// stores `(dims & 0xff)` as the low byte, which can be 0 for round
+/// values like 256, 512, 768 — so we can't use 0 as a sentinel
+/// reliably either). Instead we use the magic byte `0xCC` as a
+/// version-1+ marker; v0 blobs never started with it (the low byte of
+/// `dims` would have to be 0xCC = 204, only matching dims like 204,
+/// 460, 716, ... none of which are common embedding sizes).
+const FIELD_META_VERSION_MARKER: u8 = 0xCC;
+const FIELD_META_VERSION_CURRENT: u8 = 1;
+
 fn serialize_field_meta(meta: &VectorFieldMeta, w: &mut dyn Write) -> crate::Result<()> {
+    w.write_all(&[FIELD_META_VERSION_MARKER])?;
+    w.write_all(&[FIELD_META_VERSION_CURRENT])?;
     w.write_all(&(meta.dims as u32).to_le_bytes())?;
     w.write_all(&(meta.padded_dims as u32).to_le_bytes())?;
     w.write_all(&[match meta.metric {
@@ -524,6 +564,7 @@ fn serialize_field_meta(meta: &VectorFieldMeta, w: &mut dyn Write) -> crate::Res
     w.write_all(&[meta.rotator_type as u8])?;
     w.write_all(&meta.rotator_seed.to_le_bytes())?;
     w.write_all(&meta.tqvec_bytes_per_record.to_le_bytes())?;
+    w.write_all(&[meta.bit_width])?;
     Ok(())
 }
 
@@ -533,6 +574,22 @@ fn deserialize_field_meta(data: &[u8], pos: &mut usize) -> VectorFieldMeta {
         *p += 4;
         v
     };
+
+    // Detect format: if the first byte is the version marker, read
+    // the version byte and dispatch on it. Otherwise treat the blob
+    // as the v0 (no bit_width) format and default bit_width to
+    // TRANSPOSED_BIT_WIDTH = 4.
+    let versioned = data[*pos] == FIELD_META_VERSION_MARKER;
+    if versioned {
+        *pos += 1;
+        let version = data[*pos];
+        *pos += 1;
+        assert!(
+            version <= FIELD_META_VERSION_CURRENT,
+            "VectorFieldMeta version {version} is newer than this build supports ({FIELD_META_VERSION_CURRENT})",
+        );
+    }
+
     let dims = read_u32(pos) as usize;
     let padded_dims = read_u32(pos) as usize;
     let metric = if data[*pos] == 0 {
@@ -555,6 +612,13 @@ fn deserialize_field_meta(data: &[u8], pos: &mut usize) -> VectorFieldMeta {
     ]);
     *pos += 8;
     let tqvec_bytes_per_record = read_u32(pos);
+    let bit_width = if versioned {
+        let b = data[*pos];
+        *pos += 1;
+        b
+    } else {
+        crate::vector::turboquant::transposed::TRANSPOSED_BIT_WIDTH
+    };
     VectorFieldMeta {
         dims,
         padded_dims,
@@ -562,10 +626,14 @@ fn deserialize_field_meta(data: &[u8], pos: &mut usize) -> VectorFieldMeta {
         rotator_type,
         rotator_seed,
         tqvec_bytes_per_record,
+        bit_width,
     }
 }
 
-const FIELD_META_SIZE: usize = 4 + 4 + 1 + 1 + 8 + 4; // 22 bytes
+/// v0 (un-versioned) blob size: dims+padded+metric+rot_type+seed+bpr.
+/// v1 blob is `2 + V0_FIELD_META_SIZE + 1` (marker + version + ... + bit_width).
+const V0_FIELD_META_SIZE: usize = 4 + 4 + 1 + 1 + 8 + 4; // 22 bytes
+const FIELD_META_SIZE: usize = 2 + V0_FIELD_META_SIZE + 1; // 25 bytes
 
 impl VectorFieldMeta {
     fn from_config(cfg: &ClusterFieldConfig) -> Self {
@@ -576,6 +644,7 @@ impl VectorFieldMeta {
             rotator_type: cfg.rotator.rotator_type(),
             rotator_seed: cfg.rotator_seed,
             tqvec_bytes_per_record: cfg.quantizer.bytes_per_record() as u32,
+            bit_width: cfg.quantizer.bit_width,
         }
     }
 }
@@ -584,7 +653,7 @@ impl VectorFieldMeta {
 const WINDOW_DIR_ENTRY_SIZE: usize = 16;
 
 /// File layout:
-///   [u32 num_windows][u32 window_size][22 B field_meta]
+///   [u32 num_windows][u32 window_size][FIELD_META_SIZE B field_meta]
 ///   directory: [u32 doc_offset][u32 num_docs][u32 hot_size][u32 cold_size] × num_windows
 ///   per window in order: hot bytes, then cold bytes
 ///
@@ -738,10 +807,11 @@ impl SegmentPlugin for ClusterPlugin {
 
         for field_cfg in &self.config.fields {
             let quantizer = &field_cfg.quantizer;
-            assert_eq!(
+            assert!(
+                crate::vector::turboquant::transposed::is_supported_bit_width(quantizer.bit_width),
+                "cluster plugin transposed layout requires bit_width in {:?}, got {}",
+                crate::vector::turboquant::transposed::SUPPORTED_BIT_WIDTHS,
                 quantizer.bit_width,
-                crate::vector::turboquant::transposed::TRANSPOSED_BIT_WIDTH,
-                "cluster plugin transposed layout requires bit_width = 4",
             );
             let bpr = quantizer.bytes_per_record();
             let padded_dim = quantizer.padded_dim;
@@ -845,6 +915,7 @@ impl SegmentPlugin for ClusterPlugin {
                             &raw[off..off + bb],
                             in_batch_slot,
                             padded_dim,
+                            quantizer.bit_width,
                             rec_slice,
                         );
                     }
@@ -915,6 +986,7 @@ impl SegmentPlugin for ClusterPlugin {
                     &all_records,
                     bpr,
                     padded_dim,
+                    quantizer.bit_width,
                     &assignments,
                     num_clusters,
                 );
@@ -1001,14 +1073,16 @@ struct DocLookup {
 /// `[doc_ids: 4 × N][batches: ⌈N/16⌉ × batch_bytes(padded_dim)]`,
 /// where each batch is one coord-major SIMD chunk.
 ///
-/// All input records must be `bit_width = 4` records of length
-/// `bytes_per_record`. Tail batches with fewer than 16 docs pad the
-/// remaining lanes with zeros (γ = 0, so the lanes' contribution is
-/// neutral and the collector simply ignores them via doc-id bounds).
+/// All input records must be of bit width `bit_width` (one of
+/// [`crate::vector::turboquant::transposed::SUPPORTED_BIT_WIDTHS`]) and
+/// length `bytes_per_record`. Tail batches with fewer than 16 docs pad
+/// the remaining lanes with zeros (γ = 0, so the lanes' contribution
+/// is neutral and the collector simply ignores them via doc-id bounds).
 fn build_cluster_batch_data_external(
     docs: &[(DocId, Vec<u8>)],
     bytes_per_record: usize,
     padded_dim: usize,
+    bit_width: u8,
 ) -> ClusterBatchData {
     use crate::vector::turboquant::transposed::{self, BATCH_DOCS};
 
@@ -1037,6 +1111,7 @@ fn build_cluster_batch_data_external(
         transposed::encode_batch(
             &slot_recs,
             padded_dim,
+            bit_width,
             &mut tqvec_records[out_off..out_off + bb],
         );
     }
@@ -1128,10 +1203,13 @@ impl PluginWriter for ClusterPluginWriter {
         if self.config.defer_clustering {
             for field_cfg in &self.config.fields {
                 let quantizer = &field_cfg.quantizer;
-                assert_eq!(
+                assert!(
+                    crate::vector::turboquant::transposed::is_supported_bit_width(
+                        quantizer.bit_width
+                    ),
+                    "cluster plugin transposed layout requires bit_width in {:?}, got {}",
+                    crate::vector::turboquant::transposed::SUPPORTED_BIT_WIDTHS,
                     quantizer.bit_width,
-                    crate::vector::turboquant::transposed::TRANSPOSED_BIT_WIDTH,
-                    "cluster plugin transposed layout requires bit_width = 4",
                 );
 
                 let vectors = self.per_field_vectors.get(&field_cfg.field);
@@ -1172,10 +1250,11 @@ impl PluginWriter for ClusterPluginWriter {
 
         for field_cfg in &self.config.fields {
             let quantizer = &field_cfg.quantizer;
-            assert_eq!(
+            assert!(
+                crate::vector::turboquant::transposed::is_supported_bit_width(quantizer.bit_width),
+                "cluster plugin transposed layout requires bit_width in {:?}, got {}",
+                crate::vector::turboquant::transposed::SUPPORTED_BIT_WIDTHS,
                 quantizer.bit_width,
-                crate::vector::turboquant::transposed::TRANSPOSED_BIT_WIDTH,
-                "cluster plugin transposed layout requires bit_width = 4",
             );
 
             let vectors = self.per_field_vectors.get(&field_cfg.field);
