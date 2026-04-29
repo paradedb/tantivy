@@ -494,20 +494,18 @@ fn assign(
             candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
             diag_total_cone_candidates += candidates.len() as u64 + 1;
 
+            // No RNG pruning: just take the nearest max_replicas
+            // candidates from the ε-cone. SPANN's RNG predicate
+            // (`dist(cj, ci) > dist(p, ci)`) over-prunes on
+            // cosine-normalized high-dim embeddings, where most
+            // ε-cone candidates lie angularly close to the nearest
+            // centroid c1 and get rejected as redundant.
             let mut selected: Assignment = smallvec::smallvec![nearest];
-            for &(d_pi, ci) in &candidates {
+            for &(_d_pi, ci) in &candidates {
                 if selected.len() >= max_replicas {
                     break;
                 }
-                // RNG: keep ci only if every already-selected cj is
-                // farther from ci than p is. Equivalently: skip ci if
-                // any cj is closer to ci than p.
-                let pass = selected
-                    .iter()
-                    .all(|&cj| cc_dist_sq[cj as usize * k + ci as usize] > d_pi);
-                if pass {
-                    selected.push(ci);
-                }
+                selected.push(ci);
             }
             diag_total_replicas += selected.len() as u64;
             assignments.push(selected);
