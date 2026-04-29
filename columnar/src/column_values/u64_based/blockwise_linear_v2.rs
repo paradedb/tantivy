@@ -94,7 +94,6 @@ impl FixedSize for BlockMeta {
     const SIZE_IN_BYTES: usize = BLOCK_META_SIZE;
 }
 
-/// Parse a block metadata entry from a byte slice.
 #[inline(always)]
 fn parse_block_meta(mut entry: &[u8]) -> BlockMeta {
     BlockMeta::deserialize(&mut entry).expect("failed to parse block meta")
