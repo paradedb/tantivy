@@ -1,25 +1,19 @@
 use crate::vector::math::l2_distance_sqr;
 use crate::vector::Metric;
 
-/// Per-centroid int8 quantization.
+/// Full-precision centroid storage for brute-force probe selection.
 ///
-/// Each centroid is stored as a `f32` scale plus `dims` i8 values in the
-/// range `[-127, 127]`. The original f32 value is recovered as
-/// `i8_value as f32 * scale`. With one global scale per centroid the worst
-/// quantization error is `max_abs(centroid) / 127`, which is well under the
-/// noise floor of k-means cluster boundaries — empirically recall is unchanged.
+/// Each centroid is stored as `dims` consecutive `f32` values. The previous
+/// implementation used per-centroid int8 quantization (one f32 scale +
+/// `dims` i8 values, ~4× smaller); this is the experimental f32 variant.
 ///
 /// File-on-disk size for `dims=768`:
-///   - f32 storage: 768 * 4 = 3072 bytes per centroid
 ///   - i8 storage:  4 (scale) + 768 = 772 bytes per centroid
-///   - ~4x smaller; for the cohere-1M index the cluster file shrinks from ~5MB/segment to
-///     ~1.3MB/segment, directly reducing per-query read_bytes.
+///   - f32 storage: 768 * 4 = 3072 bytes per centroid (~4× larger)
 pub struct CentroidIndex {
     pub(crate) centroid_ids: Vec<u32>,
-    /// One scale per centroid.
-    scales: Vec<f32>,
     /// Flat layout: centroid `i` occupies `data[i*dims..(i+1)*dims]`.
-    data: Vec<i8>,
+    data: Vec<f32>,
     dims: usize,
 }
 
@@ -27,33 +21,14 @@ impl CentroidIndex {
     pub fn build(centroids: Vec<Vec<f32>>, centroid_ids: Vec<u32>, _metric: Metric) -> Self {
         assert_eq!(centroids.len(), centroid_ids.len());
         let dims = centroids.first().map_or(0, |v| v.len());
-        let n = centroids.len();
-        let mut scales = Vec::with_capacity(n);
-        let mut data = Vec::with_capacity(n * dims);
+        let mut data = Vec::with_capacity(centroids.len() * dims);
         for c in &centroids {
-            let max_abs = c.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-            scales.push(scale);
-            let inv = 1.0 / scale;
-            for &v in c {
-                let q = (v * inv).round().clamp(-127.0, 127.0) as i8;
-                data.push(q);
-            }
+            data.extend_from_slice(c);
         }
         Self {
             centroid_ids,
-            scales,
             data,
             dims,
-        }
-    }
-
-    /// Dequantize centroid `i` into the provided f32 buffer.
-    fn dequantize(&self, i: usize, out: &mut [f32]) {
-        let scale = self.scales[i];
-        let src = &self.data[i * self.dims..(i + 1) * self.dims];
-        for (dst, &q) in out.iter_mut().zip(src.iter()) {
-            *dst = (q as f32) * scale;
         }
     }
 
@@ -64,11 +39,10 @@ impl CentroidIndex {
         }
         let k = k.min(n);
 
-        let mut buf = vec![0.0f32; self.dims];
         let mut results = Vec::with_capacity(n);
         for i in 0..n {
-            self.dequantize(i, &mut buf);
-            results.push((self.centroid_ids[i], l2_distance_sqr(query, &buf)));
+            let centroid = &self.data[i * self.dims..(i + 1) * self.dims];
+            results.push((self.centroid_ids[i], l2_distance_sqr(query, centroid)));
         }
 
         if k < n {
@@ -82,24 +56,19 @@ impl CentroidIndex {
     /// On-disk format:
     ///   u32 n
     ///   u32 dims
-    ///   f32[n] scales
-    ///   i8[n*dims] quantized values
+    ///   f32[n*dims] values
     pub fn save_to_bytes(&self) -> crate::Result<Vec<u8>> {
         let n = self.centroid_ids.len() as u32;
-        let mut buf = Vec::with_capacity(8 + self.scales.len() * 4 + self.data.len());
+        let mut buf = Vec::with_capacity(8 + self.data.len() * std::mem::size_of::<f32>());
         buf.extend_from_slice(&n.to_le_bytes());
         buf.extend_from_slice(&(self.dims as u32).to_le_bytes());
         // SAFETY: f32 slice → bytes
-        let scale_bytes: &[u8] = unsafe {
+        let data_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
-                self.scales.as_ptr() as *const u8,
-                self.scales.len() * std::mem::size_of::<f32>(),
+                self.data.as_ptr() as *const u8,
+                self.data.len() * std::mem::size_of::<f32>(),
             )
         };
-        buf.extend_from_slice(scale_bytes);
-        // SAFETY: i8 slice → bytes (same size)
-        let data_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.data.len()) };
         buf.extend_from_slice(data_bytes);
         Ok(buf)
     }
@@ -114,9 +83,10 @@ impl CentroidIndex {
         let _stored_dims = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
         let mut p = 8;
 
-        let mut scales = Vec::with_capacity(n);
-        for _ in 0..n {
-            scales.push(f32::from_le_bytes([
+        let total = n * dims;
+        let mut data = Vec::with_capacity(total);
+        for _ in 0..total {
+            data.push(f32::from_le_bytes([
                 bytes[p],
                 bytes[p + 1],
                 bytes[p + 2],
@@ -125,15 +95,8 @@ impl CentroidIndex {
             p += 4;
         }
 
-        let total = n * dims;
-        let data_bytes = &bytes[p..p + total];
-        // SAFETY: i8 and u8 are the same size and alignment.
-        let data: Vec<i8> =
-            unsafe { std::slice::from_raw_parts(data_bytes.as_ptr() as *const i8, total).to_vec() };
-
         Ok(Self {
             centroid_ids,
-            scales,
             data,
             dims,
         })
@@ -210,11 +173,16 @@ mod tests {
 
         assert_eq!(results_orig[0].0, results_loaded[0].0);
         assert_eq!(results_orig.len(), results_loaded.len());
+
+        // Full precision: round-trip is exact.
+        for (a, b) in results_orig.iter().zip(results_loaded.iter()) {
+            assert_eq!(a.0, b.0);
+            assert_eq!(a.1, b.1);
+        }
     }
 
     #[test]
-    fn quantization_preserves_nearest() {
-        // High-dim test that quantization noise doesn't flip nearest results.
+    fn high_dim_nearest() {
         let mut centroids = Vec::new();
         for i in 0..10 {
             centroids.push((0..768).map(|d| (i * 100 + d) as f32 * 0.001).collect());
@@ -224,7 +192,6 @@ mod tests {
 
         let query: Vec<f32> = (0..768).map(|d| (5 * 100 + d) as f32 * 0.001).collect();
         let results = index.search(&query, 3);
-        // Nearest should be centroid 5 (which we constructed query from).
         assert_eq!(results[0].0, 5);
     }
 }
