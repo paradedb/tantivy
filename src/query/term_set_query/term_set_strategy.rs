@@ -20,11 +20,27 @@
 //! to `LinearScan` until follow-up A/B land, the bias is invisible at runtime
 //! and only shows up in unit tests on the planner.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
 use columnar::{Cardinality, Column};
 use rustc_hash::FxHashSet;
 
 use crate::index::SegmentReader;
 use crate::Order;
+
+/// Numeric tags for the chosen strategy. Used by the optional
+/// `TermSetStrategyConfig::strategy_sink` so consumers (paradedb) can surface
+/// the per-segment dispatch decision in `EXPLAIN ANALYZE` without depending
+/// on `TermSetStrategy` directly.
+pub mod strategy_tag {
+    pub const NONE: u8 = 0;
+    pub const GALLOP: u8 = 1;
+    pub const LINEAR: u8 = 2;
+    pub const BITSET: u8 = 3;
+    pub const POSTING: u8 = 4;
+    pub const HASH: u8 = 5;
+}
 
 /// User-tunable density thresholds. Defaults match the starting estimates in
 /// `design.md` §4 and are overridden via the `paradedb.term_set_*_max_density`
@@ -55,6 +71,12 @@ pub struct TermSetStrategyConfig {
     pub hash_probe_max_density: f64,
     /// Subsequent-column `BitsetFromPostings` threshold: `K' · D / C` cutoff.
     pub subsequent_bitset_max_density: f64,
+    /// Optional sink for the per-segment strategy choice. When `Some`,
+    /// `select_strategy` writes one of the `strategy_tag::*` constants on its
+    /// way out — last-segment-wins is fine because `EXPLAIN` only asks "did
+    /// any segment use it?". When `None`, no atomic store happens and the
+    /// hot-path cost is one `Option::is_some` check.
+    pub strategy_sink: Option<Arc<AtomicU8>>,
 }
 
 impl Default for TermSetStrategyConfig {
@@ -67,6 +89,7 @@ impl Default for TermSetStrategyConfig {
             bitset_max_density: 1.0 / 4.0,
             hash_probe_max_density: 1.0 / 16.0,
             subsequent_bitset_max_density: 1.0 / 4.0,
+            strategy_sink: None,
         }
     }
 }
@@ -108,7 +131,33 @@ pub struct PlannerInputs<'a> {
 /// Step 0 prunes the term set against the column's `[min, max]`. Step 1 is the
 /// sort-dependent gallop fast path. Step 2 is the sort-agnostic dispatch
 /// branching on `C < N` (subsequent column) vs `C == N` (first column).
+///
+/// When `cfg.strategy_sink` is `Some`, the chosen strategy's tag (one of the
+/// `strategy_tag::*` constants) is stored on the sink before returning so
+/// consumers can surface it in `EXPLAIN ANALYZE`. The thin wrapper around the
+/// inner planner keeps the per-segment hot path uncluttered.
 pub fn select_strategy(
+    reader: &SegmentReader,
+    column: &Column<u64>,
+    inputs: PlannerInputs<'_>,
+    term_set: &FxHashSet<u64>,
+    cfg: &TermSetStrategyConfig,
+) -> TermSetStrategy {
+    let strat = select_strategy_inner(reader, column, inputs, term_set, cfg);
+    if let Some(sink) = cfg.strategy_sink.as_ref() {
+        let tag = match &strat {
+            TermSetStrategy::Gallop { .. } => strategy_tag::GALLOP,
+            TermSetStrategy::LinearScan => strategy_tag::LINEAR,
+            TermSetStrategy::BitsetFromPostings => strategy_tag::BITSET,
+            TermSetStrategy::PostingListDirect => strategy_tag::POSTING,
+            TermSetStrategy::HashProbe => strategy_tag::HASH,
+        };
+        sink.store(tag, Ordering::Relaxed);
+    }
+    strat
+}
+
+fn select_strategy_inner(
     reader: &SegmentReader,
     column: &Column<u64>,
     inputs: PlannerInputs<'_>,
@@ -503,6 +552,63 @@ mod tests {
             }
             other => panic!("expected Gallop, got {other:?}"),
         }
+    }
+
+    /// Step 5 — `strategy_sink` records the chosen variant on every call.
+    /// `select_strategy` is invoked twice against differently-shaped corpora;
+    /// the sink should reflect the *latest* strategy on each call (last-write
+    /// semantics).
+    #[test]
+    fn select_writes_chosen_tag_to_strategy_sink() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc;
+
+        let n: u64 = 4096;
+        let sink = Arc::new(AtomicU8::new(strategy_tag::NONE));
+        let cfg = TermSetStrategyConfig {
+            strategy_sink: Some(sink.clone()),
+            ..TermSetStrategyConfig::default()
+        };
+
+        // Sorted ASC, K=8 → Gallop.
+        let (sorted_idx, _f, name_s) = build_index(
+            n,
+            Some(IndexSortByField {
+                field: "fk".to_string(),
+                order: Order::Asc,
+            }),
+            |i| i,
+        );
+        let (reader_s, col_s) = open_column(&sorted_idx, &name_s);
+        let _ = select_strategy(
+            &reader_s,
+            &col_s,
+            PlannerInputs {
+                field_name: &name_s,
+                candidate_size: None,
+                avg_docs_per_term: None,
+            },
+            &term_set(0..8),
+            &cfg,
+        );
+        assert_eq!(sink.load(Ordering::Relaxed), strategy_tag::GALLOP);
+
+        // Unsorted, K=2000 → LinearScan (terminal fallback). Last-write-wins
+        // overwrites the GALLOP tag from the previous call.
+        let (unsorted_idx, _f, name_u) = build_index(n, None, |i| i);
+        let (reader_u, col_u) = open_column(&unsorted_idx, &name_u);
+        let _ = select_strategy(
+            &reader_u,
+            &col_u,
+            PlannerInputs {
+                field_name: &name_u,
+                candidate_size: None,
+                avg_docs_per_term: None,
+            },
+            &term_set(0..2000),
+            &cfg,
+        );
+        assert_eq!(sink.load(Ordering::Relaxed), strategy_tag::LINEAR);
     }
 
     /// Step 3 — kill-switch: gallop_enabled=false forces a non-gallop strategy
