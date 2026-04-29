@@ -70,6 +70,8 @@ impl BinarySerializable for BlockMeta {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         // We serialize slope/intercept individually instead of `line.serialize()`
         // to ensure fixed-sized encoding (the latter uses varints).
+        // We do manual serialization instead of `line.serialize()`
+        // to ensure everything is fixed-sized (the latter uses varints).
         self.line.slope.serialize(writer)?;
         self.line.intercept.serialize(writer)?;
         self.bit_width.serialize(writer)?;
