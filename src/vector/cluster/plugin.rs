@@ -467,6 +467,8 @@ fn assign(
     if cone_factor_sq.is_some() {
         candidates.reserve(k);
     }
+    let mut diag_total_cone_candidates: u64 = 0;
+    let mut diag_total_replicas: u64 = 0;
 
     for doc_id in 0..n {
         let point = &points_flat[doc_id * dim..(doc_id + 1) * dim];
@@ -490,6 +492,7 @@ fn assign(
             let threshold_sq = d_min_sq * cone_factor_sq;
             candidates.retain(|&(d, j)| j != nearest && d <= threshold_sq);
             candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            diag_total_cone_candidates += candidates.len() as u64 + 1;
 
             let mut selected: Assignment = smallvec::smallvec![nearest];
             for &(d_pi, ci) in &candidates {
@@ -506,6 +509,7 @@ fn assign(
                     selected.push(ci);
                 }
             }
+            diag_total_replicas += selected.len() as u64;
             assignments.push(selected);
         } else {
             // Single-assign with Elkan-style triangle pruning.
@@ -524,6 +528,17 @@ fn assign(
             }
             assignments.push(smallvec::smallvec![best]);
         }
+    }
+    if cone_factor_sq.is_some() && n > 0 {
+        eprintln!(
+            "assign() n={} k={} eps={:.3} cap={} avg_cone_candidates={:.3} avg_replicas={:.3}",
+            n,
+            k,
+            replication.map(|rc| rc.epsilon).unwrap_or(0.0),
+            max_replicas,
+            diag_total_cone_candidates as f64 / n as f64,
+            diag_total_replicas as f64 / n as f64,
+        );
     }
     assignments
 }
