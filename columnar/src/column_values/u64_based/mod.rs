@@ -77,7 +77,9 @@ pub trait ColumnCodec<T: PartialOrd = u64> {
 }
 
 /// Available codecs to use to encode the u64 (via [`MonotonicallyMappableToU64`]) converted data.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(
+    PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum CodecType {
     /// Bitpack all values in the value range. The number of bits is defined by the amplitude

@@ -652,7 +652,10 @@ mod tests {
             serde_json::json!(["Bitpacked", "BlockwiseLinearV2"])
         );
         let deser: IndexSettings = serde_json::from_value(json).unwrap();
-        assert_eq!(deser.codec_types, vec![CodecType::Bitpacked, CodecType::BlockwiseLinearV2]);
+        assert_eq!(
+            deser.codec_types,
+            vec![CodecType::Bitpacked, CodecType::BlockwiseLinearV2]
+        );
         assert_eq!(
             deser.columnar_codec_types(),
             &[CodecType::Bitpacked, CodecType::BlockwiseLinearV2]

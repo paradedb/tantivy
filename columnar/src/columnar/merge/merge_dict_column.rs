@@ -30,7 +30,12 @@ pub fn merge_bytes_or_str_column(
         term_ord_mapping: &term_ord_mapping,
         merge_row_order,
     };
-    serialize_column_mappable_to_u64(column_index, &remapped_term_ordinals_values, codec_types, output)?;
+    serialize_column_mappable_to_u64(
+        column_index,
+        &remapped_term_ordinals_values,
+        codec_types,
+        output,
+    )?;
     output.write_all(&dictionary_num_bytes.to_le_bytes())?;
     Ok(())
 }

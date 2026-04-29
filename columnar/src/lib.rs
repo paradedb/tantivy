@@ -44,8 +44,7 @@ pub use column_values::{
 };
 
 /// Default codec types used for u64-based column serialization.
-pub const DEFAULT_CODEC_TYPES: [CodecType; 2] =
-    [CodecType::Bitpacked, CodecType::BlockwiseLinear];
+pub const DEFAULT_CODEC_TYPES: [CodecType; 2] = [CodecType::Bitpacked, CodecType::BlockwiseLinear];
 pub use columnar::{
     CURRENT_VERSION, ColumnType, ColumnarReader, ColumnarWriter, HasAssociatedColumnType,
     MergeRowOrder, ShuffleMergeOrder, StackMergeOrder, Version, compute_merged_term_ord_mapping,

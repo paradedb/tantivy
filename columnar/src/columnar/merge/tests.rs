@@ -17,7 +17,12 @@ fn make_columnar<T: Into<NumericalValue> + HasAssociatedColumnType + Copy>(
     }
     let mut buffer: Vec<u8> = Vec::new();
     dataframe_writer
-        .serialize(vals.len() as RowId, None, &crate::DEFAULT_CODEC_TYPES, &mut buffer)
+        .serialize(
+            vals.len() as RowId,
+            None,
+            &crate::DEFAULT_CODEC_TYPES,
+            &mut buffer,
+        )
         .unwrap();
     ColumnarReader::open(buffer).unwrap()
 }
@@ -562,7 +567,14 @@ fn build_columnar(spec: &ColumnarSpec) -> ColumnarReader {
     }
 
     let mut buffer = Vec::new();
-    writer.serialize(max_row_id + 1, None, &crate::DEFAULT_CODEC_TYPES, &mut buffer).unwrap();
+    writer
+        .serialize(
+            max_row_id + 1,
+            None,
+            &crate::DEFAULT_CODEC_TYPES,
+            &mut buffer,
+        )
+        .unwrap();
     ColumnarReader::open(buffer).unwrap()
 }
 

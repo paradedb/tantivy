@@ -2270,9 +2270,10 @@ mod tests {
 
     #[test]
     fn test_merge_respects_codec_types_setting() -> crate::Result<()> {
-        use crate::IndexSettings;
-        use crate::schema::Schema;
         use columnar::CodecType;
+
+        use crate::schema::Schema;
+        use crate::IndexSettings;
 
         // Create index with BlockwiseLinearV2 codec setting
         let mut schema_builder = Schema::builder();

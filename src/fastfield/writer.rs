@@ -393,7 +393,12 @@ mod tests {
         }
         let mut buffer = Vec::new();
         columnar_writer
-            .serialize(json_docs.len() as DocId, None, &columnar::DEFAULT_CODEC_TYPES, &mut buffer)
+            .serialize(
+                json_docs.len() as DocId,
+                None,
+                &columnar::DEFAULT_CODEC_TYPES,
+                &mut buffer,
+            )
             .unwrap();
         ColumnarReader::open(buffer).unwrap()
     }

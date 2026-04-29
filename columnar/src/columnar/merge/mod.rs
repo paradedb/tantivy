@@ -13,8 +13,7 @@ pub use merge_mapping::{MergeRowOrder, ShuffleMergeOrder, StackMergeOrder};
 
 use super::writer::ColumnarSerializer;
 use crate::column::{serialize_column_mappable_to_u64, serialize_column_mappable_to_u128};
-use crate::column_values::CodecType;
-use crate::column_values::MergedColumnValues;
+use crate::column_values::{CodecType, MergedColumnValues};
 use crate::columnar::ColumnarReader;
 use crate::columnar::merge::merge_dict_column::merge_bytes_or_str_column;
 use crate::columnar::writer::CompatibleNumericalTypes;
@@ -174,7 +173,12 @@ fn merge_column(
                 column_values: &column_values[..],
                 merge_row_order,
             };
-            serialize_column_mappable_to_u64(merged_column_index, &merge_column_values, codec_types, wrt)?;
+            serialize_column_mappable_to_u64(
+                merged_column_index,
+                &merge_column_values,
+                codec_types,
+                wrt,
+            )?;
         }
         ColumnType::IpAddr => {
             let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns_to_merge.len());
@@ -228,7 +232,13 @@ fn merge_column(
             }
             let merged_column_index =
                 crate::column_index::merge_column_index(&column_indexes[..], merge_row_order);
-            merge_bytes_or_str_column(merged_column_index, &bytes_columns, merge_row_order, codec_types, wrt)?;
+            merge_bytes_or_str_column(
+                merged_column_index,
+                &bytes_columns,
+                merge_row_order,
+                codec_types,
+                wrt,
+            )?;
         }
     }
     Ok(())
