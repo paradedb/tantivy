@@ -60,6 +60,12 @@ pub struct TermSetStrategyConfig {
     /// every other gate would pass.
     pub gallop_enabled: bool,
     /// Gallop fires when `K' / N < gallop_max_density` on a sorted segment.
+    /// Default `1/200 = 0.005` was set from the threshold-tier bench (commit
+    /// `ccc3b202`): at K/N = 0.005 gallop wins ≥1.74× over linear across
+    /// both N=1M and N=10M LowFk corpora, with the wider safety buffer
+    /// chosen because the bench shows a consistent 10–20% N-asymmetry
+    /// (gallop's win shrinks slightly as N grows, so the worst-case
+    /// large-N margin is what binds the default; see Follow-up G).
     pub gallop_max_density: f64,
     /// First-column `PostingListDirect` threshold: `K' · D / N` cutoff.
     pub posting_max_density: f64,
@@ -83,8 +89,11 @@ impl Default for TermSetStrategyConfig {
     fn default() -> Self {
         Self {
             gallop_enabled: true,
-            // 1/64, 1/256, 1/4, 1/16, 1/4 — all exact powers of 2 in f64.
-            gallop_max_density: 1.0 / 64.0,
+            // gallop_max_density: 1/200 — bench-tuned (see field doc).
+            // posting/bitset/hash_probe/subsequent_bitset: 1/256, 1/4, 1/16,
+            // 1/4 — starting estimates; only consulted by strategies that
+            // are stubs in #4895, so they don't affect runtime today.
+            gallop_max_density: 1.0 / 200.0,
             posting_max_density: 1.0 / 256.0,
             bitset_max_density: 1.0 / 4.0,
             hash_probe_max_density: 1.0 / 16.0,
