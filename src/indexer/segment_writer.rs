@@ -75,6 +75,7 @@ pub struct SegmentWriter {
     term_buffer: IndexingTerm,
     schema: Schema,
     ignore_store: bool,
+    columnar_codec_types: Vec<columnar::CodecType>,
 }
 
 impl SegmentWriter {
@@ -96,6 +97,7 @@ impl SegmentWriter {
         let tokenizer_manager = segment.index().tokenizers().clone();
         let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
+        let columnar_codec_types = segment.index().settings().columnar_codec_types().to_vec();
         let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
         let per_field_text_analyzers = schema
@@ -137,6 +139,7 @@ impl SegmentWriter {
             term_buffer: IndexingTerm::with_capacity(16),
             schema,
             ignore_store,
+            columnar_codec_types,
         })
     }
 
@@ -164,6 +167,7 @@ impl SegmentWriter {
             self.segment_serializer,
             mapping.as_ref(),
             self.ignore_store,
+            &self.columnar_codec_types,
         )?;
         let doc_opstamps = remap_doc_opstamps(self.doc_opstamps, mapping.as_ref());
         Ok(doc_opstamps)
@@ -429,6 +433,7 @@ fn remap_and_write(
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
     ignore_store: bool,
+    columnar_codec_types: &[columnar::CodecType],
 ) -> crate::Result<()> {
     debug!("remap-and-write");
     if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
@@ -447,7 +452,7 @@ fn remap_and_write(
         serializer.get_postings_serializer(),
     )?;
     debug!("fastfield-serialize");
-    fast_field_writers.serialize(serializer.get_fast_field_write(), doc_id_map)?;
+    fast_field_writers.serialize(columnar_codec_types, serializer.get_fast_field_write(), doc_id_map)?;
 
     // finalize temp docstore and create version, which reflects the doc_id_map
     if !ignore_store {

@@ -17,7 +17,7 @@ fn make_columnar<T: Into<NumericalValue> + HasAssociatedColumnType + Copy>(
     }
     let mut buffer: Vec<u8> = Vec::new();
     dataframe_writer
-        .serialize(vals.len() as RowId, None, &mut buffer)
+        .serialize(vals.len() as RowId, None, &crate::DEFAULT_CODEC_TYPES, &mut buffer)
         .unwrap();
     ColumnarReader::open(buffer).unwrap()
 }
@@ -144,7 +144,7 @@ fn make_numerical_columnar_multiple_columns(
         .unwrap_or(0u32);
     let mut buffer: Vec<u8> = Vec::new();
     dataframe_writer
-        .serialize(num_rows, None, &mut buffer)
+        .serialize(num_rows, None, &crate::DEFAULT_CODEC_TYPES, &mut buffer)
         .unwrap();
     ColumnarReader::open(buffer).unwrap()
 }
@@ -169,7 +169,7 @@ fn make_byte_columnar_multiple_columns(
     }
     let mut buffer: Vec<u8> = Vec::new();
     dataframe_writer
-        .serialize(num_rows, None, &mut buffer)
+        .serialize(num_rows, None, &crate::DEFAULT_CODEC_TYPES, &mut buffer)
         .unwrap();
     ColumnarReader::open(buffer).unwrap()
 }
@@ -190,7 +190,7 @@ fn make_text_columnar_multiple_columns(columns: &[(&str, &[&[&str]])]) -> Column
         .unwrap_or(0u32);
     let mut buffer: Vec<u8> = Vec::new();
     dataframe_writer
-        .serialize(num_rows, None, &mut buffer)
+        .serialize(num_rows, None, &crate::DEFAULT_CODEC_TYPES, &mut buffer)
         .unwrap();
     ColumnarReader::open(buffer).unwrap()
 }
@@ -210,6 +210,7 @@ fn test_merge_columnar_numbers() {
         columnars,
         &[],
         MergeRowOrder::Stack(stack_merge_order),
+        &crate::DEFAULT_CODEC_TYPES,
         &mut buffer,
         || false,
     )
@@ -239,6 +240,7 @@ fn test_merge_columnar_texts() {
         columnars,
         &[],
         MergeRowOrder::Stack(stack_merge_order),
+        &crate::DEFAULT_CODEC_TYPES,
         &mut buffer,
         || false,
     )
@@ -289,6 +291,7 @@ fn test_merge_columnar_byte() {
         columnars,
         &[],
         MergeRowOrder::Stack(stack_merge_order),
+        &crate::DEFAULT_CODEC_TYPES,
         &mut buffer,
         || false,
     )
@@ -346,6 +349,7 @@ fn test_merge_columnar_byte_with_missing() {
         columnars,
         &[],
         MergeRowOrder::Stack(stack_merge_order),
+        &crate::DEFAULT_CODEC_TYPES,
         &mut buffer,
         || false,
     )
@@ -399,6 +403,7 @@ fn test_merge_columnar_different_types() {
         columnars,
         &[],
         MergeRowOrder::Stack(stack_merge_order),
+        &crate::DEFAULT_CODEC_TYPES,
         &mut buffer,
         || false,
     )
@@ -465,6 +470,7 @@ fn test_merge_columnar_different_empty_cardinality() {
         columnars,
         &[],
         MergeRowOrder::Stack(stack_merge_order),
+        &crate::DEFAULT_CODEC_TYPES,
         &mut buffer,
         || false,
     )
@@ -556,7 +562,7 @@ fn build_columnar(spec: &ColumnarSpec) -> ColumnarReader {
     }
 
     let mut buffer = Vec::new();
-    writer.serialize(max_row_id + 1, None, &mut buffer).unwrap();
+    writer.serialize(max_row_id + 1, None, &crate::DEFAULT_CODEC_TYPES, &mut buffer).unwrap();
     ColumnarReader::open(buffer).unwrap()
 }
 
@@ -576,6 +582,7 @@ proptest! {
             &columnar_refs,
             &[],
             MergeRowOrder::Stack(stack_merge_order),
+            &crate::DEFAULT_CODEC_TYPES,
             &mut out,
             || false,
         ).unwrap();
@@ -594,6 +601,7 @@ proptest! {
             &columnar_refs,
             &[],
             MergeRowOrder::Stack(stack_merge_order),
+            &crate::DEFAULT_CODEC_TYPES,
             &mut out,
             || false,
         ).unwrap();
