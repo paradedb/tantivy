@@ -184,6 +184,27 @@ impl SchemaBuilder {
         self.add_field(field_entry)
     }
 
+    /// Adds a dense vector field to the schema.
+    ///
+    /// Vector fields store fixed-dimensional `f32` vectors per document.
+    /// They are not indexed or stored via the standard tantivy pipeline;
+    /// instead the
+    /// [`ClusterPlugin`](crate::vector::cluster::plugin::ClusterPlugin)
+    /// owns both the cluster index and the per-doc TurboQuant records
+    /// inside a single `.cluster` file.
+    pub fn add_vector_field(
+        &mut self,
+        field_name: &str,
+        dimensions: usize,
+        metric: VectorMetric,
+    ) -> Field {
+        let field_entry = FieldEntry::new_vector(
+            field_name.to_string(),
+            VectorOptions::new(dimensions, metric),
+        );
+        self.add_field(field_entry)
+    }
+
     /// Adds a json object field to the schema.
     pub fn add_json_field<T: Into<JsonObjectOptions>>(
         &mut self,

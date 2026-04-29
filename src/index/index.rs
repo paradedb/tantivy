@@ -300,7 +300,7 @@ impl IndexBuilder {
     /// Creates a new index given an implementation of the trait `Directory`.
     ///
     /// If a directory previously existed, it will be erased.
-    fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+    pub fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
         self.validate()?;
         let dir = dir.into();
         let directory = ManagedDirectory::wrap(dir)?;
@@ -694,6 +694,11 @@ impl Index {
     /// Accessor to the registered segment plugins.
     pub fn plugins(&self) -> &[Arc<dyn SegmentPlugin>] {
         &self.plugins
+    }
+
+    /// Register a plugin on an already-opened index.
+    pub fn register_plugin(&mut self, plugin: Arc<dyn SegmentPlugin>) {
+        self.plugins.push(plugin);
     }
 
     /// Accessor to the index settings

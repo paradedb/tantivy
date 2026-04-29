@@ -32,6 +32,9 @@ pub struct CompactDoc {
     pub node_data: Vec<u8>,
     /// The root (Field, Value) pairs
     field_values: Vec<FieldValueAddr>,
+    /// Owned vector storage. Vector values are stored here so that
+    /// `&[f32]` references can be returned with proper alignment.
+    vectors: Vec<Vec<f32>>,
 }
 
 impl Default for CompactDoc {
@@ -47,6 +50,7 @@ impl CompactDoc {
         CompactDoc {
             node_data: Vec::with_capacity(bytes),
             field_values: Vec::with_capacity(4),
+            vectors: Vec::new(),
         }
     }
 
@@ -254,6 +258,14 @@ impl CompactDoc {
             }
             ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
             ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
+            ReferenceValueLeaf::Vector(vec) => {
+                // Store the vector data in the side vec and save its index
+                // in node_data. This avoids alignment issues when reading
+                // back as &[f32].
+                let idx = self.vectors.len() as u32;
+                self.vectors.push(vec.to_vec());
+                write_into(&mut self.node_data, idx)
+            }
         };
         ValueAddr { type_id, val_addr }
     }
@@ -472,6 +484,11 @@ impl<'a> CompactDocValue<'a> {
                 self.container,
                 addr,
             )?)),
+            ValueType::Vector => {
+                let idx = self.container.read_from::<u32>(addr)?;
+                let vec = &self.container.vectors[idx as usize];
+                Ok(ReferenceValueLeaf::Vector(vec.as_slice()).into())
+            }
         }
     }
 }
@@ -542,6 +559,8 @@ pub enum ValueType {
     Object = 11,
     /// Pre-tokenized str type,
     Array = 12,
+    /// Vector of f32 values
+    Vector = 13,
 }
 
 impl BinarySerializable for ValueType {
@@ -552,7 +571,7 @@ impl BinarySerializable for ValueType {
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let num = u8::deserialize(reader)?;
-        let type_id = if (0..=12).contains(&num) {
+        let type_id = if (0..=13).contains(&num) {
             unsafe { std::mem::transmute::<u8, ValueType>(num) }
         } else {
             return Err(io::Error::new(
@@ -587,6 +606,7 @@ impl<'a> From<&ReferenceValueLeaf<'a>> for ValueType {
             ReferenceValueLeaf::PreTokStr(_) => ValueType::PreTokStr,
             ReferenceValueLeaf::Facet(_) => ValueType::Facet,
             ReferenceValueLeaf::Bytes(_) => ValueType::Bytes,
+            ReferenceValueLeaf::Vector(_) => ValueType::Vector,
         }
     }
 }

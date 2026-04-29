@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::Collector;
 use crate::collector::sort_key::{
     Comparator, ComparatorEnum, NaturalComparator, ReverseComparator, SortBySimilarityScore,
-    SortByStaticFastValue, SortByString,
+    SortByStaticFastValue, SortByString, SortByTurboQuantDistance,
 };
 use crate::collector::sort_key_top_collector::TopBySortKeyCollector;
 use crate::collector::top_collector::ComparableDoc;
@@ -225,6 +225,34 @@ impl TopDocs {
     /// Order docs by decreasing BM25 similarity score.
     pub fn order_by_score(self) -> impl Collector<Fruit = Vec<(Score, DocAddress)>> {
         TopBySortKeyCollector::new(SortBySimilarityScore, self.doc_range())
+    }
+
+    /// Top-k by approximate inner-product against a TurboQuant-encoded
+    /// `vector` field. TurboQuant is the only vector codec — use this
+    /// for any `ORDER BY vec_field <-> query` style query.
+    ///
+    /// `quantizer` must be the same `TurboQuantizer` (same dim, bit
+    /// width, rotator seeds, codebook) that was used to encode the
+    /// records at index time.
+    ///
+    /// `probe` overrides the default `ProbeConfig` for the cluster
+    /// plugin's probe pruning; pass `None` to use the plugin's default
+    /// (or, when the cluster plugin isn't registered, to fall back to
+    /// a flat scan of every doc the filter scorer matches).
+    ///
+    /// Higher score = more similar.
+    pub fn order_by_turboquant_distance(
+        self,
+        query_vector: Vec<f32>,
+        field: crate::schema::Field,
+        quantizer: crate::vector::turboquant::TurboQuantizer,
+        probe: Option<crate::vector::cluster::plugin::ProbeConfig>,
+    ) -> impl Collector<Fruit = Vec<(Score, DocAddress)>> {
+        let mut sort_key = SortByTurboQuantDistance::new(query_vector, field, quantizer);
+        if let Some(probe) = probe {
+            sort_key = sort_key.with_probe(probe);
+        }
+        TopBySortKeyCollector::new(sort_key, self.doc_range())
     }
 
     /// Set top-K to rank documents by a given fast field.
@@ -616,6 +644,19 @@ where
     }
 
     /// Push a new document to the top n.
+    /// Number of candidates currently held by the heap. After the
+    /// first overflow this is always in `[top_n, 2 * top_n)`; before
+    /// it is the raw count of `push`es that survived the threshold
+    /// check.
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// True iff the heap contains zero candidates.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
     /// If the document is below the current threshold, it will be ignored.
     ///
     /// NOTE: `push` must be called in ascending `DocId`/`DocAddress` order.
