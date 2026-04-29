@@ -116,6 +116,7 @@ fn applicable(sort: Sort, strat: Strat) -> bool {
 fn bench_tier() -> &'static str {
     match std::env::var("TERM_SET_BENCH_TIER").as_deref() {
         Ok("full") => "full",
+        Ok("threshold") => "threshold",
         _ => "smoke",
     }
 }
@@ -342,6 +343,17 @@ fn matrix_for_tier(tier: &str) -> (Vec<u64>, Vec<usize>, Vec<CorpusKind>) {
 
 fn main() {
     let tier = bench_tier();
+
+    // Threshold tier: targeted measurements to close the LowFk gallop-vs-linear
+    // crossover gap left by the full tier's 10x geometric K spacing. Runs only
+    // a focused (LowFk, ASC, gallop+linear) panel at K values distributed
+    // log-uniformly through K/N ∈ (0.001, 0.01). Bypasses the matrix loop
+    // entirely; doesn't touch smoke or full tier code paths.
+    if tier == "threshold" {
+        run_threshold_tier();
+        return;
+    }
+
     let (n_levels, k_levels, kinds) = matrix_for_tier(tier);
     let sorts = [Sort::Asc, Sort::None];
     let strategies = [
@@ -438,6 +450,71 @@ fn main() {
     //     gap, which is exactly where smart seek pays off — the upper-bound
     //     case for typical hash-join build sides.
     run_and_intersect_cells(&mut runner);
+}
+
+/// Targeted threshold-tier panel: closes the LowFk K/N ∈ (0.001, 0.01) gap
+/// the full-tier matrix skipped. Eight (K, N) cells × two strategies
+/// (gallop, linear), all on LowFk + sorted ASC. Reuses the existing
+/// build_corpus / sample_terms / cfg_force_* primitives so per-cell
+/// behavior is identical to the matrix cells — just different K values.
+fn run_threshold_tier() {
+    // (K, N) pairs spread log-uniformly through K/N ∈ (0.001, 0.01).
+    // Five at N=1M (K/N = 0.002, 0.003, 0.005, 0.007, 0.010) and three at
+    // N=10M (K/N = 0.003, 0.005, 0.007) so we can also check whether the
+    // crossover is N-dependent.
+    let cells: &[(usize, u64)] = &[
+        (2_000, 1_000_000),
+        (3_000, 1_000_000),
+        (5_000, 1_000_000),
+        (7_000, 1_000_000),
+        (10_000, 1_000_000),
+        (30_000, 10_000_000),
+        (50_000, 10_000_000),
+        (70_000, 10_000_000),
+    ];
+
+    // Build one corpus per N (LowFk distinct = N/100, comfortably above max
+    // K=70K at N=10M).
+    let mut runner = BenchRunner::new();
+    for &n in &[1_000_000u64, 10_000_000u64] {
+        let (searcher, field) = build_corpus(n, CorpusKind::LowFk, Sort::Asc);
+        let mut group = runner.new_group();
+        group.set_name(format!("threshold n={n} kind=lowfk sort=asc"));
+        group.set_input_size(n as usize);
+
+        let distinct = CorpusKind::LowFk.distinct_count(n);
+        for &(k, n_cell) in cells {
+            if n_cell != n {
+                continue;
+            }
+            assert!(
+                (k as u64) <= distinct,
+                "k={k} exceeds LowFk distinct={distinct} at n={n}",
+            );
+            let terms = sample_terms(distinct, k, 7);
+            for &strat in &[Strat::Gallop, Strat::Linear] {
+                let s = searcher.clone();
+                let terms_v = terms.clone();
+                let cell_name = format!("k={k} strat={}", strat.label());
+                group.register(cell_name, move |_| match strat {
+                    Strat::Gallop => black_box(run_planner_path(
+                        &s,
+                        field,
+                        &terms_v,
+                        cfg_force_gallop(),
+                    )),
+                    Strat::Linear => black_box(run_planner_path(
+                        &s,
+                        field,
+                        &terms_v,
+                        cfg_force_linear(),
+                    )),
+                    _ => unreachable!(),
+                });
+            }
+        }
+        group.run();
+    }
 }
 
 /// Build the (a sorted, b unsorted) two-column AND-intersection bench cells.

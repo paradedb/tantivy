@@ -254,30 +254,3 @@ k=10 strat=bitset_from_postings         Avg: 10.281 GB/s     Median: 10.322 GB/s
 k=100 strat=linear                      Avg: 278.70 MB/s     Median: 278.93 MB/s     [273.97 MB/s .. 281.81 MB/s]    Output: 10_000_000    
 k=100 strat=posting_direct              Avg: 1.7383 GB/s     Median: 1.7381 GB/s     [1.7029 GB/s .. 1.8066 GB/s]    Output: 10_000_000    
 k=100 strat=bitset_from_postings        Avg: 1.0449 GB/s     Median: 1.0392 GB/s     [993.82 MB/s .. 1.1037 GB/s]    Output: 10_000_000    
-
-================================================================
-threshold-tier (LowFk crossover refinement, 2026-04-29T20:35:32Z)
-added post-hoc to close the K/N in (0.001, 0.01) measurement gap
-================================================================
-
-   Compiling tantivy v0.26.0 (/Users/ruchirraj/Documents/Workplace/tantivy)
-    Finished `bench` profile [optimized + debuginfo] target(s) in 1.89s
-     Running benches/term_set_queries.rs (target/release/deps/term_set_queries-33a0ced6f9e202cb)
-threshold n=1000000 kind=lowfk sort=asc
-k=2000 strat=gallop         Avg: 1.0873 GB/s     Median: 1.2180 GB/s     [462.14 MB/s .. 1.2493 GB/s]    Output: 200_000      
-k=2000 strat=linear         Avg: 227.07 MB/s     Median: 261.78 MB/s     [100.02 MB/s .. 266.98 MB/s]    Output: 200_000      
-k=3000 strat=gallop         Avg: 742.97 MB/s     Median: 837.55 MB/s     [285.14 MB/s .. 846.74 MB/s]    Output: 300_000      
-k=3000 strat=linear         Avg: 224.75 MB/s     Median: 251.08 MB/s     [95.387 MB/s .. 257.00 MB/s]    Output: 300_000      
-k=5000 strat=gallop         Avg: 468.70 MB/s     Median: 501.84 MB/s     [261.13 MB/s .. 510.80 MB/s]    Output: 500_000      
-k=5000 strat=linear         Avg: 251.48 MB/s     Median: 251.72 MB/s     [241.90 MB/s .. 254.92 MB/s]    Output: 500_000      
-k=7000 strat=gallop         Avg: 362.48 MB/s     Median: 364.44 MB/s     [316.46 MB/s .. 367.43 MB/s]    Output: 700_000      
-k=7000 strat=linear         Avg: 241.88 MB/s     Median: 242.50 MB/s     [225.21 MB/s .. 245.66 MB/s]    Output: 700_000      
-k=10000 strat=gallop        Avg: 252.11 MB/s     Median: 256.24 MB/s     [191.15 MB/s .. 257.54 MB/s]    Output: 1_000_000    
-k=10000 strat=linear        Avg: 235.45 MB/s     Median: 237.35 MB/s     [193.09 MB/s .. 241.25 MB/s]    Output: 1_000_000    
-threshold n=10000000 kind=lowfk sort=asc
-k=30000 strat=gallop        Avg: 653.51 MB/s     Median: 663.38 MB/s     [466.21 MB/s .. 676.89 MB/s]    Output: 3_000_000    
-k=30000 strat=linear        Avg: 222.27 MB/s     Median: 244.99 MB/s     [94.985 MB/s .. 252.65 MB/s]    Output: 3_000_000    
-k=50000 strat=gallop        Avg: 394.96 MB/s     Median: 408.76 MB/s     [283.73 MB/s .. 414.73 MB/s]    Output: 5_000_000    
-k=50000 strat=linear        Avg: 232.35 MB/s     Median: 234.72 MB/s     [200.19 MB/s .. 238.38 MB/s]    Output: 5_000_000    
-k=70000 strat=gallop        Avg: 292.95 MB/s     Median: 294.20 MB/s     [282.67 MB/s .. 297.00 MB/s]    Output: 7_000_000    
-k=70000 strat=linear        Avg: 213.30 MB/s     Median: 225.10 MB/s     [121.01 MB/s .. 230.66 MB/s]    Output: 7_000_000    
