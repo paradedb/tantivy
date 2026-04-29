@@ -3,6 +3,7 @@ use std::net::Ipv6Addr;
 use columnar::{Column, ColumnType};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::term_set_strategy::TermSetStrategyConfig;
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{
     BooleanWeight, ConstScorer, EmptyScorer, EnableScoring, Explanation, Occur, Query, Scorer,
@@ -15,6 +16,7 @@ use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term, TERMINATED}
 /// `FastFieldTermSetQuery` is the same as [TermSetQuery] but only uses the fast field.
 pub struct FastFieldTermSetQuery {
     terms_map: FxHashMap<crate::schema::Field, Vec<Term>>,
+    strategy_config: TermSetStrategyConfig,
 }
 
 impl FastFieldTermSetQuery {
@@ -25,7 +27,17 @@ impl FastFieldTermSetQuery {
             terms_map.entry(term.field()).or_default().push(term);
         }
 
-        FastFieldTermSetQuery { terms_map }
+        FastFieldTermSetQuery {
+            terms_map,
+            strategy_config: TermSetStrategyConfig::default(),
+        }
+    }
+
+    /// Override the strategy thresholds and gates used when this query runs
+    /// against fast fields. Consumers (paradedb) build the config from GUCs.
+    pub fn with_strategy_config(mut self, cfg: TermSetStrategyConfig) -> Self {
+        self.strategy_config = cfg;
+        self
     }
 }
 
@@ -35,7 +47,11 @@ impl Query for FastFieldTermSetQuery {
         for (&field, terms) in &self.terms_map {
             sub_queries.push((
                 Occur::Should,
-                Box::new(FastFieldTermSetWeight::new(field, terms)?),
+                Box::new(FastFieldTermSetWeight::new(
+                    field,
+                    terms,
+                    self.strategy_config.clone(),
+                )?),
             ));
         }
         Ok(Box::new(BooleanWeight::new(
@@ -58,12 +74,17 @@ enum TermSet {
 pub struct FastFieldTermSetWeight {
     field: crate::schema::Field,
     term_set: Option<TermSet>,
+    // Held but unused at the dispatch site in Step 2; Step 3 wires
+    // `select_strategy` into `scorer()` and consults this field.
+    #[allow(dead_code)]
+    strategy_config: TermSetStrategyConfig,
 }
 
 impl FastFieldTermSetWeight {
     pub fn new<'a>(
         field: crate::schema::Field,
         terms: impl IntoIterator<Item = &'a Term>,
+        strategy_config: TermSetStrategyConfig,
     ) -> crate::Result<Self> {
         let mut terms_iter = terms.into_iter().peekable();
 
@@ -71,6 +92,7 @@ impl FastFieldTermSetWeight {
             return Ok(Self {
                 field,
                 term_set: None,
+                strategy_config,
             });
         }
 
@@ -109,6 +131,7 @@ impl FastFieldTermSetWeight {
         Ok(Self {
             field,
             term_set: Some(term_set),
+            strategy_config,
         })
     }
 }
