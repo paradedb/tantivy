@@ -3,7 +3,8 @@ use std::net::Ipv6Addr;
 use columnar::{Column, ColumnType};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::term_set_strategy::TermSetStrategyConfig;
+use super::term_set_gallop;
+use super::term_set_strategy::{select_strategy, PlannerInputs, TermSetStrategy, TermSetStrategyConfig};
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{
     BooleanWeight, ConstScorer, EmptyScorer, EnableScoring, Explanation, Occur, Query, Scorer,
@@ -74,9 +75,6 @@ enum TermSet {
 pub struct FastFieldTermSetWeight {
     field: crate::schema::Field,
     term_set: Option<TermSet>,
-    // Held but unused at the dispatch site in Step 2; Step 3 wires
-    // `select_strategy` into `scorer()` and consults this field.
-    #[allow(dead_code)]
     strategy_config: TermSetStrategyConfig,
 }
 
@@ -198,8 +196,44 @@ impl Weight for FastFieldTermSetWeight {
                 else {
                     return Ok(Box::new(EmptyScorer));
                 };
-                let docset = TermSetDocSet::new(column, values.clone());
-                Ok(Box::new(ConstScorer::new(docset, boost)))
+
+                let strategy = select_strategy(
+                    reader,
+                    &column,
+                    PlannerInputs {
+                        field_name,
+                        candidate_size: None,
+                        avg_docs_per_term: None,
+                    },
+                    values,
+                    &self.strategy_config,
+                );
+
+                match strategy {
+                    TermSetStrategy::Gallop {
+                        sort_order,
+                        sorted_terms,
+                    } => {
+                        let cardinality = column.get_cardinality();
+                        Ok(term_set_gallop::run(
+                            &column,
+                            sort_order,
+                            &sorted_terms,
+                            cardinality,
+                            boost,
+                        ))
+                    }
+                    // Step 2's stubs route to TermSetDocSet: follow-ups A and B
+                    // replace these arms with real implementations without
+                    // touching the planner.
+                    TermSetStrategy::LinearScan
+                    | TermSetStrategy::BitsetFromPostings
+                    | TermSetStrategy::PostingListDirect
+                    | TermSetStrategy::HashProbe => {
+                        let docset = TermSetDocSet::new(column, values.clone());
+                        Ok(Box::new(ConstScorer::new(docset, boost)))
+                    }
+                }
             }
         }
     }

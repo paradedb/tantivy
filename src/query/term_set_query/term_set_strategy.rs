@@ -63,9 +63,6 @@ impl Default for TermSetStrategyConfig {
 /// are reserved for follow-ups A and B; `select_strategy` returns them today
 /// so unit tests can pin the planner shape, but `scorer()` routes them through
 /// the `TermSetDocSet` linear path until those strategies are implemented.
-// Step 2 stages the planner without wiring the dispatch in `scorer()`; Step 3
-// activates the call site, at which point these items become live.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TermSetStrategy {
     /// Sorted-segment fast path. Carries the pruned, ascending-sorted term list
@@ -86,7 +83,6 @@ pub enum TermSetStrategy {
 }
 
 /// Inputs to the planner that aren't already on `Column`.
-#[allow(dead_code)]
 pub struct PlannerInputs<'a> {
     pub field_name: &'a str,
     /// Upstream candidate-set size. `None` ≡ full segment scan (first column).
@@ -100,7 +96,6 @@ pub struct PlannerInputs<'a> {
 /// Step 0 prunes the term set against the column's `[min, max]`. Step 1 is the
 /// sort-dependent gallop fast path. Step 2 is the sort-agnostic dispatch
 /// branching on `C < N` (subsequent column) vs `C == N` (first column).
-#[allow(dead_code)]
 pub fn select_strategy(
     reader: &SegmentReader,
     column: &Column<u64>,
@@ -199,7 +194,7 @@ mod tests {
 
     use super::*;
     use crate::schema::{NumericOptions, SchemaBuilder};
-    use crate::{doc, Index, IndexSettings, IndexSortByField};
+    use crate::{Index, IndexSettings, IndexSortByField};
 
     fn build_index(
         n: u64,
@@ -458,8 +453,74 @@ mod tests {
         assert_eq!(strat, TermSetStrategy::PostingListDirect);
     }
 
-    // Note: `select_skips_gallop_when_multivalued` and the positive
-    // `select_returns_gallop_*` assertions live in Step 3, where the gallop
-    // dispatch is wired and we can drive multi-valued and end-to-end equivalence
-    // corpora without overloading this unit-test fixture.
+    /// Step 3 — positive gallop assertion. Sorted ASC, K small, K' < N/R_GALLOP.
+    #[test]
+    fn select_returns_gallop_when_sorted_and_small_k() {
+        let n: u64 = 4096;
+        let (index, _field, name) = build_index(
+            n,
+            Some(IndexSortByField {
+                field: "fk".to_string(),
+                order: Order::Asc,
+            }),
+            |i| i,
+        );
+        let (reader, column) = open_column(&index, &name);
+        let strat = select_strategy(
+            &reader,
+            &column,
+            PlannerInputs {
+                field_name: &name,
+                candidate_size: None,
+                avg_docs_per_term: None,
+            },
+            &term_set(0..8), // K' = 8 < 4096/64 = 64
+            &TermSetStrategyConfig::default(),
+        );
+        match strat {
+            TermSetStrategy::Gallop {
+                sort_order,
+                sorted_terms,
+            } => {
+                assert!(matches!(sort_order, Order::Asc));
+                // Pruned + sorted ascending; pruning preserves all 8 (all in [0, 4095]).
+                assert_eq!(sorted_terms, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+            }
+            other => panic!("expected Gallop, got {other:?}"),
+        }
+    }
+
+    /// Step 3 — kill-switch: gallop_enabled=false forces a non-gallop strategy
+    /// even when the segment is sorted and K is tiny.
+    #[test]
+    fn select_respects_gallop_enabled_kill_switch() {
+        let n: u64 = 4096;
+        let (index, _field, name) = build_index(
+            n,
+            Some(IndexSortByField {
+                field: "fk".to_string(),
+                order: Order::Asc,
+            }),
+            |i| i,
+        );
+        let (reader, column) = open_column(&index, &name);
+        let cfg = TermSetStrategyConfig {
+            gallop_enabled: false,
+            ..TermSetStrategyConfig::default()
+        };
+        let strat = select_strategy(
+            &reader,
+            &column,
+            PlannerInputs {
+                field_name: &name,
+                candidate_size: None,
+                avg_docs_per_term: None,
+            },
+            &term_set(0..8),
+            &cfg,
+        );
+        assert!(!matches!(strat, TermSetStrategy::Gallop { .. }));
+        // Step 2 selection given K=8: PostingListDirect (K · D = 8 < N/R_POSTING = 16).
+        assert_eq!(strat, TermSetStrategy::PostingListDirect);
+    }
 }
