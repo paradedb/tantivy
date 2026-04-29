@@ -529,17 +529,16 @@ fn assign(
             assignments.push(smallvec::smallvec![best]);
         }
     }
-    if cone_factor_sq.is_some() && n > 0 {
-        eprintln!(
-            "assign() n={} k={} eps={:.3} cap={} avg_cone_candidates={:.3} avg_replicas={:.3}",
-            n,
-            k,
-            replication.map(|rc| rc.epsilon).unwrap_or(0.0),
-            max_replicas,
-            diag_total_cone_candidates as f64 / n as f64,
-            diag_total_replicas as f64 / n as f64,
-        );
-    }
+    eprintln!(
+        "assign() n={} k={} eps={:.3} cap={} cone_active={} avg_cone_candidates={:.3} avg_replicas={:.3}",
+        n,
+        k,
+        replication.map(|rc| rc.epsilon).unwrap_or(0.0),
+        max_replicas,
+        cone_factor_sq.is_some(),
+        if n > 0 { diag_total_cone_candidates as f64 / n as f64 } else { 0.0 },
+        if n > 0 { diag_total_replicas as f64 / n as f64 } else { 0.0 },
+    );
     assignments
 }
 
