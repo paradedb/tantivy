@@ -105,6 +105,16 @@ pub struct ReplicationConfig {
     pub epsilon: f32,
     /// Hard cap on replicas per vector. Default 8 (matches SPANN paper).
     pub max_replicas: usize,
+    /// RNG pruning strictness. Predicate: accept candidate `ci` if
+    /// `dist(cj, ci) > alpha · dist(p, ci)` for every already-selected
+    /// `cj`. `1.0` = paper-strict RNG (rejects any `ci` whose nearest
+    /// already-selected `cj` is closer to it than `p` is). `0.0` = no
+    /// RNG (accept up to `max_replicas` cone candidates unconditionally).
+    /// On cosine-normalized high-dim embeddings the strict predicate
+    /// over-prunes (ε-cone candidates are angularly close to c1), so
+    /// values like `0.3`–`0.7` are useful to recover replication while
+    /// still skipping the most redundant candidates.
+    pub alpha: f32,
 }
 
 impl Default for ReplicationConfig {
@@ -112,6 +122,7 @@ impl Default for ReplicationConfig {
         Self {
             epsilon: 0.1,
             max_replicas: 8,
+            alpha: 1.0,
         }
     }
 }
@@ -461,6 +472,10 @@ fn assign(
     let replication = replication.filter(|rc| rc.max_replicas > 1 && rc.epsilon > 0.0);
     let max_replicas = replication.map(|rc| rc.max_replicas.min(k)).unwrap_or(1);
     let cone_factor_sq = replication.map(|rc| (1.0 + rc.epsilon).powi(2));
+    // RNG predicate uses squared distances, so square alpha once.
+    // alpha = 0 → predicate always true (no pruning).
+    // alpha = 1 → paper-strict RNG.
+    let alpha_sq = replication.map(|rc| rc.alpha.powi(2)).unwrap_or(0.0);
 
     let mut assignments: Vec<Assignment> = Vec::with_capacity(n);
     let mut candidates: Vec<(f32, u16)> = Vec::new();
@@ -494,18 +509,22 @@ fn assign(
             candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
             diag_total_cone_candidates += candidates.len() as u64 + 1;
 
-            // No RNG pruning: just take the nearest max_replicas
-            // candidates from the ε-cone. SPANN's RNG predicate
-            // (`dist(cj, ci) > dist(p, ci)`) over-prunes on
-            // cosine-normalized high-dim embeddings, where most
-            // ε-cone candidates lie angularly close to the nearest
-            // centroid c1 and get rejected as redundant.
+            // RNG with strictness `alpha`: keep ci only if every
+            // already-selected cj satisfies dist(cj, ci) > alpha *
+            // dist(p, ci). alpha=1 is paper-strict; alpha=0 disables
+            // RNG entirely.
             let mut selected: Assignment = smallvec::smallvec![nearest];
-            for &(_d_pi, ci) in &candidates {
+            for &(d_pi, ci) in &candidates {
                 if selected.len() >= max_replicas {
                     break;
                 }
-                selected.push(ci);
+                let threshold = alpha_sq * d_pi;
+                let pass = selected
+                    .iter()
+                    .all(|&cj| cc_dist_sq[cj as usize * k + ci as usize] > threshold);
+                if pass {
+                    selected.push(ci);
+                }
             }
             diag_total_replicas += selected.len() as u64;
             assignments.push(selected);
@@ -528,11 +547,12 @@ fn assign(
         }
     }
     eprintln!(
-        "assign() n={} k={} eps={:.3} cap={} cone_active={} avg_cone_candidates={:.3} avg_replicas={:.3}",
+        "assign() n={} k={} eps={:.3} cap={} alpha={:.3} cone_active={} avg_cone_candidates={:.3} avg_replicas={:.3}",
         n,
         k,
         replication.map(|rc| rc.epsilon).unwrap_or(0.0),
         max_replicas,
+        replication.map(|rc| rc.alpha).unwrap_or(0.0),
         cone_factor_sq.is_some(),
         if n > 0 { diag_total_cone_candidates as f64 / n as f64 } else { 0.0 },
         if n > 0 { diag_total_replicas as f64 / n as f64 } else { 0.0 },
@@ -2021,6 +2041,7 @@ mod tests {
         let rc = ReplicationConfig {
             epsilon,
             max_replicas,
+            alpha: 1.0,
         };
         assign(&flat, dim, centroids, Some(&rc))
     }

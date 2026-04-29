@@ -18,6 +18,14 @@ impl<TSortKeyComputer> TopBySortKeyCollector<TSortKeyComputer> {
             doc_range,
         }
     }
+
+    pub(crate) fn map_sort_key<F>(self, f: F) -> Self
+    where F: FnOnce(TSortKeyComputer) -> TSortKeyComputer {
+        TopBySortKeyCollector {
+            sort_key_computer: f(self.sort_key_computer),
+            doc_range: self.doc_range,
+        }
+    }
 }
 
 impl<TSortKeyComputer> Collector for TopBySortKeyCollector<TSortKeyComputer>

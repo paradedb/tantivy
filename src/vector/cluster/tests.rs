@@ -277,7 +277,6 @@ fn merge_records_roundtrip_through_cluster() -> crate::Result<()> {
             q.clone(),
             vec_field,
             quantizer.clone(),
-            None,
         );
         let hits = searcher.search(&AllQuery, &collector)?;
         let got: HashSet<u64> = hits
@@ -426,6 +425,7 @@ fn replicated_assignment_round_trip() -> crate::Result<()> {
         Some(crate::vector::cluster::plugin::ReplicationConfig {
             epsilon: 0.1,
             max_replicas: 8,
+            alpha: 1.0,
         }),
         &vectors,
     )?;
@@ -439,16 +439,14 @@ fn replicated_assignment_round_trip() -> crate::Result<()> {
     // `DocAddress` would appear more than once in the heap.
     let quantizer = TurboQuantizer::new(DIMS, Some(TRANSPOSED_BIT_WIDTH), Some(0xCAFE));
     let queries: Vec<Vec<f32>> = vectors.iter().take(5).cloned().collect();
-    use crate::collector::TopDocs;
+    use crate::collector::{TopDocs, VectorSearchCounters};
     use crate::query::AllQuery;
 
+    let stats = Arc::new(VectorSearchCounters::default());
     for q in &queries {
-        let collector = TopDocs::with_limit(K_TOP).order_by_turboquant_distance(
-            q.clone(),
-            rep_field,
-            quantizer.clone(),
-            None,
-        );
+        let collector = TopDocs::with_limit(K_TOP)
+            .order_by_turboquant_distance(q.clone(), rep_field, quantizer.clone())
+            .with_stats(stats.clone());
         let hits = rep_searcher.search(&AllQuery, &collector)?;
         assert!(
             !hits.is_empty(),
@@ -461,6 +459,19 @@ fn replicated_assignment_round_trip() -> crate::Result<()> {
             "replicated top-K returned duplicate DocAddresses: {hits:?}"
         );
     }
+
+    let snap = stats.snapshot();
+    assert!(snap.windows_searched > 0, "{snap:?}");
+    assert!(snap.clusters_probed > 0, "{snap:?}");
+    assert!(snap.candidates_visited > 0, "{snap:?}");
+    assert!(
+        snap.batches_stage1_only + snap.batches_stage2 > 0,
+        "{snap:?}"
+    );
+    assert_eq!(
+        snap.windows_filter_empty, 0,
+        "AllQuery should not produce filter-empty windows: {snap:?}"
+    );
 
     Ok(())
 }

@@ -104,6 +104,14 @@ pub use self::top_collector::ComparableDoc;
 mod top_score_collector;
 pub use self::top_score_collector::{TopDocs, TopNComputer};
 
+mod turboquant_collector;
+pub use self::turboquant_collector::{
+    TurboQuantCollector, VectorSearchStats, WindowOutcome, WindowStats,
+};
+
+mod turboquant_stats;
+pub use self::turboquant_stats::{VectorSearchCounters, VectorSearchSnapshot};
+
 mod sort_key_top_collector;
 pub use self::sort_key::{SegmentSortKeyComputer, SortKeyComputer};
 mod facet_collector;

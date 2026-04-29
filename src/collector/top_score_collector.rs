@@ -235,10 +235,9 @@ impl TopDocs {
     /// width, rotator seeds, codebook) that was used to encode the
     /// records at index time.
     ///
-    /// `probe` overrides the default `ProbeConfig` for the cluster
-    /// plugin's probe pruning; pass `None` to use the plugin's default
-    /// (or, when the cluster plugin isn't registered, to fall back to
-    /// a flat scan of every doc the filter scorer matches).
+    /// Returns a [`TurboQuantCollector`](crate::collector::TurboQuantCollector); use
+    /// `.with_probe(...)` to override the default `ProbeConfig` and
+    /// `.with_stats(...)` to attach a debug telemetry sink.
     ///
     /// Higher score = more similar.
     pub fn order_by_turboquant_distance(
@@ -246,13 +245,11 @@ impl TopDocs {
         query_vector: Vec<f32>,
         field: crate::schema::Field,
         quantizer: crate::vector::turboquant::TurboQuantizer,
-        probe: Option<crate::vector::cluster::plugin::ProbeConfig>,
-    ) -> impl Collector<Fruit = Vec<(Score, DocAddress)>> {
-        let mut sort_key = SortByTurboQuantDistance::new(query_vector, field, quantizer);
-        if let Some(probe) = probe {
-            sort_key = sort_key.with_probe(probe);
-        }
-        TopBySortKeyCollector::new(sort_key, self.doc_range())
+    ) -> crate::collector::TurboQuantCollector {
+        crate::collector::TurboQuantCollector::new(
+            SortByTurboQuantDistance::new(query_vector, field, quantizer),
+            self.doc_range(),
+        )
     }
 
     /// Set top-K to rank documents by a given fast field.

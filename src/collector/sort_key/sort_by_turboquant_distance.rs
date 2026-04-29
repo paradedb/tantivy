@@ -16,6 +16,9 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::collector::sort_key::NaturalComparator;
+use crate::collector::turboquant_collector::{
+    VectorSearchStats, WindowOutcome, WindowStats,
+};
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::docset::{DocSet, TERMINATED};
 use crate::schema::Field;
@@ -41,6 +44,7 @@ pub struct SortByTurboQuantDistance {
     /// codebook, etc.).
     quantizer: TurboQuantizer,
     probe: ProbeConfig,
+    stats: Option<Arc<dyn VectorSearchStats>>,
     query_state: Arc<OnceLock<QueryState>>,
 }
 
@@ -51,12 +55,18 @@ impl SortByTurboQuantDistance {
             field,
             quantizer,
             probe: ProbeConfig::default(),
+            stats: None,
             query_state: Arc::new(OnceLock::new()),
         }
     }
 
     pub fn with_probe(mut self, probe: ProbeConfig) -> Self {
         self.probe = probe;
+        self
+    }
+
+    pub fn with_stats(mut self, stats: Arc<dyn VectorSearchStats>) -> Self {
+        self.stats = Some(stats);
         self
     }
 }
@@ -114,6 +124,17 @@ impl SortKeyComputer for SortByTurboQuantDistance {
 
         let mut filter_scorer = weight.scorer(reader, 1.0)?;
         let has_filter = filter_scorer.size_hint() < reader.max_doc();
+
+        let stats = self.stats.as_deref();
+        let emit = |win_idx: usize, outcome: WindowOutcome| {
+            if let Some(s) = stats {
+                s.record_window(WindowStats {
+                    segment_ord,
+                    window_ord: win_idx as u32,
+                    outcome,
+                });
+            }
+        };
 
         {
             let bitset_words = WINDOW_SIZE.div_ceil(64);
@@ -174,6 +195,7 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                     }
                 }
                 if !filter_matched_any {
+                    emit(win_idx, WindowOutcome::FilterEmpty);
                     continue;
                 }
 
@@ -199,8 +221,20 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                     if has_filter && filter_scorer.doc() < win_end {
                         filter_scorer.seek(win_end);
                     }
+                    emit(
+                        win_idx,
+                        WindowOutcome::CentroidsTooFar {
+                            nearest_centroid_dist: win_nearest,
+                        },
+                    );
                     continue;
                 }
+
+                let mut win_clusters_probed: u16 = 0;
+                let mut win_candidates_visited: u32 = 0;
+                let mut win_candidates_deduped: u32 = 0;
+                let mut win_batches_stage1_only: u16 = 0;
+                let mut win_batches_stage2: u16 = 0;
 
                 // Adaptive intra-window probe iteration. The first
                 // pass touches `initial_probe` clusters; each
@@ -232,6 +266,7 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                         .iter()
                         .map(|(c, _)| *c)
                         .collect();
+                    win_clusters_probed = win_clusters_probed.saturating_add(probe_ids.len() as u16);
                     let doc_ids_per_cluster = win
                         .cluster_doc_ids_many(&probe_ids, COALESCE_GAP_TOLERANCE)
                         .unwrap_or_else(|_| vec![None; probe_ids.len()]);
@@ -288,9 +323,12 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                             let stage1 = t9d::score_batch_stage1(batched_lut, batch);
                             if let Some(threshold) = top_n.threshold {
                                 if stage1.max_score_upper_bound(batched_lut) <= threshold {
+                                    win_batches_stage1_only =
+                                        win_batches_stage1_only.saturating_add(1);
                                     continue;
                                 }
                             }
+                            win_batches_stage2 = win_batches_stage2.saturating_add(1);
                             t9d::score_batch_finish(batched_lut, batch, &stage1, &mut scores);
 
                             for slot in 0..(hi_slot - lo_slot) {
@@ -300,11 +338,15 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                                 {
                                     continue;
                                 }
+                                win_candidates_visited =
+                                    win_candidates_visited.saturating_add(1);
                                 // Replication dedup: bail before the
                                 // heap push if we've already scored
                                 // this doc via another cluster.
                                 let mask = 1u64 << (local % 64);
                                 if seen_bits[local / 64] & mask != 0 {
+                                    win_candidates_deduped =
+                                        win_candidates_deduped.saturating_add(1);
                                     continue;
                                 }
                                 seen_bits[local / 64] |= mask;
@@ -342,6 +384,17 @@ impl SortKeyComputer for SortByTurboQuantDistance {
                 if win_nearest.is_finite() {
                     global_nearest_centroid_dist = global_nearest_centroid_dist.min(win_nearest);
                 }
+
+                emit(
+                    win_idx,
+                    WindowOutcome::Searched {
+                        clusters_probed: win_clusters_probed,
+                        candidates_visited: win_candidates_visited,
+                        candidates_deduped: win_candidates_deduped,
+                        batches_stage1_only: win_batches_stage1_only,
+                        batches_stage2: win_batches_stage2,
+                    },
+                );
             }
         }
 
