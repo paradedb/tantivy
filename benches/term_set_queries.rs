@@ -117,6 +117,7 @@ fn bench_tier() -> &'static str {
     match std::env::var("TERM_SET_BENCH_TIER").as_deref() {
         Ok("full") => "full",
         Ok("threshold") => "threshold",
+        Ok("gallop_helper") => "gallop_helper",
         _ => "smoke",
     }
 }
@@ -354,6 +355,14 @@ fn main() {
         return;
     }
 
+    // gallop_helper tier: per-term search cost only, no scorer, no corpus
+    // build outside the timed window. Decides Follow-up D — see the
+    // task brief and the bench output's interpretation.
+    if tier == "gallop_helper" {
+        run_gallop_helper_tier();
+        return;
+    }
+
     let (n_levels, k_levels, kinds) = matrix_for_tier(tier);
     let sorts = [Sort::Asc, Sort::None];
     let strategies = [
@@ -450,6 +459,70 @@ fn main() {
     //     gap, which is exactly where smart seek pays off — the upper-bound
     //     case for typical hash-join build sides.
     run_and_intersect_cells(&mut runner);
+}
+
+/// gallop_helper tier: helper-only head-to-head measurement. Compares
+/// `binary_search_sorted` and `gallop_search_sorted` on the same workload
+/// (K successive forward-cursor searches over a sorted N-doc column,
+/// targets drawn uniformly from the column's value range). Isolates the
+/// per-term search cost from corpus build, scorer construction, and
+/// intersection logic — Step 3 of the Follow-up D investigation.
+///
+/// Cells span K/N ∈ {1e-4, 1e-3, 5e-3} on N ∈ {1M, 10M, 50M}, all LowFk +
+/// sorted ASC. The 5e-3 column is right at the gallop_max_density default
+/// (1/200), so the result there determines whether wiring true galloping
+/// in actually helps the regime where dispatch admits gallop.
+fn run_gallop_helper_tier() {
+    use tantivy::query::__bench_run_k_searches;
+
+    // Per-N panels of K values. The 5e-3 columns are right at the
+    // gallop_max_density default (1/200) — the edge of the dispatch window.
+    let panels: &[(u64, &[usize])] = &[
+        (1_000_000, &[100, 1_000, 5_000]),
+        (10_000_000, &[1_000, 10_000, 50_000]),
+        (50_000_000, &[10_000, 100_000, 250_000]),
+    ];
+
+    let mut runner = BenchRunner::new();
+
+    for &(n, k_levels) in panels {
+        let (searcher, _field) = build_corpus(n, CorpusKind::LowFk, Sort::Asc);
+        // Pull the underlying column out of the segment so the timed closure
+        // operates on the raw fast-field — the same shape term_set_gallop's
+        // per-term loop consumes.
+        let segment = searcher.segment_reader(0).clone();
+        let (column, _) = segment
+            .fast_fields()
+            .u64_lenient_for_type(None, "fk")
+            .unwrap()
+            .unwrap();
+        let distinct = CorpusKind::LowFk.distinct_count(n);
+
+        let mut group = runner.new_group();
+        group.set_name(format!("gallop_helper n={n} kind=lowfk sort=asc"));
+        group.set_input_size(n as usize);
+
+        for &k in k_levels {
+            // Targets sorted ascending so the cursor advances forward across
+            // the K calls — same precondition as term_set_gallop's
+            // shrinking-window invariant.
+            let mut targets = sample_terms(distinct, k, 7);
+            targets.sort_unstable();
+
+            let col_bin = column.clone();
+            let t_bin = targets.clone();
+            group.register(format!("k={k} search=binary"), move |_| {
+                black_box(__bench_run_k_searches(&col_bin, &t_bin, false))
+            });
+
+            let col_gal = column.clone();
+            let t_gal = targets;
+            group.register(format!("k={k} search=gallop"), move |_| {
+                black_box(__bench_run_k_searches(&col_gal, &t_gal, true))
+            });
+        }
+        group.run();
+    }
 }
 
 /// Targeted threshold-tier panel: closes the LowFk K/N ∈ (0.001, 0.01) gap
