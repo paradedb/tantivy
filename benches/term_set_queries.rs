@@ -1,15 +1,27 @@
 //! Microbenchmarks for `FastFieldTermSetQuery` (paradedb/paradedb#4895).
 //!
-//! Two tiers driven by the `TERM_SET_BENCH_TIER` environment variable:
+//! Three tiers driven by the `TERM_SET_BENCH_TIER` environment variable:
 //!
 //!   - `smoke` (default, target < 60s wall-clock): N ∈ {1M},
-//!     K ∈ {100, 10_000}, three corpus kinds × two sort orders × four
-//!     strategies. ~48 cells. Catches regressions; not for threshold derivation.
+//!     K ∈ {100, 10_000}, two corpus kinds × two sort orders × four
+//!     strategies plus the multi-column AND-intersection panel. Catches
+//!     regressions; not for threshold derivation.
 //!   - `full` (manual, ~30min): N ∈ {1M, 10M, 50M},
 //!     K ∈ {10, 100, 1_000, 10_000, 100_000}. 360-cell matrix used to derive
 //!     `TermSetStrategyConfig::default()` densities.
+//!   - `threshold` (~1min): targeted LowFk panel through K/N ∈ [0.002, 0.01]
+//!     for fine-grained crossover characterization between the full tier's
+//!     10× geometric K spacing.
 //!
-//! Strategy mapping (design.md §4):
+//! Captured outputs from the full and threshold tiers live in
+//! `benches/term_set_queries.full-tier.txt` and
+//! `benches/term_set_queries.threshold-tier.txt`. Re-run with
+//! `TERM_SET_BENCH_TIER=full cargo bench --bench term_set_queries 2>&1
+//! | tee benches/term_set_queries.full-tier.txt` (and analogous for
+//! threshold) when the gallop algorithm or `TermSetStrategyConfig::default()`
+//! changes meaningfully.
+//!
+//! Strategy mapping:
 //!
 //!   - `Gallop`: planner forced via `gallop_max_density = 1.0` so any K < N qualifies.
 //!   - `Linear`: planner forced to terminal `LinearScan` via
