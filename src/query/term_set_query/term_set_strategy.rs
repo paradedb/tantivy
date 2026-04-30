@@ -60,12 +60,17 @@ pub struct TermSetStrategyConfig {
     /// every other gate would pass.
     pub gallop_enabled: bool,
     /// Gallop fires when `K' / N < gallop_max_density` on a sorted segment.
-    /// Default `1/200 = 0.005` was set from the threshold-tier bench (commit
-    /// `ccc3b202`): at K/N = 0.005 gallop wins ≥1.74× over linear across
-    /// both N=1M and N=10M LowFk corpora, with the wider safety buffer
-    /// chosen because the bench shows a consistent 10–20% N-asymmetry
-    /// (gallop's win shrinks slightly as N grows, so the worst-case
-    /// large-N margin is what binds the default; see Follow-up G).
+    /// Default `1/100 = 0.01`. Re-tuned post-Follow-up-D from the prior
+    /// `1/200`: with true galloping wired in, the post-Follow-up-D
+    /// threshold-tier bench shows LowFk gallop winning by 2.60× over
+    /// linear at K/N = 0.01 (vs the pre-Follow-up-D 0.93–1.08× tie at the
+    /// same point), and the prior 10–20% N-asymmetry that constrained the
+    /// `1/200` pick has collapsed to ≤5% spread. The new safe-win region
+    /// extends past K/N = 0.01 but the LowFk corpus generator caps
+    /// `distinct = N/100`, so the empirical crossover above 0.01 isn't
+    /// pinned on LowFk; PK measurements show gallop still winning out to
+    /// K/N ≈ 0.05 with a different (D-dependent) slope — see Follow-up H.
+    /// `1/100` is bounded above where LowFk loses, not below it.
     pub gallop_max_density: f64,
     /// First-column `PostingListDirect` threshold: `K' · D / N` cutoff.
     pub posting_max_density: f64,
@@ -89,11 +94,11 @@ impl Default for TermSetStrategyConfig {
     fn default() -> Self {
         Self {
             gallop_enabled: true,
-            // gallop_max_density: 1/200 — bench-tuned (see field doc).
+            // gallop_max_density: 1/100 — bench-tuned (see field doc).
             // posting/bitset/hash_probe/subsequent_bitset: 1/256, 1/4, 1/16,
             // 1/4 — starting estimates; only consulted by strategies that
             // are stubs in #4895, so they don't affect runtime today.
-            gallop_max_density: 1.0 / 200.0,
+            gallop_max_density: 1.0 / 100.0,
             posting_max_density: 1.0 / 256.0,
             bitset_max_density: 1.0 / 4.0,
             hash_probe_max_density: 1.0 / 16.0,
