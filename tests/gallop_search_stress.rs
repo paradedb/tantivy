@@ -1,16 +1,9 @@
 //! Random integration sanity-check: the production gallop path
 //! (`term_set_gallop::run`) and the linear path (`TermSetDocSet::advance`)
 //! must produce identical sorted DocId sets across random sorted corpora
-//! and random query terms.
-//!
-//! Today both production paths internally route through
-//! `binary_search_sorted` (the linear path doesn't search at all, but the
-//! "linear" config produces results via the per-doc match loop, which is
-//! a different but equivalent way to enumerate the matching set). When
-//! Follow-up D wires `gallop_search_sorted` into `term_set_gallop::run`,
-//! this test becomes the regression detector — any divergence in the new
-//! helper relative to the linear ground truth surfaces as a
-//! symmetric-difference failure here.
+//! and random query terms. Any divergence between the gallop helper and
+//! the linear ground truth surfaces as a symmetric-difference failure
+//! here, so this test catches regressions in either path.
 //!
 //! Direct head-to-head comparison of `binary_search_sorted` vs
 //! `gallop_search_sorted` (the helpers themselves) lives inside the crate
@@ -97,12 +90,11 @@ fn collect(searcher: &Searcher, field: tantivy::schema::Field, term: u64, cfg: T
 }
 
 #[test]
-fn gallop_helper_matches_binary_helper_across_random_corpora() {
+fn gallop_path_matches_linear_path_across_random_corpora() {
     // 4 (size, seed, spread, order) configurations. For each: 50 random
     // single-value queries (some in-range, some out). Total ~200
-    // single-query comparisons; each query exercises gallop_search_sorted
-    // (twice: start and end) and binary_search_sorted (twice). 800
-    // helper calls, all checked for differential agreement.
+    // single-query comparisons; the gallop and linear strategies must
+    // return identical DocId sets on each.
     let corpora: &[(usize, u64, u64, Order)] = &[
         (32, 1, 100, Order::Asc),
         (1024, 2, 1_000, Order::Asc),
@@ -134,11 +126,10 @@ fn gallop_helper_matches_binary_helper_across_random_corpora() {
 }
 
 #[test]
-fn gallop_helper_matches_binary_helper_multi_term_intersection_proxy() {
+fn gallop_path_matches_linear_path_on_multi_term_queries() {
     // Multi-term sweep: pick K=20 distinct values, run both strategies,
     // assert identical DocId vectors. Exercises the per-term loop in
-    // term_set_gallop::run, which is where binary_search_sorted lives —
-    // and where gallop_search_sorted will live if Step 4 ships.
+    // term_set_gallop::run.
     let (searcher, f) = build_sorted_index(5_000, 42, 2_000, Order::Asc);
     let mut rng = StdRng::seed_from_u64(43);
     for trial in 0..10 {

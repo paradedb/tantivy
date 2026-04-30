@@ -13,12 +13,12 @@
 //! ## Note on `inputs.avg_docs_per_term` (`D`)
 //!
 //! Computing `D` precisely from the column alone would require posting-list
-//! lookups (which are exactly the work Strategy 4 wants to amortize). For
-//! Step 2 we accept `None`, which `select_strategy` treats as `D = 1`. That
-//! biases Step 2's first-column branch toward `PostingListDirect`, but since
-//! the dispatch site stubs both `PostingListDirect` and `BitsetFromPostings`
-//! to `LinearScan` until follow-up A/B land, the bias is invisible at runtime
-//! and only shows up in unit tests on the planner.
+//! lookups (which are exactly the work Strategy 4 wants to amortize). We
+//! accept `None`, which `select_strategy` treats as `D = 1`. That biases
+//! the first-column branch toward `PostingListDirect`, but since the
+//! dispatch site stubs both `PostingListDirect` and `BitsetFromPostings`
+//! to `LinearScan` until follow-ups A and B fill them in, the bias is
+//! invisible at runtime and only shows up in unit tests on the planner.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -52,25 +52,19 @@ pub mod strategy_tag {
 /// for the hash-probe gate). Each strategy fires when its density is *below*
 /// the corresponding `_max_density` threshold.
 ///
-/// We use `f64` rather than integer denominators so the bench-derived
-/// threshold values from Step 6 don't have to round to `1/N` for small `N`.
+/// We use `f64` rather than integer denominators so bench-derived
+/// thresholds don't have to round to `1/N` for small `N`.
 #[derive(Clone, Debug)]
 pub struct TermSetStrategyConfig {
     /// Kill-switch: when `false`, the planner never returns `Gallop` even if
     /// every other gate would pass.
     pub gallop_enabled: bool,
     /// Gallop fires when `K' / N < gallop_max_density` on a sorted segment.
-    /// Default `1/100 = 0.01`. Re-tuned post-Follow-up-D from the prior
-    /// `1/200`: with true galloping wired in, the post-Follow-up-D
-    /// threshold-tier bench shows LowFk gallop winning by 2.60× over
-    /// linear at K/N = 0.01 (vs the pre-Follow-up-D 0.93–1.08× tie at the
-    /// same point), and the prior 10–20% N-asymmetry that constrained the
-    /// `1/200` pick has collapsed to ≤5% spread. The new safe-win region
-    /// extends past K/N = 0.01 but the LowFk corpus generator caps
-    /// `distinct = N/100`, so the empirical crossover above 0.01 isn't
-    /// pinned on LowFk; PK measurements show gallop still winning out to
-    /// K/N ≈ 0.05 with a different (D-dependent) slope — see Follow-up H.
-    /// `1/100` is bounded above where LowFk loses, not below it.
+    /// Default `1/100 = 0.01`. At K/N = 0.01 gallop wins ~2.6× over linear
+    /// on LowFk-shaped corpora with consistent behavior across N values.
+    /// The corpus generator caps `distinct = N/100`, so the empirical
+    /// crossover above 0.01 isn't pinned for LowFk; PK-shaped corpora
+    /// show a different (D-dependent) crossover — see Follow-up H.
     pub gallop_max_density: f64,
     /// First-column `PostingListDirect` threshold: `K' · D / N` cutoff.
     pub posting_max_density: f64,
@@ -140,11 +134,12 @@ pub struct PlannerInputs<'a> {
     pub avg_docs_per_term: Option<u32>,
 }
 
-/// Run the decision tree from `design.md` §4.
+/// Run the decision tree.
 ///
-/// Step 0 prunes the term set against the column's `[min, max]`. Step 1 is the
-/// sort-dependent gallop fast path. Step 2 is the sort-agnostic dispatch
-/// branching on `C < N` (subsequent column) vs `C == N` (first column).
+/// First, prune the term set against the column's `[min, max]`. Then try
+/// the sort-dependent gallop fast path. Otherwise fall through to the
+/// sort-agnostic dispatch, which branches on `C < N` (subsequent column)
+/// vs `C == N` (first column).
 ///
 /// When `cfg.strategy_sink` is `Some`, the chosen strategy's tag (one of the
 /// `strategy_tag::*` constants) is stored on the sink before returning so
@@ -185,7 +180,7 @@ fn select_strategy_inner(
         return TermSetStrategy::LinearScan;
     }
 
-    // Step 0: prune to [min, max].
+    // Prune to [min, max].
     let lo = column.min_value();
     let hi = column.max_value();
     let mut pruned: Vec<u64> = term_set
@@ -196,8 +191,9 @@ fn select_strategy_inner(
     let k_prime = pruned.len() as u32;
     if k_prime == 0 {
         // All terms pruned — `scorer()` will turn the empty pruned set into
-        // `EmptyScorer`. We still return `LinearScan` here because Step 2's
-        // implementation of "no docs match anything" is the natural fallback.
+        // `EmptyScorer`. We still return `LinearScan` here because the
+        // sort-agnostic branch's "no docs match anything" is the natural
+        // fallback.
         return TermSetStrategy::LinearScan;
     }
 
@@ -205,7 +201,7 @@ fn select_strategy_inner(
     let cardinality = column.get_cardinality();
     let n_f = n as f64;
 
-    // Step 1: try gallop (sort-dependent fast path).
+    // Try gallop (sort-dependent fast path).
     if cfg.gallop_enabled
         && candidate_eq_n
         && matches!(cardinality, Cardinality::Full | Cardinality::Optional)
@@ -228,7 +224,7 @@ fn select_strategy_inner(
         }
     }
 
-    // Step 2: sort-agnostic selection.
+    // Sort-agnostic selection.
     let d = inputs.avg_docs_per_term.unwrap_or(1) as u64;
     let kd = (k_prime as u64).saturating_mul(d) as f64;
 
@@ -261,12 +257,9 @@ fn select_strategy_inner(
 
 #[cfg(test)]
 mod tests {
-    //! Step 2 unit tests pin the planner's *output shape* on the cases it can
-    //! decide today. Tests asserting `Gallop` returns are deferred to Step 3,
-    //! where the gallop dispatch is wired and end-to-end behavior is observable.
-    //!
-    //! The `_planner_shape_only` suffix is a deliberate signal: today the
-    //! dispatch maps every non-Gallop / non-LinearScan variant to
+    //! Unit tests pin the planner's *output shape* on cases it can decide
+    //! today. The `_planner_shape_only` suffix is a deliberate signal:
+    //! the dispatch site maps every non-Gallop / non-LinearScan variant to
     //! `TermSetDocSet`. Once Follow-up A populates `inputs.avg_docs_per_term`
     //! properly, the `K' · D < threshold` arithmetic will shift and these
     //! tests will need to be revisited.
@@ -344,9 +337,10 @@ mod tests {
     #[test]
     fn select_returns_bitset_from_postings_when_gallop_rejected_due_to_high_k_planner_shape_only() {
         // Sorted ASC, but K is *too big* for gallop: K'/N >= gallop_max_density.
-        // With D = 1, we want K'·D / N < bitset_max_density as well so Step 2
-        // lands on BitsetFromPostings (and not PostingListDirect, which
-        // requires K'·D / N < posting_max_density — a tighter threshold).
+        // With D = 1, we want K'·D / N < bitset_max_density as well so the
+        // sort-agnostic branch lands on BitsetFromPostings (and not
+        // PostingListDirect, which requires K'·D / N < posting_max_density
+        // — a tighter threshold).
         // Defaults: gallop=1/64≈0.0156, posting=1/256≈0.00391, bitset=1/4=0.25.
         // N = 4096, K = 200 → K/N = 200/4096 ≈ 0.0488:
         //   0.0488 ≥ 0.0156 → gallop rejected
@@ -399,7 +393,7 @@ mod tests {
 
     #[test]
     fn select_falls_back_to_linear_scan_only_when_kd_exceeds_all_thresholds() {
-        // Unsorted, K large enough that K·D / N >= every threshold in Step 2's
+        // Unsorted, K large enough that K·D / N >= every threshold in the
         // first-column branch. With D = 1 and bitset_max_density = 1/4 = 0.25,
         // N = 4096 and K = 2000 → K/N ≈ 0.488 > 0.25 → LinearScan.
         let n: u64 = 4096;
@@ -464,8 +458,9 @@ mod tests {
         assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
     }
 
-    /// Step 1 gate: gallop only fires on sorted segments. The decision tree
-    /// must still produce *some* sensible non-Gallop variant on unsorted input.
+    /// Gallop precondition: only fires on sorted segments. The decision
+    /// tree must still produce *some* sensible non-Gallop variant on
+    /// unsorted input.
     #[test]
     fn select_skips_gallop_when_unsorted() {
         let n: u64 = 4096;
@@ -485,9 +480,10 @@ mod tests {
         assert!(!matches!(strat, TermSetStrategy::Gallop { .. }));
     }
 
-    /// Step 1 gate: even with sort_by, a *different* sort field disables gallop.
-    /// We build an index with two fast fields, sort by the second, and query
-    /// the first — so `sort_by_field().field != inputs.field_name` fires.
+    /// Gallop precondition: even with sort_by, a *different* sort field
+    /// disables gallop. We build an index with two fast fields, sort by the
+    /// second, and query the first — so
+    /// `sort_by_field().field != inputs.field_name` fires.
     #[test]
     fn select_skips_gallop_when_field_mismatches_sort_field() {
         let n: u64 = 4096;
@@ -527,11 +523,12 @@ mod tests {
             &TermSetStrategyConfig::default(),
         );
         assert!(!matches!(strat, TermSetStrategy::Gallop { .. }));
-        // With K=8, Step 2 first-column branch picks PostingListDirect.
+        // With K=8, the first-column branch picks PostingListDirect.
         assert_eq!(strat, TermSetStrategy::PostingListDirect);
     }
 
-    /// Step 3 — positive gallop assertion. Sorted ASC, K small, K' < N/R_GALLOP.
+    /// Positive gallop assertion. Sorted ASC, K small, K'/N below the
+    /// gallop_max_density threshold.
     #[test]
     fn select_returns_gallop_when_sorted_and_small_k() {
         let n: u64 = 4096;
@@ -568,7 +565,7 @@ mod tests {
         }
     }
 
-    /// Step 5 — `strategy_sink` records the chosen variant on every call.
+    /// `strategy_sink` records the chosen variant on every call.
     /// `select_strategy` is invoked twice against differently-shaped corpora;
     /// the sink should reflect the *latest* strategy on each call (last-write
     /// semantics).
@@ -625,7 +622,7 @@ mod tests {
         assert_eq!(sink.load(Ordering::Relaxed), strategy_tag::LINEAR);
     }
 
-    /// Step 3 — kill-switch: gallop_enabled=false forces a non-gallop strategy
+    /// Kill-switch: gallop_enabled=false forces a non-gallop strategy
     /// even when the segment is sorted and K is tiny.
     #[test]
     fn select_respects_gallop_enabled_kill_switch() {
@@ -655,7 +652,8 @@ mod tests {
             &cfg,
         );
         assert!(!matches!(strat, TermSetStrategy::Gallop { .. }));
-        // Step 2 selection given K=8: PostingListDirect (K · D = 8 < N/R_POSTING = 16).
+        // Selection given K=8: PostingListDirect
+        // (K · D = 8 < N · posting_max_density = 16).
         assert_eq!(strat, TermSetStrategy::PostingListDirect);
     }
 }

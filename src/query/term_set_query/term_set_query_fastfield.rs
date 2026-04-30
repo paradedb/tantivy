@@ -223,9 +223,9 @@ impl Weight for FastFieldTermSetWeight {
                             boost,
                         ))
                     }
-                    // Step 2's stubs route to TermSetDocSet: follow-ups A and B
-                    // replace these arms with real implementations without
-                    // touching the planner.
+                    // The non-Gallop variants are planner stubs today and route
+                    // to TermSetDocSet; follow-ups A and B replace these arms
+                    // with real implementations without touching the planner.
                     TermSetStrategy::LinearScan
                     | TermSetStrategy::BitsetFromPostings
                     | TermSetStrategy::PostingListDirect

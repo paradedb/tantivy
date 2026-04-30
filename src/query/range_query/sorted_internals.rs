@@ -111,24 +111,17 @@ fn go_right(val: u64, target: u64, order: Order, strict: bool) -> bool {
     }
 }
 
-/// Galloping (exponential probe + bounded binary search) over a sorted column.
+/// Two-phase galloping search over a sorted column. Phase 1 exponentially
+/// probes from `lo` until the value crosses `target`; phase 2 binary-
+/// searches inside the bracketed interval.
 ///
 /// Same semantics as [`binary_search_sorted`]: returns the first DocId in
 /// `[lo, hi]` where the `(order, strict)` predicate stops advancing forward.
-/// Cost is `O(log d)` where `d` is the distance from `lo` to the answer, vs
-/// `binary_search_sorted`'s `O(log W)` over the full window.
-///
-/// Used by `term_set_gallop::run` for per-term column searches. Empirically
-/// 1.65–3.50× faster than `binary_search_sorted` on the term-set forward-
-/// cursor pattern; the win is dominated by cache locality on the early
-/// probes (`lo+1`, `lo+3`, `lo+7` land in the same cache line as `lo`)
-/// rather than the asymptotic `log d` vs `log W` difference. Whether
-/// galloping wins for other access patterns (e.g. `RangeQuery`'s sorted
-/// path, which does two unrelated searches at arbitrary bounds) is a
-/// separate question and would need its own bench gate.
-///
-/// Falls back to `binary_search_sorted` for tiny windows (`hi - lo < 16`)
-/// where the per-step probe overhead dominates.
+/// Faster than a window-midpoint bisection on the term-set forward-cursor
+/// pattern (1.65–3.50× over `binary_search_sorted` per measurement)
+/// because the early probes share a cache line with `lo` while bisection
+/// misses cache on the first probe. Falls back to plain binary search
+/// when `hi - lo < 16`.
 pub(crate) fn gallop_search_sorted(
     column: &Column<u64>,
     lo: u32,

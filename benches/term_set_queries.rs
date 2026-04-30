@@ -7,8 +7,7 @@
 //!     strategies. ~48 cells. Catches regressions; not for threshold derivation.
 //!   - `full` (manual, ~30min): N ∈ {1M, 10M, 50M},
 //!     K ∈ {10, 100, 1_000, 10_000, 100_000}. 360-cell matrix used to derive
-//!     `TermSetStrategyConfig::default()` densities (Step 7 of the execution
-//!     brief).
+//!     `TermSetStrategyConfig::default()` densities.
 //!
 //! Strategy mapping (design.md §4):
 //!
@@ -178,8 +177,8 @@ fn cfg_force_gallop() -> TermSetStrategyConfig {
         gallop_enabled: true,
         // Strict less-than: K/N < 1.0 admits any K < N.
         gallop_max_density: 1.0,
-        // The other thresholds don't matter for sorted+small-K cases — once
-        // gallop is taken, Step 2 isn't reached.
+        // The other thresholds don't matter for sorted+small-K cases —
+        // once gallop is taken, the sort-agnostic branch isn't reached.
         ..TermSetStrategyConfig::default()
     }
 }
@@ -188,8 +187,8 @@ fn cfg_force_linear() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: false,
         gallop_max_density: 0.0,
-        // Strict less-than: nothing is < 0.0, so Step 2's posting / bitset
-        // arms are rejected and we land on the LinearScan terminal.
+        // Strict less-than: nothing is < 0.0, so the sort-agnostic posting
+        // / bitset arms are rejected and we land on the LinearScan terminal.
         posting_max_density: 0.0,
         bitset_max_density: 0.0,
         hash_probe_max_density: 0.0,

@@ -176,9 +176,7 @@ pub(crate) fn run(
         // end   = first doc whose value is strictly past `t`
         // Both calls exponentially probe from `non_null_start` and binary-
         // search the bracket; cache locality on early probes makes this
-        // 1.65–3.50× faster than plain bisection across the dispatch range
-        // (the win is empirical, not just asymptotic — see commit 73e634a3
-        // for the per-term head-to-head measurement that motivated this).
+        // faster than plain bisection across the dispatch range.
         let start =
             gallop_search_sorted(column, non_null_start, non_null_end, t, sort_order, false);
         let end =
@@ -189,7 +187,7 @@ pub(crate) fn run(
             // Every doc < end has value < t (ASC) or > t (DESC), so future
             // searches for larger terms cannot match there. Advance the
             // window before continuing; otherwise we re-scan the same
-            // eliminated prefix per term (Fix 1 in implementation.md §2.2).
+            // eliminated prefix per term.
             non_null_start = end;
             if non_null_start >= non_null_end {
                 break;
