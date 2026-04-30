@@ -4,32 +4,26 @@
 //!
 //! Three tiers driven by the `TERM_SET_BENCH_TIER` environment variable:
 //!
-//!   - `smoke` (default, target < 60s wall-clock): N ∈ {1M},
-//!     K ∈ {100, 10_000}, two corpus kinds × two sort orders × four
-//!     strategies plus the multi-column AND-intersection panel. Catches
+//!   - `smoke` (default, target < 60s wall-clock): N ∈ {1M}, K ∈ {100, 10_000}, two corpus kinds ×
+//!     two sort orders × four strategies plus the multi-column AND-intersection panel. Catches
 //!     regressions; not for threshold derivation.
-//!   - `full` (manual, ~30min): N ∈ {1M, 10M, 50M},
-//!     K ∈ {10, 100, 1_000, 10_000, 100_000}. 360-cell matrix used to derive
-//!     `TermSetStrategyConfig::default()` densities.
-//!   - `threshold` (~1min): targeted LowFk panel through K/N ∈ [0.002, 0.01]
-//!     for fine-grained crossover characterization between the full tier's
-//!     10× geometric K spacing.
+//!   - `full` (manual, ~30min): N ∈ {1M, 10M, 50M}, K ∈ {10, 100, 1_000, 10_000, 100_000}. 360-cell
+//!     matrix used to derive `TermSetStrategyConfig::default()` densities.
+//!   - `threshold` (~1min): targeted LowFk panel through K/N ∈ [0.002, 0.01] for fine-grained
+//!     crossover characterization between the full tier's 10× geometric K spacing.
 //!
 //! # Corpus shapes
 //!
 //! The bench varies `D` (average documents per distinct value) across three
 //! shapes that span the customer workloads we care about:
 //!
-//!   - `PrimaryKey` (`D = 1`): `value_for_doc(d) = d`, so every doc has a
-//!     unique value. `distinct = N`. Models hash-join build sides on
-//!     unique keys (UUIDs, surrogate IDs).
-//!   - `LowFk` (`D ≈ 100`): `value_for_doc(d) = d / 100`, so each value
-//!     appears in ~100 contiguous docs after sorting. `distinct = N/100`.
-//!     Models foreign-key joins on moderate-cardinality columns —
-//!     the typical paradedb hash-join pattern.
-//!   - `HighFk` (`D ≈ 100_000`): `value_for_doc(d) = d / 100_000`.
-//!     `distinct = N/100_000`. Models very-low-cardinality columns
-//!     (status enums, region codes). Only present in the full tier at
+//!   - `PrimaryKey` (`D = 1`): `value_for_doc(d) = d`, so every doc has a unique value. `distinct =
+//!     N`. Models hash-join build sides on unique keys (UUIDs, surrogate IDs).
+//!   - `LowFk` (`D ≈ 100`): `value_for_doc(d) = d / 100`, so each value appears in ~100 contiguous
+//!     docs after sorting. `distinct = N/100`. Models foreign-key joins on moderate-cardinality
+//!     columns — the typical paradedb hash-join pattern.
+//!   - `HighFk` (`D ≈ 100_000`): `value_for_doc(d) = d / 100_000`. `distinct = N/100_000`. Models
+//!     very-low-cardinality columns (status enums, region codes). Only present in the full tier at
 //!     `N ≥ 10M` where there are enough distinct values to sample from.
 //!
 //! D shape matters for strategy choice: with `LowFk`, gallop emits ~D docs
@@ -43,15 +37,14 @@
 //! # Strategy mapping
 //!
 //!   - `Gallop`: planner forced via `gallop_max_density = 1.0` so any K < N qualifies.
-//!   - `Linear`: planner forced to terminal `LinearScan` via
-//!     `gallop_enabled = false` + zero densities.
-//!   - `PostingDirect`: synthetic — `BooleanQuery` of `TermQuery::Should` over
-//!     the same terms. Strategy 4 in production isn't implemented yet; this
-//!     gives a representative posting-list-union measurement.
-//!   - `BitsetFromPostings`: synthetic — execute the same posting-union but
-//!     materialize matched DocIds into a `BitSet` and iterate. Strategy 3 in
-//!     production isn't implemented yet; this captures bitset construction +
-//!     iteration cost on top of posting-list iteration.
+//!   - `Linear`: planner forced to terminal `LinearScan` via `gallop_enabled = false` + zero
+//!     densities.
+//!   - `PostingDirect`: synthetic — `BooleanQuery` of `TermQuery::Should` over the same terms.
+//!     Strategy 4 in production isn't implemented yet; this gives a representative
+//!     posting-list-union measurement.
+//!   - `BitsetFromPostings`: synthetic — execute the same posting-union but materialize matched
+//!     DocIds into a `BitSet` and iterate. Strategy 3 in production isn't implemented yet; this
+//!     captures bitset construction + iteration cost on top of posting-list iteration.
 //!
 //! # Timing boundaries
 //!
@@ -94,20 +87,19 @@
 //! changes meaningfully. Comment-only and test-only changes don't
 //! warrant a refresh.
 
-use binggan::{black_box, BenchRunner};
+use binggan::{BenchRunner, black_box};
 use common::BitSet;
+use rand::SeedableRng;
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use rand::SeedableRng;
 use tantivy::collector::{Collector, Count, DocSetCollector, SegmentCollector};
 use tantivy::query::{
-    BooleanQuery, FastFieldTermSetQuery, Occur, Query, TermQuery, TermSetStrategyConfig,
+    BooleanQuery, FastFieldTermSetQuery, Occur, Query, TermQuery, TermSetStrategyConfig, Weight,
 };
 use tantivy::schema::{IndexRecordOption, NumericOptions, SchemaBuilder};
-use tantivy::query::Weight;
 use tantivy::{
-    doc, DocId, DocSet, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher,
-    SegmentOrdinal, SegmentReader, Term,
+    DocId, DocSet, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher,
+    SegmentOrdinal, SegmentReader, Term, doc,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,16 +184,9 @@ fn bench_tier() -> &'static str {
     }
 }
 
-fn build_corpus(
-    n: u64,
-    kind: CorpusKind,
-    sort: Sort,
-) -> (Searcher, tantivy::schema::Field) {
+fn build_corpus(n: u64, kind: CorpusKind, sort: Sort) -> (Searcher, tantivy::schema::Field) {
     let mut sb = SchemaBuilder::new();
-    let field = sb.add_u64_field(
-        "fk",
-        NumericOptions::default().set_fast().set_indexed(),
-    );
+    let field = sb.add_u64_field("fk", NumericOptions::default().set_fast().set_indexed());
     let schema = sb.build();
     let mut builder = Index::builder().schema(schema);
     if let Sort::Asc = sort {
@@ -388,7 +373,10 @@ fn _docset_collector_smoke(searcher: &Searcher) {
     // Reserved: anchor the DocSetCollector import for cells that may want
     // sorted-DocId outputs. Currently unused; left here so adding such
     // cells doesn't require import gymnastics.
-    let _ = searcher.search(&FastFieldTermSetQuery::new(Vec::<Term>::new()), &DocSetCollector);
+    let _ = searcher.search(
+        &FastFieldTermSetQuery::new(Vec::<Term>::new()),
+        &DocSetCollector,
+    );
 }
 #[allow(dead_code)]
 fn _weight_smoke<W: Weight>(_w: &W) {}
@@ -398,7 +386,11 @@ fn matrix_for_tier(tier: &str) -> (Vec<u64>, Vec<usize>, Vec<CorpusKind>) {
         "full" => (
             vec![1_000_000, 10_000_000, 50_000_000],
             vec![10, 100, 1_000, 10_000, 100_000],
-            vec![CorpusKind::PrimaryKey, CorpusKind::LowFk, CorpusKind::HighFk],
+            vec![
+                CorpusKind::PrimaryKey,
+                CorpusKind::LowFk,
+                CorpusKind::HighFk,
+            ],
         ),
         // Smoke skips HighFk at N=1M because its `distinct = 10` excludes
         // every smoke K level — building its corpus would be wasted work.
@@ -441,11 +433,7 @@ fn main() {
             for &sort in &sorts {
                 let (searcher, field) = build_corpus(n, kind, sort);
                 let mut group = runner.new_group();
-                group.set_name(format!(
-                    "n={n} kind={} sort={}",
-                    kind.label(),
-                    sort.label()
-                ));
+                group.set_name(format!("n={n} kind={} sort={}", kind.label(), sort.label()));
                 group.set_input_size(n as usize);
                 let distinct = kind.distinct_count(n);
                 for &k in &k_levels {
@@ -457,10 +445,7 @@ fn main() {
                     // (linear/posting/bitset are sort-insensitive). Drop them
                     // in smoke to keep wall-clock under 90s after the
                     // and_intersect cells were added. Full tier still has them.
-                    if tier != "full"
-                        && sort == Sort::None
-                        && k == 10_000
-                    {
+                    if tier != "full" && sort == Sort::None && k == 10_000 {
                         continue;
                     }
                     let terms = sample_terms(distinct, k, 7);
@@ -491,9 +476,9 @@ fn main() {
                                 &terms_v,
                                 cfg_force_linear(),
                             )),
-                            Strat::PostingDirect => black_box(run_posting_direct_synthetic(
-                                &searcher, field, &terms_v,
-                            )),
+                            Strat::PostingDirect => {
+                                black_box(run_posting_direct_synthetic(&searcher, field, &terms_v))
+                            }
                             Strat::BitsetFromPostings => black_box(
                                 run_bitset_from_postings_synthetic(&searcher, field, &terms_v),
                             ),
@@ -513,13 +498,12 @@ fn main() {
     // TermSetDocSet, column B jumps directly to each target.
     //
     // Two corpus shapes are exercised:
-    //   - dense FK (D ≈ 100): gallop output is ~1500 contiguous ranges of
-    //     ~100 docs each. B's seeks rarely cross range boundaries, so the
-    //     smart-vs-default delta is bounded — the lower-bound case.
-    //   - sparse PK (D = 1): gallop output is 1500 *isolated* DocIds spread
-    //     across the segment. Every gallop emit forces B to skip a large
-    //     gap, which is exactly where smart seek pays off — the upper-bound
-    //     case for typical hash-join build sides.
+    //   - dense FK (D ≈ 100): gallop output is ~1500 contiguous ranges of ~100 docs each. B's seeks
+    //     rarely cross range boundaries, so the smart-vs-default delta is bounded — the lower-bound
+    //     case.
+    //   - sparse PK (D = 1): gallop output is 1500 *isolated* DocIds spread across the segment.
+    //     Every gallop emit forces B to skip a large gap, which is exactly where smart seek pays
+    //     off — the upper-bound case for typical hash-join build sides.
     run_and_intersect_cells(&mut runner);
 }
 
@@ -568,18 +552,12 @@ fn run_threshold_tier() {
                 let terms_v = terms.clone();
                 let cell_name = format!("k={k} strat={}", strat.label());
                 group.register(cell_name, move |_| match strat {
-                    Strat::Gallop => black_box(run_planner_path(
-                        &s,
-                        field,
-                        &terms_v,
-                        cfg_force_gallop(),
-                    )),
-                    Strat::Linear => black_box(run_planner_path(
-                        &s,
-                        field,
-                        &terms_v,
-                        cfg_force_linear(),
-                    )),
+                    Strat::Gallop => {
+                        black_box(run_planner_path(&s, field, &terms_v, cfg_force_gallop()))
+                    }
+                    Strat::Linear => {
+                        black_box(run_planner_path(&s, field, &terms_v, cfg_force_linear()))
+                    }
                     _ => unreachable!(),
                 });
             }
@@ -689,7 +667,11 @@ fn build_and_intersect_corpus(
         .reload_policy(ReloadPolicy::Manual)
         .try_into()
         .unwrap();
-    let a_distinct = if kind == "sparse_pk" { n } else { n.div_ceil(100) };
+    let a_distinct = if kind == "sparse_pk" {
+        n
+    } else {
+        n.div_ceil(100)
+    };
     let b_distinct = 9973u64;
     (reader.searcher(), a, b, n, a_distinct, b_distinct)
 }

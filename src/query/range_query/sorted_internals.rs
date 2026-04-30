@@ -221,8 +221,8 @@ mod gallop_tests {
         let gal = gallop_search_sorted(column, lo, hi, target, order, strict);
         assert_eq!(
             gal, bin,
-            "gallop({lo},{hi},target={target},order={order:?},strict={strict}) \
-             returned {gal} but binary returned {bin}",
+            "gallop({lo},{hi},target={target},order={order:?},strict={strict}) returned {gal} but \
+             binary returned {bin}",
         );
     }
 
@@ -391,18 +391,18 @@ mod gallop_tests {
                 }
                 // Mix of in-range, out-of-range, and boundary targets.
                 let target: u64 = match rng.random_range(0..5) {
-                    0 => 0,                              // before
-                    1 => spread.saturating_add(100),     // after
+                    0 => 0,                                         // before
+                    1 => spread.saturating_add(100),                // after
                     2 => values[rng.random_range(0..values.len())], // present
-                    _ => rng.random_range(0..spread),    // probably present
+                    _ => rng.random_range(0..spread),               // probably present
                 };
                 for &strict in &[false, true] {
                     let bin = binary_search_sorted(&column, lo, hi, target, order, strict);
                     let gal = gallop_search_sorted(&column, lo, hi, target, order, strict);
                     assert_eq!(
                         gal, bin,
-                        "differential mismatch: n={n} spread={spread} order={order:?} \
-                         lo={lo} hi={hi} target={target} strict={strict}",
+                        "differential mismatch: n={n} spread={spread} order={order:?} lo={lo} \
+                         hi={hi} target={target} strict={strict}",
                     );
                 }
             }

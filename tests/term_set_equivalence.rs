@@ -12,13 +12,9 @@
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use tantivy::collector::DocSetCollector;
-use tantivy::query::{
-    BooleanQuery, FastFieldTermSetQuery, Occur, Query, TermSetStrategyConfig,
-};
+use tantivy::query::{BooleanQuery, FastFieldTermSetQuery, Occur, Query, TermSetStrategyConfig};
 use tantivy::schema::{NumericOptions, SchemaBuilder};
-use tantivy::{
-    doc, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher, Term,
-};
+use tantivy::{Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher, Term, doc};
 
 #[derive(Clone, Copy, Debug)]
 enum CorpusKind {
@@ -64,7 +60,9 @@ fn build_sorted_corpus(
     {
         let mut writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
         for d in 0..n {
-            writer.add_document(doc!(field => value_for(d, kind))).unwrap();
+            writer
+                .add_document(doc!(field => value_for(d, kind)))
+                .unwrap();
         }
         writer.commit().unwrap();
     }
@@ -109,12 +107,7 @@ fn cfg_gallop_off() -> TermSetStrategyConfig {
     }
 }
 
-fn assert_equivalent(
-    n: u64,
-    kind: CorpusKind,
-    order: Order,
-    k_values: &[usize],
-) {
+fn assert_equivalent(n: u64, kind: CorpusKind, order: Order, k_values: &[usize]) {
     let (searcher, field) = build_sorted_corpus(n, kind, order);
     let distinct = distinct_count(n, kind);
     for &k in k_values {
@@ -153,12 +146,7 @@ fn gallop_matches_linear_pk_desc() {
 
 #[test]
 fn gallop_matches_linear_fk_asc() {
-    assert_equivalent(
-        10_000,
-        CorpusKind::ForeignKey,
-        Order::Asc,
-        &[1, 5, 25, 100],
-    );
+    assert_equivalent(10_000, CorpusKind::ForeignKey, Order::Asc, &[1, 5, 25, 100]);
 }
 
 #[test]

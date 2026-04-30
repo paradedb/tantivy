@@ -15,9 +15,7 @@ use rand::rngs::StdRng;
 use tantivy::collector::DocSetCollector;
 use tantivy::query::{FastFieldTermSetQuery, TermSetStrategyConfig};
 use tantivy::schema::{NumericOptions, SchemaBuilder};
-use tantivy::{
-    doc, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher, Term,
-};
+use tantivy::{Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher, Term, doc};
 
 fn cfg_gallop() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
@@ -76,7 +74,12 @@ fn build_sorted_index(
     (reader.searcher(), f)
 }
 
-fn collect(searcher: &Searcher, field: tantivy::schema::Field, term: u64, cfg: TermSetStrategyConfig) -> Vec<u32> {
+fn collect(
+    searcher: &Searcher,
+    field: tantivy::schema::Field,
+    term: u64,
+    cfg: TermSetStrategyConfig,
+) -> Vec<u32> {
     let q = FastFieldTermSetQuery::new(std::iter::once(Term::from_field_u64(field, term)))
         .with_strategy_config(cfg);
     let mut docs: Vec<u32> = searcher
@@ -119,7 +122,8 @@ fn gallop_path_matches_linear_path_across_random_corpora() {
             let linear_docs = collect(&searcher, f, target, cfg_linear());
             assert_eq!(
                 gallop_docs, linear_docs,
-                "differential mismatch: corpus(n={n}, seed={seed}, spread={spread}, order={order:?}) target={target}",
+                "differential mismatch: corpus(n={n}, seed={seed}, spread={spread}, \
+                 order={order:?}) target={target}",
             );
         }
     }
@@ -133,20 +137,16 @@ fn gallop_path_matches_linear_path_on_multi_term_queries() {
     let (searcher, f) = build_sorted_index(5_000, 42, 2_000, Order::Asc);
     let mut rng = StdRng::seed_from_u64(43);
     for trial in 0..10 {
-        let mut terms: Vec<u64> = (0..20)
-            .map(|_| rng.random_range(0..2_000u64))
-            .collect();
+        let mut terms: Vec<u64> = (0..20).map(|_| rng.random_range(0..2_000u64)).collect();
         terms.sort();
         terms.dedup();
 
-        let q_gallop = FastFieldTermSetQuery::new(
-            terms.iter().map(|v| Term::from_field_u64(f, *v)),
-        )
-        .with_strategy_config(cfg_gallop());
-        let q_linear = FastFieldTermSetQuery::new(
-            terms.iter().map(|v| Term::from_field_u64(f, *v)),
-        )
-        .with_strategy_config(cfg_linear());
+        let q_gallop =
+            FastFieldTermSetQuery::new(terms.iter().map(|v| Term::from_field_u64(f, *v)))
+                .with_strategy_config(cfg_gallop());
+        let q_linear =
+            FastFieldTermSetQuery::new(terms.iter().map(|v| Term::from_field_u64(f, *v)))
+                .with_strategy_config(cfg_linear());
 
         let mut g: Vec<u32> = searcher
             .search(&q_gallop, &DocSetCollector)

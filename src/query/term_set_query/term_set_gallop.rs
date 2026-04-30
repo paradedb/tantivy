@@ -28,10 +28,9 @@ use crate::{DocId, DocSet, Order, Score, TERMINATED};
 /// single range. We keep a single struct (rather than a `BooleanWeight` of
 /// `ContiguousDocSet`-wrapped scorers) because:
 ///   - one allocation instead of K
-///   - the cursor + range index is a natural extension point for cursor-
-///     side optimizations (the `seek` walk is currently linear over the
-///     `ranges` vec; exponential probing inside `seek` is a future option
-///     if profiling shows it matters).
+///   - the cursor + range index is a natural extension point for cursor- side optimizations (the
+///     `seek` walk is currently linear over the `ranges` vec; exponential probing inside `seek` is
+///     a future option if profiling shows it matters).
 pub(crate) struct RangeUnionDocSet {
     /// Sorted ascending by `start`, non-overlapping. Empty ranges
     /// (`start == end`) are filtered out at construction so iteration logic
@@ -104,10 +103,7 @@ impl DocSet for RangeUnionDocSet {
     }
 
     fn size_hint(&self) -> u32 {
-        self.ranges
-            .iter()
-            .map(|(s, e)| e.saturating_sub(*s))
-            .sum()
+        self.ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum()
     }
 
     fn cost(&self) -> u64 {
@@ -143,14 +139,8 @@ pub(crate) fn run(
     let (mut non_null_start, non_null_end) = match cardinality {
         Cardinality::Full => (0u32, n),
         Cardinality::Optional => match sort_order {
-            Order::Asc => (
-                binary_search_null_boundary(column, 0, n, Order::Asc),
-                n,
-            ),
-            Order::Desc => (
-                0,
-                binary_search_null_boundary(column, 0, n, Order::Desc),
-            ),
+            Order::Asc => (binary_search_null_boundary(column, 0, n, Order::Asc), n),
+            Order::Desc => (0, binary_search_null_boundary(column, 0, n, Order::Desc)),
         },
         // The planner already filters out Multivalued (it gates the gallop
         // arm on `matches!(cardinality, Full | Optional)`), so this is
@@ -179,8 +169,7 @@ pub(crate) fn run(
         // faster than plain bisection across the dispatch range.
         let start =
             gallop_search_sorted(column, non_null_start, non_null_end, t, sort_order, false);
-        let end =
-            gallop_search_sorted(column, non_null_start, non_null_end, t, sort_order, true);
+        let end = gallop_search_sorted(column, non_null_start, non_null_end, t, sort_order, true);
 
         if start >= end {
             // Term absent from the column: `end` is the insertion point.
@@ -221,15 +210,9 @@ mod gallop_tests {
     use crate::schema::{NumericOptions, SchemaBuilder};
     use crate::{Index, IndexSettings, IndexSortByField, ReloadPolicy, SegmentReader, Term};
 
-    fn build_sorted_index(
-        order: Order,
-        values: &[u64],
-    ) -> (Index, crate::schema::Field, String) {
+    fn build_sorted_index(order: Order, values: &[u64]) -> (Index, crate::schema::Field, String) {
         let mut sb = SchemaBuilder::new();
-        let field = sb.add_u64_field(
-            "fk",
-            NumericOptions::default().set_fast().set_indexed(),
-        );
+        let field = sb.add_u64_field("fk", NumericOptions::default().set_fast().set_indexed());
         let schema = sb.build();
         let index = Index::builder()
             .schema(schema)
@@ -258,10 +241,7 @@ mod gallop_tests {
         // First field forces every doc to exist regardless of whether `fk`
         // is set; otherwise a None-only doc would not be added.
         let label = sb.add_text_field("label", crate::schema::STRING);
-        let field = sb.add_u64_field(
-            "fk",
-            NumericOptions::default().set_fast().set_indexed(),
-        );
+        let field = sb.add_u64_field("fk", NumericOptions::default().set_fast().set_indexed());
         let schema = sb.build();
         let index = Index::builder()
             .schema(schema)
@@ -277,7 +257,9 @@ mod gallop_tests {
         let mut writer = index.writer_for_tests().unwrap();
         for v in values {
             match v {
-                Some(x) => writer.add_document(doc!(label => "x", field => *x)).unwrap(),
+                Some(x) => writer
+                    .add_document(doc!(label => "x", field => *x))
+                    .unwrap(),
                 None => writer.add_document(doc!(label => "x")).unwrap(),
             };
         }
@@ -285,10 +267,7 @@ mod gallop_tests {
         (index, field, "fk".to_string())
     }
 
-    fn open_segment_and_column(
-        index: &Index,
-        field_name: &str,
-    ) -> (SegmentReader, Column<u64>) {
+    fn open_segment_and_column(index: &Index, field_name: &str) -> (SegmentReader, Column<u64>) {
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -304,7 +283,11 @@ mod gallop_tests {
         (segment, column)
     }
 
-    fn collect_docs_via_query(index: &Index, field: crate::schema::Field, terms: &[u64]) -> Vec<DocId> {
+    fn collect_docs_via_query(
+        index: &Index,
+        field: crate::schema::Field,
+        terms: &[u64],
+    ) -> Vec<DocId> {
         let q = FastFieldTermSetQuery::new(terms.iter().map(|v| Term::from_field_u64(field, *v)));
         let reader = index
             .reader_builder()
@@ -371,10 +354,7 @@ mod gallop_tests {
         // (linear strategy) — the matched DocIds will differ (sort permutes
         // the assignment) but the *count* must agree.
         let mut sb = SchemaBuilder::new();
-        let f2 = sb.add_u64_field(
-            "fk",
-            NumericOptions::default().set_fast().set_indexed(),
-        );
+        let f2 = sb.add_u64_field("fk", NumericOptions::default().set_fast().set_indexed());
         let schema = sb.build();
         let unsorted = Index::create_in_ram(schema);
         let mut writer = unsorted.writer_for_tests().unwrap();
