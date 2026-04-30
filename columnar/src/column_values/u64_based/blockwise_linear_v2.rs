@@ -38,7 +38,10 @@ use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnS
 use crate::column_values::{ColumnValues, VecColumn};
 
 const BLOCK_SIZE: u32 = 512u32;
-const DATA_OFFSET_UNIT: usize = (BLOCK_SIZE / 8) as usize; // 64 bytes
+/// Bytes per block when bit_width=1: one bit per value × BLOCK_SIZE values / 8 bits-per-byte.
+/// Each additional bit of `bit_width` adds another `BYTES_PER_BLOCK_BIT` bytes.
+/// `data_offset` is stored in these units so a u32 can address up to ~256GB.
+const BYTES_PER_BLOCK_BIT: usize = (BLOCK_SIZE / 8) as usize; // 64
 
 /// Fixed-size footer entry: slope(8) + intercept(8) + bit_width(1) + data_offset(4) = 21 bytes.
 /// `data_offset` is stored in units of 64 bytes (BLOCK_SIZE / 8), not raw bytes,
@@ -60,8 +63,8 @@ impl BlockMeta {
     /// Returns the byte range of this block's bitpacked data within the data region.
     #[inline(always)]
     fn data_byte_range(&self, data_region_len: usize) -> std::ops::Range<usize> {
-        let start = self.data_offset as usize * DATA_OFFSET_UNIT;
-        let end = (start + self.bit_width as usize * DATA_OFFSET_UNIT).min(data_region_len);
+        let start = self.data_offset as usize * BYTES_PER_BLOCK_BIT;
+        let end = (start + self.bit_width as usize * BYTES_PER_BLOCK_BIT).min(data_region_len);
         start..end
     }
 }
