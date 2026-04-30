@@ -1,283 +1,262 @@
 n=1000000 kind=pk sort=asc
-k=10 strat=gallop                          Avg: 30.774 GB/s              Median: 42.600 GB/s              [3.2541 GB/s .. 43.640 GB/s]    Output: 10         
-k=10 strat=linear                          Avg: 290.73 MB/s              Median: 304.77 MB/s              [159.25 MB/s .. 307.94 MB/s]    Output: 10         
-k=10 strat=posting_direct                  Avg: 146.24 GB/s              Median: 147.86 GB/s              [114.13 GB/s .. 157.18 GB/s]    Output: 10         
-k=10 strat=bitset_from_postings            Avg: 67.999 GB/s              Median: 74.344 GB/s              [21.369 GB/s .. 77.328 GB/s]    Output: 10         
-k=100 strat=gallop                         Avg: 18.816 GB/s (+4.50%)     Median: 18.936 GB/s (+0.98%)     [17.961 GB/s .. 19.310 GB/s]    Output: 100        
-k=100 strat=linear                         Avg: 209.19 MB/s (+8.09%)     Median: 214.96 MB/s (+1.11%)     [138.04 MB/s .. 217.02 MB/s]    Output: 100        
-k=100 strat=posting_direct                 Avg: 13.073 GB/s (-3.31%)     Median: 14.007 GB/s (-1.61%)     [5.3861 GB/s .. 14.442 GB/s]    Output: 100        
-k=100 strat=bitset_from_postings           Avg: 12.684 GB/s (+2.52%)     Median: 12.826 GB/s (-0.88%)     [9.1801 GB/s .. 13.157 GB/s]    Output: 100        
-k=1000 strat=gallop                        Avg: 2.9885 GB/s              Median: 3.2072 GB/s              [1.5802 GB/s .. 3.2451 GB/s]    Output: 1_000      
-k=1000 strat=linear                        Avg: 253.64 MB/s              Median: 260.11 MB/s              [185.25 MB/s .. 262.22 MB/s]    Output: 1_000      
-k=1000 strat=posting_direct                Avg: 1.1899 GB/s              Median: 1.2602 GB/s              [525.90 MB/s .. 1.2985 GB/s]    Output: 1_000      
-k=1000 strat=bitset_from_postings          Avg: 1.2147 GB/s              Median: 1.2299 GB/s              [919.31 MB/s .. 1.2995 GB/s]    Output: 1_000      
-k=10000 strat=gallop                       Avg: 367.36 MB/s (+6.09%)     Median: 369.39 MB/s (-0.65%)     [343.47 MB/s .. 375.49 MB/s]    Output: 10_000     
-k=10000 strat=linear                       Avg: 181.43 MB/s (-2.83%)     Median: 191.15 MB/s (-0.38%)     [91.100 MB/s .. 194.80 MB/s]    Output: 10_000     
-k=10000 strat=posting_direct               Avg: 68.271 MB/s (-17.45%)    Median: 78.779 MB/s (-6.02%)     [19.524 MB/s .. 85.881 MB/s]    Output: 10_000     
-k=10000 strat=bitset_from_postings         Avg: 69.697 MB/s (-12.64%)    Median: 73.659 MB/s (-11.34%)    [37.283 MB/s .. 76.587 MB/s]    Output: 10_000     
-k=100000 strat=gallop                      Avg: 33.329 MB/s              Median: 37.439 MB/s              [7.9171 MB/s .. 37.950 MB/s]    Output: 100_000    
-k=100000 strat=linear                      Avg: 58.766 MB/s              Median: 78.327 MB/s              [7.0275 MB/s .. 80.564 MB/s]    Output: 100_000    
-k=100000 strat=posting_direct              Avg: 5.1213 MB/s              Median: 5.6550 MB/s              [2.6371 MB/s .. 6.0068 MB/s]    Output: 100_000    
-k=100000 strat=bitset_from_postings        Avg: 4.6306 MB/s              Median: 5.5191 MB/s              [1.7935 MB/s .. 6.0671 MB/s]    Output: 100_000    
+k=10 strat=gallop                          Avg: 40.093 GB/s (+30.28%)     Median: 41.471 GB/s (-2.65%)      [23.995 GB/s .. 43.085 GB/s]    Output: 10         
+k=10 strat=linear                          Avg: 290.74 MB/s (+0.00%)      Median: 304.89 MB/s (+0.04%)      [189.67 MB/s .. 308.04 MB/s]    Output: 10         
+k=10 strat=posting_direct                  Avg: 150.72 GB/s (+3.06%)      Median: 152.53 GB/s (+3.16%)      [134.90 GB/s .. 160.51 GB/s]    Output: 10         
+k=10 strat=bitset_from_postings            Avg: 71.880 GB/s (+5.71%)      Median: 74.789 GB/s (+0.60%)      [46.937 GB/s .. 82.399 GB/s]    Output: 10         
+k=100 strat=gallop                         Avg: 18.875 GB/s (-6.11%)      Median: 19.761 GB/s (-1.72%)      [10.351 GB/s .. 20.317 GB/s]    Output: 100        
+k=100 strat=linear                         Avg: 200.76 MB/s (-7.10%)      Median: 209.81 MB/s (-2.86%)      [136.89 MB/s .. 212.88 MB/s]    Output: 100        
+k=100 strat=posting_direct                 Avg: 13.469 GB/s (-7.18%)      Median: 14.080 GB/s (-3.27%)      [8.9224 GB/s .. 14.745 GB/s]    Output: 100        
+k=100 strat=bitset_from_postings           Avg: 12.491 GB/s (-5.23%)      Median: 12.779 GB/s (-3.48%)      [9.3840 GB/s .. 13.406 GB/s]    Output: 100        
+k=1000 strat=gallop                        Avg: 4.3878 GB/s (+46.82%)     Median: 4.4643 GB/s (+39.20%)     [3.7216 GB/s .. 4.5899 GB/s]    Output: 1_000      
+k=1000 strat=linear                        Avg: 250.63 MB/s (-1.19%)      Median: 255.89 MB/s (-1.62%)      [228.25 MB/s .. 259.63 MB/s]    Output: 1_000      
+k=1000 strat=posting_direct                Avg: 1.2449 GB/s (+4.62%)      Median: 1.2577 GB/s (-0.20%)      [1.1701 GB/s .. 1.3062 GB/s]    Output: 1_000      
+k=1000 strat=bitset_from_postings          Avg: 1.1946 GB/s (-1.65%)      Median: 1.2298 GB/s (-0.00%)      [861.41 MB/s .. 1.3092 GB/s]    Output: 1_000      
+k=10000 strat=gallop                       Avg: 727.19 MB/s (-4.32%)      Median: 736.24 MB/s (-3.42%)      [607.53 MB/s .. 755.52 MB/s]    Output: 10_000     
+k=10000 strat=linear                       Avg: 184.46 MB/s (-4.97%)      Median: 189.87 MB/s (-2.60%)      [112.27 MB/s .. 191.74 MB/s]    Output: 10_000     
+k=10000 strat=posting_direct               Avg: 71.959 MB/s (-17.28%)     Median: 73.747 MB/s (-15.04%)     [53.064 MB/s .. 75.312 MB/s]    Output: 10_000     
+k=10000 strat=bitset_from_postings         Avg: 71.662 MB/s (-16.15%)     Median: 74.306 MB/s (-14.07%)     [46.068 MB/s .. 76.213 MB/s]    Output: 10_000     
+k=100000 strat=gallop                      Avg: 107.16 MB/s (+221.53%)    Median: 109.91 MB/s (+193.57%)    [70.272 MB/s .. 112.14 MB/s]    Output: 100_000    
+k=100000 strat=linear                      Avg: 73.715 MB/s (+25.44%)     Median: 78.947 MB/s (+0.79%)      [27.859 MB/s .. 80.641 MB/s]    Output: 100_000    
+k=100000 strat=posting_direct              Avg: 5.5601 MB/s (+8.57%)      Median: 5.7557 MB/s (+1.78%)      [4.3314 MB/s .. 6.0989 MB/s]    Output: 100_000    
+k=100000 strat=bitset_from_postings        Avg: 5.0354 MB/s (+8.74%)      Median: 5.7902 MB/s (+4.91%)      [1.2679 MB/s .. 6.0767 MB/s]    Output: 100_000    
 n=1000000 kind=pk sort=unsorted
-k=10 strat=linear                          Avg: 290.04 MB/s              Median: 305.56 MB/s              [190.24 MB/s .. 307.80 MB/s]    Output: 10         
-k=10 strat=posting_direct                  Avg: 148.21 GB/s              Median: 148.15 GB/s              [132.56 GB/s .. 158.81 GB/s]    Output: 10         
-k=10 strat=bitset_from_postings            Avg: 71.953 GB/s              Median: 73.806 GB/s              [45.232 GB/s .. 77.048 GB/s]    Output: 10         
-k=100 strat=linear                         Avg: 204.20 MB/s (-4.17%)     Median: 214.61 MB/s (+0.77%)     [107.60 MB/s .. 216.91 MB/s]    Output: 100        
-k=100 strat=posting_direct                 Avg: 13.896 GB/s (-0.33%)     Median: 14.161 GB/s (+1.88%)     [11.220 GB/s .. 14.445 GB/s]    Output: 100        
-k=100 strat=bitset_from_postings           Avg: 11.173 GB/s (-12.42%)    Median: 12.669 GB/s (-1.11%)     [2.8401 GB/s .. 13.189 GB/s]    Output: 100        
-k=1000 strat=linear                        Avg: 254.30 MB/s              Median: 258.65 MB/s              [228.10 MB/s .. 262.26 MB/s]    Output: 1_000      
-k=1000 strat=posting_direct                Avg: 1.2095 GB/s              Median: 1.2650 GB/s              [720.85 MB/s .. 1.3180 GB/s]    Output: 1_000      
-k=1000 strat=bitset_from_postings          Avg: 1.1845 GB/s              Median: 1.2551 GB/s              [533.96 MB/s .. 1.3054 GB/s]    Output: 1_000      
-k=10000 strat=linear                       Avg: 187.22 MB/s (-2.34%)     Median: 191.85 MB/s (+0.05%)     [155.40 MB/s .. 194.97 MB/s]    Output: 10_000     
-k=10000 strat=posting_direct               Avg: 73.749 MB/s (-10.74%)    Median: 75.199 MB/s (-9.48%)     [49.497 MB/s .. 81.523 MB/s]    Output: 10_000     
-k=10000 strat=bitset_from_postings         Avg: 58.099 MB/s (-31.87%)    Median: 74.988 MB/s (-11.92%)    [7.4681 MB/s .. 83.226 MB/s]    Output: 10_000     
-k=100000 strat=linear                      Avg: 77.966 MB/s              Median: 78.930 MB/s              [60.981 MB/s .. 80.561 MB/s]    Output: 100_000    
-k=100000 strat=posting_direct              Avg: 5.4130 MB/s              Median: 5.8008 MB/s              [3.4566 MB/s .. 6.0381 MB/s]    Output: 100_000    
-k=100000 strat=bitset_from_postings        Avg: 5.3027 MB/s              Median: 5.7331 MB/s              [2.1373 MB/s .. 6.0088 MB/s]    Output: 100_000    
+k=10 strat=linear                          Avg: 300.38 MB/s (+3.56%)    Median: 308.04 MB/s (+0.81%)    [237.81 MB/s .. 308.86 MB/s]    Output: 10         
+k=10 strat=posting_direct                  Avg: 152.91 GB/s (+3.17%)    Median: 153.52 GB/s (+3.62%)    [139.28 GB/s .. 161.00 GB/s]    Output: 10         
+k=10 strat=bitset_from_postings            Avg: 72.516 GB/s (+0.78%)    Median: 75.284 GB/s (+2.00%)    [36.653 GB/s .. 77.429 GB/s]    Output: 10         
+k=100 strat=linear                         Avg: 214.67 MB/s (-1.07%)    Median: 216.69 MB/s (-0.16%)    [196.85 MB/s .. 217.16 MB/s]    Output: 100        
+k=100 strat=posting_direct                 Avg: 14.390 GB/s (-1.82%)    Median: 14.489 GB/s (-1.46%)    [13.145 GB/s .. 14.720 GB/s]    Output: 100        
+k=100 strat=bitset_from_postings           Avg: 13.133 GB/s (-0.49%)    Median: 13.176 GB/s (-0.20%)    [12.631 GB/s .. 13.439 GB/s]    Output: 100        
+k=1000 strat=linear                        Avg: 260.01 MB/s (+2.25%)    Median: 261.15 MB/s (+0.97%)    [228.25 MB/s .. 262.70 MB/s]    Output: 1_000      
+k=1000 strat=posting_direct                Avg: 1.3076 GB/s (+8.11%)    Median: 1.3261 GB/s (+4.84%)    [1.0388 GB/s .. 1.3447 GB/s]    Output: 1_000      
+k=1000 strat=bitset_from_postings          Avg: 1.2716 GB/s (+7.36%)    Median: 1.3009 GB/s (+3.65%)    [783.05 MB/s .. 1.3247 GB/s]    Output: 1_000      
+k=10000 strat=linear                       Avg: 191.67 MB/s (+5.90%)    Median: 194.08 MB/s (+2.57%)    [159.28 MB/s .. 195.63 MB/s]    Output: 10_000     
+k=10000 strat=posting_direct               Avg: 77.948 MB/s (+6.40%)    Median: 77.309 MB/s (+3.92%)    [73.175 MB/s .. 85.482 MB/s]    Output: 10_000     
+k=10000 strat=bitset_from_postings         Avg: 77.706 MB/s (+2.99%)    Median: 76.665 MB/s (+2.58%)    [71.358 MB/s .. 87.054 MB/s]    Output: 10_000     
+k=100000 strat=linear                      Avg: 79.205 MB/s (+1.59%)    Median: 79.260 MB/s (+0.42%)    [76.795 MB/s .. 81.122 MB/s]    Output: 100_000    
+k=100000 strat=posting_direct              Avg: 5.8100 MB/s (+7.33%)    Median: 5.8233 MB/s (+0.39%)    [5.2497 MB/s .. 5.9855 MB/s]    Output: 100_000    
+k=100000 strat=bitset_from_postings        Avg: 5.8120 MB/s (+9.61%)    Median: 5.8308 MB/s (+1.70%)    [5.1095 MB/s .. 6.0031 MB/s]    Output: 100_000    
 n=1000000 kind=lowfk sort=asc
-k=10 strat=gallop                         Avg: 39.673 GB/s              Median: 40.232 GB/s             [28.250 GB/s .. 41.314 GB/s]    Output: 1_000        
-k=10 strat=linear                         Avg: 273.92 MB/s              Median: 275.34 MB/s             [250.14 MB/s .. 276.69 MB/s]    Output: 1_000        
-k=10 strat=posting_direct                 Avg: 104.40 GB/s              Median: 104.99 GB/s             [93.266 GB/s .. 108.11 GB/s]    Output: 1_000        
-k=10 strat=bitset_from_postings           Avg: 52.238 GB/s              Median: 53.462 GB/s             [34.168 GB/s .. 55.018 GB/s]    Output: 1_000        
-k=100 strat=gallop                        Avg: 14.777 GB/s (+0.08%)     Median: 14.776 GB/s (-0.05%)    [14.207 GB/s .. 15.169 GB/s]    Output: 10_000       
-k=100 strat=linear                        Avg: 236.73 MB/s (+1.21%)     Median: 237.92 MB/s (+1.29%)    [229.19 MB/s .. 238.84 MB/s]    Output: 10_000       
-k=100 strat=posting_direct                Avg: 9.0812 GB/s (-7.18%)     Median: 9.0955 GB/s (-7.50%)    [8.8734 GB/s .. 9.2589 GB/s]    Output: 10_000       
-k=100 strat=bitset_from_postings          Avg: 7.1999 GB/s (-4.70%)     Median: 7.2259 GB/s (-4.57%)    [6.8965 GB/s .. 7.3793 GB/s]    Output: 10_000       
-k=1000 strat=gallop                       Avg: 2.3721 GB/s              Median: 2.3782 GB/s             [2.2778 GB/s .. 2.4090 GB/s]    Output: 100_000      
-k=1000 strat=linear                       Avg: 270.67 MB/s              Median: 271.22 MB/s             [265.69 MB/s .. 272.27 MB/s]    Output: 100_000      
-k=1000 strat=posting_direct               Avg: 831.52 MB/s              Median: 834.85 MB/s             [782.70 MB/s .. 846.27 MB/s]    Output: 100_000      
-k=1000 strat=bitset_from_postings         Avg: 707.75 MB/s              Median: 707.81 MB/s             [684.10 MB/s .. 732.96 MB/s]    Output: 100_000      
-k=10000 strat=gallop                      Avg: 254.20 MB/s (+0.10%)     Median: 254.52 MB/s (-0.53%)    [243.35 MB/s .. 256.99 MB/s]    Output: 1_000_000    
-k=10000 strat=linear                      Avg: 236.90 MB/s (+14.61%)    Median: 237.26 MB/s (+2.77%)    [234.27 MB/s .. 238.56 MB/s]    Output: 1_000_000    
-k=10000 strat=posting_direct              Avg: 66.267 MB/s (+15.38%)    Median: 66.980 MB/s (+7.49%)    [56.815 MB/s .. 68.182 MB/s]    Output: 1_000_000    
-k=10000 strat=bitset_from_postings        Avg: 59.891 MB/s (+13.17%)    Median: 59.925 MB/s (+3.43%)    [36.113 MB/s .. 66.452 MB/s]    Output: 1_000_000    
+k=10 strat=gallop                         Avg: 39.448 GB/s (-0.57%)     Median: 39.407 GB/s (-2.05%)     [38.797 GB/s .. 40.607 GB/s]    Output: 1_000        
+k=10 strat=linear                         Avg: 274.99 MB/s (+0.39%)     Median: 276.37 MB/s (+0.37%)     [239.15 MB/s .. 277.79 MB/s]    Output: 1_000        
+k=10 strat=posting_direct                 Avg: 106.46 GB/s (+1.98%)     Median: 106.85 GB/s (+1.77%)     [100.35 GB/s .. 108.85 GB/s]    Output: 1_000        
+k=10 strat=bitset_from_postings           Avg: 54.389 GB/s (+4.12%)     Median: 54.437 GB/s (+1.82%)     [53.022 GB/s .. 55.343 GB/s]    Output: 1_000        
+k=100 strat=gallop                        Avg: 16.644 GB/s (+0.42%)     Median: 16.618 GB/s (+0.23%)     [16.358 GB/s .. 16.905 GB/s]    Output: 10_000       
+k=100 strat=linear                        Avg: 233.26 MB/s (-1.19%)     Median: 236.06 MB/s (-0.39%)     [204.42 MB/s .. 239.31 MB/s]    Output: 10_000       
+k=100 strat=posting_direct                Avg: 10.285 GB/s (+0.30%)     Median: 10.286 GB/s (+0.05%)     [10.117 GB/s .. 10.436 GB/s]    Output: 10_000       
+k=100 strat=bitset_from_postings          Avg: 7.9024 GB/s (+0.10%)     Median: 7.9085 GB/s (+0.19%)     [7.7283 GB/s .. 7.9790 GB/s]    Output: 10_000       
+k=1000 strat=gallop                       Avg: 3.3205 GB/s (+39.98%)    Median: 3.3224 GB/s (+39.70%)    [3.2747 GB/s .. 3.3619 GB/s]    Output: 100_000      
+k=1000 strat=linear                       Avg: 271.05 MB/s (+0.14%)     Median: 271.02 MB/s (-0.07%)     [269.85 MB/s .. 272.35 MB/s]    Output: 100_000      
+k=1000 strat=posting_direct               Avg: 946.10 MB/s (+13.78%)    Median: 943.83 MB/s (+13.05%)    [918.15 MB/s .. 967.48 MB/s]    Output: 100_000      
+k=1000 strat=bitset_from_postings         Avg: 784.05 MB/s (+10.78%)    Median: 784.98 MB/s (+10.90%)    [767.19 MB/s .. 796.79 MB/s]    Output: 100_000      
+k=10000 strat=gallop                      Avg: 615.78 MB/s (-0.40%)     Median: 616.33 MB/s (-0.33%)     [611.65 MB/s .. 619.44 MB/s]    Output: 1_000_000    
+k=10000 strat=linear                      Avg: 237.22 MB/s (-0.36%)     Median: 237.57 MB/s (-0.47%)     [230.30 MB/s .. 239.12 MB/s]    Output: 1_000_000    
+k=10000 strat=posting_direct              Avg: 72.185 MB/s (+1.57%)     Median: 72.456 MB/s (-1.55%)     [64.380 MB/s .. 73.554 MB/s]    Output: 1_000_000    
+k=10000 strat=bitset_from_postings        Avg: 66.475 MB/s (+0.30%)     Median: 66.706 MB/s (-0.93%)     [63.099 MB/s .. 68.355 MB/s]    Output: 1_000_000    
 n=1000000 kind=lowfk sort=unsorted
-k=10 strat=linear                         Avg: 274.70 MB/s             Median: 275.67 MB/s             [261.46 MB/s .. 276.82 MB/s]    Output: 1_000        
-k=10 strat=posting_direct                 Avg: 104.64 GB/s             Median: 105.43 GB/s             [97.456 GB/s .. 108.64 GB/s]    Output: 1_000        
-k=10 strat=bitset_from_postings           Avg: 53.513 GB/s             Median: 53.660 GB/s             [51.754 GB/s .. 55.402 GB/s]    Output: 1_000        
-k=100 strat=linear                        Avg: 230.62 MB/s (+2.04%)    Median: 233.76 MB/s (+1.67%)    [186.29 MB/s .. 239.11 MB/s]    Output: 10_000       
-k=100 strat=posting_direct                Avg: 9.0937 GB/s (+0.25%)    Median: 9.1298 GB/s (-3.74%)    [8.8172 GB/s .. 9.2123 GB/s]    Output: 10_000       
-k=100 strat=bitset_from_postings          Avg: 7.2180 GB/s (+1.19%)    Median: 7.2220 GB/s (-1.83%)    [6.9797 GB/s .. 7.3467 GB/s]    Output: 10_000       
-k=1000 strat=linear                       Avg: 269.96 MB/s             Median: 270.40 MB/s             [264.45 MB/s .. 272.23 MB/s]    Output: 100_000      
-k=1000 strat=posting_direct               Avg: 840.69 MB/s             Median: 845.23 MB/s             [766.64 MB/s .. 855.53 MB/s]    Output: 100_000      
-k=1000 strat=bitset_from_postings         Avg: 709.48 MB/s             Median: 714.97 MB/s             [595.43 MB/s .. 720.86 MB/s]    Output: 100_000      
-k=10000 strat=linear                      Avg: 235.95 MB/s (+1.46%)    Median: 236.46 MB/s (+1.34%)    [226.24 MB/s .. 239.50 MB/s]    Output: 1_000_000    
-k=10000 strat=posting_direct              Avg: 65.061 MB/s (+3.70%)    Median: 65.730 MB/s (+3.74%)    [57.219 MB/s .. 73.504 MB/s]    Output: 1_000_000    
-k=10000 strat=bitset_from_postings        Avg: 59.183 MB/s (+0.97%)    Median: 59.802 MB/s (+2.18%)    [50.099 MB/s .. 67.331 MB/s]    Output: 1_000_000    
+k=10 strat=linear                         Avg: 272.78 MB/s (-0.70%)     Median: 275.77 MB/s (+0.03%)     [229.18 MB/s .. 276.82 MB/s]    Output: 1_000        
+k=10 strat=posting_direct                 Avg: 104.06 GB/s (-0.55%)     Median: 104.57 GB/s (-0.82%)     [97.182 GB/s .. 108.26 GB/s]    Output: 1_000        
+k=10 strat=bitset_from_postings           Avg: 53.789 GB/s (+0.52%)     Median: 54.095 GB/s (+0.81%)     [50.769 GB/s .. 55.439 GB/s]    Output: 1_000        
+k=100 strat=linear                        Avg: 230.24 MB/s (-2.08%)     Median: 232.19 MB/s (-2.46%)     [200.43 MB/s .. 239.33 MB/s]    Output: 10_000       
+k=100 strat=posting_direct                Avg: 10.258 GB/s (-0.68%)     Median: 10.286 GB/s (-0.58%)     [9.6325 GB/s .. 10.453 GB/s]    Output: 10_000       
+k=100 strat=bitset_from_postings          Avg: 7.8670 GB/s (-0.40%)     Median: 7.8980 GB/s (-0.17%)     [7.5871 GB/s .. 8.0003 GB/s]    Output: 10_000       
+k=1000 strat=linear                       Avg: 263.85 MB/s (-2.26%)     Median: 267.90 MB/s (-0.92%)     [215.48 MB/s .. 271.48 MB/s]    Output: 100_000      
+k=1000 strat=posting_direct               Avg: 944.65 MB/s (+12.37%)    Median: 957.76 MB/s (+13.31%)    [756.39 MB/s .. 969.00 MB/s]    Output: 100_000      
+k=1000 strat=bitset_from_postings         Avg: 785.03 MB/s (+10.65%)    Median: 788.42 MB/s (+10.27%)    [723.25 MB/s .. 796.81 MB/s]    Output: 100_000      
+k=10000 strat=linear                      Avg: 233.59 MB/s (+3.27%)     Median: 236.82 MB/s (+1.16%)     [192.97 MB/s .. 238.90 MB/s]    Output: 1_000_000    
+k=10000 strat=posting_direct              Avg: 68.702 MB/s (+1.03%)     Median: 72.254 MB/s (+3.90%)     [48.798 MB/s .. 74.767 MB/s]    Output: 1_000_000    
+k=10000 strat=bitset_from_postings        Avg: 61.878 MB/s (+11.12%)    Median: 66.610 MB/s (+4.58%)     [33.354 MB/s .. 68.751 MB/s]    Output: 1_000_000    
 n=1000000 kind=highfk sort=asc
-k=10 strat=gallop                      Avg: 1.8166 GB/s     Median: 1.8334 GB/s     [1.6925 GB/s .. 1.8393 GB/s]    Output: 1_000_000    
-k=10 strat=linear                      Avg: 328.58 MB/s     Median: 341.46 MB/s     [176.62 MB/s .. 342.43 MB/s]    Output: 1_000_000    
-k=10 strat=posting_direct              Avg: 367.88 MB/s     Median: 381.13 MB/s     [227.53 MB/s .. 382.33 MB/s]    Output: 1_000_000    
-k=10 strat=bitset_from_postings        Avg: 236.16 MB/s     Median: 251.23 MB/s     [86.992 MB/s .. 254.96 MB/s]    Output: 1_000_000    
+k=10 strat=gallop                      Avg: 1.8328 GB/s (+0.89%)    Median: 1.8406 GB/s (+0.39%)    [1.6948 GB/s .. 1.8452 GB/s]    Output: 1_000_000    
+k=10 strat=linear                      Avg: 337.76 MB/s (+2.79%)    Median: 341.87 MB/s (+0.12%)    [303.04 MB/s .. 342.96 MB/s]    Output: 1_000_000    
+k=10 strat=posting_direct              Avg: 381.74 MB/s (+3.77%)    Median: 382.09 MB/s (+0.25%)    [376.76 MB/s .. 382.58 MB/s]    Output: 1_000_000    
+k=10 strat=bitset_from_postings        Avg: 250.26 MB/s (+5.97%)    Median: 250.29 MB/s (-0.37%)    [249.68 MB/s .. 250.72 MB/s]    Output: 1_000_000    
 n=1000000 kind=highfk sort=unsorted
-k=10 strat=linear                      Avg: 338.46 MB/s     Median: 341.80 MB/s     [295.19 MB/s .. 342.62 MB/s]    Output: 1_000_000    
-k=10 strat=posting_direct              Avg: 379.40 MB/s     Median: 381.55 MB/s     [355.61 MB/s .. 382.25 MB/s]    Output: 1_000_000    
-k=10 strat=bitset_from_postings        Avg: 249.11 MB/s     Median: 251.80 MB/s     [196.52 MB/s .. 256.85 MB/s]    Output: 1_000_000    
+k=10 strat=linear                      Avg: 341.16 MB/s (+0.80%)    Median: 342.07 MB/s (+0.08%)    [331.34 MB/s .. 343.01 MB/s]    Output: 1_000_000    
+k=10 strat=posting_direct              Avg: 381.56 MB/s (+0.57%)    Median: 382.12 MB/s (+0.15%)    [375.11 MB/s .. 383.09 MB/s]    Output: 1_000_000    
+k=10 strat=bitset_from_postings        Avg: 250.09 MB/s (+0.39%)    Median: 250.25 MB/s (-0.62%)    [248.36 MB/s .. 251.46 MB/s]    Output: 1_000_000    
 n=10000000 kind=pk sort=asc
-k=10 strat=gallop                          Avg: 54.663 GB/s     Median: 54.882 GB/s     [52.251 GB/s .. 55.566 GB/s]    Output: 10         
-k=10 strat=linear                          Avg: 268.89 MB/s     Median: 269.31 MB/s     [260.76 MB/s .. 271.32 MB/s]    Output: 10         
-k=10 strat=posting_direct                  Avg: 1080.0 GB/s     Median: 1006.3 GB/s     [893.58 GB/s .. 1262.6 GB/s]    Output: 10         
-k=10 strat=bitset_from_postings            Avg: 177.75 GB/s     Median: 179.83 GB/s     [166.83 GB/s .. 182.47 GB/s]    Output: 10         
-k=100 strat=gallop                         Avg: 46.142 GB/s     Median: 46.225 GB/s     [44.256 GB/s .. 47.101 GB/s]    Output: 100        
-k=100 strat=linear                         Avg: 189.50 MB/s     Median: 197.02 MB/s     [100.58 MB/s .. 199.76 MB/s]    Output: 100        
-k=100 strat=posting_direct                 Avg: 123.90 GB/s     Median: 122.50 GB/s     [114.12 GB/s .. 133.17 GB/s]    Output: 100        
-k=100 strat=bitset_from_postings           Avg: 76.642 GB/s     Median: 76.888 GB/s     [56.300 GB/s .. 81.100 GB/s]    Output: 100        
-k=1000 strat=gallop                        Avg: 17.955 GB/s     Median: 18.034 GB/s     [16.668 GB/s .. 18.334 GB/s]    Output: 1_000      
-k=1000 strat=linear                        Avg: 277.07 MB/s     Median: 278.83 MB/s     [244.20 MB/s .. 281.08 MB/s]    Output: 1_000      
-k=1000 strat=posting_direct                Avg: 11.108 GB/s     Median: 11.095 GB/s     [10.691 GB/s .. 11.472 GB/s]    Output: 1_000      
-k=1000 strat=bitset_from_postings          Avg: 10.388 GB/s     Median: 10.353 GB/s     [10.137 GB/s .. 10.757 GB/s]    Output: 1_000      
-k=10000 strat=gallop                       Avg: 2.9217 GB/s     Median: 2.9250 GB/s     [2.8770 GB/s .. 2.9450 GB/s]    Output: 10_000     
-k=10000 strat=linear                       Avg: 215.32 MB/s     Median: 215.84 MB/s     [203.23 MB/s .. 216.77 MB/s]    Output: 10_000     
-k=10000 strat=posting_direct               Avg: 612.39 MB/s     Median: 614.69 MB/s     [573.07 MB/s .. 631.74 MB/s]    Output: 10_000     
-k=10000 strat=bitset_from_postings         Avg: 523.92 MB/s     Median: 534.65 MB/s     [309.30 MB/s .. 568.43 MB/s]    Output: 10_000     
-k=100000 strat=gallop                      Avg: 309.50 MB/s     Median: 315.21 MB/s     [202.49 MB/s .. 319.65 MB/s]    Output: 100_000    
-k=100000 strat=linear                      Avg: 97.597 MB/s     Median: 99.162 MB/s     [66.974 MB/s .. 100.48 MB/s]    Output: 100_000    
-k=100000 strat=posting_direct              Avg: 41.801 MB/s     Median: 42.923 MB/s     [30.801 MB/s .. 44.269 MB/s]    Output: 100_000    
-k=100000 strat=bitset_from_postings        Avg: 41.725 MB/s     Median: 42.134 MB/s     [34.002 MB/s .. 44.091 MB/s]    Output: 100_000    
+k=10 strat=gallop                          Avg: 54.208 GB/s (-0.83%)      Median: 54.402 GB/s (-0.87%)      [52.556 GB/s .. 55.214 GB/s]    Output: 10         
+k=10 strat=linear                          Avg: 269.22 MB/s (+0.12%)      Median: 271.35 MB/s (+0.76%)      [234.85 MB/s .. 272.88 MB/s]    Output: 10         
+k=10 strat=posting_direct                  Avg: 1072.5 GB/s (-0.70%)      Median: 1036.4 GB/s (+2.98%)      [899.60 GB/s .. 1262.6 GB/s]    Output: 10         
+k=10 strat=bitset_from_postings            Avg: 176.82 GB/s (-0.53%)      Median: 178.56 GB/s (-0.71%)      [167.60 GB/s .. 182.90 GB/s]    Output: 10         
+k=100 strat=gallop                         Avg: 45.086 GB/s (-2.29%)      Median: 45.251 GB/s (-2.11%)      [43.892 GB/s .. 46.045 GB/s]    Output: 100        
+k=100 strat=linear                         Avg: 193.92 MB/s (+2.33%)      Median: 197.05 MB/s (+0.02%)      [131.22 MB/s .. 198.86 MB/s]    Output: 100        
+k=100 strat=posting_direct                 Avg: 124.93 GB/s (+0.83%)      Median: 123.52 GB/s (+0.83%)      [115.43 GB/s .. 133.84 GB/s]    Output: 100        
+k=100 strat=bitset_from_postings           Avg: 77.943 GB/s (+1.70%)      Median: 77.673 GB/s (+1.02%)      [70.394 GB/s .. 81.439 GB/s]    Output: 100        
+k=1000 strat=gallop                        Avg: 20.664 GB/s (+15.09%)     Median: 20.749 GB/s (+15.05%)     [19.921 GB/s .. 21.051 GB/s]    Output: 1_000      
+k=1000 strat=linear                        Avg: 279.35 MB/s (+0.82%)      Median: 279.98 MB/s (+0.41%)      [261.29 MB/s .. 282.25 MB/s]    Output: 1_000      
+k=1000 strat=posting_direct                Avg: 11.338 GB/s (+2.07%)      Median: 11.353 GB/s (+2.33%)      [10.787 GB/s .. 11.652 GB/s]    Output: 1_000      
+k=1000 strat=bitset_from_postings          Avg: 10.542 GB/s (+1.48%)      Median: 10.513 GB/s (+1.55%)      [10.273 GB/s .. 10.831 GB/s]    Output: 1_000      
+k=10000 strat=gallop                       Avg: 4.5119 GB/s (+54.43%)     Median: 4.5292 GB/s (+54.84%)     [4.2209 GB/s .. 4.5862 GB/s]    Output: 10_000     
+k=10000 strat=linear                       Avg: 214.72 MB/s (-0.28%)      Median: 215.03 MB/s (-0.38%)      [210.39 MB/s .. 215.99 MB/s]    Output: 10_000     
+k=10000 strat=posting_direct               Avg: 641.13 MB/s (+4.69%)      Median: 648.35 MB/s (+5.47%)      [539.43 MB/s .. 665.21 MB/s]    Output: 10_000     
+k=10000 strat=bitset_from_postings         Avg: 566.54 MB/s (+8.13%)      Median: 565.97 MB/s (+5.86%)      [551.24 MB/s .. 588.03 MB/s]    Output: 10_000     
+k=100000 strat=gallop                      Avg: 682.94 MB/s (+120.66%)    Median: 682.73 MB/s (+116.60%)    [678.10 MB/s .. 689.65 MB/s]    Output: 100_000    
+k=100000 strat=linear                      Avg: 100.16 MB/s (+2.62%)      Median: 100.14 MB/s (+0.98%)      [99.305 MB/s .. 101.11 MB/s]    Output: 100_000    
+k=100000 strat=posting_direct              Avg: 44.680 MB/s (+6.89%)      Median: 44.811 MB/s (+4.40%)      [41.077 MB/s .. 45.323 MB/s]    Output: 100_000    
+k=100000 strat=bitset_from_postings        Avg: 44.560 MB/s (+6.80%)      Median: 44.551 MB/s (+5.74%)      [43.497 MB/s .. 44.990 MB/s]    Output: 100_000    
 n=10000000 kind=pk sort=unsorted
-k=10 strat=linear                          Avg: 257.45 MB/s     Median: 268.36 MB/s     [131.75 MB/s .. 271.08 MB/s]    Output: 10         
-k=10 strat=posting_direct                  Avg: 1036.6 GB/s     Median: 1001.5 GB/s     [542.39 GB/s .. 1275.3 GB/s]    Output: 10         
-k=10 strat=bitset_from_postings            Avg: 174.76 GB/s     Median: 175.29 GB/s     [156.83 GB/s .. 182.15 GB/s]    Output: 10         
-k=100 strat=linear                         Avg: 186.48 MB/s     Median: 198.22 MB/s     [100.64 MB/s .. 199.53 MB/s]    Output: 100        
-k=100 strat=posting_direct                 Avg: 121.08 GB/s     Median: 123.43 GB/s     [90.406 GB/s .. 132.34 GB/s]    Output: 100        
-k=100 strat=bitset_from_postings           Avg: 77.165 GB/s     Median: 76.735 GB/s     [70.732 GB/s .. 80.877 GB/s]    Output: 100        
-k=1000 strat=linear                        Avg: 279.54 MB/s     Median: 279.94 MB/s     [277.03 MB/s .. 281.01 MB/s]    Output: 1_000      
-k=1000 strat=posting_direct                Avg: 11.092 GB/s     Median: 11.043 GB/s     [9.8729 GB/s .. 11.489 GB/s]    Output: 1_000      
-k=1000 strat=bitset_from_postings          Avg: 10.361 GB/s     Median: 10.371 GB/s     [9.3858 GB/s .. 10.691 GB/s]    Output: 1_000      
-k=10000 strat=linear                       Avg: 215.62 MB/s     Median: 216.12 MB/s     [211.15 MB/s .. 217.04 MB/s]    Output: 10_000     
-k=10000 strat=posting_direct               Avg: 558.69 MB/s     Median: 559.32 MB/s     [486.93 MB/s .. 634.19 MB/s]    Output: 10_000     
-k=10000 strat=bitset_from_postings         Avg: 565.92 MB/s     Median: 552.78 MB/s     [520.40 MB/s .. 646.70 MB/s]    Output: 10_000     
-k=100000 strat=linear                      Avg: 99.940 MB/s     Median: 99.921 MB/s     [98.689 MB/s .. 100.76 MB/s]    Output: 100_000    
-k=100000 strat=posting_direct              Avg: 43.722 MB/s     Median: 43.739 MB/s     [41.368 MB/s .. 44.235 MB/s]    Output: 100_000    
-k=100000 strat=bitset_from_postings        Avg: 43.539 MB/s     Median: 43.573 MB/s     [41.924 MB/s .. 44.098 MB/s]    Output: 100_000    
+k=10 strat=linear                          Avg: 262.64 MB/s (+2.01%)    Median: 270.07 MB/s (+0.64%)    [159.02 MB/s .. 272.66 MB/s]    Output: 10         
+k=10 strat=posting_direct                  Avg: 1053.2 GB/s (+1.60%)    Median: 1014.2 GB/s (+1.27%)    [711.54 GB/s .. 1283.5 GB/s]    Output: 10         
+k=10 strat=bitset_from_postings            Avg: 174.91 GB/s (+0.08%)    Median: 178.21 GB/s (+1.66%)    [151.37 GB/s .. 182.15 GB/s]    Output: 10         
+k=100 strat=linear                         Avg: 196.48 MB/s (+5.37%)    Median: 198.09 MB/s (-0.07%)    [176.14 MB/s .. 199.99 MB/s]    Output: 100        
+k=100 strat=posting_direct                 Avg: 122.48 GB/s (+1.15%)    Median: 124.07 GB/s (+0.52%)    [108.09 GB/s .. 133.55 GB/s]    Output: 100        
+k=100 strat=bitset_from_postings           Avg: 77.274 GB/s (+0.14%)    Median: 77.214 GB/s (+0.62%)    [62.784 GB/s .. 81.065 GB/s]    Output: 100        
+k=1000 strat=linear                        Avg: 277.09 MB/s (-0.88%)    Median: 280.43 MB/s (+0.17%)    [221.94 MB/s .. 281.99 MB/s]    Output: 1_000      
+k=1000 strat=posting_direct                Avg: 11.232 GB/s (+1.27%)    Median: 11.205 GB/s (+1.47%)    [10.550 GB/s .. 11.670 GB/s]    Output: 1_000      
+k=1000 strat=bitset_from_postings          Avg: 10.507 GB/s (+1.41%)    Median: 10.514 GB/s (+1.39%)    [9.7990 GB/s .. 10.894 GB/s]    Output: 1_000      
+k=10000 strat=linear                       Avg: 213.99 MB/s (-0.76%)    Median: 214.87 MB/s (-0.58%)    [199.20 MB/s .. 216.06 MB/s]    Output: 10_000     
+k=10000 strat=posting_direct               Avg: 582.62 MB/s (+4.28%)    Median: 574.70 MB/s (+2.75%)    [559.57 MB/s .. 667.27 MB/s]    Output: 10_000     
+k=10000 strat=bitset_from_postings         Avg: 579.47 MB/s (+2.39%)    Median: 564.26 MB/s (+2.08%)    [556.08 MB/s .. 657.08 MB/s]    Output: 10_000     
+k=100000 strat=linear                      Avg: 100.36 MB/s (+0.42%)    Median: 100.46 MB/s (+0.54%)    [98.983 MB/s .. 101.02 MB/s]    Output: 100_000    
+k=100000 strat=posting_direct              Avg: 44.587 MB/s (+1.98%)    Median: 44.789 MB/s (+2.40%)    [41.934 MB/s .. 45.050 MB/s]    Output: 100_000    
+k=100000 strat=bitset_from_postings        Avg: 44.369 MB/s (+1.91%)    Median: 44.344 MB/s (+1.77%)    [43.660 MB/s .. 44.905 MB/s]    Output: 100_000    
 n=10000000 kind=lowfk sort=asc
-k=10 strat=gallop                          Avg: 54.907 GB/s     Median: 55.026 GB/s     [52.463 GB/s .. 55.784 GB/s]    Output: 1_000         
-k=10 strat=linear                          Avg: 259.56 MB/s     Median: 275.50 MB/s     [100.42 MB/s .. 276.53 MB/s]    Output: 1_000         
-k=10 strat=posting_direct                  Avg: 927.90 GB/s     Median: 901.63 GB/s     [579.17 GB/s .. 1066.7 GB/s]    Output: 1_000         
-k=10 strat=bitset_from_postings            Avg: 168.04 GB/s     Median: 169.65 GB/s     [153.80 GB/s .. 173.29 GB/s]    Output: 1_000         
-k=100 strat=gallop                         Avg: 41.397 GB/s     Median: 41.460 GB/s     [38.617 GB/s .. 42.788 GB/s]    Output: 10_000        
-k=100 strat=linear                         Avg: 259.41 MB/s     Median: 261.78 MB/s     [220.07 MB/s .. 262.37 MB/s]    Output: 10_000        
-k=100 strat=posting_direct                 Avg: 86.018 GB/s     Median: 85.858 GB/s     [75.581 GB/s .. 90.996 GB/s]    Output: 10_000        
-k=100 strat=bitset_from_postings           Avg: 53.989 GB/s     Median: 53.753 GB/s     [52.038 GB/s .. 55.583 GB/s]    Output: 10_000        
-k=1000 strat=gallop                        Avg: 12.543 GB/s     Median: 12.635 GB/s     [11.457 GB/s .. 12.946 GB/s]    Output: 100_000       
-k=1000 strat=linear                        Avg: 274.78 MB/s     Median: 275.14 MB/s     [269.25 MB/s .. 275.61 MB/s]    Output: 100_000       
-k=1000 strat=posting_direct                Avg: 6.4670 GB/s     Median: 6.8998 GB/s     [2.2457 GB/s .. 6.9873 GB/s]    Output: 100_000       
-k=1000 strat=bitset_from_postings          Avg: 5.7114 GB/s     Median: 5.7673 GB/s     [5.1623 GB/s .. 5.8915 GB/s]    Output: 100_000       
-k=10000 strat=gallop                       Avg: 1.9220 GB/s     Median: 1.9303 GB/s     [1.8206 GB/s .. 1.9514 GB/s]    Output: 1_000_000     
-k=10000 strat=linear                       Avg: 261.71 MB/s     Median: 267.45 MB/s     [183.57 MB/s .. 269.15 MB/s]    Output: 1_000_000     
-k=10000 strat=posting_direct               Avg: 275.92 MB/s     Median: 284.86 MB/s     [174.27 MB/s .. 289.50 MB/s]    Output: 1_000_000     
-k=10000 strat=bitset_from_postings         Avg: 260.24 MB/s     Median: 263.13 MB/s     [188.97 MB/s .. 273.39 MB/s]    Output: 1_000_000     
-k=100000 strat=gallop                      Avg: 215.54 MB/s     Median: 216.22 MB/s     [209.10 MB/s .. 216.91 MB/s]    Output: 10_000_000    
-k=100000 strat=linear                      Avg: 231.23 MB/s     Median: 231.61 MB/s     [224.67 MB/s .. 234.97 MB/s]    Output: 10_000_000    
-k=100000 strat=posting_direct              Avg: 13.718 MB/s     Median: 13.691 MB/s     [12.731 MB/s .. 14.681 MB/s]    Output: 10_000_000    
-k=100000 strat=bitset_from_postings        Avg: 13.538 MB/s     Median: 13.829 MB/s     [8.6887 MB/s .. 14.466 MB/s]    Output: 10_000_000    
+k=10 strat=gallop                          Avg: 54.705 GB/s (-0.37%)      Median: 54.865 GB/s (-0.29%)      [52.916 GB/s .. 55.279 GB/s]    Output: 1_000         
+k=10 strat=linear                          Avg: 269.95 MB/s (+4.00%)      Median: 276.44 MB/s (+0.34%)      [201.08 MB/s .. 277.32 MB/s]    Output: 1_000         
+k=10 strat=posting_direct                  Avg: 894.77 GB/s (-3.57%)      Median: 906.62 GB/s (+0.55%)      [382.12 GB/s .. 1063.8 GB/s]    Output: 1_000         
+k=10 strat=bitset_from_postings            Avg: 167.45 GB/s (-0.35%)      Median: 168.44 GB/s (-0.71%)      [149.89 GB/s .. 173.63 GB/s]    Output: 1_000         
+k=100 strat=gallop                         Avg: 42.983 GB/s (+3.83%)      Median: 43.090 GB/s (+3.93%)      [41.037 GB/s .. 43.861 GB/s]    Output: 10_000        
+k=100 strat=linear                         Avg: 260.45 MB/s (+0.40%)      Median: 261.98 MB/s (+0.08%)      [241.65 MB/s .. 262.87 MB/s]    Output: 10_000        
+k=100 strat=posting_direct                 Avg: 96.704 GB/s (+12.42%)     Median: 95.958 GB/s (+11.76%)     [93.251 GB/s .. 101.27 GB/s]    Output: 10_000        
+k=100 strat=bitset_from_postings           Avg: 57.515 GB/s (+6.53%)      Median: 57.310 GB/s (+6.62%)      [55.872 GB/s .. 59.340 GB/s]    Output: 10_000        
+k=1000 strat=gallop                        Avg: 16.869 GB/s (+34.49%)     Median: 16.865 GB/s (+33.48%)     [16.711 GB/s .. 17.060 GB/s]    Output: 100_000       
+k=1000 strat=linear                        Avg: 274.01 MB/s (-0.28%)      Median: 275.49 MB/s (+0.13%)      [248.02 MB/s .. 276.23 MB/s]    Output: 100_000       
+k=1000 strat=posting_direct                Avg: 7.6000 GB/s (+17.52%)     Median: 7.5951 GB/s (+10.08%)     [7.4052 GB/s .. 7.7494 GB/s]    Output: 100_000       
+k=1000 strat=bitset_from_postings          Avg: 6.2446 GB/s (+9.34%)      Median: 6.2405 GB/s (+8.20%)      [6.1228 GB/s .. 6.3847 GB/s]    Output: 100_000       
+k=10000 strat=gallop                       Avg: 3.2675 GB/s (+70.01%)     Median: 3.2721 GB/s (+69.52%)     [3.1762 GB/s .. 3.2892 GB/s]    Output: 1_000_000     
+k=10000 strat=linear                       Avg: 270.65 MB/s (+3.42%)      Median: 270.85 MB/s (+1.27%)      [268.78 MB/s .. 271.77 MB/s]    Output: 1_000_000     
+k=10000 strat=posting_direct               Avg: 298.01 MB/s (+8.00%)      Median: 304.71 MB/s (+6.97%)      [178.44 MB/s .. 306.62 MB/s]    Output: 1_000_000     
+k=10000 strat=bitset_from_postings         Avg: 260.27 MB/s (+0.01%)      Median: 274.68 MB/s (+4.39%)      [141.17 MB/s .. 281.24 MB/s]    Output: 1_000_000     
+k=100000 strat=gallop                      Avg: 601.76 MB/s (+179.19%)    Median: 606.26 MB/s (+180.39%)    [480.49 MB/s .. 613.77 MB/s]    Output: 10_000_000    
+k=100000 strat=linear                      Avg: 232.85 MB/s (+0.70%)      Median: 233.34 MB/s (+0.75%)      [216.12 MB/s .. 235.33 MB/s]    Output: 10_000_000    
+k=100000 strat=posting_direct              Avg: 13.540 MB/s (-1.30%)      Median: 13.955 MB/s (+1.93%)      [8.8801 MB/s .. 15.184 MB/s]    Output: 10_000_000    
+k=100000 strat=bitset_from_postings        Avg: 13.495 MB/s (-0.32%)      Median: 13.722 MB/s (-0.78%)      [11.129 MB/s .. 14.673 MB/s]    Output: 10_000_000    
 n=10000000 kind=lowfk sort=unsorted
-k=10 strat=linear                          Avg: 272.41 MB/s     Median: 275.98 MB/s     [244.65 MB/s .. 276.91 MB/s]    Output: 1_000         
-k=10 strat=posting_direct                  Avg: 886.84 GB/s     Median: 890.95 GB/s     [350.94 GB/s .. 1073.9 GB/s]    Output: 1_000         
-k=10 strat=bitset_from_postings            Avg: 167.52 GB/s     Median: 168.97 GB/s     [147.48 GB/s .. 173.61 GB/s]    Output: 1_000         
-k=100 strat=linear                         Avg: 256.22 MB/s     Median: 257.81 MB/s     [220.63 MB/s .. 262.64 MB/s]    Output: 10_000        
-k=100 strat=posting_direct                 Avg: 79.733 GB/s     Median: 86.654 GB/s     [22.853 GB/s .. 90.944 GB/s]    Output: 10_000        
-k=100 strat=bitset_from_postings           Avg: 51.191 GB/s     Median: 53.843 GB/s     [23.160 GB/s .. 56.079 GB/s]    Output: 10_000        
-k=1000 strat=linear                        Avg: 248.77 MB/s     Median: 273.39 MB/s     [123.75 MB/s .. 274.97 MB/s]    Output: 100_000       
-k=1000 strat=posting_direct                Avg: 6.3616 GB/s     Median: 6.9452 GB/s     [2.8628 GB/s .. 7.1079 GB/s]    Output: 100_000       
-k=1000 strat=bitset_from_postings          Avg: 5.7243 GB/s     Median: 5.8203 GB/s     [4.4212 GB/s .. 5.9432 GB/s]    Output: 100_000       
-k=10000 strat=linear                       Avg: 245.14 MB/s     Median: 265.11 MB/s     [118.06 MB/s .. 268.48 MB/s]    Output: 1_000_000     
-k=10000 strat=posting_direct               Avg: 282.02 MB/s     Median: 280.87 MB/s     [267.64 MB/s .. 294.30 MB/s]    Output: 1_000_000     
-k=10000 strat=bitset_from_postings         Avg: 263.15 MB/s     Median: 263.92 MB/s     [228.83 MB/s .. 279.73 MB/s]    Output: 1_000_000     
-k=100000 strat=linear                      Avg: 230.93 MB/s     Median: 231.53 MB/s     [218.51 MB/s .. 233.99 MB/s]    Output: 10_000_000    
-k=100000 strat=posting_direct              Avg: 13.601 MB/s     Median: 13.582 MB/s     [12.228 MB/s .. 14.534 MB/s]    Output: 10_000_000    
-k=100000 strat=bitset_from_postings        Avg: 13.115 MB/s     Median: 13.541 MB/s     [6.4744 MB/s .. 14.123 MB/s]    Output: 10_000_000    
+k=10 strat=linear                          Avg: 275.52 MB/s (+1.14%)     Median: 276.49 MB/s (+0.19%)     [254.36 MB/s .. 276.76 MB/s]    Output: 1_000         
+k=10 strat=posting_direct                  Avg: 931.71 GB/s (+5.06%)     Median: 909.84 GB/s (+2.12%)     [820.01 GB/s .. 1060.6 GB/s]    Output: 1_000         
+k=10 strat=bitset_from_postings            Avg: 167.26 GB/s (-0.16%)     Median: 168.33 GB/s (-0.38%)     [148.42 GB/s .. 173.89 GB/s]    Output: 1_000         
+k=100 strat=linear                         Avg: 259.45 MB/s (+1.26%)     Median: 260.26 MB/s (+0.95%)     [253.50 MB/s .. 262.27 MB/s]    Output: 10_000        
+k=100 strat=posting_direct                 Avg: 77.226 GB/s (-3.14%)     Median: 96.195 GB/s (+11.01%)    [11.900 GB/s .. 100.89 GB/s]    Output: 10_000        
+k=100 strat=bitset_from_postings           Avg: 57.624 GB/s (+12.57%)    Median: 57.484 GB/s (+6.76%)     [56.070 GB/s .. 59.081 GB/s]    Output: 10_000        
+k=1000 strat=linear                        Avg: 273.72 MB/s (+10.03%)    Median: 274.67 MB/s (+0.47%)     [262.38 MB/s .. 275.21 MB/s]    Output: 100_000       
+k=1000 strat=posting_direct                Avg: 7.6050 GB/s (+19.55%)    Median: 7.6155 GB/s (+9.65%)     [6.9177 GB/s .. 7.8055 GB/s]    Output: 100_000       
+k=1000 strat=bitset_from_postings          Avg: 6.2697 GB/s (+9.53%)     Median: 6.2696 GB/s (+7.72%)     [6.0200 GB/s .. 6.3920 GB/s]    Output: 100_000       
+k=10000 strat=linear                       Avg: 269.07 MB/s (+9.76%)     Median: 270.31 MB/s (+1.96%)     [252.90 MB/s .. 271.37 MB/s]    Output: 1_000_000     
+k=10000 strat=posting_direct               Avg: 295.31 MB/s (+4.71%)     Median: 294.56 MB/s (+4.87%)     [290.90 MB/s .. 302.82 MB/s]    Output: 1_000_000     
+k=10000 strat=bitset_from_postings         Avg: 276.04 MB/s (+4.90%)     Median: 275.03 MB/s (+4.21%)     [269.61 MB/s .. 283.70 MB/s]    Output: 1_000_000     
+k=100000 strat=linear                      Avg: 233.12 MB/s (+0.95%)     Median: 233.59 MB/s (+0.89%)     [223.40 MB/s .. 235.90 MB/s]    Output: 10_000_000    
+k=100000 strat=posting_direct              Avg: 14.281 MB/s (+5.00%)     Median: 14.135 MB/s (+4.08%)     [13.494 MB/s .. 15.106 MB/s]    Output: 10_000_000    
+k=100000 strat=bitset_from_postings        Avg: 14.040 MB/s (+7.05%)     Median: 13.885 MB/s (+2.53%)     [13.292 MB/s .. 14.995 MB/s]    Output: 10_000_000    
 n=10000000 kind=highfk sort=asc
-k=10 strat=gallop                       Avg: 14.078 GB/s     Median: 14.252 GB/s     [12.661 GB/s .. 14.328 GB/s]    Output: 1_000_000     
-k=10 strat=linear                       Avg: 351.22 MB/s     Median: 354.15 MB/s     [318.51 MB/s .. 354.88 MB/s]    Output: 1_000_000     
-k=10 strat=posting_direct               Avg: 3.9011 GB/s     Median: 3.9253 GB/s     [3.6057 GB/s .. 3.9316 GB/s]    Output: 1_000_000     
-k=10 strat=bitset_from_postings         Avg: 2.1699 GB/s     Median: 2.1783 GB/s     [2.0030 GB/s .. 2.1968 GB/s]    Output: 1_000_000     
-k=100 strat=gallop                      Avg: 1.8278 GB/s     Median: 1.8376 GB/s     [1.7017 GB/s .. 1.8411 GB/s]    Output: 10_000_000    
-k=100 strat=linear                      Avg: 341.29 MB/s     Median: 341.49 MB/s     [338.77 MB/s .. 342.50 MB/s]    Output: 10_000_000    
-k=100 strat=posting_direct              Avg: 266.91 MB/s     Median: 262.64 MB/s     [261.53 MB/s .. 376.98 MB/s]    Output: 10_000_000    
-k=100 strat=bitset_from_postings        Avg: 201.11 MB/s     Median: 188.85 MB/s     [187.01 MB/s .. 261.84 MB/s]    Output: 10_000_000    
+k=10 strat=gallop                       Avg: 14.255 GB/s (+1.25%)     Median: 14.276 GB/s (+0.17%)     [14.052 GB/s .. 14.310 GB/s]    Output: 1_000_000     
+k=10 strat=linear                       Avg: 354.41 MB/s (+0.91%)     Median: 355.41 MB/s (+0.36%)     [337.40 MB/s .. 355.86 MB/s]    Output: 1_000_000     
+k=10 strat=posting_direct               Avg: 3.9279 GB/s (+0.69%)     Median: 3.9303 GB/s (+0.13%)     [3.9046 GB/s .. 3.9364 GB/s]    Output: 1_000_000     
+k=10 strat=bitset_from_postings         Avg: 2.1802 GB/s (+0.47%)     Median: 2.1803 GB/s (+0.09%)     [2.1576 GB/s .. 2.1984 GB/s]    Output: 1_000_000     
+k=100 strat=gallop                      Avg: 1.8472 GB/s (+1.06%)     Median: 1.8480 GB/s (+0.57%)     [1.8330 GB/s .. 1.8500 GB/s]    Output: 10_000_000    
+k=100 strat=linear                      Avg: 343.46 MB/s (+0.64%)     Median: 343.56 MB/s (+0.60%)     [341.80 MB/s .. 344.27 MB/s]    Output: 10_000_000    
+k=100 strat=posting_direct              Avg: 381.28 MB/s (+42.85%)    Median: 381.31 MB/s (+45.19%)    [379.31 MB/s .. 381.80 MB/s]    Output: 10_000_000    
+k=100 strat=bitset_from_postings        Avg: 245.92 MB/s (+22.28%)    Median: 245.96 MB/s (+30.24%)    [244.57 MB/s .. 246.70 MB/s]    Output: 10_000_000    
 n=10000000 kind=highfk sort=unsorted
-k=10 strat=linear                       Avg: 349.00 MB/s     Median: 354.35 MB/s     [294.98 MB/s .. 354.91 MB/s]    Output: 1_000_000     
-k=10 strat=posting_direct               Avg: 3.8543 GB/s     Median: 3.9248 GB/s     [2.6785 GB/s .. 3.9313 GB/s]    Output: 1_000_000     
-k=10 strat=bitset_from_postings         Avg: 2.1243 GB/s     Median: 2.1780 GB/s     [1.4891 GB/s .. 2.1990 GB/s]    Output: 1_000_000     
-k=100 strat=linear                      Avg: 333.49 MB/s     Median: 340.64 MB/s     [241.79 MB/s .. 342.12 MB/s]    Output: 10_000_000    
-k=100 strat=posting_direct              Avg: 273.29 MB/s     Median: 272.01 MB/s     [240.45 MB/s .. 348.36 MB/s]    Output: 10_000_000    
-k=100 strat=bitset_from_postings        Avg: 195.88 MB/s     Median: 188.68 MB/s     [186.65 MB/s .. 259.68 MB/s]    Output: 10_000_000    
+k=10 strat=linear                       Avg: 352.85 MB/s (+1.10%)     Median: 354.81 MB/s (+0.13%)     [329.52 MB/s .. 355.72 MB/s]    Output: 1_000_000     
+k=10 strat=posting_direct               Avg: 3.9300 GB/s (+1.96%)     Median: 3.9312 GB/s (+0.16%)     [3.9118 GB/s .. 3.9390 GB/s]    Output: 1_000_000     
+k=10 strat=bitset_from_postings         Avg: 2.1825 GB/s (+2.74%)     Median: 2.1814 GB/s (+0.15%)     [2.1601 GB/s .. 2.1990 GB/s]    Output: 1_000_000     
+k=100 strat=linear                      Avg: 339.98 MB/s (+1.95%)     Median: 343.87 MB/s (+0.95%)     [261.15 MB/s .. 344.22 MB/s]    Output: 10_000_000    
+k=100 strat=posting_direct              Avg: 377.04 MB/s (+37.96%)    Median: 381.12 MB/s (+40.11%)    [285.17 MB/s .. 381.43 MB/s]    Output: 10_000_000    
+k=100 strat=bitset_from_postings        Avg: 243.84 MB/s (+24.49%)    Median: 245.50 MB/s (+30.11%)    [214.66 MB/s .. 247.11 MB/s]    Output: 10_000_000    
 n=50000000 kind=pk sort=asc
-k=10 strat=gallop                          Avg: 56.179 GB/s     Median: 56.329 GB/s     [51.935 GB/s .. 57.702 GB/s]    Output: 10         
-k=10 strat=linear                          Avg: 270.00 MB/s     Median: 271.78 MB/s     [246.09 MB/s .. 272.56 MB/s]    Output: 10         
-k=10 strat=posting_direct                  Avg: 4960.3 GB/s     Median: 4688.7 GB/s     [3359.5 GB/s .. 6224.3 GB/s]    Output: 10         
-k=10 strat=bitset_from_postings            Avg: 211.90 GB/s     Median: 213.52 GB/s     [186.70 GB/s .. 217.59 GB/s]    Output: 10         
-k=100 strat=gallop                         Avg: 52.939 GB/s     Median: 53.652 GB/s     [42.474 GB/s .. 55.342 GB/s]    Output: 100        
-k=100 strat=linear                         Avg: 188.78 MB/s     Median: 190.73 MB/s     [156.16 MB/s .. 191.59 MB/s]    Output: 100        
-k=100 strat=posting_direct                 Avg: 597.21 GB/s     Median: 589.61 GB/s     [489.94 GB/s .. 656.50 GB/s]    Output: 100        
-k=100 strat=bitset_from_postings           Avg: 160.89 GB/s     Median: 160.96 GB/s     [142.20 GB/s .. 166.31 GB/s]    Output: 100        
-k=1000 strat=gallop                        Avg: 37.283 GB/s     Median: 37.334 GB/s     [35.042 GB/s .. 38.518 GB/s]    Output: 1_000      
-k=1000 strat=linear                        Avg: 292.85 MB/s     Median: 293.26 MB/s     [287.28 MB/s .. 293.72 MB/s]    Output: 1_000      
-k=1000 strat=posting_direct                Avg: 51.870 GB/s     Median: 52.424 GB/s     [41.374 GB/s .. 54.535 GB/s]    Output: 1_000      
-k=1000 strat=bitset_from_postings          Avg: 41.416 GB/s     Median: 41.434 GB/s     [38.641 GB/s .. 43.189 GB/s]    Output: 1_000      
-k=10000 strat=gallop                       Avg: 9.6251 GB/s     Median: 9.6374 GB/s     [8.6443 GB/s .. 9.7685 GB/s]    Output: 10_000     
-k=10000 strat=linear                       Avg: 212.58 MB/s     Median: 213.73 MB/s     [198.47 MB/s .. 214.06 MB/s]    Output: 10_000     
-k=10000 strat=posting_direct               Avg: 1.8038 GB/s     Median: 1.8433 GB/s     [1.1396 GB/s .. 1.8769 GB/s]    Output: 10_000     
-k=10000 strat=bitset_from_postings         Avg: 1.7135 GB/s     Median: 1.7177 GB/s     [1.6583 GB/s .. 1.7454 GB/s]    Output: 10_000     
-k=100000 strat=gallop                      Avg: 1.3313 GB/s     Median: 1.3340 GB/s     [1.2793 GB/s .. 1.3403 GB/s]    Output: 100_000    
-k=100000 strat=linear                      Avg: 101.80 MB/s     Median: 106.07 MB/s     [58.972 MB/s .. 106.56 MB/s]    Output: 100_000    
-k=100000 strat=posting_direct              Avg: 82.823 MB/s     Median: 87.057 MB/s     [41.503 MB/s .. 88.258 MB/s]    Output: 100_000    
-k=100000 strat=bitset_from_postings        Avg: 84.780 MB/s     Median: 86.697 MB/s     [64.059 MB/s .. 88.061 MB/s]    Output: 100_000    
+k=10 strat=gallop                          Avg: 55.754 GB/s (-0.76%)     Median: 56.023 GB/s (-0.54%)     [45.498 GB/s .. 58.016 GB/s]    Output: 10         
+k=10 strat=linear                          Avg: 272.91 MB/s (+1.08%)     Median: 273.54 MB/s (+0.65%)     [269.04 MB/s .. 274.04 MB/s]    Output: 10         
+k=10 strat=posting_direct                  Avg: 5038.8 GB/s (+1.58%)     Median: 4785.1 GB/s (+2.06%)     [4016.1 GB/s .. 6276.7 GB/s]    Output: 10         
+k=10 strat=bitset_from_postings            Avg: 213.74 GB/s (+0.87%)     Median: 214.78 GB/s (+0.59%)     [201.65 GB/s .. 216.96 GB/s]    Output: 10         
+k=100 strat=gallop                         Avg: 52.501 GB/s (-0.83%)     Median: 52.426 GB/s (-2.29%)     [49.114 GB/s .. 54.918 GB/s]    Output: 100        
+k=100 strat=linear                         Avg: 189.62 MB/s (+0.44%)     Median: 190.98 MB/s (+0.13%)     [175.34 MB/s .. 192.09 MB/s]    Output: 100        
+k=100 strat=posting_direct                 Avg: 602.96 GB/s (+0.96%)     Median: 593.78 GB/s (+0.71%)     [567.03 GB/s .. 655.52 GB/s]    Output: 100        
+k=100 strat=bitset_from_postings           Avg: 162.04 GB/s (+0.71%)     Median: 161.97 GB/s (+0.63%)     [153.14 GB/s .. 166.42 GB/s]    Output: 100        
+k=1000 strat=gallop                        Avg: 37.688 GB/s (+1.08%)     Median: 37.878 GB/s (+1.46%)     [35.330 GB/s .. 39.529 GB/s]    Output: 1_000      
+k=1000 strat=linear                        Avg: 292.74 MB/s (-0.04%)     Median: 294.64 MB/s (+0.47%)     [261.56 MB/s .. 295.25 MB/s]    Output: 1_000      
+k=1000 strat=posting_direct                Avg: 51.595 GB/s (-0.53%)     Median: 53.826 GB/s (+2.68%)     [23.622 GB/s .. 55.218 GB/s]    Output: 1_000      
+k=1000 strat=bitset_from_postings          Avg: 42.051 GB/s (+1.53%)     Median: 41.853 GB/s (+1.01%)     [39.495 GB/s .. 43.506 GB/s]    Output: 1_000      
+k=10000 strat=gallop                       Avg: 13.577 GB/s (+41.06%)    Median: 13.796 GB/s (+43.15%)    [9.7527 GB/s .. 14.019 GB/s]    Output: 10_000     
+k=10000 strat=linear                       Avg: 210.75 MB/s (-0.86%)     Median: 213.14 MB/s (-0.27%)     [188.70 MB/s .. 213.61 MB/s]    Output: 10_000     
+k=10000 strat=posting_direct               Avg: 1.9237 GB/s (+6.65%)     Median: 1.9439 GB/s (+5.45%)     [1.7529 GB/s .. 1.9824 GB/s]    Output: 10_000     
+k=10000 strat=bitset_from_postings         Avg: 1.7059 GB/s (-0.44%)     Median: 1.7146 GB/s (-0.18%)     [1.5468 GB/s .. 1.7698 GB/s]    Output: 10_000     
+k=100000 strat=gallop                      Avg: 2.4940 GB/s (+87.33%)    Median: 2.5276 GB/s (+89.48%)    [1.8146 GB/s .. 2.5458 GB/s]    Output: 100_000    
+k=100000 strat=linear                      Avg: 106.23 MB/s (+4.36%)     Median: 106.25 MB/s (+0.17%)     [105.30 MB/s .. 106.81 MB/s]    Output: 100_000    
+k=100000 strat=posting_direct              Avg: 87.913 MB/s (+6.15%)     Median: 88.172 MB/s (+1.28%)     [85.165 MB/s .. 88.951 MB/s]    Output: 100_000    
+k=100000 strat=bitset_from_postings        Avg: 87.685 MB/s (+3.43%)     Median: 87.765 MB/s (+1.23%)     [84.643 MB/s .. 88.530 MB/s]    Output: 100_000    
 n=50000000 kind=pk sort=unsorted
-k=10 strat=linear                          Avg: 269.72 MB/s     Median: 271.79 MB/s     [246.12 MB/s .. 272.61 MB/s]    Output: 10         
-k=10 strat=posting_direct                  Avg: 4954.4 GB/s     Median: 4708.1 GB/s     [2846.4 GB/s .. 6316.3 GB/s]    Output: 10         
-k=10 strat=bitset_from_postings            Avg: 209.22 GB/s     Median: 214.53 GB/s     [140.34 GB/s .. 217.39 GB/s]    Output: 10         
-k=100 strat=linear                         Avg: 189.68 MB/s     Median: 190.43 MB/s     [178.75 MB/s .. 191.70 MB/s]    Output: 100        
-k=100 strat=posting_direct                 Avg: 556.01 GB/s     Median: 594.28 GB/s     [289.29 GB/s .. 657.72 GB/s]    Output: 100        
-k=100 strat=bitset_from_postings           Avg: 153.00 GB/s     Median: 161.42 GB/s     [74.895 GB/s .. 166.18 GB/s]    Output: 100        
-k=1000 strat=linear                        Avg: 287.89 MB/s     Median: 293.17 MB/s     [232.81 MB/s .. 293.59 MB/s]    Output: 1_000      
-k=1000 strat=posting_direct                Avg: 46.603 GB/s     Median: 52.312 GB/s     [17.891 GB/s .. 54.825 GB/s]    Output: 1_000      
-k=1000 strat=bitset_from_postings          Avg: 40.795 GB/s     Median: 41.546 GB/s     [30.201 GB/s .. 43.218 GB/s]    Output: 1_000      
-k=10000 strat=linear                       Avg: 210.68 MB/s     Median: 213.64 MB/s     [171.80 MB/s .. 214.05 MB/s]    Output: 10_000     
-k=10000 strat=posting_direct               Avg: 1.7061 GB/s     Median: 1.7423 GB/s     [1.3968 GB/s .. 1.8641 GB/s]    Output: 10_000     
-k=10000 strat=bitset_from_postings         Avg: 1.6206 GB/s     Median: 1.6632 GB/s     [789.08 MB/s .. 1.9081 GB/s]    Output: 10_000     
-k=100000 strat=linear                      Avg: 100.85 MB/s     Median: 105.15 MB/s     [61.898 MB/s .. 106.59 MB/s]    Output: 100_000    
-k=100000 strat=posting_direct              Avg: 83.445 MB/s     Median: 86.454 MB/s     [69.804 MB/s .. 88.348 MB/s]    Output: 100_000    
-k=100000 strat=bitset_from_postings        Avg: 82.036 MB/s     Median: 86.133 MB/s     [55.897 MB/s .. 88.170 MB/s]    Output: 100_000    
+k=10 strat=linear                          Avg: 272.02 MB/s (+0.85%)     Median: 272.67 MB/s (+0.32%)    [257.78 MB/s .. 273.97 MB/s]    Output: 10         
+k=10 strat=posting_direct                  Avg: 5072.5 GB/s (+2.38%)     Median: 4691.3 GB/s (-0.36%)    [4095.7 GB/s .. 6329.1 GB/s]    Output: 10         
+k=10 strat=bitset_from_postings            Avg: 213.46 GB/s (+2.03%)     Median: 214.37 GB/s (-0.08%)    [188.90 GB/s .. 217.62 GB/s]    Output: 10         
+k=100 strat=linear                         Avg: 189.61 MB/s (-0.04%)     Median: 190.78 MB/s (+0.18%)    [175.06 MB/s .. 191.99 MB/s]    Output: 100        
+k=100 strat=posting_direct                 Avg: 606.49 GB/s (+9.08%)     Median: 606.30 GB/s (+2.02%)    [561.93 GB/s .. 657.46 GB/s]    Output: 100        
+k=100 strat=bitset_from_postings           Avg: 162.92 GB/s (+6.48%)     Median: 163.00 GB/s (+0.98%)    [154.39 GB/s .. 166.54 GB/s]    Output: 100        
+k=1000 strat=linear                        Avg: 294.17 MB/s (+2.18%)     Median: 294.67 MB/s (+0.51%)    [284.26 MB/s .. 295.14 MB/s]    Output: 1_000      
+k=1000 strat=posting_direct                Avg: 53.477 GB/s (+14.75%)    Median: 53.007 GB/s (+1.33%)    [51.492 GB/s .. 55.585 GB/s]    Output: 1_000      
+k=1000 strat=bitset_from_postings          Avg: 42.474 GB/s (+4.12%)     Median: 42.153 GB/s (+1.46%)    [41.708 GB/s .. 43.692 GB/s]    Output: 1_000      
+k=10000 strat=linear                       Avg: 213.32 MB/s (+1.25%)     Median: 213.58 MB/s (-0.02%)    [207.09 MB/s .. 214.33 MB/s]    Output: 10_000     
+k=10000 strat=posting_direct               Avg: 1.7959 GB/s (+5.27%)     Median: 1.7942 GB/s (+2.97%)    [1.5674 GB/s .. 2.0112 GB/s]    Output: 10_000     
+k=10000 strat=bitset_from_postings         Avg: 1.7282 GB/s (+6.64%)     Median: 1.7066 GB/s (+2.61%)    [1.6785 GB/s .. 1.8607 GB/s]    Output: 10_000     
+k=100000 strat=linear                      Avg: 105.69 MB/s (+4.80%)     Median: 106.33 MB/s (+1.13%)    [92.281 MB/s .. 106.81 MB/s]    Output: 100_000    
+k=100000 strat=posting_direct              Avg: 87.956 MB/s (+5.41%)     Median: 88.170 MB/s (+1.98%)    [82.395 MB/s .. 89.189 MB/s]    Output: 100_000    
+k=100000 strat=bitset_from_postings        Avg: 86.677 MB/s (+5.66%)     Median: 88.026 MB/s (+2.20%)    [67.241 MB/s .. 88.640 MB/s]    Output: 100_000    
 n=50000000 kind=lowfk sort=asc
-k=10 strat=gallop                          Avg: 50.423 GB/s     Median: 50.469 GB/s     [48.000 GB/s .. 51.732 GB/s]    Output: 1_000         
-k=10 strat=linear                          Avg: 273.85 MB/s     Median: 274.88 MB/s     [261.09 MB/s .. 275.83 MB/s]    Output: 1_000         
-k=10 strat=posting_direct                  Avg: 4537.2 GB/s     Median: 4305.1 GB/s     [3947.6 GB/s .. 5282.1 GB/s]    Output: 1_000         
-k=10 strat=bitset_from_postings            Avg: 206.36 GB/s     Median: 208.90 GB/s     [163.89 GB/s .. 215.00 GB/s]    Output: 1_000         
-k=100 strat=gallop                         Avg: 45.136 GB/s     Median: 45.032 GB/s     [41.637 GB/s .. 47.665 GB/s]    Output: 10_000        
-k=100 strat=linear                         Avg: 254.87 MB/s     Median: 258.58 MB/s     [194.64 MB/s .. 260.69 MB/s]    Output: 10_000        
-k=100 strat=posting_direct                 Avg: 411.07 GB/s     Median: 415.95 GB/s     [308.64 GB/s .. 450.78 GB/s]    Output: 10_000        
-k=100 strat=bitset_from_postings           Avg: 128.98 GB/s     Median: 135.14 GB/s     [80.310 GB/s .. 139.94 GB/s]    Output: 10_000        
-k=1000 strat=gallop                        Avg: 23.214 GB/s     Median: 24.315 GB/s     [10.048 GB/s .. 27.273 GB/s]    Output: 100_000       
-k=1000 strat=linear                        Avg: 268.80 MB/s     Median: 273.75 MB/s     [208.35 MB/s .. 274.94 MB/s]    Output: 100_000       
-k=1000 strat=posting_direct                Avg: 31.205 GB/s     Median: 31.408 GB/s     [26.390 GB/s .. 32.449 GB/s]    Output: 100_000       
-k=1000 strat=bitset_from_postings          Avg: 23.887 GB/s     Median: 23.939 GB/s     [22.222 GB/s .. 24.885 GB/s]    Output: 100_000       
-k=10000 strat=gallop                       Avg: 5.3852 GB/s     Median: 5.4936 GB/s     [3.3509 GB/s .. 5.6684 GB/s]    Output: 1_000_000     
-k=10000 strat=linear                       Avg: 264.38 MB/s     Median: 267.07 MB/s     [218.44 MB/s .. 268.01 MB/s]    Output: 1_000_000     
-k=10000 strat=posting_direct               Avg: 702.75 MB/s     Median: 704.62 MB/s     [685.92 MB/s .. 707.97 MB/s]    Output: 1_000_000     
-k=10000 strat=bitset_from_postings         Avg: 636.65 MB/s     Median: 659.29 MB/s     [453.78 MB/s .. 674.68 MB/s]    Output: 1_000_000     
-k=100000 strat=gallop                      Avg: 839.00 MB/s     Median: 915.55 MB/s     [481.42 MB/s .. 924.92 MB/s]    Output: 10_000_000    
-k=100000 strat=linear                      Avg: 240.33 MB/s     Median: 242.30 MB/s     [199.26 MB/s .. 244.12 MB/s]    Output: 10_000_000    
-k=100000 strat=posting_direct              Avg: 13.968 MB/s     Median: 14.014 MB/s     [12.224 MB/s .. 14.789 MB/s]    Output: 10_000_000    
-k=100000 strat=bitset_from_postings        Avg: 13.631 MB/s     Median: 14.023 MB/s     [10.428 MB/s .. 14.751 MB/s]    Output: 10_000_000    
+k=10 strat=gallop                          Avg: 52.746 GB/s (+4.61%)      Median: 53.058 GB/s (+5.13%)      [50.164 GB/s .. 54.577 GB/s]    Output: 1_000         
+k=10 strat=linear                          Avg: 275.17 MB/s (+0.48%)      Median: 275.51 MB/s (+0.23%)      [269.59 MB/s .. 276.99 MB/s]    Output: 1_000         
+k=10 strat=posting_direct                  Avg: 4537.6 GB/s (+0.01%)      Median: 4290.0 GB/s (-0.35%)      [3925.6 GB/s .. 5293.8 GB/s]    Output: 1_000         
+k=10 strat=bitset_from_postings            Avg: 210.32 GB/s (+1.92%)      Median: 211.29 GB/s (+1.14%)      [200.80 GB/s .. 214.26 GB/s]    Output: 1_000         
+k=100 strat=gallop                         Avg: 48.876 GB/s (+8.29%)      Median: 49.081 GB/s (+8.99%)      [46.627 GB/s .. 50.544 GB/s]    Output: 10_000        
+k=100 strat=linear                         Avg: 259.75 MB/s (+1.92%)      Median: 260.36 MB/s (+0.69%)      [253.66 MB/s .. 261.46 MB/s]    Output: 10_000        
+k=100 strat=posting_direct                 Avg: 471.16 GB/s (+14.62%)     Median: 467.98 GB/s (+12.51%)     [430.06 GB/s .. 500.69 GB/s]    Output: 10_000        
+k=100 strat=bitset_from_postings           Avg: 138.46 GB/s (+7.35%)      Median: 140.88 GB/s (+4.25%)      [109.22 GB/s .. 144.60 GB/s]    Output: 10_000        
+k=1000 strat=gallop                        Avg: 31.917 GB/s (+37.49%)     Median: 31.891 GB/s (+31.15%)     [29.416 GB/s .. 34.341 GB/s]    Output: 100_000       
+k=1000 strat=linear                        Avg: 274.00 MB/s (+1.93%)      Median: 274.58 MB/s (+0.30%)      [269.09 MB/s .. 275.47 MB/s]    Output: 100_000       
+k=1000 strat=posting_direct                Avg: 34.833 GB/s (+11.63%)     Median: 34.823 GB/s (+10.87%)     [32.786 GB/s .. 35.885 GB/s]    Output: 100_000       
+k=1000 strat=bitset_from_postings          Avg: 26.103 GB/s (+9.28%)      Median: 26.163 GB/s (+9.29%)      [25.175 GB/s .. 26.765 GB/s]    Output: 100_000       
+k=10000 strat=gallop                       Avg: 10.548 GB/s (+95.87%)     Median: 10.561 GB/s (+92.23%)     [10.045 GB/s .. 10.697 GB/s]    Output: 1_000_000     
+k=10000 strat=linear                       Avg: 270.23 MB/s (+2.21%)      Median: 271.63 MB/s (+1.71%)      [241.63 MB/s .. 272.58 MB/s]    Output: 1_000_000     
+k=10000 strat=posting_direct               Avg: 716.30 MB/s (+1.93%)      Median: 716.82 MB/s (+1.73%)      [705.74 MB/s .. 722.48 MB/s]    Output: 1_000_000     
+k=10000 strat=bitset_from_postings         Avg: 673.91 MB/s (+5.85%)      Median: 674.96 MB/s (+2.38%)      [656.00 MB/s .. 686.19 MB/s]    Output: 1_000_000     
+k=100000 strat=gallop                      Avg: 1.7553 GB/s (+109.22%)    Median: 1.8666 GB/s (+103.88%)    [779.52 MB/s .. 1.8866 GB/s]    Output: 10_000_000    
+k=100000 strat=linear                      Avg: 249.14 MB/s (+3.67%)      Median: 249.96 MB/s (+3.16%)      [234.21 MB/s .. 251.82 MB/s]    Output: 10_000_000    
+k=100000 strat=posting_direct              Avg: 18.658 MB/s (+33.58%)     Median: 18.658 MB/s (+33.14%)     [17.398 MB/s .. 19.359 MB/s]    Output: 10_000_000    
+k=100000 strat=bitset_from_postings        Avg: 18.468 MB/s (+35.49%)     Median: 18.477 MB/s (+31.76%)     [17.680 MB/s .. 19.229 MB/s]    Output: 10_000_000    
 n=50000000 kind=lowfk sort=unsorted
-k=10 strat=linear                          Avg: 265.39 MB/s     Median: 271.58 MB/s     [169.23 MB/s .. 272.56 MB/s]    Output: 1_000         
-k=10 strat=posting_direct                  Avg: 4449.6 GB/s     Median: 4255.7 GB/s     [2934.1 GB/s .. 5336.2 GB/s]    Output: 1_000         
-k=10 strat=bitset_from_postings            Avg: 199.79 GB/s     Median: 204.62 GB/s     [139.31 GB/s .. 213.39 GB/s]    Output: 1_000         
-k=100 strat=linear                         Avg: 250.20 MB/s     Median: 256.22 MB/s     [177.64 MB/s .. 257.67 MB/s]    Output: 10_000        
-k=100 strat=posting_direct                 Avg: 405.82 GB/s     Median: 420.23 GB/s     [273.80 GB/s .. 448.15 GB/s]    Output: 10_000        
-k=100 strat=bitset_from_postings           Avg: 125.74 GB/s     Median: 127.08 GB/s     [111.30 GB/s .. 136.92 GB/s]    Output: 10_000        
-k=1000 strat=linear                        Avg: 255.63 MB/s     Median: 257.46 MB/s     [214.33 MB/s .. 272.28 MB/s]    Output: 100_000       
-k=1000 strat=posting_direct                Avg: 29.295 GB/s     Median: 30.018 GB/s     [17.769 GB/s .. 32.027 GB/s]    Output: 100_000       
-k=1000 strat=bitset_from_postings          Avg: 22.938 GB/s     Median: 23.202 GB/s     [20.055 GB/s .. 24.631 GB/s]    Output: 100_000       
-k=10000 strat=linear                       Avg: 250.26 MB/s     Median: 252.61 MB/s     [190.35 MB/s .. 266.81 MB/s]    Output: 1_000_000     
-k=10000 strat=posting_direct               Avg: 669.63 MB/s     Median: 690.61 MB/s     [438.22 MB/s .. 720.67 MB/s]    Output: 1_000_000     
-k=10000 strat=bitset_from_postings         Avg: 655.82 MB/s     Median: 665.08 MB/s     [475.97 MB/s .. 688.36 MB/s]    Output: 1_000_000     
-k=100000 strat=linear                      Avg: 238.62 MB/s     Median: 244.30 MB/s     [152.88 MB/s .. 250.96 MB/s]    Output: 10_000_000    
-k=100000 strat=posting_direct              Avg: 14.586 MB/s     Median: 14.747 MB/s     [7.5328 MB/s .. 19.087 MB/s]    Output: 10_000_000    
-k=100000 strat=bitset_from_postings        Avg: 15.042 MB/s     Median: 15.023 MB/s     [10.463 MB/s .. 19.064 MB/s]    Output: 10_000_000    
+k=10 strat=linear                          Avg: 273.85 MB/s (+3.19%)     Median: 275.51 MB/s (+1.44%)     [242.48 MB/s .. 276.23 MB/s]    Output: 1_000         
+k=10 strat=posting_direct                  Avg: 4527.3 GB/s (+1.75%)     Median: 4277.5 GB/s (+0.51%)     [3893.8 GB/s .. 5291.0 GB/s]    Output: 1_000         
+k=10 strat=bitset_from_postings            Avg: 207.95 GB/s (+4.08%)     Median: 209.11 GB/s (+2.20%)     [199.81 GB/s .. 215.15 GB/s]    Output: 1_000         
+k=100 strat=linear                         Avg: 259.52 MB/s (+3.73%)     Median: 260.19 MB/s (+1.55%)     [252.82 MB/s .. 260.78 MB/s]    Output: 10_000        
+k=100 strat=posting_direct                 Avg: 475.25 GB/s (+17.11%)    Median: 474.79 GB/s (+12.98%)    [439.68 GB/s .. 501.23 GB/s]    Output: 10_000        
+k=100 strat=bitset_from_postings           Avg: 140.28 GB/s (+11.56%)    Median: 140.40 GB/s (+10.48%)    [129.89 GB/s .. 144.90 GB/s]    Output: 10_000        
+k=1000 strat=linear                        Avg: 272.70 MB/s (+6.68%)     Median: 275.24 MB/s (+6.91%)     [244.81 MB/s .. 275.78 MB/s]    Output: 100_000       
+k=1000 strat=posting_direct                Avg: 35.223 GB/s (+20.23%)    Median: 35.181 GB/s (+17.20%)    [34.247 GB/s .. 36.045 GB/s]    Output: 100_000       
+k=1000 strat=bitset_from_postings          Avg: 26.169 GB/s (+14.09%)    Median: 26.307 GB/s (+13.38%)    [22.147 GB/s .. 27.009 GB/s]    Output: 100_000       
+k=10000 strat=linear                       Avg: 269.21 MB/s (+7.57%)     Median: 273.04 MB/s (+8.09%)     [243.08 MB/s .. 273.73 MB/s]    Output: 1_000_000     
+k=10000 strat=posting_direct               Avg: 704.27 MB/s (+5.17%)     Median: 709.86 MB/s (+2.79%)     [662.50 MB/s .. 722.99 MB/s]    Output: 1_000_000     
+k=10000 strat=bitset_from_postings         Avg: 677.96 MB/s (+3.38%)     Median: 679.66 MB/s (+2.19%)     [627.06 MB/s .. 697.22 MB/s]    Output: 1_000_000     
+k=100000 strat=linear                      Avg: 246.41 MB/s (+3.26%)     Median: 250.02 MB/s (+2.34%)     [201.92 MB/s .. 251.61 MB/s]    Output: 10_000_000    
+k=100000 strat=posting_direct              Avg: 17.833 MB/s (+22.26%)    Median: 18.693 MB/s (+26.76%)    [11.627 MB/s .. 19.285 MB/s]    Output: 10_000_000    
+k=100000 strat=bitset_from_postings        Avg: 17.614 MB/s (+17.10%)    Median: 18.517 MB/s (+23.26%)    [12.506 MB/s .. 19.410 MB/s]    Output: 10_000_000    
 n=50000000 kind=highfk sort=asc
-k=10 strat=gallop                       Avg: 30.189 GB/s     Median: 31.453 GB/s     [13.933 GB/s .. 31.876 GB/s]    Output: 1_000_000     
-k=10 strat=linear                       Avg: 341.96 MB/s     Median: 349.61 MB/s     [254.34 MB/s .. 350.83 MB/s]    Output: 1_000_000     
-k=10 strat=posting_direct               Avg: 17.412 GB/s     Median: 19.320 GB/s     [4.3351 GB/s .. 19.412 GB/s]    Output: 1_000_000     
-k=10 strat=bitset_from_postings         Avg: 10.327 GB/s     Median: 10.326 GB/s     [10.115 GB/s .. 10.461 GB/s]    Output: 1_000_000     
-k=100 strat=gallop                      Avg: 7.6345 GB/s     Median: 7.6592 GB/s     [7.2178 GB/s .. 7.7107 GB/s]    Output: 10_000_000    
-k=100 strat=linear                      Avg: 280.71 MB/s     Median: 280.49 MB/s     [274.65 MB/s .. 286.12 MB/s]    Output: 10_000_000    
-k=100 strat=posting_direct              Avg: 1.6833 GB/s     Median: 1.6888 GB/s     [1.3586 GB/s .. 1.9123 GB/s]    Output: 10_000_000    
-k=100 strat=bitset_from_postings        Avg: 1.0586 GB/s     Median: 1.0603 GB/s     [998.65 MB/s .. 1.1016 GB/s]    Output: 10_000_000    
+k=10 strat=gallop                       Avg: 33.133 GB/s (+9.75%)     Median: 33.300 GB/s (+5.87%)     [29.339 GB/s .. 33.896 GB/s]    Output: 1_000_000     
+k=10 strat=linear                       Avg: 349.34 MB/s (+2.16%)     Median: 354.08 MB/s (+1.28%)     [305.38 MB/s .. 354.79 MB/s]    Output: 1_000_000     
+k=10 strat=posting_direct               Avg: 18.728 GB/s (+7.56%)     Median: 19.529 GB/s (+1.08%)     [8.7128 GB/s .. 19.563 GB/s]    Output: 1_000_000     
+k=10 strat=bitset_from_postings         Avg: 10.411 GB/s (+0.81%)     Median: 10.406 GB/s (+0.78%)     [10.352 GB/s .. 10.474 GB/s]    Output: 1_000_000     
+k=100 strat=gallop                      Avg: 7.5914 GB/s (-0.56%)     Median: 7.9587 GB/s (+3.91%)     [4.1988 GB/s .. 8.0084 GB/s]    Output: 10_000_000    
+k=100 strat=linear                      Avg: 282.80 MB/s (+0.74%)     Median: 282.38 MB/s (+0.67%)     [278.83 MB/s .. 290.49 MB/s]    Output: 10_000_000    
+k=100 strat=posting_direct              Avg: 1.9364 GB/s (+15.04%)    Median: 1.9398 GB/s (+14.86%)    [1.8863 GB/s .. 1.9428 GB/s]    Output: 10_000_000    
+k=100 strat=bitset_from_postings        Avg: 1.0822 GB/s (+2.23%)     Median: 1.0814 GB/s (+1.99%)     [1.0770 GB/s .. 1.0887 GB/s]    Output: 10_000_000    
 n=50000000 kind=highfk sort=unsorted
-k=10 strat=linear                       Avg: 346.31 MB/s     Median: 349.42 MB/s     [302.91 MB/s .. 350.54 MB/s]    Output: 1_000_000     
-k=10 strat=posting_direct               Avg: 19.251 GB/s     Median: 19.261 GB/s     [18.598 GB/s .. 19.388 GB/s]    Output: 1_000_000     
-k=10 strat=bitset_from_postings         Avg: 10.281 GB/s     Median: 10.322 GB/s     [8.7762 GB/s .. 10.475 GB/s]    Output: 1_000_000     
-k=100 strat=linear                      Avg: 278.70 MB/s     Median: 278.93 MB/s     [273.97 MB/s .. 281.81 MB/s]    Output: 10_000_000    
-k=100 strat=posting_direct              Avg: 1.7383 GB/s     Median: 1.7381 GB/s     [1.7029 GB/s .. 1.8066 GB/s]    Output: 10_000_000    
-k=100 strat=bitset_from_postings        Avg: 1.0449 GB/s     Median: 1.0392 GB/s     [993.82 MB/s .. 1.1037 GB/s]    Output: 10_000_000    
-
-================================================================
-threshold-tier (LowFk crossover refinement, 2026-04-29T20:35:32Z)
-added post-hoc to close the K/N in (0.001, 0.01) measurement gap
-================================================================
-
-   Compiling tantivy v0.26.0 (/Users/ruchirraj/Documents/Workplace/tantivy)
-    Finished `bench` profile [optimized + debuginfo] target(s) in 1.89s
-     Running benches/term_set_queries.rs (target/release/deps/term_set_queries-33a0ced6f9e202cb)
-threshold n=1000000 kind=lowfk sort=asc
-k=2000 strat=gallop         Avg: 1.0873 GB/s     Median: 1.2180 GB/s     [462.14 MB/s .. 1.2493 GB/s]    Output: 200_000      
-k=2000 strat=linear         Avg: 227.07 MB/s     Median: 261.78 MB/s     [100.02 MB/s .. 266.98 MB/s]    Output: 200_000      
-k=3000 strat=gallop         Avg: 742.97 MB/s     Median: 837.55 MB/s     [285.14 MB/s .. 846.74 MB/s]    Output: 300_000      
-k=3000 strat=linear         Avg: 224.75 MB/s     Median: 251.08 MB/s     [95.387 MB/s .. 257.00 MB/s]    Output: 300_000      
-k=5000 strat=gallop         Avg: 468.70 MB/s     Median: 501.84 MB/s     [261.13 MB/s .. 510.80 MB/s]    Output: 500_000      
-k=5000 strat=linear         Avg: 251.48 MB/s     Median: 251.72 MB/s     [241.90 MB/s .. 254.92 MB/s]    Output: 500_000      
-k=7000 strat=gallop         Avg: 362.48 MB/s     Median: 364.44 MB/s     [316.46 MB/s .. 367.43 MB/s]    Output: 700_000      
-k=7000 strat=linear         Avg: 241.88 MB/s     Median: 242.50 MB/s     [225.21 MB/s .. 245.66 MB/s]    Output: 700_000      
-k=10000 strat=gallop        Avg: 252.11 MB/s     Median: 256.24 MB/s     [191.15 MB/s .. 257.54 MB/s]    Output: 1_000_000    
-k=10000 strat=linear        Avg: 235.45 MB/s     Median: 237.35 MB/s     [193.09 MB/s .. 241.25 MB/s]    Output: 1_000_000    
-threshold n=10000000 kind=lowfk sort=asc
-k=30000 strat=gallop        Avg: 653.51 MB/s     Median: 663.38 MB/s     [466.21 MB/s .. 676.89 MB/s]    Output: 3_000_000    
-k=30000 strat=linear        Avg: 222.27 MB/s     Median: 244.99 MB/s     [94.985 MB/s .. 252.65 MB/s]    Output: 3_000_000    
-k=50000 strat=gallop        Avg: 394.96 MB/s     Median: 408.76 MB/s     [283.73 MB/s .. 414.73 MB/s]    Output: 5_000_000    
-k=50000 strat=linear        Avg: 232.35 MB/s     Median: 234.72 MB/s     [200.19 MB/s .. 238.38 MB/s]    Output: 5_000_000    
-k=70000 strat=gallop        Avg: 292.95 MB/s     Median: 294.20 MB/s     [282.67 MB/s .. 297.00 MB/s]    Output: 7_000_000    
-k=70000 strat=linear        Avg: 213.30 MB/s     Median: 225.10 MB/s     [121.01 MB/s .. 230.66 MB/s]    Output: 7_000_000    
+k=10 strat=linear                       Avg: 352.63 MB/s (+1.83%)     Median: 354.29 MB/s (+1.39%)     [327.01 MB/s .. 354.85 MB/s]    Output: 1_000_000     
+k=10 strat=posting_direct               Avg: 19.519 GB/s (+1.39%)     Median: 19.532 GB/s (+1.41%)     [19.420 GB/s .. 19.554 GB/s]    Output: 1_000_000     
+k=10 strat=bitset_from_postings         Avg: 10.393 GB/s (+1.08%)     Median: 10.384 GB/s (+0.60%)     [10.320 GB/s .. 10.493 GB/s]    Output: 1_000_000     
+k=100 strat=linear                      Avg: 273.64 MB/s (-1.82%)     Median: 277.78 MB/s (-0.41%)     [196.95 MB/s .. 281.67 MB/s]    Output: 10_000_000    
+k=100 strat=posting_direct              Avg: 1.9341 GB/s (+11.27%)    Median: 1.9401 GB/s (+11.62%)    [1.7793 GB/s .. 1.9413 GB/s]    Output: 10_000_000    
+k=100 strat=bitset_from_postings        Avg: 1.0826 GB/s (+3.61%)     Median: 1.0829 GB/s (+4.20%)     [1.0756 GB/s .. 1.0887 GB/s]    Output: 10_000_000    
+and_intersect n=1M kind=dense_fk (D=100)
+a=gallop b=linear        Avg: 691.88 MB/s (-0.11%)    Median: 694.87 MB/s (+0.59%)    [629.10 MB/s .. 703.86 MB/s]    Output: 22_489    
+a=linear b=linear        Avg: 212.82 MB/s (+0.30%)    Median: 212.95 MB/s (+0.23%)    [209.89 MB/s .. 214.15 MB/s]    Output: 22_489    
+and_intersect n=1M kind=sparse_pk (D=1)
+a=gallop b=linear        Avg: 2.4006 GB/s (-0.46%)    Median: 2.3953 GB/s (-0.41%)    [2.3452 GB/s .. 2.4482 GB/s]    Output: 235    
+a=linear b=linear        Avg: 163.05 MB/s (+2.80%)    Median: 163.10 MB/s (+1.43%)    [162.41 MB/s .. 163.36 MB/s]    Output: 235    
