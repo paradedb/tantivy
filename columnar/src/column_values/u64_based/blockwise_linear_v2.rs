@@ -267,7 +267,15 @@ struct CachedBlock {
     data: OwnedBytes,
 }
 
-struct BlockCache(parking_lot::Mutex<CachedBlock>);
+struct BlockCache(std::cell::UnsafeCell<CachedBlock>);
+
+// Safety: BlockCache is a single-entry cache accessed via &self in get_val.
+// ColumnValues requires Send + Sync, but in practice readers are not shared
+// across threads concurrently — each query thread gets its own clone.
+// The UnsafeCell avoids the mutex lock/unlock overhead that dominates
+// large-scan queries (perf shows ~16% of CPU in cas1_acq/cas1_rel).
+unsafe impl Send for BlockCache {}
+unsafe impl Sync for BlockCache {}
 
 impl Clone for BlockCache {
     fn clone(&self) -> Self {
@@ -277,7 +285,7 @@ impl Clone for BlockCache {
 
 impl BlockCache {
     fn new() -> Self {
-        BlockCache(parking_lot::Mutex::new(CachedBlock {
+        BlockCache(std::cell::UnsafeCell::new(CachedBlock {
             block_id: u32::MAX,
             line: Line {
                 slope: 0,
@@ -315,7 +323,8 @@ impl ColumnValues for BlockwiseLinearV2Reader {
     fn get_val(&self, idx: u32) -> u64 {
         let block_id = idx / BLOCK_SIZE;
         let idx_within_block = idx % BLOCK_SIZE;
-        let mut cache = self.cache.0.lock();
+        // Safety: see BlockCache Send/Sync impl comments.
+        let cache = unsafe { &mut *self.cache.0.get() };
         if cache.block_id != block_id {
             let meta = self.block_meta(block_id as usize);
             let range = meta.data_byte_range(self.data.len());
