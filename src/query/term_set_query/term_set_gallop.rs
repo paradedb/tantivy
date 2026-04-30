@@ -1,17 +1,17 @@
 //! Gallop strategy for `FastFieldTermSetQuery` on sorted segments.
 //!
-//! See `design.md` §2.1 for the algorithm and `implementation.md` §2.2 for the
-//! shape of `RangeUnionDocSet`. For each pruned, sort-ordered term `t`, two
-//! binary searches on the sorted column produce a half-open range
-//! `[start, end)` of DocIds whose value equals `t`. The resulting `K` ranges
-//! are emitted through `RangeUnionDocSet`, a single struct walked with one
+//! For each pruned, sort-ordered term `t`, two `gallop_search_sorted` calls
+//! on the sorted column produce a half-open range `[start, end)` of DocIds
+//! whose value equals `t`. Each call exponentially probes from the current
+//! cursor and binary-searches the bracket. The resulting `K` ranges are
+//! emitted through `RangeUnionDocSet`, a single struct walked with one
 //! cursor — no `BooleanWeight` of `Should` branches, no per-range allocation.
 //!
 //! The shrinking-window cursor (`non_null_start`) advances monotonically
 //! through DocId space because in a sorted column, larger terms map to higher
-//! DocIds (and symmetrically for DESC after `.rev()`). Each binary search is
-//! bounded above by the previous term's `end`, so the planner's claimed cost
-//! of `O(K · log(N/K))` is realistic, not `O(K · log N)`.
+//! DocIds (and symmetrically for DESC after `.rev()`). Each per-term search
+//! is bounded above by the previous term's `end`, so the planner's claimed
+//! cost of `O(K · log(N/K))` is realistic, not `O(K · log N)`.
 
 use columnar::{Cardinality, Column};
 
@@ -174,11 +174,11 @@ pub(crate) fn run(
     for &t in order_iter {
         // start = first doc whose value is at or past `t`
         // end   = first doc whose value is strictly past `t`
-        // Both calls go through gallop_search_sorted (Follow-up D landed):
-        // exponential probe from the current cursor + bounded binary search
-        // on the bracket. The gallop_helper bench tier shows 1.65–3.50× win
-        // over plain binary search across all measured (N, K) cells in the
-        // dispatch range, dominated by cache locality on the early probes.
+        // Both calls exponentially probe from `non_null_start` and binary-
+        // search the bracket; cache locality on early probes makes this
+        // 1.65–3.50× faster than plain bisection across the dispatch range
+        // (the win is empirical, not just asymptotic — see commit 73e634a3
+        // for the per-term head-to-head measurement that motivated this).
         let start =
             gallop_search_sorted(column, non_null_start, non_null_end, t, sort_order, false);
         let end =
@@ -388,7 +388,8 @@ mod gallop_tests {
         assert_eq!(docs.len(), docs_unsorted.len());
     }
 
-    /// `K = 1`: gallop degenerates to two binary searches and one range.
+    /// `K = 1`: gallop degenerates to two `gallop_search_sorted` calls
+    /// and one emitted range.
     #[test]
     fn gallop_single_term() {
         let values: Vec<u64> = (0..32).map(|i| i / 4).collect(); // 8 distinct values, 4 docs each
@@ -419,7 +420,7 @@ mod gallop_tests {
             column.get_cardinality(),
             1.0,
         );
-        // Every binary search collapses to start == end, so the ranges vec
+        // Every per-term search collapses to start == end, so the ranges vec
         // ends up empty and `run` returns EmptyScorer.
         assert_eq!(scorer.doc(), TERMINATED);
     }

@@ -11,12 +11,6 @@ pub use common::bounds::BoundsRange;
 pub use self::range_query::*;
 pub use self::range_query_fastfield::*;
 
-// Bench-only orchestration entry point. Hidden from rustdoc; exposed only so
-// `benches/term_set_queries.rs` can compare gallop vs binary-search per-term
-// search costs head-to-head (gallop_helper bench tier).
-#[doc(hidden)]
-pub use self::sorted_internals::__bench_run_k_searches;
-
 // TODO is this correct?
 pub(crate) fn is_type_valid_for_fastfield_range_query(typ: Type) -> bool {
     match typ {

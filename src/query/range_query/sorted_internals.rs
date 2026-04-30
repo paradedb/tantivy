@@ -118,11 +118,14 @@ fn go_right(val: u64, target: u64, order: Order, strict: bool) -> bool {
 /// Cost is `O(log d)` where `d` is the distance from `lo` to the answer, vs
 /// `binary_search_sorted`'s `O(log W)` over the full window.
 ///
-/// This is the per-term search used by `term_set_gallop::run` (Follow-up D
-/// landed). The `gallop_helper` bench tier shows 1.65–3.50× win over plain
-/// binary search across the measured (N, K) cells; the win is dominated by
-/// cache locality on early probes (lo+1, lo+3, lo+7 land in the same cache
-/// line as `lo`) rather than the asymptotic `log d` vs `log W` difference.
+/// Used by `term_set_gallop::run` for per-term column searches. Empirically
+/// 1.65–3.50× faster than `binary_search_sorted` on the term-set forward-
+/// cursor pattern; the win is dominated by cache locality on the early
+/// probes (`lo+1`, `lo+3`, `lo+7` land in the same cache line as `lo`)
+/// rather than the asymptotic `log d` vs `log W` difference. Whether
+/// galloping wins for other access patterns (e.g. `RangeQuery`'s sorted
+/// path, which does two unrelated searches at arbitrary bounds) is a
+/// separate question and would need its own bench gate.
 ///
 /// Falls back to `binary_search_sorted` for tiny windows (`hi - lo < 16`)
 /// where the per-step probe overhead dominates.
@@ -168,41 +171,6 @@ pub(crate) fn gallop_search_sorted(
         prev = probe;
         step = step.saturating_mul(2);
     }
-}
-
-/// Bench-only orchestration: run K successive forward-cursor searches over a
-/// sorted column, advancing `lo` to each found position. Mirrors the access
-/// pattern in `term_set_gallop::run` per-term loop. Returns an accumulator
-/// derived from each search result so the optimizer can't eliminate the
-/// calls. Hidden because it's not a stable API; exposed only so the
-/// `gallop_helper` bench tier can compare the two helpers head-to-head
-/// without exposing their full signatures.
-#[doc(hidden)]
-pub fn __bench_run_k_searches(
-    column: &Column<u64>,
-    targets_sorted: &[u64],
-    use_gallop: bool,
-) -> u64 {
-    let n = column.num_docs();
-    let mut acc: u64 = 0;
-    let mut lo: u32 = 0;
-    for &t in targets_sorted {
-        let start = if use_gallop {
-            gallop_search_sorted(column, lo, n, t, Order::Asc, false)
-        } else {
-            binary_search_sorted(column, lo, n, t, Order::Asc, false)
-        };
-        let end = if use_gallop {
-            gallop_search_sorted(column, start, n, t, Order::Asc, true)
-        } else {
-            binary_search_sorted(column, start, n, t, Order::Asc, true)
-        };
-        acc = acc.wrapping_add(start as u64).wrapping_add(end as u64);
-        // Advance the cursor — same shrinking-window pattern as
-        // term_set_gallop::run uses across successive terms.
-        lo = end;
-    }
-    acc
 }
 
 #[cfg(test)]
