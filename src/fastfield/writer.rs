@@ -246,7 +246,8 @@ impl FastFieldsWriter {
     /// Serializes all of the `FastFieldWriter`s by pushing them in
     /// order to the fast field serializer.
     pub fn serialize(
-        &mut self,
+        mut self,
+        codec_types: &[columnar::CodecType],
         wrt: &mut dyn io::Write,
         doc_id_map_opt: Option<&DocIdMapping>,
     ) -> io::Result<()> {
@@ -254,7 +255,7 @@ impl FastFieldsWriter {
         let old_to_new_row_ids =
             doc_id_map_opt.map(|doc_id_mapping| doc_id_mapping.old_to_new_ids());
         self.columnar_writer
-            .serialize(num_docs, old_to_new_row_ids, wrt)?;
+            .serialize(num_docs, old_to_new_row_ids, codec_types, wrt)?;
         Ok(())
     }
 }
@@ -422,7 +423,12 @@ mod tests {
         }
         let mut buffer = Vec::new();
         columnar_writer
-            .serialize(json_docs.len() as DocId, None, &mut buffer)
+            .serialize(
+                json_docs.len() as DocId,
+                None,
+                &columnar::DEFAULT_CODEC_TYPES,
+                &mut buffer,
+            )
             .unwrap();
         ColumnarReader::open(buffer).unwrap()
     }
