@@ -48,12 +48,12 @@
 //!
 //! # Timing boundaries
 //!
-//! Each timed closure includes the work `searcher.search` does end-to-end
-//! per call: `Term::from_field_u64` for each term, `FastFieldTermSetQuery::new`
-//! + `with_strategy_config`, the inner `query.weight()` build, per-segment
-//! `weight.scorer()` build (which runs `select_strategy`), and the
-//! collector walk. The multi-column `and_intersect` cells additionally
-//! pay one `BooleanQuery::new(...)` per iteration.
+//! Inside the timed closure (work `searcher.search` does end-to-end per call):
+//! `Term::from_field_u64` for each term; `FastFieldTermSetQuery::new` +
+//! `with_strategy_config`; the inner `query.weight()` build; per-segment
+//! `weight.scorer()` build (which runs `select_strategy`); the collector walk.
+//! Multi-column `and_intersect` cells additionally pay one `BooleanQuery::new`
+//! per iteration.
 //!
 //! Outside the timed closure (paid once per cell as setup): corpus build
 //! (schema, index, writer, all `add_document` calls, commit), reader and
