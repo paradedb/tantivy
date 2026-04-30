@@ -1,5 +1,7 @@
 //! Microbenchmarks for `FastFieldTermSetQuery` (paradedb/paradedb#4895).
 //!
+//! # Tiers
+//!
 //! Three tiers driven by the `TERM_SET_BENCH_TIER` environment variable:
 //!
 //!   - `smoke` (default, target < 60s wall-clock): N ∈ {1M},
@@ -13,15 +15,32 @@
 //!     for fine-grained crossover characterization between the full tier's
 //!     10× geometric K spacing.
 //!
-//! Captured outputs from the full and threshold tiers live in
-//! `benches/term_set_queries.full-tier.txt` and
-//! `benches/term_set_queries.threshold-tier.txt`. Re-run with
-//! `TERM_SET_BENCH_TIER=full cargo bench --bench term_set_queries 2>&1
-//! | tee benches/term_set_queries.full-tier.txt` (and analogous for
-//! threshold) when the gallop algorithm or `TermSetStrategyConfig::default()`
-//! changes meaningfully.
+//! # Corpus shapes
 //!
-//! Strategy mapping:
+//! The bench varies `D` (average documents per distinct value) across three
+//! shapes that span the customer workloads we care about:
+//!
+//!   - `PrimaryKey` (`D = 1`): `value_for_doc(d) = d`, so every doc has a
+//!     unique value. `distinct = N`. Models hash-join build sides on
+//!     unique keys (UUIDs, surrogate IDs).
+//!   - `LowFk` (`D ≈ 100`): `value_for_doc(d) = d / 100`, so each value
+//!     appears in ~100 contiguous docs after sorting. `distinct = N/100`.
+//!     Models foreign-key joins on moderate-cardinality columns —
+//!     the typical paradedb hash-join pattern.
+//!   - `HighFk` (`D ≈ 100_000`): `value_for_doc(d) = d / 100_000`.
+//!     `distinct = N/100_000`. Models very-low-cardinality columns
+//!     (status enums, region codes). Only present in the full tier at
+//!     `N ≥ 10M` where there are enough distinct values to sample from.
+//!
+//! D shape matters for strategy choice: with `LowFk`, gallop emits ~D docs
+//! per term through `RangeUnionDocSet`, which adds linear-equivalent cost
+//! on top of the per-term search. PK doesn't pay that emission cost
+//! (single-doc ranges). The `gallop_max_density` default is tuned to
+//! LowFk because that's the dominant customer shape; PK queries with
+//! K/N just above the threshold underutilize gallop slightly as a
+//! tradeoff.
+//!
+//! # Strategy mapping
 //!
 //!   - `Gallop`: planner forced via `gallop_max_density = 1.0` so any K < N qualifies.
 //!   - `Linear`: planner forced to terminal `LinearScan` via
@@ -33,6 +52,47 @@
 //!     materialize matched DocIds into a `BitSet` and iterate. Strategy 3 in
 //!     production isn't implemented yet; this captures bitset construction +
 //!     iteration cost on top of posting-list iteration.
+//!
+//! # Timing boundaries
+//!
+//! Each timed closure includes the work `searcher.search` does end-to-end
+//! per call: `Term::from_field_u64` for each term, `FastFieldTermSetQuery::new`
+//! + `with_strategy_config`, the inner `query.weight()` build, per-segment
+//! `weight.scorer()` build (which runs `select_strategy`), and the
+//! collector walk. The multi-column `and_intersect` cells additionally
+//! pay one `BooleanQuery::new(...)` per iteration.
+//!
+//! Outside the timed closure (paid once per cell as setup): corpus build
+//! (schema, index, writer, all `add_document` calls, commit), reader and
+//! `Searcher` instantiation, and the deterministic `sample_terms` shuffle.
+//! Only the raw `Vec<u64>` of sampled values is captured into the closure;
+//! `Term::from_field_u64` runs per iteration.
+//!
+//! For cells with K ≥ ~1_000 the per-iteration construction cost is a
+//! small fraction of total work (≤ ~5–10%), so the reported throughput
+//! reflects scoring-loop performance. For very small K (10, 100) the
+//! construction overhead is a larger fraction and binggan's
+//! input-size-divided-by-time formula reaches artifact territory when
+//! iterations finish in microseconds — relative ratios between strategies
+//! at the same cell remain meaningful but absolute throughput numbers
+//! below ~10ms are not reliable.
+//!
+//! # Captured outputs
+//!
+//! Captured outputs from the full and threshold tiers live in
+//! `benches/term_set_queries.full-tier.txt` and
+//! `benches/term_set_queries.threshold-tier.txt`. Re-run with
+//!
+//! ```text
+//! TERM_SET_BENCH_TIER=full      cargo bench --bench term_set_queries 2>&1 \
+//!     | tee benches/term_set_queries.full-tier.txt
+//! TERM_SET_BENCH_TIER=threshold cargo bench --bench term_set_queries 2>&1 \
+//!     | tee benches/term_set_queries.threshold-tier.txt
+//! ```
+//!
+//! when the gallop algorithm or `TermSetStrategyConfig::default()`
+//! changes meaningfully. Comment-only and test-only changes don't
+//! warrant a refresh.
 
 use binggan::{black_box, BenchRunner};
 use common::BitSet;
