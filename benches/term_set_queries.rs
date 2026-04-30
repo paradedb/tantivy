@@ -492,7 +492,7 @@ fn main() {
 
     // Multi-column AND-intersection cells. Probes the smart-seek win on the
     // linear-scan path: column A is sorted (gallop), column B is unsorted
-    // (linear) — BooleanQuery::Must of two FastFieldTermSetQuerys. With the
+    // (linear) — BooleanQuery::Must of two FastFieldTermSetQueries. With the
     // trait-default seek, column B's per-`seek(target)` walk dilutes
     // column A's gallop selectivity; with the smart-seek override on
     // TermSetDocSet, column B jumps directly to each target.
