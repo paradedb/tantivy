@@ -14,7 +14,7 @@ use rand::rngs::StdRng;
 use tantivy::collector::DocSetCollector;
 use tantivy::query::{BooleanQuery, FastFieldTermSetQuery, Occur, Query, TermSetStrategyConfig};
 use tantivy::schema::{NumericOptions, SchemaBuilder};
-use tantivy::{Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher, Term, doc};
+use tantivy::{doc, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher, Term};
 
 #[derive(Clone, Copy, Debug)]
 enum CorpusKind {

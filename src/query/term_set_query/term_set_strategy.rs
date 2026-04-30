@@ -20,14 +20,14 @@
 //! to `LinearScan` until follow-ups A and B fill them in, the bias is
 //! invisible at runtime and only shows up in unit tests on the planner.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use columnar::{Cardinality, Column};
 use rustc_hash::FxHashSet;
 
-use crate::Order;
 use crate::index::SegmentReader;
+use crate::Order;
 
 /// Numeric tags for the chosen strategy. Used by the optional
 /// `TermSetStrategyConfig::strategy_sink` so consumers (paradedb) can surface
@@ -432,8 +432,8 @@ mod tests {
     }
 
     #[test]
-    fn select_returns_bitset_from_postings_when_subsequent_column_kd_below_threshold_planner_shape_only()
-     {
+    fn select_returns_bitset_from_postings_when_subsequent_column_kd_below_threshold_planner_shape_only(
+    ) {
         // Subsequent column: K·D / C < subsequent_bitset_max_density.
         // N = 4096. C = 1024 → C/N = 0.25 ≥ hash_probe_max_density (0.0625),
         // so the HashProbe gate is bypassed.
@@ -567,8 +567,8 @@ mod tests {
     /// semantics).
     #[test]
     fn select_writes_chosen_tag_to_strategy_sink() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc;
 
         let n: u64 = 4096;
         let sink = Arc::new(AtomicU8::new(strategy_tag::NONE));

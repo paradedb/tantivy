@@ -15,7 +15,7 @@ use rand::rngs::StdRng;
 use tantivy::collector::DocSetCollector;
 use tantivy::query::{FastFieldTermSetQuery, TermSetStrategyConfig};
 use tantivy::schema::{NumericOptions, SchemaBuilder};
-use tantivy::{Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher, Term, doc};
+use tantivy::{doc, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher, Term};
 
 fn cfg_gallop() -> TermSetStrategyConfig {
     TermSetStrategyConfig {

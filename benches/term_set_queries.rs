@@ -87,19 +87,19 @@
 //! changes meaningfully. Comment-only and test-only changes don't
 //! warrant a refresh.
 
-use binggan::{BenchRunner, black_box};
+use binggan::{black_box, BenchRunner};
 use common::BitSet;
-use rand::SeedableRng;
 use rand::prelude::*;
 use rand::rngs::StdRng;
+use rand::SeedableRng;
 use tantivy::collector::{Collector, Count, DocSetCollector, SegmentCollector};
 use tantivy::query::{
     BooleanQuery, FastFieldTermSetQuery, Occur, Query, TermQuery, TermSetStrategyConfig, Weight,
 };
 use tantivy::schema::{IndexRecordOption, NumericOptions, SchemaBuilder};
 use tantivy::{
-    DocId, DocSet, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher,
-    SegmentOrdinal, SegmentReader, Term, doc,
+    doc, DocId, DocSet, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher,
+    SegmentOrdinal, SegmentReader, Term,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

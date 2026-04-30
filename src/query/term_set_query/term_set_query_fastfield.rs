@@ -5,14 +5,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::term_set_gallop;
 use super::term_set_strategy::{
-    PlannerInputs, TermSetStrategy, TermSetStrategyConfig, select_strategy,
+    select_strategy, PlannerInputs, TermSetStrategy, TermSetStrategyConfig,
 };
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{
     BooleanWeight, ConstScorer, EmptyScorer, EnableScoring, Explanation, Occur, Query, Scorer,
     Weight,
 };
-use crate::{DocId, DocSet, Score, SegmentReader, TERMINATED, TantivyError, Term};
+use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term, TERMINATED};
 
 // --- FastFieldTermSetQuery ---
 #[derive(Debug, Clone)]
@@ -349,7 +349,7 @@ mod tests {
     use super::FastFieldTermSetQuery;
     use crate::collector::{Count, TopDocs};
     use crate::query::QueryParser;
-    use crate::schema::{FAST, INDEXED, IntoIpv6Addr, STRING, Schema, TEXT};
+    use crate::schema::{IntoIpv6Addr, Schema, FAST, INDEXED, STRING, TEXT};
     use crate::{Index, IndexWriter, Term};
 
     fn create_test_index() -> crate::Result<Index> {
