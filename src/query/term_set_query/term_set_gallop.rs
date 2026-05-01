@@ -154,42 +154,27 @@ pub(crate) fn run(
     // Walk terms in the order that the column is sorted in. For ASC the input
     // `sorted_terms` is already ascending; for DESC we iterate it in reverse
     // so that the next matching term lives at higher DocIds than the previous
-    // one — `non_null_start` always increases.
+    // one — `non_null_start` always increases. The per-term loop is a generic
+    // function so the compiler monomorphizes once per concrete iterator type
+    // (no `Box<dyn Iterator>`, no dynamic dispatch in the hot path).
     let mut ranges: Vec<(DocId, DocId)> = Vec::with_capacity(sorted_terms.len());
-    let order_iter: Box<dyn Iterator<Item = &u64>> = match sort_order {
-        Order::Asc => Box::new(sorted_terms.iter()),
-        Order::Desc => Box::new(sorted_terms.iter().rev()),
-    };
-
-    for &t in order_iter {
-        // start = first doc whose value is at or past `t`
-        // end   = first doc whose value is strictly past `t`
-        // Both calls exponentially probe from `non_null_start` and binary-
-        // search the bracket; cache locality on early probes makes this
-        // faster than plain bisection across the dispatch range.
-        let start =
-            gallop_search_sorted(column, non_null_start, non_null_end, t, sort_order, false);
-        let end = gallop_search_sorted(column, non_null_start, non_null_end, t, sort_order, true);
-
-        if start >= end {
-            // Term absent from the column: `end` is the insertion point.
-            // Every doc < end has value < t (ASC) or > t (DESC), so future
-            // searches for larger terms cannot match there. Advance the
-            // window before continuing; otherwise we re-scan the same
-            // eliminated prefix per term.
-            non_null_start = end;
-            if non_null_start >= non_null_end {
-                break;
-            }
-            continue;
-        }
-
-        non_null_start = end;
-        ranges.push((start, end));
-
-        if non_null_start >= non_null_end {
-            break;
-        }
+    match sort_order {
+        Order::Asc => fill_ranges(
+            sorted_terms.iter(),
+            column,
+            &mut non_null_start,
+            non_null_end,
+            sort_order,
+            &mut ranges,
+        ),
+        Order::Desc => fill_ranges(
+            sorted_terms.iter().rev(),
+            column,
+            &mut non_null_start,
+            non_null_end,
+            sort_order,
+            &mut ranges,
+        ),
     }
 
     if ranges.is_empty() {
@@ -197,6 +182,48 @@ pub(crate) fn run(
     }
 
     Box::new(ConstScorer::new(RangeUnionDocSet::new(ranges), boost))
+}
+
+/// Per-term gallop loop, monomorphized over the concrete iterator type so
+/// the ASC and DESC dispatch paths each get their own specialized version.
+fn fill_ranges<'a, I: Iterator<Item = &'a u64>>(
+    sorted_terms_iter: I,
+    column: &Column<u64>,
+    non_null_start: &mut DocId,
+    non_null_end: DocId,
+    sort_order: Order,
+    ranges: &mut Vec<(DocId, DocId)>,
+) {
+    for &t in sorted_terms_iter {
+        // start = first doc whose value is at or past `t`
+        // end   = first doc whose value is strictly past `t`
+        // Both calls exponentially probe from `*non_null_start` and binary-
+        // search the bracket; cache locality on early probes makes this
+        // faster than plain bisection across the dispatch range.
+        let start =
+            gallop_search_sorted(column, *non_null_start, non_null_end, t, sort_order, false);
+        let end = gallop_search_sorted(column, *non_null_start, non_null_end, t, sort_order, true);
+
+        if start >= end {
+            // Term absent from the column: `end` is the insertion point.
+            // Every doc < end has value < t (ASC) or > t (DESC), so future
+            // searches for larger terms cannot match there. Advance the
+            // window before continuing; otherwise we re-scan the same
+            // eliminated prefix per term.
+            *non_null_start = end;
+            if *non_null_start >= non_null_end {
+                break;
+            }
+            continue;
+        }
+
+        *non_null_start = end;
+        ranges.push((start, end));
+
+        if *non_null_start >= non_null_end {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
