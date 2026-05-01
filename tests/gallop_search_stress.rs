@@ -10,8 +10,7 @@
 //! at `sorted_internals::gallop_tests`, where both `pub(crate)` helpers
 //! are reachable.
 
-use rand::prelude::*;
-use rand::rngs::StdRng;
+use proptest::prelude::*;
 use tantivy::collector::DocSetCollector;
 use tantivy::query::{FastFieldTermSetQuery, TermSetStrategyConfig};
 use tantivy::schema::{NumericOptions, SchemaBuilder};
@@ -37,14 +36,10 @@ fn cfg_linear() -> TermSetStrategyConfig {
     }
 }
 
-fn build_sorted_index(
-    n: usize,
-    seed: u64,
-    spread: u64,
+fn build_sorted_index_from_values(
+    values: &[u64],
     order: Order,
 ) -> (Searcher, tantivy::schema::Field) {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut values: Vec<u64> = (0..n).map(|_| rng.random_range(0..spread)).collect();
     let mut sb = SchemaBuilder::new();
     let f = sb.add_u64_field("v", NumericOptions::default().set_fast().set_indexed());
     let schema = sb.build();
@@ -60,9 +55,7 @@ fn build_sorted_index(
         .create_in_ram()
         .unwrap();
     let mut writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
-    // Avoid sorting locally — let the index sort it, matching production.
-    values.shuffle(&mut rng);
-    for v in values {
+    for &v in values {
         writer.add_document(doc!(f => v)).unwrap();
     }
     writer.commit().unwrap();
@@ -92,61 +85,59 @@ fn collect(
     docs
 }
 
-#[test]
-fn gallop_path_matches_linear_path_across_random_corpora() {
-    // 4 (size, seed, spread, order) configurations. For each: 50 random
-    // single-value queries (some in-range, some out). Total ~200
-    // single-query comparisons; the gallop and linear strategies must
-    // return identical DocId sets on each.
-    let corpora: &[(usize, u64, u64, Order)] = &[
-        (32, 1, 100, Order::Asc),
-        (1024, 2, 1_000, Order::Asc),
-        (10_000, 3, 5_000, Order::Asc),
-        (100_000, 4, 50_000, Order::Asc),
-        (32, 5, 100, Order::Desc),
-        (1024, 6, 1_000, Order::Desc),
-        (10_000, 7, 5_000, Order::Desc),
-    ];
-
-    for &(n, seed, spread, order) in corpora {
-        let (searcher, f) = build_sorted_index(n, seed, spread, order);
-        let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(31));
-        for _ in 0..50 {
-            // Random target: half in-range, quarter below, quarter above.
-            let target: u64 = match rng.random_range(0..4) {
-                0 => 0,
-                1 => spread.saturating_add(1000),
-                _ => rng.random_range(0..spread),
-            };
-            let gallop_docs = collect(&searcher, f, target, cfg_gallop());
-            let linear_docs = collect(&searcher, f, target, cfg_linear());
-            assert_eq!(
-                gallop_docs, linear_docs,
-                "differential mismatch: corpus(n={n}, seed={seed}, spread={spread}, \
-                 order={order:?}) target={target}",
-            );
-        }
-    }
+// Strategy: random sorted corpus values, ASC or DESC. Bounded so each
+// proptest case stays cheap (Index build dominates per-case cost).
+fn corpus_values_strategy() -> impl Strategy<Value = Vec<u64>> {
+    proptest::collection::vec(0u64..5000, 32usize..2000)
 }
 
-#[test]
-fn gallop_path_matches_linear_path_on_multi_term_queries() {
-    // Multi-term sweep: pick K=20 distinct values, run both strategies,
-    // assert identical DocId vectors. Exercises the per-term loop in
-    // term_set_gallop::run.
-    let (searcher, f) = build_sorted_index(5_000, 42, 2_000, Order::Asc);
-    let mut rng = StdRng::seed_from_u64(43);
-    for trial in 0..10 {
-        let mut terms: Vec<u64> = (0..20).map(|_| rng.random_range(0..2_000u64)).collect();
-        terms.sort();
+fn order_strategy() -> impl Strategy<Value = Order> {
+    prop_oneof![Just(Order::Asc), Just(Order::Desc)]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 32, ..Default::default() })]
+
+    /// Differential: single-term gallop vs linear must agree across random
+    /// sorted corpora and random target values (some in-range, some out).
+    #[test]
+    fn prop_gallop_matches_linear_path_across_random_corpora(
+        values in corpus_values_strategy(),
+        order in order_strategy(),
+        target in 0u64..6000,
+    ) {
+        let (searcher, f) = build_sorted_index_from_values(&values, order);
+        let gallop_docs = collect(&searcher, f, target, cfg_gallop());
+        let linear_docs = collect(&searcher, f, target, cfg_linear());
+        prop_assert_eq!(
+            gallop_docs, linear_docs,
+            "differential mismatch: order={:?} target={}",
+            order, target
+        );
+    }
+
+    /// Multi-term differential: a TermSetQuery with K distinct terms must
+    /// produce identical DocId sets under gallop and linear strategies.
+    /// Exercises the per-term loop in term_set_gallop::run.
+    #[test]
+    fn prop_gallop_matches_linear_path_on_multi_term_queries(
+        values in corpus_values_strategy(),
+        order in order_strategy(),
+        terms_raw in proptest::collection::vec(0u64..6000, 1usize..30),
+    ) {
+        let (searcher, f) = build_sorted_index_from_values(&values, order);
+        let mut terms = terms_raw;
+        terms.sort_unstable();
         terms.dedup();
 
-        let q_gallop =
-            FastFieldTermSetQuery::new(terms.iter().map(|v| Term::from_field_u64(f, *v)))
-                .with_strategy_config(cfg_gallop());
-        let q_linear =
-            FastFieldTermSetQuery::new(terms.iter().map(|v| Term::from_field_u64(f, *v)))
-                .with_strategy_config(cfg_linear());
+        let q_gallop = FastFieldTermSetQuery::new(
+            terms.iter().map(|v| Term::from_field_u64(f, *v)),
+        )
+        .with_strategy_config(cfg_gallop());
+        let q_linear = FastFieldTermSetQuery::new(
+            terms.iter().map(|v| Term::from_field_u64(f, *v)),
+        )
+        .with_strategy_config(cfg_linear());
 
         let mut g: Vec<u32> = searcher
             .search(&q_gallop, &DocSetCollector)
@@ -162,6 +153,6 @@ fn gallop_path_matches_linear_path_on_multi_term_queries() {
             .collect();
         g.sort_unstable();
         l.sort_unstable();
-        assert_eq!(g, l, "multi-term mismatch trial={trial}");
+        prop_assert_eq!(g, l, "multi-term mismatch");
     }
 }

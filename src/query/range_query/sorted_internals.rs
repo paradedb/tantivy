@@ -349,63 +349,44 @@ mod gallop_tests {
         }
     }
 
-    /// Randomized differential: drive both helpers with the same inputs
-    /// across many random configurations and assert agreement.
-    /// Complements the hand-written cases above — they pin specific
-    /// edge-cases; this one catches regressions in unanticipated regions
-    /// of the (lo, hi, target, order, strict) input space.
-    #[test]
-    fn randomized_differential_against_binary_search() {
-        use rand::prelude::*;
-        use rand::rngs::StdRng;
-
-        // Build several sorted corpora of varying size and value spread.
-        let configs: &[(u32, u64, Order)] = &[
-            (32, 100, Order::Asc),
-            (256, 500, Order::Asc),
-            (1024, 1000, Order::Asc),
-            (4096, 2000, Order::Asc),
-            (256, 500, Order::Desc),
-            (1024, 1000, Order::Desc),
-        ];
-
-        for &(n, spread, order) in configs {
-            // Generate a sorted column.
-            let mut rng = StdRng::seed_from_u64(u64::from(n).wrapping_mul(spread));
-            let mut values: Vec<u64> = (0..n).map(|_| rng.random_range(0..spread)).collect();
-            // Index sorts internally; just feed the unsorted vec.
+    // Randomized differential: drive both helpers with the same inputs
+    // across many random configurations and assert agreement.
+    // Complements the hand-written cases above — they pin specific
+    // edge-cases; this one catches regressions in unanticipated regions
+    // of the (lo, hi, target, order, strict) input space.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig { cases: 64, ..Default::default() })]
+        #[test]
+        fn prop_gallop_matches_binary_search(
+            // Up to 1024 values in [0, spread). spread bounded so the column
+            // build stays cheap; the input space still covers ASC/DESC,
+            // dense/sparse spread, and full input boundaries.
+            values in proptest::collection::vec(0u64..2000, 1usize..1024),
+            order in proptest::prop_oneof![
+                proptest::prelude::Just(Order::Asc),
+                proptest::prelude::Just(Order::Desc),
+            ],
+            // (lo, hi) sampled with hi >= lo enforced inside the body.
+            lo_raw in 0u32..1024,
+            hi_raw in 0u32..1025,
+            target in 0u64..2100,
+            strict in proptest::prelude::any::<bool>(),
+        ) {
             let column = build_sorted_column(&values, order);
-
-            // Sort our local copy so we can pick a representative target.
-            match order {
-                Order::Asc => values.sort_unstable(),
-                Order::Desc => values.sort_unstable_by(|a, b| b.cmp(a)),
+            let n = values.len() as u32;
+            // Clamp to the actual column size and order lo <= hi.
+            let mut lo = lo_raw.min(n);
+            let mut hi = hi_raw.min(n);
+            if lo > hi {
+                std::mem::swap(&mut lo, &mut hi);
             }
-
-            // Drive the helpers with random (lo, hi, target, strict) tuples.
-            for _ in 0..200 {
-                let mut lo = rng.random_range(0..n);
-                let mut hi = rng.random_range(0..=n);
-                if lo > hi {
-                    std::mem::swap(&mut lo, &mut hi);
-                }
-                // Mix of in-range, out-of-range, and boundary targets.
-                let target: u64 = match rng.random_range(0..5) {
-                    0 => 0,                                         // before
-                    1 => spread.saturating_add(100),                // after
-                    2 => values[rng.random_range(0..values.len())], // present
-                    _ => rng.random_range(0..spread),               // probably present
-                };
-                for &strict in &[false, true] {
-                    let bin = binary_search_sorted(&column, lo, hi, target, order, strict);
-                    let gal = gallop_search_sorted(&column, lo, hi, target, order, strict);
-                    assert_eq!(
-                        gal, bin,
-                        "differential mismatch: n={n} spread={spread} order={order:?} lo={lo} \
-                         hi={hi} target={target} strict={strict}",
-                    );
-                }
-            }
+            let bin = binary_search_sorted(&column, lo, hi, target, order, strict);
+            let gal = gallop_search_sorted(&column, lo, hi, target, order, strict);
+            proptest::prop_assert_eq!(
+                gal, bin,
+                "differential mismatch: order={:?} lo={} hi={} target={} strict={}",
+                order, lo, hi, target, strict
+            );
         }
     }
 
