@@ -191,6 +191,15 @@ fn test_small_blockwise_linear_example() {
     );
 }
 
+#[cfg(feature = "paradedb")]
+#[test]
+fn test_small_blockwise_linear_v2_example() {
+    create_and_validate::<BlockwiseLinearV2Codec>(
+        &[9223372036854775808, 9223370937344622593],
+        "proptest multilinearinterpol v2",
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
 
@@ -309,6 +318,23 @@ fn estimation_good_interpolation_case() {
     assert_lt!(linear_interpol_estimation, bitpacked_estimation);
 }
 
+#[cfg(feature = "paradedb")]
+#[test]
+fn estimation_good_interpolation_case_v2() {
+    let data = (10..=20000_u64).collect::<Vec<_>>();
+
+    let linear_interpol_estimation = estimate::<LinearCodec>(&data).unwrap();
+    assert_le!(linear_interpol_estimation, 0.01);
+
+    let multi_linear_interpol_v2_estimation =
+        estimate::<BlockwiseLinearV2Codec>(&data).unwrap();
+    assert_le!(multi_linear_interpol_v2_estimation, 0.2);
+    assert_lt!(linear_interpol_estimation, multi_linear_interpol_v2_estimation);
+
+    let bitpacked_estimation = estimate::<BitpackedCodec>(&data).unwrap();
+    assert_lt!(linear_interpol_estimation, bitpacked_estimation);
+}
+
 #[test]
 fn estimation_test_bad_interpolation_case_monotonically_increasing() {
     let mut data: Vec<u64> = (201..=20000_u64).collect();
@@ -316,6 +342,20 @@ fn estimation_test_bad_interpolation_case_monotonically_increasing() {
 
     // in this case the linear interpolation can't in fact not be worse than bitpacking,
     // but the estimator adds some threshold, which leads to estimated worse behavior
+    let linear_interpol_estimation = estimate::<LinearCodec>(&data[..]).unwrap();
+    assert_le!(linear_interpol_estimation, 0.35);
+
+    let bitpacked_estimation = estimate::<BitpackedCodec>(&data).unwrap();
+    assert_le!(bitpacked_estimation, 0.32);
+    assert_le!(bitpacked_estimation, linear_interpol_estimation);
+}
+
+#[cfg(feature = "paradedb")]
+#[test]
+fn estimation_test_bad_interpolation_case_monotonically_increasing_v2() {
+    let mut data: Vec<u64> = (201..=20000_u64).collect();
+    data.push(1_000_000);
+
     let linear_interpol_estimation = estimate::<LinearCodec>(&data[..]).unwrap();
     assert_le!(linear_interpol_estimation, 0.35);
 
