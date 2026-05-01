@@ -111,6 +111,13 @@ fn go_right(val: u64, target: u64, order: Order, strict: bool) -> bool {
     }
 }
 
+/// Stack buffer size for the small-window fallback in
+/// [`gallop_search_sorted`]. Windows of `hi - lo <= SMALL_WINDOW_THRESHOLD`
+/// are batch-fetched into the buffer in one `ColumnValues::get_range` call
+/// and linearly scanned, instead of doing per-element virtual dispatch via
+/// `Column::first` from inside `binary_search_sorted`.
+const SMALL_WINDOW_THRESHOLD: usize = 32;
+
 /// Two-phase galloping search over a sorted column. Phase 1 exponentially
 /// probes from `lo` until the value crosses `target`; phase 2 binary-
 /// searches inside the bracketed interval.
@@ -120,8 +127,9 @@ fn go_right(val: u64, target: u64, order: Order, strict: bool) -> bool {
 /// Faster than a window-midpoint bisection on the term-set forward-cursor
 /// pattern (1.65–3.50× over `binary_search_sorted` per measurement)
 /// because the early probes share a cache line with `lo` while bisection
-/// misses cache on the first probe. Falls back to plain binary search
-/// when `hi - lo < 16`.
+/// misses cache on the first probe. Small windows
+/// (`hi - lo <= SMALL_WINDOW_THRESHOLD`) are handled by a batch-fetch into
+/// a stack buffer + linear scan, eliminating per-element virtual dispatch.
 pub(crate) fn gallop_search_sorted(
     column: &Column<u64>,
     lo: u32,
@@ -130,11 +138,33 @@ pub(crate) fn gallop_search_sorted(
     order: Order,
     strict: bool,
 ) -> u32 {
-    // Small-window fallback. With < 16 elements binary search does at most
-    // 4 comparisons; galloping pays one column read + branch per probe and
-    // can easily exceed that on tiny ranges.
-    if hi.saturating_sub(lo) < 16 {
-        return binary_search_sorted(column, lo, hi, target, order, strict);
+    // Small-window fallback. Batch-fetch the entire window into a stack
+    // buffer via `Column::first_vals` and linearly scan for the predicate
+    // flip. `first_vals` handles the DocId → values-index mapping per
+    // cardinality (identity for Full, optional-index lookup for Optional),
+    // so this is correct on either. On Full columns the values fetch is
+    // SIMD-style chunked, eliminating per-element virtual dispatch on the
+    // hot path. On Optional columns it's per-docid (same cost as the prior
+    // `binary_search_sorted` fallback) but correctness is preserved.
+    let window = hi.saturating_sub(lo) as usize;
+    if window <= SMALL_WINDOW_THRESHOLD {
+        if window == 0 {
+            return hi;
+        }
+        let mut docids = [0u32; SMALL_WINDOW_THRESHOLD];
+        let mut vals = [None::<u64>; SMALL_WINDOW_THRESHOLD];
+        for i in 0..window {
+            docids[i] = lo + i as u32;
+        }
+        column.first_vals(&docids[..window], &mut vals[..window]);
+        for i in 0..window {
+            // Safe: caller guarantees `[lo, hi)` is non-NULL.
+            let val = vals[i].expect("doc in non-NULL range has no value");
+            if !go_right(val, target, order, strict) {
+                return lo + i as u32;
+            }
+        }
+        return hi;
     }
 
     // Phase 1 — exponential probe. Maintain `prev` (last index known to be in
@@ -346,6 +376,30 @@ mod gallop_tests {
         for &target in &[0u64, 1, 2, 16, 17, 100, 500, 800, 999, 1000, 9999] {
             assert_agrees(&col, 0, 1000, target, Order::Asc, false);
             assert_agrees(&col, 0, 1000, target, Order::Asc, true);
+        }
+    }
+
+    /// `SMALL_WINDOW_THRESHOLD` is the boundary where `gallop_search_sorted`
+    /// switches between batch-fetch + linear scan (small windows) and the
+    /// exponential-probe phase (large windows). Both code paths must agree
+    /// with `binary_search_sorted` ground truth across this boundary; this
+    /// test pins that contract on window sizes that span the threshold.
+    #[test]
+    fn batch_fetch_matches_binary_search_at_window_boundaries() {
+        // 100-element column lets us exercise window sizes from 1 up past
+        // the threshold (32) and into the gallop-phase regime.
+        let vals: Vec<u64> = (0..100).collect();
+        for &order in &[Order::Asc, Order::Desc] {
+            let col = build_sorted_column(&vals, order);
+            for &window_size in &[1u32, 2, 8, 15, 16, 31, 32, 33, 64] {
+                // Targets cover before, after, exact, and near-boundary values.
+                for &target in &[0u64, 1, 5, 50, 99, 100, 200] {
+                    let lo = 0u32;
+                    let hi = window_size;
+                    assert_agrees(&col, lo, hi, target, order, false);
+                    assert_agrees(&col, lo, hi, target, order, true);
+                }
+            }
         }
     }
 
