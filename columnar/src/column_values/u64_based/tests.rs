@@ -176,6 +176,11 @@ proptest! {
         create_and_validate::<BlockwiseLinearCodec>(&data, "proptest multilinearinterpol");
     }
 
+    #[cfg(feature = "paradedb")]
+    #[test]
+    fn test_proptest_small_blockwise_linear_v2(data in proptest::collection::vec(num_strategy(), 1..10)) {
+        create_and_validate::<BlockwiseLinearV2Codec>(&data, "proptest multilinearinterpol v2");
+    }
 }
 
 #[test]
@@ -204,6 +209,11 @@ proptest! {
         create_and_validate::<BlockwiseLinearCodec>(&data, "proptest multilinearinterpol");
     }
 
+    #[cfg(feature = "paradedb")]
+    #[test]
+    fn test_proptest_large_blockwise_linear_v2(data in proptest::collection::vec(num_strategy(), 1..6000)) {
+        create_and_validate::<BlockwiseLinearV2Codec>(&data, "proptest multilinearinterpol v2");
+    }
 }
 
 fn num_strategy() -> impl Strategy<Value = u64> {
@@ -260,6 +270,12 @@ fn test_codec_interpolation() {
 fn test_codec_multi_interpolation() {
     test_codec::<BlockwiseLinearCodec>();
 }
+#[cfg(feature = "paradedb")]
+#[test]
+fn test_codec_multi_interpolation_v2() {
+    test_codec::<BlockwiseLinearV2Codec>();
+}
+
 use super::*;
 
 fn estimate<C: ColumnCodec>(vals: &[u64]) -> Option<f32> {
@@ -317,6 +333,9 @@ fn test_fast_field_codec_type_to_code() {
             count_codec += 1;
         }
     }
+    #[cfg(feature = "paradedb")]
+    assert_eq!(count_codec, 4);
+    #[cfg(not(feature = "paradedb"))]
     assert_eq!(count_codec, 3);
 }
 
@@ -353,11 +372,14 @@ fn test_fastfield_gcd_i64_with_codec(codec_type: CodecType, num_vals: usize) -> 
 
 #[test]
 fn test_fastfield_gcd_i64() -> io::Result<()> {
-    for &codec_type in &[
+    let mut codec_types = vec![
         CodecType::Bitpacked,
         CodecType::BlockwiseLinear,
         CodecType::Linear,
-    ] {
+    ];
+    #[cfg(feature = "paradedb")]
+    codec_types.push(CodecType::BlockwiseLinearV2);
+    for &codec_type in &codec_types {
         test_fastfield_gcd_i64_with_codec(codec_type, 5500)?;
     }
     Ok(())
@@ -395,11 +417,14 @@ fn test_fastfield_gcd_u64_with_codec(codec_type: CodecType, num_vals: usize) -> 
 
 #[test]
 fn test_fastfield_gcd_u64() -> io::Result<()> {
-    for &codec_type in &[
+    let mut codec_types = vec![
         CodecType::Bitpacked,
         CodecType::BlockwiseLinear,
         CodecType::Linear,
-    ] {
+    ];
+    #[cfg(feature = "paradedb")]
+    codec_types.push(CodecType::BlockwiseLinearV2);
+    for &codec_type in &codec_types {
         test_fastfield_gcd_u64_with_codec(codec_type, 5500)?;
     }
     Ok(())
