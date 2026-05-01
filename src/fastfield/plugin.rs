@@ -57,6 +57,7 @@ impl SegmentPlugin for FastFieldsPlugin {
             &columnars[..],
             &required_columns,
             merge_row_order,
+            ctx.settings.columnar_codec_types(),
             &mut fast_field_wrt,
             || cancel.wants_cancel(),
         )?;
@@ -83,6 +84,7 @@ impl SegmentPlugin for FastFieldsPlugin {
 pub struct FastFieldsPluginWriter {
     pub writer: FastFieldsWriter,
     fast_field_write: WritePtr,
+    codec_types: Vec<columnar::CodecType>,
 }
 
 impl FastFieldsPluginWriter {
@@ -100,6 +102,7 @@ impl FastFieldsPluginWriter {
         Ok(FastFieldsPluginWriter {
             writer,
             fast_field_write,
+            codec_types: index.settings().columnar_codec_types().to_vec(),
         })
     }
 
@@ -128,9 +131,10 @@ impl PluginWriter for FastFieldsPluginWriter {
         let Self {
             writer,
             mut fast_field_write,
+            codec_types,
         } = *self;
         writer
-            .serialize(&mut fast_field_write, doc_id_map)
+            .serialize(&codec_types, &mut fast_field_write, doc_id_map)
             .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
         fast_field_write.terminate()?;
         Ok(())
