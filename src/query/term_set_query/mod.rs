@@ -5,4 +5,4 @@ mod term_set_strategy;
 
 pub use self::term_set_query::{InvertedIndexTermSetQuery, TermSetQuery};
 pub use self::term_set_query_fastfield::FastFieldTermSetQuery;
-pub use self::term_set_strategy::{strategy_tag, TermSetStrategyConfig};
+pub use self::term_set_strategy::{StrategyTag, TermSetStrategyConfig};

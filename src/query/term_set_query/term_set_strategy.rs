@@ -29,17 +29,35 @@ use rustc_hash::FxHashSet;
 use crate::index::SegmentReader;
 use crate::Order;
 
-/// Numeric tags for the chosen strategy. Used by the optional
+/// Numeric tag for the chosen strategy. Used by the optional
 /// `TermSetStrategyConfig::strategy_sink` so consumers (paradedb) can surface
 /// the per-segment dispatch decision in `EXPLAIN ANALYZE` without depending
 /// on `TermSetStrategy` directly.
-pub mod strategy_tag {
-    pub const NONE: u8 = 0;
-    pub const GALLOP: u8 = 1;
-    pub const LINEAR: u8 = 2;
-    pub const BITSET: u8 = 3;
-    pub const POSTING: u8 = 4;
-    pub const HASH: u8 = 5;
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum StrategyTag {
+    None = 0,
+    Gallop = 1,
+    Linear = 2,
+    Bitset = 3,
+    Posting = 4,
+    Hash = 5,
+}
+
+impl TryFrom<u8> for StrategyTag {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(StrategyTag::None),
+            1 => Ok(StrategyTag::Gallop),
+            2 => Ok(StrategyTag::Linear),
+            3 => Ok(StrategyTag::Bitset),
+            4 => Ok(StrategyTag::Posting),
+            5 => Ok(StrategyTag::Hash),
+            _ => Err("unknown StrategyTag value"),
+        }
+    }
 }
 
 /// User-tunable density thresholds. Defaults match the starting estimates in
@@ -77,9 +95,9 @@ pub struct TermSetStrategyConfig {
     /// Subsequent-column `BitsetFromPostings` threshold: `K' · D / C` cutoff.
     pub subsequent_bitset_max_density: f64,
     /// Optional sink for the per-segment strategy choice. When `Some`,
-    /// `select_strategy` writes one of the `strategy_tag::*` constants on its
-    /// way out — last-segment-wins is fine because `EXPLAIN` only asks "did
-    /// any segment use it?". When `None`, no atomic store happens and the
+    /// `select_strategy` writes the chosen `StrategyTag` (as `u8`) on its way
+    /// out — last-segment-wins is fine because `EXPLAIN` only asks "did any
+    /// segment use it?". When `None`, no atomic store happens and the
     /// hot-path cost is one `Option::is_some` check.
     pub strategy_sink: Option<Arc<AtomicU8>>,
 }
@@ -141,10 +159,10 @@ pub struct PlannerInputs<'a> {
 /// sort-agnostic dispatch, which branches on `C < N` (subsequent column)
 /// vs `C == N` (first column).
 ///
-/// When `cfg.strategy_sink` is `Some`, the chosen strategy's tag (one of the
-/// `strategy_tag::*` constants) is stored on the sink before returning so
-/// consumers can surface it in `EXPLAIN ANALYZE`. The thin wrapper around the
-/// inner planner keeps the per-segment hot path uncluttered.
+/// When `cfg.strategy_sink` is `Some`, the chosen `StrategyTag` is stored
+/// (as `u8`) on the sink before returning so consumers can surface it in
+/// `EXPLAIN ANALYZE`. The thin wrapper around the inner planner keeps the
+/// per-segment hot path uncluttered.
 pub fn select_strategy(
     reader: &SegmentReader,
     column: &Column<u64>,
@@ -155,13 +173,13 @@ pub fn select_strategy(
     let strat = select_strategy_inner(reader, column, inputs, term_set, cfg);
     if let Some(sink) = cfg.strategy_sink.as_ref() {
         let tag = match &strat {
-            TermSetStrategy::Gallop { .. } => strategy_tag::GALLOP,
-            TermSetStrategy::LinearScan => strategy_tag::LINEAR,
-            TermSetStrategy::BitsetFromPostings => strategy_tag::BITSET,
-            TermSetStrategy::PostingListDirect => strategy_tag::POSTING,
-            TermSetStrategy::HashProbe => strategy_tag::HASH,
+            TermSetStrategy::Gallop { .. } => StrategyTag::Gallop,
+            TermSetStrategy::LinearScan => StrategyTag::Linear,
+            TermSetStrategy::BitsetFromPostings => StrategyTag::Bitset,
+            TermSetStrategy::PostingListDirect => StrategyTag::Posting,
+            TermSetStrategy::HashProbe => StrategyTag::Hash,
         };
-        sink.store(tag, Ordering::Relaxed);
+        sink.store(tag as u8, Ordering::Relaxed);
     }
     strat
 }
@@ -571,7 +589,7 @@ mod tests {
         use std::sync::Arc;
 
         let n: u64 = 4096;
-        let sink = Arc::new(AtomicU8::new(strategy_tag::NONE));
+        let sink = Arc::new(AtomicU8::new(StrategyTag::None as u8));
         let cfg = TermSetStrategyConfig {
             strategy_sink: Some(sink.clone()),
             ..TermSetStrategyConfig::default()
@@ -598,7 +616,10 @@ mod tests {
             &term_set(0..8),
             &cfg,
         );
-        assert_eq!(sink.load(Ordering::Relaxed), strategy_tag::GALLOP);
+        assert_eq!(
+            StrategyTag::try_from(sink.load(Ordering::Relaxed)).unwrap(),
+            StrategyTag::Gallop
+        );
 
         // Unsorted, K=2000 → LinearScan (terminal fallback). Last-write-wins
         // overwrites the GALLOP tag from the previous call.
@@ -615,7 +636,10 @@ mod tests {
             &term_set(0..2000),
             &cfg,
         );
-        assert_eq!(sink.load(Ordering::Relaxed), strategy_tag::LINEAR);
+        assert_eq!(
+            StrategyTag::try_from(sink.load(Ordering::Relaxed)).unwrap(),
+            StrategyTag::Linear
+        );
     }
 
     /// Kill-switch: gallop_enabled=false forces a non-gallop strategy
