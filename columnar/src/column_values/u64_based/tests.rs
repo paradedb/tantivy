@@ -326,10 +326,12 @@ fn estimation_good_interpolation_case_v2() {
     let linear_interpol_estimation = estimate::<LinearCodec>(&data).unwrap();
     assert_le!(linear_interpol_estimation, 0.01);
 
-    let multi_linear_interpol_v2_estimation =
-        estimate::<BlockwiseLinearV2Codec>(&data).unwrap();
+    let multi_linear_interpol_v2_estimation = estimate::<BlockwiseLinearV2Codec>(&data).unwrap();
     assert_le!(multi_linear_interpol_v2_estimation, 0.2);
-    assert_lt!(linear_interpol_estimation, multi_linear_interpol_v2_estimation);
+    assert_lt!(
+        linear_interpol_estimation,
+        multi_linear_interpol_v2_estimation
+    );
 
     let bitpacked_estimation = estimate::<BitpackedCodec>(&data).unwrap();
     assert_lt!(linear_interpol_estimation, bitpacked_estimation);
