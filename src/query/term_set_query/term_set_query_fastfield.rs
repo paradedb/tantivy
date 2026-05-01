@@ -307,8 +307,7 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
     /// one column read + one hash probe for every doc between the current
     /// cursor and `target`; this override skips that work entirely.
     ///
-    /// Important for multi-column AND-intersection (`BooleanQuery` of two
-    /// `TermSetQuery` filters): when one column gallops and the other lands
+    /// Important for AND-intersection: when one column gallops and the other lands
     /// here, the intersection drives `seek(target)` calls toward the
     /// gallop-emitted DocIds. Without this override, the dumb default seek
     /// re-scans the gaps and the gallop speedup is largely diluted.
