@@ -199,6 +199,12 @@ impl Weight for FastFieldTermSetWeight {
                     return Ok(Box::new(EmptyScorer));
                 };
 
+                // `select_strategy` takes a slice so callers that don't
+                // naturally produce a HashSet aren't forced to allocate one.
+                // Today this Weight always carries a HashSet (built eagerly in
+                // `new`), so we materialize a Vec at the call site; follow-up
+                // work that defers the HashSet will pass a Vec directly.
+                let term_vec: Vec<u64> = values.iter().copied().collect();
                 let strategy = select_strategy(
                     reader,
                     &column,
@@ -207,7 +213,7 @@ impl Weight for FastFieldTermSetWeight {
                         candidate_size: None,
                         avg_docs_per_term: None,
                     },
-                    values,
+                    &term_vec,
                     &self.strategy_config,
                 );
 

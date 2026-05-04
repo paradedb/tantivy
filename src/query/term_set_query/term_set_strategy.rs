@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use columnar::{Cardinality, Column};
-use rustc_hash::FxHashSet;
 
 use crate::index::SegmentReader;
 use crate::Order;
@@ -167,7 +166,7 @@ pub fn select_strategy(
     reader: &SegmentReader,
     column: &Column<u64>,
     inputs: PlannerInputs<'_>,
-    term_set: &FxHashSet<u64>,
+    term_set: &[u64],
     cfg: &TermSetStrategyConfig,
 ) -> TermSetStrategy {
     let strat = select_strategy_inner(reader, column, inputs, term_set, cfg);
@@ -188,7 +187,7 @@ fn select_strategy_inner(
     reader: &SegmentReader,
     column: &Column<u64>,
     inputs: PlannerInputs<'_>,
-    term_set: &FxHashSet<u64>,
+    term_set: &[u64],
     cfg: &TermSetStrategyConfig,
 ) -> TermSetStrategy {
     let n = column.num_docs();
@@ -281,8 +280,6 @@ mod tests {
     //! `TermSetDocSet`. Once Follow-up A populates `inputs.avg_docs_per_term`
     //! properly, the `K' · D < threshold` arithmetic will shift and these
     //! tests will need to be revisited.
-    use rustc_hash::FxHashSet;
-
     use super::*;
     use crate::schema::{NumericOptions, SchemaBuilder};
     use crate::{Index, IndexSettings, IndexSortByField};
@@ -325,7 +322,7 @@ mod tests {
         (segment_reader, column)
     }
 
-    fn term_set(values: impl IntoIterator<Item = u64>) -> FxHashSet<u64> {
+    fn term_set(values: impl IntoIterator<Item = u64>) -> Vec<u64> {
         values.into_iter().collect()
     }
 
