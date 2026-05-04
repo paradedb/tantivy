@@ -233,6 +233,15 @@ fn select_strategy_inner(
             // exactly-representable density (the defaults are 1/2^k).
             if (k_prime as f64) / n_f < cfg.gallop_max_density {
                 pruned.sort_unstable();
+                // Dedup duplicate input terms. `term_set_gallop::run`
+                // tolerates duplicates (the second occurrence finds an
+                // empty range and skips), but each duplicate still pays
+                // two `gallop_search_sorted` probes — cheap insurance on
+                // the hot path. Production input today flows through
+                // HashSet-derived sources so this is a no-op there;
+                // `TermSetQuery::new` doesn't enforce uniqueness on its
+                // input, hence the belt-and-suspenders dedup.
+                pruned.dedup();
                 return TermSetStrategy::Gallop {
                     sort_order: order,
                     sorted_terms: pruned,

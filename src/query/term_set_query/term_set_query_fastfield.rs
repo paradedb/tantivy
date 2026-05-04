@@ -67,16 +67,21 @@ impl Query for FastFieldTermSetQuery {
 
 // --- FastFieldTermSetWeight ---
 
+/// Validated input terms held in their post-validation type. Stored as
+/// `Vec` rather than `FxHashSet` so that strategies that don't need
+/// hash-set semantics (today: `Gallop`, which walks sorted ranges) don't
+/// pay the HashSet build cost. The non-gallop arms in `scorer()` build a
+/// `FxHashSet` locally from the Vec just before `TermSetDocSet::new`.
 #[derive(Clone, Debug)]
-enum TermSet {
-    U64(FxHashSet<u64>),
-    Ipv6Addr(FxHashSet<Ipv6Addr>),
+enum TermVec {
+    U64(Vec<u64>),
+    Ipv6Addr(Vec<Ipv6Addr>),
 }
 
 #[derive(Clone, Debug)]
 pub struct FastFieldTermSetWeight {
     field: crate::schema::Field,
-    term_set: Option<TermSet>,
+    term_vec: Option<TermVec>,
     strategy_config: TermSetStrategyConfig,
 }
 
@@ -91,18 +96,18 @@ impl FastFieldTermSetWeight {
         if terms_iter.peek().is_none() {
             return Ok(Self {
                 field,
-                term_set: None,
+                term_vec: None,
                 strategy_config,
             });
         }
 
         let first_term_value = terms_iter.peek().unwrap().value();
-        let term_set = if first_term_value.as_ip_addr().is_some() {
-            let mut values = FxHashSet::default();
+        let term_vec = if first_term_value.as_ip_addr().is_some() {
+            let mut values = Vec::new();
             for term in terms_iter {
                 let value = term.value();
                 if let Some(val) = value.as_ip_addr() {
-                    values.insert(val);
+                    values.push(val);
                 } else {
                     return Err(crate::TantivyError::InvalidArgument(format!(
                         "Expected term with ip address, but got {:?}",
@@ -110,12 +115,12 @@ impl FastFieldTermSetWeight {
                     )));
                 }
             }
-            TermSet::Ipv6Addr(values)
+            TermVec::Ipv6Addr(values)
         } else {
             // Numeric types.
             //
             // NOTE: Keep in sync with `TermSetQuery::specialized_weight`.
-            let mut values = FxHashSet::default();
+            let mut values = Vec::new();
             for term in terms_iter {
                 let Some(val_u64) = term.value().as_u64_lenient() else {
                     return Err(crate::TantivyError::InvalidArgument(format!(
@@ -123,14 +128,14 @@ impl FastFieldTermSetWeight {
                         term
                     )));
                 };
-                values.insert(val_u64);
+                values.push(val_u64);
             }
-            TermSet::U64(values)
+            TermVec::U64(values)
         };
 
         Ok(Self {
             field,
-            term_set: Some(term_set),
+            term_vec: Some(term_vec),
             strategy_config,
         })
     }
@@ -138,7 +143,7 @@ impl FastFieldTermSetWeight {
 
 impl Weight for FastFieldTermSetWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
-        let Some(term_set) = &self.term_set else {
+        let Some(term_vec) = &self.term_vec else {
             return Ok(Box::new(EmptyScorer));
         };
 
@@ -162,8 +167,8 @@ impl Weight for FastFieldTermSetWeight {
             )));
         }
 
-        match term_set {
-            TermSet::Ipv6Addr(values) => {
+        match term_vec {
+            TermVec::Ipv6Addr(values) => {
                 if !field_type.is_ip_addr() {
                     return Err(crate::TantivyError::InvalidArgument(format!(
                         "fast fields TermSet for field `{field_name}` contains IP addresses, but \
@@ -175,10 +180,13 @@ impl Weight for FastFieldTermSetWeight {
                 else {
                     return Ok(Box::new(EmptyScorer));
                 };
-                let docset = TermSetDocSet::new(ip_addr_column, values.clone());
+                // IPv6 always routes through TermSetDocSet — no Gallop strategy
+                // for IP — so the HashSet is needed unconditionally here.
+                let term_set: FxHashSet<Ipv6Addr> = values.iter().copied().collect();
+                let docset = TermSetDocSet::new(ip_addr_column, term_set);
                 Ok(Box::new(ConstScorer::new(docset, boost)))
             }
-            TermSet::U64(values) => {
+            TermVec::U64(values) => {
                 if field_type.is_ip_addr() {
                     return Err(crate::TantivyError::InvalidArgument(format!(
                         "fast fields TermSet for field `{field_name}` contains numeric values, \
@@ -199,12 +207,6 @@ impl Weight for FastFieldTermSetWeight {
                     return Ok(Box::new(EmptyScorer));
                 };
 
-                // `select_strategy` takes a slice so callers that don't
-                // naturally produce a HashSet aren't forced to allocate one.
-                // Today this Weight always carries a HashSet (built eagerly in
-                // `new`), so we materialize a Vec at the call site; follow-up
-                // work that defers the HashSet will pass a Vec directly.
-                let term_vec: Vec<u64> = values.iter().copied().collect();
                 let strategy = select_strategy(
                     reader,
                     &column,
@@ -213,7 +215,7 @@ impl Weight for FastFieldTermSetWeight {
                         candidate_size: None,
                         avg_docs_per_term: None,
                     },
-                    &term_vec,
+                    values.as_slice(),
                     &self.strategy_config,
                 );
 
@@ -222,6 +224,8 @@ impl Weight for FastFieldTermSetWeight {
                         sort_order,
                         sorted_terms,
                     } => {
+                        // Gallop walks `sorted_terms` directly via
+                        // `RangeUnionDocSet`; no HashSet build needed.
                         let cardinality = column.get_cardinality();
                         Ok(term_set_gallop::run(
                             &column,
@@ -234,11 +238,14 @@ impl Weight for FastFieldTermSetWeight {
                     // The non-Gallop variants are planner stubs today and route
                     // to TermSetDocSet; follow-ups A and B replace these arms
                     // with real implementations without touching the planner.
+                    // The HashSet is built locally here so the gallop path
+                    // doesn't pay for it.
                     TermSetStrategy::LinearScan
                     | TermSetStrategy::BitsetFromPostings
                     | TermSetStrategy::PostingListDirect
                     | TermSetStrategy::HashProbe => {
-                        let docset = TermSetDocSet::new(column, values.clone());
+                        let term_set: FxHashSet<u64> = values.iter().copied().collect();
+                        let docset = TermSetDocSet::new(column, term_set);
                         Ok(Box::new(ConstScorer::new(docset, boost)))
                     }
                 }
