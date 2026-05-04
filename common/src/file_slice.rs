@@ -261,9 +261,10 @@ impl FileSlice {
     /// Reads a single byte without allocating OwnedBytes.
     pub fn read_byte(&self, offset: usize) -> io::Result<u8> {
         if let Some(slice) = self.as_slice() {
-            slice.get(offset).copied().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "offset out of bounds")
-            })
+            slice
+                .get(offset)
+                .copied()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset out of bounds"))
         } else {
             self.data.read_byte(self.range.start + offset)
         }
