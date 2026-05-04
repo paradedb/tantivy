@@ -1,109 +1,210 @@
-//! Gallop strategy for `FastFieldTermSetQuery` on sorted segments.
+//! Lazy gallop strategy for `FastFieldTermSetQuery` on sorted segments.
 //!
-//! For each pruned, sort-ordered term `t`, two `gallop_search_sorted` calls
-//! on the sorted column produce a half-open range `[start, end)` of DocIds
-//! whose value equals `t`. Each call exponentially probes from the current
-//! cursor and binary-searches the bracket. The resulting `K` ranges are
-//! emitted through `RangeUnionDocSet`, a single struct walked with one
-//! cursor — no `BooleanWeight` of `Should` branches, no per-range allocation.
+//! `TermSetGallopDocSet` is a single-cursor DocSet that gallops the sorted
+//! column on demand inside `advance()` and `seek()`. For each pruned term,
+//! two `gallop_search_sorted` calls produce a half-open `[start, end)`
+//! range of DocIds whose value equals the term; the cursor consumes the
+//! range, then `find_next_match` walks to the next term and gallops again.
+//!
+//! Lazy because: when this scorer is ANDed with a more selective DocSet
+//! (another `TermSetQuery` filter, a `TermQuery`, a TopK driver), the
+//! intersection driver calls `seek(target)` and skips most ranges. The
+//! eager precomputation that materialized all K ranges at construction
+//! time produced ranges the consumer never reaches; this version scales
+//! work with ranges actually visited.
+//!
+//! `seek` short-circuits when `target` falls inside the current range
+//! (cheap in-range path); otherwise it reads the column at `target` and
+//! uses `gallop_partition_point` to skip past intervening terms in
+//! O(log K) without galloping their column ranges.
 //!
 //! The shrinking-window cursor (`non_null_start`) advances monotonically
-//! through DocId space because in a sorted column, larger terms map to higher
-//! DocIds (and symmetrically for DESC after `.rev()`). Each per-term search
-//! is bounded above by the previous term's `end`, so the planner's claimed
-//! cost of `O(K · log(N/K))` is realistic, not `O(K · log N)`.
+//! through DocId space because in a sorted column, larger terms map to
+//! higher DocIds (and symmetrically for DESC after pre-rotating the term
+//! list to descending order). Each per-term search is bounded above by
+//! the previous term's `end`, so the planner's claimed cost of
+//! `O(K · log(N/K))` is realistic, not `O(K · log N)`.
 
 use columnar::{Cardinality, Column};
 
 use crate::query::range_query::sorted_internals::{
-    binary_search_null_boundary, gallop_search_sorted,
+    binary_search_null_boundary, gallop_partition_point, gallop_search_sorted,
 };
-use crate::query::{ConstScorer, EmptyScorer, Scorer};
-use crate::{DocId, DocSet, Order, Score, TERMINATED};
+use crate::{DocId, DocSet, Order, TERMINATED};
 
-/// A `DocSet` walking a sorted, non-overlapping list of `[start, end)` DocId
-/// ranges with a single cursor.
-///
-/// Modeled on `ContiguousDocSet` but with a `Vec<(start, end)>` instead of a
-/// single range. We keep a single struct (rather than a `BooleanWeight` of
-/// `ContiguousDocSet`-wrapped scorers) because:
-///   - one allocation instead of K
-///   - the cursor + range index is a natural extension point for cursor- side optimizations (the
-///     `seek` walk is currently linear over the `ranges` vec; exponential probing inside `seek` is
-///     a future option if profiling shows it matters).
-pub(crate) struct RangeUnionDocSet {
-    /// Sorted ascending by `start`, non-overlapping. Empty ranges
-    /// (`start == end`) are filtered out at construction so iteration logic
-    /// can assume each entry contains at least one doc.
-    ranges: Vec<(DocId, DocId)>,
-    range_idx: usize,
+/// A `DocSet` that gallops a sorted column on demand for each term in a
+/// pre-rotated, ascending-iteration-order list. See module-level docs.
+pub(crate) struct TermSetGallopDocSet {
+    column: Column<u64>,
+    /// Pre-rotated to iteration order: ascending for `Order::Asc`, descending
+    /// for `Order::Desc`. Rotating once in `new()` lets `seek` use a single
+    /// `gallop_partition_point` call regardless of sort direction.
+    terms: Vec<u64>,
+    sort_order: Order,
+    /// Lower bound (inclusive) of the unconsumed column window. Advances
+    /// monotonically as terms are consumed.
+    non_null_start: DocId,
+    /// Upper bound (exclusive). For ASC this is `n`; for DESC on Optional
+    /// columns this is the NULL boundary. Fixed at construction.
+    non_null_end: DocId,
+    next_term_idx: usize,
+    current_range_end: DocId,
     current: DocId,
 }
 
-impl RangeUnionDocSet {
-    pub(crate) fn new(ranges: Vec<(DocId, DocId)>) -> Self {
-        if ranges.is_empty() {
-            return Self {
-                ranges,
-                range_idx: 0,
-                current: TERMINATED,
-            };
+impl TermSetGallopDocSet {
+    pub(crate) fn new(
+        column: Column<u64>,
+        sort_order: Order,
+        sorted_terms: Vec<u64>,
+        cardinality: Cardinality,
+    ) -> Self {
+        let n = column.num_docs();
+
+        // NULL-boundary for Optional columns (NULLs cluster at start in ASC,
+        // end in DESC). Full has no NULLs. Multivalued is filtered out by
+        // the planner's gallop gate.
+        let (non_null_start, non_null_end) = match cardinality {
+            Cardinality::Full => (0u32, n),
+            Cardinality::Optional => match sort_order {
+                Order::Asc => (binary_search_null_boundary(&column, 0, n, Order::Asc), n),
+                Order::Desc => (0, binary_search_null_boundary(&column, 0, n, Order::Desc)),
+            },
+            Cardinality::Multivalued => unreachable!("planner filters out Multivalued"),
+        };
+
+        // Pre-rotate so that ascending iteration of `terms` corresponds to
+        // ascending-DocId iteration in the column, in either sort direction.
+        let terms = match sort_order {
+            Order::Asc => sorted_terms,
+            Order::Desc => {
+                let mut t = sorted_terms;
+                t.reverse();
+                t
+            }
+        };
+
+        let mut s = Self {
+            column,
+            terms,
+            sort_order,
+            non_null_start,
+            non_null_end,
+            next_term_idx: 0,
+            current_range_end: 0,
+            current: TERMINATED,
+        };
+
+        // Seed the cursor: advance past empty/missing terms to the first
+        // matching DocId, or set current=TERMINATED if none exist.
+        s.find_next_match();
+        s
+    }
+
+    /// Advance `next_term_idx` until a non-empty range is found. Sets
+    /// `current`, `current_range_end`, and `non_null_start` accordingly.
+    /// Returns the new `current` (which may be `TERMINATED`).
+    fn find_next_match(&mut self) -> DocId {
+        while self.next_term_idx < self.terms.len() && self.non_null_start < self.non_null_end {
+            let t = self.terms[self.next_term_idx];
+            let start = gallop_search_sorted(
+                &self.column,
+                self.non_null_start,
+                self.non_null_end,
+                t,
+                self.sort_order,
+                false,
+            );
+            let end = gallop_search_sorted(
+                &self.column,
+                self.non_null_start,
+                self.non_null_end,
+                t,
+                self.sort_order,
+                true,
+            );
+            self.next_term_idx += 1;
+            if start < end {
+                self.current = start;
+                self.current_range_end = end;
+                self.non_null_start = end;
+                return self.current;
+            }
+            // Term absent from the remaining window: advance the lower bound
+            // so the next term's gallop doesn't re-scan the eliminated prefix.
+            self.non_null_start = end;
         }
-        let first = ranges[0].0;
-        Self {
-            ranges,
-            range_idx: 0,
-            current: first,
-        }
+        self.current = TERMINATED;
+        TERMINATED
     }
 }
 
-impl DocSet for RangeUnionDocSet {
-    #[inline]
+impl DocSet for TermSetGallopDocSet {
     fn advance(&mut self) -> DocId {
         if self.current == TERMINATED {
             return TERMINATED;
         }
-        self.current += 1;
-        // If still inside the current range, return the new doc.
-        if let Some(&(_, end)) = self.ranges.get(self.range_idx) {
-            if self.current < end {
-                return self.current;
-            }
+        let next = self.current + 1;
+        if next < self.current_range_end {
+            self.current = next;
+            return next;
         }
-        // Otherwise, jump to the start of the next range.
-        self.range_idx += 1;
-        if let Some(&(start, _)) = self.ranges.get(self.range_idx) {
-            self.current = start;
-            return self.current;
-        }
-        self.current = TERMINATED;
-        TERMINATED
+        // Past the current range: gallop the next term.
+        self.non_null_start = self.current_range_end;
+        self.find_next_match()
     }
 
-    #[inline]
     fn seek(&mut self, target: DocId) -> DocId {
-        // K is small in the gallop regime, so a linear walk over `ranges` is
-        // fine; switch to binary search if profiling demands it.
-        while self.range_idx < self.ranges.len() {
-            let (start, end) = self.ranges[self.range_idx];
-            if target < end {
-                self.current = target.max(start);
-                return self.current;
-            }
-            self.range_idx += 1;
+        debug_assert!(target >= self.current || self.current == TERMINATED);
+        if self.current == TERMINATED {
+            return TERMINATED;
         }
-        self.current = TERMINATED;
-        TERMINATED
+        if target >= self.non_null_end {
+            self.current = TERMINATED;
+            return TERMINATED;
+        }
+        // Cheap in-range path: target falls inside the current range we've
+        // already galloped. No column or term-list lookup.
+        if target < self.current_range_end {
+            self.current = target;
+            return target;
+        }
+        // Skip path: read the column at `target`, then partition-point the
+        // term list. For ASC the term list is ascending and the column value
+        // at `target` is `v`; terms with `t < v` have ranges entirely before
+        // `target` (already past us), so the partition point is the first
+        // `t` with `t >= v`. Symmetric for DESC (`t > v` means already past).
+        let v = self
+            .column
+            .first(target)
+            .expect("seek into non-NULL window must find a value");
+        let next_idx = match self.sort_order {
+            Order::Asc => gallop_partition_point(&self.terms, self.next_term_idx, |&t| t < v),
+            Order::Desc => gallop_partition_point(&self.terms, self.next_term_idx, |&t| t > v),
+        };
+        if next_idx >= self.terms.len() {
+            self.current = TERMINATED;
+            return TERMINATED;
+        }
+        self.next_term_idx = next_idx;
+        // Clamping `non_null_start` by `target` is load-bearing: when
+        // `terms[next_idx] == v`, the term's range may start before
+        // `target`, but the seek contract requires the returned DocId be
+        // `>= target`. Starting the gallop at `target` ensures that.
+        self.non_null_start = target;
+        self.find_next_match()
     }
 
-    #[inline]
     fn doc(&self) -> DocId {
         self.current
     }
 
     fn size_hint(&self) -> u32 {
-        self.ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum()
+        // Deliberate overestimate: the lazy DocSet does not know exact match
+        // count without doing the work it exists to defer. Reporting the
+        // unconsumed window size biases the intersection driver toward
+        // seeking us, which is the regime this strategy is built for.
+        self.non_null_end.saturating_sub(self.non_null_start)
     }
 
     fn cost(&self) -> u64 {
@@ -111,125 +212,9 @@ impl DocSet for RangeUnionDocSet {
     }
 }
 
-/// Build a scorer for the gallop strategy.
-///
-/// `sorted_terms` must already be ascending; for `Order::Desc` the iteration
-/// is reversed internally so that the search window's `non_null_start`
-/// advances monotonically in either case.
-///
-/// Returns `EmptyScorer` for any of:
-///   - empty term set
-///   - `n == 0`
-///   - non-NULL slice empty after the NULL boundary
-///   - all binary searches landed on empty ranges
-pub(crate) fn run(
-    column: &Column<u64>,
-    sort_order: Order,
-    sorted_terms: &[u64],
-    cardinality: Cardinality,
-    boost: Score,
-) -> Box<dyn Scorer> {
-    let n = column.num_docs();
-    if n == 0 || sorted_terms.is_empty() {
-        return Box::new(EmptyScorer);
-    }
-
-    // Reuse the same NULL-boundary logic that RangeQuery uses: NULLs cluster
-    // at the start (ASC) or end (DESC) of an `Optional` column.
-    let (mut non_null_start, non_null_end) = match cardinality {
-        Cardinality::Full => (0u32, n),
-        Cardinality::Optional => match sort_order {
-            Order::Asc => (binary_search_null_boundary(column, 0, n, Order::Asc), n),
-            Order::Desc => (0, binary_search_null_boundary(column, 0, n, Order::Desc)),
-        },
-        // The planner already filters out Multivalued (it gates the gallop
-        // arm on `matches!(cardinality, Full | Optional)`), so this is
-        // unreachable in practice.
-        Cardinality::Multivalued => unreachable!("planner filters out Multivalued"),
-    };
-    if non_null_start >= non_null_end {
-        return Box::new(EmptyScorer);
-    }
-
-    // Walk terms in the order that the column is sorted in. For ASC the input
-    // `sorted_terms` is already ascending; for DESC we iterate it in reverse
-    // so that the next matching term lives at higher DocIds than the previous
-    // one — `non_null_start` always increases. The per-term loop is a generic
-    // function so the compiler monomorphizes once per concrete iterator type
-    // (no `Box<dyn Iterator>`, no dynamic dispatch in the hot path).
-    let mut ranges: Vec<(DocId, DocId)> = Vec::with_capacity(sorted_terms.len());
-    match sort_order {
-        Order::Asc => fill_ranges(
-            sorted_terms.iter(),
-            column,
-            &mut non_null_start,
-            non_null_end,
-            sort_order,
-            &mut ranges,
-        ),
-        Order::Desc => fill_ranges(
-            sorted_terms.iter().rev(),
-            column,
-            &mut non_null_start,
-            non_null_end,
-            sort_order,
-            &mut ranges,
-        ),
-    }
-
-    if ranges.is_empty() {
-        return Box::new(EmptyScorer);
-    }
-
-    Box::new(ConstScorer::new(RangeUnionDocSet::new(ranges), boost))
-}
-
-/// Per-term gallop loop, monomorphized over the concrete iterator type so
-/// the ASC and DESC dispatch paths each get their own specialized version.
-fn fill_ranges<'a, I: Iterator<Item = &'a u64>>(
-    sorted_terms_iter: I,
-    column: &Column<u64>,
-    non_null_start: &mut DocId,
-    non_null_end: DocId,
-    sort_order: Order,
-    ranges: &mut Vec<(DocId, DocId)>,
-) {
-    for &t in sorted_terms_iter {
-        // start = first doc whose value is at or past `t`
-        // end   = first doc whose value is strictly past `t`
-        // Both calls exponentially probe from `*non_null_start` and binary-
-        // search the bracket; cache locality on early probes makes this
-        // faster than plain bisection across the dispatch range.
-        let start =
-            gallop_search_sorted(column, *non_null_start, non_null_end, t, sort_order, false);
-        let end = gallop_search_sorted(column, *non_null_start, non_null_end, t, sort_order, true);
-
-        if start >= end {
-            // Term absent from the column: `end` is the insertion point.
-            // Every doc < end has value < t (ASC) or > t (DESC), so future
-            // searches for larger terms cannot match there. Advance the
-            // window before continuing; otherwise we re-scan the same
-            // eliminated prefix per term.
-            *non_null_start = end;
-            if *non_null_start >= non_null_end {
-                break;
-            }
-            continue;
-        }
-
-        *non_null_start = end;
-        ranges.push((start, end));
-
-        if *non_null_start >= non_null_end {
-            break;
-        }
-    }
-}
-
 #[cfg(test)]
 mod gallop_tests {
     use columnar::Cardinality;
-    use rustc_hash::FxHashSet;
 
     use super::*;
     use crate::collector::DocSetCollector;
@@ -310,6 +295,23 @@ mod gallop_tests {
         (segment, column)
     }
 
+    /// Drive a `TermSetGallopDocSet` to exhaustion via `advance()` and
+    /// collect every emitted DocId.
+    fn collect_via_docset(
+        column: Column<u64>,
+        order: Order,
+        sorted_terms: &[u64],
+        cardinality: Cardinality,
+    ) -> Vec<DocId> {
+        let mut ds = TermSetGallopDocSet::new(column, order, sorted_terms.to_vec(), cardinality);
+        let mut docs = Vec::new();
+        while ds.doc() != TERMINATED {
+            docs.push(ds.doc());
+            ds.advance();
+        }
+        docs
+    }
+
     fn collect_docs_via_query(
         index: &Index,
         field: crate::schema::Field,
@@ -340,16 +342,10 @@ mod gallop_tests {
         let (_segment, column) = open_segment_and_column(&index, &name);
         let cardinality = column.get_cardinality();
 
-        // Drive `run` directly to verify the algorithm contract.
-        // Term 99 is outside [1, 17] so the planner would prune it; here we
-        // pre-prune to mirror that and feed only {3, 7, 13} sorted ASC.
-        let scorer = run(&column, Order::Asc, &[3, 7, 13], cardinality, 1.0);
-        let mut docs = Vec::new();
-        let mut s = scorer;
-        while s.doc() != TERMINATED {
-            docs.push(s.doc());
-            s.advance();
-        }
+        // Drive `TermSetGallopDocSet` directly. Term 99 is outside [1, 17] so
+        // the planner would prune it; here we pre-prune to mirror that and
+        // feed only {3, 7, 13} sorted ASC.
+        let docs = collect_via_docset(column, Order::Asc, &[3, 7, 13], cardinality);
         assert_eq!(docs, vec![3, 4, 11, 12, 16, 17, 18]);
 
         // End-to-end: also pass the unpruned term set through the actual
@@ -358,14 +354,9 @@ mod gallop_tests {
         assert_eq!(docs_from_query, vec![3, 4, 11, 12, 16, 17, 18]);
     }
 
-    /// Symmetric DESC fixture: same logical set, segment built DESC.
-    /// With Order::Desc, large values are at low DocIds.
-    /// Values written in this order land in the column as the same vector
-    /// (the writer presorts the segment by value DESC).
-    /// The mirror of {3,4,11,12,16,17,18} for DESC depends on the value layout
-    /// after sorting. We rely on `collect_docs_via_query` to compute the
-    /// ground truth (DocSetCollector returns the matched DocIds independent
-    /// of strategy) and assert the gallop output equals it.
+    /// Symmetric DESC fixture: same logical set, segment built DESC. Ground
+    /// truth from `DocSetCollector` (independent of strategy) cross-checked
+    /// against the unsorted-index path.
     #[test]
     fn gallop_design_doc_fixture_desc_matches_query_pipeline() {
         let values: Vec<u64> = vec![
@@ -373,8 +364,6 @@ mod gallop_tests {
         ];
         let (index, field, _name) = build_sorted_index(Order::Desc, &values);
         let docs = collect_docs_via_query(&index, field, &[3, 7, 13, 99]);
-        // Ground truth: 7 docs match (three 3s, two 7s, three 13s minus one
-        // pruned 99 = 8). Wait: 3 → 2 docs, 7 → 2 docs, 13 → 3 docs = 7 total.
         assert_eq!(docs.len(), 7);
 
         // Cross-check by also running an unsorted index with the same data
@@ -400,44 +389,30 @@ mod gallop_tests {
         let values: Vec<u64> = (0..32).map(|i| i / 4).collect(); // 8 distinct values, 4 docs each
         let (index, _field, name) = build_sorted_index(Order::Asc, &values);
         let (_segment, column) = open_segment_and_column(&index, &name);
-        let scorer = run(&column, Order::Asc, &[3], column.get_cardinality(), 1.0);
-        let mut s = scorer;
-        let mut docs = Vec::new();
-        while s.doc() != TERMINATED {
-            docs.push(s.doc());
-            s.advance();
-        }
+        let cardinality = column.get_cardinality();
+        let docs = collect_via_docset(column, Order::Asc, &[3], cardinality);
         assert_eq!(docs, vec![12, 13, 14, 15]);
     }
 
     /// All terms outside [min, max]: empty result. The planner would prune
-    /// these before calling `run`, but `run` itself handles the case via
-    /// each individual `start >= end` check returning an empty ranges vec.
+    /// these before constructing the DocSet, but the DocSet itself handles
+    /// the case via each per-term `start >= end` check, leaving `current`
+    /// at `TERMINATED`.
     #[test]
     fn gallop_all_terms_outside_range_returns_empty() {
         let values: Vec<u64> = (0..16).collect();
         let (index, _field, name) = build_sorted_index(Order::Asc, &values);
         let (_segment, column) = open_segment_and_column(&index, &name);
-        let scorer = run(
-            &column,
-            Order::Asc,
-            &[100, 200, 300],
-            column.get_cardinality(),
-            1.0,
-        );
-        // Every per-term search collapses to start == end, so the ranges vec
-        // ends up empty and `run` returns EmptyScorer.
-        assert_eq!(scorer.doc(), TERMINATED);
+        let cardinality = column.get_cardinality();
+        let docs = collect_via_docset(column, Order::Asc, &[100, 200, 300], cardinality);
+        assert!(docs.is_empty());
     }
 
     /// Optional column with NULLs at the start (ASC). The NULL prefix must
     /// be skipped and absent from the output.
     #[test]
     fn gallop_optional_with_nulls_asc() {
-        // 5 NULLs, then [1,1,1,3,3,5,5,5,5,5,5,7,7,9,9,11,13,13,13,17]. We
-        // hand the writer Option<u64> values; the index sort places None
-        // values at the start in ASC order (binary_search_null_boundary
-        // assumes that placement, mirroring RangeQuery).
+        // 5 NULLs, then [1,1,1,3,3,5,5,5,5,5,5,7,7,9,9,11,13,13,13,17].
         let values: Vec<Option<u64>> = vec![
             None,
             None,
@@ -467,30 +442,15 @@ mod gallop_tests {
         ];
         let (index, _field, name) = build_optional_sorted_index(Order::Asc, &values);
         let (_segment, column) = open_segment_and_column(&index, &name);
+        let cardinality = column.get_cardinality();
         assert!(matches!(
-            column.get_cardinality(),
+            cardinality,
             Cardinality::Full | Cardinality::Optional
         ));
 
-        let scorer = run(
-            &column,
-            Order::Asc,
-            &[3, 7, 13],
-            column.get_cardinality(),
-            1.0,
-        );
-        let mut s = scorer;
-        let mut docs = Vec::new();
-        while s.doc() != TERMINATED {
-            docs.push(s.doc());
-            s.advance();
-        }
-        // Expect 8 matches: 3→docs 8,9 ; 7→docs 16,17 ; 13→docs 21,22,23.
-        // The exact DocIds depend on how the writer rearranged the input; we
-        // only assert that no NULL-region doc appears (DocIds 0..5) and that
-        // the count is correct.
+        let docs = collect_via_docset(column, Order::Asc, &[3, 7, 13], cardinality);
+        // No NULL-region doc may appear; count must equal ground truth.
         assert!(!docs.iter().any(|&d| d < 5));
-        // ground truth: count of matches in `values`
         let truth = values
             .iter()
             .filter(|v| matches!(v, Some(3) | Some(7) | Some(13)))
@@ -498,22 +458,93 @@ mod gallop_tests {
         assert_eq!(docs.len(), truth);
 
         // Cross-check via the actual query pipeline (which also dispatches
-        // through `select_strategy` → `run`).
-        let q_terms: Vec<u64> = vec![3, 7, 13, 99];
-        // DocSetCollector returns all matches; we just want the count.
-        // The planner will prune 99 (it's outside [1, 17]) and pass only
-        // {3, 7, 13} into `run`, which is the case the scorer directly
-        // exercised above.
-        // Need to gather the field handle again for collect_docs_via_query.
+        // through `select_strategy` → `TermSetGallopDocSet`).
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
         let field = searcher.schema().get_field(&name).unwrap();
-        let docs2 = collect_docs_via_query(&index, field, &q_terms);
+        let docs2 = collect_docs_via_query(&index, field, &[3, 7, 13, 99]);
         assert_eq!(docs2.len(), truth);
+    }
 
-        // Suppress unused-warning for the FxHashSet import: keep the import
-        // for symmetry with other test modules but no test in this file
-        // needs it directly.
-        let _ = FxHashSet::<u64>::default();
+    // ----- Lazy-path tests: exercise paths the eager impl couldn't -----
+
+    /// `seek` skips intermediate terms via `gallop_partition_point` without
+    /// galloping their column ranges. Column has 8 distinct values × 4 docs
+    /// each (32 docs); term set covers all 8 values.
+    #[test]
+    fn seek_skips_intermediate_terms_via_partition_point() {
+        let values: Vec<u64> = (0..32).map(|i| i / 4).collect();
+        let (index, _field, name) = build_sorted_index(Order::Asc, &values);
+        let (_segment, column) = open_segment_and_column(&index, &name);
+        let cardinality = column.get_cardinality();
+        let mut ds = TermSetGallopDocSet::new(
+            column,
+            Order::Asc,
+            (0u64..8).collect(),
+            cardinality,
+        );
+        // Seed lands on term 0's range [0, 4).
+        assert_eq!(ds.doc(), 0);
+        // seek(20) is in term 5's range [20, 24). The partition-point skip
+        // skips terms 1..5 without galloping their column ranges.
+        assert_eq!(ds.seek(20), 20);
+        // Advance through the rest of term 5's range.
+        assert_eq!(ds.advance(), 21);
+        assert_eq!(ds.advance(), 22);
+        assert_eq!(ds.advance(), 23);
+        // Crossing into term 6's range [24, 28).
+        assert_eq!(ds.advance(), 24);
+        assert_eq!(ds.advance(), 25);
+    }
+
+    /// `seek` to a target inside the current already-galloped range hits
+    /// the cheap in-range path (no column read, no term-list lookup).
+    /// `seek` past `current_range_end` then triggers the column-read path.
+    #[test]
+    fn seek_inside_current_range_returns_target() {
+        // 16 docs: 0..7 = 0, 8..11 = 5, 12..15 = 6. Term set {5} occupies [8, 12).
+        let mut values: Vec<u64> = vec![0; 8];
+        values.extend(std::iter::repeat_n(5u64, 4));
+        values.extend(std::iter::repeat_n(6u64, 4));
+        let (index, _field, name) = build_sorted_index(Order::Asc, &values);
+        let (_segment, column) = open_segment_and_column(&index, &name);
+        let cardinality = column.get_cardinality();
+        let mut ds = TermSetGallopDocSet::new(column, Order::Asc, vec![5], cardinality);
+        assert_eq!(ds.doc(), 8);
+        // Cheap in-range path.
+        assert_eq!(ds.seek(10), 10);
+        assert_eq!(ds.seek(11), 11);
+        // seek past current_range_end with no further term in the set: TERMINATED.
+        assert_eq!(ds.seek(12), TERMINATED);
+    }
+
+    /// `seek` to a target whose column value isn't in the term set must
+    /// land on the next term's range (not on `target`).
+    #[test]
+    fn seek_to_non_matching_value_lands_on_next_term() {
+        let values: Vec<u64> = (0..32).map(|i| i / 4).collect(); // 8 distinct × 4
+        let (index, _field, name) = build_sorted_index(Order::Asc, &values);
+        let (_segment, column) = open_segment_and_column(&index, &name);
+        let cardinality = column.get_cardinality();
+        let mut ds = TermSetGallopDocSet::new(column, Order::Asc, vec![1, 5], cardinality);
+        // Seed lands on term 1's range [4, 8).
+        assert_eq!(ds.doc(), 4);
+        // seek(12): column[12] = 3 (not in {1, 5}). partition-point skips
+        // past term 1, lands on term 5 (next ≥ 3), term 5's range is [20, 24).
+        assert_eq!(ds.seek(12), 20);
+    }
+
+    /// `seek` past `non_null_end` terminates immediately.
+    #[test]
+    fn seek_past_non_null_end_terminates() {
+        let values: Vec<u64> = (0..16).map(|i| i / 4).collect(); // 4 distinct × 4
+        let (index, _field, name) = build_sorted_index(Order::Asc, &values);
+        let (_segment, column) = open_segment_and_column(&index, &name);
+        let cardinality = column.get_cardinality();
+        let mut ds = TermSetGallopDocSet::new(column, Order::Asc, vec![3], cardinality);
+        // Seed lands on term 3's range [12, 16).
+        assert_eq!(ds.doc(), 12);
+        // seek(100) is past the column's 16 docs.
+        assert_eq!(ds.seek(100), TERMINATED);
     }
 }

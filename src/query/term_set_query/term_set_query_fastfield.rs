@@ -224,16 +224,16 @@ impl Weight for FastFieldTermSetWeight {
                         sort_order,
                         sorted_terms,
                     } => {
-                        // Gallop walks `sorted_terms` directly via
-                        // `RangeUnionDocSet`; no HashSet build needed.
+                        // Gallop walks the column on demand via
+                        // `TermSetGallopDocSet`; no HashSet build needed.
                         let cardinality = column.get_cardinality();
-                        Ok(term_set_gallop::run(
-                            &column,
+                        let docset = term_set_gallop::TermSetGallopDocSet::new(
+                            column,
                             sort_order,
-                            &sorted_terms,
+                            sorted_terms,
                             cardinality,
-                            boost,
-                        ))
+                        );
+                        Ok(Box::new(ConstScorer::new(docset, boost)))
                     }
                     // The non-Gallop variants are planner stubs today and route
                     // to TermSetDocSet; follow-ups A and B replace these arms

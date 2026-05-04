@@ -196,6 +196,40 @@ pub(crate) fn gallop_search_sorted(
     }
 }
 
+/// Galloping partition point on a sorted slice.
+///
+/// Returns the smallest `i` in `[lo, slice.len()]` for which `pred(&slice[i])`
+/// is false. The predicate must be monotone over `slice[lo..]`: true for some
+/// prefix, false thereafter — same contract as `gallop_search_sorted`.
+///
+/// Phase 1 doubles `step` from `lo` until a probe lands in the false region;
+/// phase 2 binary-searches the bracketed sub-slice via `partition_point`.
+/// Faster than plain `slice[lo..].partition_point` on the term-set
+/// forward-cursor pattern when the answer is close to `lo`, because the
+/// early probes share a cache line with `slice[lo]`.
+pub(crate) fn gallop_partition_point<T, F>(slice: &[T], lo: usize, mut pred: F) -> usize
+where
+    F: FnMut(&T) -> bool,
+{
+    let hi = slice.len();
+    if lo >= hi {
+        return hi;
+    }
+    let mut prev = lo;
+    let mut step: usize = 1;
+    loop {
+        let probe = lo.saturating_add(step).min(hi - 1);
+        if !pred(&slice[probe]) {
+            return prev + slice[prev..probe + 1].partition_point(&mut pred);
+        }
+        if probe == hi - 1 {
+            return hi;
+        }
+        prev = probe;
+        step = step.saturating_mul(2);
+    }
+}
+
 #[cfg(test)]
 mod gallop_tests {
     //! Hand-written coverage of `gallop_search_sorted` against
@@ -203,6 +237,7 @@ mod gallop_tests {
     //! test in `tests/gallop_search_stress.rs` exercises the helper against
     //! 1000s of random inputs; the cases here pin specific edge-cases so a
     //! regression has a clear failure point.
+
     use super::*;
     use crate::schema::{NumericOptions, SchemaBuilder};
     use crate::{Index, IndexSettings, IndexSortByField};
@@ -457,6 +492,85 @@ mod gallop_tests {
                 assert_agrees(&col, lo, 1000, target, Order::Asc, false);
                 assert_agrees(&col, lo, 1000, target, Order::Asc, true);
             }
+        }
+    }
+
+    // ----- gallop_partition_point hand-written cases -----
+
+    #[test]
+    fn partition_point_empty_slice() {
+        let s: &[u64] = &[];
+        assert_eq!(gallop_partition_point(s, 0, |&x| x < 5), 0);
+    }
+
+    #[test]
+    fn partition_point_lo_at_end() {
+        let s: &[u64] = &[1, 2, 3];
+        assert_eq!(gallop_partition_point(s, 3, |&x| x < 5), 3);
+        // lo > slice.len() also returns slice.len() (clamped).
+        assert_eq!(gallop_partition_point(s, 10, |&x| x < 5), 3);
+    }
+
+    #[test]
+    fn partition_point_pred_true_everywhere() {
+        let s: &[u64] = &[1, 2, 3, 4, 5];
+        // Predicate true for every element → answer is slice.len().
+        assert_eq!(gallop_partition_point(s, 0, |&x| x < 100), 5);
+        assert_eq!(gallop_partition_point(s, 2, |&x| x < 100), 5);
+    }
+
+    #[test]
+    fn partition_point_pred_false_at_lo() {
+        let s: &[u64] = &[10, 20, 30];
+        // Predicate false at the very first probe → answer is lo.
+        assert_eq!(gallop_partition_point(s, 0, |&x| x < 5), 0);
+        assert_eq!(gallop_partition_point(s, 1, |&x| x < 15), 1);
+    }
+
+    #[test]
+    fn partition_point_flip_near_lo() {
+        // Gallop's win case: answer is close to lo, so the bracket [prev,
+        // probe+1) closes after one or two doublings.
+        let s: Vec<u64> = (0..1000).collect();
+        for &lo in &[0usize, 100, 500, 950] {
+            for offset in &[0usize, 1, 2, 5] {
+                let target = lo as u64 + *offset as u64;
+                let expected = s.partition_point(|&x| x < target);
+                assert_eq!(gallop_partition_point(&s, lo, |&x| x < target), expected,
+                    "lo={lo} target={target}");
+            }
+        }
+    }
+
+    #[test]
+    fn partition_point_flip_near_end() {
+        // Worst case for gallop: answer near slice.len(), so phase 1 doubles
+        // through most of the slice before bracketing.
+        let s: Vec<u64> = (0..1000).collect();
+        let expected = s.partition_point(|&x| x < 999);
+        assert_eq!(gallop_partition_point(&s, 0, |&x| x < 999), expected);
+        // Predicate true everywhere from `lo` (loop must terminate at hi).
+        assert_eq!(gallop_partition_point(&s, 800, |&x| x < 1500), 1000);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig { cases: 64, ..Default::default() })]
+        // Differential against std's `partition_point`. `gallop_partition_point`
+        // must agree on every monotone predicate at every `lo`.
+        #[test]
+        fn prop_gallop_partition_point_matches_std(
+            slice in proptest::collection::vec(0u64..2000, 0usize..512),
+            lo in 0usize..600,
+            target in 0u64..2100,
+        ) {
+            // Sort to satisfy the monotone-predicate contract.
+            let mut s = slice;
+            s.sort_unstable();
+            let lo = lo.min(s.len());
+            let expected = lo + s[lo..].partition_point(|&x| x < target);
+            let actual = gallop_partition_point(&s, lo, |&x| x < target);
+            proptest::prop_assert_eq!(actual, expected,
+                "lo={} target={} slice={:?}", lo, target, s);
         }
     }
 }
