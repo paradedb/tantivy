@@ -477,12 +477,7 @@ mod gallop_tests {
         let (index, _field, name) = build_sorted_index(Order::Asc, &values);
         let (_segment, column) = open_segment_and_column(&index, &name);
         let cardinality = column.get_cardinality();
-        let mut ds = TermSetGallopDocSet::new(
-            column,
-            Order::Asc,
-            (0u64..8).collect(),
-            cardinality,
-        );
+        let mut ds = TermSetGallopDocSet::new(column, Order::Asc, (0u64..8).collect(), cardinality);
         // Seed lands on term 0's range [0, 4).
         assert_eq!(ds.doc(), 0);
         // seek(20) is in term 5's range [20, 24). The partition-point skip
