@@ -197,20 +197,18 @@ fn select_strategy_inner(
         return TermSetStrategy::LinearScan;
     }
 
-    // Prune to [min, max].
+    // Count terms surviving min/max pruning. Non-gallop branches only need
+    // K' to evaluate density gates; allocating a `Vec<u64>` here just to
+    // discard it on those branches is wasted work. The Gallop branch below
+    // does the allocation only when it commits to that strategy.
     let lo = column.min_value();
     let hi = column.max_value();
-    let mut pruned: Vec<u64> = term_set
-        .iter()
-        .copied()
-        .filter(|v| *v >= lo && *v <= hi)
-        .collect();
-    let k_prime = pruned.len() as u32;
+    let in_range = |v: u64| v >= lo && v <= hi;
+    let k_prime = term_set.iter().copied().filter(|&v| in_range(v)).count() as u32;
     if k_prime == 0 {
-        // All terms pruned — `scorer()` will turn the empty pruned set into
-        // `EmptyScorer`. We still return `LinearScan` here because the
-        // sort-agnostic branch's "no docs match anything" is the natural
-        // fallback.
+        // All terms pruned — return `LinearScan` as the natural fallback.
+        // `scorer()` upstream will detect the empty result via its own
+        // empty-range checks.
         return TermSetStrategy::LinearScan;
     }
 
@@ -232,8 +230,13 @@ fn select_strategy_inner(
             // pre-refactor integer form `K' < N / R_GALLOP` at every
             // exactly-representable density (the defaults are 1/2^k).
             if (k_prime as f64) / n_f < cfg.gallop_max_density {
+                // Gallop is the only branch that needs the pruned Vec
+                // (sorted + deduped + handed to `TermSetGallopDocSet`), so
+                // allocate it only here.
+                let mut pruned: Vec<u64> =
+                    term_set.iter().copied().filter(|&v| in_range(v)).collect();
                 pruned.sort_unstable();
-                // Dedup duplicate input terms. `term_set_gallop::run`
+                // Dedup duplicate input terms. `TermSetGallopDocSet`
                 // tolerates duplicates (the second occurrence finds an
                 // empty range and skips), but each duplicate still pays
                 // two `gallop_search_sorted` probes — cheap insurance on

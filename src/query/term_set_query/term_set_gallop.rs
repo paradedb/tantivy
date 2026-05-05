@@ -56,7 +56,7 @@ impl TermSetGallopDocSet {
     pub(crate) fn new(
         column: Column<u64>,
         sort_order: Order,
-        sorted_terms: Vec<u64>,
+        mut sorted_terms: Vec<u64>,
         cardinality: Cardinality,
     ) -> Self {
         let n = column.num_docs();
@@ -78,9 +78,8 @@ impl TermSetGallopDocSet {
         let terms = match sort_order {
             Order::Asc => sorted_terms,
             Order::Desc => {
-                let mut t = sorted_terms;
-                t.reverse();
-                t
+                sorted_terms.reverse();
+                sorted_terms
             }
         };
 
