@@ -208,3 +208,7 @@ harness = false
 name = "regex_all_terms"
 harness = false
 
+[[bench]]
+name = "term_set_queries"
+harness = false
+
