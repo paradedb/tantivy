@@ -98,7 +98,8 @@ use rand::SeedableRng;
 use tantivy::collector::{Collector, Count, DocSetCollector, SegmentCollector};
 use tantivy::query::{
     BitSetDocSet, BooleanQuery, ConstScorer, EmptyScorer, EnableScoring, Explanation,
-    FastFieldTermSetQuery, Occur, Query, Scorer, TermQuery, TermSetStrategyConfig, Weight,
+    FastFieldTermSetQuery, Occur, Query, Scorer, TermQuery, TermSetQuery, TermSetStrategyConfig,
+    Weight,
 };
 use tantivy::schema::{Field, IndexRecordOption, NumericOptions, SchemaBuilder};
 use tantivy::{
@@ -205,6 +206,7 @@ fn bench_tier() -> &'static str {
         Ok("phase5c20m") => "phase5c20m",
         Ok("phase5e_calib") => "phase5e_calib",
         Ok("phase5e_validate") => "phase5e_validate",
+        Ok("phase5h_smallK") => "phase5h_smallK",
         Ok("profile5e") => "profile5e",
         _ => "smoke",
     }
@@ -453,6 +455,15 @@ fn run_direct_bitset(searcher: &Searcher, field: tantivy::schema::Field, terms: 
     searcher.search(&q, &Count).unwrap()
 }
 
+/// Drive `TermSetQuery` rather than `FastFieldTermSetQuery` so tier-1 dispatch
+/// (`TermSetQuery::specialized_weight`) runs. Used by the Phase 5h cells that
+/// validate the K ≤ 1024 short-circuit removal: pre-change captures show
+/// `AutomatonWeight`, post-change captures show the tier-2 dispatch result.
+fn run_term_set_query(searcher: &Searcher, field: tantivy::schema::Field, terms: &[u64]) -> usize {
+    let q = TermSetQuery::new(terms.iter().map(|v| Term::from_field_u64(field, *v)));
+    searcher.search(&q, &Count).unwrap()
+}
+
 /// Collector that, per segment, materializes matches into a `BitSet` sized
 /// to the segment's `max_doc`, then walks the bitset to count.
 struct BitSetCounter;
@@ -551,6 +562,43 @@ fn build_corpus_parametric_d(n: u64, d: u64) -> (Searcher, tantivy::schema::Fiel
     let field = sb.add_u64_field("fk", NumericOptions::default().set_fast().set_indexed());
     let schema = sb.build();
     let index = Index::builder().schema(schema).create_in_ram().unwrap();
+    {
+        let writer_mem = (200_000_000u64).max(n * 32);
+        let mut writer = index
+            .writer_with_num_threads(1, writer_mem as usize)
+            .unwrap();
+        for doc_id in 0..n {
+            writer.add_document(doc!(field => doc_id / d)).unwrap();
+        }
+        writer.commit().unwrap();
+    }
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
+        .unwrap();
+    (reader.searcher(), field)
+}
+
+/// Sorted variant of `build_corpus_parametric_d`. `sort_by_field` is set to
+/// the parametric-D column ascending, so the resulting segment has
+/// `reader.sort_by_field()` matching `"fk"` — the precondition tier-2
+/// dispatch checks to admit `Gallop`. Used by Phase 5h Sorted_PK cells.
+fn build_corpus_parametric_d_sorted(n: u64, d: u64) -> (Searcher, tantivy::schema::Field) {
+    let mut sb = SchemaBuilder::new();
+    let field = sb.add_u64_field("fk", NumericOptions::default().set_fast().set_indexed());
+    let schema = sb.build();
+    let index = Index::builder()
+        .schema(schema)
+        .settings(IndexSettings {
+            sort_by_field: Some(IndexSortByField {
+                field: "fk".to_string(),
+                order: Order::Asc,
+            }),
+            ..Default::default()
+        })
+        .create_in_ram()
+        .unwrap();
     {
         let writer_mem = (200_000_000u64).max(n * 32);
         let mut writer = index
@@ -862,6 +910,128 @@ fn run_phase5e_validate_tier() {
     }
 }
 
+/// Phase 5h validation: small-K cells driven through `TermSetQuery::specialized_weight`
+/// (tier-1 dispatch). Captured PRE-change to record AutomatonWeight numbers
+/// and POST-change to record the new tier-2 dispatch numbers; the file
+/// `term_set_queries-captures/phase5h-smallk.txt` holds the post-change
+/// reading (the pre-change baseline lives in the same file via run name).
+///
+/// We measure `term_set_query` (drives `TermSetQuery` → tier-1 dispatch) and
+/// `posting_direct` (BooleanQuery::Should over TermQuery — proxy for the
+/// BufferedUnionScorer compose step that both AutomatonWeight and any
+/// K-direct-lookup alternative pay). The cell-by-cell delta on the
+/// `term_set_query` row tells the story.
+fn run_phase5h_smallk_tier() {
+    let mut runner = BenchRunner::new();
+    let small_ks: &[usize] = &[10, 100, 500, 1000];
+
+    // PK_1M (D=1, dict_size=1M).
+    {
+        let n: u64 = 1_000_000;
+        let d: u64 = 1;
+        let (searcher, field) = build_corpus_parametric_d(n, d);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5h_smallK n={n} D={d} (pk_1m)"));
+        group.set_input_size(n as usize);
+        let distinct = n.div_ceil(d).max(1);
+        for &k in small_ks {
+            let k_eff = k.min(distinct as usize);
+            let terms = sample_terms(distinct, k_eff, 7);
+            let s = searcher.clone();
+            let t = terms.clone();
+            group.register(format!("k={k_eff} run=term_set_query"), move |_| {
+                black_box(run_term_set_query(&s, field, &t))
+            });
+            let s = searcher.clone();
+            let t = terms;
+            group.register(format!("k={k_eff} run=posting_direct"), move |_| {
+                black_box(run_posting_direct_synthetic(&s, field, &t))
+            });
+        }
+        group.run();
+    }
+
+    // PK_20M (D=1, dict_size=20M).
+    {
+        let n: u64 = 20_000_000;
+        let d: u64 = 1;
+        let (searcher, field) = build_corpus_parametric_d(n, d);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5h_smallK n={n} D={d} (pk_20m)"));
+        group.set_input_size(n as usize);
+        let distinct = n.div_ceil(d).max(1);
+        for &k in small_ks {
+            let k_eff = k.min(distinct as usize);
+            let terms = sample_terms(distinct, k_eff, 7);
+            let s = searcher.clone();
+            let t = terms.clone();
+            group.register(format!("k={k_eff} run=term_set_query"), move |_| {
+                black_box(run_term_set_query(&s, field, &t))
+            });
+            let s = searcher.clone();
+            let t = terms;
+            group.register(format!("k={k_eff} run=posting_direct"), move |_| {
+                black_box(run_posting_direct_synthetic(&s, field, &t))
+            });
+        }
+        group.run();
+    }
+
+    // LowFk_20M (D=100, dict_size=200K).
+    {
+        let n: u64 = 20_000_000;
+        let d: u64 = 100;
+        let (searcher, field) = build_corpus_parametric_d(n, d);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5h_smallK n={n} D={d} (lowfk_20m)"));
+        group.set_input_size(n as usize);
+        let distinct = n.div_ceil(d).max(1);
+        for &k in small_ks {
+            let k_eff = k.min(distinct as usize);
+            let terms = sample_terms(distinct, k_eff, 7);
+            let s = searcher.clone();
+            let t = terms.clone();
+            group.register(format!("k={k_eff} run=term_set_query"), move |_| {
+                black_box(run_term_set_query(&s, field, &t))
+            });
+            let s = searcher.clone();
+            let t = terms;
+            group.register(format!("k={k_eff} run=posting_direct"), move |_| {
+                black_box(run_posting_direct_synthetic(&s, field, &t))
+            });
+        }
+        group.run();
+    }
+
+    // Sorted_PK_20M (D=1, dict_size=20M, segment sorted ASC by `fk`). This is the
+    // headline cell for tier-1 removal: pre-change it routed to AutomatonWeight
+    // ignoring the sort; post-change it should hit Gallop via tier-2.
+    {
+        let n: u64 = 20_000_000;
+        let d: u64 = 1;
+        let (searcher, field) = build_corpus_parametric_d_sorted(n, d);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5h_smallK n={n} D={d} (sorted_pk_20m)"));
+        group.set_input_size(n as usize);
+        let distinct = n.div_ceil(d).max(1);
+        for &k in small_ks {
+            let k_eff = k.min(distinct as usize);
+            let terms = sample_terms(distinct, k_eff, 7);
+            let s = searcher.clone();
+            let t = terms.clone();
+            group.register(format!("k={k_eff} run=term_set_query"), move |_| {
+                black_box(run_term_set_query(&s, field, &t))
+            });
+            let s = searcher.clone();
+            let t = terms;
+            group.register(format!("k={k_eff} run=posting_direct"), move |_| {
+                black_box(run_posting_direct_synthetic(&s, field, &t))
+            });
+        }
+        group.run();
+    }
+}
+
 /// Phase 5b.2 profiling mode: run the regression cell (PK D=1 K=10K
 /// Phase 5e-verify profiling mode: run the bench-only `direct_bitset`
 /// helper (Phase 5c — algorithmically identical to the production
@@ -964,6 +1134,10 @@ fn main() {
     }
     if tier == "phase5e_validate" {
         run_phase5e_validate_tier();
+        return;
+    }
+    if tier == "phase5h_smallK" {
+        run_phase5h_smallk_tier();
         return;
     }
     if tier == "profile5e" {

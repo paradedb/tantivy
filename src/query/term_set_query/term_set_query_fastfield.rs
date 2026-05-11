@@ -220,6 +220,10 @@ impl Weight for FastFieldTermSetWeight {
                 );
 
                 match strategy {
+                    // Planner proved the result is empty (empty segment, empty
+                    // query set, all terms pruned by [min, max], or empty
+                    // upstream candidate set on a subsequent column).
+                    TermSetStrategy::Empty => Ok(Box::new(EmptyScorer)),
                     TermSetStrategy::Gallop {
                         sort_order,
                         sorted_terms,

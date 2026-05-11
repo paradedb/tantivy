@@ -35,6 +35,7 @@ pub enum StrategyTag {
     Gallop = 1,
     Linear = 2,
     Bitset = 3,
+    Empty = 4,
 }
 
 impl TryFrom<u8> for StrategyTag {
@@ -46,6 +47,7 @@ impl TryFrom<u8> for StrategyTag {
             1 => Ok(StrategyTag::Gallop),
             2 => Ok(StrategyTag::Linear),
             3 => Ok(StrategyTag::Bitset),
+            4 => Ok(StrategyTag::Empty),
             _ => Err("unknown StrategyTag value"),
         }
     }
@@ -123,6 +125,17 @@ pub enum TermSetStrategy {
     /// Direct `TermDictionary::get(key)` lookups + bitset OR. The K-bounded
     /// inverted-index path; see `term_set_bitset.rs`.
     BitsetFromPostings,
+    /// The result is definitively empty; no posting list reads or column
+    /// scans needed. Returned when the planner can prove no docs can match:
+    ///   - `n == 0` (empty segment)
+    ///   - `term_set.is_empty()` (no query terms)
+    ///   - `k_prime == 0` (all query terms pruned outside `[min, max]`)
+    ///   - `candidate_size == 0` (subsequent-column branch with empty upstream)
+    /// The dispatch site emits an `EmptyScorer` for this variant. Closing
+    /// this gap was Phase 5i — pre-fix the planner returned `LinearScan`
+    /// here and the dispatch site walked every doc in the segment doing
+    /// hashset probes that all failed by construction.
+    Empty,
 }
 
 /// Inputs to the planner that aren't already on `Column`.
@@ -140,25 +153,23 @@ pub struct PlannerInputs<'a> {
 ///
 /// ## Tier 1 — upstream: `TermSetQuery::specialized_weight`
 ///
-/// `TermSetQuery` itself doesn't reach this function. Before any strategy
-/// here is considered, the outer query routes on a K threshold:
+/// `TermSetQuery` itself doesn't reach this function unless tier 1 routes
+/// to `FastFieldTermSetWeight`. The tier-1 fork is on field type only:
 ///
-///   - `terms.len() > TERM_SET_FAST_FIELD_CARDINALITY_THRESHOLD` (= 1024) AND field is `is_fast()`
-///     AND value type is U64/I64/F64/Date/IpAddr → `FastFieldTermSetWeight` (this dispatch table
-///     runs)
-///   - Otherwise → `AutomatonWeight` (streaming dictionary walk + `BufferedUnionScorer` heap merge
-///     of K posting lists). Operates on the inverted index, not the fast field; the strategy
-///     framework below never sees the query.
+///   - field is `is_fast()` AND value type is U64/I64/F64/Date/IpAddr → `FastFieldTermSetWeight`
+///     (this dispatch table runs for every K).
+///   - Otherwise (non-fast field, or `Bool/Json/Str/...` value type) → `AutomatonWeight` over the
+///     inverted index (streaming dictionary walk + `BufferedUnionScorer` heap merge of K posting
+///     lists). The strategy framework below never sees the query in this branch.
 ///
-/// **Known limitation (out of scope for the Phase 5 PR):** the K ≤ 1024
-/// gate is K-only — it ignores `is_sorted_by(field)` and dict_size. As a
-/// result, `AutomatonWeight` is picked even when:
-///   - the column is sorted (where `Gallop` would dominate by 10–100×), or
-///   - dict_size ≈ N (PK-shape, where the streaming dict walk dominates cost — at PK_20M K=1K,
-///     AutomatonWeight is ~150–300 ms while direct-lookup `BitsetFromPostings` would be ~265 µs).
-///
-/// See the "Known limitations" section of PR #<NN> for the gap analysis;
-/// fixing it is its own follow-up.
+/// Phase 5h removed the prior `terms.len() > 1024` short-circuit that
+/// forced small-K queries on fast-supported types into `AutomatonWeight`.
+/// Tier 2 below handles every K cleanly: small K on a sorted column hits
+/// `Gallop`; small K on an unsorted column hits `BitsetFromPostings` with
+/// direct dictionary lookups — both much faster than the streaming
+/// `AutomatonWeight` walk on a large dictionary. `AutomatonWeight` is now
+/// reserved exclusively for fields where the fast-field path doesn't
+/// apply.
 ///
 /// ## Tier 2 — this function (`select_strategy` over a `Column<u64>`)
 ///
@@ -201,7 +212,6 @@ pub struct PlannerInputs<'a> {
 /// All "density" values are unitless ratios; the strict less-than gate
 /// means the threshold value itself routes to the next-tier strategy.
 ///
-///   - `TERM_SET_FAST_FIELD_CARDINALITY_THRESHOLD` = 1024 (in `term_set_query.rs`; tier-1 K gate)
 ///   - `cfg.gallop_max_density`              default 1/100 = 0.01
 ///   - `cfg.bitset_max_density`              default 1/50  = 0.02
 ///   - `cfg.subsequent_bitset_max_density`   default 1/4   = 0.25
@@ -232,6 +242,7 @@ pub fn select_strategy(
             TermSetStrategy::Gallop { .. } => StrategyTag::Gallop,
             TermSetStrategy::LinearScan => StrategyTag::Linear,
             TermSetStrategy::BitsetFromPostings => StrategyTag::Bitset,
+            TermSetStrategy::Empty => StrategyTag::Empty,
         };
         sink.store(tag as u8, Ordering::Relaxed);
     }
@@ -247,9 +258,8 @@ fn select_strategy_inner(
 ) -> TermSetStrategy {
     let n = column.num_docs();
     if n == 0 || term_set.is_empty() {
-        // The empty-input case is handled upstream as `EmptyScorer`; falling
-        // through to `LinearScan` here is a no-op for correctness.
-        return TermSetStrategy::LinearScan;
+        // Empty segment or empty query → no docs can match.
+        return TermSetStrategy::Empty;
     }
 
     // Count terms surviving min/max pruning. Non-gallop branches only need
@@ -261,10 +271,12 @@ fn select_strategy_inner(
     let in_range = |v: u64| v >= lo && v <= hi;
     let k_prime = term_set.iter().copied().filter(|&v| in_range(v)).count() as u32;
     if k_prime == 0 {
-        // All terms pruned — return `LinearScan` as the natural fallback.
-        // `scorer()` upstream will detect the empty result via its own
-        // empty-range checks.
-        return TermSetStrategy::LinearScan;
+        // All query terms fall outside the column's [min, max] — no doc
+        // can match. Returning `LinearScan` here would let the dispatch
+        // site walk every doc in the segment doing hashset probes that
+        // we already know will fail; returning `Empty` lets it short
+        // circuit to `EmptyScorer`. (Phase 5i fix.)
+        return TermSetStrategy::Empty;
     }
 
     let candidate_eq_n = inputs.candidate_size.is_none_or(|c| c == n);
@@ -313,11 +325,14 @@ fn select_strategy_inner(
     let kd = (k_prime as u64).saturating_mul(d) as f64;
 
     if let Some(c) = inputs.candidate_size.filter(|&c| c < n) {
-        // Subsequent column. `c == 0` is degenerate (the upstream is empty);
-        // there's nothing to filter, so `LinearScan` is the cheapest no-op.
-        // For `c > 0`, fire `BitsetFromPostings` when `K·D/C` falls below the
-        // threshold; otherwise default to `LinearScan`.
-        if c > 0 && kd / (c as f64) < cfg.subsequent_bitset_max_density {
+        // Subsequent column. `c == 0` means the upstream filter produced no
+        // candidates — no docs can match this filter either. For `c > 0`,
+        // fire `BitsetFromPostings` when `K·D/C` falls below the threshold;
+        // otherwise default to `LinearScan`.
+        if c == 0 {
+            return TermSetStrategy::Empty;
+        }
+        if kd / (c as f64) < cfg.subsequent_bitset_max_density {
             return TermSetStrategy::BitsetFromPostings;
         }
         TermSetStrategy::LinearScan
@@ -399,8 +414,11 @@ mod tests {
             &term_set([10_000_000u64, 99_999_999, u64::MAX]),
             &TermSetStrategyConfig::default(),
         );
-        // All terms pruned → LinearScan (scorer() will turn it into EmptyScorer).
-        assert_eq!(strat, TermSetStrategy::LinearScan);
+        // All query terms fall outside the column's [min, max]. The planner
+        // proves no docs can match and returns `Empty` so the dispatch site
+        // emits `EmptyScorer` instead of walking the segment with a hashset
+        // of guaranteed-to-miss values. (Phase 5i.)
+        assert_eq!(strat, TermSetStrategy::Empty);
     }
 
     #[test]

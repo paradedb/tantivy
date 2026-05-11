@@ -1,0 +1,39 @@
+   Compiling tantivy v0.26.0 (/Users/ruchir/dev/paradedb/tantivy)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 9.13s
+     Running benches/term_set_queries.rs (target/release/deps/term_set_queries-7aa5fa5113919241)
+phase5h_smallK n=1000000 D=1 (pk_1m)
+k=10 run=term_set_query          Avg: 43.662 GB/s (+427.93%)     Median: 43.691 GB/s (+423.14%)     [42.900 GB/s .. 43.887 GB/s]    Output: 10       
+k=10 run=posting_direct          Avg: 185.15 GB/s (+2.48%)       Median: 185.53 GB/s (+1.58%)       [176.18 GB/s .. 187.90 GB/s]    Output: 10       
+k=100 run=term_set_query         Avg: 27.421 GB/s (+1313.89%)    Median: 27.401 GB/s (+1307.18%)    [27.233 GB/s .. 27.607 GB/s]    Output: 100      
+k=100 run=posting_direct         Avg: 17.200 GB/s (+2.14%)       Median: 17.234 GB/s (+1.60%)       [16.996 GB/s .. 17.344 GB/s]    Output: 100      
+k=500 run=term_set_query         Avg: 10.976 GB/s (+2122.90%)    Median: 10.974 GB/s (+2105.59%)    [10.873 GB/s .. 11.062 GB/s]    Output: 500      
+k=500 run=posting_direct         Avg: 3.0180 GB/s (-5.34%)       Median: 3.1389 GB/s (-2.03%)       [1.6425 GB/s .. 3.1639 GB/s]    Output: 500      
+k=1000 run=term_set_query        Avg: 6.2756 GB/s (+2219.15%)    Median: 6.3125 GB/s (+2229.51%)    [4.9263 GB/s .. 6.4182 GB/s]    Output: 1_000    
+k=1000 run=posting_direct        Avg: 1.4652 GB/s (-2.61%)       Median: 1.4862 GB/s (-1.72%)       [1.0323 GB/s .. 1.4908 GB/s]    Output: 1_000    
+phase5h_smallK n=20000000 D=1 (pk_20m)
+k=10 run=term_set_query          Avg: 1.3616 GB/s (-99.05%)     Median: 1.3871 GB/s (-99.04%)     [1.0201 GB/s .. 1.3971 GB/s]    Output: 10       
+k=10 run=posting_direct          Avg: 2795.6 GB/s (-4.65%)      Median: 2838.1 GB/s (-3.39%)      [2261.2 GB/s .. 3049.7 GB/s]    Output: 10       
+k=100 run=term_set_query         Avg: 43.959 GB/s (+77.91%)     Median: 45.094 GB/s (+82.17%)     [24.708 GB/s .. 46.092 GB/s]    Output: 100      
+k=100 run=posting_direct         Avg: 125.68 GB/s (-58.12%)     Median: 298.85 GB/s (-0.47%)      [6.7384 GB/s .. 313.34 GB/s]    Output: 100      
+k=500 run=term_set_query         Avg: 26.780 GB/s (+312.36%)    Median: 38.064 GB/s (+483.24%)    [3.6264 GB/s .. 38.804 GB/s]    Output: 500      
+k=500 run=posting_direct         Avg: 53.897 GB/s (-4.35%)      Median: 55.463 GB/s (-1.51%)      [40.641 GB/s .. 55.759 GB/s]    Output: 500      
+k=1000 run=term_set_query        Avg: 30.628 GB/s (+719.61%)    Median: 32.408 GB/s (+767.27%)    [16.168 GB/s .. 32.541 GB/s]    Output: 1_000    
+k=1000 run=posting_direct        Avg: 24.405 GB/s (-6.48%)      Median: 25.279 GB/s (-3.16%)      [17.216 GB/s .. 25.336 GB/s]    Output: 1_000    
+phase5h_smallK n=20000000 D=100 (lowfk_20m)
+k=10 run=term_set_query          Avg: 46.695 GB/s (-74.30%)     Median: 46.795 GB/s (-74.27%)     [44.005 GB/s .. 46.910 GB/s]    Output: 1_000      
+k=10 run=posting_direct          Avg: 2433.7 GB/s (-0.44%)      Median: 2428.1 GB/s (+0.50%)      [2354.3 GB/s .. 2512.9 GB/s]    Output: 1_000      
+k=100 run=term_set_query         Avg: 42.638 GB/s (+1.18%)      Median: 42.742 GB/s (+1.11%)      [41.267 GB/s .. 42.815 GB/s]    Output: 10_000     
+k=100 run=posting_direct         Avg: 229.07 GB/s (-0.42%)      Median: 229.12 GB/s (-0.59%)      [227.21 GB/s .. 230.58 GB/s]    Output: 10_000     
+k=500 run=term_set_query         Avg: 31.181 GB/s (+200.99%)    Median: 31.226 GB/s (+201.33%)    [30.210 GB/s .. 31.264 GB/s]    Output: 50_000     
+k=500 run=posting_direct         Avg: 37.848 GB/s (-4.23%)      Median: 37.848 GB/s (-4.29%)      [37.644 GB/s .. 38.097 GB/s]    Output: 50_000     
+k=1000 run=term_set_query        Avg: 23.444 GB/s (+311.88%)    Median: 23.457 GB/s (+312.09%)    [23.088 GB/s .. 23.542 GB/s]    Output: 100_000    
+k=1000 run=posting_direct        Avg: 15.805 GB/s (-7.31%)      Median: 15.971 GB/s (-6.34%)      [11.945 GB/s .. 16.028 GB/s]    Output: 100_000    
+phase5h_smallK n=20000000 D=1 (sorted_pk_20m)
+k=10 run=term_set_query          Avg: 1.3842 GB/s (-99.04%)     Median: 1.3837 GB/s (-99.04%)     [1.3820 GB/s .. 1.3864 GB/s]    Output: 10       
+k=10 run=posting_direct          Avg: 2833.3 GB/s (-3.65%)      Median: 2836.9 GB/s (-3.04%)      [2569.7 GB/s .. 2950.3 GB/s]    Output: 10       
+k=100 run=term_set_query         Avg: 53.243 GB/s (+113.94%)    Median: 53.263 GB/s (+114.03%)    [52.626 GB/s .. 54.073 GB/s]    Output: 100      
+k=100 run=posting_direct         Avg: 296.36 GB/s (-0.91%)      Median: 297.18 GB/s (-0.54%)      [276.71 GB/s .. 312.74 GB/s]    Output: 100      
+k=500 run=term_set_query         Avg: 39.951 GB/s (+510.79%)    Median: 39.955 GB/s (+510.85%)    [39.560 GB/s .. 40.523 GB/s]    Output: 500      
+k=500 run=posting_direct         Avg: 55.241 GB/s (-1.91%)      Median: 55.271 GB/s (-1.82%)      [54.670 GB/s .. 55.710 GB/s]    Output: 500      
+k=1000 run=term_set_query        Avg: 31.691 GB/s (+752.37%)    Median: 31.856 GB/s (+751.10%)    [27.228 GB/s .. 31.955 GB/s]    Output: 1_000    
+k=1000 run=posting_direct        Avg: 25.151 GB/s (-3.84%)      Median: 25.163 GB/s (-3.87%)      [25.025 GB/s .. 25.278 GB/s]    Output: 1_000    
