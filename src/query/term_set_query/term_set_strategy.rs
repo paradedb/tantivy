@@ -134,12 +134,86 @@ pub struct PlannerInputs<'a> {
     pub avg_docs_per_term: Option<u32>,
 }
 
-/// Run the decision tree.
+/// Strategy dispatch for `FastFieldTermSetQuery`.
 ///
-/// First, prune the term set against the column's `[min, max]`. Then try
-/// the sort-dependent gallop fast path. Otherwise fall through to the
-/// sort-agnostic dispatch, which branches on `C < N` (subsequent column)
-/// vs `C == N` (first column).
+/// # Decision tree (evaluated in order)
+///
+/// ## Tier 1 — upstream: `TermSetQuery::specialized_weight`
+///
+/// `TermSetQuery` itself doesn't reach this function. Before any strategy
+/// here is considered, the outer query routes on a K threshold:
+///
+///   - `terms.len() > TERM_SET_FAST_FIELD_CARDINALITY_THRESHOLD` (= 1024) AND field is `is_fast()`
+///     AND value type is U64/I64/F64/Date/IpAddr → `FastFieldTermSetWeight` (this dispatch table
+///     runs)
+///   - Otherwise → `AutomatonWeight` (streaming dictionary walk + `BufferedUnionScorer` heap merge
+///     of K posting lists). Operates on the inverted index, not the fast field; the strategy
+///     framework below never sees the query.
+///
+/// **Known limitation (out of scope for the Phase 5 PR):** the K ≤ 1024
+/// gate is K-only — it ignores `is_sorted_by(field)` and dict_size. As a
+/// result, `AutomatonWeight` is picked even when:
+///   - the column is sorted (where `Gallop` would dominate by 10–100×), or
+///   - dict_size ≈ N (PK-shape, where the streaming dict walk dominates cost — at PK_20M K=1K,
+///     AutomatonWeight is ~150–300 ms while direct-lookup `BitsetFromPostings` would be ~265 µs).
+///
+/// See the "Known limitations" section of PR #<NN> for the gap analysis;
+/// fixing it is its own follow-up.
+///
+/// ## Tier 2 — this function (`select_strategy` over a `Column<u64>`)
+///
+/// 1. **Defensive empty checks** — if `n == 0`, the input term set is empty, or all terms prune
+///    outside `[column.min, column.max]`, return `LinearScan`. Upstream callers handle the
+///    truly-empty result via `EmptyScorer`; this arm just keeps the planner total over its
+///    well-defined domain.
+///
+/// 2. **Gallop** — sort-dependent fast path. Fires when all of:
+///      - `cfg.gallop_enabled` (kill switch, default true)
+///      - `inputs.candidate_size.is_none_or(|c| c == n)`  (first column; candidate-set filtering
+///        hasn't already reduced N)
+///      - column cardinality is `Full` or `Optional` (gallop's range walk assumes one value per
+///        doc)
+///      - the segment has a `sort_by_field` matching `inputs.field_name`
+///      - `K' / N < cfg.gallop_max_density`  (default 1/100 = 0.01)
+///    `Gallop` reads the fast-field column directly with exponential jumps;
+///    cost is `O(K' · log(N/K'))`. Preferred over all inverted-index
+///    strategies when the column is sort-compatible with the filter, since
+///    no other strategy exploits sortedness.
+///
+/// 3. **Subsequent-column branch** — when an upstream candidate set has already narrowed work to
+///    `C` candidates (`inputs.candidate_size < n`):
+///      - `c > 0` AND `K' · D / C < cfg.subsequent_bitset_max_density` (default 1/4) →
+///        `BitsetFromPostings`
+///      - Otherwise → `LinearScan`
+///    The bitset path here still streams K direct dictionary lookups (the
+///    `BitsetFromPostings` algorithm is the same as the first-column
+///    branch); it's the eligibility threshold that differs.
+///
+/// 4. **First-column branch** — full segment, no upstream filter:
+///      - `K' · D / N < cfg.bitset_max_density` (default 1/50 = 0.02) → `BitsetFromPostings`.
+///        Direct dictionary lookups + bitset OR. Wins 5–250× over `LinearScan` in this band per
+///        Phase 5c sweeps; see PR #<NN>.
+///      - Otherwise → `LinearScan`. Single O(N) pass with `HashSet` probe per doc; wins when K is a
+///        large enough fraction of N that K discrete dictionary lookups exceed one full scan.
+///
+/// # Constants
+///
+/// All "density" values are unitless ratios; the strict less-than gate
+/// means the threshold value itself routes to the next-tier strategy.
+///
+///   - `TERM_SET_FAST_FIELD_CARDINALITY_THRESHOLD` = 1024 (in `term_set_query.rs`; tier-1 K gate)
+///   - `cfg.gallop_max_density`              default 1/100 = 0.01
+///   - `cfg.bitset_max_density`              default 1/50  = 0.02
+///   - `cfg.subsequent_bitset_max_density`   default 1/4   = 0.25
+///   - `cfg.gallop_enabled`                  default true
+///
+/// `D` (`avg_docs_per_term`) defaults to 1 when the caller doesn't supply
+/// it. The dispatch site in `FastFieldTermSetWeight::scorer` currently
+/// always passes `None`; the threshold gates therefore reduce to `K' / N`
+/// and `K' / C` in practice. Plumbing a real per-column D estimator is a
+/// separate follow-up.
+///
+/// # Strategy sink for EXPLAIN
 ///
 /// When `cfg.strategy_sink` is `Some`, the chosen `StrategyTag` is stored
 /// (as `u8`) on the sink before returning so consumers can surface it in
