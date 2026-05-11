@@ -26,8 +26,8 @@
 //! entirely.
 //!
 //! See `design-doc.md` for the cost analysis. The bench captures live in
-//! `tantivy/benches/term_set_queries.phase5c-rerun.txt` and
-//! `tantivy/benches/term_set_queries.phase5c-20M.txt`.
+//! `tantivy/benches/term_set_queries-captures/phase5c-rerun.txt` and
+//! `tantivy/benches/term_set_queries-captures/phase5c-20M.txt`.
 
 use common::BitSet;
 

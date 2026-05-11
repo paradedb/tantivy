@@ -1,0 +1,76 @@
+   Compiling tantivy v0.26.0 (/Users/ruchir/dev/paradedb/tantivy)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 1.09s
+     Running benches/term_set_queries.rs (target/release/deps/term_set_queries-7aa5fa5113919241)
+phase5b k_scaling n=1000000 D=1 (pk)
+k=500 strat=bitset_real              Avg: 445.43 MB/s     Median: 446.89 MB/s     [427.63 MB/s .. 449.52 MB/s]    Output: 500        
+k=500 strat=linear                   Avg: 301.40 MB/s     Median: 303.02 MB/s     [263.74 MB/s .. 309.88 MB/s]    Output: 500        
+k=500 strat=posting_direct           Avg: 3.0908 GB/s     Median: 3.1005 GB/s     [2.9283 GB/s .. 3.1907 GB/s]    Output: 500        
+k=1000 strat=bitset_real             Avg: 244.98 MB/s     Median: 245.69 MB/s     [232.33 MB/s .. 248.46 MB/s]    Output: 1_000      
+k=1000 strat=linear                  Avg: 293.56 MB/s     Median: 294.03 MB/s     [282.18 MB/s .. 302.85 MB/s]    Output: 1_000      
+k=1000 strat=posting_direct          Avg: 1.3971 GB/s     Median: 1.4200 GB/s     [1.0513 GB/s .. 1.4513 GB/s]    Output: 1_000      
+k=2000 strat=bitset_real             Avg: 137.55 MB/s     Median: 138.48 MB/s     [128.70 MB/s .. 140.55 MB/s]    Output: 2_000      
+k=2000 strat=linear                  Avg: 301.71 MB/s     Median: 304.25 MB/s     [266.92 MB/s .. 307.96 MB/s]    Output: 2_000      
+k=2000 strat=posting_direct          Avg: 584.03 MB/s     Median: 595.09 MB/s     [464.64 MB/s .. 617.07 MB/s]    Output: 2_000      
+k=3000 strat=bitset_real             Avg: 101.01 MB/s     Median: 101.17 MB/s     [96.503 MB/s .. 102.69 MB/s]    Output: 3_000      
+k=3000 strat=linear                  Avg: 163.97 MB/s     Median: 164.32 MB/s     [160.43 MB/s .. 165.73 MB/s]    Output: 3_000      
+k=3000 strat=posting_direct          Avg: 380.77 MB/s     Median: 382.28 MB/s     [349.11 MB/s .. 394.86 MB/s]    Output: 3_000      
+k=5000 strat=bitset_real             Avg: 75.584 MB/s     Median: 75.798 MB/s     [71.793 MB/s .. 76.197 MB/s]    Output: 5_000      
+k=5000 strat=linear                  Avg: 230.32 MB/s     Median: 230.55 MB/s     [225.41 MB/s .. 233.43 MB/s]    Output: 5_000      
+k=5000 strat=posting_direct          Avg: 204.86 MB/s     Median: 206.92 MB/s     [161.26 MB/s .. 214.54 MB/s]    Output: 5_000      
+k=7000 strat=bitset_real             Avg: 62.519 MB/s     Median: 65.174 MB/s     [29.705 MB/s .. 65.505 MB/s]    Output: 7_000      
+k=7000 strat=linear                  Avg: 93.981 MB/s     Median: 95.246 MB/s     [77.497 MB/s .. 97.670 MB/s]    Output: 7_000      
+k=7000 strat=posting_direct          Avg: 131.23 MB/s     Median: 136.23 MB/s     [102.64 MB/s .. 141.50 MB/s]    Output: 7_000      
+k=10000 strat=bitset_real            Avg: 56.799 MB/s     Median: 57.646 MB/s     [46.730 MB/s .. 57.977 MB/s]    Output: 10_000     
+k=10000 strat=linear                 Avg: 216.30 MB/s     Median: 219.00 MB/s     [164.43 MB/s .. 222.81 MB/s]    Output: 10_000     
+k=10000 strat=posting_direct         Avg: 87.350 MB/s     Median: 87.510 MB/s     [83.347 MB/s .. 89.117 MB/s]    Output: 10_000     
+k=15000 strat=bitset_real            Avg: 52.424 MB/s     Median: 52.446 MB/s     [51.837 MB/s .. 52.653 MB/s]    Output: 15_000     
+k=15000 strat=linear                 Avg: 288.11 MB/s     Median: 289.02 MB/s     [268.23 MB/s .. 292.27 MB/s]    Output: 15_000     
+k=15000 strat=posting_direct         Avg: 54.174 MB/s     Median: 54.849 MB/s     [46.301 MB/s .. 55.602 MB/s]    Output: 15_000     
+k=20000 strat=bitset_real            Avg: 49.362 MB/s     Median: 49.459 MB/s     [47.299 MB/s .. 49.665 MB/s]    Output: 20_000     
+k=20000 strat=linear                 Avg: 204.87 MB/s     Median: 205.57 MB/s     [198.83 MB/s .. 207.52 MB/s]    Output: 20_000     
+k=20000 strat=posting_direct         Avg: 39.869 MB/s     Median: 39.971 MB/s     [37.844 MB/s .. 40.798 MB/s]    Output: 20_000     
+k=30000 strat=bitset_real            Avg: 44.952 MB/s     Median: 45.247 MB/s     [43.582 MB/s .. 45.499 MB/s]    Output: 30_000     
+k=30000 strat=linear                 Avg: 255.65 MB/s     Median: 257.56 MB/s     [211.29 MB/s .. 260.89 MB/s]    Output: 30_000     
+k=30000 strat=posting_direct         Avg: 25.768 MB/s     Median: 26.010 MB/s     [23.352 MB/s .. 26.500 MB/s]    Output: 30_000     
+k=50000 strat=bitset_real            Avg: 38.380 MB/s     Median: 38.577 MB/s     [37.178 MB/s .. 39.307 MB/s]    Output: 50_000     
+k=50000 strat=linear                 Avg: 106.75 MB/s     Median: 107.04 MB/s     [98.089 MB/s .. 109.25 MB/s]    Output: 50_000     
+k=50000 strat=posting_direct         Avg: 14.920 MB/s     Median: 14.973 MB/s     [14.268 MB/s .. 15.167 MB/s]    Output: 50_000     
+k=100000 strat=bitset_real           Avg: 28.097 MB/s     Median: 28.268 MB/s     [23.215 MB/s .. 29.076 MB/s]    Output: 100_000    
+k=100000 strat=linear                Avg: 97.001 MB/s     Median: 97.610 MB/s     [91.384 MB/s .. 98.844 MB/s]    Output: 100_000    
+k=100000 strat=posting_direct        Avg: 6.2266 MB/s     Median: 6.3089 MB/s     [5.7836 MB/s .. 6.4175 MB/s]    Output: 100_000    
+phase5b d_scaling n=1000000 K_req=10000 D=1
+k=10000 strat=bitset_real           Avg: 56.909 MB/s     Median: 57.501 MB/s     [47.904 MB/s .. 57.832 MB/s]    Output: 10_000    
+k=10000 strat=linear                Avg: 217.16 MB/s     Median: 216.78 MB/s     [211.08 MB/s .. 223.61 MB/s]    Output: 10_000    
+k=10000 strat=posting_direct        Avg: 83.044 MB/s     Median: 86.316 MB/s     [63.060 MB/s .. 88.676 MB/s]    Output: 10_000    
+phase5b d_scaling n=1000000 K_req=10000 D=10
+k=10000 strat=bitset_real           Avg: 262.60 MB/s     Median: 264.67 MB/s     [240.40 MB/s .. 269.22 MB/s]    Output: 100_000    
+k=10000 strat=linear                Avg: 290.22 MB/s     Median: 290.29 MB/s     [284.17 MB/s .. 293.74 MB/s]    Output: 100_000    
+k=10000 strat=posting_direct        Avg: 90.013 MB/s     Median: 91.059 MB/s     [76.563 MB/s .. 94.701 MB/s]    Output: 100_000    
+phase5b d_scaling n=1000000 K_req=10000 D=100
+k=10000 strat=bitset_real           Avg: 235.12 MB/s     Median: 237.63 MB/s     [191.53 MB/s .. 239.90 MB/s]    Output: 1_000_000    
+k=10000 strat=linear                Avg: 283.70 MB/s     Median: 286.11 MB/s     [224.31 MB/s .. 287.70 MB/s]    Output: 1_000_000    
+k=10000 strat=posting_direct        Avg: 77.653 MB/s     Median: 77.779 MB/s     [75.776 MB/s .. 78.918 MB/s]    Output: 1_000_000    
+phase5b d_scaling n=1000000 K_req=10000 D=1000
+k=1000 strat=bitset_real           Avg: 378.48 MB/s     Median: 381.41 MB/s     [347.65 MB/s .. 385.76 MB/s]    Output: 1_000_000    
+k=1000 strat=linear                Avg: 338.42 MB/s     Median: 340.05 MB/s     [323.61 MB/s .. 341.23 MB/s]    Output: 1_000_000    
+k=1000 strat=posting_direct        Avg: 308.81 MB/s     Median: 312.77 MB/s     [272.18 MB/s .. 317.29 MB/s]    Output: 1_000_000    
+phase5b n_scaling n=100000 D=1 (pk)
+k=1000 strat=bitset_real           Avg: 56.526 MB/s     Median: 57.208 MB/s     [50.799 MB/s .. 57.480 MB/s]    Output: 1_000    
+k=1000 strat=linear                Avg: 274.49 MB/s     Median: 283.29 MB/s     [218.61 MB/s .. 290.04 MB/s]    Output: 1_000    
+k=1000 strat=posting_direct        Avg: 167.59 MB/s     Median: 172.43 MB/s     [124.79 MB/s .. 174.63 MB/s]    Output: 1_000    
+phase5b n_scaling n=1000000 D=1 (pk)
+k=1000 strat=bitset_real           Avg: 247.17 MB/s     Median: 248.40 MB/s     [221.75 MB/s .. 249.37 MB/s]    Output: 1_000    
+k=1000 strat=linear                Avg: 289.67 MB/s     Median: 293.55 MB/s     [228.87 MB/s .. 301.15 MB/s]    Output: 1_000    
+k=1000 strat=posting_direct        Avg: 1.4371 GB/s     Median: 1.4683 GB/s     [990.92 MB/s .. 1.4941 GB/s]    Output: 1_000    
+phase5b n_scaling n=10000000 D=1 (pk)
+k=1000 strat=bitset_real           Avg: 1.7035 GB/s     Median: 1.7070 GB/s     [1.5408 GB/s .. 1.7484 GB/s]    Output: 1_000    
+k=1000 strat=linear                Avg: 318.38 MB/s     Median: 319.30 MB/s     [309.98 MB/s .. 323.37 MB/s]    Output: 1_000    
+k=1000 strat=posting_direct        Avg: 12.807 GB/s     Median: 12.870 GB/s     [11.847 GB/s .. 13.534 GB/s]    Output: 1_000    
+phase5b n_scaling n=1000000 D=1 (pk)
+k=10000 strat=bitset_real           Avg: 55.618 MB/s     Median: 57.187 MB/s     [33.461 MB/s .. 57.813 MB/s]    Output: 10_000    
+k=10000 strat=linear                Avg: 215.35 MB/s     Median: 217.85 MB/s     [170.80 MB/s .. 221.96 MB/s]    Output: 10_000    
+k=10000 strat=posting_direct        Avg: 81.280 MB/s     Median: 81.653 MB/s     [69.128 MB/s .. 88.657 MB/s]    Output: 10_000    
+phase5b n_scaling n=10000000 D=1 (pk)
+k=10000 strat=bitset_real           Avg: 231.27 MB/s     Median: 232.08 MB/s     [214.84 MB/s .. 232.88 MB/s]    Output: 10_000    
+k=10000 strat=linear                Avg: 239.83 MB/s     Median: 239.90 MB/s     [236.17 MB/s .. 244.65 MB/s]    Output: 10_000    
+k=10000 strat=posting_direct        Avg: 599.61 MB/s     Median: 600.17 MB/s     [547.03 MB/s .. 611.61 MB/s]    Output: 10_000    

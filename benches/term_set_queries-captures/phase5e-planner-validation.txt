@@ -1,0 +1,30 @@
+   Compiling tantivy v0.26.0 (/Users/ruchir/dev/paradedb/tantivy)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 9.67s
+     Running benches/term_set_queries.rs (target/release/deps/term_set_queries-7aa5fa5113919241)
+phase5e_validate n=1000000 D=1 (pk)
+k=500 planner=default           Avg: 9.9583 GB/s     Median: 9.8030 GB/s     [9.0293 GB/s .. 11.058 GB/s]    Output: 500        
+k=500 forced=linear             Avg: 288.96 MB/s     Median: 289.73 MB/s     [257.70 MB/s .. 296.75 MB/s]    Output: 500        
+k=10000 planner=default         Avg: 666.39 MB/s     Median: 671.87 MB/s     [567.42 MB/s .. 714.29 MB/s]    Output: 10_000     
+k=10000 forced=linear           Avg: 210.16 MB/s     Median: 211.69 MB/s     [172.79 MB/s .. 213.16 MB/s]    Output: 10_000     
+k=100000 planner=default        Avg: 98.046 MB/s     Median: 98.068 MB/s     [95.584 MB/s .. 99.084 MB/s]    Output: 100_000    
+k=100000 forced=linear          Avg: 98.103 MB/s     Median: 98.433 MB/s     [92.981 MB/s .. 99.536 MB/s]    Output: 100_000    
+k=500000 planner=default        Avg: 51.049 MB/s     Median: 51.354 MB/s     [46.963 MB/s .. 52.849 MB/s]    Output: 500_000    
+k=500000 forced=linear          Avg: 50.903 MB/s     Median: 51.397 MB/s     [46.892 MB/s .. 53.214 MB/s]    Output: 500_000    
+phase5e_validate n=20000000 D=1 (pk_20m)
+k=1000 planner=default           Avg: 31.240 GB/s     Median: 30.861 GB/s     [29.784 GB/s .. 33.267 GB/s]    Output: 1_000        
+k=1000 forced=linear             Avg: 309.33 MB/s     Median: 308.79 MB/s     [303.45 MB/s .. 319.37 MB/s]    Output: 1_000        
+k=10000 planner=default          Avg: 6.7077 GB/s     Median: 6.5549 GB/s     [4.2289 GB/s .. 8.5220 GB/s]    Output: 10_000       
+k=10000 forced=linear            Avg: 225.56 MB/s     Median: 226.43 MB/s     [217.51 MB/s .. 229.28 MB/s]    Output: 10_000       
+k=100000 planner=default         Avg: 607.31 MB/s     Median: 545.62 MB/s     [496.14 MB/s .. 875.45 MB/s]    Output: 100_000      
+k=100000 forced=linear           Avg: 114.34 MB/s     Median: 114.36 MB/s     [110.71 MB/s .. 115.31 MB/s]    Output: 100_000      
+k=500000 planner=default         Avg: 190.24 MB/s     Median: 190.31 MB/s     [183.07 MB/s .. 199.53 MB/s]    Output: 500_000      
+k=500000 forced=linear           Avg: 189.13 MB/s     Median: 190.77 MB/s     [143.31 MB/s .. 199.39 MB/s]    Output: 500_000      
+k=1000000 planner=default        Avg: 133.79 MB/s     Median: 134.25 MB/s     [118.84 MB/s .. 137.34 MB/s]    Output: 1_000_000    
+k=1000000 forced=linear          Avg: 134.21 MB/s     Median: 134.37 MB/s     [127.89 MB/s .. 138.03 MB/s]    Output: 1_000_000    
+phase5e_validate n=20000000 D=10 (medfk_20m)
+k=10000 planner=default         Avg: 8.7047 GB/s     Median: 8.7795 GB/s     [6.5336 GB/s .. 9.5080 GB/s]    Output: 100_000      
+k=10000 forced=linear           Avg: 292.03 MB/s     Median: 292.67 MB/s     [264.65 MB/s .. 298.77 MB/s]    Output: 100_000      
+k=100000 planner=default        Avg: 934.96 MB/s     Median: 971.48 MB/s     [764.53 MB/s .. 1.0515 GB/s]    Output: 1_000_000    
+k=100000 forced=linear          Avg: 227.68 MB/s     Median: 229.61 MB/s     [209.77 MB/s .. 233.79 MB/s]    Output: 1_000_000    
+k=500000 planner=default        Avg: 230.83 MB/s     Median: 236.46 MB/s     [194.79 MB/s .. 240.50 MB/s]    Output: 5_000_000    
+k=500000 forced=linear          Avg: 237.63 MB/s     Median: 238.07 MB/s     [234.33 MB/s .. 240.10 MB/s]    Output: 5_000_000    

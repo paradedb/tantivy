@@ -1,0 +1,14 @@
+   Compiling tantivy v0.26.0 (/Users/ruchir/dev/paradedb/tantivy)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 1.00s
+     Running benches/term_set_queries.rs (target/release/deps/term_set_queries-7aa5fa5113919241)
+phase5e_calib n=50000000 D=1 (pk_50m)
+k=10000 strat=bitset_real          Avg: 14.560 GB/s     Median: 15.381 GB/s     [9.7834 GB/s .. 16.488 GB/s]    Output: 10_000       
+k=10000 strat=linear               Avg: 231.39 MB/s     Median: 231.94 MB/s     [217.95 MB/s .. 239.32 MB/s]    Output: 10_000       
+k=100000 strat=bitset_real         Avg: 1.3102 GB/s     Median: 1.3011 GB/s     [1.0366 GB/s .. 1.6187 GB/s]    Output: 100_000      
+k=100000 strat=linear              Avg: 116.98 MB/s     Median: 117.46 MB/s     [111.15 MB/s .. 121.90 MB/s]    Output: 100_000      
+k=500000 strat=bitset_real         Avg: 267.45 MB/s     Median: 272.29 MB/s     [230.16 MB/s .. 292.57 MB/s]    Output: 500_000      
+k=500000 strat=linear              Avg: 222.39 MB/s     Median: 223.01 MB/s     [212.66 MB/s .. 226.96 MB/s]    Output: 500_000      
+k=1000000 strat=bitset_real        Avg: 125.76 MB/s     Median: 126.05 MB/s     [116.14 MB/s .. 126.90 MB/s]    Output: 1_000_000    
+k=1000000 strat=linear             Avg: 164.44 MB/s     Median: 165.07 MB/s     [155.70 MB/s .. 166.81 MB/s]    Output: 1_000_000    
+k=2000000 strat=bitset_real        Avg: 63.632 MB/s     Median: 63.710 MB/s     [61.870 MB/s .. 64.090 MB/s]    Output: 2_000_000    
+k=2000000 strat=linear             Avg: 125.34 MB/s     Median: 125.57 MB/s     [121.38 MB/s .. 126.34 MB/s]    Output: 2_000_000    

@@ -39,12 +39,15 @@
 //!   - `Gallop`: planner forced via `gallop_max_density = 1.0` so any K < N qualifies.
 //!   - `Linear`: planner forced to terminal `LinearScan` via `gallop_enabled = false` + zero
 //!     densities.
-//!   - `PostingDirect`: synthetic — `BooleanQuery` of `TermQuery::Should` over the same terms.
-//!     Strategy 4 in production isn't implemented yet; this gives a representative
-//!     posting-list-union measurement.
-//!   - `BitsetFromPostings`: synthetic — execute the same posting-union but materialize matched
-//!     DocIds into a `BitSet` and iterate. Strategy 3 in production isn't implemented yet; this
-//!     captures bitset construction + iteration cost on top of posting-list iteration.
+//!   - `BitsetFromPostings` (real, exercised as `bitset_from_postings_real`): planner forced via
+//!     `bitset_max_density = 1.0`. This is the production strategy as of Phase 5d.
+//!   - `DirectBitset`: bench-only verbatim copy of the production `bitset_from_postings_scorer`,
+//!     kept for comparison against pre-5d numbers.
+//!   - `PostingDirect`: synthetic baseline — `BooleanQuery` of `TermQuery::Should` over the same
+//!     terms. Exercises `BufferedUnionScorer`. Retained to characterize the union scaling cost.
+//!   - `BitsetFromPostings` (synthetic, exercised as `bitset_from_postings`): synthetic baseline —
+//!     `BooleanQuery::Should` union materialized into a `BitSet` via a custom collector. Retained
+//!     to characterize bitset construction + iteration cost on top of the union scorer.
 //!
 //! # Timing boundaries
 //!
@@ -72,15 +75,15 @@
 //!
 //! # Captured outputs
 //!
-//! Captured outputs from the full and threshold tiers live in
-//! `benches/term_set_queries.full-tier.txt` and
-//! `benches/term_set_queries.threshold-tier.txt`. Re-run with
+//! Captured outputs from all tiers live in `benches/term_set_queries-captures/`.
+//! The full and threshold tiers in particular are persisted as
+//! `full-tier.txt` and `threshold-tier.txt` in that directory. Re-run with
 //!
 //! ```text
 //! TERM_SET_BENCH_TIER=full      cargo bench --bench term_set_queries 2>&1 \
-//!     | tee benches/term_set_queries.full-tier.txt
+//!     | tee benches/term_set_queries-captures/full-tier.txt
 //! TERM_SET_BENCH_TIER=threshold cargo bench --bench term_set_queries 2>&1 \
-//!     | tee benches/term_set_queries.threshold-tier.txt
+//!     | tee benches/term_set_queries-captures/threshold-tier.txt
 //! ```
 //!
 //! when the gallop algorithm or `TermSetStrategyConfig::default()`
@@ -94,12 +97,13 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tantivy::collector::{Collector, Count, DocSetCollector, SegmentCollector};
 use tantivy::query::{
-    BooleanQuery, FastFieldTermSetQuery, Occur, Query, TermQuery, TermSetStrategyConfig, Weight,
+    BitSetDocSet, BooleanQuery, ConstScorer, EmptyScorer, EnableScoring, Explanation,
+    FastFieldTermSetQuery, Occur, Query, Scorer, TermQuery, TermSetStrategyConfig, Weight,
 };
-use tantivy::schema::{IndexRecordOption, NumericOptions, SchemaBuilder};
+use tantivy::schema::{Field, IndexRecordOption, NumericOptions, SchemaBuilder};
 use tantivy::{
-    doc, DocId, DocSet, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Searcher,
-    SegmentOrdinal, SegmentReader, Term,
+    doc, DocId, DocSet, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Score,
+    Searcher, SegmentOrdinal, SegmentReader, TantivyError, Term,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +163,20 @@ enum Strat {
     Linear,
     PostingDirect,
     BitsetFromPostings,
+    /// Real planner-driven `BitsetFromPostings` strategy. Forced via
+    /// `bitset_max_density = 1.0` so the dispatch always picks it on
+    /// indexed numeric fast fields. The other `BitsetFromPostings`
+    /// variant is the synthetic posting-union-into-bitset baseline that
+    /// retains `BufferedUnionScorer`; this one exercises the real
+    /// strategy that bypasses the union scorer entirely.
+    BitsetFromPostingsReal,
+    /// Phase 5c fourth variant: K independent `TermDictionary::get(key)`
+    /// lookups (no streaming automaton) + OR each posting list into one
+    /// `BitSet`. Bench-only — lives in this file, not in production code.
+    /// Measures whether the streaming dict-walk in `bitset_real` is the
+    /// avoidable overhead on low-D columns, and whether bitset-OR is a
+    /// strict improvement over `BufferedUnionScorer` at our K range.
+    DirectBitset,
 }
 
 impl Strat {
@@ -168,6 +186,8 @@ impl Strat {
             Strat::Linear => "linear",
             Strat::PostingDirect => "posting_direct",
             Strat::BitsetFromPostings => "bitset_from_postings",
+            Strat::BitsetFromPostingsReal => "bitset_from_postings_real",
+            Strat::DirectBitset => "direct_bitset",
         }
     }
 }
@@ -180,6 +200,12 @@ fn bench_tier() -> &'static str {
     match std::env::var("TERM_SET_BENCH_TIER").as_deref() {
         Ok("full") => "full",
         Ok("threshold") => "threshold",
+        Ok("phase5b") => "phase5b",
+        Ok("profile5b") => "profile5b",
+        Ok("phase5c20m") => "phase5c20m",
+        Ok("phase5e_calib") => "phase5e_calib",
+        Ok("phase5e_validate") => "phase5e_validate",
+        Ok("profile5e") => "profile5e",
         _ => "smoke",
     }
 }
@@ -240,15 +266,23 @@ fn cfg_force_gallop() -> TermSetStrategyConfig {
     }
 }
 
+fn cfg_force_bitset_real() -> TermSetStrategyConfig {
+    TermSetStrategyConfig {
+        gallop_enabled: false,
+        gallop_max_density: 0.0,
+        bitset_max_density: 1.0,
+        subsequent_bitset_max_density: 1.0,
+        strategy_sink: None,
+    }
+}
+
 fn cfg_force_linear() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: false,
         gallop_max_density: 0.0,
-        // Strict less-than: nothing is < 0.0, so the sort-agnostic posting
-        // / bitset arms are rejected and we land on the LinearScan terminal.
-        posting_max_density: 0.0,
+        // Strict less-than: nothing is < 0.0, so the sort-agnostic bitset
+        // arms are rejected and we land on the LinearScan terminal.
         bitset_max_density: 0.0,
-        hash_probe_max_density: 0.0,
         subsequent_bitset_max_density: 0.0,
         strategy_sink: None,
     }
@@ -314,6 +348,109 @@ fn run_bitset_from_postings_synthetic(
         .collect();
     let q = BooleanQuery::new(subqueries);
     searcher.search(&q, &BitSetCounter).unwrap()
+}
+
+// --- Phase 5c fourth variant: direct lookups + bitset OR --------------------
+
+/// `direct_bitset_scorer`: K independent `TermDictionary::get(key)` lookups,
+/// each opening a `BlockSegmentPostings` and OR'ing its docs into a single
+/// per-segment `BitSet`. No streaming automaton, no `BufferedUnionScorer`.
+///
+/// Bench-only — lives in this file, not in `term_set_bitset.rs`.
+fn direct_bitset_scorer(
+    reader: &SegmentReader,
+    field: Field,
+    values: &[u64],
+    boost: Score,
+) -> tantivy::Result<Box<dyn Scorer>> {
+    if values.is_empty() || reader.max_doc() == 0 {
+        return Ok(Box::new(EmptyScorer));
+    }
+    let inverted_index = reader.inverted_index(field)?;
+    let term_dict = inverted_index.terms();
+    let mut bitset = BitSet::with_max_value(reader.max_doc());
+    for &v in values {
+        let key_buf = v.to_be_bytes();
+        let term_info = term_dict.get(&key_buf[..])?;
+        let Some(term_info) = term_info else { continue };
+        let mut block_postings = inverted_index
+            .read_block_postings_from_terminfo(&term_info, IndexRecordOption::Basic)?;
+        loop {
+            let docs = block_postings.docs();
+            if docs.is_empty() {
+                break;
+            }
+            for &doc in docs {
+                bitset.insert(doc);
+            }
+            block_postings.advance();
+        }
+    }
+    let docset = BitSetDocSet::from(bitset);
+    Ok(Box::new(ConstScorer::new(docset, boost)))
+}
+
+/// Minimal `Query` wrapper so `Searcher::search` can drive the fourth
+/// variant the same way it drives the other strategies — apples-to-apples
+/// on `Searcher::search` overhead.
+struct DirectBitsetQuery {
+    field: Field,
+    values: Vec<u64>,
+}
+
+impl std::fmt::Debug for DirectBitsetQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectBitsetQuery")
+            .field("field", &self.field)
+            .field("values_len", &self.values.len())
+            .finish()
+    }
+}
+
+impl Clone for DirectBitsetQuery {
+    fn clone(&self) -> Self {
+        Self {
+            field: self.field,
+            values: self.values.clone(),
+        }
+    }
+}
+
+impl Query for DirectBitsetQuery {
+    fn weight(&self, _enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        Ok(Box::new(DirectBitsetWeight {
+            field: self.field,
+            values: self.values.clone(),
+        }))
+    }
+}
+
+struct DirectBitsetWeight {
+    field: Field,
+    values: Vec<u64>,
+}
+
+impl Weight for DirectBitsetWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+        direct_bitset_scorer(reader, self.field, &self.values, boost)
+    }
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        if scorer.seek(doc) != doc {
+            return Err(TantivyError::InvalidArgument(format!(
+                "doc {doc} does not match"
+            )));
+        }
+        Ok(Explanation::new("DirectBitsetScorer", scorer.score()))
+    }
+}
+
+fn run_direct_bitset(searcher: &Searcher, field: tantivy::schema::Field, terms: &[u64]) -> usize {
+    let q = DirectBitsetQuery {
+        field,
+        values: terms.to_vec(),
+    };
+    searcher.search(&q, &Count).unwrap()
 }
 
 /// Collector that, per segment, materializes matches into a `BitSet` sized
@@ -404,8 +541,435 @@ fn matrix_for_tier(tier: &str) -> (Vec<u64>, Vec<usize>, Vec<CorpusKind>) {
     }
 }
 
+/// Build a corpus with a parametric `D` (average docs per distinct value).
+/// `value_for_doc(d_idx) = d_idx / d`, so `distinct = ceil(n / d)`. Sort is
+/// always `None` for the Phase 5b matrices (the PK-shape regression case
+/// shows up identically on sorted and unsorted segments — gallop is gated
+/// off by `cfg_force_bitset_real` regardless).
+fn build_corpus_parametric_d(n: u64, d: u64) -> (Searcher, tantivy::schema::Field) {
+    let mut sb = SchemaBuilder::new();
+    let field = sb.add_u64_field("fk", NumericOptions::default().set_fast().set_indexed());
+    let schema = sb.build();
+    let index = Index::builder().schema(schema).create_in_ram().unwrap();
+    {
+        let writer_mem = (200_000_000u64).max(n * 32);
+        let mut writer = index
+            .writer_with_num_threads(1, writer_mem as usize)
+            .unwrap();
+        for doc_id in 0..n {
+            writer.add_document(doc!(field => doc_id / d)).unwrap();
+        }
+        writer.commit().unwrap();
+    }
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
+        .unwrap();
+    (reader.searcher(), field)
+}
+
+/// Phase 5b measurement-only tier: K-scaling, D-scaling, N-scaling sweeps
+/// to confirm (or refute) the per-term-setup-cost hypothesis. Three
+/// strategies measured: `bitset_real`, `linear`, `posting_direct`.
+/// All cells use the same dispatch path (`run_planner_path` with forced
+/// configs); no synthetic baselines.
+fn run_phase5b_tier() {
+    let mut runner = BenchRunner::new();
+
+    // --- K-scaling sweep: D=1 (PK), N=1M, K logarithmically from 500 to 100K ---
+    {
+        let n: u64 = 1_000_000;
+        let (searcher, field) = build_corpus_parametric_d(n, 1);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5b k_scaling n={n} D=1 (pk)"));
+        group.set_input_size(n as usize);
+        let k_levels: &[usize] = &[
+            500, 1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 30_000, 50_000, 100_000,
+        ];
+        for &k in k_levels {
+            let terms = sample_terms(n, k, 7);
+            register_four_strategies(&mut group, &searcher, field, k, terms);
+        }
+        group.run();
+    }
+
+    // --- D-scaling sweep: K=10K, N=1M, D ∈ {1, 10, 100, 1000} ---
+    // At D=1000 with N=1M, distinct = 1000 and K_clamped = 1000 (sample_terms
+    // clamps K to distinct). The strategy's per-term-setup cost is driven by
+    // K' (post-dedup distinct count), so the D=1000 row directly probes the
+    // K=1000 cost at high-D; results should be read as "what does the bitset
+    // strategy cost at K' = 1000 on a high-D column?", not as "K=10K at
+    // D=1000". Documented in the report.
+    {
+        let n: u64 = 1_000_000;
+        let k_requested: usize = 10_000;
+        let d_levels: &[u64] = &[1, 10, 100, 1_000];
+        for &d in d_levels {
+            let (searcher, field) = build_corpus_parametric_d(n, d);
+            let mut group = runner.new_group();
+            group.set_name(format!("phase5b d_scaling n={n} K_req={k_requested} D={d}"));
+            group.set_input_size(n as usize);
+            // Honest K' shown in the cell name: sample_terms clamps to distinct.
+            let distinct = n.div_ceil(d).max(1);
+            let k_effective = k_requested.min(distinct as usize);
+            let terms = sample_terms(distinct, k_effective, 7);
+            register_four_strategies(&mut group, &searcher, field, k_effective, terms);
+            group.run();
+        }
+    }
+
+    // --- N-scaling sweep: vary (K, N) along the K-floor crossover curve ---
+    {
+        let cells: &[(usize, u64)] = &[
+            (1_000, 100_000),
+            (1_000, 1_000_000),
+            (1_000, 10_000_000),
+            (10_000, 1_000_000),
+            (10_000, 10_000_000),
+        ];
+        for &(k, n) in cells {
+            let (searcher, field) = build_corpus_parametric_d(n, 1);
+            let mut group = runner.new_group();
+            group.set_name(format!("phase5b n_scaling n={n} D=1 (pk)"));
+            group.set_input_size(n as usize);
+            let terms = sample_terms(n, k, 7);
+            register_four_strategies(&mut group, &searcher, field, k, terms);
+            group.run();
+        }
+    }
+}
+
+/// Register the four strategies under measurement (`bitset_real`,
+/// `direct_bitset`, `linear`, `posting_direct`) on a binggan group. Used by
+/// the Phase 5b sub-sweeps and the Phase 5c N=20M cells so a label change
+/// applies uniformly.
+fn register_four_strategies(
+    group: &mut binggan::BenchGroup<'_, '_>,
+    searcher: &Searcher,
+    field: tantivy::schema::Field,
+    k: usize,
+    terms: Vec<u64>,
+) {
+    let s = searcher.clone();
+    let t = terms.clone();
+    group.register(format!("k={k} strat=bitset_real"), move |_| {
+        black_box(run_planner_path(&s, field, &t, cfg_force_bitset_real()))
+    });
+    let s = searcher.clone();
+    let t = terms.clone();
+    group.register(format!("k={k} strat=direct_bitset"), move |_| {
+        black_box(run_direct_bitset(&s, field, &t))
+    });
+    let s = searcher.clone();
+    let t = terms.clone();
+    group.register(format!("k={k} strat=linear"), move |_| {
+        black_box(run_planner_path(&s, field, &t, cfg_force_linear()))
+    });
+    let s = searcher.clone();
+    let t = terms;
+    group.register(format!("k={k} strat=posting_direct"), move |_| {
+        black_box(run_posting_direct_synthetic(&s, field, &t))
+    });
+}
+
+/// Phase 5c N=20M tier: scale the K-sweep to production-relevant segment
+/// sizes (10–100M docs) and exercise all four variants — `bitset_real`,
+/// `direct_bitset`, `linear`, `posting_direct` — across three D shapes:
+///   - PK_20M:    D=1,   dict_size=20M   (primary key)
+///   - MedFk_20M: D=10,  dict_size=2M    (foreign key, modest cardinality)
+///   - LowFk_20M: D=100, dict_size=200K  (low-cardinality FK)
+fn run_phase5c20m_tier() {
+    let mut runner = BenchRunner::new();
+    let n: u64 = 20_000_000;
+
+    // PK_20M (D=1) — K ∈ {1K, 10K, 100K, 500K, 1M}
+    {
+        let d: u64 = 1;
+        let (searcher, field) = build_corpus_parametric_d(n, d);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5c20m n={n} D={d} (pk_20m)"));
+        group.set_input_size(n as usize);
+        let distinct = n.div_ceil(d).max(1);
+        for &k in &[1_000usize, 10_000, 100_000, 500_000, 1_000_000] {
+            let k_eff = k.min(distinct as usize);
+            let terms = sample_terms(distinct, k_eff, 7);
+            register_four_strategies(&mut group, &searcher, field, k_eff, terms);
+        }
+        group.run();
+    }
+
+    // MedFk_20M (D=10) — K ∈ {1K, 10K, 100K, 500K}
+    {
+        let d: u64 = 10;
+        let (searcher, field) = build_corpus_parametric_d(n, d);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5c20m n={n} D={d} (medfk_20m)"));
+        group.set_input_size(n as usize);
+        let distinct = n.div_ceil(d).max(1);
+        for &k in &[1_000usize, 10_000, 100_000, 500_000] {
+            let k_eff = k.min(distinct as usize);
+            let terms = sample_terms(distinct, k_eff, 7);
+            register_four_strategies(&mut group, &searcher, field, k_eff, terms);
+        }
+        group.run();
+    }
+
+    // LowFk_20M (D=100) — K ∈ {100, 1K, 10K, 100K}
+    {
+        let d: u64 = 100;
+        let (searcher, field) = build_corpus_parametric_d(n, d);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5c20m n={n} D={d} (lowfk_20m)"));
+        group.set_input_size(n as usize);
+        let distinct = n.div_ceil(d).max(1);
+        for &k in &[100usize, 1_000, 10_000, 100_000] {
+            let k_eff = k.min(distinct as usize);
+            let terms = sample_terms(distinct, k_eff, 7);
+            register_four_strategies(&mut group, &searcher, field, k_eff, terms);
+        }
+        group.run();
+    }
+}
+
+/// Phase 5e-planner calibration: locate `K_crossover` (where direct-lookup
+/// `BitsetFromPostings` starts losing to `LinearScan`) at N=50M on PK shape.
+/// Measures only `bitset_real` (post-5d production) vs `linear` — the two
+/// strategies the planner picks between in the regression band.
+fn run_phase5e_calib_tier() {
+    let mut runner = BenchRunner::new();
+    let n: u64 = 50_000_000;
+    let d: u64 = 1;
+    let (searcher, field) = build_corpus_parametric_d(n, d);
+    let mut group = runner.new_group();
+    group.set_name(format!("phase5e_calib n={n} D={d} (pk_50m)"));
+    group.set_input_size(n as usize);
+    let distinct = n.div_ceil(d).max(1);
+    for &k in &[10_000usize, 100_000, 500_000, 1_000_000, 2_000_000] {
+        let k_eff = k.min(distinct as usize);
+        let terms = sample_terms(distinct, k_eff, 7);
+        // Only the two strategies the planner toggles between in this band.
+        let s = searcher.clone();
+        let t = terms.clone();
+        group.register(format!("k={k_eff} strat=bitset_real"), move |_| {
+            black_box(run_planner_path(&s, field, &t, cfg_force_bitset_real()))
+        });
+        let s = searcher.clone();
+        let t = terms;
+        group.register(format!("k={k_eff} strat=linear"), move |_| {
+            black_box(run_planner_path(&s, field, &t, cfg_force_linear()))
+        });
+    }
+    group.run();
+}
+
+/// Phase 5e-planner validation: re-run a focused subset of N=1M and N=20M
+/// cells to verify that the tightened `bitset_max_density` correctly routes
+/// the regression cells to `LinearScan` without losing wins. Exercises the
+/// **default** TermSetStrategyConfig (no force-bitset / force-linear) so the
+/// planner's dispatch is what's under test, not the strategy in isolation.
+fn run_phase5e_validate_tier() {
+    let mut runner = BenchRunner::new();
+
+    // PK D=1 at N=1M — K spanning the win region into the regression band.
+    {
+        let n: u64 = 1_000_000;
+        let (searcher, field) = build_corpus_parametric_d(n, 1);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5e_validate n={n} D=1 (pk)"));
+        group.set_input_size(n as usize);
+        for &k in &[500usize, 10_000, 100_000, 500_000] {
+            let terms = sample_terms(n, k, 7);
+            // Planner-driven (default config) — the dispatch is the test.
+            let s = searcher.clone();
+            let t = terms.clone();
+            group.register(format!("k={k} planner=default"), move |_| {
+                black_box(run_planner_path(
+                    &s,
+                    field,
+                    &t,
+                    TermSetStrategyConfig::default(),
+                ))
+            });
+            // For comparison: forced LinearScan, to verify the planner picked
+            // the cheaper of (default-dispatch, LinearScan) in each cell.
+            let s = searcher.clone();
+            let t = terms;
+            group.register(format!("k={k} forced=linear"), move |_| {
+                black_box(run_planner_path(&s, field, &t, cfg_force_linear()))
+            });
+        }
+        group.run();
+    }
+
+    // PK_20M D=1 — covers the high-K regression band cells.
+    {
+        let n: u64 = 20_000_000;
+        let (searcher, field) = build_corpus_parametric_d(n, 1);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5e_validate n={n} D=1 (pk_20m)"));
+        group.set_input_size(n as usize);
+        for &k in &[1_000usize, 10_000, 100_000, 500_000, 1_000_000] {
+            let terms = sample_terms(n, k, 7);
+            let s = searcher.clone();
+            let t = terms.clone();
+            group.register(format!("k={k} planner=default"), move |_| {
+                black_box(run_planner_path(
+                    &s,
+                    field,
+                    &t,
+                    TermSetStrategyConfig::default(),
+                ))
+            });
+            let s = searcher.clone();
+            let t = terms;
+            group.register(format!("k={k} forced=linear"), move |_| {
+                black_box(run_planner_path(&s, field, &t, cfg_force_linear()))
+            });
+        }
+        group.run();
+    }
+
+    // MedFk_20M (D=10) — covers the K=500K regression cell + a win cell.
+    {
+        let n: u64 = 20_000_000;
+        let d: u64 = 10;
+        let (searcher, field) = build_corpus_parametric_d(n, d);
+        let mut group = runner.new_group();
+        group.set_name(format!("phase5e_validate n={n} D={d} (medfk_20m)"));
+        group.set_input_size(n as usize);
+        let distinct = n.div_ceil(d).max(1);
+        for &k in &[10_000usize, 100_000, 500_000] {
+            let k_eff = k.min(distinct as usize);
+            let terms = sample_terms(distinct, k_eff, 7);
+            let s = searcher.clone();
+            let t = terms.clone();
+            group.register(format!("k={k_eff} planner=default"), move |_| {
+                black_box(run_planner_path(
+                    &s,
+                    field,
+                    &t,
+                    TermSetStrategyConfig::default(),
+                ))
+            });
+            let s = searcher.clone();
+            let t = terms;
+            group.register(format!("k={k_eff} forced=linear"), move |_| {
+                black_box(run_planner_path(&s, field, &t, cfg_force_linear()))
+            });
+        }
+        group.run();
+    }
+}
+
+/// Phase 5b.2 profiling mode: run the regression cell (PK D=1 K=10K
+/// Phase 5e-verify profiling mode: run the bench-only `direct_bitset`
+/// helper (Phase 5c — algorithmically identical to the production
+/// `bitset_real` post-5d but skips planner overhead) at one of two
+/// regression cells, picked by `PROFILE5E_CELL`:
+///
+///   - `5e1` (default): PK D=1 K=100K N=1M    — smaller regression (~1.26× linear)
+///   - `5e2`:           PK D=1 K=1M   N=20M   — extreme regression  (~2.07× linear)
+///
+/// Same tight-loop / wall-clock-budget shape as `run_profile5b_tier`.
+fn run_profile5e_tier() {
+    let cell = std::env::var("PROFILE5E_CELL").unwrap_or_else(|_| "5e1".to_string());
+    let (n, k, label) = match cell.as_str() {
+        "5e2" => (20_000_000u64, 1_000_000usize, "PK D=1 K=1M N=20M"),
+        _ => (1_000_000u64, 100_000usize, "PK D=1 K=100K N=1M"),
+    };
+    let (searcher, field) = build_corpus_parametric_d(n, 1);
+    let terms = sample_terms(n, k, 7);
+
+    // Warm OS page cache the same way a binggan cell would see it.
+    for _ in 0..3 {
+        std::hint::black_box(run_direct_bitset(&searcher, field, &terms));
+    }
+
+    let budget = std::time::Duration::from_secs(
+        std::env::var("PROFILE5E_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15),
+    );
+    let start = std::time::Instant::now();
+    let mut iters = 0u64;
+    while start.elapsed() < budget {
+        std::hint::black_box(run_direct_bitset(&searcher, field, &terms));
+        iters += 1;
+    }
+    let elapsed = start.elapsed();
+    let per_iter_ms = elapsed.as_secs_f64() * 1000.0 / iters as f64;
+    eprintln!(
+        "profile5e[{cell}]: {label} direct_bitset | iters={iters} elapsed={:.2}s per_iter={:.2}ms",
+        elapsed.as_secs_f64(),
+        per_iter_ms,
+    );
+}
+
+/// bitset_real on N=1M) repeatedly for a fixed wall-clock budget so
+/// `samply` has a stable target to sample. Not a binggan group — just a
+/// raw loop, so the profile isn't diluted by binggan's stat machinery.
+fn run_profile5b_tier() {
+    let n: u64 = 1_000_000;
+    let k: usize = 10_000;
+    let (searcher, field) = build_corpus_parametric_d(n, 1);
+    let terms = sample_terms(n, k, 7);
+    let cfg = cfg_force_bitset_real();
+
+    // Warmup so the OS page cache is hot — same as a binggan cell would see.
+    for _ in 0..3 {
+        std::hint::black_box(run_planner_path(&searcher, field, &terms, cfg.clone()));
+    }
+
+    let budget = std::time::Duration::from_secs(
+        std::env::var("PROFILE5B_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10),
+    );
+    let start = std::time::Instant::now();
+    let mut iters = 0u64;
+    while start.elapsed() < budget {
+        std::hint::black_box(run_planner_path(&searcher, field, &terms, cfg.clone()));
+        iters += 1;
+    }
+    let elapsed = start.elapsed();
+    let per_iter_ms = elapsed.as_secs_f64() * 1000.0 / iters as f64;
+    eprintln!(
+        "profile5b: PK D=1 K={k} N={n} bitset_real | iters={iters} elapsed={:.2}s per_iter={:.2}ms",
+        elapsed.as_secs_f64(),
+        per_iter_ms,
+    );
+}
+
 fn main() {
     let tier = bench_tier();
+
+    if tier == "phase5b" {
+        run_phase5b_tier();
+        return;
+    }
+    if tier == "profile5b" {
+        run_profile5b_tier();
+        return;
+    }
+    if tier == "phase5c20m" {
+        run_phase5c20m_tier();
+        return;
+    }
+    if tier == "phase5e_calib" {
+        run_phase5e_calib_tier();
+        return;
+    }
+    if tier == "phase5e_validate" {
+        run_phase5e_validate_tier();
+        return;
+    }
+    if tier == "profile5e" {
+        run_profile5e_tier();
+        return;
+    }
 
     // Threshold tier: targeted measurements to close the LowFk gallop-vs-linear
     // crossover gap left by the full tier's 10x geometric K spacing. Runs only
@@ -424,6 +988,8 @@ fn main() {
         Strat::Linear,
         Strat::PostingDirect,
         Strat::BitsetFromPostings,
+        Strat::BitsetFromPostingsReal,
+        Strat::DirectBitset,
     ];
 
     let mut runner = BenchRunner::new();
@@ -482,6 +1048,15 @@ fn main() {
                             Strat::BitsetFromPostings => black_box(
                                 run_bitset_from_postings_synthetic(&searcher, field, &terms_v),
                             ),
+                            Strat::BitsetFromPostingsReal => black_box(run_planner_path(
+                                &searcher,
+                                field,
+                                &terms_v,
+                                cfg_force_bitset_real(),
+                            )),
+                            Strat::DirectBitset => {
+                                black_box(run_direct_bitset(&searcher, field, &terms_v))
+                            }
                         });
                     }
                 }
