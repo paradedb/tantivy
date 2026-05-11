@@ -235,15 +235,16 @@ impl Weight for FastFieldTermSetWeight {
                         );
                         Ok(Box::new(ConstScorer::new(docset, boost)))
                     }
-                    // The non-Gallop variants are planner stubs today and route
-                    // to TermSetDocSet; follow-ups A and B replace these arms
-                    // with real implementations without touching the planner.
-                    // The HashSet is built locally here so the gallop path
-                    // doesn't pay for it.
-                    TermSetStrategy::LinearScan
-                    | TermSetStrategy::BitsetFromPostings
-                    | TermSetStrategy::PostingListDirect
-                    | TermSetStrategy::HashProbe => {
+                    // BitsetFromPostings reads from the inverted index, so it
+                    // requires the field to be indexed. Fields that are FAST
+                    // but not INDEXED fall through to the TermSetDocSet linear
+                    // path below.
+                    TermSetStrategy::BitsetFromPostings if field_type.is_indexed() => {
+                        super::term_set_bitset::bitset_from_postings_scorer(
+                            reader, self.field, values, boost,
+                        )
+                    }
+                    TermSetStrategy::LinearScan | TermSetStrategy::BitsetFromPostings => {
                         let term_set: FxHashSet<u64> = values.iter().copied().collect();
                         let docset = TermSetDocSet::new(column, term_set);
                         Ok(Box::new(ConstScorer::new(docset, boost)))

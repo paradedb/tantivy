@@ -1,24 +1,20 @@
 //! Strategy selection for `FastFieldTermSetQuery`.
 //!
 //! Mirrors the structure of `range_query::range_query_fastfield`:
-//! `Weight::scorer()` consults this module to decide between gallop, linear, or
-//! future strategies, then constructs the right `DocSet`.
+//! `Weight::scorer()` consults this module to decide between `Gallop`,
+//! `BitsetFromPostings`, and `LinearScan`, then constructs the right `DocSet`.
 //!
-//! See `design.md` §4 (decision tree) and `implementation.md` §2.1 for the
-//! background. For #4895 the planner returns its full set of variants from day
-//! one — the dispatch in `FastFieldTermSetWeight::scorer()` will route the
-//! non-`Gallop` / non-`LinearScan` variants to the existing `TermSetDocSet`
-//! until follow-ups A and B fill them in.
+//! See `design-doc.md` for the decision tree and Phase 5c bench data for the
+//! `BitsetFromPostings` vs `LinearScan` cost model.
 //!
 //! ## Note on `inputs.avg_docs_per_term` (`D`)
 //!
 //! Computing `D` precisely from the column alone would require posting-list
-//! lookups (which are exactly the work Strategy 4 wants to amortize). We
-//! accept `None`, which `select_strategy` treats as `D = 1`. That biases
-//! the first-column branch toward `PostingListDirect`, but since the
-//! dispatch site stubs both `PostingListDirect` and `BitsetFromPostings`
-//! to `LinearScan` until follow-ups A and B fill them in, the bias is
-//! invisible at runtime and only shows up in unit tests on the planner.
+//! lookups (which is some of the work `BitsetFromPostings` does anyway). We
+//! accept `None`, which `select_strategy` treats as `D = 1`. The first-column
+//! dispatch uses `D` only to bias the `BitsetFromPostings` vs `LinearScan`
+//! cutoff via `bitset_max_density`; a missing estimate degrades to the
+//! conservative `D = 1` reading, which broadens the bitset-eligible region.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -39,8 +35,6 @@ pub enum StrategyTag {
     Gallop = 1,
     Linear = 2,
     Bitset = 3,
-    Posting = 4,
-    Hash = 5,
 }
 
 impl TryFrom<u8> for StrategyTag {
@@ -52,8 +46,6 @@ impl TryFrom<u8> for StrategyTag {
             1 => Ok(StrategyTag::Gallop),
             2 => Ok(StrategyTag::Linear),
             3 => Ok(StrategyTag::Bitset),
-            4 => Ok(StrategyTag::Posting),
-            5 => Ok(StrategyTag::Hash),
             _ => Err("unknown StrategyTag value"),
         }
     }
@@ -64,10 +56,9 @@ impl TryFrom<u8> for StrategyTag {
 /// GUCs at the consumer side.
 ///
 /// "Density" is a unitless ratio of *matching count over corpus count*. For
-/// gallop, that's `K' / N`; for posting/bitset on the first column, it's
-/// `K' · D / N`; for the subsequent-column branch, `K' · D / C` (or `C / N`
-/// for the hash-probe gate). Each strategy fires when its density is *below*
-/// the corresponding `_max_density` threshold.
+/// gallop, that's `K' / N`; for bitset on the first column, it's `K' · D / N`;
+/// for the subsequent-column branch, `K' · D / C`. Each strategy fires when
+/// its density is *below* the corresponding `_max_density` threshold.
 ///
 /// We use `f64` rather than integer denominators so bench-derived
 /// thresholds don't have to round to `1/N` for small `N`.
@@ -83,14 +74,10 @@ pub struct TermSetStrategyConfig {
     /// crossover above 0.01 isn't pinned for LowFk; PK-shaped corpora
     /// show a different (D-dependent) crossover — see Follow-up H.
     pub gallop_max_density: f64,
-    /// First-column `PostingListDirect` threshold: `K' · D / N` cutoff.
-    pub posting_max_density: f64,
-    /// First-column `BitsetFromPostings` threshold: `K' · D / N` cutoff.
+    /// First-column `BitsetFromPostings` threshold: `K' · D / N` cutoff. The
+    /// strategy fires when `K' · D / N < bitset_max_density`; otherwise the
+    /// planner falls through to `LinearScan`.
     pub bitset_max_density: f64,
-    /// Subsequent-column `HashProbe` gate: `C / N` cutoff (`C` = upstream
-    /// candidate-set size). Below this, the candidate set is small enough to
-    /// hash-probe rather than build a bitset.
-    pub hash_probe_max_density: f64,
     /// Subsequent-column `BitsetFromPostings` threshold: `K' · D / C` cutoff.
     pub subsequent_bitset_max_density: f64,
     /// Optional sink for the per-segment strategy choice. When `Some`,
@@ -106,23 +93,22 @@ impl Default for TermSetStrategyConfig {
         Self {
             gallop_enabled: true,
             // gallop_max_density: 1/100 — bench-tuned (see field doc).
-            // posting/bitset/hash_probe/subsequent_bitset: 1/256, 1/4, 1/16,
-            // 1/4 — starting estimates; only consulted by strategies that
-            // are stubs in #4895, so they don't affect runtime today.
+            // bitset_max_density: 1/50 — calibrated Phase 5e from N ∈ {1M, 20M,
+            //   50M} sweeps on PK-shape (D=1). Direct-lookup `BitsetFromPostings`
+            //   loses to `LinearScan` once K·D/N crosses ~1/50; the strict
+            //   less-than gate keeps bitset firing below that ratio.
+            // subsequent_bitset_max_density: 1/4 — unchanged from Phase 5c
+            //   starting estimate; subsequent-column bench coverage is thinner,
+            //   defer tightening until we have data.
             gallop_max_density: 1.0 / 100.0,
-            posting_max_density: 1.0 / 256.0,
-            bitset_max_density: 1.0 / 4.0,
-            hash_probe_max_density: 1.0 / 16.0,
+            bitset_max_density: 1.0 / 50.0,
             subsequent_bitset_max_density: 1.0 / 4.0,
             strategy_sink: None,
         }
     }
 }
 
-/// Selected execution strategy. The non-`Gallop` / non-`LinearScan` variants
-/// are reserved for follow-ups A and B; `select_strategy` returns them today
-/// so unit tests can pin the planner shape, but `scorer()` routes them through
-/// the `TermSetDocSet` linear path until those strategies are implemented.
+/// Selected execution strategy. Set of variants that can be dispatched today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TermSetStrategy {
     /// Sorted-segment fast path. Carries the pruned, ascending-sorted term list
@@ -131,15 +117,12 @@ pub enum TermSetStrategy {
         sort_order: Order,
         sorted_terms: Vec<u64>,
     },
-    /// Today's `TermSetDocSet`. Also the terminal fallback when no other
+    /// `TermSetDocSet` over the fast field. Terminal fallback when no other
     /// strategy qualifies.
     LinearScan,
-    /// Reserved (follow-up B).
+    /// Direct `TermDictionary::get(key)` lookups + bitset OR. The K-bounded
+    /// inverted-index path; see `term_set_bitset.rs`.
     BitsetFromPostings,
-    /// Reserved (follow-up A).
-    PostingListDirect,
-    /// Reserved (subsequent-column work, post-#4895).
-    HashProbe,
 }
 
 /// Inputs to the planner that aren't already on `Column`.
@@ -175,8 +158,6 @@ pub fn select_strategy(
             TermSetStrategy::Gallop { .. } => StrategyTag::Gallop,
             TermSetStrategy::LinearScan => StrategyTag::Linear,
             TermSetStrategy::BitsetFromPostings => StrategyTag::Bitset,
-            TermSetStrategy::PostingListDirect => StrategyTag::Posting,
-            TermSetStrategy::HashProbe => StrategyTag::Hash,
         };
         sink.store(tag as u8, Ordering::Relaxed);
     }
@@ -258,25 +239,17 @@ fn select_strategy_inner(
     let kd = (k_prime as u64).saturating_mul(d) as f64;
 
     if let Some(c) = inputs.candidate_size.filter(|&c| c < n) {
-        // Subsequent column. `c == 0` is degenerate (the upstream is empty),
-        // but guard the division anyway: with no candidates, no work to do
-        // — HashProbe is the cheapest fallthrough.
-        if c == 0 {
-            return TermSetStrategy::HashProbe;
-        }
-        if (c as f64) / n_f < cfg.hash_probe_max_density {
-            return TermSetStrategy::HashProbe;
-        }
-        if kd / (c as f64) < cfg.subsequent_bitset_max_density {
+        // Subsequent column. `c == 0` is degenerate (the upstream is empty);
+        // there's nothing to filter, so `LinearScan` is the cheapest no-op.
+        // For `c > 0`, fire `BitsetFromPostings` when `K·D/C` falls below the
+        // threshold; otherwise default to `LinearScan`.
+        if c > 0 && kd / (c as f64) < cfg.subsequent_bitset_max_density {
             return TermSetStrategy::BitsetFromPostings;
         }
-        TermSetStrategy::HashProbe
+        TermSetStrategy::LinearScan
     } else {
         // First column, post-gallop.
         let kd_density = kd / n_f;
-        if kd_density < cfg.posting_max_density {
-            return TermSetStrategy::PostingListDirect;
-        }
         if kd_density < cfg.bitset_max_density {
             return TermSetStrategy::BitsetFromPostings;
         }
@@ -287,11 +260,9 @@ fn select_strategy_inner(
 #[cfg(test)]
 mod tests {
     //! Unit tests pin the planner's *output shape* on cases it can decide
-    //! today. The `_planner_shape_only` suffix is a deliberate signal:
-    //! the dispatch site maps every non-Gallop / non-LinearScan variant to
-    //! `TermSetDocSet`. Once Follow-up A populates `inputs.avg_docs_per_term`
-    //! properly, the `K' · D < threshold` arithmetic will shift and these
-    //! tests will need to be revisited.
+    //! today. Once `inputs.avg_docs_per_term` is populated from a real column
+    //! estimator, the `K' · D < threshold` arithmetic will shift and these
+    //! tests may need to be revisited.
     use super::*;
     use crate::schema::{NumericOptions, SchemaBuilder};
     use crate::{Index, IndexSettings, IndexSortByField};
@@ -361,15 +332,12 @@ mod tests {
     #[test]
     fn select_returns_bitset_from_postings_when_gallop_rejected_due_to_high_k_planner_shape_only() {
         // Sorted ASC, but K is *too big* for gallop: K'/N >= gallop_max_density.
-        // With D = 1, we want K'·D / N < bitset_max_density as well so the
-        // sort-agnostic branch lands on BitsetFromPostings (and not
-        // PostingListDirect, which requires K'·D / N < posting_max_density
-        // — a tighter threshold).
-        // Defaults: gallop=1/64≈0.0156, posting=1/256≈0.00391, bitset=1/4=0.25.
-        // N = 4096, K = 200 → K/N = 200/4096 ≈ 0.0488:
-        //   0.0488 ≥ 0.0156 → gallop rejected
-        //   0.0488 ≥ 0.00391 → posting rejected
-        //   0.0488 < 0.25  → bitset accepted
+        // With D = 1, we want K'·D / N < bitset_max_density so the
+        // sort-agnostic branch lands on BitsetFromPostings.
+        // Defaults (Phase 5e): gallop=1/100=0.01, bitset=1/50=0.02.
+        // N = 4096, K = 60 → K/N = 60/4096 ≈ 0.0146:
+        //   0.0146 ≥ 0.01  → gallop rejected
+        //   0.0146 < 0.02  → bitset accepted
         let n: u64 = 4096;
         let (index, _field, name) = build_index(
             n,
@@ -388,16 +356,16 @@ mod tests {
                 candidate_size: None,
                 avg_docs_per_term: None,
             },
-            &term_set(0..200), // K' = 200 (all in [0, 4095])
+            &term_set(0..60), // K' = 60 (all in [0, 4095])
             &TermSetStrategyConfig::default(),
         );
         assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
     }
 
     #[test]
-    fn select_returns_posting_direct_when_first_column_highly_selective_planner_shape_only() {
-        // Unsorted, K small enough that K·D / N < posting_max_density.
-        // N = 4096, K = 8, D = 1 → K/N = 0.00195 < 1/256 ≈ 0.00391.
+    fn select_returns_bitset_when_first_column_highly_selective() {
+        // Unsorted, K well below `bitset_max_density`.
+        // N = 4096, K = 8, D = 1 → K/N = 0.00195 < 0.25.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
         let (reader, column) = open_column(&index, &name);
@@ -412,13 +380,13 @@ mod tests {
             &term_set(0..8),
             &TermSetStrategyConfig::default(),
         );
-        assert_eq!(strat, TermSetStrategy::PostingListDirect);
+        assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
     }
 
     #[test]
-    fn select_falls_back_to_linear_scan_only_when_kd_exceeds_all_thresholds() {
-        // Unsorted, K large enough that K·D / N >= every threshold in the
-        // first-column branch. With D = 1 and bitset_max_density = 1/4 = 0.25,
+    fn select_falls_back_to_linear_scan_when_kd_exceeds_bitset_threshold() {
+        // Unsorted, K large enough that K·D / N >= bitset_max_density.
+        // With D = 1 and bitset_max_density = 1/4 = 0.25,
         // N = 4096 and K = 2000 → K/N ≈ 0.488 > 0.25 → LinearScan.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
@@ -438,9 +406,9 @@ mod tests {
     }
 
     #[test]
-    fn select_returns_hash_probe_when_subsequent_column_with_small_c_planner_shape_only() {
-        // Subsequent column: C / N < hash_probe_max_density.
-        // N = 4096, C = 100 → 100/4096 ≈ 0.0244 < 1/16 = 0.0625.
+    fn select_returns_linear_scan_for_subsequent_column_when_kd_exceeds_threshold() {
+        // Subsequent column with c=100, K·D/c = 50/100 = 0.5 > 0.25 →
+        // bitset rejected, falls through to LinearScan.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
         let (reader, column) = open_column(&index, &name);
@@ -455,15 +423,12 @@ mod tests {
             &term_set(0..50),
             &TermSetStrategyConfig::default(),
         );
-        assert_eq!(strat, TermSetStrategy::HashProbe);
+        assert_eq!(strat, TermSetStrategy::LinearScan);
     }
 
     #[test]
-    fn select_returns_bitset_from_postings_when_subsequent_column_kd_below_threshold_planner_shape_only(
-    ) {
+    fn select_returns_bitset_from_postings_when_subsequent_column_kd_below_threshold() {
         // Subsequent column: K·D / C < subsequent_bitset_max_density.
-        // N = 4096. C = 1024 → C/N = 0.25 ≥ hash_probe_max_density (0.0625),
-        // so the HashProbe gate is bypassed.
         // K·D / C = 50 / 1024 ≈ 0.0488 < 1/4 = 0.25 → BitsetFromPostings.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
@@ -546,8 +511,9 @@ mod tests {
             &TermSetStrategyConfig::default(),
         );
         assert!(!matches!(strat, TermSetStrategy::Gallop { .. }));
-        // With K=8, the first-column branch picks PostingListDirect.
-        assert_eq!(strat, TermSetStrategy::PostingListDirect);
+        // With K=8 on N=4096, K/N = 0.00195 < bitset_max_density (0.25), so
+        // the first-column branch picks BitsetFromPostings.
+        assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
     }
 
     /// Positive gallop assertion. Sorted ASC, K small, K'/N below the
@@ -681,8 +647,8 @@ mod tests {
             &cfg,
         );
         assert!(!matches!(strat, TermSetStrategy::Gallop { .. }));
-        // Selection given K=8: PostingListDirect
-        // (K · D = 8 < N · posting_max_density = 16).
-        assert_eq!(strat, TermSetStrategy::PostingListDirect);
+        // K=8 on N=4096, K·D/N = 0.00195 < bitset_max_density (0.25), so the
+        // first-column branch picks BitsetFromPostings.
+        assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
     }
 }
