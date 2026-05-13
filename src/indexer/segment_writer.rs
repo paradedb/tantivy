@@ -408,7 +408,6 @@ impl SegmentWriter {
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {
         let AddOperation { document, opstamp } = add_operation;
-        let doc_id = self.max_doc;
         self.doc_opstamps.push(opstamp);
         self.segment_serializer
             .get_plugin_writer::<FastFieldsPluginWriter>("fast_fields")
@@ -421,9 +420,6 @@ impl SegmentWriter {
                 .get_plugin_writer::<StorePluginWriter>("store")
                 .expect("store plugin")
                 .store(&document, &self.schema)?;
-        }
-        for (_, writer) in self.segment_serializer.plugin_writers_mut().iter_mut() {
-            writer.add_document(doc_id)?;
         }
         self.max_doc += 1;
         Ok(())
