@@ -127,6 +127,12 @@ pub struct BatchedTermInfoIter<'a, K: AsRef<[u8]>, TSSTable: SSTable> {
     delta_reader: Option<DeltaReader<TSSTable::ValueReader>>,
     current_entry_key: Vec<u8>,
     entry_loaded: bool,
+    /// Set when the current block's `DeltaReader` returned `Ok(false)`
+    /// (exhausted). Any subsequent input target that maps to the same
+    /// block is guaranteed absent and is short-circuited without
+    /// re-entering the inner walker, which would otherwise pay another
+    /// `advance() -> Ok(false)` per target. Reset on block transition.
+    block_exhausted: bool,
     errored: bool,
 }
 
@@ -140,6 +146,7 @@ impl<'a, K: AsRef<[u8]>, TSSTable: SSTable> BatchedTermInfoIter<'a, K, TSSTable>
             delta_reader: None,
             current_entry_key: Vec::new(),
             entry_loaded: false,
+            block_exhausted: false,
             errored: false,
         }
     }
@@ -181,12 +188,21 @@ where
                         self.current_block_addr = Some(target_block);
                         self.current_entry_key.clear();
                         self.entry_loaded = false;
+                        self.block_exhausted = false;
                     }
                     Err(e) => {
                         self.errored = true;
                         return Some(Err(e));
                     }
                 }
+            } else if self.block_exhausted {
+                // Same block as the previously-exhausted one. Input is
+                // sorted, so this target is past the block's last entry
+                // (or the block index padded `last_key_or_greater`
+                // forward into a gap). Either way the target is absent;
+                // skip without re-entering the inner walker.
+                self.input_cursor += 1;
+                continue;
             }
 
             // Inner: walk the current block forward, comparing to target.
@@ -207,7 +223,11 @@ where
                             // Block exhausted — target wasn't in this block.
                             // Skip target; the next outer iteration may
                             // transition to a different block via
-                            // `get_block_with_key`.
+                            // `get_block_with_key`. Flag the exhaustion
+                            // so subsequent targets that resolve to this
+                            // same block short-circuit at the outer loop
+                            // rather than re-paying an `advance()` here.
+                            self.block_exhausted = true;
                             self.input_cursor += 1;
                             break;
                         }

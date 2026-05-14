@@ -211,6 +211,29 @@ fn inputs_concentrated_in_one_block() {
 }
 
 #[test]
+fn multiple_absent_targets_in_same_exhausted_block() {
+    // Sparse dict (keys 0, 10, 20, ..., 190) with `block_len = 2`
+    // engineers wide inter-block gaps. The block-index entry for the
+    // block containing keys 10 and 20 may pad `last_key_or_greater`
+    // forward into the gap, so multiple absent targets in 11..20 can
+    // resolve to the same block. After the first such target exhausts
+    // the in-block walker, the `block_exhausted` short-circuit must
+    // skip the rest without re-entering the walker — output equivalence
+    // against the per-key `dict.get` baseline pins this.
+    let mut builder = Dictionary::<MonotonicU64SSTable>::builder(Vec::new()).unwrap();
+    builder.set_block_len(2);
+    for i in 0u64..20 {
+        let v = i * 10;
+        builder.insert(&v.to_be_bytes()[..], &v).unwrap();
+    }
+    let bytes = builder.finish().unwrap();
+    let dict =
+        Dictionary::<MonotonicU64SSTable>::from_bytes_for_tests(OwnedBytes::new(bytes)).unwrap();
+    let keys: Vec<Vec<u8>> = (11u64..20).map(|i| i.to_be_bytes().to_vec()).collect();
+    assert_equivalent_on_sorted(&dict, &keys);
+}
+
+#[test]
 fn inputs_spanning_many_blocks() {
     // Tiny block_len + queries spread evenly across the key range
     // exercises the block-transition logic many times.
