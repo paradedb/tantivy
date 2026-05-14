@@ -40,6 +40,13 @@ impl SegmentPlugin for FlatVecPlugin {
         if !has_vector_field {
             return Ok(());
         }
+        // Symmetric short-circuit with `IvfVecPlugin::merge`: exactly
+        // one of the two writes a vector file per merge. At/above the
+        // clustering threshold IVF takes over and flat writes nothing.
+        let target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
+        if (target_docs as usize) >= ctx.settings.vector_clustering_threshold() {
+            return Ok(());
+        }
         if ctx.cancel.wants_cancel() {
             return Err(crate::TantivyError::Cancelled);
         }

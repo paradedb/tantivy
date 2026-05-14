@@ -19,4 +19,5 @@ pub use backend::VectorBackend;
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
 pub use flat::{FlatVecPlugin, FlatVecPluginWriter, FlatVecReader, VectorColumn};
+pub use ivf::{IvfVecPlugin, IvfVecPluginWriter};
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};

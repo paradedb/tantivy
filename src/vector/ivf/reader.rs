@@ -1,10 +1,9 @@
 //! Stub reader for the IVF plugin.
 //!
-//! Until the IVF writer lands, the plugin isn't registered, so
-//! `segment_reader.plugin_reader::<IvfVecReader>("ivf_vec")` always
-//! returns `None`. The types here exist so that
-//! [`VectorBackend`](super::super::backend::VectorBackend) can dispatch
-//! over `Flat | Ivf` at compile time.
+//! The plugin is registered (so backend dispatch and GC accounting
+//! pick it up), but until the merge body lands no segment actually
+//! has an `.ivfvec` file. `open_column` returns `None` accordingly,
+//! which sends the backend to the flat fallback.
 
 use std::any::Any;
 
@@ -19,6 +18,10 @@ pub struct IvfVecReader {
 }
 
 impl IvfVecReader {
+    pub(crate) fn stub() -> Self {
+        Self {}
+    }
+
     /// Open a per-field IVF column. Stub returns `None` so the backend
     /// always falls through to flat.
     pub fn open_column(&self, _field: Field) -> Option<IvfVectorColumn> {
