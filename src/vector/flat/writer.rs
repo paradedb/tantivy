@@ -1,58 +1,172 @@
-//! Stub writer for the flat vector plugin.
-//!
-//! Until the on-disk format lands, this writer is unregistered and
-//! every method is a `todo!()`. The type surface is stable so that
-//! `SegmentWriter` integration can be added in a single commit alongside
-//! the real implementation.
-
 use std::any::Any;
+use std::collections::BTreeMap;
+use std::io::Write;
 
-use crate::index::Segment;
+use super::presence::Presence;
+use crate::directory::CompositeWrite;
+use crate::index::{Segment, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
-use crate::schema::document::Document;
-use crate::schema::Schema;
-use crate::DocId;
+use crate::schema::document::{Document, Value};
+use crate::schema::{Field, FieldType, Schema};
+use crate::{DocId, TantivyError};
+
+/// Per-field in-memory state: the doc ids that have a value (ascending),
+/// plus a dense byte array — analogous to fast-fields' `Optional`
+/// cardinality. Docs without a vector occupy zero bytes of storage.
+///
+/// Rows are kept as raw little-endian bytes rather than decoded `T`
+/// values. The bytes go in via `add_document` and come back out at
+/// serialize time unchanged — no decode/re-encode round-trip, no
+/// dependency on `T: VectorElement` in the writer.
+struct FieldBuffer {
+    /// Doc ids that have a value for this field, in insertion order
+    /// (which equals ascending old-doc-id order since `add_document<D>`
+    /// is called sequentially).
+    present_doc_ids: Vec<DocId>,
+    /// Dense byte blob: `row_bytes[i*stride..(i+1)*stride]` is the
+    /// vector for `present_doc_ids[i]`.
+    row_bytes: Vec<u8>,
+    /// Bytes per vector (`dim * dtype.size_bytes()`).
+    stride: usize,
+}
+
+impl FieldBuffer {
+    fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) {
+        debug_assert_eq!(bytes.len(), self.stride);
+        self.present_doc_ids.push(doc_id);
+        self.row_bytes.extend_from_slice(bytes);
+    }
+
+    fn mem_usage(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.present_doc_ids.capacity() * std::mem::size_of::<DocId>()
+            + self.row_bytes.capacity()
+    }
+}
 
 pub struct FlatVecPluginWriter {
-    // TODO: per-field byte buffers + present-doc-id lists, captured
-    // num_docs for sizing the presence bitmap.
+    fields: BTreeMap<Field, FieldBuffer>,
+    /// Set by [`SegmentWriter::finalize`] before [`serialize`]. Used to
+    /// size the presence bitmap.
+    num_docs: DocId,
 }
 
 impl FlatVecPluginWriter {
-    pub(crate) fn stub() -> Self {
-        Self {}
+    pub fn for_schema(schema: &Schema) -> Self {
+        let mut fields = BTreeMap::new();
+        for (field, entry) in schema.fields() {
+            if let FieldType::Vector(opts) = entry.field_type() {
+                fields.insert(
+                    field,
+                    FieldBuffer {
+                        present_doc_ids: Vec::new(),
+                        row_bytes: Vec::new(),
+                        stride: opts.bytes_per_vector(),
+                    },
+                );
+            }
+        }
+        Self {
+            fields,
+            num_docs: 0,
+        }
     }
 
-    /// Append the vector-typed fields of a document.
+    /// Records the vector-typed fields of a document.
     ///
-    /// Called from `SegmentWriter::add_document` (parallel to how
-    /// `FastFieldsWriter::add_document` is fed). The real implementation
-    /// extracts raw bytes from each vector-typed field and appends them
-    /// to a per-field dense byte blob, marking the doc as present.
+    /// Called by `SegmentWriter` for every document (parallel to how
+    /// `FastFieldsWriter::add_document` is fed). Iterates the document's
+    /// field values and appends any vector-typed field's raw bytes to
+    /// the per-field byte blob, marking the doc as present. Docs that
+    /// omit a vector field write nothing and stay absent.
     pub fn add_document<D: Document>(
         &mut self,
-        _doc_id: DocId,
-        _doc: &D,
-        _schema: &Schema,
+        doc_id: DocId,
+        doc: &D,
+        schema: &Schema,
     ) -> crate::Result<()> {
-        todo!("flat vector writer add_document")
+        if self.fields.is_empty() {
+            return Ok(());
+        }
+        for (field, value) in doc.iter_fields_and_values() {
+            let buf = match self.fields.get_mut(&field) {
+                Some(b) => b,
+                None => continue,
+            };
+            let entry = schema.get_field_entry(field);
+            let bytes = value.as_value().as_bytes().ok_or_else(|| {
+                TantivyError::SchemaError(format!(
+                    "Expected vector bytes for field {:?}",
+                    entry.name()
+                ))
+            })?;
+            if bytes.len() != buf.stride {
+                return Err(TantivyError::SchemaError(format!(
+                    "vector byte length mismatch for field {:?}: expected {} bytes, got {}",
+                    entry.name(),
+                    buf.stride,
+                    bytes.len(),
+                )));
+            }
+            buf.push_bytes(doc_id, bytes);
+        }
+        Ok(())
     }
 
     /// Sets the total doc count used to size the presence bitmap. Called
     /// from `SegmentWriter::finalize` before [`PluginWriter::serialize`].
-    pub fn set_num_docs(&mut self, _num_docs: DocId) {
-        todo!("flat vector writer set_num_docs")
+    pub fn set_num_docs(&mut self, num_docs: DocId) {
+        self.num_docs = num_docs;
     }
 }
 
 impl PluginWriter for FlatVecPluginWriter {
     fn serialize(
         &mut self,
-        _segment: &mut Segment,
-        _doc_id_map: Option<&DocIdMapping>,
+        segment: &mut Segment,
+        doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
-        todo!("flat vector writer serialize")
+        if self.fields.is_empty() {
+            return Ok(());
+        }
+        let write = segment.open_write(SegmentComponent::Custom("flatvec".to_string()))?;
+        let mut composite = CompositeWrite::wrap(write);
+
+        for (field, buf) in &self.fields {
+            // Compute (present, row_bytes) in target doc-id order. For
+            // the no-remap case the writer already accumulates in
+            // ascending insertion (= target) order.
+            let (present, row_bytes): (Vec<DocId>, Vec<u8>) = if let Some(map) = doc_id_map {
+                let mut p = Vec::new();
+                let mut r = Vec::new();
+                for new_doc_id in 0..map.num_new_doc_ids() as DocId {
+                    let old_doc_id = map.get_old_doc_id(new_doc_id);
+                    if let Ok(row_idx) = buf.present_doc_ids.binary_search(&old_doc_id) {
+                        p.push(new_doc_id);
+                        let start = row_idx * buf.stride;
+                        r.extend_from_slice(&buf.row_bytes[start..start + buf.stride]);
+                    }
+                }
+                (p, r)
+            } else {
+                (buf.present_doc_ids.clone(), buf.row_bytes.clone())
+            };
+
+            // Slice (field, 0): presence section. Picks Full if every
+            // doc is present (typical for dense embeddings, just one
+            // tag byte) or Optional otherwise.
+            let bitmap_w = composite.for_field_with_idx(*field, 0);
+            Presence::serialize(&present, self.num_docs, bitmap_w)?;
+            bitmap_w.flush()?;
+
+            // Slice (field, 1): dense LE byte rows, one per present doc.
+            let rows_w = composite.for_field_with_idx(*field, 1);
+            rows_w.write_all(&row_bytes)?;
+            rows_w.flush()?;
+        }
+        composite.close()?;
+        Ok(())
     }
 
     fn close(self: Box<Self>) -> crate::Result<()> {
@@ -60,7 +174,12 @@ impl PluginWriter for FlatVecPluginWriter {
     }
 
     fn mem_usage(&self) -> usize {
-        0
+        std::mem::size_of::<Self>()
+            + self
+                .fields
+                .values()
+                .map(FieldBuffer::mem_usage)
+                .sum::<usize>()
     }
 
     fn as_any(&self) -> &dyn Any {

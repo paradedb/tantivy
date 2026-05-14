@@ -13,6 +13,7 @@ use std::sync::Arc;
 use super::flat::{FlatVecReader, VectorColumn as FlatVectorColumn};
 use super::ivf::{AdaptiveProbeParams, IvfVecReader, IvfVectorColumn};
 use super::options::{Metric, VectorElement};
+use crate::collector::TopNComputer;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
 use crate::{DocId, Score, SegmentReader, TantivyError};
@@ -24,11 +25,8 @@ pub enum VectorBackend<T: VectorElement> {
 }
 
 pub struct FlatBackend<T: VectorElement> {
-    #[allow(dead_code)] // wired up when the flat backend lands
     column: FlatVectorColumn,
-    #[allow(dead_code)]
     metric: Metric,
-    #[allow(dead_code)]
     query: Arc<Vec<T>>,
 }
 
@@ -100,20 +98,35 @@ impl<T: VectorElement> VectorBackend<T> {
 impl<T: VectorElement> FlatBackend<T> {
     fn top_n(
         &self,
-        _weight: &dyn Weight,
-        _segment_reader: &SegmentReader,
-        _top_n: usize,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
     ) -> crate::Result<Vec<(Score, DocId)>> {
-        // Sketch of the implementation when the flat reader lands:
-        //   1. Walk the filter `DocSet` in ascending doc order via
-        //      weight.for_each_no_score, gated by segment_reader.alive_bitset().
-        //   2. For each surviving doc, fetch self.column.vector_bytes_at(doc) and score it via
-        //      self.metric.similarity_bytes(&self.query[..], bytes).
-        //   3. Push each (score, doc) into a TopNComputer<Score, DocId>. The ascending-doc-id walk
-        //      lets us use the fast `TopNComputer::push` path; cluster-order backends like IVF use
-        //      `push_unordered` instead.
-        //   4. Return the descending-similarity sorted vec.
-        todo!("flat segment-level top-N")
+        // `for_each_no_score` walks the filter DocSet in ascending doc
+        // order, which lets us use the fast `TopNComputer::push` path
+        // (strict-greater threshold short-circuit, valid only under
+        // ascending-D pushes). IVF's cluster-order iteration would use
+        // `push_unordered` instead.
+        let mut topn = TopNComputer::<Score, DocId, _>::new(top_n);
+        let alive = segment_reader.alive_bitset();
+        weight.for_each_no_score(segment_reader, &mut |docs| {
+            for &doc in docs {
+                if let Some(bs) = alive {
+                    if !bs.is_alive(doc) {
+                        continue;
+                    }
+                }
+                if let Some(bytes) = self.column.vector_bytes_at(doc) {
+                    let score = self.metric.similarity_bytes(&self.query[..], bytes);
+                    topn.push(score, doc);
+                }
+            }
+        })?;
+        Ok(topn
+            .into_sorted_vec()
+            .into_iter()
+            .map(|cd| (cd.sort_key, cd.doc))
+            .collect())
     }
 }
 

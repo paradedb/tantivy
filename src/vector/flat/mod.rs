@@ -1,18 +1,17 @@
 //! Flat vector index plugin.
 //!
-//! Status: skeleton. The type surface exists so that
-//! [`VectorBackend`](crate::vector::backend::VectorBackend) compiles and
-//! callers can wire up [`TopDocsByVectorSimilarity`](crate::vector::TopDocsByVectorSimilarity)
-//! end-to-end, but no plugin is actually registered yet and the runtime
-//! methods are `todo!()`. The on-disk format (dense full-precision rows
-//! multiplexed across fields via a
-//! [`CompositeFile`](crate::directory::CompositeFile)) lands with the
-//! real writer/reader.
+//! Stores full-precision vectors contiguously per segment, multiplexed across
+//! fields via a [`CompositeFile`](crate::directory::CompositeFile). The segment
+//! file extension is `.flatvec`. Lookup is `slice_start + doc_id * dim * 4`.
 
 mod plugin;
+mod presence;
 mod reader;
 mod writer;
 
 pub use plugin::FlatVecPlugin;
 pub use reader::{FlatVecReader, VectorColumn};
 pub use writer::FlatVecPluginWriter;
+
+#[cfg(test)]
+mod tests;

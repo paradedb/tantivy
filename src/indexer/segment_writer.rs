@@ -19,6 +19,7 @@ use crate::schema::document::{Document, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::store::StorePluginWriter;
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
+use crate::vector::FlatVecPluginWriter;
 use crate::{DocId, Opstamp, TantivyError};
 
 /// Computes the initial size of the hash table.
@@ -142,6 +143,10 @@ impl SegmentWriter {
             .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
             .expect("fieldnorms plugin")
             .fill_up_to_max_doc(max_doc);
+        self.segment_serializer
+            .get_plugin_writer::<FlatVecPluginWriter>("flat_vec")
+            .expect("flat_vec plugin")
+            .set_num_docs(max_doc);
         let mapping: Option<DocIdMapping> = self
             .segment_serializer
             .segment()
@@ -198,6 +203,7 @@ impl SegmentWriter {
                     field_entry.name()
                 ))
             };
+
             if !field_entry.is_indexed() {
                 continue;
             }
@@ -411,12 +417,17 @@ impl SegmentWriter {
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {
         let AddOperation { document, opstamp } = add_operation;
+        let doc_id = self.max_doc;
         self.doc_opstamps.push(opstamp);
         self.segment_serializer
             .get_plugin_writer::<FastFieldsPluginWriter>("fast_fields")
             .expect("fast_fields plugin")
             .writer_mut()
             .add_document(&document)?;
+        self.segment_serializer
+            .get_plugin_writer::<FlatVecPluginWriter>("flat_vec")
+            .expect("flat_vec plugin")
+            .add_document(doc_id, &document, &self.schema)?;
         self.index_document(&document)?;
         if !self.ignore_store {
             self.segment_serializer
