@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::term_set_gallop;
 use super::term_set_strategy::{
-    select_strategy, PlannerInputs, TermSetStrategy, TermSetStrategyConfig,
+    k_prime_in_range, select_strategy, PlannerInputs, TermSetStrategy, TermSetStrategyConfig,
 };
 use crate::query::score_combiner::DoNothingCombiner;
 use crate::query::{
@@ -207,19 +207,39 @@ impl Weight for FastFieldTermSetWeight {
                     return Ok(Box::new(EmptyScorer));
                 };
 
-                // Estimate `D = N / dict_size` (avg docs per distinct term)
-                // so the dispatcher can pick between its D=1 (tight) and
-                // D≥2 (loose) bitset gates. The inverted index is the only
-                // source for `dict_size`; FAST-only fields (no inverted
-                // index) can't reach `BitsetFromPostings` anyway, so we
-                // fall back to D=1 silently in that case.
-                let d = if field_type.is_indexed() {
+                // Estimate `D = N / dict_size` (avg docs per distinct
+                // term) so the dispatcher can pick between its D=1
+                // (tight) and D≥2 (loose) bitset gates. The inverted
+                // index is the only source for `dict_size`; FAST-only
+                // fields (no inverted index) can't reach
+                // `BitsetFromPostings` anyway, so we fall back to D=1
+                // silently in that case.
+                //
+                // Pre-gate by `K'/N` before opening the inverted index:
+                // when K'/N already exceeds the *loosest* admissible
+                // bitset density (the max of unique and multi), no D
+                // value can rescue bitset admission — every D routes to
+                // `LinearScan`. Skipping the `dict.num_terms()` load on
+                // that path saves the inverted-index open for high-K
+                // queries that wouldn't have used it. The D=1 fallback
+                // is consistent: density already exceeds the
+                // unique-branch threshold so the planner picks
+                // `LinearScan` regardless. Do not undo this without
+                // verifying the planner still rejects bitset on the
+                // skipped band.
+                let n = column.num_docs() as u64;
+                let k_prime = k_prime_in_range(values.as_slice(), &column);
+                let density = k_prime as f64 / n as f64;
+                let loosest_gate = self
+                    .strategy_config
+                    .bitset_max_density_unique
+                    .max(self.strategy_config.bitset_max_density_multi);
+                let d = if density <= loosest_gate && field_type.is_indexed() {
                     let dict_size = reader
                         .inverted_index(self.field)?
                         .terms()
                         .num_terms()
                         .max(1) as u64;
-                    let n = column.num_docs() as u64;
                     ((n / dict_size).max(1)).min(u32::MAX as u64) as u32
                 } else {
                     1

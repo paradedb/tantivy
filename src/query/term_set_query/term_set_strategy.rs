@@ -287,10 +287,7 @@ fn select_strategy_inner(
     if n == 0 || term_set.is_empty() {
         return TermSetStrategy::Empty;
     }
-    let lo = column.min_value();
-    let hi = column.max_value();
-    let in_range = |v: u64| v >= lo && v <= hi;
-    let k_prime = term_set.iter().copied().filter(|&v| in_range(v)).count() as u32;
+    let k_prime = k_prime_in_range(term_set, column);
     if k_prime == 0 {
         // All query terms outside [min, max]. Returning `LinearScan` would
         // walk every doc in the segment doing hashset probes guaranteed to
@@ -302,7 +299,7 @@ fn select_strategy_inner(
     // segment is sorted by the queried field. The density gate is a
     // no-op at the default `gallop_max_density = 1.0` but is retained
     // as a knob.
-    if let Some(strategy) = try_gallop(reader, column, &inputs, term_set, cfg, k_prime, in_range) {
+    if let Some(strategy) = try_gallop(reader, column, &inputs, term_set, cfg, k_prime) {
         return strategy;
     }
 
@@ -340,6 +337,22 @@ fn select_strategy_inner(
     }
 }
 
+/// Count the query terms that survive the `[column.min, column.max]`
+/// range prune — `K'` in the dispatcher's gate formulas. Public-in-crate
+/// so the dispatch site (`FastFieldTermSetWeight::scorer`) can pre-compute
+/// the density gate's left-hand-side without re-running the filter or
+/// having to call the full planner first. Keeping a single definition
+/// here ensures dispatch and planner stay consistent by construction.
+///
+/// Duplicates are *not* removed: counts occurrences. Production input
+/// flows through HashSet-derived sources so duplicates are rare; the
+/// Gallop branch dedups defensively when it commits to that strategy.
+pub(crate) fn k_prime_in_range(term_set: &[u64], column: &Column<u64>) -> u32 {
+    let lo = column.min_value();
+    let hi = column.max_value();
+    term_set.iter().filter(|&&v| v >= lo && v <= hi).count() as u32
+}
+
 /// Gallop admissibility: returns `Some(Gallop { .. })` when the segment is
 /// sorted by `field_name`, the column shape supports gallop, no upstream
 /// filter has narrowed the work, and the density gate admits. Builds the
@@ -351,7 +364,6 @@ fn try_gallop(
     term_set: &[u64],
     cfg: &TermSetStrategyConfig,
     k_prime: u32,
-    in_range: impl Fn(u64) -> bool,
 ) -> Option<TermSetStrategy> {
     if !cfg.gallop_enabled {
         return None;
@@ -379,7 +391,13 @@ fn try_gallop(
     // `gallop_search_sorted` probes. Production input is HashSet-derived
     // so dedup is usually a no-op; `TermSetQuery::new` doesn't enforce
     // uniqueness on its input, so we dedup defensively here.
-    let mut sorted_terms: Vec<u64> = term_set.iter().copied().filter(|&v| in_range(v)).collect();
+    let lo = column.min_value();
+    let hi = column.max_value();
+    let mut sorted_terms: Vec<u64> = term_set
+        .iter()
+        .copied()
+        .filter(|&v| v >= lo && v <= hi)
+        .collect();
     sorted_terms.sort_unstable();
     sorted_terms.dedup();
     Some(TermSetStrategy::Gallop {
