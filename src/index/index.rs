@@ -30,7 +30,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{FlatVecPlugin, IvfVecPlugin};
+use crate::vector::VectorPlugin;
 use crate::SegmentReader;
 
 fn load_metas(
@@ -461,8 +461,7 @@ impl Index {
             Arc::new(PostingsPlugin),
             Arc::new(FastFieldsPlugin),
             Arc::new(StorePlugin),
-            Arc::new(FlatVecPlugin),
-            Arc::new(IvfVecPlugin),
+            Arc::new(VectorPlugin),
         ]
     }
 

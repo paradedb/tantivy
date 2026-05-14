@@ -10,9 +10,10 @@
 
 use std::sync::Arc;
 
-use super::flat::{FlatVecReader, VectorColumn as FlatVectorColumn};
-use super::ivf::{AdaptiveProbeParams, IvfVecReader, IvfVectorColumn};
+use super::flat::VectorColumn as FlatVectorColumn;
+use super::ivf::{AdaptiveProbeParams, IvfVectorColumn};
 use super::options::{Metric, VectorElement};
+use super::reader::VectorReader;
 use crate::collector::TopNComputer;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
@@ -42,8 +43,9 @@ pub struct IvfBackend<T: VectorElement> {
 }
 
 impl<T: VectorElement> VectorBackend<T> {
-    /// Probe plugins in priority order: IVF if the segment has it, else
-    /// flat. Returns an error if the segment has no vector data at all.
+    /// Probe formats in priority order: IVF if the segment has it,
+    /// else flat. One plugin lookup; the reader exposes both views.
+    /// Returns an error if the segment has no vector data at all.
     pub fn for_segment(
         segment_reader: &SegmentReader,
         field: Field,
@@ -53,21 +55,20 @@ impl<T: VectorElement> VectorBackend<T> {
         let schema = segment_reader.schema();
         let metric = lookup_metric(&schema, field)?;
 
-        if let Some(ivf) = segment_reader.plugin_reader::<IvfVecReader>("ivf_vec")? {
-            if let Some(column) = ivf.open_column(field) {
-                return Ok(Self::Ivf(IvfBackend {
-                    column,
-                    metric,
-                    query,
-                    adaptive,
-                }));
-            }
+        let vec_reader = segment_reader
+            .plugin_reader::<VectorReader>("vectors")?
+            .ok_or_else(|| TantivyError::InternalError("vectors plugin reader missing".into()))?;
+
+        if let Some(column) = vec_reader.open_ivf_column(field) {
+            return Ok(Self::Ivf(IvfBackend {
+                column,
+                metric,
+                query,
+                adaptive,
+            }));
         }
 
-        let flat = segment_reader
-            .plugin_reader::<FlatVecReader>("flat_vec")?
-            .ok_or_else(|| TantivyError::InternalError("flat_vec plugin reader missing".into()))?;
-        let column = flat.open_column(field).ok_or_else(|| {
+        let column = vec_reader.open_flat_column(field).ok_or_else(|| {
             TantivyError::InternalError(format!(
                 "no vector data for field {:?} in segment",
                 schema.get_field_name(field),

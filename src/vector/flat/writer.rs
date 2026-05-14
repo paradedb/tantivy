@@ -45,14 +45,14 @@ impl FieldBuffer {
     }
 }
 
-pub struct FlatVecPluginWriter {
+pub struct FlatVecWriter {
     fields: BTreeMap<Field, FieldBuffer>,
     /// Set by [`SegmentWriter::finalize`] before [`serialize`]. Used to
     /// size the presence bitmap.
     num_docs: DocId,
 }
 
-impl FlatVecPluginWriter {
+impl FlatVecWriter {
     pub fn for_schema(schema: &Schema) -> Self {
         let mut fields = BTreeMap::new();
         for (field, entry) in schema.fields() {
@@ -121,7 +121,7 @@ impl FlatVecPluginWriter {
     }
 }
 
-impl PluginWriter for FlatVecPluginWriter {
+impl PluginWriter for FlatVecWriter {
     fn serialize(
         &mut self,
         segment: &mut Segment,

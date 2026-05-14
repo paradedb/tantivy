@@ -1,20 +1,17 @@
-//! IVF (inverted-file) vector index plugin.
+//! IVF (inverted-file) vector storage format.
 //!
-//! Status: plugin registered, merge hook present, clustering algorithm
-//! pending. The plugin participates in the merge lifecycle and
-//! short-circuits below
-//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings).
-//! At/above the threshold the body is a TODO — when it lands, every
-//! qualifying merge writes a `.ivfvec` file. Until then, both the
-//! reader's `open_column` and the search-side `IvfBackend::top_n` stay
-//! `None`/`todo!()` and queries fall through to the flat backend.
+//! Status: scaffolding only. The [`merge_ivf`] body and the
+//! [`IvfVecReader`]'s column-open path are both `todo!()` / `None`
+//! until the clustering algorithm lands. Until then, the unified
+//! [`VectorPlugin`](crate::vector::VectorPlugin) only routes to this
+//! module when the merge target meets
+//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold),
+//! which defaults to `usize::MAX` (effectively off).
 
 mod params;
 mod plugin;
 mod reader;
-mod writer;
 
 pub use params::AdaptiveProbeParams;
-pub use plugin::IvfVecPlugin;
+pub(crate) use plugin::merge_ivf;
 pub use reader::{IvfVecReader, IvfVectorColumn};
-pub use writer::IvfVecPluginWriter;
