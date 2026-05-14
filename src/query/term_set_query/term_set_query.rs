@@ -76,7 +76,7 @@ impl TermSetQuery {
             // Gallop / BitsetFromPostings / LinearScan per segment. Non-fast and
             // unsupported value types (Bool/Json/Str/...) fall through to
             // `AutomatonWeight` on the inverted index. The strategy framework
-            // handles small K cleanly post-Phase-5h — there's no K threshold here.
+            // handles every K cleanly — no K-based short-circuit lives here.
             if field_type.is_fast() && supported_for_ff {
                 sub_queries.push((
                     Occur::Should,

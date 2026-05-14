@@ -28,7 +28,8 @@ fn cfg_linear() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: false,
         gallop_max_density: 0.0,
-        bitset_max_density: 0.0,
+        bitset_max_density_unique: 0.0,
+        bitset_max_density_multi: 0.0,
         subsequent_bitset_max_density: 0.0,
         strategy_sink: None,
     }

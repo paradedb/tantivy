@@ -207,13 +207,31 @@ impl Weight for FastFieldTermSetWeight {
                     return Ok(Box::new(EmptyScorer));
                 };
 
+                // Estimate `D = N / dict_size` (avg docs per distinct term)
+                // so the dispatcher can pick between its D=1 (tight) and
+                // D≥2 (loose) bitset gates. The inverted index is the only
+                // source for `dict_size`; FAST-only fields (no inverted
+                // index) can't reach `BitsetFromPostings` anyway, so we
+                // fall back to D=1 silently in that case.
+                let d = if field_type.is_indexed() {
+                    let dict_size = reader
+                        .inverted_index(self.field)?
+                        .terms()
+                        .num_terms()
+                        .max(1) as u64;
+                    let n = column.num_docs() as u64;
+                    ((n / dict_size).max(1)).min(u32::MAX as u64) as u32
+                } else {
+                    1
+                };
+
                 let strategy = select_strategy(
                     reader,
                     &column,
                     PlannerInputs {
                         field_name,
                         candidate_size: None,
-                        avg_docs_per_term: None,
+                        avg_docs_per_term: Some(d),
                     },
                     values.as_slice(),
                     &self.strategy_config,

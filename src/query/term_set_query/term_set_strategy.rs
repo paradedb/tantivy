@@ -2,19 +2,19 @@
 //!
 //! Mirrors the structure of `range_query::range_query_fastfield`:
 //! `Weight::scorer()` consults this module to decide between `Gallop`,
-//! `BitsetFromPostings`, and `LinearScan`, then constructs the right `DocSet`.
+//! `BitsetFromPostings`, and `LinearScan`, then constructs the right
+//! `DocSet`. The decision tree and threshold calibration live on
+//! [`select_strategy`].
 //!
-//! See `design-doc.md` for the decision tree and Phase 5c bench data for the
-//! `BitsetFromPostings` vs `LinearScan` cost model.
+//! ## `inputs.avg_docs_per_term` (`D`)
 //!
-//! ## Note on `inputs.avg_docs_per_term` (`D`)
-//!
-//! Computing `D` precisely from the column alone would require posting-list
-//! lookups (which is some of the work `BitsetFromPostings` does anyway). We
-//! accept `None`, which `select_strategy` treats as `D = 1`. The first-column
-//! dispatch uses `D` only to bias the `BitsetFromPostings` vs `LinearScan`
-//! cutoff via `bitset_max_density`; a missing estimate degrades to the
-//! conservative `D = 1` reading, which broadens the bitset-eligible region.
+//! Computing `D` precisely from the column alone would require
+//! posting-list lookups (which is some of the work
+//! `BitsetFromPostings` does anyway). `select_strategy` accepts
+//! `None` and treats it as `D = 1`. The first-column dispatch uses
+//! `D` to pick between two `BitsetFromPostings`-vs-`LinearScan`
+//! thresholds (see [`select_strategy`] for the cost-model reasoning);
+//! a missing estimate degrades to the tighter D=1 threshold.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -53,14 +53,18 @@ impl TryFrom<u8> for StrategyTag {
     }
 }
 
-/// User-tunable density thresholds. Defaults match the starting estimates in
-/// `design.md` §4 and are overridden via the `paradedb.term_set_*_max_density`
-/// GUCs at the consumer side.
+/// User-tunable density thresholds. Defaults are bench-calibrated
+/// against the SSTable backend (see [`select_strategy`] for the
+/// cost-model reasoning) and overridable via the
+/// `paradedb.term_set_*_max_density` GUCs at the consumer side.
 ///
-/// "Density" is a unitless ratio of *matching count over corpus count*. For
-/// gallop, that's `K' / N`; for bitset on the first column, it's `K' · D / N`;
-/// for the subsequent-column branch, `K' · D / C`. Each strategy fires when
-/// its density is *below* the corresponding `_max_density` threshold.
+/// "Density" is a unitless ratio of *matching count over corpus
+/// count*. For gallop, that's `K' / N`; for bitset on the first
+/// column it reduces to `K' / N` (D is used only to pick which
+/// threshold applies, not multiplied into the gate variable); for
+/// the subsequent-column branch, `K' · D / C`. Each strategy fires
+/// when its density is at or below the corresponding `_max_density`
+/// threshold.
 ///
 /// We use `f64` rather than integer denominators so bench-derived
 /// thresholds don't have to round to `1/N` for small `N`.
@@ -69,17 +73,35 @@ pub struct TermSetStrategyConfig {
     /// Kill-switch: when `false`, the planner never returns `Gallop` even if
     /// every other gate would pass.
     pub gallop_enabled: bool,
-    /// Gallop fires when `K' / N < gallop_max_density` on a sorted segment.
-    /// Default `1/100 = 0.01`. At K/N = 0.01 gallop wins ~2.6× over linear
-    /// on LowFk-shaped corpora with consistent behavior across N values.
-    /// The corpus generator caps `distinct = N/100`, so the empirical
-    /// crossover above 0.01 isn't pinned for LowFk; PK-shaped corpora
-    /// show a different (D-dependent) crossover — see Follow-up H.
+    /// Density cap for Gallop. The strategy fires when `K' / N <=
+    /// gallop_max_density` on a sorted segment. Default `1.0` — Gallop
+    /// wins uniformly whenever the segment is sorted by the queried
+    /// field (every cell measured by the `compare` and `production`
+    /// bench tiers had Gallop at least as fast as the alternatives),
+    /// so no K-based gate is needed in practice. Kept as a
+    /// configurable knob for pathological corpora.
     pub gallop_max_density: f64,
-    /// First-column `BitsetFromPostings` threshold: `K' · D / N` cutoff. The
-    /// strategy fires when `K' · D / N < bitset_max_density`; otherwise the
-    /// planner falls through to `LinearScan`.
-    pub bitset_max_density: f64,
+    /// `BitsetFromPostings` first-column threshold for *unique-valued
+    /// columns* (`D = 1`, i.e. `dict_size = N`, e.g. primary keys).
+    /// The strategy fires when `K' / N <= bitset_max_density_unique`.
+    /// Default `1/2000 = 0.0005` — calibrated against the SSTable
+    /// backend where per-`dict.get` zstd block decompress dominates
+    /// batched cost on unique columns; the empirical crossover with
+    /// `LinearScan` lands at K/N ≈ 1/1000 and this default sits at
+    /// half that to give linear the boundary cells.
+    pub bitset_max_density_unique: f64,
+    /// `BitsetFromPostings` first-column threshold for *non-unique
+    /// columns* (`D >= 2`). The strategy fires when
+    /// `K' / N <= bitset_max_density_multi`. Default `1/200 = 0.005` —
+    /// the `cost_model` bench tier pinned the batched-vs-linear
+    /// crossover to K/N ∈ [0.0055, 0.0088] across D ∈ {2, 5, 20, 50}
+    /// (spread 1.59×), and `1/200` sits just below the tightest
+    /// measured crossover (D=2). Exactly 10× looser than the unique
+    /// threshold, matching the ~10× per-K cost gap: batched on a
+    /// non-unique column amortizes the zstd block decompress across
+    /// multiple keys per block, dropping per-K dict cost relative to
+    /// the D=1 case where every key maps to a distinct block.
+    pub bitset_max_density_multi: f64,
     /// Subsequent-column `BitsetFromPostings` threshold: `K' · D / C` cutoff.
     pub subsequent_bitset_max_density: f64,
     /// Optional sink for the per-segment strategy choice. When `Some`,
@@ -94,16 +116,13 @@ impl Default for TermSetStrategyConfig {
     fn default() -> Self {
         Self {
             gallop_enabled: true,
-            // gallop_max_density: 1/100 — bench-tuned (see field doc).
-            // bitset_max_density: 1/50 — calibrated Phase 5e from N ∈ {1M, 20M,
-            //   50M} sweeps on PK-shape (D=1). Direct-lookup `BitsetFromPostings`
-            //   loses to `LinearScan` once K·D/N crosses ~1/50; the strict
-            //   less-than gate keeps bitset firing below that ratio.
-            // subsequent_bitset_max_density: 1/4 — unchanged from Phase 5c
-            //   starting estimate; subsequent-column bench coverage is thinner,
-            //   defer tightening until we have data.
-            gallop_max_density: 1.0 / 100.0,
-            bitset_max_density: 1.0 / 50.0,
+            // Defaults are bench-derived. See per-field doc-comments for the
+            // calibration story. `subsequent_bitset_max_density` is an
+            // unverified starting estimate — no bench data for the
+            // subsequent-column branch yet.
+            gallop_max_density: 1.0,
+            bitset_max_density_unique: 1.0 / 2000.0,
+            bitset_max_density_multi: 1.0 / 200.0,
             subsequent_bitset_max_density: 1.0 / 4.0,
             strategy_sink: None,
         }
@@ -125,16 +144,18 @@ pub enum TermSetStrategy {
     /// Direct `TermDictionary::get(key)` lookups + bitset OR. The K-bounded
     /// inverted-index path; see `term_set_bitset.rs`.
     BitsetFromPostings,
-    /// The result is definitively empty; no posting list reads or column
-    /// scans needed. Returned when the planner can prove no docs can match:
+    /// The result is definitively empty; no posting list reads or
+    /// column scans needed. Returned when the planner can prove no
+    /// docs can match:
     ///   - `n == 0` (empty segment)
     ///   - `term_set.is_empty()` (no query terms)
     ///   - `k_prime == 0` (all query terms pruned outside `[min, max]`)
     ///   - `candidate_size == 0` (subsequent-column branch with empty upstream)
-    /// The dispatch site emits an `EmptyScorer` for this variant. Closing
-    /// this gap was Phase 5i — pre-fix the planner returned `LinearScan`
-    /// here and the dispatch site walked every doc in the segment doing
-    /// hashset probes that all failed by construction.
+    ///
+    /// The dispatch site emits an `EmptyScorer` for this variant —
+    /// returning `LinearScan` here instead would have the dispatch
+    /// site walk every doc in the segment doing hashset probes that
+    /// all fail by construction.
     Empty,
 }
 
@@ -149,86 +170,91 @@ pub struct PlannerInputs<'a> {
 
 /// Strategy dispatch for `FastFieldTermSetQuery`.
 ///
-/// # Decision tree (evaluated in order)
+/// # How this function gets called
 ///
-/// ## Tier 1 — upstream: `TermSetQuery::specialized_weight`
+/// `TermSetQuery::specialized_weight` upstream forks on field type:
+/// fast-field numeric types (U64/I64/F64/Date/IpAddr) route through
+/// `FastFieldTermSetWeight`, which calls `select_strategy` for every
+/// segment scorer build. Other field types (non-fast, or
+/// `Bool/Json/Str/...`) route through `AutomatonWeight` (a streaming
+/// dictionary walk + `BufferedUnionScorer` over K posting lists);
+/// this dispatch table never sees those queries.
 ///
-/// `TermSetQuery` itself doesn't reach this function unless tier 1 routes
-/// to `FastFieldTermSetWeight`. The tier-1 fork is on field type only:
+/// # Decision tree
 ///
-///   - field is `is_fast()` AND value type is U64/I64/F64/Date/IpAddr → `FastFieldTermSetWeight`
-///     (this dispatch table runs for every K).
-///   - Otherwise (non-fast field, or `Bool/Json/Str/...` value type) → `AutomatonWeight` over the
-///     inverted index (streaming dictionary walk + `BufferedUnionScorer` heap merge of K posting
-///     lists). The strategy framework below never sees the query in this branch.
+/// Each step is "decide and return"; later steps run only if the
+/// earlier ones declined.
 ///
-/// Phase 5h removed the prior `terms.len() > 1024` short-circuit that
-/// forced small-K queries on fast-supported types into `AutomatonWeight`.
-/// Tier 2 below handles every K cleanly: small K on a sorted column hits
-/// `Gallop`; small K on an unsorted column hits `BitsetFromPostings` with
-/// direct dictionary lookups — both much faster than the streaming
-/// `AutomatonWeight` walk on a large dictionary. `AutomatonWeight` is now
-/// reserved exclusively for fields where the fast-field path doesn't
-/// apply.
+/// ```text
+/// 1. Edge cases
+///      n == 0  ||  term_set.is_empty()            →  Empty
+///      k_prime == 0  (all terms outside [min,max]) →  Empty
 ///
-/// ## Tier 2 — this function (`select_strategy` over a `Column<u64>`)
+/// 2. Gallop  (sorted-segment fast path)
+///      cfg.gallop_enabled                          AND
+///      inputs.candidate_size is None or == n       AND
+///      cardinality in {Full, Optional}             AND
+///      reader.sort_by_field matches field_name     AND
+///      K' / N <= cfg.gallop_max_density            →  Gallop
 ///
-/// 1. **Defensive empty checks** — if `n == 0`, the input term set is empty, or all terms prune
-///    outside `[column.min, column.max]`, return `LinearScan`. Upstream callers handle the
-///    truly-empty result via `EmptyScorer`; this arm just keeps the planner total over its
-///    well-defined domain.
+/// 3. Subsequent-column branch  (candidate_size < n)
+///      candidate_size == 0                         →  Empty
+///      K' · D / C <=                                  BitsetFromPostings
+///        cfg.subsequent_bitset_max_density         →
+///      otherwise                                   →  LinearScan
 ///
-/// 2. **Gallop** — sort-dependent fast path. Fires when all of:
-///      - `cfg.gallop_enabled` (kill switch, default true)
-///      - `inputs.candidate_size.is_none_or(|c| c == n)`  (first column; candidate-set filtering
-///        hasn't already reduced N)
-///      - column cardinality is `Full` or `Optional` (gallop's range walk assumes one value per
-///        doc)
-///      - the segment has a `sort_by_field` matching `inputs.field_name`
-///      - `K' / N < cfg.gallop_max_density`  (default 1/100 = 0.01)
-///    `Gallop` reads the fast-field column directly with exponential jumps;
-///    cost is `O(K' · log(N/K'))`. Preferred over all inverted-index
-///    strategies when the column is sort-compatible with the filter, since
-///    no other strategy exploits sortedness.
+/// 4. First-column branch  (full segment, no upstream filter)
+///      threshold = if D >= 2 { bitset_max_density_multi }
+///                  else      { bitset_max_density_unique }
+///      K' / N <= threshold                         →  BitsetFromPostings
+///      otherwise                                   →  LinearScan
+/// ```
 ///
-/// 3. **Subsequent-column branch** — when an upstream candidate set has already narrowed work to
-///    `C` candidates (`inputs.candidate_size < n`):
-///      - `c > 0` AND `K' · D / C < cfg.subsequent_bitset_max_density` (default 1/4) →
-///        `BitsetFromPostings`
-///      - Otherwise → `LinearScan`
-///    The bitset path here still streams K direct dictionary lookups (the
-///    `BitsetFromPostings` algorithm is the same as the first-column
-///    branch); it's the eligibility threshold that differs.
+/// # Gallop admission
 ///
-/// 4. **First-column branch** — full segment, no upstream filter:
-///      - `K' · D / N < cfg.bitset_max_density` (default 1/50 = 0.02) → `BitsetFromPostings`.
-///        Direct dictionary lookups + bitset OR. Wins 5–250× over `LinearScan` in this band per
-///        Phase 5c sweeps; see PR #<NN>.
-///      - Otherwise → `LinearScan`. Single O(N) pass with `HashSet` probe per doc; wins when K is a
-///        large enough fraction of N that K discrete dictionary lookups exceed one full scan.
+/// Gallop walks the fast-field column directly with exponential
+/// jumps once the segment is sorted by the queried field; no other
+/// strategy exploits the sort. The default `gallop_max_density = 1.0`
+/// admits Gallop whenever the structural preconditions hold, because
+/// every benched cell on a sort-matching segment showed Gallop
+/// at least as fast as the alternatives. The density knob exists for
+/// pathological corpora where that might not hold in the future.
+///
+/// # Why two bitset thresholds (D=1 vs D >= 2)
+///
+/// On the SSTable backend each `dict.get` pays a zstd block
+/// decompress. For unique-valued columns (`D = 1`, i.e.
+/// `dict_size = N`) every query term lands in a distinct dict block,
+/// so per-K dict cost is large and `BatchedBitsetFromPostings` only
+/// wins against `LinearScan` for very small K (crossover at K/N ≈
+/// 1/1000). For non-unique columns (`D >= 2`) multiple query terms
+/// share dict blocks and the batched API amortizes the decompress;
+/// the crossover with linear moves out to K/N ≈ 1/100. The two-arm
+/// gate picks the right side of that ~10× cost gap based on
+/// `inputs.avg_docs_per_term`, which the dispatch site derives from
+/// `dict_size = TermDictionary::num_terms()` (a constant-time field
+/// read on both backends) as `D = N / dict_size`.
+///
+/// Both defaults sit at half the empirical crossover (the
+/// strict-less-than form would set them exactly at it; the `<=`
+/// gate gives the simpler-strategy linear the benefit at the
+/// boundary). All density values are unitless ratios in `[0, 1]`.
 ///
 /// # Constants
 ///
-/// All "density" values are unitless ratios; the strict less-than gate
-/// means the threshold value itself routes to the next-tier strategy.
-///
-///   - `cfg.gallop_max_density`              default 1/100 = 0.01
-///   - `cfg.bitset_max_density`              default 1/50  = 0.02
-///   - `cfg.subsequent_bitset_max_density`   default 1/4   = 0.25
-///   - `cfg.gallop_enabled`                  default true
-///
-/// `D` (`avg_docs_per_term`) defaults to 1 when the caller doesn't supply
-/// it. The dispatch site in `FastFieldTermSetWeight::scorer` currently
-/// always passes `None`; the threshold gates therefore reduce to `K' / N`
-/// and `K' / C` in practice. Plumbing a real per-column D estimator is a
-/// separate follow-up.
+///   - `cfg.gallop_enabled`                    default true
+///   - `cfg.gallop_max_density`                default 1.0    (no-op gate)
+///   - `cfg.bitset_max_density_unique`         default 1/2000 = 0.0005
+///   - `cfg.bitset_max_density_multi`          default 1/200  = 0.005
+///   - `cfg.subsequent_bitset_max_density`     default 1/4    = 0.25
 ///
 /// # Strategy sink for EXPLAIN
 ///
-/// When `cfg.strategy_sink` is `Some`, the chosen `StrategyTag` is stored
-/// (as `u8`) on the sink before returning so consumers can surface it in
-/// `EXPLAIN ANALYZE`. The thin wrapper around the inner planner keeps the
-/// per-segment hot path uncluttered.
+/// When `cfg.strategy_sink` is `Some`, the chosen `StrategyTag` is
+/// stored (as `u8`) on the sink before returning so consumers can
+/// surface it in `EXPLAIN ANALYZE`. A thin wrapper around the inner
+/// planner keeps the per-segment hot path uncluttered when no sink
+/// is configured.
 pub fn select_strategy(
     reader: &SegmentReader,
     column: &Column<u64>,
@@ -256,102 +282,118 @@ fn select_strategy_inner(
     term_set: &[u64],
     cfg: &TermSetStrategyConfig,
 ) -> TermSetStrategy {
+    // --- Edge cases: nothing to do.
     let n = column.num_docs();
     if n == 0 || term_set.is_empty() {
-        // Empty segment or empty query → no docs can match.
         return TermSetStrategy::Empty;
     }
-
-    // Count terms surviving min/max pruning. Non-gallop branches only need
-    // K' to evaluate density gates; allocating a `Vec<u64>` here just to
-    // discard it on those branches is wasted work. The Gallop branch below
-    // does the allocation only when it commits to that strategy.
     let lo = column.min_value();
     let hi = column.max_value();
     let in_range = |v: u64| v >= lo && v <= hi;
     let k_prime = term_set.iter().copied().filter(|&v| in_range(v)).count() as u32;
     if k_prime == 0 {
-        // All query terms fall outside the column's [min, max] — no doc
-        // can match. Returning `LinearScan` here would let the dispatch
-        // site walk every doc in the segment doing hashset probes that
-        // we already know will fail; returning `Empty` lets it short
-        // circuit to `EmptyScorer`. (Phase 5i fix.)
+        // All query terms outside [min, max]. Returning `LinearScan` would
+        // walk every doc in the segment doing hashset probes guaranteed to
+        // miss; `Empty` lets the dispatch site emit `EmptyScorer` instead.
         return TermSetStrategy::Empty;
     }
 
-    let candidate_eq_n = inputs.candidate_size.is_none_or(|c| c == n);
-    let cardinality = column.get_cardinality();
-    let n_f = n as f64;
-
-    // Try gallop (sort-dependent fast path).
-    if cfg.gallop_enabled
-        && candidate_eq_n
-        && matches!(cardinality, Cardinality::Full | Cardinality::Optional)
-    {
-        if let Some(order) = reader
-            .sort_by_field()
-            .filter(|sbf| sbf.field == inputs.field_name)
-            .map(|sbf| sbf.order)
-        {
-            // K' / N < gallop_max_density. Strict less-than matches the
-            // pre-refactor integer form `K' < N / R_GALLOP` at every
-            // exactly-representable density (the defaults are 1/2^k).
-            if (k_prime as f64) / n_f < cfg.gallop_max_density {
-                // Gallop is the only branch that needs the pruned Vec
-                // (sorted + deduped + handed to `TermSetGallopDocSet`), so
-                // allocate it only here.
-                let mut pruned: Vec<u64> =
-                    term_set.iter().copied().filter(|&v| in_range(v)).collect();
-                pruned.sort_unstable();
-                // Dedup duplicate input terms. `TermSetGallopDocSet`
-                // tolerates duplicates (the second occurrence finds an
-                // empty range and skips), but each duplicate still pays
-                // two `gallop_search_sorted` probes — cheap insurance on
-                // the hot path. Production input today flows through
-                // HashSet-derived sources so this is a no-op there;
-                // `TermSetQuery::new` doesn't enforce uniqueness on its
-                // input, hence the belt-and-suspenders dedup.
-                pruned.dedup();
-                return TermSetStrategy::Gallop {
-                    sort_order: order,
-                    sorted_terms: pruned,
-                };
-            }
-        }
+    // Gallop: sorted-segment fast path. Dominates whenever the
+    // segment is sorted by the queried field. The density gate is a
+    // no-op at the default `gallop_max_density = 1.0` but is retained
+    // as a knob.
+    if let Some(strategy) = try_gallop(reader, column, &inputs, term_set, cfg, k_prime, in_range) {
+        return strategy;
     }
 
-    // Sort-agnostic selection.
-    let d = inputs.avg_docs_per_term.unwrap_or(1) as u64;
-    let kd = (k_prime as u64).saturating_mul(d) as f64;
-
+    // --- Subsequent-column branch (upstream filter narrowed work to c < n).
     if let Some(c) = inputs.candidate_size.filter(|&c| c < n) {
-        // Subsequent column. `c == 0` means the upstream filter produced no
-        // candidates — no docs can match this filter either. For `c > 0`,
-        // fire `BitsetFromPostings` when `K·D/C` falls below the threshold;
-        // otherwise default to `LinearScan`.
         if c == 0 {
             return TermSetStrategy::Empty;
         }
-        if kd / (c as f64) < cfg.subsequent_bitset_max_density {
+        let d = inputs.avg_docs_per_term.unwrap_or(1) as u64;
+        let kd = (k_prime as u64).saturating_mul(d) as f64;
+        if kd / (c as f64) <= cfg.subsequent_bitset_max_density {
             return TermSetStrategy::BitsetFromPostings;
         }
-        TermSetStrategy::LinearScan
+        return TermSetStrategy::LinearScan;
+    }
+
+    // --- Tier 2: first-column bitset vs linear, parameterized by D.
+    // The cost driver is K/N. Picking the right threshold needs D:
+    //   - D = 1 (unique-valued, dict_size >= N): per-K dict cost is ~10× higher than D >= 2 because
+    //     every key maps to a distinct SSTable block; tight gate keeps linear winning past
+    //     K/N≈1/2000.
+    //   - D >= 2: batched amortizes the zstd block decompress across multiple keys per block; loose
+    //     gate admits up to K/N≈1/200.
+    let d = inputs.avg_docs_per_term.unwrap_or(1);
+    let density = (k_prime as f64) / (n as f64);
+    let bitset_threshold = if d >= 2 {
+        cfg.bitset_max_density_multi
     } else {
-        // First column, post-gallop.
-        let kd_density = kd / n_f;
-        if kd_density < cfg.bitset_max_density {
-            return TermSetStrategy::BitsetFromPostings;
-        }
+        cfg.bitset_max_density_unique
+    };
+    if density <= bitset_threshold {
+        TermSetStrategy::BitsetFromPostings
+    } else {
         TermSetStrategy::LinearScan
     }
+}
+
+/// Gallop admissibility: returns `Some(Gallop { .. })` when the segment is
+/// sorted by `field_name`, the column shape supports gallop, no upstream
+/// filter has narrowed the work, and the density gate admits. Builds the
+/// pruned+sorted+deduped `sorted_terms` Vec only on commit.
+fn try_gallop(
+    reader: &SegmentReader,
+    column: &Column<u64>,
+    inputs: &PlannerInputs<'_>,
+    term_set: &[u64],
+    cfg: &TermSetStrategyConfig,
+    k_prime: u32,
+    in_range: impl Fn(u64) -> bool,
+) -> Option<TermSetStrategy> {
+    if !cfg.gallop_enabled {
+        return None;
+    }
+    let n = column.num_docs();
+    let candidate_eq_n = inputs.candidate_size.is_none_or(|c| c == n);
+    if !candidate_eq_n {
+        return None;
+    }
+    if !matches!(
+        column.get_cardinality(),
+        Cardinality::Full | Cardinality::Optional
+    ) {
+        return None;
+    }
+    let order = reader
+        .sort_by_field()
+        .filter(|sbf| sbf.field == inputs.field_name)
+        .map(|sbf| sbf.order)?;
+    if (k_prime as f64) / (n as f64) > cfg.gallop_max_density {
+        return None;
+    }
+    // Gallop tolerates duplicate input terms (the second occurrence finds
+    // an empty range and skips), but each duplicate still pays two
+    // `gallop_search_sorted` probes. Production input is HashSet-derived
+    // so dedup is usually a no-op; `TermSetQuery::new` doesn't enforce
+    // uniqueness on its input, so we dedup defensively here.
+    let mut sorted_terms: Vec<u64> = term_set.iter().copied().filter(|&v| in_range(v)).collect();
+    sorted_terms.sort_unstable();
+    sorted_terms.dedup();
+    Some(TermSetStrategy::Gallop {
+        sort_order: order,
+        sorted_terms,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     //! Unit tests pin the planner's *output shape* on cases it can decide
-    //! today. Once `inputs.avg_docs_per_term` is populated from a real column
-    //! estimator, the `K' · D < threshold` arithmetic will shift and these
-    //! tests may need to be revisited.
+    //! today. Tests that need to exercise gate semantics on specific K/N
+    //! cells pass `avg_docs_per_term` and density-threshold overrides
+    //! directly so they remain stable across future calibration changes.
     use super::*;
     use crate::schema::{NumericOptions, SchemaBuilder};
     use crate::{Index, IndexSettings, IndexSortByField};
@@ -414,22 +456,24 @@ mod tests {
             &term_set([10_000_000u64, 99_999_999, u64::MAX]),
             &TermSetStrategyConfig::default(),
         );
-        // All query terms fall outside the column's [min, max]. The planner
-        // proves no docs can match and returns `Empty` so the dispatch site
-        // emits `EmptyScorer` instead of walking the segment with a hashset
-        // of guaranteed-to-miss values. (Phase 5i.)
+        // All query terms fall outside the column's [min, max]. The
+        // planner proves no docs can match and returns `Empty` so the
+        // dispatch site emits `EmptyScorer` instead of walking the
+        // segment with a hashset of guaranteed-to-miss values.
         assert_eq!(strat, TermSetStrategy::Empty);
     }
 
     #[test]
-    fn select_returns_bitset_from_postings_when_gallop_rejected_due_to_high_k_planner_shape_only() {
-        // Sorted ASC, but K is *too big* for gallop: K'/N >= gallop_max_density.
-        // With D = 1, we want K'·D / N < bitset_max_density so the
-        // sort-agnostic branch lands on BitsetFromPostings.
-        // Defaults (Phase 5e): gallop=1/100=0.01, bitset=1/50=0.02.
-        // N = 4096, K = 60 → K/N = 60/4096 ≈ 0.0146:
-        //   0.0146 ≥ 0.01  → gallop rejected
-        //   0.0146 < 0.02  → bitset accepted
+    fn select_returns_bitset_from_postings_when_gallop_kill_switch_engaged() {
+        // Sorted segment, K above the D=1 bitset gate but below D=2 gate.
+        // With gallop disabled, dispatch falls through to the first-column
+        // bitset gate. We pass D=2 so the looser threshold admits.
+        // N = 4096, K = 60 → K/N ≈ 0.0146.
+        //   gallop_enabled = false → gallop skipped
+        //   D = 2 → use bitset_max_density_multi = 1/200 = 0.005
+        //   0.0146 > 0.005 → LinearScan
+        // To verify the gate-shape assertion (bitset accepted at K/N below
+        // its threshold), override bitset_max_density_multi to 1/50.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(
             n,
@@ -440,46 +484,55 @@ mod tests {
             |i| i, // every value distinct, all in range
         );
         let (reader, column) = open_column(&index, &name);
+        let cfg = TermSetStrategyConfig {
+            gallop_enabled: false,
+            bitset_max_density_multi: 1.0 / 50.0,
+            ..TermSetStrategyConfig::default()
+        };
         let strat = select_strategy(
             &reader,
             &column,
             PlannerInputs {
                 field_name: &name,
                 candidate_size: None,
-                avg_docs_per_term: None,
+                avg_docs_per_term: Some(2),
             },
-            &term_set(0..60), // K' = 60 (all in [0, 4095])
-            &TermSetStrategyConfig::default(),
+            &term_set(0..60),
+            &cfg,
         );
         assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
     }
 
     #[test]
     fn select_returns_bitset_when_first_column_highly_selective() {
-        // Unsorted, K well below `bitset_max_density`.
-        // N = 4096, K = 8, D = 1 → K/N = 0.00195 < 0.25.
+        // Unsorted, K well below the D=1 bitset gate when overridden to 1/50.
+        // N = 4096, K = 8, D = 1 → K/N ≈ 0.00195 ≤ 1/50.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
         let (reader, column) = open_column(&index, &name);
+        let cfg = TermSetStrategyConfig {
+            bitset_max_density_unique: 1.0 / 50.0,
+            ..TermSetStrategyConfig::default()
+        };
         let strat = select_strategy(
             &reader,
             &column,
             PlannerInputs {
                 field_name: &name,
                 candidate_size: None,
-                avg_docs_per_term: None,
+                avg_docs_per_term: Some(1),
             },
             &term_set(0..8),
-            &TermSetStrategyConfig::default(),
+            &cfg,
         );
         assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
     }
 
     #[test]
-    fn select_falls_back_to_linear_scan_when_kd_exceeds_bitset_threshold() {
-        // Unsorted, K large enough that K·D / N >= bitset_max_density.
-        // With D = 1 and bitset_max_density = 1/4 = 0.25,
-        // N = 4096 and K = 2000 → K/N ≈ 0.488 > 0.25 → LinearScan.
+    fn select_falls_back_to_linear_scan_when_density_exceeds_bitset_threshold() {
+        // Unsorted, K large enough that K/N exceeds the D=1 gate.
+        // N = 4096, K = 2000 → K/N ≈ 0.488; default unique gate is
+        // 1/2000 = 0.0005, far below. Falls through to LinearScan.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(n, None, |i| i);
         let (reader, column) = open_column(&index, &name);
@@ -489,7 +542,7 @@ mod tests {
             PlannerInputs {
                 field_name: &name,
                 candidate_size: None,
-                avg_docs_per_term: None,
+                avg_docs_per_term: Some(1),
             },
             &term_set(0..2000),
             &TermSetStrategyConfig::default(),
@@ -591,20 +644,24 @@ mod tests {
             writer.commit().unwrap();
         }
         let (reader, column) = open_column(&index, "fk");
+        let cfg = TermSetStrategyConfig {
+            bitset_max_density_unique: 1.0 / 50.0,
+            ..TermSetStrategyConfig::default()
+        };
         let strat = select_strategy(
             &reader,
             &column,
             PlannerInputs {
                 field_name: "fk",
                 candidate_size: None,
-                avg_docs_per_term: None,
+                avg_docs_per_term: Some(1),
             },
             &term_set(0..8),
-            &TermSetStrategyConfig::default(),
+            &cfg,
         );
         assert!(!matches!(strat, TermSetStrategy::Gallop { .. }));
-        // With K=8 on N=4096, K/N = 0.00195 < bitset_max_density (0.25), so
-        // the first-column branch picks BitsetFromPostings.
+        // With K=8 on N=4096, K/N = 0.00195 ≤ 1/50 (overridden D=1 gate),
+        // so the first-column branch picks BitsetFromPostings.
         assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
     }
 
@@ -725,6 +782,7 @@ mod tests {
         let (reader, column) = open_column(&index, &name);
         let cfg = TermSetStrategyConfig {
             gallop_enabled: false,
+            bitset_max_density_unique: 1.0 / 50.0,
             ..TermSetStrategyConfig::default()
         };
         let strat = select_strategy(
@@ -733,14 +791,119 @@ mod tests {
             PlannerInputs {
                 field_name: &name,
                 candidate_size: None,
-                avg_docs_per_term: None,
+                avg_docs_per_term: Some(1),
             },
             &term_set(0..8),
             &cfg,
         );
         assert!(!matches!(strat, TermSetStrategy::Gallop { .. }));
-        // K=8 on N=4096, K·D/N = 0.00195 < bitset_max_density (0.25), so the
-        // first-column branch picks BitsetFromPostings.
+        // K=8 on N=4096, K/N = 0.00195 ≤ 1/50 (overridden D=1 gate),
+        // so the first-column branch picks BitsetFromPostings.
         assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
+    }
+
+    // ---- D-aware first-column bitset gate ----
+
+    /// Build a generic unsorted N=20_000 column, K terms in range.
+    fn run_dispatch_at(d: u32, k: usize) -> TermSetStrategy {
+        let n: u64 = 20_000;
+        let (index, _field, name) = build_index(n, None, |i| i);
+        let (reader, column) = open_column(&index, &name);
+        let strat = select_strategy(
+            &reader,
+            &column,
+            PlannerInputs {
+                field_name: &name,
+                candidate_size: None,
+                avg_docs_per_term: Some(d),
+            },
+            &term_set(0..k as u64),
+            &TermSetStrategyConfig::default(),
+        );
+        strat
+    }
+
+    #[test]
+    fn d1_gate_admits_bitset_just_below_threshold() {
+        // N=20_000, threshold 1/2000 = 0.0005, so admit K such that
+        // K/N ≤ 0.0005, i.e. K ≤ 10. Use K=10 → K/N = 0.0005 exactly.
+        assert_eq!(run_dispatch_at(1, 10), TermSetStrategy::BitsetFromPostings);
+    }
+
+    #[test]
+    fn d1_gate_rejects_bitset_just_above_threshold() {
+        // K=11 → K/N = 0.00055 > 0.0005 → LinearScan.
+        assert_eq!(run_dispatch_at(1, 11), TermSetStrategy::LinearScan);
+    }
+
+    #[test]
+    fn d2_gate_admits_bitset_just_below_threshold() {
+        // Threshold 1/200 = 0.005. K=100 → K/N = 0.005 exactly. Admit.
+        assert_eq!(run_dispatch_at(2, 100), TermSetStrategy::BitsetFromPostings);
+    }
+
+    #[test]
+    fn d2_gate_rejects_bitset_just_above_threshold() {
+        // K=101 → K/N = 0.00505 > 0.005 → LinearScan.
+        assert_eq!(run_dispatch_at(2, 101), TermSetStrategy::LinearScan);
+    }
+
+    #[test]
+    fn d50_uses_the_multi_value_gate() {
+        // K=20 → K/N = 0.001, well below the D≥2 gate of 1/200. Bitset.
+        // (Confirms D=50 routes through the same threshold as D=2 —
+        // any D ≥ 2 hits the multi-value gate.)
+        assert_eq!(run_dispatch_at(50, 20), TermSetStrategy::BitsetFromPostings);
+    }
+
+    #[test]
+    fn gallop_admits_at_any_density_when_segment_is_sorted() {
+        // The default `gallop_max_density = 1.0` admits Gallop on any
+        // K/N as long as the structural preconditions hold (sorted
+        // segment, matching field, etc.). Pick K/N ≈ 0.012, which
+        // would have failed an old K/N < 1/100 cap, to confirm the
+        // default really is no-op.
+        let n: u64 = 4096;
+        let (index, _field, name) = build_index(
+            n,
+            Some(IndexSortByField {
+                field: "fk".to_string(),
+                order: Order::Asc,
+            }),
+            |i| i,
+        );
+        let (reader, column) = open_column(&index, &name);
+        let strat = select_strategy(
+            &reader,
+            &column,
+            PlannerInputs {
+                field_name: &name,
+                candidate_size: None,
+                avg_docs_per_term: Some(1),
+            },
+            &term_set(0..50),
+            &TermSetStrategyConfig::default(),
+        );
+        assert!(matches!(strat, TermSetStrategy::Gallop { .. }));
+    }
+
+    #[test]
+    fn empty_inputs_route_to_empty_strategy() {
+        let n: u64 = 4096;
+        let (index, _field, name) = build_index(n, None, |i| i);
+        let (reader, column) = open_column(&index, &name);
+        // term_set empty → Empty.
+        let strat = select_strategy(
+            &reader,
+            &column,
+            PlannerInputs {
+                field_name: &name,
+                candidate_size: None,
+                avg_docs_per_term: Some(1),
+            },
+            &[],
+            &TermSetStrategyConfig::default(),
+        );
+        assert_eq!(strat, TermSetStrategy::Empty);
     }
 }

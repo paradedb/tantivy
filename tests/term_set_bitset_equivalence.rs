@@ -93,13 +93,14 @@ fn sample_terms(distinct: u64, k: usize, seed: u64) -> Vec<u64> {
 }
 
 /// Force `BitsetFromPostings` for any non-empty term set on any unsorted
-/// segment by setting `bitset_max_density = 1.0`. Gallop is gated off so
-/// the planner always lands on bitset.
+/// segment by setting both bitset densities to `1.0`. Gallop is gated off
+/// so the planner always lands on bitset regardless of D.
 fn cfg_force_bitset() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: false,
         gallop_max_density: 0.0,
-        bitset_max_density: 1.0,
+        bitset_max_density_unique: 1.0,
+        bitset_max_density_multi: 1.0,
         subsequent_bitset_max_density: 1.0,
         strategy_sink: None,
     }
@@ -110,7 +111,8 @@ fn cfg_force_linear() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: false,
         gallop_max_density: 0.0,
-        bitset_max_density: 0.0,
+        bitset_max_density_unique: 0.0,
+        bitset_max_density_multi: 0.0,
         subsequent_bitset_max_density: 0.0,
         strategy_sink: None,
     }
