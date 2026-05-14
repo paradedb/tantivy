@@ -172,6 +172,7 @@ pub(crate) fn value_type_to_column_type(typ: Type) -> Option<ColumnType> {
         Type::Bytes => Some(ColumnType::Bytes),
         Type::IpAddr => Some(ColumnType::IpAddr),
         Type::Json => None,
+        Type::Vector => None,
     }
 }
 
