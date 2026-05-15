@@ -14,9 +14,10 @@ use super::flat::VectorColumn as FlatVectorColumn;
 use super::ivf::{AdaptiveProbeParams, IvfVectorColumn};
 use super::options::{Metric, VectorElement};
 use super::reader::VectorReader;
+use crate::collector::TopNComputer;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
-use crate::{DocAddress, Score, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 /// Per-segment vector backend. Pick via [`VectorBackend::for_segment`].
 pub enum VectorBackend<T: VectorElement> {
@@ -25,13 +26,9 @@ pub enum VectorBackend<T: VectorElement> {
 }
 
 pub struct FlatBackend<T: VectorElement> {
-    #[allow(dead_code)] // wired up when the flat backend lands
     column: FlatVectorColumn,
-    #[allow(dead_code)]
     metric: Metric,
-    #[allow(dead_code)]
     query: Arc<Vec<T>>,
-    #[allow(dead_code)]
     segment_ord: SegmentOrdinal,
 }
 
@@ -111,21 +108,41 @@ impl<T: VectorElement> VectorBackend<T> {
 impl<T: VectorElement> FlatBackend<T> {
     fn top_n(
         &self,
-        _weight: &dyn Weight,
-        _segment_reader: &SegmentReader,
-        _top_n: usize,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        // Sketch of the implementation when the flat reader lands:
-        //   1. Walk the filter `DocSet` in ascending doc order via
-        //      weight.for_each_no_score, gated by segment_reader.alive_bitset().
-        //   2. For each surviving doc, fetch self.column.vector_bytes_at(doc) and score it via
-        //      self.metric.similarity_bytes(&self.query[..], bytes).
-        //   3. Push each (score, doc) into a TopNComputer<Score, DocId>. The ascending-doc-id walk
-        //      lets us use the fast `TopNComputer::push` path; cluster-order backends like IVF use
-        //      `push_unordered` instead.
-        //   4. Tag each result with `self.segment_ord` as a `DocAddress` on the way out so the
-        //      collector doesn't need a second pass.
-        todo!("flat segment-level top-N")
+        // `for_each_no_score` walks the filter DocSet in ascending doc
+        // order, which lets us use the fast `TopNComputer::push` path
+        // (strict-greater threshold short-circuit, valid only under
+        // ascending-D pushes). IVF's cluster-order iteration would use
+        // `push_unordered` instead.
+        //
+        // The heap keys on segment-local `DocId` (cheaper compares than
+        // `DocAddress`); we tag with `self.segment_ord` at drain time
+        // so the collector returns ready-to-use `DocAddress`es without
+        // a second pass.
+        let mut topn = TopNComputer::<Score, DocId, _>::new(top_n);
+        let alive = segment_reader.alive_bitset();
+        weight.for_each_no_score(segment_reader, &mut |docs| {
+            for &doc in docs {
+                if let Some(bs) = alive {
+                    if !bs.is_alive(doc) {
+                        continue;
+                    }
+                }
+                if let Some(bytes) = self.column.vector_bytes_at(doc) {
+                    let score = self.metric.similarity_bytes(&self.query[..], bytes);
+                    topn.push(score, doc);
+                }
+            }
+        })?;
+        let segment_ord = self.segment_ord;
+        Ok(topn
+            .into_sorted_vec()
+            .into_iter()
+            .map(|cd| (cd.sort_key, DocAddress::new(segment_ord, cd.doc)))
+            .collect())
     }
 }
 
