@@ -6,6 +6,7 @@ use crate::schema::{
     is_valid_field_name, DateOptions, FacetOptions, FieldType, JsonObjectOptions, NumericOptions,
     TextOptions,
 };
+use crate::vector::VectorOptions;
 
 /// A `FieldEntry` represents a field and its configuration.
 /// `Schema` are a collection of `FieldEntry`
@@ -80,6 +81,11 @@ impl FieldEntry {
         Self::new(field_name, FieldType::JsonObject(json_object_options))
     }
 
+    /// Creates a field entry for a brute-force vector field.
+    pub fn new_vector(field_name: String, vector_options: VectorOptions) -> FieldEntry {
+        Self::new(field_name, FieldType::Vector(vector_options))
+    }
+
     /// Returns the name of the field
     pub fn name(&self) -> &str {
         &self.name
@@ -129,6 +135,7 @@ impl FieldEntry {
             FieldType::Bytes(ref options) => options.is_stored(),
             FieldType::JsonObject(ref options) => options.is_stored(),
             FieldType::IpAddr(ref options) => options.is_stored(),
+            FieldType::Vector(_) => false,
         }
     }
 }

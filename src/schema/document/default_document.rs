@@ -14,6 +14,7 @@ use crate::schema::document::{
 use crate::schema::field_type::ValueParsingError;
 use crate::schema::{Facet, Field, NamedFieldDocument, OwnedValue, Schema};
 use crate::tokenizer::PreTokenizedString;
+use crate::vector::VectorElement;
 
 #[repr(C, packed)]
 #[derive(Debug, Clone)]
@@ -116,6 +117,29 @@ impl CompactDoc {
     /// Add a bytes field
     pub fn add_bytes(&mut self, field: Field, value: &[u8]) {
         self.add_leaf_field_value(field, value);
+    }
+
+    /// Add a vector value.
+    ///
+    /// The vector is encoded as little-endian bytes and routed to the
+    /// flat vector plugin by the `SegmentWriter`. The field must be
+    /// declared as a [`FieldType::Vector`](crate::schema::FieldType::Vector)
+    /// in the schema; the vector's length must match the declared `dim`,
+    /// and `T::DTYPE` must match the schema's declared dtype.
+    pub fn add_vector<T: VectorElement>(&mut self, field: Field, value: &[T]) {
+        let mut bytes = Vec::with_capacity(value.len() * T::SIZE_BYTES);
+        for v in value {
+            v.encode_le(&mut bytes);
+        }
+        let value_addr = self.add_value_leaf(ReferenceValueLeaf::Bytes(&bytes));
+        let field_value = FieldValueAddr {
+            field: field
+                .field_id()
+                .try_into()
+                .expect("support only up to u16::MAX field ids"),
+            value_addr,
+        };
+        self.field_values.push(field_value);
     }
 
     /// Add a dynamic object field
