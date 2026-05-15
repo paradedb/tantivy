@@ -417,6 +417,9 @@ impl SegmentWriter {
                             .record(doc_id, field, num_vals);
                     }
                 }
+                FieldType::Vector(_) => {
+                    unreachable!("is_indexed is not supposed to be true for vector fields")
+                }
             }
         }
         Ok(())

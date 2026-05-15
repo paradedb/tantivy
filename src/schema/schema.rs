@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::*;
 use crate::json_utils::split_json_path;
+use crate::vector::VectorOptions;
 use crate::TantivyError;
 
 /// Tantivy has a very strict schema.
@@ -191,6 +192,12 @@ impl SchemaBuilder {
         field_options: T,
     ) -> Field {
         let field_entry = FieldEntry::new_json(field_name.to_string(), field_options.into());
+        self.add_field(field_entry)
+    }
+
+    /// Adds a vector field to the schema.
+    pub fn add_vector_field(&mut self, field_name: &str, vector_options: VectorOptions) -> Field {
+        let field_entry = FieldEntry::new_vector(field_name.to_string(), vector_options);
         self.add_field(field_entry)
     }
 
