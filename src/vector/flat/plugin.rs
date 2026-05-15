@@ -35,7 +35,7 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     }
     let path = ctx
         .target_segment
-        .relative_path(SegmentComponent::Custom("flatvec".to_string()));
+        .relative_path(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()));
     let write = ctx.target_segment.index().directory().open_write(&path)?;
     let source_readers: Vec<Option<Arc<VectorReader>>> = ctx
         .readers

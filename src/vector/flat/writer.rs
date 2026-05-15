@@ -130,7 +130,7 @@ impl PluginWriter for FlatVecWriter {
         if self.fields.is_empty() {
             return Ok(());
         }
-        let write = segment.open_write(SegmentComponent::Custom("flatvec".to_string()))?;
+        let write = segment.open_write(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()))?;
         let mut composite = CompositeWrite::wrap(write);
 
         for (field, buf) in &self.fields {

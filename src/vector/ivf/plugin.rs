@@ -30,8 +30,7 @@ use crate::plugin::PluginMergeContext;
 ///      assembled vectors. K, sample size, iteration cap, and seed
 ///      live on a forthcoming `IvfVecConfig`.
 ///   3. Assign every vector to its nearest centroid.
-///   4. Serialize the IVF layout under
-///      `SegmentComponent::Custom("ivfvec")`.
+///   4. Serialize the IVF layout
 pub(crate) fn merge_ivf(_ctx: &PluginMergeContext) -> crate::Result<()> {
     todo!("IVF clustering at merge time")
 }

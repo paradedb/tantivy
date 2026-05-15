@@ -32,7 +32,7 @@ impl FlatVecReader {
         } else {
             match ctx
                 .segment_reader
-                .open_read(SegmentComponent::Custom("flatvec".to_string()))
+                .open_read(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()))
             {
                 Ok(file_slice) => CompositeFile::open(&file_slice)?,
                 Err(_) => CompositeFile::empty(),

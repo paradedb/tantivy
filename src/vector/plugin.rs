@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use super::flat::{merge_flat, FlatVecWriter};
+use super::flat::{merge_flat, FlatVecWriter, FLATVEC_EXT};
 use super::ivf::merge_ivf;
 use super::reader::VectorReader;
 use crate::plugin::{
@@ -37,20 +37,10 @@ impl SegmentPlugin for VectorPlugin {
     }
 
     fn extensions(&self) -> Vec<&str> {
-        // `extensions()` controls which file paths the segment-updater's
-        // GC considers "living" for this plugin. A segment will only
-        // ever have one of these materialized (flatvec OR ivfvec,
-        // decided at merge by the clustering threshold), but we list
-        // both because we don't know in advance which — if we omitted
-        // one and the plugin happened to write that format, GC would
-        // delete the file on the next pass.
-        vec!["flatvec", "ivfvec"]
+        // todo: add ivf extensions
+        vec![FLATVEC_EXT]
     }
 
-    /// Phase 2 (same as the other "leaf" components — fast fields,
-    /// store). Merge ordering relative to fieldnorms/postings doesn't
-    /// matter here; vector merge reads from sources and writes to the
-    /// target, independent of the other components' merge output.
     fn write_phase(&self) -> u32 {
         2
     }
@@ -66,6 +56,8 @@ impl SegmentPlugin for VectorPlugin {
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
+        // simple merge strategy, may change later
+        // do clustering only if the target segment has more than the threshold number of docs
         let target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum();
         let threshold = ctx.settings.vector_clustering_threshold();
         if (target_docs as usize) < threshold {
