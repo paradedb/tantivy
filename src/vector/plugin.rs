@@ -37,10 +37,13 @@ impl SegmentPlugin for VectorPlugin {
     }
 
     fn extensions(&self) -> Vec<&str> {
-        // Both file formats this plugin can produce. GC accounting
-        // treats every registered (segment, extension) pair as living,
-        // so both `.flatvec` and `.ivfvec` survive even when only one
-        // is materialized for a given segment.
+        // `extensions()` controls which file paths the segment-updater's
+        // GC considers "living" for this plugin. A segment will only
+        // ever have one of these materialized (flatvec OR ivfvec,
+        // decided at merge by the clustering threshold), but we list
+        // both because we don't know in advance which — if we omitted
+        // one and the plugin happened to write that format, GC would
+        // delete the file on the next pass.
         vec!["flatvec", "ivfvec"]
     }
 
