@@ -3251,6 +3251,10 @@ mod tests {
                 id_field => i,
                 title_field => title,
             ))?;
+            writer.add_document(doc!(
+                id_field => i + n,
+                title_field => title,
+            ))?;
         }
 
         writer.commit()?;
