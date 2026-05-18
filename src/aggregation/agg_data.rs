@@ -882,7 +882,7 @@ fn build_terms_or_cardinality_nodes(
             get_missing_val_as_u64_lenient(
                 column_type,
                 accessor.max_value(),
-                accessor.num_vals(),
+                accessor.values.num_vals() as u64,
                 m,
                 field_name,
             )?
