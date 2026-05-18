@@ -173,11 +173,9 @@ where
 
             // Locate the block that *would* contain `target`. `None` means
             // `target` sorts past the last block; since input is sorted,
-            // every remaining input is also past the last block.
-            let target_block = match self.dict.sstable_index.get_block_with_key(target) {
-                Some(addr) => addr,
-                None => return None,
-            };
+            // every remaining input is also past the last block — `?`
+            // short-circuits the whole iterator in that case.
+            let target_block = self.dict.sstable_index.get_block_with_key(target)?;
 
             // Transition to a new block if needed. `BlockAddr` derives
             // `PartialEq`, so direct comparison is correct.

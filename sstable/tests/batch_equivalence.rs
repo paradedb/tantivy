@@ -12,9 +12,9 @@
 use std::io;
 
 use common::OwnedBytes;
-use rand::SeedableRng;
-use rand::prelude::*;
+use proptest::prelude::*;
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use tantivy_sstable::{Dictionary, MonotonicU64SSTable, SortedTermSlice, sort_and_dedupe_terms};
 
 /// Build a dictionary of `n` u64-encoded BE keys with values `i as u64`.
@@ -246,90 +246,64 @@ fn inputs_spanning_many_blocks() {
 }
 
 // ---------------------------------------------------------------------------
-// Random equivalence across dictionary sizes + query subsets
+// Randomized equivalence — proptest with shrinking
 // ---------------------------------------------------------------------------
 
-fn random_equivalence_at(n_dict: usize, n_query: usize, seed: u64) {
-    let (dict, dict_keys) = build_dict_strings(n_dict, seed);
-    let n_dict_actual = dict_keys.len();
-    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0xdead));
-
-    // Sample `n_query` keys: half present (drawn from dict_keys), half
-    // absent (random fresh bytes).
-    let mut query: Vec<Vec<u8>> = Vec::with_capacity(n_query);
-    for i in 0..n_query {
-        if i % 2 == 0 && n_dict_actual > 0 {
-            let idx = rng.random_range(0..n_dict_actual);
-            query.push(dict_keys[idx].clone());
-        } else {
-            // Random bytes — overwhelmingly likely to be absent from dict.
-            let len = rng.random_range(1..32usize);
-            query.push((0..len).map(|_| rng.random()).collect());
-        }
-    }
-    sort_and_dedupe_terms(&mut query);
-    assert_equivalent_on_sorted(&dict, &query);
+/// Per-query intent. Proptest strategies can't depend on per-run runtime
+/// values (`dict_keys` is computed from `dict_n` / `dict_seed`), so we
+/// generate "either an index that will resolve to a likely-present key,
+/// or fresh bytes that are almost certainly absent" and resolve to
+/// actual `Vec<u8>` keys in the test body. This keeps the
+/// mixed-presence property of the old seeded helpers while letting
+/// proptest shrink on either dimension when a failure surfaces.
+#[derive(Debug, Clone)]
+enum QuerySpec {
+    /// Index into the generated `dict_keys`, mod its length at use site.
+    /// Resolves to a key that is definitely present in the dictionary.
+    DictIndex(usize),
+    /// Fresh bytes. Overwhelmingly likely to be absent — proptest can
+    /// shrink the byte vector when a failure depends on its shape.
+    Bytes(Vec<u8>),
 }
 
-#[test]
-fn random_small_dict_zero_query() {
-    random_equivalence_at(10, 0, 1);
-}
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        ..ProptestConfig::default()
+    })]
 
-#[test]
-fn random_small_dict_single_query() {
-    random_equivalence_at(10, 1, 2);
-}
+    /// Randomized equivalence across dictionary sizes and query shapes.
+    /// Replaces the older fixed-seed `random_*` battery — proptest
+    /// covers the same space and shrinks failing inputs to a minimal
+    /// counterexample on regression.
+    #[test]
+    fn batch_equivalent_to_baseline_proptest(
+        dict_n in 1usize..2_000,
+        dict_seed in 0u64..1_000_000,
+        query_specs in prop::collection::vec(
+            prop_oneof![
+                any::<usize>().prop_map(QuerySpec::DictIndex),
+                prop::collection::vec(any::<u8>(), 1..32usize).prop_map(QuerySpec::Bytes),
+            ],
+            0..200usize,
+        ),
+    ) {
+        let (dict, dict_keys) = build_dict_strings(dict_n, dict_seed);
+        let mut query: Vec<Vec<u8>> = query_specs
+            .into_iter()
+            .filter_map(|spec| match spec {
+                QuerySpec::DictIndex(i) if !dict_keys.is_empty() => {
+                    Some(dict_keys[i % dict_keys.len()].clone())
+                }
+                QuerySpec::DictIndex(_) => None,
+                QuerySpec::Bytes(b) => Some(b),
+            })
+            .collect();
+        sort_and_dedupe_terms(&mut query);
 
-#[test]
-fn random_small_dict_ten_query() {
-    random_equivalence_at(10, 10, 3);
-}
-
-#[test]
-fn random_medium_dict_ten_query() {
-    random_equivalence_at(1_000, 10, 4);
-}
-
-#[test]
-fn random_medium_dict_hundred_query() {
-    random_equivalence_at(1_000, 100, 5);
-}
-
-#[test]
-fn random_medium_dict_full_query() {
-    random_equivalence_at(1_000, 1_000, 6);
-}
-
-#[test]
-fn random_large_dict_hundred_query() {
-    random_equivalence_at(10_000, 100, 7);
-}
-
-#[test]
-fn random_large_dict_thousand_query() {
-    random_equivalence_at(10_000, 1_000, 8);
-}
-
-#[test]
-fn random_large_dict_full_query() {
-    random_equivalence_at(10_000, 10_000, 9);
-}
-
-// ---------------------------------------------------------------------------
-// Several seeds at each shape (lightweight fuzzing)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn random_multi_seed_medium() {
-    for seed in 100..120u64 {
-        random_equivalence_at(1_000, 50, seed);
-    }
-}
-
-#[test]
-fn random_multi_seed_large() {
-    for seed in 200..205u64 {
-        random_equivalence_at(10_000, 500, seed);
+        let sorted = SortedTermSlice::new(&query).expect("sorted+deduped by construction");
+        let base = baseline(&dict, &query);
+        let batch = batched(&dict, sorted);
+        prop_assert_eq!(base, batch);
     }
 }

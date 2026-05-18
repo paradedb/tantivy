@@ -1,10 +1,14 @@
-//! Strategy selection for `FastFieldTermSetQuery`.
+//! Strategy selection for `TermSetWeight`.
 //!
 //! Mirrors the structure of `range_query::range_query_fastfield`:
 //! `Weight::scorer()` consults this module to decide between `Gallop`,
-//! `BitsetFromPostings`, and `LinearScan`, then constructs the right
-//! `DocSet`. The decision tree and threshold calibration live on
-//! [`select_strategy`].
+//! `BitsetFromPostings`, `LinearScan`, and `Automaton`, then constructs
+//! the right `DocSet`. The decision tree and threshold calibration live
+//! on [`select_strategy`]. `TermSetWeight`'s non-fast dispatch path
+//! (text / string fields) inlines a simpler bitset-vs-automaton density
+//! gate instead of calling [`select_strategy`], because it has no
+//! `Column<u64>` to feed the planner — see the "Non-fast indexed
+//! fields" section of [`select_strategy`]'s doc comment.
 //!
 //! ## `inputs.avg_docs_per_term` (`D`)
 //!
@@ -36,6 +40,11 @@ pub enum StrategyTag {
     Linear = 2,
     Bitset = 3,
     Empty = 4,
+    /// Streaming dictionary walk via FST set-membership automaton. Picked
+    /// when the field has no fast representation but is indexed — Gallop /
+    /// LinearScan / BitsetFromPostings all require a `Column<u64>` so the
+    /// planner routes here instead.
+    Automaton = 5,
 }
 
 impl TryFrom<u8> for StrategyTag {
@@ -48,57 +57,50 @@ impl TryFrom<u8> for StrategyTag {
             2 => Ok(StrategyTag::Linear),
             3 => Ok(StrategyTag::Bitset),
             4 => Ok(StrategyTag::Empty),
+            5 => Ok(StrategyTag::Automaton),
             _ => Err("unknown StrategyTag value"),
         }
     }
 }
 
-/// User-tunable density thresholds. Defaults are bench-calibrated
+/// User-tunable density thresholds for `BitsetFromPostings`. Defaults are bench-calibrated
 /// against the SSTable backend (see [`select_strategy`] for the
 /// cost-model reasoning) and overridable via the
 /// `paradedb.term_set_*_max_density` GUCs at the consumer side.
 ///
 /// "Density" is a unitless ratio of *matching count over corpus
-/// count*. For gallop, that's `K' / N`; for bitset on the first
-/// column it reduces to `K' / N` (D is used only to pick which
-/// threshold applies, not multiplied into the gate variable); for
-/// the subsequent-column branch, `K' · D / C`. Each strategy fires
-/// when its density is at or below the corresponding `_max_density`
-/// threshold.
+/// count*. For bitset on the first column it reduces to `K' / N` (D
+/// is used only to pick which threshold applies, not multiplied into
+/// the gate variable); for the subsequent-column branch, `K' · D / C`.
+/// Bitset fires when its density is at or below the corresponding
+/// `_max_density` threshold. Gallop has no density gate — see
+/// `gallop_enabled`.
 ///
 /// We use `f64` rather than integer denominators so bench-derived
 /// thresholds don't have to round to `1/N` for small `N`.
 #[derive(Clone, Debug)]
 pub struct TermSetStrategyConfig {
     /// Kill-switch: when `false`, the planner never returns `Gallop` even if
-    /// every other gate would pass.
+    /// every other gate passes.
     pub gallop_enabled: bool,
-    /// Density cap for Gallop. The strategy fires when `K' / N <=
-    /// gallop_max_density` on a sorted segment. Default `1.0` — Gallop
-    /// wins uniformly whenever the segment is sorted by the queried
-    /// field (every cell measured by the `compare` and `production`
-    /// bench tiers had Gallop at least as fast as the alternatives),
-    /// so no K-based gate is needed in practice. Kept as a
-    /// configurable knob for pathological corpora.
-    pub gallop_max_density: f64,
     /// `BitsetFromPostings` first-column threshold for *unique-valued
-    /// columns* (`D = 1`, i.e. `dict_size = N`, e.g. primary keys).
-    /// The strategy fires when `K' / N <= bitset_max_density_unique`.
+    /// columns* (`D = 1`, i.e. `dict_size = N`, e.g., pri,mary keys).
+    /// The strategy fires when `'K' / N <= bitset_max_density_unique`.
     /// Default `1/2000 = 0.0005` — calibrated against the SSTable
     /// backend where per-`dict.get` zstd block decompress dominates
     /// batched cost on unique columns; the empirical crossover with
-    /// `LinearScan` lands at K/N ≈ 1/1000 and this default sits at
+    /// `LinearScan` lands at `'K'/N ≈ 1/1000` and this default sits at
     /// half that to give linear the boundary cells.
     pub bitset_max_density_unique: f64,
-    /// `BitsetFromPostings` first-column threshold for *non-unique
+    /// `BitsetFromPostings` a first-column threshold for *non-unique
     /// columns* (`D >= 2`). The strategy fires when
-    /// `K' / N <= bitset_max_density_multi`. Default `1/200 = 0.005` —
+    /// `'K' / N <= bitset_max_density_multi`. Default `1/200 = 0.005` —
     /// the `cost_model` bench tier pinned the batched-vs-linear
     /// crossover to K/N ∈ [0.0055, 0.0088] across D ∈ {2, 5, 20, 50}
     /// (spread 1.59×), and `1/200` sits just below the tightest
     /// measured crossover (D=2). Exactly 10× looser than the unique
     /// threshold, matching the ~10× per-K cost gap: batched on a
-    /// non-unique column amortizes the zstd block decompress across
+    /// non-unique column amortizes the zstd block decompressed across
     /// multiple keys per block, dropping per-K dict cost relative to
     /// the D=1 case where every key maps to a distinct block.
     pub bitset_max_density_multi: f64,
@@ -120,7 +122,6 @@ impl Default for TermSetStrategyConfig {
             // calibration story. `subsequent_bitset_max_density` is an
             // unverified starting estimate — no bench data for the
             // subsequent-column branch yet.
-            gallop_max_density: 1.0,
             bitset_max_density_unique: 1.0 / 2000.0,
             bitset_max_density_multi: 1.0 / 200.0,
             subsequent_bitset_max_density: 1.0 / 4.0,
@@ -144,6 +145,12 @@ pub enum TermSetStrategy {
     /// Direct `TermDictionary::get(key)` lookups + bitset OR. The K-bounded
     /// inverted-index path; see `term_set_bitset.rs`.
     BitsetFromPostings,
+    /// Streaming dictionary walk via FST set-membership automaton.
+    /// Picked when the field has no fast representation (so Gallop /
+    /// LinearScan / BitsetFromPostings would all fail to open a
+    /// `Column<u64>`) but is indexed. The dispatch site composes an
+    /// `AutomatonWeight` over the pre-built term FST.
+    Automaton,
     /// The result is definitively empty; no posting list reads or
     /// column scans needed. Returned when the planner can prove no
     /// docs can match:
@@ -166,24 +173,42 @@ pub struct PlannerInputs<'a> {
     pub candidate_size: Option<u32>,
     /// Average documents per term in this column. `None` is treated as `D = 1`.
     pub avg_docs_per_term: Option<u32>,
+    /// Whether the field has a fast-field representation the planner can
+    /// open as `Column<u64>`. When `false`, the planner never returns
+    /// `Gallop`, `LinearScan`, or `BitsetFromPostings`'s fast-field
+    /// fallback; the terminal route becomes `Automaton` instead. The
+    /// `BitsetFromPostings` strategy is fast-field-independent (it reads
+    /// posting lists, not the column) and remains admissible for
+    /// non-fast indexed fields.
+    pub fast_available: bool,
 }
 
-/// Strategy dispatch for `FastFieldTermSetQuery`.
+/// Strategy dispatch for `TermSetWeight`.
 ///
 /// # How this function gets called
 ///
-/// `TermSetQuery::specialized_weight` upstream forks on field type:
-/// fast-field numeric types (U64/I64/F64/Date/IpAddr) route through
-/// `FastFieldTermSetWeight`, which calls `select_strategy` for every
-/// segment scorer build. Other field types (non-fast, or
-/// `Bool/Json/Str/...`) route through `AutomatonWeight` (a streaming
-/// dictionary walk + `BufferedUnionScorer` over K posting lists);
-/// this dispatch table never sees those queries.
+/// `TermSetQuery::build_weight` constructs one `TermSetWeight` per
+/// field; `TermSetWeight::scorer` calls `select_strategy` once per
+/// segment when the field has a fast-field representation (so a
+/// `Column<u64>` can be opened). Pre-unification this was a fork on
+/// `field_type.is_fast()`: numeric-on-fast went through the planner
+/// while everything else routed straight to `AutomatonWeight`,
+/// bypassing the dispatch table. The unified weight collapses that
+/// fork — every field reaches the planner, and `inputs.fast_available`
+/// tells it whether the column-bound strategies (Gallop / LinearScan)
+/// are admissible or whether the terminal fallback must be `Automaton`.
+///
+/// `BitsetFromPostings` is fast-field-independent (it reads posting
+/// lists from the inverted index, not the column) and remains
+/// admissible regardless of `fast_available` as long as the field is
+/// indexed.
 ///
 /// # Decision tree
 ///
 /// Each step is "decide and return"; later steps run only if the
-/// earlier ones declined.
+/// earlier ones declined. `terminal_fallback()` is shorthand for
+/// "`LinearScan` if `inputs.fast_available`, else `Automaton`" — both
+/// shapes scale ~O(N) but on different substrates.
 ///
 /// ```text
 /// 1. Edge cases
@@ -191,34 +216,33 @@ pub struct PlannerInputs<'a> {
 ///      k_prime == 0  (all terms outside [min,max]) →  Empty
 ///
 /// 2. Gallop  (sorted-segment fast path)
+///      inputs.fast_available                       AND
 ///      cfg.gallop_enabled                          AND
 ///      inputs.candidate_size is None or == n       AND
 ///      cardinality in {Full, Optional}             AND
-///      reader.sort_by_field matches field_name     AND
-///      K' / N <= cfg.gallop_max_density            →  Gallop
+///      reader.sort_by_field matches field_name     →  Gallop
 ///
 /// 3. Subsequent-column branch  (candidate_size < n)
 ///      candidate_size == 0                         →  Empty
 ///      K' · D / C <=                                  BitsetFromPostings
 ///        cfg.subsequent_bitset_max_density         →
-///      otherwise                                   →  LinearScan
+///      otherwise                                   →  terminal_fallback()
 ///
 /// 4. First-column branch  (full segment, no upstream filter)
 ///      threshold = if D >= 2 { bitset_max_density_multi }
 ///                  else      { bitset_max_density_unique }
 ///      K' / N <= threshold                         →  BitsetFromPostings
-///      otherwise                                   →  LinearScan
+///      otherwise                                   →  terminal_fallback()
 /// ```
 ///
 /// # Gallop admission
 ///
-/// Gallop walks the fast-field column directly with exponential
-/// jumps once the segment is sorted by the queried field; no other
-/// strategy exploits the sort. The default `gallop_max_density = 1.0`
-/// admits Gallop whenever the structural preconditions hold, because
-/// every benched cell on a sort-matching segment showed Gallop
-/// at least as fast as the alternatives. The density knob exists for
-/// pathological corpora where that might not hold in the future.
+/// Gallop walks the fast-field column directly with exponential jumps
+/// once the segment is sorted by the queried field; no other strategy
+/// exploits the sort. Every benched cell on a sort-matching segment
+/// showed Gallop at least as fast as the alternatives, so once the
+/// structural preconditions hold the planner commits — no density
+/// component to the gate. `cfg.gallop_enabled` is the only knob.
 ///
 /// # Why two bitset thresholds (D=1 vs D >= 2)
 ///
@@ -237,13 +261,25 @@ pub struct PlannerInputs<'a> {
 ///
 /// Both defaults sit at half the empirical crossover (the
 /// strict-less-than form would set them exactly at it; the `<=`
-/// gate gives the simpler-strategy linear the benefit at the
+/// gate gives the simpler-strategy fallback the benefit at the
 /// boundary). All density values are unitless ratios in `[0, 1]`.
+///
+/// # Non-fast indexed fields
+///
+/// `select_strategy` still requires `column: &Column<u64>` and is
+/// therefore only called by the fast-numeric dispatch path in
+/// `TermSetWeight::dispatch_numeric_fast`. The non-fast dispatch path
+/// (`TermSetWeight::dispatch_non_fast`, used for text / string fields)
+/// can't open a column and inlines its own simpler density gate —
+/// `K / max_doc <= bitset_max_density_multi` → `BitsetFromPostings`,
+/// else `Automaton`. It writes to `strategy_sink` directly. The
+/// `inputs.fast_available = false` substitution rule here exists for
+/// future callers that may have a column but want to suppress
+/// fast-field-bound strategies anyway.
 ///
 /// # Constants
 ///
 ///   - `cfg.gallop_enabled`                    default true
-///   - `cfg.gallop_max_density`                default 1.0    (no-op gate)
 ///   - `cfg.bitset_max_density_unique`         default 1/2000 = 0.0005
 ///   - `cfg.bitset_max_density_multi`          default 1/200  = 0.005
 ///   - `cfg.subsequent_bitset_max_density`     default 1/4    = 0.25
@@ -254,7 +290,8 @@ pub struct PlannerInputs<'a> {
 /// stored (as `u8`) on the sink before returning so consumers can
 /// surface it in `EXPLAIN ANALYZE`. A thin wrapper around the inner
 /// planner keeps the per-segment hot path uncluttered when no sink
-/// is configured.
+/// is configured. `StrategyTag::Automaton` is included alongside the
+/// fast-field-bound tags so a single sink covers both dispatch paths.
 pub fn select_strategy(
     reader: &SegmentReader,
     column: &Column<u64>,
@@ -268,6 +305,7 @@ pub fn select_strategy(
             TermSetStrategy::Gallop { .. } => StrategyTag::Gallop,
             TermSetStrategy::LinearScan => StrategyTag::Linear,
             TermSetStrategy::BitsetFromPostings => StrategyTag::Bitset,
+            TermSetStrategy::Automaton => StrategyTag::Automaton,
             TermSetStrategy::Empty => StrategyTag::Empty,
         };
         sink.store(tag as u8, Ordering::Relaxed);
@@ -295,12 +333,13 @@ fn select_strategy_inner(
         return TermSetStrategy::Empty;
     }
 
-    // Gallop: sorted-segment fast path. Dominates whenever the
-    // segment is sorted by the queried field. The density gate is a
-    // no-op at the default `gallop_max_density = 1.0` but is retained
-    // as a knob.
-    if let Some(strategy) = try_gallop(reader, column, &inputs, term_set, cfg, k_prime) {
-        return strategy;
+    // Gallop: sorted-segment fast path. Dominates whenever the segment
+    // is sorted by the queried field. Skipped when `!fast_available`
+    // because Gallop walks a `Column<u64>`.
+    if inputs.fast_available {
+        if let Some(strategy) = try_gallop(reader, column, &inputs, term_set, cfg) {
+            return strategy;
+        }
     }
 
     // --- Subsequent-column branch (upstream filter narrowed work to c < n).
@@ -313,7 +352,7 @@ fn select_strategy_inner(
         if kd / (c as f64) <= cfg.subsequent_bitset_max_density {
             return TermSetStrategy::BitsetFromPostings;
         }
-        return TermSetStrategy::LinearScan;
+        return terminal_fallback(&inputs);
     }
 
     // --- Tier 2: first-column bitset vs linear, parameterized by D.
@@ -333,7 +372,20 @@ fn select_strategy_inner(
     if density <= bitset_threshold {
         TermSetStrategy::BitsetFromPostings
     } else {
+        terminal_fallback(&inputs)
+    }
+}
+
+/// Terminal fallback when no specialized strategy committed: picks the
+/// scan-shaped path. Fast-field-available fields land on `LinearScan`
+/// (FxHashSet-probing column scan); non-fast indexed fields land on
+/// `Automaton` (FST set-membership streaming walk over the inverted
+/// index). Both shapes scale ~O(N) but on different substrates.
+fn terminal_fallback(inputs: &PlannerInputs<'_>) -> TermSetStrategy {
+    if inputs.fast_available {
         TermSetStrategy::LinearScan
+    } else {
+        TermSetStrategy::Automaton
     }
 }
 
@@ -354,16 +406,16 @@ pub(crate) fn k_prime_in_range(term_set: &[u64], column: &Column<u64>) -> u32 {
 }
 
 /// Gallop admissibility: returns `Some(Gallop { .. })` when the segment is
-/// sorted by `field_name`, the column shape supports gallop, no upstream
-/// filter has narrowed the work, and the density gate admits. Builds the
-/// pruned+sorted+deduped `sorted_terms` Vec only on commit.
+/// sorted by `field_name`, the column shape supports gallop, and no upstream
+/// filter has narrowed the work. Builds the pruned+sorted+deduped
+/// `sorted_terms` Vec only on commit. `cfg.gallop_enabled` is the only
+/// configurable gate.
 fn try_gallop(
     reader: &SegmentReader,
     column: &Column<u64>,
     inputs: &PlannerInputs<'_>,
     term_set: &[u64],
     cfg: &TermSetStrategyConfig,
-    k_prime: u32,
 ) -> Option<TermSetStrategy> {
     if !cfg.gallop_enabled {
         return None;
@@ -383,9 +435,6 @@ fn try_gallop(
         .sort_by_field()
         .filter(|sbf| sbf.field == inputs.field_name)
         .map(|sbf| sbf.order)?;
-    if (k_prime as f64) / (n as f64) > cfg.gallop_max_density {
-        return None;
-    }
     // Gallop tolerates duplicate input terms (the second occurrence finds
     // an empty range and skips), but each duplicate still pays two
     // `gallop_search_sorted` probes. Production input is HashSet-derived
@@ -470,6 +519,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: None,
+                fast_available: true,
             },
             &term_set([10_000_000u64, 99_999_999, u64::MAX]),
             &TermSetStrategyConfig::default(),
@@ -514,6 +564,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: Some(2),
+                fast_available: true,
             },
             &term_set(0..60),
             &cfg,
@@ -539,6 +590,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: Some(1),
+                fast_available: true,
             },
             &term_set(0..8),
             &cfg,
@@ -561,6 +613,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: Some(1),
+                fast_available: true,
             },
             &term_set(0..2000),
             &TermSetStrategyConfig::default(),
@@ -582,6 +635,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: Some(100),
                 avg_docs_per_term: None,
+                fast_available: true,
             },
             &term_set(0..50),
             &TermSetStrategyConfig::default(),
@@ -603,6 +657,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: Some(1024),
                 avg_docs_per_term: None,
+                fast_available: true,
             },
             &term_set(0..50),
             &TermSetStrategyConfig::default(),
@@ -625,6 +680,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: None,
+                fast_available: true,
             },
             &term_set(0..8),
             &TermSetStrategyConfig::default(),
@@ -673,6 +729,7 @@ mod tests {
                 field_name: "fk",
                 candidate_size: None,
                 avg_docs_per_term: Some(1),
+                fast_available: true,
             },
             &term_set(0..8),
             &cfg,
@@ -683,8 +740,8 @@ mod tests {
         assert_eq!(strat, TermSetStrategy::BitsetFromPostings);
     }
 
-    /// Positive gallop assertion. Sorted ASC, K small, K'/N below the
-    /// gallop_max_density threshold.
+    /// Positive gallop assertion. Sorted ASC, small K, planner commits
+    /// to Gallop because all structural preconditions hold.
     #[test]
     fn select_returns_gallop_when_sorted_and_small_k() {
         let n: u64 = 4096;
@@ -704,6 +761,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: None,
+                fast_available: true,
             },
             &term_set(0..8), // K' = 8 < 4096/64 = 64
             &TermSetStrategyConfig::default(),
@@ -754,6 +812,7 @@ mod tests {
                 field_name: &name_s,
                 candidate_size: None,
                 avg_docs_per_term: None,
+                fast_available: true,
             },
             &term_set(0..8),
             &cfg,
@@ -774,6 +833,7 @@ mod tests {
                 field_name: &name_u,
                 candidate_size: None,
                 avg_docs_per_term: None,
+                fast_available: true,
             },
             &term_set(0..2000),
             &cfg,
@@ -810,6 +870,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: Some(1),
+                fast_available: true,
             },
             &term_set(0..8),
             &cfg,
@@ -834,6 +895,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: Some(d),
+                fast_available: true,
             },
             &term_set(0..k as u64),
             &TermSetStrategyConfig::default(),
@@ -876,11 +938,10 @@ mod tests {
 
     #[test]
     fn gallop_admits_at_any_density_when_segment_is_sorted() {
-        // The default `gallop_max_density = 1.0` admits Gallop on any
-        // K/N as long as the structural preconditions hold (sorted
-        // segment, matching field, etc.). Pick K/N ≈ 0.012, which
-        // would have failed an old K/N < 1/100 cap, to confirm the
-        // default really is no-op.
+        // Gallop commits on any K/N as long as the structural
+        // preconditions hold (sorted segment, matching field,
+        // supported cardinality) — no density-component gate. Pick
+        // K/N ≈ 0.012 to confirm.
         let n: u64 = 4096;
         let (index, _field, name) = build_index(
             n,
@@ -898,6 +959,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: Some(1),
+                fast_available: true,
             },
             &term_set(0..50),
             &TermSetStrategyConfig::default(),
@@ -918,6 +980,7 @@ mod tests {
                 field_name: &name,
                 candidate_size: None,
                 avg_docs_per_term: Some(1),
+                fast_available: true,
             },
             &[],
             &TermSetStrategyConfig::default(),

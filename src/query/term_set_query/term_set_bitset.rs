@@ -51,21 +51,31 @@ use crate::query::{BitSetDocSet, ConstScorer, EmptyScorer, Scorer};
 use crate::schema::{Field, IndexRecordOption};
 use crate::Score;
 
-/// Build a `Scorer` that OR's the posting lists of every input value into
-/// a per-segment `BitSet`. Values are interpreted via `u64::to_be_bytes`,
-/// which matches the encoding `Term::serialized_value_bytes` produces for
-/// numeric Terms (the same encoding the term dictionary keys on).
+/// Build a `Scorer` that OR's the posting lists of every input key into
+/// a per-segment `BitSet`.
 ///
-/// Caller must guarantee the field has an inverted index. The dispatch
-/// site in `FastFieldTermSetWeight::scorer` enforces this; the function
+/// `sorted_keys` must be **sorted ascending in byte order with no
+/// duplicates** — this is the same precondition `SortedTermSlice` encodes
+/// at the type level, and the quickwit arm wraps `sorted_keys` in
+/// `SortedTermSlice::new_assume_sorted` to feed the batched dictionary
+/// API. The non-quickwit arm doesn't care about ordering for
+/// correctness, but reuses the same slice for consistency.
+///
+/// The key bytes must already match the dictionary's encoding for the
+/// field — for numeric fields this is `Term::serialized_value_bytes`
+/// (effectively `u64::to_be_bytes` for u64). The caller (`TermSetWeight`)
+/// pre-computes these bytes once at construction so per-segment
+/// dispatch is alloc-free.
+///
+/// Caller must guarantee the field has an inverted index; the function
 /// returns an error if `reader.inverted_index(field)` fails.
 pub(crate) fn bitset_from_postings_scorer(
     reader: &SegmentReader,
     field: Field,
-    values: &[u64],
+    sorted_keys: &[Vec<u8>],
     boost: Score,
 ) -> crate::Result<Box<dyn Scorer>> {
-    if values.is_empty() || reader.max_doc() == 0 {
+    if sorted_keys.is_empty() || reader.max_doc() == 0 {
         return Ok(Box::new(EmptyScorer));
     }
 
@@ -75,16 +85,14 @@ pub(crate) fn bitset_from_postings_scorer(
 
     #[cfg(feature = "quickwit")]
     {
-        use crate::termdict::{sort_and_dedupe_terms, SortedTermSlice};
+        use crate::termdict::SortedTermSlice;
 
         // The SSTable backend's `get` pays a zstd block decompress per
-        // call. Sort + dedupe the keys once, then walk the dictionary in
-        // a single forward pass via `batch_term_info_exact`. Each
-        // touched block decompresses exactly once regardless of how many
-        // query terms land in it.
-        let mut keys: Vec<[u8; 8]> = values.iter().map(|v| v.to_be_bytes()).collect();
-        sort_and_dedupe_terms(&mut keys);
-        let sorted = SortedTermSlice::new_assume_sorted(&keys);
+        // call. The caller has already sorted+deduped the keys; we walk
+        // the dictionary in a single forward pass via
+        // `batch_term_info_exact`. Each touched block decompresses
+        // exactly once regardless of how many query terms land in it.
+        let sorted = SortedTermSlice::new_assume_sorted(sorted_keys);
         for result in term_dict.batch_term_info_exact(sorted) {
             let (_idx, term_info) = result?;
             or_term_info_into_bitset(&inverted_index, &term_info, &mut bitset)?;
@@ -93,11 +101,8 @@ pub(crate) fn bitset_from_postings_scorer(
     #[cfg(not(feature = "quickwit"))]
     {
         // FST backend: `get` is cheap (no block decompression), so the
-        // per-key loop is fine. Duplicate values in `values` issue
-        // duplicate lookups but each returns the same `TermInfo` and
-        // produces a no-op set of bitset inserts.
-        for &v in values {
-            let key = v.to_be_bytes();
+        // per-key loop is fine.
+        for key in sorted_keys {
             let Some(term_info) = term_dict.get(key.as_slice())? else {
                 continue;
             };

@@ -98,7 +98,6 @@ fn sample_terms(distinct: u64, k: usize, seed: u64) -> Vec<u64> {
 fn cfg_force_bitset() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: false,
-        gallop_max_density: 0.0,
         bitset_max_density_unique: 1.0,
         bitset_max_density_multi: 1.0,
         subsequent_bitset_max_density: 1.0,
@@ -110,7 +109,6 @@ fn cfg_force_bitset() -> TermSetStrategyConfig {
 fn cfg_force_linear() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: false,
-        gallop_max_density: 0.0,
         bitset_max_density_unique: 0.0,
         bitset_max_density_multi: 0.0,
         subsequent_bitset_max_density: 0.0,
@@ -334,5 +332,178 @@ proptest! {
         let bitset_docs = run_query(&searcher, field, &queries, cfg_force_bitset());
         let linear_docs = run_query(&searcher, field, &queries, cfg_force_linear());
         prop_assert_eq!(bitset_docs, linear_docs);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text-field equivalence (non-fast indexed) — BitsetFromPostings vs Automaton
+// ---------------------------------------------------------------------------
+
+mod text_equivalence {
+    //! Equivalence on text fields, where the dispatch path is
+    //! `BitsetFromPostings` (low K) vs `Automaton` (high K) — both
+    //! reading the inverted index. The pre-unification code routed
+    //! every text-field term set through `AutomatonWeight`
+    //! unconditionally; the unified `TermSetWeight` now picks Bitset
+    //! for low-K queries. Both must yield identical docs.
+
+    use proptest::prelude::*;
+    use rand::prelude::*;
+    use rand::rngs::StdRng;
+    use tantivy::collector::DocSetCollector;
+    use tantivy::query::{FastFieldTermSetQuery, TermSetStrategyConfig};
+    use tantivy::schema::{SchemaBuilder, STRING};
+    use tantivy::{doc, Index, ReloadPolicy, Searcher, Term};
+
+    /// Force `BitsetFromPostings` on the non-fast path: density gate
+    /// admits everything.
+    fn cfg_force_bitset_text() -> TermSetStrategyConfig {
+        TermSetStrategyConfig {
+            gallop_enabled: false,
+            bitset_max_density_unique: 1.0,
+            bitset_max_density_multi: 1.0,
+            subsequent_bitset_max_density: 1.0,
+            strategy_sink: None,
+        }
+    }
+
+    /// Force `Automaton` on the non-fast path: density gate rejects
+    /// everything, so the dispatcher falls through to Automaton.
+    fn cfg_force_automaton_text() -> TermSetStrategyConfig {
+        TermSetStrategyConfig {
+            gallop_enabled: false,
+            bitset_max_density_unique: 0.0,
+            bitset_max_density_multi: 0.0,
+            subsequent_bitset_max_density: 0.0,
+            strategy_sink: None,
+        }
+    }
+
+    fn build_text_corpus(
+        n: u64,
+        distinct_terms: u64,
+        seed: u64,
+    ) -> (Searcher, tantivy::schema::Field, Vec<String>) {
+        let mut sb = SchemaBuilder::new();
+        // STRING (not TEXT) for tokenization-free, exact-match
+        // semantics — every doc has one whole-string value.
+        let field = sb.add_text_field("text", STRING);
+        let schema = sb.build();
+        let index = Index::builder().schema(schema).create_in_ram().unwrap();
+        let vocab: Vec<String> = (0..distinct_terms).map(|i| format!("t{i:06}")).collect();
+        let mut rng = StdRng::seed_from_u64(seed);
+        {
+            let mut writer = index.writer_with_num_threads(1, 30_000_000).unwrap();
+            for _ in 0..n {
+                let idx = rng.random_range(0..vocab.len());
+                writer
+                    .add_document(doc!(field => vocab[idx].as_str()))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        (reader.searcher(), field, vocab)
+    }
+
+    fn run_text_query(
+        searcher: &Searcher,
+        field: tantivy::schema::Field,
+        terms: &[String],
+        cfg: TermSetStrategyConfig,
+    ) -> Vec<u32> {
+        let q = FastFieldTermSetQuery::new(terms.iter().map(|s| Term::from_field_text(field, s)))
+            .with_strategy_config(cfg);
+        let result = searcher.search(&q, &DocSetCollector).unwrap();
+        let mut docs: Vec<u32> = result.into_iter().map(|addr| addr.doc_id).collect();
+        docs.sort_unstable();
+        docs
+    }
+
+    #[test]
+    fn text_bitset_matches_automaton_small_k() {
+        let (searcher, field, vocab) = build_text_corpus(500, 50, 1);
+        let terms: Vec<String> = vocab.iter().take(3).cloned().collect();
+        let bitset_docs = run_text_query(&searcher, field, &terms, cfg_force_bitset_text());
+        let automaton_docs = run_text_query(&searcher, field, &terms, cfg_force_automaton_text());
+        assert_eq!(bitset_docs, automaton_docs);
+        assert!(!bitset_docs.is_empty(), "fixture degenerate");
+    }
+
+    #[test]
+    fn text_bitset_matches_automaton_large_k() {
+        let (searcher, field, vocab) = build_text_corpus(1_000, 100, 2);
+        let terms: Vec<String> = vocab.iter().take(80).cloned().collect();
+        let bitset_docs = run_text_query(&searcher, field, &terms, cfg_force_bitset_text());
+        let automaton_docs = run_text_query(&searcher, field, &terms, cfg_force_automaton_text());
+        assert_eq!(bitset_docs, automaton_docs);
+        assert!(!bitset_docs.is_empty());
+    }
+
+    #[test]
+    fn text_bitset_matches_automaton_all_missing() {
+        let (searcher, field, _vocab) = build_text_corpus(500, 50, 3);
+        let terms: Vec<String> = (1000..1010).map(|i| format!("missing-{i}")).collect();
+        let bitset_docs = run_text_query(&searcher, field, &terms, cfg_force_bitset_text());
+        let automaton_docs = run_text_query(&searcher, field, &terms, cfg_force_automaton_text());
+        assert!(bitset_docs.is_empty());
+        assert!(automaton_docs.is_empty());
+    }
+
+    #[test]
+    fn text_bitset_matches_automaton_empty_input() {
+        let (searcher, field, _vocab) = build_text_corpus(200, 30, 4);
+        let terms: Vec<String> = vec![];
+        let bitset_docs = run_text_query(&searcher, field, &terms, cfg_force_bitset_text());
+        let automaton_docs = run_text_query(&searcher, field, &terms, cfg_force_automaton_text());
+        assert!(bitset_docs.is_empty());
+        assert!(automaton_docs.is_empty());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 48,
+            ..ProptestConfig::default()
+        })]
+
+        /// Randomized equivalence on text fields: BitsetFromPostings
+        /// vs Automaton on arbitrary corpora and query sets. Pre-PR
+        /// the planner couldn't reach Bitset for text fields at all
+        /// (the `is_fast()` fork sent them straight to AutomatonWeight);
+        /// this property establishes the new Bitset path's correctness
+        /// against the well-established Automaton baseline.
+        #[test]
+        fn text_bitset_equivalent_to_automaton(
+            num_docs in 50usize..1_000,
+            distinct_terms in 4u64..200,
+            num_queries in 1usize..120,
+            seed in 0u64..1_000_000,
+        ) {
+            let n = num_docs as u64;
+            let (searcher, field, vocab) = build_text_corpus(n, distinct_terms, seed);
+            let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x9e37));
+
+            // Half query terms drawn from the vocab (probably present),
+            // half random fresh strings (probably absent).
+            let mut queries: Vec<String> = Vec::with_capacity(num_queries);
+            for i in 0..num_queries {
+                if i % 2 == 0 {
+                    let idx = rng.random_range(0..vocab.len());
+                    queries.push(vocab[idx].clone());
+                } else {
+                    let r: u32 = rng.random();
+                    queries.push(format!("absent-{r:08x}"));
+                }
+            }
+
+            let bitset_docs = run_text_query(&searcher, field, &queries, cfg_force_bitset_text());
+            let automaton_docs =
+                run_text_query(&searcher, field, &queries, cfg_force_automaton_text());
+            prop_assert_eq!(bitset_docs, automaton_docs);
+        }
     }
 }

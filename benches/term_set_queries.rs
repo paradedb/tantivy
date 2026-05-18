@@ -247,7 +247,6 @@ fn cfg_force_gallop() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: true,
         // Strict less-than: K/N < 1.0 admits any K < N.
-        gallop_max_density: 1.0,
         // The other thresholds don't matter for sorted+small-K cases —
         // once gallop is taken, the sort-agnostic branch isn't reached.
         ..TermSetStrategyConfig::default()
@@ -257,7 +256,6 @@ fn cfg_force_gallop() -> TermSetStrategyConfig {
 fn cfg_force_bitset_real() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: false,
-        gallop_max_density: 0.0,
         bitset_max_density_unique: 1.0,
         bitset_max_density_multi: 1.0,
         subsequent_bitset_max_density: 1.0,
@@ -268,7 +266,6 @@ fn cfg_force_bitset_real() -> TermSetStrategyConfig {
 fn cfg_force_linear() -> TermSetStrategyConfig {
     TermSetStrategyConfig {
         gallop_enabled: false,
-        gallop_max_density: 0.0,
         // `<=` gate with threshold 0.0 admits only density == 0 (i.e.
         // k_prime == 0, which short-circuits to Empty earlier). Every
         // non-empty term set falls through to LinearScan.
@@ -794,6 +791,124 @@ fn run_production_tier() {
             group.run();
         }
     }
+
+    // ---- Non-fast indexed (text/string) cell ----
+    // Exercises the new dispatch path enabled by the `TermSetWeight`
+    // unification: `BitsetFromPostings` at low K, `Automaton` at high
+    // K. Pre-unification this corpus shape always went through the
+    // streaming `AutomatonWeight` regardless of K.
+    run_production_text_cell(&mut runner);
+}
+
+#[cfg(feature = "quickwit")]
+fn run_production_text_cell(runner: &mut BenchRunner) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+
+    let n: u64 = 20_000_000;
+    let distinct: u64 = 200_000; // D ≈ 100
+    let (searcher, field, vocab) = build_text_corpus_parametric(n, distinct);
+
+    let mut group = runner.new_group();
+    group.set_name(format!(
+        "production n={n} text_indexed (distinct={distinct})"
+    ));
+    group.set_input_size(n as usize);
+
+    for &k in &[100usize, 1_000, 100_000] {
+        let k_eff = k.min(vocab.len());
+        let terms: Vec<String> = vocab.iter().take(k_eff).cloned().collect();
+
+        let sink = Arc::new(AtomicU8::new(StrategyTag::None as u8));
+        let probe_cfg = TermSetStrategyConfig {
+            strategy_sink: Some(sink.clone()),
+            ..TermSetStrategyConfig::default()
+        };
+        let _ = run_planner_path_text(&searcher, field, &terms, probe_cfg);
+        let pick = StrategyTag::try_from(sink.load(Ordering::Relaxed)).unwrap();
+        eprintln!("BENCH_PICK cell=text_indexed_20m k={k_eff} pick={pick:?}");
+
+        let s = searcher.clone();
+        let t = terms.clone();
+        group.register(format!("k={k_eff} run=planner_default"), move |_| {
+            black_box(run_planner_path_text(
+                &s,
+                field,
+                &t,
+                TermSetStrategyConfig::default(),
+            ))
+        });
+
+        // Force-bitset cfg: density gate admits all K.
+        let mut cfg_bitset = TermSetStrategyConfig::default();
+        cfg_bitset.gallop_enabled = false;
+        cfg_bitset.bitset_max_density_unique = 1.0;
+        cfg_bitset.bitset_max_density_multi = 1.0;
+        let s = searcher.clone();
+        let t = terms.clone();
+        group.register(format!("k={k_eff} run=bitset_forced"), move |_| {
+            black_box(run_planner_path_text(&s, field, &t, cfg_bitset.clone()))
+        });
+
+        // Force-automaton cfg: density gate rejects all K → Automaton.
+        let mut cfg_auto = TermSetStrategyConfig::default();
+        cfg_auto.gallop_enabled = false;
+        cfg_auto.bitset_max_density_unique = 0.0;
+        cfg_auto.bitset_max_density_multi = 0.0;
+        let s = searcher.clone();
+        let t = terms;
+        group.register(format!("k={k_eff} run=automaton_forced"), move |_| {
+            black_box(run_planner_path_text(&s, field, &t, cfg_auto.clone()))
+        });
+    }
+    group.run();
+}
+
+#[cfg(feature = "quickwit")]
+fn build_text_corpus_parametric(
+    n: u64,
+    distinct: u64,
+) -> (Searcher, tantivy::schema::Field, Vec<String>) {
+    use rand::{Rng, SeedableRng};
+    use tantivy::schema::STRING;
+
+    let mut sb = SchemaBuilder::new();
+    // STRING (not TEXT) for exact-match semantics — no tokenization, no
+    // analysis. Indexed only (no FAST), which routes the dispatch
+    // through the unified `TermSetWeight`'s non-fast path.
+    let field = sb.add_text_field("text", STRING);
+    let schema = sb.build();
+    let index = Index::builder().schema(schema).create_in_ram().unwrap();
+    let vocab: Vec<String> = (0..distinct).map(|i| format!("term-{i:08}")).collect();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xbeef);
+    {
+        let mut writer = index.writer_with_num_threads(1, 200_000_000).unwrap();
+        for _ in 0..n {
+            let idx = rng.random_range(0..vocab.len());
+            writer
+                .add_document(doc!(field => vocab[idx].as_str()))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+    }
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
+        .unwrap();
+    (reader.searcher(), field, vocab)
+}
+
+#[cfg(feature = "quickwit")]
+fn run_planner_path_text(
+    searcher: &Searcher,
+    field: tantivy::schema::Field,
+    terms: &[String],
+    cfg: TermSetStrategyConfig,
+) -> usize {
+    let q = FastFieldTermSetQuery::new(terms.iter().map(|s| Term::from_field_text(field, s)))
+        .with_strategy_config(cfg);
+    searcher.search(&q, &Count).unwrap()
 }
 
 #[cfg(not(feature = "quickwit"))]
