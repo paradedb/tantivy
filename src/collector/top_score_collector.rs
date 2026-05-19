@@ -224,7 +224,7 @@ impl TopDocs {
 
     /// Order docs by decreasing BM25 similarity score.
     pub fn order_by_score(self) -> impl Collector<Fruit = Vec<(Score, DocAddress)>> {
-        TopBySortKeyCollector::new(SortBySimilarityScore, self.doc_range())
+        TopBySortKeyCollector::new(SortBySimilarityScore::new(), self.doc_range())
     }
 
     /// Set top-K to rank documents by a given fast field.

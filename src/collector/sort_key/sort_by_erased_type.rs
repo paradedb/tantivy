@@ -184,7 +184,7 @@ impl SortKeyComputer for SortByErasedType {
                 }
             }
             Self::Score => Box::new(ScoreSegmentSortKeyComputer {
-                segment_computer: SortBySimilarityScore,
+                segment_computer: SortBySimilarityScore::new(),
             }),
         };
         Ok(ErasedColumnSegmentSortKeyComputer { inner })

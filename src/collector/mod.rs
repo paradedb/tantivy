@@ -105,7 +105,9 @@ mod top_score_collector;
 pub use self::top_score_collector::{TopDocs, TopNComputer};
 
 mod sort_key_top_collector;
-pub use self::sort_key::{SegmentSortKeyComputer, SortKeyComputer};
+pub use self::sort_key::{
+    AtomicSharedThreshold, SegmentSortKeyComputer, SharedThreshold, SortKeyComputer,
+};
 mod facet_collector;
 pub use self::facet_collector::{FacetCollector, FacetCounts};
 use crate::query::Weight;
