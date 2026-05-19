@@ -1,33 +1,28 @@
-//! Unified `TermSetWeight` — a single `Weight` impl that holds every
+//! `TermSetWeight` — a single `Weight` impl that holds every
 //! representation needed to dispatch any of the term-set strategies
 //! (`Gallop` / `LinearScan` / `BitsetFromPostings` / `Automaton` /
 //! `Empty`), built once at construction and consulted per-segment.
 //!
-//! ## Why one type
+//! ## Two orthogonal concerns, one type
 //!
-//! Pre-unification, `TermSetQuery::specialized_weight` forked on
-//! `field_type.is_fast()` at the top: fast-supported numeric types
-//! routed through `FastFieldTermSetWeight` (which itself dispatched
-//! Gallop/Linear/Bitset per segment via the planner), and every other
-//! type fell through to `AutomatonWeight`. That fork conflated two
-//! orthogonal concerns:
+//! Dispatch separates two questions:
 //!
 //!   - "Which field representations are available?" — `is_fast()`, `is_indexed()`.
 //!   - "Which strategy wins on the current K/N/D?" — the planner's job.
 //!
 //! `BitsetFromPostings` only needs the field to be **indexed** (it
 //! reads posting lists, not a column), so non-fast indexed fields
-//! (text / string) were stuck on the streaming `AutomatonWeight` path
-//! even when the planner would have picked Bitset.
+//! (text / string) still reach the bitset path — the planner picks
+//! between `BitsetFromPostings` (low K) and `Automaton` (high K) on
+//! those.
 //!
-//! `TermSetWeight` collapses the fork: one struct holds the bytes
-//! representation (consumed by Bitset + Automaton), an optional u64
-//! representation (consumed by Gallop + Linear + Bitset on
-//! numeric-fast), a pre-built FST (consumed by Automaton), and a
-//! `fast_strategies_available` flag set at construction. The
-//! per-segment scorer opens the column only when fast is available,
-//! calls `select_strategy`, and dispatches all five variants
-//! including `Automaton` for non-fast indexed fields.
+//! `TermSetWeight` holds the bytes representation (consumed by Bitset
+//! + Automaton), an optional u64 representation (consumed by Gallop +
+//! Linear + Bitset on numeric-fast), a pre-built FST (consumed by
+//! Automaton), and a `fast_strategies_available` flag set at
+//! construction. The per-segment scorer opens the column only when
+//! fast is available, calls `select_strategy`, and dispatches all
+//! five variants including `Automaton` for non-fast indexed fields.
 
 use std::io;
 use std::net::Ipv6Addr;
@@ -56,12 +51,11 @@ use crate::{DocId, DocSet, Score, TantivyError, Term, TERMINATED};
 // FastFieldTermSetQuery — preserved as a thin public Query type
 // ---------------------------------------------------------------------------
 
-/// `FastFieldTermSetQuery` was the original entry-point for routing
-/// numeric-on-fast term sets through the planner-dispatched strategies.
-/// Now a thin wrapper that delegates to the unified `TermSetWeight`,
-/// kept as a public type for back-compat — consumers that need the
-/// "fast-only" name keep using it without code change. The underlying
-/// dispatch path is the same regardless of which `Query` type is built.
+/// Thin `Query` wrapper that delegates to `TermSetWeight`. Provided
+/// alongside [`TermSetQuery`] for consumers that prefer the "fast-only"
+/// name at the call site; the underlying dispatch path is identical.
+///
+/// [`TermSetQuery`]: super::TermSetQuery
 #[derive(Debug, Clone)]
 pub struct FastFieldTermSetQuery {
     terms_map: std::collections::HashMap<Field, Vec<Term>>,
@@ -234,9 +228,10 @@ impl TermSetWeight {
         };
 
         // Pick a typed representation based on the first Term's value
-        // type — same logic as the legacy `FastFieldTermSetWeight::new`
-        // path, but extended with a `Bytes` arm for fields that can't
-        // produce numeric or IP values (text / string / json).
+        // type. Numeric / IP terms decode to typed arms that the
+        // fast-field dispatch path consumes; everything else (text /
+        // string / json) lands on `Bytes` and goes through the
+        // inverted-index dispatch path.
         let repr = if let Some(first) = terms.first() {
             let first_val = first.value();
             if first_val.as_ip_addr().is_some() {
@@ -379,9 +374,8 @@ impl Weight for TermSetWeight {
 }
 
 impl TermSetWeight {
-    /// Fast-numeric dispatch path. Mirrors the legacy
-    /// `FastFieldTermSetWeight::scorer` body: estimate D, run the
-    /// planner, dispatch on the returned variant.
+    /// Fast-numeric dispatch path: open the `Column<u64>`, estimate D,
+    /// run the planner, dispatch on the returned variant.
     fn dispatch_numeric_fast(
         &self,
         reader: &SegmentReader,
@@ -492,10 +486,12 @@ impl TermSetWeight {
             return Ok(Box::new(EmptyScorer));
         }
         if !self.is_indexed {
-            // FAST-only field that isn't supported by FF strategies and
-            // has no inverted index — neither Bitset nor Automaton can
-            // build. Return EmptyScorer rather than error to match the
-            // pre-refactor behaviour of silently dropping these cells.
+            // FAST-only field whose value type isn't supported by FF
+            // strategies and has no inverted index — neither Bitset nor
+            // Automaton can build. Return `EmptyScorer` silently rather
+            // than erroring, matching the rest of the dispatch surface
+            // which prefers to drop unscorable cells over surfacing a
+            // hard schema error mid-query.
             self.record_strategy_tag(StrategyTag::Empty);
             return Ok(Box::new(EmptyScorer));
         }
@@ -516,8 +512,7 @@ impl TermSetWeight {
 }
 
 // ---------------------------------------------------------------------------
-// SetDfaWrapper — FST-as-set automaton (moved from term_set_query.rs so the
-// Automaton dispatch can build it without re-importing across modules)
+// SetDfaWrapper — FST-as-set automaton driving the `Automaton` dispatch
 // ---------------------------------------------------------------------------
 
 pub(crate) struct SetDfaWrapper(pub(crate) Arc<Map<Vec<u8>>>);
@@ -553,8 +548,8 @@ impl Automaton for SetDfaWrapper {
 }
 
 // ---------------------------------------------------------------------------
-// TermSetDocSet — fast-field linear scan (moved from
-// term_set_query_fastfield.rs; semantics unchanged)
+// TermSetDocSet — fast-field linear scan over a `Column<T>` filtered by an
+// in-memory `FxHashSet<T>` of accepted values
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -644,12 +639,10 @@ mod tests {
         Ok(())
     }
 
-    /// String fields (STRING | FAST) are now supported via the
-    /// inverted-index dispatch path inside `TermSetWeight`. Pre-unification,
-    /// `FastFieldTermSetWeight::scorer` rejected `field_type.is_str()` with
-    /// `InvalidArgument`; the unified weight type routes those queries to
-    /// `BitsetFromPostings` or `Automaton` instead. This test pins the new
-    /// "string fields work" behavior.
+    /// String fields (STRING | FAST) dispatch through `TermSetWeight`'s
+    /// inverted-index path, which routes to `BitsetFromPostings` or
+    /// `Automaton` depending on K. Pins the contract that string-field
+    /// term sets are scorable.
     #[test]
     pub fn test_term_set_query_fast_field_string() -> crate::Result<()> {
         let index = create_test_index()?;

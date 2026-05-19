@@ -342,10 +342,8 @@ proptest! {
 mod text_equivalence {
     //! Equivalence on text fields, where the dispatch path is
     //! `BitsetFromPostings` (low K) vs `Automaton` (high K) — both
-    //! reading the inverted index. The pre-unification code routed
-    //! every text-field term set through `AutomatonWeight`
-    //! unconditionally; the unified `TermSetWeight` now picks Bitset
-    //! for low-K queries. Both must yield identical docs.
+    //! reading the inverted index. The two strategies must yield
+    //! identical docs on every input.
 
     use proptest::prelude::*;
     use rand::prelude::*;
@@ -470,12 +468,10 @@ mod text_equivalence {
             ..ProptestConfig::default()
         })]
 
-        /// Randomized equivalence on text fields: BitsetFromPostings
-        /// vs Automaton on arbitrary corpora and query sets. Pre-PR
-        /// the planner couldn't reach Bitset for text fields at all
-        /// (the `is_fast()` fork sent them straight to AutomatonWeight);
-        /// this property establishes the new Bitset path's correctness
-        /// against the well-established Automaton baseline.
+        /// Randomized equivalence on text fields: `BitsetFromPostings`
+        /// and `Automaton` must yield identical docs on every
+        /// (corpus, query-set) pair. Pins the bitset path's correctness
+        /// against the `AutomatonWeight` baseline.
         #[test]
         fn text_bitset_equivalent_to_automaton(
             num_docs in 50usize..1_000,

@@ -31,17 +31,14 @@
 //!
 //! ## Why direct lookups, not streaming-with-automaton
 //!
-//! An earlier version of this strategy streamed the term dictionary
-//! with an FST set-membership automaton (one scan touches all K
-//! matches plus every other dictionary entry). Microbenchmarks
-//! comparing the streaming variant against direct lookups across a
-//! wide K/D/N matrix found direct lookups won every cell — frequently
-//! by 10–25× on low-D columns, where the streaming walk's per-entry
-//! FST traversal scales with `dict_size` (≈ N/D), not K. The
-//! streaming variant's bottleneck was the lack of within-entry
-//! `can_match` early termination on the SSTable streamer — bytes feed
-//! through the automaton even into dead states. Direct lookups avoid
-//! the walk entirely.
+//! The streaming alternative would walk the term dictionary with an
+//! FST set-membership automaton, touching all K matches plus every
+//! intervening entry — per-entry cost scales with `dict_size` (≈ N/D),
+//! not K. Microbenchmarks across a wide K/D/N matrix found direct
+//! lookups faster on every cell, frequently by 10–25× on low-D
+//! columns. The SSTable streamer also lacks within-entry `can_match`
+//! early termination, so bytes feed through the automaton even into
+//! dead states. Direct lookups skip the walk entirely.
 
 use common::BitSet;
 

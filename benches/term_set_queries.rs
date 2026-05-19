@@ -47,9 +47,9 @@
 //!     + zero densities).
 //!   - `BitsetFromPostings` (real, exercised as `bitset_from_postings_real`): planner forced via
 //!     `cfg_force_bitset_real()` (both bitset densities = 1.0).
-//!   - `DirectBitset`: bench-only `DirectBitsetQuery` wrapper around the pre-batching scorer (K
-//!     individual `term_dict.get(key)` calls + bitset OR). Kept for comparison against the batched
-//!     variant under `cost_model`.
+//!   - `DirectBitset`: bench-only `DirectBitsetQuery` wrapper that drives K individual
+//!     `term_dict.get(key)` calls into a bitset OR (no batched dictionary lookup). Used by
+//!     `cost_model` to measure the per-block-decode amortization the batched API provides.
 //!   - `PostingDirect`: synthetic baseline — `BooleanQuery` of `TermQuery::Should`. Exercises
 //!     `BufferedUnionScorer`. Retained to characterize union scaling cost.
 //!   - `BitsetFromPostings` (synthetic, `bitset_from_postings`): synthetic baseline —
@@ -157,10 +157,11 @@ enum Strat {
     /// strategy that bypasses the union scorer entirely.
     BitsetFromPostingsReal,
     /// K independent `TermDictionary::get(key)` lookups (no streaming
-    /// automaton) + OR each posting list into one `BitSet`. Bench-only
-    /// — lives in this file, not in production code. The pre-batching
-    /// scorer shape; retained so `compare` can measure direct vs
-    /// batched dictionary lookups against each other.
+    /// automaton, no batched dictionary API) + OR each posting list
+    /// into one `BitSet`. Bench-only — lives in this file, not in
+    /// production code. Measured by `compare` to quantify the
+    /// per-block-decode amortization the batched dictionary API
+    /// provides relative to per-key dispatch.
     DirectBitset,
 }
 
@@ -793,10 +794,8 @@ fn run_production_tier() {
     }
 
     // ---- Non-fast indexed (text/string) cell ----
-    // Exercises the new dispatch path enabled by the `TermSetWeight`
-    // unification: `BitsetFromPostings` at low K, `Automaton` at high
-    // K. Pre-unification this corpus shape always went through the
-    // streaming `AutomatonWeight` regardless of K.
+    // Exercises `TermSetWeight`'s inverted-index dispatch path:
+    // `BitsetFromPostings` at low K, `Automaton` at high K.
     run_production_text_cell(&mut runner);
 }
 
@@ -978,11 +977,11 @@ fn run_cost_model_tier() {
 /// `linear`         — `cfg_force_linear()`.
 /// `gallop`         — `cfg_force_gallop()` (includes the upfront sort cost).
 /// `direct_bitset`  — bench-only `DirectBitsetQuery`. K individual
-///                    `term_dict.get(key)` calls + bitset OR (the
-///                    pre-batching scorer). Kept for direct
-///                    comparison against the batched variant.
-/// `batched_bitset` — bench-only `BatchedBitsetQuery`. The current
-///                    production `bitset_from_postings_scorer` under
+///                    `term_dict.get(key)` calls + bitset OR. Used
+///                    here as the per-key baseline for the batched
+///                    variant.
+/// `batched_bitset` — bench-only `BatchedBitsetQuery`. The
+///                    `bitset_from_postings_scorer` under
 ///                    `--features quickwit`. Registered only when the
 ///                    `quickwit` feature is enabled — the FST backend
 ///                    has no block decode to amortize.

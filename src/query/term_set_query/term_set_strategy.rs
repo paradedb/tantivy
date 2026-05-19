@@ -190,18 +190,14 @@ pub struct PlannerInputs<'a> {
 /// `TermSetQuery::build_weight` constructs one `TermSetWeight` per
 /// field; `TermSetWeight::scorer` calls `select_strategy` once per
 /// segment when the field has a fast-field representation (so a
-/// `Column<u64>` can be opened). Pre-unification this was a fork on
-/// `field_type.is_fast()`: numeric-on-fast went through the planner
-/// while everything else routed straight to `AutomatonWeight`,
-/// bypassing the dispatch table. The unified weight collapses that
-/// fork — every field reaches the planner, and `inputs.fast_available`
-/// tells it whether the column-bound strategies (Gallop / LinearScan)
-/// are admissible or whether the terminal fallback must be `Automaton`.
+/// `Column<u64>` can be opened). `inputs.fast_available` tells the
+/// planner whether the column-bound strategies (Gallop / LinearScan)
+/// are admissible — when `false`, the terminal fallback is `Automaton`
+/// instead.
 ///
 /// `BitsetFromPostings` is fast-field-independent (it reads posting
-/// lists from the inverted index, not the column) and remains
-/// admissible regardless of `fast_available` as long as the field is
-/// indexed.
+/// lists from the inverted index, not the column) and is admissible
+/// regardless of `fast_available` as long as the field is indexed.
 ///
 /// # Decision tree
 ///

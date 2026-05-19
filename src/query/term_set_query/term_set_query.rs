@@ -42,14 +42,11 @@ impl TermSetQuery {
     }
 
     /// Build the per-field weights and wrap them in a `BooleanWeight`.
-    ///
-    /// Pre-unification this method forked on `field_type.is_fast()` and
-    /// routed non-fast indexed fields straight through `AutomatonWeight`,
-    /// bypassing the planner. The unified `TermSetWeight` collapses that
-    /// fork — every field goes through the same weight type, which then
-    /// dispatches per segment based on what the field actually supports
-    /// (fast strategies if available, Bitset / Automaton on the inverted
-    /// index otherwise).
+    /// Every field routes through `TermSetWeight`, which dispatches per
+    /// segment based on what the field actually supports — fast
+    /// strategies (Gallop / Linear / Bitset on the fast column) when
+    /// available, `BitsetFromPostings` / `Automaton` on the inverted
+    /// index otherwise.
     fn build_weight(&self, schema: &Schema) -> crate::Result<BooleanWeight<DoNothingCombiner>> {
         let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
 
@@ -57,11 +54,12 @@ impl TermSetQuery {
             let field_entry = schema.get_field_entry(field);
             let field_type = field_entry.field_type();
             if !field_type.is_indexed() {
-                // Mirrors the pre-unification gate. `TermSetWeight::new`
+                // Top-level schema gate: `TermSetQuery` requires an
+                // inverted index on every field. `TermSetWeight::new`
                 // would also reject (neither-fast-nor-indexed → schema
-                // error), but the early return here preserves the exact
-                // error message and short-circuits before per-term
-                // decoding.
+                // error), but the early return here short-circuits
+                // before per-term decoding and yields a more specific
+                // error message.
                 let error_msg = format!("Field {:?} is not indexed.", field_entry.name());
                 return Err(crate::TantivyError::SchemaError(error_msg));
             }
@@ -156,10 +154,6 @@ impl Query for InvertedIndexTermSetQuery {
         )))
     }
 }
-
-// `SetDfaWrapper` moved to `term_set_weight.rs` (its primary consumer
-// is `TermSetWeight::automaton_scorer`). `InvertedIndexTermSetQuery`
-// below imports it from there.
 
 #[cfg(test)]
 mod tests {
