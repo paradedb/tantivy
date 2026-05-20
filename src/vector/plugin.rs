@@ -43,7 +43,7 @@ impl SegmentPlugin for VectorPlugin {
         if (target_docs as usize) < threshold {
             merge_flat(&ctx)
         } else {
-            merge_ivf(&ctx)
+            merge_ivf(&ctx, ctx.target_segment.index().ivf_clusterer())
         }
     }
 }
