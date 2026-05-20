@@ -29,11 +29,13 @@ use crate::plugin::{
     SegmentPlugin,
 };
 
+pub(crate) const VECTOR_PLUGIN_NAME: &str = "vectors";
+
 pub struct VectorPlugin;
 
 impl SegmentPlugin for VectorPlugin {
     fn name(&self) -> &str {
-        "vectors"
+        VECTOR_PLUGIN_NAME
     }
 
     fn extensions(&self) -> Vec<&str> {

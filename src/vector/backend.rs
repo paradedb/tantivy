@@ -10,10 +10,11 @@
 
 use std::sync::Arc;
 
-use super::flat::VectorColumn as FlatVectorColumn;
+use super::flat::FlatVectorColumn;
 use super::ivf::{AdaptiveProbeParams, IvfVectorColumn};
 use super::options::{Metric, VectorElement};
-use super::reader::VectorReader;
+use super::reader::{VectorColumn, VectorColumnReader, VectorReader};
+use super::VECTOR_PLUGIN_NAME;
 use crate::collector::TopNComputer;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
@@ -60,31 +61,24 @@ impl<T: VectorElement> VectorBackend<T> {
         let metric = lookup_metric(&schema, field)?;
 
         let vec_reader = segment_reader
-            .plugin_reader::<VectorReader>("vectors")?
+            .plugin_reader::<VectorReader>(VECTOR_PLUGIN_NAME)?
             .ok_or_else(|| TantivyError::InternalError("vectors plugin reader missing".into()))?;
 
-        if let Some(column) = vec_reader.open_ivf_column(field) {
-            return Ok(Self::Ivf(IvfBackend {
+        match vec_reader.open_column(field)? {
+            VectorColumn::Ivf(column) => Ok(Self::Ivf(IvfBackend {
                 column,
                 metric,
                 query,
                 adaptive,
                 segment_ord,
-            }));
+            })),
+            VectorColumn::Flat(column) => Ok(Self::Flat(FlatBackend {
+                column,
+                metric,
+                query,
+                segment_ord,
+            })),
         }
-
-        let column = vec_reader.open_flat_column(field).ok_or_else(|| {
-            TantivyError::InternalError(format!(
-                "no vector data for field {:?} in segment",
-                schema.get_field_name(field),
-            ))
-        })?;
-        Ok(Self::Flat(FlatBackend {
-            column,
-            metric,
-            query,
-            segment_ord,
-        }))
     }
 
     /// Top-N within this segment. Each variant decides whether to

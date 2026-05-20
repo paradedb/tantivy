@@ -6,26 +6,64 @@
 //! which sends the backend to the flat fallback.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 
 use crate::plugin::PluginReader;
-use crate::schema::Field;
-use crate::vector::options::{Metric, VectorElement};
-use crate::DocId;
+use crate::schema::{Field, FieldType, Schema};
+use crate::vector::reader::VectorColumnReader;
+use crate::{DocId, TantivyError};
 
 pub struct IvfVecReader {
     // TODO: handles to the centroid index, assignment file, vector file,
     // and the per-cluster offsets metadata.
+    field_dims: BTreeMap<Field, usize>,
 }
 
 impl IvfVecReader {
-    pub(crate) fn stub() -> Self {
-        Self {}
+    pub(crate) fn stub(schema: &Schema) -> Self {
+        let mut field_dims = BTreeMap::new();
+        for (field, entry) in schema.fields() {
+            if let FieldType::Vector(opts) = entry.field_type() {
+                field_dims.insert(field, opts.dim());
+            }
+        }
+        Self { field_dims }
     }
 
-    /// Open a per-field IVF column. Stub returns `None` so the backend
-    /// always falls through to flat.
-    pub fn open_column(&self, _field: Field) -> Option<IvfVectorColumn> {
-        None
+    pub(crate) fn has_column(&self, _field: Field) -> bool {
+        false
+    }
+}
+
+impl VectorColumnReader for IvfVecReader {
+    type Column = IvfVectorColumn;
+
+    fn open_column(&self, field: Field) -> crate::Result<IvfVectorColumn> {
+        if !self.field_dims.contains_key(&field) {
+            return Err(TantivyError::InvalidArgument(format!(
+                "field {field:?} is not a vector field"
+            )));
+        }
+        Err(TantivyError::InternalError(format!(
+            "no IVF vector data for vector field {field:?} in segment"
+        )))
+    }
+
+    fn count(&self, field: Field) -> crate::Result<usize> {
+        if !self.field_dims.contains_key(&field) {
+            return Err(TantivyError::InvalidArgument(format!(
+                "field {field:?} is not a vector field"
+            )));
+        }
+        Err(TantivyError::InternalError(format!(
+            "no IVF vector data for vector field {field:?} in segment"
+        )))
+    }
+
+    fn dim(&self, field: Field) -> crate::Result<usize> {
+        self.field_dims.get(&field).copied().ok_or_else(|| {
+            TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
+        })
     }
 }
 
@@ -46,19 +84,23 @@ pub struct IvfVectorColumn {
 }
 
 impl IvfVectorColumn {
-    /// Rank centroids by distance to the query (closest first). Drives
-    /// the probe order in adaptive cluster scanning.
-    pub fn rank_centroids<T: VectorElement>(&self, _query: &[T], _metric: Metric) -> Vec<u32> {
-        todo!("IVF centroid ranking")
+    pub fn dim(&self) -> usize {
+        todo!("IVF vector column reader")
     }
 
-    /// Sorted doc ids belonging to a cluster (within-cluster order).
-    pub fn cluster_doc_ids(&self, _cluster: u32) -> &[DocId] {
-        todo!("IVF cluster doc-id postings")
+    pub fn len(&self) -> usize {
+        todo!("IVF vector column reader")
     }
 
-    /// Raw little-endian vector bytes for a doc in a given cluster.
-    pub fn vector_bytes_in_cluster(&self, _cluster: u32, _doc: DocId) -> &[u8] {
-        todo!("IVF intra-cluster vector lookup")
+    pub fn is_empty(&self) -> bool {
+        todo!("IVF vector column reader")
+    }
+
+    pub fn contains(&self, _doc_id: DocId) -> bool {
+        todo!("IVF vector column reader")
+    }
+
+    pub fn vector_bytes_at(&self, _doc_id: DocId) -> Option<&[u8]> {
+        todo!("IVF vector column reader")
     }
 }

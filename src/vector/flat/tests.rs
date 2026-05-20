@@ -6,7 +6,7 @@ use crate::index::SegmentId;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, Query, RangeQuery, TermQuery};
 use crate::schema::{Field, IndexRecordOption, Schema, Term, Value, FAST, INDEXED, STORED, TEXT};
-use crate::vector::{Metric, VectorOptions};
+use crate::vector::{Metric, VectorColumnReader, VectorOptions, VECTOR_PLUGIN_NAME};
 use crate::{DocAddress, Index, IndexWriter, Score, Searcher, TantivyDocument};
 
 // ---- helpers shared across the metric tests ----
@@ -289,9 +289,9 @@ fn test_search_sparse_vectors() -> crate::Result<()> {
 
     // Plugin reader: column reports only 3 present docs out of 6.
     let vec_reader: Arc<crate::vector::VectorReader> = segments[0]
-        .plugin_reader::<crate::vector::VectorReader>("vectors")?
+        .plugin_reader::<crate::vector::VectorReader>(VECTOR_PLUGIN_NAME)?
         .expect("plugin reader");
-    let column = vec_reader.open_flat_column(embed).expect("column");
+    let column = vec_reader.open_column(embed)?;
     assert_eq!(column.len(), 3);
     // Present docs: 0, 2, 4
     for d in [0u32, 2, 4] {
@@ -373,9 +373,9 @@ fn test_merge_preserves_sparsity() -> crate::Result<()> {
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].max_doc(), 4);
     let vec_reader: Arc<crate::vector::VectorReader> = segments[0]
-        .plugin_reader::<crate::vector::VectorReader>("vectors")?
+        .plugin_reader::<crate::vector::VectorReader>(VECTOR_PLUGIN_NAME)?
         .expect("plugin reader");
-    let column = vec_reader.open_flat_column(embed).expect("column");
+    let column = vec_reader.open_column(embed)?;
     assert_eq!(column.len(), 2, "two vectors should survive the merge");
     let present: Vec<u32> = (0..4).filter(|&d| column.contains(d)).collect();
     assert_eq!(present.len(), 2);
@@ -423,9 +423,9 @@ fn test_flat_vec_plugin_merge() -> crate::Result<()> {
     assert_eq!(segments.len(), 1);
 
     let vec_reader: Arc<crate::vector::VectorReader> = segments[0]
-        .plugin_reader::<crate::vector::VectorReader>("vectors")?
+        .plugin_reader::<crate::vector::VectorReader>(VECTOR_PLUGIN_NAME)?
         .expect("plugin reader");
-    let column = vec_reader.open_flat_column(vec_field).expect("column");
+    let column = vec_reader.open_column(vec_field)?;
 
     let decode = |bytes: &[u8]| -> Vec<f32> {
         bytes

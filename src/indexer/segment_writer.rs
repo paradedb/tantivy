@@ -19,7 +19,7 @@ use crate::schema::document::{Document, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::store::StorePluginWriter;
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
-use crate::vector::FlatVecWriter;
+use crate::vector::{FlatVecWriter, VECTOR_PLUGIN_NAME};
 use crate::{DocId, Opstamp, TantivyError};
 
 /// Computes the initial size of the hash table.
@@ -144,7 +144,7 @@ impl SegmentWriter {
             .expect("fieldnorms plugin")
             .fill_up_to_max_doc(max_doc);
         self.segment_serializer
-            .get_plugin_writer::<FlatVecWriter>("vectors")
+            .get_plugin_writer::<FlatVecWriter>(VECTOR_PLUGIN_NAME)
             .expect("vectors plugin")
             .set_num_docs(max_doc);
         let mapping: Option<DocIdMapping> = self
@@ -425,7 +425,7 @@ impl SegmentWriter {
             .writer_mut()
             .add_document(&document)?;
         self.segment_serializer
-            .get_plugin_writer::<FlatVecWriter>("vectors")
+            .get_plugin_writer::<FlatVecWriter>(VECTOR_PLUGIN_NAME)
             .expect("vectors plugin")
             .add_document(doc_id, &document, &self.schema)?;
         self.index_document(&document)?;
