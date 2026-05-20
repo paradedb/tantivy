@@ -3,7 +3,7 @@
 //! Schema-level concepts ([`VectorOptions`], [`Metric`], [`VectorElement`])
 //! and the distance kernels live at this level. The on-disk formats
 //! live in submodules: [`flat`] for the dense full-precision layout
-//! and [`ivf`] for the partitioned/clustered accelerator (stub).
+//! and [`ivf`] for the partitioned/clustered accelerator.
 //! Both formats are owned by a single [`VectorPlugin`] which picks
 //! between them per merge based on
 //! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
