@@ -6,12 +6,13 @@
 //! - During merge, picks exactly one of two output formats by target
 //!   doc count: below
 //!   [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold)
-//!   it copies vectors forward into flat `.vecmeta` and `.flatvec`; at
-//!   or above the threshold it routes to the IVF merge body.
+//!   it copies vectors forward into flat `.vecmeta` and `.flatvec`; at or
+//!   above the threshold it writes IVF `.vecmeta`, `.assignments`, and
+//!   `.vec` files.
 //! - During reads, [`VectorReader`](super::reader::VectorReader) uses
 //!   the segment-level `.vecmeta` marker to open the selected storage format.
 //!
-//! Owning both `flatvec` and `ivfvec` extensions on one plugin keeps
+//! Owning both flat and IVF extensions on one plugin keeps
 //! the "exactly one format per segment" invariant right by construction:
 //! the dispatch is one `if` inside one `merge()` method, not a
 //! cross-plugin coordination problem.
@@ -19,7 +20,7 @@
 use std::sync::Arc;
 
 use super::flat::{merge_flat, FlatVecWriter, FLATVEC_EXT};
-use super::ivf::merge_ivf;
+use super::ivf::{merge_ivf, ASSIGNMENTS_EXT, IVFVEC_EXT};
 use super::meta::VECMETA_EXT;
 use super::reader::VectorReader;
 use crate::plugin::{
@@ -37,7 +38,7 @@ impl SegmentPlugin for VectorPlugin {
     }
 
     fn extensions(&self) -> Vec<&str> {
-        vec![FLATVEC_EXT, VECMETA_EXT]
+        vec![FLATVEC_EXT, VECMETA_EXT, ASSIGNMENTS_EXT, IVFVEC_EXT]
     }
 
     fn write_phase(&self) -> u32 {

@@ -3,10 +3,10 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 
-use super::flat::{FlatVecReader, FlatVectorColumn};
-use super::ivf::{IvfVecReader, IvfVectorColumn};
+use super::flat::{FlatVecReader, FlatVectorColumn, FLATVEC_EXT};
+use super::ivf::{IvfVecReader, IvfVectorColumn, ASSIGNMENTS_EXT, IVFVEC_EXT};
 use super::meta::{VectorSegmentMeta, VectorStorageFormat, VECMETA_EXT};
-use crate::directory::error::OpenReadError;
+use crate::directory::{error::OpenReadError, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::{PluginReader, PluginReaderContext};
 use crate::schema::{Field, FieldType};
@@ -51,11 +51,38 @@ impl VectorReader {
         };
         let storage = if let Some(file_slice) = meta_slice {
             let meta = VectorSegmentMeta::open(file_slice)?;
-            let _payload = meta.payload;
+            let directory = ctx.segment.index().directory();
+            let flat_path = ctx
+                .segment
+                .relative_path(SegmentComponent::Custom(FLATVEC_EXT.to_string()));
+            let assignments_path = ctx
+                .segment
+                .relative_path(SegmentComponent::Custom(ASSIGNMENTS_EXT.to_string()));
+            let vec_path = ctx
+                .segment
+                .relative_path(SegmentComponent::Custom(IVFVEC_EXT.to_string()));
             match meta.format {
-                VectorStorageFormat::Flat => VectorStorageReader::Flat(FlatVecReader::open(ctx)?),
+                VectorStorageFormat::Flat => {
+                    if directory.exists(&assignments_path)? || directory.exists(&vec_path)? {
+                        return Err(TantivyError::InternalError(
+                            "segment is marked flat but has IVF vector components".to_string(),
+                        ));
+                    }
+                    VectorStorageReader::Flat(FlatVecReader::open(ctx)?)
+                }
                 VectorStorageFormat::Ivf => {
-                    VectorStorageReader::Ivf(IvfVecReader::stub(ctx.schema))
+                    if directory.exists(&flat_path)? {
+                        return Err(TantivyError::InternalError(
+                            "segment is marked IVF but has flat vector data".to_string(),
+                        ));
+                    }
+                    if !directory.exists(&assignments_path)? || !directory.exists(&vec_path)? {
+                        return Err(TantivyError::InternalError(
+                            "segment is marked IVF but is missing IVF vector components"
+                                .to_string(),
+                        ));
+                    }
+                    VectorStorageReader::Ivf(IvfVecReader::open(ctx, meta.payload)?)
                 }
             }
         } else {
