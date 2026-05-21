@@ -1,25 +1,42 @@
 use std::sync::Arc;
 
-use super::{ASSIGNMENTS_EXT, IVFVEC_EXT};
+use super::{
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, ASSIGNMENTS_EXT,
+    IVFVEC_EXT,
+};
 use crate::index::{SegmentComponent, SegmentId};
 use crate::indexer::NoMergePolicy;
 use crate::schema::{Schema, STORED, TEXT};
 use crate::vector::meta::VECMETA_EXT;
-use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfVectors, Metric, VectorColumn, VectorColumnReader,
-    VectorOptions, VECTOR_PLUGIN_NAME,
-};
+use crate::vector::{Metric, VectorColumn, VectorColumnReader, VectorOptions, VECTOR_PLUGIN_NAME};
 use crate::{Index, IndexSettings, IndexWriter, TantivyDocument};
 
-struct TestClusterer;
+struct ParametricClusterer {
+    centroids: Vec<Vec<f32>>,
+}
 
-impl IvfClusterer for TestClusterer {
+impl ParametricClusterer {
+    fn new(centroids: Vec<Vec<f32>>) -> Arc<Self> {
+        assert!(!centroids.is_empty(), "need at least one centroid");
+        Arc::new(Self { centroids })
+    }
+}
+
+impl IvfClusterer for ParametricClusterer {
     fn centroid_ratio(&self) -> f32 {
-        0.5
+        1.0
     }
 
     fn training_samples_per_centroid(&self) -> usize {
         2
+    }
+
+    fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
+        Ok(IvfMergeSettings {
+            num_centroids: self.centroids.len(),
+            training_samples_per_centroid: 2,
+            assign_batch_size: self.assign_batch_size(),
+        })
     }
 
     fn train(
@@ -28,20 +45,22 @@ impl IvfClusterer for TestClusterer {
         vectors: IvfVectors<'_>,
         num_centroids: usize,
     ) -> crate::Result<IvfCentroids> {
-        assert_eq!(options.dim(), 2);
-        assert_eq!(num_centroids, 2);
+        let rows = self.centroids.len();
+        let dims = self.centroids[0].len();
+        assert_eq!(options.dim(), dims);
+        assert_eq!(num_centroids, rows);
         match vectors {
             IvfVectors::F32(vectors) => {
                 assert!(!vectors.doc_ids.is_empty());
                 assert_eq!(vectors.doc_ids.len(), vectors.matrix.rows);
-                assert_eq!(vectors.matrix.dims, 2);
-                assert_eq!(vectors.matrix.values.len(), vectors.matrix.rows * 2);
+                assert_eq!(vectors.matrix.dims, dims);
+                assert_eq!(vectors.matrix.values.len(), vectors.matrix.rows * dims);
             }
         }
         Ok(IvfCentroids::F32(IvfMatrix {
-            values: vec![0.0, 0.0, 10.0, 10.0],
-            rows: 2,
-            dims: 2,
+            values: self.centroids.iter().flatten().copied().collect(),
+            rows,
+            dims,
         }))
     }
 
@@ -51,16 +70,35 @@ impl IvfClusterer for TestClusterer {
         vectors: IvfVectors<'_>,
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>> {
-        assert_eq!(options.dim(), 2);
-        match centroids {
-            IvfCentroids::F32(centroids) => assert_eq!(centroids.rows, 2),
-        }
+        let dims = self.centroids[0].len();
+        assert_eq!(options.dim(), dims);
         let IvfVectors::F32(vectors) = vectors;
+        let IvfCentroids::F32(centroids) = centroids;
+        assert_eq!(centroids.rows, self.centroids.len());
+        assert_eq!(centroids.dims, dims);
         Ok(vectors
             .matrix
             .values
             .chunks_exact(vectors.matrix.dims)
-            .map(|vector| if vector[0] < 5.0 { 0 } else { 1 })
+            .map(|v| {
+                let mut best_idx = 0usize;
+                let mut best_d2 = f32::INFINITY;
+                for (i, c) in centroids.values.chunks_exact(centroids.dims).enumerate() {
+                    let d2 = v
+                        .iter()
+                        .zip(c.iter())
+                        .map(|(a, b)| {
+                            let d = a - b;
+                            d * d
+                        })
+                        .sum::<f32>();
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best_idx = i;
+                    }
+                }
+                best_idx as u32
+            })
             .collect())
     }
 }
@@ -77,7 +115,10 @@ fn test_merge_ivf_writes_meta_assignments_and_vec() -> crate::Result<()> {
             vector_clustering_threshold: 1,
             ..IndexSettings::default()
         })
-        .ivf_clusterer(Arc::new(TestClusterer))
+        .ivf_clusterer(ParametricClusterer::new(vec![
+            vec![0.0, 0.0],
+            vec![10.0, 10.0],
+        ]))
         .create_in_ram()?;
 
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -173,7 +214,10 @@ fn test_ivf_assignments_and_vec_components_are_lazy() -> crate::Result<()> {
             vector_clustering_threshold: 1,
             ..IndexSettings::default()
         })
-        .ivf_clusterer(Arc::new(TestClusterer))
+        .ivf_clusterer(ParametricClusterer::new(vec![
+            vec![0.0, 0.0],
+            vec![10.0, 10.0],
+        ]))
         .open_or_create(directory)?;
 
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
