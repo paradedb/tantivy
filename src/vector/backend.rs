@@ -8,12 +8,16 @@
 //! Adding a new format (HNSW, etc.) is a new enum variant — the
 //! collector layer doesn't change.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
+
+use common::BitSet;
 
 use super::flat::FlatVectorColumn;
 use super::ivf::{AdaptiveProbeParams, IvfVectorColumn};
 use super::options::{Metric, VectorElement};
 use super::reader::{VectorColumn, VectorColumnReader, VectorReader};
+use crate::collector::sort_key::NaturalComparator;
 use crate::collector::TopNComputer;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
@@ -33,15 +37,10 @@ pub struct FlatBackend<T: VectorElement> {
 }
 
 pub struct IvfBackend<T: VectorElement> {
-    #[allow(dead_code)] // wired up when the IVF backend lands
     column: IvfVectorColumn,
-    #[allow(dead_code)]
     metric: Metric,
-    #[allow(dead_code)]
     query: Arc<Vec<T>>,
-    #[allow(dead_code)]
     adaptive: AdaptiveProbeParams,
-    #[allow(dead_code)]
     segment_ord: SegmentOrdinal,
 }
 
@@ -140,22 +139,122 @@ impl<T: VectorElement> FlatBackend<T> {
 impl<T: VectorElement> IvfBackend<T> {
     fn top_n(
         &self,
-        _weight: &dyn Weight,
-        _segment_reader: &SegmentReader,
-        _top_n: usize,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        // Sketch of the implementation when the IVF reader lands:
-        //   1. Drain the filter `DocSet` into a RoaringBitmap via weight.for_each_no_score(reader,
-        //      |docs| bitmap.insert_many(docs)).
-        //   2. probe_order = self.column.rank_centroids(&self.query, self.metric).
-        //   3. for each cluster in probe_order, intersect its doc ids with the bitmap, score
-        //      survivors via metric.similarity_bytes against
-        //      self.column.vector_bytes_in_cluster(cluster, doc), and push each into a TopNComputer
-        //      via `push_unordered` (cluster-order iteration breaks the ascending-D invariant of
-        //      plain `push`).
-        //   4. Stop when AdaptiveProbeParams convergence criterion fires.
-        //   5. Tag results with `self.segment_ord` as a `DocAddress` on the way out.
-        todo!("IVF segment-level top-N")
+        if top_n == 0 {
+            return Ok(Vec::new());
+        }
+        let max_doc = segment_reader.max_doc();
+        if max_doc == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Drain the filter `DocSet` into a dense BitSet for random
+        // membership testing per cluster doc. The BitSet allocates
+        // `max_doc / 8` bytes regardless of filter selectivity —
+        // inherent to IVF needing O(1) membership tests on
+        // out-of-order doc ids. Revisit only if memory profiling
+        // flags it.
+        let mut filter = BitSet::with_max_value(max_doc);
+        weight.for_each_no_score(segment_reader, &mut |docs| {
+            for &doc in docs {
+                filter.insert(doc);
+            }
+        })?;
+        if filter.len() == 0 {
+            return Ok(Vec::new());
+        }
+        let alive = segment_reader.alive_bitset();
+
+        let stride = self.column.dim() * T::SIZE_BYTES;
+        let centroid_bytes = self.column.centroid_bytes();
+        let num_centroids = centroid_bytes.len() / stride;
+        if num_centroids == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Rank centroids descending by similarity. Full scan over
+        // `num_centroids` is the dominant fixed cost; inherent to
+        // flat-centroid IVF, unrelated to the storage layout.
+        let mut ranked: Vec<(f32, usize)> = (0..num_centroids)
+            .map(|c| {
+                let cb = &centroid_bytes[c * stride..(c + 1) * stride];
+                (self.metric.similarity_bytes(&self.query[..], cb), c)
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+
+        let best = ranked[0].0;
+        let threshold = adaptive_threshold(self.metric, best, self.adaptive.epsilon);
+        // Resolve the candidate floor at the call site so a default
+        // `min_candidates = 0` still gives a sane `4 × top_n` floor.
+        // Critical for selective filters where a single near cluster
+        // yields few survivors — without the floor the loop trips the
+        // threshold gate immediately and returns < K results.
+        let min_candidates = self.adaptive.min_candidates.max(4 * top_n);
+
+        // Adaptive probe loop. Cluster-order arrival of survivors
+        // forbids the ascending-D shortcut in `push`; use
+        // `push_unordered`. The filter check is cheap (constant-time
+        // bitset lookup) so we do it before the more expensive alive
+        // check + similarity score.
+        //
+        // Note on `NaturalComparator` (vs the `TopNComputer::new`
+        // default): vector similarity is "higher = better", so we
+        // want top-N *largest* scores in descending order. The
+        // default `new()` wires `ReverseComparator`, which keeps
+        // top-N *smallest* in ascending order — correct for
+        // ascending-distance metrics but inverted for our convention.
+        let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
+            top_n,
+            NaturalComparator,
+        );
+        let mut candidates = 0usize;
+
+        for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
+            if probe_count >= self.adaptive.max_nprobe {
+                break;
+            }
+            if centroid_score < threshold
+                && candidates >= min_candidates
+                && probe_count >= self.adaptive.min_nprobe
+            {
+                break;
+            }
+
+            let Some(doc_ids) = self.column.cluster_doc_ids(cluster)? else {
+                continue;
+            };
+            let cluster_vecs = self.column.cluster_vector_bytes(cluster)?;
+            let cluster_vec_slice = cluster_vecs.as_slice();
+
+            for (local_i, &doc) in doc_ids.iter().enumerate() {
+                if !filter.contains(doc) {
+                    continue;
+                }
+                if let Some(bs) = alive {
+                    if !bs.is_alive(doc) {
+                        continue;
+                    }
+                }
+                let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
+                let score = self.metric.similarity_bytes(&self.query[..], vbytes);
+                topn.push_unordered(score, doc);
+                candidates += 1;
+            }
+        }
+
+        // Drain best-first, tag with our segment_ord. The collector's
+        // `merge_fruits` flattens across segments, sorts descending,
+        // and applies offset/limit.
+        let segment_ord = self.segment_ord;
+        Ok(topn
+            .into_sorted_vec()
+            .into_iter()
+            .map(|cd| (cd.sort_key, DocAddress::new(segment_ord, cd.doc)))
+            .collect())
     }
 }
 
@@ -264,5 +363,442 @@ mod tests {
         // threshold collapses to 0 because |0| = 0.
         let dot_zero = adaptive_threshold(Metric::Dot, 0.0, 0.5);
         assert_eq!(dot_zero, 0.0);
+    }
+
+    // ============================================================
+    // IVF `top_n` test gate.
+    // ============================================================
+
+    use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
+    use crate::schema::{IndexRecordOption, Term};
+    use crate::vector::ivf::test_harness::{
+        brute_force_oracle, build_ivf_segment, decode_vec, open_ivf_column, IvfFixture,
+    };
+
+    /// Run `IvfBackend::top_n` against the fixture's single segment with
+    /// the given filter query (`None` ⇒ `AllQuery`) and adaptive params.
+    /// Returns the per-segment hits in the backend's native order
+    /// (best-first / ascending-doc tiebreak).
+    fn run_top_n(
+        fixture: &IvfFixture,
+        filter: Option<&dyn Query>,
+        query: Vec<f32>,
+        k: usize,
+        params: AdaptiveProbeParams,
+    ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        let searcher = fixture.index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let scoring = EnableScoring::disabled_from_searcher(&searcher);
+        let weight: Box<dyn Weight> = match filter {
+            Some(q) => q.weight(scoring)?,
+            None => AllQuery.weight(scoring)?,
+        };
+        let backend = VectorBackend::<f32>::for_segment(
+            segment_reader,
+            0,
+            fixture.vec_field,
+            Arc::new(query),
+            params,
+        )?;
+        backend.top_n(weight.as_ref(), segment_reader, k)
+    }
+
+    fn exhaustive_params(num_centroids: usize) -> AdaptiveProbeParams {
+        // Wide epsilon + nprobe ceiling = num_centroids forces a full
+        // exhaustive scan. Used to assert correctness against the
+        // brute-force oracle.
+        AdaptiveProbeParams {
+            epsilon: 1e6,
+            min_candidates: 0,
+            min_nprobe: num_centroids,
+            max_nprobe: num_centroids,
+        }
+    }
+
+    fn assert_hits_match_oracle(
+        hits: &[(Score, DocAddress)],
+        oracle: &[(Score, DocId)],
+        label: &str,
+    ) {
+        assert_eq!(hits.len(), oracle.len(), "{label}: length mismatch");
+        for (i, ((score, addr), (oscore, odoc))) in hits.iter().zip(oracle.iter()).enumerate() {
+            assert_eq!(addr.doc_id, *odoc, "{label}: doc mismatch at rank {i}");
+            assert!(
+                (*score - *oscore).abs() < 1e-5,
+                "{label}: score mismatch at rank {i}: {score} vs {oscore}",
+            );
+        }
+    }
+
+    // 1+2. Exhaustive probing matches the brute-force oracle exactly
+    // for L2 across several queries and K. The oracle is ground truth;
+    // if this fails, the bug is in ranking/scoring/drain.
+    #[test]
+    fn ivf_top_n_brute_force_oracle_l2() -> crate::Result<()> {
+        let centroids = vec![vec![0.0_f32, 0.0], vec![10.0, 10.0]];
+        let docs = vec![
+            ("a", vec![1.0_f32, 0.2]),
+            ("a", vec![0.3, 1.1]),
+            ("a", vec![2.2, 2.7]),
+            ("b", vec![9.4, 9.1]),
+            ("b", vec![11.3, 10.6]),
+            ("b", vec![8.2, 12.1]),
+        ];
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+        let column = open_ivf_column(&fixture)?;
+        let params = exhaustive_params(2);
+
+        for query in [
+            vec![0.5_f32, 0.5],
+            vec![9.5, 9.5],
+            vec![5.0, 0.0],
+            vec![3.7, 11.2],
+        ] {
+            for k in [1usize, 3, 6, 10] {
+                let oracle = brute_force_oracle(&column, Metric::L2, &query, k, None, None);
+                let hits = run_top_n(&fixture, None, query.clone(), k, params.clone())?;
+                assert_hits_match_oracle(
+                    &hits,
+                    &oracle,
+                    &format!("L2 exhaustive query={query:?} k={k}"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // 8. Same exhaustive correctness for Cosine, confirming the metric
+    // threads through generically.
+    #[test]
+    fn ivf_top_n_brute_force_oracle_cosine() -> crate::Result<()> {
+        let centroids = vec![vec![1.0_f32, 0.0], vec![0.0, 1.0]];
+        let docs = vec![
+            ("a", vec![0.95_f32, 0.1]),
+            ("a", vec![0.8, 0.15]),
+            ("a", vec![1.0, -0.05]),
+            ("b", vec![0.05, 0.97]),
+            ("b", vec![0.12, 0.85]),
+            ("b", vec![-0.04, 1.0]),
+        ];
+        let fixture = build_ivf_segment(2, Metric::Cosine, centroids, &docs)?;
+        let column = open_ivf_column(&fixture)?;
+        let params = exhaustive_params(2);
+        for query in [vec![1.0_f32, 0.0], vec![0.0, 1.0], vec![0.7, 0.3]] {
+            for k in [1usize, 3, 6] {
+                let oracle = brute_force_oracle(&column, Metric::Cosine, &query, k, None, None);
+                let hits = run_top_n(&fixture, None, query.clone(), k, params.clone())?;
+                assert_hits_match_oracle(
+                    &hits,
+                    &oracle,
+                    &format!("Cosine exhaustive query={query:?} k={k}"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // 3. The trap: query closest to centroid A, true NN in cluster B.
+    // Adaptive probing finds it; max_nprobe=1 must miss. The setup
+    // assertions confirm we actually constructed the trap geometry
+    // before exercising the adaptive boundary — without them a
+    // slightly-off geometry could trivialize the test.
+    #[test]
+    fn ivf_top_n_trap_case() -> crate::Result<()> {
+        let centroids = vec![vec![0.0_f32, 0.0], vec![10.0, 10.0]];
+        // A-side docs deliberately far from the [1,1] query; B-side
+        // trap doc [5, 5.01] sits just over the perpendicular bisector
+        // (x+y=10 boundary) so it lands in cluster 1 yet is much
+        // closer to the query than any A-side doc.
+        let docs = vec![
+            ("far_a", vec![0.0_f32, -10.0]),
+            ("far_a", vec![-10.0, 0.0]),
+            ("trap_b", vec![5.0, 5.01]),
+            ("anchor_b", vec![10.0, 10.0]),
+        ];
+        let fixture = build_ivf_segment(2, Metric::L2, centroids.clone(), &docs)?;
+        let column = open_ivf_column(&fixture)?;
+        let query = vec![1.0_f32, 1.0];
+
+        // ---- Setup assertions (per Ruchir's instruction #4) ----
+        // (i) Trap doc must be in cluster 1 (B), not cluster 0 (A).
+        // Identify it by its known vector signature.
+        let cluster_a = column.cluster_doc_ids(0)?.expect("cluster A");
+        let cluster_b = column.cluster_doc_ids(1)?.expect("cluster B");
+        let is_trap = |doc: DocId| -> bool {
+            let v = decode_vec(column.vector_bytes_at(doc).expect("vec"));
+            (v[0] - 5.0).abs() < 1e-3 && (v[1] - 5.01).abs() < 1e-3
+        };
+        let trap_doc = *cluster_b
+            .iter()
+            .find(|&&d| is_trap(d))
+            .expect("trap doc [5, 5.01] must be in cluster B");
+        assert!(
+            !cluster_a.iter().any(|&d| is_trap(d)),
+            "trap doc must not be in cluster A"
+        );
+
+        // (ii) Query's nearest centroid must be A (cluster 0).
+        let stride = column.dim() * <f32 as VectorElement>::SIZE_BYTES;
+        let cb = column.centroid_bytes();
+        let score_a = Metric::L2.similarity_bytes(&query, &cb[0..stride]);
+        let score_b = Metric::L2.similarity_bytes(&query, &cb[stride..2 * stride]);
+        assert!(
+            score_a > score_b,
+            "query's nearest centroid must be A: score_a={score_a} vs score_b={score_b}",
+        );
+
+        // (iii) Trap doc must genuinely be the true top-1 — without
+        // this, "miss" and "find" would be indistinguishable.
+        let oracle = brute_force_oracle(&column, Metric::L2, &query, 1, None, None);
+        assert_eq!(oracle[0].1, trap_doc, "true NN must be the trap doc");
+
+        // ---- Behavioral check 1: max_nprobe=1 misses the trap. ----
+        let one_probe = AdaptiveProbeParams {
+            epsilon: 1e6,
+            min_candidates: 0,
+            min_nprobe: 1,
+            max_nprobe: 1,
+        };
+        let hits1 = run_top_n(&fixture, None, query.clone(), 1, one_probe)?;
+        assert_eq!(hits1.len(), 1);
+        assert_ne!(
+            hits1[0].1.doc_id, trap_doc,
+            "max_nprobe=1 should miss the trap doc (probes only cluster A)",
+        );
+
+        // ---- Behavioral check 2: adaptive probing finds it. ----
+        let hits2 = run_top_n(&fixture, None, query, 1, exhaustive_params(2))?;
+        assert_eq!(hits2.len(), 1);
+        assert_eq!(
+            hits2[0].1.doc_id, trap_doc,
+            "exhaustive probing should find the trap doc",
+        );
+
+        Ok(())
+    }
+
+    // 4. Filter selectivity: only docs in the filter set appear, and
+    // the result equals the oracle restricted to the filter.
+    #[test]
+    fn ivf_top_n_filter_selectivity() -> crate::Result<()> {
+        let centroids = vec![vec![0.0_f32, 0.0], vec![10.0, 10.0]];
+        let docs = vec![
+            ("a", vec![1.0_f32, 0.2]),
+            ("a", vec![0.3, 1.1]),
+            ("a", vec![2.2, 2.7]),
+            ("b", vec![9.4, 9.1]),
+            ("b", vec![11.3, 10.6]),
+            ("b", vec![8.2, 12.1]),
+        ];
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+        let column = open_ivf_column(&fixture)?;
+        // Build the filter bitset that matches the "b" category.
+        let searcher = fixture.index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let max_doc = segment_reader.max_doc();
+        let mut filter_set = BitSet::with_max_value(max_doc);
+        let b_term = Term::from_field_text(fixture.category_field, "b");
+        let filter_query = TermQuery::new(b_term, IndexRecordOption::Basic);
+        let weight = filter_query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        weight.for_each_no_score(segment_reader, &mut |docs| {
+            for &d in docs {
+                filter_set.insert(d);
+            }
+        })?;
+
+        let query = vec![0.5_f32, 0.5];
+        let oracle = brute_force_oracle(&column, Metric::L2, &query, 10, Some(&filter_set), None);
+        let hits = run_top_n(
+            &fixture,
+            Some(&filter_query),
+            query,
+            10,
+            exhaustive_params(2),
+        )?;
+        assert_hits_match_oracle(&hits, &oracle, "filtered L2");
+        // Every hit is in the filter set (sanity beyond oracle equality).
+        for (_, addr) in &hits {
+            assert!(
+                filter_set.contains(addr.doc_id),
+                "hit outside filter: {addr:?}"
+            );
+        }
+        Ok(())
+    }
+
+    // 5. Empty filter returns empty results, no panic.
+    #[test]
+    fn ivf_top_n_empty_filter() -> crate::Result<()> {
+        let centroids = vec![vec![0.0_f32, 0.0], vec![10.0, 10.0]];
+        let docs = vec![
+            ("a", vec![1.0_f32, 0.2]),
+            ("a", vec![0.3, 1.1]),
+            ("b", vec![9.4, 9.1]),
+            ("b", vec![11.3, 10.6]),
+        ];
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+        // No "z" docs exist ⇒ TermQuery yields an empty DocSet.
+        let z_term = Term::from_field_text(fixture.category_field, "z");
+        let empty_filter = TermQuery::new(z_term, IndexRecordOption::Basic);
+        let hits = run_top_n(
+            &fixture,
+            Some(&empty_filter),
+            vec![0.0_f32, 0.0],
+            5,
+            exhaustive_params(2),
+        )?;
+        assert!(hits.is_empty(), "empty filter must produce no hits");
+        Ok(())
+    }
+
+    // 6. K > surviving candidates: returns all survivors, sorted, no
+    // panic.
+    #[test]
+    fn ivf_top_n_k_exceeds_candidates() -> crate::Result<()> {
+        let centroids = vec![vec![0.0_f32, 0.0], vec![10.0, 10.0]];
+        let docs = vec![
+            ("a", vec![1.0_f32, 0.2]),
+            ("a", vec![0.3, 1.1]),
+            ("b", vec![9.4, 9.1]),
+            ("b", vec![11.3, 10.6]),
+        ];
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+        let column = open_ivf_column(&fixture)?;
+        let query = vec![0.0_f32, 0.0];
+        let hits = run_top_n(&fixture, None, query.clone(), 100, exhaustive_params(2))?;
+        let oracle = brute_force_oracle(&column, Metric::L2, &query, 100, None, None);
+        assert_eq!(hits.len(), 4, "should return all four docs");
+        assert_hits_match_oracle(&hits, &oracle, "K > candidates");
+        Ok(())
+    }
+
+    // 7. Deletes: a doc marked deleted must never appear, even if it
+    // would otherwise rank top-K. Confirms the separate alive-check
+    // (filter bitmap doesn't carry delete info).
+    #[test]
+    fn ivf_top_n_respects_deletes() -> crate::Result<()> {
+        let centroids = vec![vec![0.0_f32, 0.0], vec![10.0, 10.0]];
+        let docs = vec![
+            ("doomed", vec![0.01_f32, 0.01]), // would-be top-1 — gets deleted
+            ("survivor_a", vec![1.0, 0.5]),
+            ("survivor_b", vec![9.4, 9.1]),
+            ("survivor_b", vec![11.3, 10.6]),
+        ];
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+
+        // Apply delete to the "doomed" docs and commit. NoMergePolicy
+        // so we don't lose the IVF segment.
+        {
+            let mut writer: crate::IndexWriter =
+                fixture.index.writer_with_num_threads(1, 15_000_000)?;
+            writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+            writer.delete_term(Term::from_field_text(fixture.category_field, "doomed"));
+            writer.commit()?;
+        }
+
+        // Identify the "doomed" doc id so we can assert it's absent
+        // from the results.
+        let column = open_ivf_column(&fixture)?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let alive = segment_reader
+            .alive_bitset()
+            .expect("delete should produce an alive bitset");
+        let doomed: Vec<DocId> = (0..segment_reader.max_doc())
+            .filter(|&d| !alive.is_alive(d))
+            .collect();
+        assert!(!doomed.is_empty(), "expected at least one deleted doc");
+        // Sanity: the doomed doc is the one near the origin.
+        for &d in &doomed {
+            let v = decode_vec(column.vector_bytes_at(d).expect("doomed has vec"));
+            assert!(
+                v[0].abs() < 0.1 && v[1].abs() < 0.1,
+                "doomed should be near origin: {v:?}"
+            );
+        }
+
+        let query = vec![0.0_f32, 0.0];
+        let hits = run_top_n(&fixture, None, query, 10, exhaustive_params(2))?;
+        for (_, addr) in &hits {
+            assert!(
+                !doomed.contains(&addr.doc_id),
+                "deleted doc {addr:?} surfaced in results",
+            );
+        }
+        assert!(!hits.is_empty(), "should return surviving docs");
+        Ok(())
+    }
+
+    // 9. min_candidates floor: with a setup where cluster A's
+    // closest-to-query has fewer survivors than 4*top_n, the loop must
+    // keep probing into cluster B to satisfy the floor even though
+    // epsilon=0 makes the threshold trip immediately.
+    #[test]
+    fn ivf_top_n_min_candidates_floor() -> crate::Result<()> {
+        let centroids = vec![vec![0.0_f32, 0.0], vec![10.0, 10.0]];
+        // Cluster A has one doc near the query; cluster B has the true
+        // top-1 by query distance. Query nearest centroid is A.
+        let docs = vec![
+            ("a_only", vec![3.0_f32, 3.0]),   // A-side
+            ("b_close", vec![5.0_f32, 5.01]), // B-side, true NN
+            ("b_far", vec![10.0_f32, 10.0]),  // B-side anchor
+            ("b_far2", vec![11.0_f32, 9.5]),  // B-side anchor
+        ];
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+        let column = open_ivf_column(&fixture)?;
+        let query = vec![1.0_f32, 1.0];
+
+        // Setup: verify nearest centroid is A, and the true top-1 is
+        // the [5, 5.01] B-side doc (so the floor MUST kick in to find
+        // it past the immediate threshold trip).
+        let stride = column.dim() * <f32 as VectorElement>::SIZE_BYTES;
+        let cb = column.centroid_bytes();
+        let score_a = Metric::L2.similarity_bytes(&query, &cb[0..stride]);
+        let score_b = Metric::L2.similarity_bytes(&query, &cb[stride..2 * stride]);
+        assert!(score_a > score_b, "nearest centroid must be A");
+
+        // Params: epsilon=0 makes the threshold trip the moment we
+        // move off centroid A; max_nprobe=2 means we *could* probe B
+        // but the threshold + min_nprobe=1 gate alone would stop us
+        // after A. Only the candidate floor (4 * top_n = 4) — with
+        // only 1 candidate after A — keeps us probing.
+        let params = AdaptiveProbeParams {
+            epsilon: 0.0,
+            min_candidates: 0,
+            min_nprobe: 1,
+            max_nprobe: 2,
+        };
+        let top_k = 1;
+        let hits = run_top_n(&fixture, None, query.clone(), top_k, params)?;
+        let oracle = brute_force_oracle(&column, Metric::L2, &query, top_k, None, None);
+        assert_hits_match_oracle(&hits, &oracle, "floor activated");
+
+        // Confirm the floor was load-bearing: the floor at the call
+        // site is 4 * top_n = 4, A yields only 1 survivor, so probing
+        // had to continue to B to reach the floor.
+        let cluster_a_docs = column.cluster_doc_ids(0)?.expect("A");
+        assert!(
+            cluster_a_docs.len() < 4 * top_k,
+            "test geometry requires |A| < 4*top_n: |A|={}",
+            cluster_a_docs.len(),
+        );
+        Ok(())
+    }
+
+    // Extra sanity: top_n=0 returns empty without touching the column.
+    #[test]
+    fn ivf_top_n_zero_returns_empty() -> crate::Result<()> {
+        let centroids = vec![vec![0.0_f32, 0.0], vec![10.0, 10.0]];
+        let docs = vec![("a", vec![1.0_f32, 0.2]), ("b", vec![9.4, 9.1])];
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+        let hits = run_top_n(
+            &fixture,
+            None,
+            vec![0.0_f32, 0.0],
+            0,
+            AdaptiveProbeParams::default(),
+        )?;
+        assert!(hits.is_empty());
+        Ok(())
     }
 }
