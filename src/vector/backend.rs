@@ -146,12 +146,56 @@ impl<T: VectorElement> FlatBackend<T> {
     }
 }
 
+/// Test-only instrumentation collected by `IvfBackend::top_n_instrumented`:
+/// which clusters were probed (in probe order) and how many candidate
+/// docs were scored. Useful for asserting efficiency properties of the
+/// adaptive probe loop in scenarios that pair the IVF backend with a
+/// known geometry.
+///
+/// The production `top_n` entry point passes `None` to the shared inner
+/// helper and pays no allocation for stats accumulation.
+#[derive(Debug, Default)]
+pub struct ProbeStats {
+    /// Clusters visited by the probe loop, in probe order. A cluster
+    /// appears here once we've passed the stop-condition gate for it,
+    /// regardless of whether its doc-ids slice ends up empty.
+    pub probed_clusters: Vec<usize>,
+    /// Number of docs that survived the filter + alive checks and got
+    /// scored against the query.
+    pub candidates_scored: usize,
+}
+
 impl<T: VectorElement> IvfBackend<T> {
     fn top_n(
         &self,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
         top_n: usize,
+    ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        self.top_n_inner(weight, segment_reader, top_n, None)
+    }
+
+    /// Same logic as `top_n` but also returns a `ProbeStats` describing
+    /// which clusters the adaptive loop visited. Test-only seam used by
+    /// the 2D fixture scenarios.
+    #[cfg(test)]
+    pub(crate) fn top_n_instrumented(
+        &self,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
+    ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+        let mut stats = ProbeStats::default();
+        let hits = self.top_n_inner(weight, segment_reader, top_n, Some(&mut stats))?;
+        Ok((hits, stats))
+    }
+
+    fn top_n_inner(
+        &self,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
+        mut stats: Option<&mut ProbeStats>,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
         if top_n == 0 {
             return Ok(Vec::new());
@@ -234,6 +278,13 @@ impl<T: VectorElement> IvfBackend<T> {
                 break;
             }
 
+            // Record the probe before doing any work, so even an empty
+            // cluster (no doc-ids slice) counts as "probed" — that's
+            // the right unit for the efficiency assertions.
+            if let Some(s) = stats.as_deref_mut() {
+                s.probed_clusters.push(cluster);
+            }
+
             let Some(doc_ids) = self.column.cluster_doc_ids(cluster)? else {
                 continue;
             };
@@ -253,6 +304,9 @@ impl<T: VectorElement> IvfBackend<T> {
                 let score = self.metric.similarity_bytes(&self.query[..], vbytes);
                 topn.push_unordered(score, doc);
                 candidates += 1;
+                if let Some(s) = stats.as_deref_mut() {
+                    s.candidates_scored += 1;
+                }
             }
         }
 
@@ -856,6 +910,51 @@ mod tests {
             AdaptiveProbeParams::default(),
         )?;
         assert!(hits.is_empty());
+        Ok(())
+    }
+
+    // Smoke test for the instrumented entry point: probed_clusters is
+    // non-empty, every entry is within [0, num_centroids), and
+    // candidates_scored is at most total docs. Exhaustive params on a
+    // 2-cluster segment must visit both clusters.
+    #[test]
+    fn ivf_top_n_instrumented_collects_probe_stats() -> crate::Result<()> {
+        let centroids = vec![vec![0.0_f32, 0.0], vec![10.0, 10.0]];
+        let docs = vec![
+            ("a", vec![1.0_f32, 0.0]),
+            ("a", vec![0.0, 1.0]),
+            ("b", vec![9.0, 11.0]),
+            ("b", vec![11.0, 9.0]),
+        ];
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+        let searcher = fixture.index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let weight = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let backend = VectorBackend::<f32>::for_segment(
+            segment_reader,
+            0,
+            fixture.vec_field,
+            Arc::new(vec![0.0_f32, 0.0]),
+            exhaustive_params(2),
+        )?;
+        let ivf = match &backend {
+            VectorBackend::Ivf(b) => b,
+            _ => panic!("expected IVF backend"),
+        };
+        let (hits, stats) = ivf.top_n_instrumented(weight.as_ref(), segment_reader, 4)?;
+        assert_eq!(hits.len(), 4);
+        // Exhaustive params on a 2-cluster segment ⇒ both clusters probed.
+        assert_eq!(
+            stats.probed_clusters.len(),
+            2,
+            "probed: {:?}",
+            stats.probed_clusters
+        );
+        for &c in &stats.probed_clusters {
+            assert!(c < 2, "probed cluster {c} out of range");
+        }
+        // 4 docs all pass AllQuery + are alive ⇒ all 4 scored.
+        assert_eq!(stats.candidates_scored, 4);
         Ok(())
     }
 }
