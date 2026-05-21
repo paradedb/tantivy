@@ -12,6 +12,7 @@
 mod backend;
 mod collector;
 mod distance;
+mod meta;
 mod options;
 mod plugin;
 mod reader;
@@ -22,7 +23,8 @@ pub mod ivf;
 pub use backend::VectorBackend;
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
-pub use flat::{FlatVecReader, FlatVecWriter, VectorColumn};
+pub use flat::{FlatVecReader, FlatVectorColumn, FlatVecWriter};
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};
+pub(crate) use plugin::VECTOR_PLUGIN_NAME;
 pub use plugin::VectorPlugin;
-pub use reader::VectorReader;
+pub use reader::{VectorColumn, VectorColumnReader, VectorReader};

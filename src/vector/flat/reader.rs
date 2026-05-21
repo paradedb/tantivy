@@ -1,73 +1,148 @@
-//! Stub reader for the flat vector format.
-//!
-//! Until the writer lands, the unified [`VectorPlugin`](crate::vector::VectorPlugin)
-//! isn't registered in `Index::default_plugins`, so this type is
-//! never instantiated at runtime. `open_column` returns `None`, which
-//! sends [`VectorBackend::for_segment`](crate::vector::VectorBackend::for_segment)
-//! to an error path on the no-vector-data branch.
-
 use std::any::Any;
+use std::collections::BTreeMap;
 
+use common::OwnedBytes;
+
+use super::presence::Presence;
+use crate::directory::CompositeFile;
+use crate::index::SegmentComponent;
 use crate::plugin::{PluginReader, PluginReaderContext};
-use crate::schema::Field;
-use crate::DocId;
+use crate::schema::{Field, FieldType};
+use crate::vector::reader::VectorColumnReader;
+use crate::vector::VectorOptions;
+use crate::{DocId, TantivyError};
 
 pub struct FlatVecReader {
-    // TODO: composite file handle, per-field presence sections, dense
-    // row blob, per-field dimension table.
+    composite: CompositeFile,
+    field_options: BTreeMap<Field, VectorOptions>,
+    max_doc: u32,
 }
 
 impl FlatVecReader {
-    pub(crate) fn open(_ctx: &PluginReaderContext) -> crate::Result<Self> {
-        Ok(Self {})
+    pub(crate) fn open(ctx: &PluginReaderContext) -> crate::Result<Self> {
+        let mut field_options = BTreeMap::new();
+        for (field, entry) in ctx.schema.fields() {
+            if let FieldType::Vector(opts) = entry.field_type() {
+                field_options.insert(field, opts.clone());
+            }
+        }
+        let file_slice = ctx
+            .segment_reader
+            .open_read(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()))?;
+        Ok(Self {
+            composite: CompositeFile::open(&file_slice)?,
+            field_options,
+            max_doc: ctx.segment_reader.max_doc(),
+        })
+    }
+}
+
+impl VectorColumnReader for FlatVecReader {
+    type Column = FlatVectorColumn;
+
+    fn open_column(&self, field: Field) -> crate::Result<FlatVectorColumn> {
+        let options = self.field_options.get(&field).cloned().ok_or_else(|| {
+            TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
+        })?;
+        let presence_slice = self.composite.open_read_with_idx(field, 0).ok_or_else(|| {
+            TantivyError::InternalError(format!(
+                "no flat vector data for vector field {field:?} in segment"
+            ))
+        })?;
+        let rows_slice = self.composite.open_read_with_idx(field, 1).ok_or_else(|| {
+            TantivyError::InternalError(format!(
+                "no flat vector data for vector field {field:?} in segment"
+            ))
+        })?;
+        let presence = Presence::open(presence_slice, self.max_doc)?;
+        let row_bytes = rows_slice.read_bytes()?;
+        Ok(FlatVectorColumn {
+            presence,
+            row_bytes,
+            options,
+        })
     }
 
-    pub fn dim(&self, _field: Field) -> Option<usize> {
-        todo!("flat vector reader dim")
+    fn count(&self, field: Field) -> crate::Result<usize> {
+        self.field_options.get(&field).ok_or_else(|| {
+            TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
+        })?;
+        let presence_slice = self.composite.open_read_with_idx(field, 0).ok_or_else(|| {
+            TantivyError::InternalError(format!(
+                "no flat vector data for vector field {field:?} in segment"
+            ))
+        })?;
+        let presence = Presence::open(presence_slice, self.max_doc)?;
+        Ok(presence.num_non_null() as usize)
     }
 
-    /// Open a per-field flat vector column. Stub returns `None`.
-    pub fn open_column(&self, _field: Field) -> Option<VectorColumn> {
-        None
+    fn dim(&self, field: Field) -> crate::Result<usize> {
+        self.field_options
+            .get(&field)
+            .map(VectorOptions::dim)
+            .ok_or_else(|| {
+                TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
+            })
+    }
+}
+
+/// A view over one vector field's data within a single segment.
+///
+/// Layout:
+/// - `presence`: [`Presence::Full`] for dense columns (no bitmap stored, `row_id == doc_id`) or
+///   [`Presence::Optional`] for sparse columns (rank-supporting bitmap).
+/// - `row_bytes`: dense LE blob, exactly `presence.num_non_null()` rows of the schema dtype.
+///
+/// Lookup is `presence.rank_if_exists(doc) -> row_idx`, then
+/// `&row_bytes[row_idx * bytes_per_vector ..]`. In the `Full` case the rank
+/// step is the identity map — no bitmap consulted.
+pub struct FlatVectorColumn {
+    presence: Presence,
+    row_bytes: OwnedBytes,
+    options: VectorOptions,
+}
+
+impl FlatVectorColumn {
+    pub fn dim(&self) -> usize {
+        self.options.dim()
+    }
+
+    /// Number of docs that actually have a vector value.
+    pub fn len(&self) -> usize {
+        self.presence.num_non_null() as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.presence.num_non_null() == 0
+    }
+
+    /// `true` if `doc_id` has a stored vector.
+    #[inline]
+    pub fn contains(&self, doc_id: DocId) -> bool {
+        self.presence.contains(doc_id)
+    }
+
+    /// Borrow the raw little-endian f32 bytes for a single document.
+    ///
+    /// Returns `None` if `doc_id` has no vector. The returned slice is a
+    /// zero-copy borrow into the column's `OwnedBytes` (mmap page cache
+    /// for `MmapDirectory`, refcounted in-memory blob for `RamDirectory`,
+    /// or whatever the backing directory provides).
+    #[inline]
+    pub fn vector_bytes_at(&self, doc_id: DocId) -> Option<&[u8]> {
+        let row_id = self.presence.rank_if_exists(doc_id)? as usize;
+        let stride = self.options.bytes_per_vector();
+        let start = row_id * stride;
+        let end = start + stride;
+        if end > self.row_bytes.len() {
+            return None;
+        }
+        Some(&self.row_bytes[start..end])
     }
 }
 
 impl PluginReader for FlatVecReader {
     fn as_any(&self) -> &dyn Any {
         self
-    }
-}
-
-/// Per-segment, per-field flat-vector column view.
-///
-/// Methods are `todo!()` placeholders — they document the surface that
-/// [`FlatBackend`](crate::vector::VectorBackend) needs from the reader
-/// once the writer/plugin land.
-pub struct VectorColumn {
-    // TODO: presence section (Full / Optional cardinality), zero-copy
-    // borrow of the dense little-endian row bytes, per-row stride.
-}
-
-impl VectorColumn {
-    pub fn dim(&self) -> usize {
-        todo!("flat vector column dim")
-    }
-
-    pub fn len(&self) -> usize {
-        todo!("flat vector column len")
-    }
-
-    pub fn is_empty(&self) -> bool {
-        todo!("flat vector column is_empty")
-    }
-
-    pub fn contains(&self, _doc_id: DocId) -> bool {
-        todo!("flat vector column contains")
-    }
-
-    /// Borrow the raw little-endian element bytes for a single document.
-    /// Returns `None` if `doc_id` has no vector.
-    pub fn vector_bytes_at(&self, _doc_id: DocId) -> Option<&[u8]> {
-        todo!("flat vector column lookup")
     }
 }
