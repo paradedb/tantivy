@@ -112,7 +112,17 @@ impl<T: VectorElement> FlatBackend<T> {
         // `DocAddress`); we tag with `self.segment_ord` at drain time
         // so the collector returns ready-to-use `DocAddress`es without
         // a second pass.
-        let mut topn = TopNComputer::<Score, DocId, _>::new(top_n);
+        //
+        // `NaturalComparator` is required: vector similarity is
+        // "higher = better", so we want top-N *largest*. The default
+        // `TopNComputer::new()` wires `ReverseComparator`, which keeps
+        // top-N *smallest* — for our convention that returns the K
+        // *farthest* docs under truncation. See the matching note in
+        // `IvfBackend::top_n`.
+        let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
+            top_n,
+            NaturalComparator,
+        );
         let alive = segment_reader.alive_bitset();
         weight.for_each_no_score(segment_reader, &mut |docs| {
             for &doc in docs {
