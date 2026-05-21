@@ -507,6 +507,53 @@ mod tests {
         Ok(())
     }
 
+    // Exhaustive-probe correctness for the Dot metric. Mirrors the
+    // L2 and Cosine cases but uses vectors with varied magnitudes so
+    // the ranking is genuinely magnitude-sensitive (not accidentally
+    // cosine-like behavior on near-unit vectors): e.g. query
+    // [1, 0] ranks doc [3, 0.1] (dot = 3) above doc [1, 0] (dot = 1),
+    // which would tie under direction-only similarity.
+    //
+    // EXHAUSTIVE-PROBE ONLY. We deliberately don't add an adaptive
+    // (default-params) Dot test. Dot isn't a metric — no triangle
+    // inequality — so the IVF cluster-locality assumption ("query
+    // near a centroid ⇒ true nearest neighbors live in that cluster")
+    // is heuristic for Dot and can break when a high-magnitude vector
+    // in a far cluster outscores nearby ones. Adaptive Dot recall is
+    // a benchmark question, deferred. This test confirms only that
+    // `Metric::Dot` threads through the backend's full top_n loop and
+    // produces scores that match brute force when every cluster is
+    // visited.
+    #[test]
+    fn ivf_top_n_brute_force_oracle_dot() -> crate::Result<()> {
+        // Centroids on opposite sides of the x-axis; ParametricClusterer
+        // assigns by L2-nearest, so the partition is sign(x).
+        let centroids = vec![vec![1.0_f32, 0.0], vec![-1.0, 0.0]];
+        let docs = vec![
+            ("a", vec![1.0_f32, 0.0]),
+            ("a", vec![3.0, 0.1]),
+            ("a", vec![0.5, 0.5]),
+            ("b", vec![-1.0, 0.0]),
+            ("b", vec![-3.0, 0.0]),
+            ("b", vec![-0.5, 0.5]),
+        ];
+        let fixture = build_ivf_segment(2, Metric::Dot, centroids, &docs)?;
+        let column = open_ivf_column(&fixture)?;
+        let params = exhaustive_params(2);
+        for query in [vec![1.0_f32, 0.0], vec![2.0, 0.0], vec![0.5, -0.5]] {
+            for k in [1usize, 3, 6] {
+                let oracle = brute_force_oracle(&column, Metric::Dot, &query, k, None, None);
+                let hits = run_top_n(&fixture, None, query.clone(), k, params.clone())?;
+                assert_hits_match_oracle(
+                    &hits,
+                    &oracle,
+                    &format!("Dot exhaustive query={query:?} k={k}"),
+                );
+            }
+        }
+        Ok(())
+    }
+
     // 3. The trap: query closest to centroid A, true NN in cluster B.
     // Adaptive probing finds it; max_nprobe=1 must miss. The setup
     // assertions confirm we actually constructed the trap geometry
