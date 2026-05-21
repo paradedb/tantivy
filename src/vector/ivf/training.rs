@@ -42,7 +42,8 @@ pub trait IvfClusterer: Send + Sync + 'static {
             "IvfClusterer assign_batch_size must be greater than 0, got {assign_batch_size}"
         );
 
-        let num_centroids = ((total_target_docs as f64) * f64::from(centroid_ratio)).ceil() as usize;
+        let num_centroids =
+            ((total_target_docs as f64) * f64::from(centroid_ratio)).ceil() as usize;
         let num_centroids = num_centroids.clamp(1, total_target_docs);
         Ok(IvfMergeSettings {
             num_centroids,
@@ -61,18 +62,32 @@ pub struct IvfMergeSettings {
 
 #[derive(Clone, Debug)]
 pub enum IvfCentroids {
-    F32(Vec<Vec<f32>>),
+    F32(IvfMatrix<f32>),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum IvfVectors<'a> {
-    F32(&'a [IvfTypedVector<f32>]),
+    F32(IvfVectorBatch<'a, f32>),
 }
 
 #[derive(Clone, Debug)]
-pub struct IvfTypedVector<T: VectorElement> {
-    pub doc_id: DocId,
-    pub vector: Vec<T>,
+pub struct IvfMatrix<T> {
+    pub values: Vec<T>,
+    pub rows: usize,
+    pub dims: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct IvfMatrixView<'a, T> {
+    pub values: &'a [T],
+    pub rows: usize,
+    pub dims: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct IvfVectorBatch<'a, T> {
+    pub doc_ids: &'a [DocId],
+    pub matrix: IvfMatrixView<'a, T>,
 }
 
 pub(crate) fn decode_row<T: VectorElement>(bytes: &[u8], dim: usize) -> crate::Result<Vec<T>> {
@@ -83,13 +98,13 @@ pub(crate) fn decode_row<T: VectorElement>(bytes: &[u8], dim: usize) -> crate::R
             bytes.len()
         )));
     }
-    Ok(bytes.chunks_exact(T::SIZE_BYTES).map(T::decode_le).collect())
+    Ok(bytes
+        .chunks_exact(T::SIZE_BYTES)
+        .map(T::decode_le)
+        .collect())
 }
 
-pub(crate) fn encode_vector<T: VectorElement>(
-    vector: &[T],
-    dim: usize,
-) -> crate::Result<Vec<u8>> {
+pub(crate) fn encode_vector<T: VectorElement>(vector: &[T], dim: usize) -> crate::Result<Vec<u8>> {
     if vector.len() != dim {
         return Err(TantivyError::InvalidArgument(format!(
             "centroid length mismatch: expected {dim} elements, got {}",

@@ -6,7 +6,7 @@ use crate::indexer::NoMergePolicy;
 use crate::schema::{Schema, STORED, TEXT};
 use crate::vector::meta::VECMETA_EXT;
 use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfVectors, Metric, VectorColumn, VectorColumnReader,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfVectors, Metric, VectorColumn, VectorColumnReader,
     VectorOptions, VECTOR_PLUGIN_NAME,
 };
 use crate::{Index, IndexSettings, IndexWriter, TantivyDocument};
@@ -31,9 +31,18 @@ impl IvfClusterer for TestClusterer {
         assert_eq!(options.dim(), 2);
         assert_eq!(num_centroids, 2);
         match vectors {
-            IvfVectors::F32(vectors) => assert!(!vectors.is_empty()),
+            IvfVectors::F32(vectors) => {
+                assert!(!vectors.doc_ids.is_empty());
+                assert_eq!(vectors.doc_ids.len(), vectors.matrix.rows);
+                assert_eq!(vectors.matrix.dims, 2);
+                assert_eq!(vectors.matrix.values.len(), vectors.matrix.rows * 2);
+            }
         }
-        Ok(IvfCentroids::F32(vec![vec![0.0, 0.0], vec![10.0, 10.0]]))
+        Ok(IvfCentroids::F32(IvfMatrix {
+            values: vec![0.0, 0.0, 10.0, 10.0],
+            rows: 2,
+            dims: 2,
+        }))
     }
 
     fn assign(
@@ -44,12 +53,14 @@ impl IvfClusterer for TestClusterer {
     ) -> crate::Result<Vec<u32>> {
         assert_eq!(options.dim(), 2);
         match centroids {
-            IvfCentroids::F32(centroids) => assert_eq!(centroids.len(), 2),
+            IvfCentroids::F32(centroids) => assert_eq!(centroids.rows, 2),
         }
         let IvfVectors::F32(vectors) = vectors;
         Ok(vectors
-            .iter()
-            .map(|vector| if vector.vector[0] < 5.0 { 0 } else { 1 })
+            .matrix
+            .values
+            .chunks_exact(vectors.matrix.dims)
+            .map(|vector| if vector[0] < 5.0 { 0 } else { 1 })
             .collect())
     }
 }
@@ -101,21 +112,15 @@ fn test_merge_ivf_writes_meta_assignments_and_vec() -> crate::Result<()> {
     let segments = searcher.segment_readers();
     assert_eq!(segments.len(), 1);
     let segment = &segments[0];
-    assert!(
-        segment
-            .open_read(SegmentComponent::Custom(VECMETA_EXT.to_string()))
-            .is_ok()
-    );
-    assert!(
-        segment
-            .open_read(SegmentComponent::Custom(ASSIGNMENTS_EXT.to_string()))
-            .is_ok()
-    );
-    assert!(
-        segment
-            .open_read(SegmentComponent::Custom(IVFVEC_EXT.to_string()))
-            .is_ok()
-    );
+    assert!(segment
+        .open_read(SegmentComponent::Custom(VECMETA_EXT.to_string()))
+        .is_ok());
+    assert!(segment
+        .open_read(SegmentComponent::Custom(ASSIGNMENTS_EXT.to_string()))
+        .is_ok());
+    assert!(segment
+        .open_read(SegmentComponent::Custom(IVFVEC_EXT.to_string()))
+        .is_ok());
 
     let vec_reader: Arc<crate::vector::VectorReader> = segment
         .plugin_reader::<crate::vector::VectorReader>(VECTOR_PLUGIN_NAME)?
