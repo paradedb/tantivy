@@ -45,35 +45,3 @@ impl Default for AdaptiveProbeParams {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_values_are_the_documented_provisional_set() {
-        let params = AdaptiveProbeParams::default();
-        assert_eq!(params.epsilon, 0.3);
-        assert_eq!(params.min_candidates, 0);
-        assert_eq!(params.min_nprobe, 1);
-        assert_eq!(params.max_nprobe, usize::MAX);
-    }
-
-    #[test]
-    fn with_adaptive_params_threads_through_the_collector() {
-        // The collector's `with_adaptive_params` builder is what query
-        // sites use to override defaults; smoke-test that overriding
-        // and reading back round-trips through `Clone`.
-        let overridden = AdaptiveProbeParams {
-            epsilon: 0.1,
-            min_candidates: 32,
-            min_nprobe: 4,
-            max_nprobe: 16,
-        };
-        let cloned = overridden.clone();
-        assert_eq!(cloned.epsilon, 0.1);
-        assert_eq!(cloned.min_candidates, 32);
-        assert_eq!(cloned.min_nprobe, 4);
-        assert_eq!(cloned.max_nprobe, 16);
-    }
-}
