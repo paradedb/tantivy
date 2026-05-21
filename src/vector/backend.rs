@@ -292,11 +292,11 @@ fn lookup_metric(schema: &Schema, field: Field) -> crate::Result<Metric> {
 /// - **Cosine:** `distance = 1 - similarity`. Widening that distance by `(1 + eps)` gives
 ///   `threshold = 1 - (1 - best) * (1 + eps)`.
 /// - **Dot:** has no bounded distance interpretation (raw dot isn't a metric — no triangle
-///   inequality). The threshold here is a pragmatic linear widening of the score floor: `best - eps
-///   * |best|`. NOTE: with unnormalized dot, the IVF locality assumption itself is heuristic —
-///   "query near a centroid ⇒ true nearest neighbors live in that cluster" can fail when a
-///   high-magnitude vector in a far cluster outscores nearby ones. That's the clusterer's problem,
-///   not the threshold's; this function just controls when probing stops.
+///   inequality). The threshold here is a pragmatic linear widening of the score floor: `best -
+///   epsilon * best.abs()`. NOTE: with unnormalized dot, the IVF locality assumption itself is
+///   heuristic — "query near a centroid ⇒ true nearest neighbors live in that cluster" can fail
+///   when a high-magnitude vector in a far cluster outscores nearby ones. That's the clusterer's
+///   problem, not the threshold's; this function just controls when probing stops.
 fn adaptive_threshold(metric: Metric, best: f32, epsilon: f32) -> f32 {
     match metric {
         Metric::L2 => best * (1.0 + epsilon) * (1.0 + epsilon),
