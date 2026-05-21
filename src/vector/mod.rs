@@ -23,6 +23,8 @@ pub mod ivf;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use backend::ProbeStats;
 pub use backend::VectorBackend;
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
@@ -33,4 +35,5 @@ pub use ivf::{
 };
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};
 pub use plugin::VectorPlugin;
+pub(crate) use plugin::VECTOR_PLUGIN_NAME;
 pub use reader::{VectorColumn, VectorColumnReader, VectorReader};
