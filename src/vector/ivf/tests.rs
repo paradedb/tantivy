@@ -6,7 +6,7 @@ use crate::indexer::NoMergePolicy;
 use crate::schema::{Schema, STORED, TEXT};
 use crate::vector::meta::VECMETA_EXT;
 use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfVector, IvfVectors, Metric, VectorColumn, VectorColumnReader,
+    IvfCentroids, IvfClusterer, IvfVectors, Metric, VectorColumn, VectorColumnReader,
     VectorOptions, VECTOR_PLUGIN_NAME,
 };
 use crate::{Index, IndexSettings, IndexWriter, TantivyDocument};
@@ -39,15 +39,18 @@ impl IvfClusterer for TestClusterer {
     fn assign(
         &self,
         options: &VectorOptions,
-        vector: IvfVector,
+        vectors: IvfVectors<'_>,
         centroids: &IvfCentroids,
-    ) -> crate::Result<u32> {
+    ) -> crate::Result<Vec<u32>> {
         assert_eq!(options.dim(), 2);
         match centroids {
             IvfCentroids::F32(centroids) => assert_eq!(centroids.len(), 2),
         }
-        let IvfVector::F32(vector) = vector;
-        Ok(if vector.vector[0] < 5.0 { 0 } else { 1 })
+        let IvfVectors::F32(vectors) = vectors;
+        Ok(vectors
+            .iter()
+            .map(|vector| if vector.vector[0] < 5.0 { 0 } else { 1 })
+            .collect())
     }
 }
 

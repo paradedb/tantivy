@@ -24,9 +24,7 @@ pub use backend::VectorBackend;
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
 pub use flat::{FlatVecReader, FlatVectorColumn, FlatVecWriter};
-pub use ivf::{
-    IvfCentroids, IvfClusterer, IvfMergeSettings, IvfTypedVector, IvfVector, IvfVectors,
-};
+pub use ivf::{IvfCentroids, IvfClusterer, IvfMergeSettings, IvfTypedVector, IvfVectors};
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};
 pub use plugin::VectorPlugin;
 pub use reader::{VectorColumn, VectorColumnReader, VectorReader};

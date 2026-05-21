@@ -20,6 +20,4 @@ pub(crate) use super::meta::IvfFieldMeta;
 pub(crate) use plugin::merge_ivf;
 pub use reader::{IvfVecReader, IvfVectorColumn};
 pub(crate) use training::{decode_row, encode_vector};
-pub use training::{
-    IvfCentroids, IvfClusterer, IvfMergeSettings, IvfTypedVector, IvfVector, IvfVectors,
-};
+pub use training::{IvfCentroids, IvfClusterer, IvfMergeSettings, IvfTypedVector, IvfVectors};

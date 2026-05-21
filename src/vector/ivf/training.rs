@@ -16,13 +16,18 @@ pub trait IvfClusterer: Send + Sync + 'static {
     fn assign(
         &self,
         options: &VectorOptions,
-        vector: IvfVector,
+        vectors: IvfVectors<'_>,
         centroids: &IvfCentroids,
-    ) -> crate::Result<u32>;
+    ) -> crate::Result<Vec<u32>>;
+
+    fn assign_batch_size(&self) -> usize {
+        2048
+    }
 
     fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
         let centroid_ratio = self.centroid_ratio();
         let training_samples_per_centroid = self.training_samples_per_centroid();
+        let assign_batch_size = self.assign_batch_size();
 
         assert!(
             centroid_ratio > 0.0 && centroid_ratio <= 1.0,
@@ -32,12 +37,17 @@ pub trait IvfClusterer: Send + Sync + 'static {
             training_samples_per_centroid > 1,
             "IvfClusterer training_samples_per_centroid must be greater than 1, got {training_samples_per_centroid}"
         );
+        assert!(
+            assign_batch_size > 0,
+            "IvfClusterer assign_batch_size must be greater than 0, got {assign_batch_size}"
+        );
 
         let num_centroids = ((total_target_docs as f64) * f64::from(centroid_ratio)).ceil() as usize;
         let num_centroids = num_centroids.clamp(1, total_target_docs);
         Ok(IvfMergeSettings {
             num_centroids,
             training_samples_per_centroid,
+            assign_batch_size,
         })
     }
 }
@@ -46,21 +56,17 @@ pub trait IvfClusterer: Send + Sync + 'static {
 pub struct IvfMergeSettings {
     pub num_centroids: usize,
     pub training_samples_per_centroid: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum IvfVectors<'a> {
-    F32(&'a [IvfTypedVector<f32>]),
-}
-
-#[derive(Clone, Debug)]
-pub enum IvfVector {
-    F32(IvfTypedVector<f32>),
+    pub assign_batch_size: usize,
 }
 
 #[derive(Clone, Debug)]
 pub enum IvfCentroids {
     F32(Vec<Vec<f32>>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum IvfVectors<'a> {
+    F32(&'a [IvfTypedVector<f32>]),
 }
 
 #[derive(Clone, Debug)]
