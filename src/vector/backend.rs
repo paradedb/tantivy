@@ -170,3 +170,99 @@ fn lookup_metric(schema: &Schema, field: Field) -> crate::Result<Metric> {
         ))),
     }
 }
+
+/// SPANN-style stopping threshold: how far below the best centroid
+/// score the per-cluster similarity may drop before the adaptive
+/// probe loop is allowed to terminate (given the other floors).
+///
+/// Per-metric because the relationship between "similarity score" and
+/// "distance one wants to widen by `(1 + epsilon)`" differs:
+///
+/// - **L2:** `similarity = -d²`. Widening distance by `(1 + eps)` squares to `(1 + eps)²` on the d²
+///   side, so the threshold is `best * (1 + eps)²` (more negative ⇒ more permissive).
+/// - **Cosine:** `distance = 1 - similarity`. Widening that distance by `(1 + eps)` gives
+///   `threshold = 1 - (1 - best) * (1 + eps)`.
+/// - **Dot:** has no bounded distance interpretation (raw dot isn't a metric — no triangle
+///   inequality). The threshold here is a pragmatic linear widening of the score floor: `best - eps
+///   * |best|`. NOTE: with unnormalized dot, the IVF locality assumption itself is heuristic —
+///   "query near a centroid ⇒ true nearest neighbors live in that cluster" can fail when a
+///   high-magnitude vector in a far cluster outscores nearby ones. That's the clusterer's problem,
+///   not the threshold's; this function just controls when probing stops.
+fn adaptive_threshold(metric: Metric, best: f32, epsilon: f32) -> f32 {
+    match metric {
+        Metric::L2 => best * (1.0 + epsilon) * (1.0 + epsilon),
+        Metric::Cosine => 1.0 - (1.0 - best) * (1.0 + epsilon),
+        Metric::Dot => best - epsilon * best.abs(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_threshold_identity_at_zero_epsilon() {
+        // With epsilon = 0 the threshold is exactly `best` for the
+        // bounded-distance metrics — no widening, no permissiveness.
+        for &best in &[-10.0_f32, -1.0, 0.0, 0.5, 1.0] {
+            assert_eq!(adaptive_threshold(Metric::L2, best, 0.0), best);
+            assert_eq!(adaptive_threshold(Metric::Cosine, best, 0.0), best);
+            assert_eq!(adaptive_threshold(Metric::Dot, best, 0.0), best);
+        }
+    }
+
+    #[test]
+    fn adaptive_threshold_lowers_with_positive_epsilon() {
+        // "Higher score = closer" convention; widening means the
+        // threshold is *lower* (more permissive) than `best`.
+        let eps = 0.1;
+        // L2 similarity is `-d²`, so `best` is always ≤ 0. Multiplying
+        // a non-positive value by `(1+eps)² > 1` makes it more negative
+        // (= lower / more permissive). For best = 0 the threshold is
+        // also 0 (zero distance gives zero similarity, nothing to
+        // widen).
+        for &best in &[-10.0_f32, -1.0, -0.001] {
+            let l2 = adaptive_threshold(Metric::L2, best, eps);
+            assert!(l2 < best, "L2 threshold {l2} should be < best {best}");
+        }
+        let cos_best = 0.8;
+        let cos = adaptive_threshold(Metric::Cosine, cos_best, eps);
+        assert!(
+            cos < cos_best,
+            "Cosine threshold {cos} should be < {cos_best}"
+        );
+
+        // Dot: pinned linear widening. Lower than `best` for positive
+        // `best`; *also* lower (more negative) for negative `best`,
+        // because we subtract `eps * |best|`, never add. This is the
+        // intentional behavior — `best - eps * |best|` is monotonic
+        // in the "more permissive" direction regardless of sign.
+        let pos = adaptive_threshold(Metric::Dot, 10.0, eps);
+        assert!(pos < 10.0, "Dot threshold {pos} should be < 10.0");
+        let neg = adaptive_threshold(Metric::Dot, -10.0, eps);
+        assert!(neg < -10.0, "Dot threshold {neg} should be < -10.0");
+    }
+
+    #[test]
+    fn adaptive_threshold_hand_checked_values() {
+        // L2: best = -10, eps = 0.1 ⇒ -10 * 1.21 = -12.1.
+        let l2 = adaptive_threshold(Metric::L2, -10.0, 0.1);
+        assert!((l2 - -12.1).abs() < 1e-5, "got {l2}");
+
+        // Cosine: best = 0.8, eps = 0.1 ⇒ 1 - 0.2 * 1.1 = 0.78.
+        let cos = adaptive_threshold(Metric::Cosine, 0.8, 0.1);
+        assert!((cos - 0.78).abs() < 1e-5, "got {cos}");
+
+        // Dot: pinned `best - eps * |best|`.
+        // best =  10, eps = 0.1 ⇒  9.0
+        // best = -10, eps = 0.1 ⇒ -11.0
+        let dot_pos = adaptive_threshold(Metric::Dot, 10.0, 0.1);
+        assert!((dot_pos - 9.0).abs() < 1e-5, "got {dot_pos}");
+        let dot_neg = adaptive_threshold(Metric::Dot, -10.0, 0.1);
+        assert!((dot_neg - -11.0).abs() < 1e-5, "got {dot_neg}");
+        // Origin: degenerate (query orthogonal to nearest centroid);
+        // threshold collapses to 0 because |0| = 0.
+        let dot_zero = adaptive_threshold(Metric::Dot, 0.0, 0.5);
+        assert_eq!(dot_zero, 0.0);
+    }
+}
