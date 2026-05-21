@@ -12,6 +12,7 @@
 mod backend;
 mod collector;
 mod distance;
+mod meta;
 mod options;
 mod plugin;
 mod reader;

@@ -30,9 +30,6 @@ impl IvfVecReader {
         Self { field_dims }
     }
 
-    pub(crate) fn has_column(&self, _field: Field) -> bool {
-        false
-    }
 }
 
 impl VectorColumnReader for IvfVecReader {

@@ -2,17 +2,14 @@
 //!
 //! [`VectorPlugin`] owns per-segment vector storage end-to-end:
 //! - During indexing, accumulates raw vector bytes per doc and writes
-//!   a `.flatvec` file at segment finalize.
+//!   flat `.vecmeta` and `.flatvec` files at segment finalize.
 //! - During merge, picks exactly one of two output formats by target
 //!   doc count: below
 //!   [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold)
-//!   it copies vectors forward into a new `.flatvec`; at or above the
-//!   threshold it clusters everything into a new `.ivfvec` (currently
-//!   a `todo!()` body).
-//! - During reads, exposes both flat and IVF views via a single
-//!   [`VectorReader`](super::reader::VectorReader) — the search-side
-//!   [`VectorBackend`](super::backend::VectorBackend) picks IVF when
-//!   present and falls back to flat.
+//!   it copies vectors forward into flat `.vecmeta` and `.flatvec`; at
+//!   or above the threshold it routes to the IVF merge body.
+//! - During reads, [`VectorReader`](super::reader::VectorReader) uses
+//!   the segment-level `.vecmeta` marker to open the selected storage format.
 //!
 //! Owning both `flatvec` and `ivfvec` extensions on one plugin keeps
 //! the "exactly one format per segment" invariant right by construction:
@@ -23,6 +20,7 @@ use std::sync::Arc;
 
 use super::flat::{merge_flat, FlatVecWriter, FLATVEC_EXT};
 use super::ivf::merge_ivf;
+use super::meta::VECMETA_EXT;
 use super::reader::VectorReader;
 use crate::plugin::{
     PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
@@ -39,8 +37,7 @@ impl SegmentPlugin for VectorPlugin {
     }
 
     fn extensions(&self) -> Vec<&str> {
-        // todo: add ivf extensions
-        vec![FLATVEC_EXT]
+        vec![FLATVEC_EXT, VECMETA_EXT]
     }
 
     fn write_phase(&self) -> u32 {

@@ -9,42 +9,31 @@ use crate::index::SegmentComponent;
 use crate::plugin::{PluginReader, PluginReaderContext};
 use crate::schema::{Field, FieldType};
 use crate::vector::reader::VectorColumnReader;
+use crate::vector::VectorOptions;
 use crate::{DocId, TantivyError};
 
 pub struct FlatVecReader {
     composite: CompositeFile,
-    field_dims: BTreeMap<Field, usize>,
+    field_options: BTreeMap<Field, VectorOptions>,
     max_doc: u32,
 }
 
 impl FlatVecReader {
     pub(crate) fn open(ctx: &PluginReaderContext) -> crate::Result<Self> {
-        let mut field_dims = BTreeMap::new();
+        let mut field_options = BTreeMap::new();
         for (field, entry) in ctx.schema.fields() {
             if let FieldType::Vector(opts) = entry.field_type() {
-                field_dims.insert(field, opts.dim());
+                field_options.insert(field, opts.clone());
             }
         }
-        let composite = if field_dims.is_empty() {
-            CompositeFile::empty()
-        } else {
-            match ctx
-                .segment_reader
-                .open_read(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()))
-            {
-                Ok(file_slice) => CompositeFile::open(&file_slice)?,
-                Err(_) => CompositeFile::empty(),
-            }
-        };
+        let file_slice = ctx
+            .segment_reader
+            .open_read(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()))?;
         Ok(Self {
-            composite,
-            field_dims,
+            composite: CompositeFile::open(&file_slice)?,
+            field_options,
             max_doc: ctx.segment_reader.max_doc(),
         })
-    }
-
-    pub(crate) fn has_column(&self, field: Field) -> bool {
-        self.field_dims.contains_key(&field) && self.composite.open_read_with_idx(field, 0).is_some()
     }
 }
 
@@ -52,7 +41,7 @@ impl VectorColumnReader for FlatVecReader {
     type Column = FlatVectorColumn;
 
     fn open_column(&self, field: Field) -> crate::Result<FlatVectorColumn> {
-        let dim = self.field_dims.get(&field).copied().ok_or_else(|| {
+        let options = self.field_options.get(&field).cloned().ok_or_else(|| {
             TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
         })?;
         let presence_slice = self.composite.open_read_with_idx(field, 0).ok_or_else(|| {
@@ -70,12 +59,12 @@ impl VectorColumnReader for FlatVecReader {
         Ok(FlatVectorColumn {
             presence,
             row_bytes,
-            dim,
+            options,
         })
     }
 
     fn count(&self, field: Field) -> crate::Result<usize> {
-        self.field_dims.get(&field).ok_or_else(|| {
+        self.field_options.get(&field).ok_or_else(|| {
             TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
         })?;
         let presence_slice = self.composite.open_read_with_idx(field, 0).ok_or_else(|| {
@@ -88,9 +77,12 @@ impl VectorColumnReader for FlatVecReader {
     }
 
     fn dim(&self, field: Field) -> crate::Result<usize> {
-        self.field_dims.get(&field).copied().ok_or_else(|| {
-            TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
-        })
+        self.field_options
+            .get(&field)
+            .map(VectorOptions::dim)
+            .ok_or_else(|| {
+                TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
+            })
     }
 }
 
@@ -99,20 +91,20 @@ impl VectorColumnReader for FlatVecReader {
 /// Layout:
 /// - `presence`: [`Presence::Full`] for dense columns (no bitmap stored, `row_id == doc_id`) or
 ///   [`Presence::Optional`] for sparse columns (rank-supporting bitmap).
-/// - `row_bytes`: dense `f32` LE blob, exactly `presence.num_non_null()` rows of `dim` f32s each.
+/// - `row_bytes`: dense LE blob, exactly `presence.num_non_null()` rows of the schema dtype.
 ///
 /// Lookup is `presence.rank_if_exists(doc) -> row_idx`, then
-/// `&row_bytes[row_idx * dim * 4 ..]`. In the `Full` case the rank step
-/// is the identity map — no bitmap consulted.
+/// `&row_bytes[row_idx * bytes_per_vector ..]`. In the `Full` case the rank
+/// step is the identity map — no bitmap consulted.
 pub struct FlatVectorColumn {
     presence: Presence,
     row_bytes: OwnedBytes,
-    dim: usize,
+    options: VectorOptions,
 }
 
 impl FlatVectorColumn {
     pub fn dim(&self) -> usize {
-        self.dim
+        self.options.dim()
     }
 
     /// Number of docs that actually have a vector value.
@@ -139,7 +131,7 @@ impl FlatVectorColumn {
     #[inline]
     pub fn vector_bytes_at(&self, doc_id: DocId) -> Option<&[u8]> {
         let row_id = self.presence.rank_if_exists(doc_id)? as usize;
-        let stride = self.dim * 4;
+        let stride = self.options.bytes_per_vector();
         let start = row_id * stride;
         let end = start + stride;
         if end > self.row_bytes.len() {

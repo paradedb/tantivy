@@ -47,8 +47,8 @@ pub struct IvfBackend<T: VectorElement> {
 }
 
 impl<T: VectorElement> VectorBackend<T> {
-    /// Probe formats in priority order: IVF if the segment has it,
-    /// else flat. One plugin lookup; the reader exposes both views.
+    /// Open the segment's vector column using the storage format recorded in
+    /// vector metadata.
     /// Returns an error if the segment has no vector data at all.
     pub fn for_segment(
         segment_reader: &SegmentReader,

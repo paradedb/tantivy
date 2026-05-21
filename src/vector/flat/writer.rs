@@ -2,6 +2,8 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use common::TerminatingWrite;
+
 use super::presence::Presence;
 use crate::directory::CompositeWrite;
 use crate::index::{Segment, SegmentComponent};
@@ -9,6 +11,7 @@ use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema};
+use crate::vector::meta::{VectorStorageFormat, VECMETA_EXT};
 use crate::{DocId, TantivyError};
 
 /// Per-field in-memory state: the doc ids that have a value (ascending),
@@ -130,6 +133,11 @@ impl PluginWriter for FlatVecWriter {
         if self.fields.is_empty() {
             return Ok(());
         }
+        let mut meta_write =
+            segment.open_write(SegmentComponent::Custom(VECMETA_EXT.to_string()))?;
+        VectorStorageFormat::Flat.serialize(&mut meta_write)?;
+        meta_write.terminate()?;
+
         let write = segment.open_write(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()))?;
         let mut composite = CompositeWrite::wrap(write);
 
