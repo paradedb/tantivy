@@ -357,7 +357,7 @@ mod ivf_e2e_tests {
         writer.merge(&new_ones).wait()?;
         writer.wait_merging_threads()?;
 
-        let final_count = index.searchable_segment_ids()?.into_iter().count();
+        let final_count = index.searchable_segment_ids()?.len();
         assert_eq!(final_count, 2, "should now have two IVF segments");
         // Both segments must be IVF.
         assert_eq!(column_variant(&index, vec_f, 0)?, "Ivf");
@@ -461,7 +461,7 @@ mod ivf_e2e_tests {
         )?;
         writer.wait_merging_threads()?;
 
-        let segs = index.searchable_segment_ids()?.into_iter().count();
+        let segs = index.searchable_segment_ids()?.len();
         assert_eq!(segs, 2, "expect 1 IVF + 1 flat segment");
         // Confirm format variety.
         let mut variants: Vec<&str> = (0..segs)
