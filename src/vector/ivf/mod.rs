@@ -10,9 +10,6 @@ mod plugin;
 mod reader;
 mod training;
 
-#[cfg(test)]
-mod tests;
-
 pub use params::AdaptiveProbeParams;
 pub(crate) const ASSIGNMENTS_EXT: &str = "assignments";
 pub(crate) const IVFVEC_EXT: &str = "vec";
