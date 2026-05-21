@@ -3,7 +3,7 @@
 //! Schema-level concepts ([`VectorOptions`], [`Metric`], [`VectorElement`])
 //! and the distance kernels live at this level. The on-disk formats
 //! live in submodules: [`flat`] for the dense full-precision layout
-//! and [`ivf`] for the partitioned/clustered accelerator (stub).
+//! and [`ivf`] for the partitioned/clustered accelerator.
 //! Both formats are owned by a single [`VectorPlugin`] which picks
 //! between them per merge based on
 //! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
@@ -24,6 +24,9 @@ pub use backend::VectorBackend;
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
 pub use flat::{FlatVecReader, FlatVectorColumn, FlatVecWriter};
+pub use ivf::{
+    IvfCentroids, IvfClusterer, IvfMergeSettings, IvfTypedVector, IvfVector, IvfVectors,
+};
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};
 pub(crate) use plugin::VECTOR_PLUGIN_NAME;
 pub use plugin::VectorPlugin;
