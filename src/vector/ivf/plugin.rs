@@ -11,7 +11,7 @@ use common::{BinarySerializable, OwnedBytes};
 
 use super::{
     decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfFieldMeta, IvfTypedVector,
-    IvfVector, IvfVectors, ASSIGNMENTS_EXT, IVFVEC_EXT,
+    IvfVectors, ASSIGNMENTS_EXT, IVFVEC_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
@@ -174,31 +174,70 @@ pub(crate) fn merge_ivf(
                 let mut assigned_vectors = Vec::with_capacity(vector_count);
                 let mut cluster_counts = vec![0usize; num_centroids];
                 let mut target_doc_id: DocId = 0;
-                for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                    let column = &columns[old_doc_addr.segment_ord as usize];
-                    if let Some(bytes) = column.vector_bytes_at(old_doc_addr.doc_id) {
-                        let vector = decode_row::<f32>(bytes, opts.dim())?;
-                        let vector = IvfTypedVector {
-                            doc_id: target_doc_id,
-                            vector,
+                {
+                    let mut batch_vectors =
+                        Vec::with_capacity(settings.assign_batch_size.min(vector_count));
+                    let mut batch_sources =
+                        Vec::with_capacity(settings.assign_batch_size.min(vector_count));
+                    let mut flush_assign_batch =
+                        |batch_vectors: &mut Vec<IvfTypedVector<f32>>,
+                         batch_sources: &mut Vec<(DocId, usize, DocId)>|
+                         -> crate::Result<()> {
+                            if batch_vectors.is_empty() {
+                                return Ok(());
+                            }
+                            let clusters = clusterer.assign(
+                                opts,
+                                IvfVectors::F32(batch_vectors.as_slice()),
+                                &centroids,
+                            )?;
+                            if clusters.len() != batch_vectors.len() {
+                                return Err(TantivyError::InvalidArgument(format!(
+                                    "IvfClusterer assigned {} clusters for {} vectors",
+                                    clusters.len(),
+                                    batch_vectors.len()
+                                )));
+                            }
+                            for (cluster, (target_doc_id, source_segment_ord, source_doc_id)) in
+                                clusters.into_iter().zip(batch_sources.drain(..))
+                            {
+                                let cluster = cluster as usize;
+                                if cluster >= num_centroids {
+                                    return Err(TantivyError::InvalidArgument(format!(
+                                        "IvfClusterer assigned vector to cluster {cluster}, but \
+                                         only {num_centroids} centroids were trained"
+                                    )));
+                                }
+                                assigned_vectors.push(AssignedVector {
+                                    cluster,
+                                    target_doc_id,
+                                    source_segment_ord,
+                                    source_doc_id,
+                                });
+                                cluster_counts[cluster] += 1;
+                            }
+                            batch_vectors.clear();
+                            Ok(())
                         };
-                        let cluster =
-                            clusterer.assign(opts, IvfVector::F32(vector), &centroids)? as usize;
-                        if cluster >= num_centroids {
-                            return Err(TantivyError::InvalidArgument(format!(
-                                "IvfClusterer assigned vector to cluster {cluster}, but only \
-                                 {num_centroids} centroids were trained"
-                            )));
+                    for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
+                        let column = &columns[old_doc_addr.segment_ord as usize];
+                        if let Some(bytes) = column.vector_bytes_at(old_doc_addr.doc_id) {
+                            batch_vectors.push(IvfTypedVector {
+                                doc_id: target_doc_id,
+                                vector: decode_row::<f32>(bytes, opts.dim())?,
+                            });
+                            batch_sources.push((
+                                target_doc_id,
+                                old_doc_addr.segment_ord as usize,
+                                old_doc_addr.doc_id,
+                            ));
+                            if batch_vectors.len() == settings.assign_batch_size {
+                                flush_assign_batch(&mut batch_vectors, &mut batch_sources)?;
+                            }
                         }
-                        assigned_vectors.push(AssignedVector {
-                            cluster,
-                            target_doc_id,
-                            source_segment_ord: old_doc_addr.segment_ord as usize,
-                            source_doc_id: old_doc_addr.doc_id,
-                        });
-                        cluster_counts[cluster] += 1;
+                        target_doc_id += 1;
                     }
-                    target_doc_id += 1;
+                    flush_assign_batch(&mut batch_vectors, &mut batch_sources)?;
                 }
                 debug_assert_eq!(target_doc_id, num_target_docs);
                 debug_assert_eq!(assigned_vectors.len(), vector_count);
