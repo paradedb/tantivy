@@ -165,6 +165,18 @@ pub struct ProbeStats {
     pub candidates_scored: usize,
 }
 
+/// How many candidate docs the IVF probe loop is willing to score per
+/// requested top-K result before the threshold gate is allowed to
+/// terminate it. Combined with the user-supplied `min_candidates` at
+/// the call site as `min_candidates.max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n)`,
+/// so a default `min_candidates = 0` still gives a sane floor.
+///
+/// The "4×" rule of thumb is intentionally conservative — enough
+/// overfetch that one near-cluster with a tail of duplicates can't
+/// short-circuit recall. Provisional; revisit alongside the other
+/// adaptive defaults once real benchmarks land.
+pub(crate) const CANDIDATE_OVERFETCH_MULTIPLIER: usize = 4;
+
 impl<T: VectorElement> IvfBackend<T> {
     fn top_n(
         &self,
@@ -243,11 +255,15 @@ impl<T: VectorElement> IvfBackend<T> {
         let best = ranked[0].0;
         let threshold = adaptive_threshold(self.metric, best, self.adaptive.epsilon);
         // Resolve the candidate floor at the call site so a default
-        // `min_candidates = 0` still gives a sane `4 × top_n` floor.
-        // Critical for selective filters where a single near cluster
-        // yields few survivors — without the floor the loop trips the
-        // threshold gate immediately and returns < K results.
-        let min_candidates = self.adaptive.min_candidates.max(4 * top_n);
+        // `min_candidates = 0` still gives a sane
+        // `CANDIDATE_OVERFETCH_MULTIPLIER * top_n` floor. Critical for
+        // selective filters where a single near cluster yields few
+        // survivors — without the floor the loop trips the threshold
+        // gate immediately and returns < K results.
+        let min_candidates = self
+            .adaptive
+            .min_candidates
+            .max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n);
 
         // Adaptive probe loop. Cluster-order arrival of survivors
         // forbids the ascending-D shortcut in `push`; use
@@ -910,12 +926,14 @@ mod tests {
         assert_hits_match_oracle(&hits, &oracle, "floor activated");
 
         // Confirm the floor was load-bearing: the floor at the call
-        // site is 4 * top_n = 4, A yields only 1 survivor, so probing
-        // had to continue to B to reach the floor.
+        // site is `CANDIDATE_OVERFETCH_MULTIPLIER * top_n`, A yields
+        // only 1 survivor, so probing had to continue to B to reach
+        // the floor.
         let cluster_a_docs = column.cluster_doc_ids(0)?.expect("A");
+        let floor = CANDIDATE_OVERFETCH_MULTIPLIER * top_k;
         assert!(
-            cluster_a_docs.len() < 4 * top_k,
-            "test geometry requires |A| < 4*top_n: |A|={}",
+            cluster_a_docs.len() < floor,
+            "test geometry requires |A| < {floor}: |A|={}",
             cluster_a_docs.len(),
         );
         Ok(())
@@ -1105,9 +1123,11 @@ mod tests {
         let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
         let top_k = 4;
         let total_docs = 6 * 2;
-        // Resolved floor at call site: `min_candidates.max(4 * top_n)`.
-        // With the default `min_candidates = 0`, this collapses to `4 * top_n`.
-        let resolved_floor = 4 * top_k;
+        // Resolved floor at the call site:
+        // `min_candidates.max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n)`.
+        // With the default `min_candidates = 0`, this collapses to
+        // `CANDIDATE_OVERFETCH_MULTIPLIER * top_n`.
+        let resolved_floor = CANDIDATE_OVERFETCH_MULTIPLIER * top_k;
         let expected_min = total_docs.min(resolved_floor);
 
         // Default params: epsilon=0.3, min_candidates=0, min_nprobe=1,
