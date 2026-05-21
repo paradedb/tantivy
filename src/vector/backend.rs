@@ -467,6 +467,31 @@ mod tests {
         backend.top_n(weight.as_ref(), segment_reader, k)
     }
 
+    /// Same shape as `run_top_n`, but always uses `AllQuery` and
+    /// returns the `ProbeStats` alongside the hits — the probe-stat
+    /// contract tests below need both.
+    fn run_top_n_instrumented(
+        fixture: &IvfFixture,
+        query: Vec<f32>,
+        k: usize,
+        params: AdaptiveProbeParams,
+    ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+        let searcher = fixture.index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let weight = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let backend = VectorBackend::<f32>::for_segment(
+            segment_reader,
+            0,
+            fixture.vec_field,
+            Arc::new(query),
+            params,
+        )?;
+        match backend {
+            VectorBackend::Ivf(b) => b.top_n_instrumented(weight.as_ref(), segment_reader, k),
+            VectorBackend::Flat(_) => panic!("expected IVF backend"),
+        }
+    }
+
     fn exhaustive_params(num_centroids: usize) -> AdaptiveProbeParams {
         // Wide epsilon + nprobe ceiling = num_centroids forces a full
         // exhaustive scan. Used to assert correctness against the
@@ -955,6 +980,266 @@ mod tests {
         }
         // 4 docs all pass AllQuery + are alive ⇒ all 4 scored.
         assert_eq!(stats.candidates_scored, 4);
+        Ok(())
+    }
+
+    // ============================================================
+    // Adaptive-probing parameter contracts.
+    //
+    // The stop condition couples all four adaptive knobs. Each test
+    // below holds three of them permissive so the fourth becomes the
+    // binding constraint, then asserts the *contract* (an inequality
+    // implied by the knob's definition) — never an exact emergent
+    // count, which would break the moment defaults are tuned.
+    //
+    // Built with `build_ivf_segment` directly (not the 2D fixture) so
+    // the canonical backend suite stays independent of any viz tool.
+    // ============================================================
+
+    /// Eight well-separated centroids. With `max_nprobe = 2` the loop
+    /// must break before entering the third iteration — i.e. it
+    /// visits at most two clusters, regardless of how generous the
+    /// other gates are.
+    #[test]
+    fn probe_stats_max_nprobe_ceiling() -> crate::Result<()> {
+        // Centroids on a wide ring; pairwise distances well above
+        // 2*cluster_radius.
+        let centroids: Vec<Vec<f32>> = (0..8)
+            .map(|i| {
+                let theta = std::f32::consts::TAU * (i as f32) / 8.0;
+                vec![100.0 * theta.cos(), 100.0 * theta.sin()]
+            })
+            .collect();
+        // Three docs near each centroid.
+        let mut docs: Vec<(&str, Vec<f32>)> = Vec::new();
+        for c in &centroids {
+            for j in 0..3 {
+                docs.push(("a", vec![c[0] + 0.1 * (j as f32), c[1] + 0.1 * (j as f32)]));
+            }
+        }
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+
+        let params = AdaptiveProbeParams {
+            epsilon: 1e6,      // threshold gate never trips
+            min_candidates: 0, // candidate floor irrelevant
+            min_nprobe: 1,     // nprobe floor irrelevant
+            max_nprobe: 2,     // the binding constraint
+        };
+        let (_, stats) = run_top_n_instrumented(&fixture, vec![100.0, 0.0], 3, params)?;
+        assert!(
+            stats.probed_clusters.len() <= 2,
+            "max_nprobe=2 ⇒ ≤ 2 probed, got {} ({:?})",
+            stats.probed_clusters.len(),
+            stats.probed_clusters,
+        );
+        Ok(())
+    }
+
+    /// Four well-separated centroids. `epsilon = 0` so the threshold
+    /// gate trips for every probe past the first; ppc is large enough
+    /// that the candidate floor is satisfied after the first cluster.
+    /// `min_nprobe = 3` is the only thing keeping the loop going past
+    /// the second probe; assert it does.
+    #[test]
+    fn probe_stats_min_nprobe_floor() -> crate::Result<()> {
+        let centroids: Vec<Vec<f32>> = (0..4)
+            .map(|i| {
+                let theta = std::f32::consts::TAU * (i as f32) / 4.0;
+                vec![50.0 * theta.cos(), 50.0 * theta.sin()]
+            })
+            .collect();
+        // 10 docs per cluster — way over the default 4*top_n candidate
+        // floor so the floor is satisfied early and isn't what's
+        // pulling more probes.
+        let mut docs: Vec<(&str, Vec<f32>)> = Vec::new();
+        for c in &centroids {
+            for j in 0..10 {
+                docs.push((
+                    "a",
+                    vec![c[0] + 0.01 * (j as f32), c[1] + 0.01 * (j as f32)],
+                ));
+            }
+        }
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+
+        let params = AdaptiveProbeParams {
+            epsilon: 0.0, // threshold == best ⇒ trips immediately for any other centroid
+            min_candidates: 0, /* resolved to 4*top_n = 8 at the call site; 10 from one cluster
+                           * satisfies it */
+            min_nprobe: 3, // the binding constraint
+            max_nprobe: usize::MAX,
+        };
+        let (_, stats) = run_top_n_instrumented(&fixture, vec![50.0, 0.0], 2, params)?;
+        assert!(
+            stats.probed_clusters.len() >= 3,
+            "min_nprobe=3 ⇒ ≥ 3 probed, got {} ({:?})",
+            stats.probed_clusters.len(),
+            stats.probed_clusters,
+        );
+        Ok(())
+    }
+
+    /// Six well-separated centroids, only 2 docs each ⇒ no single
+    /// cluster can satisfy the candidate floor on its own. With
+    /// default params the loop must keep probing until
+    /// `candidates_scored ≥ min(total_docs, resolved_floor)`.
+    /// (`total_docs < resolved_floor` here, so it ends up scoring
+    /// everything that's reachable.)
+    #[test]
+    fn probe_stats_min_candidates_floor_scores_floor_or_total() -> crate::Result<()> {
+        let centroids: Vec<Vec<f32>> = (0..6)
+            .map(|i| {
+                let theta = std::f32::consts::TAU * (i as f32) / 6.0;
+                vec![30.0 * theta.cos(), 30.0 * theta.sin()]
+            })
+            .collect();
+        let mut docs: Vec<(&str, Vec<f32>)> = Vec::new();
+        for c in &centroids {
+            for j in 0..2 {
+                docs.push((
+                    "a",
+                    vec![c[0] + 0.01 * (j as f32), c[1] + 0.01 * (j as f32)],
+                ));
+            }
+        }
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+        let top_k = 4;
+        let total_docs = 6 * 2;
+        // Resolved floor at call site: `min_candidates.max(4 * top_n)`.
+        // With the default `min_candidates = 0`, this collapses to `4 * top_n`.
+        let resolved_floor = 4 * top_k;
+        let expected_min = total_docs.min(resolved_floor);
+
+        // Default params: epsilon=0.3, min_candidates=0, min_nprobe=1,
+        // max_nprobe=usize::MAX. The floor is what's pulling more probes.
+        let (_, stats) = run_top_n_instrumented(
+            &fixture,
+            vec![30.0, 0.0],
+            top_k,
+            AdaptiveProbeParams::default(),
+        )?;
+        assert!(
+            stats.candidates_scored >= expected_min,
+            "candidate floor (resolved {resolved_floor}, total {total_docs}) ⇒ ≥ {expected_min} \
+             candidates scored; got {}",
+            stats.candidates_scored,
+        );
+        Ok(())
+    }
+
+    /// Six well-separated clusters, a near cluster fat enough to
+    /// satisfy the candidate floor on its own. With default adaptive
+    /// params (epsilon=0.3), the threshold gate trips for every
+    /// remaining centroid and the loop *should* prune — i.e. probe
+    /// strictly fewer than all clusters. Loose contract: no exact
+    /// number, just `< num_centroids`, so this stays stable when
+    /// defaults are tuned.
+    #[test]
+    fn probe_stats_pruning_happens() -> crate::Result<()> {
+        let centroids: Vec<Vec<f32>> = (0..6)
+            .map(|i| {
+                let theta = std::f32::consts::TAU * (i as f32) / 6.0;
+                vec![100.0 * theta.cos(), 100.0 * theta.sin()]
+            })
+            .collect();
+        // 20 docs near each centroid — first cluster alone covers
+        // 4*top_n = 16 even at top_n = 4.
+        let mut docs: Vec<(&str, Vec<f32>)> = Vec::new();
+        for c in &centroids {
+            for j in 0..20 {
+                docs.push((
+                    "a",
+                    vec![c[0] + 0.01 * (j as f32), c[1] + 0.01 * (j as f32)],
+                ));
+            }
+        }
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+
+        // Query right on top of cluster 0's centroid.
+        let (_, stats) = run_top_n_instrumented(
+            &fixture,
+            vec![100.0, 0.0],
+            4,
+            AdaptiveProbeParams::default(),
+        )?;
+        let num_centroids = 6;
+        assert!(
+            stats.probed_clusters.len() < num_centroids,
+            "default-params pruning should visit strictly fewer than {num_centroids} clusters; \
+             got {} ({:?})",
+            stats.probed_clusters.len(),
+            stats.probed_clusters,
+        );
+        Ok(())
+    }
+
+    /// Structural invariants on the probe stats themselves —
+    /// independent of any specific stop-condition behavior.
+    ///   - all probed indices live in [0, num_centroids)
+    ///   - no duplicates (a cluster is probed at most once)
+    ///   - the first probed cluster is the centroid nearest the query under the configured metric
+    ///     (L2 here)
+    #[test]
+    fn probe_stats_probed_clusters_validity() -> crate::Result<()> {
+        let centroids = vec![
+            vec![0.0_f32, 0.0],
+            vec![10.0, 0.0],
+            vec![0.0, 10.0],
+            vec![10.0, 10.0],
+        ];
+        let mut docs: Vec<(&str, Vec<f32>)> = Vec::new();
+        for c in &centroids {
+            for j in 0..3 {
+                docs.push((
+                    "a",
+                    vec![c[0] + 0.05 * (j as f32), c[1] + 0.05 * (j as f32)],
+                ));
+            }
+        }
+        let num_centroids = centroids.len();
+        let centroids_copy: Vec<Vec<f32>> = centroids.to_vec();
+        let fixture = build_ivf_segment(2, Metric::L2, centroids, &docs)?;
+
+        // Query closest to centroid index 1 (at [10, 0]).
+        let query = vec![9.0_f32, 0.5];
+        let (_, stats) =
+            run_top_n_instrumented(&fixture, query.clone(), 2, exhaustive_params(num_centroids))?;
+
+        // All indices in range.
+        for &c in &stats.probed_clusters {
+            assert!(
+                c < num_centroids,
+                "probed cluster {c} out of range (num_centroids={num_centroids})",
+            );
+        }
+        // No duplicates.
+        let unique: std::collections::HashSet<usize> =
+            stats.probed_clusters.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            stats.probed_clusters.len(),
+            "duplicate probed cluster: {:?}",
+            stats.probed_clusters,
+        );
+        // First probed cluster is the centroid nearest the query (by
+        // L2, the field metric).
+        let nearest = centroids_copy
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let d_a = (a[0] - query[0]).powi(2) + (a[1] - query[1]).powi(2);
+                let d_b = (b[0] - query[0]).powi(2) + (b[1] - query[1]).powi(2);
+                d_a.partial_cmp(&d_b).unwrap()
+            })
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(
+            stats.probed_clusters.first().copied(),
+            Some(nearest),
+            "first probed should be the centroid nearest the query; nearest = {nearest}, \
+             probed_clusters = {:?}",
+            stats.probed_clusters,
+        );
         Ok(())
     }
 }
