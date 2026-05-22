@@ -13,7 +13,6 @@ mod training;
 pub use params::AdaptiveProbeParams;
 pub(crate) const ASSIGNMENTS_EXT: &str = "assignments";
 pub(crate) const IVFVEC_EXT: &str = "vec";
-pub(crate) use super::meta::IvfFieldMeta;
 pub(crate) use plugin::merge_ivf;
 pub use reader::{IvfVecReader, IvfVectorColumn};
 pub(crate) use training::{decode_row, encode_vector};
@@ -21,3 +20,5 @@ pub use training::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
     IvfVectors,
 };
+
+pub(crate) use super::meta::IvfFieldMeta;

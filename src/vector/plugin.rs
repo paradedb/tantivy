@@ -9,8 +9,8 @@
 //!   it copies vectors forward into flat `.vecmeta` and `.flatvec`; at or
 //!   above the threshold it writes IVF `.vecmeta`, `.assignments`, and
 //!   `.vec` files.
-//! - During reads, [`VectorReader`](super::reader::VectorReader) uses
-//!   the segment-level `.vecmeta` marker to open the selected storage format.
+//! - During reads, [`VectorReader`](super::reader::VectorReader) uses the segment-level `.vecmeta`
+//!   marker to open the selected storage format.
 //!
 //! Owning both flat and IVF extensions on one plugin keeps
 //! the "exactly one format per segment" invariant right by construction:

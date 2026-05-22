@@ -10,7 +10,7 @@ use crate::query::TermQuery;
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric, VectorColumn,
-    VectorColumnReader, VectorDType, VectorOptions, VectorReader, VECTOR_PLUGIN_NAME,
+    VectorColumnReader, VectorDType, VectorOptions, VectorReader,
 };
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
@@ -24,6 +24,7 @@ pub(crate) struct TestVectorIndex {
 }
 
 pub(crate) struct TestVectorIndexBuilder {
+    centroids: Vec<[f32; grid2d::DIM]>,
     dtype: VectorDType,
     metric: Metric,
     selectivities: Vec<f32>,
@@ -46,6 +47,12 @@ impl TestVectorIndexBuilder {
 
     pub(crate) fn metric(mut self, metric: Metric) -> Self {
         self.metric = metric;
+        self
+    }
+
+    pub(crate) fn centroids(mut self, centroids: &[[f32; grid2d::DIM]]) -> Self {
+        assert!(!centroids.is_empty(), "need at least one centroid");
+        self.centroids = centroids.to_vec();
         self
     }
 
@@ -92,7 +99,9 @@ impl TestVectorIndexBuilder {
         }
         let mut builder = Index::builder().schema(schema).settings(settings);
         if self.vector_storage_format == VectorStorageFormat::Ivf {
-            builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer::default()));
+            builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer {
+                centroids: self.centroids.clone(),
+            }));
         }
         builder.create_in_ram()
     }
@@ -101,6 +110,7 @@ impl TestVectorIndexBuilder {
 impl TestVectorIndex {
     pub(crate) fn builder(dtype: VectorDType) -> TestVectorIndexBuilder {
         TestVectorIndexBuilder {
+            centroids: grid2d::centroids(),
             dtype,
             metric: Metric::L2,
             selectivities: Vec::new(),
@@ -155,8 +165,9 @@ impl TestVectorIndex {
     }
 }
 
-#[derive(Default)]
-struct Grid2DClusterer;
+struct Grid2DClusterer {
+    centroids: Vec<[f32; grid2d::DIM]>,
+}
 
 impl IvfClusterer for Grid2DClusterer {
     fn centroid_ratio(&self) -> f32 {
@@ -169,7 +180,7 @@ impl IvfClusterer for Grid2DClusterer {
 
     fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
         Ok(IvfMergeSettings {
-            num_centroids: grid2d::centroids().len().min(total_target_docs),
+            num_centroids: self.centroids.len().min(total_target_docs),
             training_samples_per_centroid: self.training_samples_per_centroid(),
             assign_batch_size: self.assign_batch_size(),
         })
@@ -182,9 +193,9 @@ impl IvfClusterer for Grid2DClusterer {
         num_centroids: usize,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), grid2d::DIM);
-        let centroids = grid2d::centroids();
         Ok(IvfCentroids::F32(IvfMatrix {
-            values: centroids
+            values: self
+                .centroids
                 .iter()
                 .take(num_centroids)
                 .flat_map(|centroid| centroid.iter().copied())
@@ -253,11 +264,12 @@ fn fixture_uses_selected_storage_format() -> crate::Result<()> {
             .vector_storage_format(vector_storage_format)
             .build()?;
         let searcher = index.index.reader()?.searcher();
-        let vec_reader: Arc<VectorReader> = searcher.segment_readers()[0]
-            .plugin_reader::<VectorReader>(VECTOR_PLUGIN_NAME)?
-            .expect("vector plugin reader");
+        let vec_reader = VectorReader::open(&searcher.segment_readers()[0])?;
         assert!(matches!(
-            (vector_storage_format, vec_reader.open_column(index.embedding_field())?),
+            (
+                vector_storage_format,
+                vec_reader.open_column(index.embedding_field())?
+            ),
             (VectorStorageFormat::Flat, VectorColumn::Flat(_))
                 | (VectorStorageFormat::Ivf, VectorColumn::Ivf(_))
         ));
@@ -287,9 +299,7 @@ fn fixture_vectors_round_trip_from_readers() -> crate::Result<()> {
         let searcher = index.index.reader()?.searcher();
         let mut got = Vec::new();
         for segment_reader in searcher.segment_readers() {
-            let vec_reader: Arc<VectorReader> = segment_reader
-                .plugin_reader::<VectorReader>(VECTOR_PLUGIN_NAME)?
-                .expect("vector plugin reader");
+            let vec_reader = VectorReader::open(segment_reader)?;
             let column = vec_reader.open_column(index.embedding_field())?;
             for doc in 0..segment_reader.max_doc() {
                 if let Some(bytes) = column.vector_bytes_at(doc) {
@@ -320,11 +330,12 @@ fn fixture_vectors_round_trip_from_readers() -> crate::Result<()> {
 }
 
 #[test]
-fn ivf_fixture_assigns_vectors_to_nearest_grid_centroid() -> crate::Result<()> {
+fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
+    let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
     let index = TestVectorIndex::builder(VectorDType::F32)
         .vector_storage_format(VectorStorageFormat::Ivf)
+        .centroids(&centroids)
         .build()?;
-    let centroids = grid2d::centroids();
     let centroid_values: Vec<f32> = centroids
         .iter()
         .flat_map(|vector| vector.iter().copied())
@@ -333,9 +344,7 @@ fn ivf_fixture_assigns_vectors_to_nearest_grid_centroid() -> crate::Result<()> {
     let mut assigned_docs = 0;
 
     for segment_reader in searcher.segment_readers() {
-        let vec_reader: Arc<VectorReader> = segment_reader
-            .plugin_reader::<VectorReader>(VECTOR_PLUGIN_NAME)?
-            .expect("vector plugin reader");
+        let vec_reader = VectorReader::open(segment_reader)?;
         let column = vec_reader.open_column(index.embedding_field())?;
         let VectorColumn::Ivf(column) = column else {
             panic!("expected IVF column");
@@ -398,7 +407,7 @@ mod ground_truth {
     use std::cmp::Ordering;
 
     use crate::schema::Field;
-    use crate::vector::{Metric, VectorColumnReader, VectorReader, VECTOR_PLUGIN_NAME};
+    use crate::vector::{Metric, VectorColumnReader, VectorReader};
     use crate::{DocAddress, Index, Score};
 
     pub(crate) fn top_k(
@@ -411,11 +420,7 @@ mod ground_truth {
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
-            let Some(vec_reader) =
-                segment_reader.plugin_reader::<VectorReader>(VECTOR_PLUGIN_NAME)?
-            else {
-                continue;
-            };
+            let vec_reader = VectorReader::open(segment_reader)?;
             let column = vec_reader.open_column(vec_field)?;
             let alive = segment_reader.alive_bitset();
             for doc in 0..segment_reader.max_doc() {
