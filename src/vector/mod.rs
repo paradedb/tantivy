@@ -20,6 +20,9 @@ mod reader;
 pub mod flat;
 pub mod ivf;
 
+#[cfg(test)]
+mod tests;
+
 pub use backend::VectorBackend;
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
