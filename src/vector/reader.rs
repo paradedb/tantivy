@@ -76,7 +76,8 @@ impl VectorReader {
                     }
                     if !exists(ASSIGNMENTS_EXT)? || !exists(IVFVEC_EXT)? {
                         return Err(TantivyError::InternalError(
-                            "segment is marked IVF but is missing IVF vector components".to_string(),
+                            "segment is marked IVF but is missing IVF vector components"
+                                .to_string(),
                         ));
                     }
                     VectorStorageReader::Ivf(IvfVecReader::open(segment_reader, meta.payload)?)

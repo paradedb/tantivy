@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
-use std::io;
-use std::mem;
 use std::sync::OnceLock;
+use std::{io, mem};
 
 use common::file_slice::DeferredFileSlice;
 use common::{BinarySerializable, HasLen, OwnedBytes};

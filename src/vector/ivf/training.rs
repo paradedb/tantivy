@@ -31,11 +31,13 @@ pub trait IvfClusterer: Send + Sync + 'static {
 
         assert!(
             centroid_ratio > 0.0 && centroid_ratio <= 1.0,
-            "IvfClusterer centroid_ratio must be greater than 0 and less than or equal to 1, got {centroid_ratio}"
+            "IvfClusterer centroid_ratio must be greater than 0 and less than or equal to 1, got \
+             {centroid_ratio}"
         );
         assert!(
             training_samples_per_centroid > 1,
-            "IvfClusterer training_samples_per_centroid must be greater than 1, got {training_samples_per_centroid}"
+            "IvfClusterer training_samples_per_centroid must be greater than 1, got \
+             {training_samples_per_centroid}"
         );
         assert!(
             assign_batch_size > 0,

@@ -99,9 +99,7 @@ impl IvfFieldMeta {
             ));
         }
         u32::try_from(self.num_centroids)
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "centroid count exceeds u32")
-            })?
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "centroid count exceeds u32"))?
             .serialize(writer)?;
         writer.write_all(self.centroid_bytes.as_slice())?;
         writer.write_all(self.cluster_offsets.as_slice())?;
