@@ -183,24 +183,24 @@ mod ivf_e2e_tests {
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{STORED, STRING, Schema};
+    use crate::schema::{Schema, STORED, STRING};
     use crate::vector::ivf::AdaptiveProbeParams;
     use crate::vector::meta::VectorStorageFormat;
-    use crate::vector::tests::{Grid2DClusterer, TestVectorIndex, ground_truth};
+    use crate::vector::tests::{ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{
-        Metric, VECTOR_PLUGIN_NAME, VectorColumn, VectorColumnReader, VectorDType, VectorOptions,
-        VectorReader,
+        Metric, VectorColumn, VectorColumnReader, VectorDType, VectorOptions, VectorReader,
+        VECTOR_PLUGIN_NAME,
     };
     use crate::{Index, TantivyDocument};
 
-    /// Probe every cluster (default 3×3 grid ⇒ 9 centroids) and use
-    /// a wide enough epsilon that the threshold gate can't trip.
-    fn exhaustive_params(num_centroids: usize) -> AdaptiveProbeParams {
+    /// Probe every cluster and use a wide enough epsilon that the
+    /// threshold gate can't trip.
+    fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
         AdaptiveProbeParams {
             epsilon: 1e6,
             min_candidates: 0,
-            min_nprobe: num_centroids,
-            max_nprobe: num_centroids,
+            min_probe_fanout: 1.0,
+            max_probe_fanout: 1.0,
         }
     }
 
@@ -373,8 +373,8 @@ mod ivf_e2e_tests {
         let params = AdaptiveProbeParams {
             epsilon: 1e6,
             min_candidates: 0,
-            min_nprobe: centroids.len(),
-            max_nprobe: centroids.len(),
+            min_probe_fanout: 1.0,
+            max_probe_fanout: 1.0,
         };
         for query in [[0.0_f32, 0.0], [10.0, 10.0], [5.0, 5.0]] {
             for k in [1usize, 3, 6] {

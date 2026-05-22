@@ -264,6 +264,8 @@ impl<T: VectorElement> IvfBackend<T> {
             .adaptive
             .min_candidates
             .max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n);
+        let (min_probe_count, max_probe_count) =
+            self.adaptive.resolved_probe_counts(num_centroids)?;
 
         // Adaptive probe loop. Cluster-order arrival of survivors
         // forbids the ascending-D shortcut in `push`; use
@@ -284,12 +286,12 @@ impl<T: VectorElement> IvfBackend<T> {
         let mut candidates = 0usize;
 
         for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
-            if probe_count >= self.adaptive.max_nprobe {
+            if probe_count >= max_probe_count {
                 break;
             }
             if centroid_score < threshold
                 && candidates >= min_candidates
-                && probe_count >= self.adaptive.min_nprobe
+                && probe_count >= min_probe_count
             {
                 break;
             }
@@ -477,16 +479,16 @@ mod tests {
     /// "exhaustive" probe ceiling.
     const DEFAULT_NUM_CENTROIDS: usize = 9;
 
-    /// Wide-epsilon + cap-at-num_centroids params: every probe gate
+    /// Wide-epsilon + 100% fanout params: every probe gate
     /// stays open, so the IVF backend visits every cluster. Used by
     /// oracle-equality tests where any kind of pruning would make the
     /// equality check fail.
-    fn exhaustive_params(num_centroids: usize) -> AdaptiveProbeParams {
+    fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
         AdaptiveProbeParams {
             epsilon: 1e6,
             min_candidates: 0,
-            min_nprobe: num_centroids,
-            max_nprobe: num_centroids,
+            min_probe_fanout: 1.0,
+            max_probe_fanout: 1.0,
         }
     }
 
@@ -747,7 +749,7 @@ mod tests {
     }
 
     /// The trap: query closest to centroid A, true NN in cluster B.
-    /// Adaptive probing finds it; max_nprobe=1 must miss. Setup
+    /// Adaptive probing finds it; 50% max fanout must miss. Setup
     /// assertions confirm the geometry is genuinely a trap before
     /// the behavioral check — a slightly-off geometry could trivialize
     /// the test. INLINE because the shared fixture's 100-doc grid
@@ -783,19 +785,19 @@ mod tests {
         // directly — the geometry says distance to A = √2 ≈ 1.41,
         // distance to B = √162 ≈ 12.73, so A wins decisively.
 
-        // Behavioral check 1: max_nprobe = 1 misses the trap.
+        // Behavioral check 1: 50% max fanout misses the trap.
         let one_probe = AdaptiveProbeParams {
             epsilon: 1e6,
             min_candidates: 0,
-            min_nprobe: 1,
-            max_nprobe: 1,
+            min_probe_fanout: 0.5,
+            max_probe_fanout: 0.5,
         };
         let hits1 = search(&index, embed_field, &AllQuery, query.to_vec(), 1, one_probe)?;
         assert_eq!(hits1.len(), 1);
         assert_ne!(
             stored_label_at(&index, label_field, hits1[0].1)?,
             "trap_b",
-            "max_nprobe=1 should miss the trap (probes only cluster A)",
+            "50% max fanout should miss the trap (probes only cluster A)",
         );
 
         // Behavioral check 2: exhaustive probing finds it.
@@ -1103,8 +1105,8 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: 0,
-            min_nprobe: 1,
-            max_nprobe: 2,
+            min_probe_fanout: 0.5,
+            max_probe_fanout: 1.0,
         };
         let hits = search(
             &index,
@@ -1189,18 +1191,18 @@ mod tests {
     // count.
     // ============================================================
 
-    /// `max_nprobe = 2` ⇒ at most 2 probes per segment, regardless of
+    /// 2 / 9 max fanout ⇒ at most 2 probes per segment, regardless of
     /// how generous the other gates are.
     #[test]
-    fn probe_stats_max_nprobe_ceiling() -> crate::Result<()> {
+    fn probe_stats_max_fanout_ceiling() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
         let params = AdaptiveProbeParams {
             epsilon: 1e6,
             min_candidates: 0,
-            min_nprobe: 1,
-            max_nprobe: 2,
+            min_probe_fanout: 0.0,
+            max_probe_fanout: 2.0 / DEFAULT_NUM_CENTROIDS as f32,
         };
         let (_, stats) = run_top_n_instrumented(
             &index.index,
@@ -1211,28 +1213,28 @@ mod tests {
         )?;
         assert!(
             stats.probed_clusters.len() <= 2,
-            "max_nprobe=2 ⇒ ≤ 2 probed, got {} ({:?})",
+            "2 / 9 max fanout ⇒ ≤ 2 probed, got {} ({:?})",
             stats.probed_clusters.len(),
             stats.probed_clusters,
         );
         Ok(())
     }
 
-    /// `min_nprobe = 5` keeps the loop going even after the candidate
+    /// 5 / 9 min fanout keeps the loop going even after the candidate
     /// floor and threshold gates both want to terminate. The shared
     /// fixture's 9-centroid grid yields ~2 docs per cluster per IVF
     /// segment; with `top_k = 1` the floor (4) is met after 2 probes,
-    /// but min_nprobe forces 5.
+    /// but min fanout forces 5.
     #[test]
-    fn probe_stats_min_nprobe_floor() -> crate::Result<()> {
+    fn probe_stats_min_fanout_floor() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: 0,
-            min_nprobe: 5,
-            max_nprobe: usize::MAX,
+            min_probe_fanout: 5.0 / DEFAULT_NUM_CENTROIDS as f32,
+            max_probe_fanout: 1.0,
         };
         let (_, stats) = run_top_n_instrumented(
             &index.index,
@@ -1243,7 +1245,7 @@ mod tests {
         )?;
         assert!(
             stats.probed_clusters.len() >= 5,
-            "min_nprobe=5 ⇒ ≥ 5 probed, got {} ({:?})",
+            "5 / 9 min fanout ⇒ ≥ 5 probed, got {} ({:?})",
             stats.probed_clusters.len(),
             stats.probed_clusters,
         );
