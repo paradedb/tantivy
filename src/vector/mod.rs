@@ -21,10 +21,8 @@ pub mod flat;
 pub mod ivf;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-#[cfg(test)]
-pub(crate) use backend::ProbeStats;
 pub use backend::VectorBackend;
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
