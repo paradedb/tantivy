@@ -40,7 +40,7 @@ impl Default for AdaptiveProbeParams {
             epsilon: 0.3,
             min_candidates: 0,
             min_probe_fanout: 0.0,
-            max_probe_fanout: 1.0,
+            max_probe_fanout: 0.1,
         }
     }
 }

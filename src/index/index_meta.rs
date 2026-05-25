@@ -324,7 +324,7 @@ fn is_default_codec_types(types: &[columnar::CodecType]) -> bool {
 }
 
 fn default_vector_clustering_threshold() -> usize {
-    10_000
+    1000
 }
 
 fn is_default_vector_clustering_threshold(threshold: &usize) -> bool {
