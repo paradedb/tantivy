@@ -43,6 +43,18 @@ impl IvfVecReader {
             field_options,
         })
     }
+
+    pub(crate) fn field_meta(&self, field: Field) -> crate::Result<IvfFieldMeta> {
+        let options = self.field_options.get(&field).ok_or_else(|| {
+            TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
+        })?;
+        let meta_slice = self.meta.open_read(field).ok_or_else(|| {
+            TantivyError::InternalError(format!(
+                "no IVF vector metadata for vector field {field:?} in segment"
+            ))
+        })?;
+        Ok(IvfFieldMeta::open(meta_slice, options)?)
+    }
 }
 
 impl VectorColumnReader for IvfVecReader {
@@ -90,15 +102,7 @@ impl VectorColumnReader for IvfVecReader {
     }
 
     fn count(&self, field: Field) -> crate::Result<usize> {
-        let options = self.field_options.get(&field).ok_or_else(|| {
-            TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
-        })?;
-        let meta_slice = self.meta.open_read(field).ok_or_else(|| {
-            TantivyError::InternalError(format!(
-                "no IVF vector metadata for vector field {field:?} in segment"
-            ))
-        })?;
-        Ok(IvfFieldMeta::open(meta_slice, options)?.num_vectors())
+        Ok(self.field_meta(field)?.num_vectors())
     }
 
     fn dim(&self, field: Field) -> crate::Result<usize> {

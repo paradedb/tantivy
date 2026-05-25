@@ -12,12 +12,19 @@ const FORMAT_FLAT: u8 = 0;
 const FORMAT_IVF: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum VectorStorageFormat {
+pub enum VectorStorageFormat {
     Flat,
     Ivf,
 }
 
 impl VectorStorageFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Ivf => "ivf",
+        }
+    }
+
     pub(crate) fn serialize<W: Write + ?Sized>(self, writer: &mut W) -> io::Result<()> {
         let code = match self {
             Self::Flat => FORMAT_FLAT,
@@ -161,5 +168,11 @@ impl IvfFieldMeta {
 
     pub(crate) fn num_vectors(&self) -> usize {
         self.cluster_offset(self.num_centroids) as usize
+    }
+
+    pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.num_centroids).map(|cluster| {
+            (self.cluster_offset(cluster + 1) - self.cluster_offset(cluster)) as usize
+        })
     }
 }
