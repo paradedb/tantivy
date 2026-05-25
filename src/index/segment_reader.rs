@@ -20,6 +20,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
+use crate::vector::{VectorInfo, VectorReader};
 use crate::{Directory, DocId, Index, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -153,6 +154,12 @@ impl SegmentReader {
     /// The size of blocks is configurable, this should be reflexted in the
     pub fn get_store_reader(&self, cache_num_blocks: usize) -> io::Result<StoreReader> {
         StoreReader::open(self.store_file().clone(), cache_num_blocks)
+    }
+
+    /// Returns vector storage info for `field`, or `None` if the segment has no
+    /// vector data for it.
+    pub fn vector_info(&self, field: Field) -> crate::Result<Option<VectorInfo>> {
+        VectorReader::open(self)?.info(field)
     }
 
     /// Open a new segment for reading.

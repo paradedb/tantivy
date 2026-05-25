@@ -31,7 +31,9 @@ pub use ivf::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
     IvfVectors,
 };
+pub use meta::VectorStorageFormat;
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};
 pub use plugin::VectorPlugin;
-pub(crate) use plugin::VECTOR_PLUGIN_NAME;
-pub use reader::{VectorColumn, VectorColumnReader, VectorReader};
+pub use reader::{
+    VectorClusterStats, VectorColumn, VectorColumnReader, VectorInfo, VectorReader,
+};
