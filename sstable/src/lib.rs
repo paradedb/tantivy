@@ -40,12 +40,15 @@ use std::ops::Range;
 
 use merge::ValueMerger;
 
+mod batch;
 mod block_match_automaton;
 mod delta;
 mod dictionary;
 pub mod merge;
 pub mod streamer;
 pub mod value;
+
+pub use batch::{BatchedTermInfoIter, SortedTermSlice, sort_and_dedupe_terms};
 
 mod sstable_index_v3;
 pub use sstable_index_v3::{BlockAddr, SSTableIndex, SSTableIndexBuilder, SSTableIndexV3};
