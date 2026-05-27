@@ -9,7 +9,7 @@ const TRUNCATIONS_PER_SHARED_UPDATE: u32 = 2;
 
 #[derive(Clone)]
 pub struct SortBySimilarityScore {
-    shared_threshold: Arc<dyn SharedThreshold>,
+    shared_threshold: Arc<dyn SharedThreshold<Score>>,
 }
 
 impl std::fmt::Debug for SortBySimilarityScore {
@@ -33,7 +33,7 @@ impl SortBySimilarityScore {
         Self::default()
     }
 
-    pub fn with_shared_threshold(shared_threshold: Arc<dyn SharedThreshold>) -> Self {
+    pub fn with_shared_threshold(shared_threshold: Arc<dyn SharedThreshold<Score>>) -> Self {
         Self { shared_threshold }
     }
 }
