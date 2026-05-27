@@ -114,6 +114,11 @@ pub trait SortKeyComputer: Sync {
         false
     }
 
+    /// Returns a shared threshold that can be used to synchronize the worst score across multiple threads/segments.
+    fn shared_threshold(&self) -> Option<std::sync::Arc<dyn crate::collector::sort_key::shared_threshold::SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>> {
+        None
+    }
+
     /// Sorting by score has a overriding implementation for BM25 scores, using Block-WAND.
     fn collect_segment_top_k(
         &self,
@@ -124,7 +129,9 @@ pub trait SortKeyComputer: Sync {
     ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
         let with_scoring = self.requires_scoring();
         let segment_sort_key_computer = self.segment_sort_key_computer(reader)?;
-        let topn_computer = TopNComputer::new_with_comparator(k, self.comparator());
+        let mut topn_computer: TopNComputer<_, DocId, _> =
+            TopNComputer::new_with_comparator(k, self.comparator());
+        topn_computer.shared_threshold = self.shared_threshold();
         let mut segment_top_key_collector = TopBySortKeySegmentCollector {
             topn_computer,
             segment_ord,

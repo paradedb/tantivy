@@ -5,8 +5,6 @@ use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::{DocAddress, DocId, Score};
 
-const TRUNCATIONS_PER_SHARED_UPDATE: u32 = 2;
-
 #[derive(Clone)]
 pub struct SortBySimilarityScore {
     shared_threshold: Arc<dyn SharedThreshold<Score>>,
@@ -49,6 +47,10 @@ impl SortKeyComputer for SortBySimilarityScore {
         true
     }
 
+    fn shared_threshold(&self) -> Option<Arc<dyn SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>> {
+        Some(self.shared_threshold.clone())
+    }
+
     fn segment_sort_key_computer(
         &self,
         _segment_reader: &crate::SegmentReader,
@@ -65,58 +67,28 @@ impl SortKeyComputer for SortBySimilarityScore {
     ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
         let mut top_n: TopNComputer<Score, DocId, Self::Comparator> =
             TopNComputer::new_with_comparator(k, self.comparator());
+        top_n.shared_threshold = self.shared_threshold();
 
-        let shared = &self.shared_threshold;
-        let initial_threshold = shared.load();
-        let mut truncation_count: u32 = 0;
+        let initial_threshold = self.shared_threshold.load();
+        top_n.threshold = Some(initial_threshold);
 
         if let Some(alive_bitset) = reader.alive_bitset() {
-            let mut threshold = initial_threshold;
-            top_n.threshold = Some(threshold);
-            weight.for_each_pruning(threshold, reader, &mut |doc, score| {
+            weight.for_each_pruning(initial_threshold, reader, &mut |doc, score| {
                 if alive_bitset.is_deleted(doc) {
-                    return threshold;
+                    return top_n.threshold.unwrap_or(Score::MIN);
                 }
                 top_n.push(score, doc);
-                let new_threshold = top_n.threshold.unwrap_or(Score::MIN);
-                if new_threshold > threshold {
-                    threshold = new_threshold;
-                    truncation_count += 1;
-                    if truncation_count % TRUNCATIONS_PER_SHARED_UPDATE == 0 {
-                        shared.update(threshold);
-                        let global = shared.load();
-                        if global > threshold {
-                            threshold = global;
-                            top_n.threshold = Some(threshold);
-                        }
-                    }
-                }
-                threshold
+                top_n.threshold.unwrap_or(Score::MIN)
             })?;
         } else {
-            let mut threshold = initial_threshold;
-            top_n.threshold = Some(threshold);
-            weight.for_each_pruning(threshold, reader, &mut |doc, score| {
+            weight.for_each_pruning(initial_threshold, reader, &mut |doc, score| {
                 top_n.push(score, doc);
-                let new_threshold = top_n.threshold.unwrap_or(Score::MIN);
-                if new_threshold > threshold {
-                    threshold = new_threshold;
-                    truncation_count += 1;
-                    if truncation_count % TRUNCATIONS_PER_SHARED_UPDATE == 0 {
-                        shared.update(threshold);
-                        let global = shared.load();
-                        if global > threshold {
-                            threshold = global;
-                            top_n.threshold = Some(threshold);
-                        }
-                    }
-                }
-                threshold
+                top_n.threshold.unwrap_or(Score::MIN)
             })?;
         }
 
         let final_threshold = top_n.threshold.unwrap_or(Score::MIN);
-        shared.update(final_threshold);
+        self.shared_threshold.update(final_threshold);
 
         Ok(top_n
             .into_vec()

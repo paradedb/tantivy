@@ -515,6 +515,10 @@ pub struct TopNComputer<Score, D, C> {
     top_n: usize,
     pub(crate) threshold: Option<Score>,
     comparator: C,
+    #[serde(skip)]
+    pub(crate) shared_threshold: Option<std::sync::Arc<dyn crate::collector::sort_key::shared_threshold::SharedThreshold<Score>>>,
+    #[serde(skip)]
+    truncation_count: u32,
 }
 
 // Intermediate struct for TopNComputer for deserialization, to keep vec capacity
@@ -541,6 +545,8 @@ impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D
             top_n: value.top_n,
             threshold: value.threshold,
             comparator: value.comparator,
+            shared_threshold: None,
+            truncation_count: 0,
         }
     }
 }
@@ -568,6 +574,8 @@ impl<Score: Clone, D: Clone, C: Clone> Clone for TopNComputer<Score, D, C> {
             top_n: self.top_n,
             threshold: self.threshold.clone(),
             comparator: self.comparator.clone(),
+            shared_threshold: self.shared_threshold.clone(),
+            truncation_count: self.truncation_count,
         }
     }
 }
@@ -612,6 +620,8 @@ where
             top_n,
             threshold: None,
             comparator,
+            shared_threshold: None,
+            truncation_count: 0,
         }
     }
 
@@ -636,8 +646,7 @@ where
     #[inline(always)]
     pub(crate) fn append_doc(&mut self, doc: D, sort_key: TSortKey) {
         if self.buffer.len() == self.buffer.capacity() {
-            let median = self.truncate_top_n();
-            self.threshold = Some(median);
+            self.truncate_top_n();
         }
         // This cannot panic, because we truncate_median will at least remove one element, since
         // the min capacity is 2.
@@ -646,17 +655,36 @@ where
     }
 
     #[inline(never)]
-    fn truncate_top_n(&mut self) -> TSortKey {
+    fn truncate_top_n(&mut self) {
         // Use select_nth_unstable to find the top nth score
         let (_, median_el, _) = self.buffer.select_nth_unstable_by(self.top_n, |lhs, rhs| {
             compare_for_top_k(&self.comparator, lhs, rhs)
         });
 
-        let median_score = median_el.sort_key.clone();
+        let median = median_el.sort_key.clone();
         // Remove all elements below the top_n
         self.buffer.truncate(self.top_n);
 
-        median_score
+        if let Some(shared) = &self.shared_threshold {
+            self.truncation_count += 1;
+            if self.truncation_count % 2 == 0 {
+                // Send our median to the global pool
+                shared.update(median.clone());
+                // Immediately adopt the global threshold
+                let global = shared.load();
+                // We only want to adopt the global if it's strictly better than our current median.
+                // But shared.load() is guaranteed to be at least as restrictive as the median we just pushed.
+                if self.comparator.compare(&global, &median) == std::cmp::Ordering::Greater {
+                    self.threshold = Some(global);
+                } else {
+                    self.threshold = Some(median);
+                }
+            } else {
+                self.threshold = Some(median);
+            }
+        } else {
+            self.threshold = Some(median);
+        }
     }
 
     /// Returns the top n elements in sorted order.
