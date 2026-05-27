@@ -668,17 +668,10 @@ where
         if let Some(shared) = &self.shared_threshold {
             self.truncation_count += 1;
             if self.truncation_count % 2 == 0 {
-                // Send our median to the global pool
-                shared.update(median.clone());
-                // Immediately adopt the global threshold
-                let global = shared.load();
-                // We only want to adopt the global if it's strictly better than our current median.
-                // But shared.load() is guaranteed to be at least as restrictive as the median we just pushed.
-                if self.comparator.compare(&global, &median) == std::cmp::Ordering::Greater {
-                    self.threshold = Some(global);
-                } else {
-                    self.threshold = Some(median);
-                }
+                // Send our median to the global pool, and immediately adopt the resulting
+                // global threshold (which is guaranteed to be at least as restrictive as the median)
+                let global = shared.update(median);
+                self.threshold = Some(global);
             } else {
                 self.threshold = Some(median);
             }

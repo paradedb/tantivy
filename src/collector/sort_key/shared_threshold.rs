@@ -5,7 +5,9 @@ use crate::collector::sort_key::{Comparator, ComparatorEnum};
 
 pub trait SharedThreshold<T>: Send + Sync {
     fn load(&self) -> T;
-    fn update(&self, new_threshold: T);
+    /// Conditionally updates the shared threshold if `new_threshold` is more restrictive.
+    /// Returns the most restrictive threshold currently known (which will be `new_threshold` if the update succeeded, or the pre-existing strictly better threshold if it failed).
+    fn update(&self, new_threshold: T) -> T;
 }
 
 pub struct NoopSharedThreshold<T> {
@@ -23,7 +25,9 @@ impl<T: Clone + Send + Sync> SharedThreshold<T> for NoopSharedThreshold<T> {
         self.noop_value.clone()
     }
 
-    fn update(&self, _new_threshold: T) {}
+    fn update(&self, new_threshold: T) -> T {
+        new_threshold
+    }
 }
 
 #[inline]
@@ -63,12 +67,12 @@ impl SharedThreshold<Score> for AtomicSharedThreshold {
         ordered_u32_to_f32(self.value.load(Ordering::Relaxed))
     }
 
-    fn update(&self, new_threshold: Score) {
+    fn update(&self, new_threshold: Score) -> Score {
         let new_ordered = f32_to_ordered_u32(new_threshold);
         let mut current = self.value.load(Ordering::Relaxed);
         loop {
             if new_ordered <= current {
-                break;
+                return ordered_u32_to_f32(current);
             }
             match self.value.compare_exchange_weak(
                 current,
@@ -76,7 +80,7 @@ impl SharedThreshold<Score> for AtomicSharedThreshold {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => break,
+                Ok(_) => return new_threshold,
                 Err(actual) => current = actual,
             }
         }
@@ -106,7 +110,7 @@ impl SharedThreshold<u64> for AtomicSharedThresholdU64 {
         self.value.load(Ordering::Relaxed)
     }
 
-    fn update(&self, new_threshold: u64) {
+    fn update(&self, new_threshold: u64) -> u64 {
         let mut current = self.value.load(Ordering::Relaxed);
         loop {
             let should_update = match self.order {
@@ -114,7 +118,7 @@ impl SharedThreshold<u64> for AtomicSharedThresholdU64 {
                 Order::Desc => new_threshold > current,
             };
             if !should_update {
-                break;
+                return current;
             }
             match self.value.compare_exchange_weak(
                 current,
@@ -122,7 +126,7 @@ impl SharedThreshold<u64> for AtomicSharedThresholdU64 {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => break,
+                Ok(_) => return new_threshold,
                 Err(actual) => current = actual,
             }
         }
@@ -163,15 +167,19 @@ impl SharedThreshold<Option<u64>> for RwLockSharedThresholdOptionU64 {
         *self.value.read().unwrap()
     }
 
-    fn update(&self, new_threshold: Option<u64>) {
+    fn update(&self, new_threshold: Option<u64>) -> Option<u64> {
         let current = *self.value.read().unwrap();
         if self.is_better(&new_threshold, &current) {
             if let Ok(mut write_guard) = self.value.write() {
                 if self.is_better(&new_threshold, &write_guard) {
                     *write_guard = new_threshold;
+                    return new_threshold;
+                } else {
+                    return *write_guard;
                 }
             }
         }
+        current
     }
 }
 
