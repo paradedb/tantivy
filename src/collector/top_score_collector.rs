@@ -219,7 +219,7 @@ impl TopDocs {
         field: impl ToString,
         order: Order,
     ) -> impl Collector<Fruit = Vec<(Option<u64>, DocAddress)>> {
-        self.order_by((SortByStaticFastValue::for_field(field), order))
+        self.order_by(SortByStaticFastValue::for_field_and_order(field, order))
     }
 
     /// Order docs by decreasing BM25 similarity score.
@@ -305,7 +305,7 @@ impl TopDocs {
         TFastValue: FastValue,
         ComparatorEnum: Comparator<Option<TFastValue>>,
     {
-        self.order_by((SortByStaticFastValue::for_field(fast_field), order))
+        self.order_by(SortByStaticFastValue::for_field_and_order(fast_field, order))
     }
 
     /// Like `order_by_fast_field`, but for a `String` fast field.

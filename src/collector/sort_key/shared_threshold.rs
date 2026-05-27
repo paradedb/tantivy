@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::{Order, Score};
+use crate::collector::sort_key::{Comparator, ComparatorEnum};
 
 pub trait SharedThreshold<T>: Send + Sync {
     fn load(&self) -> T;
@@ -130,9 +131,8 @@ impl SharedThreshold<u64> for AtomicSharedThresholdU64 {
 
 /// A shared threshold for `Option<u64>` values.
 ///
-/// In `NaturalComparator`, `None` is strictly smaller than any `Some(_)`.
-/// * When sorting Ascending, the worst value is `Some(MAX)`. `None` is the most restrictive threshold.
-/// * When sorting Descending, the worst value is `None`. `Some(MAX)` is the most restrictive threshold.
+/// In both `NaturalComparator` and `ReverseNoneIsLowerComparator`, `None` is the worst value
+/// (it appears last in top docs). So the initial threshold is `None`.
 ///
 /// Since `AtomicU64` cannot cleanly pack `Option<u64>` without losing a state, and threshold updates
 /// are very rare compared to reads, we use a `RwLock<Option<u64>>`.
@@ -145,31 +145,16 @@ pub struct RwLockSharedThresholdOptionU64 {
 
 impl RwLockSharedThresholdOptionU64 {
     pub fn new(order: Order) -> Self {
-        // Initial "worst" threshold
-        let init_val = match order {
-            Order::Asc => Some(u64::MAX),
-            // For descending order, `None` is the smallest value (which is worst because we want largest).
-            Order::Desc => None,
-        };
         Self {
-            value: RwLock::new(init_val),
+            value: RwLock::new(None),
             order,
         }
     }
     
     // helper to compare
     fn is_better(&self, new: &Option<u64>, old: &Option<u64>) -> bool {
-        // Natural ordering: None < Some(_)
-        match self.order {
-            Order::Asc => {
-                // We want smaller values, so `new` is better if `new < old`.
-                new < old
-            }
-            Order::Desc => {
-                // We want larger values, so `new` is better if `new > old`.
-                new > old
-            }
-        }
+        let cmp_enum = ComparatorEnum::from(self.order);
+        cmp_enum.compare(new, old) == std::cmp::Ordering::Greater
     }
 }
 
@@ -275,7 +260,7 @@ mod tests {
     #[test]
     fn test_rwlock_shared_threshold_option_u64_asc() {
         let t = RwLockSharedThresholdOptionU64::new(Order::Asc);
-        assert_eq!(t.load(), Some(u64::MAX));
+        assert_eq!(t.load(), None);
 
         t.update(Some(100));
         assert_eq!(t.load(), Some(100));
@@ -283,11 +268,11 @@ mod tests {
         t.update(Some(200)); // 200 > 100, worse
         assert_eq!(t.load(), Some(100));
 
-        t.update(None); // None is strictly smaller than Some(100)
-        assert_eq!(t.load(), None);
+        t.update(None); // None is strictly smaller than Some(100) -> Wait, None is worse.
+        assert_eq!(t.load(), Some(100));
 
-        t.update(Some(0)); // Some(0) > None, worse
-        assert_eq!(t.load(), None);
+        t.update(Some(0)); // Some(0) > None, better
+        assert_eq!(t.load(), Some(0));
     }
 
     #[test]
