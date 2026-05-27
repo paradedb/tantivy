@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Range;
 
@@ -513,12 +512,13 @@ pub struct TopNComputer<Score, D, C> {
     /// The buffer reverses sort order to get top-semantics instead of bottom-semantics
     buffer: Vec<ComparableDoc<Score, D>>,
     top_n: usize,
-    pub(crate) threshold: Option<Score>,
+    pub(crate) threshold: Option<(Score, u32)>,
     comparator: C,
     #[serde(skip)]
     pub(crate) shared_threshold: Option<std::sync::Arc<dyn crate::collector::sort_key::shared_threshold::SharedThreshold<Score>>>,
     #[serde(skip)]
     truncation_count: u32,
+    pub(crate) segment_ord: u32,
 }
 
 // Intermediate struct for TopNComputer for deserialization, to keep vec capacity
@@ -526,8 +526,10 @@ pub struct TopNComputer<Score, D, C> {
 struct TopNComputerDeser<Score, D, C> {
     buffer: Vec<ComparableDoc<Score, D>>,
     top_n: usize,
-    threshold: Option<Score>,
+    threshold: Option<(Score, u32)>,
     comparator: C,
+    #[serde(default)]
+    segment_ord: u32,
 }
 
 impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D, C> {
@@ -547,6 +549,7 @@ impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D
             comparator: value.comparator,
             shared_threshold: None,
             truncation_count: 0,
+            segment_ord: value.segment_ord,
         }
     }
 }
@@ -576,6 +579,7 @@ impl<Score: Clone, D: Clone, C: Clone> Clone for TopNComputer<Score, D, C> {
             comparator: self.comparator.clone(),
             shared_threshold: self.shared_threshold.clone(),
             truncation_count: self.truncation_count,
+            segment_ord: self.segment_ord,
         }
     }
 }
@@ -622,6 +626,7 @@ where
             comparator,
             shared_threshold: None,
             truncation_count: 0,
+            segment_ord: 0,
         }
     }
 
@@ -631,9 +636,18 @@ where
     /// NOTE: `push` must be called in ascending `DocId`/`DocAddress` order.
     #[inline]
     pub fn push(&mut self, sort_key: TSortKey, doc: D) {
-        if let Some(last_median) = &self.threshold {
-            // See the struct docs for an explanation of why this comparison is strict.
-            if self.comparator.compare(&sort_key, last_median) != Ordering::Greater {
+        if let Some((last_median, thresh_ord)) = &self.threshold {
+            let cmp = self.comparator.compare(&sort_key, last_median);
+            if cmp == std::cmp::Ordering::Less {
+                return;
+            }
+            if cmp == std::cmp::Ordering::Equal && self.segment_ord >= *thresh_ord {
+                // If it is a global threshold tie, but we have a lower global tie-breaker priority 
+                // (a higher segment_ord means we appear later globally, therefore our document would have
+                // a higher `DocAddress`, meaning it should lose the tie-breaker).
+                // Or if `self.segment_ord == *thresh_ord`, it's a purely local tie. Since we iterate
+                // docs in ascending order within a segment, our doc has a higher `DocId` and must 
+                // lose the local tie-breaker.
                 return;
             }
         }
@@ -670,13 +684,13 @@ where
             if self.truncation_count % 2 == 0 {
                 // Send our median to the global pool, and immediately adopt the resulting
                 // global threshold (which is guaranteed to be at least as restrictive as the median)
-                let global = shared.update(median);
+                let global = shared.update(median, self.segment_ord);
                 self.threshold = Some(global);
             } else {
-                self.threshold = Some(median);
+                self.threshold = Some((median, self.segment_ord));
             }
         } else {
-            self.threshold = Some(median);
+            self.threshold = Some((median, self.segment_ord));
         }
     }
 

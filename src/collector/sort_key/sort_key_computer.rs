@@ -132,6 +132,7 @@ pub trait SortKeyComputer: Sync {
         let mut topn_computer: TopNComputer<_, DocId, _> =
             TopNComputer::new_with_comparator(k, self.comparator());
         topn_computer.shared_threshold = self.shared_threshold();
+        topn_computer.segment_ord = segment_ord;
         let mut segment_top_key_collector = TopBySortKeySegmentCollector {
             topn_computer,
             segment_ord,
@@ -228,7 +229,7 @@ where
         top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
     ) {
         let sort_key: Self::SegmentSortKey;
-        if let Some(threshold) = &top_n_computer.threshold {
+        if let Some((threshold, _ord)) = &top_n_computer.threshold {
             if let Some((_cmp, lazy_sort_key)) = self.accept_sort_key_lazy(doc, score, threshold) {
                 sort_key = lazy_sort_key;
             } else {

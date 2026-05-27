@@ -68,27 +68,28 @@ impl SortKeyComputer for SortBySimilarityScore {
         let mut top_n: TopNComputer<Score, DocId, Self::Comparator> =
             TopNComputer::new_with_comparator(k, self.comparator());
         top_n.shared_threshold = self.shared_threshold();
+        top_n.segment_ord = segment_ord;
 
         let initial_threshold = self.shared_threshold.load();
         top_n.threshold = Some(initial_threshold);
 
         if let Some(alive_bitset) = reader.alive_bitset() {
-            weight.for_each_pruning(initial_threshold, reader, &mut |doc, score| {
+            weight.for_each_pruning(initial_threshold.0, reader, &mut |doc, score| {
                 if alive_bitset.is_deleted(doc) {
-                    return top_n.threshold.unwrap_or(Score::MIN);
+                    return top_n.threshold.map(|t| t.0).unwrap_or(Score::MIN);
                 }
                 top_n.push(score, doc);
-                top_n.threshold.unwrap_or(Score::MIN)
+                top_n.threshold.map(|t| t.0).unwrap_or(Score::MIN)
             })?;
         } else {
-            weight.for_each_pruning(initial_threshold, reader, &mut |doc, score| {
+            weight.for_each_pruning(initial_threshold.0, reader, &mut |doc, score| {
                 top_n.push(score, doc);
-                top_n.threshold.unwrap_or(Score::MIN)
+                top_n.threshold.map(|t| t.0).unwrap_or(Score::MIN)
             })?;
         }
 
-        let final_threshold = top_n.threshold.unwrap_or(Score::MIN);
-        self.shared_threshold.update(final_threshold);
+        let final_threshold = top_n.threshold.map(|t| t.0).unwrap_or(Score::MIN);
+        self.shared_threshold.update(final_threshold, segment_ord);
 
         Ok(top_n
             .into_vec()
