@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use super::flat::{FlatVecReader, FlatVectorColumn, FLATVEC_EXT};
-use super::ivf::{IvfVecReader, IvfVectorColumn, ASSIGNMENTS_EXT, IVFVEC_EXT};
+use super::flat::{FlatVecReader, FlatVectorColumn};
+use super::ivf::{IvfVecReader, IvfVectorColumn};
 use super::meta::{VectorSegmentMeta, VectorStorageFormat, VECMETA_EXT};
 use crate::directory::error::OpenReadError;
 use crate::index::SegmentComponent;
@@ -60,13 +60,6 @@ impl VectorReader {
                 vector_dims.insert(field, opts.dim());
             }
         }
-        let exists = |ext: &str| -> crate::Result<bool> {
-            match segment_reader.open_read(SegmentComponent::Custom(ext.to_string())) {
-                Ok(_) => Ok(true),
-                Err(OpenReadError::FileDoesNotExist(_)) => Ok(false),
-                Err(err) => Err(err.into()),
-            }
-        };
         let meta_slice =
             match segment_reader.open_read(SegmentComponent::Custom(VECMETA_EXT.to_string())) {
                 Ok(file_slice) => Some(file_slice),
@@ -77,25 +70,9 @@ impl VectorReader {
             let meta = VectorSegmentMeta::open(file_slice)?;
             match meta.format {
                 VectorStorageFormat::Flat => {
-                    if exists(ASSIGNMENTS_EXT)? || exists(IVFVEC_EXT)? {
-                        return Err(TantivyError::InternalError(
-                            "segment is marked flat but has IVF vector components".to_string(),
-                        ));
-                    }
                     VectorStorageReader::Flat(FlatVecReader::open(segment_reader)?)
                 }
                 VectorStorageFormat::Ivf => {
-                    if exists(FLATVEC_EXT)? {
-                        return Err(TantivyError::InternalError(
-                            "segment is marked IVF but has flat vector data".to_string(),
-                        ));
-                    }
-                    if !exists(ASSIGNMENTS_EXT)? || !exists(IVFVEC_EXT)? {
-                        return Err(TantivyError::InternalError(
-                            "segment is marked IVF but is missing IVF vector components"
-                                .to_string(),
-                        ));
-                    }
                     VectorStorageReader::Ivf(IvfVecReader::open(segment_reader, meta.payload)?)
                 }
             }
