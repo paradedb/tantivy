@@ -1,21 +1,30 @@
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::collector::sort_key::{Comparator, SegmentSortKeyComputer, SortKeyComputer};
+use crate::collector::sort_key::shared_threshold::SharedThreshold;
 use crate::collector::{Collector, SegmentCollector, TopNComputer};
 use crate::query::Weight;
 use crate::schema::Schema;
 use crate::{DocAddress, DocId, Result, Score, SegmentReader};
 
-pub(crate) struct TopBySortKeyCollector<TSortKeyComputer> {
+pub(crate) struct TopBySortKeyCollector<TSortKeyComputer>
+where TSortKeyComputer: SortKeyComputer
+{
     sort_key_computer: TSortKeyComputer,
     doc_range: Range<usize>,
+    shared_threshold: Option<Arc<dyn SharedThreshold<<<TSortKeyComputer as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>>,
 }
 
-impl<TSortKeyComputer> TopBySortKeyCollector<TSortKeyComputer> {
+impl<TSortKeyComputer> TopBySortKeyCollector<TSortKeyComputer>
+where TSortKeyComputer: SortKeyComputer
+{
     pub fn new(sort_key_computer: TSortKeyComputer, doc_range: Range<usize>) -> Self {
+        let shared_threshold = sort_key_computer.create_shared_threshold();
         TopBySortKeyCollector {
             sort_key_computer,
             doc_range,
+            shared_threshold,
         }
     }
 }
@@ -36,10 +45,13 @@ where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
         let segment_sort_key_computer = self
             .sort_key_computer
             .segment_sort_key_computer(segment_reader)?;
-        let topn_computer = TopNComputer::new_with_comparator(
+        let mut topn_computer = TopNComputer::new_with_comparator(
             self.doc_range.end,
             self.sort_key_computer.comparator(),
         );
+        topn_computer.segment_ord = segment_ord;
+        topn_computer.shared_threshold = self.shared_threshold.clone();
+        
         Ok(TopBySortKeySegmentCollector {
             topn_computer,
             segment_ord,
@@ -68,7 +80,7 @@ where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
         let k = self.doc_range.end;
         let docs = self
             .sort_key_computer
-            .collect_segment_top_k(k, weight, reader, segment_ord)?;
+            .collect_segment_top_k(k, weight, reader, segment_ord, self.shared_threshold.clone())?;
         Ok(docs)
     }
 }

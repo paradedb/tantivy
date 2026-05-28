@@ -22,7 +22,6 @@ use crate::{DocId, Order, Score, SegmentReader};
 pub struct SortByStaticFastValue<T: FastValue> {
     field: String,
     order: Order,
-    shared_threshold: Arc<RwLockSharedThresholdOptionU64>,
     typ: PhantomData<T>,
 }
 
@@ -41,7 +40,6 @@ impl<T: FastValue> SortByStaticFastValue<T> {
         Self {
             field: column_name.to_string(),
             order,
-            shared_threshold: Arc::new(RwLockSharedThresholdOptionU64::new(order)),
             typ: PhantomData,
         }
     }
@@ -57,9 +55,9 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
     type SortKey = Option<T>;
     type Comparator = ComparatorEnum;
 
-    fn shared_threshold(&self) -> Option<Arc<dyn SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>> {
-        // We can directly return our shared_threshold since it is an Option<u64>!
-        Some(self.shared_threshold.clone())
+    fn create_shared_threshold(&self) -> Option<Arc<dyn SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>> {
+        let rwlock = Arc::new(RwLockSharedThresholdOptionU64::new(self.order));
+        Some(rwlock)
     }
 
     fn check_schema(&self, schema: &crate::schema::Schema) -> crate::Result<()> {

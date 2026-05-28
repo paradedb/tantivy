@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use crate::collector::sort_key::{Comparator, NaturalComparator};
+use crate::collector::sort_key::shared_threshold::SharedThreshold;
 use crate::collector::sort_key_top_collector::TopBySortKeySegmentCollector;
 use crate::collector::{default_collect_segment_impl, SegmentCollector as _, TopNComputer};
 use crate::schema::Schema;
@@ -115,7 +117,7 @@ pub trait SortKeyComputer: Sync {
     }
 
     /// Returns a shared threshold that can be used to synchronize the worst score across multiple threads/segments.
-    fn shared_threshold(&self) -> Option<std::sync::Arc<dyn crate::collector::sort_key::shared_threshold::SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>> {
+    fn create_shared_threshold(&self) -> Option<Arc<dyn SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>> {
         None
     }
 
@@ -126,12 +128,13 @@ pub trait SortKeyComputer: Sync {
         weight: &dyn crate::query::Weight,
         reader: &crate::SegmentReader,
         segment_ord: u32,
+        shared_threshold: Option<Arc<dyn SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>>,
     ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
         let with_scoring = self.requires_scoring();
         let segment_sort_key_computer = self.segment_sort_key_computer(reader)?;
         let mut topn_computer: TopNComputer<_, DocId, _> =
             TopNComputer::new_with_comparator(k, self.comparator());
-        topn_computer.shared_threshold = self.shared_threshold();
+        topn_computer.shared_threshold = shared_threshold;
         topn_computer.segment_ord = segment_ord;
         let mut segment_top_key_collector = TopBySortKeySegmentCollector {
             topn_computer,

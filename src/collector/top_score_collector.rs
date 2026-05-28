@@ -1,5 +1,6 @@
 use std::fmt;
 use std::ops::Range;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +9,7 @@ use crate::collector::sort_key::{
     Comparator, ComparatorEnum, NaturalComparator, ReverseComparator, SortBySimilarityScore,
     SortByStaticFastValue, SortByString,
 };
+use crate::collector::sort_key::shared_threshold::SharedThreshold;
 use crate::collector::sort_key_top_collector::TopBySortKeyCollector;
 use crate::collector::top_collector::ComparableDoc;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
@@ -515,7 +517,7 @@ pub struct TopNComputer<Score, D, C> {
     pub(crate) threshold: Option<(Score, u32)>,
     comparator: C,
     #[serde(skip)]
-    pub(crate) shared_threshold: Option<std::sync::Arc<dyn crate::collector::sort_key::shared_threshold::SharedThreshold<Score>>>,
+    pub(crate) shared_threshold: Option<Arc<dyn SharedThreshold<Score>>>,
     #[serde(skip)]
     truncation_count: u32,
     pub(crate) segment_ord: u32,
