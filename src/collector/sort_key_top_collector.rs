@@ -1,8 +1,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::collector::sort_key::{Comparator, SegmentSortKeyComputer, SortKeyComputer};
 use crate::collector::sort_key::shared_threshold::SharedThreshold;
+use crate::collector::sort_key::{Comparator, SegmentSortKeyComputer, SortKeyComputer};
 use crate::collector::{Collector, SegmentCollector, TopNComputer};
 use crate::query::Weight;
 use crate::schema::Schema;
@@ -51,7 +51,7 @@ where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
         );
         topn_computer.segment_ord = segment_ord;
         topn_computer.shared_threshold = self.shared_threshold.clone();
-        
+
         Ok(TopBySortKeySegmentCollector {
             topn_computer,
             segment_ord,
@@ -78,9 +78,13 @@ where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
         reader: &SegmentReader,
     ) -> crate::Result<Vec<(TSortKeyComputer::SortKey, DocAddress)>> {
         let k = self.doc_range.end;
-        let docs = self
-            .sort_key_computer
-            .collect_segment_top_k(k, weight, reader, segment_ord, self.shared_threshold.clone())?;
+        let docs = self.sort_key_computer.collect_segment_top_k(
+            k,
+            weight,
+            reader,
+            segment_ord,
+            self.shared_threshold.clone(),
+        )?;
         Ok(docs)
     }
 }

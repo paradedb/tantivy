@@ -47,7 +47,15 @@ impl SortKeyComputer for SortBySimilarityScore {
         true
     }
 
-    fn create_shared_threshold(&self) -> Option<Arc<dyn SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>> {
+    fn create_shared_threshold(
+        &self,
+    ) -> Option<
+        Arc<
+            dyn SharedThreshold<
+                <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+            >,
+        >,
+    > {
         Some(self.shared_threshold.clone())
     }
 
@@ -64,7 +72,13 @@ impl SortKeyComputer for SortBySimilarityScore {
         weight: &dyn crate::query::Weight,
         reader: &crate::SegmentReader,
         segment_ord: u32,
-        shared_threshold: Option<Arc<dyn SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>>,
+        shared_threshold: Option<
+            Arc<
+                dyn SharedThreshold<
+                    <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+                >,
+            >,
+        >,
     ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
         let mut top_n: TopNComputer<Score, DocId, Self::Comparator> =
             TopNComputer::new_with_comparator(k, self.comparator());

@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use columnar::Column;
 
+use crate::collector::sort_key::shared_threshold::{
+    RwLockSharedThresholdOptionU64, SharedThreshold,
+};
 use crate::collector::sort_key::ComparatorEnum;
-use crate::collector::sort_key::shared_threshold::{RwLockSharedThresholdOptionU64, SharedThreshold};
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::{DocId, Order, Score, SegmentReader};
@@ -36,7 +38,10 @@ impl<T: FastValue> std::fmt::Debug for SortByStaticFastValue<T> {
 
 impl<T: FastValue> SortByStaticFastValue<T> {
     /// Creates a new `SortByStaticFastValue` instance for the given field and order.
-    pub fn for_field_and_order(column_name: impl ToString, order: Order) -> SortByStaticFastValue<T> {
+    pub fn for_field_and_order(
+        column_name: impl ToString,
+        order: Order,
+    ) -> SortByStaticFastValue<T> {
         Self {
             field: column_name.to_string(),
             order,
@@ -55,7 +60,15 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
     type SortKey = Option<T>;
     type Comparator = ComparatorEnum;
 
-    fn create_shared_threshold(&self) -> Option<Arc<dyn SharedThreshold<<<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>> {
+    fn create_shared_threshold(
+        &self,
+    ) -> Option<
+        Arc<
+            dyn SharedThreshold<
+                <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+            >,
+        >,
+    > {
         let rwlock = Arc::new(RwLockSharedThresholdOptionU64::new(self.order));
         Some(rwlock)
     }

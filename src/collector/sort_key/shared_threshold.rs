@@ -1,13 +1,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-use crate::{Order, Score};
 use crate::collector::sort_key::{Comparator, ComparatorEnum};
+use crate::{Order, Score};
 
 pub trait SharedThreshold<T>: Send + Sync {
     fn load(&self) -> (T, u32);
     /// Conditionally updates the shared threshold if `new_threshold` is more restrictive.
-    /// Returns the most restrictive threshold currently known (which will be `new_threshold` if the update succeeded, or the pre-existing strictly better threshold if it failed).
+    /// Returns the most restrictive threshold currently known (which will be `new_threshold` if the
+    /// update succeeded, or the pre-existing strictly better threshold if it failed).
     fn update(&self, new_threshold: T, segment_ord: u32) -> (T, u32);
 }
 
@@ -110,8 +111,8 @@ impl SharedThreshold<Score> for AtomicSharedThreshold {
 /// In both `NaturalComparator` and `ReverseNoneIsLowerComparator`, `None` is the worst value
 /// (it appears last in top docs). So the initial threshold is `None`.
 ///
-/// Since `AtomicU64` cannot cleanly pack `Option<u64>` without losing a state, and threshold updates
-/// are very rare compared to reads, we use a `RwLock<(Option<u64>, u32)>`.
+/// Since `AtomicU64` cannot cleanly pack `Option<u64>` without losing a state, and threshold
+/// updates are very rare compared to reads, we use a `RwLock<(Option<u64>, u32)>`.
 pub struct RwLockSharedThresholdOptionU64 {
     value: RwLock<(Option<u64>, u32)>,
     order: Order,
@@ -163,16 +164,7 @@ mod tests {
 
     #[test]
     fn test_f32_ordered_roundtrip() {
-        let values = [
-            Score::MIN,
-            -1.0,
-            -0.0,
-            0.0,
-            0.5,
-            1.0,
-            42.0,
-            Score::MAX,
-        ];
+        let values = [Score::MIN, -1.0, -0.0, 0.0, 0.5, 1.0, 42.0, Score::MAX];
         for &v in &values {
             let u = f32_to_ordered_u32(v);
             let back = ordered_u32_to_f32(u);

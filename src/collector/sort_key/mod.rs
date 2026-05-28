@@ -278,7 +278,8 @@ pub(crate) mod tests {
             let searcher = index.reader()?.searcher();
             let ids = id_mapping(&searcher);
 
-            let top_collector = TopDocs::with_limit(4).order_by((SortBySimilarityScore::new(), order));
+            let top_collector =
+                TopDocs::with_limit(4).order_by((SortBySimilarityScore::new(), order));
             let field = index.schema().get_field("catchphrase").unwrap();
             let query_parser = QueryParser::for_index(index, vec![field]);
             let text_query = query_parser.parse_query("glow")?;

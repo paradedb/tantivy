@@ -5,11 +5,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::Collector;
+use crate::collector::sort_key::shared_threshold::SharedThreshold;
 use crate::collector::sort_key::{
     Comparator, ComparatorEnum, NaturalComparator, ReverseComparator, SortBySimilarityScore,
     SortByStaticFastValue, SortByString,
 };
-use crate::collector::sort_key::shared_threshold::SharedThreshold;
 use crate::collector::sort_key_top_collector::TopBySortKeyCollector;
 use crate::collector::top_collector::ComparableDoc;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
@@ -306,7 +306,9 @@ impl TopDocs {
         TFastValue: FastValue,
         ComparatorEnum: Comparator<Option<TFastValue>>,
     {
-        self.order_by(SortByStaticFastValue::for_field_and_order(fast_field, order))
+        self.order_by(SortByStaticFastValue::for_field_and_order(
+            fast_field, order,
+        ))
     }
 
     /// Like `order_by_fast_field`, but for a `String` fast field.
@@ -644,12 +646,13 @@ where
                 return;
             }
             if cmp == std::cmp::Ordering::Equal && self.segment_ord >= *thresh_ord {
-                // If it is a global threshold tie, but we have a lower global tie-breaker priority 
-                // (a higher segment_ord means we appear later globally, therefore our document would have
-                // a higher `DocAddress`, meaning it should lose the tie-breaker).
-                // Or if `self.segment_ord == *thresh_ord`, it's a purely local tie. Since we iterate
-                // docs in ascending order within a segment, our doc has a higher `DocId` and must 
-                // lose the local tie-breaker.
+                // If it is a global threshold tie, but we have a lower global tie-breaker priority
+                // (a higher segment_ord means we appear later globally, therefore our document
+                // would have a higher `DocAddress`, meaning it should lose the
+                // tie-breaker). Or if `self.segment_ord == *thresh_ord`, it's a
+                // purely local tie. Since we iterate docs in ascending order within
+                // a segment, our doc has a higher `DocId` and must lose the local
+                // tie-breaker.
                 return;
             }
         }
@@ -685,7 +688,8 @@ where
             self.truncation_count += 1;
             if self.truncation_count % 2 == 0 {
                 // Send our median to the global pool, and immediately adopt the resulting
-                // global threshold (which is guaranteed to be at least as restrictive as the median)
+                // global threshold (which is guaranteed to be at least as restrictive as the
+                // median)
                 let global = shared.update(median, self.segment_ord);
                 self.threshold = Some(global);
             } else {
