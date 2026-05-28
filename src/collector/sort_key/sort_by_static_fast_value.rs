@@ -4,7 +4,7 @@ use std::sync::Arc;
 use columnar::Column;
 
 use crate::collector::sort_key::shared_threshold::{
-    RwLockSharedThresholdOptionU64, SharedThreshold,
+    RwLockSharedThresholdOptionU64, SharedThresholdArcOpt,
 };
 use crate::collector::sort_key::ComparatorEnum;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
@@ -62,12 +62,8 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
 
     fn create_shared_threshold(
         &self,
-    ) -> Option<
-        Arc<
-            dyn SharedThreshold<
-                <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
-            >,
-        >,
+    ) -> SharedThresholdArcOpt<
+        <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
     > {
         let rwlock = Arc::new(RwLockSharedThresholdOptionU64::new(self.order));
         Some(rwlock)

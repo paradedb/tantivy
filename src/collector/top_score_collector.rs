@@ -1,11 +1,10 @@
 use std::fmt;
 use std::ops::Range;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use super::Collector;
-use crate::collector::sort_key::shared_threshold::SharedThreshold;
+use crate::collector::sort_key::shared_threshold::SharedThresholdArcOpt;
 use crate::collector::sort_key::{
     Comparator, ComparatorEnum, NaturalComparator, ReverseComparator, SortBySimilarityScore,
     SortByStaticFastValue, SortByString,
@@ -519,7 +518,7 @@ pub struct TopNComputer<Score, D, C> {
     pub(crate) threshold: Option<(Score, u32)>,
     comparator: C,
     #[serde(skip)]
-    pub(crate) shared_threshold: Option<Arc<dyn SharedThreshold<Score>>>,
+    pub(crate) shared_threshold: SharedThresholdArcOpt<Score>,
     #[serde(skip)]
     truncation_count: u32,
     pub(crate) segment_ord: u32,

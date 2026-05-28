@@ -8,7 +8,9 @@ mod sort_by_string;
 mod sort_key_computer;
 
 pub use order::*;
-pub use shared_threshold::{AtomicSharedThreshold, SharedThreshold};
+pub use shared_threshold::{
+    AtomicSharedThreshold, SharedThreshold, SharedThresholdArc, SharedThresholdArcOpt,
+};
 pub use sort_by_bytes::SortByBytes;
 pub use sort_by_erased_type::SortByErasedType;
 pub use sort_by_score::SortBySimilarityScore;

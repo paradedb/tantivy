@@ -1,8 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use crate::collector::sort_key::{Comparator, ComparatorEnum};
 use crate::{Order, Score};
+
+pub type SharedThresholdArc<T> = Arc<dyn SharedThreshold<T>>;
+pub type SharedThresholdArcOpt<T> = Option<SharedThresholdArc<T>>;
 
 pub trait SharedThreshold<T>: Send + Sync {
     fn load(&self) -> (T, u32);

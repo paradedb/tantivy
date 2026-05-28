@@ -1,7 +1,6 @@
 use std::ops::Range;
-use std::sync::Arc;
 
-use crate::collector::sort_key::shared_threshold::SharedThreshold;
+use crate::collector::sort_key::shared_threshold::SharedThresholdArcOpt;
 use crate::collector::sort_key::{Comparator, SegmentSortKeyComputer, SortKeyComputer};
 use crate::collector::{Collector, SegmentCollector, TopNComputer};
 use crate::query::Weight;
@@ -13,7 +12,9 @@ where TSortKeyComputer: SortKeyComputer
 {
     sort_key_computer: TSortKeyComputer,
     doc_range: Range<usize>,
-    shared_threshold: Option<Arc<dyn SharedThreshold<<<TSortKeyComputer as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey>>>,
+    shared_threshold: SharedThresholdArcOpt<
+        <<TSortKeyComputer as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+    >,
 }
 
 impl<TSortKeyComputer> TopBySortKeyCollector<TSortKeyComputer>

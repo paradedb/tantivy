@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use super::shared_threshold::{AtomicSharedThreshold, SharedThreshold};
+use super::shared_threshold::{AtomicSharedThreshold, SharedThresholdArc, SharedThresholdArcOpt};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::{DocAddress, DocId, Score};
 
 #[derive(Clone)]
 pub struct SortBySimilarityScore {
-    shared_threshold: Arc<dyn SharedThreshold<Score>>,
+    shared_threshold: SharedThresholdArc<Score>,
 }
 
 impl std::fmt::Debug for SortBySimilarityScore {
@@ -31,7 +31,7 @@ impl SortBySimilarityScore {
         Self::default()
     }
 
-    pub fn with_shared_threshold(shared_threshold: Arc<dyn SharedThreshold<Score>>) -> Self {
+    pub fn with_shared_threshold(shared_threshold: SharedThresholdArc<Score>) -> Self {
         Self { shared_threshold }
     }
 }
@@ -49,12 +49,8 @@ impl SortKeyComputer for SortBySimilarityScore {
 
     fn create_shared_threshold(
         &self,
-    ) -> Option<
-        Arc<
-            dyn SharedThreshold<
-                <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
-            >,
-        >,
+    ) -> SharedThresholdArcOpt<
+        <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
     > {
         Some(self.shared_threshold.clone())
     }
@@ -72,12 +68,8 @@ impl SortKeyComputer for SortBySimilarityScore {
         weight: &dyn crate::query::Weight,
         reader: &crate::SegmentReader,
         segment_ord: u32,
-        shared_threshold: Option<
-            Arc<
-                dyn SharedThreshold<
-                    <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
-                >,
-            >,
+        shared_threshold: SharedThresholdArcOpt<
+            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
         >,
     ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
         let mut top_n: TopNComputer<Score, DocId, Self::Comparator> =

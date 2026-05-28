@@ -106,7 +106,8 @@ pub use self::top_score_collector::{TopDocs, TopNComputer};
 
 mod sort_key_top_collector;
 pub use self::sort_key::{
-    AtomicSharedThreshold, SegmentSortKeyComputer, SharedThreshold, SortKeyComputer,
+    AtomicSharedThreshold, SegmentSortKeyComputer, SharedThreshold, SharedThresholdArc,
+    SharedThresholdArcOpt, SortKeyComputer,
 };
 mod facet_collector;
 pub use self::facet_collector::{FacetCollector, FacetCounts};
