@@ -21,7 +21,7 @@ impl<TSortKeyComputer> TopBySortKeyCollector<TSortKeyComputer>
 where TSortKeyComputer: SortKeyComputer
 {
     pub fn new(sort_key_computer: TSortKeyComputer, doc_range: Range<usize>) -> Self {
-        let shared_threshold = sort_key_computer.create_shared_threshold();
+        let shared_threshold = sort_key_computer.shared_threshold();
         TopBySortKeyCollector {
             sort_key_computer,
             doc_range,

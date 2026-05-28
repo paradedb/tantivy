@@ -1,19 +1,22 @@
 use std::sync::Arc;
 
-use super::shared_threshold::{AtomicSharedThreshold, SharedThresholdArc, SharedThresholdArcOpt};
+use super::shared_threshold::{AtomicSharedThreshold, SharedThresholdArcOpt};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::{DocAddress, DocId, Score};
 
 #[derive(Clone)]
 pub struct SortBySimilarityScore {
-    shared_threshold: SharedThresholdArc<Score>,
+    shared_threshold: SharedThresholdArcOpt<Score>,
 }
 
 impl std::fmt::Debug for SortBySimilarityScore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SortBySimilarityScore")
-            .field("threshold", &self.shared_threshold.load())
+            .field(
+                "threshold",
+                &self.shared_threshold.as_ref().map(|s| s.load()),
+            )
             .finish()
     }
 }
@@ -21,7 +24,7 @@ impl std::fmt::Debug for SortBySimilarityScore {
 impl Default for SortBySimilarityScore {
     fn default() -> Self {
         Self {
-            shared_threshold: Arc::new(AtomicSharedThreshold::default()),
+            shared_threshold: Some(Arc::new(AtomicSharedThreshold::default())),
         }
     }
 }
@@ -31,7 +34,7 @@ impl SortBySimilarityScore {
         Self::default()
     }
 
-    pub fn with_shared_threshold(shared_threshold: SharedThresholdArc<Score>) -> Self {
+    pub fn with_shared_threshold(shared_threshold: SharedThresholdArcOpt<Score>) -> Self {
         Self { shared_threshold }
     }
 }
@@ -47,12 +50,12 @@ impl SortKeyComputer for SortBySimilarityScore {
         true
     }
 
-    fn create_shared_threshold(
+    fn shared_threshold(
         &self,
     ) -> SharedThresholdArcOpt<
         <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
     > {
-        Some(self.shared_threshold.clone())
+        self.shared_threshold.clone()
     }
 
     fn segment_sort_key_computer(

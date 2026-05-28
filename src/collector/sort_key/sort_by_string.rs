@@ -1,5 +1,6 @@
 use columnar::StrColumn;
 
+use crate::collector::sort_key::shared_threshold::SharedThresholdArcOpt;
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::termdict::TermOrdinal;
@@ -14,9 +15,18 @@ use crate::{DocId, Score};
 ///
 /// Documents that do not have this value are still considered.
 /// Their sort key will simply be `None`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SortByString {
     column_name: String,
+    shared_threshold: SharedThresholdArcOpt<Option<TermOrdinal>>,
+}
+
+impl std::fmt::Debug for SortByString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SortByString")
+            .field("column_name", &self.column_name)
+            .finish()
+    }
 }
 
 impl SortByString {
@@ -24,7 +34,17 @@ impl SortByString {
     pub fn for_field(column_name: impl ToString) -> Self {
         SortByString {
             column_name: column_name.to_string(),
+            shared_threshold: None,
         }
+    }
+
+    /// Configures a shared threshold to be used by this sort key computer.
+    pub fn with_shared_threshold(
+        mut self,
+        shared_threshold: SharedThresholdArcOpt<Option<TermOrdinal>>,
+    ) -> Self {
+        self.shared_threshold = shared_threshold;
+        self
     }
 }
 
@@ -32,6 +52,14 @@ impl SortKeyComputer for SortByString {
     type SortKey = Option<String>;
     type Child = ByStringColumnSegmentSortKeyComputer;
     type Comparator = NaturalComparator;
+
+    fn shared_threshold(
+        &self,
+    ) -> SharedThresholdArcOpt<
+        <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
+    > {
+        self.shared_threshold.clone()
+    }
 
     fn segment_sort_key_computer(
         &self,

@@ -7,11 +7,24 @@ use crate::{Order, Score};
 pub type SharedThresholdArc<T> = Arc<dyn SharedThreshold<T>>;
 pub type SharedThresholdArcOpt<T> = Option<SharedThresholdArc<T>>;
 
+/// A trait for sharing a search threshold across multiple threads or segments.
+///
+/// Implementations of this trait must be thread-safe as they are typically wrapped in an [`Arc`].
+/// The threshold is used to prune documents that cannot possibly compete with the top-K
+/// documents already found in other segments.
 pub trait SharedThreshold<T>: Send + Sync {
+    /// Loads the current shared threshold and its associated segment ordinal.
+    ///
+    /// Among documents with the same sort key, we favor those from segments with a lower ordinal.
+    /// This is consistent with the tie-breaking behavior of [`DocAddress`], which ensures
+    /// stable sorting across multiple segments.
     fn load(&self) -> (T, u32);
+
     /// Conditionally updates the shared threshold if `new_threshold` is more restrictive.
-    /// Returns the most restrictive threshold currently known (which will be `new_threshold` if the
-    /// update succeeded, or the pre-existing strictly better threshold if it failed).
+    ///
+    /// Returns the most restrictive threshold currently known after the update attempt (which
+    /// will be `new_threshold` if the update succeeded, or a pre-existing strictly better
+    /// threshold if it failed).
     fn update(&self, new_threshold: T, segment_ord: u32) -> (T, u32);
 }
 
