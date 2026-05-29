@@ -12,6 +12,7 @@ use crate::plugin::PluginWriter;
 use crate::schema::document::{TantivyDocument, Value};
 use crate::schema::{Field, FieldType, Schema};
 use crate::vector::meta::{VectorStorageFormat, VECMETA_EXT};
+use crate::vector::options::VectorOptions;
 use crate::{DocId, TantivyError};
 
 /// Per-field in-memory state: the doc ids that have a value (ascending),
@@ -30,15 +31,18 @@ struct FieldBuffer {
     /// Dense byte blob: `row_bytes[i*stride..(i+1)*stride]` is the
     /// vector for `present_doc_ids[i]`.
     row_bytes: Vec<u8>,
-    /// Bytes per vector (`dim * dtype.size_bytes()`).
-    stride: usize,
+    opts: VectorOptions,
 }
 
 impl FieldBuffer {
     fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) {
-        debug_assert_eq!(bytes.len(), self.stride);
+        let stride = self.opts.bytes_per_vector();
+        debug_assert_eq!(bytes.len(), stride);
         self.present_doc_ids.push(doc_id);
+        let start = self.row_bytes.len();
         self.row_bytes.extend_from_slice(bytes);
+        self.opts
+            .maybe_normalize_doc_bytes(&mut self.row_bytes[start..start + stride]);
     }
 
     fn mem_usage(&self) -> usize {
@@ -65,7 +69,7 @@ impl FlatVecWriter {
                     FieldBuffer {
                         present_doc_ids: Vec::new(),
                         row_bytes: Vec::new(),
-                        stride: opts.bytes_per_vector(),
+                        opts: opts.clone(),
                     },
                 );
             }
@@ -100,11 +104,12 @@ impl PluginWriter for FlatVecWriter {
                     schema.get_field_entry(*field).name()
                 ))
             })?;
-            if bytes.len() != buf.stride {
+            let stride = buf.opts.bytes_per_vector();
+            if bytes.len() != stride {
                 return Err(TantivyError::SchemaError(format!(
                     "vector byte length mismatch for field {:?}: expected {} bytes, got {}",
                     schema.get_field_entry(*field).name(),
-                    buf.stride,
+                    stride,
                     bytes.len(),
                 )));
             }
@@ -112,6 +117,7 @@ impl PluginWriter for FlatVecWriter {
         }
         Ok(())
     }
+
     fn serialize(
         &mut self,
         segment: &Segment,
@@ -133,14 +139,15 @@ impl PluginWriter for FlatVecWriter {
             // the no-remap case the writer already accumulates in
             // ascending insertion (= target) order.
             let (present, row_bytes): (Vec<DocId>, Vec<u8>) = if let Some(map) = doc_id_map {
+                let stride = buf.opts.bytes_per_vector();
                 let mut p = Vec::new();
                 let mut r = Vec::new();
                 for new_doc_id in 0..map.num_new_doc_ids() as DocId {
                     let old_doc_id = map.get_old_doc_id(new_doc_id);
                     if let Ok(row_idx) = buf.present_doc_ids.binary_search(&old_doc_id) {
                         p.push(new_doc_id);
-                        let start = row_idx * buf.stride;
-                        r.extend_from_slice(&buf.row_bytes[start..start + buf.stride]);
+                        let start = row_idx * stride;
+                        r.extend_from_slice(&buf.row_bytes[start..start + stride]);
                     }
                 }
                 (p, r)
@@ -185,3 +192,4 @@ impl PluginWriter for FlatVecWriter {
         self
     }
 }
+

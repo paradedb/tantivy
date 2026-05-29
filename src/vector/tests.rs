@@ -432,9 +432,10 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
 
 pub(crate) mod ground_truth {
     use std::cmp::Ordering;
+    use std::sync::Arc;
 
     use crate::schema::Field;
-    use crate::vector::{Metric, VectorColumnReader, VectorReader};
+    use crate::vector::{Metric, PreparedQuery, VectorColumnReader, VectorReader};
     use crate::{DocAddress, Index, Score};
 
     pub(crate) fn top_k(
@@ -444,6 +445,7 @@ pub(crate) mod ground_truth {
         query: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        let query = PreparedQuery::<f32>::new(metric, Arc::new(query.to_vec()));
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
@@ -458,7 +460,7 @@ pub(crate) mod ground_truth {
                 }
                 if let Some(bytes) = column.vector_bytes_at(doc) {
                     scored.push((
-                        metric.similarity_bytes(query, bytes),
+                        query.score_doc_bytes(bytes),
                         DocAddress::new(seg_ord as u32, doc),
                     ));
                 }

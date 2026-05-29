@@ -16,6 +16,7 @@ use common::BitSet;
 use super::flat::FlatVectorColumn;
 use super::ivf::{AdaptiveProbeParams, IvfVectorColumn};
 use super::options::{Metric, VectorElement};
+use super::prepared::PreparedQuery;
 use super::reader::{VectorColumn, VectorColumnReader, VectorReader};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::TopNComputer;
@@ -31,15 +32,13 @@ pub enum VectorBackend<T: VectorElement> {
 
 pub struct FlatBackend<T: VectorElement> {
     column: FlatVectorColumn,
-    metric: Metric,
-    query: Arc<Vec<T>>,
+    query: Arc<PreparedQuery<T>>,
     segment_ord: SegmentOrdinal,
 }
 
 pub struct IvfBackend<T: VectorElement> {
     column: IvfVectorColumn,
-    metric: Metric,
-    query: Arc<Vec<T>>,
+    query: Arc<PreparedQuery<T>>,
     adaptive: AdaptiveProbeParams,
     segment_ord: SegmentOrdinal,
 }
@@ -60,17 +59,16 @@ impl<T: VectorElement> VectorBackend<T> {
 
         let vec_reader = VectorReader::open(segment_reader)?;
 
+        let query = Arc::new(PreparedQuery::<T>::new(metric, query));
         match vec_reader.open_column(field)? {
             VectorColumn::Ivf(column) => Ok(Self::Ivf(IvfBackend {
                 column,
-                metric,
                 query,
                 adaptive,
                 segment_ord,
             })),
             VectorColumn::Flat(column) => Ok(Self::Flat(FlatBackend {
                 column,
-                metric,
                 query,
                 segment_ord,
             })),
@@ -132,7 +130,7 @@ impl<T: VectorElement> FlatBackend<T> {
                     }
                 }
                 if let Some(bytes) = self.column.vector_bytes_at(doc) {
-                    let score = self.metric.similarity_bytes(&self.query[..], bytes);
+                    let score = self.query.score_doc_bytes(bytes);
                     topn.push(score, doc);
                 }
             }
@@ -247,13 +245,13 @@ impl<T: VectorElement> IvfBackend<T> {
         let mut ranked: Vec<(f32, usize)> = (0..num_centroids)
             .map(|c| {
                 let cb = &centroid_bytes[c * stride..(c + 1) * stride];
-                (self.metric.similarity_bytes(&self.query[..], cb), c)
+                (self.query.score_centroid_bytes(cb), c)
             })
             .collect();
         ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
 
         let best = ranked[0].0;
-        let threshold = adaptive_threshold(self.metric, best, self.adaptive.epsilon);
+        let threshold = adaptive_threshold(self.query.metric(), best, self.adaptive.epsilon);
         // Resolve the candidate floor at the call site so a default
         // `min_candidates = 0` still gives a sane
         // `CANDIDATE_OVERFETCH_MULTIPLIER * top_n` floor. Critical for
@@ -319,7 +317,7 @@ impl<T: VectorElement> IvfBackend<T> {
                     }
                 }
                 let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
-                let score = self.metric.similarity_bytes(&self.query[..], vbytes);
+                let score = self.query.score_doc_bytes(vbytes);
                 topn.push_unordered(score, doc);
                 candidates += 1;
                 if let Some(s) = stats.as_deref_mut() {
@@ -1370,6 +1368,7 @@ mod tests {
         query: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        let query = PreparedQuery::<f32>::new(metric, Arc::new(query.to_vec()));
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
@@ -1388,7 +1387,7 @@ mod tests {
                 }
                 if let Some(bytes) = column.vector_bytes_at(doc) {
                     scored.push((
-                        metric.similarity_bytes(query, bytes),
+                        query.score_doc_bytes(bytes),
                         DocAddress::new(seg_ord as u32, doc),
                     ));
                 }

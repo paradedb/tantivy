@@ -15,6 +15,7 @@ mod distance;
 mod meta;
 mod options;
 mod plugin;
+mod prepared;
 mod reader;
 
 pub mod flat;
@@ -34,6 +35,7 @@ pub use ivf::{
 pub use meta::VectorStorageFormat;
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};
 pub use plugin::VectorPlugin;
+pub use prepared::PreparedQuery;
 pub use reader::{
     VectorClusterStats, VectorColumn, VectorColumnReader, VectorInfo, VectorReader,
 };
