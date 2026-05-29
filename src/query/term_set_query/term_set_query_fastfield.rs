@@ -349,7 +349,7 @@ impl<T: Copy + Eq + std::hash::Hash + PartialOrd + std::fmt::Debug + Send + Sync
     }
 
     fn size_hint(&self) -> u32 {
-        self.max_doc - self.doc_id.saturating_add(1)
+        self.max_doc.saturating_sub(self.doc_id.saturating_add(1))
     }
 }
 
