@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::collector::sort_key::{Comparator, ComparatorEnum};
-use crate::{Order, Score};
+use crate::{Order, Score, SegmentOrdinal};
 
 pub type SharedThresholdArc<T> = Arc<dyn SharedThreshold<T>>;
 pub type SharedThresholdArcOpt<T> = Option<SharedThresholdArc<T>>;
@@ -18,14 +18,14 @@ pub trait SharedThreshold<T>: Send + Sync {
     /// Among documents with the same sort key, we favor those from segments with a lower ordinal.
     /// This is consistent with the tie-breaking behavior of [`DocAddress`], which ensures
     /// stable sorting across multiple segments.
-    fn load(&self) -> (T, u32);
+    fn load(&self) -> (T, SegmentOrdinal);
 
     /// Conditionally updates the shared threshold if `new_threshold` is more restrictive.
     ///
     /// Returns the most restrictive threshold currently known after the update attempt (which
     /// will be `new_threshold` if the update succeeded, or a pre-existing strictly better
     /// threshold if it failed).
-    fn update(&self, new_threshold: T, segment_ord: u32) -> (T, u32);
+    fn update(&self, new_threshold: T, segment_ord: SegmentOrdinal) -> (T, SegmentOrdinal);
 
     /// Returns a threshold value `T` that is strictly better than the current shared threshold
     /// if the given `segment_ord` would lose a tie-break against the `threshold_ord`.
@@ -45,7 +45,12 @@ pub trait SharedThreshold<T>: Send + Sync {
     /// is "one step better" than `value`. For floating-point scores, this is typically
     /// `value.next_up()`. If `segment_ord < threshold_ord`, the document could still win the
     /// tie-break, so the `value` should be returned unchanged.
-    fn competitive_threshold(&self, value: T, threshold_ord: u32, segment_ord: u32) -> T {
+    fn competitive_threshold(
+        &self,
+        value: T,
+        threshold_ord: SegmentOrdinal,
+        segment_ord: SegmentOrdinal,
+    ) -> T {
         let _ = threshold_ord;
         let _ = segment_ord;
         value
@@ -63,11 +68,11 @@ impl<T: Clone + Send + Sync> NoopSharedThreshold<T> {
 }
 
 impl<T: Clone + Send + Sync> SharedThreshold<T> for NoopSharedThreshold<T> {
-    fn load(&self) -> (T, u32) {
+    fn load(&self) -> (T, SegmentOrdinal) {
         (self.noop_value.clone(), 0)
     }
 
-    fn update(&self, new_threshold: T, segment_ord: u32) -> (T, u32) {
+    fn update(&self, new_threshold: T, segment_ord: SegmentOrdinal) -> (T, SegmentOrdinal) {
         (new_threshold, segment_ord)
     }
 }
@@ -96,14 +101,14 @@ fn ordered_u32_to_f32(u: u32) -> f32 {
 /// We want to maximize the score, but *minimize* the segment ordinal to favor lower segments
 /// in tie-breakers. So we pack the inverted segment ordinal into the lower 32 bits.
 #[inline(always)]
-fn pack_score_and_ord(score: Score, segment_ord: u32) -> u64 {
+fn pack_score_and_ord(score: Score, segment_ord: SegmentOrdinal) -> u64 {
     let top = f32_to_ordered_u32(score) as u64;
     let bottom = (!segment_ord) as u64;
     (top << 32) | bottom
 }
 
 #[inline(always)]
-fn unpack_score_and_ord(val: u64) -> (Score, u32) {
+fn unpack_score_and_ord(val: u64) -> (Score, SegmentOrdinal) {
     let score = ordered_u32_to_f32((val >> 32) as u32);
     let segment_ord = !(val as u32);
     (score, segment_ord)
@@ -116,17 +121,16 @@ pub struct AtomicSharedThreshold {
 impl Default for AtomicSharedThreshold {
     fn default() -> Self {
         Self {
-            value: AtomicU64::new(pack_score_and_ord(Score::MIN, u32::MAX)),
+            value: AtomicU64::new(pack_score_and_ord(Score::MIN, SegmentOrdinal::MAX)),
         }
     }
 }
-
 impl SharedThreshold<Score> for AtomicSharedThreshold {
-    fn load(&self) -> (Score, u32) {
+    fn load(&self) -> (Score, SegmentOrdinal) {
         unpack_score_and_ord(self.value.load(Ordering::Relaxed))
     }
 
-    fn update(&self, new_threshold: Score, segment_ord: u32) -> (Score, u32) {
+    fn update(&self, new_threshold: Score, segment_ord: SegmentOrdinal) -> (Score, SegmentOrdinal) {
         let new_packed = pack_score_and_ord(new_threshold, segment_ord);
         let mut current = self.value.load(Ordering::Relaxed);
         loop {
@@ -145,7 +149,12 @@ impl SharedThreshold<Score> for AtomicSharedThreshold {
         }
     }
 
-    fn competitive_threshold(&self, value: Score, threshold_ord: u32, segment_ord: u32) -> Score {
+    fn competitive_threshold(
+        &self,
+        value: Score,
+        threshold_ord: SegmentOrdinal,
+        segment_ord: SegmentOrdinal,
+    ) -> Score {
         if segment_ord < threshold_ord {
             // If our segment wins tie-breaks against the threshold setter, we want to accept
             // documents with a score GREATER THAN OR EQUAL to the threshold.
@@ -166,22 +175,28 @@ impl SharedThreshold<Score> for AtomicSharedThreshold {
 /// (it appears last in top docs). So the initial threshold is `None`.
 ///
 /// Since `AtomicU64` cannot cleanly pack `Option<u64>` without losing a state, and threshold
-/// updates are very rare compared to reads, we use a `RwLock<(Option<u64>, u32)>`.
+/// updates are very rare compared to reads, we use a `RwLock<(Option<u64>, SegmentOrdinal)>`.
 pub struct RwLockSharedThresholdOptionU64 {
-    value: RwLock<(Option<u64>, u32)>,
+    value: RwLock<(Option<u64>, SegmentOrdinal)>,
     order: Order,
 }
 
 impl RwLockSharedThresholdOptionU64 {
     pub fn new(order: Order) -> Self {
         Self {
-            value: RwLock::new((None, u32::MAX)),
+            value: RwLock::new((None, SegmentOrdinal::MAX)),
             order,
         }
     }
 
     // helper to compare
-    fn is_better(&self, new: &Option<u64>, new_ord: u32, old: &Option<u64>, old_ord: u32) -> bool {
+    fn is_better(
+        &self,
+        new: &Option<u64>,
+        new_ord: SegmentOrdinal,
+        old: &Option<u64>,
+        old_ord: SegmentOrdinal,
+    ) -> bool {
         let cmp_enum = ComparatorEnum::from(self.order);
         match cmp_enum.compare(new, old) {
             std::cmp::Ordering::Greater => true,
@@ -192,11 +207,15 @@ impl RwLockSharedThresholdOptionU64 {
 }
 
 impl SharedThreshold<Option<u64>> for RwLockSharedThresholdOptionU64 {
-    fn load(&self) -> (Option<u64>, u32) {
+    fn load(&self) -> (Option<u64>, SegmentOrdinal) {
         *self.value.read().unwrap()
     }
 
-    fn update(&self, new_threshold: Option<u64>, segment_ord: u32) -> (Option<u64>, u32) {
+    fn update(
+        &self,
+        new_threshold: Option<u64>,
+        segment_ord: SegmentOrdinal,
+    ) -> (Option<u64>, SegmentOrdinal) {
         let current = *self.value.read().unwrap();
         if self.is_better(&new_threshold, segment_ord, &current.0, current.1) {
             if let Ok(mut write_guard) = self.value.write() {
@@ -256,7 +275,7 @@ mod tests {
     #[test]
     fn test_atomic_shared_threshold() {
         let t = AtomicSharedThreshold::default();
-        assert_eq!(t.load(), (Score::MIN, u32::MAX));
+        assert_eq!(t.load(), (Score::MIN, SegmentOrdinal::MAX));
 
         t.update(0.5, 5);
         assert_eq!(t.load(), (0.5, 5));
@@ -293,7 +312,7 @@ mod tests {
     #[test]
     fn test_rwlock_shared_threshold_option_u64_asc() {
         let t = RwLockSharedThresholdOptionU64::new(Order::Asc);
-        assert_eq!(t.load(), (None, u32::MAX));
+        assert_eq!(t.load(), (None, SegmentOrdinal::MAX));
 
         t.update(Some(100), 5);
         assert_eq!(t.load(), (Some(100), 5));
@@ -304,7 +323,7 @@ mod tests {
         t.update(Some(100), 2); // Same score, better ord
         assert_eq!(t.load(), (Some(100), 2));
 
-        t.update(None, 1); // None is strictly smaller than Some(100) -> Wait, None is worse.
+        t.update(None, 1); // None is strictly smaller than Some(100)
         assert_eq!(t.load(), (Some(100), 2));
 
         t.update(Some(0), 10); // Some(0) > None, better
@@ -314,7 +333,7 @@ mod tests {
     #[test]
     fn test_rwlock_shared_threshold_option_u64_desc() {
         let t = RwLockSharedThresholdOptionU64::new(Order::Desc);
-        assert_eq!(t.load(), (None, u32::MAX));
+        assert_eq!(t.load(), (None, SegmentOrdinal::MAX));
 
         t.update(Some(100), 5);
         assert_eq!(t.load(), (Some(100), 5));

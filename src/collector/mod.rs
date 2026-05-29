@@ -176,7 +176,7 @@ pub trait Collector: Sync + Send {
     fn collect_segment(
         &self,
         weight: &dyn Weight,
-        segment_ord: u32,
+        segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
         let with_scoring = self.requires_scoring();

@@ -13,7 +13,7 @@ use crate::collector::sort_key_top_collector::TopBySortKeyCollector;
 use crate::collector::top_collector::ComparableDoc;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::fastfield::FastValue;
-use crate::{DocAddress, DocId, Order, Score, SegmentReader};
+use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
 
 /// The `TopDocs` collector keeps track of the top `K` documents
 /// sorted by their score.
@@ -178,7 +178,7 @@ impl TopDocs {
     /// #   let query = QueryParser::for_index(&index, vec![title]).parse_query("diary")?;
     /// #   let top_docs = docs_sorted_by_rating(&reader.searcher(), &query)?;
     /// #   assert_eq!(top_docs,
-    /// #            vec![(Some(97u64), DocAddress::new(0u32, 1)),
+    /// #            vec![(Some(97u64), DocAddress::new(0, 1)),
     /// #                 (Some(80u64), DocAddress::new(0u32, 3))]);
     /// #   Ok(())
     /// # }
@@ -515,13 +515,13 @@ pub struct TopNComputer<Score, D, C> {
     /// The buffer reverses sort order to get top-semantics instead of bottom-semantics
     buffer: Vec<ComparableDoc<Score, D>>,
     top_n: usize,
-    pub(crate) threshold: Option<(Score, u32)>,
+    pub(crate) threshold: Option<(Score, SegmentOrdinal)>,
     comparator: C,
     #[serde(skip)]
     pub(crate) shared_threshold: SharedThresholdArcOpt<Score>,
     #[serde(skip)]
     truncation_count: u32,
-    pub(crate) segment_ord: u32,
+    pub(crate) segment_ord: SegmentOrdinal,
     #[serde(skip)]
     pub(crate) pruning_threshold: Option<Score>,
 }
@@ -531,10 +531,10 @@ pub struct TopNComputer<Score, D, C> {
 struct TopNComputerDeser<Score, D, C> {
     buffer: Vec<ComparableDoc<Score, D>>,
     top_n: usize,
-    threshold: Option<(Score, u32)>,
+    threshold: Option<(Score, SegmentOrdinal)>,
     comparator: C,
     #[serde(default)]
-    segment_ord: u32,
+    segment_ord: SegmentOrdinal,
 }
 
 impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D, C> {
@@ -639,7 +639,7 @@ where
     }
 
     /// Sets the current threshold.
-    pub fn set_threshold(&mut self, threshold: (TSortKey, u32)) {
+    pub fn set_threshold(&mut self, threshold: (TSortKey, SegmentOrdinal)) {
         self.threshold = Some(threshold);
         self.update_pruning_threshold();
     }
@@ -909,8 +909,8 @@ mod tests {
         assert_results_equals(
             &score_docs,
             &[
-                (0.81221175, DocAddress::new(0u32, 1)),
-                (0.5376842, DocAddress::new(0u32, 2)),
+                (0.81221175, DocAddress::new(0, 1)),
+                (0.5376842, DocAddress::new(0, 2)),
                 (0.48527452, DocAddress::new(0, 0)),
             ],
         );
@@ -950,8 +950,8 @@ mod tests {
         assert_results_equals(
             &score_docs,
             &[
-                (0.81221175, DocAddress::new(0u32, 1)),
-                (0.5376842, DocAddress::new(0u32, 2)),
+                (0.81221175, DocAddress::new(0, 1)),
+                (0.5376842, DocAddress::new(0, 2)),
             ],
         );
     }
@@ -974,7 +974,7 @@ mod tests {
         assert_results_equals(
             &score_docs[..],
             &[
-                (0.5376842, DocAddress::new(0u32, 2)),
+                (0.5376842, DocAddress::new(0, 2)),
                 (0.48527452, DocAddress::new(0, 0)),
             ],
         );
@@ -1545,7 +1545,7 @@ mod tests {
         });
         let searcher = index.reader().unwrap().searcher();
         let top_collector = TopDocs::with_limit(4).order_by_u64_field("missing_field", Order::Desc);
-        let segment_reader = searcher.segment_reader(0u32);
+        let segment_reader = searcher.segment_reader(0);
         top_collector
             .for_segment(0, segment_reader)
             .expect("should panic");

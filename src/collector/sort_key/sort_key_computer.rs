@@ -15,32 +15,26 @@ pub trait SegmentSortKeyComputer: 'static {
     /// The final score being emitted.
     type SortKey: 'static + Send + Sync + Clone;
 
-    /// Sort key used at the segment level by the `SegmentSortKeyComputer`.
+    /// Sort key used by at the segment level by the `SegmentSortKeyComputer`.
     ///
-    /// It is typically a small, efficient type like a `u64` or `TermOrdinal`, and is meant to be
-    /// converted to the final [`Self::SortKey`] at the end of the collection of the segment.
+    /// It is typically small like a `u64`, and is meant to be converted
+    /// to the final score at the end of the collection of the segment.
     type SegmentSortKey: 'static + Clone + Send + Sync + Clone;
 
-    /// Comparator type for the segment-level sort key.
+    /// Comparator type.
     type SegmentComparator: Comparator<Self::SegmentSortKey> + 'static;
 
     /// Returns the segment sort key comparator.
-    ///
-    /// By default, returns [`Self::SegmentComparator::default()`].
     fn segment_comparator(&self) -> Self::SegmentComparator {
         Self::SegmentComparator::default()
     }
 
     /// Computes the sort key for the given document and score.
-    ///
-    /// This is the primary method for segment-level sorting logic.
     fn segment_sort_key(&mut self, doc: DocId, score: Score) -> Self::SegmentSortKey;
 
-    /// Computes the sort key and pushes the document into a [`TopNComputer`].
+    /// Computes the sort key and pushes the document in a TopN Computer.
     ///
-    /// The default implementation computes the full sort key via [`Self::segment_sort_key`]
-    /// and pushes it. Implementations can override this to optimize for specific cases,
-    /// for example by performing lazy or partial computation of the sort key.
+    /// When using a tuple as the sorting key, the sort key is evaluated in a lazy manner.
     #[inline(always)]
     fn compute_sort_key_and_collect<C: Comparator<Self::SegmentSortKey>>(
         &mut self,
@@ -52,10 +46,10 @@ pub trait SegmentSortKeyComputer: 'static {
         top_n_computer.push(sort_key, doc);
     }
 
-    /// Compares two segment-level sort keys.
+    /// A SegmentSortKeyComputer maps to a SegmentSortKey, but it can also decide on
+    /// its ordering.
     ///
-    /// This method must be consistent with the global [`SortKeyComputer::SortKey`] ordering.
-    /// By default, it uses the comparator returned by [`Self::segment_comparator`].
+    /// This method must be consistent with the `SortKey` ordering.
     #[inline(always)]
     fn compare_segment_sort_key(
         &self,
@@ -65,14 +59,11 @@ pub trait SegmentSortKeyComputer: 'static {
         self.segment_comparator().compare(left, right)
     }
 
-    /// Attempts to accept a document based on a partial or lazy computation of the sort key
-    /// against a threshold.
+    /// Implementing this method makes it possible to avoid computing
+    /// a sort_key entirely if we can assess that it won't pass a threshold
+    /// with a partial computation.
     ///
-    /// If the document is accepted, returns the [`Ordering`] relative to the threshold and the
-    /// (possibly partial) sort key. If the document is rejected, returns `None`.
-    ///
-    /// This is currently used for optimizing lexicographic sorting by avoiding full key
-    /// computation for documents that clearly don't pass the threshold.
+    /// This is currently used for lexicographic sorting.
     fn accept_sort_key_lazy(
         &mut self,
         doc_id: DocId,
@@ -88,45 +79,38 @@ pub trait SegmentSortKeyComputer: 'static {
         }
     }
 
-    /// Converts a segment-level sort key into the global sort key.
-    ///
-    /// This is called when harvesting results to provide the final sort key type to the user.
+    /// Convert a segment level sort key into the global sort key.
     fn convert_segment_sort_key(&self, sort_key: Self::SegmentSortKey) -> Self::SortKey;
 }
 
 /// `SortKeyComputer` defines the sort key to be used by a TopK Collector.
 ///
-/// The `SortKeyComputer` itself does not perform most of the computation.
-/// Instead, it acts as a factory for constructing [`Self::Child`] instances
-/// ([`SegmentSortKeyComputer` religion]) that perform the actual computation at a segment scale.
+/// The `SortKeyComputer` itself does not make much of the computation itself.
+/// Instead, it helps constructing `Self::Child` instances that will compute
+/// the sort key at a segment scale.
 pub trait SortKeyComputer: Sync {
-    /// The global sort key type returned to the user.
+    /// The sort key type.
     type SortKey: 'static + Send + Sync + Clone + std::fmt::Debug;
     /// Type of the associated [`SegmentSortKeyComputer`].
     type Child: SegmentSortKeyComputer<SortKey = Self::SortKey>;
-    /// Comparator type for the global sort key and the segment-level sort key.
+    /// Comparator type.
     type Comparator: Comparator<Self::SortKey>
         + Comparator<<Self::Child as SegmentSortKeyComputer>::SegmentSortKey>
         + 'static;
 
-    /// Checks whether the schema is compatible with this sort key computer.
-    ///
-    /// Returns an error if the schema lacks required fields or if field types are incompatible.
+    /// Checks whether the schema is compatible with the sort key computer.
     fn check_schema(&self, _schema: &Schema) -> crate::Result<()> {
         Ok(())
     }
 
-    /// Returns the global sort key comparator.
-    ///
-    /// By default, returns [`Self::Comparator::default()`].
+    /// Returns the sort key comparator.
     fn comparator(&self) -> Self::Comparator {
         Self::Comparator::default()
     }
 
-    /// Indicates whether this sort key computer requires the similarity score (e.g. BM25).
-    ///
-    /// If returns `false`, the similarity score might not be computed as an optimization.
-    /// By default, returns `false`.
+    /// Indicates whether the sort key actually uses the similarity score (by default BM25).
+    /// If set to false, the similary score might not be computed (as an optimization),
+    /// and the score fed in the segment sort key computer could take any value.
     fn requires_scoring(&self) -> bool {
         false
     }
@@ -145,10 +129,7 @@ pub trait SortKeyComputer: Sync {
         None
     }
 
-    /// Collects the top-K documents for a single segment.
-    ///
-    /// Implementations can override this to provide specialized collection logic,
-    /// such as Block-WAND optimization for scoring-based queries.
+    /// Sorting by score has a overriding implementation for BM25 scores, using Block-WAND.
     fn collect_segment_top_k(
         &self,
         weight: &dyn crate::query::Weight,

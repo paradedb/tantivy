@@ -4,7 +4,7 @@ use super::shared_threshold::{AtomicSharedThreshold, SharedThresholdArcOpt};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::sort_key_top_collector::TopBySortKeySegmentCollector;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
-use crate::{DocId, Score};
+use crate::{DocId, Score, SegmentOrdinal};
 
 #[derive(Clone)]
 pub struct SortBySimilarityScore {
@@ -79,7 +79,7 @@ impl SortKeyComputer for SortBySimilarityScore {
             .shared_threshold
             .as_ref()
             .map(|s| s.load())
-            .unwrap_or((Score::MIN, u32::MAX));
+            .unwrap_or((Score::MIN, SegmentOrdinal::MAX));
 
         top_n.set_threshold((initial_score, initial_ord));
 
