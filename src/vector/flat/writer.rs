@@ -42,7 +42,7 @@ impl FieldBuffer {
         let start = self.row_bytes.len();
         self.row_bytes.extend_from_slice(bytes);
         self.opts
-            .maybe_normalize_doc_bytes(&mut self.row_bytes[start..start + stride]);
+            .maybe_normalize_bytes(&mut self.row_bytes[start..start + stride]);
     }
 
     fn mem_usage(&self) -> usize {
@@ -192,4 +192,3 @@ impl PluginWriter for FlatVecWriter {
         self
     }
 }
-

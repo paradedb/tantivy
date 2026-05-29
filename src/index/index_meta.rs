@@ -627,7 +627,7 @@ mod tests {
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
-                vector_clustering_threshold: 10_000,
+                vector_clustering_threshold: 1000,
             }
         );
         {
