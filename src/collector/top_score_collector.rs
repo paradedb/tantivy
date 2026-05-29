@@ -519,8 +519,6 @@ pub struct TopNComputer<Score, D, C> {
     comparator: C,
     #[serde(skip)]
     pub(crate) shared_threshold: SharedThresholdArcOpt<Score>,
-    #[serde(skip)]
-    truncation_count: u32,
     pub(crate) segment_ord: SegmentOrdinal,
     #[serde(skip)]
     pub(crate) pruning_threshold: Option<Score>,
@@ -553,7 +551,6 @@ impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D
             threshold: value.threshold,
             comparator: value.comparator,
             shared_threshold: None,
-            truncation_count: 0,
             segment_ord: value.segment_ord,
             pruning_threshold: None,
         }
@@ -584,7 +581,6 @@ impl<Score: Clone, D: Clone, C: Clone> Clone for TopNComputer<Score, D, C> {
             threshold: self.threshold.clone(),
             comparator: self.comparator.clone(),
             shared_threshold: self.shared_threshold.clone(),
-            truncation_count: self.truncation_count,
             segment_ord: self.segment_ord,
             pruning_threshold: self.pruning_threshold.clone(),
         }
@@ -632,7 +628,6 @@ where
             threshold: None,
             comparator,
             shared_threshold: None,
-            truncation_count: 0,
             segment_ord: 0,
             pruning_threshold: None,
         }
@@ -706,16 +701,11 @@ where
         self.buffer.truncate(self.top_n);
 
         if let Some(shared) = &self.shared_threshold {
-            self.truncation_count += 1;
-            if self.truncation_count % 2 == 0 {
-                // Send our median to the global pool, and immediately adopt the resulting
-                // global threshold (which is guaranteed to be at least as restrictive as the
-                // median)
-                let global = shared.update(median, self.segment_ord);
-                self.threshold = Some(global);
-            } else {
-                self.threshold = Some((median, self.segment_ord));
-            }
+            // Send our median to the global pool, and immediately adopt the resulting
+            // global threshold (which is guaranteed to be at least as restrictive as the
+            // median)
+            let global = shared.update(median, self.segment_ord);
+            self.threshold = Some(global);
         } else {
             self.threshold = Some((median, self.segment_ord));
         }
