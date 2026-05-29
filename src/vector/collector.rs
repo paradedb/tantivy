@@ -189,7 +189,6 @@ mod ivf_e2e_tests {
     use crate::vector::tests::{ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{
         Metric, VectorColumn, VectorColumnReader, VectorDType, VectorOptions, VectorReader,
-        VECTOR_PLUGIN_NAME,
     };
     use crate::{Index, TantivyDocument};
 
@@ -354,9 +353,7 @@ mod ivf_e2e_tests {
         let mut flat_count = 0usize;
         let mut ivf_count = 0usize;
         for reader in searcher.segment_readers() {
-            let vec_reader = reader
-                .plugin_reader::<VectorReader>(VECTOR_PLUGIN_NAME)?
-                .expect("vector plugin reader");
+            let vec_reader = VectorReader::open(reader)?;
             match vec_reader.open_column(embedding_field)? {
                 VectorColumn::Flat(_) => flat_count += 1,
                 VectorColumn::Ivf(_) => ivf_count += 1,

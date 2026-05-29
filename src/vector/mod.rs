@@ -36,6 +36,4 @@ pub use meta::VectorStorageFormat;
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
-pub use reader::{
-    VectorClusterStats, VectorColumn, VectorColumnReader, VectorInfo, VectorReader,
-};
+pub use reader::{VectorClusterStats, VectorColumn, VectorColumnReader, VectorInfo, VectorReader};

@@ -53,7 +53,6 @@ impl Metric {
             Metric::Dot => dot_bytes(query, doc_bytes),
         }
     }
-
 }
 
 /// A vector element type with the primitives needed by the storage
@@ -155,7 +154,7 @@ impl VectorOptions {
     /// [`PreparedQuery::score_doc_bytes`](super::prepared::PreparedQuery::score_doc_bytes)
     /// reduce per-doc cosine work to `dot * inv_norm_q` — no per-doc
     /// `norm_squared_bytes` pass.
-    pub fn maybe_normalize_doc_bytes(&self, row: &mut [u8]) {
+    pub fn maybe_normalize_bytes(&self, row: &mut [u8]) {
         debug_assert_eq!(row.len(), self.bytes_per_vector());
         match (self.metric, self.dtype) {
             (Metric::Cosine, VectorDType::F32) => normalize_f32_inplace(row),
@@ -235,10 +234,13 @@ mod tests {
     fn maybe_normalize_routes_only_cosine_f32() {
         let opts = VectorOptions::new(3, Metric::Cosine);
         let mut buf = bytes(&[3.0_f32, 0.0, 4.0]);
-        opts.maybe_normalize_doc_bytes(&mut buf);
+        opts.maybe_normalize_bytes(&mut buf);
         let out = floats(&buf);
         let n: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((n - 1.0).abs() < 1e-6, "Cosine+F32 should normalize, norm={n}");
+        assert!(
+            (n - 1.0).abs() < 1e-6,
+            "Cosine+F32 should normalize, norm={n}"
+        );
     }
 
     #[test]
@@ -246,8 +248,12 @@ mod tests {
         let opts = VectorOptions::new(3, Metric::L2);
         let input = [3.0_f32, 0.0, 4.0];
         let mut buf = bytes(&input);
-        opts.maybe_normalize_doc_bytes(&mut buf);
-        assert_eq!(floats(&buf), input.to_vec(), "L2 must not mutate stored rows");
+        opts.maybe_normalize_bytes(&mut buf);
+        assert_eq!(
+            floats(&buf),
+            input.to_vec(),
+            "L2 must not mutate stored rows"
+        );
     }
 
     #[test]
@@ -255,7 +261,11 @@ mod tests {
         let opts = VectorOptions::new(3, Metric::Dot);
         let input = [3.0_f32, 0.0, 4.0];
         let mut buf = bytes(&input);
-        opts.maybe_normalize_doc_bytes(&mut buf);
-        assert_eq!(floats(&buf), input.to_vec(), "Dot must not mutate stored rows");
+        opts.maybe_normalize_bytes(&mut buf);
+        assert_eq!(
+            floats(&buf),
+            input.to_vec(),
+            "Dot must not mutate stored rows"
+        );
     }
 }

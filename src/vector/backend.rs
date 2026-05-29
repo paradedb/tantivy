@@ -245,7 +245,7 @@ impl<T: VectorElement> IvfBackend<T> {
         let mut ranked: Vec<(f32, usize)> = (0..num_centroids)
             .map(|c| {
                 let cb = &centroid_bytes[c * stride..(c + 1) * stride];
-                (self.query.score_centroid_bytes(cb), c)
+                (self.query.score_doc_bytes(cb), c)
             })
             .collect();
         ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
@@ -467,7 +467,7 @@ mod tests {
     use crate::vector::tests::TestVectorIndex;
     use crate::vector::{
         IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, VectorColumn,
-        VectorColumnReader, VectorDType, VectorOptions, VectorReader, VECTOR_PLUGIN_NAME,
+        VectorColumnReader, VectorDType, VectorOptions, VectorReader,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -1016,9 +1016,7 @@ mod tests {
         // After `build_inline_ivf`'s merge, all docs sit in segment 0.
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
-        let vec_reader = segment_reader
-            .plugin_reader::<VectorReader>(VECTOR_PLUGIN_NAME)?
-            .expect("vector plugin reader");
+        let vec_reader = VectorReader::open(segment_reader)?;
         let column = match vec_reader.open_column(embed_field)? {
             VectorColumn::Ivf(c) => c,
             VectorColumn::Flat(_) => panic!("expected IVF segment for this test"),
@@ -1081,8 +1079,8 @@ mod tests {
         let a_only_doc = a_only_doc.expect("a_only must exist in segment 0");
         assert!(
             cluster_a_docs.contains(&a_only_doc),
-            "a_only must land in cluster A (index 0) — got cluster_a = {cluster_a_docs:?}, \
-             a_only doc = {a_only_doc}",
+            "a_only must land in cluster A (index 0) — got cluster_a = {cluster_a_docs:?}, a_only \
+             doc = {a_only_doc}",
         );
 
         // Setup assertion (iii): the near cluster has fewer survivors
@@ -1372,11 +1370,7 @@ mod tests {
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
-            let Some(vec_reader) =
-                segment_reader.plugin_reader::<VectorReader>(VECTOR_PLUGIN_NAME)?
-            else {
-                continue;
-            };
+            let vec_reader = VectorReader::open(segment_reader)?;
             let column = vec_reader.open_column(vec_field)?;
             let alive = segment_reader.alive_bitset();
             for doc in 0..segment_reader.max_doc() {
