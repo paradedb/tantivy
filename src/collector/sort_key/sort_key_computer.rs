@@ -3,9 +3,9 @@ use std::cmp::Ordering;
 use crate::collector::sort_key::shared_threshold::SharedThresholdArcOpt;
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::sort_key_top_collector::TopBySortKeySegmentCollector;
-use crate::collector::{default_collect_segment_impl, SegmentCollector as _, TopNComputer};
+use crate::collector::{default_collect_segment_impl, TopNComputer};
 use crate::schema::Schema;
-use crate::{DocAddress, DocId, Result, Score, SegmentReader};
+use crate::{DocId, Result, Score, SegmentReader};
 
 /// A `SegmentSortKeyComputer` makes it possible to modify the default score
 /// for a given document belonging to a specific segment.
@@ -151,27 +151,13 @@ pub trait SortKeyComputer: Sync {
     /// such as Block-WAND optimization for scoring-based queries.
     fn collect_segment_top_k(
         &self,
-        k: usize,
         weight: &dyn crate::query::Weight,
         reader: &crate::SegmentReader,
-        segment_ord: u32,
-        shared_threshold: SharedThresholdArcOpt<
-            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
-        >,
-    ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
+        segment_collector: &mut TopBySortKeySegmentCollector<Self::Child, Self::Comparator>,
+    ) -> crate::Result<()> {
         let with_scoring = self.requires_scoring();
-        let segment_sort_key_computer = self.segment_sort_key_computer(reader)?;
-        let mut topn_computer: TopNComputer<_, DocId, _> =
-            TopNComputer::new_with_comparator(k, self.comparator());
-        topn_computer.shared_threshold = shared_threshold;
-        topn_computer.segment_ord = segment_ord;
-        let mut segment_top_key_collector = TopBySortKeySegmentCollector {
-            topn_computer,
-            segment_ord,
-            segment_sort_key_computer,
-        };
-        default_collect_segment_impl(&mut segment_top_key_collector, weight, reader, with_scoring)?;
-        Ok(segment_top_key_collector.harvest())
+        default_collect_segment_impl(segment_collector, weight, reader, with_scoring)?;
+        Ok(())
     }
 
     /// Builds a child sort key computer for a specific segment.

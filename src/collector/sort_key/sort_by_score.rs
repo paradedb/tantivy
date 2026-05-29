@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use super::shared_threshold::{AtomicSharedThreshold, SharedThresholdArcOpt};
 use crate::collector::sort_key::NaturalComparator;
-use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
-use crate::{DocAddress, DocId, Score};
+use crate::collector::sort_key_top_collector::TopBySortKeySegmentCollector;
+use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
+use crate::{DocId, Score};
 
 #[derive(Clone)]
 pub struct SortBySimilarityScore {
@@ -67,52 +68,44 @@ impl SortKeyComputer for SortBySimilarityScore {
 
     fn collect_segment_top_k(
         &self,
-        k: usize,
         weight: &dyn crate::query::Weight,
         reader: &crate::SegmentReader,
-        segment_ord: u32,
-        shared_threshold: SharedThresholdArcOpt<
-            <<Self as SortKeyComputer>::Child as SegmentSortKeyComputer>::SegmentSortKey,
-        >,
-    ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
-        let mut top_n: TopNComputer<Score, DocId, Self::Comparator> =
-            TopNComputer::new_with_comparator(k, self.comparator());
-        top_n.shared_threshold = shared_threshold.clone();
-        top_n.segment_ord = segment_ord;
+        segment_collector: &mut TopBySortKeySegmentCollector<Self::Child, Self::Comparator>,
+    ) -> crate::Result<()> {
+        let segment_ord = segment_collector.segment_ord;
+        let top_n = &mut segment_collector.topn_computer;
 
-        let initial_threshold = if let Some(shared) = &shared_threshold {
-            let (score, _ord) = shared.load();
-            score
-        } else {
-            Score::MIN
-        };
-        top_n.threshold = Some((initial_threshold, u32::MAX)); // We don't have the original ord easily, but u32::MAX allows it to act locally
+        let (initial_score, initial_ord) = top_n
+            .shared_threshold
+            .as_ref()
+            .map(|s| s.load())
+            .unwrap_or((Score::MIN, u32::MAX));
+
+        top_n.set_threshold((initial_score, initial_ord));
+
+        let pruning_threshold = top_n.pruning_threshold.unwrap_or(Score::MIN);
 
         if let Some(alive_bitset) = reader.alive_bitset() {
-            weight.for_each_pruning(initial_threshold, reader, &mut |doc, score| {
+            weight.for_each_pruning(pruning_threshold, reader, &mut |doc, score| {
                 if alive_bitset.is_deleted(doc) {
-                    return top_n.threshold.map(|t| t.0).unwrap_or(Score::MIN);
+                    return top_n.pruning_threshold.unwrap_or(Score::MIN);
                 }
                 top_n.push(score, doc);
-                top_n.threshold.map(|t| t.0).unwrap_or(Score::MIN)
+                top_n.pruning_threshold.unwrap_or(Score::MIN)
             })?;
         } else {
-            weight.for_each_pruning(initial_threshold, reader, &mut |doc, score| {
+            weight.for_each_pruning(pruning_threshold, reader, &mut |doc, score| {
                 top_n.push(score, doc);
-                top_n.threshold.map(|t| t.0).unwrap_or(Score::MIN)
+                top_n.pruning_threshold.unwrap_or(Score::MIN)
             })?;
         }
 
         let final_threshold = top_n.threshold.map(|t| t.0).unwrap_or(Score::MIN);
-        if let Some(shared) = &shared_threshold {
+        if let Some(shared) = &top_n.shared_threshold {
             shared.update(final_threshold, segment_ord);
         }
 
-        Ok(top_n
-            .into_vec()
-            .into_iter()
-            .map(|cid| (cid.sort_key, DocAddress::new(segment_ord, cid.doc)))
-            .collect())
+        Ok(())
     }
 }
 

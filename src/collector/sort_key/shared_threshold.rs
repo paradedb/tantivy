@@ -26,6 +26,30 @@ pub trait SharedThreshold<T>: Send + Sync {
     /// will be `new_threshold` if the update succeeded, or a pre-existing strictly better
     /// threshold if it failed).
     fn update(&self, new_threshold: T, segment_ord: u32) -> (T, u32);
+
+    /// Returns a threshold value `T` that is strictly better than the current shared threshold
+    /// if the given `segment_ord` would lose a tie-break against the `threshold_ord`.
+    ///
+    /// This is used for Block-Max WAND pruning to ensure determinism when multiple segments
+    /// have documents with the same score. Currently, this is only used for score-based
+    /// pushdown; for other types, it can safely return the value unchanged.
+    ///
+    /// # Tie-breaking Logic
+    /// Tantivy breaks ties on sort keys by favoring documents with a lower [`DocAddress`].
+    /// A [`DocAddress`] is composed of a `segment_ord` and a `doc_id`. Since documents within
+    /// a segment are processed in ascending `doc_id` order, any new document in a segment
+    /// with `segment_ord >= threshold_ord` will have a strictly higher [`DocAddress`] than the
+    /// document that set the threshold.
+    ///
+    /// Therefore, if `segment_ord >= threshold_ord`, this method should return a threshold that
+    /// is "one step better" than `value`. For floating-point scores, this is typically
+    /// `value.next_up()`. If `segment_ord < threshold_ord`, the document could still win the
+    /// tie-break, so the `value` should be returned unchanged.
+    fn competitive_threshold(&self, value: T, threshold_ord: u32, segment_ord: u32) -> T {
+        let _ = threshold_ord;
+        let _ = segment_ord;
+        value
+    }
 }
 
 pub struct NoopSharedThreshold<T> {
@@ -118,6 +142,20 @@ impl SharedThreshold<Score> for AtomicSharedThreshold {
                 Ok(_) => return (new_threshold, segment_ord),
                 Err(actual) => current = actual,
             }
+        }
+    }
+
+    fn competitive_threshold(&self, value: Score, threshold_ord: u32, segment_ord: u32) -> Score {
+        if segment_ord < threshold_ord {
+            // If our segment wins tie-breaks against the threshold setter, we want to accept
+            // documents with a score GREATER THAN OR EQUAL to the threshold.
+            // Since Tantivy's pruning loop uses a strict `score > threshold` check, we
+            // return `next_down()` to effectively relax the check to `>=`.
+            value.next_down()
+        } else {
+            // If our segment loses tie-breaks, we demand a score STRICTLY GREATER than the
+            // threshold. The pruning loop's `score > threshold` check already achieves this.
+            value
         }
     }
 }
@@ -231,6 +269,25 @@ mod tests {
 
         t.update(0.9, 10);
         assert_eq!(t.load(), (0.9, 10));
+    }
+
+    #[test]
+    fn test_competitive_threshold() {
+        let t = AtomicSharedThreshold::default();
+        t.update(0.5, 5);
+
+        // Segment 5 itself: should require strictly greater score for new docs.
+        // The pruning loop uses `score > threshold`, so returning 0.5 unchanged
+        // means we only accept scores > 0.5.
+        assert_eq!(t.competitive_threshold(0.5, 5, 5), 0.5);
+
+        // Segment 6 (later): should require strictly greater score.
+        assert_eq!(t.competitive_threshold(0.5, 5, 6), 0.5);
+
+        // Segment 4 (earlier): can accept equal score (>= 0.5).
+        // Since pruning loop is `score > threshold`, we must return `next_down(0.5)`
+        // so that `0.5 > next_down(0.5)` is true.
+        assert_eq!(t.competitive_threshold(0.5, 5, 4), 0.5f32.next_down());
     }
 
     #[test]

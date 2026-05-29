@@ -78,15 +78,10 @@ where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
         segment_ord: u32,
         reader: &SegmentReader,
     ) -> crate::Result<Vec<(TSortKeyComputer::SortKey, DocAddress)>> {
-        let k = self.doc_range.end;
-        let docs = self.sort_key_computer.collect_segment_top_k(
-            k,
-            weight,
-            reader,
-            segment_ord,
-            self.shared_threshold.clone(),
-        )?;
-        Ok(docs)
+        let mut segment_collector = self.for_segment(segment_ord, reader)?;
+        self.sort_key_computer
+            .collect_segment_top_k(weight, reader, &mut segment_collector)?;
+        Ok(segment_collector.harvest())
     }
 }
 

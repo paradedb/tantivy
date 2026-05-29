@@ -522,6 +522,8 @@ pub struct TopNComputer<Score, D, C> {
     #[serde(skip)]
     truncation_count: u32,
     pub(crate) segment_ord: u32,
+    #[serde(skip)]
+    pub(crate) pruning_threshold: Option<Score>,
 }
 
 // Intermediate struct for TopNComputer for deserialization, to keep vec capacity
@@ -553,6 +555,7 @@ impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D
             shared_threshold: None,
             truncation_count: 0,
             segment_ord: value.segment_ord,
+            pruning_threshold: None,
         }
     }
 }
@@ -583,6 +586,7 @@ impl<Score: Clone, D: Clone, C: Clone> Clone for TopNComputer<Score, D, C> {
             shared_threshold: self.shared_threshold.clone(),
             truncation_count: self.truncation_count,
             segment_ord: self.segment_ord,
+            pruning_threshold: self.pruning_threshold.clone(),
         }
     }
 }
@@ -630,6 +634,24 @@ where
             shared_threshold: None,
             truncation_count: 0,
             segment_ord: 0,
+            pruning_threshold: None,
+        }
+    }
+
+    /// Sets the current threshold.
+    pub fn set_threshold(&mut self, threshold: (TSortKey, u32)) {
+        self.threshold = Some(threshold);
+        self.update_pruning_threshold();
+    }
+
+    pub(crate) fn update_pruning_threshold(&mut self) {
+        if let Some((val, ord)) = &self.threshold {
+            if let Some(shared) = &self.shared_threshold {
+                self.pruning_threshold =
+                    Some(shared.competitive_threshold(val.clone(), *ord, self.segment_ord));
+            } else {
+                self.pruning_threshold = Some(val.clone());
+            }
         }
     }
 
@@ -697,6 +719,7 @@ where
         } else {
             self.threshold = Some((median, self.segment_ord));
         }
+        self.update_pruning_threshold();
     }
 
     /// Returns the top n elements in sorted order.
