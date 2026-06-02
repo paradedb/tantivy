@@ -15,15 +15,20 @@ pub struct SegmentSerializer {
 
 impl SegmentSerializer {
     /// Creates a new `SegmentSerializer`.
-    pub fn for_segment(segment: Segment, is_in_merge: bool) -> crate::Result<SegmentSerializer> {
+    pub fn for_segment(
+        segment: Segment,
+        is_in_merge: bool,
+        ignore_store: bool,
+    ) -> crate::Result<SegmentSerializer> {
         let plugins: Vec<Arc<dyn SegmentPlugin>> = segment.index().plugins().to_vec();
-        Self::for_segment_with_plugins(segment, is_in_merge, &plugins)
+        Self::for_segment_with_plugins(segment, is_in_merge, ignore_store, &plugins)
     }
 
     /// Creates a new `SegmentSerializer` with explicit plugins.
     pub fn for_segment_with_plugins(
         segment: Segment,
         is_in_merge: bool,
+        ignore_store: bool,
         plugins: &[Arc<dyn SegmentPlugin>],
     ) -> crate::Result<SegmentSerializer> {
         let settings = segment.index().settings().clone();
@@ -40,6 +45,7 @@ impl SegmentSerializer {
                     schema: &schema,
                     settings: &settings,
                     is_in_merge,
+                    ignore_store,
                     directory,
                 };
                 Ok((p.name().to_string(), p.create_writer(&ctx)?))
