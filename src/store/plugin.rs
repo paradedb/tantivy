@@ -45,7 +45,8 @@ impl SegmentPlugin for StorePlugin {
 
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         let settings = ctx.settings;
-        let remapping_required = settings.sort_by_field.is_some() && !ctx.is_in_merge;
+        let remapping_required =
+            !ctx.ignore_store && settings.sort_by_field.is_some() && !ctx.is_in_merge;
 
         // During merge, the merge() method handles file creation directly.
         // Only open the file during normal indexing.
