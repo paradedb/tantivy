@@ -55,7 +55,7 @@ pub struct InvertedIndexSerializer {
 
 impl InvertedIndexSerializer {
     /// Open a new `InvertedIndexSerializer` for the given segment
-    pub fn open(segment: &mut Segment) -> crate::Result<InvertedIndexSerializer> {
+    pub fn open(segment: &Segment) -> crate::Result<InvertedIndexSerializer> {
         use crate::index::SegmentComponent::{Positions, Postings, Terms};
         let inv_index_serializer = InvertedIndexSerializer {
             terms_write: CompositeWrite::wrap(segment.open_write(Terms)?),
@@ -64,24 +64,6 @@ impl InvertedIndexSerializer {
             schema: segment.schema(),
         };
         Ok(inv_index_serializer)
-    }
-
-    /// Create an `InvertedIndexSerializer` from pre-opened file handles.
-    ///
-    /// This is used by the postings plugin to construct the serializer without
-    /// requiring `&mut Segment`.
-    pub fn from_parts(
-        terms_write: CompositeWrite<WritePtr>,
-        postings_write: CompositeWrite<WritePtr>,
-        positions_write: CompositeWrite<WritePtr>,
-        schema: Schema,
-    ) -> InvertedIndexSerializer {
-        InvertedIndexSerializer {
-            terms_write,
-            postings_write,
-            positions_write,
-            schema,
-        }
     }
 
     /// Must be called before starting pushing terms of
