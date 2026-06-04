@@ -155,16 +155,14 @@ impl SegmentWriter {
         // Transfer per_field_postings_writers and ctx to the PostingsPluginWriter
         // so they can be consumed during plugin-based serialization.
         {
+            let per_field_postings_writers = self.per_field_postings_writers;
+            let ctx = self.ctx;
             let postings_plugin = self
                 .segment_serializer
                 .get_plugin_writer::<PostingsPluginWriter>()
                 .expect("postings plugin");
-            postings_plugin.per_field_postings_writers = Some(std::mem::replace(
-                &mut self.per_field_postings_writers,
-                PerFieldPostingsWriter::empty(),
-            ));
-            postings_plugin.ctx =
-                Some(std::mem::replace(&mut self.ctx, IndexingContext::default()));
+            postings_plugin.per_field_postings_writers = Some(per_field_postings_writers);
+            postings_plugin.ctx = Some(ctx);
         }
 
         remap_and_write(self.segment_serializer, mapping.as_ref())?;
