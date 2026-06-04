@@ -26,7 +26,7 @@ pub use self::alive_bitset::{intersect_alive_bitsets, write_alive_bitset, AliveB
 pub use self::error::{FastFieldNotAvailableError, Result};
 pub use self::facet_reader::FacetReader;
 pub mod plugin;
-pub use self::plugin::{FastFieldsPlugin, FastFieldsPluginReader, FastFieldsPluginWriter};
+pub use self::plugin::{FastFieldsPlugin, FastFieldsPluginWriter};
 pub use self::readers::FastFieldReaders;
 pub use self::writer::FastFieldsWriter;
 use crate::schema::Type;

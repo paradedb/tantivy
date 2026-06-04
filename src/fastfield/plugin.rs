@@ -5,7 +5,6 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use columnar::{
     ColumnType, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder, StackMergeOrder,
@@ -15,12 +14,9 @@ use measure_time::debug_time;
 
 use crate::directory::{Directory, WritePtr};
 use crate::fastfield::{FastFieldReaders, FastFieldsWriter};
-use crate::index::SegmentComponent;
+use crate::index::{SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{DocIdMapping, MappingType, SegmentDocIdMapping};
-use crate::plugin::{
-    PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
-    SegmentPlugin,
-};
+use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::schema::{value_type_to_column_type, Schema};
 use crate::space_usage::{ComponentSpaceUsage, FAST_FIELDS};
 use crate::Segment;
@@ -66,14 +62,6 @@ impl SegmentPlugin for FastFieldsPlugin {
         }))
     }
 
-    fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
-        let file = ctx.segment_reader.open_read(SegmentComponent::FastFields)?;
-        let schema = ctx.schema.clone();
-        let readers = FastFieldReaders::open(file, schema)
-            .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
-        Ok(Arc::new(FastFieldsPluginReader(readers)))
-    }
-
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
         debug_time!("write-fast-fields");
         let path = ctx
@@ -109,10 +97,10 @@ impl SegmentPlugin for FastFieldsPlugin {
 
     fn space_usage(
         &self,
-        ctx: &PluginReaderContext,
+        segment_reader: &SegmentReader,
     ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
-        let file = ctx.segment_reader.open_read(SegmentComponent::FastFields)?;
-        let readers = FastFieldReaders::open(file, ctx.schema.clone())
+        let file = segment_reader.open_read(SegmentComponent::FastFields)?;
+        let readers = FastFieldReaders::open(file, segment_reader.schema().clone())
             .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
         let usage = readers.space_usage()?;
         Ok(BTreeMap::from([(
@@ -182,22 +170,6 @@ impl PluginWriter for FastFieldsPluginWriter {
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-/// Plugin reader wrapping [`FastFieldReaders`].
-pub struct FastFieldsPluginReader(pub FastFieldReaders);
-
-impl FastFieldsPluginReader {
-    /// Access the underlying [`FastFieldReaders`].
-    pub fn readers(&self) -> &FastFieldReaders {
-        &self.0
-    }
-}
-
-impl PluginReader for FastFieldsPluginReader {
-    fn as_any(&self) -> &dyn Any {
         self
     }
 }
