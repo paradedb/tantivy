@@ -6,16 +6,12 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use crate::directory::Directory;
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
-use crate::index::SegmentComponent;
+use crate::index::{SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::DocIdMapping;
-use crate::plugin::{
-    PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
-    SegmentPlugin,
-};
+use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::space_usage::{ComponentSpaceUsage, FIELDNORMS};
 use crate::{DocId, Segment};
 
@@ -53,12 +49,6 @@ impl SegmentPlugin for FieldNormsPlugin {
         Ok(Box::new(FieldNormsPluginWriter { writer, serializer }))
     }
 
-    fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
-        let file = ctx.segment_reader.open_read(SegmentComponent::FieldNorms)?;
-        let readers = FieldNormReaders::open(file)?;
-        Ok(Arc::new(FieldNormsPluginReader(readers)))
-    }
-
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
         let path = ctx
             .target_segment
@@ -94,11 +84,11 @@ impl SegmentPlugin for FieldNormsPlugin {
 
     fn space_usage(
         &self,
-        ctx: &PluginReaderContext,
+        segment_reader: &SegmentReader,
     ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
-        let file = ctx.segment_reader.open_read(SegmentComponent::FieldNorms)?;
+        let file = segment_reader.open_read(SegmentComponent::FieldNorms)?;
         let readers = FieldNormReaders::open(file)?;
-        let usage = readers.space_usage(ctx.schema);
+        let usage = readers.space_usage(segment_reader.schema());
         Ok(BTreeMap::from([(
             FIELDNORMS.to_string(),
             ComponentSpaceUsage::PerField(usage),
@@ -160,22 +150,6 @@ impl PluginWriter for FieldNormsPluginWriter {
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-/// Plugin reader wrapping [`FieldNormReaders`].
-pub struct FieldNormsPluginReader(pub FieldNormReaders);
-
-impl FieldNormsPluginReader {
-    /// Access the underlying [`FieldNormReaders`].
-    pub fn readers(&self) -> &FieldNormReaders {
-        &self.0
-    }
-}
-
-impl PluginReader for FieldNormsPluginReader {
-    fn as_any(&self) -> &dyn Any {
         self
     }
 }

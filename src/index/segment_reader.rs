@@ -16,7 +16,7 @@ use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
 use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
-use crate::plugin::{PluginReader, PluginReaderContext, SegmentPlugin};
+use crate::plugin::SegmentPlugin;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
@@ -56,7 +56,6 @@ pub struct SegmentReader {
     alive_bitset_opt: Arc<OnceLock<Option<AliveBitSet>>>,
     schema: Schema,
 
-    plugin_readers: Arc<RwLock<HashMap<String, Arc<dyn PluginReader>>>>,
     plugins: Vec<Arc<dyn SegmentPlugin>>,
 }
 
@@ -159,65 +158,6 @@ impl SegmentReader {
         StoreReader::open(self.store_file().clone(), cache_num_blocks)
     }
 
-    /// Access a plugin reader by name, with lazy initialization.
-    ///
-    /// The reader is created on first access and cached for subsequent calls.
-    /// Returns `None` if no plugin with the given name is registered.
-    pub fn plugin_reader<T: 'static>(&self, name: &str) -> crate::Result<Option<Arc<T>>> {
-        // Check cache first
-        {
-            let cache = self
-                .plugin_readers
-                .read()
-                .expect("Lock poisoned. This should never happen");
-            if let Some(reader) = cache.get(name) {
-                if reader.as_any().downcast_ref::<T>().is_some() {
-                    // Create a new Arc<T> by reconstructing from the raw pointer.
-                    // We bump the refcount by cloning the dyn Arc first.
-                    let _clone = Arc::clone(reader);
-                    let ptr = Arc::into_raw(_clone) as *const T;
-                    // Safety: we verified the downcast succeeds so the pointer is valid as T
-                    return Ok(Some(unsafe { Arc::from_raw(ptr) }));
-                }
-                return Ok(None);
-            }
-        }
-
-        // Find the plugin and create the reader
-        let plugin = match self.plugins.iter().find(|p| p.name() == name) {
-            Some(p) => Arc::clone(p),
-            None => return Ok(None),
-        };
-
-        let segment_meta = self.index.new_segment_meta(self.segment_id, self.max_doc);
-        let segment = Segment::for_index(self.index.clone(), segment_meta);
-        let ctx = PluginReaderContext {
-            segment: &segment,
-            schema: &self.schema,
-            segment_reader: self,
-        };
-        let reader = plugin.open_reader(&ctx)?;
-
-        let result = if let Some(_) = reader.as_any().downcast_ref::<T>() {
-            let cloned = Arc::clone(&reader);
-            let ptr = Arc::into_raw(cloned) as *const T;
-            Some(unsafe { Arc::from_raw(ptr) })
-        } else {
-            None
-        };
-
-        // Cache the reader
-        {
-            let mut cache = self
-                .plugin_readers
-                .write()
-                .expect("Lock poisoned. This should never happen");
-            cache.insert(name.to_string(), reader);
-        }
-
-        Ok(result)
-    }
-
     /// Open a new segment for reading.
     pub fn open(segment: &Segment) -> crate::Result<SegmentReader> {
         Self::open_with_custom_alive_set(segment, None)
@@ -251,7 +191,6 @@ impl SegmentReader {
             alive_bitset_opt: Default::default(),
             schema: segment.schema(),
 
-            plugin_readers: Default::default(),
             plugins,
         })
     }
@@ -599,17 +538,10 @@ impl SegmentReader {
     /// [`SegmentPlugin::space_usage`](crate::plugin::SegmentPlugin::space_usage), plus
     /// the non-plugin `deletes` entry (the alive bitset).
     pub fn space_usage(&self) -> io::Result<SegmentSpaceUsage> {
-        let segment_meta = self.index.new_segment_meta(self.segment_id, self.max_doc);
-        let segment = Segment::for_index(self.index.clone(), segment_meta);
-        let ctx = PluginReaderContext {
-            segment: &segment,
-            schema: &self.schema,
-            segment_reader: self,
-        };
         let mut components: BTreeMap<String, ComponentSpaceUsage> = BTreeMap::new();
         for plugin in &self.plugins {
             let plugin_usage = plugin
-                .space_usage(&ctx)
+                .space_usage(self)
                 .map_err(|err| io::Error::other(err.to_string()))?;
             components.extend(plugin_usage);
         }

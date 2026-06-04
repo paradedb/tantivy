@@ -5,17 +5,13 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use measure_time::debug_time;
 
 use crate::directory::Directory;
-use crate::index::SegmentComponent;
+use crate::index::{SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::DocIdMapping;
-use crate::plugin::{
-    PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
-    SegmentPlugin,
-};
+use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::schema::document::Document;
 use crate::schema::Schema;
 use crate::space_usage::{ComponentSpaceUsage, STORE};
@@ -84,12 +80,6 @@ impl SegmentPlugin for StorePlugin {
             store_writer,
             remapping_required,
         }))
-    }
-
-    fn open_reader(&self, _ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
-        // The StoreReader is opened on-demand via SegmentReader::get_store_reader()
-        // because it requires a cache_num_blocks parameter. We provide a no-op reader here.
-        Ok(Arc::new(StorePluginReader))
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
@@ -166,9 +156,9 @@ impl SegmentPlugin for StorePlugin {
 
     fn space_usage(
         &self,
-        ctx: &PluginReaderContext,
+        segment_reader: &SegmentReader,
     ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
-        let store = ctx.segment_reader.get_store_reader(0)?;
+        let store = segment_reader.get_store_reader(0)?;
         Ok(BTreeMap::from([(
             STORE.to_string(),
             ComponentSpaceUsage::Store(store.space_usage()),
@@ -274,18 +264,6 @@ impl PluginWriter for StorePluginWriter {
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-/// Plugin reader for the document store.
-///
-/// The actual store reading is done via `SegmentReader::get_store_reader()` which
-/// requires a `cache_num_blocks` parameter, so this reader is a placeholder.
-pub struct StorePluginReader;
-
-impl PluginReader for StorePluginReader {
-    fn as_any(&self) -> &dyn Any {
         self
     }
 }
