@@ -8,13 +8,17 @@
 //! to attach new data to segments without modifying tantivy internals.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use common::HasLen;
+
 use crate::directory::Directory;
-use crate::index::{IndexSettings, SegmentReader};
+use crate::index::{IndexSettings, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::schema::Schema;
+use crate::space_usage::ComponentSpaceUsage;
 use crate::Segment;
 
 /// A pluggable segment component that participates in writing, reading, and merging.
@@ -57,6 +61,31 @@ pub trait SegmentPlugin: Send + Sync + 'static {
 
     /// Merge data from multiple source segments into a target segment.
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()>;
+
+    /// Report on-disk space usage of this component, keyed by component name.
+    ///
+    /// The returned entries are merged into [`SegmentSpaceUsage`]. The default
+    /// implementation emits one [`ComponentSpaceUsage::Basic`] entry per file in
+    /// [`extensions()`](Self::extensions); built-in plugins override this to report
+    /// richer per-field breakdowns under the keys the named accessors expect.
+    ///
+    /// [`SegmentSpaceUsage`]: crate::space_usage::SegmentSpaceUsage
+    fn space_usage(
+        &self,
+        ctx: &PluginReaderContext,
+    ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
+        let mut usage = BTreeMap::new();
+        for ext in self.extensions() {
+            let file = ctx
+                .segment_reader
+                .open_read(SegmentComponent::Custom(ext.to_string()))?;
+            usage.insert(
+                ext.to_string(),
+                ComponentSpaceUsage::Basic(file.len().into()),
+            );
+        }
+        Ok(usage)
+    }
 }
 
 /// Writer for a single component within a segment.
