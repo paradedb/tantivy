@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use measure_time::debug_time;
 
-use crate::directory::{CompositeFile, CompositeWrite, Directory, WritePtr};
+use crate::directory::CompositeFile;
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
@@ -58,23 +58,7 @@ impl SegmentPlugin for PostingsPlugin {
         // During merge, the merge() method handles file creation directly.
         // Only open the serializer during normal indexing.
         let serializer = if !ctx.is_in_merge {
-            // Replicate InvertedIndexSerializer::open but using the directory directly
-            // to avoid needing &mut Segment.
-            let segment = ctx.segment;
-            let directory = ctx.directory;
-            let terms_path = segment.relative_path(SegmentComponent::Terms);
-            let postings_path = segment.relative_path(SegmentComponent::Postings);
-            let positions_path = segment.relative_path(SegmentComponent::Positions);
-            let terms_write = CompositeWrite::wrap(directory.open_write(&terms_path)?);
-            let postings_write = CompositeWrite::wrap(directory.open_write(&postings_path)?);
-            let positions_write = CompositeWrite::wrap(directory.open_write(&positions_path)?);
-            let schema = ctx.schema.clone();
-            Some(InvertedIndexSerializer::from_parts(
-                terms_write,
-                postings_write,
-                positions_write,
-                schema,
-            ))
+            Some(InvertedIndexSerializer::open(ctx.segment)?)
         } else {
             None
         };
@@ -93,19 +77,7 @@ impl SegmentPlugin for PostingsPlugin {
 
         // Open the target inverted index serializer
         let target_segment = &*ctx.target_segment;
-        let directory = target_segment.index().directory();
-        let terms_path = target_segment.relative_path(SegmentComponent::Terms);
-        let postings_path = target_segment.relative_path(SegmentComponent::Postings);
-        let positions_path = target_segment.relative_path(SegmentComponent::Positions);
-        let terms_write: WritePtr = directory.open_write(&terms_path)?;
-        let postings_write: WritePtr = directory.open_write(&postings_path)?;
-        let positions_write: WritePtr = directory.open_write(&positions_path)?;
-        let mut serializer = InvertedIndexSerializer::from_parts(
-            CompositeWrite::wrap(terms_write),
-            CompositeWrite::wrap(postings_write),
-            CompositeWrite::wrap(positions_write),
-            ctx.schema.clone(),
-        );
+        let mut serializer = InvertedIndexSerializer::open(target_segment)?;
 
         // Read back fieldnorms written by FieldNormsPlugin (phase 0)
         let fieldnorm_data = target_segment.open_read(SegmentComponent::FieldNorms)?;
