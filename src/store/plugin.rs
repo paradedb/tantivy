@@ -29,10 +29,6 @@ use crate::Segment;
 pub struct StorePlugin;
 
 impl SegmentPlugin for StorePlugin {
-    fn name(&self) -> &str {
-        "store"
-    }
-
     fn extensions(&self) -> Vec<&str> {
         vec!["store", "temp"]
     }
@@ -83,6 +79,9 @@ impl SegmentPlugin for StorePlugin {
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
+        if ctx.ignore_store {
+            return Ok(());
+        }
         debug_time!("write-storable-fields");
         debug!("write-storable-fields");
 

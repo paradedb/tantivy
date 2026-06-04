@@ -7,10 +7,11 @@ use crate::plugin::{PluginWriter, PluginWriterContext, SegmentPlugin};
 /// the data accumulated and sorted by the `SegmentWriter`.
 pub struct SegmentSerializer {
     segment: Segment,
-    /// Plugin writers, stored as (name, writer) pairs.
-    /// Includes built-in plugins (fieldnorms, postings, fast_fields, store, etc.)
-    /// and custom plugins.
-    plugin_writers: Vec<(String, Box<dyn PluginWriter>)>,
+    /// Plugin writers for the built-in plugins (fieldnorms, postings, fast_fields,
+    /// store, etc.) and custom plugins, each paired with its plugin's write phase
+    /// (captured at creation, used to order serialization). Looked up by concrete
+    /// writer type.
+    plugin_writers: Vec<(u32, Box<dyn PluginWriter>)>,
 }
 
 impl SegmentSerializer {
@@ -48,7 +49,7 @@ impl SegmentSerializer {
                     ignore_store,
                     directory,
                 };
-                Ok((p.name().to_string(), p.create_writer(&ctx)?))
+                Ok((p.write_phase(), p.create_writer(&ctx)?))
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -74,24 +75,22 @@ impl SegmentSerializer {
         &mut self.segment
     }
 
-    /// Get a plugin writer by name and downcast to the expected type (mutable).
-    pub fn get_plugin_writer<T: 'static>(&mut self, name: &str) -> Option<&mut T> {
+    /// Get the plugin writer of the given concrete type (mutable).
+    pub fn get_plugin_writer<T: 'static>(&mut self) -> Option<&mut T> {
         self.plugin_writers
             .iter_mut()
-            .find(|(n, _)| n == name)
-            .and_then(|(_, w)| w.as_any_mut().downcast_mut::<T>())
+            .find_map(|(_, w)| w.as_any_mut().downcast_mut::<T>())
     }
 
-    /// Get a plugin writer by name and downcast to the expected type (immutable).
-    pub fn get_plugin_writer_ref<T: 'static>(&self, name: &str) -> Option<&T> {
+    /// Get the plugin writer of the given concrete type (immutable).
+    pub fn get_plugin_writer_ref<T: 'static>(&self) -> Option<&T> {
         self.plugin_writers
             .iter()
-            .find(|(n, _)| n == name)
-            .and_then(|(_, w)| w.as_any().downcast_ref::<T>())
+            .find_map(|(_, w)| w.as_any().downcast_ref::<T>())
     }
 
-    /// Access the plugin writers for iteration.
-    pub fn plugin_writers_mut(&mut self) -> &mut Vec<(String, Box<dyn PluginWriter>)> {
+    /// Access the plugin writers (paired with their write phase) for iteration.
+    pub fn plugin_writers_mut(&mut self) -> &mut Vec<(u32, Box<dyn PluginWriter>)> {
         &mut self.plugin_writers
     }
 

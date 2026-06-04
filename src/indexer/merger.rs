@@ -529,12 +529,9 @@ impl IndexMerger {
         sorted_plugins.sort_by_key(|p| p.write_phase());
 
         for plugin in sorted_plugins {
-            if self.ignore_store && plugin.name() == "store" {
-                continue;
-            }
             debug!(
-                "merge-plugin: {} (phase {})",
-                plugin.name(),
+                "merge-plugin: {:?} (phase {})",
+                plugin.extensions(),
                 plugin.write_phase()
             );
             plugin.merge(PluginMergeContext {
@@ -543,6 +540,7 @@ impl IndexMerger {
                 target_segment: serializer.segment_mut(),
                 schema: &self.schema,
                 settings: &self.index_settings,
+                ignore_store: self.ignore_store,
                 cancel: &*self.cancel,
             })?;
         }
