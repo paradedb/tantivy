@@ -23,10 +23,6 @@ use crate::{DocId, Segment};
 pub struct FieldNormsPlugin;
 
 impl SegmentPlugin for FieldNormsPlugin {
-    fn name(&self) -> &str {
-        "fieldnorms"
-    }
-
     fn extensions(&self) -> Vec<&str> {
         vec!["fieldnorm"]
     }

@@ -28,10 +28,6 @@ use crate::Segment;
 pub struct FastFieldsPlugin;
 
 impl SegmentPlugin for FastFieldsPlugin {
-    fn name(&self) -> &str {
-        "fast_fields"
-    }
-
     fn extensions(&self) -> Vec<&str> {
         vec!["fast"]
     }

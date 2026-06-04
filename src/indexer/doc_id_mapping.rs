@@ -144,7 +144,7 @@ pub(crate) fn get_doc_id_mapping_from_field(
     expect_field_id_for_sort_field(&schema, &sort_by_field)?; // for now expect
     let fast_fields_plugin = segment_writer
         .segment_serializer
-        .get_plugin_writer_ref::<FastFieldsPluginWriter>("fast_fields")
+        .get_plugin_writer_ref::<FastFieldsPluginWriter>()
         .expect("fast_fields plugin");
     let new_doc_id_to_old = fast_fields_plugin.writer().sort_order(
         sort_by_field.field.as_str(),

@@ -139,7 +139,7 @@ impl SegmentWriter {
     pub fn finalize(mut self) -> crate::Result<Vec<u64>> {
         let max_doc = self.max_doc;
         self.segment_serializer
-            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+            .get_plugin_writer::<FieldNormsPluginWriter>()
             .expect("fieldnorms plugin")
             .fill_up_to_max_doc(max_doc);
         let mapping: Option<DocIdMapping> = self
@@ -157,7 +157,7 @@ impl SegmentWriter {
         {
             let postings_plugin = self
                 .segment_serializer
-                .get_plugin_writer::<PostingsPluginWriter>("postings")
+                .get_plugin_writer::<PostingsPluginWriter>()
                 .expect("postings plugin");
             postings_plugin.per_field_postings_writers = Some(std::mem::replace(
                 &mut self.per_field_postings_writers,
@@ -251,7 +251,7 @@ impl SegmentWriter {
                     }
                     if field_entry.has_fieldnorms() {
                         self.segment_serializer
-                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .get_plugin_writer::<FieldNormsPluginWriter>()
                             .expect("fieldnorms plugin")
                             .record(doc_id, field, indexing_position.num_tokens);
                     }
@@ -268,7 +268,7 @@ impl SegmentWriter {
                     }
                     if field_entry.has_fieldnorms() {
                         self.segment_serializer
-                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .get_plugin_writer::<FieldNormsPluginWriter>()
                             .expect("fieldnorms plugin")
                             .record(doc_id, field, num_vals);
                     }
@@ -286,7 +286,7 @@ impl SegmentWriter {
                     }
                     if field_entry.has_fieldnorms() {
                         self.segment_serializer
-                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .get_plugin_writer::<FieldNormsPluginWriter>()
                             .expect("fieldnorms plugin")
                             .record(doc_id, field, num_vals);
                     }
@@ -303,7 +303,7 @@ impl SegmentWriter {
                     }
                     if field_entry.has_fieldnorms() {
                         self.segment_serializer
-                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .get_plugin_writer::<FieldNormsPluginWriter>()
                             .expect("fieldnorms plugin")
                             .record(doc_id, field, num_vals);
                     }
@@ -319,7 +319,7 @@ impl SegmentWriter {
                     }
                     if field_entry.has_fieldnorms() {
                         self.segment_serializer
-                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .get_plugin_writer::<FieldNormsPluginWriter>()
                             .expect("fieldnorms plugin")
                             .record(doc_id, field, num_vals);
                     }
@@ -335,7 +335,7 @@ impl SegmentWriter {
                     }
                     if field_entry.has_fieldnorms() {
                         self.segment_serializer
-                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .get_plugin_writer::<FieldNormsPluginWriter>()
                             .expect("fieldnorms plugin")
                             .record(doc_id, field, num_vals);
                     }
@@ -351,7 +351,7 @@ impl SegmentWriter {
                     }
                     if field_entry.has_fieldnorms() {
                         self.segment_serializer
-                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .get_plugin_writer::<FieldNormsPluginWriter>()
                             .expect("fieldnorms plugin")
                             .record(doc_id, field, num_vals);
                     }
@@ -390,7 +390,7 @@ impl SegmentWriter {
                     }
                     if field_entry.has_fieldnorms() {
                         self.segment_serializer
-                            .get_plugin_writer::<FieldNormsPluginWriter>("fieldnorms")
+                            .get_plugin_writer::<FieldNormsPluginWriter>()
                             .expect("fieldnorms plugin")
                             .record(doc_id, field, num_vals);
                     }
@@ -410,14 +410,14 @@ impl SegmentWriter {
         let AddOperation { document, opstamp } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.segment_serializer
-            .get_plugin_writer::<FastFieldsPluginWriter>("fast_fields")
+            .get_plugin_writer::<FastFieldsPluginWriter>()
             .expect("fast_fields plugin")
             .writer_mut()
             .add_document(&document)?;
         self.index_document(&document)?;
         if !self.ignore_store {
             self.segment_serializer
-                .get_plugin_writer::<StorePluginWriter>("store")
+                .get_plugin_writer::<StorePluginWriter>()
                 .expect("store plugin")
                 .store(&document, &self.schema)?;
         }
@@ -465,19 +465,12 @@ fn remap_and_write(
     // We need to take them out so we can pass &mut Segment from the serializer.
     let mut plugin_writers = std::mem::take(serializer.plugin_writers_mut());
 
-    // Collect (index, phase) so we can process in phase order
+    // Process in ascending phase order (e.g. fieldnorms before postings, which
+    // reads them back).
     let mut indexed: Vec<(usize, u32)> = plugin_writers
         .iter()
         .enumerate()
-        .map(|(i, (name, _))| {
-            // Determine phase from the name
-            let phase = match name.as_str() {
-                "fieldnorms" => 0,
-                "postings" => 1,
-                _ => 2,
-            };
-            (i, phase)
-        })
+        .map(|(i, (phase, _))| (i, *phase))
         .collect();
     indexed.sort_by_key(|&(_, phase)| phase);
 
