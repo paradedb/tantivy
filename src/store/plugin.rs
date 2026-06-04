@@ -22,7 +22,7 @@ pub struct StorePlugin;
 
 impl SegmentPlugin for StorePlugin {
     fn extensions(&self) -> Vec<&str> {
-        vec!["store", "temp"]
+        vec!["store", "store.temp"]
     }
 
     fn write_phase(&self) -> u32 {
