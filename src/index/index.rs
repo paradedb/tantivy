@@ -165,10 +165,10 @@ impl IndexBuilder {
 
     /// Register a custom segment plugin.
     ///
-    /// Plugins participate in the segment lifecycle: they create writers during indexing,
-    /// readers during search, and handle merging. See [`SegmentPlugin`] for details.
+    /// Plugins participate in the segment lifecycle: they create writers during indexing
+    /// and handle merging. See [`SegmentPlugin`] for details.
     #[must_use]
-    pub fn plugin(mut self, plugin: Arc<dyn SegmentPlugin>) -> Self {
+    pub fn register_plugin(mut self, plugin: Arc<dyn SegmentPlugin>) -> Self {
         self.plugins.push(plugin);
         self
     }
@@ -449,18 +449,13 @@ impl Index {
             fast_field_tokenizers: TokenizerManager::default(),
             executor: Executor::single_thread(),
             inventory,
-            plugins: Self::builtin_plugins(),
+            plugins: vec![
+                Arc::new(FieldNormsPlugin),
+                Arc::new(PostingsPlugin),
+                Arc::new(FastFieldsPlugin),
+                Arc::new(StorePlugin),
+            ],
         }
-    }
-
-    /// Returns the set of built-in segment plugins.
-    fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
-        vec![
-            Arc::new(FieldNormsPlugin),
-            Arc::new(PostingsPlugin),
-            Arc::new(FastFieldsPlugin),
-            Arc::new(StorePlugin),
-        ]
     }
 
     /// Setter for the tokenizer manager.

@@ -46,10 +46,6 @@ use crate::DocId;
 pub struct PostingsPlugin;
 
 impl SegmentPlugin for PostingsPlugin {
-    fn name(&self) -> &str {
-        "postings"
-    }
-
     fn extensions(&self) -> Vec<&str> {
         vec!["idx", "pos", "term"]
     }

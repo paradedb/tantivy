@@ -26,9 +26,6 @@ use crate::Segment;
 /// that creates writers, readers, and handles merging. The actual data APIs are
 /// component-specific and accessed via downcasting on the concrete types.
 pub trait SegmentPlugin: Send + Sync + 'static {
-    /// Unique name identifying this component (e.g., "postings", "fast_fields").
-    fn name(&self) -> &str;
-
     /// File extensions this component manages (e.g., `["idx", "pos", "term"]` for postings).
     fn extensions(&self) -> Vec<&str>;
 
@@ -139,6 +136,8 @@ pub struct PluginMergeContext<'a> {
     pub schema: &'a Schema,
     /// The index settings.
     pub settings: &'a IndexSettings,
+    /// Whether the document store should be ignored for this segment.
+    pub ignore_store: bool,
     /// Cancel sentinel for cooperative cancellation.
     pub cancel: &'a dyn CancelSentinel,
 }
@@ -163,10 +162,6 @@ mod tests {
     struct MarkerPlugin;
 
     impl SegmentPlugin for MarkerPlugin {
-        fn name(&self) -> &str {
-            "marker"
-        }
-
         fn extensions(&self) -> Vec<&str> {
             vec!["marker"]
         }
@@ -230,16 +225,22 @@ mod tests {
         let plugin: Arc<dyn SegmentPlugin> = Arc::new(MarkerPlugin);
         let index = Index::builder()
             .schema(schema)
-            .plugin(plugin)
+            .register_plugin(plugin)
             .create_in_ram()?;
 
         assert!(index.plugins().len() >= 2);
         assert!(
-            index.plugins().iter().any(|p| p.name() == "marker"),
+            index
+                .plugins()
+                .iter()
+                .any(|p| p.extensions().contains(&"marker")),
             "marker plugin should be registered"
         );
         assert!(
-            index.plugins().iter().any(|p| p.name() == "fieldnorms"),
+            index
+                .plugins()
+                .iter()
+                .any(|p| p.extensions().contains(&"fieldnorm")),
             "fieldnorms built-in plugin should be registered"
         );
 
@@ -268,7 +269,6 @@ mod tests {
     #[test]
     fn test_plugin_extensions() {
         let plugin = MarkerPlugin;
-        assert_eq!(plugin.name(), "marker");
         assert_eq!(plugin.extensions(), vec!["marker"]);
         assert_eq!(plugin.write_phase(), 2);
     }
