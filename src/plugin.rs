@@ -9,7 +9,6 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use common::HasLen;
 
@@ -56,9 +55,6 @@ pub trait SegmentPlugin: Send + Sync + 'static {
     /// the postings writer).
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>>;
 
-    /// Create a reader for an existing segment's data.
-    fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>>;
-
     /// Merge data from multiple source segments into a target segment.
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()>;
 
@@ -72,13 +68,11 @@ pub trait SegmentPlugin: Send + Sync + 'static {
     /// [`SegmentSpaceUsage`]: crate::space_usage::SegmentSpaceUsage
     fn space_usage(
         &self,
-        ctx: &PluginReaderContext,
+        segment_reader: &SegmentReader,
     ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
         let mut usage = BTreeMap::new();
         for ext in self.extensions() {
-            let file = ctx
-                .segment_reader
-                .open_read(SegmentComponent::Custom(ext.to_string()))?;
+            let file = segment_reader.open_read(SegmentComponent::Custom(ext.to_string()))?;
             usage.insert(
                 ext.to_string(),
                 ComponentSpaceUsage::Basic(file.len().into()),
@@ -114,12 +108,6 @@ pub trait PluginWriter: Send + Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-/// Reader for a single component within a segment.
-pub trait PluginReader: Send + Sync + Any {
-    /// Downcast support for accessing component-specific APIs.
-    fn as_any(&self) -> &dyn Any;
-}
-
 /// Context provided to [`SegmentPlugin::create_writer`].
 pub struct PluginWriterContext<'a> {
     /// The segment being written to.
@@ -137,16 +125,6 @@ pub struct PluginWriterContext<'a> {
     /// The `Directory::open_write` trait method takes `&self`, so no mutable
     /// segment reference is needed.
     pub directory: &'a dyn Directory,
-}
-
-/// Context provided to [`SegmentPlugin::open_reader`].
-pub struct PluginReaderContext<'a> {
-    /// The segment to read from.
-    pub segment: &'a Segment,
-    /// The index schema.
-    pub schema: &'a Schema,
-    /// The segment reader, for accessing existing component data.
-    pub segment_reader: &'a SegmentReader,
 }
 
 /// Context provided to [`SegmentPlugin::merge`].
@@ -172,6 +150,8 @@ mod tests {
     //! Defines a custom marker plugin, then verifies it works through the
     //! full lifecycle: write → read → merge → read.
 
+    use std::sync::Arc;
+
     use super::*;
     use crate::index::SegmentComponent;
     use crate::schema::{Schema, STORED, TEXT};
@@ -196,21 +176,6 @@ mod tests {
             _ctx: &PluginWriterContext,
         ) -> crate::Result<Box<dyn PluginWriter>> {
             Ok(Box::new(MarkerWriter))
-        }
-
-        fn open_reader(&self, ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
-            let component = SegmentComponent::Custom("marker".to_string());
-            let file_slice = ctx.segment_reader.open_read(component).map_err(|e| {
-                crate::TantivyError::InternalError(format!("marker open_read: {e}"))
-            })?;
-            let data = file_slice.read_bytes()?;
-            assert!(
-                data.len() >= 4,
-                "marker file too short: {} bytes",
-                data.len()
-            );
-            let value = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            Ok(Arc::new(MarkerReader { value }))
         }
 
         fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
@@ -256,22 +221,6 @@ mod tests {
         }
     }
 
-    struct MarkerReader {
-        value: u32,
-    }
-
-    impl MarkerReader {
-        fn value(&self) -> u32 {
-            self.value
-        }
-    }
-
-    impl PluginReader for MarkerReader {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
     #[test]
     fn test_plugin_full_lifecycle() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
@@ -307,10 +256,11 @@ mod tests {
         let segment_readers = searcher.segment_readers();
         assert_eq!(segment_readers.len(), 1);
 
-        let marker_reader: Arc<MarkerReader> = segment_readers[0]
-            .plugin_reader::<MarkerReader>("marker")?
-            .expect("marker plugin reader should exist");
-        assert_eq!(marker_reader.value(), MARKER);
+        let data = segment_readers[0]
+            .open_read(SegmentComponent::Custom("marker".to_string()))?
+            .read_bytes()?;
+        let value = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        assert_eq!(value, MARKER);
 
         Ok(())
     }

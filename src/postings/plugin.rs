@@ -21,10 +21,7 @@ use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedI
 use crate::index::{Segment, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{DocIdMapping, SegmentDocIdMapping};
 use crate::indexer::segment_updater::CancelSentinel;
-use crate::plugin::{
-    PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
-    SegmentPlugin,
-};
+use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::postings::{
     serialize_postings, IndexingContext, InvertedIndexSerializer, PerFieldPostingsWriter, Postings,
     SegmentPostings,
@@ -94,12 +91,6 @@ impl SegmentPlugin for PostingsPlugin {
         }))
     }
 
-    fn open_reader(&self, _ctx: &PluginReaderContext) -> crate::Result<Arc<dyn PluginReader>> {
-        // The inverted index reader is opened on-demand via SegmentReader::inverted_index()
-        // because it requires a field parameter. We provide a no-op reader here.
-        Ok(Arc::new(PostingsPluginReader))
-    }
-
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
         debug_time!("write-postings");
         debug!("write-postings");
@@ -140,10 +131,9 @@ impl SegmentPlugin for PostingsPlugin {
 
     fn space_usage(
         &self,
-        ctx: &PluginReaderContext,
+        segment_reader: &SegmentReader,
     ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
-        let segment_reader = ctx.segment_reader;
-        let schema = ctx.schema;
+        let schema = segment_reader.schema();
         let termdict = CompositeFile::open(&segment_reader.open_read(SegmentComponent::Terms)?)?
             .space_usage(schema);
         let postings = CompositeFile::open(&segment_reader.open_read(SegmentComponent::Postings)?)?
@@ -526,18 +516,6 @@ impl PluginWriter for PostingsPluginWriter {
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-/// Plugin reader for the inverted index.
-///
-/// The actual inverted index reading is done via `SegmentReader::inverted_index()`
-/// which requires a field parameter, so this reader is a placeholder.
-pub struct PostingsPluginReader;
-
-impl PluginReader for PostingsPluginReader {
-    fn as_any(&self) -> &dyn Any {
         self
     }
 }

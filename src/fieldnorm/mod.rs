@@ -23,7 +23,7 @@ mod serializer;
 mod writer;
 
 use self::code::{fieldnorm_to_id, id_to_fieldnorm};
-pub use self::plugin::{FieldNormsPlugin, FieldNormsPluginReader, FieldNormsPluginWriter};
+pub use self::plugin::{FieldNormsPlugin, FieldNormsPluginWriter};
 pub use self::reader::{FieldNormReader, FieldNormReaders};
 pub use self::serializer::FieldNormsSerializer;
 pub use self::writer::FieldNormsWriter;
