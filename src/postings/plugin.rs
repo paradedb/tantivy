@@ -8,11 +8,12 @@
 //! (phase 0) from disk.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use measure_time::debug_time;
 
-use crate::directory::{CompositeWrite, Directory, WritePtr};
+use crate::directory::{CompositeFile, CompositeWrite, Directory, WritePtr};
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
@@ -29,6 +30,7 @@ use crate::postings::{
     SegmentPostings,
 };
 use crate::schema::{Field, FieldType, Schema};
+use crate::space_usage::{ComponentSpaceUsage, POSITIONS, POSTINGS, TERMDICT};
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::DocId;
 
@@ -134,6 +136,36 @@ impl SegmentPlugin for PostingsPlugin {
 
         serializer.close()?;
         Ok(())
+    }
+
+    fn space_usage(
+        &self,
+        ctx: &PluginReaderContext,
+    ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
+        let segment_reader = ctx.segment_reader;
+        let schema = ctx.schema;
+        let termdict = CompositeFile::open(&segment_reader.open_read(SegmentComponent::Terms)?)?
+            .space_usage(schema);
+        let postings = CompositeFile::open(&segment_reader.open_read(SegmentComponent::Postings)?)?
+            .space_usage(schema);
+        let positions = match segment_reader.open_read(SegmentComponent::Positions) {
+            Ok(file) => CompositeFile::open(&file)?.space_usage(schema),
+            Err(_) => CompositeFile::empty().space_usage(schema),
+        };
+        Ok(BTreeMap::from([
+            (
+                TERMDICT.to_string(),
+                ComponentSpaceUsage::PerField(termdict),
+            ),
+            (
+                POSTINGS.to_string(),
+                ComponentSpaceUsage::PerField(postings),
+            ),
+            (
+                POSITIONS.to_string(),
+                ComponentSpaceUsage::PerField(positions),
+            ),
+        ]))
     }
 }
 

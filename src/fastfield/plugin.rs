@@ -4,6 +4,7 @@
 //! the plugin interface so that fast fields participate in the unified plugin lifecycle.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use columnar::{
@@ -21,6 +22,7 @@ use crate::plugin::{
     SegmentPlugin,
 };
 use crate::schema::{value_type_to_column_type, Schema};
+use crate::space_usage::{ComponentSpaceUsage, FAST_FIELDS};
 use crate::Segment;
 
 /// Built-in plugin for fast fields (columnar storage).
@@ -103,6 +105,20 @@ impl SegmentPlugin for FastFieldsPlugin {
 
         fast_field_wrt.terminate()?;
         Ok(())
+    }
+
+    fn space_usage(
+        &self,
+        ctx: &PluginReaderContext,
+    ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
+        let file = ctx.segment_reader.open_read(SegmentComponent::FastFields)?;
+        let readers = FastFieldReaders::open(file, ctx.schema.clone())
+            .map_err(|e| crate::TantivyError::InternalError(e.to_string()))?;
+        let usage = readers.space_usage()?;
+        Ok(BTreeMap::from([(
+            FAST_FIELDS.to_string(),
+            ComponentSpaceUsage::PerField(usage),
+        )]))
     }
 }
 

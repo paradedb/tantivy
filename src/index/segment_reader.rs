@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::{fmt, io};
@@ -18,7 +18,7 @@ use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::plugin::{PluginReader, PluginReaderContext, SegmentPlugin};
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
-use crate::space_usage::SegmentSpaceUsage;
+use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
 use crate::{Directory, DocId, Index, Opstamp};
@@ -594,19 +594,37 @@ impl SegmentReader {
     }
 
     /// Summarize total space usage of this segment.
+    ///
+    /// The per-component usage is assembled from each registered plugin's
+    /// [`SegmentPlugin::space_usage`](crate::plugin::SegmentPlugin::space_usage), plus
+    /// the non-plugin `deletes` entry (the alive bitset).
     pub fn space_usage(&self) -> io::Result<SegmentSpaceUsage> {
-        Ok(SegmentSpaceUsage::new(
+        let segment_meta = self.index.new_segment_meta(self.segment_id, self.max_doc);
+        let segment = Segment::for_index(self.index.clone(), segment_meta);
+        let ctx = PluginReaderContext {
+            segment: &segment,
+            schema: &self.schema,
+            segment_reader: self,
+        };
+        let mut components: BTreeMap<String, ComponentSpaceUsage> = BTreeMap::new();
+        for plugin in &self.plugins {
+            let plugin_usage = plugin
+                .space_usage(&ctx)
+                .map_err(|err| io::Error::other(err.to_string()))?;
+            components.extend(plugin_usage);
+        }
+        let deletes = self
+            .alive_bitset_opt()
+            .as_ref()
+            .map(AliveBitSet::space_usage)
+            .unwrap_or_default();
+        components.insert(
+            crate::space_usage::DELETES.to_string(),
+            ComponentSpaceUsage::Basic(deletes),
+        );
+        Ok(SegmentSpaceUsage::from_components(
             self.num_docs(),
-            self.termdict_composite().space_usage(self.schema()),
-            self.postings_composite().space_usage(self.schema()),
-            self.positions_composite().space_usage(self.schema()),
-            self.fast_fields_readers().space_usage()?,
-            self.fieldnorm_readers().space_usage(self.schema()),
-            self.get_store_reader(0)?.space_usage(),
-            self.alive_bitset_opt()
-                .as_ref()
-                .map(AliveBitSet::space_usage)
-                .unwrap_or_default(),
+            components,
         ))
     }
 
