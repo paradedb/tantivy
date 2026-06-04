@@ -4,6 +4,7 @@
 //! interface so that the document store participates in the unified plugin lifecycle.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use measure_time::debug_time;
@@ -17,6 +18,7 @@ use crate::plugin::{
 };
 use crate::schema::document::Document;
 use crate::schema::Schema;
+use crate::space_usage::{ComponentSpaceUsage, STORE};
 use crate::store::{StoreReader, StoreWriter};
 use crate::Segment;
 
@@ -160,6 +162,17 @@ impl SegmentPlugin for StorePlugin {
         }
         store_writer.close()?;
         Ok(())
+    }
+
+    fn space_usage(
+        &self,
+        ctx: &PluginReaderContext,
+    ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
+        let store = ctx.segment_reader.get_store_reader(0)?;
+        Ok(BTreeMap::from([(
+            STORE.to_string(),
+            ComponentSpaceUsage::Store(store.space_usage()),
+        )]))
     }
 }
 

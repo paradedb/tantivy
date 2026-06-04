@@ -5,6 +5,7 @@
 //! participate in the unified plugin lifecycle.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::directory::Directory;
@@ -15,6 +16,7 @@ use crate::plugin::{
     PluginMergeContext, PluginReader, PluginReaderContext, PluginWriter, PluginWriterContext,
     SegmentPlugin,
 };
+use crate::space_usage::{ComponentSpaceUsage, FIELDNORMS};
 use crate::{DocId, Segment};
 
 /// Built-in plugin for field norms.
@@ -88,6 +90,19 @@ impl SegmentPlugin for FieldNormsPlugin {
         }
         serializer.close()?;
         Ok(())
+    }
+
+    fn space_usage(
+        &self,
+        ctx: &PluginReaderContext,
+    ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
+        let file = ctx.segment_reader.open_read(SegmentComponent::FieldNorms)?;
+        let readers = FieldNormReaders::open(file)?;
+        let usage = readers.space_usage(ctx.schema);
+        Ok(BTreeMap::from([(
+            FIELDNORMS.to_string(),
+            ComponentSpaceUsage::PerField(usage),
+        )]))
     }
 }
 
