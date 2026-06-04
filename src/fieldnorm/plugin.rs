@@ -92,22 +92,16 @@ impl SegmentPlugin for FieldNormsPlugin {
     }
 }
 
-/// Plugin writer wrapping [`FieldNormsWriter`] and [`FieldNormsSerializer`].
-///
-/// Exposes `record()` and `fill_up_to_max_doc()` for the `SegmentWriter`
-/// to call via downcast.
 pub struct FieldNormsPluginWriter {
     pub writer: FieldNormsWriter,
     serializer: Option<FieldNormsSerializer>,
 }
 
 impl FieldNormsPluginWriter {
-    /// Record a fieldnorm value. Called by `SegmentWriter` via downcast.
     pub fn record(&mut self, doc: DocId, field: crate::schema::Field, fieldnorm: u32) {
         self.writer.record(doc, field, fieldnorm);
     }
 
-    /// Pad fieldnorms to max_doc. Called before serialize.
     pub fn fill_up_to_max_doc(&mut self, max_doc: DocId) {
         self.writer.fill_up_to_max_doc(max_doc);
     }

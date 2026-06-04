@@ -165,16 +165,12 @@ impl SegmentPlugin for StorePlugin {
     }
 }
 
-/// Plugin writer wrapping [`StoreWriter`].
-///
-/// Exposes `store()` and `store_bytes()` for the `SegmentWriter` to call via downcast.
 pub struct StorePluginWriter {
     store_writer: Option<StoreWriter>,
     remapping_required: bool,
 }
 
 impl StorePluginWriter {
-    /// Store a document. Called by `SegmentWriter` via downcast.
     pub fn store<D: Document>(&mut self, document: &D, schema: &Schema) -> crate::Result<()> {
         if let Some(ref mut writer) = self.store_writer {
             writer
@@ -184,7 +180,6 @@ impl StorePluginWriter {
         Ok(())
     }
 
-    /// Store raw document bytes. Called during TempStore-to-Store reordering.
     pub fn store_bytes(&mut self, serialized_document: &[u8]) -> crate::Result<()> {
         if let Some(ref mut writer) = self.store_writer {
             writer
