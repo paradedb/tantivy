@@ -18,14 +18,6 @@ use crate::space_usage::{ComponentSpaceUsage, STORE};
 use crate::store::{StoreReader, StoreWriter};
 use crate::Segment;
 
-/// Built-in plugin for the document store (row-oriented compressed storage).
-///
-/// The document store holds the stored fields for each document. It is accessed
-/// when retrieving full documents after search. During indexing, documents are
-/// written incrementally as they arrive.
-///
-/// For sorted indexes, documents are first written to a temporary store, then
-/// reordered according to the sort field during serialization.
 pub struct StorePlugin;
 
 impl SegmentPlugin for StorePlugin {

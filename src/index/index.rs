@@ -163,10 +163,6 @@ impl IndexBuilder {
         self
     }
 
-    /// Register a custom segment plugin.
-    ///
-    /// Plugins participate in the segment lifecycle: they create writers during indexing
-    /// and handle merging. See [`SegmentPlugin`] for details.
     #[must_use]
     pub fn register_plugin(mut self, plugin: Arc<dyn SegmentPlugin>) -> Self {
         self.plugins.push(plugin);
