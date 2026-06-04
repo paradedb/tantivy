@@ -31,18 +31,6 @@ use crate::space_usage::{ComponentSpaceUsage, POSITIONS, POSTINGS, TERMDICT};
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::DocId;
 
-/// Built-in plugin for the inverted index (postings).
-///
-/// The inverted index maps terms to posting lists — sorted sequences of document
-/// ids that contain each term, optionally with term frequencies and positions.
-/// This is the core data structure that enables full-text search.
-///
-/// During indexing, `PostingsPluginWriter` wraps `PerFieldPostingsWriter` and
-/// `IndexingContext` which accumulate postings in memory. At serialize time,
-/// they are consumed and written to the `.idx`, `.pos`, and `.term` files.
-///
-/// During merge, the plugin reads inverted index data from source segments and
-/// writes merged postings into the target segment.
 pub struct PostingsPlugin;
 
 impl SegmentPlugin for PostingsPlugin {
