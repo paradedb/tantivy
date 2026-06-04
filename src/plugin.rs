@@ -20,10 +20,10 @@ use crate::schema::Schema;
 use crate::space_usage::ComponentSpaceUsage;
 use crate::Segment;
 
-/// A pluggable segment component that participates in writing, reading, and merging.
+/// A pluggable segment component that participates in writing and merging.
 ///
 /// Each plugin manages one or more files within a segment. The plugin is a factory
-/// that creates writers, readers, and handles merging. The actual data APIs are
+/// that creates writers and handles merging. The actual data APIs are
 /// component-specific and accessed via downcasting on the concrete types.
 pub trait SegmentPlugin: Send + Sync + 'static {
     /// File extensions this component manages (e.g., `["idx", "pos", "term"]` for postings).

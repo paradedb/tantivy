@@ -106,10 +106,6 @@ impl SegmentPlugin for FastFieldsPlugin {
     }
 }
 
-/// Plugin writer wrapping [`FastFieldsWriter`].
-///
-/// Exposes `add_document()` and `sort_order()` for the `SegmentWriter`
-/// to call via downcast.
 pub struct FastFieldsPluginWriter {
     /// The inner writer is wrapped in an `Option` because `FastFieldsWriter::serialize`
     /// takes `self` by value. We `.take()` it during serialize.
@@ -119,16 +115,12 @@ pub struct FastFieldsPluginWriter {
 }
 
 impl FastFieldsPluginWriter {
-    /// Access the inner writer for `add_document` calls.
-    /// Panics if called after serialization.
     pub fn writer_mut(&mut self) -> &mut FastFieldsWriter {
         self.writer
             .as_mut()
             .expect("FastFieldsWriter already consumed by serialize")
     }
 
-    /// Access the inner writer immutably (e.g. for `sort_order`).
-    /// Panics if called after serialization.
     pub fn writer(&self) -> &FastFieldsWriter {
         self.writer
             .as_ref()
