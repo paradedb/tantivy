@@ -21,10 +21,6 @@ use crate::schema::{value_type_to_column_type, Schema};
 use crate::space_usage::{ComponentSpaceUsage, FAST_FIELDS};
 use crate::Segment;
 
-/// Built-in plugin for fast fields (columnar storage).
-///
-/// Fast fields provide column-oriented random access to document field values,
-/// used for sorting, aggregation, filtering, and scoring.
 pub struct FastFieldsPlugin;
 
 impl SegmentPlugin for FastFieldsPlugin {

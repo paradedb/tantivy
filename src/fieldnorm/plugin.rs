@@ -15,11 +15,6 @@ use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, Segme
 use crate::space_usage::{ComponentSpaceUsage, FIELDNORMS};
 use crate::{DocId, Segment};
 
-/// Built-in plugin for field norms.
-///
-/// Field norms track the number of tokens per field per document, used for
-/// BM25 scoring. This is the simplest built-in component and serves as the
-/// reference implementation for the plugin pattern.
 pub struct FieldNormsPlugin;
 
 impl SegmentPlugin for FieldNormsPlugin {
