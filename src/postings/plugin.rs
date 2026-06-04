@@ -386,47 +386,33 @@ fn write_postings_merge(
 
 // --- Plugin writer ---
 
-/// Plugin writer wrapping [`PerFieldPostingsWriter`], [`IndexingContext`], and
-/// [`InvertedIndexSerializer`].
-///
-/// During normal indexing, the `SegmentWriter` populates `per_field_postings_writers`
-/// and `ctx` via downcast, then at serialize time they are consumed along with
-/// the serializer.
 pub struct PostingsPluginWriter {
-    /// Per-field postings writers. Populated by `SegmentWriter` before serialization.
     pub(crate) per_field_postings_writers: Option<PerFieldPostingsWriter>,
-    /// Indexing context (arena, term index). Populated by `SegmentWriter` before serialization.
     pub(crate) ctx: Option<IndexingContext>,
-    /// The inverted index serializer. `None` during merge (merge() handles it directly).
     serializer: Option<InvertedIndexSerializer>,
-    /// Schema needed for serialization.
     schema: Schema,
 }
 
 #[allow(dead_code)]
 impl PostingsPluginWriter {
-    /// Access the per-field postings writers mutably. Used by `SegmentWriter` hot path.
     pub(crate) fn per_field_postings_writers_mut(&mut self) -> &mut PerFieldPostingsWriter {
         self.per_field_postings_writers
             .as_mut()
             .expect("PostingsPluginWriter: per_field_postings_writers not set")
     }
 
-    /// Access the per-field postings writers immutably.
     pub(crate) fn per_field_postings_writers_ref(&self) -> &PerFieldPostingsWriter {
         self.per_field_postings_writers
             .as_ref()
             .expect("PostingsPluginWriter: per_field_postings_writers not set")
     }
 
-    /// Access the indexing context mutably. Used by `SegmentWriter` hot path.
     pub(crate) fn ctx_mut(&mut self) -> &mut IndexingContext {
         self.ctx
             .as_mut()
             .expect("PostingsPluginWriter: ctx not set")
     }
 
-    /// Access the indexing context immutably.
     pub(crate) fn ctx_ref(&self) -> &IndexingContext {
         self.ctx
             .as_ref()
