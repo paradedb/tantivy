@@ -459,6 +459,16 @@ impl Index {
         self.tokenizers = tokenizers;
     }
 
+    /// Re-attach a custom segment plugin after the index has been opened.
+    ///
+    /// Plugin registration is not persisted, so `Index::open` restores only the
+    /// built-in plugins. Custom plugins must be re-registered before writing or
+    /// merging, the same way custom tokenizers are re-attached via
+    /// [`Index::set_tokenizers`].
+    pub fn register_plugin(&mut self, plugin: Arc<dyn SegmentPlugin>) {
+        self.plugins.push(plugin);
+    }
+
     /// Accessor for the tokenizer manager.
     pub fn tokenizers(&self) -> &TokenizerManager {
         &self.tokenizers
