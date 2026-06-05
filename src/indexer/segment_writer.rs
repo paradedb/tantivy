@@ -97,25 +97,16 @@ impl SegmentWriter {
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
-        let plugin_writers = {
-            let settings = segment.index().settings().clone();
-            let directory = segment.index().directory();
-            segment
-                .index()
-                .plugins()
-                .iter()
-                .map(|p| {
-                    let ctx = PluginWriterContext {
-                        segment: &segment,
-                        schema: &schema,
-                        settings: &settings,
-                        ignore_store,
-                        directory,
-                    };
-                    crate::Result::Ok((p.write_phase(), p.create_writer(&ctx)?))
-                })
-                .collect::<crate::Result<Vec<_>>>()?
+        let ctx = PluginWriterContext {
+            segment: &segment,
+            ignore_store,
         };
+        let plugin_writers = segment
+            .index()
+            .plugins()
+            .iter()
+            .map(|p| crate::Result::Ok((p.write_phase(), p.create_writer(&ctx)?)))
+            .collect::<crate::Result<Vec<_>>>()?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
         let per_field_text_analyzers = schema
             .fields()
