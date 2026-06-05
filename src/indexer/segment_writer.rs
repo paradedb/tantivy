@@ -33,15 +33,6 @@ pub(crate) fn find_plugin_writer<T: 'static>(
         .find_map(|(_, w)| w.as_any_mut().downcast_mut::<T>())
 }
 
-/// Finds a plugin writer of the given concrete type (immutable).
-pub(crate) fn find_plugin_writer_ref<T: 'static>(
-    plugin_writers: &[(u32, Box<dyn PluginWriter>)],
-) -> Option<&T> {
-    plugin_writers
-        .iter()
-        .find_map(|(_, w)| w.as_any().downcast_ref::<T>())
-}
-
 /// Builds a writer for every registered plugin (built-in and custom), each paired
 /// with its plugin's write phase for phase-ordered serialization.
 fn create_plugin_writers(
@@ -183,14 +174,36 @@ impl SegmentWriter {
         })
     }
 
+    pub(crate) fn plugin_writer<T: 'static>(&self) -> &T {
+        self.plugin_writers
+            .iter()
+            .find_map(|(_, w)| w.as_any().downcast_ref::<T>())
+            .expect("plugin writer")
+    }
+
+    pub(crate) fn plugin_writer_mut<T: 'static>(&mut self) -> &mut T {
+        find_plugin_writer::<T>(&mut self.plugin_writers).expect("plugin writer")
+    }
+
+    /// Resolves a custom plugin writer by one of its registered extensions.
+    /// Callers downcast the returned writer to their concrete type via `as_any_mut`.
+    pub fn custom_plugin_writer_mut(&mut self, extension: &str) -> Option<&mut dyn PluginWriter> {
+        let idx = self
+            .segment
+            .index()
+            .plugins()
+            .iter()
+            .position(|p| p.extensions().contains(&extension))?;
+        self.plugin_writers.get_mut(idx).map(|(_, w)| w.as_mut())
+    }
+
     /// Lay on disk the current content of the `SegmentWriter`
     ///
     /// Finalize consumes the `SegmentWriter`, so that it cannot
     /// be used afterwards.
     pub fn finalize(mut self) -> crate::Result<Vec<u64>> {
         let max_doc = self.max_doc;
-        find_plugin_writer::<FieldNormsPluginWriter>(&mut self.plugin_writers)
-            .expect("fieldnorms plugin")
+        self.plugin_writer_mut::<FieldNormsPluginWriter>()
             .fill_up_to_max_doc(max_doc);
         let mapping: Option<DocIdMapping> = self
             .segment
@@ -301,9 +314,11 @@ impl SegmentWriter {
                         );
                     }
                     if field_entry.has_fieldnorms() {
-                        find_plugin_writer::<FieldNormsPluginWriter>(&mut self.plugin_writers)
-                            .expect("fieldnorms plugin")
-                            .record(doc_id, field, indexing_position.num_tokens);
+                        self.plugin_writer_mut::<FieldNormsPluginWriter>().record(
+                            doc_id,
+                            field,
+                            indexing_position.num_tokens,
+                        );
                     }
                 }
                 FieldType::U64(_) => {
@@ -317,8 +332,7 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        find_plugin_writer::<FieldNormsPluginWriter>(&mut self.plugin_writers)
-                            .expect("fieldnorms plugin")
+                        self.plugin_writer_mut::<FieldNormsPluginWriter>()
                             .record(doc_id, field, num_vals);
                     }
                 }
@@ -334,8 +348,7 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        find_plugin_writer::<FieldNormsPluginWriter>(&mut self.plugin_writers)
-                            .expect("fieldnorms plugin")
+                        self.plugin_writer_mut::<FieldNormsPluginWriter>()
                             .record(doc_id, field, num_vals);
                     }
                 }
@@ -350,8 +363,7 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        find_plugin_writer::<FieldNormsPluginWriter>(&mut self.plugin_writers)
-                            .expect("fieldnorms plugin")
+                        self.plugin_writer_mut::<FieldNormsPluginWriter>()
                             .record(doc_id, field, num_vals);
                     }
                 }
@@ -365,8 +377,7 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        find_plugin_writer::<FieldNormsPluginWriter>(&mut self.plugin_writers)
-                            .expect("fieldnorms plugin")
+                        self.plugin_writer_mut::<FieldNormsPluginWriter>()
                             .record(doc_id, field, num_vals);
                     }
                 }
@@ -380,8 +391,7 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        find_plugin_writer::<FieldNormsPluginWriter>(&mut self.plugin_writers)
-                            .expect("fieldnorms plugin")
+                        self.plugin_writer_mut::<FieldNormsPluginWriter>()
                             .record(doc_id, field, num_vals);
                     }
                 }
@@ -395,8 +405,7 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        find_plugin_writer::<FieldNormsPluginWriter>(&mut self.plugin_writers)
-                            .expect("fieldnorms plugin")
+                        self.plugin_writer_mut::<FieldNormsPluginWriter>()
                             .record(doc_id, field, num_vals);
                     }
                 }
@@ -433,8 +442,7 @@ impl SegmentWriter {
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
-                        find_plugin_writer::<FieldNormsPluginWriter>(&mut self.plugin_writers)
-                            .expect("fieldnorms plugin")
+                        self.plugin_writer_mut::<FieldNormsPluginWriter>()
                             .record(doc_id, field, num_vals);
                     }
                 }
@@ -452,15 +460,14 @@ impl SegmentWriter {
     ) -> crate::Result<()> {
         let AddOperation { document, opstamp } = add_operation;
         self.doc_opstamps.push(opstamp);
-        find_plugin_writer::<FastFieldsPluginWriter>(&mut self.plugin_writers)
-            .expect("fast_fields plugin")
+        self.plugin_writer_mut::<FastFieldsPluginWriter>()
             .writer_mut()
             .add_document(&document)?;
         self.index_document(&document)?;
         if !self.ignore_store {
-            find_plugin_writer::<StorePluginWriter>(&mut self.plugin_writers)
-                .expect("store plugin")
-                .store(&document, &self.schema)?;
+            let schema = self.schema.clone();
+            self.plugin_writer_mut::<StorePluginWriter>()
+                .store(&document, &schema)?;
         }
         self.max_doc += 1;
         Ok(())
