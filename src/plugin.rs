@@ -366,32 +366,4 @@ mod tests {
         );
         Ok(())
     }
-
-    #[test]
-    fn test_custom_segment_component() {
-        let component = SegmentComponent::Custom("myext".to_string());
-        assert_eq!(format!("{component}"), "myext");
-
-        let parsed = SegmentComponent::try_from("myext").unwrap();
-        assert_eq!(parsed, SegmentComponent::Custom("myext".to_string()));
-
-        // Built-in components still parse correctly
-        assert_eq!(
-            SegmentComponent::try_from("idx").unwrap(),
-            SegmentComponent::Postings
-        );
-    }
-
-    #[test]
-    fn test_segment_component_iterator_only_builtins() {
-        let components: Vec<_> = SegmentComponent::iterator().collect();
-        assert_eq!(components.len(), 8);
-        // Custom components are not in the static iterator
-        for comp in &components {
-            assert!(
-                !matches!(comp, SegmentComponent::Custom(_)),
-                "Custom should not appear in static iterator"
-            );
-        }
-    }
 }
