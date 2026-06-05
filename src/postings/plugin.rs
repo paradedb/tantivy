@@ -34,8 +34,8 @@ use crate::DocId;
 pub struct PostingsPlugin;
 
 impl SegmentPlugin for PostingsPlugin {
-    fn extensions(&self) -> Vec<&str> {
-        vec!["idx", "pos", "term"]
+    fn extensions(&self) -> &[&str] {
+        &["idx", "pos", "term"]
     }
 
     fn write_phase(&self) -> u32 {

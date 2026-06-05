@@ -77,7 +77,7 @@ fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
 fn builtin_extensions() -> HashSet<String> {
     builtin_plugins()
         .iter()
-        .flat_map(|plugin| plugin.extensions().into_iter().map(str::to_string))
+        .flat_map(|plugin| plugin.extensions().iter().copied().map(str::to_string))
         .collect()
 }
 
@@ -726,7 +726,7 @@ impl Index {
         let builtin = builtin_extensions();
         self.plugins
             .iter()
-            .flat_map(|plugin| plugin.extensions())
+            .flat_map(|plugin| plugin.extensions().iter().copied())
             .filter(|ext| !builtin.contains(*ext))
             .map(str::to_string)
             .collect()
@@ -745,7 +745,11 @@ impl Index {
     pub(crate) fn check_plugins_registered(&self) -> crate::Result<()> {
         let mut registered: HashSet<&str> = HashSet::new();
         let mut conflicting: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for ext in self.plugins.iter().flat_map(|plugin| plugin.extensions()) {
+        for ext in self
+            .plugins
+            .iter()
+            .flat_map(|plugin| plugin.extensions().iter().copied())
+        {
             if !registered.insert(ext) {
                 conflicting.insert(ext.to_string());
             }

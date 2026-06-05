@@ -24,8 +24,8 @@ use crate::Segment;
 pub struct FastFieldsPlugin;
 
 impl SegmentPlugin for FastFieldsPlugin {
-    fn extensions(&self) -> Vec<&str> {
-        vec!["fast"]
+    fn extensions(&self) -> &[&str] {
+        &["fast"]
     }
 
     fn write_phase(&self) -> u32 {
