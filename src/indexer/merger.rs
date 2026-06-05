@@ -505,7 +505,7 @@ impl IndexMerger {
     ///
     /// # Returns
     /// The number of documents in the resulting segment.
-    pub fn write(&self, target_segment: &mut Segment) -> crate::Result<u32> {
+    pub fn write(&self, target_segment: &Segment) -> crate::Result<u32> {
         let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
         {
             if self.is_disjunct_and_sorted_on_sort_property(sort_by_field)? {
@@ -533,7 +533,7 @@ impl IndexMerger {
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
                 doc_id_mapping: &doc_id_mapping,
-                target_segment: &mut *target_segment,
+                target_segment,
                 schema: &self.schema,
                 settings: &self.index_settings,
                 ignore_store: self.ignore_store,

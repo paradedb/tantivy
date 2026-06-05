@@ -56,7 +56,7 @@ impl SegmentPlugin for PostingsPlugin {
         debug!("write-postings");
 
         // Open the target inverted index serializer
-        let target_segment = &*ctx.target_segment;
+        let target_segment = ctx.target_segment;
         let mut serializer = InvertedIndexSerializer::open(target_segment)?;
 
         // Read back fieldnorms written by FieldNormsPlugin (phase 0)
@@ -403,7 +403,7 @@ impl PostingsPluginWriter {
 impl PluginWriter for PostingsPluginWriter {
     fn serialize(
         &mut self,
-        segment: &mut Segment,
+        segment: &Segment,
         doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
         if let Some(mut serializer) = self.serializer.take() {

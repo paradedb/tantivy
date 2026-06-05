@@ -123,7 +123,7 @@ impl FastFieldsPluginWriter {
 impl PluginWriter for FastFieldsPluginWriter {
     fn serialize(
         &mut self,
-        _segment: &mut Segment,
+        _segment: &Segment,
         doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
         if let (Some(writer), Some(wrt)) = (self.writer.take(), self.fast_field_write.as_mut()) {
