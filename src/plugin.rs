@@ -258,6 +258,64 @@ mod tests {
     }
 
     #[test]
+    fn test_plugin_merge_lifecycle() -> crate::Result<()> {
+        use crate::directory::RamDirectory;
+        use crate::indexer::NoMergePolicy;
+        use crate::TantivyError;
+
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let dir = RamDirectory::create();
+        let index = Index::builder()
+            .schema(schema)
+            .register_plugin(Arc::new(MarkerPlugin))
+            .create(dir.clone())?;
+
+        // Two commits, no auto-merge, so we control when the merge happens.
+        {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            writer.add_document(crate::doc!(text_field => "hello world"))?;
+            writer.commit()?;
+            writer.add_document(crate::doc!(text_field => "foo bar"))?;
+            writer.commit()?;
+
+            let segment_ids = index.searchable_segment_ids()?;
+            assert_eq!(segment_ids.len(), 2);
+
+            // Force a merge: this is what exercises MarkerPlugin::merge.
+            writer.merge(&segment_ids).wait()?;
+        }
+
+        // The merged segment carries the marker written by MarkerPlugin::merge.
+        let searcher = index.reader()?.searcher();
+        let segment_readers = searcher.segment_readers();
+        assert_eq!(segment_readers.len(), 1);
+        assert_eq!(searcher.num_docs(), 2);
+        let data = segment_readers[0]
+            .open_read(SegmentComponent::Custom("marker".to_string()))?
+            .read_bytes()?;
+        let value = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        assert_eq!(value, MARKER);
+
+        // Reopen without re-registering: further mutation must fail closed rather
+        // than silently dropping the plugin's merged data.
+        let reopened = Index::open(dir)?;
+        let err = reopened
+            .writer_with_num_threads::<crate::TantivyDocument>(1, 15_000_000)
+            .err()
+            .expect("writer creation should fail when the plugin is not registered");
+        assert!(
+            matches!(err, TantivyError::MissingPlugin(ref exts) if exts.contains("marker")),
+            "expected MissingPlugin error, got {err:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_plugin_extensions() {
         let plugin = MarkerPlugin;
         assert_eq!(plugin.extensions(), vec!["marker"]);
