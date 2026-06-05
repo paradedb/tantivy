@@ -116,11 +116,6 @@ impl IndexMerger {
         )
     }
 
-    /// Set plugins for this merger. Called by the segment updater before writing.
-    pub fn set_plugins(&mut self, plugins: Vec<Arc<dyn SegmentPlugin>>) {
-        self.plugins = plugins;
-    }
-
     // Create merge with a custom delete set.
     // For every Segment, a delete bitset can be provided, which
     // will be merged with the existing bit set. Make sure the index
