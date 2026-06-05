@@ -99,7 +99,7 @@ impl FieldNormsPluginWriter {
 impl PluginWriter for FieldNormsPluginWriter {
     fn serialize(
         &mut self,
-        _segment: &mut Segment,
+        _segment: &Segment,
         doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
         if let Some(serializer) = self.serializer.take() {

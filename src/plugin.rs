@@ -84,9 +84,12 @@ pub trait SegmentPlugin: Send + Sync + 'static {
 pub trait PluginWriter: Send + Any {
     /// Serialize accumulated data to segment files.
     /// Called during `SegmentWriter::finalize()`.
+    ///
+    /// `Segment`'s file APIs (`open_write`/`open_read`) take `&self`, so a shared
+    /// reference is sufficient.
     fn serialize(
         &mut self,
-        segment: &mut Segment,
+        segment: &Segment,
         doc_id_map: Option<&crate::indexer::doc_id_mapping::DocIdMapping>,
     ) -> crate::Result<()>;
 
@@ -120,8 +123,9 @@ pub struct PluginMergeContext<'a> {
     pub readers: &'a [SegmentReader],
     /// The document id mapping from old segments to the new merged segment.
     pub doc_id_mapping: &'a SegmentDocIdMapping,
-    /// The target segment being written to.
-    pub target_segment: &'a mut Segment,
+    /// The target segment being written to. `Segment`'s file APIs take `&self`, so
+    /// a shared reference is sufficient.
+    pub target_segment: &'a Segment,
     /// The index schema.
     pub schema: &'a Schema,
     /// The index settings.
@@ -178,7 +182,7 @@ mod tests {
     impl PluginWriter for MarkerWriter {
         fn serialize(
             &mut self,
-            segment: &mut Segment,
+            segment: &Segment,
             _doc_id_map: Option<&crate::indexer::doc_id_mapping::DocIdMapping>,
         ) -> crate::Result<()> {
             let component = SegmentComponent::Custom("marker".to_string());
