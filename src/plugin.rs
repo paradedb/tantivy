@@ -98,10 +98,10 @@ pub trait PluginWriter: Send + Any {
     /// Current memory usage of this writer.
     fn mem_usage(&self) -> usize;
 
-    /// Downcast support for accessing component-specific APIs.
+    // Downcast support for accessing component-specific APIs. Once the crate MSRV
+    // reaches Rust 1.86, these can be dropped: trait upcasting lets callers coerce
+    // `&dyn PluginWriter` to `&dyn Any` and call `downcast_ref`/`downcast_mut` directly.
     fn as_any(&self) -> &dyn Any;
-
-    /// Downcast support for accessing component-specific APIs (mutable).
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
@@ -118,20 +118,12 @@ pub struct PluginWriterContext<'a> {
 
 /// Context provided to [`SegmentPlugin::merge`].
 pub struct PluginMergeContext<'a> {
-    /// Readers for the source segments being merged.
     pub readers: &'a [SegmentReader],
-    /// The document id mapping from old segments to the new merged segment.
     pub doc_id_mapping: &'a SegmentDocIdMapping,
-    /// The target segment being written to. `Segment`'s file APIs take `&self`, so
-    /// a shared reference is sufficient.
     pub target_segment: &'a Segment,
-    /// The index schema.
     pub schema: &'a Schema,
-    /// The index settings.
     pub settings: &'a IndexSettings,
-    /// Whether the document store should be ignored for this segment.
     pub ignore_store: bool,
-    /// Cancel sentinel for cooperative cancellation.
     pub cancel: &'a dyn CancelSentinel,
 }
 
