@@ -26,7 +26,7 @@ use crate::postings::{
     serialize_postings, IndexingContext, InvertedIndexSerializer, PerFieldPostingsWriter, Postings,
     SegmentPostings,
 };
-use crate::schema::{Field, FieldType, Schema};
+use crate::schema::{Field, Schema};
 use crate::space_usage::{ComponentSpaceUsage, POSITIONS, POSTINGS, TERMDICT};
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::DocId;
@@ -172,7 +172,6 @@ fn write_postings_for_field(
     readers: &[SegmentReader],
     schema: &Schema,
     indexed_field: Field,
-    _field_type: &FieldType,
     serializer: &mut InvertedIndexSerializer,
     fieldnorm_reader: Option<FieldNormReader>,
     doc_id_mapping: &SegmentDocIdMapping,
@@ -228,10 +227,8 @@ fn write_postings_for_field(
 
     let mut cnt = 0;
     while merged_terms.advance() {
-        if cnt % 1000 == 0 {
-            if cancel.wants_cancel() {
-                return Err(crate::TantivyError::Cancelled);
-            }
+        if cnt % 1000 == 0 && cancel.wants_cancel() {
+            return Err(crate::TantivyError::Cancelled);
         }
         cnt += 1;
 
@@ -287,10 +284,8 @@ fn write_postings_for_field(
 
             let mut doc = segment_postings.doc();
             while doc != TERMINATED {
-                if doc % 1000 == 0 {
-                    if cancel.wants_cancel() {
-                        return Err(crate::TantivyError::Cancelled);
-                    }
+                if doc % 1000 == 0 && cancel.wants_cancel() {
+                    return Err(crate::TantivyError::Cancelled);
                 }
                 if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
                     let term_freq = if has_term_freq {
@@ -349,7 +344,6 @@ fn write_postings_merge(
                 readers,
                 schema,
                 field,
-                field_entry.field_type(),
                 serializer,
                 fieldnorm_reader,
                 doc_id_mapping,
