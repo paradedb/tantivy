@@ -48,6 +48,7 @@ impl SegmentMetaInventory {
             max_doc,
             include_temp_doc_store: Arc::new(AtomicBool::new(true)),
             deletes: None,
+            plugin_extensions: Vec::new(),
         };
         SegmentMeta::from(self.inventory.track(inner))
     }
@@ -176,6 +177,24 @@ impl SegmentMeta {
         self.num_deleted_docs() > 0
     }
 
+    /// Custom plugin file extensions this segment was written with.
+    pub fn plugin_extensions(&self) -> &[String] {
+        &self.tracked.plugin_extensions
+    }
+
+    /// Records the custom plugin extensions this segment was written with.
+    #[must_use]
+    pub fn with_plugin_extensions(self, plugin_extensions: Vec<String>) -> SegmentMeta {
+        let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
+            segment_id: inner_meta.segment_id,
+            max_doc: inner_meta.max_doc,
+            deletes: inner_meta.deletes.clone(),
+            include_temp_doc_store: inner_meta.include_temp_doc_store.clone(),
+            plugin_extensions: plugin_extensions.clone(),
+        });
+        SegmentMeta { tracked }
+    }
+
     /// Updates the max_doc value from the `SegmentMeta`.
     pub fn with_max_doc(self, max_doc: u32) -> SegmentMeta {
         assert_eq!(self.tracked.max_doc, 0);
@@ -185,6 +204,7 @@ impl SegmentMeta {
             max_doc,
             deletes: None,
             include_temp_doc_store: Arc::new(AtomicBool::new(true)),
+            plugin_extensions: inner_meta.plugin_extensions.clone(),
         });
         SegmentMeta { tracked }
     }
@@ -205,6 +225,7 @@ impl SegmentMeta {
             max_doc: inner_meta.max_doc,
             include_temp_doc_store: Arc::new(AtomicBool::new(true)),
             deletes: Some(delete_meta),
+            plugin_extensions: inner_meta.plugin_extensions.clone(),
         });
         SegmentMeta { tracked }
     }
@@ -220,6 +241,14 @@ pub struct InnerSegmentMeta {
     #[serde(skip)]
     #[serde(default = "default_temp_store")]
     pub include_temp_doc_store: Arc<AtomicBool>,
+    /// Custom plugin file extensions this segment was written with.
+    ///
+    /// Persisted so that, after reopen, garbage collection can keep these files
+    /// and the writer/merger can refuse to run when the owning plugin has not
+    /// been re-registered (otherwise the plugin's data is silently dropped).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub plugin_extensions: Vec<String>,
 }
 fn default_temp_store() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))

@@ -274,6 +274,56 @@ mod tests {
     }
 
     #[test]
+    fn test_reopen_without_plugin_fails_closed() -> crate::Result<()> {
+        use crate::directory::RamDirectory;
+        use crate::TantivyError;
+
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        // Build an index with the custom plugin and persist a segment.
+        let dir = RamDirectory::create();
+        let plugin: Arc<dyn SegmentPlugin> = Arc::new(MarkerPlugin);
+        let index = Index::builder()
+            .schema(schema)
+            .register_plugin(plugin)
+            .create(dir.clone())?;
+        {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.add_document(crate::doc!(text_field => "hello world"))?;
+            writer.commit()?;
+        }
+
+        // The committed segment records that it requires the "marker" extension.
+        let segment_metas = index.searchable_segment_metas()?;
+        assert_eq!(segment_metas.len(), 1);
+        assert_eq!(
+            segment_metas[0].plugin_extensions(),
+            &["marker".to_string()]
+        );
+
+        // Reopen without re-registering the plugin: writing must fail closed
+        // rather than silently dropping the plugin's data.
+        let reopened = Index::open(dir.clone())?;
+        let err = reopened
+            .writer_with_num_threads::<crate::TantivyDocument>(1, 15_000_000)
+            .err()
+            .expect("writer creation should fail when the plugin is not registered");
+        assert!(
+            matches!(err, TantivyError::MissingPlugin(ref exts) if exts.contains("marker")),
+            "expected MissingPlugin error, got {err:?}"
+        );
+
+        // Re-registering the plugin clears the guard.
+        let mut reopened = reopened;
+        reopened.register_plugin(Arc::new(MarkerPlugin));
+        let _writer: IndexWriter = reopened.writer_with_num_threads(1, 15_000_000)?;
+
+        Ok(())
+    }
+
+    #[test]
     fn test_custom_segment_component() {
         let component = SegmentComponent::Custom("myext".to_string());
         assert_eq!(format!("{component}"), "myext");

@@ -317,6 +317,8 @@ impl<D: Document> IndexWriter<D> {
             // return Err(TantivyError::InvalidArgument(err_msg));
         }
 
+        index.check_plugins_registered()?;
+
         let (document_sender, document_receiver) =
             crossbeam_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
 
