@@ -28,10 +28,6 @@ impl SegmentPlugin for FastFieldsPlugin {
         &["fast"]
     }
 
-    fn write_phase(&self) -> u32 {
-        2
-    }
-
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         let index = ctx.segment.index();
         let tokenizer_manager = index.fast_field_tokenizer().clone();

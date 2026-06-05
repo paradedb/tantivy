@@ -517,19 +517,11 @@ impl IndexMerger {
             self.get_doc_id_from_concatenated_data()?
         };
 
-        // Merge all plugins in phase order.
-        // Phase 0: FieldNorms
-        // Phase 1: Postings (reads back fieldnorms written above)
-        // Phase 2+: FastFields, Store, custom plugins
-        let mut sorted_plugins: Vec<&Arc<dyn SegmentPlugin>> = self.plugins.iter().collect();
-        sorted_plugins.sort_by_key(|p| p.write_phase());
-
-        for plugin in sorted_plugins {
-            debug!(
-                "merge-plugin: {:?} (phase {})",
-                plugin.extensions(),
-                plugin.write_phase()
-            );
+        // Merge plugins in `index.plugins()` order, which is their write order:
+        // fieldnorms before postings (which reads them back), then fast_fields,
+        // store, and custom plugins.
+        for plugin in &self.plugins {
+            debug!("merge-plugin: {:?}", plugin.extensions());
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
                 doc_id_mapping: &doc_id_mapping,
