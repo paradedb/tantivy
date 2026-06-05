@@ -62,6 +62,25 @@ fn load_metas(
     }
 }
 
+/// The built-in plugins that `Index::open` always restores, in write-phase order.
+fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
+    vec![
+        Arc::new(FieldNormsPlugin),
+        Arc::new(PostingsPlugin),
+        Arc::new(FastFieldsPlugin),
+        Arc::new(StorePlugin),
+    ]
+}
+
+/// Extensions owned by the built-in plugins. These always exist and are always
+/// registered, so they are excluded from a segment's persisted plugin extensions.
+fn builtin_extensions() -> HashSet<String> {
+    builtin_plugins()
+        .iter()
+        .flat_map(|plugin| plugin.extensions().into_iter().map(str::to_string))
+        .collect()
+}
+
 /// Save the index meta file.
 /// This operation is atomic :
 /// Either
@@ -296,7 +315,7 @@ impl IndexBuilder {
     /// Creates a new index given an implementation of the trait `Directory`.
     ///
     /// If a directory previously existed, it will be erased.
-    fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+    pub(crate) fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
         self.validate()?;
         let dir = dir.into();
         let directory = ManagedDirectory::wrap(dir)?;
@@ -445,12 +464,7 @@ impl Index {
             fast_field_tokenizers: TokenizerManager::default(),
             executor: Executor::single_thread(),
             inventory,
-            plugins: vec![
-                Arc::new(FieldNormsPlugin),
-                Arc::new(PostingsPlugin),
-                Arc::new(FastFieldsPlugin),
-                Arc::new(StorePlugin),
-            ],
+            plugins: builtin_plugins(),
         }
     }
 
@@ -462,9 +476,14 @@ impl Index {
     /// Re-attach a custom segment plugin after the index has been opened.
     ///
     /// Plugin registration is not persisted, so `Index::open` restores only the
-    /// built-in plugins. Custom plugins must be re-registered before writing or
-    /// merging, the same way custom tokenizers are re-attached via
-    /// [`Index::set_tokenizers`].
+    /// built-in plugins. Custom plugins must be re-registered before any write,
+    /// merge, or garbage collection, the same way custom tokenizers are
+    /// re-attached via [`Index::set_tokenizers`].
+    ///
+    /// Each segment records the custom extensions it was written with, so these
+    /// operations fail closed with [`TantivyError::MissingPlugin`] when an owning
+    /// plugin is not registered — rather than dropping its data from a merge or
+    /// deleting its files during garbage collection.
     pub fn register_plugin(&mut self, plugin: Arc<dyn SegmentPlugin>) {
         self.plugins.push(plugin);
     }
@@ -573,7 +592,9 @@ impl Index {
     /// `SegmentMeta` are guaranteed to not be garbage collected, regardless of
     /// whether the segment is recorded as part of the index or not.
     pub fn new_segment_meta(&self, segment_id: SegmentId, max_doc: u32) -> SegmentMeta {
-        self.inventory.new_segment_meta(segment_id, max_doc)
+        self.inventory
+            .new_segment_meta(segment_id, max_doc)
+            .with_plugin_extensions(self.custom_plugin_extensions())
     }
 
     /// Open the index using the provided directory
@@ -697,6 +718,49 @@ impl Index {
         &self.plugins
     }
 
+    /// Extensions owned by registered plugins that are not built-in.
+    ///
+    /// These are recorded on each new segment so that, after reopen, the file is
+    /// kept by GC and the owning plugin's absence can be detected.
+    fn custom_plugin_extensions(&self) -> Vec<String> {
+        let builtin = builtin_extensions();
+        self.plugins
+            .iter()
+            .flat_map(|plugin| plugin.extensions())
+            .filter(|ext| !builtin.contains(*ext))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Fail-closed guard: returns an error if any live segment was written with
+    /// a custom plugin extension that no currently-registered plugin provides.
+    ///
+    /// Called before writing, merging, and garbage collecting so that an index
+    /// reopened without re-registering its custom plugins refuses to proceed
+    /// rather than silently dropping or deleting that plugin's data.
+    pub(crate) fn check_plugins_registered(&self) -> crate::Result<()> {
+        let registered: HashSet<&str> = self
+            .plugins
+            .iter()
+            .flat_map(|plugin| plugin.extensions())
+            .collect();
+        let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for segment_meta in &self.load_metas()?.segments {
+            for ext in segment_meta.plugin_extensions() {
+                if !registered.contains(ext.as_str()) {
+                    missing.insert(ext.clone());
+                }
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::TantivyError::MissingPlugin(
+                missing.into_iter().collect::<Vec<_>>().join(", "),
+            ))
+        }
+    }
+
     /// Accessor to the index settings
     pub fn settings(&self) -> &IndexSettings {
         &self.settings
@@ -734,7 +798,7 @@ impl Index {
     }
 
     pub fn new_segment_with_id(&self, segment_id: SegmentId) -> Segment {
-        let segment_meta = self.inventory.new_segment_meta(segment_id, 0);
+        let segment_meta = self.new_segment_meta(segment_id, 0);
         self.segment(segment_meta)
     }
 

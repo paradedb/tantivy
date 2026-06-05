@@ -117,6 +117,7 @@ fn garbage_collect_files(
 ) -> crate::Result<GarbageCollectionResult> {
     info!("Running garbage collection");
     let mut index = segment_updater.index.clone();
+    index.check_plugins_registered()?;
     index
         .directory_mut()
         .garbage_collect(move || segment_updater.list_files())
@@ -131,6 +132,7 @@ fn merge(
     cancel: Box<dyn CancelSentinel>,
     ignore_store: bool,
 ) -> crate::Result<Option<SegmentEntry>> {
+    index.check_plugins_registered()?;
     let num_docs = segment_entries
         .iter()
         .map(|segment| segment.meta().num_docs() as u64)
@@ -545,13 +547,12 @@ impl SegmentUpdater {
             .iter()
             .flat_map(|segment_meta| segment_meta.list_files())
             .collect();
-        // Include files from registered plugins
-        for plugin in self.index.plugins() {
-            for ext in plugin.extensions() {
-                for segment_meta in &segment_metas {
-                    let component = crate::index::SegmentComponent::Custom(ext.to_string());
-                    files.insert(segment_meta.relative_path(component));
-                }
+        // Keep custom plugin files based on what each segment was written with,
+        // so GC is correct even before a custom plugin is re-registered.
+        for segment_meta in &segment_metas {
+            for ext in segment_meta.plugin_extensions() {
+                let component = crate::index::SegmentComponent::Custom(ext.clone());
+                files.insert(segment_meta.relative_path(component));
             }
         }
         files.insert(META_FILEPATH.to_path_buf());
