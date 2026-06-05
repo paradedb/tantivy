@@ -203,7 +203,7 @@ impl SegmentWriter {
             postings_plugin.ctx = Some(ctx);
         }
 
-        remap_and_write(&mut self.segment, self.plugin_writers, mapping.as_ref())?;
+        remap_and_write(&self.segment, self.plugin_writers, mapping.as_ref())?;
         let doc_opstamps = remap_doc_opstamps(self.doc_opstamps, mapping.as_ref());
         Ok(doc_opstamps)
     }
@@ -480,7 +480,7 @@ impl SegmentWriter {
 /// - Phase 1: Postings (reads back fieldnorms from disk)
 /// - Phase 2+: FastFields, Store, custom plugins
 fn remap_and_write(
-    segment: &mut Segment,
+    segment: &Segment,
     mut plugin_writers: Vec<(u32, Box<dyn PluginWriter>)>,
     doc_id_map: Option<&DocIdMapping>,
 ) -> crate::Result<()> {

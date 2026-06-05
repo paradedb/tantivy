@@ -178,7 +178,7 @@ impl StorePluginWriter {
 impl PluginWriter for StorePluginWriter {
     fn serialize(
         &mut self,
-        segment: &mut Segment,
+        segment: &Segment,
         doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
         // For sorted indexes (remapping_required), we need to close the temp store

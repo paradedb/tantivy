@@ -166,8 +166,7 @@ fn merge(
     )?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let mut merged_segment = merged_segment;
-    let num_docs = merger.write(&mut merged_segment)?;
+    let num_docs = merger.write(&merged_segment)?;
 
     let merged_segment_id = merged_segment.id();
 
@@ -272,7 +271,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         target_schema.clone(),
         target_settings.clone(),
     )?;
-    let mut merged_segment = merged_index.new_segment();
+    let merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();
     let merger = IndexMerger::open_with_custom_alive_set(
         merged_index.schema(),
@@ -282,7 +281,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         cancel,
         false,
     )?;
-    let num_docs = merger.write(&mut merged_segment)?;
+    let num_docs = merger.write(&merged_segment)?;
 
     let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
 
