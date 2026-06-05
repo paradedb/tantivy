@@ -24,27 +24,23 @@ use crate::Segment;
 /// Each plugin manages one or more files within a segment. The plugin is a factory
 /// that creates writers and handles merging. The actual data APIs are
 /// component-specific and accessed via downcasting on the concrete types.
+///
+/// # Ordering
+///
+/// Plugins are written and merged in registration order ([`Index::plugins`]): the
+/// built-ins first (field norms, postings, fast fields, store — postings reads field
+/// norms back from disk, so field norms come first), then custom plugins in the order
+/// they were registered. A plugin can read any earlier plugin's output from disk;
+/// custom plugins run after all built-ins, so they can read built-in output, and a
+/// built-in never depends on a custom plugin.
+///
+/// [`Index::plugins`]: crate::Index::plugins
 pub trait SegmentPlugin: Send + Sync + 'static {
     /// File extensions this component manages (e.g., `["idx", "pos", "term"]` for postings).
     ///
     /// Returned by shared reference so a fixed list can be backed by a static literal
     /// (e.g. `&["idx", "pos", "term"]`) without allocating a `Vec` on every call.
     fn extensions(&self) -> &[&str];
-
-    /// Write phase for ordering during serialization and merge.
-    ///
-    /// Components are processed in ascending phase order. This allows components
-    /// that depend on data from earlier components to read it back.
-    ///
-    /// Built-in phases:
-    /// - Phase 0: FieldNorms
-    /// - Phase 1: Postings (reads back fieldnorms)
-    /// - Phase 2: Store, FastFields (independent)
-    ///
-    /// Custom plugins default to phase 2.
-    fn write_phase(&self) -> u32 {
-        2
-    }
 
     /// Create a writer for accumulating and serializing data during indexing.
     ///
@@ -290,7 +286,6 @@ mod tests {
     fn test_plugin_extensions() {
         let plugin = MarkerPlugin;
         assert_eq!(plugin.extensions(), &["marker"]);
-        assert_eq!(plugin.write_phase(), 2);
     }
 
     #[test]

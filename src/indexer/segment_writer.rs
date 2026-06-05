@@ -67,9 +67,9 @@ pub struct SegmentWriter {
     pub(crate) per_field_postings_writers: PerFieldPostingsWriter,
     pub(crate) segment: Segment,
     /// Built-in (fieldnorms, postings, fast_fields, store) and custom plugin writers,
-    /// each paired with its plugin's write phase. Serialized in ascending phase order
-    /// during `finalize`; looked up by concrete type via [`find_plugin_writer`].
-    pub(crate) plugin_writers: Vec<(u32, Box<dyn PluginWriter>)>,
+    /// in `index.plugins()` order, which is also their write order. Serialized in that
+    /// order during `finalize`; looked up by concrete type via [`SegmentWriter::plugin_writer`].
+    pub(crate) plugin_writers: Vec<Box<dyn PluginWriter>>,
     pub(crate) json_path_writer: JsonPathWriter,
     pub(crate) json_positions_per_path: IndexingPositionsPerPath,
     pub(crate) doc_opstamps: Vec<Opstamp>,
@@ -105,7 +105,7 @@ impl SegmentWriter {
             .index()
             .plugins()
             .iter()
-            .map(|p| crate::Result::Ok((p.write_phase(), p.create_writer(&ctx)?)))
+            .map(|p| p.create_writer(&ctx))
             .collect::<crate::Result<Vec<_>>>()?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
         let per_field_text_analyzers = schema
@@ -149,14 +149,14 @@ impl SegmentWriter {
     pub(crate) fn plugin_writer<T: 'static>(&self) -> &T {
         self.plugin_writers
             .iter()
-            .find_map(|(_, w)| w.as_any().downcast_ref::<T>())
+            .find_map(|w| w.as_any().downcast_ref::<T>())
             .expect("plugin writer")
     }
 
     pub(crate) fn plugin_writer_mut<T: 'static>(&mut self) -> &mut T {
         self.plugin_writers
             .iter_mut()
-            .find_map(|(_, w)| w.as_any_mut().downcast_mut::<T>())
+            .find_map(|w| w.as_any_mut().downcast_mut::<T>())
             .expect("plugin writer")
     }
 
@@ -169,7 +169,7 @@ impl SegmentWriter {
             .plugins()
             .iter()
             .position(|p| p.extensions().contains(&extension))?;
-        self.plugin_writers.get_mut(idx).map(|(_, w)| w.as_mut())
+        self.plugin_writers.get_mut(idx).map(|w| w.as_mut())
     }
 
     /// Lay on disk the current content of the `SegmentWriter`
@@ -197,7 +197,7 @@ impl SegmentWriter {
             let postings_plugin = self
                 .plugin_writers
                 .iter_mut()
-                .find_map(|(_, w)| w.as_any_mut().downcast_mut::<PostingsPluginWriter>())
+                .find_map(|w| w.as_any_mut().downcast_mut::<PostingsPluginWriter>())
                 .expect("postings plugin");
             postings_plugin.per_field_postings_writers = Some(per_field_postings_writers);
             postings_plugin.ctx = Some(ctx);
@@ -215,7 +215,7 @@ impl SegmentWriter {
             + self
                 .plugin_writers
                 .iter()
-                .map(|(_, w)| w.mem_usage())
+                .map(|w| w.mem_usage())
                 .sum::<usize>()
     }
 
@@ -471,37 +471,26 @@ impl SegmentWriter {
     }
 }
 
-/// Serializes a segment's plugin writers to disk in write-phase order.
+/// Serializes a segment's plugin writers to disk.
 ///
 /// `doc_id_map` is used to map to the new doc_id order.
 ///
-/// Plugin writers are serialized in phase order:
-/// - Phase 0: FieldNorms
-/// - Phase 1: Postings (reads back fieldnorms from disk)
-/// - Phase 2+: FastFields, Store, custom plugins
+/// Writers are serialized in `index.plugins()` order, which is their write order:
+/// fieldnorms before postings (which reads fieldnorms back from disk), then
+/// fast_fields, store, and custom plugins.
 fn remap_and_write(
     segment: &Segment,
-    mut plugin_writers: Vec<(u32, Box<dyn PluginWriter>)>,
+    mut plugin_writers: Vec<Box<dyn PluginWriter>>,
     doc_id_map: Option<&DocIdMapping>,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
 
-    // Process in ascending phase order (e.g. fieldnorms before postings, which
-    // reads them back).
-    let mut indexed: Vec<(usize, u32)> = plugin_writers
-        .iter()
-        .enumerate()
-        .map(|(i, (phase, _))| (i, *phase))
-        .collect();
-    indexed.sort_by_key(|&(_, phase)| phase);
-
-    for (i, _phase) in indexed {
-        let (_, writer) = &mut plugin_writers[i];
+    for writer in &mut plugin_writers {
         writer.serialize(segment, doc_id_map)?;
     }
 
     debug!("plugin-writers-close");
-    for (_, writer) in plugin_writers {
+    for writer in plugin_writers {
         writer.close()?;
     }
 

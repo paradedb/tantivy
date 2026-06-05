@@ -38,10 +38,6 @@ impl SegmentPlugin for PostingsPlugin {
         &["idx", "pos", "term"]
     }
 
-    fn write_phase(&self) -> u32 {
-        1 // Must execute after FieldNorms (phase 0), before FastFields/Store (phase 2).
-    }
-
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         Ok(Box::new(PostingsPluginWriter {
             per_field_postings_writers: None,
