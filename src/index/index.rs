@@ -732,18 +732,29 @@ impl Index {
             .collect()
     }
 
-    /// Fail-closed guard: returns an error if any live segment was written with
-    /// a custom plugin extension that no currently-registered plugin provides.
+    /// Fail-closed guard: errors unless every Custom segment component is owned by
+    /// exactly one registered plugin.
     ///
-    /// Called before writing, merging, and garbage collecting so that an index
-    /// reopened without re-registering its custom plugins refuses to proceed
-    /// rather than silently dropping or deleting that plugin's data.
+    /// Two directions, both of which would silently corrupt segments:
+    /// - more than one plugin claims an extension, so writers contend for the same file
+    ///   ([`TantivyError::ConflictingPlugins`]);
+    /// - a live segment was written with a custom extension that no currently registered plugin
+    ///   provides ([`TantivyError::MissingPlugin`]).
+    ///
+    /// Called before writing, merging, and garbage collecting.
     pub(crate) fn check_plugins_registered(&self) -> crate::Result<()> {
-        let registered: HashSet<&str> = self
-            .plugins
-            .iter()
-            .flat_map(|plugin| plugin.extensions())
-            .collect();
+        let mut registered: HashSet<&str> = HashSet::new();
+        let mut conflicting: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for ext in self.plugins.iter().flat_map(|plugin| plugin.extensions()) {
+            if !registered.insert(ext) {
+                conflicting.insert(ext.to_string());
+            }
+        }
+        if !conflicting.is_empty() {
+            return Err(crate::TantivyError::ConflictingPlugins(
+                conflicting.into_iter().collect::<Vec<_>>().join(", "),
+            ));
+        }
         let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for segment_meta in &self.load_metas()?.segments {
             for ext in segment_meta.plugin_extensions() {

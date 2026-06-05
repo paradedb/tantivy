@@ -126,6 +126,13 @@ pub enum TantivyError {
          Index::register_plugin before writing, merging, or garbage collecting."
     )]
     MissingPlugin(String),
+    /// More than one registered plugin claims the same segment component
+    /// extension, so writers would contend for the same file.
+    #[error(
+        "Conflicting segment plugins claim the same extension(s): {0}. Each extension must be \
+         owned by exactly one registered plugin."
+    )]
+    ConflictingPlugins(String),
 }
 
 impl From<io::Error> for TantivyError {
