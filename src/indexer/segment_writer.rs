@@ -10,7 +10,7 @@ use crate::fieldnorm::FieldNormsPluginWriter;
 use crate::index::Segment;
 use crate::indexer::indexing_term::IndexingTerm;
 use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
-use crate::plugin::{PluginWriter, PluginWriterContext, SegmentPlugin};
+use crate::plugin::{PluginWriter, PluginWriterContext};
 use crate::postings::{
     compute_table_memory_size, IndexingContext, IndexingPosition, PerFieldPostingsWriter,
     PostingsPluginWriter, PostingsWriter,
@@ -20,31 +20,6 @@ use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::store::StorePluginWriter;
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, Opstamp, TantivyError};
-
-/// Builds a writer for every registered plugin (built-in and custom), each paired
-/// with its plugin's write phase for phase-ordered serialization.
-fn create_plugin_writers(
-    segment: &Segment,
-    schema: &Schema,
-    ignore_store: bool,
-) -> crate::Result<Vec<(u32, Box<dyn PluginWriter>)>> {
-    let plugins: Vec<std::sync::Arc<dyn SegmentPlugin>> = segment.index().plugins().to_vec();
-    let settings = segment.index().settings().clone();
-    let directory: &dyn crate::Directory = segment.index().directory();
-    plugins
-        .iter()
-        .map(|p| {
-            let ctx = PluginWriterContext {
-                segment,
-                schema,
-                settings: &settings,
-                ignore_store,
-                directory,
-            };
-            Ok((p.write_phase(), p.create_writer(&ctx)?))
-        })
-        .collect()
-}
 
 /// Computes the initial size of the hash table.
 ///
@@ -122,7 +97,25 @@ impl SegmentWriter {
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
-        let plugin_writers = create_plugin_writers(&segment, &schema, ignore_store)?;
+        let plugin_writers = {
+            let settings = segment.index().settings().clone();
+            let directory = segment.index().directory();
+            segment
+                .index()
+                .plugins()
+                .iter()
+                .map(|p| {
+                    let ctx = PluginWriterContext {
+                        segment: &segment,
+                        schema: &schema,
+                        settings: &settings,
+                        ignore_store,
+                        directory,
+                    };
+                    crate::Result::Ok((p.write_phase(), p.create_writer(&ctx)?))
+                })
+                .collect::<crate::Result<Vec<_>>>()?
+        };
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
         let per_field_text_analyzers = schema
             .fields()
