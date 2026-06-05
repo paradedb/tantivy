@@ -27,9 +27,9 @@ impl SegmentPlugin for FieldNormsPlugin {
     }
 
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
-        let writer = FieldNormsWriter::for_schema(ctx.schema);
+        let writer = FieldNormsWriter::for_schema(&ctx.segment.schema());
         let path = ctx.segment.relative_path(SegmentComponent::FieldNorms);
-        let write = ctx.directory.open_write(&path)?;
+        let write = ctx.segment.index().directory().open_write(&path)?;
         let serializer = Some(FieldNormsSerializer::from_write(write)?);
         Ok(Box::new(FieldNormsPluginWriter { writer, serializer }))
     }

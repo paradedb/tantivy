@@ -47,7 +47,7 @@ impl SegmentPlugin for PostingsPlugin {
             per_field_postings_writers: None,
             ctx: None,
             serializer: Some(InvertedIndexSerializer::open(ctx.segment)?),
-            schema: ctx.schema.clone(),
+            schema: ctx.segment.schema(),
         }))
     }
 

@@ -30,12 +30,13 @@ impl SegmentPlugin for StorePlugin {
     }
 
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
-        let settings = ctx.settings;
+        let settings = ctx.segment.index().settings();
+        let directory = ctx.segment.index().directory();
         let remapping_required = !ctx.ignore_store && settings.sort_by_field.is_some();
 
         let store_writer = if remapping_required {
             let path = ctx.segment.relative_path(SegmentComponent::TempStore);
-            let store_write = ctx.directory.open_write(&path)?;
+            let store_write = directory.open_write(&path)?;
             StoreWriter::new(
                 store_write,
                 crate::store::Compressor::None,
@@ -47,7 +48,7 @@ impl SegmentPlugin for StorePlugin {
             )?
         } else {
             let path = ctx.segment.relative_path(SegmentComponent::Store);
-            let store_write = ctx.directory.open_write(&path)?;
+            let store_write = directory.open_write(&path)?;
             StoreWriter::new(
                 store_write,
                 settings.docstore_compression,
