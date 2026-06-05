@@ -315,6 +315,33 @@ mod tests {
     }
 
     #[test]
+    fn test_conflicting_plugins_fail_closed() -> crate::Result<()> {
+        use crate::TantivyError;
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        // Two plugins claiming the same "marker" extension would make their writers
+        // contend for the same segment file.
+        let index = Index::builder()
+            .schema(schema)
+            .register_plugin(Arc::new(MarkerPlugin))
+            .register_plugin(Arc::new(MarkerPlugin))
+            .create_in_ram()?;
+
+        let err = index
+            .writer_with_num_threads::<crate::TantivyDocument>(1, 15_000_000)
+            .err()
+            .expect("writer creation should fail when two plugins claim one extension");
+        assert!(
+            matches!(err, TantivyError::ConflictingPlugins(ref exts) if exts.contains("marker")),
+            "expected ConflictingPlugins error, got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_custom_segment_component() {
         let component = SegmentComponent::Custom("myext".to_string());
         assert_eq!(format!("{component}"), "myext");
