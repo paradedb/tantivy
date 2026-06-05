@@ -3,9 +3,9 @@
 //! This module defines the [`SegmentPlugin`] trait and supporting types that allow
 //! custom data structures to participate in the segment lifecycle (write, read, merge).
 //!
-//! Built-in components (postings, fast fields, field norms, store) will eventually
-//! implement this trait as well, but the primary use case is allowing external code
-//! to attach new data to segments without modifying tantivy internals.
+//! The built-in components (postings, fast fields, field norms, store) are themselves
+//! implemented as plugins; external code attaches new data to segments through the same
+//! trait without modifying tantivy internals.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -37,7 +37,6 @@ pub trait SegmentPlugin: Send + Sync + 'static {
     /// - Phase 0: FieldNorms
     /// - Phase 1: Postings (reads back fieldnorms)
     /// - Phase 2: Store, FastFields (independent)
-    /// - Phase 3: Delete
     ///
     /// Custom plugins default to phase 2.
     fn write_phase(&self) -> u32 {
