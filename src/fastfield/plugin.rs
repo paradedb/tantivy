@@ -33,17 +33,20 @@ impl SegmentPlugin for FastFieldsPlugin {
     }
 
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
-        let tokenizer_manager = ctx.segment.index().fast_field_tokenizer().clone();
-        let writer =
-            FastFieldsWriter::from_schema_and_tokenizer_manager(ctx.schema, tokenizer_manager)?;
+        let index = ctx.segment.index();
+        let tokenizer_manager = index.fast_field_tokenizer().clone();
+        let writer = FastFieldsWriter::from_schema_and_tokenizer_manager(
+            &ctx.segment.schema(),
+            tokenizer_manager,
+        )?;
 
         let path = ctx.segment.relative_path(SegmentComponent::FastFields);
-        let fast_field_write = Some(ctx.directory.open_write(&path)?);
+        let fast_field_write = Some(index.directory().open_write(&path)?);
 
         Ok(Box::new(FastFieldsPluginWriter {
             writer: Some(writer),
             fast_field_write,
-            codec_types: ctx.settings.columnar_codec_types().to_vec(),
+            codec_types: index.settings().columnar_codec_types().to_vec(),
         }))
     }
 

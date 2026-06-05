@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 
 use common::HasLen;
 
-use crate::directory::Directory;
 use crate::index::{IndexSettings, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
 use crate::indexer::segment_updater::CancelSentinel;
@@ -106,20 +105,14 @@ pub trait PluginWriter: Send + Any {
 }
 
 /// Context provided to [`SegmentPlugin::create_writer`].
+///
+/// The schema, settings, and directory are reachable from `segment`
+/// (`segment.schema()`, `segment.index().settings()`, `segment.index().directory()`).
 pub struct PluginWriterContext<'a> {
     /// The segment being written to.
     pub segment: &'a Segment,
-    /// The index schema.
-    pub schema: &'a Schema,
-    /// The index settings.
-    pub settings: &'a IndexSettings,
     /// Whether the document store should be ignored for this segment.
     pub ignore_store: bool,
-    /// The directory for reading/writing files. Plugins can use this to open
-    /// file handles directly (e.g., `directory.open_write(&path)`).
-    /// The `Directory::open_write` trait method takes `&self`, so no mutable
-    /// segment reference is needed.
-    pub directory: &'a dyn Directory,
 }
 
 /// Context provided to [`SegmentPlugin::merge`].
