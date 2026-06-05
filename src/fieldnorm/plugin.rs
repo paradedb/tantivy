@@ -22,10 +22,6 @@ impl SegmentPlugin for FieldNormsPlugin {
         &["fieldnorm"]
     }
 
-    fn write_phase(&self) -> u32 {
-        0 // Must be written first; postings reads fieldnorms back.
-    }
-
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         let writer = FieldNormsWriter::for_schema(&ctx.segment.schema());
         let path = ctx.segment.relative_path(SegmentComponent::FieldNorms);

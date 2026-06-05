@@ -25,10 +25,6 @@ impl SegmentPlugin for StorePlugin {
         &["store"]
     }
 
-    fn write_phase(&self) -> u32 {
-        2
-    }
-
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         let settings = ctx.segment.index().settings();
         let directory = ctx.segment.index().directory();
