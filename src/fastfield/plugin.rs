@@ -37,15 +37,8 @@ impl SegmentPlugin for FastFieldsPlugin {
         let writer =
             FastFieldsWriter::from_schema_and_tokenizer_manager(ctx.schema, tokenizer_manager)?;
 
-        // During merge, the merge() method handles file creation directly.
-        // Only open the file during normal indexing.
-        let fast_field_write = if !ctx.is_in_merge {
-            let path = ctx.segment.relative_path(SegmentComponent::FastFields);
-            let write = ctx.directory.open_write(&path)?;
-            Some(write)
-        } else {
-            None
-        };
+        let path = ctx.segment.relative_path(SegmentComponent::FastFields);
+        let fast_field_write = Some(ctx.directory.open_write(&path)?);
 
         Ok(Box::new(FastFieldsPluginWriter {
             writer: Some(writer),

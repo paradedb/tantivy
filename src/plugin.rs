@@ -113,8 +113,6 @@ pub struct PluginWriterContext<'a> {
     pub schema: &'a Schema,
     /// The index settings.
     pub settings: &'a IndexSettings,
-    /// Whether this writer is being created for a merge operation.
-    pub is_in_merge: bool,
     /// Whether the document store should be ignored for this segment.
     pub ignore_store: bool,
     /// The directory for reading/writing files. Plugins can use this to open
