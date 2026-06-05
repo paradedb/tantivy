@@ -31,41 +31,33 @@ impl SegmentPlugin for StorePlugin {
 
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         let settings = ctx.settings;
-        let remapping_required =
-            !ctx.ignore_store && settings.sort_by_field.is_some() && !ctx.is_in_merge;
+        let remapping_required = !ctx.ignore_store && settings.sort_by_field.is_some();
 
-        // During merge, the merge() method handles file creation directly.
-        // Only open the file during normal indexing.
-        let store_writer = if !ctx.is_in_merge {
-            let store_writer = if remapping_required {
-                let path = ctx.segment.relative_path(SegmentComponent::TempStore);
-                let store_write = ctx.directory.open_write(&path)?;
-                StoreWriter::new(
-                    store_write,
-                    crate::store::Compressor::None,
-                    // We want fast random access on the docs, so we choose a small block size.
-                    // If this is zero, the skip index will contain too many checkpoints and
-                    // therefore will be relatively slow.
-                    16000,
-                    settings.docstore_compress_dedicated_thread,
-                )?
-            } else {
-                let path = ctx.segment.relative_path(SegmentComponent::Store);
-                let store_write = ctx.directory.open_write(&path)?;
-                StoreWriter::new(
-                    store_write,
-                    settings.docstore_compression,
-                    settings.docstore_blocksize,
-                    settings.docstore_compress_dedicated_thread,
-                )?
-            };
-            Some(store_writer)
+        let store_writer = if remapping_required {
+            let path = ctx.segment.relative_path(SegmentComponent::TempStore);
+            let store_write = ctx.directory.open_write(&path)?;
+            StoreWriter::new(
+                store_write,
+                crate::store::Compressor::None,
+                // We want fast random access on the docs, so we choose a small block size.
+                // If this is zero, the skip index will contain too many checkpoints and
+                // therefore will be relatively slow.
+                16000,
+                settings.docstore_compress_dedicated_thread,
+            )?
         } else {
-            None
+            let path = ctx.segment.relative_path(SegmentComponent::Store);
+            let store_write = ctx.directory.open_write(&path)?;
+            StoreWriter::new(
+                store_write,
+                settings.docstore_compression,
+                settings.docstore_blocksize,
+                settings.docstore_compress_dedicated_thread,
+            )?
         };
 
         Ok(Box::new(StorePluginWriter {
-            store_writer,
+            store_writer: Some(store_writer),
             remapping_required,
         }))
     }

@@ -28,15 +28,9 @@ impl SegmentPlugin for FieldNormsPlugin {
 
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
         let writer = FieldNormsWriter::for_schema(ctx.schema);
-        // During merge, the merge() method handles file creation directly.
-        // Only open the file during normal indexing.
-        let serializer = if !ctx.is_in_merge {
-            let path = ctx.segment.relative_path(SegmentComponent::FieldNorms);
-            let write = ctx.directory.open_write(&path)?;
-            Some(FieldNormsSerializer::from_write(write)?)
-        } else {
-            None
-        };
+        let path = ctx.segment.relative_path(SegmentComponent::FieldNorms);
+        let write = ctx.directory.open_write(&path)?;
+        let serializer = Some(FieldNormsSerializer::from_write(write)?);
         Ok(Box::new(FieldNormsPluginWriter { writer, serializer }))
     }
 

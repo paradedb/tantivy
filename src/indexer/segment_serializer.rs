@@ -15,20 +15,15 @@ pub struct SegmentSerializer {
 }
 
 impl SegmentSerializer {
-    /// Creates a new `SegmentSerializer`.
-    pub fn for_segment(
-        segment: Segment,
-        is_in_merge: bool,
-        ignore_store: bool,
-    ) -> crate::Result<SegmentSerializer> {
+    /// Creates a new `SegmentSerializer` for incremental indexing.
+    pub fn for_segment(segment: Segment, ignore_store: bool) -> crate::Result<SegmentSerializer> {
         let plugins: Vec<Arc<dyn SegmentPlugin>> = segment.index().plugins().to_vec();
-        Self::for_segment_with_plugins(segment, is_in_merge, ignore_store, &plugins)
+        Self::for_segment_with_plugins(segment, ignore_store, &plugins)
     }
 
     /// Creates a new `SegmentSerializer` with explicit plugins.
     pub fn for_segment_with_plugins(
         segment: Segment,
-        is_in_merge: bool,
         ignore_store: bool,
         plugins: &[Arc<dyn SegmentPlugin>],
     ) -> crate::Result<SegmentSerializer> {
@@ -45,7 +40,6 @@ impl SegmentSerializer {
                     segment: &segment,
                     schema: &schema,
                     settings: &settings,
-                    is_in_merge,
                     ignore_store,
                     directory,
                 };
@@ -57,6 +51,18 @@ impl SegmentSerializer {
             segment,
             plugin_writers,
         })
+    }
+
+    /// Creates a `SegmentSerializer` for a merge.
+    ///
+    /// Merging never drives the incremental plugin writers: [`crate::indexer::merger`]
+    /// calls each plugin's [`SegmentPlugin::merge`] directly and only uses the
+    /// serializer to carry the target segment and to close it. No writers are built.
+    pub fn for_merge(segment: Segment) -> SegmentSerializer {
+        SegmentSerializer {
+            segment,
+            plugin_writers: Vec::new(),
+        }
     }
 
     /// The memory used (inclusive childs)

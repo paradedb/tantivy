@@ -43,18 +43,10 @@ impl SegmentPlugin for PostingsPlugin {
     }
 
     fn create_writer(&self, ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
-        // During merge, the merge() method handles file creation directly.
-        // Only open the serializer during normal indexing.
-        let serializer = if !ctx.is_in_merge {
-            Some(InvertedIndexSerializer::open(ctx.segment)?)
-        } else {
-            None
-        };
-
         Ok(Box::new(PostingsPluginWriter {
             per_field_postings_writers: None,
             ctx: None,
-            serializer,
+            serializer: Some(InvertedIndexSerializer::open(ctx.segment)?),
             schema: ctx.schema.clone(),
         }))
     }
