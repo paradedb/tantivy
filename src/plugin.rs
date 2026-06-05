@@ -26,7 +26,10 @@ use crate::Segment;
 /// component-specific and accessed via downcasting on the concrete types.
 pub trait SegmentPlugin: Send + Sync + 'static {
     /// File extensions this component manages (e.g., `["idx", "pos", "term"]` for postings).
-    fn extensions(&self) -> Vec<&str>;
+    ///
+    /// Returned by shared reference so a fixed list can be backed by a static literal
+    /// (e.g. `&["idx", "pos", "term"]`) without allocating a `Vec` on every call.
+    fn extensions(&self) -> &[&str];
 
     /// Write phase for ordering during serialization and merge.
     ///
@@ -66,7 +69,7 @@ pub trait SegmentPlugin: Send + Sync + 'static {
         segment_reader: &SegmentReader,
     ) -> crate::Result<BTreeMap<String, ComponentSpaceUsage>> {
         let mut usage = BTreeMap::new();
-        for ext in self.extensions() {
+        for &ext in self.extensions() {
             let file = segment_reader.open_read(SegmentComponent::Custom(ext.to_string()))?;
             usage.insert(
                 ext.to_string(),
@@ -156,8 +159,8 @@ mod tests {
     struct MarkerPlugin;
 
     impl SegmentPlugin for MarkerPlugin {
-        fn extensions(&self) -> Vec<&str> {
-            vec!["marker"]
+        fn extensions(&self) -> &[&str] {
+            &["marker"]
         }
 
         fn create_writer(
@@ -286,7 +289,7 @@ mod tests {
     #[test]
     fn test_plugin_extensions() {
         let plugin = MarkerPlugin;
-        assert_eq!(plugin.extensions(), vec!["marker"]);
+        assert_eq!(plugin.extensions(), &["marker"]);
         assert_eq!(plugin.write_phase(), 2);
     }
 
