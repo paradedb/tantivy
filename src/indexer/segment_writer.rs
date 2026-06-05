@@ -21,18 +21,6 @@ use crate::store::StorePluginWriter;
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, Opstamp, TantivyError};
 
-/// Finds a plugin writer of the given concrete type (mutable).
-///
-/// Borrows only the writers slice, so callers can hold disjoint borrows of the
-/// segment writer's other fields at the same time.
-pub(crate) fn find_plugin_writer<T: 'static>(
-    plugin_writers: &mut [(u32, Box<dyn PluginWriter>)],
-) -> Option<&mut T> {
-    plugin_writers
-        .iter_mut()
-        .find_map(|(_, w)| w.as_any_mut().downcast_mut::<T>())
-}
-
 /// Builds a writer for every registered plugin (built-in and custom), each paired
 /// with its plugin's write phase for phase-ordered serialization.
 fn create_plugin_writers(
@@ -182,7 +170,10 @@ impl SegmentWriter {
     }
 
     pub(crate) fn plugin_writer_mut<T: 'static>(&mut self) -> &mut T {
-        find_plugin_writer::<T>(&mut self.plugin_writers).expect("plugin writer")
+        self.plugin_writers
+            .iter_mut()
+            .find_map(|(_, w)| w.as_any_mut().downcast_mut::<T>())
+            .expect("plugin writer")
     }
 
     /// Resolves a custom plugin writer by one of its registered extensions.
@@ -219,9 +210,11 @@ impl SegmentWriter {
         {
             let per_field_postings_writers = self.per_field_postings_writers;
             let ctx = self.ctx;
-            let postings_plugin =
-                find_plugin_writer::<PostingsPluginWriter>(&mut self.plugin_writers)
-                    .expect("postings plugin");
+            let postings_plugin = self
+                .plugin_writers
+                .iter_mut()
+                .find_map(|(_, w)| w.as_any_mut().downcast_mut::<PostingsPluginWriter>())
+                .expect("postings plugin");
             postings_plugin.per_field_postings_writers = Some(per_field_postings_writers);
             postings_plugin.ctx = Some(ctx);
         }
