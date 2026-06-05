@@ -8,7 +8,6 @@ use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
 use crate::index::{Segment, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::segment_updater::CancelSentinel;
-use crate::indexer::SegmentSerializer;
 use crate::plugin::{PluginMergeContext, SegmentPlugin};
 use crate::schema::{Schema, Type};
 use crate::termdict::TermOrdinal;
@@ -504,12 +503,14 @@ impl IndexMerger {
         ))
     }
 
-    /// Writes the merged segment by pushing information
-    /// to the `SegmentSerializer`.
+    /// Writes the merged segment into `target_segment`.
+    ///
+    /// Each plugin's [`SegmentPlugin::merge`] opens and closes its own serializers,
+    /// so the merge path drives no incremental plugin writers.
     ///
     /// # Returns
     /// The number of documents in the resulting segment.
-    pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
+    pub fn write(&self, target_segment: &mut Segment) -> crate::Result<u32> {
         let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
         {
             if self.is_disjunct_and_sorted_on_sort_property(sort_by_field)? {
@@ -537,7 +538,7 @@ impl IndexMerger {
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
                 doc_id_mapping: &doc_id_mapping,
-                target_segment: serializer.segment_mut(),
+                target_segment: &mut *target_segment,
                 schema: &self.schema,
                 settings: &self.index_settings,
                 ignore_store: self.ignore_store,
@@ -545,8 +546,6 @@ impl IndexMerger {
             })?;
         }
 
-        debug!("close-serializer");
-        serializer.close()?;
         Ok(self.max_doc)
     }
 }

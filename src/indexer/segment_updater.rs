@@ -22,7 +22,6 @@ use crate::indexer::segment_manager::SegmentsStatus;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{
     DefaultMergePolicy, MergeCandidate, MergeOperation, MergePolicy, SegmentEntry,
-    SegmentSerializer,
 };
 use crate::{FutureResult, Opstamp, TantivyError};
 
@@ -167,9 +166,8 @@ fn merge(
     )?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let segment_serializer = SegmentSerializer::for_merge(merged_segment.clone());
-
-    let num_docs = merger.write(segment_serializer)?;
+    let mut merged_segment = merged_segment;
+    let num_docs = merger.write(&mut merged_segment)?;
 
     let merged_segment_id = merged_segment.id();
 
@@ -274,7 +272,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         target_schema.clone(),
         target_settings.clone(),
     )?;
-    let merged_segment = merged_index.new_segment();
+    let mut merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();
     let merger = IndexMerger::open_with_custom_alive_set(
         merged_index.schema(),
@@ -284,8 +282,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         cancel,
         false,
     )?;
-    let segment_serializer = SegmentSerializer::for_merge(merged_segment);
-    let num_docs = merger.write(segment_serializer)?;
+    let num_docs = merger.write(&mut merged_segment)?;
 
     let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
 
