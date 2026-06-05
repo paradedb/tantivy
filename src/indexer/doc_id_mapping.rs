@@ -3,6 +3,7 @@
 
 use common::ReadOnlyBitSet;
 
+use super::segment_writer::find_plugin_writer_ref;
 use super::SegmentWriter;
 use crate::fastfield::FastFieldsPluginWriter;
 use crate::schema::{Field, Schema};
@@ -140,12 +141,11 @@ pub(crate) fn get_doc_id_mapping_from_field(
     sort_by_field: IndexSortByField,
     segment_writer: &SegmentWriter,
 ) -> crate::Result<DocIdMapping> {
-    let schema = segment_writer.segment_serializer.segment().schema();
+    let schema = segment_writer.segment.schema();
     expect_field_id_for_sort_field(&schema, &sort_by_field)?; // for now expect
-    let fast_fields_plugin = segment_writer
-        .segment_serializer
-        .get_plugin_writer_ref::<FastFieldsPluginWriter>()
-        .expect("fast_fields plugin");
+    let fast_fields_plugin =
+        find_plugin_writer_ref::<FastFieldsPluginWriter>(&segment_writer.plugin_writers)
+            .expect("fast_fields plugin");
     let new_doc_id_to_old = fast_fields_plugin.writer().sort_order(
         sort_by_field.field.as_str(),
         segment_writer.max_doc(),
