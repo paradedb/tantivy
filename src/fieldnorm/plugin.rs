@@ -18,8 +18,8 @@ use crate::{DocId, Segment};
 pub struct FieldNormsPlugin;
 
 impl SegmentPlugin for FieldNormsPlugin {
-    fn extensions(&self) -> Vec<&str> {
-        vec!["fieldnorm"]
+    fn extensions(&self) -> &[&str] {
+        &["fieldnorm"]
     }
 
     fn write_phase(&self) -> u32 {

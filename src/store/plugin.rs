@@ -21,8 +21,8 @@ use crate::Segment;
 pub struct StorePlugin;
 
 impl SegmentPlugin for StorePlugin {
-    fn extensions(&self) -> Vec<&str> {
-        vec!["store"]
+    fn extensions(&self) -> &[&str] {
+        &["store"]
     }
 
     fn write_phase(&self) -> u32 {
