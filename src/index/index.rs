@@ -62,7 +62,7 @@ fn load_metas(
     }
 }
 
-/// The built-in plugins that `Index::open` always restores, in write-phase order.
+/// The built-in plugins that `Index::open` always restores.
 fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
     vec![
         Arc::new(FieldNormsPlugin),
@@ -80,6 +80,12 @@ fn builtin_extensions() -> HashSet<String> {
         .flat_map(|plugin| plugin.extensions().iter().copied().map(str::to_string))
         .collect()
 }
+
+/// File extensions for built-in segment components that no plugin owns: the temp
+/// store (`<uuid>.store.temp`) and the delete bitset (`<uuid>.<opstamp>.del`).
+/// Both spellings of each are reserved — the bare [`SegmentComponent`] name and the
+/// on-disk extension — so a custom plugin cannot claim either and contend for the file.
+const RESERVED_NON_PLUGIN_EXTENSIONS: &[&str] = &["temp", "store.temp", "del"];
 
 /// Save the index meta file.
 /// This operation is atomic :
@@ -743,7 +749,7 @@ impl Index {
     ///
     /// Called before writing, merging, and garbage collecting.
     pub(crate) fn check_plugins_registered(&self) -> crate::Result<()> {
-        let mut registered: HashSet<&str> = HashSet::new();
+        let mut registered: HashSet<&str> = RESERVED_NON_PLUGIN_EXTENSIONS.iter().copied().collect();
         let mut conflicting: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for ext in self
             .plugins

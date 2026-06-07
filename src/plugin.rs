@@ -356,4 +356,51 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn test_reserved_extension_plugins_fail_closed() -> crate::Result<()> {
+        use crate::TantivyError;
+
+        struct ReservedExtPlugin(&'static str);
+
+        impl SegmentPlugin for ReservedExtPlugin {
+            fn extensions(&self) -> &[&str] {
+                std::slice::from_ref(&self.0)
+            }
+
+            fn create_writer(
+                &self,
+                _ctx: &PluginWriterContext,
+            ) -> crate::Result<Box<dyn PluginWriter>> {
+                unreachable!("guard rejects the reserved extension before writer creation")
+            }
+
+            fn merge(&self, _ctx: PluginMergeContext) -> crate::Result<()> {
+                unreachable!("guard rejects the reserved extension before merge")
+            }
+        }
+
+        // The temp store (`store.temp`) and delete bitset (`del`) are not owned by any
+        // plugin, so a custom plugin claiming one would contend for the reserved file.
+        for reserved in ["temp", "store.temp", "del"] {
+            let mut schema_builder = Schema::builder();
+            schema_builder.add_text_field("text", TEXT | STORED);
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .register_plugin(Arc::new(ReservedExtPlugin(reserved)))
+                .create_in_ram()?;
+
+            let err = index
+                .writer_with_num_threads::<crate::TantivyDocument>(1, 15_000_000)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("writer creation should fail when a plugin claims `{reserved}`")
+                });
+            assert!(
+                matches!(err, TantivyError::ConflictingPlugins(ref exts) if exts.contains(reserved)),
+                "expected ConflictingPlugins error for `{reserved}`, got {err:?}"
+            );
+        }
+        Ok(())
+    }
 }
