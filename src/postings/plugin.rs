@@ -363,33 +363,6 @@ pub struct PostingsPluginWriter {
     schema: Schema,
 }
 
-#[allow(dead_code)]
-impl PostingsPluginWriter {
-    pub(crate) fn per_field_postings_writers_mut(&mut self) -> &mut PerFieldPostingsWriter {
-        self.per_field_postings_writers
-            .as_mut()
-            .expect("PostingsPluginWriter: per_field_postings_writers not set")
-    }
-
-    pub(crate) fn per_field_postings_writers_ref(&self) -> &PerFieldPostingsWriter {
-        self.per_field_postings_writers
-            .as_ref()
-            .expect("PostingsPluginWriter: per_field_postings_writers not set")
-    }
-
-    pub(crate) fn ctx_mut(&mut self) -> &mut IndexingContext {
-        self.ctx
-            .as_mut()
-            .expect("PostingsPluginWriter: ctx not set")
-    }
-
-    pub(crate) fn ctx_ref(&self) -> &IndexingContext {
-        self.ctx
-            .as_ref()
-            .expect("PostingsPluginWriter: ctx not set")
-    }
-}
-
 impl PluginWriter for PostingsPluginWriter {
     fn serialize(
         &mut self,
