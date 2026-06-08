@@ -23,7 +23,6 @@ use crate::{DocId, Order, Score, SegmentReader};
 #[derive(Clone)]
 pub struct SortByStaticFastValue<T: FastValue> {
     field: String,
-    order: Order,
     shared_threshold: SharedThresholdArcOpt<Option<u64>>,
     typ: PhantomData<T>,
 }
@@ -32,28 +31,18 @@ impl<T: FastValue> std::fmt::Debug for SortByStaticFastValue<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SortByStaticFastValue")
             .field("field", &self.field)
-            .field("order", &self.order)
             .finish()
     }
 }
 
 impl<T: FastValue> SortByStaticFastValue<T> {
-    /// Creates a new `SortByStaticFastValue` instance for the given field and order.
-    pub fn for_field_and_order(
-        column_name: impl ToString,
-        order: Order,
-    ) -> SortByStaticFastValue<T> {
+    /// Creates a new `SortByStaticFastValue` instance for the given field.
+    pub fn for_field(column_name: impl ToString) -> SortByStaticFastValue<T> {
         Self {
             field: column_name.to_string(),
-            order,
-            shared_threshold: Some(Arc::new(RwLockSharedThresholdOptionU64::new(order))),
+            shared_threshold: Some(Arc::new(RwLockSharedThresholdOptionU64::new())),
             typ: PhantomData,
         }
-    }
-
-    /// Backwards compatibility / when order is ignored (assumed Asc).
-    pub fn for_field(column_name: impl ToString) -> SortByStaticFastValue<T> {
-        Self::for_field_and_order(column_name, Order::Asc)
     }
 
     /// Configures a shared threshold to be used by this sort key computer.
@@ -102,7 +91,7 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
     }
 
     fn comparator(&self) -> Self::Comparator {
-        self.order.into()
+        Order::Asc.into()
     }
 
     fn segment_sort_key_computer(
@@ -116,7 +105,6 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
             })?;
         Ok(SortByFastValueSegmentSortKeyComputer {
             sort_column,
-            order: self.order,
             typ: PhantomData,
         })
     }
@@ -124,7 +112,6 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
 
 pub struct SortByFastValueSegmentSortKeyComputer<T> {
     sort_column: Column<u64>,
-    order: Order,
     typ: PhantomData<T>,
 }
 
@@ -134,7 +121,7 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyCompu
     type SegmentComparator = ComparatorEnum;
 
     fn segment_comparator(&self) -> Self::SegmentComparator {
-        self.order.into()
+        Order::Asc.into()
     }
 
     #[inline(always)]

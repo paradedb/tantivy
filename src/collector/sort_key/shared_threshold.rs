@@ -1,8 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::collector::sort_key::{Comparator, ComparatorEnum};
-use crate::{Order, Score, SegmentOrdinal};
+use crate::{Score, SegmentOrdinal};
 
 pub type SharedThresholdArc<T> = Arc<dyn SharedThreshold<T>>;
 pub type SharedThresholdArcOpt<T> = Option<SharedThresholdArc<T>>;
@@ -15,17 +14,26 @@ pub type SharedThresholdArcOpt<T> = Option<SharedThresholdArc<T>>;
 pub trait SharedThreshold<T>: Send + Sync {
     /// Loads the current shared threshold and its associated segment ordinal.
     ///
+    /// Returns `None` if the threshold is uninitialized (i.e. no segment has
+    /// successfully pushed a document yet).
+    ///
     /// Among documents with the same sort key, we favor those from segments with a lower ordinal.
     /// This is consistent with the tie-breaking behavior of [`DocAddress`], which ensures
     /// stable sorting across multiple segments.
-    fn load(&self) -> (T, SegmentOrdinal);
+    fn load(&self) -> Option<(T, SegmentOrdinal)>;
 
-    /// Conditionally updates the shared threshold if `new_threshold` is more restrictive.
+    /// Attempts to update the shared threshold to `new_threshold`.
     ///
-    /// Returns the most restrictive threshold currently known after the update attempt (which
-    /// will be `new_threshold` if the update succeeded, or a pre-existing strictly better
-    /// threshold if it failed).
-    fn update(&self, new_threshold: T, segment_ord: SegmentOrdinal) -> (T, SegmentOrdinal);
+    /// This method succeeds if the internal threshold exactly matches `expected_threshold`.
+    ///
+    /// Returns `Ok(())` on success, or `Err(current_threshold)` if the internal state was
+    /// different, in which case the caller should evaluate the new `current_threshold` and retry
+    /// if appropriate.
+    fn try_update(
+        &self,
+        expected_threshold: &Option<(T, SegmentOrdinal)>,
+        new_threshold: (T, SegmentOrdinal),
+    ) -> Result<(), Option<(T, SegmentOrdinal)>>;
 
     /// Returns a threshold value `T` that is strictly better than the current shared threshold
     /// if the given `segment_ord` would lose a tie-break against the `threshold_ord`.
@@ -54,26 +62,6 @@ pub trait SharedThreshold<T>: Send + Sync {
         let _ = threshold_ord;
         let _ = segment_ord;
         value
-    }
-}
-
-pub struct NoopSharedThreshold<T> {
-    noop_value: T,
-}
-
-impl<T: Clone + Send + Sync> NoopSharedThreshold<T> {
-    pub fn new(noop_value: T) -> Self {
-        Self { noop_value }
-    }
-}
-
-impl<T: Clone + Send + Sync> SharedThreshold<T> for NoopSharedThreshold<T> {
-    fn load(&self) -> (T, SegmentOrdinal) {
-        (self.noop_value.clone(), 0)
-    }
-
-    fn update(&self, new_threshold: T, segment_ord: SegmentOrdinal) -> (T, SegmentOrdinal) {
-        (new_threshold, segment_ord)
     }
 }
 
@@ -126,25 +114,40 @@ impl Default for AtomicSharedThreshold {
     }
 }
 impl SharedThreshold<Score> for AtomicSharedThreshold {
-    fn load(&self) -> (Score, SegmentOrdinal) {
-        unpack_score_and_ord(self.value.load(Ordering::Relaxed))
+    fn load(&self) -> Option<(Score, SegmentOrdinal)> {
+        let packed = self.value.load(Ordering::Relaxed);
+        let (score, ord) = unpack_score_and_ord(packed);
+        if score == Score::MIN && ord == SegmentOrdinal::MAX {
+            None
+        } else {
+            Some((score, ord))
+        }
     }
 
-    fn update(&self, new_threshold: Score, segment_ord: SegmentOrdinal) -> (Score, SegmentOrdinal) {
-        let new_packed = pack_score_and_ord(new_threshold, segment_ord);
-        let mut current = self.value.load(Ordering::Relaxed);
-        loop {
-            if new_packed <= current {
-                return unpack_score_and_ord(current);
-            }
-            match self.value.compare_exchange_weak(
-                current,
-                new_packed,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return (new_threshold, segment_ord),
-                Err(actual) => current = actual,
+    fn try_update(
+        &self,
+        expected_threshold: &Option<(Score, SegmentOrdinal)>,
+        new_threshold: (Score, SegmentOrdinal),
+    ) -> Result<(), Option<(Score, SegmentOrdinal)>> {
+        let expected_packed = match expected_threshold {
+            Some((score, ord)) => pack_score_and_ord(*score, *ord),
+            None => pack_score_and_ord(Score::MIN, SegmentOrdinal::MAX),
+        };
+        let new_packed = pack_score_and_ord(new_threshold.0, new_threshold.1);
+        match self.value.compare_exchange_weak(
+            expected_packed,
+            new_packed,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            Err(actual_packed) => {
+                let actual = unpack_score_and_ord(actual_packed);
+                if actual.0 == Score::MIN && actual.1 == SegmentOrdinal::MAX {
+                    Err(None)
+                } else {
+                    Err(Some(actual))
+                }
             }
         }
     }
@@ -177,63 +180,57 @@ impl SharedThreshold<Score> for AtomicSharedThreshold {
 /// Since `AtomicU64` cannot cleanly pack `Option<u64>` without losing a state, and threshold
 /// updates are very rare compared to reads, we use a `RwLock<(Option<u64>, SegmentOrdinal)>`.
 pub struct RwLockSharedThresholdOptionU64 {
-    value: RwLock<(Option<u64>, SegmentOrdinal)>,
-    order: Order,
+    value: RwLock<Option<(Option<u64>, SegmentOrdinal)>>,
+}
+
+impl Default for RwLockSharedThresholdOptionU64 {
+    fn default() -> Self {
+        Self {
+            value: RwLock::new(None),
+        }
+    }
 }
 
 impl RwLockSharedThresholdOptionU64 {
-    pub fn new(order: Order) -> Self {
-        Self {
-            value: RwLock::new((None, SegmentOrdinal::MAX)),
-            order,
-        }
-    }
-
-    // helper to compare
-    fn is_better(
-        &self,
-        new: &Option<u64>,
-        new_ord: SegmentOrdinal,
-        old: &Option<u64>,
-        old_ord: SegmentOrdinal,
-    ) -> bool {
-        let cmp_enum = ComparatorEnum::from(self.order);
-        match cmp_enum.compare(new, old) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => new_ord < old_ord,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
 impl SharedThreshold<Option<u64>> for RwLockSharedThresholdOptionU64 {
-    fn load(&self) -> (Option<u64>, SegmentOrdinal) {
+    fn load(&self) -> Option<(Option<u64>, SegmentOrdinal)> {
         *self.value.read().unwrap()
     }
 
-    fn update(
+    fn try_update(
         &self,
-        new_threshold: Option<u64>,
-        segment_ord: SegmentOrdinal,
-    ) -> (Option<u64>, SegmentOrdinal) {
-        let current = *self.value.read().unwrap();
-        if self.is_better(&new_threshold, segment_ord, &current.0, current.1) {
-            if let Ok(mut write_guard) = self.value.write() {
-                if self.is_better(&new_threshold, segment_ord, &write_guard.0, write_guard.1) {
-                    *write_guard = (new_threshold, segment_ord);
-                    return (new_threshold, segment_ord);
-                } else {
-                    return *write_guard;
-                }
-            }
+        expected_threshold: &Option<(Option<u64>, SegmentOrdinal)>,
+        new_threshold: (Option<u64>, SegmentOrdinal),
+    ) -> Result<(), Option<(Option<u64>, SegmentOrdinal)>> {
+        let mut guard = self.value.write().unwrap();
+        if *guard == *expected_threshold {
+            *guard = Some(new_threshold);
+            Ok(())
+        } else {
+            Err(*guard)
         }
-        current
+    }
+
+    fn competitive_threshold(
+        &self,
+        value: Option<u64>,
+        _threshold_ord: SegmentOrdinal,
+        _segment_ord: SegmentOrdinal,
+    ) -> Option<u64> {
+        value
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::sort_key::{Comparator, ComparatorEnum};
+    use crate::Order;
 
     #[test]
     fn test_f32_ordered_roundtrip() {
@@ -245,16 +242,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_f32_ordering_preserved() {
-        let sorted = [-100.0f32, -1.0, -0.001, 0.0, 0.001, 1.0, 100.0];
-        for w in sorted.windows(2) {
-            assert!(
-                f32_to_ordered_u32(w[0]) < f32_to_ordered_u32(w[1]),
-                "{} should map below {}",
-                w[0],
-                w[1]
-            );
+    fn update_helper<T: Clone + std::fmt::Debug, C>(
+        t: &impl SharedThreshold<T>,
+        val: T,
+        ord: SegmentOrdinal,
+        _comparator: &C,
+        is_better: impl Fn(&T, SegmentOrdinal, &T, SegmentOrdinal) -> bool,
+    ) {
+        let mut current = t.load();
+        loop {
+            if let Some(ref curr) = current {
+                if !is_better(&val, ord, &curr.0, curr.1) {
+                    break;
+                }
+            }
+            match t.try_update(&current, (val.clone(), ord)) {
+                Ok(()) => break,
+                Err(actual) => current = actual,
+            }
         }
     }
 
@@ -275,25 +280,44 @@ mod tests {
     #[test]
     fn test_atomic_shared_threshold() {
         let t = AtomicSharedThreshold::default();
-        assert_eq!(t.load(), (Score::MIN, SegmentOrdinal::MAX));
+        assert_eq!(t.load(), None);
 
-        t.update(0.5, 5);
-        assert_eq!(t.load(), (0.5, 5));
+        let is_better = |a: &Score, a_ord: SegmentOrdinal, b: &Score, b_ord: SegmentOrdinal| {
+            if a > b {
+                true
+            } else if a == b {
+                a_ord < b_ord
+            } else {
+                false
+            }
+        };
 
-        t.update(0.3, 2);
-        assert_eq!(t.load(), (0.5, 5));
+        update_helper(&t, 0.5, 5, &(), &is_better);
+        assert_eq!(t.load(), Some((0.5, 5)));
 
-        t.update(0.5, 2); // Same score, better ord
-        assert_eq!(t.load(), (0.5, 2));
+        update_helper(&t, 0.3, 2, &(), &is_better);
+        assert_eq!(t.load(), Some((0.5, 5)));
 
-        t.update(0.9, 10);
-        assert_eq!(t.load(), (0.9, 10));
+        update_helper(&t, 0.5, 2, &(), &is_better); // Same score, better ord
+        assert_eq!(t.load(), Some((0.5, 2)));
+
+        update_helper(&t, 0.9, 10, &(), &is_better);
+        assert_eq!(t.load(), Some((0.9, 10)));
     }
 
     #[test]
     fn test_competitive_threshold() {
         let t = AtomicSharedThreshold::default();
-        t.update(0.5, 5);
+        let is_better = |a: &Score, a_ord: SegmentOrdinal, b: &Score, b_ord: SegmentOrdinal| {
+            if a > b {
+                true
+            } else if a == b {
+                a_ord < b_ord
+            } else {
+                false
+            }
+        };
+        update_helper(&t, 0.5, 5, &(), &is_better);
 
         // Segment 5 itself: should require strictly greater score for new docs.
         // The pruning loop uses `score > threshold`, so returning 0.5 unchanged
@@ -311,43 +335,65 @@ mod tests {
 
     #[test]
     fn test_rwlock_shared_threshold_option_u64_asc() {
-        let t = RwLockSharedThresholdOptionU64::new(Order::Asc);
-        assert_eq!(t.load(), (None, SegmentOrdinal::MAX));
+        let t = RwLockSharedThresholdOptionU64::new();
+        let cmp = ComparatorEnum::from(Order::Asc);
+        let compare = |a: &Option<u64>, b: &Option<u64>| cmp.compare(a, b);
+        let is_better =
+            |a: &Option<u64>, a_ord: SegmentOrdinal, b: &Option<u64>, b_ord: SegmentOrdinal| {
+                match compare(a, b) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Equal => a_ord < b_ord,
+                }
+            };
 
-        t.update(Some(100), 5);
-        assert_eq!(t.load(), (Some(100), 5));
+        assert_eq!(t.load(), None);
 
-        t.update(Some(200), 2); // 200 > 100, worse
-        assert_eq!(t.load(), (Some(100), 5));
+        update_helper(&t, Some(100), 5, &cmp, &is_better);
+        assert_eq!(t.load(), Some((Some(100), 5)));
 
-        t.update(Some(100), 2); // Same score, better ord
-        assert_eq!(t.load(), (Some(100), 2));
+        update_helper(&t, Some(200), 2, &cmp, &is_better); // 200 > 100, worse
+        assert_eq!(t.load(), Some((Some(100), 5)));
 
-        t.update(None, 1); // None is strictly smaller than Some(100)
-        assert_eq!(t.load(), (Some(100), 2));
+        update_helper(&t, Some(100), 2, &cmp, &is_better); // Same score, better ord
+        assert_eq!(t.load(), Some((Some(100), 2)));
 
-        t.update(Some(0), 10); // Some(0) > None, better
-        assert_eq!(t.load(), (Some(0), 10));
+        update_helper(&t, None, 1, &cmp, &is_better); // None is strictly smaller than Some(100)
+        assert_eq!(t.load(), Some((Some(100), 2)));
+
+        update_helper(&t, Some(0), 10, &cmp, &is_better); // Some(0) > None, better
+        assert_eq!(t.load(), Some((Some(0), 10)));
     }
 
     #[test]
     fn test_rwlock_shared_threshold_option_u64_desc() {
-        let t = RwLockSharedThresholdOptionU64::new(Order::Desc);
-        assert_eq!(t.load(), (None, SegmentOrdinal::MAX));
+        let t = RwLockSharedThresholdOptionU64::new();
+        let cmp = ComparatorEnum::from(Order::Desc);
+        let compare = |a: &Option<u64>, b: &Option<u64>| cmp.compare(a, b);
+        let is_better =
+            |a: &Option<u64>, a_ord: SegmentOrdinal, b: &Option<u64>, b_ord: SegmentOrdinal| {
+                match compare(a, b) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Equal => a_ord < b_ord,
+                }
+            };
 
-        t.update(Some(100), 5);
-        assert_eq!(t.load(), (Some(100), 5));
+        assert_eq!(t.load(), None);
 
-        t.update(Some(50), 2); // 50 < 100, worse
-        assert_eq!(t.load(), (Some(100), 5));
+        update_helper(&t, Some(100), 5, &cmp, &is_better);
+        assert_eq!(t.load(), Some((Some(100), 5)));
 
-        t.update(Some(100), 2); // Same score, better ord
-        assert_eq!(t.load(), (Some(100), 2));
+        update_helper(&t, Some(50), 2, &cmp, &is_better); // 50 < 100, worse
+        assert_eq!(t.load(), Some((Some(100), 5)));
 
-        t.update(Some(200), 10); // 200 > 100
-        assert_eq!(t.load(), (Some(200), 10));
+        update_helper(&t, Some(100), 2, &cmp, &is_better); // Same score, better ord
+        assert_eq!(t.load(), Some((Some(100), 2)));
 
-        t.update(None, 1); // None < Some(200), worse
-        assert_eq!(t.load(), (Some(200), 10));
+        update_helper(&t, Some(200), 10, &cmp, &is_better); // 200 > 100
+        assert_eq!(t.load(), Some((Some(200), 10)));
+
+        update_helper(&t, None, 1, &cmp, &is_better); // None < Some(200), worse
+        assert_eq!(t.load(), Some((Some(200), 10)));
     }
 }

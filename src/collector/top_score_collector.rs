@@ -178,7 +178,7 @@ impl TopDocs {
     /// #   let query = QueryParser::for_index(&index, vec![title]).parse_query("diary")?;
     /// #   let top_docs = docs_sorted_by_rating(&reader.searcher(), &query)?;
     /// #   assert_eq!(top_docs,
-    /// #            vec![(Some(97u64), DocAddress::new(0, 1)),
+    /// #            vec![(Some(97u64), DocAddress::new(0u32, 1)),
     /// #                 (Some(80u64), DocAddress::new(0u32, 3))]);
     /// #   Ok(())
     /// # }
@@ -219,7 +219,7 @@ impl TopDocs {
         field: impl ToString,
         order: Order,
     ) -> impl Collector<Fruit = Vec<(Option<u64>, DocAddress)>> {
-        self.order_by(SortByStaticFastValue::for_field_and_order(field, order))
+        self.order_by((SortByStaticFastValue::for_field(field), order))
     }
 
     /// Order docs by decreasing BM25 similarity score.
@@ -305,9 +305,7 @@ impl TopDocs {
         TFastValue: FastValue,
         ComparatorEnum: Comparator<Option<TFastValue>>,
     {
-        self.order_by(SortByStaticFastValue::for_field_and_order(
-            fast_field, order,
-        ))
+        self.order_by((SortByStaticFastValue::for_field(fast_field), order))
     }
 
     /// Like `order_by_fast_field`, but for a `String` fast field.
@@ -701,11 +699,36 @@ where
         self.buffer.truncate(self.top_n);
 
         if let Some(shared) = &self.shared_threshold {
-            // Send our median to the global pool, and immediately adopt the resulting
-            // global threshold (which is guaranteed to be at least as restrictive as the
-            // median)
-            let global = shared.update(median, self.segment_ord);
-            self.threshold = Some(global);
+            // We use a Compare-And-Swap (CAS) loop to update the global threshold.
+            // By doing the comparison here, we can use static dispatch for the comparator,
+            // which enables optimal codegen inside the tight pruning loop.
+            let mut current = shared.load();
+            loop {
+                let is_better = if let Some(ref curr) = current {
+                    let cmp = self.comparator.compare(&median, &curr.0);
+                    match cmp {
+                        std::cmp::Ordering::Greater => true,
+                        std::cmp::Ordering::Less => false,
+                        std::cmp::Ordering::Equal => self.segment_ord < curr.1,
+                    }
+                } else {
+                    true
+                };
+
+                if !is_better {
+                    self.threshold = current;
+                    break;
+                }
+                match shared.try_update(&current, (median.clone(), self.segment_ord)) {
+                    Ok(()) => {
+                        self.threshold = Some((median.clone(), self.segment_ord));
+                        break;
+                    }
+                    Err(actual) => {
+                        current = actual;
+                    }
+                }
+            }
         } else {
             self.threshold = Some((median, self.segment_ord));
         }

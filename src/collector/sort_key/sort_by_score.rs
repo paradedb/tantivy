@@ -16,7 +16,7 @@ impl std::fmt::Debug for SortBySimilarityScore {
         f.debug_struct("SortBySimilarityScore")
             .field(
                 "threshold",
-                &self.shared_threshold.as_ref().map(|s| s.load()),
+                &self.shared_threshold.as_ref().and_then(|s| s.load()),
             )
             .finish()
     }
@@ -72,13 +72,12 @@ impl SortKeyComputer for SortBySimilarityScore {
         reader: &crate::SegmentReader,
         segment_collector: &mut TopBySortKeySegmentCollector<Self::Child, Self::Comparator>,
     ) -> crate::Result<()> {
-        let segment_ord = segment_collector.segment_ord;
         let top_n = &mut segment_collector.topn_computer;
 
         let (initial_score, initial_ord) = top_n
             .shared_threshold
             .as_ref()
-            .map(|s| s.load())
+            .and_then(|s| s.load())
             .unwrap_or((Score::MIN, SegmentOrdinal::MAX));
 
         top_n.set_threshold((initial_score, initial_ord));
@@ -98,11 +97,6 @@ impl SortKeyComputer for SortBySimilarityScore {
                 top_n.push(score, doc);
                 top_n.pruning_threshold.unwrap_or(Score::MIN)
             })?;
-        }
-
-        let final_threshold = top_n.threshold.map(|t| t.0).unwrap_or(Score::MIN);
-        if let Some(shared) = &top_n.shared_threshold {
-            shared.update(final_threshold, segment_ord);
         }
 
         Ok(())
