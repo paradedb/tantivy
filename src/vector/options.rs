@@ -26,6 +26,36 @@ pub enum Metric {
     Dot,
 }
 
+impl Metric {
+    /// Compute a "higher is better" similarity score between two vectors.
+    ///
+    /// L2 distance is negated (squared, then sign-flipped) so all metrics
+    /// share the same ranking convention. Magnitude differences across
+    /// metrics are the caller's problem.
+    #[inline]
+    pub fn similarity<T: VectorElement>(self, query: &[T], doc: &[T]) -> f32 {
+        use crate::vector::distance::{cosine, dot, l2_squared};
+        match self {
+            Metric::L2 => -l2_squared(query, doc),
+            Metric::Cosine => cosine(query, doc),
+            Metric::Dot => dot(query, doc),
+        }
+    }
+
+    /// Like [`similarity`](Self::similarity), but the doc side is
+    /// little-endian bytes — typically a borrowed slice straight out
+    /// of the segment's file.
+    #[inline]
+    pub fn similarity_bytes<T: VectorElement>(self, query: &[T], doc_bytes: &[u8]) -> f32 {
+        use crate::vector::distance::{cosine_bytes, dot_bytes, l2_squared_bytes};
+        match self {
+            Metric::L2 => -l2_squared_bytes(query, doc_bytes),
+            Metric::Cosine => cosine_bytes(query, doc_bytes),
+            Metric::Dot => dot_bytes(query, doc_bytes),
+        }
+    }
+}
+
 /// A vector element type with the primitives needed by the storage
 /// layer and the distance kernels.
 ///
