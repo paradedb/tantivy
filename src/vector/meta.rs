@@ -7,16 +7,19 @@ use crate::directory::FileSlice;
 pub(crate) const VECMETA_EXT: &str = "vecmeta";
 
 const FORMAT_FLAT: u8 = 0;
+const FORMAT_IVF: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VectorStorageFormat {
     Flat,
+    Ivf,
 }
 
 impl VectorStorageFormat {
     pub(crate) fn serialize<W: Write + ?Sized>(self, writer: &mut W) -> io::Result<()> {
         let code = match self {
             Self::Flat => FORMAT_FLAT,
+            Self::Ivf => FORMAT_IVF,
         };
         writer.write_all(&[code])
     }
@@ -24,6 +27,7 @@ impl VectorStorageFormat {
     fn from_code(code: u8) -> io::Result<Self> {
         match code {
             FORMAT_FLAT => Ok(Self::Flat),
+            FORMAT_IVF => Ok(Self::Ivf),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unsupported vector storage format",

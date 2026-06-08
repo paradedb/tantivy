@@ -1,12 +1,13 @@
 //! Per-segment vector storage dispatch.
 //!
-//! Reads the segment's `.vecmeta` to learn which storage format was written,
-//! opens the matching reader, and exposes a field's column via
+//! Reads the segment's `.vecmeta` to learn which storage format was written
+//! (flat or IVF), opens the matching reader, and exposes a field's column via
 //! [`VectorColumnReader::open_column`].
 
 use std::collections::BTreeMap;
 
 use super::flat::{FlatVecReader, FlatVectorColumn};
+use super::ivf::{IvfVecReader, IvfVectorColumn};
 use super::meta::{VectorSegmentMeta, VectorStorageFormat, VECMETA_EXT};
 use crate::directory::error::OpenReadError;
 use crate::index::SegmentComponent;
@@ -31,6 +32,7 @@ pub struct VectorReader {
 enum VectorStorageReader {
     None,
     Flat(FlatVecReader),
+    Ivf(IvfVecReader),
 }
 
 impl VectorReader {
@@ -55,6 +57,7 @@ impl VectorReader {
                 VectorStorageFormat::Flat => {
                     VectorStorageReader::Flat(FlatVecReader::open(segment_reader)?)
                 }
+                VectorStorageFormat::Ivf => VectorStorageReader::Ivf(IvfVecReader::stub(schema)),
             }
         } else {
             VectorStorageReader::None
@@ -77,6 +80,7 @@ impl VectorColumnReader for VectorReader {
         }
         match &self.storage {
             VectorStorageReader::Flat(reader) => reader.open_column(field).map(VectorColumn::Flat),
+            VectorStorageReader::Ivf(reader) => reader.open_column(field).map(VectorColumn::Ivf),
             VectorStorageReader::None => Err(TantivyError::InternalError(format!(
                 "no vector data for vector field {field:?} in segment"
             ))),
@@ -91,6 +95,7 @@ impl VectorColumnReader for VectorReader {
         }
         match &self.storage {
             VectorStorageReader::Flat(reader) => reader.count(field),
+            VectorStorageReader::Ivf(reader) => reader.count(field),
             VectorStorageReader::None => Err(TantivyError::InternalError(format!(
                 "no vector data for vector field {field:?} in segment"
             ))),
@@ -106,36 +111,42 @@ impl VectorColumnReader for VectorReader {
 
 pub enum VectorColumn {
     Flat(FlatVectorColumn),
+    Ivf(IvfVectorColumn),
 }
 
 impl VectorColumn {
     pub fn dim(&self) -> usize {
         match self {
             Self::Flat(column) => column.dim(),
+            Self::Ivf(column) => column.dim(),
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
             Self::Flat(column) => column.len(),
+            Self::Ivf(column) => column.len(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Flat(column) => column.is_empty(),
+            Self::Ivf(column) => column.is_empty(),
         }
     }
 
     pub fn contains(&self, doc_id: DocId) -> bool {
         match self {
             Self::Flat(column) => column.contains(doc_id),
+            Self::Ivf(column) => column.contains(doc_id),
         }
     }
 
     pub fn vector_bytes_at(&self, doc_id: DocId) -> Option<&[u8]> {
         match self {
             Self::Flat(column) => column.vector_bytes_at(doc_id),
+            Self::Ivf(column) => column.vector_bytes_at(doc_id),
         }
     }
 }
