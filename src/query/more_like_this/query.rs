@@ -108,6 +108,16 @@ impl MoreLikeThisQueryBuilder {
         self
     }
 
+    /// Sets the maximum term frequency.
+    ///
+    /// The resulting query will ignore words more 
+    /// frequent than this number in the source document.
+    #[must_use]
+    pub fn with_max_term_frequency(mut self, value: usize) -> Self {
+        self.mlt.max_term_frequency = Some(value);
+        self
+    }
+
     /// Sets the maximum query terms.
     ///
     /// The resulting query will not return a query with more clause than this.
@@ -209,6 +219,19 @@ mod tests {
         Ok(index)
     }
 
+    fn create_test_index_max_term_frequency() -> crate::Result<Index> {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT);
+        let body = schema_builder.add_text_field("body", TEXT | STORED);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+        index_writer.add_document(doc!(title => "aaa", body => "rust rust rust"))?;
+        index_writer.add_document(doc!(title => "bbb", body => "rust programming"))?;
+        index_writer.commit()?;
+        Ok(index)
+    }
+
     #[test]
     fn test_more_like_this_query_builder() {
         // default settings
@@ -217,6 +240,7 @@ mod tests {
         assert_eq!(query.mlt.min_doc_frequency, Some(5));
         assert_eq!(query.mlt.max_doc_frequency, None);
         assert_eq!(query.mlt.min_term_frequency, Some(2));
+        assert_eq!(query.mlt.max_term_frequency, None); 
         assert_eq!(query.mlt.max_query_terms, Some(25));
         assert_eq!(query.mlt.min_word_length, None);
         assert_eq!(query.mlt.max_word_length, None);
@@ -229,6 +253,7 @@ mod tests {
             .with_min_doc_frequency(2)
             .with_max_doc_frequency(5)
             .with_min_term_frequency(2)
+            .with_max_term_frequency(15)
             .with_min_word_length(2)
             .with_max_word_length(4)
             .with_boost_factor(0.5)
@@ -238,6 +263,7 @@ mod tests {
         assert_eq!(query.mlt.min_doc_frequency, Some(2));
         assert_eq!(query.mlt.max_doc_frequency, Some(5));
         assert_eq!(query.mlt.min_term_frequency, Some(2));
+        assert_eq!(query.mlt.max_term_frequency, Some(15)); 
         assert_eq!(query.mlt.min_word_length, Some(2));
         assert_eq!(query.mlt.max_word_length, Some(4));
         assert_eq!(query.mlt.boost_factor, Some(0.5));
@@ -289,6 +315,40 @@ mod tests {
 
         assert_eq!(doc_ids.len(), 2);
         assert_eq!(doc_ids, vec![3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_more_like_this_query_max_term_frequency() -> crate::Result<()> {
+        let index = create_test_index_max_term_frequency()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // search base 1st doc with word [rust] "rust" appears 3 times, no cap applied
+        // both docs containing "rust" are returned
+        let query = MoreLikeThisQuery::builder()
+            .with_min_doc_frequency(1)
+            .with_min_term_frequency(1)
+            .with_document(DocAddress::new(0, 0));
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(5).order_by_score())?;
+        let mut doc_ids: Vec<_> = top_docs.iter().map(|item| item.1.doc_id).collect();
+        doc_ids.sort_unstable();
+
+        assert_eq!(doc_ids.len(), 2);
+        assert_eq!(doc_ids, vec![0, 1]);
+
+        // search base 1st doc with max_term_frequency=2 "rust" appears 3 times in source doc
+        // so it is excluded, leaving no terms to match on
+        let query = MoreLikeThisQuery::builder()
+            .with_min_doc_frequency(1)
+            .with_min_term_frequency(1)
+            .with_max_term_frequency(2)
+            .with_document(DocAddress::new(0, 0));
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(5).order_by_score())?;
+        let mut doc_ids: Vec<_> = top_docs.iter().map(|item| item.1.doc_id).collect();
+        doc_ids.sort_unstable();
+
+        assert_eq!(doc_ids.len(), 0);
         Ok(())
     }
 }

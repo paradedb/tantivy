@@ -52,6 +52,8 @@ pub struct MoreLikeThis {
     pub max_doc_frequency: Option<u64>,
     /// Ignore words less frequent than this.
     pub min_term_frequency: Option<usize>,
+    /// Ignore words more frequent than this. 
+    pub max_term_frequency: Option<usize>, 
     /// Don't return a query longer than this.
     pub max_query_terms: Option<usize>,
     /// Ignore words if less than this length.
@@ -70,6 +72,7 @@ impl Default for MoreLikeThis {
             min_doc_frequency: Some(5),
             max_doc_frequency: None,
             min_term_frequency: Some(2),
+            max_term_frequency: None, 
             max_query_terms: Some(25),
             min_word_length: None,
             max_word_length: None,
@@ -313,6 +316,15 @@ impl MoreLikeThis {
             if self
                 .min_term_frequency
                 .map(|min_term_frequency| *term_frequency < min_term_frequency)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            
+            // ignore terms with more than max_term_frequency 
+            if self
+                .max_term_frequency
+                .map(|max_term_frequency| *term_frequency > max_term_frequency)
                 .unwrap_or(false)
             {
                 continue;
