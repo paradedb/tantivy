@@ -340,6 +340,51 @@ impl IndexBuilder {
     }
 }
 
+/// An [`Index`] whose registered plugin set has been validated against its segments:
+/// no two plugins claim the same extension, none claim a reserved one, and every
+/// persisted custom extension has an owning plugin.
+pub(crate) struct PluginCheckedIndex(Index);
+
+impl PluginCheckedIndex {
+    pub(crate) fn new(index: Index) -> crate::Result<Self> {
+        let mut registered: HashSet<&str> =
+            RESERVED_NON_PLUGIN_EXTENSIONS.iter().copied().collect();
+        let mut conflicting: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for ext in index
+            .plugins
+            .iter()
+            .flat_map(|plugin| plugin.extensions().iter().copied())
+        {
+            if !registered.insert(ext) {
+                conflicting.insert(ext.to_string());
+            }
+        }
+        if !conflicting.is_empty() {
+            return Err(crate::TantivyError::ConflictingPlugins(
+                conflicting.into_iter().collect::<Vec<_>>().join(", "),
+            ));
+        }
+        let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for segment_meta in &index.load_metas()?.segments {
+            for ext in segment_meta.plugin_extensions() {
+                if !registered.contains(ext.as_str()) {
+                    missing.insert(ext.clone());
+                }
+            }
+        }
+        if !missing.is_empty() {
+            return Err(crate::TantivyError::MissingPlugin(
+                missing.into_iter().collect::<Vec<_>>().join(", "),
+            ));
+        }
+        Ok(Self(index))
+    }
+
+    pub(crate) fn into_inner(self) -> Index {
+        self.0
+    }
+}
+
 /// Search Index
 #[derive(Clone)]
 pub struct Index {
@@ -652,7 +697,7 @@ impl Index {
                 )
             })?;
 
-        IndexWriter::new(self, options, directory_lock)
+        IndexWriter::new(PluginCheckedIndex::new(self.clone())?, options, directory_lock)
     }
 
     /// Open a new index writer. Attempts to acquire a lockfile.
@@ -736,50 +781,6 @@ impl Index {
             .filter(|ext| !builtin.contains(*ext))
             .map(str::to_string)
             .collect()
-    }
-
-    /// Fail-closed guard: errors unless every Custom segment component is owned by
-    /// exactly one registered plugin.
-    ///
-    /// Two directions, both of which would silently corrupt segments:
-    /// - more than one plugin claims an extension, so writers contend for the same file
-    ///   ([`TantivyError::ConflictingPlugins`]);
-    /// - a live segment was written with a custom extension that no currently registered plugin
-    ///   provides ([`TantivyError::MissingPlugin`]).
-    ///
-    /// Called before writing, merging, and garbage collecting.
-    pub(crate) fn check_plugins_registered(&self) -> crate::Result<()> {
-        let mut registered: HashSet<&str> = RESERVED_NON_PLUGIN_EXTENSIONS.iter().copied().collect();
-        let mut conflicting: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for ext in self
-            .plugins
-            .iter()
-            .flat_map(|plugin| plugin.extensions().iter().copied())
-        {
-            if !registered.insert(ext) {
-                conflicting.insert(ext.to_string());
-            }
-        }
-        if !conflicting.is_empty() {
-            return Err(crate::TantivyError::ConflictingPlugins(
-                conflicting.into_iter().collect::<Vec<_>>().join(", "),
-            ));
-        }
-        let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for segment_meta in &self.load_metas()?.segments {
-            for ext in segment_meta.plugin_extensions() {
-                if !registered.contains(ext.as_str()) {
-                    missing.insert(ext.clone());
-                }
-            }
-        }
-        if missing.is_empty() {
-            Ok(())
-        } else {
-            Err(crate::TantivyError::MissingPlugin(
-                missing.into_iter().collect::<Vec<_>>().join(", "),
-            ))
-        }
     }
 
     /// Accessor to the index settings
