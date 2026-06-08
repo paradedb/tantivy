@@ -723,7 +723,11 @@ impl Index {
                 )
             })?;
 
-        IndexWriter::new(PluginCheckedIndex::new(self.clone())?, options, directory_lock)
+        IndexWriter::new(
+            PluginCheckedIndex::new(self.clone())?,
+            options,
+            directory_lock,
+        )
     }
 
     /// Open a new index writer. Attempts to acquire a lockfile.

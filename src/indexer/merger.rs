@@ -160,7 +160,8 @@ impl IndexMerger {
             );
             return Err(crate::TantivyError::InvalidArgument(err_msg));
         }
-        // Get plugins from the first segment's index (all segments should share the same index config)
+        // Get plugins from the first segment's index (all segments should share the same index
+        // config)
         let plugins = if let Some(first_segment) = segments.first() {
             first_segment.index().plugins().to_vec()
         } else {

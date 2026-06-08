@@ -11,8 +11,8 @@ mod segment_component;
 mod segment_id;
 mod segment_reader;
 
-pub use self::index::{Index, IndexBuilder};
 pub(crate) use self::index::PluginCheckedIndex;
+pub use self::index::{Index, IndexBuilder};
 pub use self::index_meta::{
     Bm25Params, DeleteMeta, IndexMeta, IndexSettings, IndexSortByField, InnerSegmentMeta, Order,
     SegmentMeta, SegmentMetaInventory,
