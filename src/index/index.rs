@@ -341,8 +341,10 @@ impl IndexBuilder {
 }
 
 /// An [`Index`] whose registered plugin set has been validated against its segments:
-/// no two plugins claim the same extension, none claim a reserved one, and every
-/// persisted custom extension has an owning plugin.
+/// no two plugins claim the same extension, none claim a reserved one, and — for an index
+/// that already has segments — the registered custom plugins exactly match the extensions
+/// those segments were written with. The plugin set is part of the index's structure, like
+/// the schema, and is fixed once the index holds data.
 pub(crate) struct PluginCheckedIndex(Index);
 
 impl PluginCheckedIndex {
@@ -364,19 +366,43 @@ impl PluginCheckedIndex {
                 conflicting.into_iter().collect::<Vec<_>>().join(", "),
             ));
         }
-        let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for segment_meta in &index.load_metas()?.segments {
-            for ext in segment_meta.plugin_extensions() {
-                if !registered.contains(ext.as_str()) {
-                    missing.insert(ext.clone());
-                }
-            }
-        }
+
+        let metas = index.load_metas()?;
+        let recorded: HashSet<&str> = metas
+            .segments
+            .iter()
+            .flat_map(|segment_meta| segment_meta.plugin_extensions())
+            .map(String::as_str)
+            .collect();
+
+        // Every recorded custom extension must have a registered plugin.
+        let missing: std::collections::BTreeSet<&str> = recorded
+            .iter()
+            .copied()
+            .filter(|ext| !registered.contains(ext))
+            .collect();
         if !missing.is_empty() {
             return Err(crate::TantivyError::MissingPlugin(
                 missing.into_iter().collect::<Vec<_>>().join(", "),
             ));
         }
+
+        // Conversely, on a non-empty index every registered custom plugin must already be
+        // present in the existing segments: a plugin defines a per-segment component, so
+        // adding one to a populated index would leave those segments without it.
+        if !metas.segments.is_empty() {
+            let unexpected: std::collections::BTreeSet<String> = index
+                .custom_plugin_extensions()
+                .into_iter()
+                .filter(|ext| !recorded.contains(ext.as_str()))
+                .collect();
+            if !unexpected.is_empty() {
+                return Err(crate::TantivyError::UnexpectedPlugin(
+                    unexpected.into_iter().collect::<Vec<_>>().join(", "),
+                ));
+            }
+        }
+
         Ok(Self(index))
     }
 
