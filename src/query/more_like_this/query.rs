@@ -110,7 +110,7 @@ impl MoreLikeThisQueryBuilder {
 
     /// Sets the maximum term frequency.
     ///
-    /// The resulting query will ignore words more 
+    /// The resulting query will ignore words more
     /// frequent than this number in the source document.
     #[must_use]
     pub fn with_max_term_frequency(mut self, value: usize) -> Self {
@@ -240,7 +240,7 @@ mod tests {
         assert_eq!(query.mlt.min_doc_frequency, Some(5));
         assert_eq!(query.mlt.max_doc_frequency, None);
         assert_eq!(query.mlt.min_term_frequency, Some(2));
-        assert_eq!(query.mlt.max_term_frequency, None); 
+        assert_eq!(query.mlt.max_term_frequency, None);
         assert_eq!(query.mlt.max_query_terms, Some(25));
         assert_eq!(query.mlt.min_word_length, None);
         assert_eq!(query.mlt.max_word_length, None);
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(query.mlt.min_doc_frequency, Some(2));
         assert_eq!(query.mlt.max_doc_frequency, Some(5));
         assert_eq!(query.mlt.min_term_frequency, Some(2));
-        assert_eq!(query.mlt.max_term_frequency, Some(15)); 
+        assert_eq!(query.mlt.max_term_frequency, Some(15));
         assert_eq!(query.mlt.min_word_length, Some(2));
         assert_eq!(query.mlt.max_word_length, Some(4));
         assert_eq!(query.mlt.boost_factor, Some(0.5));
