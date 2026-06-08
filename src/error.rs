@@ -115,19 +115,11 @@ pub enum TantivyError {
     Cancelled,
     #[error("Segment Merging failed: {0:#?}")]
     MergeErrors(Vec<TantivyError>),
-    /// One or more segments require a custom plugin that is not registered.
-    ///
-    /// Plugin registration is not persisted, so after `Index::open` a custom
-    /// plugin must be re-attached via `Index::register_plugin` before writing,
-    /// merging, or garbage collecting. Proceeding without it would silently drop
-    /// or delete the plugin's data.
     #[error(
         "Missing required segment plugin(s) for extension(s): {0}. Re-register via \
          Index::register_plugin before writing, merging, or garbage collecting."
     )]
     MissingPlugin(String),
-    /// More than one registered plugin claims the same segment component
-    /// extension, so writers would contend for the same file.
     #[error(
         "Conflicting segment plugins claim the same extension(s): {0}. Each extension must be \
          owned by exactly one registered plugin."
