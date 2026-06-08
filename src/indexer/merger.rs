@@ -160,12 +160,13 @@ impl IndexMerger {
             );
             return Err(crate::TantivyError::InvalidArgument(err_msg));
         }
-        // Get plugins from the first segment's index (all segments share the same index config)
+        // Get plugins from the first segment's index (all segments should share the same index config)
         let plugins = if let Some(first_segment) = segments.first() {
             first_segment.index().plugins().to_vec()
         } else {
             Vec::new()
         };
+
         Ok(IndexMerger {
             index_settings,
             schema,
@@ -175,6 +176,10 @@ impl IndexMerger {
             ignore_store,
             plugins,
         })
+    }
+
+    pub(crate) fn plugins(&self) -> &[Arc<dyn SegmentPlugin>] {
+        &self.plugins
     }
 
     fn sort_by_field_type(&self, sort_by_field: &IndexSortByField) -> crate::Result<Type> {

@@ -116,7 +116,6 @@ fn garbage_collect_files(
 ) -> crate::Result<GarbageCollectionResult> {
     info!("Running garbage collection");
     let mut index = segment_updater.index.clone();
-    index.check_plugins_registered()?;
     index
         .directory_mut()
         .garbage_collect(move || segment_updater.list_files())
@@ -131,7 +130,6 @@ fn merge(
     cancel: Box<dyn CancelSentinel>,
     ignore_store: bool,
 ) -> crate::Result<Option<SegmentEntry>> {
-    index.check_plugins_registered()?;
     let num_docs = segment_entries
         .iter()
         .map(|segment| segment.meta().num_docs() as u64)
@@ -185,6 +183,11 @@ fn merge(
 /// This function does NOT check or take the `IndexWriter` is running. It is not
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
+///
+/// It is the caller's responsibility to ensure every custom
+/// [`SegmentPlugin`](crate::SegmentPlugin) is registered on the source indices and that
+/// the indices share the same plugin set. A source segment whose custom extension has no
+/// registered plugin has that component's data silently dropped from the merge.
 #[doc(hidden)]
 pub fn merge_indices<T: Into<Box<dyn Directory>>>(
     indices: &[Index],
@@ -238,6 +241,11 @@ pub fn merge_indices<T: Into<Box<dyn Directory>>>(
 /// This function does NOT check or take the `IndexWriter` is running. It is not
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
+///
+/// It is the caller's responsibility to ensure every custom
+/// [`SegmentPlugin`](crate::SegmentPlugin) is registered on the segments' source indices.
+/// A source segment whose custom extension has no registered plugin has that component's
+/// data silently dropped from the merge.
 #[doc(hidden)]
 pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     segments: &[Segment],
@@ -266,21 +274,43 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         ));
     }
 
-    let mut merged_index = Index::create(
-        output_directory,
+    // Opening the merger validates that the source plugins cover every source
+    // segment's recorded extensions (else `MissingPlugin`).
+    let merger = IndexMerger::open_with_custom_alive_set(
         target_schema.clone(),
         target_settings.clone(),
-    )?;
-    let merged_segment = merged_index.new_segment();
-    let merged_segment_id = merged_segment.id();
-    let merger = IndexMerger::open_with_custom_alive_set(
-        merged_index.schema(),
-        merged_index.settings().clone(),
         segments,
         filter_doc_ids,
         cancel,
         false,
     )?;
+
+    let mut merged_index = Index::create(
+        output_directory,
+        target_schema.clone(),
+        target_settings.clone(),
+    )?;
+
+    // Carry the merger's custom plugins onto the merged index (built-ins are already
+    // registered by `Index::create`) so the new segment meta records their extensions;
+    // without this the first GC drops the merged files.
+    let builtin_exts: HashSet<String> = merged_index
+        .plugins()
+        .iter()
+        .flat_map(|plugin| plugin.extensions().iter().map(|ext| ext.to_string()))
+        .collect();
+    for plugin in merger.plugins() {
+        if plugin
+            .extensions()
+            .iter()
+            .all(|ext| !builtin_exts.contains(*ext))
+        {
+            merged_index.register_plugin(plugin.clone());
+        }
+    }
+
+    let merged_segment = merged_index.new_segment();
+    let merged_segment_id = merged_segment.id();
     let num_docs = merger.write(&merged_segment)?;
 
     let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
