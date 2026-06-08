@@ -37,9 +37,6 @@ use crate::Segment;
 /// [`Index::plugins`]: crate::Index::plugins
 pub trait SegmentPlugin: Send + Sync + 'static {
     /// File extensions this component manages (e.g., `["idx", "pos", "term"]` for postings).
-    ///
-    /// Returned by shared reference so a fixed list can be backed by a static literal
-    /// (e.g. `&["idx", "pos", "term"]`) without allocating a `Vec` on every call.
     fn extensions(&self) -> &[&str];
 
     /// Create a writer for accumulating and serializing data during indexing.
