@@ -2,15 +2,19 @@
 //!
 //! Unlike the other `TopDocs::order_by_*` paths, vector similarity is
 //! not a [`SortKeyComputer`](crate::collector::sort_key::SortKeyComputer).
-//! It is its own [`Collector`] with an overridden
-//! [`Collector::collect_segment`] that hands the filter `Weight` down to
-//! the per-segment [`VectorBackend`](super::backend::VectorBackend),
-//! which owns the loop.
+//! IVF needs to drain the filter `DocSet` into a bitmap upfront and
+//! drive its own cluster iteration — that inverts the per-doc pull
+//! model that sort-key computers assume. So this is its own
+//! [`Collector`] with an overridden [`Collector::collect_segment`] that
+//! hands the filter `Weight` down to the per-segment
+//! [`VectorBackend`](super::backend::VectorBackend), which owns the
+//! loop. Flat fits the model trivially; IVF gets to drive.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
 
 use super::backend::VectorBackend;
+use super::ivf::AdaptiveProbeParams;
 use super::options::VectorElement;
 use crate::collector::{Collector, SegmentCollector};
 use crate::index::SegmentReader;
@@ -21,7 +25,8 @@ use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 /// Top-N by vector similarity. Returns documents in descending
 /// similarity order. Only docs that actually have a vector are
 /// returned — docs that match the filter but lack a vector for `field`
-/// are dropped.
+/// are dropped (this is required for IVF compatibility, which can't
+/// see vectorless docs at all).
 ///
 /// Generic over `T: VectorElement` — `T` must match the schema's
 /// declared dtype, checked at [`Collector::check_schema`] time.
@@ -30,6 +35,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement> {
     query: Arc<Vec<T>>,
     limit: usize,
     offset: usize,
+    adaptive: AdaptiveProbeParams,
 }
 
 impl<T: VectorElement> TopDocsByVectorSimilarity<T> {
@@ -39,6 +45,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T> {
             query: Arc::new(query),
             limit,
             offset: 0,
+            adaptive: AdaptiveProbeParams::default(),
         }
     }
 
@@ -47,6 +54,13 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T> {
     /// to ensure the global window has enough candidates.
     pub fn and_offset(mut self, offset: usize) -> Self {
         self.offset = offset;
+        self
+    }
+
+    /// Override the adaptive probing parameters (ignored by flat-only
+    /// segments).
+    pub fn with_adaptive_params(mut self, params: AdaptiveProbeParams) -> Self {
+        self.adaptive = params;
         self
     }
 
@@ -116,6 +130,7 @@ impl<T: VectorElement> Collector for TopDocsByVectorSimilarity<T> {
             segment_ord,
             self.field,
             Arc::clone(&self.query),
+            self.adaptive.clone(),
         )?;
         backend.top_n(weight, reader, self.segment_top_n())
     }

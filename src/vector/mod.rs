@@ -1,10 +1,13 @@
 //! Vector field type, distance kernels, and the per-segment storage plugin.
 //!
 //! Schema-level concepts ([`VectorOptions`], [`Metric`], [`VectorElement`])
-//! and the distance kernels live at this level. The on-disk format lives
-//! in the [`flat`] submodule (dense full-precision layout), owned by the
-//! [`VectorPlugin`]. Top-N vector queries dispatch over it via
-//! [`VectorBackend`].
+//! and the distance kernels live at this level. The on-disk formats
+//! live in submodules: [`flat`] for the dense full-precision layout
+//! and [`ivf`] for the partitioned/clustered accelerator (stub).
+//! Both formats are owned by a single [`VectorPlugin`] which picks
+//! between them per merge based on
+//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
+//! Top-N vector queries dispatch over them via [`VectorBackend`].
 
 mod backend;
 mod collector;
@@ -15,6 +18,7 @@ mod plugin;
 mod reader;
 
 pub mod flat;
+pub mod ivf;
 
 pub use backend::VectorBackend;
 pub use collector::TopDocsByVectorSimilarity;
