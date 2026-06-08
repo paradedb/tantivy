@@ -133,6 +133,12 @@ pub enum TantivyError {
          owned by exactly one registered plugin."
     )]
     ConflictingPlugins(String),
+    #[error(
+        "Segment plugin(s) for extension(s) {0} were registered on a non-empty index whose \
+         existing segments do not contain them. The plugin set is fixed once an index has \
+         segments; create a new index to change it."
+    )]
+    UnexpectedPlugin(String),
 }
 
 impl From<io::Error> for TantivyError {

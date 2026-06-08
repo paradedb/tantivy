@@ -331,6 +331,41 @@ mod tests {
     }
 
     #[test]
+    fn test_add_plugin_to_non_empty_index_fails_closed() -> crate::Result<()> {
+        use crate::directory::RamDirectory;
+        use crate::TantivyError;
+
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+
+        // Build an index WITHOUT the plugin and persist a segment.
+        let dir = RamDirectory::create();
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .create(dir.clone())?;
+        {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.add_document(crate::doc!(text_field => "hello world"))?;
+            writer.commit()?;
+        }
+
+        // Registering the plugin now — after the index has data — must fail closed: the
+        // existing segment has no "marker" component, so the plugin set can't change.
+        let mut reopened = Index::open(dir)?;
+        reopened.register_plugin(Arc::new(MarkerPlugin));
+        let err = reopened
+            .writer_with_num_threads::<crate::TantivyDocument>(1, 15_000_000)
+            .err()
+            .expect("writer creation should fail when a plugin is added to a non-empty index");
+        assert!(
+            matches!(err, TantivyError::UnexpectedPlugin(ref exts) if exts.contains("marker")),
+            "expected UnexpectedPlugin error, got {err:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_conflicting_plugins_fail_closed() -> crate::Result<()> {
         use crate::TantivyError;
 
