@@ -67,7 +67,7 @@ pub struct SegmentWriter {
     pub(crate) per_field_postings_writers: PerFieldPostingsWriter,
     pub(crate) segment: Segment,
     /// Built-in (fieldnorms, postings, fast_fields, store) and custom plugin writers,
-    /// in `index.plugins()` order, which is also their write order. Serialized in that
+    /// in `index.all_plugins()` order, which is also their write order. Serialized in that
     /// order during `finalize`; looked up by concrete type via [`SegmentWriter::plugin_writer`].
     pub(crate) plugin_writers: Vec<Box<dyn PluginWriter>>,
     pub(crate) json_path_writer: JsonPathWriter,
@@ -103,8 +103,7 @@ impl SegmentWriter {
         };
         let plugin_writers = segment
             .index()
-            .plugins()
-            .iter()
+            .all_plugins()
             .map(|p| p.create_writer(&ctx))
             .collect::<crate::Result<Vec<_>>>()?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
@@ -166,8 +165,7 @@ impl SegmentWriter {
         let idx = self
             .segment
             .index()
-            .plugins()
-            .iter()
+            .all_plugins()
             .position(|p| p.extensions().contains(&extension))?;
         self.plugin_writers.get_mut(idx).map(|w| w.as_mut())
     }
@@ -475,7 +473,7 @@ impl SegmentWriter {
 ///
 /// `doc_id_map` is used to map to the new doc_id order.
 ///
-/// Writers are serialized in `index.plugins()` order, which is their write order:
+/// Writers are serialized in `index.all_plugins()` order, which is their write order:
 /// fieldnorms before postings (which reads fieldnorms back from disk), then
 /// fast_fields, store, and custom plugins.
 fn remap_and_write(

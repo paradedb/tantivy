@@ -62,23 +62,14 @@ fn load_metas(
     }
 }
 
-/// The built-in plugins that `Index::open` always restores.
-fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
+/// The built-in plugins, in write order.
+pub(crate) fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
     vec![
         Arc::new(FieldNormsPlugin),
         Arc::new(PostingsPlugin),
         Arc::new(FastFieldsPlugin),
         Arc::new(StorePlugin),
     ]
-}
-
-/// Extensions owned by the built-in plugins. These always exist and are always
-/// registered, so they are excluded from a segment's persisted plugin extensions.
-fn builtin_extensions() -> HashSet<String> {
-    builtin_plugins()
-        .iter()
-        .flat_map(|plugin| plugin.extensions().iter().copied().map(str::to_string))
-        .collect()
 }
 
 /// File extensions for built-in segment components that no plugin owns: the temp
@@ -97,10 +88,19 @@ const RESERVED_NON_PLUGIN_EXTENSIONS: &[&str] = &["temp", "store.temp", "del"];
 fn save_new_metas(
     schema: Schema,
     index_settings: IndexSettings,
+    plugins: &[Arc<dyn SegmentPlugin>],
     directory: &dyn Directory,
 ) -> crate::Result<()> {
+    // The registered plugins are the index's custom plugin set (built-ins are not on the
+    // builder); record their extensions as the index's required, fixed-at-creation set.
+    let persisted_custom_extensions: Vec<String> = plugins
+        .iter()
+        .flat_map(|plugin| plugin.extensions().iter().copied())
+        .map(str::to_string)
+        .collect();
     let empty_metas = IndexMeta {
         index_settings,
+        persisted_custom_extensions,
         segments: Vec::new(),
         schema,
         opstamp: 0u64,
@@ -143,7 +143,7 @@ pub struct IndexBuilder {
     index_settings: IndexSettings,
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
-    plugins: Vec<Arc<dyn SegmentPlugin>>,
+    custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -158,7 +158,7 @@ impl IndexBuilder {
             index_settings: IndexSettings::default(),
             tokenizer_manager: TokenizerManager::default(),
             fast_field_tokenizer_manager: TokenizerManager::default(),
-            plugins: Vec::new(),
+            custom_plugins: Vec::new(),
         }
     }
 
@@ -190,7 +190,7 @@ impl IndexBuilder {
 
     #[must_use]
     pub fn register_plugin(mut self, plugin: Arc<dyn SegmentPlugin>) -> Self {
-        self.plugins.push(plugin);
+        self.custom_plugins.push(plugin);
         self
     }
 
@@ -268,7 +268,7 @@ impl IndexBuilder {
         let mut index = Index::open(dir)?;
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
-            index.plugins.extend(self.plugins);
+            index.custom_plugins.extend(self.custom_plugins);
             Ok(index)
         } else {
             Err(TantivyError::SchemaError(
@@ -328,6 +328,7 @@ impl IndexBuilder {
         save_new_metas(
             self.get_expect_schema()?,
             self.index_settings.clone(),
+            &self.custom_plugins,
             &directory,
         )?;
         let mut metas = IndexMeta::with_schema(self.get_expect_schema()?);
@@ -335,30 +336,30 @@ impl IndexBuilder {
         let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
-        index.plugins.extend(self.plugins);
+        index.custom_plugins.extend(self.custom_plugins);
         Ok(index)
     }
 }
 
-/// An [`Index`] whose registered plugin set has been validated against its segments:
-/// no two plugins claim the same extension, none claim a reserved one, and — for an index
-/// that already has segments — the registered custom plugins exactly match the extensions
-/// those segments were written with. The plugin set is part of the index's structure, like
-/// the schema, and is fixed once the index holds data.
+/// An [`Index`] whose registered plugin set has been validated against the index's
+/// recorded plugin set: no two plugins claim the same extension, none claim a reserved
+/// one, and the registered custom plugins exactly match the extensions the index was
+/// created with. The plugin set is part of the index's structure, like the schema, and
+/// is fixed at creation.
 pub(crate) struct PluginCheckedIndex(Index);
 
 impl PluginCheckedIndex {
     pub(crate) fn new(index: Index) -> crate::Result<Self> {
-        let mut registered: HashSet<&str> =
+        // No two plugins may claim the same extension, and none may claim a reserved one.
+        let all_plugins: Vec<_> = index.all_plugins().collect();
+        let mut claimed_extensions: HashSet<&str> =
             RESERVED_NON_PLUGIN_EXTENSIONS.iter().copied().collect();
         let mut conflicting: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for ext in index
-            .plugins
-            .iter()
-            .flat_map(|plugin| plugin.extensions().iter().copied())
-        {
-            if !registered.insert(ext) {
-                conflicting.insert(ext.to_string());
+        for plugin in &all_plugins {
+            for &ext in plugin.extensions() {
+                if !claimed_extensions.insert(ext) {
+                    conflicting.insert(ext.to_string());
+                }
             }
         }
         if !conflicting.is_empty() {
@@ -367,19 +368,25 @@ impl PluginCheckedIndex {
             ));
         }
 
+        // The index persists, at creation, the custom plugin extensions it requires; that
+        // index-wide record is the single source of truth for the plugin set. The currently
+        // registered custom plugins must match it exactly.
         let metas = index.load_metas()?;
-        let recorded: HashSet<&str> = metas
-            .segments
+        let persisted_custom_extensions: HashSet<&str> = metas
+            .persisted_custom_extensions
             .iter()
-            .flat_map(|segment_meta| segment_meta.plugin_extensions())
             .map(String::as_str)
             .collect();
-
-        // Every recorded custom extension must have a registered plugin.
-        let missing: std::collections::BTreeSet<&str> = recorded
+        let registered_custom_extensions: HashSet<&str> = index
+            .custom_plugins
             .iter()
+            .flat_map(|plugin| plugin.extensions().iter().copied())
+            .collect();
+
+        // Persisted but not registered: writing or merging would silently drop that plugin's data.
+        let missing: std::collections::BTreeSet<&str> = persisted_custom_extensions
+            .difference(&registered_custom_extensions)
             .copied()
-            .filter(|ext| !registered.contains(ext))
             .collect();
         if !missing.is_empty() {
             return Err(crate::TantivyError::MissingPlugin(
@@ -387,20 +394,16 @@ impl PluginCheckedIndex {
             ));
         }
 
-        // Conversely, on a non-empty index every registered custom plugin must already be
-        // present in the existing segments: a plugin defines a per-segment component, so
-        // adding one to a populated index would leave those segments without it.
-        if !metas.segments.is_empty() {
-            let unexpected: std::collections::BTreeSet<String> = index
-                .custom_plugin_extensions()
-                .into_iter()
-                .filter(|ext| !recorded.contains(ext.as_str()))
-                .collect();
-            if !unexpected.is_empty() {
-                return Err(crate::TantivyError::UnexpectedPlugin(
-                    unexpected.into_iter().collect::<Vec<_>>().join(", "),
-                ));
-            }
+        // Registered but not persisted: the plugin set is fixed at creation, so a plugin not
+        // persisted there cannot be added to an existing index.
+        let unexpected: std::collections::BTreeSet<&str> = registered_custom_extensions
+            .difference(&persisted_custom_extensions)
+            .copied()
+            .collect();
+        if !unexpected.is_empty() {
+            return Err(crate::TantivyError::UnexpectedPlugin(
+                unexpected.into_iter().collect::<Vec<_>>().join(", "),
+            ));
         }
 
         Ok(Self(index))
@@ -421,7 +424,7 @@ pub struct Index {
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
-    plugins: Vec<Arc<dyn SegmentPlugin>>,
+    custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
 }
 
 impl Index {
@@ -541,7 +544,7 @@ impl Index {
             fast_field_tokenizers: TokenizerManager::default(),
             executor: Executor::single_thread(),
             inventory,
-            plugins: builtin_plugins(),
+            custom_plugins: Vec::new(),
         }
     }
 
@@ -557,12 +560,12 @@ impl Index {
     /// merge, or garbage collection, the same way custom tokenizers are
     /// re-attached via [`Index::set_tokenizers`].
     ///
-    /// Each segment records the custom extensions it was written with, so these
+    /// The index records, at creation, the custom extensions it requires, so these
     /// operations fail closed with [`TantivyError::MissingPlugin`] when an owning
     /// plugin is not registered — rather than dropping its data from a merge or
     /// deleting its files during garbage collection.
     pub fn register_plugin(&mut self, plugin: Arc<dyn SegmentPlugin>) {
-        self.plugins.push(plugin);
+        self.custom_plugins.push(plugin);
     }
 
     /// Accessor for the tokenizer manager.
@@ -669,9 +672,7 @@ impl Index {
     /// `SegmentMeta` are guaranteed to not be garbage collected, regardless of
     /// whether the segment is recorded as part of the index or not.
     pub fn new_segment_meta(&self, segment_id: SegmentId, max_doc: u32) -> SegmentMeta {
-        self.inventory
-            .new_segment_meta(segment_id, max_doc)
-            .with_plugin_extensions(self.custom_plugin_extensions())
+        self.inventory.new_segment_meta(segment_id, max_doc)
     }
 
     /// Open the index using the provided directory
@@ -794,23 +795,18 @@ impl Index {
         self.writer_with_num_threads(num_threads, memory_budget_in_bytes)
     }
 
-    /// Accessor to the registered segment plugins.
-    pub fn plugins(&self) -> &[Arc<dyn SegmentPlugin>] {
-        &self.plugins
+    /// The custom (non-built-in) plugins registered on this index.
+    pub fn custom_plugins(&self) -> &[Arc<dyn SegmentPlugin>] {
+        &self.custom_plugins
     }
 
-    /// Extensions owned by registered plugins that are not built-in.
-    ///
-    /// These are recorded on each new segment so that, after reopen, the file is
-    /// kept by GC and the owning plugin's absence can be detected.
-    fn custom_plugin_extensions(&self) -> Vec<String> {
-        let builtin = builtin_extensions();
-        self.plugins
-            .iter()
-            .flat_map(|plugin| plugin.extensions().iter().copied())
-            .filter(|ext| !builtin.contains(*ext))
-            .map(str::to_string)
-            .collect()
+    /// All plugins that participate in writing and merging, in write order: the built-ins
+    /// (field norms, postings, fast fields, store) followed by the registered custom
+    /// plugins. Built-ins are not stored; they are produced fresh here from `builtin_plugins`.
+    pub fn all_plugins(&self) -> impl Iterator<Item = Arc<dyn SegmentPlugin>> + '_ {
+        builtin_plugins()
+            .into_iter()
+            .chain(self.custom_plugins.iter().cloned())
     }
 
     /// Accessor to the index settings

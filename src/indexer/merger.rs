@@ -5,7 +5,7 @@ use common::ReadOnlyBitSet;
 use itertools::Itertools;
 
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
-use crate::index::{Segment, SegmentReader};
+use crate::index::{builtin_plugins, Segment, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::{PluginMergeContext, SegmentPlugin};
@@ -59,7 +59,7 @@ pub struct IndexMerger {
     max_doc: u32,
     cancel: Box<dyn CancelSentinel>,
     ignore_store: bool,
-    plugins: Vec<Arc<dyn SegmentPlugin>>,
+    custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
 }
 
 impl IndexMerger {
@@ -160,10 +160,10 @@ impl IndexMerger {
             );
             return Err(crate::TantivyError::InvalidArgument(err_msg));
         }
-        // Get plugins from the first segment's index (all segments should share the same index
-        // config)
-        let plugins = if let Some(first_segment) = segments.first() {
-            first_segment.index().plugins().to_vec()
+        // Get the custom plugins from the first segment's index (all segments should share
+        // the same index config).
+        let custom_plugins = if let Some(first_segment) = segments.first() {
+            first_segment.index().custom_plugins().to_vec()
         } else {
             Vec::new()
         };
@@ -175,12 +175,20 @@ impl IndexMerger {
             max_doc,
             cancel,
             ignore_store,
-            plugins,
+            custom_plugins,
         })
     }
 
-    pub(crate) fn plugins(&self) -> &[Arc<dyn SegmentPlugin>] {
-        &self.plugins
+    /// The custom (non-built-in) plugins of the segments being merged.
+    pub(crate) fn custom_plugins(&self) -> &[Arc<dyn SegmentPlugin>] {
+        &self.custom_plugins
+    }
+
+    /// All plugins to run during the merge, in write order: built-ins then custom.
+    fn all_plugins(&self) -> impl Iterator<Item = Arc<dyn SegmentPlugin>> + '_ {
+        builtin_plugins()
+            .into_iter()
+            .chain(self.custom_plugins.iter().cloned())
     }
 
     fn sort_by_field_type(&self, sort_by_field: &IndexSortByField) -> crate::Result<Type> {
@@ -523,10 +531,10 @@ impl IndexMerger {
             self.get_doc_id_from_concatenated_data()?
         };
 
-        // Merge plugins in `index.plugins()` order, which is their write order:
+        // Merge plugins in `all_plugins` order, which is their write order:
         // fieldnorms before postings (which reads them back), then fast_fields,
         // store, and custom plugins.
-        for plugin in &self.plugins {
+        for plugin in self.all_plugins() {
             debug!("merge-plugin: {:?}", plugin.extensions());
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
