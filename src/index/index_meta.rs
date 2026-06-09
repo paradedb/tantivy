@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -103,28 +102,12 @@ impl SegmentMeta {
             .unwrap_or(0u32)
     }
 
-    /// Returns the list of files that
-    /// are required for the segment meta.
-    /// Note: Some of the returned files may not exist depending on the state of the segment.
-    ///
-    /// This is useful as the way tantivy removes files
-    /// is by removing all files that have been created by tantivy
-    /// and are not used by any segment anymore.
-    pub fn list_files(&self) -> HashSet<PathBuf> {
-        if self
-            .tracked
+    /// Whether the segment still has a temp store file (true while it is being written,
+    /// false once finalized).
+    pub(crate) fn include_temp_store(&self) -> bool {
+        self.tracked
             .include_temp_doc_store
             .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            SegmentComponent::iterator()
-                .map(|component| self.relative_path(component.clone()))
-                .collect::<HashSet<PathBuf>>()
-        } else {
-            SegmentComponent::iterator()
-                .filter(|comp| *comp != &SegmentComponent::TempStore)
-                .map(|component| self.relative_path(component.clone()))
-                .collect::<HashSet<PathBuf>>()
-        }
     }
 
     /// Returns the relative path of a component of our segment.

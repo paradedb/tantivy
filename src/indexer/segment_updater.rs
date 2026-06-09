@@ -13,7 +13,9 @@ use super::segment_manager::SegmentManager;
 use crate::core::META_FILEPATH;
 use crate::directory::{Directory, DirectoryClone, DirectoryPanicHandler, GarbageCollectionResult};
 use crate::fastfield::AliveBitSet;
-use crate::index::{Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta};
+use crate::index::{
+    list_segment_files, Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta,
+};
 use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::index_writer::advance_deletes;
 use crate::indexer::merge_operation::MergeOperationInventory;
@@ -562,20 +564,13 @@ impl SegmentUpdater {
     /// This does not include lock files, or files that are obsolete
     /// but have not yet been deleted by the garbage collector.
     fn list_files(&self) -> HashSet<PathBuf> {
-        let segment_metas: Vec<_> = self.index.list_all_segment_metas();
-        let mut files: HashSet<PathBuf> = segment_metas
-            .iter()
-            .flat_map(|segment_meta| segment_meta.list_files())
-            .collect();
-        // Keep the custom plugin files for every segment, based on the index-wide
-        // record of required plugins. GC is correct even before a custom plugin is
-        // re-registered, since the record (not the live registry) is the source of truth.
-        for ext in &self.load_meta().persisted_custom_extensions {
-            let component = crate::index::SegmentComponent::Custom(ext.clone());
-            for segment_meta in &segment_metas {
-                files.insert(segment_meta.relative_path(component.clone()));
-            }
-        }
+        // All tracked segments (including in-flight ones), so GC keeps files for segments
+        // not yet in the committed meta. Custom extensions come from the persisted record
+        // (not the live registry), so GC is correct even before a plugin is re-registered.
+        let mut files = list_segment_files(
+            &self.index.list_all_segment_metas(),
+            &self.load_meta().persisted_custom_extensions,
+        );
         files.insert(META_FILEPATH.to_path_buf());
         files
     }
