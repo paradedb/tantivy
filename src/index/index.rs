@@ -17,7 +17,7 @@ use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_L
 use crate::error::{DataCorruption, TantivyError};
 use crate::fastfield::FastFieldsPlugin;
 use crate::fieldnorm::FieldNormsPlugin;
-use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
+use crate::index::{IndexMeta, SegmentComponent, SegmentId, SegmentMeta, SegmentMetaInventory};
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
 };
@@ -70,6 +70,35 @@ pub(crate) fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
         Arc::new(FastFieldsPlugin),
         Arc::new(StorePlugin),
     ]
+}
+
+/// The files owned by the given segments: one per plugin extension (the built-in
+/// extensions plus the index's required custom ones), plus each segment's delete bitset
+/// and — while it is still being written — its temp store.
+///
+/// Callers pass the segment set they care about (e.g. all tracked segments for garbage
+/// collection, or just the committed ones) and the index's persisted custom extensions.
+pub(crate) fn list_segment_files(
+    segment_metas: &[SegmentMeta],
+    persisted_custom_extensions: &[String],
+) -> HashSet<PathBuf> {
+    // Built-in extensions (derived from the plugins) plus the index's required custom ones.
+    let extensions: Vec<String> = builtin_plugins()
+        .iter()
+        .flat_map(|plugin| plugin.extensions().iter().map(|ext| ext.to_string()))
+        .chain(persisted_custom_extensions.iter().cloned())
+        .collect();
+    let mut files = HashSet::new();
+    for segment_meta in segment_metas {
+        for ext in &extensions {
+            files.insert(segment_meta.relative_path(SegmentComponent::Custom(ext.clone())));
+        }
+        files.insert(segment_meta.relative_path(SegmentComponent::Delete));
+        if segment_meta.include_temp_store() {
+            files.insert(segment_meta.relative_path(SegmentComponent::TempStore));
+        }
+    }
+    files
 }
 
 /// File extensions for built-in segment components that no plugin owns: the temp
@@ -878,11 +907,9 @@ impl Index {
     /// Returns the set of corrupted files
     pub fn validate_checksum(&self) -> crate::Result<HashSet<PathBuf>> {
         let managed_files = self.directory.list_managed_files()?;
-        let active_segments_files: HashSet<PathBuf> = self
-            .searchable_segment_metas()?
-            .iter()
-            .flat_map(|segment_meta| segment_meta.list_files())
-            .collect();
+        let metas = self.load_metas()?;
+        let active_segments_files =
+            list_segment_files(&metas.segments, &metas.persisted_custom_extensions);
         let active_existing_files: HashSet<&PathBuf> =
             active_segments_files.intersection(&managed_files).collect();
 
