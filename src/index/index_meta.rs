@@ -534,6 +534,7 @@ mod tests {
                 docstore_compress_dedicated_thread: true,
                 ..IndexSettings::default()
             },
+            persisted_custom_extensions: Vec::new(),
             segments: Vec::new(),
             schema,
             opstamp: 0u64,
