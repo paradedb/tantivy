@@ -27,14 +27,14 @@ use crate::Segment;
 ///
 /// # Ordering
 ///
-/// Plugins are written and merged in registration order ([`Index::plugins`]): the
-/// built-ins first (field norms, postings, fast fields, store — postings reads field
-/// norms back from disk, so field norms come first), then custom plugins in the order
-/// they were registered. A plugin can read any earlier plugin's output from disk;
-/// custom plugins run after all built-ins, so they can read built-in output, and a
-/// built-in never depends on a custom plugin.
+/// Plugins are written and merged in [`Index::all_plugins`] order: the built-ins first
+/// (field norms, postings, fast fields, store — postings reads field norms back from
+/// disk, so field norms come first), then custom plugins in the order they were
+/// registered. A plugin can read any earlier plugin's output from disk; custom plugins
+/// run after all built-ins, so they can read built-in output, and a built-in never
+/// depends on a custom plugin.
 ///
-/// [`Index::plugins`]: crate::Index::plugins
+/// [`Index::all_plugins`]: crate::Index::all_plugins
 pub trait SegmentPlugin: Send + Sync + 'static {
     /// File extensions this component manages (e.g., `["idx", "pos", "term"]` for postings).
     fn extensions(&self) -> &[&str];
@@ -212,18 +212,16 @@ mod tests {
             .register_plugin(plugin)
             .create_in_ram()?;
 
-        assert!(index.plugins().len() >= 2);
+        assert!(index.all_plugins().count() >= 2);
         assert!(
             index
-                .plugins()
-                .iter()
+                .all_plugins()
                 .any(|p| p.extensions().contains(&"marker")),
             "marker plugin should be registered"
         );
         assert!(
             index
-                .plugins()
-                .iter()
+                .all_plugins()
                 .any(|p| p.extensions().contains(&"fieldnorm")),
             "fieldnorms built-in plugin should be registered"
         );
@@ -299,12 +297,12 @@ mod tests {
             writer.commit()?;
         }
 
-        // The committed segment records that it requires the "marker" extension.
+        // The index records, index-wide, that it requires the "marker" extension.
         let segment_metas = index.searchable_segment_metas()?;
         assert_eq!(segment_metas.len(), 1);
         assert_eq!(
-            segment_metas[0].plugin_extensions(),
-            &["marker".to_string()]
+            index.load_metas()?.persisted_custom_extensions,
+            vec!["marker".to_string()]
         );
 
         // Reopen without re-registering the plugin: writing must fail closed

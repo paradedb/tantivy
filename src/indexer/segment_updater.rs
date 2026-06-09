@@ -274,8 +274,8 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         ));
     }
 
-    // Opening the merger validates that the source plugins cover every source
-    // segment's recorded extensions (else `MissingPlugin`).
+    // The source index's writer was already validated against its recorded plugin
+    // set (else `MissingPlugin`); the merger reuses those registered plugins.
     let merger = IndexMerger::open_with_custom_alive_set(
         target_schema.clone(),
         target_settings.clone(),
@@ -291,22 +291,13 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         target_settings.clone(),
     )?;
 
-    // Carry the merger's custom plugins onto the merged index (built-ins are already
-    // registered by `Index::create`) so the new segment meta records their extensions;
-    // without this the first GC drops the merged files.
-    let builtin_exts: HashSet<String> = merged_index
-        .plugins()
-        .iter()
-        .flat_map(|plugin| plugin.extensions().iter().map(|ext| ext.to_string()))
-        .collect();
-    for plugin in merger.plugins() {
-        if plugin
-            .extensions()
-            .iter()
-            .all(|ext| !builtin_exts.contains(*ext))
-        {
-            merged_index.register_plugin(plugin.clone());
-        }
+    // Carry the merger's custom plugins onto the merged index (built-ins come for free) and
+    // record their extensions as the merged index's required set; without this the first GC
+    // drops the merged files.
+    let mut persisted_custom_extensions: Vec<String> = Vec::new();
+    for plugin in merger.custom_plugins() {
+        persisted_custom_extensions.extend(plugin.extensions().iter().map(|ext| ext.to_string()));
+        merged_index.register_plugin(plugin.clone());
     }
 
     let merged_segment = merged_index.new_segment();
@@ -329,6 +320,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     let index_meta = IndexMeta {
         index_settings: target_settings.clone(), /* index_settings of all segments should be the
                                                   * same */
+        persisted_custom_extensions: persisted_custom_extensions.clone(),
         segments: vec![segment_meta],
         schema: target_schema.clone(),
         opstamp: 0u64,
@@ -342,6 +334,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         .collect();
     let previous_meta = IndexMeta {
         index_settings: target_settings,
+        persisted_custom_extensions,
         segments: segment_metas,
         schema: target_schema,
         opstamp: 0u64,
@@ -540,6 +533,8 @@ impl SegmentUpdater {
             committed_segment_metas.sort_by_key(|segment_meta| -(segment_meta.max_doc() as i32));
             let index_meta = IndexMeta {
                 index_settings: index.settings().clone(),
+                // The required plugin set is fixed at index creation; carry it forward.
+                persisted_custom_extensions: previous_metas.persisted_custom_extensions.clone(),
                 segments: committed_segment_metas,
                 schema: index.schema(),
                 opstamp,
@@ -571,12 +566,13 @@ impl SegmentUpdater {
             .iter()
             .flat_map(|segment_meta| segment_meta.list_files())
             .collect();
-        // Keep custom plugin files based on what each segment was written with,
-        // so GC is correct even before a custom plugin is re-registered.
-        for segment_meta in &segment_metas {
-            for ext in segment_meta.plugin_extensions() {
-                let component = crate::index::SegmentComponent::Custom(ext.clone());
-                files.insert(segment_meta.relative_path(component));
+        // Keep the custom plugin files for every segment, based on the index-wide
+        // record of required plugins. GC is correct even before a custom plugin is
+        // re-registered, since the record (not the live registry) is the source of truth.
+        for ext in &self.load_meta().persisted_custom_extensions {
+            let component = crate::index::SegmentComponent::Custom(ext.clone());
+            for segment_meta in &segment_metas {
+                files.insert(segment_meta.relative_path(component.clone()));
             }
         }
         files.insert(META_FILEPATH.to_path_buf());

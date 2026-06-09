@@ -16,7 +16,6 @@ use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
 use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
-use crate::plugin::SegmentPlugin;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
@@ -55,8 +54,6 @@ pub struct SegmentReader {
     has_deletes: bool,
     alive_bitset_opt: Arc<OnceLock<Option<AliveBitSet>>>,
     schema: Schema,
-
-    plugins: Vec<Arc<dyn SegmentPlugin>>,
 }
 
 impl SegmentReader {
@@ -168,7 +165,6 @@ impl SegmentReader {
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
-        let plugins = segment.index().plugins().to_vec();
         Ok(SegmentReader {
             index: segment.index().clone(),
             segment_id: segment.id(),
@@ -190,8 +186,6 @@ impl SegmentReader {
             has_deletes: segment.meta().has_deletes(),
             alive_bitset_opt: Default::default(),
             schema: segment.schema(),
-
-            plugins,
         })
     }
 
@@ -539,7 +533,7 @@ impl SegmentReader {
     /// the non-plugin `deletes` entry (the alive bitset).
     pub fn space_usage(&self) -> io::Result<SegmentSpaceUsage> {
         let mut components: BTreeMap<String, ComponentSpaceUsage> = BTreeMap::new();
-        for plugin in &self.plugins {
+        for plugin in self.index.all_plugins() {
             let plugin_usage = plugin
                 .space_usage(self)
                 .map_err(|err| io::Error::other(err.to_string()))?;

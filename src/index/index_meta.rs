@@ -48,7 +48,6 @@ impl SegmentMetaInventory {
             max_doc,
             include_temp_doc_store: Arc::new(AtomicBool::new(true)),
             deletes: None,
-            plugin_extensions: Vec::new(),
         };
         SegmentMeta::from(self.inventory.track(inner))
     }
@@ -177,24 +176,6 @@ impl SegmentMeta {
         self.num_deleted_docs() > 0
     }
 
-    /// Custom plugin file extensions this segment was written with.
-    pub fn plugin_extensions(&self) -> &[String] {
-        &self.tracked.plugin_extensions
-    }
-
-    /// Records the custom plugin extensions this segment was written with.
-    #[must_use]
-    pub fn with_plugin_extensions(self, plugin_extensions: Vec<String>) -> SegmentMeta {
-        let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
-            segment_id: inner_meta.segment_id,
-            max_doc: inner_meta.max_doc,
-            deletes: inner_meta.deletes.clone(),
-            include_temp_doc_store: inner_meta.include_temp_doc_store.clone(),
-            plugin_extensions: plugin_extensions.clone(),
-        });
-        SegmentMeta { tracked }
-    }
-
     /// Updates the max_doc value from the `SegmentMeta`.
     pub fn with_max_doc(self, max_doc: u32) -> SegmentMeta {
         assert_eq!(self.tracked.max_doc, 0);
@@ -204,7 +185,6 @@ impl SegmentMeta {
             max_doc,
             deletes: None,
             include_temp_doc_store: Arc::new(AtomicBool::new(true)),
-            plugin_extensions: inner_meta.plugin_extensions.clone(),
         });
         SegmentMeta { tracked }
     }
@@ -225,7 +205,6 @@ impl SegmentMeta {
             max_doc: inner_meta.max_doc,
             include_temp_doc_store: Arc::new(AtomicBool::new(true)),
             deletes: Some(delete_meta),
-            plugin_extensions: inner_meta.plugin_extensions.clone(),
         });
         SegmentMeta { tracked }
     }
@@ -241,14 +220,6 @@ pub struct InnerSegmentMeta {
     #[serde(skip)]
     #[serde(default = "default_temp_store")]
     pub include_temp_doc_store: Arc<AtomicBool>,
-    /// Custom plugin file extensions this segment was written with.
-    ///
-    /// Persisted so that, after reopen, garbage collection can keep these files
-    /// and the writer/merger can refuse to run when the owning plugin has not
-    /// been re-registered (otherwise the plugin's data is silently dropped).
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub plugin_extensions: Vec<String>,
 }
 fn default_temp_store() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
@@ -422,6 +393,16 @@ pub struct IndexMeta {
     /// `IndexSettings` to configure index options.
     #[serde(default)]
     pub index_settings: IndexSettings,
+    /// Custom (non-built-in) plugin extensions this index was created with.
+    ///
+    /// Fixed at index creation. This is the single source of truth for which
+    /// custom plugins the index requires: garbage collection keeps their files,
+    /// and the writer/merger fails closed if an owning plugin is not registered.
+    /// An index created before this field existed deserializes to empty, i.e.
+    /// built-in plugins only.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub persisted_custom_extensions: Vec<String>,
     /// List of `SegmentMeta` information associated with each finalized segment of the index.
     pub segments: Vec<SegmentMeta>,
     /// Index `Schema`
@@ -442,6 +423,8 @@ struct UntrackedIndexMeta {
     pub segments: Vec<InnerSegmentMeta>,
     #[serde(default)]
     pub index_settings: IndexSettings,
+    #[serde(default)]
+    pub persisted_custom_extensions: Vec<String>,
     pub schema: Schema,
     pub opstamp: Opstamp,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -452,6 +435,7 @@ impl UntrackedIndexMeta {
     pub fn track(self, inventory: &SegmentMetaInventory) -> IndexMeta {
         IndexMeta {
             index_settings: self.index_settings,
+            persisted_custom_extensions: self.persisted_custom_extensions,
             segments: self
                 .segments
                 .into_iter()
@@ -473,6 +457,7 @@ impl IndexMeta {
     pub fn with_schema(schema: Schema) -> IndexMeta {
         IndexMeta {
             index_settings: IndexSettings::default(),
+            persisted_custom_extensions: Vec::new(),
             segments: vec![],
             schema,
             opstamp: 0u64,
@@ -527,6 +512,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            persisted_custom_extensions: Vec::new(),
             segments: Vec::new(),
             schema,
             opstamp: 0u64,
