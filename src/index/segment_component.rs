@@ -1,5 +1,4 @@
 use std::fmt::{Display, Formatter};
-use std::slice;
 
 /// Enum describing each component of a tantivy segment.
 ///
@@ -65,25 +64,5 @@ impl Display for SegmentComponent {
             SegmentComponent::Delete => write!(f, "del"),
             SegmentComponent::Custom(ext) => write!(f, "{ext}"),
         }
-    }
-}
-
-impl SegmentComponent {
-    /// Iterates through the built-in components.
-    ///
-    /// Note: This does not include `Custom` components, which are
-    /// registered dynamically through the plugin system.
-    pub fn iterator() -> slice::Iter<'static, SegmentComponent> {
-        static SEGMENT_COMPONENTS: [SegmentComponent; 8] = [
-            SegmentComponent::Postings,
-            SegmentComponent::Positions,
-            SegmentComponent::FastFields,
-            SegmentComponent::FieldNorms,
-            SegmentComponent::Terms,
-            SegmentComponent::Store,
-            SegmentComponent::TempStore,
-            SegmentComponent::Delete,
-        ];
-        SEGMENT_COMPONENTS.iter()
     }
 }
