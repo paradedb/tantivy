@@ -131,15 +131,7 @@ impl CompactDoc {
         for v in value {
             v.encode_le(&mut bytes);
         }
-        let value_addr = self.add_value_leaf(ReferenceValueLeaf::Bytes(&bytes));
-        let field_value = FieldValueAddr {
-            field: field
-                .field_id()
-                .try_into()
-                .expect("support only up to u16::MAX field ids"),
-            value_addr,
-        };
-        self.field_values.push(field_value);
+        self.add_bytes(field, &bytes);
     }
 
     /// Add a dynamic object field
