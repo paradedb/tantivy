@@ -15,13 +15,14 @@ mod distance;
 mod meta;
 mod options;
 mod plugin;
+mod prepared;
 mod reader;
 
 pub mod flat;
 pub mod ivf;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use backend::VectorBackend;
 pub use collector::TopDocsByVectorSimilarity;
@@ -31,6 +32,8 @@ pub use ivf::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
     IvfVectors,
 };
+pub use meta::VectorStorageFormat;
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};
 pub use plugin::VectorPlugin;
-pub use reader::{VectorColumn, VectorColumnReader, VectorReader};
+pub use prepared::PreparedQuery;
+pub use reader::{VectorClusterStats, VectorColumn, VectorColumnReader, VectorInfo, VectorReader};

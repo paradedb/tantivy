@@ -187,7 +187,15 @@ pub(crate) fn merge_ivf(
                 let encoded_centroids = centroid_matrix
                     .values
                     .chunks_exact(opts.dim())
-                    .map(|centroid| encode_vector(centroid, opts.dim()))
+                    .map(|centroid| {
+                        let mut bytes = encode_vector(centroid, opts.dim())?;
+                        // K-means cluster means are not unit-norm; for
+                        // Cosine+F32 normalize them here so the search
+                        // path can score both docs and centroids with
+                        // the same `dot * inv_norm_q` fast kernel.
+                        opts.maybe_normalize_bytes(&mut bytes);
+                        Ok::<_, TantivyError>(bytes)
+                    })
                     .collect::<crate::Result<Vec<_>>>()?;
 
                 let mut assigned_vectors = Vec::with_capacity(vector_count);

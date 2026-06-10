@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use super::flat::{FlatVecReader, FlatVectorColumn, FLATVEC_EXT};
-use super::ivf::{IvfVecReader, IvfVectorColumn, ASSIGNMENTS_EXT, IVFVEC_EXT};
+use super::flat::{FlatVecReader, FlatVectorColumn};
+use super::ivf::{IvfVecReader, IvfVectorColumn};
 use super::meta::{VectorSegmentMeta, VectorStorageFormat, VECMETA_EXT};
 use crate::directory::error::OpenReadError;
 use crate::index::SegmentComponent;
@@ -29,6 +29,22 @@ pub struct VectorReader {
     vector_dims: BTreeMap<Field, usize>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorInfo {
+    pub format: VectorStorageFormat,
+    pub num_vectors: usize,
+    pub num_centroids: Option<usize>,
+    pub cluster_stats: Option<VectorClusterStats>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorClusterStats {
+    pub min_cluster_size: usize,
+    pub max_cluster_size: usize,
+    pub avg_cluster_size: f64,
+    pub empty_clusters: usize,
+}
+
 enum VectorStorageReader {
     None,
     Flat(FlatVecReader),
@@ -44,13 +60,6 @@ impl VectorReader {
                 vector_dims.insert(field, opts.dim());
             }
         }
-        let exists = |ext: &str| -> crate::Result<bool> {
-            match segment_reader.open_read(SegmentComponent::Custom(ext.to_string())) {
-                Ok(_) => Ok(true),
-                Err(OpenReadError::FileDoesNotExist(_)) => Ok(false),
-                Err(err) => Err(err.into()),
-            }
-        };
         let meta_slice =
             match segment_reader.open_read(SegmentComponent::Custom(VECMETA_EXT.to_string())) {
                 Ok(file_slice) => Some(file_slice),
@@ -61,25 +70,9 @@ impl VectorReader {
             let meta = VectorSegmentMeta::open(file_slice)?;
             match meta.format {
                 VectorStorageFormat::Flat => {
-                    if exists(ASSIGNMENTS_EXT)? || exists(IVFVEC_EXT)? {
-                        return Err(TantivyError::InternalError(
-                            "segment is marked flat but has IVF vector components".to_string(),
-                        ));
-                    }
                     VectorStorageReader::Flat(FlatVecReader::open(segment_reader)?)
                 }
                 VectorStorageFormat::Ivf => {
-                    if exists(FLATVEC_EXT)? {
-                        return Err(TantivyError::InternalError(
-                            "segment is marked IVF but has flat vector data".to_string(),
-                        ));
-                    }
-                    if !exists(ASSIGNMENTS_EXT)? || !exists(IVFVEC_EXT)? {
-                        return Err(TantivyError::InternalError(
-                            "segment is marked IVF but is missing IVF vector components"
-                                .to_string(),
-                        ));
-                    }
                     VectorStorageReader::Ivf(IvfVecReader::open(segment_reader, meta.payload)?)
                 }
             }
@@ -90,6 +83,55 @@ impl VectorReader {
             storage,
             vector_dims,
         })
+    }
+
+    pub fn info(&self, field: Field) -> crate::Result<Option<VectorInfo>> {
+        if !self.vector_dims.contains_key(&field) {
+            return Ok(None);
+        }
+        match &self.storage {
+            VectorStorageReader::None => Ok(None),
+            VectorStorageReader::Flat(reader) => Ok(Some(VectorInfo {
+                format: VectorStorageFormat::Flat,
+                num_vectors: reader.count(field)?,
+                num_centroids: None,
+                cluster_stats: None,
+            })),
+            VectorStorageReader::Ivf(reader) => {
+                let meta = reader.field_meta(field)?;
+                let mut empty_clusters = 0;
+                let mut min_cluster_size = usize::MAX;
+                let mut max_cluster_size = 0;
+                let mut total_cluster_size = 0;
+                for cluster_size in meta.cluster_sizes() {
+                    empty_clusters += usize::from(cluster_size == 0);
+                    min_cluster_size = min_cluster_size.min(cluster_size);
+                    max_cluster_size = max_cluster_size.max(cluster_size);
+                    total_cluster_size += cluster_size;
+                }
+                let avg_cluster_size = if meta.num_centroids == 0 {
+                    0.0
+                } else {
+                    total_cluster_size as f64 / meta.num_centroids as f64
+                };
+                let min_cluster_size = if meta.num_centroids == 0 {
+                    0
+                } else {
+                    min_cluster_size
+                };
+                Ok(Some(VectorInfo {
+                    format: VectorStorageFormat::Ivf,
+                    num_vectors: meta.num_vectors(),
+                    num_centroids: Some(meta.num_centroids),
+                    cluster_stats: Some(VectorClusterStats {
+                        min_cluster_size,
+                        max_cluster_size,
+                        avg_cluster_size,
+                        empty_clusters,
+                    }),
+                }))
+            }
+        }
     }
 }
 

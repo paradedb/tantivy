@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use super::meta::VectorStorageFormat;
-use crate::collector::Count;
+use crate::collector::{Count, TopDocs};
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
-use crate::query::TermQuery;
+use crate::query::{AllQuery, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric, VectorColumn,
@@ -165,8 +165,8 @@ impl TestVectorIndex {
     }
 }
 
-struct Grid2DClusterer {
-    centroids: Vec<[f32; grid2d::DIM]>,
+pub(crate) struct Grid2DClusterer {
+    pub(crate) centroids: Vec<[f32; grid2d::DIM]>,
 }
 
 impl IvfClusterer for Grid2DClusterer {
@@ -381,6 +381,33 @@ fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
     Ok(())
 }
 
+/// Regression for `FlatBackend::top_n` under truncation. A bare
+/// `TopNComputer::new` defaults to `ReverseComparator`, which keeps
+/// the K *smallest* sort_keys — for our "higher = closer" similarity
+/// convention that returned the K *farthest* docs once a segment had
+/// more than K matches. Latent before the fix because every previous
+/// flat test had ≤ K docs per segment, so the truncate_top_n path
+/// never fired. The backend now wires `NaturalComparator` explicitly;
+/// this test would fail under the old code.
+///
+/// The shared fixture commits every `DOCS_PER_SEGMENT = 10` docs, so
+/// each segment has 10 > K = 3 docs — the truncation path is on.
+#[test]
+fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Flat)
+        .build()?;
+    let query = grid2d::centroids()[0];
+    let top_k = 3;
+    let expected = index.ground_truth(query, top_k)?;
+    let hits = index.index.reader()?.searcher().search(
+        &AllQuery,
+        &TopDocs::with_limit(top_k).order_by_similarity(index.embedding_field(), query.to_vec()),
+    )?;
+    assert_eq!(hits, expected);
+    Ok(())
+}
+
 #[test]
 fn ground_truth_orders_by_metric() -> crate::Result<()> {
     let index = TestVectorIndex::builder(VectorDType::F32)
@@ -403,11 +430,12 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
     Ok(())
 }
 
-mod ground_truth {
+pub(crate) mod ground_truth {
     use std::cmp::Ordering;
+    use std::sync::Arc;
 
     use crate::schema::Field;
-    use crate::vector::{Metric, VectorColumnReader, VectorReader};
+    use crate::vector::{Metric, PreparedQuery, VectorColumnReader, VectorReader};
     use crate::{DocAddress, Index, Score};
 
     pub(crate) fn top_k(
@@ -417,6 +445,7 @@ mod ground_truth {
         query: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        let query = PreparedQuery::<f32>::new(metric, Arc::new(query.to_vec()));
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
@@ -431,7 +460,7 @@ mod ground_truth {
                 }
                 if let Some(bytes) = column.vector_bytes_at(doc) {
                     scored.push((
-                        metric.similarity_bytes(query, bytes),
+                        query.score_doc_bytes(bytes),
                         DocAddress::new(seg_ord as u32, doc),
                     ));
                 }

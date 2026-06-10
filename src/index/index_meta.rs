@@ -324,7 +324,7 @@ fn is_default_codec_types(types: &[columnar::CodecType]) -> bool {
 }
 
 fn default_vector_clustering_threshold() -> usize {
-    10_000
+    1000
 }
 
 fn is_default_vector_clustering_threshold(threshold: &usize) -> bool {
@@ -627,7 +627,7 @@ mod tests {
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
-                vector_clustering_threshold: 10_000,
+                vector_clustering_threshold: 1000,
             }
         );
         {
