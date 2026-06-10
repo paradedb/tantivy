@@ -82,7 +82,6 @@ pub(crate) fn list_segment_files(
     segment_metas: &[SegmentMeta],
     persisted_custom_extensions: &[String],
 ) -> HashSet<PathBuf> {
-    // Built-in extensions (derived from the plugins) plus the index's required custom ones.
     let extensions: Vec<String> = builtin_plugins()
         .iter()
         .flat_map(|plugin| plugin.extensions().iter().map(|ext| ext.to_string()))
@@ -120,8 +119,6 @@ fn save_new_metas(
     plugins: &[Arc<dyn SegmentPlugin>],
     directory: &dyn Directory,
 ) -> crate::Result<()> {
-    // The registered plugins are the index's custom plugin set (built-ins are not on the
-    // builder); record their extensions as the index's required, fixed-at-creation set.
     let persisted_custom_extensions: Vec<String> = plugins
         .iter()
         .flat_map(|plugin| plugin.extensions().iter().copied())

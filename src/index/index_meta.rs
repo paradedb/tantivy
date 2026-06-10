@@ -102,8 +102,6 @@ impl SegmentMeta {
             .unwrap_or(0u32)
     }
 
-    /// Whether the segment still has a temp store file (true while it is being written,
-    /// false once finalized).
     pub(crate) fn include_temp_store(&self) -> bool {
         self.tracked
             .include_temp_doc_store
