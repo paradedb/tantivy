@@ -184,13 +184,6 @@ impl IndexMerger {
         &self.custom_plugins
     }
 
-    /// All plugins to run during the merge, in write order: built-ins then custom.
-    fn all_plugins(&self) -> impl Iterator<Item = Arc<dyn SegmentPlugin>> + '_ {
-        builtin_plugins()
-            .into_iter()
-            .chain(self.custom_plugins.iter().cloned())
-    }
-
     fn sort_by_field_type(&self, sort_by_field: &IndexSortByField) -> crate::Result<Type> {
         let schema_field = self.schema.get_field(&sort_by_field.field)?;
         let field_entry = self.schema.get_field_entry(schema_field);
@@ -531,10 +524,13 @@ impl IndexMerger {
             self.get_doc_id_from_concatenated_data()?
         };
 
-        // Merge plugins in `all_plugins` order, which is their write order:
+        // Merge plugins in write order (matching `Index::all_plugins`):
         // fieldnorms before postings (which reads them back), then fast_fields,
         // store, and custom plugins.
-        for plugin in self.all_plugins() {
+        for plugin in builtin_plugins()
+            .into_iter()
+            .chain(self.custom_plugins.iter().cloned())
+        {
             debug!("merge-plugin: {:?}", plugin.extensions());
             plugin.merge(PluginMergeContext {
                 readers: &self.readers,
