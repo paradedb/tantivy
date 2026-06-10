@@ -15,9 +15,9 @@ use common::HasLen;
 use crate::index::{IndexSettings, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::SegmentDocIdMapping;
 use crate::indexer::segment_updater::CancelSentinel;
-use crate::schema::Schema;
+use crate::schema::{Schema, TantivyDocument};
 use crate::space_usage::ComponentSpaceUsage;
-use crate::Segment;
+use crate::{DocId, Segment};
 
 /// A pluggable segment component that participates in writing and merging.
 ///
@@ -75,9 +75,23 @@ pub trait SegmentPlugin: Send + Sync + 'static {
 
 /// Writer for a single component within a segment.
 ///
-/// The writer accumulates data during indexing (via component-specific APIs on the
-/// concrete type) and serializes it to segment files during finalization.
+/// The writer accumulates data during indexing (via [`add_document`](Self::add_document)
+/// and component-specific APIs on the concrete type) and serializes it to segment files
+/// during finalization.
 pub trait PluginWriter: Send + Any {
+    /// Records a single document during indexing.
+    ///
+    /// Called once per document added to the segment, in doc-id order, for every plugin
+    /// writer. The default is a no-op; override it to accumulate per-document state.
+    fn add_document(
+        &mut self,
+        _doc_id: DocId,
+        _doc: &TantivyDocument,
+        _schema: &Schema,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
     /// Serialize accumulated data to segment files.
     /// Called during `SegmentWriter::finalize()`.
     ///

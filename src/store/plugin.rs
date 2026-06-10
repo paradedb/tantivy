@@ -12,11 +12,11 @@ use crate::directory::Directory;
 use crate::index::{SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
-use crate::schema::document::Document;
+use crate::schema::document::{Document, TantivyDocument};
 use crate::schema::Schema;
 use crate::space_usage::{ComponentSpaceUsage, STORE};
 use crate::store::{StoreReader, StoreWriter};
-use crate::Segment;
+use crate::{DocId, Segment};
 
 pub struct StorePlugin;
 
@@ -56,6 +56,7 @@ impl SegmentPlugin for StorePlugin {
         Ok(Box::new(StorePluginWriter {
             store_writer: Some(store_writer),
             remapping_required,
+            ignore_store: ctx.ignore_store,
         }))
     }
 
@@ -149,6 +150,7 @@ impl SegmentPlugin for StorePlugin {
 pub struct StorePluginWriter {
     store_writer: Option<StoreWriter>,
     remapping_required: bool,
+    ignore_store: bool,
 }
 
 impl StorePluginWriter {
@@ -172,6 +174,18 @@ impl StorePluginWriter {
 }
 
 impl PluginWriter for StorePluginWriter {
+    fn add_document(
+        &mut self,
+        _doc_id: DocId,
+        doc: &TantivyDocument,
+        schema: &Schema,
+    ) -> crate::Result<()> {
+        if self.ignore_store {
+            return Ok(());
+        }
+        self.store(doc, schema)
+    }
+
     fn serialize(
         &mut self,
         segment: &Segment,
