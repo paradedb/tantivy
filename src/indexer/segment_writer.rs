@@ -233,6 +233,7 @@ impl SegmentWriter {
                     field_entry.name()
                 ))
             };
+
             if !field_entry.is_indexed() {
                 continue;
             }
