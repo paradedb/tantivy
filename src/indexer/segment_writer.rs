@@ -5,7 +5,6 @@ use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
-use crate::fastfield::FastFieldsPluginWriter;
 use crate::fieldnorm::FieldNormsPluginWriter;
 use crate::index::Segment;
 use crate::indexer::indexing_term::IndexingTerm;
@@ -17,7 +16,6 @@ use crate::postings::{
 };
 use crate::schema::document::{Document, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
-use crate::store::StorePluginWriter;
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, Opstamp, TantivyError};
 
@@ -76,7 +74,6 @@ pub struct SegmentWriter {
     per_field_text_analyzers: Vec<TextAnalyzer>,
     term_buffer: IndexingTerm,
     schema: Schema,
-    ignore_store: bool,
 }
 
 impl SegmentWriter {
@@ -141,7 +138,6 @@ impl SegmentWriter {
             per_field_text_analyzers,
             term_buffer: IndexingTerm::with_capacity(16),
             schema,
-            ignore_store,
         })
     }
 
@@ -434,15 +430,13 @@ impl SegmentWriter {
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {
         let AddOperation { document, opstamp } = add_operation;
+        let document = document.into_tantivy_document();
+        let doc_id = self.max_doc;
         self.doc_opstamps.push(opstamp);
-        self.plugin_writer_mut::<FastFieldsPluginWriter>()
-            .writer_mut()
-            .add_document(&document)?;
         self.index_document(&document)?;
-        if !self.ignore_store {
-            let schema = self.schema.clone();
-            self.plugin_writer_mut::<StorePluginWriter>()
-                .store(&document, &schema)?;
+        let schema = self.schema.clone();
+        for writer in &mut self.plugin_writers {
+            writer.add_document(doc_id, &document, &schema)?;
         }
         self.max_doc += 1;
         Ok(())

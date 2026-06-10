@@ -17,9 +17,9 @@ use crate::fastfield::{FastFieldReaders, FastFieldsWriter};
 use crate::index::{SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{DocIdMapping, MappingType, SegmentDocIdMapping};
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
-use crate::schema::{value_type_to_column_type, Schema};
+use crate::schema::{value_type_to_column_type, Schema, TantivyDocument};
 use crate::space_usage::{ComponentSpaceUsage, FAST_FIELDS};
-use crate::Segment;
+use crate::{DocId, Segment};
 
 pub struct FastFieldsPlugin;
 
@@ -117,6 +117,15 @@ impl FastFieldsPluginWriter {
 }
 
 impl PluginWriter for FastFieldsPluginWriter {
+    fn add_document(
+        &mut self,
+        _doc_id: DocId,
+        doc: &TantivyDocument,
+        _schema: &Schema,
+    ) -> crate::Result<()> {
+        self.writer_mut().add_document(doc)
+    }
+
     fn serialize(
         &mut self,
         _segment: &Segment,
