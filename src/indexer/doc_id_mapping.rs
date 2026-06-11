@@ -5,15 +5,18 @@ use common::ReadOnlyBitSet;
 
 use crate::DocAddress;
 
+/// Describes how the documents of the merged segments map onto the new segment.
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum MappingType {
+    /// Segments are stacked in order of their ordinal, with no deletes.
     Stacked,
+    /// Segments are stacked in order of their ordinal, but some documents are deleted.
     StackedWithDeletes,
 }
 
 /// Struct to provide mapping from new doc_id to old doc_id and segment.
 #[derive(Clone)]
-pub(crate) struct SegmentDocIdMapping {
+pub struct SegmentDocIdMapping {
     pub(crate) new_doc_id_to_old_doc_addr: Vec<DocAddress>,
     pub(crate) alive_bitsets: Vec<Option<ReadOnlyBitSet>>,
     mapping_type: MappingType,
@@ -32,6 +35,7 @@ impl SegmentDocIdMapping {
         }
     }
 
+    /// Returns the [`MappingType`] describing how documents are mapped.
     pub fn mapping_type(&self) -> MappingType {
         self.mapping_type
     }

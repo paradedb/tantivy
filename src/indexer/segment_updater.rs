@@ -13,7 +13,9 @@ use super::segment_manager::SegmentManager;
 use crate::core::META_FILEPATH;
 use crate::directory::{Directory, DirectoryClone, GarbageCollectionResult};
 use crate::fastfield::AliveBitSet;
-use crate::index::{Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta};
+use crate::index::{
+    list_segment_files, Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta,
+};
 use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::index_writer::advance_deletes;
 use crate::indexer::merge_operation::MergeOperationInventory;
@@ -22,7 +24,6 @@ use crate::indexer::segment_manager::SegmentsStatus;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{
     DefaultMergePolicy, MergeCandidate, MergeOperation, MergePolicy, SegmentEntry,
-    SegmentSerializer,
 };
 use crate::{FutureResult, Opstamp, TantivyError};
 
@@ -35,8 +36,15 @@ const PANIC_CAUGHT: &str = "Panic caught in merge thread";
 /// - it success, and `meta.json` is written and flushed.
 ///
 /// This method is not part of tantivy's public API
-pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate::Result<()> {
+pub(crate) fn save_metas(
+    metas: &IndexMeta,
+    previous_metas: &IndexMeta,
+    directory: &dyn Directory,
+) -> crate::Result<()> {
     info!("save metas");
+    // `previous_metas` carries the persisted plugin set forward (fail-closed reopen). It is
+    // consumed by callers building `metas`; the write itself only needs `metas`.
+    let _ = previous_metas;
     let mut buffer = serde_json::to_vec_pretty(metas)?;
     // Just adding a new line at the end of the buffer.
     writeln!(&mut buffer)?;
@@ -88,6 +96,7 @@ fn merge(
     index: &Index,
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
+    ignore_store: bool,
 ) -> crate::Result<Option<SegmentEntry>> {
     let num_docs = segment_entries
         .iter()
@@ -114,12 +123,15 @@ fn merge(
         .collect();
 
     // An IndexMerger is like a "view" of our merged segments.
-    let merger: IndexMerger = IndexMerger::open(index.schema(), &segments[..])?;
+    let merger = IndexMerger::open(
+        index.schema(),
+        index.settings().clone(),
+        &segments[..],
+        ignore_store,
+    )?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
-
-    let num_docs = merger.write(segment_serializer)?;
+    let num_docs = merger.write(&merged_segment)?;
 
     let merged_segment_id = merged_segment.id();
 
@@ -138,6 +150,11 @@ fn merge(
 /// This function does NOT check or take the `IndexWriter` is running. It is not
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
+///
+/// It is the caller's responsibility to ensure every custom
+/// [`SegmentPlugin`](crate::SegmentPlugin) is registered on the source indices and that
+/// the indices share the same plugin set. A source segment whose custom extension has no
+/// registered plugin has that component's data silently dropped from the merge.
 #[doc(hidden)]
 pub fn merge_indices<T: Into<Box<dyn Directory>>>(
     indices: &[Index],
@@ -184,6 +201,11 @@ pub fn merge_indices<T: Into<Box<dyn Directory>>>(
 /// This function does NOT check or take the `IndexWriter` is running. It is not
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
+///
+/// It is the caller's responsibility to ensure every custom
+/// [`SegmentPlugin`](crate::SegmentPlugin) is registered on the segments' source indices.
+/// A source segment whose custom extension has no registered plugin has that component's
+/// data silently dropped from the merge.
 #[doc(hidden)]
 pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     segments: &[Segment],
@@ -211,17 +233,34 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         ));
     }
 
+    // The source index's writer was already validated against its recorded plugin
+    // set (else `MissingPlugin`); the merger reuses those registered plugins.
+    let merger = IndexMerger::open_with_custom_alive_set(
+        target_schema.clone(),
+        target_settings.clone(),
+        segments,
+        filter_doc_ids,
+        false,
+    )?;
+
     let mut merged_index = Index::create(
         output_directory,
         target_schema.clone(),
         target_settings.clone(),
     )?;
+
+    // Carry the merger's custom plugins onto the merged index (built-ins come for free) and
+    // record their extensions as the merged index's required set; without this the first GC
+    // drops the merged files.
+    let mut persisted_custom_extensions: Vec<String> = Vec::new();
+    for plugin in merger.custom_plugins() {
+        persisted_custom_extensions.extend(plugin.extensions().iter().map(|ext| ext.to_string()));
+        merged_index.register_plugin(plugin.clone());
+    }
+
     let merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();
-    let merger: IndexMerger =
-        IndexMerger::open_with_custom_alive_set(merged_index.schema(), segments, filter_doc_ids)?;
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment)?;
-    let num_docs = merger.write(segment_serializer)?;
+    let num_docs = merger.write(&merged_segment)?;
 
     let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
 
@@ -237,15 +276,29 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     );
 
     let index_meta = IndexMeta {
-        index_settings: target_settings, // index_settings of all segments should be the same
+        index_settings: target_settings.clone(), /* index_settings of all segments should be the
+                                                  * same */
+        persisted_custom_extensions: persisted_custom_extensions.clone(),
         segments: vec![segment_meta],
-        schema: target_schema,
+        schema: target_schema.clone(),
         opstamp: 0u64,
         payload: Some(stats),
     };
 
     // save the meta.json
-    save_metas(&index_meta, merged_index.directory_mut())?;
+    let segment_metas = segments
+        .iter()
+        .map(|segment| segment.meta().clone())
+        .collect();
+    let previous_meta = IndexMeta {
+        index_settings: target_settings,
+        persisted_custom_extensions,
+        segments: segment_metas,
+        schema: target_schema,
+        opstamp: 0u64,
+        payload: None,
+    };
+    save_metas(&index_meta, &previous_meta, merged_index.directory_mut())?;
 
     Ok(merged_index)
 }
@@ -278,6 +331,7 @@ impl SegmentUpdater {
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
+
         let pool = ThreadPoolBuilder::new()
             .thread_name(|_| "segment_updater".to_string())
             .num_threads(1)
@@ -384,6 +438,7 @@ impl SegmentUpdater {
         &self,
         opstamp: Opstamp,
         commit_message: Option<String>,
+        previous_metas: &IndexMeta,
     ) -> crate::Result<()> {
         if self.is_alive() {
             let index = &self.index;
@@ -407,13 +462,19 @@ impl SegmentUpdater {
                 .sort_by_key(|segment_meta| std::cmp::Reverse(segment_meta.max_doc()));
             let index_meta = IndexMeta {
                 index_settings: index.settings().clone(),
+                // The required plugin set is fixed at index creation; carry it forward.
+                persisted_custom_extensions: previous_metas.persisted_custom_extensions.clone(),
                 segments: committed_segment_metas,
                 schema: index.schema(),
                 opstamp,
                 payload: commit_message,
             };
             // TODO add context to the error.
-            save_metas(&index_meta, directory.box_clone().borrow_mut())?;
+            save_metas(
+                &index_meta,
+                previous_metas,
+                directory.box_clone().borrow_mut(),
+            )?;
             self.store_meta(&index_meta);
         }
         Ok(())
@@ -429,12 +490,13 @@ impl SegmentUpdater {
     /// This does not include lock files, or files that are obsolete
     /// but have not yet been deleted by the garbage collector.
     fn list_files(&self) -> HashSet<PathBuf> {
-        let mut files: HashSet<PathBuf> = self
-            .index
-            .list_all_segment_metas()
-            .into_iter()
-            .flat_map(|segment_meta| segment_meta.list_files())
-            .collect();
+        // All tracked segments (including in-flight ones), so GC keeps files for segments
+        // not yet in the committed meta. Custom extensions come from the persisted record
+        // (not the live registry), so GC is correct even before a plugin is re-registered.
+        let mut files = list_segment_files(
+            &self.index.list_all_segment_metas(),
+            &self.load_meta().persisted_custom_extensions,
+        );
         files.insert(META_FILEPATH.to_path_buf());
         files
     }
@@ -444,11 +506,12 @@ impl SegmentUpdater {
         opstamp: Opstamp,
         payload: Option<String>,
     ) -> FutureResult<Opstamp> {
-        let segment_updater: SegmentUpdater = self.clone();
+        let segment_updater = self.clone();
         self.schedule_task(move || {
             let segment_entries = segment_updater.purge_deletes(opstamp)?;
+            let previous_metas = segment_updater.load_meta();
             segment_updater.segment_manager.commit(segment_entries);
-            segment_updater.save_metas(opstamp, payload)?;
+            segment_updater.save_metas(opstamp, payload, &previous_metas)?;
             let _ = garbage_collect_files(segment_updater.clone());
             segment_updater.consider_merge_options();
             Ok(opstamp)
@@ -523,6 +586,7 @@ impl SegmentUpdater {
                     &segment_updater.index,
                     segment_entries,
                     merge_operation.target_opstamp(),
+                    false,
                 )
             }));
             let merge_res = match merge_panic_res {
@@ -662,8 +726,11 @@ impl SegmentUpdater {
                     .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)?;
 
                 if segments_status == SegmentsStatus::Committed {
-                    segment_updater
-                        .save_metas(previous_metas.opstamp, previous_metas.payload.clone())?;
+                    segment_updater.save_metas(
+                        previous_metas.opstamp,
+                        previous_metas.payload.clone(),
+                        &previous_metas,
+                    )?;
                 }
 
                 segment_updater.consider_merge_options();
@@ -1113,10 +1180,12 @@ mod tests {
                 target_schema,
                 target_settings.clone(),
             )?;
-            let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
+            let merger = IndexMerger::open_with_custom_alive_set(
                 merged_index.schema(),
+                merged_index.settings().clone(),
                 &segments[..],
                 filter_segments,
+                false,
             )?;
 
             let doc_ids_alive: Vec<_> = merger.readers[0].doc_ids_alive().collect();
@@ -1128,10 +1197,12 @@ mod tests {
             let target_schema = segments[0].schema();
             let merged_index =
                 Index::create(RamDirectory::default(), target_schema, target_settings)?;
-            let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
+            let merger = IndexMerger::open_with_custom_alive_set(
                 merged_index.schema(),
+                merged_index.settings().clone(),
                 &segments[..],
                 filter_segments,
+                false,
             )?;
 
             let doc_ids_alive: Vec<_> = merger.readers[0].doc_ids_alive().collect();

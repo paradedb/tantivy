@@ -10,6 +10,7 @@ mod indexing_context;
 mod json_postings_writer;
 mod loaded_postings;
 mod per_field_postings_writer;
+pub(crate) mod plugin;
 mod postings;
 mod postings_writer;
 mod recorder;
@@ -25,6 +26,7 @@ pub(crate) use stacker::compute_table_memory_size;
 pub use self::block_segment_postings::BlockSegmentPostings;
 pub(crate) use self::indexing_context::IndexingContext;
 pub(crate) use self::per_field_postings_writer::PerFieldPostingsWriter;
+pub use self::plugin::{PostingsPlugin, PostingsPluginWriter};
 pub use self::postings::Postings;
 pub(crate) use self::postings_writer::{serialize_postings, IndexingPosition, PostingsWriter};
 pub use self::segment_postings::SegmentPostings;
@@ -228,7 +230,7 @@ pub(crate) mod tests {
 
         {
             let mut segment_writer =
-                SegmentWriter::for_segment(15_000_000, segment.clone()).unwrap();
+                SegmentWriter::for_segment(15_000_000, segment.clone(), false).unwrap();
             {
                 // checking that position works if the field has two values
                 let op = AddOperation {

@@ -17,7 +17,7 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
         let segment = index.new_segment();
-        let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
+        let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone(), false)?;
         Ok(Self {
             segment_writer,
             segment,
@@ -42,14 +42,16 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         self.segment_writer.finalize()?;
         let segment: Segment = self.segment.with_max_doc(max_doc);
         let index = segment.index();
+        let previous_meta = index.load_metas()?;
         let index_meta = IndexMeta {
             index_settings: index.settings().clone(),
+            persisted_custom_extensions: previous_meta.persisted_custom_extensions.clone(),
             segments: vec![segment.meta().clone()],
             schema: index.schema(),
             opstamp: 0,
             payload: None,
         };
-        save_metas(&index_meta, index.directory())?;
+        save_metas(&index_meta, &previous_meta, index.directory())?;
         index.directory().sync_directory()?;
         Ok(segment.index().clone())
     }
