@@ -115,6 +115,22 @@ pub enum TantivyError {
     Cancelled,
     #[error("Segment Merging failed: {0:#?}")]
     MergeErrors(Vec<TantivyError>),
+    #[error(
+        "Missing required segment plugin(s) for extension(s): {0}. Re-register via \
+         Index::register_plugin before writing, merging, or garbage collecting."
+    )]
+    MissingPlugin(String),
+    #[error(
+        "Conflicting segment plugins claim the same extension(s): {0}. Each extension must be \
+         owned by exactly one registered plugin."
+    )]
+    ConflictingPlugins(String),
+    #[error(
+        "Segment plugin(s) for extension(s) {0} were registered on a non-empty index whose \
+         existing segments do not contain them. The plugin set is fixed once an index has \
+         segments; create a new index to change it."
+    )]
+    UnexpectedPlugin(String),
 }
 
 impl From<io::Error> for TantivyError {
