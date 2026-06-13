@@ -36,6 +36,7 @@ pub struct SegmentWriter {
     custom_plugins: Vec<Box<dyn PluginWriter>>,
     pub(crate) doc_opstamps: Vec<Opstamp>,
     schema: Schema,
+    ignore_store: bool,
 }
 
 impl SegmentWriter {
@@ -48,11 +49,16 @@ impl SegmentWriter {
     ///   behavior as a memory limit.
     /// - segment: The segment being written
     /// - schema
-    pub fn for_segment(memory_budget_in_bytes: usize, segment: Segment) -> crate::Result<Self> {
+    pub fn for_segment(
+        memory_budget_in_bytes: usize,
+        segment: Segment,
+        ignore_store: bool,
+    ) -> crate::Result<Self> {
         let schema = segment.schema();
         let ctx = PluginWriterContext {
             segment: &segment,
             memory_budget_in_bytes,
+            ignore_store,
         };
         let inverted_index = InvertedIndexPluginWriter::new(&ctx)?;
         let fast_fields = FastFieldsPluginWriter::new(&ctx)?;
@@ -72,6 +78,7 @@ impl SegmentWriter {
             custom_plugins,
             doc_opstamps: Vec::with_capacity(1_000),
             schema,
+            ignore_store,
         })
     }
 

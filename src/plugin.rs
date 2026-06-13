@@ -128,6 +128,8 @@ pub struct PluginWriterContext<'a> {
     /// Per-thread indexing memory budget in bytes. Plugins that keep an in-memory arena
     /// (e.g. the inverted index) size it from this.
     pub memory_budget_in_bytes: usize,
+    /// Whether the document store should be ignored for this segment.
+    pub ignore_store: bool,
 }
 
 /// Context provided to [`SegmentPlugin::merge`].

@@ -119,13 +119,15 @@ impl SegmentPlugin for StorePlugin {
 pub struct StorePluginWriter {
     store_writer: Option<StoreWriter>,
     remapping_required: bool,
+    ignore_store: bool,
 }
 
 impl StorePluginWriter {
     pub(crate) fn new(ctx: &PluginWriterContext) -> crate::Result<Self> {
         let settings = ctx.segment.index().settings();
         let directory = ctx.segment.index().directory();
-        let remapping_required = settings.sort_by_field.is_some() || settings.manual_doc_id_mapping;
+        let remapping_required = !ctx.ignore_store
+            && (settings.sort_by_field.is_some() || settings.manual_doc_id_mapping);
 
         let store_writer = if remapping_required {
             let path = ctx.segment.relative_path(SegmentComponent::TempStore);
@@ -153,10 +155,14 @@ impl StorePluginWriter {
         Ok(StorePluginWriter {
             store_writer: Some(store_writer),
             remapping_required,
+            ignore_store: ctx.ignore_store,
         })
     }
 
     pub fn store<D: Document>(&mut self, document: &D, schema: &Schema) -> crate::Result<()> {
+        if self.ignore_store {
+            return Ok(());
+        }
         if let Some(ref mut writer) = self.store_writer {
             writer
                 .store(document, schema)
@@ -166,6 +172,9 @@ impl StorePluginWriter {
     }
 
     pub fn store_bytes(&mut self, serialized_document: &[u8]) -> crate::Result<()> {
+        if self.ignore_store {
+            return Ok(());
+        }
         if let Some(ref mut writer) = self.store_writer {
             writer
                 .store_bytes(serialized_document)

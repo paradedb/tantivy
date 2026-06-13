@@ -18,7 +18,7 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 impl<D: Document> SingleSegmentIndexWriter<D> {
     pub(crate) fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
         let segment = index.new_segment();
-        let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
+        let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone(), false)?;
         Ok(Self {
             segment_writer,
             segment,
