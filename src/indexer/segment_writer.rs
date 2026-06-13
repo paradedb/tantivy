@@ -74,6 +74,7 @@ pub struct SegmentWriter {
     per_field_text_analyzers: Vec<TextAnalyzer>,
     term_buffer: IndexingTerm,
     schema: Schema,
+    ignore_store: bool,
 }
 
 impl SegmentWriter {
@@ -86,7 +87,11 @@ impl SegmentWriter {
     ///   behavior as a memory limit.
     /// - segment: The segment being written
     /// - schema
-    pub fn for_segment(memory_budget_in_bytes: usize, segment: Segment) -> crate::Result<Self> {
+    pub fn for_segment(
+        memory_budget_in_bytes: usize,
+        segment: Segment,
+        ignore_store: bool,
+    ) -> crate::Result<Self> {
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
         let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
@@ -131,6 +136,7 @@ impl SegmentWriter {
             per_field_text_analyzers,
             term_buffer: IndexingTerm::with_capacity(16),
             schema,
+            ignore_store,
         })
     }
 
@@ -157,6 +163,7 @@ impl SegmentWriter {
             &self.fieldnorms_writer,
             self.segment_serializer,
             mapping.as_ref(),
+            self.ignore_store,
         )?;
         let doc_opstamps = remap_doc_opstamps(self.doc_opstamps, mapping.as_ref());
         Ok(doc_opstamps)
@@ -421,6 +428,7 @@ fn remap_and_write(
     fieldnorms_writer: &FieldNormsWriter,
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
+    ignore_store: bool,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
     if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
@@ -442,30 +450,32 @@ fn remap_and_write(
     fast_field_writers.serialize(serializer.get_fast_field_write(), doc_id_map)?;
 
     // finalize temp docstore and create version, which reflects the doc_id_map
-    if let Some(doc_id_map) = doc_id_map {
-        debug!("resort-docstore");
-        let store_write = serializer
-            .segment_mut()
-            .open_write(SegmentComponent::Store)?;
-        let settings = serializer.segment().index().settings();
-        let store_writer = StoreWriter::new(
-            store_write,
-            settings.docstore_compression,
-            settings.docstore_blocksize,
-            settings.docstore_compress_dedicated_thread,
-        )?;
-        let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
-        old_store_writer.close()?;
-        let store_read = StoreReader::open(
-            serializer
-                .segment()
-                .open_read(SegmentComponent::TempStore)?,
-            1, /* The docstore is configured to have one doc per block, and each doc is
-                * accessed only once: we don't need caching. */
-        )?;
-        for old_doc_id in doc_id_map.iter_old_doc_ids() {
-            let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
-            serializer.get_store_writer().store_bytes(&doc_bytes)?;
+    if !ignore_store {
+        if let Some(doc_id_map) = doc_id_map {
+            debug!("resort-docstore");
+            let store_write = serializer
+                .segment_mut()
+                .open_write(SegmentComponent::Store)?;
+            let settings = serializer.segment().index().settings();
+            let store_writer = StoreWriter::new(
+                store_write,
+                settings.docstore_compression,
+                settings.docstore_blocksize,
+                settings.docstore_compress_dedicated_thread,
+            )?;
+            let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
+            old_store_writer.close()?;
+            let store_read = StoreReader::open(
+                serializer
+                    .segment()
+                    .open_read(SegmentComponent::TempStore)?,
+                1, /* The docstore is configured to have one doc per block, and each doc is
+                    * accessed only once: we don't need caching. */
+            )?;
+            for old_doc_id in doc_id_map.iter_old_doc_ids() {
+                let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
+                serializer.get_store_writer().store_bytes(&doc_bytes)?;
+            }
         }
     }
 
