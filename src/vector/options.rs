@@ -16,8 +16,7 @@ impl VectorDType {
 
 /// Distance / similarity metric used when ranking vector field values.
 ///
-/// All metrics are presented to callers in a "higher is better" orientation
-/// — internally L2 is negated so it composes uniformly with cosine and dot.
+/// All metrics are presented to callers in a "higher is better" orientation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
