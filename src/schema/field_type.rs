@@ -36,6 +36,8 @@ pub enum ValueParsingError {
         expected: &'static str,
         json: serde_json::Value,
     },
+    #[error("Vector fields cannot be parsed from JSON yet, got {json}")]
+    VectorFromJson { json: serde_json::Value },
     #[error("Parse  error on {json}: {error}")]
     ParseError {
         error: String,
@@ -481,8 +483,7 @@ impl FieldType {
 
                         Ok(OwnedValue::IpAddr(ip_addr.into_ipv6_addr()))
                     }
-                    FieldType::Vector(_) => Err(ValueParsingError::TypeError {
-                        expected: "an array of floats",
+                    FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
                         json: JsonValue::String(field_text),
                     }),
                 }
@@ -544,8 +545,7 @@ impl FieldType {
                     expected: "a string with an ip addr",
                     json: JsonValue::Number(field_val_num),
                 }),
-                FieldType::Vector(_) => Err(ValueParsingError::TypeError {
-                    expected: "an array of floats",
+                FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
                     json: JsonValue::Number(field_val_num),
                 }),
             },
@@ -563,8 +563,7 @@ impl FieldType {
                     }
                 }
                 FieldType::JsonObject(_) => Ok(OwnedValue::from(json_map)),
-                FieldType::Vector(_) => Err(ValueParsingError::TypeError {
-                    expected: "an array of floats",
+                FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
                     json: JsonValue::Object(json_map),
                 }),
                 _ => Err(ValueParsingError::TypeError {
@@ -584,6 +583,9 @@ impl FieldType {
                         })
                     }
                 }
+                FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
+                    json: JsonValue::Bool(json_bool_val),
+                }),
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Bool(json_bool_val),
@@ -601,11 +603,17 @@ impl FieldType {
                         })
                     }
                 }
+                FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
+                    json: JsonValue::Null,
+                }),
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Null,
                 }),
             },
+            _ if matches!(self, FieldType::Vector(_)) => {
+                Err(ValueParsingError::VectorFromJson { json: json.clone() })
+            }
             _ => Err(ValueParsingError::TypeError {
                 expected: self.value_type().name(),
                 json: json.clone(),
