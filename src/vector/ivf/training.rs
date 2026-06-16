@@ -47,19 +47,48 @@ pub trait IvfClusterer: Send + Sync + 'static {
         let num_centroids =
             ((total_target_docs as f64) * f64::from(centroid_ratio)).ceil() as usize;
         let num_centroids = num_centroids.clamp(1, total_target_docs);
+
+        // Default size bounds the merge driver enforces on PRIMARY cluster
+        // membership: split clusters above `max_posting_len`, dissolve those
+        // below `min_posting_len`. Both are anchored to the mean posting
+        // length (≈ `1 / centroid_ratio`). Provisional factors — tune
+        // against real-data size sweeps. A clusterer that wants to opt out
+        // of balancing can override `merge_settings` and pass
+        // `max_posting_len = usize::MAX`, `min_posting_len = 0`.
+        let mean_posting_len = (total_target_docs / num_centroids).max(1);
+        let max_posting_len = mean_posting_len.saturating_mul(MAX_POSTING_FACTOR);
+        let min_posting_len = (mean_posting_len / MIN_POSTING_DIVISOR).max(1);
+
         Ok(IvfMergeSettings {
             num_centroids,
             training_samples_per_centroid,
             assign_batch_size,
+            max_posting_len,
+            min_posting_len,
         })
     }
 }
+
+/// Split clusters whose primary membership exceeds `MAX_POSTING_FACTOR ×`
+/// the mean posting length. Provisional — see [`IvfClusterer::merge_settings`].
+const MAX_POSTING_FACTOR: usize = 2;
+/// Dissolve clusters whose primary membership falls below `1 /
+/// MIN_POSTING_DIVISOR ×` the mean posting length. Provisional.
+const MIN_POSTING_DIVISOR: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct IvfMergeSettings {
     pub num_centroids: usize,
     pub training_samples_per_centroid: usize,
     pub assign_batch_size: usize,
+    /// Hard upper bound on a primary cluster's size. The merge driver
+    /// splits any cluster above this into sub-clusters. `usize::MAX`
+    /// disables splitting.
+    pub max_posting_len: usize,
+    /// Lower bound on a primary cluster's size. The merge driver dissolves
+    /// any cluster below this and reassigns its members to the nearest
+    /// surviving centroid. `0` disables merging.
+    pub min_posting_len: usize,
 }
 
 #[derive(Clone, Debug)]

@@ -20,6 +20,7 @@ use super::prepared::PreparedQuery;
 use super::reader::{VectorColumn, VectorColumnReader, VectorReader};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::TopNComputer;
+use crate::fastfield::AliveBitSet;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
@@ -205,7 +206,7 @@ impl<T: VectorElement> IvfBackend<T> {
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
         top_n: usize,
-        mut stats: Option<&mut ProbeStats>,
+        stats: Option<&mut ProbeStats>,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
         if top_n == 0 {
             return Ok(Vec::new());
@@ -239,16 +240,10 @@ impl<T: VectorElement> IvfBackend<T> {
             return Ok(Vec::new());
         }
 
-        // Rank centroids descending by similarity. Full scan over
-        // `num_centroids` is the dominant fixed cost; inherent to
-        // flat-centroid IVF, unrelated to the storage layout.
-        let mut ranked: Vec<(f32, usize)> = (0..num_centroids)
-            .map(|c| {
-                let cb = &centroid_bytes[c * stride..(c + 1) * stride];
-                (self.query.score_doc_bytes(cb), c)
-            })
-            .collect();
-        ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        // Rank centroids descending by similarity. Extracted into a
+        // `#[inline(never)]` method so this phase shows as its own
+        // flamegraph frame (carrying its own `score_doc_bytes` cost).
+        let ranked = self.rank_centroids(centroid_bytes, stride, num_centroids);
 
         let best = ranked[0].0;
         let threshold = adaptive_threshold(self.query.metric(), best, self.adaptive.epsilon);
@@ -265,18 +260,83 @@ impl<T: VectorElement> IvfBackend<T> {
         let (min_probe_count, max_probe_count) =
             self.adaptive.resolved_probe_counts(num_centroids)?;
 
-        // Adaptive probe loop. Cluster-order arrival of survivors
-        // forbids the ascending-D shortcut in `push`; use
-        // `push_unordered`. The filter check is cheap (constant-time
-        // bitset lookup) so we do it before the more expensive alive
-        // check + similarity score.
-        //
-        // Note on `NaturalComparator` (vs the `TopNComputer::new`
-        // default): vector similarity is "higher = better", so we
-        // want top-N *largest* scores in descending order. The
-        // default `new()` wires `ReverseComparator`, which keeps
-        // top-N *smallest* in ascending order — correct for
-        // ascending-distance metrics but inverted for our convention.
+        // Adaptive probe loop, extracted into a `#[inline(never)]`
+        // method so this phase shows as its own flamegraph frame
+        // (carrying its own `score_doc_bytes` cost), distinct from the
+        // centroid-ranking frame above.
+        let topn = self.scan_clusters(
+            ranked,
+            threshold,
+            min_candidates,
+            min_probe_count,
+            max_probe_count,
+            stride,
+            &filter,
+            alive,
+            top_n,
+            stats,
+        )?;
+
+        // Drain best-first, tag with our segment_ord. The collector's
+        // `merge_fruits` flattens across segments, sorts descending,
+        // and applies offset/limit.
+        let segment_ord = self.segment_ord;
+        Ok(topn
+            .into_sorted_vec()
+            .into_iter()
+            .map(|cd| (cd.sort_key, DocAddress::new(segment_ord, cd.doc)))
+            .collect())
+    }
+
+    /// Phase 1: rank centroids descending by similarity. Full scan over
+    /// `num_centroids` is the dominant fixed cost; inherent to flat-centroid
+    /// IVF, unrelated to the storage layout. `#[inline(never)]` so it forms
+    /// its own flamegraph frame carrying its `score_doc_bytes` cost.
+    #[inline(never)]
+    fn rank_centroids(
+        &self,
+        centroid_bytes: &[u8],
+        stride: usize,
+        num_centroids: usize,
+    ) -> Vec<(f32, usize)> {
+        let mut ranked: Vec<(f32, usize)> = (0..num_centroids)
+            .map(|c| {
+                let cb = &centroid_bytes[c * stride..(c + 1) * stride];
+                (self.query.score_doc_bytes(cb), c)
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        ranked
+    }
+
+    /// Phase 2: adaptive probe loop. Cluster-order arrival of survivors
+    /// forbids the ascending-D shortcut in `push`; use `push_unordered`. The
+    /// filter check is cheap (constant-time bitset lookup) so we do it before
+    /// the more expensive alive check + similarity score.
+    ///
+    /// Note on `NaturalComparator` (vs the `TopNComputer::new` default):
+    /// vector similarity is "higher = better", so we want top-N *largest*
+    /// scores in descending order. The default `new()` wires
+    /// `ReverseComparator`, which keeps top-N *smallest* in ascending order —
+    /// correct for ascending-distance metrics but inverted for our convention.
+    ///
+    /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
+    /// `score_doc_bytes` cost, distinct from `rank_centroids`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_clusters(
+        &self,
+        ranked: Vec<(f32, usize)>,
+        threshold: f32,
+        min_candidates: usize,
+        min_probe_count: usize,
+        max_probe_count: usize,
+        stride: usize,
+        filter: &BitSet,
+        alive: Option<&AliveBitSet>,
+        top_n: usize,
+        mut stats: Option<&mut ProbeStats>,
+    ) -> crate::Result<TopNComputer<Score, DocId, NaturalComparator>> {
         let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
             top_n,
             NaturalComparator,
@@ -326,15 +386,7 @@ impl<T: VectorElement> IvfBackend<T> {
             }
         }
 
-        // Drain best-first, tag with our segment_ord. The collector's
-        // `merge_fruits` flattens across segments, sorts descending,
-        // and applies offset/limit.
-        let segment_ord = self.segment_ord;
-        Ok(topn
-            .into_sorted_vec()
-            .into_iter()
-            .map(|cd| (cd.sort_key, DocAddress::new(segment_ord, cd.doc)))
-            .collect())
+        Ok(topn)
     }
 }
 
@@ -560,6 +612,11 @@ mod tests {
                 num_centroids: self.centroids.len(),
                 training_samples_per_centroid: self.training_samples_per_centroid(),
                 assign_batch_size: self.assign_batch_size(),
+                // Crafted-geometry tests assert exact cluster membership;
+                // keep balancing disabled so the inline centroids are used
+                // verbatim.
+                max_posting_len: usize::MAX,
+                min_posting_len: 0,
             })
         }
         fn train(
@@ -657,6 +714,220 @@ mod tests {
         writer.merge(&segment_ids).wait()?;
         writer.wait_merging_threads()?;
         Ok((index, embed_field, label_field))
+    }
+
+    // ---- Merge-time cluster balancing (Phase 1) ----
+
+    /// Clusterer that drives the merge-time rebalance path. The first
+    /// `train()` is the top-level clustering and returns the configured
+    /// (deliberately imbalanced) centroids; every later `train()` is a split
+    /// sub-clustering and seeds sub-centroids by striding through the
+    /// oversized cluster's members, so splits genuinely partition it.
+    /// Assignment is real nearest-centroid (L2). The size bounds are
+    /// configurable so a single test can exercise both the split (oversized)
+    /// and merge (undersized) branches.
+    struct BalancedTestClusterer {
+        centroids: Vec<[f32; 2]>,
+        max_posting_len: usize,
+        min_posting_len: usize,
+        top_level_done: std::sync::atomic::AtomicBool,
+    }
+
+    impl IvfClusterer for BalancedTestClusterer {
+        fn centroid_ratio(&self) -> f32 {
+            1.0
+        }
+        fn training_samples_per_centroid(&self) -> usize {
+            2
+        }
+        fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
+            Ok(IvfMergeSettings {
+                num_centroids: self.centroids.len().min(total_target_docs),
+                training_samples_per_centroid: self.training_samples_per_centroid(),
+                assign_batch_size: self.assign_batch_size(),
+                max_posting_len: self.max_posting_len,
+                min_posting_len: self.min_posting_len,
+            })
+        }
+        fn train(
+            &self,
+            options: &VectorOptions,
+            vectors: IvfVectors<'_>,
+            num_centroids: usize,
+        ) -> crate::Result<IvfCentroids> {
+            use std::sync::atomic::Ordering;
+            assert_eq!(options.dim(), 2);
+            let IvfVectors::F32(batch) = vectors;
+            if !self.top_level_done.swap(true, Ordering::Relaxed) {
+                return Ok(IvfCentroids::F32(IvfMatrix {
+                    values: self
+                        .centroids
+                        .iter()
+                        .take(num_centroids)
+                        .flat_map(|c| c.iter().copied())
+                        .collect(),
+                    rows: num_centroids,
+                    dims: 2,
+                }));
+            }
+            let rows = batch.matrix.rows;
+            assert!(
+                rows >= num_centroids,
+                "split needs >= num_centroids members"
+            );
+            let mut values = Vec::with_capacity(num_centroids * 2);
+            for j in 0..num_centroids {
+                let row = (j * rows) / num_centroids;
+                values.extend_from_slice(&batch.matrix.values[row * 2..row * 2 + 2]);
+            }
+            Ok(IvfCentroids::F32(IvfMatrix {
+                values,
+                rows: num_centroids,
+                dims: 2,
+            }))
+        }
+        fn assign(
+            &self,
+            options: &VectorOptions,
+            vectors: IvfVectors<'_>,
+            centroids: &IvfCentroids,
+        ) -> crate::Result<Vec<u32>> {
+            assert_eq!(options.dim(), 2);
+            let IvfVectors::F32(vectors) = vectors;
+            let IvfCentroids::F32(centroids) = centroids;
+            Ok(vectors
+                .matrix
+                .values
+                .chunks_exact(2)
+                .map(|v| {
+                    let mut best = 0u32;
+                    let mut best_d2 = f32::INFINITY;
+                    for (i, c) in centroids.values.chunks_exact(2).enumerate() {
+                        let dx = v[0] - c[0];
+                        let dy = v[1] - c[1];
+                        let d2 = dx * dx + dy * dy;
+                        if d2 < best_d2 {
+                            best_d2 = d2;
+                            best = i as u32;
+                        }
+                    }
+                    best
+                })
+                .collect())
+        }
+    }
+
+    /// End-to-end Step-6 check: a deliberately imbalanced top-level
+    /// clustering (one ~60-member fat cluster + one 3-member outlier
+    /// cluster) is balanced at merge time. The fat cluster is split below
+    /// the cap and the outlier cluster is dissolved above the floor, with
+    /// every vector preserved and still retrievable.
+    #[test]
+    fn ivf_merge_rebalances_cluster_sizes() -> crate::Result<()> {
+        use std::sync::atomic::AtomicBool;
+
+        const MAX_POSTING: usize = 20;
+        const MIN_POSTING: usize = 5;
+        const NUM_DENSE: usize = 60;
+        const NUM_FAR: usize = 3;
+        let total = NUM_DENSE + NUM_FAR;
+
+        let mut docs: Vec<(String, [f32; 2])> = Vec::new();
+        for i in 0..NUM_DENSE {
+            docs.push((format!("dense-{i}"), [i as f32, 0.0]));
+        }
+        for i in 0..NUM_FAR {
+            docs.push((format!("far-{i}"), [1000.0, 1000.0 + i as f32]));
+        }
+
+        let clusterer = Arc::new(BalancedTestClusterer {
+            centroids: vec![[0.0, 0.0], [1000.0, 1000.0]],
+            max_posting_len: MAX_POSTING,
+            min_posting_len: MIN_POSTING,
+            top_level_done: AtomicBool::new(false),
+        });
+
+        let mut sb = Schema::builder();
+        let embed_field = sb.add_vector_field(
+            "embedding",
+            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let schema = sb.build();
+
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .ivf_clusterer(clusterer)
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        // Two commits so the merge has >= 2 source segments.
+        let mid = docs.len() / 2;
+        for chunk in [&docs[..mid], &docs[mid..]] {
+            for (label, v) in chunk {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(label_field, label);
+                doc.add_vector(embed_field, v.as_slice());
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        let segment_ids: Vec<_> = index.searchable_segment_ids()?.into_iter().collect();
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let searcher = index.reader()?.searcher();
+        assert_eq!(
+            searcher.segment_readers().len(),
+            1,
+            "expected a single merged segment"
+        );
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = VectorReader::open(segment_reader)?;
+        let info = vec_reader.info(embed_field)?.expect("vector info");
+        assert_eq!(info.format, VectorStorageFormat::Ivf);
+        let stats = info.cluster_stats.expect("ivf cluster stats");
+
+        // No vectors lost across the rebalance.
+        assert_eq!(info.num_vectors, total);
+        // Max cap enforced (the dense cloud was a single ~60-member cluster).
+        assert!(
+            stats.max_cluster_size <= MAX_POSTING,
+            "max cluster size {} exceeds cap {MAX_POSTING}",
+            stats.max_cluster_size
+        );
+        // Min floor enforced (the 3-member outlier cluster was dissolved, not
+        // left as an undersized posting).
+        assert!(
+            stats.min_cluster_size >= MIN_POSTING,
+            "min cluster size {} below floor {MIN_POSTING}",
+            stats.min_cluster_size
+        );
+        // Dissolving undersized clusters also clears empties.
+        assert_eq!(stats.empty_clusters, 0);
+        // Splitting the fat cluster added centroids beyond the original 2.
+        assert!(
+            info.num_centroids.unwrap() >= 2,
+            "expected splits to add centroids, got {:?}",
+            info.num_centroids
+        );
+
+        // Every document is still retrievable from its posting.
+        let column = vec_reader.open_column(embed_field)?;
+        for doc_id in 0..total as u32 {
+            assert!(
+                column.contains(doc_id),
+                "doc {doc_id} missing from IVF index after rebalance"
+            );
+        }
+
+        Ok(())
     }
 
     // ---- IVF top_n correctness tests ----

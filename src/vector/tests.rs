@@ -183,6 +183,10 @@ impl IvfClusterer for Grid2DClusterer {
             num_centroids: self.centroids.len().min(total_target_docs),
             training_samples_per_centroid: self.training_samples_per_centroid(),
             assign_batch_size: self.assign_batch_size(),
+            // The grid fixture asserts exact cluster geometry; keep
+            // balancing disabled so the 3×3 grid centroids are used verbatim.
+            max_posting_len: usize::MAX,
+            min_posting_len: 0,
         })
     }
 
