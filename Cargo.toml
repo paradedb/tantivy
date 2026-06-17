@@ -221,3 +221,7 @@ harness = false
 [[bench]]
 name = "term_set_queries"
 harness = false
+
+[[bench]]
+name = "distance"
+harness = false
