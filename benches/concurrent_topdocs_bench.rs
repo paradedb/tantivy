@@ -33,12 +33,12 @@ fn main() {
             }
         });
 
-    // Clustered Index: High BM25 scores are entirely concentrated in segment 0
-    let (_clustered_single, clustered_multi) =
-        build_index(num_docs, num_segments, terms, |seg_ord, _, rng| {
-            // Segment 0 has 8x the density of high score docs (80%) so the overall 
-            // number of high score docs remains equivalent to the uniform index.
-            if seg_ord == 0 && rng.random_bool(0.8) {
+    // Bursty Index: High BM25 scores are distributed across ALL segments, but 
+    // are spatially clustered at the beginning of each segment to test Block-WAND.
+    let (_bursty_single, bursty_multi) =
+        build_index(num_docs, num_segments, terms, |_, doc_id, rng| {
+            let docs_per_segment = (num_docs / num_segments) as u32;
+            if doc_id < docs_per_segment / 10 {
                 (20, 0)
             } else {
                 (1, 20)
@@ -55,7 +55,7 @@ fn main() {
     println!("Starting benchmark in 15 seconds.");
     std::thread::sleep(std::time::Duration::from_secs(15));
 
-    for (dist_name, bench_index) in [("uniform", uniform_multi), ("clustered", clustered_multi)] {
+    for (dist_name, bench_index) in [("uniform", uniform_multi), ("bursty", bursty_multi)] {
         let mut index_multi_thread = bench_index.index.clone();
         index_multi_thread.set_multithread_executor(4).unwrap();
         let searcher_4t = index_multi_thread.reader().unwrap().searcher();
