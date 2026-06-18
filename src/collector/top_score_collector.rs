@@ -522,6 +522,8 @@ pub struct TopNComputer<Score, D, C> {
     pub(crate) segment_ord: SegmentOrdinal,
     #[serde(skip)]
     pub(crate) pruning_threshold: Option<Score>,
+    #[serde(skip)]
+    truncate_count: u32,
 }
 
 // Intermediate struct for TopNComputer for deserialization, to keep vec capacity
@@ -553,6 +555,7 @@ impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D
             shared_threshold: None,
             segment_ord: value.segment_ord,
             pruning_threshold: None,
+            truncate_count: 0,
         }
     }
 }
@@ -583,6 +586,7 @@ impl<Score: Clone, D: Clone, C: Clone> Clone for TopNComputer<Score, D, C> {
             shared_threshold: self.shared_threshold.clone(),
             segment_ord: self.segment_ord,
             pruning_threshold: self.pruning_threshold.clone(),
+            truncate_count: self.truncate_count,
         }
     }
 }
@@ -630,6 +634,7 @@ where
             shared_threshold: None,
             segment_ord: 0,
             pruning_threshold: None,
+            truncate_count: 0,
         }
     }
 
@@ -700,35 +705,55 @@ where
         // Remove all elements below the top_n
         self.buffer.truncate(self.top_n);
 
+        self.truncate_count += 1;
+
         if let Some(shared) = &self.shared_threshold {
-            // We use a Compare-And-Swap (CAS) loop to update the global threshold.
-            // By doing the comparison here, we can use static dispatch for the comparator,
-            // which enables optimal codegen inside the tight pruning loop.
-            let mut current = shared.load();
-            loop {
-                let is_better = if let Some(ref curr) = current {
+            if self.truncate_count % 8 == 0 {
+                // We use a Compare-And-Swap (CAS) loop to update the global threshold.
+                let mut current = shared.load();
+                loop {
+                    let is_better = if let Some(ref curr) = current {
+                        let cmp = self.comparator.compare(&median, &curr.0);
+                        match cmp {
+                            std::cmp::Ordering::Greater => true,
+                            std::cmp::Ordering::Less => false,
+                            std::cmp::Ordering::Equal => self.segment_ord < curr.1,
+                        }
+                    } else {
+                        true
+                    };
+
+                    if !is_better {
+                        self.threshold = current;
+                        break;
+                    }
+                    match shared.try_update(&current, (median.clone(), self.segment_ord)) {
+                        Ok(()) => {
+                            self.threshold = Some((median.clone(), self.segment_ord));
+                            break;
+                        }
+                        Err(actual) => {
+                            current = actual;
+                        }
+                    }
+                }
+            } else {
+                let current = shared.load();
+                let mut adopted = false;
+                if let Some(ref curr) = current {
                     let cmp = self.comparator.compare(&median, &curr.0);
-                    match cmp {
+                    let is_better = match cmp {
                         std::cmp::Ordering::Greater => true,
                         std::cmp::Ordering::Less => false,
                         std::cmp::Ordering::Equal => self.segment_ord < curr.1,
+                    };
+                    if !is_better {
+                        self.threshold = current;
+                        adopted = true;
                     }
-                } else {
-                    true
-                };
-
-                if !is_better {
-                    self.threshold = current;
-                    break;
                 }
-                match shared.try_update(&current, (median.clone(), self.segment_ord)) {
-                    Ok(()) => {
-                        self.threshold = Some((median.clone(), self.segment_ord));
-                        break;
-                    }
-                    Err(actual) => {
-                        current = actual;
-                    }
+                if !adopted {
+                    self.threshold = Some((median, self.segment_ord));
                 }
             }
         } else {
