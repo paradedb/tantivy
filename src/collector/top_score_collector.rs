@@ -621,7 +621,7 @@ where
     /// Create a new `TopNComputer`.
     /// Internally it will allocate a buffer of size `2 * top_n`.
     pub fn new_with_comparator(top_n: usize, comparator: C) -> Self {
-        let vec_cap = top_n.max(1) * 2;
+        let vec_cap = (top_n.max(1) * 2).max(1024);
         TopNComputer {
             buffer: Vec::with_capacity(vec_cap),
             top_n,
