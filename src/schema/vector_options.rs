@@ -62,3 +62,32 @@ impl VectorOptions {
         self.dim * self.dtype.size_bytes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::schema::{Metric, Schema, VectorOptions};
+
+    #[test]
+    fn test_vector_field_schema_round_trip() {
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_vector_field("embedding", VectorOptions::new(128, Metric::Cosine));
+        let schema = schema_builder.build();
+
+        let schema_json = serde_json::to_string_pretty(&schema).unwrap();
+        let expected = r#"[
+  {
+    "name": "embedding",
+    "type": "vector",
+    "options": {
+      "dim": 128,
+      "dtype": "f32",
+      "metric": "cosine"
+    }
+  }
+]"#;
+        assert_eq!(schema_json, expected);
+
+        let deserialized: Schema = serde_json::from_str(expected).unwrap();
+        assert_eq!(schema, deserialized);
+    }
+}
