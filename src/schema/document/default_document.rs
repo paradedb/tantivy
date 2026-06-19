@@ -129,7 +129,8 @@ impl CompactDoc {
     pub fn add_vector<T: VectorElement>(&mut self, field: Field, value: &[T]) {
         let mut bytes = Vec::with_capacity(value.len() * T::SIZE_BYTES);
         for v in value {
-            v.encode_le(&mut bytes);
+            v.encode_le(&mut bytes)
+                .expect("writing to a Vec is infallible");
         }
         self.add_bytes(field, &bytes);
     }

@@ -1,3 +1,5 @@
+use std::io;
+
 use crate::schema::VectorDType;
 
 /// A vector element type with the primitives needed by the storage
@@ -12,7 +14,7 @@ pub trait VectorElement: Copy + Send + Sync + 'static {
     const DTYPE: VectorDType;
     const SIZE_BYTES: usize;
 
-    fn encode_le(&self, buf: &mut Vec<u8>);
+    fn encode_le<W: io::Write + ?Sized>(&self, buf: &mut W) -> io::Result<()>;
 
     /// Decode one element from its little-endian byte representation.
     /// `bytes.len()` must be `SIZE_BYTES`.
@@ -32,8 +34,8 @@ impl VectorElement for f32 {
     const SIZE_BYTES: usize = 4;
 
     #[inline(always)]
-    fn encode_le(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.to_le_bytes());
+    fn encode_le<W: io::Write + ?Sized>(&self, buf: &mut W) -> io::Result<()> {
+        buf.write_all(&self.to_le_bytes())
     }
 
     #[inline(always)]
