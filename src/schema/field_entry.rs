@@ -4,9 +4,8 @@ use super::ip_options::IpAddrOptions;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::{
     is_valid_field_name, DateOptions, FacetOptions, FieldType, JsonObjectOptions, NumericOptions,
-    TextOptions,
+    TextOptions, VectorOptions,
 };
-use crate::vector::VectorOptions;
 
 /// A `FieldEntry` represents a field and its configuration.
 /// `Schema` are a collection of `FieldEntry`

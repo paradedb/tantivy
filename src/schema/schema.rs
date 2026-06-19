@@ -8,7 +8,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::*;
 use crate::json_utils::split_json_path;
-use crate::vector::VectorOptions;
 use crate::TantivyError;
 
 /// Tantivy has a very strict schema.
