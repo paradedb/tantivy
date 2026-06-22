@@ -9,8 +9,8 @@ use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric, VectorColumn,
-    VectorColumnReader, VectorDType, VectorOptions, VectorReader,
+    Assignment, IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric,
+    VectorColumn, VectorColumnReader, VectorDType, VectorOptions, VectorReader,
 };
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
@@ -187,6 +187,9 @@ impl IvfClusterer for Grid2DClusterer {
             // balancing disabled so the 3×3 grid centroids are used verbatim.
             max_posting_len: usize::MAX,
             min_posting_len: 0,
+            max_replicas_per_vector: 0,
+            max_replicas_per_cluster: 0,
+            replica_epsilon: 10.0,
         })
     }
 
@@ -214,7 +217,7 @@ impl IvfClusterer for Grid2DClusterer {
         options: &VectorOptions,
         vectors: IvfVectors<'_>,
         centroids: &IvfCentroids,
-    ) -> crate::Result<Vec<u32>> {
+    ) -> crate::Result<Vec<Assignment>> {
         assert_eq!(options.dim(), grid2d::DIM);
         let IvfVectors::F32(vectors) = vectors;
         let IvfCentroids::F32(centroids) = centroids;
@@ -222,7 +225,11 @@ impl IvfClusterer for Grid2DClusterer {
             .matrix
             .values
             .chunks_exact(vectors.matrix.dims)
-            .map(|vector| grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32)
+            .map(|vector| {
+                Assignment::primary_only(
+                    grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32,
+                )
+            })
             .collect())
     }
 }

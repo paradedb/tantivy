@@ -30,6 +30,16 @@ struct AssignedVector {
     source_doc_id: DocId,
 }
 
+/// A proposed boundary-replication of a vector into a non-primary cluster
+/// (Phase 2). `primary_idx` indexes the vector's primary [`AssignedVector`]
+/// (its source bytes/doc-id are reused for the replica entry); `cluster` is
+/// the trained-centroid id of the replication target, remapped to final ids
+/// after rebalance and then subjected to the per-cluster budget.
+struct ReplicaCandidate {
+    primary_idx: usize,
+    cluster: usize,
+}
+
 /// Safety cap on rebalance passes. Each pass dissolves undersized clusters
 /// then splits oversized ones; a handful of passes converges the size
 /// distribution into `[min_posting_len, max_posting_len]` in practice. The
@@ -75,7 +85,7 @@ fn rebalance_clusters(
     max_posting_len: usize,
     min_posting_len: usize,
     target_posting_len: usize,
-) -> crate::Result<()> {
+) -> crate::Result<Vec<usize>> {
     let dim = opts.dim();
     let mut alive = vec![true; centroids.len()];
 
@@ -135,7 +145,11 @@ fn rebalance_clusters(
         entry.cluster = new_cluster;
     }
     *centroids = compacted;
-    Ok(())
+    // `remap[c]` maps a pre-rebalance centroid id (including the trained-id
+    // prefix that replica candidates reference) to its final compacted id, or
+    // `usize::MAX` if the cluster was dissolved. The driver uses it to
+    // re-point replica candidates onto the final centroid set.
+    Ok(remap)
 }
 
 /// Dissolve clusters with fewer than `min_posting_len` members, reassigning
@@ -220,8 +234,9 @@ fn merge_undersized(
                 chunk.len()
             )));
         }
-        for (&i, &survivor_ord) in chunk.iter().zip(local.iter()) {
-            let survivor_ord = survivor_ord as usize;
+        for (&i, assignment) in chunk.iter().zip(local.iter()) {
+            // Rebalance reassigns primaries only; replicas are ignored here.
+            let survivor_ord = assignment.primary as usize;
             if survivor_ord >= survivors.len() {
                 return Err(TantivyError::InvalidArgument(format!(
                     "IvfClusterer reassigned to survivor {survivor_ord}, but only {} survive",
@@ -334,8 +349,9 @@ fn split_oversized(
             centroids.push(sub_matrix.values[j * dim..(j + 1) * dim].to_vec());
             alive.push(true);
         }
-        for (&i, &sub_ord) in members.iter().zip(local.iter()) {
-            let sub_ord = sub_ord as usize;
+        for (&i, assignment) in members.iter().zip(local.iter()) {
+            // Splitting reassigns primaries only; replicas are ignored here.
+            let sub_ord = assignment.primary as usize;
             if sub_ord >= n_sub {
                 return Err(TantivyError::InvalidArgument(format!(
                     "IvfClusterer split assigned to sub-cluster {sub_ord}, but only {n_sub} exist"
@@ -346,6 +362,73 @@ fn split_oversized(
         changed = true;
     }
     Ok(changed)
+}
+
+/// Phase 2 boundary replication, post-rebalance: re-point each replica
+/// candidate onto the final centroid set, enforce the per-cluster budget, and
+/// append the accepted replicas to `assigned` as extra entries (same source
+/// bytes + doc-id as their primary, but a different target cluster).
+///
+/// A candidate is dropped if its target cluster was dissolved during rebalance
+/// or if it maps to the vector's own primary cluster (which would duplicate
+/// the doc within a single posting and break the reader's within-cluster
+/// binary search). Per target cluster, when candidates exceed
+/// `max_replicas_per_cluster` the nearest (highest-similarity) ones are kept.
+fn append_replicas(
+    opts: &VectorOptions,
+    columns: &[VectorColumn],
+    centroids: &[Vec<f32>],
+    assigned: &mut Vec<AssignedVector>,
+    candidates: &[ReplicaCandidate],
+    remap: &[usize],
+    max_replicas_per_cluster: usize,
+) -> crate::Result<()> {
+    let dim = opts.dim();
+    let metric = opts.metric();
+    // Per final cluster: (primary_idx, similarity-to-this-cluster). Higher
+    // similarity == nearer (Metric is "higher is better").
+    let mut by_cluster: Vec<Vec<(usize, f32)>> = vec![Vec::new(); centroids.len()];
+    for cand in candidates {
+        let final_cluster = remap[cand.cluster];
+        if final_cluster == usize::MAX {
+            continue; // replication target dissolved during rebalance
+        }
+        let primary = &assigned[cand.primary_idx];
+        if final_cluster == primary.cluster {
+            continue; // would duplicate the doc inside its own primary cluster
+        }
+        let vector = decode_source_vector(columns, primary, dim)?;
+        let similarity = metric.similarity(&vector, &centroids[final_cluster]);
+        by_cluster[final_cluster].push((cand.primary_idx, similarity));
+    }
+
+    for (final_cluster, mut cands) in by_cluster.into_iter().enumerate() {
+        if cands.is_empty() {
+            continue;
+        }
+        if max_replicas_per_cluster > 0 && cands.len() > max_replicas_per_cluster {
+            // Distance-ranked acceptance: keep the nearest budget-many.
+            cands.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            cands.truncate(max_replicas_per_cluster);
+        }
+        for (primary_idx, _similarity) in cands {
+            let (target_doc_id, source_segment_ord, source_doc_id) = {
+                let primary = &assigned[primary_idx];
+                (
+                    primary.target_doc_id,
+                    primary.source_segment_ord,
+                    primary.source_doc_id,
+                )
+            };
+            assigned.push(AssignedVector {
+                cluster: final_cluster,
+                target_doc_id,
+                source_segment_ord,
+                source_doc_id,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn merge_ivf(
@@ -513,6 +596,10 @@ pub(crate) fn merge_ivf(
                     .collect();
 
                 let mut assigned_vectors = Vec::with_capacity(vector_count);
+                // Phase 2 replica candidates accumulated across assign batches
+                // (empty unless the clusterer proposes replicas, i.e. unless
+                // max_replicas_per_vector > 0). Empty => byte-identical to Phase 1.
+                let mut replica_candidates: Vec<ReplicaCandidate> = Vec::new();
                 let mut target_doc_id: DocId = 0;
                 {
                     let mut batch_values = Vec::with_capacity(
@@ -550,22 +637,32 @@ pub(crate) fn merge_ivf(
                                     batch_len
                                 )));
                             }
-                            for (cluster, (target_doc_id, source_segment_ord, source_doc_id)) in
+                            for (assignment, (target_doc_id, source_segment_ord, source_doc_id)) in
                                 clusters.into_iter().zip(batch_sources.drain(..))
                             {
-                                let cluster = cluster as usize;
+                                let cluster = assignment.primary as usize;
                                 if cluster >= num_centroids {
                                     return Err(TantivyError::InvalidArgument(format!(
                                         "IvfClusterer assigned vector to cluster {cluster}, but \
                                          only {num_centroids} centroids were trained"
                                     )));
                                 }
+                                let primary_idx = assigned_vectors.len();
                                 assigned_vectors.push(AssignedVector {
                                     cluster,
                                     target_doc_id,
                                     source_segment_ord,
                                     source_doc_id,
                                 });
+                                // Phase 2: stash this vector's replica candidates
+                                // (trained-centroid ids) against the primary entry;
+                                // the per-cluster budget is enforced after rebalance.
+                                for &replica_cluster in &assignment.replicas {
+                                    replica_candidates.push(ReplicaCandidate {
+                                        primary_idx,
+                                        cluster: replica_cluster as usize,
+                                    });
+                                }
                             }
                             batch_values.clear();
                             batch_doc_ids.clear();
@@ -598,11 +695,15 @@ pub(crate) fn merge_ivf(
 
                 // ---- Phase 1: balance enforcement on PRIMARY membership ----
                 // Dissolve undersized clusters (lifts the min off 1) and split
-                // oversized ones (caps the max). Boundary replication and the
-                // per-cluster radius are Phase 2; the entry-based write path
-                // below already tolerates more than one entry per vector, so
-                // Phase 2 only appends entries without restructuring this code.
-                if settings.max_posting_len != usize::MAX || settings.min_posting_len != 0 {
+                // oversized ones (caps the max). Operates on PRIMARY membership
+                // only; boundary replicas (Phase 2) are appended afterwards and
+                // never count against the split threshold. `rebalance_clusters`
+                // returns the centroid-id remap so the replica candidates
+                // (captured against trained ids) can be re-pointed onto the
+                // final centroid set.
+                let remap: Vec<usize> = if settings.max_posting_len != usize::MAX
+                    || settings.min_posting_len != 0
+                {
                     // Natural target posting length ≈ mean cluster size
                     // (≈ 1/centroid_ratio); splits aim sub-clusters here.
                     let target_posting_len = (vector_count / num_centroids)
@@ -611,13 +712,12 @@ pub(crate) fn merge_ivf(
                     if matches!(opts.metric(), Metric::Dot) {
                         // NOTE(metric soundness): Dot has no triangle
                         // inequality and is clustered from raw, unnormalized
-                        // magnitudes, so both the Euclidean balanced split
-                        // (clusterer.train) and the nearest-centroid
-                        // reassignment are geometrically unsound for Dot.
-                        // Phase 1 leaves the query path untouched, but this
-                        // MUST be resolved (normalize, or skip rebalance and
-                        // replication for Dot) before Phase 2. It is NOT
-                        // silently treated as L2.
+                        // magnitudes, so the Euclidean balanced split, the
+                        // nearest-centroid reassignment, AND the Phase-2 ε₁
+                        // replica gate are all geometrically questionable for
+                        // Dot. The clusterer sets `angular=true` for Dot;
+                        // replicas follow that same treatment. NOT silently
+                        // treated as L2 — flagged, still unresolved.
                     }
                     rebalance_clusters(
                         ctx.cancel,
@@ -630,19 +730,39 @@ pub(crate) fn merge_ivf(
                         settings.max_posting_len,
                         settings.min_posting_len,
                         target_posting_len,
-                    )?;
-                }
+                    )?
+                } else {
+                    // Balancing disabled: centroids unchanged, identity remap.
+                    (0..centroid_rows.len()).collect()
+                };
 
                 // Rebalance may have changed the centroid count.
                 let num_centroids = centroid_rows.len();
 
-                // radius: the per-cluster radius would be computed HERE, over
-                // the FINAL primary membership. MUST move to after replication
-                // in Phase 2 — boundary replicas are the farthest cluster
-                // members and define r_c, so a radius computed pre-replication
-                // under-covers the stored replicas and the query-time
-                // termination bound would prune clusters that actually hold
-                // them (silent recall loss).
+                // ---- Phase 2: boundary replication ----
+                // Re-point each replica candidate onto the final centroid set,
+                // enforce the per-cluster budget (distance-ranked acceptance),
+                // and append the survivors as extra `(vector, cluster)` entries.
+                // Skipped entirely when replication is off (no candidates), so
+                // the write below stays byte-identical to Phase 1.
+                if settings.max_replicas_per_vector > 0 && !replica_candidates.is_empty() {
+                    append_replicas(
+                        opts,
+                        &columns,
+                        &centroid_rows,
+                        &mut assigned_vectors,
+                        &replica_candidates,
+                        &remap,
+                        settings.max_replicas_per_cluster,
+                    )?;
+                }
+
+                // radius: per-cluster radius is computed HERE — AFTER replication,
+                // over FINAL membership (primaries + accepted replicas). Boundary
+                // replicas are the farthest members and define r_c, so computing
+                // before replication would under-cover stored vectors. No meta
+                // field persists radius yet; this is the persist point that will
+                // feed the future radius-bound termination. (stub)
 
                 let mut cluster_counts = vec![0usize; num_centroids];
                 for assigned_vector in &assigned_vectors {

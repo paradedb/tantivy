@@ -1,5 +1,34 @@
+use smallvec::SmallVec;
+
 use crate::vector::options::{VectorElement, VectorOptions};
 use crate::{DocId, TantivyError};
+
+/// Per-vector cluster assignment produced by [`IvfClusterer::assign`].
+///
+/// `primary` is the single cluster the vector's bytes are stored in (the
+/// nearest centroid). `replicas` are additional boundary-replication
+/// CANDIDATES — clusters the vector also lies close to (Phase 2). Most
+/// vectors are interior and carry zero replicas, so the inline `SmallVec`
+/// keeps the common case allocation-free. The replica list is only a
+/// proposal; the merge driver enforces the global per-cluster replica
+/// budget before any are written.
+#[derive(Clone, Debug)]
+pub struct Assignment {
+    pub primary: u32,
+    pub replicas: SmallVec<[u32; 8]>,
+}
+
+impl Assignment {
+    /// A primary-only assignment with no replica candidates — the Phase-1
+    /// shape. Used by clusterers that don't replicate (and by the rebalance
+    /// reassignment paths, which never replicate).
+    pub fn primary_only(primary: u32) -> Self {
+        Self {
+            primary,
+            replicas: SmallVec::new(),
+        }
+    }
+}
 
 pub trait IvfClusterer: Send + Sync + 'static {
     fn centroid_ratio(&self) -> f32;
@@ -18,7 +47,7 @@ pub trait IvfClusterer: Send + Sync + 'static {
         options: &VectorOptions,
         vectors: IvfVectors<'_>,
         centroids: &IvfCentroids,
-    ) -> crate::Result<Vec<u32>>;
+    ) -> crate::Result<Vec<Assignment>>;
 
     fn assign_batch_size(&self) -> usize {
         2048
@@ -65,6 +94,12 @@ pub trait IvfClusterer: Send + Sync + 'static {
             assign_batch_size,
             max_posting_len,
             min_posting_len,
+            // Boundary replication is OFF by default — the default path is
+            // Phase-1 (primary-only) behavior. A clusterer opts in by
+            // overriding `merge_settings` with `max_replicas_per_vector > 0`.
+            max_replicas_per_vector: 0,
+            max_replicas_per_cluster: (max_posting_len / 2).max(1),
+            replica_epsilon: DEFAULT_REPLICA_EPSILON,
         })
     }
 }
@@ -75,6 +110,9 @@ const MAX_POSTING_FACTOR: usize = 2;
 /// Dissolve clusters whose primary membership falls below `1 /
 /// MIN_POSTING_DIVISOR ×` the mean posting length. Provisional.
 const MIN_POSTING_DIVISOR: usize = 2;
+/// Default ε₁ closure factor: a vector replicates to every centroid within
+/// `replica_epsilon × dist(v, nearest)`. Provisional — see Phase 2 brief.
+const DEFAULT_REPLICA_EPSILON: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct IvfMergeSettings {
@@ -89,6 +127,19 @@ pub struct IvfMergeSettings {
     /// any cluster below this and reassigns its members to the nearest
     /// surviving centroid. `0` disables merging.
     pub min_posting_len: usize,
+    /// Max clusters a single boundary vector may be replicated into, beyond
+    /// its primary. `0` disables replication entirely (Phase-1 behavior) —
+    /// the isolation knob: with this `0`, the merge produces byte-identical
+    /// output to Phase 1.
+    pub max_replicas_per_vector: usize,
+    /// Per-cluster replica budget: a cluster accepts at most this many
+    /// replica vectors from neighbors (distance-ranked; nearest kept).
+    /// Replicas count ONLY against this budget, never the split threshold.
+    pub max_replicas_per_cluster: usize,
+    /// ε₁ closure factor for replica candidacy: a vector is a replica
+    /// candidate for centroid `c` when `dist(v, c) <= replica_epsilon ×
+    /// dist(v, nearest)`.
+    pub replica_epsilon: f32,
 }
 
 #[derive(Clone, Debug)]

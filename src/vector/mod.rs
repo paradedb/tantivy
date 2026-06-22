@@ -29,8 +29,8 @@ pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
 pub use flat::{FlatVecReader, FlatVecWriter, FlatVectorColumn};
 pub use ivf::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
-    IvfVectors,
+    Assignment, IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
+    IvfVectorBatch, IvfVectors,
 };
 pub use meta::VectorStorageFormat;
 pub use options::{Metric, VectorDType, VectorElement, VectorOptions};

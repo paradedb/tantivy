@@ -274,6 +274,7 @@ impl<T: VectorElement> IvfBackend<T> {
             &filter,
             alive,
             top_n,
+            max_doc,
             stats,
         )?;
 
@@ -335,6 +336,7 @@ impl<T: VectorElement> IvfBackend<T> {
         filter: &BitSet,
         alive: Option<&AliveBitSet>,
         top_n: usize,
+        max_doc: DocId,
         mut stats: Option<&mut ProbeStats>,
     ) -> crate::Result<TopNComputer<Score, DocId, NaturalComparator>> {
         let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
@@ -342,6 +344,14 @@ impl<T: VectorElement> IvfBackend<T> {
             NaturalComparator,
         );
         let mut candidates = 0usize;
+        // Phase 2 (boundary replication): a single doc can be physically
+        // present in several clusters, so probing more than one of them would
+        // score the same doc repeatedly. Track scored docs and skip repeats —
+        // not just for correct counts, but because a duplicate pushed into the
+        // top-K heap can evict a legitimately-distinct result (a post-pass over
+        // the final heap can't recover that). Costs one doc-id bitset, like the
+        // filter; a no-replica index simply never hits a repeat.
+        let mut seen = BitSet::with_max_value(max_doc);
 
         for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
             if probe_count >= max_probe_count {
@@ -376,6 +386,10 @@ impl<T: VectorElement> IvfBackend<T> {
                         continue;
                     }
                 }
+                if seen.contains(doc) {
+                    continue; // already scored from an earlier probed cluster (a replica)
+                }
+                seen.insert(doc);
                 let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
                 let score = self.query.score_doc_bytes(vbytes);
                 topn.push_unordered(score, doc);
@@ -518,7 +532,8 @@ mod tests {
     use crate::vector::meta::VectorStorageFormat;
     use crate::vector::tests::TestVectorIndex;
     use crate::vector::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, VectorColumn,
+        Assignment, IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors,
+        VectorColumn,
         VectorColumnReader, VectorDType, VectorOptions, VectorReader,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
@@ -617,6 +632,9 @@ mod tests {
                 // verbatim.
                 max_posting_len: usize::MAX,
                 min_posting_len: 0,
+                max_replicas_per_vector: 0,
+                max_replicas_per_cluster: 0,
+                replica_epsilon: 10.0,
             })
         }
         fn train(
@@ -642,7 +660,7 @@ mod tests {
             options: &VectorOptions,
             vectors: IvfVectors<'_>,
             centroids: &IvfCentroids,
-        ) -> crate::Result<Vec<u32>> {
+        ) -> crate::Result<Vec<Assignment>> {
             assert_eq!(options.dim(), 2);
             let IvfVectors::F32(vectors) = vectors;
             let IvfCentroids::F32(centroids) = centroids;
@@ -662,7 +680,7 @@ mod tests {
                             best_d2 = d2;
                         }
                     }
-                    best
+                    Assignment::primary_only(best)
                 })
                 .collect())
         }
@@ -747,6 +765,9 @@ mod tests {
                 assign_batch_size: self.assign_batch_size(),
                 max_posting_len: self.max_posting_len,
                 min_posting_len: self.min_posting_len,
+                max_replicas_per_vector: 0,
+                max_replicas_per_cluster: 0,
+                replica_epsilon: 10.0,
             })
         }
         fn train(
@@ -791,7 +812,7 @@ mod tests {
             options: &VectorOptions,
             vectors: IvfVectors<'_>,
             centroids: &IvfCentroids,
-        ) -> crate::Result<Vec<u32>> {
+        ) -> crate::Result<Vec<Assignment>> {
             assert_eq!(options.dim(), 2);
             let IvfVectors::F32(vectors) = vectors;
             let IvfCentroids::F32(centroids) = centroids;
@@ -811,7 +832,7 @@ mod tests {
                             best = i as u32;
                         }
                     }
-                    best
+                    Assignment::primary_only(best)
                 })
                 .collect())
         }
@@ -926,6 +947,216 @@ mod tests {
                 "doc {doc_id} missing from IVF index after rebalance"
             );
         }
+
+        Ok(())
+    }
+
+    // ---- Phase 2: boundary replication ----
+
+    /// Test clusterer that replicates near-equidistant boundary vectors. The
+    /// primary is the nearest centroid; any other centroid within
+    /// `epsilon × dist(nearest)` becomes a replica candidate (capped at
+    /// `max_replicas_per_vector`). Balancing is disabled so the clusters stay
+    /// exactly as trained, isolating the replication behavior.
+    struct ReplicatingClusterer {
+        centroids: Vec<[f32; 2]>,
+        epsilon: f32,
+        max_replicas_per_vector: usize,
+    }
+
+    impl IvfClusterer for ReplicatingClusterer {
+        fn centroid_ratio(&self) -> f32 {
+            1.0
+        }
+        fn training_samples_per_centroid(&self) -> usize {
+            2
+        }
+        fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
+            Ok(IvfMergeSettings {
+                num_centroids: self.centroids.len().min(total_target_docs),
+                training_samples_per_centroid: self.training_samples_per_centroid(),
+                assign_batch_size: self.assign_batch_size(),
+                max_posting_len: usize::MAX, // no split — keep the trained clusters
+                min_posting_len: 0,          // no merge
+                max_replicas_per_vector: self.max_replicas_per_vector,
+                max_replicas_per_cluster: 10,
+                replica_epsilon: self.epsilon,
+            })
+        }
+        fn train(
+            &self,
+            options: &VectorOptions,
+            _vectors: IvfVectors<'_>,
+            num_centroids: usize,
+        ) -> crate::Result<IvfCentroids> {
+            assert_eq!(options.dim(), 2);
+            Ok(IvfCentroids::F32(IvfMatrix {
+                values: self
+                    .centroids
+                    .iter()
+                    .take(num_centroids)
+                    .flat_map(|c| c.iter().copied())
+                    .collect(),
+                rows: num_centroids,
+                dims: 2,
+            }))
+        }
+        fn assign(
+            &self,
+            options: &VectorOptions,
+            vectors: IvfVectors<'_>,
+            centroids: &IvfCentroids,
+        ) -> crate::Result<Vec<Assignment>> {
+            assert_eq!(options.dim(), 2);
+            let IvfVectors::F32(vectors) = vectors;
+            let IvfCentroids::F32(centroids) = centroids;
+            Ok(vectors
+                .matrix
+                .values
+                .chunks_exact(2)
+                .map(|v| {
+                    let mut dists: Vec<(f32, u32)> = centroids
+                        .values
+                        .chunks_exact(2)
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let dx = v[0] - c[0];
+                            let dy = v[1] - c[1];
+                            (dx * dx + dy * dy, i as u32)
+                        })
+                        .collect();
+                    dists.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let nearest = dists[0].0.sqrt();
+                    let mut assignment = Assignment::primary_only(dists[0].1);
+                    for &(d2, c) in dists[1..].iter() {
+                        if assignment.replicas.len() >= self.max_replicas_per_vector {
+                            break;
+                        }
+                        if self.max_replicas_per_vector > 0 && d2.sqrt() <= self.epsilon * nearest {
+                            assignment.replicas.push(c);
+                        }
+                    }
+                    assignment
+                })
+                .collect())
+        }
+    }
+
+    /// A boundary vector equidistant from two centroids must be physically
+    /// stored in BOTH clusters (one replica), yet a probe of both clusters
+    /// must return it exactly once (Step 7 dedup).
+    #[test]
+    fn ivf_replication_places_boundary_vector_in_two_clusters() -> crate::Result<()> {
+        // Interior docs near A=[0,0] and B=[10,0], plus one boundary doc at the
+        // midpoint [5,0] equidistant from both.
+        let mut docs: Vec<(String, [f32; 2])> = Vec::new();
+        for i in 0..5 {
+            docs.push((format!("a-{i}"), [i as f32, 0.0]));
+        }
+        for i in 0..5 {
+            docs.push((format!("b-{i}"), [(10 - i) as f32, 0.0]));
+        }
+        docs.push(("boundary".to_string(), [5.0, 0.0]));
+        let total = docs.len();
+
+        // ε = 1.2: the midpoint [5,0] (ratio 1.0) replicates; the next-closest
+        // interior docs [4,0]/[6,0] (ratio 1.5) do not.
+        let clusterer = Arc::new(ReplicatingClusterer {
+            centroids: vec![[0.0, 0.0], [10.0, 0.0]],
+            epsilon: 1.2,
+            max_replicas_per_vector: 1,
+        });
+
+        let mut sb = Schema::builder();
+        let embed_field = sb.add_vector_field(
+            "embedding",
+            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .ivf_clusterer(clusterer)
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let mid = docs.len() / 2;
+        for chunk in [&docs[..mid], &docs[mid..]] {
+            for (label, v) in chunk {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(label_field, label);
+                doc.add_vector(embed_field, v.as_slice());
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        let segment_ids: Vec<_> = index.searchable_segment_ids()?.into_iter().collect();
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = VectorReader::open(segment_reader)?;
+        let info = vec_reader.info(embed_field)?.expect("vector info");
+        assert_eq!(info.format, VectorStorageFormat::Ivf);
+
+        // Exactly one replica appended: stored entries = docs + 1.
+        assert_eq!(
+            info.num_vectors,
+            total + 1,
+            "expected one boundary replica beyond the {total} primaries"
+        );
+        assert_eq!(info.num_centroids, Some(2), "no rebalance: two clusters");
+
+        // The boundary doc is the only doc-id present in BOTH clusters.
+        let column = match vec_reader.open_column(embed_field)? {
+            VectorColumn::Ivf(column) => column,
+            VectorColumn::Flat(_) => panic!("expected IVF column"),
+        };
+        let cluster0: std::collections::HashSet<DocId> = column
+            .cluster_doc_ids(0)?
+            .expect("cluster 0")
+            .iter()
+            .copied()
+            .collect();
+        let in_both: Vec<DocId> = column
+            .cluster_doc_ids(1)?
+            .expect("cluster 1")
+            .iter()
+            .copied()
+            .filter(|d| cluster0.contains(d))
+            .collect();
+        assert_eq!(
+            in_both.len(),
+            1,
+            "exactly one (boundary) doc should be replicated into both clusters, got {in_both:?}"
+        );
+
+        // Probing BOTH clusters must return each doc exactly once — the
+        // replicated boundary doc must not appear twice (Step 7 dedup).
+        let params = exhaustive_params(2);
+        let hits = search(
+            &index,
+            embed_field,
+            &AllQuery,
+            vec![5.0_f32, 0.0],
+            total,
+            params,
+        )?;
+        let mut doc_ids: Vec<u32> = hits.iter().map(|(_, addr)| addr.doc_id).collect();
+        let unique: std::collections::HashSet<u32> = doc_ids.iter().copied().collect();
+        assert_eq!(
+            doc_ids.len(),
+            unique.len(),
+            "duplicate doc-ids in top-K from a replicated doc: {doc_ids:?}"
+        );
+        doc_ids.sort_unstable();
+        assert_eq!(doc_ids.len(), total, "all primaries retrievable, deduped");
 
         Ok(())
     }
