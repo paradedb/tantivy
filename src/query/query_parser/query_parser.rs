@@ -533,6 +533,10 @@ impl QueryParser {
             FieldType::Custom(_) => {
                 unreachable!("the query parser does not support custom field types")
             }
+            FieldType::Vector(_) => Err(QueryParserError::UnsupportedQuery(format!(
+                "Vector field {:?} cannot be queried via the query parser.",
+                field_entry.name()
+            ))),
         }
     }
 
@@ -638,6 +642,9 @@ impl QueryParser {
             FieldType::Custom(_) => {
                 unreachable!("the query parser does not support custom field types")
             }
+            FieldType::Vector(_) => Err(QueryParserError::UnsupportedQuery(format!(
+                "Vector field {field_name:?} cannot be queried via the query parser."
+            ))),
         }
     }
 

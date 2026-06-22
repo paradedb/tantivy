@@ -392,6 +392,9 @@ impl InvertedIndexPluginWriter {
                 FieldType::Custom(_) => {
                     unreachable!("the inverted index does not support custom field types")
                 }
+                FieldType::Vector(_) => {
+                    unreachable!("is_indexed is not supposed to be true for vector fields")
+                }
             }
         }
         self.max_doc = doc_id + 1;

@@ -15,7 +15,7 @@ use crate::schema::custom_options::CustomOptions;
 use crate::schema::facet_options::FacetOptions;
 use crate::schema::{
     DateOptions, Facet, IndexRecordOption, JsonObjectOptions, NumericOptions, OwnedValue,
-    TextFieldIndexing, TextOptions,
+    TextFieldIndexing, TextOptions, VectorOptions,
 };
 use crate::time::format_description::well_known::Rfc3339;
 use crate::time::OffsetDateTime;
@@ -36,6 +36,8 @@ pub enum ValueParsingError {
         expected: &'static str,
         json: serde_json::Value,
     },
+    #[error("Vector fields cannot be parsed from JSON yet, got {json}")]
+    VectorFromJson { json: serde_json::Value },
     #[error("Parse  error on {json}: {error}")]
     ParseError {
         error: String,
@@ -85,6 +87,8 @@ pub enum Type {
     ///
     /// [`CustomOptions`]: crate::schema::CustomOptions
     Custom = b'c',
+    /// Fixed-dim float vector. Stored by the brute-force vector plugin.
+    Vector = b'v',
 }
 
 impl From<ColumnType> for Type {
@@ -102,7 +106,7 @@ impl From<ColumnType> for Type {
     }
 }
 
-const ALL_TYPES: [Type; 11] = [
+const ALL_TYPES: [Type; 12] = [
     Type::Str,
     Type::U64,
     Type::I64,
@@ -114,6 +118,7 @@ const ALL_TYPES: [Type; 11] = [
     Type::Json,
     Type::IpAddr,
     Type::Custom,
+    Type::Vector,
 ];
 
 impl Type {
@@ -155,6 +160,7 @@ impl Type {
             Type::Json => "Json",
             Type::IpAddr => "IpAddr",
             Type::Custom => "Custom",
+            Type::Vector => "Vector",
         }
     }
 
@@ -174,6 +180,7 @@ impl Type {
             b'j' => Some(Type::Json),
             b'p' => Some(Type::IpAddr),
             b'c' => Some(Type::Custom),
+            b'v' => Some(Type::Vector),
             _ => None,
         }
     }
@@ -210,6 +217,8 @@ pub enum FieldType {
     /// [`add_custom`](crate::TantivyDocument::add_custom) and consumed by a
     /// [`SegmentPlugin`](crate::SegmentPlugin).
     Custom(CustomOptions),
+    /// Fixed-dim float vector. Backed by the brute-force vector plugin.
+    Vector(VectorOptions),
 }
 
 impl FieldType {
@@ -227,6 +236,7 @@ impl FieldType {
             FieldType::JsonObject(_) => Type::Json,
             FieldType::IpAddr(_) => Type::IpAddr,
             FieldType::Custom(_) => Type::Custom,
+            FieldType::Vector(_) => Type::Vector,
         }
     }
 
@@ -274,6 +284,7 @@ impl FieldType {
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_indexed(),
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_indexed(),
             FieldType::Custom(_) => false,
+            FieldType::Vector(_) => false,
         }
     }
 
@@ -288,6 +299,7 @@ impl FieldType {
             FieldType::JsonObject(json_object_options) => json_object_options
                 .get_text_indexing_options()
                 .map(|text_indexing| text_indexing.index_option()),
+            FieldType::Vector(_) => None,
             field_type => {
                 if field_type.is_indexed() {
                     Some(IndexRecordOption::Basic)
@@ -325,6 +337,7 @@ impl FieldType {
             FieldType::Facet(_) => true,
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_fast(),
             FieldType::Custom(_) => false,
+            FieldType::Vector(_) => false,
         }
     }
 
@@ -345,6 +358,7 @@ impl FieldType {
             FieldType::JsonObject(ref _json_object_options) => false,
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.fieldnorms(),
             FieldType::Custom(_) => false,
+            FieldType::Vector(_) => false,
         }
     }
 
@@ -397,6 +411,7 @@ impl FieldType {
                 }
             }
             FieldType::Custom(_) => None,
+            FieldType::Vector(_) => None,
         }
     }
 
@@ -500,6 +515,9 @@ impl FieldType {
                     Ok(OwnedValue::IpAddr(ip_addr.into_ipv6_addr()))
                 }
                 FieldType::Custom(_) => Err(custom_not_json_error(JsonValue::String(field_text))),
+                FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
+                    json: JsonValue::String(field_text),
+                }),
             },
             JsonValue::Number(field_val_num) => match self {
                 FieldType::I64(_) | FieldType::Date(_) => {
@@ -561,6 +579,9 @@ impl FieldType {
                 FieldType::Custom(_) => {
                     Err(custom_not_json_error(JsonValue::Number(field_val_num)))
                 }
+                FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
+                    json: JsonValue::Number(field_val_num),
+                }),
             },
             JsonValue::Object(json_map) => match self {
                 FieldType::Str(_) => {
@@ -576,6 +597,9 @@ impl FieldType {
                     }
                 }
                 FieldType::JsonObject(_) => Ok(OwnedValue::from(json_map)),
+                FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
+                    json: JsonValue::Object(json_map),
+                }),
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Object(json_map),
@@ -593,6 +617,9 @@ impl FieldType {
                         })
                     }
                 }
+                FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
+                    json: JsonValue::Bool(json_bool_val),
+                }),
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Bool(json_bool_val),
@@ -610,11 +637,17 @@ impl FieldType {
                         })
                     }
                 }
+                FieldType::Vector(_) => Err(ValueParsingError::VectorFromJson {
+                    json: JsonValue::Null,
+                }),
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Null,
                 }),
             },
+            _ if matches!(self, FieldType::Vector(_)) => {
+                Err(ValueParsingError::VectorFromJson { json: json.clone() })
+            }
             _ => Err(ValueParsingError::TypeError {
                 expected: self.value_type().name(),
                 json: json.clone(),

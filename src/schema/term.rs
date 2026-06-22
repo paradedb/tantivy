@@ -531,6 +531,9 @@ where B: AsRef<[u8]>
             }
             // Custom fields produce no terms, so no term ever carries this type.
             Type::Custom => unreachable!("the term does not support custom field types"),
+            Type::Vector => {
+                write!(f, "<vector>")?;
+            }
         }
         Ok(())
     }
