@@ -12,6 +12,7 @@ use super::id_map::IdMap;
 use crate::directory::CompositeFile;
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
+use crate::vector::header::read_header;
 use crate::vector::reader::VectorColumnReader;
 use crate::vector::VEC_EXT;
 use crate::{DocId, SegmentReader, TantivyError};
@@ -33,8 +34,9 @@ impl FlatVecReader {
         }
         let file_slice =
             segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
+        let (_version, body) = read_header(&file_slice)?;
         Ok(Self {
-            composite: CompositeFile::open(&file_slice)?,
+            composite: CompositeFile::open(&body)?,
             field_options,
             max_doc: segment_reader.max_doc(),
         })

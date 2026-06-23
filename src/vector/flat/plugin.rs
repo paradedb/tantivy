@@ -13,6 +13,7 @@ use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::FieldType;
+use crate::vector::header::write_header;
 use crate::vector::reader::{VectorColumnReader, VectorReader};
 use crate::vector::VEC_EXT;
 use crate::DocId;
@@ -36,7 +37,8 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     let path = ctx
         .target_segment
         .relative_path(SegmentComponent::Custom(VEC_EXT.to_string()));
-    let write = ctx.target_segment.index().directory().open_write(&path)?;
+    let mut write = ctx.target_segment.index().directory().open_write(&path)?;
+    write_header(&mut write)?;
     let source_readers: Vec<VectorReader> = ctx
         .readers
         .iter()

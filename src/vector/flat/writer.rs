@@ -9,6 +9,7 @@ use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{TantivyDocument, Value};
 use crate::schema::{Field, FieldType, Schema};
+use crate::vector::header::write_header;
 use crate::vector::VEC_EXT;
 use crate::{DocId, TantivyError};
 
@@ -117,7 +118,8 @@ impl PluginWriter for FlatVecWriter {
         if self.fields.is_empty() {
             return Ok(());
         }
-        let write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
+        let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
+        write_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
 
         for (field, buf) in &self.fields {

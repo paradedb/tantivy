@@ -13,6 +13,7 @@ use crate::schema::VectorDType;
 mod backend;
 mod collector;
 mod distance;
+mod header;
 mod plugin;
 mod reader;
 
