@@ -18,9 +18,6 @@ mod reader;
 
 pub mod flat;
 
-/// Extension of the unified per-segment vector file (vectors + row→doc_id map).
-/// Both the flat and IVF backends write this; the on-disk `IdMap` header makes
-/// the storage mode self-describing, so there is no separate metadata file.
 pub(crate) const VEC_EXT: &str = "vec";
 
 pub use backend::VectorBackend;
