@@ -319,6 +319,10 @@ mod tests {
         fn score(&mut self) -> Score {
             self.foo.get(self.cursor).map(|x| x.1).unwrap_or(0.0)
         }
+
+        fn set_threshold(&mut self, _score: Score) {
+            unimplemented!();
+        }
     }
 
     #[test]

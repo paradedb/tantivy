@@ -147,71 +147,18 @@ fn advance_all_scorers_on_pivot(term_scorers: &mut Vec<TermScorerWithMaxScore>, 
 /// Link: <http://engineering.nyu.edu/~suel/papers/bmw.pdf>
 pub fn block_wand(
     mut scorers: Vec<TermScorer>,
-    mut threshold: Score,
+    threshold: Score,
     callback: &mut dyn FnMut(u32, Score) -> Score,
 ) {
-    scorers.retain(|scorer| scorer.doc() < TERMINATED);
     if scorers.len() == 1 {
         let scorer = scorers.pop().unwrap();
         return block_wand_single_scorer(scorer, threshold, callback);
     }
-    let mut scorers: Vec<TermScorerWithMaxScore> = scorers
-        .iter_mut()
-        .map(TermScorerWithMaxScore::from)
-        .collect();
-    // At this point we need to ensure that the scorers are sorted!
-    scorers.sort_by_key(|scorer| scorer.doc());
-    while let Some((before_pivot_len, pivot_len, pivot_doc)) =
-        find_pivot_doc(&scorers[..], threshold)
-    {
-        debug_assert!(scorers.iter().map(|scorer| scorer.doc()).is_sorted());
-        debug_assert_ne!(pivot_doc, TERMINATED);
-        debug_assert!(before_pivot_len < pivot_len);
-
-        let block_max_score_upperbound: Score = scorers[..pivot_len]
-            .iter_mut()
-            .map(|scorer| {
-                scorer.seek_block(pivot_doc);
-                scorer.block_max_score()
-            })
-            .sum();
-
-        // Beware after shallow advance, skip readers can be in advance compared to
-        // the segment posting lists.
-        //
-        // `block_segment_postings.load_block()` need to be called separately.
-        if block_max_score_upperbound <= threshold {
-            // Block max condition was not reached
-            // We could get away by simply advancing the scorers to DocId + 1 but it would
-            // be inefficient. The optimization requires proper explanation and was
-            // isolated in a different function.
-            block_max_was_too_low_advance_one_scorer(&mut scorers, pivot_len);
-            continue;
-        }
-
-        // Block max condition is observed.
-        //
-        // Let's try and advance all scorers before the pivot to the pivot.
-        if !align_scorers(&mut scorers, pivot_doc, before_pivot_len) {
-            // At least of the scorer does not contain the pivot.
-            //
-            // Let's stop scoring this pivot and go through the pivot selection again.
-            // Note that the current pivot is not necessarily a bad candidate and it
-            // may be picked again.
-            continue;
-        }
-
-        // At this point, all scorers are positioned on the doc.
-        let score = scorers[..pivot_len]
-            .iter_mut()
-            .map(|scorer| scorer.score())
-            .sum();
-
-        if score > threshold {
-            threshold = callback(pivot_doc, score);
-        }
-        // let's advance all of the scorers that are currently positioned on the pivot.
-        advance_all_scorers_on_pivot(&mut scorers, pivot_len);
+    let mut scorer = BlockWandUnionScorer::new(scorers, threshold);
+    while scorer.doc() != TERMINATED {
+        let new_threshold = callback(scorer.doc(), scorer.score());
+        scorer.set_threshold(new_threshold);
+        scorer.advance();
     }
 }
 
@@ -224,69 +171,227 @@ pub fn block_wand(
 ///   - On a block, advance until the end and execute `callback` when the doc score is greater or
 ///     equal to the `threshold`.
 pub fn block_wand_single_scorer(
-    mut scorer: TermScorer,
-    mut threshold: Score,
+    scorer: TermScorer,
+    threshold: Score,
     callback: &mut dyn FnMut(u32, Score) -> Score,
 ) {
-    let mut doc = scorer.doc();
-    loop {
-        // We position the scorer on a block that can reach
-        // the threshold.
-        while scorer.block_max_score() <= threshold {
-            let last_doc_in_block = scorer.last_doc_in_block();
-            if last_doc_in_block == TERMINATED {
-                return;
-            }
-            doc = last_doc_in_block + 1;
-            scorer.seek_block(doc);
-        }
-        // Seek will effectively load that block.
-        doc = scorer.seek(doc);
-        if doc == TERMINATED {
-            break;
-        }
-        loop {
-            let score = scorer.score();
-            if score > threshold {
-                threshold = callback(doc, score);
-            }
-            debug_assert!(doc <= scorer.last_doc_in_block());
-            if doc == scorer.last_doc_in_block() {
-                break;
-            }
-            doc = scorer.advance();
-            if doc == TERMINATED {
-                return;
-            }
-        }
-        doc += 1;
-        scorer.seek_block(doc);
+    let mut scorer = BlockWandSingleScorer::new(scorer, threshold);
+    while scorer.doc() != TERMINATED {
+        let new_threshold = callback(scorer.doc(), scorer.score());
+        scorer.set_threshold(new_threshold);
+        scorer.advance();
     }
 }
 
-struct TermScorerWithMaxScore<'a> {
-    scorer: &'a mut TermScorer,
+struct TermScorerWithMaxScore {
+    scorer: TermScorer,
     max_score: Score,
 }
 
-impl<'a> From<&'a mut TermScorer> for TermScorerWithMaxScore<'a> {
-    fn from(scorer: &'a mut TermScorer) -> Self {
+impl From<TermScorer> for TermScorerWithMaxScore {
+    fn from(scorer: TermScorer) -> Self {
         let max_score = scorer.max_score();
         TermScorerWithMaxScore { scorer, max_score }
     }
 }
 
-impl Deref for TermScorerWithMaxScore<'_> {
+impl Deref for TermScorerWithMaxScore {
     type Target = TermScorer;
 
     fn deref(&self) -> &Self::Target {
-        self.scorer
+        &self.scorer
     }
 }
 
-impl DerefMut for TermScorerWithMaxScore<'_> {
+impl DerefMut for TermScorerWithMaxScore {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.scorer
+        &mut self.scorer
+    }
+}
+
+struct BlockWandUnionScorer {
+    scorers: Vec<TermScorerWithMaxScore>,
+    threshold: Score,
+    current: (DocId, Score),
+}
+impl BlockWandUnionScorer {
+    fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
+        debug_assert!(scorers.len() > 1);
+        scorers.retain(|scorer| scorer.doc() < TERMINATED);
+        let mut scorers: Vec<TermScorerWithMaxScore> = scorers
+            .into_iter()
+            .map(TermScorerWithMaxScore::from)
+            .collect();
+        // At this point we need to ensure that the scorers are sorted!
+        scorers.sort_by_key(|scorer| scorer.doc());
+
+        let mut scorer = Self {
+            scorers,
+            threshold,
+            current: (0, Score::MIN), // TODO: Fix
+        };
+        // advance to fill current with actual (doc id, score)
+        scorer.advance();
+        scorer
+    }
+}
+impl Scorer for BlockWandUnionScorer {
+    fn score(&mut self) -> Score {
+        self.current.1
+    }
+
+    fn set_threshold(&mut self, score: Score) {
+        self.threshold = score;
+    }
+}
+impl DocSet for BlockWandUnionScorer {
+    fn advance(&mut self) -> DocId {
+        while let Some((before_pivot_len, pivot_len, pivot_doc)) =
+            find_pivot_doc(&self.scorers[..], self.threshold)
+        {
+            debug_assert!(self.scorers.iter().map(|scorer| scorer.doc()).is_sorted());
+            debug_assert_ne!(pivot_doc, TERMINATED);
+            debug_assert!(before_pivot_len < pivot_len);
+
+            let block_max_score_upperbound: Score = self.scorers[..pivot_len]
+                .iter_mut()
+                .map(|scorer| {
+                    scorer.seek_block(pivot_doc);
+                    scorer.block_max_score()
+                })
+                .sum();
+
+            // Beware after shallow advance, skip readers can be in advance compared to
+            // the segment posting lists.
+            //
+            // `block_segment_postings.load_block()` need to be called separately.
+            if block_max_score_upperbound <= self.threshold {
+                // Block max condition was not reached
+                // We could get away by simply advancing the scorers to DocId + 1 but it would
+                // be inefficient. The optimization requires proper explanation and was
+                // isolated in a different function.
+                block_max_was_too_low_advance_one_scorer(&mut self.scorers, pivot_len);
+                continue;
+            }
+
+            // Block max condition is observed.
+            //
+            // Let's try and advance all scorers before the pivot to the pivot.
+            if !align_scorers(&mut self.scorers, pivot_doc, before_pivot_len) {
+                // At least of the scorer does not contain the pivot.
+                //
+                // Let's stop scoring this pivot and go through the pivot selection again.
+                // Note that the current pivot is not necessarily a bad candidate and it
+                // may be picked again.
+                continue;
+            }
+
+            // At this point, all scorers are positioned on the doc.
+            let score = self.scorers[..pivot_len]
+                .iter_mut()
+                .map(|scorer| scorer.score())
+                .sum();
+
+            if score > self.threshold {
+                self.current = (pivot_doc, score);
+                // let's advance all of the scorers that are currently positioned on the pivot.
+                advance_all_scorers_on_pivot(&mut self.scorers, pivot_len);
+                return pivot_doc;
+            } else {
+                // let's advance all of the scorers that are currently positioned on the pivot.
+                advance_all_scorers_on_pivot(&mut self.scorers, pivot_len);
+            }
+        }
+
+        self.current = (TERMINATED, 0.0);
+        TERMINATED
+    }
+
+    fn doc(&self) -> DocId {
+        self.current.0
+    }
+
+    fn size_hint(&self) -> u32 {
+        todo!("Figure out what's reasonable to put here since we can't give an actual value");
+    }
+}
+
+struct BlockWandSingleScorer {
+    scorer: TermScorer,
+    threshold: Score,
+    current: (DocId, Score),
+}
+impl BlockWandSingleScorer {
+    fn new(term_scorer: TermScorer, threshold: Score) -> Self {
+        let mut scorer = Self {
+            scorer: term_scorer,
+            threshold,
+            current: (0, Score::MIN),
+        };
+        // advance to fill current
+        scorer.advance();
+        scorer
+    }
+}
+impl Scorer for BlockWandSingleScorer {
+    fn score(&mut self) -> Score {
+        self.current.1
+    }
+
+    fn set_threshold(&mut self, score: Score) {
+        self.threshold = score;
+    }
+}
+impl DocSet for BlockWandSingleScorer {
+    fn advance(&mut self) -> DocId {
+        let mut doc = self.scorer.doc();
+        'outer: loop {
+            // We position the scorer on a block that can reach
+            // the threshold.
+            while self.scorer.block_max_score() <= self.threshold {
+                let last_doc_in_block = self.scorer.last_doc_in_block();
+                if last_doc_in_block == TERMINATED {
+                    self.current = (TERMINATED, 0.0);
+                    return TERMINATED;
+                }
+                doc = last_doc_in_block + 1;
+                self.scorer.seek_block(doc);
+            }
+            // Seek will effectively load that block.
+            doc = self.scorer.seek(doc);
+            if doc == TERMINATED {
+                self.current = (TERMINATED, 0.0);
+                return TERMINATED;
+            }
+            loop {
+                let score = self.scorer.score();
+                if score > self.threshold {
+                    self.current = (doc, score);
+                    self.scorer.advance();
+                    break 'outer;
+                }
+                debug_assert!(doc <= self.scorer.last_doc_in_block());
+                if doc == self.scorer.last_doc_in_block() {
+                    break;
+                }
+                doc = self.scorer.advance();
+                if doc == TERMINATED {
+                    self.current = (TERMINATED, 0.0);
+                    return TERMINATED;
+                }
+            }
+            doc += 1;
+            self.scorer.seek_block(doc);
+        }
+        self.doc()
+    }
+
+    fn doc(&self) -> DocId {
+        self.current.0
+    }
+
+    fn size_hint(&self) -> u32 {
+        todo!()
     }
 }
 
