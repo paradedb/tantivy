@@ -2,16 +2,14 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use common::TerminatingWrite;
-
-use super::presence::Presence;
+use super::id_map::IdMap;
 use crate::directory::CompositeWrite;
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{TantivyDocument, Value};
 use crate::schema::{Field, FieldType, Schema};
-use crate::vector::meta::{VectorStorageFormat, VECMETA_EXT};
+use crate::vector::VEC_EXT;
 use crate::{DocId, TantivyError};
 
 /// Per-field in-memory state: the doc ids that have a value (ascending),
@@ -119,12 +117,7 @@ impl PluginWriter for FlatVecWriter {
         if self.fields.is_empty() {
             return Ok(());
         }
-        let mut meta_write =
-            segment.open_write(SegmentComponent::Custom(VECMETA_EXT.to_string()))?;
-        VectorStorageFormat::Flat.serialize(&mut meta_write)?;
-        meta_write.terminate()?;
-
-        let write = segment.open_write(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()))?;
+        let write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
         let mut composite = CompositeWrite::wrap(write);
 
         for (field, buf) in &self.fields {
@@ -147,12 +140,12 @@ impl PluginWriter for FlatVecWriter {
                 (buf.present_doc_ids.clone(), buf.row_bytes.clone())
             };
 
-            // Slice (field, 0): presence section. Picks Full if every
+            // Slice (field, 0): row→doc_id map. Picks Identity if every
             // doc is present (typical for dense embeddings, just one
-            // tag byte) or Optional otherwise.
-            let bitmap_w = composite.for_field_with_idx(*field, 0);
-            Presence::serialize(&present, self.num_docs, bitmap_w)?;
-            bitmap_w.flush()?;
+            // tag byte) or Bitmap otherwise.
+            let id_map_w = composite.for_field_with_idx(*field, 0);
+            IdMap::serialize(&present, self.num_docs, id_map_w)?;
+            id_map_w.flush()?;
 
             // Slice (field, 1): dense LE byte rows, one per present doc.
             let rows_w = composite.for_field_with_idx(*field, 1);

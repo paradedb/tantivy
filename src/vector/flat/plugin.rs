@@ -3,27 +3,25 @@
 //! The flat format is one of two storage modes the unified
 //! [`VectorPlugin`](crate::vector::VectorPlugin) can produce per merge.
 //! This module exposes the merge body — copying raw vector bytes from
-//! source segments into a single `.flatvec` composite file — so the
-//! parent plugin can call it after the threshold check.
+//! source segments into a single `.vec` composite file — so the parent
+//! plugin can call it after the threshold check.
 
 use std::io::Write;
 
-use common::TerminatingWrite;
-
-use super::presence::Presence;
+use super::id_map::IdMap;
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::FieldType;
-use crate::vector::meta::{VectorStorageFormat, VECMETA_EXT};
 use crate::vector::reader::{VectorColumnReader, VectorReader};
+use crate::vector::VEC_EXT;
 use crate::DocId;
 
-/// Merge source vectors into the target segment's `.flatvec` file.
+/// Merge source vectors into the target segment's `.vec` file.
 ///
 /// Caller (`VectorPlugin::merge`) has already verified that the target
 /// segment's doc count is below the clustering threshold. This routine
-/// is unconditional — it always writes flatvec when called.
+/// is unconditional — it always writes the flat `.vec` when called.
 pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     let has_vector_field = ctx
         .schema
@@ -35,20 +33,9 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     if ctx.cancel.wants_cancel() {
         return Err(crate::TantivyError::Cancelled);
     }
-    let meta_path = ctx
-        .target_segment
-        .relative_path(SegmentComponent::Custom(VECMETA_EXT.to_string()));
-    let mut meta_write = ctx
-        .target_segment
-        .index()
-        .directory()
-        .open_write(&meta_path)?;
-    VectorStorageFormat::Flat.serialize(&mut meta_write)?;
-    meta_write.terminate()?;
-
     let path = ctx
         .target_segment
-        .relative_path(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()));
+        .relative_path(SegmentComponent::Custom(VEC_EXT.to_string()));
     let write = ctx.target_segment.index().directory().open_write(&path)?;
     let source_readers: Vec<VectorReader> = ctx
         .readers
@@ -93,10 +80,10 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
         // Sanity: the mapping iterator should yield exactly num_target_docs items.
         debug_assert_eq!(new_doc_id, num_target_docs);
 
-        // Slice (field, 0): presence section (Full or Optional).
-        let bitmap_w = composite.for_field_with_idx(field, 0);
-        Presence::serialize(&target_present, num_target_docs, bitmap_w)?;
-        bitmap_w.flush()?;
+        // Slice (field, 0): row→doc_id map (Identity or Bitmap).
+        let id_map_w = composite.for_field_with_idx(field, 0);
+        IdMap::serialize(&target_present, num_target_docs, id_map_w)?;
+        id_map_w.flush()?;
     }
     composite.close()?;
     Ok(())

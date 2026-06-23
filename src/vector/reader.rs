@@ -1,13 +1,13 @@
 //! Per-segment vector storage dispatch.
 //!
-//! Reads the segment's `.vecmeta` to learn which storage format was written,
-//! opens the matching reader, and exposes a field's column via
+//! Opens the segment's `.vec` file (if present), learns the storage mode from
+//! its self-describing `IdMap` header, and exposes a field's column via
 //! [`VectorColumnReader::open_column`].
 
 use std::collections::BTreeMap;
 
 use super::flat::{FlatVecReader, FlatVectorColumn};
-use super::meta::{VectorSegmentMeta, VectorStorageFormat, VECMETA_EXT};
+use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType};
@@ -42,23 +42,15 @@ impl VectorReader {
                 vector_dims.insert(field, opts.dim());
             }
         }
-        let meta_slice =
-            match segment_reader.open_read(SegmentComponent::Custom(VECMETA_EXT.to_string())) {
-                Ok(file_slice) => Some(file_slice),
-                Err(OpenReadError::FileDoesNotExist(_)) => None,
+        // A `.vec` file is present iff this segment carries vector data. The
+        // flat backend is the only mode for now; once IVF lands, the `IdMap`
+        // header (`Explicit` ⟺ IVF) selects the reader.
+        let storage =
+            match segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string())) {
+                Ok(_) => VectorStorageReader::Flat(FlatVecReader::open(segment_reader)?),
+                Err(OpenReadError::FileDoesNotExist(_)) => VectorStorageReader::None,
                 Err(err) => return Err(err.into()),
             };
-        let storage = if let Some(file_slice) = meta_slice {
-            let meta = VectorSegmentMeta::open(file_slice)?;
-            let _payload = meta.payload;
-            match meta.format {
-                VectorStorageFormat::Flat => {
-                    VectorStorageReader::Flat(FlatVecReader::open(segment_reader)?)
-                }
-            }
-        } else {
-            VectorStorageReader::None
-        };
         Ok(Self {
             storage,
             vector_dims,

@@ -1,18 +1,19 @@
 //! Reader for the flat vector format.
 //!
-//! Opens the segment's `.flatvec` composite file (one presence section +
-//! one dense row blob per vector field) and hands out per-field
-//! [`FlatVectorColumn`] views for sequential scan.
+//! Opens the segment's `.vec` composite file (one id-map section + one dense
+//! row blob per vector field) and hands out per-field [`FlatVectorColumn`]
+//! views for sequential scan.
 
 use std::collections::BTreeMap;
 
 use common::OwnedBytes;
 
-use super::presence::Presence;
+use super::id_map::IdMap;
 use crate::directory::CompositeFile;
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::vector::reader::VectorColumnReader;
+use crate::vector::VEC_EXT;
 use crate::{DocId, SegmentReader, TantivyError};
 
 pub struct FlatVecReader {
@@ -31,7 +32,7 @@ impl FlatVecReader {
             }
         }
         let file_slice =
-            segment_reader.open_read(SegmentComponent::Custom(super::FLATVEC_EXT.to_string()))?;
+            segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
         Ok(Self {
             composite: CompositeFile::open(&file_slice)?,
             field_options,
@@ -47,7 +48,7 @@ impl VectorColumnReader for FlatVecReader {
         let options = self.field_options.get(&field).cloned().ok_or_else(|| {
             TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
         })?;
-        let presence_slice = self.composite.open_read_with_idx(field, 0).ok_or_else(|| {
+        let id_map_slice = self.composite.open_read_with_idx(field, 0).ok_or_else(|| {
             TantivyError::InternalError(format!(
                 "no flat vector data for vector field {field:?} in segment"
             ))
@@ -57,10 +58,10 @@ impl VectorColumnReader for FlatVecReader {
                 "no flat vector data for vector field {field:?} in segment"
             ))
         })?;
-        let presence = Presence::open(presence_slice, self.max_doc)?;
+        let id_map = IdMap::open(id_map_slice, self.max_doc)?;
         let row_bytes = rows_slice.read_bytes()?;
         Ok(FlatVectorColumn {
-            presence,
+            id_map,
             row_bytes,
             options,
         })
@@ -70,13 +71,13 @@ impl VectorColumnReader for FlatVecReader {
         self.field_options.get(&field).ok_or_else(|| {
             TantivyError::InvalidArgument(format!("field {field:?} is not a vector field"))
         })?;
-        let presence_slice = self.composite.open_read_with_idx(field, 0).ok_or_else(|| {
+        let id_map_slice = self.composite.open_read_with_idx(field, 0).ok_or_else(|| {
             TantivyError::InternalError(format!(
                 "no flat vector data for vector field {field:?} in segment"
             ))
         })?;
-        let presence = Presence::open(presence_slice, self.max_doc)?;
-        Ok(presence.num_non_null() as usize)
+        let id_map = IdMap::open(id_map_slice, self.max_doc)?;
+        Ok(id_map.num_rows() as usize)
     }
 
     fn dim(&self, field: Field) -> crate::Result<usize> {
@@ -92,15 +93,15 @@ impl VectorColumnReader for FlatVecReader {
 /// A view over one vector field's data within a single segment.
 ///
 /// Layout:
-/// - `presence`: [`Presence::Full`] for dense columns (no bitmap stored, `row_id == doc_id`) or
-///   [`Presence::Optional`] for sparse columns (rank-supporting bitmap).
-/// - `row_bytes`: dense LE blob, exactly `presence.num_non_null()` rows of the schema dtype.
+/// - `id_map`: [`IdMap::Identity`] for dense columns (no bitmap stored, `row_id == doc_id`) or
+///   [`IdMap::Bitmap`] for sparse columns (rank-supporting bitmap).
+/// - `row_bytes`: dense LE blob, exactly `id_map.num_rows()` rows of the schema dtype.
 ///
-/// Lookup is `presence.rank_if_exists(doc) -> row_idx`, then
-/// `&row_bytes[row_idx * bytes_per_vector ..]`. In the `Full` case the rank
+/// Lookup is `id_map.rank_if_exists(doc) -> row_idx`, then
+/// `&row_bytes[row_idx * bytes_per_vector ..]`. In the `Identity` case the rank
 /// step is the identity map — no bitmap consulted.
 pub struct FlatVectorColumn {
-    presence: Presence,
+    id_map: IdMap,
     row_bytes: OwnedBytes,
     options: VectorOptions,
 }
@@ -112,17 +113,17 @@ impl FlatVectorColumn {
 
     /// Number of docs that actually have a vector value.
     pub fn len(&self) -> usize {
-        self.presence.num_non_null() as usize
+        self.id_map.num_rows() as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.presence.num_non_null() == 0
+        self.id_map.num_rows() == 0
     }
 
     /// `true` if `doc_id` has a stored vector.
     #[inline]
     pub fn contains(&self, doc_id: DocId) -> bool {
-        self.presence.contains(doc_id)
+        self.id_map.contains(doc_id)
     }
 
     /// Borrow the raw little-endian bytes for a single document.
@@ -131,7 +132,7 @@ impl FlatVectorColumn {
     /// zero-copy borrow into the column's `OwnedBytes`.
     #[inline]
     pub fn vector_bytes_at(&self, doc_id: DocId) -> Option<&[u8]> {
-        let row_id = self.presence.rank_if_exists(doc_id)? as usize;
+        let row_id = self.id_map.rank_if_exists(doc_id)? as usize;
         let stride = self.options.bytes_per_vector();
         let start = row_id * stride;
         let end = start + stride;

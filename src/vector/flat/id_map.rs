@@ -1,24 +1,29 @@
-//! Per-segment presence tracker for vector fields.
+//! Per-segment row→doc_id map for vector fields.
 //!
-//! Marks which `doc_id`s have a value for a given vector field. Used to
-//! address the dense row array via rank (`rank(doc_id) -> row_id`) and
-//! to distinguish "missing vector" from "zero vector" at query time.
+//! Stored as slot `[0]` of the `.vec` composite file, parallel to the dense
+//! row blob in slot `[1]`. The variant is the storage-mode discriminator: the
+//! flat backend writes `Identity` (dense) or `Bitmap` (sparse); the future IVF
+//! backend writes `Explicit`. Reading the variant tag is all it takes to learn
+//! the mode — there is no separate format byte or metadata file.
 //!
-//! Mirrors the `Full | Optional` cardinality split in
-//! `tantivy-columnar`. For dense columns (every doc present — the
-//! typical case for embeddings) the `Full` variant skips the bitmap
-//! entirely: `row_id == doc_id` is the identity map, no rank lookup
-//! needed. For sparse columns we delegate to columnar's
-//! [`OptionalIndex`], a roaring-style bitmap with rank/select support
-//! that's also used by fast-field columns elsewhere in tantivy.
+//! For the flat variants the map also addresses the dense row array via rank
+//! (`rank(doc_id) -> row_id`) and distinguishes "missing vector" from "zero
+//! vector" at query time.
+//!
+//! Mirrors the `Full | Optional` cardinality split in `tantivy-columnar`. For
+//! dense columns (every doc present — the typical case for embeddings) the
+//! `Identity` variant skips the bitmap entirely: `row_id == doc_id` is the
+//! identity map, no rank lookup needed. For sparse columns we delegate to
+//! columnar's [`OptionalIndex`], a roaring-style bitmap with rank/select
+//! support that's also used by fast-field columns elsewhere in tantivy.
 //!
 //! ## On-disk layout
 //!
 //! ```text
 //! [u8 variant_tag] [body]
-//!   tag = 0  (Full):     no body — `num_docs` comes from the caller
+//!   tag = 0  (Identity): no body — `num_docs` comes from the caller
 //!                        (typically `segment_reader.max_doc()`)
-//!   tag = 1  (Optional): body = serialized columnar OptionalIndex
+//!   tag = 1  (Bitmap):   body = serialized columnar OptionalIndex
 //! ```
 
 use std::io::{self, Write};
@@ -29,25 +34,25 @@ use common::HasLen;
 use crate::directory::FileSlice;
 use crate::DocId;
 
-const VARIANT_FULL: u8 = 0;
-const VARIANT_OPTIONAL: u8 = 1;
+const VARIANT_IDENTITY: u8 = 0;
+const VARIANT_BITMAP: u8 = 1;
 
-/// Per-field presence tracker. Dispatches on cardinality at open time so
-/// the hot path can skip the bitmap entirely when every doc has a value.
-pub enum Presence {
+/// Per-field row→doc_id map. Dispatches on cardinality at open time so the hot
+/// path can skip the bitmap entirely when every doc has a value.
+pub enum IdMap {
     /// Every doc has a value. `row_id == doc_id`; no bitmap stored.
-    Full { num_docs: u32 },
+    Identity { num_docs: u32 },
     /// Some docs may be absent. Rank/contains go through columnar's
     /// `OptionalIndex` (roaring-style block bitmap).
-    Optional(OptionalIndex),
+    Bitmap(OptionalIndex),
 }
 
-impl Presence {
+impl IdMap {
     /// Serialize the appropriate variant given a sorted list of present
-    /// `doc_id`s. Chooses `Full` if every doc is present, `Optional`
+    /// `doc_id`s. Chooses `Identity` if every doc is present, `Bitmap`
     /// otherwise.
     ///
-    /// The Full variant writes only the variant tag — `num_docs` is
+    /// The Identity variant writes only the variant tag — `num_docs` is
     /// supplied at open time (typically from `segment_reader.max_doc()`).
     pub fn serialize<W: Write>(
         present_doc_ids: &[DocId],
@@ -55,41 +60,41 @@ impl Presence {
         out: &mut W,
     ) -> io::Result<()> {
         if present_doc_ids.len() == num_docs as usize {
-            out.write_all(&[VARIANT_FULL])?;
+            out.write_all(&[VARIANT_IDENTITY])?;
         } else {
-            out.write_all(&[VARIANT_OPTIONAL])?;
+            out.write_all(&[VARIANT_BITMAP])?;
             serialize_optional_index(&present_doc_ids, num_docs, out)?;
         }
         Ok(())
     }
 
-    /// Parse a serialized presence section, dispatching on the variant tag.
-    /// `num_docs` is used only when the variant is `Full` — for `Optional`,
+    /// Parse a serialized id-map section, dispatching on the variant tag.
+    /// `num_docs` is used only when the variant is `Identity` — for `Bitmap`,
     /// the count is read from the embedded `OptionalIndex` header.
-    pub fn open(file_slice: FileSlice, num_docs: u32) -> io::Result<Presence> {
+    pub fn open(file_slice: FileSlice, num_docs: u32) -> io::Result<IdMap> {
         if file_slice.len() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "presence section is empty",
+                "id map section is empty",
             ));
         }
         let tag = file_slice.slice(0..1).read_bytes()?[0];
         let body = file_slice.slice_from(1);
         match tag {
-            VARIANT_FULL => Ok(Presence::Full { num_docs }),
-            VARIANT_OPTIONAL => Ok(Presence::Optional(open_optional_index(body)?)),
+            VARIANT_IDENTITY => Ok(IdMap::Identity { num_docs }),
+            VARIANT_BITMAP => Ok(IdMap::Bitmap(open_optional_index(body)?)),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unknown presence variant tag: {other}"),
+                format!("unknown id map variant tag: {other}"),
             )),
         }
     }
 
-    /// Number of docs that have a value.
-    pub fn num_non_null(&self) -> u32 {
+    /// Number of docs that have a value (= number of stored rows).
+    pub fn num_rows(&self) -> u32 {
         match self {
-            Presence::Full { num_docs } => *num_docs,
-            Presence::Optional(idx) => idx.num_non_nulls(),
+            IdMap::Identity { num_docs } => *num_docs,
+            IdMap::Bitmap(idx) => idx.num_non_nulls(),
         }
     }
 
@@ -97,23 +102,23 @@ impl Presence {
     #[inline]
     pub fn contains(&self, doc_id: DocId) -> bool {
         match self {
-            Presence::Full { num_docs } => doc_id < *num_docs,
-            Presence::Optional(idx) => Set::contains(idx, doc_id),
+            IdMap::Identity { num_docs } => doc_id < *num_docs,
+            IdMap::Bitmap(idx) => Set::contains(idx, doc_id),
         }
     }
 
     /// Returns the dense row id for `doc_id` if it has a value, else `None`.
-    /// For `Full`, this is the identity map — no bitmap consulted.
+    /// For `Identity`, this is the identity map — no bitmap consulted.
     /// Callers must pass a `doc_id` within the segment (`doc_id < max_doc`);
     /// this is asserted in debug builds.
     #[inline]
     pub fn rank_if_exists(&self, doc_id: DocId) -> Option<u32> {
         match self {
-            Presence::Full { num_docs } => {
+            IdMap::Identity { num_docs } => {
                 debug_assert!(doc_id < *num_docs, "doc_id {doc_id} >= num_docs {num_docs}");
                 Some(doc_id)
             }
-            Presence::Optional(idx) => Set::rank_if_exists(idx, doc_id),
+            IdMap::Bitmap(idx) => Set::rank_if_exists(idx, doc_id),
         }
     }
 }
@@ -122,27 +127,27 @@ impl Presence {
 mod tests {
     use super::*;
 
-    fn round_trip(present: &[DocId], num_docs: u32) -> Presence {
+    fn round_trip(present: &[DocId], num_docs: u32) -> IdMap {
         let mut buf = Vec::new();
-        Presence::serialize(present, num_docs, &mut buf).unwrap();
-        Presence::open(FileSlice::from(buf), num_docs).unwrap()
+        IdMap::serialize(present, num_docs, &mut buf).unwrap();
+        IdMap::open(FileSlice::from(buf), num_docs).unwrap()
     }
 
     #[test]
-    fn test_all_present_uses_full_variant() {
+    fn test_all_present_uses_identity_variant() {
         let n = 100u32;
         let present: Vec<DocId> = (0..n).collect();
 
         // Wire-level: the serialized output is exactly 1 byte (just the
         // variant tag); no body — num_docs comes from the caller.
         let mut buf = Vec::new();
-        Presence::serialize(&present, n, &mut buf).unwrap();
-        assert_eq!(buf.len(), 1, "Full variant should write only the tag");
-        assert_eq!(buf[0], VARIANT_FULL);
+        IdMap::serialize(&present, n, &mut buf).unwrap();
+        assert_eq!(buf.len(), 1, "Identity variant should write only the tag");
+        assert_eq!(buf[0], VARIANT_IDENTITY);
 
-        let p = Presence::open(FileSlice::from(buf), n).unwrap();
-        assert!(matches!(p, Presence::Full { num_docs } if num_docs == n));
-        assert_eq!(p.num_non_null(), n);
+        let p = IdMap::open(FileSlice::from(buf), n).unwrap();
+        assert!(matches!(p, IdMap::Identity { num_docs } if num_docs == n));
+        assert_eq!(p.num_rows(), n);
         for d in 0..n {
             assert!(p.contains(d));
             assert_eq!(p.rank_if_exists(d), Some(d));
@@ -154,10 +159,10 @@ mod tests {
     }
 
     #[test]
-    fn test_none_present_uses_optional_variant() {
+    fn test_none_present_uses_bitmap_variant() {
         let p = round_trip(&[], 100);
-        assert!(matches!(p, Presence::Optional(_)));
-        assert_eq!(p.num_non_null(), 0);
+        assert!(matches!(p, IdMap::Bitmap(_)));
+        assert_eq!(p.num_rows(), 0);
         for d in 0..100 {
             assert!(!p.contains(d));
             assert_eq!(p.rank_if_exists(d), None);
@@ -165,11 +170,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_uses_optional_variant() {
+    fn test_sparse_uses_bitmap_variant() {
         let present: Vec<DocId> = vec![3, 7, 11, 12, 50, 99];
         let p = round_trip(&present, 100);
-        assert!(matches!(p, Presence::Optional(_)));
-        assert_eq!(p.num_non_null(), 6);
+        assert!(matches!(p, IdMap::Bitmap(_)));
+        assert_eq!(p.num_rows(), 6);
         for (row, &doc) in present.iter().enumerate() {
             assert!(p.contains(doc));
             assert_eq!(p.rank_if_exists(doc), Some(row as u32));
@@ -181,13 +186,13 @@ mod tests {
     }
 
     #[test]
-    fn test_optional_across_blocks() {
+    fn test_bitmap_across_blocks() {
         // Exercise multiple roaring-style blocks (each spans 64K docs).
         let n = 1500u32;
         let present: Vec<DocId> = (0..n).filter(|d| d % 3 == 0).collect();
         let p = round_trip(&present, n);
-        assert!(matches!(p, Presence::Optional(_)));
-        assert_eq!(p.num_non_null() as usize, present.len());
+        assert!(matches!(p, IdMap::Bitmap(_)));
+        assert_eq!(p.num_rows() as usize, present.len());
         for (row, &doc) in present.iter().enumerate() {
             assert_eq!(p.rank_if_exists(doc), Some(row as u32));
         }
