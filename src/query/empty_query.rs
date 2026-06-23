@@ -59,6 +59,10 @@ impl Scorer for EmptyScorer {
     fn score(&mut self) -> Score {
         0.0
     }
+
+    fn set_threshold(&mut self, _score: Score) {
+        unimplemented!();
+    }
 }
 
 #[cfg(test)]

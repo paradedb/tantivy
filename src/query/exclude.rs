@@ -111,6 +111,10 @@ where
     fn score(&mut self) -> Score {
         self.underlying_docset.score()
     }
+
+    fn set_threshold(&mut self, _score: Score) {
+        unimplemented!();
+    }
 }
 
 #[cfg(test)]

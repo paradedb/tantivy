@@ -584,6 +584,10 @@ impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
             1.0f32
         }
     }
+
+    fn set_threshold(&mut self, _score: Score) {
+        unimplemented!();
+    }
 }
 
 #[cfg(test)]

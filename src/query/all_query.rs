@@ -109,6 +109,10 @@ impl Scorer for AllScorer {
     fn score(&mut self) -> Score {
         1.0
     }
+
+    fn set_threshold(&mut self, _score: Score) {
+        unimplemented!();
+    }
 }
 
 #[cfg(test)]

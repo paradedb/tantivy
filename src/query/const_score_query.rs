@@ -147,6 +147,10 @@ impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
     fn score(&mut self) -> Score {
         self.score
     }
+
+    fn set_threshold(&mut self, _score: Score) {
+        unimplemented!();
+    }
 }
 
 #[cfg(test)]

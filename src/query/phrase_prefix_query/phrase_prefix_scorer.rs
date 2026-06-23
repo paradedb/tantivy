@@ -94,6 +94,10 @@ impl<TPostings: Postings> Scorer for PhraseKind<TPostings> {
             PhraseKind::MultiPrefix(postings) => postings.score(),
         }
     }
+
+    fn set_threshold(&mut self, _score: Score) {
+        unimplemented!();
+    }
 }
 
 pub struct PhrasePrefixScorer<TPostings: Postings> {
@@ -225,5 +229,9 @@ impl<TPostings: Postings> Scorer for PhrasePrefixScorer<TPostings> {
     fn score(&mut self) -> Score {
         // TODO modify score??
         self.phrase_scorer.score()
+    }
+
+    fn set_threshold(&mut self, _score: Score) {
+        unimplemented!();
     }
 }
