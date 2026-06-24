@@ -2,10 +2,13 @@
 //!
 //! Unlike the other `TopDocs::order_by_*` paths, vector similarity is
 //! not a [`SortKeyComputer`](crate::collector::sort_key::SortKeyComputer).
-//! It is its own [`Collector`] with an overridden
-//! [`Collector::collect_segment`] that hands the filter `Weight` down to
-//! the per-segment [`VectorBackend`](super::backend::VectorBackend),
-//! which owns the loop.
+//! IVF needs to drain the filter `DocSet` into a bitmap upfront and
+//! drive its own cluster iteration — that inverts the per-doc pull
+//! model that sort-key computers assume. So this is its own
+//! [`Collector`] with an overridden [`Collector::collect_segment`] that
+//! hands the filter `Weight` down to the per-segment
+//! [`VectorBackend`](super::backend::VectorBackend), which owns the
+//! loop. Flat fits the model trivially; IVF gets to drive.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -21,7 +24,8 @@ use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 /// Top-N by vector similarity. Returns documents in descending
 /// similarity order. Only docs that actually have a vector are
 /// returned — docs that match the filter but lack a vector for `field`
-/// are dropped.
+/// are dropped (this is required for IVF compatibility, which can't
+/// see vectorless docs at all).
 ///
 /// Generic over `T: VectorElement` — `T` must match the schema's
 /// declared dtype, checked at [`Collector::check_schema`] time.

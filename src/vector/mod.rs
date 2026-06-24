@@ -1,16 +1,15 @@
 //! Distance kernels, the vector element trait, and the per-segment storage plugin.
 //!
 //! The schema-level field configuration ([`VectorOptions`](crate::schema::VectorOptions),
-//! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema module; the
-//! element trait [`VectorElement`] and the distance kernels live here. The on-disk format
-//! lives in the [`flat`] submodule (dense full-precision layout), owned by the
-//! [`VectorPlugin`]. Top-N vector queries dispatch over it via [`VectorBackend`]. The
-//! [`ivf`] submodule holds the clustering abstraction ([`IvfClusterer`]) used to build the
-//! partitioned/clustered accelerator at merge time.
+//! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema module and is
+//! re-exported here; the element trait [`VectorElement`] and the distance kernels live here.
+//! The on-disk formats live in submodules: [`flat`] for the dense full-precision layout and
+//! [`ivf`] for the partitioned/clustered accelerator. Both are owned by a single
+//! [`VectorPlugin`] which picks between them per merge based on
+//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
+//! Top-N vector queries dispatch over them via [`VectorBackend`].
 
 use std::io;
-
-use crate::schema::VectorDType;
 
 mod backend;
 mod collector;
@@ -21,6 +20,9 @@ mod reader;
 
 pub mod flat;
 pub mod ivf;
+
+#[cfg(test)]
+mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
@@ -34,6 +36,9 @@ pub use ivf::{
 };
 pub use plugin::VectorPlugin;
 pub use reader::{VectorColumn, VectorColumnReader, VectorReader};
+// The schema-level vector types are re-exported here so `crate::vector::{...}`
+// resolves for callers and tests that work entirely within the vector module.
+pub use crate::schema::{Metric, VectorDType, VectorOptions};
 
 /// A vector element type with the primitives needed by the storage
 /// layer and the distance kernels.
