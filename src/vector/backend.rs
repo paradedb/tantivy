@@ -1190,6 +1190,69 @@ mod tests {
         Ok(())
     }
 
+    /// The raw per-cluster sizes from `vector_cluster_sizes` must be exactly the
+    /// un-collapsed array behind `vector_info`'s aggregate cluster stats — the
+    /// invariant `paradedb.ivf_cluster_sizes` relies on to reconcile with
+    /// `paradedb.index_info`. Flat segments expose no sizes.
+    #[test]
+    fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .build()?;
+        let field = index.embedding_field();
+        let searcher = index.index.reader()?.searcher();
+
+        let mut segments_checked = 0;
+        for segment_reader in searcher.segment_readers() {
+            let sizes = segment_reader
+                .vector_cluster_sizes(field)?
+                .expect("ivf segment exposes cluster sizes");
+            let info = segment_reader.vector_info(field)?.expect("vector info");
+            assert_eq!(info.format, VectorStorageFormat::Ivf);
+            let stats = info.cluster_stats.expect("ivf cluster stats");
+
+            // count == num_centroids, and every aggregate index_info reports is
+            // reproducible from the raw array.
+            assert_eq!(sizes.len(), info.num_centroids.expect("ivf centroids"));
+            let sum: u64 = sizes.iter().map(|&s| u64::from(s)).sum();
+            let min = sizes.iter().copied().min().unwrap() as usize;
+            let max = sizes.iter().copied().max().unwrap() as usize;
+            let empty = sizes.iter().filter(|&&s| s == 0).count();
+            let avg = sum as f64 / sizes.len() as f64;
+
+            assert_eq!(sum as usize, info.num_vectors, "sizes sum to num_vectors");
+            assert_eq!(min, stats.min_cluster_size, "min");
+            assert_eq!(max, stats.max_cluster_size, "max");
+            assert_eq!(empty, stats.empty_clusters, "empty");
+            assert!(
+                (avg - stats.avg_cluster_size).abs() < 1e-9,
+                "avg {avg} vs {}",
+                stats.avg_cluster_size
+            );
+            segments_checked += 1;
+        }
+        assert!(
+            segments_checked > 0,
+            "fixture must produce >= 1 IVF segment"
+        );
+
+        // Flat segments (no IVF data) yield None — the SRF emits no rows for them.
+        let flat = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Flat)
+            .build()?;
+        let flat_field = flat.embedding_field();
+        let flat_searcher = flat.index.reader()?.searcher();
+        for segment_reader in flat_searcher.segment_readers() {
+            assert!(
+                segment_reader.vector_cluster_sizes(flat_field)?.is_none(),
+                "flat segments expose no cluster sizes"
+            );
+        }
+        Ok(())
+    }
+
     /// Same exhaustive correctness, confirming the metric threads
     /// through generically.
     #[test]
