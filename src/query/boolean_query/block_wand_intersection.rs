@@ -33,6 +33,8 @@ pub(crate) fn block_wand_intersection(
 struct BlockWandIntersectionScorer {
     leader: TermScorer,
     secondaries: Vec<TermScorer>,
+
+    maxixum_possible_score: Score,
     secondary_block_max_scores: Box<[f32]>,
     secondary_suffix_block_max: Box<[f32]>,
     fieldnorm_reader: FieldNormReader,
@@ -55,7 +57,11 @@ impl BlockWandIntersectionScorer {
         // Sort by cost (ascending). scorers[0] becomes the "leader" (rarest term).
         scorers.sort_by_key(TermScorer::size_hint);
         let leader = scorers.remove(0);
-        let secondaries_len = scorers.len();
+        let secondaries = scorers;
+        let secondaries_len = secondaries.len();
+
+        let secondaries_global_max_sum: Score = secondaries.iter().map(TermScorer::max_score).sum();
+        let maxixum_possible_score = leader.max_score() + secondaries_global_max_sum;
 
         // Borrow fieldnorm reader and BM25 weight before the main loop.
         // These are immutable references to disjoint fields from block_cursor,
@@ -68,7 +74,8 @@ impl BlockWandIntersectionScorer {
 
         let mut scorer = Self {
             leader,
-            secondaries: scorers,
+            secondaries,
+            maxixum_possible_score,
             secondary_block_max_scores: vec![0.0f32; secondaries_len].into_boxed_slice(),
             secondary_suffix_block_max: vec![0.0f32; secondaries_len].into_boxed_slice(),
             fieldnorm_reader,
@@ -138,6 +145,11 @@ impl Scorer for BlockWandIntersectionScorer {
 }
 impl DocSet for BlockWandIntersectionScorer {
     fn advance(&mut self) -> DocId {
+        if self.maxixum_possible_score <= self.threshold {
+            self.current = (TERMINATED, Score::MIN);
+            return TERMINATED;
+        }
+
         // check for leftover candidates to handle
         if self.num_candidates > 0 {
             if let Some(doc_id) = self.handle_candidates() {
@@ -209,20 +221,21 @@ impl DocSet for BlockWandIntersectionScorer {
             // conditionally advance the count. The compiler can turn this into
             // a cmov instead of a branch, avoiding misprediction costs.
             let score_threshold = self.threshold - secondary_block_max_sum;
-            self.candidate_doc_ids = [0u32; COMPRESSION_BLOCK_SIZE];
-            self.candidate_scores = [0.0f32; COMPRESSION_BLOCK_SIZE];
-            self.num_candidates = 0;
-            self.candidate_idx = 0;
+            //self.candidate_doc_ids = [0u32; COMPRESSION_BLOCK_SIZE];
+            //self.candidate_scores = [0.0f32; COMPRESSION_BLOCK_SIZE];
 
+            let mut num_candidates = 0usize;
             for (candidate_doc, term_freq) in
                 block_docs.iter().copied().zip(block_freqs.iter().copied())
             {
                 let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(candidate_doc);
                 let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
-                self.candidate_doc_ids[self.num_candidates] = candidate_doc;
-                self.candidate_scores[self.num_candidates] = leader_score;
-                self.num_candidates += (leader_score > score_threshold) as usize;
+                self.candidate_doc_ids[num_candidates] = candidate_doc;
+                self.candidate_scores[num_candidates] = leader_score;
+                num_candidates += (leader_score > score_threshold) as usize;
             }
+            self.num_candidates = num_candidates;
+            self.candidate_idx = 0;
 
             // Precompute suffix sums: suffix[i] = sum of block_max for secondaries[i+1..].
             // Used in Phase 2 to prune candidates that can't beat threshold even with
