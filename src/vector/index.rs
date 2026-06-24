@@ -32,6 +32,14 @@ pub struct NeighborhoodGraphConfig {
     ///
     /// [`refine`]: RelativeNeighborhoodGraph::refine
     pub num_candidates: usize,
+    /// Number of independent TPT partitions [`build`] unions to seed the initial
+    /// KNN graph. Each tree splits along different random directions; unioning
+    /// their per-leaf edges stitches across any single tree's split boundaries,
+    /// so more trees means fewer missed neighbors (better init recall) at linear
+    /// build cost.
+    ///
+    /// [`build`]: RelativeNeighborhoodGraph::build
+    pub num_trees: usize,
 }
 
 impl Default for NeighborhoodGraphConfig {
@@ -40,6 +48,7 @@ impl Default for NeighborhoodGraphConfig {
             max_edges: 32,
             ef: 64,
             num_candidates: 256,
+            num_trees: 32,
         }
     }
 }
@@ -55,7 +64,7 @@ pub struct RelativeNeighborhoodGraph<T: VectorElement> {
     /// Similarity metric (higher is better). Search ranks by similarity; build
     /// orders edges by its negation, so smaller is closer.
     metric: Metric,
-    /// Tuning knobs (`max_edges`, `ef`).
+    /// Search, build, and refine tuning knobs.
     config: NeighborhoodGraphConfig,
 }
 
@@ -159,35 +168,45 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
         out
     }
 
-    /// Builds the KNN graph by inserting reciprocal edges from a candidate
-    /// source. Candidate generation (per-cluster vs TPTree) is still open.
-    pub fn build(&mut self) {
-        todo!("reciprocal init-KNN build")
-    }
-
     /// Refines every node against the current graph: searches from the node
     /// itself to gather a candidate pool, applies the RNG occlusion rule to
     /// reselect its edges, and rewrites them in place. This pass is what turns a
     /// raw KNN graph into an RNG.
     pub fn refine(&mut self) {
         let mut ws = Workspace::new();
-        for node_id in 0..self.graph.len() as NodeId {
+        let len = self.graph.len();
+        let mut search_time = std::time::Duration::ZERO;
+        let mut select_time = std::time::Duration::ZERO;
+        for node_id in 0..len as NodeId {
             let query = self.graph.payload(node_id);
+            let t_search = std::time::Instant::now();
             let candidates = self.search(&mut ws, query, &[node_id], self.config.num_candidates);
+            search_time += t_search.elapsed();
+            let t_select = std::time::Instant::now();
             self.set_neighbors(&mut ws, node_id, &candidates);
+            select_time += t_select.elapsed();
+            if (node_id as usize + 1) % 20_000 == 0 {
+                println!(
+                    "[refine] {}/{len} nodes | cumulative: search {search_time:?}, select \
+                     {select_time:?}",
+                    node_id + 1
+                );
+            }
         }
+        println!("[refine] {len} nodes | search {search_time:?}, select {select_time:?}");
     }
 
-    /// Applies SPTAG's RNG occlusion rule to `candidates` (nearest-first), writing
-    /// the survivors straight into `node`'s adjacency (at most `max_edges`) and
-    /// skipping `node` itself.
+    /// Applies the relative-neighborhood-graph occlusion rule to `candidates`
+    /// (nearest-first), writing the survivors straight into `node`'s adjacency (at
+    /// most `max_edges`) and skipping `node` itself.
     ///
     /// Everything is in similarity space (higher is better): a candidate `c` is
-    /// kept unless some already-selected neighbor `r` is *strictly more* similar to
-    /// `c` than `node` is — then `r` makes the direct `node -> c` edge redundant and
-    /// occludes it. The comparison is non-strict (`<=`), so an `r`
-    /// *exactly* as similar as `node` does not occlude — matching SPTAG and keeping
-    /// duplicate vectors from wiping out a node's whole edge set.
+    /// kept unless some already-selected neighbor `r` is *more* similar to `c`
+    /// than `node` is — then `r` makes the direct `node -> c` edge redundant and
+    /// occludes it (the classic RNG "lune" emptiness test). The comparison is
+    /// non-strict (`<=`), so an `r` *exactly* as similar as `node` does not
+    /// occlude — the canonical RNG definition, and what keeps duplicate vectors
+    /// from wiping out a node's whole edge set.
     fn set_neighbors(&mut self, ws: &mut Workspace, node: NodeId, candidates: &[Candidate]) {
         let max_edges = self.config.max_edges;
         let selected = &mut ws.selected;
@@ -210,6 +229,95 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
 
         debug_assert!(!selected.is_empty(), "selected nodes should not be empty");
         self.graph.set_neighbors(node, selected);
+    }
+}
+
+/// Build is `f32`-only for now: the TPT partitioner does floating-point
+/// variance/projection math over the vectors, so it needs a concrete float
+/// element. The rest of the index ([`search`](RelativeNeighborhoodGraph::search),
+/// [`refine`](RelativeNeighborhoodGraph::refine)) stays generic over
+/// [`VectorElement`]; only this construction path is pinned to `f32`.
+impl RelativeNeighborhoodGraph<f32> {
+    /// Builds the RNG index over `vectors` — a flat `dim`-strided arena, the same
+    /// layout [`TPTree`](partition::TPTree) consumes. Seeds a raw KNN graph with a
+    /// TPT forest and then prunes it into an RNG, so a caller needs only this one
+    /// call (no separate [`refine`](Self::refine)).
+    ///
+    /// `vectors` is passed in rather than read back out of the inner [`Graph`] so
+    /// the partitioner can borrow the arena immutably while edge insertion borrows
+    /// the graph mutably. Expects an empty graph sized for at least
+    /// `vectors.len() / dim` nodes; `vectors.len()` must be a multiple of `dim`.
+    pub fn build(&mut self, vectors: &[f32]) {
+        self.build_init_knn(vectors);
+        self.refine();
+    }
+
+    /// Seeds the raw KNN graph: adds every vector as a node, then unions a forest
+    /// of [`num_trees`](NeighborhoodGraphConfig::num_trees) TPT partitions,
+    /// brute-forcing exact KNN within each leaf and inserting the edges in both
+    /// directions. The result is the raw (best-effort symmetric) KNN graph that
+    /// [`build`](Self::build) hands to [`refine`](Self::refine).
+    fn build_init_knn(&mut self, vectors: &[f32]) {
+        let dim = self.graph.dim();
+        debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
+        debug_assert!(self.graph.is_empty(), "build expects an empty graph");
+        let n = vectors.len() / dim;
+        if n == 0 {
+            return;
+        }
+
+        let t_nodes = std::time::Instant::now();
+        for chunk in vectors.chunks_exact(dim) {
+            self.graph.add_node(chunk);
+        }
+        println!("[build_init_knn] loaded {n} nodes in {:?}", t_nodes.elapsed());
+
+        // Seed the KNN edges by unioning a forest of TPT partitions. One
+        // TPTree is reused across trees: its RNG advances between partitions so
+        // successive trees split along different directions, and each tree
+        // starts from the previous one's in-place permutation, diversifying the
+        // prefix sample. `add_edge` keeps each node's nearest `max_edges` and
+        // dedups, so unioning is just re-inserting.
+        let mut tpt = partition::TPTree::new(vectors, dim, partition::TPTreeConfig::default());
+        let mut indices: Vec<NodeId> = (0..n as NodeId).collect();
+        let mut partition_time = std::time::Duration::ZERO;
+        let mut knn_time = std::time::Duration::ZERO;
+        let mut total_leaves = 0usize;
+        let mut total_pairs = 0u64;
+        for tree in 0..self.config.num_trees {
+            let t_part = std::time::Instant::now();
+            let leaves = tpt.partition(&mut indices);
+            partition_time += t_part.elapsed();
+            total_leaves += leaves.len();
+
+            let t_knn = std::time::Instant::now();
+            for leaf in leaves {
+                let members = &indices[leaf];
+                for (i, &a) in members.iter().enumerate() {
+                    let va = &vectors[a as usize * dim..][..dim];
+                    for &b in &members[i + 1..] {
+                        let vb = &vectors[b as usize * dim..][..dim];
+                        let dist = -self.metric.similarity(va, vb);
+                        self.graph.add_edge(a, b, dist);
+                        self.graph.add_edge(b, a, dist);
+                        total_pairs += 1;
+                    }
+                }
+            }
+            knn_time += t_knn.elapsed();
+            println!(
+                "[build_init_knn] tree {}/{} done | cumulative: partition {:?}, knn {:?}",
+                tree + 1,
+                self.config.num_trees,
+                partition_time,
+                knn_time
+            );
+        }
+        println!(
+            "[build_init_knn] {} trees | {total_leaves} leaves, {total_pairs} pairs | \
+             partition {:?}, knn {:?}",
+            self.config.num_trees, partition_time, knn_time
+        );
     }
 }
 
@@ -284,6 +392,300 @@ impl PartialOrd for Candidate {
     }
 }
 
+/// Trinary-projection-tree (TPT) partitioning, the candidate generator that
+/// seeds the initial KNN graph before [`refine`](RelativeNeighborhoodGraph::refine).
+///
+/// A TPT recursively splits a slice of node ids along a sparse random
+/// hyperplane — only the few highest-variance dimensions carry a weight, the
+/// rest are implicitly zero (the "trinary" sparsity). Each split direction is
+/// *fit on a sample* of the slice but *applied to the whole slice*, so the cost
+/// is independent of node count. Recursion bottoms out at
+/// [`leaf_size`](TPTreeConfig::leaf_size); the leaves are small contiguous index
+/// ranges the builder brute-forces into exact KNN edges.
+///
+/// Unioning a forest of independent trees (each with different random splits)
+/// stitches neighbors across any single tree's split boundaries, so a point that
+/// landed just across a hyperplane from its true neighbor in one tree shares a
+/// leaf with it in another. This forest-of-trinary-projection-trees construction
+/// is the initial-graph builder used by, among others, Microsoft's
+/// [SPTAG](https://github.com/microsoft/SPTAG).
+pub(crate) mod partition {
+    use std::ops::Range;
+
+    use super::NodeId;
+
+    /// Tuning knobs for [`TPTree`].
+    #[derive(Clone, Copy, Debug)]
+    pub struct TPTreeConfig {
+        /// Max points in a leaf before recursion stops. The per-leaf exact KNN is
+        /// quadratic in this, so it trades build cost for init-graph recall.
+        pub leaf_size: usize,
+        /// How many points of each slice to sample when fitting a split
+        /// direction. The split is fit on the sample, then applied to the whole
+        /// slice.
+        pub samples: usize,
+        /// How many of the highest-variance dimensions carry a nonzero projection
+        /// weight; every other dimension is weighted zero.
+        pub top_dims: usize,
+        /// Random unit-norm projections tried per split; the one that spreads the
+        /// sample most (max projected variance) wins, with the single
+        /// highest-variance axis as the baseline.
+        pub iterations: usize,
+    }
+
+    impl Default for TPTreeConfig {
+        fn default() -> Self {
+            // Defaults tuned for large slices (typical of a full-scale TPT
+            // forest); safe to shrink for small centroid head indexes.
+            TPTreeConfig {
+                leaf_size: 2000,
+                samples: 1000,
+                top_dims: 5,
+                iterations: 100,
+            }
+        }
+    }
+
+    /// A single TPT over a flat, `dim`-strided vector arena. Borrows the arena
+    /// and owns the RNG; [`partition`](TPTree::partition) permutes a caller-owned
+    /// `indices` slice in place and returns the leaf ranges into it.
+    pub struct TPTree<'a> {
+        /// Flat arena: node `id`'s coordinate `d` is `vectors[id * dim + d]`.
+        vectors: &'a [f32],
+        dim: usize,
+        config: TPTreeConfig,
+        rng: fastrand::Rng,
+    }
+
+    impl<'a> TPTree<'a> {
+        /// Wraps an arena for partitioning. `vectors` is the flat `dim`-strided
+        /// buffer (its length must be a multiple of `dim`).
+        pub fn new(vectors: &'a [f32], dim: usize, config: TPTreeConfig) -> Self {
+            debug_assert!(dim > 0, "dim must be non-zero");
+            debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
+            TPTree {
+                vectors,
+                dim,
+                config,
+                rng: fastrand::Rng::new(),
+            }
+        }
+
+        /// Partitions `indices` in place and returns the leaf ranges into it.
+        /// Each returned range is a contiguous run of `indices` holding one
+        /// leaf's node ids (at most [`leaf_size`](TPTreeConfig::leaf_size)).
+        pub fn partition(&mut self, indices: &mut [NodeId]) -> Vec<Range<usize>> {
+            let mut leaves = Vec::new();
+            if !indices.is_empty() {
+                self.subdivide(indices, 0, &mut leaves);
+            }
+            leaves
+        }
+
+        /// Coordinate `d` of `node`.
+        #[inline]
+        fn coord(&self, node: NodeId, d: usize) -> f32 {
+            self.vectors[node as usize * self.dim + d]
+        }
+
+        /// Recursively splits `indices` (whose first element sits at absolute
+        /// `offset` in the original array), appending leaf ranges to `leaves`.
+        fn subdivide(
+            &mut self,
+            indices: &mut [NodeId],
+            offset: usize,
+            leaves: &mut Vec<Range<usize>>,
+        ) {
+            if indices.len() <= self.config.leaf_size {
+                leaves.push(offset..offset + indices.len());
+                return;
+            }
+            let split = self.choose_split(indices);
+            let (left, right) = indices.split_at_mut(split);
+            self.subdivide(left, offset, leaves);
+            self.subdivide(right, offset + split, leaves);
+        }
+
+        /// Picks a split hyperplane for `indices` and partitions the slice around
+        /// it in place, returning the boundary `split` (left = `[0, split)`,
+        /// right = `[split, len)`). The boundary is always in `1..len`, so each
+        /// child is strictly smaller and the recursion terminates.
+        fn choose_split(&mut self, indices: &mut [NodeId]) -> usize {
+            let n = indices.len();
+            let dim = self.dim;
+            let sample = n.min(self.config.samples);
+            let top_dims = self.config.top_dims.min(dim).max(1);
+
+            // Per-dimension mean over the sample.
+            let mut mean = vec![0.0f32; dim];
+            for &node in &indices[..sample] {
+                for (d, m) in mean.iter_mut().enumerate() {
+                    *m += self.coord(node, d);
+                }
+            }
+            for m in &mut mean {
+                *m /= sample as f32;
+            }
+
+            // Per-dimension variance (sum of squared deviations) over the sample.
+            let mut variance = vec![0.0f32; dim];
+            for &node in &indices[..sample] {
+                for (d, var) in variance.iter_mut().enumerate() {
+                    let diff = self.coord(node, d) - mean[d];
+                    *var += diff * diff;
+                }
+            }
+
+            // The top-`top_dims` highest-variance dimensions; only these carry a
+            // projection weight.
+            let mut dims: Vec<usize> = (0..dim).collect();
+            dims.sort_unstable_by(|&a, &b| variance[b].total_cmp(&variance[a]));
+            dims.truncate(top_dims);
+
+            // Baseline: project onto the single highest-variance axis.
+            let mut best_weight = vec![0.0f32; top_dims];
+            best_weight[0] = 1.0;
+            let mut best_mean = mean[dims[0]];
+            let mut best_var = variance[dims[0]];
+
+            // Try random unit-norm projections over the top dims; keep whichever
+            // spreads the sample the most.
+            let mut proj = vec![0.0f32; sample];
+            let mut weight = vec![0.0f32; top_dims];
+            for _ in 0..self.config.iterations {
+                let mut norm = 0.0f32;
+                for w in &mut weight {
+                    *w = self.rng.f32() * 2.0 - 1.0; // [-1, 1)
+                    norm += *w * *w;
+                }
+                let norm = norm.sqrt();
+                if norm == 0.0 {
+                    continue;
+                }
+                for w in &mut weight {
+                    *w /= norm;
+                }
+
+                let mut m = 0.0f32;
+                for (slot, &node) in proj.iter_mut().zip(&indices[..sample]) {
+                    let mut v = 0.0f32;
+                    for (k, &d) in dims.iter().enumerate() {
+                        v += weight[k] * self.coord(node, d);
+                    }
+                    *slot = v;
+                    m += v;
+                }
+                m /= sample as f32;
+
+                let mut var = 0.0f32;
+                for &p in &proj {
+                    let diff = p - m;
+                    var += diff * diff;
+                }
+                if var > best_var {
+                    best_var = var;
+                    best_mean = m;
+                    best_weight.copy_from_slice(&weight);
+                }
+            }
+
+            // Partition the WHOLE slice around the chosen hyperplane: below the
+            // threshold stays left, at-or-above swaps to the tail (two-pointer,
+            // in place). `i`/`j` are signed so the right pointer can cross zero.
+            let mut i: isize = 0;
+            let mut j: isize = n as isize - 1;
+            while i <= j {
+                let node = indices[i as usize];
+                let mut val = 0.0f32;
+                for (k, &d) in dims.iter().enumerate() {
+                    val += best_weight[k] * self.coord(node, d);
+                }
+                if val < best_mean {
+                    i += 1;
+                } else {
+                    indices.swap(i as usize, j as usize);
+                    j -= 1;
+                }
+            }
+
+            // Everything landed on one side (e.g. identical vectors): fall back to
+            // a median split so the recursion still shrinks.
+            let split = i as usize;
+            if split == 0 || split == n {
+                n / 2
+            } else {
+                split
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn arena(pts: &[[f32; 3]]) -> Vec<f32> {
+            pts.iter().flatten().copied().collect()
+        }
+
+        #[test]
+        fn partition_separates_two_far_clusters() {
+            // Two clusters far apart in the x–z plane (y is low-variance noise).
+            // One split must cleanly separate them: max-variance projection puts
+            // the threshold in the gap, so no leaf mixes the two.
+            let pts = [
+                [1., 5., 1.],
+                [2., 5., 0.],
+                [0., 4., 2.],
+                [1., 6., 1.], // cluster A: ids 0..4
+                [9., 5., 10.],
+                [10., 5., 9.],
+                [8., 4., 11.],
+                [9., 6., 10.], // cluster B: ids 4..8
+            ];
+            let v = arena(&pts);
+            let config = TPTreeConfig {
+                leaf_size: 4,
+                samples: 8,
+                top_dims: 2,
+                iterations: 100,
+            };
+            let mut tpt = TPTree::new(&v, 3, config);
+            let mut indices: Vec<NodeId> = (0..8).collect();
+
+            let leaves = tpt.partition(&mut indices);
+
+            assert_eq!(leaves.len(), 2, "8 points / leaf_size 4 → one split");
+            for leaf in leaves {
+                let ids = &indices[leaf];
+                let all_a = ids.iter().all(|&id| id < 4);
+                let all_b = ids.iter().all(|&id| id >= 4);
+                assert!(all_a || all_b, "leaf mixes clusters: {ids:?}");
+            }
+        }
+
+        #[test]
+        fn partition_terminates_on_identical_vectors() {
+            // Every vector identical → no projection separates anything. The
+            // median-split fallback must still drive recursion to leaves rather
+            // than loop forever.
+            let v = vec![0.0f32; 3 * 8];
+            let config = TPTreeConfig {
+                leaf_size: 2,
+                samples: 8,
+                top_dims: 2,
+                iterations: 8,
+            };
+            let mut tpt = TPTree::new(&v, 3, config);
+            let mut indices: Vec<NodeId> = (0..8).collect();
+
+            let leaves = tpt.partition(&mut indices);
+
+            assert!(leaves.iter().all(|l| l.len() <= 2));
+            assert_eq!(leaves.iter().map(|l| l.len()).sum::<usize>(), 8);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +697,7 @@ mod tests {
             max_edges: 4,
             ef: 8,
             num_candidates: 8,
+            num_trees: 1,
         };
         let mut rng = RelativeNeighborhoodGraph::new(n as usize, 1, Metric::L2, params);
         for i in 0..n {
@@ -369,6 +772,7 @@ mod tests {
             max_edges: 4, // room for both edges; RNG, not capacity, does the pruning
             ef: 4,
             num_candidates: 4,
+            num_trees: 1,
         };
         let mut rng = RelativeNeighborhoodGraph::new(3, 1, Metric::L2, config);
         for i in 0..3 {
@@ -403,6 +807,7 @@ mod tests {
             max_edges: 8, // far more room than the answer needs
             ef: 8,
             num_candidates: 8,
+            num_trees: 1,
         };
         let mut rng = RelativeNeighborhoodGraph::new(N as usize, 1, Metric::L2, config);
         for i in 0..N {
@@ -447,6 +852,7 @@ mod tests {
             max_edges: 4,
             ef: 4,
             num_candidates: 4,
+            num_trees: 1,
         };
         let mut rng = RelativeNeighborhoodGraph::new(3, 2, Metric::L2, config);
         let pts = [[0.0f32, 0.0], [0.0, 0.0], [1.0, 0.0]];
@@ -469,6 +875,7 @@ mod tests {
             max_edges: 2,
             ef: 8,
             num_candidates: 8,
+            num_trees: 1,
         };
         let mut rng = RelativeNeighborhoodGraph::new(5, 2, Metric::L2, config);
         rng.add_vector(&[0.0, 0.0]); // 0: origin
@@ -488,5 +895,107 @@ mod tests {
 
         // Nearest two kept; the farther two dropped despite being valid RNG edges.
         assert_eq!(sorted_neighbors(&rng, 0), vec![1, 2]);
+    }
+
+    #[test]
+    fn build_init_knn_seeds_reciprocal_edges() {
+        // The raw KNN seam before refine: 1-D line 0..6, single tree. The whole
+        // set fits in one leaf, so build_init_knn does exact brute-force KNN —
+        // each node's nearest is its ±1 neighbor, and every edge is inserted both
+        // ways. (build() would then refine this down to the path graph.)
+        let config = NeighborhoodGraphConfig {
+            max_edges: 4,
+            ef: 8,
+            num_candidates: 8,
+            num_trees: 1,
+        };
+        let mut rng = RelativeNeighborhoodGraph::new(6, 1, Metric::L2, config);
+        let vectors: Vec<f32> = (0..6).map(|i| i as f32).collect();
+
+        rng.build_init_knn(&vectors);
+
+        for i in 0..6u32 {
+            let nbrs = rng.graph.neighbors(i);
+            assert!(!nbrs.is_empty(), "node {i} has no edges");
+            assert!(
+                nbrs[0] == i.wrapping_sub(1) || nbrs[0] == i + 1,
+                "node {i}'s nearest edge {} is not adjacent",
+                nbrs[0]
+            );
+        }
+        // Reciprocity: the 0–1 edge exists in both directions.
+        assert!(rng.graph.neighbors(0).contains(&1));
+        assert!(rng.graph.neighbors(1).contains(&0));
+    }
+
+    #[test]
+    fn build_recovers_the_path_graph() {
+        // Full pipeline through the single public call: build() seeds the init KNN
+        // over a colinear line and refines it internally. The exact RNG of equally
+        // spaced colinear points is the path graph — the same target as
+        // refine_prunes_full_mesh_to_the_optimal_path_graph, but driven end-to-end
+        // by build() with no separate refine().
+        const N: NodeId = 6;
+        let config = NeighborhoodGraphConfig {
+            max_edges: 8,
+            ef: 8,
+            num_candidates: 8,
+            num_trees: 1,
+        };
+        let mut rng = RelativeNeighborhoodGraph::new(N as usize, 1, Metric::L2, config);
+        let vectors: Vec<f32> = (0..N).map(|i| i as f32).collect();
+
+        rng.build(&vectors);
+
+        assert_eq!(sorted_neighbors(&rng, 0), vec![1]);
+        assert_eq!(sorted_neighbors(&rng, N - 1), vec![N - 2]);
+        for i in 1..N - 1 {
+            assert_eq!(sorted_neighbors(&rng, i), vec![i - 1, i + 1]);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual perf run; needs RNG_BENCH_VECS and --release"]
+    fn build_timing_on_real_vectors() {
+        use std::time::Instant;
+
+        let path = std::env::var("RNG_BENCH_VECS")
+            .expect("set RNG_BENCH_VECS to a flat f32 file (see download_cohere.py)");
+        let dim: usize = std::env::var("RNG_BENCH_DIM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
+
+        let bytes = std::fs::read(&path).expect("read RNG_BENCH_VECS");
+        assert_eq!(
+            bytes.len() % (dim * 4),
+            0,
+            "file size not a multiple of dim*4"
+        );
+        let n = bytes.len() / (dim * 4);
+        let vectors: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let config = NeighborhoodGraphConfig::default();
+        let mut rng = RelativeNeighborhoodGraph::new(n, dim, Metric::Cosine, config);
+        println!("loaded {n} x {dim} from {path}; config = {config:?}, metric = Cosine");
+
+        let t = Instant::now();
+        rng.build_init_knn(&vectors);
+        let init = t.elapsed();
+
+        let t = Instant::now();
+        rng.refine();
+        let refine = t.elapsed();
+
+        let per = |d: std::time::Duration| d.as_secs_f64() / n as f64 * 1e6; // µs/node
+        println!("build_init_knn: {init:>10.2?}  ({:.1} µs/node)", per(init));
+        println!(
+            "refine:         {refine:>10.2?}  ({:.1} µs/node)",
+            per(refine)
+        );
+        println!("total build:    {:>10.2?}", init + refine);
     }
 }
