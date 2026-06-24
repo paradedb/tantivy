@@ -247,8 +247,10 @@ impl Scorer for BlockWandUnionScorer {
 }
 impl DocSet for BlockWandUnionScorer {
     fn advance(&mut self) -> DocId {
+        // hoist threshold into a local while we loop to avoid going to memory
+        let threshold = self.threshold;
         while let Some((before_pivot_len, pivot_len, pivot_doc)) =
-            find_pivot_doc(&self.scorers[..], self.threshold)
+            find_pivot_doc(&self.scorers[..], threshold)
         {
             debug_assert!(self.scorers.iter().map(|scorer| scorer.doc()).is_sorted());
             debug_assert_ne!(pivot_doc, TERMINATED);
@@ -266,7 +268,7 @@ impl DocSet for BlockWandUnionScorer {
             // the segment posting lists.
             //
             // `block_segment_postings.load_block()` need to be called separately.
-            if block_max_score_upperbound <= self.threshold {
+            if block_max_score_upperbound <= threshold {
                 // Block max condition was not reached
                 // We could get away by simply advancing the scorers to DocId + 1 but it would
                 // be inefficient. The optimization requires proper explanation and was
@@ -293,7 +295,7 @@ impl DocSet for BlockWandUnionScorer {
                 .map(|scorer| scorer.score())
                 .sum();
 
-            if score > self.threshold {
+            if score > threshold {
                 self.current = (pivot_doc, score);
                 // let's advance all of the scorers that are currently positioned on the pivot.
                 advance_all_scorers_on_pivot(&mut self.scorers, pivot_len);
@@ -346,10 +348,12 @@ impl Scorer for BlockWandSingleScorer {
 impl DocSet for BlockWandSingleScorer {
     fn advance(&mut self) -> DocId {
         let mut doc = self.scorer.doc();
+        // host threshold to a local so we avoid going to memory in the loop
+        let threshold = self.threshold;
         'outer: loop {
             // We position the scorer on a block that can reach
             // the threshold.
-            while self.scorer.block_max_score() <= self.threshold {
+            while self.scorer.block_max_score() <= threshold {
                 let last_doc_in_block = self.scorer.last_doc_in_block();
                 if last_doc_in_block == TERMINATED {
                     self.current = (TERMINATED, 0.0);
@@ -366,7 +370,7 @@ impl DocSet for BlockWandSingleScorer {
             }
             loop {
                 let score = self.scorer.score();
-                if score > self.threshold {
+                if score > threshold {
                     self.current = (doc, score);
                     self.scorer.advance();
                     break 'outer;
