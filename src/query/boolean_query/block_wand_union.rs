@@ -184,12 +184,13 @@ pub fn block_wand_single_scorer(
 }
 
 struct TermScorerWithMaxScore {
-    scorer: TermScorer,
+    scorer: Box<TermScorer>,
     max_score: Score,
 }
 
 impl From<TermScorer> for TermScorerWithMaxScore {
     fn from(scorer: TermScorer) -> Self {
+        let scorer = Box::new(scorer);
         let max_score = scorer.max_score();
         TermScorerWithMaxScore { scorer, max_score }
     }
