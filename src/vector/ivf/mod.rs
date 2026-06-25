@@ -17,8 +17,8 @@ pub(crate) use plugin::merge_ivf;
 pub use reader::{IvfVecReader, IvfVectorColumn};
 pub(crate) use training::{decode_row, encode_vector};
 pub use training::{
-    Assignment, IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
-    IvfVectorBatch, IvfVectors,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
+    IvfVectors,
 };
 
 pub(crate) use super::meta::IvfFieldMeta;
