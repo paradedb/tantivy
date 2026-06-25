@@ -153,15 +153,43 @@ impl<T: VectorElement> FlatBackend<T> {
 ///
 /// The production `top_n` entry point passes `None` to the shared inner
 /// helper and pays no allocation for stats accumulation.
+/// How the probe loop stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProbeTermination {
+    /// `probe_count >= max_probe_count` — the hard fanout ceiling.
+    Ceiling,
+    /// The epsilon threshold + survivor-floor gate fired.
+    Gate,
+    /// The ranked centroids were exhausted without hitting either stop.
+    #[default]
+    Exhausted,
+}
+
 #[derive(Debug, Default)]
 pub struct ProbeStats {
     /// Clusters visited by the probe loop, in probe order. A cluster
     /// appears here once we've passed the stop-condition gate for it,
     /// regardless of whether its doc-ids slice ends up empty.
     pub probed_clusters: Vec<usize>,
-    /// Number of docs that survived the filter + alive checks and got
-    /// scored against the query.
+    /// Docs that passed filter + alive + seen and were scored against the
+    /// query. This stays the "scored" bucket and equals the final survivor
+    /// `candidates`, so starvation is just `candidates_scored < min_candidates`.
     pub candidates_scored: usize,
+    /// Every doc-id the inner loop touched, before any gate — the denominator
+    /// for the prune breakdown.
+    pub vectors_visited: usize,
+    /// Touched docs rejected by `filter.contains`.
+    pub pruned_filter: usize,
+    /// Touched docs rejected by `is_alive`.
+    pub pruned_dead: usize,
+    /// Touched docs rejected by the replica `seen` dedup.
+    pub pruned_seen: usize,
+    /// Centroids ranked for this query (`= num_centroids`; the navigation cost).
+    pub centroids_ranked: usize,
+    /// The resolved survivor floor the gate used for this query.
+    pub min_candidates: usize,
+    /// How the probe loop terminated. Per-segment; does not sum.
+    pub termination: ProbeTermination,
 }
 
 /// How many candidate docs the IVF probe loop is willing to score per
@@ -206,7 +234,7 @@ impl<T: VectorElement> IvfBackend<T> {
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
         top_n: usize,
-        stats: Option<&mut ProbeStats>,
+        mut stats: Option<&mut ProbeStats>,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
         if top_n == 0 {
             return Ok(Vec::new());
@@ -216,18 +244,10 @@ impl<T: VectorElement> IvfBackend<T> {
             return Ok(Vec::new());
         }
 
-        // Drain the filter `DocSet` into a dense BitSet for random
-        // membership testing per cluster doc. The BitSet allocates
-        // `max_doc / 8` bytes regardless of filter selectivity —
-        // inherent to IVF needing O(1) membership tests on
-        // out-of-order doc ids. Revisit only if memory profiling
-        // flags it.
-        let mut filter = BitSet::with_max_value(max_doc);
-        weight.for_each_no_score(segment_reader, &mut |docs| {
-            for &doc in docs {
-                filter.insert(doc);
-            }
-        })?;
+        // Materialize the filter `DocSet` into a dense BitSet. Its own
+        // `#[inline(never)]` frame: at low selectivity over a large segment
+        // this drain is real cost otherwise hidden in the search entry.
+        let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
         if filter.len() == 0 {
             return Ok(Vec::new());
         }
@@ -259,6 +279,12 @@ impl<T: VectorElement> IvfBackend<T> {
             .max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n);
         let (min_probe_count, max_probe_count) =
             self.adaptive.resolved_probe_counts(num_centroids)?;
+
+        // Navigation cost + the resolved survivor floor are known here, once.
+        if let Some(s) = stats.as_deref_mut() {
+            s.centroids_ranked = num_centroids;
+            s.min_candidates = min_candidates;
+        }
 
         // Adaptive probe loop, extracted into a `#[inline(never)]`
         // method so this phase shows as its own flamegraph frame
@@ -343,25 +369,36 @@ impl<T: VectorElement> IvfBackend<T> {
             top_n,
             NaturalComparator,
         );
+        // `candidates` is the cumulative scored count that drives the gate; the
+        // prune counters accumulate into locals and fold into `ProbeStats` once
+        // after the loop, so the hot per-doc path carries no `Option` check.
         let mut candidates = 0usize;
+        let mut visited = 0usize;
+        let mut pruned_filter = 0usize;
+        let mut pruned_dead = 0usize;
+        let mut pruned_seen = 0usize;
+        let mut termination = ProbeTermination::Exhausted;
         // Replication can place the same doc in several probed clusters; dedup
         // by doc id so a vector is scored at most once.
         let mut seen = BitSet::with_max_value(max_doc);
 
         for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
             if probe_count >= max_probe_count {
+                termination = ProbeTermination::Ceiling;
                 break;
             }
             if centroid_score < threshold
                 && candidates >= min_candidates
                 && probe_count >= min_probe_count
             {
+                termination = ProbeTermination::Gate;
                 break;
             }
 
             // Record the probe before doing any work, so even an empty
-            // cluster (no doc-ids slice) counts as "probed" — that's
-            // the right unit for the efficiency assertions.
+            // cluster (no doc-ids slice) counts as "probed" — that's the right
+            // unit for the efficiency assertions. Per-cluster, so this `Option`
+            // check is O(clusters), not in the hot per-doc path.
             if let Some(s) = stats.as_deref_mut() {
                 s.probed_clusters.push(cluster);
             }
@@ -372,31 +409,105 @@ impl<T: VectorElement> IvfBackend<T> {
             let cluster_vecs = self.column.cluster_vector_bytes(cluster)?;
             let cluster_vec_slice = cluster_vecs.as_slice();
 
-            for (local_i, &doc) in doc_ids.iter().enumerate() {
-                if !filter.contains(doc) {
-                    continue;
-                }
-                if let Some(bs) = alive {
-                    if !bs.is_alive(doc) {
-                        continue;
-                    }
-                }
-                if seen.contains(doc) {
-                    continue;
-                }
-                seen.insert(doc);
-                let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
-                let score = self.query.score_doc_bytes(vbytes);
-                topn.push_unordered(score, doc);
-                candidates += 1;
-                if let Some(s) = stats.as_deref_mut() {
-                    s.candidates_scored += 1;
-                }
-            }
+            let (v, pf, pd, ps, scored) = self.scan_one_cluster(
+                doc_ids,
+                cluster_vec_slice,
+                stride,
+                filter,
+                alive,
+                &mut seen,
+                &mut topn,
+            );
+            visited += v;
+            pruned_filter += pf;
+            pruned_dead += pd;
+            pruned_seen += ps;
+            candidates += scored;
+        }
+
+        // Fold the locally-accumulated counters into `ProbeStats` once (the
+        // `Option` check lives here at write-back, never per doc).
+        if let Some(s) = stats.as_deref_mut() {
+            s.vectors_visited += visited;
+            s.pruned_filter += pruned_filter;
+            s.pruned_dead += pruned_dead;
+            s.pruned_seen += pruned_seen;
+            s.candidates_scored += candidates;
+            s.termination = termination;
         }
 
         Ok(topn)
     }
+
+    /// Phase 2 inner: scan one cluster's docs through the
+    /// `filter → alive → seen → score` gate, pushing survivors into `topn`.
+    /// Returns `(visited, pruned_filter, pruned_dead, pruned_seen, scored)` so
+    /// the caller folds the counters locally. `#[inline(never)]` so per-cluster
+    /// scan cost forms its own frame — but the per-doc loop itself stays inlined
+    /// here (a non-inlined call per doc would distort the profile and add real
+    /// latency). Called O(clusters) times.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_one_cluster(
+        &self,
+        doc_ids: &[DocId],
+        cluster_vec_slice: &[u8],
+        stride: usize,
+        filter: &BitSet,
+        alive: Option<&AliveBitSet>,
+        seen: &mut BitSet,
+        topn: &mut TopNComputer<Score, DocId, NaturalComparator>,
+    ) -> (usize, usize, usize, usize, usize) {
+        let mut visited = 0usize;
+        let mut pruned_filter = 0usize;
+        let mut pruned_dead = 0usize;
+        let mut pruned_seen = 0usize;
+        let mut scored = 0usize;
+        for (local_i, &doc) in doc_ids.iter().enumerate() {
+            visited += 1;
+            if !filter.contains(doc) {
+                pruned_filter += 1;
+                continue;
+            }
+            if let Some(bs) = alive {
+                if !bs.is_alive(doc) {
+                    pruned_dead += 1;
+                    continue;
+                }
+            }
+            if seen.contains(doc) {
+                pruned_seen += 1;
+                continue;
+            }
+            seen.insert(doc);
+            let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
+            let score = self.query.score_doc_bytes(vbytes);
+            topn.push_unordered(score, doc);
+            scored += 1;
+        }
+        (visited, pruned_filter, pruned_dead, pruned_seen, scored)
+    }
+}
+
+/// Drain the filter `DocSet` into a dense BitSet for O(1) random membership
+/// testing per cluster doc. The BitSet allocates `max_doc / 8` bytes regardless
+/// of filter selectivity — inherent to IVF needing membership tests on
+/// out-of-order doc ids. `#[inline(never)]` so it forms its own flamegraph
+/// frame; at low selectivity over a large segment this drain is real cost
+/// otherwise hidden in the search entry.
+#[inline(never)]
+fn build_filter_bitset(
+    weight: &dyn Weight,
+    segment_reader: &SegmentReader,
+    max_doc: DocId,
+) -> crate::Result<BitSet> {
+    let mut filter = BitSet::with_max_value(max_doc);
+    weight.for_each_no_score(segment_reader, &mut |docs| {
+        for &doc in docs {
+            filter.insert(doc);
+        }
+    })?;
+    Ok(filter)
 }
 
 fn lookup_metric(schema: &Schema, field: Field) -> crate::Result<Metric> {
@@ -1653,6 +1764,114 @@ mod tests {
         let segment_doc_count =
             index.index.reader()?.searcher().segment_readers()[0].max_doc() as usize;
         assert_eq!(stats.candidates_scored, segment_doc_count);
+
+        // Counter invariant: every touched doc lands in exactly one bucket.
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
+            "visited must equal filter+dead+seen+scored ({stats:?})"
+        );
+        // Navigation cost == the centroids ranked for this query.
+        assert_eq!(stats.centroids_ranked, DEFAULT_NUM_CENTROIDS);
+        // Exhaustive params (fanout 1.0, huge epsilon) drain the ranked list.
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        Ok(())
+    }
+
+    /// A tiny `max_probe_fanout` forces the hard ceiling: the loop stops with
+    /// `termination == Ceiling`, having probed fewer than all centroids, and the
+    /// counter invariant still holds. Uses the deterministic `build_inline_ivf`
+    /// fixture (fixed 6 centroids) so the cutoff is stable.
+    #[test]
+    fn ivf_probe_stats_termination_ceiling() -> crate::Result<()> {
+        let centroids = [
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let n_per = 6usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+
+        // max_probe_fanout 1/6 → ceiling at the first probe; huge epsilon keeps
+        // the gate from firing first.
+        let params = AdaptiveProbeParams {
+            epsilon: 1e6,
+            min_candidates: 0,
+            min_probe_fanout: 0.0,
+            max_probe_fanout: 1.0 / centroids.len() as f32,
+        };
+        let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![10.0, 10.0], 3, params)?;
+        assert_eq!(stats.termination, ProbeTermination::Ceiling);
+        // Stopped short of exhausting the ranked list.
+        assert!(stats.probed_clusters.len() < centroids.len());
+        assert_eq!(stats.centroids_ranked, centroids.len());
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
+            "visited must equal filter+dead+seen+scored ({stats:?})"
+        );
+        Ok(())
+    }
+
+    /// Replica dedup is counted: on a `replicas=4` index, exhaustive probing
+    /// re-encounters each doc in several cells, so `pruned_seen` is non-zero,
+    /// each doc is still scored exactly once, and the invariant holds.
+    #[test]
+    fn ivf_probe_stats_counts_replica_dedup() -> crate::Result<()> {
+        let centroids = [
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let n_per = 6usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+        let n = docs.len();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 4)?;
+
+        let (_, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            vec![10.0, 10.0],
+            n,
+            exhaustive_params(centroids.len()),
+        )?;
+        // Each doc is in up to 4 probed cells; the 3 re-encounters are deduped.
+        assert!(
+            stats.pruned_seen > 0,
+            "replica dedup should fire: {stats:?}"
+        );
+        // Still scored exactly once each.
+        assert_eq!(stats.candidates_scored, n);
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
+            "visited must equal filter+dead+seen+scored ({stats:?})"
+        );
         Ok(())
     }
 
