@@ -87,9 +87,23 @@ impl<T: VectorElement> VectorBackend<T> {
         segment_reader: &SegmentReader,
         top_n: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        self.top_n_with_stats(weight, segment_reader, top_n, None)
+    }
+
+    /// Like [`Self::top_n`] but threads an optional [`ProbeStats`] sink into the
+    /// IVF probe loop. `None` is identical in behavior and cost to `top_n` (no
+    /// allocation, the per-doc hot loop unchanged). The Flat backend ignores
+    /// `stats` — no IVF probe stats apply there.
+    pub fn top_n_with_stats(
+        &self,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
+        stats: Option<&mut ProbeStats>,
+    ) -> crate::Result<Vec<(Score, DocAddress)>> {
         match self {
             Self::Flat(b) => b.top_n(weight, segment_reader, top_n),
-            Self::Ivf(b) => b.top_n(weight, segment_reader, top_n),
+            Self::Ivf(b) => b.top_n(weight, segment_reader, top_n, stats),
         }
     }
 }
@@ -205,18 +219,7 @@ pub struct ProbeStats {
 pub(crate) const CANDIDATE_OVERFETCH_MULTIPLIER: usize = 4;
 
 impl<T: VectorElement> IvfBackend<T> {
-    fn top_n(
-        &self,
-        weight: &dyn Weight,
-        segment_reader: &SegmentReader,
-        top_n: usize,
-    ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        self.top_n_inner(weight, segment_reader, top_n, None)
-    }
-
-    /// Same logic as `top_n` but also returns a `ProbeStats` describing
-    /// which clusters the adaptive loop visited. Test-only seam used by
-    /// the 2D fixture scenarios.
+    /// Test helper: run `top_n` with a fresh `ProbeStats` and return both.
     #[cfg(test)]
     pub(crate) fn top_n_instrumented(
         &self,
@@ -225,11 +228,15 @@ impl<T: VectorElement> IvfBackend<T> {
         top_n: usize,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let mut stats = ProbeStats::default();
-        let hits = self.top_n_inner(weight, segment_reader, top_n, Some(&mut stats))?;
+        let hits = self.top_n(weight, segment_reader, top_n, Some(&mut stats))?;
         Ok((hits, stats))
     }
 
-    fn top_n_inner(
+    /// Top-N by IVF probe. When `stats` is `Some`, it is filled with this
+    /// segment's probe-loop counters; `None` is the zero-cost production path —
+    /// no allocation, the per-doc hot loop unchanged (the counts `scan_one_cluster`
+    /// already computes are simply discarded).
+    fn top_n(
         &self,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
