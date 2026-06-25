@@ -6,20 +6,23 @@
 //! after the threshold check.
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use common::{BinarySerializable, OwnedBytes};
+use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
 
 use super::{
-    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfFieldMeta, IvfMatrixView,
+    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfFieldMeta, IvfMatrix, IvfMatrixView,
     IvfVectorBatch, IvfVectors, ASSIGNMENTS_EXT, IVFVEC_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
+use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::PluginMergeContext;
 use crate::schema::FieldType;
 use crate::vector::meta::{VectorStorageFormat, VECMETA_EXT};
-use crate::vector::reader::{VectorColumnReader, VectorReader};
-use crate::vector::VectorDType;
+use crate::vector::reader::{VectorColumn, VectorColumnReader, VectorReader};
+use crate::vector::{Metric, VectorDType, VectorOptions};
 use crate::{DocId, TantivyError};
 
 struct AssignedVector {
@@ -27,6 +30,392 @@ struct AssignedVector {
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_doc_id: DocId,
+}
+
+/// Transient build-time HNSW over the trained centroids, used to pick a
+/// vector's `replicas - 1` nearest non-primary cells. Built once per field
+/// when `replicas > 1`, queried during the assign loop, then dropped — never
+/// serialized. The distance must match how the primary is assigned: angular
+/// (cosine) for Cosine/Dot — both clustered in angular space — and L2 for L2.
+/// `DistCosine` handles un-normalized centroids, so no normalized copy is kept.
+enum CentroidHnsw {
+    Angular(Hnsw<'static, f32, DistCosine>),
+    L2(Hnsw<'static, f32, DistL2>),
+}
+
+impl CentroidHnsw {
+    fn build(metric: Metric, centroids: &[Vec<f32>]) -> Self {
+        let n = centroids.len();
+        // hnsw_rs caps `max_nb_connection` at 256; small centroid sets need it
+        // below `n`. ef_construction/max_layer are standard build-quality knobs.
+        let max_nb_connection = 24.min(n.saturating_sub(1)).max(1);
+        let ef_construction = 200;
+        let max_layer = 16;
+        let data: Vec<(&[f32], usize)> = centroids
+            .iter()
+            .enumerate()
+            .map(|(id, c)| (c.as_slice(), id))
+            .collect();
+        if matches!(metric, Metric::Cosine | Metric::Dot) {
+            let hnsw = Hnsw::<f32, DistCosine>::new(
+                max_nb_connection,
+                n,
+                max_layer,
+                ef_construction,
+                DistCosine {},
+            );
+            hnsw.parallel_insert_slice(&data);
+            CentroidHnsw::Angular(hnsw)
+        } else {
+            let hnsw = Hnsw::<f32, DistL2>::new(
+                max_nb_connection,
+                n,
+                max_layer,
+                ef_construction,
+                DistL2 {},
+            );
+            hnsw.parallel_insert_slice(&data);
+            CentroidHnsw::L2(hnsw)
+        }
+    }
+
+    /// Centroid ids of the `knn` nearest centroids to `query`, nearest first.
+    fn nearest(&self, query: &[f32], knn: usize, ef: usize) -> Vec<usize> {
+        let neighbours = match self {
+            CentroidHnsw::Angular(h) => h.search(query, knn, ef),
+            CentroidHnsw::L2(h) => h.search(query, knn, ef),
+        };
+        neighbours.into_iter().map(|nb| nb.d_id).collect()
+    }
+}
+
+/// Per-field IVF build timings (one phase per field), emitted at end of build
+/// as a parseable `log::info!` line on target `paradedb::ivf_build`.
+#[derive(Default)]
+struct IvfBuildTimings {
+    train: Duration,
+    hnsw_build: Duration,
+    assign: Duration,
+    replica_knn: Duration,
+    posting_write: Duration,
+}
+
+/// Safety cap on rebalance passes. Each pass dissolves undersized clusters
+/// then splits oversized ones; a handful of passes converges the size
+/// distribution into `[min_posting_len, max_posting_len]` in practice. The
+/// cap bounds worst-case merge/split ping-pong rather than being expected to
+/// be hit.
+const MAX_REBALANCE_PASSES: usize = 4;
+
+/// Fetch and decode a single source vector for an assigned entry.
+fn decode_source_vector(
+    columns: &[VectorColumn],
+    entry: &AssignedVector,
+    dim: usize,
+) -> crate::Result<Vec<f32>> {
+    let bytes = columns[entry.source_segment_ord]
+        .vector_bytes_at(entry.source_doc_id)
+        .ok_or_else(|| {
+            TantivyError::InternalError(format!(
+                "missing source vector for doc {:?} during cluster rebalance",
+                entry.source_doc_id
+            ))
+        })?;
+    decode_row::<f32>(bytes, dim)
+}
+
+/// Enforce the primary-membership size bounds produced by
+/// [`IvfClusterer::merge_settings`]. Dissolves clusters below
+/// `min_posting_len` (reassigning their members to the nearest surviving
+/// centroid) and splits clusters above `max_posting_len` into sub-clusters,
+/// appending the new centroids. On return, every entry in `assigned` points
+/// at a densely re-indexed surviving centroid in `centroids`.
+///
+/// Operates on PRIMARY membership only — one entry per vector. Boundary
+/// replication (Phase 2) appends additional entries afterwards.
+#[allow(clippy::too_many_arguments)]
+fn rebalance_clusters(
+    cancel: &dyn CancelSentinel,
+    opts: &VectorOptions,
+    clusterer: &dyn IvfClusterer,
+    columns: &[VectorColumn],
+    assigned: &mut [AssignedVector],
+    centroids: &mut Vec<Vec<f32>>,
+    assign_batch_size: usize,
+    max_posting_len: usize,
+    min_posting_len: usize,
+    target_posting_len: usize,
+) -> crate::Result<()> {
+    let dim = opts.dim();
+    let mut alive = vec![true; centroids.len()];
+
+    for _pass in 0..MAX_REBALANCE_PASSES {
+        if cancel.wants_cancel() {
+            return Err(TantivyError::Cancelled);
+        }
+        let mut changed = merge_undersized(
+            opts,
+            clusterer,
+            columns,
+            assigned,
+            centroids.as_slice(),
+            &mut alive,
+            assign_batch_size,
+            min_posting_len,
+            dim,
+        )?;
+        if cancel.wants_cancel() {
+            return Err(TantivyError::Cancelled);
+        }
+        changed |= split_oversized(
+            opts,
+            clusterer,
+            columns,
+            assigned,
+            centroids,
+            &mut alive,
+            max_posting_len,
+            target_posting_len,
+            min_posting_len,
+            dim,
+        )?;
+        if !changed {
+            break;
+        }
+    }
+
+    // Compact: drop dissolved (dead) centroids and densely re-index the
+    // survivors. Every live entry already points at a surviving centroid, so
+    // the remap is total.
+    let mut remap = vec![usize::MAX; centroids.len()];
+    let mut compacted: Vec<Vec<f32>> = Vec::with_capacity(centroids.len());
+    for (c, centroid) in centroids.drain(..).enumerate() {
+        if alive[c] {
+            remap[c] = compacted.len();
+            compacted.push(centroid);
+        }
+    }
+    for entry in assigned.iter_mut() {
+        let new_cluster = remap[entry.cluster];
+        debug_assert_ne!(
+            new_cluster,
+            usize::MAX,
+            "entry remained assigned to a dissolved cluster"
+        );
+        entry.cluster = new_cluster;
+    }
+    *centroids = compacted;
+    Ok(())
+}
+
+/// Dissolve clusters with fewer than `min_posting_len` members, reassigning
+/// each member to the nearest surviving centroid (one whose count is already
+/// `>= min_posting_len`). Returns whether anything changed.
+#[allow(clippy::too_many_arguments)]
+fn merge_undersized(
+    opts: &VectorOptions,
+    clusterer: &dyn IvfClusterer,
+    columns: &[VectorColumn],
+    assigned: &mut [AssignedVector],
+    centroids: &[Vec<f32>],
+    alive: &mut [bool],
+    assign_batch_size: usize,
+    min_posting_len: usize,
+    dim: usize,
+) -> crate::Result<bool> {
+    if min_posting_len == 0 {
+        return Ok(false);
+    }
+    let n = centroids.len();
+    let mut counts = vec![0usize; n];
+    for entry in assigned.iter() {
+        counts[entry.cluster] += 1;
+    }
+    let survivors: Vec<usize> = (0..n)
+        .filter(|&c| alive[c] && counts[c] >= min_posting_len)
+        .collect();
+    let dissolved: Vec<usize> = (0..n)
+        .filter(|&c| alive[c] && counts[c] < min_posting_len)
+        .collect();
+    // Nothing to dissolve, or nowhere to send the members.
+    if dissolved.is_empty() || survivors.is_empty() {
+        return Ok(false);
+    }
+
+    let mut survivor_values = Vec::with_capacity(survivors.len() * dim);
+    for &c in &survivors {
+        survivor_values.extend_from_slice(&centroids[c]);
+    }
+    let survivor_centroids = IvfCentroids::F32(IvfMatrix {
+        values: survivor_values,
+        rows: survivors.len(),
+        dims: dim,
+    });
+
+    let mut is_dissolved = vec![false; n];
+    for &c in &dissolved {
+        is_dissolved[c] = true;
+    }
+    let members: Vec<usize> = (0..assigned.len())
+        .filter(|&i| is_dissolved[assigned[i].cluster])
+        .collect();
+
+    let batch_size = assign_batch_size.max(1);
+    let mut batch_values = Vec::with_capacity(batch_size * dim);
+    let mut batch_doc_ids = Vec::with_capacity(batch_size);
+    for chunk in members.chunks(batch_size) {
+        batch_values.clear();
+        batch_doc_ids.clear();
+        for &i in chunk {
+            let vector = decode_source_vector(columns, &assigned[i], dim)?;
+            batch_values.extend_from_slice(&vector);
+            batch_doc_ids.push(assigned[i].target_doc_id);
+        }
+        let local = clusterer.assign(
+            opts,
+            IvfVectors::F32(IvfVectorBatch {
+                doc_ids: &batch_doc_ids,
+                matrix: IvfMatrixView {
+                    values: &batch_values,
+                    rows: chunk.len(),
+                    dims: dim,
+                },
+            }),
+            &survivor_centroids,
+        )?;
+        if local.len() != chunk.len() {
+            return Err(TantivyError::InvalidArgument(format!(
+                "IvfClusterer reassigned {} clusters for {} vectors during merge",
+                local.len(),
+                chunk.len()
+            )));
+        }
+        for (&i, &survivor_ord) in chunk.iter().zip(local.iter()) {
+            let survivor_ord = survivor_ord as usize;
+            if survivor_ord >= survivors.len() {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "IvfClusterer reassigned to survivor {survivor_ord}, but only {} survive",
+                    survivors.len()
+                )));
+            }
+            assigned[i].cluster = survivors[survivor_ord];
+        }
+    }
+
+    for &c in &dissolved {
+        alive[c] = false;
+    }
+    Ok(true)
+}
+
+/// Split clusters with more than `max_posting_len` members into sub-clusters
+/// (re-trained on just those members), reusing the original centroid id for
+/// the first sub-cluster and appending the rest. Returns whether anything
+/// changed. Only clusters present at entry are considered; sub-clusters that
+/// are themselves still oversized are handled by the next rebalance pass.
+#[allow(clippy::too_many_arguments)]
+fn split_oversized(
+    opts: &VectorOptions,
+    clusterer: &dyn IvfClusterer,
+    columns: &[VectorColumn],
+    assigned: &mut [AssignedVector],
+    centroids: &mut Vec<Vec<f32>>,
+    alive: &mut Vec<bool>,
+    max_posting_len: usize,
+    target_posting_len: usize,
+    min_posting_len: usize,
+    dim: usize,
+) -> crate::Result<bool> {
+    if max_posting_len == usize::MAX {
+        return Ok(false);
+    }
+    let n = centroids.len();
+    let mut counts = vec![0usize; n];
+    for entry in assigned.iter() {
+        counts[entry.cluster] += 1;
+    }
+    let mut changed = false;
+    for c in 0..n {
+        if !alive[c] || counts[c] <= max_posting_len {
+            continue;
+        }
+        let members: Vec<usize> = (0..assigned.len())
+            .filter(|&i| assigned[i].cluster == c)
+            .collect();
+        let count = members.len();
+        debug_assert_eq!(count, counts[c]);
+
+        // Aim sub-clusters at the target posting length, but never produce so
+        // many that the average sub-cluster would fall below `min_posting_len`
+        // (which would only feed the next merge pass).
+        let target = target_posting_len.max(1);
+        let mut n_sub = count.div_ceil(target).max(2);
+        if min_posting_len >= 1 {
+            n_sub = n_sub.min((count / min_posting_len).max(2));
+        }
+        n_sub = n_sub.min(count);
+        if n_sub < 2 {
+            continue;
+        }
+
+        let mut values = Vec::with_capacity(count * dim);
+        let mut doc_ids = Vec::with_capacity(count);
+        for &i in &members {
+            let vector = decode_source_vector(columns, &assigned[i], dim)?;
+            values.extend_from_slice(&vector);
+            doc_ids.push(assigned[i].target_doc_id);
+        }
+        let batch = IvfVectors::F32(IvfVectorBatch {
+            doc_ids: &doc_ids,
+            matrix: IvfMatrixView {
+                values: &values,
+                rows: count,
+                dims: dim,
+            },
+        });
+        let sub = clusterer.train(opts, batch, n_sub)?;
+        let IvfCentroids::F32(sub_matrix) = &sub;
+        if sub_matrix.dims != dim
+            || sub_matrix.rows != n_sub
+            || sub_matrix.values.len() != n_sub * dim
+        {
+            return Err(TantivyError::InvalidArgument(format!(
+                "IvfClusterer split produced {} centroids ({} values, {} dims) for {n_sub} \
+                 requested sub-clusters of dim {dim}",
+                sub_matrix.rows,
+                sub_matrix.values.len(),
+                sub_matrix.dims
+            )));
+        }
+        let local = clusterer.assign(opts, batch, &sub)?;
+        if local.len() != count {
+            return Err(TantivyError::InvalidArgument(format!(
+                "IvfClusterer assigned {} sub-clusters for {count} split members",
+                local.len()
+            )));
+        }
+
+        // Sub-cluster 0 reuses centroid id `c`; the rest are appended.
+        let mut sub_global = Vec::with_capacity(n_sub);
+        sub_global.push(c);
+        centroids[c].copy_from_slice(&sub_matrix.values[0..dim]);
+        for j in 1..n_sub {
+            sub_global.push(centroids.len());
+            centroids.push(sub_matrix.values[j * dim..(j + 1) * dim].to_vec());
+            alive.push(true);
+        }
+        for (&i, &sub_ord) in members.iter().zip(local.iter()) {
+            let sub_ord = sub_ord as usize;
+            if sub_ord >= n_sub {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "IvfClusterer split assigned to sub-cluster {sub_ord}, but only {n_sub} exist"
+                )));
+            }
+            assigned[i].cluster = sub_global[sub_ord];
+        }
+        changed = true;
+    }
+    Ok(changed)
 }
 
 pub(crate) fn merge_ivf(
@@ -122,6 +511,9 @@ pub(crate) fn merge_ivf(
         let training_sample_interval = (vector_count / training_sample_size).max(1);
         match opts.dtype() {
             VectorDType::F32 => {
+                let field_build_start = Instant::now();
+                let mut timings = IvfBuildTimings::default();
+                let replicas = settings.replicas.max(1);
                 let mut training_values = Vec::with_capacity(training_sample_size * opts.dim());
                 let mut training_doc_ids = Vec::with_capacity(training_sample_size);
                 let mut target_doc_id: DocId = 0;
@@ -156,7 +548,9 @@ pub(crate) fn merge_ivf(
                         dims: opts.dim(),
                     },
                 });
+                let train_start = Instant::now();
                 let centroids = clusterer.train(opts, training_vectors, num_centroids)?;
+                timings.train = train_start.elapsed();
 
                 if ctx.cancel.wants_cancel() {
                     return Err(TantivyError::Cancelled);
@@ -184,22 +578,35 @@ pub(crate) fn merge_ivf(
                         centroid_matrix.rows
                     )));
                 }
-                let encoded_centroids = centroid_matrix
+                // Mutable working copy of the trained centroids. Encoding +
+                // Cosine normalization is deferred until after rebalance,
+                // which can split/merge clusters and append new centroids.
+                let mut centroid_rows: Vec<Vec<f32>> = centroid_matrix
                     .values
                     .chunks_exact(opts.dim())
-                    .map(|centroid| {
-                        let mut bytes = encode_vector(centroid, opts.dim())?;
-                        // K-means cluster means are not unit-norm; for
-                        // Cosine+F32 normalize them here so the search
-                        // path can score both docs and centroids with
-                        // the same `dot * inv_norm_q` fast kernel.
-                        opts.maybe_normalize_bytes(&mut bytes);
-                        Ok::<_, TantivyError>(bytes)
-                    })
-                    .collect::<crate::Result<Vec<_>>>()?;
+                    .map(|centroid| centroid.to_vec())
+                    .collect();
+
+                // Fixed-k replication (Part A3): a transient HNSW over the
+                // trained centroids, built ONCE before the assign loop and only
+                // when `replicas > 1`. At `replicas == 1` nothing is built or
+                // allocated — the layout stays primary-only Phase 1.
+                let dim = opts.dim();
+                let ef_search = (replicas * 4).max(64);
+                let centroid_hnsw = if replicas > 1 {
+                    let hnsw_start = Instant::now();
+                    let hnsw = CentroidHnsw::build(opts.metric(), &centroid_rows);
+                    timings.hnsw_build = hnsw_start.elapsed();
+                    Some(hnsw)
+                } else {
+                    None
+                };
+                // Replica cells accumulated during assign; appended as extra
+                // entries AFTER any rebalance so primary membership and the
+                // rebalance path are untouched. Empty at `replicas == 1`.
+                let mut replica_entries: Vec<AssignedVector> = Vec::new();
 
                 let mut assigned_vectors = Vec::with_capacity(vector_count);
-                let mut cluster_counts = vec![0usize; num_centroids];
                 let mut target_doc_id: DocId = 0;
                 {
                     let mut batch_values = Vec::with_capacity(
@@ -218,6 +625,7 @@ pub(crate) fn merge_ivf(
                                 return Ok(());
                             }
                             let batch_len = batch_doc_ids.len();
+                            let assign_start = Instant::now();
                             let clusters = clusterer.assign(
                                 opts,
                                 IvfVectors::F32(IvfVectorBatch {
@@ -230,6 +638,7 @@ pub(crate) fn merge_ivf(
                                 }),
                                 &centroids,
                             )?;
+                            timings.assign += assign_start.elapsed();
                             if clusters.len() != batch_len {
                                 return Err(TantivyError::InvalidArgument(format!(
                                     "IvfClusterer assigned {} clusters for {} vectors",
@@ -237,8 +646,13 @@ pub(crate) fn merge_ivf(
                                     batch_len
                                 )));
                             }
-                            for (cluster, (target_doc_id, source_segment_ord, source_doc_id)) in
-                                clusters.into_iter().zip(batch_sources.drain(..))
+                            for (
+                                i,
+                                (cluster, (target_doc_id, source_segment_ord, source_doc_id)),
+                            ) in clusters
+                                .into_iter()
+                                .zip(batch_sources.drain(..))
+                                .enumerate()
                             {
                                 let cluster = cluster as usize;
                                 if cluster >= num_centroids {
@@ -253,7 +667,35 @@ pub(crate) fn merge_ivf(
                                     source_segment_ord,
                                     source_doc_id,
                                 });
-                                cluster_counts[cluster] += 1;
+                                // Fixed-k replication: take the `replicas - 1`
+                                // nearest NON-primary centroids from the HNSW.
+                                // The top-k includes the primary; drop it
+                                // (build-time dedup) so a vector is never written
+                                // into its primary list twice.
+                                if replicas > 1 {
+                                    if let Some(hnsw) = centroid_hnsw.as_ref() {
+                                        let v = &batch_values[i * dim..(i + 1) * dim];
+                                        let knn_start = Instant::now();
+                                        let nearest = hnsw.nearest(v, replicas, ef_search);
+                                        timings.replica_knn += knn_start.elapsed();
+                                        let mut added = 0usize;
+                                        for cell in nearest {
+                                            if added >= replicas - 1 {
+                                                break;
+                                            }
+                                            if cell == cluster {
+                                                continue;
+                                            }
+                                            replica_entries.push(AssignedVector {
+                                                cluster: cell,
+                                                target_doc_id,
+                                                source_segment_ord,
+                                                source_doc_id,
+                                            });
+                                            added += 1;
+                                        }
+                                    }
+                                }
                             }
                             batch_values.clear();
                             batch_doc_ids.clear();
@@ -283,6 +725,71 @@ pub(crate) fn merge_ivf(
                 }
                 debug_assert_eq!(target_doc_id, num_target_docs);
                 debug_assert_eq!(assigned_vectors.len(), vector_count);
+
+                // ---- Phase 1: balance enforcement on PRIMARY membership ----
+                // Dissolve undersized clusters (lifts the min off 1) and split
+                // oversized ones (caps the max). Boundary replication and the
+                // per-cluster radius are Phase 2; the entry-based write path
+                // below already tolerates more than one entry per vector, so
+                // Phase 2 only appends entries without restructuring this code.
+                if settings.max_posting_len != usize::MAX || settings.min_posting_len != 0 {
+                    // Natural target posting length ≈ mean cluster size
+                    // (≈ 1/centroid_ratio); splits aim sub-clusters here.
+                    let target_posting_len = (vector_count / num_centroids)
+                        .max(1)
+                        .min(settings.max_posting_len.max(1));
+                    if matches!(opts.metric(), Metric::Dot) {
+                        // NOTE(metric soundness): Dot has no triangle
+                        // inequality and is clustered from raw, unnormalized
+                        // magnitudes, so both the Euclidean balanced split
+                        // (clusterer.train) and the nearest-centroid
+                        // reassignment are geometrically unsound for Dot.
+                        // Phase 1 leaves the query path untouched, but this
+                        // MUST be resolved (normalize, or skip rebalance and
+                        // replication for Dot) before Phase 2. It is NOT
+                        // silently treated as L2.
+                    }
+                    rebalance_clusters(
+                        ctx.cancel,
+                        opts,
+                        clusterer,
+                        &columns,
+                        &mut assigned_vectors,
+                        &mut centroid_rows,
+                        settings.assign_batch_size,
+                        settings.max_posting_len,
+                        settings.min_posting_len,
+                        target_posting_len,
+                    )?;
+                }
+
+                // Rebalance may have changed the centroid count.
+                let num_centroids = centroid_rows.len();
+
+                // Fixed-k replication: append the accumulated replica cells as
+                // extra entries (the write path below already tolerates >1 entry
+                // per vector). Cells index the trained centroids; with balancing
+                // off (the default) the count is unchanged so all are in range —
+                // guard anyway so a rebalanced count never indexes out of bounds.
+                for entry in replica_entries.drain(..) {
+                    if entry.cluster < num_centroids {
+                        assigned_vectors.push(entry);
+                    }
+                }
+
+                // radius: the per-cluster radius would be computed HERE, over
+                // the FINAL primary membership. MUST move to after replication
+                // in Phase 2 — boundary replicas are the farthest cluster
+                // members and define r_c, so a radius computed pre-replication
+                // under-covers the stored replicas and the query-time
+                // termination bound would prune clusters that actually hold
+                // them (silent recall loss).
+
+                let mut cluster_counts = vec![0usize; num_centroids];
+                for assigned_vector in &assigned_vectors {
+                    cluster_counts[assigned_vector.cluster] += 1;
+                }
+
                 assigned_vectors
                     .sort_unstable_by_key(|vector| (vector.cluster, vector.target_doc_id));
 
@@ -294,6 +801,7 @@ pub(crate) fn merge_ivf(
                     next_offset.serialize(&mut cluster_offsets)?;
                 }
 
+                let posting_start = Instant::now();
                 {
                     let assignments_w = assignments_write.for_field(field);
                     for assigned_vector in &assigned_vectors {
@@ -318,12 +826,22 @@ pub(crate) fn merge_ivf(
                     }
                     vec_w.flush()?;
                 }
+                timings.posting_write = posting_start.elapsed();
 
-                let centroid_bytes =
-                    OwnedBytes::new(encoded_centroids.into_iter().flatten().collect::<Vec<_>>());
+                // K-means cluster means are not unit-norm; for Cosine+F32
+                // normalize each centroid here so the search path can score
+                // both docs and centroids with the same `dot * inv_norm_q`
+                // fast kernel.
+                let mut centroid_bytes =
+                    Vec::with_capacity(num_centroids * opts.bytes_per_vector());
+                for centroid in &centroid_rows {
+                    let mut bytes = encode_vector(centroid, opts.dim())?;
+                    opts.maybe_normalize_bytes(&mut bytes);
+                    centroid_bytes.extend_from_slice(&bytes);
+                }
                 let meta = IvfFieldMeta {
                     num_centroids,
-                    centroid_bytes,
+                    centroid_bytes: OwnedBytes::new(centroid_bytes),
                     cluster_offsets: OwnedBytes::new(cluster_offsets),
                 };
                 {
@@ -331,6 +849,21 @@ pub(crate) fn merge_ivf(
                     meta.serialize(meta_w, opts)?;
                     meta_w.flush()?;
                 }
+
+                log::info!(
+                    target: "paradedb::ivf_build",
+                    "ivf_build timings_ms train={} hnsw_build={} assign={} replica_knn={} \
+                     posting_write={} total={} replicas={} centroids={} vectors={}",
+                    timings.train.as_millis(),
+                    timings.hnsw_build.as_millis(),
+                    timings.assign.as_millis(),
+                    timings.replica_knn.as_millis(),
+                    timings.posting_write.as_millis(),
+                    field_build_start.elapsed().as_millis(),
+                    replicas,
+                    num_centroids,
+                    vector_count,
+                );
             }
         }
     }

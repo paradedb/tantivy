@@ -20,6 +20,7 @@ use super::prepared::PreparedQuery;
 use super::reader::{VectorColumn, VectorColumnReader, VectorReader};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::TopNComputer;
+use crate::fastfield::AliveBitSet;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
@@ -86,9 +87,23 @@ impl<T: VectorElement> VectorBackend<T> {
         segment_reader: &SegmentReader,
         top_n: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        self.top_n_with_stats(weight, segment_reader, top_n, None)
+    }
+
+    /// Like [`Self::top_n`] but threads an optional [`ProbeStats`] sink into the
+    /// IVF probe loop. `None` is identical in behavior and cost to `top_n` (no
+    /// allocation, the per-doc hot loop unchanged). The Flat backend ignores
+    /// `stats` — no IVF probe stats apply there.
+    pub fn top_n_with_stats(
+        &self,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
+        stats: Option<&mut ProbeStats>,
+    ) -> crate::Result<Vec<(Score, DocAddress)>> {
         match self {
             Self::Flat(b) => b.top_n(weight, segment_reader, top_n),
-            Self::Ivf(b) => b.top_n(weight, segment_reader, top_n),
+            Self::Ivf(b) => b.top_n(weight, segment_reader, top_n, stats),
         }
     }
 }
@@ -152,15 +167,43 @@ impl<T: VectorElement> FlatBackend<T> {
 ///
 /// The production `top_n` entry point passes `None` to the shared inner
 /// helper and pays no allocation for stats accumulation.
+/// How the probe loop stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProbeTermination {
+    /// `probe_count >= max_probe_count` — the hard fanout ceiling.
+    Ceiling,
+    /// The epsilon threshold + survivor-floor gate fired.
+    Gate,
+    /// The ranked centroids were exhausted without hitting either stop.
+    #[default]
+    Exhausted,
+}
+
 #[derive(Debug, Default)]
 pub struct ProbeStats {
     /// Clusters visited by the probe loop, in probe order. A cluster
     /// appears here once we've passed the stop-condition gate for it,
     /// regardless of whether its doc-ids slice ends up empty.
     pub probed_clusters: Vec<usize>,
-    /// Number of docs that survived the filter + alive checks and got
-    /// scored against the query.
+    /// Docs that passed filter + alive + seen and were scored against the
+    /// query. This stays the "scored" bucket and equals the final survivor
+    /// `candidates`, so starvation is just `candidates_scored < min_candidates`.
     pub candidates_scored: usize,
+    /// Every doc-id the inner loop touched, before any gate — the denominator
+    /// for the prune breakdown.
+    pub vectors_visited: usize,
+    /// Touched docs rejected by `filter.contains`.
+    pub pruned_filter: usize,
+    /// Touched docs rejected by `is_alive`.
+    pub pruned_dead: usize,
+    /// Touched docs rejected by the replica `seen` dedup.
+    pub pruned_seen: usize,
+    /// Centroids ranked for this query (`= num_centroids`; the navigation cost).
+    pub centroids_ranked: usize,
+    /// The resolved survivor floor the gate used for this query.
+    pub min_candidates: usize,
+    /// How the probe loop terminated. Per-segment; does not sum.
+    pub termination: ProbeTermination,
 }
 
 /// How many candidate docs the IVF probe loop is willing to score per
@@ -176,18 +219,7 @@ pub struct ProbeStats {
 pub(crate) const CANDIDATE_OVERFETCH_MULTIPLIER: usize = 4;
 
 impl<T: VectorElement> IvfBackend<T> {
-    fn top_n(
-        &self,
-        weight: &dyn Weight,
-        segment_reader: &SegmentReader,
-        top_n: usize,
-    ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        self.top_n_inner(weight, segment_reader, top_n, None)
-    }
-
-    /// Same logic as `top_n` but also returns a `ProbeStats` describing
-    /// which clusters the adaptive loop visited. Test-only seam used by
-    /// the 2D fixture scenarios.
+    /// Test helper: run `top_n` with a fresh `ProbeStats` and return both.
     #[cfg(test)]
     pub(crate) fn top_n_instrumented(
         &self,
@@ -196,11 +228,15 @@ impl<T: VectorElement> IvfBackend<T> {
         top_n: usize,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let mut stats = ProbeStats::default();
-        let hits = self.top_n_inner(weight, segment_reader, top_n, Some(&mut stats))?;
+        let hits = self.top_n(weight, segment_reader, top_n, Some(&mut stats))?;
         Ok((hits, stats))
     }
 
-    fn top_n_inner(
+    /// Top-N by IVF probe. When `stats` is `Some`, it is filled with this
+    /// segment's probe-loop counters; `None` is the zero-cost production path —
+    /// no allocation, the per-doc hot loop unchanged (the counts `scan_one_cluster`
+    /// already computes are simply discarded).
+    fn top_n(
         &self,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
@@ -215,18 +251,10 @@ impl<T: VectorElement> IvfBackend<T> {
             return Ok(Vec::new());
         }
 
-        // Drain the filter `DocSet` into a dense BitSet for random
-        // membership testing per cluster doc. The BitSet allocates
-        // `max_doc / 8` bytes regardless of filter selectivity —
-        // inherent to IVF needing O(1) membership tests on
-        // out-of-order doc ids. Revisit only if memory profiling
-        // flags it.
-        let mut filter = BitSet::with_max_value(max_doc);
-        weight.for_each_no_score(segment_reader, &mut |docs| {
-            for &doc in docs {
-                filter.insert(doc);
-            }
-        })?;
+        // Materialize the filter `DocSet` into a dense BitSet. Its own
+        // `#[inline(never)]` frame: at low selectivity over a large segment
+        // this drain is real cost otherwise hidden in the search entry.
+        let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
         if filter.len() == 0 {
             return Ok(Vec::new());
         }
@@ -239,16 +267,10 @@ impl<T: VectorElement> IvfBackend<T> {
             return Ok(Vec::new());
         }
 
-        // Rank centroids descending by similarity. Full scan over
-        // `num_centroids` is the dominant fixed cost; inherent to
-        // flat-centroid IVF, unrelated to the storage layout.
-        let mut ranked: Vec<(f32, usize)> = (0..num_centroids)
-            .map(|c| {
-                let cb = &centroid_bytes[c * stride..(c + 1) * stride];
-                (self.query.score_doc_bytes(cb), c)
-            })
-            .collect();
-        ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        // Rank centroids descending by similarity. Extracted into a
+        // `#[inline(never)]` method so this phase shows as its own
+        // flamegraph frame (carrying its own `score_doc_bytes` cost).
+        let ranked = self.rank_centroids(centroid_bytes, stride, num_centroids);
 
         let best = ranked[0].0;
         let threshold = adaptive_threshold(self.query.metric(), best, self.adaptive.epsilon);
@@ -265,66 +287,29 @@ impl<T: VectorElement> IvfBackend<T> {
         let (min_probe_count, max_probe_count) =
             self.adaptive.resolved_probe_counts(num_centroids)?;
 
-        // Adaptive probe loop. Cluster-order arrival of survivors
-        // forbids the ascending-D shortcut in `push`; use
-        // `push_unordered`. The filter check is cheap (constant-time
-        // bitset lookup) so we do it before the more expensive alive
-        // check + similarity score.
-        //
-        // Note on `NaturalComparator` (vs the `TopNComputer::new`
-        // default): vector similarity is "higher = better", so we
-        // want top-N *largest* scores in descending order. The
-        // default `new()` wires `ReverseComparator`, which keeps
-        // top-N *smallest* in ascending order — correct for
-        // ascending-distance metrics but inverted for our convention.
-        let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
-            top_n,
-            NaturalComparator,
-        );
-        let mut candidates = 0usize;
-
-        for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
-            if probe_count >= max_probe_count {
-                break;
-            }
-            if centroid_score < threshold
-                && candidates >= min_candidates
-                && probe_count >= min_probe_count
-            {
-                break;
-            }
-
-            // Record the probe before doing any work, so even an empty
-            // cluster (no doc-ids slice) counts as "probed" — that's
-            // the right unit for the efficiency assertions.
-            if let Some(s) = stats.as_deref_mut() {
-                s.probed_clusters.push(cluster);
-            }
-
-            let Some(doc_ids) = self.column.cluster_doc_ids(cluster)? else {
-                continue;
-            };
-            let cluster_vecs = self.column.cluster_vector_bytes(cluster)?;
-            let cluster_vec_slice = cluster_vecs.as_slice();
-
-            for (local_i, &doc) in doc_ids.iter().enumerate() {
-                if !filter.contains(doc) {
-                    continue;
-                }
-                if let Some(bs) = alive {
-                    if !bs.is_alive(doc) {
-                        continue;
-                    }
-                }
-                let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
-                let score = self.query.score_doc_bytes(vbytes);
-                topn.push_unordered(score, doc);
-                candidates += 1;
-                if let Some(s) = stats.as_deref_mut() {
-                    s.candidates_scored += 1;
-                }
-            }
+        // Navigation cost + the resolved survivor floor are known here, once.
+        if let Some(s) = stats.as_deref_mut() {
+            s.centroids_ranked = num_centroids;
+            s.min_candidates = min_candidates;
         }
+
+        // Adaptive probe loop, extracted into a `#[inline(never)]`
+        // method so this phase shows as its own flamegraph frame
+        // (carrying its own `score_doc_bytes` cost), distinct from the
+        // centroid-ranking frame above.
+        let topn = self.scan_clusters(
+            ranked,
+            threshold,
+            min_candidates,
+            min_probe_count,
+            max_probe_count,
+            stride,
+            &filter,
+            max_doc,
+            alive,
+            top_n,
+            stats,
+        )?;
 
         // Drain best-first, tag with our segment_ord. The collector's
         // `merge_fruits` flattens across segments, sorts descending,
@@ -336,6 +321,200 @@ impl<T: VectorElement> IvfBackend<T> {
             .map(|cd| (cd.sort_key, DocAddress::new(segment_ord, cd.doc)))
             .collect())
     }
+
+    /// Phase 1: rank centroids descending by similarity. Full scan over
+    /// `num_centroids` is the dominant fixed cost; inherent to flat-centroid
+    /// IVF, unrelated to the storage layout. `#[inline(never)]` so it forms
+    /// its own flamegraph frame carrying its `score_doc_bytes` cost.
+    #[inline(never)]
+    fn rank_centroids(
+        &self,
+        centroid_bytes: &[u8],
+        stride: usize,
+        num_centroids: usize,
+    ) -> Vec<(f32, usize)> {
+        let mut ranked: Vec<(f32, usize)> = (0..num_centroids)
+            .map(|c| {
+                let cb = &centroid_bytes[c * stride..(c + 1) * stride];
+                (self.query.score_doc_bytes(cb), c)
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        ranked
+    }
+
+    /// Phase 2: adaptive probe loop. Cluster-order arrival of survivors
+    /// forbids the ascending-D shortcut in `push`; use `push_unordered`. The
+    /// filter check is cheap (constant-time bitset lookup) so we do it before
+    /// the more expensive alive check + similarity score.
+    ///
+    /// Note on `NaturalComparator` (vs the `TopNComputer::new` default):
+    /// vector similarity is "higher = better", so we want top-N *largest*
+    /// scores in descending order. The default `new()` wires
+    /// `ReverseComparator`, which keeps top-N *smallest* in ascending order —
+    /// correct for ascending-distance metrics but inverted for our convention.
+    ///
+    /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
+    /// `score_doc_bytes` cost, distinct from `rank_centroids`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_clusters(
+        &self,
+        ranked: Vec<(f32, usize)>,
+        threshold: f32,
+        min_candidates: usize,
+        min_probe_count: usize,
+        max_probe_count: usize,
+        stride: usize,
+        filter: &BitSet,
+        max_doc: DocId,
+        alive: Option<&AliveBitSet>,
+        top_n: usize,
+        mut stats: Option<&mut ProbeStats>,
+    ) -> crate::Result<TopNComputer<Score, DocId, NaturalComparator>> {
+        let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
+            top_n,
+            NaturalComparator,
+        );
+        // `candidates` is the cumulative scored count that drives the gate; the
+        // prune counters accumulate into locals and fold into `ProbeStats` once
+        // after the loop, so the hot per-doc path carries no `Option` check.
+        let mut candidates = 0usize;
+        let mut visited = 0usize;
+        let mut pruned_filter = 0usize;
+        let mut pruned_dead = 0usize;
+        let mut pruned_seen = 0usize;
+        let mut termination = ProbeTermination::Exhausted;
+        // Replication can place the same doc in several probed clusters; dedup
+        // by doc id so a vector is scored at most once.
+        let mut seen = BitSet::with_max_value(max_doc);
+
+        for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
+            if probe_count >= max_probe_count {
+                termination = ProbeTermination::Ceiling;
+                break;
+            }
+            if centroid_score < threshold
+                && candidates >= min_candidates
+                && probe_count >= min_probe_count
+            {
+                termination = ProbeTermination::Gate;
+                break;
+            }
+
+            // Record the probe before doing any work, so even an empty
+            // cluster (no doc-ids slice) counts as "probed" — that's the right
+            // unit for the efficiency assertions. Per-cluster, so this `Option`
+            // check is O(clusters), not in the hot per-doc path.
+            if let Some(s) = stats.as_deref_mut() {
+                s.probed_clusters.push(cluster);
+            }
+
+            let Some(doc_ids) = self.column.cluster_doc_ids(cluster)? else {
+                continue;
+            };
+            let cluster_vecs = self.column.cluster_vector_bytes(cluster)?;
+            let cluster_vec_slice = cluster_vecs.as_slice();
+
+            let (v, pf, pd, ps, scored) = self.scan_one_cluster(
+                doc_ids,
+                cluster_vec_slice,
+                stride,
+                filter,
+                alive,
+                &mut seen,
+                &mut topn,
+            );
+            visited += v;
+            pruned_filter += pf;
+            pruned_dead += pd;
+            pruned_seen += ps;
+            candidates += scored;
+        }
+
+        // Fold the locally-accumulated counters into `ProbeStats` once (the
+        // `Option` check lives here at write-back, never per doc).
+        if let Some(s) = stats.as_deref_mut() {
+            s.vectors_visited += visited;
+            s.pruned_filter += pruned_filter;
+            s.pruned_dead += pruned_dead;
+            s.pruned_seen += pruned_seen;
+            s.candidates_scored += candidates;
+            s.termination = termination;
+        }
+
+        Ok(topn)
+    }
+
+    /// Phase 2 inner: scan one cluster's docs through the
+    /// `filter → alive → seen → score` gate, pushing survivors into `topn`.
+    /// Returns `(visited, pruned_filter, pruned_dead, pruned_seen, scored)` so
+    /// the caller folds the counters locally. `#[inline(never)]` so per-cluster
+    /// scan cost forms its own frame — but the per-doc loop itself stays inlined
+    /// here (a non-inlined call per doc would distort the profile and add real
+    /// latency). Called O(clusters) times.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_one_cluster(
+        &self,
+        doc_ids: &[DocId],
+        cluster_vec_slice: &[u8],
+        stride: usize,
+        filter: &BitSet,
+        alive: Option<&AliveBitSet>,
+        seen: &mut BitSet,
+        topn: &mut TopNComputer<Score, DocId, NaturalComparator>,
+    ) -> (usize, usize, usize, usize, usize) {
+        let mut visited = 0usize;
+        let mut pruned_filter = 0usize;
+        let mut pruned_dead = 0usize;
+        let mut pruned_seen = 0usize;
+        let mut scored = 0usize;
+        for (local_i, &doc) in doc_ids.iter().enumerate() {
+            visited += 1;
+            if !filter.contains(doc) {
+                pruned_filter += 1;
+                continue;
+            }
+            if let Some(bs) = alive {
+                if !bs.is_alive(doc) {
+                    pruned_dead += 1;
+                    continue;
+                }
+            }
+            if seen.contains(doc) {
+                pruned_seen += 1;
+                continue;
+            }
+            seen.insert(doc);
+            let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
+            let score = self.query.score_doc_bytes(vbytes);
+            topn.push_unordered(score, doc);
+            scored += 1;
+        }
+        (visited, pruned_filter, pruned_dead, pruned_seen, scored)
+    }
+}
+
+/// Drain the filter `DocSet` into a dense BitSet for O(1) random membership
+/// testing per cluster doc. The BitSet allocates `max_doc / 8` bytes regardless
+/// of filter selectivity — inherent to IVF needing membership tests on
+/// out-of-order doc ids. `#[inline(never)]` so it forms its own flamegraph
+/// frame; at low selectivity over a large segment this drain is real cost
+/// otherwise hidden in the search entry.
+#[inline(never)]
+fn build_filter_bitset(
+    weight: &dyn Weight,
+    segment_reader: &SegmentReader,
+    max_doc: DocId,
+) -> crate::Result<BitSet> {
+    let mut filter = BitSet::with_max_value(max_doc);
+    weight.for_each_no_score(segment_reader, &mut |docs| {
+        for &doc in docs {
+            filter.insert(doc);
+        }
+    })?;
+    Ok(filter)
 }
 
 fn lookup_metric(schema: &Schema, field: Field) -> crate::Result<Metric> {
@@ -546,6 +725,7 @@ mod tests {
 
     struct InlineClusterer {
         centroids: Vec<[f32; 2]>,
+        replicas: usize,
     }
 
     impl IvfClusterer for InlineClusterer {
@@ -560,6 +740,12 @@ mod tests {
                 num_centroids: self.centroids.len(),
                 training_samples_per_centroid: self.training_samples_per_centroid(),
                 assign_batch_size: self.assign_batch_size(),
+                // Crafted-geometry tests assert exact cluster membership;
+                // keep balancing disabled so the inline centroids are used
+                // verbatim.
+                max_posting_len: usize::MAX,
+                min_posting_len: 0,
+                replicas: self.replicas,
             })
         }
         fn train(
@@ -619,6 +805,7 @@ mod tests {
         metric: Metric,
         centroids: &[[f32; 2]],
         docs: &[(&str, [f32; 2])],
+        replicas: usize,
     ) -> crate::Result<(Index, Field, Field)> {
         assert!(docs.len() >= 2, "need ≥ 2 docs for ≥ 2 source segments");
         let mut sb = Schema::builder();
@@ -638,6 +825,7 @@ mod tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.to_vec(),
+                replicas,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -657,6 +845,352 @@ mod tests {
         writer.merge(&segment_ids).wait()?;
         writer.wait_merging_threads()?;
         Ok((index, embed_field, label_field))
+    }
+
+    /// Fixed-k replication is additive: each vector is written into exactly
+    /// `replicas` cells (the primary plus `replicas - 1` HNSW-nearest
+    /// non-primary cells), so total posting entries scale linearly with
+    /// `replicas`. `replicas == 1` is the primary-only Phase-1 layout. Query
+    /// results never repeat a doc id (the `seen` dedup).
+    #[test]
+    fn ivf_fixed_k_replication_is_additive() -> crate::Result<()> {
+        // Six well-separated centroids (3×2 grid); docs sit tightly around each
+        // so the primary and nearest-others are unambiguous.
+        let centroids = [
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let n_per = 6usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+        let n = docs.len();
+
+        let total_entries = |replicas: usize| -> crate::Result<(usize, usize)> {
+            let (index, embed_field, _label) =
+                build_inline_ivf(Metric::L2, &centroids, &docs, replicas)?;
+            let searcher = index.reader()?.searcher();
+            let segment_reader = &searcher.segment_readers()[0];
+            let sizes = segment_reader
+                .vector_cluster_sizes(embed_field)?
+                .expect("ivf cluster sizes");
+            Ok((sizes.iter().map(|&s| s as usize).sum(), sizes.len()))
+        };
+
+        // replicas = 1: primary-only — exactly N entries, no extra centroids.
+        let (sum1, k1) = total_entries(1)?;
+        assert_eq!(sum1, n, "replicas=1 must be primary-only (N entries)");
+        assert_eq!(k1, centroids.len());
+
+        // replicas = k: every vector lands in exactly k cells (>= k centroids
+        // exist, so k-1 distinct non-primary neighbours are always available).
+        for replicas in [2usize, 3, 4] {
+            let (sum, _k) = total_entries(replicas)?;
+            assert_eq!(
+                sum,
+                replicas * n,
+                "replicas={replicas} must write {replicas}× the entries (additive)"
+            );
+        }
+
+        // Query-time dedup: with replication a doc lands in several probed
+        // clusters, but a search must return each doc id at most once.
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 4)?;
+        let params = exhaustive_params(centroids.len());
+        let hits = search(&index, embed_field, &AllQuery, vec![10.0, 10.0], n, params)?;
+        let unique = hits.len();
+        let mut ids: Vec<_> = hits.iter().map(|(_, addr)| addr.doc_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), unique, "search returned duplicate doc ids");
+        Ok(())
+    }
+
+    /// Captures `paradedb::ivf_build` log records so a test can read back the
+    /// timings line the merge emits.
+    struct CaptureLogger;
+    static CAPTURED_IVF_BUILD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.target() == "paradedb::ivf_build"
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                CAPTURED_IVF_BUILD
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}", r.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+    /// The merge emits one parseable `ivf_build timings_ms ...` line per field,
+    /// with `replica_knn` non-trivial at `replicas > 1`. Builds a larger index
+    /// so the phase timings are measurable, captures the line, and prints it
+    /// (run with `--nocapture`) so we can see where build time goes.
+    #[test]
+    fn ivf_build_emits_timings_log() -> crate::Result<()> {
+        let _ = log::set_logger(&CAPTURE_LOGGER);
+        log::set_max_level(log::LevelFilter::Info);
+
+        // 200 centroids on a 20×10 grid; ~5000 docs clustered around them.
+        let mut centroids: Vec<[f32; 2]> = Vec::new();
+        for x in 0..20 {
+            for y in 0..10 {
+                centroids.push([x as f32 * 10.0, y as f32 * 10.0]);
+            }
+        }
+        let n_per = 25usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.05;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+
+        let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
+        let _ = build_inline_ivf(Metric::L2, &centroids, &docs, 8)?;
+        let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
+        let line = lines
+            .iter()
+            .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
+            .expect("expected an ivf_build timings line for the 200-centroid build");
+        assert!(line.contains("replicas=8"));
+        assert!(line.contains("replica_knn="));
+        eprintln!("IVF_BUILD_SAMPLE {line}");
+        Ok(())
+    }
+
+    // ---- Merge-time cluster balancing (Phase 1) ----
+
+    /// Clusterer that drives the merge-time rebalance path. The first
+    /// `train()` is the top-level clustering and returns the configured
+    /// (deliberately imbalanced) centroids; every later `train()` is a split
+    /// sub-clustering and seeds sub-centroids by striding through the
+    /// oversized cluster's members, so splits genuinely partition it.
+    /// Assignment is real nearest-centroid (L2). The size bounds are
+    /// configurable so a single test can exercise both the split (oversized)
+    /// and merge (undersized) branches.
+    struct BalancedTestClusterer {
+        centroids: Vec<[f32; 2]>,
+        max_posting_len: usize,
+        min_posting_len: usize,
+        top_level_done: std::sync::atomic::AtomicBool,
+    }
+
+    impl IvfClusterer for BalancedTestClusterer {
+        fn centroid_ratio(&self) -> f32 {
+            1.0
+        }
+        fn training_samples_per_centroid(&self) -> usize {
+            2
+        }
+        fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
+            Ok(IvfMergeSettings {
+                num_centroids: self.centroids.len().min(total_target_docs),
+                training_samples_per_centroid: self.training_samples_per_centroid(),
+                assign_batch_size: self.assign_batch_size(),
+                max_posting_len: self.max_posting_len,
+                min_posting_len: self.min_posting_len,
+                replicas: 1,
+            })
+        }
+        fn train(
+            &self,
+            options: &VectorOptions,
+            vectors: IvfVectors<'_>,
+            num_centroids: usize,
+        ) -> crate::Result<IvfCentroids> {
+            use std::sync::atomic::Ordering;
+            assert_eq!(options.dim(), 2);
+            let IvfVectors::F32(batch) = vectors;
+            if !self.top_level_done.swap(true, Ordering::Relaxed) {
+                return Ok(IvfCentroids::F32(IvfMatrix {
+                    values: self
+                        .centroids
+                        .iter()
+                        .take(num_centroids)
+                        .flat_map(|c| c.iter().copied())
+                        .collect(),
+                    rows: num_centroids,
+                    dims: 2,
+                }));
+            }
+            let rows = batch.matrix.rows;
+            assert!(
+                rows >= num_centroids,
+                "split needs >= num_centroids members"
+            );
+            let mut values = Vec::with_capacity(num_centroids * 2);
+            for j in 0..num_centroids {
+                let row = (j * rows) / num_centroids;
+                values.extend_from_slice(&batch.matrix.values[row * 2..row * 2 + 2]);
+            }
+            Ok(IvfCentroids::F32(IvfMatrix {
+                values,
+                rows: num_centroids,
+                dims: 2,
+            }))
+        }
+        fn assign(
+            &self,
+            options: &VectorOptions,
+            vectors: IvfVectors<'_>,
+            centroids: &IvfCentroids,
+        ) -> crate::Result<Vec<u32>> {
+            assert_eq!(options.dim(), 2);
+            let IvfVectors::F32(vectors) = vectors;
+            let IvfCentroids::F32(centroids) = centroids;
+            Ok(vectors
+                .matrix
+                .values
+                .chunks_exact(2)
+                .map(|v| {
+                    let mut best = 0u32;
+                    let mut best_d2 = f32::INFINITY;
+                    for (i, c) in centroids.values.chunks_exact(2).enumerate() {
+                        let dx = v[0] - c[0];
+                        let dy = v[1] - c[1];
+                        let d2 = dx * dx + dy * dy;
+                        if d2 < best_d2 {
+                            best_d2 = d2;
+                            best = i as u32;
+                        }
+                    }
+                    best
+                })
+                .collect())
+        }
+    }
+
+    /// End-to-end Step-6 check: a deliberately imbalanced top-level
+    /// clustering (one ~60-member fat cluster + one 3-member outlier
+    /// cluster) is balanced at merge time. The fat cluster is split below
+    /// the cap and the outlier cluster is dissolved above the floor, with
+    /// every vector preserved and still retrievable.
+    #[test]
+    fn ivf_merge_rebalances_cluster_sizes() -> crate::Result<()> {
+        use std::sync::atomic::AtomicBool;
+
+        const MAX_POSTING: usize = 20;
+        const MIN_POSTING: usize = 5;
+        const NUM_DENSE: usize = 60;
+        const NUM_FAR: usize = 3;
+        let total = NUM_DENSE + NUM_FAR;
+
+        let mut docs: Vec<(String, [f32; 2])> = Vec::new();
+        for i in 0..NUM_DENSE {
+            docs.push((format!("dense-{i}"), [i as f32, 0.0]));
+        }
+        for i in 0..NUM_FAR {
+            docs.push((format!("far-{i}"), [1000.0, 1000.0 + i as f32]));
+        }
+
+        let clusterer = Arc::new(BalancedTestClusterer {
+            centroids: vec![[0.0, 0.0], [1000.0, 1000.0]],
+            max_posting_len: MAX_POSTING,
+            min_posting_len: MIN_POSTING,
+            top_level_done: AtomicBool::new(false),
+        });
+
+        let mut sb = Schema::builder();
+        let embed_field = sb.add_vector_field(
+            "embedding",
+            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let schema = sb.build();
+
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .ivf_clusterer(clusterer)
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        // Two commits so the merge has >= 2 source segments.
+        let mid = docs.len() / 2;
+        for chunk in [&docs[..mid], &docs[mid..]] {
+            for (label, v) in chunk {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(label_field, label);
+                doc.add_vector(embed_field, v.as_slice());
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        let segment_ids: Vec<_> = index.searchable_segment_ids()?.into_iter().collect();
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let searcher = index.reader()?.searcher();
+        assert_eq!(
+            searcher.segment_readers().len(),
+            1,
+            "expected a single merged segment"
+        );
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = VectorReader::open(segment_reader)?;
+        let info = vec_reader.info(embed_field)?.expect("vector info");
+        assert_eq!(info.format, VectorStorageFormat::Ivf);
+        let stats = info.cluster_stats.expect("ivf cluster stats");
+
+        // No vectors lost across the rebalance.
+        assert_eq!(info.num_vectors, total);
+        // Max cap enforced (the dense cloud was a single ~60-member cluster).
+        assert!(
+            stats.max_cluster_size <= MAX_POSTING,
+            "max cluster size {} exceeds cap {MAX_POSTING}",
+            stats.max_cluster_size
+        );
+        // Min floor enforced (the 3-member outlier cluster was dissolved, not
+        // left as an undersized posting).
+        assert!(
+            stats.min_cluster_size >= MIN_POSTING,
+            "min cluster size {} below floor {MIN_POSTING}",
+            stats.min_cluster_size
+        );
+        // Dissolving undersized clusters also clears empties.
+        assert_eq!(stats.empty_clusters, 0);
+        // Splitting the fat cluster added centroids beyond the original 2.
+        assert!(
+            info.num_centroids.unwrap() >= 2,
+            "expected splits to add centroids, got {:?}",
+            info.num_centroids
+        );
+
+        // Every document is still retrievable from its posting.
+        let column = vec_reader.open_column(embed_field)?;
+        for doc_id in 0..total as u32 {
+            assert!(
+                column.contains(doc_id),
+                "doc {doc_id} missing from IVF index after rebalance"
+            );
+        }
+
+        Ok(())
     }
 
     // ---- IVF top_n correctness tests ----
@@ -684,6 +1218,69 @@ mod tests {
                 )?;
                 assert_eq!(actual, expected, "L2 exhaustive query={query:?} k={k}");
             }
+        }
+        Ok(())
+    }
+
+    /// The raw per-cluster sizes from `vector_cluster_sizes` must be exactly the
+    /// un-collapsed array behind `vector_info`'s aggregate cluster stats — the
+    /// invariant `paradedb.ivf_cluster_sizes` relies on to reconcile with
+    /// `paradedb.index_info`. Flat segments expose no sizes.
+    #[test]
+    fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .build()?;
+        let field = index.embedding_field();
+        let searcher = index.index.reader()?.searcher();
+
+        let mut segments_checked = 0;
+        for segment_reader in searcher.segment_readers() {
+            let sizes = segment_reader
+                .vector_cluster_sizes(field)?
+                .expect("ivf segment exposes cluster sizes");
+            let info = segment_reader.vector_info(field)?.expect("vector info");
+            assert_eq!(info.format, VectorStorageFormat::Ivf);
+            let stats = info.cluster_stats.expect("ivf cluster stats");
+
+            // count == num_centroids, and every aggregate index_info reports is
+            // reproducible from the raw array.
+            assert_eq!(sizes.len(), info.num_centroids.expect("ivf centroids"));
+            let sum: u64 = sizes.iter().map(|&s| u64::from(s)).sum();
+            let min = sizes.iter().copied().min().unwrap() as usize;
+            let max = sizes.iter().copied().max().unwrap() as usize;
+            let empty = sizes.iter().filter(|&&s| s == 0).count();
+            let avg = sum as f64 / sizes.len() as f64;
+
+            assert_eq!(sum as usize, info.num_vectors, "sizes sum to num_vectors");
+            assert_eq!(min, stats.min_cluster_size, "min");
+            assert_eq!(max, stats.max_cluster_size, "max");
+            assert_eq!(empty, stats.empty_clusters, "empty");
+            assert!(
+                (avg - stats.avg_cluster_size).abs() < 1e-9,
+                "avg {avg} vs {}",
+                stats.avg_cluster_size
+            );
+            segments_checked += 1;
+        }
+        assert!(
+            segments_checked > 0,
+            "fixture must produce >= 1 IVF segment"
+        );
+
+        // Flat segments (no IVF data) yield None — the SRF emits no rows for them.
+        let flat = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Flat)
+            .build()?;
+        let flat_field = flat.embedding_field();
+        let flat_searcher = flat.index.reader()?.searcher();
+        for segment_reader in flat_searcher.segment_readers() {
+            assert!(
+                segment_reader.vector_cluster_sizes(flat_field)?.is_none(),
+                "flat segments expose no cluster sizes"
+            );
         }
         Ok(())
     }
@@ -765,7 +1362,7 @@ mod tests {
             ("trap_b", [5.0, 5.01]),
             ("anchor_b", [10.0, 10.0]),
         ];
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
         let query = [1.0_f32, 1.0];
 
         // Setup assertions.
@@ -1008,7 +1605,7 @@ mod tests {
             ("b_far", [10.0_f32, 10.0]),
             ("b_far2", [11.0_f32, 9.5]),
         ];
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
         let query = [1.0_f32, 1.0];
         let top_k = 1;
 
@@ -1174,6 +1771,114 @@ mod tests {
         let segment_doc_count =
             index.index.reader()?.searcher().segment_readers()[0].max_doc() as usize;
         assert_eq!(stats.candidates_scored, segment_doc_count);
+
+        // Counter invariant: every touched doc lands in exactly one bucket.
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
+            "visited must equal filter+dead+seen+scored ({stats:?})"
+        );
+        // Navigation cost == the centroids ranked for this query.
+        assert_eq!(stats.centroids_ranked, DEFAULT_NUM_CENTROIDS);
+        // Exhaustive params (fanout 1.0, huge epsilon) drain the ranked list.
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        Ok(())
+    }
+
+    /// A tiny `max_probe_fanout` forces the hard ceiling: the loop stops with
+    /// `termination == Ceiling`, having probed fewer than all centroids, and the
+    /// counter invariant still holds. Uses the deterministic `build_inline_ivf`
+    /// fixture (fixed 6 centroids) so the cutoff is stable.
+    #[test]
+    fn ivf_probe_stats_termination_ceiling() -> crate::Result<()> {
+        let centroids = [
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let n_per = 6usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+
+        // max_probe_fanout 1/6 → ceiling at the first probe; huge epsilon keeps
+        // the gate from firing first.
+        let params = AdaptiveProbeParams {
+            epsilon: 1e6,
+            min_candidates: 0,
+            min_probe_fanout: 0.0,
+            max_probe_fanout: 1.0 / centroids.len() as f32,
+        };
+        let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![10.0, 10.0], 3, params)?;
+        assert_eq!(stats.termination, ProbeTermination::Ceiling);
+        // Stopped short of exhausting the ranked list.
+        assert!(stats.probed_clusters.len() < centroids.len());
+        assert_eq!(stats.centroids_ranked, centroids.len());
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
+            "visited must equal filter+dead+seen+scored ({stats:?})"
+        );
+        Ok(())
+    }
+
+    /// Replica dedup is counted: on a `replicas=4` index, exhaustive probing
+    /// re-encounters each doc in several cells, so `pruned_seen` is non-zero,
+    /// each doc is still scored exactly once, and the invariant holds.
+    #[test]
+    fn ivf_probe_stats_counts_replica_dedup() -> crate::Result<()> {
+        let centroids = [
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let n_per = 6usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+        let n = docs.len();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 4)?;
+
+        let (_, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            vec![10.0, 10.0],
+            n,
+            exhaustive_params(centroids.len()),
+        )?;
+        // Each doc is in up to 4 probed cells; the 3 re-encounters are deduped.
+        assert!(
+            stats.pruned_seen > 0,
+            "replica dedup should fire: {stats:?}"
+        );
+        // Still scored exactly once each.
+        assert_eq!(stats.candidates_scored, n);
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
+            "visited must equal filter+dead+seen+scored ({stats:?})"
+        );
         Ok(())
     }
 

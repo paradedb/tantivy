@@ -11,9 +11,9 @@
 //! loop. Flat fits the model trivially; IVF gets to drive.
 
 use std::cmp::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use super::backend::VectorBackend;
+use super::backend::{ProbeStats, VectorBackend};
 use super::ivf::AdaptiveProbeParams;
 use super::options::VectorElement;
 use crate::collector::{Collector, SegmentCollector};
@@ -36,6 +36,11 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement> {
     limit: usize,
     offset: usize,
     adaptive: AdaptiveProbeParams,
+    /// Optional per-segment [`ProbeStats`] sink. When `Some`, each segment's
+    /// probe stats are pushed here; the caller aggregates after the search.
+    /// `None` (the default) is the zero-cost production path. Shared because
+    /// `collect_segment` takes `&self`.
+    probe_stats_sink: Option<Arc<Mutex<Vec<ProbeStats>>>>,
 }
 
 impl<T: VectorElement> TopDocsByVectorSimilarity<T> {
@@ -46,7 +51,15 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T> {
             limit,
             offset: 0,
             adaptive: AdaptiveProbeParams::default(),
+            probe_stats_sink: None,
         }
+    }
+
+    /// Collect per-segment [`ProbeStats`] into `sink`. Each `collect_segment`
+    /// pushes one entry; the caller aggregates after the search. Off by default.
+    pub fn with_probe_stats_sink(mut self, sink: Arc<Mutex<Vec<ProbeStats>>>) -> Self {
+        self.probe_stats_sink = Some(sink);
+        self
     }
 
     /// Drop the first `offset` results in the global ranking — used to
@@ -132,7 +145,20 @@ impl<T: VectorElement> Collector for TopDocsByVectorSimilarity<T> {
             Arc::clone(&self.query),
             self.adaptive.clone(),
         )?;
-        backend.top_n(weight, reader, self.segment_top_n())
+        match &self.probe_stats_sink {
+            None => backend.top_n(weight, reader, self.segment_top_n()),
+            Some(sink) => {
+                let mut stats = ProbeStats::default();
+                let hits = backend.top_n_with_stats(
+                    weight,
+                    reader,
+                    self.segment_top_n(),
+                    Some(&mut stats),
+                )?;
+                sink.lock().unwrap().push(stats);
+                Ok(hits)
+            }
+        }
     }
 
     fn merge_fruits(
@@ -225,6 +251,44 @@ mod ivf_e2e_tests {
                 assert_eq!(actual, expected, "IVF query={query:?} k={k}");
             }
         }
+        Ok(())
+    }
+
+    /// The production-collectible path: attaching a `ProbeStats` sink to the
+    /// collector fills one entry per IVF segment during the normal
+    /// `searcher.search` path, each satisfying the counter invariant. Without a
+    /// sink the search is unaffected (covered by `e2e_ivf_matches_global_oracle`).
+    #[test]
+    fn e2e_ivf_probe_stats_sink_collects() -> crate::Result<()> {
+        use std::sync::Mutex;
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .build()?;
+        let searcher = index.index.reader()?.searcher();
+        let num_segments = searcher.segment_readers().len();
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let collector = TopDocs::with_limit(4)
+            .order_by_similarity(index.embedding_field(), vec![0.5_f32, 0.5])
+            .with_adaptive_params(exhaustive_params(9))
+            .with_probe_stats_sink(Arc::clone(&sink));
+        let _ = searcher.search(&AllQuery, &collector)?;
+
+        let collected = sink.lock().unwrap();
+        // One ProbeStats per searched segment.
+        assert_eq!(collected.len(), num_segments);
+        let mut total_visited = 0usize;
+        for s in collected.iter() {
+            assert_eq!(
+                s.vectors_visited,
+                s.pruned_filter + s.pruned_dead + s.pruned_seen + s.candidates_scored,
+                "invariant per segment: {s:?}"
+            );
+            assert!(s.centroids_ranked > 0);
+            total_visited += s.vectors_visited;
+        }
+        assert!(total_visited > 0, "exhaustive probe should visit docs");
         Ok(())
     }
 

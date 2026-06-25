@@ -162,6 +162,13 @@ impl SegmentReader {
         VectorReader::open(self)?.info(field)
     }
 
+    /// Returns the raw per-cluster posting-list sizes for an IVF `field`, or
+    /// `None` if the segment has no IVF vector data for it. The un-collapsed
+    /// distribution behind [`Self::vector_info`]'s cluster stats.
+    pub fn vector_cluster_sizes(&self, field: Field) -> crate::Result<Option<Vec<u32>>> {
+        VectorReader::open(self)?.cluster_sizes(field)
+    }
+
     /// Open a new segment for reading.
     pub fn open(segment: &Segment) -> crate::Result<SegmentReader> {
         Self::open_with_custom_alive_set(segment, None)

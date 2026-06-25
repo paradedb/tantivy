@@ -46,6 +46,8 @@ impl Default for AdaptiveProbeParams {
 }
 
 impl AdaptiveProbeParams {
+
+    /// Return absolute Min and Max probe counts -> `(min, max)`
     pub(crate) fn resolved_probe_counts(
         &self,
         num_clusters: usize,

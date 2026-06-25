@@ -133,6 +133,24 @@ impl VectorReader {
             }
         }
     }
+
+    /// Raw per-cluster posting-list sizes for an IVF `field`, in cluster order.
+    /// `None` when the field is not a vector field, or its storage is not IVF
+    /// (Flat / absent). This is the un-collapsed array behind [`Self::info`]'s
+    /// min/max/avg cluster stats — exposed for tooling that needs the full
+    /// distribution. Computes nothing new; reads no extra on-disk state.
+    pub fn cluster_sizes(&self, field: Field) -> crate::Result<Option<Vec<u32>>> {
+        if !self.vector_dims.contains_key(&field) {
+            return Ok(None);
+        }
+        match &self.storage {
+            VectorStorageReader::None | VectorStorageReader::Flat(_) => Ok(None),
+            VectorStorageReader::Ivf(reader) => {
+                let meta = reader.field_meta(field)?;
+                Ok(Some(meta.cluster_sizes().map(|s| s as u32).collect()))
+            }
+        }
+    }
 }
 
 impl VectorColumnReader for VectorReader {
