@@ -187,6 +187,7 @@ impl IvfClusterer for Grid2DClusterer {
             // balancing disabled so the 3×3 grid centroids are used verbatim.
             max_posting_len: usize::MAX,
             min_posting_len: 0,
+            replicas: 1,
         })
     }
 

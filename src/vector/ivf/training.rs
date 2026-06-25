@@ -65,6 +65,8 @@ pub trait IvfClusterer: Send + Sync + 'static {
             assign_batch_size,
             max_posting_len,
             min_posting_len,
+            // Replication off by default (Phase-1 primary-only layout).
+            replicas: 1,
         })
     }
 }
@@ -89,6 +91,12 @@ pub struct IvfMergeSettings {
     /// any cluster below this and reassigns its members to the nearest
     /// surviving centroid. `0` disables merging.
     pub min_posting_len: usize,
+    /// Total number of cells a vector is written into (SPANN `ReplicaCount`):
+    /// the primary plus up to `replicas - 1` additional cells taken from the
+    /// nearest centroids via a transient build-time HNSW. `1` (the default)
+    /// disables replication entirely — no HNSW is built and the output is the
+    /// primary-only Phase-1 layout.
+    pub replicas: usize,
 }
 
 #[derive(Clone, Debug)]

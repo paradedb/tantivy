@@ -6,8 +6,10 @@
 //! after the threshold check.
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use common::{BinarySerializable, OwnedBytes};
+use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
 
 use super::{
     decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfFieldMeta, IvfMatrix, IvfMatrixView,
@@ -28,6 +30,74 @@ struct AssignedVector {
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_doc_id: DocId,
+}
+
+/// Transient build-time HNSW over the trained centroids, used to pick a
+/// vector's `replicas - 1` nearest non-primary cells. Built once per field
+/// when `replicas > 1`, queried during the assign loop, then dropped — never
+/// serialized. The distance must match how the primary is assigned: angular
+/// (cosine) for Cosine/Dot — both clustered in angular space — and L2 for L2.
+/// `DistCosine` handles un-normalized centroids, so no normalized copy is kept.
+enum CentroidHnsw {
+    Angular(Hnsw<'static, f32, DistCosine>),
+    L2(Hnsw<'static, f32, DistL2>),
+}
+
+impl CentroidHnsw {
+    fn build(metric: Metric, centroids: &[Vec<f32>]) -> Self {
+        let n = centroids.len();
+        // hnsw_rs caps `max_nb_connection` at 256; small centroid sets need it
+        // below `n`. ef_construction/max_layer are standard build-quality knobs.
+        let max_nb_connection = 24.min(n.saturating_sub(1)).max(1);
+        let ef_construction = 200;
+        let max_layer = 16;
+        let data: Vec<(&[f32], usize)> = centroids
+            .iter()
+            .enumerate()
+            .map(|(id, c)| (c.as_slice(), id))
+            .collect();
+        if matches!(metric, Metric::Cosine | Metric::Dot) {
+            let hnsw = Hnsw::<f32, DistCosine>::new(
+                max_nb_connection,
+                n,
+                max_layer,
+                ef_construction,
+                DistCosine {},
+            );
+            hnsw.parallel_insert_slice(&data);
+            CentroidHnsw::Angular(hnsw)
+        } else {
+            let hnsw = Hnsw::<f32, DistL2>::new(
+                max_nb_connection,
+                n,
+                max_layer,
+                ef_construction,
+                DistL2 {},
+            );
+            hnsw.parallel_insert_slice(&data);
+            CentroidHnsw::L2(hnsw)
+        }
+    }
+
+    /// Centroid ids of the `knn` nearest centroids to `query`, nearest first.
+    fn nearest(&self, query: &[f32], knn: usize, ef: usize) -> Vec<usize> {
+        let neighbours = match self {
+            CentroidHnsw::Angular(h) => h.search(query, knn, ef),
+            CentroidHnsw::L2(h) => h.search(query, knn, ef),
+        };
+        neighbours.into_iter().map(|nb| nb.d_id).collect()
+    }
+}
+
+/// Per-field IVF build timings (one phase per field), emitted at end of build
+/// as a parseable `log::info!` line on target `paradedb::ivf_build`.
+#[derive(Default)]
+struct IvfBuildTimings {
+    train: Duration,
+    hnsw_build: Duration,
+    assign: Duration,
+    replica_knn: Duration,
+    posting_write: Duration,
 }
 
 /// Safety cap on rebalance passes. Each pass dissolves undersized clusters
@@ -441,6 +511,9 @@ pub(crate) fn merge_ivf(
         let training_sample_interval = (vector_count / training_sample_size).max(1);
         match opts.dtype() {
             VectorDType::F32 => {
+                let field_build_start = Instant::now();
+                let mut timings = IvfBuildTimings::default();
+                let replicas = settings.replicas.max(1);
                 let mut training_values = Vec::with_capacity(training_sample_size * opts.dim());
                 let mut training_doc_ids = Vec::with_capacity(training_sample_size);
                 let mut target_doc_id: DocId = 0;
@@ -475,7 +548,9 @@ pub(crate) fn merge_ivf(
                         dims: opts.dim(),
                     },
                 });
+                let train_start = Instant::now();
                 let centroids = clusterer.train(opts, training_vectors, num_centroids)?;
+                timings.train = train_start.elapsed();
 
                 if ctx.cancel.wants_cancel() {
                     return Err(TantivyError::Cancelled);
@@ -512,6 +587,25 @@ pub(crate) fn merge_ivf(
                     .map(|centroid| centroid.to_vec())
                     .collect();
 
+                // Fixed-k replication (Part A3): a transient HNSW over the
+                // trained centroids, built ONCE before the assign loop and only
+                // when `replicas > 1`. At `replicas == 1` nothing is built or
+                // allocated — the layout stays primary-only Phase 1.
+                let dim = opts.dim();
+                let ef_search = (replicas * 4).max(64);
+                let centroid_hnsw = if replicas > 1 {
+                    let hnsw_start = Instant::now();
+                    let hnsw = CentroidHnsw::build(opts.metric(), &centroid_rows);
+                    timings.hnsw_build = hnsw_start.elapsed();
+                    Some(hnsw)
+                } else {
+                    None
+                };
+                // Replica cells accumulated during assign; appended as extra
+                // entries AFTER any rebalance so primary membership and the
+                // rebalance path are untouched. Empty at `replicas == 1`.
+                let mut replica_entries: Vec<AssignedVector> = Vec::new();
+
                 let mut assigned_vectors = Vec::with_capacity(vector_count);
                 let mut target_doc_id: DocId = 0;
                 {
@@ -531,6 +625,7 @@ pub(crate) fn merge_ivf(
                                 return Ok(());
                             }
                             let batch_len = batch_doc_ids.len();
+                            let assign_start = Instant::now();
                             let clusters = clusterer.assign(
                                 opts,
                                 IvfVectors::F32(IvfVectorBatch {
@@ -543,6 +638,7 @@ pub(crate) fn merge_ivf(
                                 }),
                                 &centroids,
                             )?;
+                            timings.assign += assign_start.elapsed();
                             if clusters.len() != batch_len {
                                 return Err(TantivyError::InvalidArgument(format!(
                                     "IvfClusterer assigned {} clusters for {} vectors",
@@ -550,8 +646,13 @@ pub(crate) fn merge_ivf(
                                     batch_len
                                 )));
                             }
-                            for (cluster, (target_doc_id, source_segment_ord, source_doc_id)) in
-                                clusters.into_iter().zip(batch_sources.drain(..))
+                            for (
+                                i,
+                                (cluster, (target_doc_id, source_segment_ord, source_doc_id)),
+                            ) in clusters
+                                .into_iter()
+                                .zip(batch_sources.drain(..))
+                                .enumerate()
                             {
                                 let cluster = cluster as usize;
                                 if cluster >= num_centroids {
@@ -566,6 +667,35 @@ pub(crate) fn merge_ivf(
                                     source_segment_ord,
                                     source_doc_id,
                                 });
+                                // Fixed-k replication: take the `replicas - 1`
+                                // nearest NON-primary centroids from the HNSW.
+                                // The top-k includes the primary; drop it
+                                // (build-time dedup) so a vector is never written
+                                // into its primary list twice.
+                                if replicas > 1 {
+                                    if let Some(hnsw) = centroid_hnsw.as_ref() {
+                                        let v = &batch_values[i * dim..(i + 1) * dim];
+                                        let knn_start = Instant::now();
+                                        let nearest = hnsw.nearest(v, replicas, ef_search);
+                                        timings.replica_knn += knn_start.elapsed();
+                                        let mut added = 0usize;
+                                        for cell in nearest {
+                                            if added >= replicas - 1 {
+                                                break;
+                                            }
+                                            if cell == cluster {
+                                                continue;
+                                            }
+                                            replica_entries.push(AssignedVector {
+                                                cluster: cell,
+                                                target_doc_id,
+                                                source_segment_ord,
+                                                source_doc_id,
+                                            });
+                                            added += 1;
+                                        }
+                                    }
+                                }
                             }
                             batch_values.clear();
                             batch_doc_ids.clear();
@@ -636,6 +766,17 @@ pub(crate) fn merge_ivf(
                 // Rebalance may have changed the centroid count.
                 let num_centroids = centroid_rows.len();
 
+                // Fixed-k replication: append the accumulated replica cells as
+                // extra entries (the write path below already tolerates >1 entry
+                // per vector). Cells index the trained centroids; with balancing
+                // off (the default) the count is unchanged so all are in range —
+                // guard anyway so a rebalanced count never indexes out of bounds.
+                for entry in replica_entries.drain(..) {
+                    if entry.cluster < num_centroids {
+                        assigned_vectors.push(entry);
+                    }
+                }
+
                 // radius: the per-cluster radius would be computed HERE, over
                 // the FINAL primary membership. MUST move to after replication
                 // in Phase 2 — boundary replicas are the farthest cluster
@@ -660,6 +801,7 @@ pub(crate) fn merge_ivf(
                     next_offset.serialize(&mut cluster_offsets)?;
                 }
 
+                let posting_start = Instant::now();
                 {
                     let assignments_w = assignments_write.for_field(field);
                     for assigned_vector in &assigned_vectors {
@@ -684,6 +826,7 @@ pub(crate) fn merge_ivf(
                     }
                     vec_w.flush()?;
                 }
+                timings.posting_write = posting_start.elapsed();
 
                 // K-means cluster means are not unit-norm; for Cosine+F32
                 // normalize each centroid here so the search path can score
@@ -706,6 +849,21 @@ pub(crate) fn merge_ivf(
                     meta.serialize(meta_w, opts)?;
                     meta_w.flush()?;
                 }
+
+                log::info!(
+                    target: "paradedb::ivf_build",
+                    "ivf_build timings_ms train={} hnsw_build={} assign={} replica_knn={} \
+                     posting_write={} total={} replicas={} centroids={} vectors={}",
+                    timings.train.as_millis(),
+                    timings.hnsw_build.as_millis(),
+                    timings.assign.as_millis(),
+                    timings.replica_knn.as_millis(),
+                    timings.posting_write.as_millis(),
+                    field_build_start.elapsed().as_millis(),
+                    replicas,
+                    num_centroids,
+                    vector_count,
+                );
             }
         }
     }

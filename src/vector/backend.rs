@@ -272,6 +272,7 @@ impl<T: VectorElement> IvfBackend<T> {
             max_probe_count,
             stride,
             &filter,
+            max_doc,
             alive,
             top_n,
             stats,
@@ -333,6 +334,7 @@ impl<T: VectorElement> IvfBackend<T> {
         max_probe_count: usize,
         stride: usize,
         filter: &BitSet,
+        max_doc: DocId,
         alive: Option<&AliveBitSet>,
         top_n: usize,
         mut stats: Option<&mut ProbeStats>,
@@ -342,6 +344,9 @@ impl<T: VectorElement> IvfBackend<T> {
             NaturalComparator,
         );
         let mut candidates = 0usize;
+        // Replication can place the same doc in several probed clusters; dedup
+        // by doc id so a vector is scored at most once.
+        let mut seen = BitSet::with_max_value(max_doc);
 
         for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
             if probe_count >= max_probe_count {
@@ -376,6 +381,10 @@ impl<T: VectorElement> IvfBackend<T> {
                         continue;
                     }
                 }
+                if seen.contains(doc) {
+                    continue;
+                }
+                seen.insert(doc);
                 let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
                 let score = self.query.score_doc_bytes(vbytes);
                 topn.push_unordered(score, doc);
@@ -598,6 +607,7 @@ mod tests {
 
     struct InlineClusterer {
         centroids: Vec<[f32; 2]>,
+        replicas: usize,
     }
 
     impl IvfClusterer for InlineClusterer {
@@ -617,6 +627,7 @@ mod tests {
                 // verbatim.
                 max_posting_len: usize::MAX,
                 min_posting_len: 0,
+                replicas: self.replicas,
             })
         }
         fn train(
@@ -676,6 +687,7 @@ mod tests {
         metric: Metric,
         centroids: &[[f32; 2]],
         docs: &[(&str, [f32; 2])],
+        replicas: usize,
     ) -> crate::Result<(Index, Field, Field)> {
         assert!(docs.len() >= 2, "need ≥ 2 docs for ≥ 2 source segments");
         let mut sb = Schema::builder();
@@ -695,6 +707,7 @@ mod tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.to_vec(),
+                replicas,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -714,6 +727,137 @@ mod tests {
         writer.merge(&segment_ids).wait()?;
         writer.wait_merging_threads()?;
         Ok((index, embed_field, label_field))
+    }
+
+    /// Fixed-k replication is additive: each vector is written into exactly
+    /// `replicas` cells (the primary plus `replicas - 1` HNSW-nearest
+    /// non-primary cells), so total posting entries scale linearly with
+    /// `replicas`. `replicas == 1` is the primary-only Phase-1 layout. Query
+    /// results never repeat a doc id (the `seen` dedup).
+    #[test]
+    fn ivf_fixed_k_replication_is_additive() -> crate::Result<()> {
+        // Six well-separated centroids (3×2 grid); docs sit tightly around each
+        // so the primary and nearest-others are unambiguous.
+        let centroids = [
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let n_per = 6usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+        let n = docs.len();
+
+        let total_entries = |replicas: usize| -> crate::Result<(usize, usize)> {
+            let (index, embed_field, _label) =
+                build_inline_ivf(Metric::L2, &centroids, &docs, replicas)?;
+            let searcher = index.reader()?.searcher();
+            let segment_reader = &searcher.segment_readers()[0];
+            let sizes = segment_reader
+                .vector_cluster_sizes(embed_field)?
+                .expect("ivf cluster sizes");
+            Ok((sizes.iter().map(|&s| s as usize).sum(), sizes.len()))
+        };
+
+        // replicas = 1: primary-only — exactly N entries, no extra centroids.
+        let (sum1, k1) = total_entries(1)?;
+        assert_eq!(sum1, n, "replicas=1 must be primary-only (N entries)");
+        assert_eq!(k1, centroids.len());
+
+        // replicas = k: every vector lands in exactly k cells (>= k centroids
+        // exist, so k-1 distinct non-primary neighbours are always available).
+        for replicas in [2usize, 3, 4] {
+            let (sum, _k) = total_entries(replicas)?;
+            assert_eq!(
+                sum,
+                replicas * n,
+                "replicas={replicas} must write {replicas}× the entries (additive)"
+            );
+        }
+
+        // Query-time dedup: with replication a doc lands in several probed
+        // clusters, but a search must return each doc id at most once.
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 4)?;
+        let params = exhaustive_params(centroids.len());
+        let hits = search(&index, embed_field, &AllQuery, vec![10.0, 10.0], n, params)?;
+        let unique = hits.len();
+        let mut ids: Vec<_> = hits.iter().map(|(_, addr)| addr.doc_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), unique, "search returned duplicate doc ids");
+        Ok(())
+    }
+
+    /// Captures `paradedb::ivf_build` log records so a test can read back the
+    /// timings line the merge emits.
+    struct CaptureLogger;
+    static CAPTURED_IVF_BUILD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.target() == "paradedb::ivf_build"
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                CAPTURED_IVF_BUILD
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}", r.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+    /// The merge emits one parseable `ivf_build timings_ms ...` line per field,
+    /// with `replica_knn` non-trivial at `replicas > 1`. Builds a larger index
+    /// so the phase timings are measurable, captures the line, and prints it
+    /// (run with `--nocapture`) so we can see where build time goes.
+    #[test]
+    fn ivf_build_emits_timings_log() -> crate::Result<()> {
+        let _ = log::set_logger(&CAPTURE_LOGGER);
+        log::set_max_level(log::LevelFilter::Info);
+
+        // 200 centroids on a 20×10 grid; ~5000 docs clustered around them.
+        let mut centroids: Vec<[f32; 2]> = Vec::new();
+        for x in 0..20 {
+            for y in 0..10 {
+                centroids.push([x as f32 * 10.0, y as f32 * 10.0]);
+            }
+        }
+        let n_per = 25usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.05;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+
+        let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
+        let _ = build_inline_ivf(Metric::L2, &centroids, &docs, 8)?;
+        let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
+        let line = lines
+            .iter()
+            .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
+            .expect("expected an ivf_build timings line for the 200-centroid build");
+        assert!(line.contains("replicas=8"));
+        assert!(line.contains("replica_knn="));
+        eprintln!("IVF_BUILD_SAMPLE {line}");
+        Ok(())
     }
 
     // ---- Merge-time cluster balancing (Phase 1) ----
@@ -747,6 +891,7 @@ mod tests {
                 assign_batch_size: self.assign_batch_size(),
                 max_posting_len: self.max_posting_len,
                 min_posting_len: self.min_posting_len,
+                replicas: 1,
             })
         }
         fn train(
@@ -1099,7 +1244,7 @@ mod tests {
             ("trap_b", [5.0, 5.01]),
             ("anchor_b", [10.0, 10.0]),
         ];
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
         let query = [1.0_f32, 1.0];
 
         // Setup assertions.
@@ -1342,7 +1487,7 @@ mod tests {
             ("b_far", [10.0_f32, 10.0]),
             ("b_far2", [11.0_f32, 9.5]),
         ];
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
         let query = [1.0_f32, 1.0];
         let top_k = 1;
 
