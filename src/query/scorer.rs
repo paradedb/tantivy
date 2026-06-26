@@ -13,8 +13,6 @@ pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
     ///
     /// This method will perform a bit of computation and is not cached.
     fn score(&mut self) -> Score;
-
-    fn set_threshold(&mut self, score: Score);
 }
 
 impl_downcast!(Scorer);
@@ -24,7 +22,22 @@ impl Scorer for Box<dyn Scorer> {
     fn score(&mut self) -> Score {
         self.deref_mut().score()
     }
+}
 
+pub trait PruningScorer: Scorer {
+    fn set_threshold(&mut self, score: Score);
+}
+
+impl_downcast!(PruningScorer);
+
+impl Scorer for Box<dyn PruningScorer> {
+    #[inline]
+    fn score(&mut self) -> Score {
+        self.deref_mut().score()
+    }
+}
+
+impl PruningScorer for Box<dyn PruningScorer> {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.deref_mut().set_threshold(score);

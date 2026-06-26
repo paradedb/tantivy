@@ -96,10 +96,6 @@ where
         self.score_cache = Some(score);
         score
     }
-
-    fn set_threshold(&mut self, _score: Score) {
-        unimplemented!();
-    }
 }
 
 #[cfg(test)]

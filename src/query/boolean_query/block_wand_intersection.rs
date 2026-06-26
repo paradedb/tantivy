@@ -1,5 +1,6 @@
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
+use crate::query::scorer::PruningScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::{Bm25Weight, Scorer};
 use crate::{DocId, DocSet, Score, TERMINATED};
@@ -138,7 +139,8 @@ impl Scorer for BlockWandIntersectionScorer {
     fn score(&mut self) -> Score {
         self.current.1
     }
-
+}
+impl PruningScorer for BlockWandIntersectionScorer {
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }

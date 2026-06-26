@@ -147,10 +147,6 @@ impl Scorer for TermScorer {
         let term_freq = self.term_freq();
         self.similarity_weight.score(fieldnorm_id, term_freq)
     }
-
-    fn set_threshold(&mut self, _score: Score) {
-        unimplemented!();
-    }
 }
 
 #[cfg(test)]

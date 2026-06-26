@@ -1,5 +1,6 @@
 use std::ops::{Deref, DerefMut};
 
+use crate::query::scorer::PruningScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::Scorer;
 use crate::{DocId, DocSet, Score, TERMINATED};
@@ -155,11 +156,7 @@ pub fn block_wand(
         return block_wand_single_scorer(scorer, threshold, callback);
     }
     let mut scorer = BlockWandUnionScorer::new(scorers, threshold);
-    while scorer.doc() != TERMINATED {
-        let new_threshold = callback(scorer.doc(), scorer.score());
-        scorer.set_threshold(new_threshold);
-        scorer.advance();
-    }
+    scorer.consume_all(callback);
 }
 
 /// Specialized version of [`block_wand`] for a single scorer.
@@ -176,11 +173,7 @@ pub fn block_wand_single_scorer(
     callback: &mut dyn FnMut(u32, Score) -> Score,
 ) {
     let mut scorer = BlockWandSingleScorer::new(scorer, threshold);
-    while scorer.doc() != TERMINATED {
-        let new_threshold = callback(scorer.doc(), scorer.score());
-        scorer.set_threshold(new_threshold);
-        scorer.advance();
-    }
+    scorer.consume_all(callback);
 }
 
 struct TermScorerWithMaxScore {
@@ -235,12 +228,22 @@ impl BlockWandUnionScorer {
         scorer.advance();
         scorer
     }
+
+    fn consume_all(&mut self, callback: &mut dyn FnMut(DocId, Score) -> Score) {
+        let mut doc = self.doc();
+        while doc != TERMINATED {
+            let new_threshold = callback(doc, self.score());
+            self.set_threshold(new_threshold);
+            doc = self.advance();
+        }
+    }
 }
 impl Scorer for BlockWandUnionScorer {
     fn score(&mut self) -> Score {
         self.current.1
     }
-
+}
+impl PruningScorer for BlockWandUnionScorer {
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }
@@ -335,16 +338,27 @@ impl BlockWandSingleScorer {
         scorer.advance();
         scorer
     }
+
+    fn consume_all(&mut self, callback: &mut dyn FnMut(DocId, Score) -> Score) {
+        let mut doc = self.doc();
+        while doc != TERMINATED {
+            let new_threshold = callback(doc, self.score());
+            self.set_threshold(new_threshold);
+            doc = self.advance();
+        }
+    }
 }
 impl Scorer for BlockWandSingleScorer {
     fn score(&mut self) -> Score {
         self.current.1
     }
-
+}
+impl PruningScorer for BlockWandSingleScorer {
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }
 }
+
 impl DocSet for BlockWandSingleScorer {
     fn advance(&mut self) -> DocId {
         let mut doc = self.scorer.doc();

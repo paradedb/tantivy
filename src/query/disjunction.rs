@@ -180,10 +180,6 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Scorer
     fn score(&mut self) -> Score {
         self.current_score
     }
-
-    fn set_threshold(&mut self, _score: Score) {
-        unimplemented!();
-    }
 }
 
 #[cfg(test)]

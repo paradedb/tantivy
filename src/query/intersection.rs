@@ -344,10 +344,6 @@ where
             + self.right.score()
             + self.others.iter_mut().map(Scorer::score).sum::<Score>()
     }
-
-    fn set_threshold(&mut self, _score: Score) {
-        unimplemented!();
-    }
 }
 
 #[cfg(test)]
