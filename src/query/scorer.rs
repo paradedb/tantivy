@@ -3,7 +3,7 @@ use std::ops::DerefMut;
 use downcast_rs::impl_downcast;
 
 use crate::docset::DocSet;
-use crate::Score;
+use crate::{DocId, Score, TERMINATED};
 
 /// Scored set of documents matching a query within a specific segment.
 ///
@@ -26,9 +26,16 @@ impl Scorer for Box<dyn Scorer> {
 
 pub trait PruningScorer: Scorer {
     fn set_threshold(&mut self, score: Score);
-}
 
-impl_downcast!(PruningScorer);
+    fn consume_all(&mut self, callback: &mut dyn FnMut(DocId, Score) -> Score) {
+        let mut doc = self.doc();
+        while doc != TERMINATED {
+            let new_threshold = callback(doc, self.score());
+            self.set_threshold(new_threshold);
+            doc = self.advance();
+        }
+    }
+}
 
 impl Scorer for Box<dyn PruningScorer> {
     #[inline]
@@ -41,5 +48,56 @@ impl PruningScorer for Box<dyn PruningScorer> {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.deref_mut().set_threshold(score);
+    }
+}
+
+pub struct BasicPruningScorer {
+    scorer: Box<dyn Scorer>,
+    threshold: Score,
+    current: (DocId, Score),
+}
+impl BasicPruningScorer {
+    pub fn new(scorer: Box<dyn Scorer>, threshold: Score) -> Self {
+        let mut pruning = Self {
+            scorer,
+            threshold,
+            current: (0, Score::MIN),
+        };
+        pruning.advance();
+        pruning
+    }
+}
+impl Scorer for BasicPruningScorer {
+    fn score(&mut self) -> Score {
+        self.current.1
+    }
+}
+impl PruningScorer for BasicPruningScorer {
+    fn set_threshold(&mut self, score: Score) {
+        self.threshold = score;
+    }
+}
+impl DocSet for BasicPruningScorer {
+    fn doc(&self) -> crate::DocId {
+        self.current.0
+    }
+
+    fn advance(&mut self) -> crate::DocId {
+        let mut doc_id = self.scorer.doc();
+        while doc_id != TERMINATED {
+            let score = self.scorer.score();
+            if score > self.threshold {
+                self.current = (doc_id, score);
+                self.scorer.advance();
+                return doc_id;
+            }
+            doc_id = self.scorer.advance();
+        }
+        self.current = (TERMINATED, Score::MIN);
+        TERMINATED
+    }
+
+    fn size_hint(&self) -> u32 {
+        todo!()
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tantivy_fst::Automaton;
 
 use super::phrase_prefix_query::prefix_end;
+use super::scorer::{BasicPruningScorer, PruningScorer};
 use super::BufferedUnionScorer;
 use crate::index::SegmentReader;
 use crate::postings::TermInfo;
@@ -103,6 +104,18 @@ where
 
         let scorer = BufferedUnionScorer::build(scorers, SumCombiner::default, reader.max_doc());
         Ok(Box::new(scorer))
+    }
+
+    fn pruning_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        init_threshold: Score,
+    ) -> crate::Result<Box<dyn PruningScorer>> {
+        Ok(Box::new(BasicPruningScorer::new(
+            self.scorer(reader, boost)?,
+            init_threshold,
+        )))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {

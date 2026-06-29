@@ -203,13 +203,13 @@ impl DerefMut for TermScorerWithMaxScore {
     }
 }
 
-struct BlockWandUnionScorer {
+pub struct BlockWandUnionScorer {
     scorers: Vec<TermScorerWithMaxScore>,
     threshold: Score,
     current: (DocId, Score),
 }
 impl BlockWandUnionScorer {
-    fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
+    pub fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
         debug_assert!(scorers.len() > 1);
         scorers.retain(|scorer| scorer.doc() < TERMINATED);
         let mut scorers: Vec<TermScorerWithMaxScore> = scorers
@@ -222,20 +222,11 @@ impl BlockWandUnionScorer {
         let mut scorer = Self {
             scorers,
             threshold,
-            current: (0, Score::MIN), // TODO: Fix
+            current: (0, Score::MIN),
         };
         // advance to fill current with actual (doc id, score)
         scorer.advance();
         scorer
-    }
-
-    fn consume_all(&mut self, callback: &mut dyn FnMut(DocId, Score) -> Score) {
-        let mut doc = self.doc();
-        while doc != TERMINATED {
-            let new_threshold = callback(doc, self.score());
-            self.set_threshold(new_threshold);
-            doc = self.advance();
-        }
     }
 }
 impl Scorer for BlockWandUnionScorer {
@@ -322,13 +313,13 @@ impl DocSet for BlockWandUnionScorer {
     }
 }
 
-struct BlockWandSingleScorer {
+pub struct BlockWandSingleScorer {
     scorer: TermScorer,
     threshold: Score,
     current: (DocId, Score),
 }
 impl BlockWandSingleScorer {
-    fn new(term_scorer: TermScorer, threshold: Score) -> Self {
+    pub fn new(term_scorer: TermScorer, threshold: Score) -> Self {
         let mut scorer = Self {
             scorer: term_scorer,
             threshold,
@@ -337,15 +328,6 @@ impl BlockWandSingleScorer {
         // advance to fill current
         scorer.advance();
         scorer
-    }
-
-    fn consume_all(&mut self, callback: &mut dyn FnMut(DocId, Score) -> Score) {
-        let mut doc = self.doc();
-        while doc != TERMINATED {
-            let new_threshold = callback(doc, self.score());
-            self.set_threshold(new_threshold);
-            doc = self.advance();
-        }
     }
 }
 impl Scorer for BlockWandSingleScorer {

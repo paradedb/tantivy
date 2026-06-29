@@ -61,7 +61,7 @@ pub use self::range_query::*;
 pub use self::regex_query::RegexQuery;
 pub use self::reqopt_scorer::RequiredOptionalScorer;
 pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner};
-pub use self::scorer::Scorer;
+pub use self::scorer::{PruningScorer, Scorer};
 pub use self::term_query::TermQuery;
 pub use self::term_set_query::*;
 pub use self::union::{BufferedUnionScorer, SimpleUnion};

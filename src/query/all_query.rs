@@ -5,6 +5,8 @@ use crate::query::explanation::does_not_match;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::{DocId, Score};
 
+use super::scorer::{BasicPruningScorer, PruningScorer};
+
 /// Query that matches all of the documents.
 ///
 /// All of the documents get the score 1.0.
@@ -28,6 +30,18 @@ impl Weight for AllWeight {
         } else {
             Ok(Box::new(all_scorer))
         }
+    }
+
+    fn pruning_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        init_threshold: Score,
+    ) -> crate::Result<Box<dyn PruningScorer>> {
+        Ok(Box::new(BasicPruningScorer::new(
+            self.scorer(reader, boost)?,
+            init_threshold,
+        )))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {

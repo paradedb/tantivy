@@ -5,6 +5,8 @@ use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
+use super::scorer::BasicPruningScorer;
+
 /// `ConstScoreQuery` is a wrapper over a query to provide a constant score.
 /// It can avoid unnecessary score computation on the wrapped query.
 ///
@@ -72,6 +74,18 @@ impl Weight for ConstWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let inner_scorer = self.weight.scorer(reader, boost)?;
         Ok(Box::new(ConstScorer::new(inner_scorer, boost * self.score)))
+    }
+
+    fn pruning_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        init_threshold: Score,
+    ) -> crate::Result<Box<dyn super::scorer::PruningScorer>> {
+        Ok(Box::new(BasicPruningScorer::new(
+            self.scorer(reader, boost)?,
+            init_threshold,
+        )))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {

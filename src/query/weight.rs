@@ -1,3 +1,4 @@
+use super::scorer::PruningScorer;
 use super::Scorer;
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
@@ -34,31 +35,6 @@ pub(crate) fn for_each_docset_buffered<T: DocSet + ?Sized>(
     }
 }
 
-/// Calls `callback` with all of the `(doc, score)` for which score
-/// is exceeding a given threshold.
-///
-/// This method is useful for the [`TopDocs`](crate::collector::TopDocs) collector.
-/// For all docsets, the blanket implementation has the benefit
-/// of prefiltering (doc, score) pairs, avoiding the
-/// virtual dispatch cost.
-///
-/// More importantly, it makes it possible for scorers to implement
-/// important optimization (e.g. BlockWAND for union).
-pub(crate) fn for_each_pruning_scorer<TScorer: Scorer + ?Sized>(
-    scorer: &mut TScorer,
-    mut threshold: Score,
-    callback: &mut dyn FnMut(DocId, Score) -> Score,
-) {
-    let mut doc = scorer.doc();
-    while doc != TERMINATED {
-        let score = scorer.score();
-        if score > threshold {
-            threshold = callback(doc, score);
-        }
-        doc = scorer.advance();
-    }
-}
-
 /// A Weight is the specialization of a `Query`
 /// for a given set of segments.
 ///
@@ -70,6 +46,16 @@ pub trait Weight: Send + Sync + 'static {
     ///
     /// See [`Query`](crate::query::Query).
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>>;
+
+    /// Returns a pruning scorer for the given segment
+    ///
+    /// `boost` is a multiplier to apply to the score.
+    fn pruning_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        init_threshold: Score,
+    ) -> crate::Result<Box<dyn PruningScorer>>;
 
     /// Returns an [`Explanation`] for the given document.
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation>;
@@ -126,8 +112,8 @@ pub trait Weight: Send + Sync + 'static {
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
-        let mut scorer = self.scorer(reader, 1.0)?;
-        for_each_pruning_scorer(scorer.as_mut(), threshold, callback);
+        let mut scorer = self.pruning_scorer(reader, 1.0, threshold)?;
+        scorer.consume_all(callback);
         Ok(())
     }
 }

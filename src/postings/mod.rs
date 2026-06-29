@@ -535,10 +535,6 @@ pub(crate) mod tests {
         fn score(&mut self) -> Score {
             self.0.score()
         }
-
-        fn set_threshold(&mut self, _score: Score) {
-            unimplemented!();
-        }
     }
 
     pub fn test_skip_against_unoptimized<F: Fn() -> Box<dyn DocSet>>(

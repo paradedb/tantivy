@@ -4,6 +4,7 @@ use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
 use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
+use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
 use crate::query::weight::{for_each_docset_buffered, for_each_scorer};
 use crate::query::{AllScorer, AllWeight, EmptyScorer, Explanation, Scorer, Weight};
@@ -36,6 +37,24 @@ impl TermOrEmptyOrAllScorer {
 impl Weight for TermWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         Ok(self.specialized_scorer(reader, boost)?.into_boxed_scorer())
+    }
+
+    fn pruning_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        init_threshold: Score,
+    ) -> crate::Result<Box<dyn crate::query::scorer::PruningScorer>> {
+        let specialized_scorer = self.specialized_scorer(reader, boost)?;
+        match specialized_scorer {
+            TermOrEmptyOrAllScorer::TermScorer(term_scorer) => Ok(Box::new(
+                BlockWandSingleScorer::new(*term_scorer, init_threshold),
+            )),
+            TermOrEmptyOrAllScorer::Empty => Ok(Box::new(EmptyScorer)),
+            TermOrEmptyOrAllScorer::AllMatch(_) => Err(TantivyError::InvalidArgument(
+                "for each pruning should only be called if scoring is enabled".to_string(),
+            )),
+        }
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -102,41 +121,6 @@ impl Weight for TermWeight {
             }
         };
 
-        Ok(())
-    }
-
-    /// Calls `callback` with all of the `(doc, score)` for which score
-    /// is exceeding a given threshold.
-    ///
-    /// This method is useful for the TopDocs collector.
-    /// For all docsets, the blanket implementation has the benefit
-    /// of prefiltering (doc, score) pairs, avoiding the
-    /// virtual dispatch cost.
-    ///
-    /// More importantly, it makes it possible for scorers to implement
-    /// important optimization (e.g. BlockWAND for union).
-    fn for_each_pruning(
-        &self,
-        threshold: Score,
-        reader: &SegmentReader,
-        callback: &mut dyn FnMut(DocId, Score) -> Score,
-    ) -> crate::Result<()> {
-        let specialized_scorer = self.specialized_scorer(reader, 1.0)?;
-        match specialized_scorer {
-            TermOrEmptyOrAllScorer::TermScorer(term_scorer) => {
-                crate::query::boolean_query::block_wand_single_scorer(
-                    *term_scorer,
-                    threshold,
-                    callback,
-                );
-            }
-            TermOrEmptyOrAllScorer::Empty => {}
-            TermOrEmptyOrAllScorer::AllMatch(_) => {
-                return Err(TantivyError::InvalidArgument(
-                    "for each pruning should only be called if scoring is enabled".to_string(),
-                ));
-            }
-        }
         Ok(())
     }
 }

@@ -31,7 +31,7 @@ pub(crate) fn block_wand_intersection(
     }
 }
 
-struct BlockWandIntersectionScorer {
+pub struct BlockWandIntersectionScorer {
     leader: TermScorer,
     secondaries: Vec<TermScorer>,
 
@@ -52,7 +52,7 @@ struct BlockWandIntersectionScorer {
     window_end: DocId,
 }
 impl BlockWandIntersectionScorer {
-    fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
+    pub fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
         assert!(scorers.len() >= 2);
 
         // Sort by cost (ascending). scorers[0] becomes the "leader" (rarest term).

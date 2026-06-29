@@ -6,6 +6,8 @@ use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
+use super::scorer::PruningScorer;
+
 /// `BoostQuery` is a wrapper over a query used to boost its score.
 ///
 /// The document set matched by the `BoostQuery` is strictly the same as the underlying query.
@@ -75,6 +77,16 @@ impl BoostWeight {
 impl Weight for BoostWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         self.weight.scorer(reader, boost * self.boost)
+    }
+
+    fn pruning_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        init_threshold: Score,
+    ) -> crate::Result<Box<dyn PruningScorer>> {
+        self.weight
+            .pruning_scorer(reader, boost * self.boost, init_threshold)
     }
 
     fn explain(&self, reader: &SegmentReader, doc: u32) -> crate::Result<Explanation> {

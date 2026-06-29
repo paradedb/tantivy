@@ -6,13 +6,18 @@ use crate::postings::FreqReadingOption;
 use crate::query::disjunction::Disjunction;
 use crate::query::explanation::does_not_match;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
+use crate::query::scorer::BasicPruningScorer;
 use crate::query::term_query::TermScorer;
-use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
+use crate::query::weight::{for_each_docset_buffered, for_each_scorer};
 use crate::query::{
     intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
     RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score};
+
+use crate::query::boolean_query::{
+    BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
+};
 
 enum SpecializedScorer {
     TermUnion(Vec<TermScorer>),
@@ -476,6 +481,33 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         }
     }
 
+    fn pruning_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+        init_threshold: Score,
+    ) -> crate::Result<Box<dyn crate::query::scorer::PruningScorer>> {
+        let scorer = self.complex_scorer(reader, boost, &self.score_combiner_fn)?;
+        match scorer {
+            SpecializedScorer::TermUnion(mut scorers) => {
+                if scorers.len() == 1 {
+                    Ok(Box::new(BlockWandSingleScorer::new(
+                        scorers.pop().unwrap(),
+                        init_threshold,
+                    )))
+                } else {
+                    Ok(Box::new(BlockWandUnionScorer::new(scorers, init_threshold)))
+                }
+            }
+            SpecializedScorer::TermIntersection(scorers) => Ok(Box::new(
+                BlockWandIntersectionScorer::new(scorers, init_threshold),
+            )),
+            SpecializedScorer::Other(scorer) => {
+                Ok(Box::new(BasicPruningScorer::new(scorer, init_threshold)))
+            }
+        }
+    }
+
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
         let mut scorer = self.scorer(reader, 1.0)?;
         if scorer.seek(doc) != doc {
@@ -549,37 +581,6 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             }
             SpecializedScorer::Other(mut scorer) => {
                 for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
-            }
-        }
-        Ok(())
-    }
-
-    /// Calls `callback` with all of the `(doc, score)` for which score
-    /// is exceeding a given threshold.
-    ///
-    /// This method is useful for the TopDocs collector.
-    /// For all docsets, the blanket implementation has the benefit
-    /// of prefiltering (doc, score) pairs, avoiding the
-    /// virtual dispatch cost.
-    ///
-    /// More importantly, it makes it possible for scorers to implement
-    /// important optimization (e.g. BlockWAND for union).
-    fn for_each_pruning(
-        &self,
-        threshold: Score,
-        reader: &SegmentReader,
-        callback: &mut dyn FnMut(DocId, Score) -> Score,
-    ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
-        match scorer {
-            SpecializedScorer::TermUnion(term_scorers) => {
-                super::block_wand(term_scorers, threshold, callback);
-            }
-            SpecializedScorer::TermIntersection(term_scorers) => {
-                super::block_wand_intersection(term_scorers, threshold, callback);
-            }
-            SpecializedScorer::Other(mut scorer) => {
-                for_each_pruning_scorer(scorer.as_mut(), threshold, callback);
             }
         }
         Ok(())
