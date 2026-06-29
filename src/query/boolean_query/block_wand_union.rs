@@ -308,8 +308,14 @@ impl DocSet for BlockWandUnionScorer {
         self.current.0
     }
 
+    /// The number of elements returned by a PruningScorer depends on the threshold and cannot be
+    /// computed ahead of time, so just defer to the largest internal scorer
     fn size_hint(&self) -> u32 {
-        todo!("Figure out what's reasonable to put here since we can't give an actual value");
+        self.scorers
+            .iter()
+            .map(|s| s.scorer.size_hint())
+            .max()
+            .unwrap_or(0u32)
     }
 }
 
@@ -391,8 +397,10 @@ impl DocSet for BlockWandSingleScorer {
         self.current.0
     }
 
+    /// The number of elements returned by a PruningScorer depends on the threshold and cannot be
+    /// computed ahead of time, so just defer to the internal scorer
     fn size_hint(&self) -> u32 {
-        todo!()
+        self.scorer.size_hint()
     }
 }
 

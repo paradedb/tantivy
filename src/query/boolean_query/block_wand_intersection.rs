@@ -268,8 +268,10 @@ impl DocSet for BlockWandIntersectionScorer {
         self.current.0
     }
 
+    /// The number of elements yielded by a PruningScorer depends on the threshold and cannot be
+    /// computed ahead of time, so just defer to the leader, as it will be the smallest.
     fn size_hint(&self) -> u32 {
-        todo!();
+        self.leader.size_hint()
     }
 }
 

@@ -97,7 +97,9 @@ impl DocSet for BasicPruningScorer {
         TERMINATED
     }
 
+    /// The number of elements yielded by a PruningScorer depends on the threshold and cannot be
+    /// computed ahead of time, so just defer to the inner scorer.
     fn size_hint(&self) -> u32 {
-        todo!()
+        self.scorer.size_hint()
     }
 }
