@@ -8,7 +8,7 @@ use crate::query::explanation::does_not_match;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::scorer::BasicPruningScorer;
 use crate::query::term_query::TermScorer;
-use crate::query::weight::{for_each_docset_buffered, for_each_scorer};
+use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
     intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
     RequiredOptionalScorer, Scorer, Weight,
@@ -506,6 +506,41 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 Ok(Box::new(BasicPruningScorer::new(scorer, init_threshold)))
             }
         }
+    }
+
+    /// Overrides the blanket implementation to drive the concrete pruning scorer
+    /// directly, rather than through a `Box<dyn PruningScorer>`. Monomorphizing
+    /// `for_each_pruning_scorer` over the concrete scorer type keeps
+    /// `advance`/`score`/`set_threshold` statically dispatched (and inlinable) in
+    /// the hot loop, so the callback is the only dynamic call — matching the
+    /// codegen of the pre-refactor `block_wand` free functions.
+    fn for_each_pruning(
+        &self,
+        threshold: Score,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) -> crate::Result<()> {
+        let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
+        match scorer {
+            SpecializedScorer::TermUnion(mut scorers) => {
+                if scorers.len() == 1 {
+                    let mut scorer = BlockWandSingleScorer::new(scorers.pop().unwrap(), threshold);
+                    for_each_pruning_scorer(&mut scorer, callback);
+                } else {
+                    let mut scorer = BlockWandUnionScorer::new(scorers, threshold);
+                    for_each_pruning_scorer(&mut scorer, callback);
+                }
+            }
+            SpecializedScorer::TermIntersection(scorers) => {
+                let mut scorer = BlockWandIntersectionScorer::new(scorers, threshold);
+                for_each_pruning_scorer(&mut scorer, callback);
+            }
+            SpecializedScorer::Other(scorer) => {
+                let mut scorer = BasicPruningScorer::new(scorer, threshold);
+                for_each_pruning_scorer(&mut scorer, callback);
+            }
+        }
+        Ok(())
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {

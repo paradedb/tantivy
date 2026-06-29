@@ -136,11 +136,13 @@ impl BlockWandIntersectionScorer {
     }
 }
 impl Scorer for BlockWandIntersectionScorer {
+    #[inline]
     fn score(&mut self) -> Score {
         self.current.1
     }
 }
 impl PruningScorer for BlockWandIntersectionScorer {
+    #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }
@@ -264,6 +266,7 @@ impl DocSet for BlockWandIntersectionScorer {
         TERMINATED
     }
 
+    #[inline]
     fn doc(&self) -> DocId {
         self.current.0
     }

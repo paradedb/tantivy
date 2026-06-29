@@ -59,16 +59,19 @@ impl BasicPruningScorer {
     }
 }
 impl Scorer for BasicPruningScorer {
+    #[inline]
     fn score(&mut self) -> Score {
         self.current.1
     }
 }
 impl PruningScorer for BasicPruningScorer {
+    #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }
 }
 impl DocSet for BasicPruningScorer {
+    #[inline]
     fn doc(&self) -> crate::DocId {
         self.current.0
     }

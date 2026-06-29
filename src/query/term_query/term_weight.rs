@@ -6,7 +6,7 @@ use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::weight::{for_each_docset_buffered, for_each_scorer};
+use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{AllScorer, AllWeight, EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::IndexRecordOption;
 use crate::{DocId, Score, TantivyError, Term};
@@ -55,6 +55,33 @@ impl Weight for TermWeight {
                 "for each pruning should only be called if scoring is enabled".to_string(),
             )),
         }
+    }
+
+    /// Overrides the blanket implementation to drive the concrete
+    /// [`BlockWandSingleScorer`] directly, rather than through a
+    /// `Box<dyn PruningScorer>`. This monomorphizes `for_each_pruning_scorer`
+    /// over the concrete scorer so `advance`/`score`/`set_threshold` are
+    /// statically dispatched (and inlinable) in the hot loop.
+    fn for_each_pruning(
+        &self,
+        threshold: Score,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) -> crate::Result<()> {
+        let specialized_scorer = self.specialized_scorer(reader, 1.0)?;
+        match specialized_scorer {
+            TermOrEmptyOrAllScorer::TermScorer(term_scorer) => {
+                let mut scorer = BlockWandSingleScorer::new(*term_scorer, threshold);
+                for_each_pruning_scorer(&mut scorer, callback);
+            }
+            TermOrEmptyOrAllScorer::Empty => {}
+            TermOrEmptyOrAllScorer::AllMatch(_) => {
+                return Err(TantivyError::InvalidArgument(
+                    "for each pruning should only be called if scoring is enabled".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {

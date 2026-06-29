@@ -231,11 +231,13 @@ impl BlockWandUnionScorer {
     }
 }
 impl Scorer for BlockWandUnionScorer {
+    #[inline]
     fn score(&mut self) -> Score {
         self.current.1
     }
 }
 impl PruningScorer for BlockWandUnionScorer {
+    #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }
@@ -305,6 +307,7 @@ impl DocSet for BlockWandUnionScorer {
         TERMINATED
     }
 
+    #[inline]
     fn doc(&self) -> DocId {
         self.current.0
     }
@@ -338,11 +341,13 @@ impl BlockWandSingleScorer {
     }
 }
 impl Scorer for BlockWandSingleScorer {
+    #[inline]
     fn score(&mut self) -> Score {
         self.current.1
     }
 }
 impl PruningScorer for BlockWandSingleScorer {
+    #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
     }
@@ -394,6 +399,7 @@ impl DocSet for BlockWandSingleScorer {
         self.doc()
     }
 
+    #[inline]
     fn doc(&self) -> DocId {
         self.current.0
     }
