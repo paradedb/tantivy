@@ -35,6 +35,22 @@ pub(crate) fn for_each_docset_buffered<T: DocSet + ?Sized>(
     }
 }
 
+/// Iterates through all of the `(doc, score)` produced by a pruning scorer.
+///
+/// `callback` returns the new threshold after each call, which is fed back into
+/// the scorer via [`PruningScorer::set_threshold`] so it can keep pruning.
+pub(crate) fn for_each_pruning_scorer<TScorer: PruningScorer + ?Sized>(
+    scorer: &mut TScorer,
+    callback: &mut dyn FnMut(DocId, Score) -> Score,
+) {
+    let mut doc = scorer.doc();
+    while doc != TERMINATED {
+        let new_threshold = callback(doc, scorer.score());
+        scorer.set_threshold(new_threshold);
+        doc = scorer.advance();
+    }
+}
+
 /// A Weight is the specialization of a `Query`
 /// for a given set of segments.
 ///
@@ -113,7 +129,7 @@ pub trait Weight: Send + Sync + 'static {
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
         let mut scorer = self.pruning_scorer(reader, 1.0, threshold)?;
-        scorer.consume_all(callback);
+        for_each_pruning_scorer(scorer.as_mut(), callback);
         Ok(())
     }
 }

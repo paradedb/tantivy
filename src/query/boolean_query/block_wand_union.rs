@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::query::scorer::PruningScorer;
 use crate::query::term_query::TermScorer;
+use crate::query::weight::for_each_pruning_scorer;
 use crate::query::Scorer;
 use crate::{DocId, DocSet, Score, TERMINATED};
 
@@ -156,7 +157,7 @@ pub fn block_wand(
         return block_wand_single_scorer(scorer, threshold, callback);
     }
     let mut scorer = BlockWandUnionScorer::new(scorers, threshold);
-    scorer.consume_all(callback);
+    for_each_pruning_scorer(&mut scorer, callback);
 }
 
 /// Specialized version of [`block_wand`] for a single scorer.
@@ -173,7 +174,7 @@ pub fn block_wand_single_scorer(
     callback: &mut dyn FnMut(u32, Score) -> Score,
 ) {
     let mut scorer = BlockWandSingleScorer::new(scorer, threshold);
-    scorer.consume_all(callback);
+    for_each_pruning_scorer(&mut scorer, callback);
 }
 
 struct TermScorerWithMaxScore {

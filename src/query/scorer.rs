@@ -26,15 +26,6 @@ impl Scorer for Box<dyn Scorer> {
 
 pub trait PruningScorer: Scorer {
     fn set_threshold(&mut self, score: Score);
-
-    fn consume_all(&mut self, callback: &mut dyn FnMut(DocId, Score) -> Score) {
-        let mut doc = self.doc();
-        while doc != TERMINATED {
-            let new_threshold = callback(doc, self.score());
-            self.set_threshold(new_threshold);
-            doc = self.advance();
-        }
-    }
 }
 
 impl Scorer for Box<dyn PruningScorer> {
