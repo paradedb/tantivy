@@ -5,6 +5,18 @@ use crate::query::term_query::TermScorer;
 use crate::query::{Bm25Weight, Scorer};
 use crate::{DocId, DocSet, Score, TERMINATED};
 
+#[cfg(test)]
+pub(crate) fn block_wand_intersection(
+    scorers: Vec<TermScorer>,
+    threshold: Score,
+    callback: &mut dyn FnMut(DocId, Score) -> Score,
+) {
+    use crate::query::weight::for_each_pruning_scorer;
+
+    let mut scorer = BlockWandIntersectionScorer::new(scorers, threshold);
+    for_each_pruning_scorer(&mut scorer, callback);
+}
+
 /// Block-max pruning for top-K over intersection of term scorers.
 ///
 /// Uses the least-frequent term as "leader" to define 128-doc processing windows.
@@ -18,19 +30,6 @@ use crate::{DocId, DocSet, Score, TERMINATED};
 /// # Preconditions
 /// - `scorers` has at least 2 elements
 /// - All scorers read frequencies (`FreqReadingOption::ReadFreq`)
-pub(crate) fn block_wand_intersection(
-    scorers: Vec<TermScorer>,
-    threshold: Score,
-    callback: &mut dyn FnMut(DocId, Score) -> Score,
-) {
-    let mut scorer = BlockWandIntersectionScorer::new(scorers, threshold);
-    while scorer.doc() != TERMINATED {
-        let new_threshold = callback(scorer.doc(), scorer.score());
-        scorer.set_threshold(new_threshold);
-        scorer.advance();
-    }
-}
-
 pub struct BlockWandIntersectionScorer {
     leader: TermScorer,
     secondaries: Vec<TermScorer>,
@@ -225,8 +224,6 @@ impl DocSet for BlockWandIntersectionScorer {
             // conditionally advance the count. The compiler can turn this into
             // a cmov instead of a branch, avoiding misprediction costs.
             let score_threshold = self.threshold - secondary_block_max_sum;
-            //self.candidate_doc_ids = [0u32; COMPRESSION_BLOCK_SIZE];
-            //self.candidate_scores = [0.0f32; COMPRESSION_BLOCK_SIZE];
 
             let mut num_candidates = 0usize;
             for (candidate_doc, term_freq) in
@@ -258,6 +255,7 @@ impl DocSet for BlockWandIntersectionScorer {
             if let Some(doc_id) = self.handle_candidates() {
                 return doc_id;
             }
+            // no candidates left, reset and advance internal doc
             self.num_candidates = 0;
             self.internal_doc = self.window_end + 1;
         }

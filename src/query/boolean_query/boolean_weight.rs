@@ -512,12 +512,42 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         }
     }
 
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        if scorer.seek(doc) != doc {
+            return Err(does_not_match(doc));
+        }
+        if !self.scoring_enabled {
+            return Ok(Explanation::new("BooleanQuery with no scoring", 1.0));
+        }
+
+        let mut explanation = Explanation::new("BooleanClause. sum of ...", scorer.score());
+        for (occur, subweight) in &self.weights {
+            if is_include_occur(*occur) {
+                if let Ok(child_explanation) = subweight.explain(reader, doc) {
+                    explanation.add_detail(child_explanation);
+                }
+            }
+        }
+        Ok(explanation)
+    }
+
+    /// Calls `callback` with all of the `(doc, score)` for which score
+    /// is exceeding a given threshold.
+    ///
+    /// This method is useful for the TopDocs collector.
+    /// For all docsets, the blanket implementation has the benefit
+    /// of prefiltering (doc, score) pairs, avoiding the
+    /// virtual dispatch cost.
+    ///
+    /// More importantly, it makes it possible for scorers to implement
+    /// important optimization (e.g. BlockWAND for union).
+    ///
     /// Overrides the blanket implementation to drive the concrete pruning scorer
     /// directly, rather than through a `Box<dyn PruningScorer>`. Monomorphizing
     /// `for_each_pruning_scorer` over the concrete scorer type keeps
     /// `advance`/`score`/`set_threshold` statically dispatched (and inlinable) in
-    /// the hot loop, so the callback is the only dynamic call — matching the
-    /// codegen of the pre-refactor `block_wand` free functions.
+    /// the hot loop, so the callback is the only dynamic call
     fn for_each_pruning(
         &self,
         threshold: Score,
@@ -527,9 +557,6 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
         match scorer {
             SpecializedScorer::TermUnion(mut scorers) => {
-                // Drop already-exhausted scorers so a lone survivor uses the
-                // (~3x faster) single-scorer specialization, matching the
-                // pre-refactor `block_wand` routing.
                 scorers.retain(|scorer| scorer.doc() < TERMINATED);
                 match scorers.len() {
                     0 => {}
@@ -554,26 +581,6 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             }
         }
         Ok(())
-    }
-
-    fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
-        let mut scorer = self.scorer(reader, 1.0)?;
-        if scorer.seek(doc) != doc {
-            return Err(does_not_match(doc));
-        }
-        if !self.scoring_enabled {
-            return Ok(Explanation::new("BooleanQuery with no scoring", 1.0));
-        }
-
-        let mut explanation = Explanation::new("BooleanClause. sum of ...", scorer.score());
-        for (occur, subweight) in &self.weights {
-            if is_include_occur(*occur) {
-                if let Ok(child_explanation) = subweight.explain(reader, doc) {
-                    explanation.add_detail(child_explanation);
-                }
-            }
-        }
-        Ok(explanation)
     }
 
     fn for_each(

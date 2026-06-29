@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::query::scorer::PruningScorer;
 use crate::query::term_query::TermScorer;
+#[cfg(test)]
 use crate::query::weight::for_each_pruning_scorer;
 use crate::query::Scorer;
 use crate::{DocId, DocSet, Score, TERMINATED};
@@ -144,9 +145,7 @@ fn advance_all_scorers_on_pivot(term_scorers: &mut Vec<TermScorerWithMaxScore>, 
     term_scorers.sort_by_key(|scorer| scorer.doc());
 }
 
-/// Implements the WAND (Weak AND) algorithm for dynamic pruning
-/// described in the paper "Faster Top-k Document Retrieval Using Block-Max Indexes".
-/// Link: <http://engineering.nyu.edu/~suel/papers/bmw.pdf>
+#[cfg(test)]
 pub fn block_wand(
     mut scorers: Vec<TermScorer>,
     threshold: Score,
@@ -160,14 +159,7 @@ pub fn block_wand(
     for_each_pruning_scorer(&mut scorer, callback);
 }
 
-/// Specialized version of [`block_wand`] for a single scorer.
-/// In this case, the algorithm is simple, readable and faster (~ x3)
-/// than the generic algorithm.
-/// The algorithm behaves as follows:
-/// - While we don't hit the end of the docset:
-///   - While the block max score is under the `threshold`, go to the next block.
-///   - On a block, advance until the end and execute `callback` when the doc score is greater or
-///     equal to the `threshold`.
+#[cfg(test)]
 pub fn block_wand_single_scorer(
     scorer: TermScorer,
     threshold: Score,
@@ -204,6 +196,9 @@ impl DerefMut for TermScorerWithMaxScore {
     }
 }
 
+/// Implements the WAND (Weak AND) algorithm for dynamic pruning
+/// described in the paper "Faster Top-k Document Retrieval Using Block-Max Indexes".
+/// Link: <http://engineering.nyu.edu/~suel/papers/bmw.pdf>
 pub struct BlockWandUnionScorer {
     scorers: Vec<TermScorerWithMaxScore>,
     threshold: Score,
@@ -303,7 +298,7 @@ impl DocSet for BlockWandUnionScorer {
             }
         }
 
-        self.current = (TERMINATED, 0.0);
+        self.current = (TERMINATED, Score::MIN);
         TERMINATED
     }
 
@@ -323,6 +318,14 @@ impl DocSet for BlockWandUnionScorer {
     }
 }
 
+/// Specialized version of [`BlockWandUnionScorer`] for a single scorer.
+/// In this case, the algorithm is simple, readable and faster (~ x3)
+/// than the generic algorithm.
+/// The algorithm behaves as follows:
+/// - While we don't hit the end of the docset:
+///   - While the block max score is under the `threshold`, go to the next block.
+///   - On a block, advance until the end and execute `callback` when the doc score is greater or
+///     equal to the `threshold`.
 pub struct BlockWandSingleScorer {
     scorer: TermScorer,
     threshold: Score,
@@ -364,7 +367,7 @@ impl DocSet for BlockWandSingleScorer {
             while self.scorer.block_max_score() <= threshold {
                 let last_doc_in_block = self.scorer.last_doc_in_block();
                 if last_doc_in_block == TERMINATED {
-                    self.current = (TERMINATED, 0.0);
+                    self.current = (TERMINATED, Score::MIN);
                     return TERMINATED;
                 }
                 doc = last_doc_in_block + 1;
@@ -373,7 +376,7 @@ impl DocSet for BlockWandSingleScorer {
             // Seek will effectively load that block.
             doc = self.scorer.seek(doc);
             if doc == TERMINATED {
-                self.current = (TERMINATED, 0.0);
+                self.current = (TERMINATED, Score::MIN);
                 return TERMINATED;
             }
             loop {
@@ -389,7 +392,7 @@ impl DocSet for BlockWandSingleScorer {
                 }
                 doc = self.scorer.advance();
                 if doc == TERMINATED {
-                    self.current = (TERMINATED, 0.0);
+                    self.current = (TERMINATED, Score::MIN);
                     return TERMINATED;
                 }
             }

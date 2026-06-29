@@ -57,6 +57,32 @@ impl Weight for TermWeight {
         }
     }
 
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
+        match self.specialized_scorer(reader, 1.0)? {
+            TermOrEmptyOrAllScorer::TermScorer(mut term_scorer) => {
+                if term_scorer.doc() > doc || term_scorer.seek(doc) != doc {
+                    return Err(does_not_match(doc));
+                }
+                let mut explanation = term_scorer.explain();
+                explanation.add_context(format!("Term={:?}", self.term,));
+                Ok(explanation)
+            }
+            TermOrEmptyOrAllScorer::Empty => Err(does_not_match(doc)),
+            TermOrEmptyOrAllScorer::AllMatch(_) => AllWeight.explain(reader, doc),
+        }
+    }
+
+    /// Calls `callback` with all of the `(doc, score)` for which score
+    /// is exceeding a given threshold.
+    ///
+    /// This method is useful for the TopDocs collector.
+    /// For all docsets, the blanket implementation has the benefit
+    /// of prefiltering (doc, score) pairs, avoiding the
+    /// virtual dispatch cost.
+    ///
+    /// More importantly, it makes it possible for scorers to implement
+    /// important optimization (e.g. BlockWAND for union).
+    ///
     /// Overrides the blanket implementation to drive the concrete
     /// [`BlockWandSingleScorer`] directly, rather than through a
     /// `Box<dyn PruningScorer>`. This monomorphizes `for_each_pruning_scorer`
@@ -82,21 +108,6 @@ impl Weight for TermWeight {
             }
         }
         Ok(())
-    }
-
-    fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
-        match self.specialized_scorer(reader, 1.0)? {
-            TermOrEmptyOrAllScorer::TermScorer(mut term_scorer) => {
-                if term_scorer.doc() > doc || term_scorer.seek(doc) != doc {
-                    return Err(does_not_match(doc));
-                }
-                let mut explanation = term_scorer.explain();
-                explanation.add_context(format!("Term={:?}", self.term,));
-                Ok(explanation)
-            }
-            TermOrEmptyOrAllScorer::Empty => Err(does_not_match(doc)),
-            TermOrEmptyOrAllScorer::AllMatch(_) => AllWeight.explain(reader, doc),
-        }
     }
 
     fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
