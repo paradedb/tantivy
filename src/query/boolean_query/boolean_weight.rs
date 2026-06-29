@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::postings::FreqReadingOption;
 use crate::query::disjunction::Disjunction;
@@ -13,7 +13,7 @@ use crate::query::{
     intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
     RequiredOptionalScorer, Scorer, Weight,
 };
-use crate::{DocId, Score};
+use crate::{DocId, Score, TERMINATED};
 
 use crate::query::boolean_query::{
     BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
@@ -490,13 +490,17 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         let scorer = self.complex_scorer(reader, boost, &self.score_combiner_fn)?;
         match scorer {
             SpecializedScorer::TermUnion(mut scorers) => {
-                if scorers.len() == 1 {
-                    Ok(Box::new(BlockWandSingleScorer::new(
+                // Drop already-exhausted scorers so a lone survivor uses the
+                // (~3x faster) single-scorer specialization, matching the
+                // pre-refactor `block_wand` routing.
+                scorers.retain(|scorer| scorer.doc() < TERMINATED);
+                match scorers.len() {
+                    0 => Ok(Box::new(EmptyScorer)),
+                    1 => Ok(Box::new(BlockWandSingleScorer::new(
                         scorers.pop().unwrap(),
                         init_threshold,
-                    )))
-                } else {
-                    Ok(Box::new(BlockWandUnionScorer::new(scorers, init_threshold)))
+                    ))),
+                    _ => Ok(Box::new(BlockWandUnionScorer::new(scorers, init_threshold))),
                 }
             }
             SpecializedScorer::TermIntersection(scorers) => Ok(Box::new(
@@ -523,12 +527,21 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
         match scorer {
             SpecializedScorer::TermUnion(mut scorers) => {
-                if scorers.len() == 1 {
-                    let mut scorer = BlockWandSingleScorer::new(scorers.pop().unwrap(), threshold);
-                    for_each_pruning_scorer(&mut scorer, callback);
-                } else {
-                    let mut scorer = BlockWandUnionScorer::new(scorers, threshold);
-                    for_each_pruning_scorer(&mut scorer, callback);
+                // Drop already-exhausted scorers so a lone survivor uses the
+                // (~3x faster) single-scorer specialization, matching the
+                // pre-refactor `block_wand` routing.
+                scorers.retain(|scorer| scorer.doc() < TERMINATED);
+                match scorers.len() {
+                    0 => {}
+                    1 => {
+                        let mut scorer =
+                            BlockWandSingleScorer::new(scorers.pop().unwrap(), threshold);
+                        for_each_pruning_scorer(&mut scorer, callback);
+                    }
+                    _ => {
+                        let mut scorer = BlockWandUnionScorer::new(scorers, threshold);
+                        for_each_pruning_scorer(&mut scorer, callback);
+                    }
                 }
             }
             SpecializedScorer::TermIntersection(scorers) => {
