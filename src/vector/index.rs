@@ -26,24 +26,20 @@ pub struct NeighborhoodGraphConfig {
     pub max_edges: usize,
     /// Beam width for query-time search (`>= k`).
     pub ef: usize,
-    /// Size of the candidate pool gathered per node during [`rebuild`]: each
+    /// Size of the candidate pool gathered per node during [`refine`]: each
     /// node runs a top-`num_candidates` search of the current graph, and those
-    /// candidates feed RNG edge selection. SPTAG's CEF.
+    /// candidates feed RNG edge selection.
     ///
-    /// [`rebuild`]: RelativeNeighborhoodGraph::rebuild
+    /// [`refine`]: RelativeNeighborhoodGraph::refine
     pub num_candidates: usize,
-    /// RNG pruning strictness: `1.0` is pure RNG, `> 1.0` keeps more edges.
-    pub rng_factor: f32,
 }
 
 impl Default for NeighborhoodGraphConfig {
-    /// SPTAG-like defaults: degree 32, beam 64, 64-wide candidate pool, pure RNG.
     fn default() -> Self {
         NeighborhoodGraphConfig {
             max_edges: 32,
             ef: 64,
             num_candidates: 256,
-            rng_factor: 1.0,
         }
     }
 }
@@ -59,7 +55,7 @@ pub struct RelativeNeighborhoodGraph<T: VectorElement> {
     /// Similarity metric (higher is better). Search ranks by similarity; build
     /// orders edges by its negation, so smaller is closer.
     metric: Metric,
-    /// Tuning knobs (`max_edges`, `ef`, `rng_factor`).
+    /// Tuning knobs (`max_edges`, `ef`).
     config: NeighborhoodGraphConfig,
 }
 
@@ -189,12 +185,10 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
     /// Everything is in similarity space (higher is better): a candidate `c` is
     /// kept unless some already-selected neighbor `r` is *strictly more* similar to
     /// `c` than `node` is — then `r` makes the direct `node -> c` edge redundant and
-    /// occludes it. `rng_factor` scales that bar: `1.0` is pure RNG, `> 1.0` raises
-    /// the bar so more edges survive. The comparison is non-strict (`<=`), so an `r`
+    /// occludes it. The comparison is non-strict (`<=`), so an `r`
     /// *exactly* as similar as `node` does not occlude — matching SPTAG and keeping
     /// duplicate vectors from wiping out a node's whole edge set.
     fn set_neighbors(&mut self, ws: &mut Workspace, node: NodeId, candidates: &[Candidate]) {
-        let rng_factor = self.config.rng_factor;
         let max_edges = self.config.max_edges;
         let selected = &mut ws.selected;
         selected.clear();
@@ -206,14 +200,15 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
                 break;
             }
             let cand_vec = self.graph.payload(cand);
-            let keep = selected.iter().all(|&r| {
-                rng_factor * self.metric.similarity(self.graph.payload(r), cand_vec) <= sim
-            });
+            let keep = selected
+                .iter()
+                .all(|&r| self.metric.similarity(self.graph.payload(r), cand_vec) <= sim);
             if keep {
                 selected.push(cand);
             }
         }
 
+        debug_assert!(!selected.is_empty(), "selected nodes should not be empty");
         self.graph.set_neighbors(node, selected);
     }
 }
@@ -300,7 +295,6 @@ mod tests {
             max_edges: 4,
             ef: 8,
             num_candidates: 8,
-            rng_factor: 1.0,
         };
         let mut rng = RelativeNeighborhoodGraph::new(n as usize, 1, Metric::L2, params);
         for i in 0..n {
@@ -375,7 +369,6 @@ mod tests {
             max_edges: 4, // room for both edges; RNG, not capacity, does the pruning
             ef: 4,
             num_candidates: 4,
-            rng_factor: 1.0,
         };
         let mut rng = RelativeNeighborhoodGraph::new(3, 1, Metric::L2, config);
         for i in 0..3 {
@@ -402,7 +395,7 @@ mod tests {
     fn refine_prunes_full_mesh_to_the_optimal_path_graph() {
         // The exact RNG of n equally spaced colinear points is the path graph:
         // every node keeps only its immediate ±1 neighbors; ±2 and beyond are
-        // occluded by the node in between. Starting from a full mesh, `rebuild`
+        // occluded by the node in between. Starting from a full mesh, `refine`
         // must recover exactly that minimal, optimal edge set — proof the
         // occlusion rule prunes everything redundant and nothing it shouldn't.
         const N: NodeId = 6;
@@ -410,7 +403,6 @@ mod tests {
             max_edges: 8, // far more room than the answer needs
             ef: 8,
             num_candidates: 8,
-            rng_factor: 1.0,
         };
         let mut rng = RelativeNeighborhoodGraph::new(N as usize, 1, Metric::L2, config);
         for i in 0..N {
@@ -455,7 +447,6 @@ mod tests {
             max_edges: 4,
             ef: 4,
             num_candidates: 4,
-            rng_factor: 1.0,
         };
         let mut rng = RelativeNeighborhoodGraph::new(3, 2, Metric::L2, config);
         let pts = [[0.0f32, 0.0], [0.0, 0.0], [1.0, 0.0]];
@@ -470,36 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn refine_rng_factor_keeps_otherwise_occluded_edge() {
-        // Same colinear 0,1,2 as `refine_applies_rng_occlusion`, where pure RNG
-        // (factor 1) occludes the 0–2 edge via 1. Relaxing rng_factor above the
-        // gap ratio keeps it: 0->2 survives once `rng_factor * sim(1,2) <=
-        // sim(0,2)`, i.e. `factor * -1 <= -4`, so factor >= 4. Use 5 to clear it.
-        let config = NeighborhoodGraphConfig {
-            max_edges: 4,
-            ef: 4,
-            num_candidates: 4,
-            rng_factor: 5.0,
-        };
-        let mut rng = RelativeNeighborhoodGraph::new(3, 1, Metric::L2, config);
-        for i in 0..3 {
-            rng.add_vector(&[i as f32]);
-        }
-        for i in 0..3i64 {
-            for j in 0..3i64 {
-                if i != j {
-                    rng.graph
-                        .add_edge(i as NodeId, j as NodeId, ((i - j) * (i - j)) as f32);
-                }
-            }
-        }
-
-        rng.refine();
-
-        assert_eq!(sorted_neighbors(&rng, 0), vec![1, 2]); // 0–2 no longer occluded
-    }
-
-    #[test]
     fn refine_caps_selected_neighbors_at_max_edges() {
         // Node 0 has four neighbors in four directions at distinct distances;
         // none occlude each other, so pure RNG would keep all four. With
@@ -508,7 +469,6 @@ mod tests {
             max_edges: 2,
             ef: 8,
             num_candidates: 8,
-            rng_factor: 1.0,
         };
         let mut rng = RelativeNeighborhoodGraph::new(5, 2, Metric::L2, config);
         rng.add_vector(&[0.0, 0.0]); // 0: origin
@@ -516,8 +476,8 @@ mod tests {
         rng.add_vector(&[0.0, 2.0]); // 2: dist 4  (2nd)
         rng.add_vector(&[-3.0, 0.0]); // 3: dist 9
         rng.add_vector(&[0.0, -4.0]); // 4: dist 16
-        // Hand-wired connected init (max_edges = 2 each) so node 0's search can
-        // still reach all four candidates despite the tight degree.
+                                      // Hand-wired connected init (max_edges = 2 each) so node 0's search can
+                                      // still reach all four candidates despite the tight degree.
         rng.graph.set_neighbors(0, &[1, 2]);
         rng.graph.set_neighbors(1, &[0, 3]);
         rng.graph.set_neighbors(2, &[0, 4]);
