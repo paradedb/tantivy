@@ -567,7 +567,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
     /// virtual dispatch cost.
     ///
     /// More importantly, it makes it possible for scorers to implement
-    /// important optimization (e.g. BlockWAND for union).
+    /// important optimization (e.g. BlockWAND).
     ///
     /// Overrides the blanket implementation to drive the concrete pruning scorer
     /// directly, rather than through a `Box<dyn PruningScorer>`. Monomorphizing
