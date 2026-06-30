@@ -28,6 +28,8 @@ pub trait PruningScorer: Scorer {
     fn set_threshold(&mut self, score: Score);
 }
 
+impl_downcast!(PruningScorer);
+
 impl Scorer for Box<dyn PruningScorer> {
     #[inline]
     fn score(&mut self) -> Score {
