@@ -297,10 +297,6 @@ impl RelativeNeighborhoodGraph<f32> {
     /// brute-forcing exact KNN within each leaf and inserting the edges in both
     /// directions. The result is the raw (best-effort symmetric) KNN graph that
     /// [`build`](Self::build) hands to [`refine`](Self::refine).
-    ///
-    /// Within each tree the per-leaf distance computation is independent, so it
-    /// runs on the `executor` (one task per leaf); the resulting edge lists are
-    /// then folded into the graph serially.
     fn build_init_knn(&mut self, executor: &Executor, vectors: &[f32]) {
         let dim = self.graph.dim();
         debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
@@ -319,14 +315,11 @@ impl RelativeNeighborhoodGraph<f32> {
         // starts from the previous one's in-place permutation, diversifying the
         // prefix sample.
         let metric = self.metric;
-        let mut tpt = partition::TPTree::new(vectors, dim, partition::TPTreeConfig::default());
+        let mut tpt = partition::TPTree::new(partition::TPTreeConfig::default(), dim, vectors);
         let mut indices: Vec<NodeId> = (0..n as NodeId).collect();
         for _ in 0..self.config.num_trees {
             let leaves = tpt.partition(&mut indices);
 
-            // Parallel: each leaf computes its pairwise edges (distances only),
-            // reading shared-immutable state — `indices`, `vectors`, `metric` —
-            // and never touching the graph.
             let indices_ref: &[NodeId] = &indices;
             let per_leaf: Vec<Vec<(NodeId, NodeId, f32)>> = executor
                 .map(
@@ -347,9 +340,6 @@ impl RelativeNeighborhoodGraph<f32> {
                 )
                 .expect("leaf KNN computation panicked");
 
-            // Serial: fold each leaf's edges into the graph, both directions.
-            // `add_edge` keeps each node's nearest `max_edges` and dedups, so
-            // unioning the forest is just re-inserting.
             for edges in &per_leaf {
                 for &(a, b, dist) in edges {
                     self.graph.add_edge(a, b, dist);
@@ -439,13 +429,6 @@ impl PartialOrd for Candidate {
 /// is independent of node count. Recursion bottoms out at
 /// [`leaf_size`](TPTreeConfig::leaf_size); the leaves are small contiguous index
 /// ranges the builder brute-forces into exact KNN edges.
-///
-/// Unioning a forest of independent trees (each with different random splits)
-/// stitches neighbors across any single tree's split boundaries, so a point that
-/// landed just across a hyperplane from its true neighbor in one tree shares a
-/// leaf with it in another. This forest-of-trinary-projection-trees construction
-/// is the initial-graph builder used by, among others, Microsoft's
-/// [SPTAG](https://github.com/microsoft/SPTAG).
 pub(crate) mod partition {
     use std::ops::Range;
 
@@ -472,8 +455,6 @@ pub(crate) mod partition {
 
     impl Default for TPTreeConfig {
         fn default() -> Self {
-            // Defaults tuned for large slices (typical of a full-scale TPT
-            // forest); safe to shrink for small centroid head indexes.
             TPTreeConfig {
                 leaf_size: 2000,
                 samples: 1000,
@@ -487,7 +468,6 @@ pub(crate) mod partition {
     /// and owns the RNG; [`partition`](TPTree::partition) permutes a caller-owned
     /// `indices` slice in place and returns the leaf ranges into it.
     pub struct TPTree<'a> {
-        /// Flat arena: node `id`'s coordinate `d` is `vectors[id * dim + d]`.
         vectors: &'a [f32],
         dim: usize,
         config: TPTreeConfig,
@@ -497,7 +477,7 @@ pub(crate) mod partition {
     impl<'a> TPTree<'a> {
         /// Wraps an arena for partitioning. `vectors` is the flat `dim`-strided
         /// buffer (its length must be a multiple of `dim`).
-        pub fn new(vectors: &'a [f32], dim: usize, config: TPTreeConfig) -> Self {
+        pub fn new(config: TPTreeConfig, dim: usize, vectors: &'a [f32]) -> Self {
             debug_assert!(dim > 0, "dim must be non-zero");
             debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
             TPTree {
@@ -686,7 +666,7 @@ pub(crate) mod partition {
                 top_dims: 2,
                 iterations: 100,
             };
-            let mut tpt = TPTree::new(&v, 3, config);
+            let mut tpt = TPTree::new(config, 3, &v);
             let mut indices: Vec<NodeId> = (0..8).collect();
 
             let leaves = tpt.partition(&mut indices);
@@ -712,7 +692,7 @@ pub(crate) mod partition {
                 top_dims: 2,
                 iterations: 8,
             };
-            let mut tpt = TPTree::new(&v, 3, config);
+            let mut tpt = TPTree::new(config, 3, &v);
             let mut indices: Vec<NodeId> = (0..8).collect();
 
             let leaves = tpt.partition(&mut indices);
@@ -990,5 +970,4 @@ mod tests {
             assert_eq!(sorted_neighbors(&rng, i), vec![i - 1, i + 1]);
         }
     }
-
 }
