@@ -328,8 +328,8 @@ impl DocSet for BlockWandUnionScorer {
 /// The algorithm behaves as follows:
 /// - While we don't hit the end of the docset:
 ///   - While the block max score is under the `threshold`, go to the next block.
-///   - On a block, advance until the end and execute return the current doc when the
-///     doc score is greater or equal to the `threshold`.
+///   - On a block, advance until the end and execute return the current doc when the doc score is
+///     greater or equal to the `threshold`.
 pub struct BlockWandSingleScorer {
     scorer: TermScorer,
     threshold: Score,
