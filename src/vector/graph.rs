@@ -1,6 +1,8 @@
-//! A generic, single-threaded relative neighborhood graph, modeled on the RNG
-//! in Microsoft's [SPTAG](https://github.com/microsoft/SPTAG). For now only the
-//! plain *k*-nearest-neighbor graph is implemented; RNG edge pruning comes later.
+//! A generic, single-threaded *k*-nearest-neighbor graph: a flat vector arena
+//! plus fixed-degree adjacency. It is the storage substrate for graph-based
+//! approximate-nearest-neighbor indexes — such as the relative neighborhood
+//! graph built on top of it in the sibling `index` module — and carries no edge
+//! semantics of its own beyond "node `i`'s nearest neighbors, in order".
 //!
 //! - Node ids are dense indices straight into the backing arrays.
 //! - Adjacency is one flat array: node `i` owns the contiguous, nearest-first,
