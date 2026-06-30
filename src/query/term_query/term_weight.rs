@@ -72,6 +72,17 @@ impl Weight for TermWeight {
         }
     }
 
+    fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
+        if let Some(alive_bitset) = reader.alive_bitset() {
+            Ok(self.scorer(reader, 1.0)?.count(alive_bitset))
+        } else {
+            let field = self.term.field();
+            let inv_index = reader.inverted_index(field)?;
+            let term_info = inv_index.get_term_info(&self.term)?;
+            Ok(term_info.map(|term_info| term_info.doc_freq).unwrap_or(0))
+        }
+    }
+
     /// Calls `callback` with all of the `(doc, score)` for which score
     /// is exceeding a given threshold.
     ///
@@ -108,17 +119,6 @@ impl Weight for TermWeight {
             }
         }
         Ok(())
-    }
-
-    fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
-        if let Some(alive_bitset) = reader.alive_bitset() {
-            Ok(self.scorer(reader, 1.0)?.count(alive_bitset))
-        } else {
-            let field = self.term.field();
-            let inv_index = reader.inverted_index(field)?;
-            let term_info = inv_index.get_term_info(&self.term)?;
-            Ok(term_info.map(|term_info| term_info.doc_freq).unwrap_or(0))
-        }
     }
 
     /// Iterates through all of the document matched by the DocSet
