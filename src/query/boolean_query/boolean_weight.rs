@@ -490,8 +490,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         match scorer {
             SpecializedScorer::TermUnion(mut scorers) => {
                 // Drop already-exhausted scorers so a lone survivor uses the
-                // (~3x faster) single-scorer specialization, matching the
-                // pre-refactor `block_wand` routing.
+                // (~3x faster) single-scorer specialization
                 scorers.retain(|scorer| scorer.doc() < TERMINATED);
                 match scorers.len() {
                     0 => Ok(Box::new(EmptyScorer)),
