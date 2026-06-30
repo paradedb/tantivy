@@ -4,7 +4,6 @@ use crate::index::SegmentReader;
 use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
-use crate::query::scorer::{BasicPruningScorer, PruningScorer};
 use crate::query::{EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::{IndexRecordOption, Term};
 use crate::{DocId, DocSet, Score};
@@ -121,18 +120,6 @@ impl Weight for PhrasePrefixWeight {
         } else {
             Ok(Box::new(EmptyScorer))
         }
-    }
-
-    fn pruning_scorer(
-        &self,
-        reader: &SegmentReader,
-        boost: Score,
-        init_threshold: Score,
-    ) -> crate::Result<Box<dyn PruningScorer>> {
-        Ok(Box::new(BasicPruningScorer::new(
-            self.scorer(reader, boost)?,
-            init_threshold,
-        )))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {

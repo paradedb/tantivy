@@ -1,4 +1,4 @@
-use super::scorer::PruningScorer;
+use super::scorer::{BasicPruningScorer, PruningScorer};
 use super::Scorer;
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
@@ -63,15 +63,26 @@ pub trait Weight: Send + Sync + 'static {
     /// See [`Query`](crate::query::Query).
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>>;
 
-    /// Returns a pruning scorer for the given segment
+    /// Returns a pruning scorer for the given segment.
     ///
-    /// `boost` is a multiplier to apply to the score.
+    /// `boost` is a multiplier to apply to the score. `init_threshold` is the
+    /// initial score threshold below which documents may be pruned.
+    ///
+    /// The default implementation wraps [`Weight::scorer`] in a
+    /// [`BasicPruningScorer`], which simply filters out `(doc, score)` pairs
+    /// below the current threshold. Scorers that can prune more aggressively
+    /// (e.g. BlockWAND over a union or intersection) override this.
     fn pruning_scorer(
         &self,
         reader: &SegmentReader,
         boost: Score,
         init_threshold: Score,
-    ) -> crate::Result<Box<dyn PruningScorer>>;
+    ) -> crate::Result<Box<dyn PruningScorer>> {
+        Ok(Box::new(BasicPruningScorer::new(
+            self.scorer(reader, boost)?,
+            init_threshold,
+        )))
+    }
 
     /// Returns an [`Explanation`] for the given document.
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation>;

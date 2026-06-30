@@ -3,7 +3,6 @@ use core::fmt::Debug;
 use columnar::{ColumnIndex, DynamicColumn};
 use common::BitSet;
 
-use super::scorer::BasicPruningScorer;
 use super::{ConstScorer, EmptyScorer};
 use crate::docset::{DocSet, TERMINATED};
 use crate::index::SegmentReader;
@@ -164,18 +163,6 @@ impl Weight for ExistsWeight {
         }
         let docset = BitSetDocSet::from(doc_bitset);
         Ok(Box::new(ConstScorer::new(docset, boost)))
-    }
-
-    fn pruning_scorer(
-        &self,
-        reader: &SegmentReader,
-        boost: Score,
-        init_threshold: Score,
-    ) -> crate::Result<Box<dyn super::scorer::PruningScorer>> {
-        Ok(Box::new(BasicPruningScorer::new(
-            self.scorer(reader, boost)?,
-            init_threshold,
-        )))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {

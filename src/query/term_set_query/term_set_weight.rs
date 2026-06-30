@@ -40,7 +40,6 @@ use super::term_set_strategy::{
 };
 use crate::index::SegmentReader;
 use crate::query::score_combiner::DoNothingCombiner;
-use crate::query::scorer::{BasicPruningScorer, PruningScorer};
 use crate::query::{
     AutomatonWeight, BooleanWeight, ConstScorer, EmptyScorer, EnableScoring, Explanation, Occur,
     Query, Scorer, Weight,
@@ -361,18 +360,6 @@ impl Weight for TermSetWeight {
                 self.dispatch_non_fast(reader, boost)
             }
         }
-    }
-
-    fn pruning_scorer(
-        &self,
-        reader: &SegmentReader,
-        boost: Score,
-        init_threshold: Score,
-    ) -> crate::Result<Box<dyn PruningScorer>> {
-        Ok(Box::new(BasicPruningScorer::new(
-            self.scorer(reader, boost)?,
-            init_threshold,
-        )))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {

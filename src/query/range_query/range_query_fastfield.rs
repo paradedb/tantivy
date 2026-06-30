@@ -15,7 +15,6 @@ use super::contiguous_doc_set::ContiguousDocSet;
 use super::fast_field_range_doc_set::RangeDocSet;
 use super::sorted_internals::{binary_search_null_boundary, binary_search_sorted};
 use crate::index::SegmentReader;
-use crate::query::scorer::{BasicPruningScorer, PruningScorer};
 use crate::query::{
     AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer, Weight,
 };
@@ -263,18 +262,6 @@ impl Weight for FastFieldRangeWeight {
                 sort_order,
             )
         }
-    }
-
-    fn pruning_scorer(
-        &self,
-        reader: &SegmentReader,
-        boost: Score,
-        init_threshold: Score,
-    ) -> crate::Result<Box<dyn PruningScorer>> {
-        Ok(Box::new(BasicPruningScorer::new(
-            self.scorer(reader, boost)?,
-            init_threshold,
-        )))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
