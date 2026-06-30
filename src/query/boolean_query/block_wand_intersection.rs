@@ -51,6 +51,7 @@ pub struct BlockWandIntersectionScorer {
     window_end: DocId,
 }
 impl BlockWandIntersectionScorer {
+    /// Construction positions `current` on the first match
     pub fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
         assert!(scorers.len() >= 2);
 

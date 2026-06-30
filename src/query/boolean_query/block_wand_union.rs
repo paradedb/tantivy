@@ -199,12 +199,16 @@ impl DerefMut for TermScorerWithMaxScore {
 /// Implements the WAND (Weak AND) algorithm for dynamic pruning
 /// described in the paper "Faster Top-k Document Retrieval Using Block-Max Indexes".
 /// Link: <http://engineering.nyu.edu/~suel/papers/bmw.pdf>
+///
+/// # Preconditions
+/// - All scorers read frequencies (`FreqReadingOption::ReadFreq`)
 pub struct BlockWandUnionScorer {
     scorers: Vec<TermScorerWithMaxScore>,
     threshold: Score,
     current: (DocId, Score),
 }
 impl BlockWandUnionScorer {
+    /// Construction positions `current` on the first match
     pub fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
         debug_assert!(scorers.len() > 1);
         scorers.retain(|scorer| scorer.doc() < TERMINATED);
@@ -324,14 +328,15 @@ impl DocSet for BlockWandUnionScorer {
 /// The algorithm behaves as follows:
 /// - While we don't hit the end of the docset:
 ///   - While the block max score is under the `threshold`, go to the next block.
-///   - On a block, advance until the end and execute `callback` when the doc score is greater or
-///     equal to the `threshold`.
+///   - On a block, advance until the end and execute return the current doc when the
+///     doc score is greater or equal to the `threshold`.
 pub struct BlockWandSingleScorer {
     scorer: TermScorer,
     threshold: Score,
     current: (DocId, Score),
 }
 impl BlockWandSingleScorer {
+    /// Construction positions `current` on the first match
     pub fn new(term_scorer: TermScorer, threshold: Score) -> Self {
         let mut scorer = Self {
             scorer: term_scorer,
