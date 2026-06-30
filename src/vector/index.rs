@@ -9,12 +9,18 @@
 //! workspace is a parameter rather than borrowed from the index, `search` only
 //! needs `&self` — so a query can run while the caller still borrows the graph
 //! (e.g. `refine` uses each node's vector as the query straight from the arena,
-//! with no copy), and one workspace can be reused across many queries.
+//! with no copy), one workspace can be reused across many queries, and many
+//! queries can run *concurrently*. That last property is what lets
+//! [`build`](RelativeNeighborhoodGraph::build) and
+//! [`refine`](RelativeNeighborhoodGraph::refine) fan their per-leaf / per-node
+//! search work across an [`Executor`](crate::Executor), serializing only the
+//! cheap graph mutation.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 use crate::schema::Metric;
+use crate::Executor;
 
 use super::graph::{Graph, NodeId};
 use super::VectorElement;
@@ -168,37 +174,70 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
         out
     }
 
-    /// Refines every node against the current graph: searches from the node
+    /// Refines every node against the current graph: each node searches from
     /// itself to gather a candidate pool, applies the RNG occlusion rule to
-    /// reselect its edges, and rewrites them in place. This pass is what turns a
-    /// raw KNN graph into an RNG.
-    pub fn refine(&mut self) {
-        let mut ws = Workspace::new();
+    /// reselect its edges, and the new adjacencies are written back. This pass is
+    /// what turns a raw KNN graph into an RNG.
+    ///
+    /// The search-and-select phase is read-only over the graph, so it runs in
+    /// parallel on the `executor`; the cheap write-back is applied serially
+    /// afterward (a node's adjacency must not be mutated while other nodes are
+    /// still reading it). Because every node reads the same pre-pass snapshot,
+    /// this is a *synchronous* refinement — all nodes see the original edges, not
+    /// each other's updates — which is the shape that parallelizes and is
+    /// equivalent in quality on a single pass. Nodes are processed in chunks so
+    /// each task reuses one [`Workspace`] instead of allocating a per-node
+    /// `O(len)` visited buffer.
+    pub fn refine(&mut self, executor: &Executor) {
         let len = self.graph.len();
-        let mut search_time = std::time::Duration::ZERO;
-        let mut select_time = std::time::Duration::ZERO;
-        for node_id in 0..len as NodeId {
-            let query = self.graph.payload(node_id);
-            let t_search = std::time::Instant::now();
-            let candidates = self.search(&mut ws, query, &[node_id], self.config.num_candidates);
-            search_time += t_search.elapsed();
-            let t_select = std::time::Instant::now();
-            self.set_neighbors(&mut ws, node_id, &candidates);
-            select_time += t_select.elapsed();
-            if (node_id as usize + 1) % 20_000 == 0 {
-                println!(
-                    "[refine] {}/{len} nodes | cumulative: search {search_time:?}, select \
-                     {select_time:?}",
-                    node_id + 1
-                );
+        if len == 0 {
+            return;
+        }
+
+        // Phase 1 (parallel, read-only): each node searches the snapshot and
+        // RNG-selects its new neighbors. One chunk per executor thread, so a
+        // single Workspace is reused across the chunk's nodes rather than
+        // allocating a per-node visited buffer. `max(1)` guards the degenerate
+        // case of more threads than nodes.
+        let chunk = (len / executor.num_threads()).max(1);
+        let ranges = (0..len)
+            .step_by(chunk)
+            .map(|s| (s as NodeId, (s + chunk).min(len) as NodeId));
+        let chunked_selected: Vec<Vec<Vec<NodeId>>> = {
+            let rng = &*self;
+            executor
+                .map(
+                    move |(start, end): (NodeId, NodeId)| {
+                        let mut ws = Workspace::new();
+                        let mut out = Vec::with_capacity((end - start) as usize);
+                        for node in start..end {
+                            let query = rng.graph.payload(node);
+                            let candidates =
+                                rng.search(&mut ws, query, &[node], rng.config.num_candidates);
+                            out.push(rng.select_neighbors(node, &candidates));
+                        }
+                        Ok(out)
+                    },
+                    ranges,
+                )
+                .expect("refine search panicked")
+        };
+
+        // Phase 2 (serial): write each node's selection back. Disjoint per node
+        // and a bounded copy each, so the serial cost is negligible.
+        let mut node: NodeId = 0;
+        for chunk in &chunked_selected {
+            for selected in chunk {
+                self.graph.set_neighbors(node, selected);
+                node += 1;
             }
         }
-        println!("[refine] {len} nodes | search {search_time:?}, select {select_time:?}");
     }
 
     /// Applies the relative-neighborhood-graph occlusion rule to `candidates`
-    /// (nearest-first), writing the survivors straight into `node`'s adjacency (at
-    /// most `max_edges`) and skipping `node` itself.
+    /// (nearest-first) and returns the survivors — `node`'s new adjacency, at most
+    /// `max_edges`, skipping `node` itself. Read-only, so it can run concurrently
+    /// across nodes; the caller writes the result back into the graph.
     ///
     /// Everything is in similarity space (higher is better): a candidate `c` is
     /// kept unless some already-selected neighbor `r` is *more* similar to `c`
@@ -207,10 +246,9 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
     /// non-strict (`<=`), so an `r` *exactly* as similar as `node` does not
     /// occlude — the canonical RNG definition, and what keeps duplicate vectors
     /// from wiping out a node's whole edge set.
-    fn set_neighbors(&mut self, ws: &mut Workspace, node: NodeId, candidates: &[Candidate]) {
+    fn select_neighbors(&self, node: NodeId, candidates: &[Candidate]) -> Vec<NodeId> {
         let max_edges = self.config.max_edges;
-        let selected = &mut ws.selected;
-        selected.clear();
+        let mut selected: Vec<NodeId> = Vec::with_capacity(max_edges);
         for &Candidate { sim, node: cand } in candidates {
             if cand == node {
                 continue; // the query node itself is never its own neighbor
@@ -228,7 +266,7 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
         }
 
         debug_assert!(!selected.is_empty(), "selected nodes should not be empty");
-        self.graph.set_neighbors(node, selected);
+        selected
     }
 }
 
@@ -245,11 +283,13 @@ impl RelativeNeighborhoodGraph<f32> {
     ///
     /// `vectors` is passed in rather than read back out of the inner [`Graph`] so
     /// the partitioner can borrow the arena immutably while edge insertion borrows
-    /// the graph mutably. Expects an empty graph sized for at least
-    /// `vectors.len() / dim` nodes; `vectors.len()` must be a multiple of `dim`.
-    pub fn build(&mut self, vectors: &[f32]) {
-        self.build_init_knn(vectors);
-        self.refine();
+    /// the graph mutably. The `executor` parallelizes the per-leaf distance work
+    /// (see [`build_init_knn`](Self::build_init_knn)). Expects an empty graph
+    /// sized for at least `vectors.len() / dim` nodes; `vectors.len()` must be a
+    /// multiple of `dim`.
+    pub fn build(&mut self, executor: &Executor, vectors: &[f32]) {
+        self.build_init_knn(executor, vectors);
+        self.refine(executor);
     }
 
     /// Seeds the raw KNN graph: adds every vector as a node, then unions a forest
@@ -257,7 +297,11 @@ impl RelativeNeighborhoodGraph<f32> {
     /// brute-forcing exact KNN within each leaf and inserting the edges in both
     /// directions. The result is the raw (best-effort symmetric) KNN graph that
     /// [`build`](Self::build) hands to [`refine`](Self::refine).
-    fn build_init_knn(&mut self, vectors: &[f32]) {
+    ///
+    /// Within each tree the per-leaf distance computation is independent, so it
+    /// runs on the `executor` (one task per leaf); the resulting edge lists are
+    /// then folded into the graph serially.
+    fn build_init_knn(&mut self, executor: &Executor, vectors: &[f32]) {
         let dim = self.graph.dim();
         debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
         debug_assert!(self.graph.is_empty(), "build expects an empty graph");
@@ -266,58 +310,53 @@ impl RelativeNeighborhoodGraph<f32> {
             return;
         }
 
-        let t_nodes = std::time::Instant::now();
         for chunk in vectors.chunks_exact(dim) {
             self.graph.add_node(chunk);
         }
-        println!("[build_init_knn] loaded {n} nodes in {:?}", t_nodes.elapsed());
 
-        // Seed the KNN edges by unioning a forest of TPT partitions. One
-        // TPTree is reused across trees: its RNG advances between partitions so
-        // successive trees split along different directions, and each tree
+        // One TPTree is reused across trees: its RNG advances between partitions
+        // so successive trees split along different directions, and each tree
         // starts from the previous one's in-place permutation, diversifying the
-        // prefix sample. `add_edge` keeps each node's nearest `max_edges` and
-        // dedups, so unioning is just re-inserting.
+        // prefix sample.
+        let metric = self.metric;
         let mut tpt = partition::TPTree::new(vectors, dim, partition::TPTreeConfig::default());
         let mut indices: Vec<NodeId> = (0..n as NodeId).collect();
-        let mut partition_time = std::time::Duration::ZERO;
-        let mut knn_time = std::time::Duration::ZERO;
-        let mut total_leaves = 0usize;
-        let mut total_pairs = 0u64;
-        for tree in 0..self.config.num_trees {
-            let t_part = std::time::Instant::now();
+        for _ in 0..self.config.num_trees {
             let leaves = tpt.partition(&mut indices);
-            partition_time += t_part.elapsed();
-            total_leaves += leaves.len();
 
-            let t_knn = std::time::Instant::now();
-            for leaf in leaves {
-                let members = &indices[leaf];
-                for (i, &a) in members.iter().enumerate() {
-                    let va = &vectors[a as usize * dim..][..dim];
-                    for &b in &members[i + 1..] {
-                        let vb = &vectors[b as usize * dim..][..dim];
-                        let dist = -self.metric.similarity(va, vb);
-                        self.graph.add_edge(a, b, dist);
-                        self.graph.add_edge(b, a, dist);
-                        total_pairs += 1;
-                    }
+            // Parallel: each leaf computes its pairwise edges (distances only),
+            // reading shared-immutable state — `indices`, `vectors`, `metric` —
+            // and never touching the graph.
+            let indices_ref: &[NodeId] = &indices;
+            let per_leaf: Vec<Vec<(NodeId, NodeId, f32)>> = executor
+                .map(
+                    move |leaf: std::ops::Range<usize>| {
+                        let members = &indices_ref[leaf];
+                        let mut edges =
+                            Vec::with_capacity(members.len() * members.len().saturating_sub(1) / 2);
+                        for (i, &a) in members.iter().enumerate() {
+                            let va = &vectors[a as usize * dim..][..dim];
+                            for &b in &members[i + 1..] {
+                                let vb = &vectors[b as usize * dim..][..dim];
+                                edges.push((a, b, -metric.similarity(va, vb)));
+                            }
+                        }
+                        Ok(edges)
+                    },
+                    leaves.into_iter(),
+                )
+                .expect("leaf KNN computation panicked");
+
+            // Serial: fold each leaf's edges into the graph, both directions.
+            // `add_edge` keeps each node's nearest `max_edges` and dedups, so
+            // unioning the forest is just re-inserting.
+            for edges in &per_leaf {
+                for &(a, b, dist) in edges {
+                    self.graph.add_edge(a, b, dist);
+                    self.graph.add_edge(b, a, dist);
                 }
             }
-            knn_time += t_knn.elapsed();
-            println!(
-                "[build_init_knn] tree {}/{} done | cumulative: partition {:?}, knn {:?}",
-                tree + 1,
-                self.config.num_trees,
-                partition_time,
-                knn_time
-            );
         }
-        println!(
-            "[build_init_knn] {} trees | {total_leaves} leaves, {total_pairs} pairs | \
-             partition {:?}, knn {:?}",
-            self.config.num_trees, partition_time, knn_time
-        );
     }
 }
 
@@ -335,8 +374,6 @@ pub struct Workspace {
     /// Min-heap by similarity (via `Reverse`): the best `ef` results so far, with
     /// the least-similar on top for eviction.
     results: BinaryHeap<Reverse<Candidate>>,
-    /// RNG-selected neighbor ids for the node being refined.
-    selected: Vec<NodeId>,
 }
 
 impl Workspace {
@@ -788,7 +825,7 @@ mod tests {
             }
         }
 
-        rng.refine();
+        rng.refine(&Executor::SingleThread);
 
         assert_eq!(sorted_neighbors(&rng, 0), vec![1]); // 0–2 occluded by 1
         assert_eq!(sorted_neighbors(&rng, 2), vec![1]); // 2–0 occluded by 1
@@ -822,7 +859,7 @@ mod tests {
             }
         }
 
-        rng.refine();
+        rng.refine(&Executor::SingleThread);
 
         assert_eq!(sorted_neighbors(&rng, 0), vec![1]);
         assert_eq!(sorted_neighbors(&rng, N - 1), vec![N - 2]);
@@ -861,7 +898,7 @@ mod tests {
         }
         fully_connect(&mut rng, &pts);
 
-        rng.refine();
+        rng.refine(&Executor::SingleThread);
 
         assert_eq!(sorted_neighbors(&rng, 0), vec![1, 2]);
     }
@@ -891,7 +928,7 @@ mod tests {
         rng.graph.set_neighbors(3, &[1, 0]);
         rng.graph.set_neighbors(4, &[2, 0]);
 
-        rng.refine();
+        rng.refine(&Executor::SingleThread);
 
         // Nearest two kept; the farther two dropped despite being valid RNG edges.
         assert_eq!(sorted_neighbors(&rng, 0), vec![1, 2]);
@@ -912,7 +949,7 @@ mod tests {
         let mut rng = RelativeNeighborhoodGraph::new(6, 1, Metric::L2, config);
         let vectors: Vec<f32> = (0..6).map(|i| i as f32).collect();
 
-        rng.build_init_knn(&vectors);
+        rng.build_init_knn(&Executor::single_thread(), &vectors);
 
         for i in 0..6u32 {
             let nbrs = rng.graph.neighbors(i);
@@ -945,7 +982,7 @@ mod tests {
         let mut rng = RelativeNeighborhoodGraph::new(N as usize, 1, Metric::L2, config);
         let vectors: Vec<f32> = (0..N).map(|i| i as f32).collect();
 
-        rng.build(&vectors);
+        rng.build(&Executor::single_thread(), &vectors);
 
         assert_eq!(sorted_neighbors(&rng, 0), vec![1]);
         assert_eq!(sorted_neighbors(&rng, N - 1), vec![N - 2]);
@@ -954,48 +991,4 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "manual perf run; needs RNG_BENCH_VECS and --release"]
-    fn build_timing_on_real_vectors() {
-        use std::time::Instant;
-
-        let path = std::env::var("RNG_BENCH_VECS")
-            .expect("set RNG_BENCH_VECS to a flat f32 file (see download_cohere.py)");
-        let dim: usize = std::env::var("RNG_BENCH_DIM")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(768);
-
-        let bytes = std::fs::read(&path).expect("read RNG_BENCH_VECS");
-        assert_eq!(
-            bytes.len() % (dim * 4),
-            0,
-            "file size not a multiple of dim*4"
-        );
-        let n = bytes.len() / (dim * 4);
-        let vectors: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-
-        let config = NeighborhoodGraphConfig::default();
-        let mut rng = RelativeNeighborhoodGraph::new(n, dim, Metric::Cosine, config);
-        println!("loaded {n} x {dim} from {path}; config = {config:?}, metric = Cosine");
-
-        let t = Instant::now();
-        rng.build_init_knn(&vectors);
-        let init = t.elapsed();
-
-        let t = Instant::now();
-        rng.refine();
-        let refine = t.elapsed();
-
-        let per = |d: std::time::Duration| d.as_secs_f64() / n as f64 * 1e6; // µs/node
-        println!("build_init_knn: {init:>10.2?}  ({:.1} µs/node)", per(init));
-        println!(
-            "refine:         {refine:>10.2?}  ({:.1} µs/node)",
-            per(refine)
-        );
-        println!("total build:    {:>10.2?}", init + refine);
-    }
 }
