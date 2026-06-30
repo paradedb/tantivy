@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::postings::FreqReadingOption;
+use crate::query::boolean_query::{
+    BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
+};
 use crate::query::disjunction::Disjunction;
 use crate::query::explanation::does_not_match;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
@@ -14,10 +17,6 @@ use crate::query::{
     RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score, TERMINATED};
-
-use crate::query::boolean_query::{
-    BlockWandIntersectionScorer, BlockWandSingleScorer, BlockWandUnionScorer,
-};
 
 enum SpecializedScorer {
     TermUnion(Vec<TermScorer>),

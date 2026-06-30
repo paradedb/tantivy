@@ -1,12 +1,11 @@
 use std::fmt;
 
+use super::scorer::PruningScorer;
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::Field;
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
-
-use super::scorer::PruningScorer;
 
 /// `BoostQuery` is a wrapper over a query used to boost its score.
 ///
