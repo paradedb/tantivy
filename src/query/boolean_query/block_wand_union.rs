@@ -359,7 +359,7 @@ impl PruningScorer for BlockWandSingleScorer {
 impl DocSet for BlockWandSingleScorer {
     fn advance(&mut self) -> DocId {
         let mut doc = self.scorer.doc();
-        // host threshold to a local so we avoid going to memory in the loop
+        // hoist threshold to a local so we avoid going to memory in the loop
         let threshold = self.threshold;
         'outer: loop {
             // We position the scorer on a block that can reach

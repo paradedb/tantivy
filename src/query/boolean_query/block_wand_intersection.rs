@@ -34,7 +34,7 @@ pub struct BlockWandIntersectionScorer {
     leader: TermScorer,
     secondaries: Vec<TermScorer>,
 
-    maxixum_possible_score: Score,
+    maximum_possible_score: Score,
     secondary_block_max_scores: Box<[f32]>,
     secondary_suffix_block_max: Box<[f32]>,
     fieldnorm_reader: FieldNormReader,
@@ -61,7 +61,7 @@ impl BlockWandIntersectionScorer {
         let secondaries_len = secondaries.len();
 
         let secondaries_global_max_sum: Score = secondaries.iter().map(TermScorer::max_score).sum();
-        let maxixum_possible_score = leader.max_score() + secondaries_global_max_sum;
+        let maximum_possible_score = leader.max_score() + secondaries_global_max_sum;
 
         // Borrow fieldnorm reader and BM25 weight before the main loop.
         // These are immutable references to disjoint fields from block_cursor,
@@ -75,7 +75,7 @@ impl BlockWandIntersectionScorer {
         let mut scorer = Self {
             leader,
             secondaries,
-            maxixum_possible_score,
+            maximum_possible_score,
             secondary_block_max_scores: vec![0.0f32; secondaries_len].into_boxed_slice(),
             secondary_suffix_block_max: vec![0.0f32; secondaries_len].into_boxed_slice(),
             fieldnorm_reader,
@@ -148,7 +148,7 @@ impl PruningScorer for BlockWandIntersectionScorer {
 }
 impl DocSet for BlockWandIntersectionScorer {
     fn advance(&mut self) -> DocId {
-        if self.maxixum_possible_score <= self.threshold {
+        if self.maximum_possible_score <= self.threshold {
             self.current = (TERMINATED, Score::MIN);
             return TERMINATED;
         }
