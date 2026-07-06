@@ -1,6 +1,6 @@
 //! The `.centroids` file: IVF cluster routing, written per field.
 //!
-//! Present only for IVF segments (⟺ the field's `.vec` `IdMap` is `Explicit`).
+//! Present only for IVF segments (⟺   the field's `.vec` `IdMap` is `Explicit`).
 //! A [`CompositeFile`](crate::directory::CompositeFile) with two slots per
 //! field:
 //!

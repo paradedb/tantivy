@@ -18,6 +18,7 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::ops::Deref;
 
 use crate::schema::Metric;
 use crate::Executor;
@@ -59,14 +60,17 @@ impl Default for NeighborhoodGraphConfig {
     }
 }
 
-/// A relative neighborhood graph (RNG) index over vectors of element type `T`.
+/// A relative neighborhood graph (RNG) index over `dim`-strided vector storage
+/// `S` (any `Deref<Target = [T]>`, borrowed or owned) with element type `T`.
 ///
-/// Vectors live in the inner [`Graph`]'s flat `dim`-strided arena; queries are
-/// `&[T]` of the same element type and dimension. This type owns the metric and
-/// parameters; per-query scratch is supplied by the caller as a [`Workspace`].
-pub struct RelativeNeighborhoodGraph<T: VectorElement> {
-    /// Flat vector arena and directed adjacency.
-    graph: Graph<T>,
+/// The inner [`Graph`] never copies the vectors: a merge-time build borrows the
+/// clusterer's centroid matrix (`S = &[f32]`), a reload owns its decoded arena
+/// (`S = Vec<T>`). Queries are `&[T]` of the same element type and dimension.
+/// This type owns the metric and parameters; per-query scratch is supplied by
+/// the caller as a [`Workspace`].
+pub struct RelativeNeighborhoodGraph<S> {
+    /// Vector arena and directed adjacency.
+    graph: Graph<S>,
     /// Similarity metric (higher is better). Search ranks by similarity; build
     /// orders edges by its negation, so smaller is closer.
     metric: Metric,
@@ -74,25 +78,16 @@ pub struct RelativeNeighborhoodGraph<T: VectorElement> {
     config: NeighborhoodGraphConfig,
 }
 
-impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
-    /// Creates an empty index with room for `capacity` nodes of `dim`-dimensional
-    /// vectors, using `metric` and the given tuning `params`.
-    pub fn new(
-        capacity: usize,
-        dim: usize,
-        metric: Metric,
-        params: NeighborhoodGraphConfig,
-    ) -> Self {
+impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
+    /// Creates an edge-less index over `vectors`, a flat `dim`-strided arena
+    /// whose length fixes the node count, using `metric` and the given tuning
+    /// `params`.
+    pub fn new(vectors: S, dim: usize, metric: Metric, params: NeighborhoodGraphConfig) -> Self {
         RelativeNeighborhoodGraph {
-            graph: Graph::new(capacity, dim, params.max_edges),
+            graph: Graph::new(vectors, dim, params.max_edges),
             metric,
             config: params,
         }
-    }
-
-    /// Copies `vector` into the flat arena as a new node and returns its id.
-    pub fn add_vector(&mut self, vector: &[T]) -> NodeId {
-        self.graph.add_node(vector)
     }
 
     /// Greedy beam search for the `k` nodes most similar to `query`, expanding
@@ -188,7 +183,10 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
     /// equivalent in quality on a single pass. Nodes are processed in chunks so
     /// each task reuses one [`Workspace`] instead of allocating a per-node
     /// `O(len)` visited buffer.
-    pub fn refine(&mut self, executor: &Executor) {
+    pub fn refine(&mut self, executor: &Executor)
+    where
+        S: Sync,
+    {
         let len = self.graph.len();
         if len == 0 {
             return;
@@ -270,39 +268,35 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
     }
 }
 
-/// Build is `f32`-only for now: the TPT partitioner does floating-point math
-/// over the vectors. The rest of the index stays generic over [`VectorElement`].
-impl RelativeNeighborhoodGraph<f32> {
-    /// Builds the RNG index over `vectors`, a flat `dim`-strided arena: seeds a
-    /// raw KNN graph with a TPT forest, then prunes it into an RNG.
-    ///
-    /// `vectors` is passed in rather than read from the inner [`Graph`] so the
-    /// partitioner can borrow it while the graph is mutated. Expects an empty
-    /// graph sized for `vectors.len() / dim` nodes.
-    pub fn build(&mut self, executor: &Executor, vectors: &[f32]) {
-        self.build_init_knn(executor, vectors);
+/// Build is `f32`-only and borrow-only for now: the TPT partitioner does
+/// floating-point math over the vectors, and borrowed storage is what lets the
+/// partitioner keep reading the arena while the graph's edge lists are mutated
+/// — `&[f32]` is `Copy`, so [`Graph::arena`] hands back a reference independent
+/// of `&mut self`. The rest of the index stays generic over storage and
+/// [`VectorElement`].
+impl RelativeNeighborhoodGraph<&[f32]> {
+    /// Builds the RNG index over the borrowed arena: seeds a raw KNN graph with
+    /// a TPT forest, then prunes it into an RNG. Expects a freshly constructed,
+    /// edge-less index.
+    pub fn build(&mut self, executor: &Executor) {
+        self.build_init_knn(executor);
         self.refine(executor);
     }
 
-    /// Seeds the raw KNN graph: adds every vector as a node, then unions a forest
-    /// of [`num_trees`](NeighborhoodGraphConfig::num_trees) TPT partitions,
+    /// Seeds the raw KNN graph: unions a forest of
+    /// [`num_trees`](NeighborhoodGraphConfig::num_trees) TPT partitions,
     /// brute-forcing KNN within each leaf. Leaves run in parallel on the
     /// `executor`, writing edges directly into their members' edge lists —
     /// leaves partition the nodes, so the lists touched by different leaves are
     /// disjoint, and each list keeps only the node's nearest
     /// [`max_edges`](NeighborhoodGraphConfig::max_edges), so memory stays
     /// bounded by the graph itself.
-    fn build_init_knn(&mut self, executor: &Executor, vectors: &[f32]) {
+    fn build_init_knn(&mut self, executor: &Executor) {
+        let vectors = self.graph.arena();
         let dim = self.graph.dim();
-        debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
-        debug_assert!(self.graph.is_empty(), "build expects an empty graph");
-        let n = vectors.len() / dim;
+        let n = self.graph.len();
         if n == 0 {
             return;
-        }
-
-        for chunk in vectors.chunks_exact(dim) {
-            self.graph.add_node(chunk);
         }
 
         // One TPTree reused across trees: its RNG advances between partitions,
@@ -724,17 +718,15 @@ mod tests {
 
     /// A line of `n` 1-D points at positions `0..n`, each connected to its ±1 and
     /// ±2 neighbors (edge "distance" = squared gap, matching `-L2` similarity).
-    fn line_index(n: NodeId) -> RelativeNeighborhoodGraph<f32> {
+    fn line_index(n: NodeId) -> RelativeNeighborhoodGraph<Vec<f32>> {
         let params = NeighborhoodGraphConfig {
             max_edges: 4,
             ef: 8,
             num_candidates: 8,
             num_trees: 1,
         };
-        let mut rng = RelativeNeighborhoodGraph::new(n as usize, 1, Metric::L2, params);
-        for i in 0..n {
-            rng.add_vector(&[i as f32]);
-        }
+        let vectors: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let mut rng = RelativeNeighborhoodGraph::new(vectors, 1, Metric::L2, params);
         for i in 0..n as i64 {
             for off in [-2i64, -1, 1, 2] {
                 let nb = i + off;
@@ -766,8 +758,12 @@ mod tests {
         assert!(rng.search(&mut ws, &[1.0], &[0], 0).is_empty()); // k == 0
         assert!(rng.search(&mut ws, &[1.0], &[], 3).is_empty()); // no seeds
 
-        let empty: RelativeNeighborhoodGraph<f32> =
-            RelativeNeighborhoodGraph::new(4, 1, Metric::L2, NeighborhoodGraphConfig::default());
+        let empty: RelativeNeighborhoodGraph<Vec<f32>> = RelativeNeighborhoodGraph::new(
+            Vec::new(),
+            1,
+            Metric::L2,
+            NeighborhoodGraphConfig::default(),
+        );
         assert!(empty.search(&mut ws, &[1.0], &[0], 3).is_empty()); // empty graph
     }
 
@@ -790,7 +786,10 @@ mod tests {
         assert!(ids[1] == 3 || ids[1] == 5); // then its nearest neighbors
     }
 
-    fn sorted_neighbors(rng: &RelativeNeighborhoodGraph<f32>, node: NodeId) -> Vec<NodeId> {
+    fn sorted_neighbors<S: Deref<Target = [f32]>>(
+        rng: &RelativeNeighborhoodGraph<S>,
+        node: NodeId,
+    ) -> Vec<NodeId> {
         let mut v = rng.graph.neighbors(node).to_vec();
         v.sort_unstable();
         v
@@ -806,10 +805,8 @@ mod tests {
             num_candidates: 4,
             num_trees: 1,
         };
-        let mut rng = RelativeNeighborhoodGraph::new(3, 1, Metric::L2, config);
-        for i in 0..3 {
-            rng.add_vector(&[i as f32]);
-        }
+        let vectors: Vec<f32> = (0..3).map(|i| i as f32).collect();
+        let mut rng = RelativeNeighborhoodGraph::new(vectors, 1, Metric::L2, config);
         // Start fully connected so each node's search sees every other node.
         for i in 0..3i64 {
             for j in 0..3i64 {
@@ -841,10 +838,8 @@ mod tests {
             num_candidates: 8,
             num_trees: 1,
         };
-        let mut rng = RelativeNeighborhoodGraph::new(N as usize, 1, Metric::L2, config);
-        for i in 0..N {
-            rng.add_vector(&[i as f32]);
-        }
+        let vectors: Vec<f32> = (0..N).map(|i| i as f32).collect();
+        let mut rng = RelativeNeighborhoodGraph::new(vectors, 1, Metric::L2, config);
         for i in 0..N as i64 {
             for j in 0..N as i64 {
                 if i != j {
@@ -864,7 +859,7 @@ mod tests {
     }
 
     /// Fully connect every node to every other with `-L2` edge distances.
-    fn fully_connect(rng: &mut RelativeNeighborhoodGraph<f32>, pts: &[[f32; 2]]) {
+    fn fully_connect(rng: &mut RelativeNeighborhoodGraph<Vec<f32>>, pts: &[[f32; 2]]) {
         for i in 0..pts.len() {
             for j in 0..pts.len() {
                 if i != j {
@@ -886,11 +881,9 @@ mod tests {
             num_candidates: 4,
             num_trees: 1,
         };
-        let mut rng = RelativeNeighborhoodGraph::new(3, 2, Metric::L2, config);
         let pts = [[0.0f32, 0.0], [0.0, 0.0], [1.0, 0.0]];
-        for p in &pts {
-            rng.add_vector(p);
-        }
+        let vectors: Vec<f32> = pts.iter().flatten().copied().collect();
+        let mut rng = RelativeNeighborhoodGraph::new(vectors, 2, Metric::L2, config);
         fully_connect(&mut rng, &pts);
 
         rng.refine(&Executor::SingleThread);
@@ -909,14 +902,16 @@ mod tests {
             num_candidates: 8,
             num_trees: 1,
         };
-        let mut rng = RelativeNeighborhoodGraph::new(5, 2, Metric::L2, config);
-        rng.add_vector(&[0.0, 0.0]); // 0: origin
-        rng.add_vector(&[1.0, 0.0]); // 1: dist 1  (nearest)
-        rng.add_vector(&[0.0, 2.0]); // 2: dist 4  (2nd)
-        rng.add_vector(&[-3.0, 0.0]); // 3: dist 9
-        rng.add_vector(&[0.0, -4.0]); // 4: dist 16
-                                      // Hand-wired connected init (max_edges = 2 each) so node 0's search can
-                                      // still reach all four candidates despite the tight degree.
+        let vectors: Vec<f32> = vec![
+            0.0, 0.0, // 0: origin
+            1.0, 0.0, // 1: dist 1  (nearest)
+            0.0, 2.0, // 2: dist 4  (2nd)
+            -3.0, 0.0, // 3: dist 9
+            0.0, -4.0, // 4: dist 16
+        ];
+        let mut rng = RelativeNeighborhoodGraph::new(vectors, 2, Metric::L2, config);
+        // Hand-wired connected init (max_edges = 2 each) so node 0's search can
+        // still reach all four candidates despite the tight degree.
         rng.graph.set_neighbors(0, &[1, 2]);
         rng.graph.set_neighbors(1, &[0, 3]);
         rng.graph.set_neighbors(2, &[0, 4]);
@@ -941,10 +936,10 @@ mod tests {
             num_candidates: 8,
             num_trees: 1,
         };
-        let mut rng = RelativeNeighborhoodGraph::new(6, 1, Metric::L2, config);
         let vectors: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let mut rng = RelativeNeighborhoodGraph::new(vectors.as_slice(), 1, Metric::L2, config);
 
-        rng.build_init_knn(&Executor::single_thread(), &vectors);
+        rng.build_init_knn(&Executor::single_thread());
 
         for i in 0..6u32 {
             let nbrs = rng.graph.neighbors(i);
@@ -974,10 +969,10 @@ mod tests {
             num_candidates: 8,
             num_trees: 1,
         };
-        let mut rng = RelativeNeighborhoodGraph::new(N as usize, 1, Metric::L2, config);
         let vectors: Vec<f32> = (0..N).map(|i| i as f32).collect();
+        let mut rng = RelativeNeighborhoodGraph::new(vectors.as_slice(), 1, Metric::L2, config);
 
-        rng.build(&Executor::single_thread(), &vectors);
+        rng.build(&Executor::single_thread());
 
         assert_eq!(sorted_neighbors(&rng, 0), vec![1]);
         assert_eq!(sorted_neighbors(&rng, N - 1), vec![N - 2]);
