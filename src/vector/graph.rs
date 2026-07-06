@@ -1,6 +1,8 @@
-//! A generic, single-threaded relative neighborhood graph, modeled on the RNG
-//! in Microsoft's [SPTAG](https://github.com/microsoft/SPTAG). For now only the
-//! plain *k*-nearest-neighbor graph is implemented; RNG edge pruning comes later.
+//! A generic, single-threaded *k*-nearest-neighbor graph: a flat vector arena
+//! plus fixed-degree adjacency. It is the storage substrate for graph-based
+//! approximate-nearest-neighbor indexes — such as the relative neighborhood
+//! graph built on top of it in the sibling `index` module — and carries no edge
+//! semantics of its own beyond "node `i`'s nearest neighbors, in order".
 //!
 //! - Node ids are dense indices straight into the backing arrays.
 //! - Adjacency is one flat array: node `i` owns the contiguous, nearest-first,
@@ -108,50 +110,41 @@ impl<T> Graph<T> {
         );
         debug_assert!((from as usize) < self.len(), "from out of range");
         debug_assert!((to as usize) < self.len(), "to out of range");
-        if from == to {
-            return;
-        }
+        self.edge_list_mut(from).add_edge(to, dist);
+    }
 
+    /// Mutable view of `node`'s edge list.
+    fn edge_list_mut(&mut self, node: NodeId) -> EdgeListMut<'_> {
         let k = self.max_edges;
-        let start = from as usize * k;
-        let end = start + k - 1;
-
-        // Reject when the list is full and this edge is no closer than the
-        // farthest neighbor.
-        if dist >= self.dists[end] {
-            return;
+        let start = node as usize * k;
+        EdgeListMut {
+            node,
+            neighbors: &mut self.neighbors[start..start + k],
+            dists: &mut self.dists[start..start + k],
         }
+    }
 
-        // Deduplicate: if `to` is already a neighbor, keep only the closer copy
-        // and let it bubble back into sorted position.
-        if let Some(off) = self.neighbors[start..start + k]
-            .iter()
-            .position(|&n| n == to)
-        {
-            let pos = start + off;
-            if dist >= self.dists[pos] {
-                return;
-            }
-            self.dists[pos] = dist;
-            let mut j = pos;
-            while j > start && self.dists[j - 1] > self.dists[j] {
-                self.neighbors.swap(j - 1, j);
-                self.dists.swap(j - 1, j);
-                j -= 1;
-            }
-            return;
-        }
-
-        // Insertion sort: slide `dist` into place from the back, shifting larger
-        // distances up and dropping whatever falls off the last slot.
-        let mut j = end;
-        while j > start && self.dists[j - 1] > dist {
-            self.neighbors[j] = self.neighbors[j - 1];
-            self.dists[j] = self.dists[j - 1];
-            j -= 1;
-        }
-        self.neighbors[j] = to;
-        self.dists[j] = dist;
+    /// Mutable views of every node's edge list, in id order. The views are
+    /// disjoint, so they can be split across threads and mutated concurrently
+    /// without locks. Only valid on a build graph ([`new`](Graph::new)), which
+    /// has the distance buffer.
+    pub(crate) fn edge_lists_mut(&mut self) -> impl Iterator<Item = EdgeListMut<'_>> {
+        debug_assert_eq!(
+            self.dists.len(),
+            self.neighbors.len(),
+            "edge_lists_mut requires the build-time distance buffer"
+        );
+        let k = self.max_edges;
+        self.neighbors
+            .chunks_mut(k)
+            .zip(self.dists.chunks_mut(k))
+            .take(self.vectors.len() / self.dim)
+            .enumerate()
+            .map(|(node, (neighbors, dists))| EdgeListMut {
+                node: node as NodeId,
+                neighbors,
+                dists,
+            })
     }
 
     /// Blindly appends `to` as `from`'s next neighbor, with no top-*k* or
@@ -249,6 +242,61 @@ impl<'a, T> IntoIterator for &'a Graph<T> {
     }
 }
 
+/// Mutable view of one node's edge list: its neighbor-id and distance runs,
+/// nearest-first. Views of different nodes are disjoint, so a set of them
+/// (from [`Graph::edge_lists_mut`]) can be mutated by different threads
+/// without locks.
+pub(crate) struct EdgeListMut<'a> {
+    /// The node this list belongs to; self-edges to it are rejected.
+    node: NodeId,
+    neighbors: &'a mut [NodeId],
+    dists: &'a mut [f32],
+}
+
+impl EdgeListMut<'_> {
+    /// Considers the directed edge `self.node -> to` — the same bounded
+    /// nearest-first insert as [`Graph::add_edge`], which delegates here.
+    pub(crate) fn add_edge(&mut self, to: NodeId, dist: f32) {
+        if to == self.node {
+            return;
+        }
+
+        // Reject when the list is full and this edge is no closer than the
+        // farthest neighbor.
+        let last = self.dists.len() - 1;
+        if dist >= self.dists[last] {
+            return;
+        }
+
+        // Deduplicate: if `to` is already a neighbor, keep only the closer copy
+        // and let it bubble back into sorted position.
+        if let Some(pos) = self.neighbors.iter().position(|&n| n == to) {
+            if dist >= self.dists[pos] {
+                return;
+            }
+            self.dists[pos] = dist;
+            let mut j = pos;
+            while j > 0 && self.dists[j - 1] > self.dists[j] {
+                self.neighbors.swap(j - 1, j);
+                self.dists.swap(j - 1, j);
+                j -= 1;
+            }
+            return;
+        }
+
+        // Insertion sort: slide `dist` into place from the back, shifting larger
+        // distances up and dropping whatever falls off the last slot.
+        let mut j = last;
+        while j > 0 && self.dists[j - 1] > dist {
+            self.neighbors[j] = self.neighbors[j - 1];
+            self.dists[j] = self.dists[j - 1];
+            j -= 1;
+        }
+        self.neighbors[j] = to;
+        self.dists[j] = dist;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +309,30 @@ mod tests {
             assert_eq!(g.add_node(&[i as f32]), i);
         }
         g
+    }
+
+    #[test]
+    fn edge_lists_mut_allows_disjoint_parallel_writes() {
+        // Two threads each own half the edge lists. The borrows are disjoint,
+        // so this compiles without locks and behaves like serial add_edge.
+        let mut g = graph_with_nodes(4, 2);
+        let mut lists: Vec<EdgeListMut> = g.edge_lists_mut().collect();
+        let (left, right) = lists.split_at_mut(2);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                left[0].add_edge(1, 1.0);
+                left[1].add_edge(0, 1.0);
+            });
+            scope.spawn(move || {
+                right[0].add_edge(3, 1.0);
+                right[1].add_edge(2, 1.0);
+            });
+        });
+        drop(lists);
+        assert_eq!(g.neighbors(0), &[1]);
+        assert_eq!(g.neighbors(1), &[0]);
+        assert_eq!(g.neighbors(2), &[3]);
+        assert_eq!(g.neighbors(3), &[2]);
     }
 
     #[test]
