@@ -869,8 +869,6 @@ impl Index {
         self.ivf_clusterer = Some(clusterer);
     }
 
-    // Consumed by the IVF merge routine, which lands with the IVF storage format.
-    #[allow(dead_code)]
     pub(crate) fn ivf_clusterer(&self) -> Option<&dyn IvfClusterer> {
         self.ivf_clusterer.as_deref()
     }
