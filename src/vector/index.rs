@@ -22,7 +22,7 @@ use std::collections::BinaryHeap;
 use crate::schema::Metric;
 use crate::Executor;
 
-use super::graph::{Graph, NodeId};
+use super::graph::{EdgeListMut, Graph, NodeId};
 use super::VectorElement;
 
 /// Tuning knobs for a [`RelativeNeighborhoodGraph`].
@@ -270,23 +270,15 @@ impl<T: VectorElement> RelativeNeighborhoodGraph<T> {
     }
 }
 
-/// Build is `f32`-only for now: the TPT partitioner does floating-point
-/// variance/projection math over the vectors, so it needs a concrete float
-/// element. The rest of the index ([`search`](RelativeNeighborhoodGraph::search),
-/// [`refine`](RelativeNeighborhoodGraph::refine)) stays generic over
-/// [`VectorElement`]; only this construction path is pinned to `f32`.
+/// Build is `f32`-only for now: the TPT partitioner does floating-point math
+/// over the vectors. The rest of the index stays generic over [`VectorElement`].
 impl RelativeNeighborhoodGraph<f32> {
-    /// Builds the RNG index over `vectors` — a flat `dim`-strided arena, the same
-    /// layout [`TPTree`](partition::TPTree) consumes. Seeds a raw KNN graph with a
-    /// TPT forest and then prunes it into an RNG, so a caller needs only this one
-    /// call (no separate [`refine`](Self::refine)).
+    /// Builds the RNG index over `vectors`, a flat `dim`-strided arena: seeds a
+    /// raw KNN graph with a TPT forest, then prunes it into an RNG.
     ///
-    /// `vectors` is passed in rather than read back out of the inner [`Graph`] so
-    /// the partitioner can borrow the arena immutably while edge insertion borrows
-    /// the graph mutably. The `executor` parallelizes the per-leaf distance work
-    /// (see [`build_init_knn`](Self::build_init_knn)). Expects an empty graph
-    /// sized for at least `vectors.len() / dim` nodes; `vectors.len()` must be a
-    /// multiple of `dim`.
+    /// `vectors` is passed in rather than read from the inner [`Graph`] so the
+    /// partitioner can borrow it while the graph is mutated. Expects an empty
+    /// graph sized for `vectors.len() / dim` nodes.
     pub fn build(&mut self, executor: &Executor, vectors: &[f32]) {
         self.build_init_knn(executor, vectors);
         self.refine(executor);
@@ -294,9 +286,12 @@ impl RelativeNeighborhoodGraph<f32> {
 
     /// Seeds the raw KNN graph: adds every vector as a node, then unions a forest
     /// of [`num_trees`](NeighborhoodGraphConfig::num_trees) TPT partitions,
-    /// brute-forcing exact KNN within each leaf and inserting the edges in both
-    /// directions. The result is the raw (best-effort symmetric) KNN graph that
-    /// [`build`](Self::build) hands to [`refine`](Self::refine).
+    /// brute-forcing KNN within each leaf. Leaves run in parallel on the
+    /// `executor`, writing edges directly into their members' edge lists —
+    /// leaves partition the nodes, so the lists touched by different leaves are
+    /// disjoint, and each list keeps only the node's nearest
+    /// [`max_edges`](NeighborhoodGraphConfig::max_edges), so memory stays
+    /// bounded by the graph itself.
     fn build_init_knn(&mut self, executor: &Executor, vectors: &[f32]) {
         let dim = self.graph.dim();
         debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
@@ -310,42 +305,62 @@ impl RelativeNeighborhoodGraph<f32> {
             self.graph.add_node(chunk);
         }
 
-        // One TPTree is reused across trees: its RNG advances between partitions
-        // so successive trees split along different directions, and each tree
-        // starts from the previous one's in-place permutation, diversifying the
-        // prefix sample.
+        // One TPTree reused across trees: its RNG advances between partitions,
+        // so each tree splits along different directions.
         let metric = self.metric;
         let mut tpt = partition::TPTree::new(partition::TPTreeConfig::default(), dim, vectors);
         let mut indices: Vec<NodeId> = (0..n as NodeId).collect();
         for _ in 0..self.config.num_trees {
             let leaves = tpt.partition(&mut indices);
 
-            let indices_ref: &[NodeId] = &indices;
-            let per_leaf: Vec<Vec<(NodeId, NodeId, f32)>> = executor
+            // Rearrange the graph's edge-list borrows into `indices` order.
+            // `indices` is a permutation, so every list is claimed exactly once,
+            // and afterwards the leaf ranges partition `edge_lists` — the
+            // disjointness the borrow checker needs to let leaves run in
+            // parallel.
+            let mut unclaimed: Vec<Option<EdgeListMut>> =
+                self.graph.edge_lists_mut().map(Some).collect();
+            let mut edge_lists: Vec<EdgeListMut> = indices
+                .iter()
+                .map(|&node| {
+                    unclaimed[node as usize]
+                        .take()
+                        .expect("indices is a permutation")
+                })
+                .collect();
+
+            // One task per leaf: its member ids and their edge lists.
+            // `partition` returns the leaves in order, tiling `0..n`.
+            let mut leaf_tasks: Vec<(&[NodeId], &mut [EdgeListMut])> =
+                Vec::with_capacity(leaves.len());
+            let mut rest = edge_lists.as_mut_slice();
+            for leaf in &leaves {
+                let (leaf_lists, tail) = std::mem::take(&mut rest).split_at_mut(leaf.len());
+                leaf_tasks.push((&indices[leaf.clone()], leaf_lists));
+                rest = tail;
+            }
+            debug_assert!(rest.is_empty(), "leaves must tile all of indices");
+
+            // Each leaf brute-forces its pairwise distances and inserts both
+            // directions of each edge; the lists dedup re-encounters across
+            // trees and keep only the nearest `max_edges`.
+            executor
                 .map(
-                    move |leaf: std::ops::Range<usize>| {
-                        let members = &indices_ref[leaf];
-                        let mut edges =
-                            Vec::with_capacity(members.len() * members.len().saturating_sub(1) / 2);
-                        for (i, &a) in members.iter().enumerate() {
-                            let va = &vectors[a as usize * dim..][..dim];
-                            for &b in &members[i + 1..] {
-                                let vb = &vectors[b as usize * dim..][..dim];
-                                edges.push((a, b, -metric.similarity(va, vb)));
+                    move |(members, edge_lists): (&[NodeId], &mut [EdgeListMut])| {
+                        for i in 0..members.len() {
+                            let vec_a = &vectors[members[i] as usize * dim..][..dim];
+                            for j in (i + 1)..members.len() {
+                                let vec_b = &vectors[members[j] as usize * dim..][..dim];
+                                let dist = -metric.similarity(vec_a, vec_b);
+                                edge_lists[i].add_edge(members[j], dist);
+                                edge_lists[j].add_edge(members[i], dist);
                             }
                         }
-                        Ok(edges)
+                        Ok(())
                     },
-                    leaves.into_iter(),
+                    leaf_tasks.into_iter(),
                 )
                 .expect("leaf KNN computation panicked");
-
-            for edges in &per_leaf {
-                for &(a, b, dist) in edges {
-                    self.graph.add_edge(a, b, dist);
-                    self.graph.add_edge(b, a, dist);
-                }
-            }
         }
     }
 }
