@@ -18,8 +18,8 @@ use crate::schema::{FieldType, VectorDType};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
 use crate::vector::reader::{VectorColumnReader, VectorReader};
-use crate::vector::VEC_EXT;
-use crate::{DocId, TantivyError};
+use crate::vector::{NeighborhoodGraphConfig, RelativeNeighborhoodGraph, VEC_EXT};
+use crate::{DocId, Executor, TantivyError};
 
 struct AssignedVector {
     cluster: usize,
@@ -329,6 +329,34 @@ pub(crate) fn merge_ivf(
                     let offsets_w = centroids_write.for_field_with_idx(field, 1);
                     CentroidsMeta::serialize_offsets(&cluster_offsets, offsets_w)?;
                     offsets_w.flush()?;
+                }
+
+                // `.centroids` slot [2]: the RNG over the centroids, so a query
+                // can route to its nearest clusters without scanning all of
+                // them. Skipped for degenerate centroid counts — the reader
+                // treats the absent slot as "route by linear scan".
+                if num_centroids > 1 {
+                    if ctx.cancel.wants_cancel() {
+                        return Err(TantivyError::Cancelled);
+                    }
+                    let num_threads = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    let executor = if num_threads > 1 {
+                        Executor::multi_thread(num_threads, "rng-build-")?
+                    } else {
+                        Executor::single_thread()
+                    };
+                    let mut rng = RelativeNeighborhoodGraph::new(
+                        centroid_matrix.values.as_slice(),
+                        opts.dim(),
+                        opts.metric(),
+                        NeighborhoodGraphConfig::default(),
+                    );
+                    rng.build(&executor);
+                    let graph_w = centroids_write.for_field_with_idx(field, 2);
+                    rng.serialize(graph_w)?;
+                    graph_w.flush()?;
                 }
             }
         }

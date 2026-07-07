@@ -18,6 +18,7 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::io::{self, Write};
 use std::ops::Deref;
 
 use crate::schema::Metric;
@@ -167,6 +168,13 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
         out.sort_unstable_by(|a, b| b.sim.total_cmp(&a.sim).then_with(|| a.node.cmp(&b.node)));
         out.truncate(k);
         out
+    }
+
+    /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
+    /// see [`Graph::serialize`] for the format. The metric and tuning knobs are
+    /// configuration, not data, so they are not persisted.
+    pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+        self.graph.serialize(out)
     }
 
     /// Refines every node against the current graph: each node searches from
