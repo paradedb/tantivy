@@ -6,6 +6,7 @@ use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
+use crate::query::scorer::BasicPruningScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{AllScorer, AllWeight, EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::IndexRecordOption;
@@ -51,9 +52,10 @@ impl Weight for TermWeight {
                 BlockWandSingleScorer::new(*term_scorer, init_threshold),
             )),
             TermOrEmptyOrAllScorer::Empty => Ok(Box::new(EmptyScorer)),
-            TermOrEmptyOrAllScorer::AllMatch(_) => Err(TantivyError::InvalidArgument(
-                "for each pruning should only be called if scoring is enabled".to_string(),
-            )),
+            TermOrEmptyOrAllScorer::AllMatch(all_scorer) => Ok(Box::new(BasicPruningScorer::new(
+                Box::new(all_scorer),
+                init_threshold,
+            ))),
         }
     }
 
