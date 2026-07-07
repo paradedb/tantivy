@@ -183,7 +183,15 @@ pub(crate) fn merge_ivf(
                 let encoded_centroids = centroid_matrix
                     .values
                     .chunks_exact(opts.dim())
-                    .map(|centroid| encode_vector(centroid, opts.dim()))
+                    .map(|centroid| {
+                        let mut bytes = encode_vector(centroid, opts.dim())?;
+                        // K-means cluster means are not unit-norm; for
+                        // Cosine+F32 normalize them here so the search
+                        // path can score both docs and centroids with
+                        // the same `dot * inv_norm_q` fast kernel.
+                        opts.maybe_normalize_bytes(&mut bytes);
+                        Ok::<_, TantivyError>(bytes)
+                    })
                     .collect::<crate::Result<Vec<_>>>()?;
 
                 let mut assigned_vectors = Vec::with_capacity(vector_count);
@@ -307,7 +315,16 @@ pub(crate) fn merge_ivf(
                                     assigned_vector.source_doc_id
                                 ))
                             })?;
-                        rows_w.write_all(bytes)?;
+                        // Sources are already unit-normalized at ingest for
+                        // Cosine+F32 (see `FlatVecWriter`), but re-normalize on
+                        // the way into the cluster rows so the IVF invariant —
+                        // the query path scores pre-normalized rows — holds
+                        // locally, even for a source segment written before
+                        // ingest-time normalization existed. Idempotent, and a
+                        // no-op for L2/Dot.
+                        let mut row = bytes.to_vec();
+                        opts.maybe_normalize_bytes(&mut row);
+                        rows_w.write_all(&row)?;
                     }
                     rows_w.flush()?;
                 }

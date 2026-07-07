@@ -18,13 +18,14 @@ mod graph;
 mod header;
 mod index;
 mod plugin;
+mod prepared;
 mod reader;
 
 pub mod flat;
 pub mod ivf;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
@@ -39,7 +40,9 @@ pub use ivf::{
     IvfVectors,
 };
 pub use plugin::VectorPlugin;
+pub use prepared::PreparedQuery;
 pub use reader::{VectorColumn, VectorColumnReader, VectorReader};
+
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
 // resolves for callers and tests that work entirely within the vector module.
 pub use crate::schema::{Metric, VectorDType, VectorOptions};
