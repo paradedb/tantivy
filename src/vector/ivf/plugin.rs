@@ -6,6 +6,7 @@
 //! after the threshold check.
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use super::{
     decode_row, encode_vector, CentroidsMeta, IvfCentroids, IvfClusterer, IvfMatrixView,
@@ -26,6 +27,15 @@ struct AssignedVector {
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_doc_id: DocId,
+}
+
+/// Per-field IVF build timings (one phase per field), emitted at end of build
+/// as a parseable `log::info!` line on target `paradedb::ivf_build`.
+#[derive(Default)]
+struct IvfBuildTimings {
+    train: Duration,
+    assign: Duration,
+    posting_write: Duration,
 }
 
 pub(crate) fn merge_ivf(
@@ -118,6 +128,8 @@ pub(crate) fn merge_ivf(
         let training_sample_interval = (vector_count / training_sample_size).max(1);
         match opts.dtype() {
             VectorDType::F32 => {
+                let field_build_start = Instant::now();
+                let mut timings = IvfBuildTimings::default();
                 let mut training_values = Vec::with_capacity(training_sample_size * opts.dim());
                 let mut training_doc_ids = Vec::with_capacity(training_sample_size);
                 let mut target_doc_id: DocId = 0;
@@ -152,7 +164,9 @@ pub(crate) fn merge_ivf(
                         dims: opts.dim(),
                     },
                 });
+                let train_start = Instant::now();
                 let centroids = clusterer.train(opts, training_vectors, num_centroids)?;
+                timings.train = train_start.elapsed();
 
                 if ctx.cancel.wants_cancel() {
                     return Err(TantivyError::Cancelled);
@@ -214,6 +228,7 @@ pub(crate) fn merge_ivf(
                                 return Ok(());
                             }
                             let batch_len = batch_doc_ids.len();
+                            let assign_start = Instant::now();
                             let clusters = clusterer.assign(
                                 opts,
                                 IvfVectors::F32(IvfVectorBatch {
@@ -226,6 +241,7 @@ pub(crate) fn merge_ivf(
                                 }),
                                 &centroids,
                             )?;
+                            timings.assign += assign_start.elapsed();
                             if clusters.len() != batch_len {
                                 return Err(TantivyError::InvalidArgument(format!(
                                     "IvfClusterer assigned {} clusters for {} vectors",
@@ -290,6 +306,7 @@ pub(crate) fn merge_ivf(
                     cluster_offsets.push(next_offset);
                 }
 
+                let posting_start = Instant::now();
                 // `.vec` slot [0]: the row→doc_id permutation (Explicit), in
                 // cluster-sorted row order — parallel to the rows in slot [1].
                 {
@@ -328,6 +345,7 @@ pub(crate) fn merge_ivf(
                     }
                     rows_w.flush()?;
                 }
+                timings.posting_write = posting_start.elapsed();
 
                 // `.centroids`: routing — centroids in slot [0], cluster
                 // offsets in slot [1].
@@ -347,6 +365,18 @@ pub(crate) fn merge_ivf(
                     CentroidsMeta::serialize_offsets(&cluster_offsets, offsets_w)?;
                     offsets_w.flush()?;
                 }
+
+                log::info!(
+                    target: "paradedb::ivf_build",
+                    "ivf_build timings_ms train={} assign={} posting_write={} total={} \
+                     centroids={} vectors={}",
+                    timings.train.as_millis(),
+                    timings.assign.as_millis(),
+                    timings.posting_write.as_millis(),
+                    field_build_start.elapsed().as_millis(),
+                    num_centroids,
+                    vector_count,
+                );
             }
         }
     }

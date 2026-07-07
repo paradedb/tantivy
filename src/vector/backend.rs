@@ -20,6 +20,7 @@ use super::reader::{VectorColumn, VectorColumnReader, VectorReader};
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::TopNComputer;
+use crate::fastfield::AliveBitSet;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Metric, Schema};
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
@@ -86,9 +87,23 @@ impl<T: VectorElement> VectorBackend<T> {
         segment_reader: &SegmentReader,
         top_n: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        self.top_n_with_stats(weight, segment_reader, top_n, None)
+    }
+
+    /// Like [`Self::top_n`] but threads an optional [`ProbeStats`] sink into the
+    /// IVF probe loop. `None` is identical in behavior and cost to `top_n` (no
+    /// allocation, the per-doc hot loop unchanged). The Flat backend ignores
+    /// `stats` — no IVF probe stats apply there.
+    pub fn top_n_with_stats(
+        &self,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
+        stats: Option<&mut ProbeStats>,
+    ) -> crate::Result<Vec<(Score, DocAddress)>> {
         match self {
             Self::Flat(b) => b.top_n(weight, segment_reader, top_n),
-            Self::Ivf(b) => b.top_n(weight, segment_reader, top_n),
+            Self::Ivf(b) => b.top_n(weight, segment_reader, top_n, stats),
         }
     }
 }
@@ -144,23 +159,48 @@ impl<T: VectorElement> FlatBackend<T> {
     }
 }
 
-/// Test-only instrumentation collected by `IvfBackend::top_n_instrumented`:
-/// which clusters were probed (in probe order) and how many candidate
-/// docs were scored. Useful for asserting efficiency properties of the
-/// adaptive probe loop in scenarios that pair the IVF backend with a
-/// known geometry.
-///
-/// The production `top_n` entry point passes `None` to the shared inner
-/// helper and pays no allocation for stats accumulation.
+/// How the probe loop stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProbeTermination {
+    /// `probe_count >= max_probe_count` — the hard fanout ceiling.
+    Ceiling,
+    /// The epsilon threshold + survivor-floor gate fired.
+    Gate,
+    /// The ranked centroids were exhausted without hitting either stop.
+    #[default]
+    Exhausted,
+}
+
+/// Per-segment probe-loop instrumentation: which clusters were probed
+/// (in probe order) and a prune breakdown of every doc the inner loop
+/// touched. Filled by [`VectorBackend::top_n_with_stats`] when a sink
+/// is supplied; the production `top_n` entry point passes `None` and
+/// pays no allocation for stats accumulation.
 #[derive(Debug, Default)]
 pub struct ProbeStats {
     /// Clusters visited by the probe loop, in probe order. A cluster
     /// appears here once we've passed the stop-condition gate for it,
     /// regardless of whether its doc-ids slice ends up empty.
     pub probed_clusters: Vec<usize>,
-    /// Number of docs that survived the filter + alive checks and got
-    /// scored against the query.
+    /// Docs that passed filter + alive + seen and were scored against the
+    /// query. This stays the "scored" bucket and equals the final survivor
+    /// `candidates`, so starvation is just `candidates_scored < min_candidates`.
     pub candidates_scored: usize,
+    /// Every doc-id the inner loop touched, before any gate — the denominator
+    /// for the prune breakdown.
+    pub vectors_visited: usize,
+    /// Touched docs rejected by `filter.contains`.
+    pub pruned_filter: usize,
+    /// Touched docs rejected by `is_alive`.
+    pub pruned_dead: usize,
+    /// Touched docs rejected by the replica `seen` dedup.
+    pub pruned_seen: usize,
+    /// Centroids ranked for this query (`= num_centroids`; the navigation cost).
+    pub centroids_ranked: usize,
+    /// The resolved survivor floor the gate used for this query.
+    pub min_candidates: usize,
+    /// How the probe loop terminated. Per-segment; does not sum.
+    pub termination: ProbeTermination,
 }
 
 /// How many candidate docs the IVF probe loop is willing to score per
@@ -176,18 +216,7 @@ pub struct ProbeStats {
 pub(crate) const CANDIDATE_OVERFETCH_MULTIPLIER: usize = 4;
 
 impl<T: VectorElement> IvfBackend<T> {
-    fn top_n(
-        &self,
-        weight: &dyn Weight,
-        segment_reader: &SegmentReader,
-        top_n: usize,
-    ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        self.top_n_inner(weight, segment_reader, top_n, None)
-    }
-
-    /// Same logic as `top_n` but also returns a `ProbeStats` describing
-    /// which clusters the adaptive loop visited. Test-only seam used by
-    /// the 2D fixture scenarios.
+    /// Test helper: run `top_n` with a fresh `ProbeStats` and return both.
     #[cfg(test)]
     pub(crate) fn top_n_instrumented(
         &self,
@@ -196,11 +225,15 @@ impl<T: VectorElement> IvfBackend<T> {
         top_n: usize,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let mut stats = ProbeStats::default();
-        let hits = self.top_n_inner(weight, segment_reader, top_n, Some(&mut stats))?;
+        let hits = self.top_n(weight, segment_reader, top_n, Some(&mut stats))?;
         Ok((hits, stats))
     }
 
-    fn top_n_inner(
+    /// Top-N by IVF probe. When `stats` is `Some`, it is filled with this
+    /// segment's probe-loop counters; `None` is the zero-cost production path —
+    /// no allocation, the per-doc hot loop unchanged (the counts `scan_one_cluster`
+    /// already computes are simply discarded).
+    fn top_n(
         &self,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
@@ -215,18 +248,10 @@ impl<T: VectorElement> IvfBackend<T> {
             return Ok(Vec::new());
         }
 
-        // Drain the filter `DocSet` into a dense BitSet for random
-        // membership testing per cluster doc. The BitSet allocates
-        // `max_doc / 8` bytes regardless of filter selectivity —
-        // inherent to IVF needing O(1) membership tests on
-        // out-of-order doc ids. Revisit only if memory profiling
-        // flags it.
-        let mut filter = BitSet::with_max_value(max_doc);
-        weight.for_each_no_score(segment_reader, &mut |docs| {
-            for &doc in docs {
-                filter.insert(doc);
-            }
-        })?;
+        // Materialize the filter `DocSet` into a dense BitSet. Its own
+        // `#[inline(never)]` frame: at low selectivity over a large segment
+        // this drain is real cost otherwise hidden in the search entry.
+        let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
         if filter.len() == 0 {
             return Ok(Vec::new());
         }
@@ -239,16 +264,10 @@ impl<T: VectorElement> IvfBackend<T> {
             return Ok(Vec::new());
         }
 
-        // Rank centroids descending by similarity. Full scan over
-        // `num_centroids` is the dominant fixed cost; inherent to
-        // flat-centroid IVF, unrelated to the storage layout.
-        let mut ranked: Vec<(f32, usize)> = (0..num_centroids)
-            .map(|c| {
-                let cb = &centroid_bytes[c * stride..(c + 1) * stride];
-                (self.query.score_doc_bytes(cb), c)
-            })
-            .collect();
-        ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        // Rank centroids descending by similarity. Extracted into a
+        // `#[inline(never)]` method so this phase shows as its own
+        // flamegraph frame (carrying its own `score_doc_bytes` cost).
+        let ranked = self.rank_centroids(centroid_bytes, stride, num_centroids);
 
         let best = ranked[0].0;
         let threshold = adaptive_threshold(self.query.metric(), best, self.adaptive.epsilon);
@@ -265,65 +284,29 @@ impl<T: VectorElement> IvfBackend<T> {
         let (min_probe_count, max_probe_count) =
             self.adaptive.resolved_probe_counts(num_centroids)?;
 
-        // Adaptive probe loop. Cluster-order arrival of survivors
-        // forbids the ascending-D shortcut in `push`; use
-        // `push_unordered`. The filter check is cheap (constant-time
-        // bitset lookup) so we do it before the more expensive alive
-        // check + similarity score.
-        //
-        // Note on `NaturalComparator` (vs the `TopNComputer::new`
-        // default): vector similarity is "higher = better", so we
-        // want top-N *largest* scores in descending order. The
-        // default `new()` wires `ReverseComparator`, which keeps
-        // top-N *smallest* in ascending order — correct for
-        // ascending-distance metrics but inverted for our convention.
-        let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
-            top_n,
-            NaturalComparator,
-        );
-        let mut candidates = 0usize;
-
-        for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
-            if probe_count >= max_probe_count {
-                break;
-            }
-            if centroid_score < threshold
-                && candidates >= min_candidates
-                && probe_count >= min_probe_count
-            {
-                break;
-            }
-
-            // Record the probe before doing any work, so even an empty
-            // cluster (no doc-ids slice) counts as "probed" — that's
-            // the right unit for the efficiency assertions.
-            if let Some(s) = stats.as_deref_mut() {
-                s.probed_clusters.push(cluster);
-            }
-
-            let Some(doc_ids) = self.column.cluster_doc_ids(cluster)? else {
-                continue;
-            };
-            let cluster_vec_slice = self.column.cluster_vector_bytes(cluster)?;
-
-            for (local_i, &doc) in doc_ids.iter().enumerate() {
-                if !filter.contains(doc) {
-                    continue;
-                }
-                if let Some(bs) = alive {
-                    if !bs.is_alive(doc) {
-                        continue;
-                    }
-                }
-                let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
-                let score = self.query.score_doc_bytes(vbytes);
-                topn.push_unordered(score, doc);
-                candidates += 1;
-                if let Some(s) = stats.as_deref_mut() {
-                    s.candidates_scored += 1;
-                }
-            }
+        // Navigation cost + the resolved survivor floor are known here, once.
+        if let Some(s) = stats.as_deref_mut() {
+            s.centroids_ranked = num_centroids;
+            s.min_candidates = min_candidates;
         }
+
+        // Adaptive probe loop, extracted into a `#[inline(never)]`
+        // method so this phase shows as its own flamegraph frame
+        // (carrying its own `score_doc_bytes` cost), distinct from the
+        // centroid-ranking frame above.
+        let topn = self.scan_clusters(
+            ranked,
+            threshold,
+            min_candidates,
+            min_probe_count,
+            max_probe_count,
+            stride,
+            &filter,
+            max_doc,
+            alive,
+            top_n,
+            stats,
+        )?;
 
         // Drain best-first, tag with our segment_ord. The collector's
         // `merge_fruits` flattens across segments, sorts descending,
@@ -335,6 +318,199 @@ impl<T: VectorElement> IvfBackend<T> {
             .map(|cd| (cd.sort_key, DocAddress::new(segment_ord, cd.doc)))
             .collect())
     }
+
+    /// Phase 1: rank centroids descending by similarity. Full scan over
+    /// `num_centroids` is the dominant fixed cost; inherent to flat-centroid
+    /// IVF, unrelated to the storage layout. `#[inline(never)]` so it forms
+    /// its own flamegraph frame carrying its `score_doc_bytes` cost.
+    #[inline(never)]
+    fn rank_centroids(
+        &self,
+        centroid_bytes: &[u8],
+        stride: usize,
+        num_centroids: usize,
+    ) -> Vec<(f32, usize)> {
+        let mut ranked: Vec<(f32, usize)> = (0..num_centroids)
+            .map(|c| {
+                let cb = &centroid_bytes[c * stride..(c + 1) * stride];
+                (self.query.score_doc_bytes(cb), c)
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        ranked
+    }
+
+    /// Phase 2: adaptive probe loop. Cluster-order arrival of survivors
+    /// forbids the ascending-D shortcut in `push`; use `push_unordered`. The
+    /// filter check is cheap (constant-time bitset lookup) so we do it before
+    /// the more expensive alive check + similarity score.
+    ///
+    /// Note on `NaturalComparator` (vs the `TopNComputer::new` default):
+    /// vector similarity is "higher = better", so we want top-N *largest*
+    /// scores in descending order. The default `new()` wires
+    /// `ReverseComparator`, which keeps top-N *smallest* in ascending order —
+    /// correct for ascending-distance metrics but inverted for our convention.
+    ///
+    /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
+    /// `score_doc_bytes` cost, distinct from `rank_centroids`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_clusters(
+        &self,
+        ranked: Vec<(f32, usize)>,
+        threshold: f32,
+        min_candidates: usize,
+        min_probe_count: usize,
+        max_probe_count: usize,
+        stride: usize,
+        filter: &BitSet,
+        max_doc: DocId,
+        alive: Option<&AliveBitSet>,
+        top_n: usize,
+        mut stats: Option<&mut ProbeStats>,
+    ) -> crate::Result<TopNComputer<Score, DocId, NaturalComparator>> {
+        let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
+            top_n,
+            NaturalComparator,
+        );
+        // `candidates` is the cumulative scored count that drives the gate; the
+        // prune counters accumulate into locals and fold into `ProbeStats` once
+        // after the loop, so the hot per-doc path carries no `Option` check.
+        let mut candidates = 0usize;
+        let mut visited = 0usize;
+        let mut pruned_filter = 0usize;
+        let mut pruned_dead = 0usize;
+        let mut pruned_seen = 0usize;
+        let mut termination = ProbeTermination::Exhausted;
+        // Replication can place the same doc in several probed clusters; dedup
+        // by doc id so a vector is scored at most once.
+        let mut seen = BitSet::with_max_value(max_doc);
+
+        for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
+            if probe_count >= max_probe_count {
+                termination = ProbeTermination::Ceiling;
+                break;
+            }
+            if centroid_score < threshold
+                && candidates >= min_candidates
+                && probe_count >= min_probe_count
+            {
+                termination = ProbeTermination::Gate;
+                break;
+            }
+
+            // Record the probe before doing any work, so even an empty
+            // cluster (no doc-ids slice) counts as "probed" — that's the right
+            // unit for the efficiency assertions. Per-cluster, so this `Option`
+            // check is O(clusters), not in the hot per-doc path.
+            if let Some(s) = stats.as_deref_mut() {
+                s.probed_clusters.push(cluster);
+            }
+
+            let Some(doc_ids) = self.column.cluster_doc_ids(cluster)? else {
+                continue;
+            };
+            let cluster_vec_slice = self.column.cluster_vector_bytes(cluster)?;
+
+            let (v, pf, pd, ps, scored) = self.scan_one_cluster(
+                doc_ids,
+                cluster_vec_slice,
+                stride,
+                filter,
+                alive,
+                &mut seen,
+                &mut topn,
+            );
+            visited += v;
+            pruned_filter += pf;
+            pruned_dead += pd;
+            pruned_seen += ps;
+            candidates += scored;
+        }
+
+        // Fold the locally-accumulated counters into `ProbeStats` once (the
+        // `Option` check lives here at write-back, never per doc).
+        if let Some(s) = stats {
+            s.vectors_visited += visited;
+            s.pruned_filter += pruned_filter;
+            s.pruned_dead += pruned_dead;
+            s.pruned_seen += pruned_seen;
+            s.candidates_scored += candidates;
+            s.termination = termination;
+        }
+
+        Ok(topn)
+    }
+
+    /// Phase 2 inner: scan one cluster's docs through the
+    /// `filter → alive → seen → score` gate, pushing survivors into `topn`.
+    /// Returns `(visited, pruned_filter, pruned_dead, pruned_seen, scored)` so
+    /// the caller folds the counters locally. `#[inline(never)]` so per-cluster
+    /// scan cost forms its own frame — but the per-doc loop itself stays inlined
+    /// here (a non-inlined call per doc would distort the profile and add real
+    /// latency). Called O(clusters) times.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_one_cluster(
+        &self,
+        doc_ids: &[DocId],
+        cluster_vec_slice: &[u8],
+        stride: usize,
+        filter: &BitSet,
+        alive: Option<&AliveBitSet>,
+        seen: &mut BitSet,
+        topn: &mut TopNComputer<Score, DocId, NaturalComparator>,
+    ) -> (usize, usize, usize, usize, usize) {
+        let mut visited = 0usize;
+        let mut pruned_filter = 0usize;
+        let mut pruned_dead = 0usize;
+        let mut pruned_seen = 0usize;
+        let mut scored = 0usize;
+        for (local_i, &doc) in doc_ids.iter().enumerate() {
+            visited += 1;
+            if !filter.contains(doc) {
+                pruned_filter += 1;
+                continue;
+            }
+            if let Some(bs) = alive {
+                if !bs.is_alive(doc) {
+                    pruned_dead += 1;
+                    continue;
+                }
+            }
+            if seen.contains(doc) {
+                pruned_seen += 1;
+                continue;
+            }
+            seen.insert(doc);
+            let vbytes = &cluster_vec_slice[local_i * stride..(local_i + 1) * stride];
+            let score = self.query.score_doc_bytes(vbytes);
+            topn.push_unordered(score, doc);
+            scored += 1;
+        }
+        (visited, pruned_filter, pruned_dead, pruned_seen, scored)
+    }
+}
+
+/// Drain the filter `DocSet` into a dense BitSet for O(1) random membership
+/// testing per cluster doc. The BitSet allocates `max_doc / 8` bytes regardless
+/// of filter selectivity — inherent to IVF needing membership tests on
+/// out-of-order doc ids. `#[inline(never)]` so it forms its own flamegraph
+/// frame; at low selectivity over a large segment this drain is real cost
+/// otherwise hidden in the search entry.
+#[inline(never)]
+fn build_filter_bitset(
+    weight: &dyn Weight,
+    segment_reader: &SegmentReader,
+    max_doc: DocId,
+) -> crate::Result<BitSet> {
+    let mut filter = BitSet::with_max_value(max_doc);
+    weight.for_each_no_score(segment_reader, &mut |docs| {
+        for &doc in docs {
+            filter.insert(doc);
+        }
+    })?;
+    Ok(filter)
 }
 
 fn lookup_metric(schema: &Schema, field: Field) -> crate::Result<Metric> {
@@ -462,10 +638,10 @@ mod tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
-    use crate::vector::tests::{TestVectorIndex, VectorStorageFormat};
+    use crate::vector::tests::TestVectorIndex;
     use crate::vector::{
         IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, VectorColumn,
-        VectorColumnReader, VectorDType, VectorOptions, VectorReader,
+        VectorColumnReader, VectorDType, VectorOptions, VectorReader, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -1123,7 +1299,7 @@ mod tests {
     /// collector layer rejects `TopDocs::with_limit(0)` before it
     /// reaches the backend, so this test calls the backend directly
     /// via the instrumented seam — the short-circuit lives in
-    /// `IvfBackend::top_n_inner`.
+    /// `IvfBackend::top_n`.
     #[test]
     fn ivf_top_n_zero_returns_empty() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
@@ -1172,6 +1348,128 @@ mod tests {
         let segment_doc_count =
             index.index.reader()?.searcher().segment_readers()[0].max_doc() as usize;
         assert_eq!(stats.candidates_scored, segment_doc_count);
+
+        // Counter invariant: every touched doc lands in exactly one bucket.
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
+            "visited must equal filter+dead+seen+scored ({stats:?})"
+        );
+        // Navigation cost == the centroids ranked for this query.
+        assert_eq!(stats.centroids_ranked, DEFAULT_NUM_CENTROIDS);
+        // Exhaustive params (fanout 1.0, huge epsilon) drain the ranked list.
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        Ok(())
+    }
+
+    /// A tiny `max_probe_fanout` forces the hard ceiling: the loop stops with
+    /// `termination == Ceiling`, having probed fewer than all centroids, and the
+    /// counter invariant still holds. Uses the deterministic `build_inline_ivf`
+    /// fixture (fixed 6 centroids) so the cutoff is stable.
+    #[test]
+    fn ivf_probe_stats_termination_ceiling() -> crate::Result<()> {
+        let centroids = [
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let n_per = 6usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
+
+        // max_probe_fanout 1/6 → ceiling at the first probe; huge epsilon keeps
+        // the gate from firing first.
+        let params = AdaptiveProbeParams {
+            epsilon: 1e6,
+            min_candidates: 0,
+            min_probe_fanout: 0.0,
+            max_probe_fanout: 1.0 / centroids.len() as f32,
+        };
+        let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![10.0, 10.0], 3, params)?;
+        assert_eq!(stats.termination, ProbeTermination::Ceiling);
+        // Stopped short of exhausting the ranked list.
+        assert!(stats.probed_clusters.len() < centroids.len());
+        assert_eq!(stats.centroids_ranked, centroids.len());
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
+            "visited must equal filter+dead+seen+scored ({stats:?})"
+        );
+        Ok(())
+    }
+
+    /// The raw per-cluster sizes from `vector_cluster_sizes` must be exactly the
+    /// un-collapsed array behind `vector_info`'s aggregate cluster stats — the
+    /// invariant `paradedb.ivf_cluster_sizes` relies on to reconcile with
+    /// `paradedb.index_info`. Flat segments expose no sizes.
+    #[test]
+    fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .build()?;
+        let field = index.embedding_field();
+        let searcher = index.index.reader()?.searcher();
+
+        let mut segments_checked = 0;
+        for segment_reader in searcher.segment_readers() {
+            let sizes = segment_reader
+                .vector_cluster_sizes(field)?
+                .expect("ivf segment exposes cluster sizes");
+            let info = segment_reader.vector_info(field)?.expect("vector info");
+            assert_eq!(info.format, VectorStorageFormat::Ivf);
+            let stats = info.cluster_stats.expect("ivf cluster stats");
+
+            // count == num_centroids, and every aggregate index_info reports is
+            // reproducible from the raw array.
+            assert_eq!(sizes.len(), info.num_centroids.expect("ivf centroids"));
+            let sum: u64 = sizes.iter().map(|&s| u64::from(s)).sum();
+            let min = sizes.iter().copied().min().unwrap() as usize;
+            let max = sizes.iter().copied().max().unwrap() as usize;
+            let empty = sizes.iter().filter(|&&s| s == 0).count();
+            let avg = sum as f64 / sizes.len() as f64;
+
+            assert_eq!(sum as usize, info.num_vectors, "sizes sum to num_vectors");
+            assert_eq!(min, stats.min_cluster_size, "min");
+            assert_eq!(max, stats.max_cluster_size, "max");
+            assert_eq!(empty, stats.empty_clusters, "empty");
+            assert!(
+                (avg - stats.avg_cluster_size).abs() < 1e-9,
+                "avg {avg} vs {}",
+                stats.avg_cluster_size
+            );
+            segments_checked += 1;
+        }
+        assert!(
+            segments_checked > 0,
+            "fixture must produce >= 1 IVF segment"
+        );
+
+        // Flat segments (no IVF data) yield None — the SRF emits no rows for them.
+        let flat = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Flat)
+            .build()?;
+        let flat_field = flat.embedding_field();
+        let flat_searcher = flat.index.reader()?.searcher();
+        for segment_reader in flat_searcher.segment_readers() {
+            assert!(
+                segment_reader.vector_cluster_sizes(flat_field)?.is_none(),
+                "flat segments expose no cluster sizes"
+            );
+        }
         Ok(())
     }
 

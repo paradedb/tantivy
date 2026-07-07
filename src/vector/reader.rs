@@ -32,6 +32,32 @@ pub struct VectorReader {
     vector_dims: BTreeMap<Field, usize>,
 }
 
+/// Which on-disk layout a segment's vector data uses. Discovered from the
+/// `.vec` file's self-describing `IdMap` header (`Explicit` ⟺ IVF), never
+/// stored separately — this enum is the in-memory descriptor surfaced by
+/// [`VectorInfo`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorStorageFormat {
+    Flat,
+    Ivf,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorInfo {
+    pub format: VectorStorageFormat,
+    pub num_vectors: usize,
+    pub num_centroids: Option<usize>,
+    pub cluster_stats: Option<VectorClusterStats>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorClusterStats {
+    pub min_cluster_size: usize,
+    pub max_cluster_size: usize,
+    pub avg_cluster_size: f64,
+    pub empty_clusters: usize,
+}
+
 enum VectorStorageReader {
     None,
     Flat(FlatVecReader),
@@ -66,6 +92,73 @@ impl VectorReader {
             storage,
             vector_dims,
         })
+    }
+
+    pub fn info(&self, field: Field) -> crate::Result<Option<VectorInfo>> {
+        if !self.vector_dims.contains_key(&field) {
+            return Ok(None);
+        }
+        match &self.storage {
+            VectorStorageReader::None => Ok(None),
+            VectorStorageReader::Flat(reader) => Ok(Some(VectorInfo {
+                format: VectorStorageFormat::Flat,
+                num_vectors: reader.count(field)?,
+                num_centroids: None,
+                cluster_stats: None,
+            })),
+            VectorStorageReader::Ivf(reader) => {
+                let meta = reader.field_meta(field)?;
+                let mut empty_clusters = 0;
+                let mut min_cluster_size = usize::MAX;
+                let mut max_cluster_size = 0;
+                let mut total_cluster_size = 0;
+                for cluster_size in meta.cluster_sizes() {
+                    empty_clusters += usize::from(cluster_size == 0);
+                    min_cluster_size = min_cluster_size.min(cluster_size);
+                    max_cluster_size = max_cluster_size.max(cluster_size);
+                    total_cluster_size += cluster_size;
+                }
+                let avg_cluster_size = if meta.num_centroids == 0 {
+                    0.0
+                } else {
+                    total_cluster_size as f64 / meta.num_centroids as f64
+                };
+                let min_cluster_size = if meta.num_centroids == 0 {
+                    0
+                } else {
+                    min_cluster_size
+                };
+                Ok(Some(VectorInfo {
+                    format: VectorStorageFormat::Ivf,
+                    num_vectors: meta.num_vectors(),
+                    num_centroids: Some(meta.num_centroids),
+                    cluster_stats: Some(VectorClusterStats {
+                        min_cluster_size,
+                        max_cluster_size,
+                        avg_cluster_size,
+                        empty_clusters,
+                    }),
+                }))
+            }
+        }
+    }
+
+    /// Raw per-cluster posting-list sizes for an IVF `field`, in cluster order.
+    /// `None` when the field is not a vector field, or its storage is not IVF
+    /// (Flat / absent). This is the un-collapsed array behind [`Self::info`]'s
+    /// min/max/avg cluster stats — exposed for tooling that needs the full
+    /// distribution. Computes nothing new; reads no extra on-disk state.
+    pub fn cluster_sizes(&self, field: Field) -> crate::Result<Option<Vec<u32>>> {
+        if !self.vector_dims.contains_key(&field) {
+            return Ok(None);
+        }
+        match &self.storage {
+            VectorStorageReader::None | VectorStorageReader::Flat(_) => Ok(None),
+            VectorStorageReader::Ivf(reader) => {
+                let meta = reader.field_meta(field)?;
+                Ok(Some(meta.cluster_sizes().map(|s| s as u32).collect()))
+            }
+        }
     }
 }
 

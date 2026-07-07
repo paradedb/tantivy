@@ -65,6 +65,13 @@ impl IvfVecReader {
         let offsets_slice = self.centroids.open_read_with_idx(field, 1).ok_or_else(missing)?;
         Ok(CentroidsMeta::open(centroids_slice, offsets_slice, options)?)
     }
+
+    /// A field's cluster-routing metadata (`num_centroids` + the cluster
+    /// offsets prefix sum), for cluster-size introspection.
+    pub(crate) fn field_meta(&self, field: Field) -> crate::Result<CentroidsMeta> {
+        let options = self.field_options(field)?;
+        self.centroids_meta(field, options)
+    }
 }
 
 impl VectorColumnReader for IvfVecReader {

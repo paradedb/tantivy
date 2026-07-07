@@ -18,14 +18,11 @@ const LABEL_FIELD_NAME: &str = "label";
 const NUM_DOCS: usize = 100;
 const DOCS_PER_SEGMENT: usize = 10;
 
-/// Which on-disk layout the fixture should produce. Selected via the index
-/// settings (clustering threshold + clusterer); the resulting segment is
-/// self-describing through its `.vec` `IdMap`, so this is purely a build knob.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum VectorStorageFormat {
-    Flat,
-    Ivf,
-}
+// Which on-disk layout the fixture should produce, reusing the public
+// descriptor enum. Selected via the index settings (clustering threshold +
+// clusterer); the resulting segment is self-describing through its `.vec`
+// `IdMap`, so this is purely a build knob here.
+pub(crate) use crate::vector::VectorStorageFormat;
 
 pub(crate) struct TestVectorIndex {
     pub(crate) index: Index,

@@ -29,7 +29,7 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
-pub use backend::VectorBackend;
+pub use backend::{ProbeStats, ProbeTermination, VectorBackend};
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
 pub use flat::{FlatVecReader, FlatVecWriter, FlatVectorColumn};
@@ -41,7 +41,10 @@ pub use ivf::{
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
-pub use reader::{VectorColumn, VectorColumnReader, VectorReader};
+pub use reader::{
+    VectorClusterStats, VectorColumn, VectorColumnReader, VectorInfo, VectorReader,
+    VectorStorageFormat,
+};
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
 // resolves for callers and tests that work entirely within the vector module.
