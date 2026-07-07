@@ -23,7 +23,10 @@
 //! [`payload`](Graph::payload) hands back the `&[T]` slice; the graph has no
 //! notion of a metric and never computes a distance itself.
 
+use std::io::{self, Write};
 use std::ops::Deref;
+
+use common::BinarySerializable;
 
 /// A dense node identifier, indexing straight into the backing arrays.
 pub type NodeId = u32;
@@ -218,6 +221,28 @@ impl<T, S: Deref<Target = [T]>> Graph<S> {
     #[inline]
     pub fn max_edges(&self) -> usize {
         self.max_edges
+    }
+
+    /// Writes the durable part of the graph — `max_edges`, then the flat
+    /// adjacency exactly as held in memory — as little-endian `u32`s:
+    ///
+    /// ```text
+    /// max_edges (u32) + neighbors (u32[len · max_edges], nearest-first,
+    ///                              EMPTY-padded runs of max_edges per node)
+    /// ```
+    ///
+    /// Neither the vectors nor the node count are written: the arena is
+    /// persisted (and the count derived) elsewhere, and a reload wraps it via
+    /// [`for_reload`](Graph::for_reload). Distances aren't durable at all —
+    /// see the [module docs](self).
+    pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+        let max_edges = u32::try_from(self.max_edges)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "max_edges exceeds u32"))?;
+        max_edges.serialize(out)?;
+        for &neighbor in &self.neighbors {
+            neighbor.serialize(out)?;
+        }
+        Ok(())
     }
 
     /// Iterates every node's vector in id order — node `0`, then `1`, and so on.
@@ -473,5 +498,57 @@ mod tests {
     fn set_neighbors_rejects_more_than_max_edges() {
         let mut g = graph_with_nodes(4, 2);
         g.set_neighbors(0, &[1, 2, 3]); // 3 > max_edges 2
+    }
+
+    /// Decodes a serialized graph back into (max_edges, neighbors) u32s.
+    fn decode(bytes: &[u8]) -> (u32, Vec<NodeId>) {
+        assert_eq!(bytes.len() % 4, 0, "serialization is a whole number of u32s");
+        let mut words = bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()));
+        let max_edges = words.next().expect("missing max_edges header");
+        (max_edges, words.collect())
+    }
+
+    #[test]
+    fn serialize_writes_max_edges_then_padded_adjacency() {
+        let mut g = graph_with_nodes(3, 2);
+        g.add_edge(0, 2, 0.9);
+        g.add_edge(0, 1, 0.2); // closer: sorts ahead of 2
+        g.add_edge(1, 0, 0.2);
+        // node 2 keeps an all-EMPTY run
+
+        let mut bytes = Vec::new();
+        g.serialize(&mut bytes).unwrap();
+
+        let (max_edges, neighbors) = decode(&bytes);
+        assert_eq!(max_edges, 2);
+        assert_eq!(neighbors, vec![1, 2, 0, EMPTY, EMPTY, EMPTY]);
+    }
+
+    #[test]
+    fn reloaded_graph_serializes_byte_identically() {
+        // The durable invariant behind slot reuse across merges: serialize →
+        // reload (push edges in stored order) → serialize must be a fixed
+        // point, so nothing drifts however many times a graph round-trips.
+        let mut built = graph_with_nodes(4, 3);
+        built.add_edge(0, 1, 0.1);
+        built.add_edge(0, 3, 0.4);
+        built.add_edge(2, 0, 0.2);
+
+        let mut bytes = Vec::new();
+        built.serialize(&mut bytes).unwrap();
+
+        let arena: Vec<f32> = (0..4).map(|i| i as f32).collect();
+        let mut reloaded = Graph::for_reload(arena, 1, built.max_edges());
+        for node in 0..built.len() as NodeId {
+            for &to in built.neighbors(node) {
+                reloaded.push_edge(node, to);
+            }
+        }
+
+        let mut reloaded_bytes = Vec::new();
+        reloaded.serialize(&mut reloaded_bytes).unwrap();
+        assert_eq!(bytes, reloaded_bytes);
     }
 }
