@@ -1,5 +1,6 @@
 use crate::schema::VectorOptions;
-use crate::DocId;
+use crate::vector::VectorElement;
+use crate::{DocId, TantivyError};
 
 pub trait IvfClusterer: Send + Sync + 'static {
     fn centroid_ratio(&self) -> f32;
@@ -90,4 +91,32 @@ pub struct IvfMatrixView<'a, T> {
 pub struct IvfVectorBatch<'a, T> {
     pub doc_ids: &'a [DocId],
     pub matrix: IvfMatrixView<'a, T>,
+}
+
+pub(crate) fn decode_row<T: VectorElement>(bytes: &[u8], dim: usize) -> crate::Result<Vec<T>> {
+    let expected = dim * T::SIZE_BYTES;
+    if bytes.len() != expected {
+        return Err(TantivyError::InvalidArgument(format!(
+            "vector byte length mismatch: expected {expected} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(T::SIZE_BYTES)
+        .map(T::decode_le)
+        .collect())
+}
+
+pub(crate) fn encode_vector<T: VectorElement>(vector: &[T], dim: usize) -> crate::Result<Vec<u8>> {
+    if vector.len() != dim {
+        return Err(TantivyError::InvalidArgument(format!(
+            "centroid length mismatch: expected {dim} elements, got {}",
+            vector.len()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(dim * T::SIZE_BYTES);
+    for element in vector {
+        element.encode_le(&mut bytes)?;
+    }
+    Ok(bytes)
 }
