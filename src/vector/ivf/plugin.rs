@@ -5,8 +5,11 @@
 //! This module exposes the merge body so the parent plugin can call it
 //! after the threshold check.
 
+use std::cmp::Ordering;
 use std::io::Write;
 use std::time::{Duration, Instant};
+
+use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
 
 use super::{
     decode_row, encode_vector, CentroidsMeta, IvfCentroids, IvfClusterer, IvfMatrixView,
@@ -15,7 +18,8 @@ use super::{
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
-use crate::schema::{FieldType, VectorDType};
+use crate::schema::{FieldType, Metric, VectorDType};
+use crate::vector::distance::{cosine, l2_squared};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
 use crate::vector::reader::{VectorColumnReader, VectorReader};
@@ -29,12 +33,120 @@ struct AssignedVector {
     source_doc_id: DocId,
 }
 
+/// How a vector's `replicas - 1` non-primary cells are picked from the
+/// trained centroids. Constructed once per field when `replicas > 1`,
+/// queried during the assign loop, then dropped — never serialized.
+///
+/// HNSW is a recall structure for *large* centroid sets. When the whole set
+/// fits within the search's own `ef` visit budget the brute scan is at most
+/// as expensive — and exact: a parallel-built HNSW over a handful of points
+/// can come out sparse enough that `search` returns fewer than `knn`
+/// neighbours, silently under-replicating small indexes.
+enum ReplicaSelector {
+    /// Exact k-NN scan over the trained centroids (small centroid sets).
+    Exact,
+    /// Approximate k-NN via a transient HNSW (large centroid sets).
+    Hnsw(CentroidHnsw),
+}
+
+/// Centroid ids of the `knn` nearest centroids to `query`, nearest first —
+/// the exact counterpart of [`CentroidHnsw::nearest`], same distance family
+/// per metric. Ties break on centroid id so selection is deterministic.
+fn exact_nearest_centroids(
+    metric: Metric,
+    centroid_rows: &[Vec<f32>],
+    query: &[f32],
+    knn: usize,
+) -> Vec<usize> {
+    let mut scored: Vec<(f32, usize)> = centroid_rows
+        .iter()
+        .enumerate()
+        .map(|(id, centroid)| {
+            let d = match metric {
+                // Angular distance, like `DistCosine`; handles un-normalized
+                // centroids the same way.
+                Metric::Cosine | Metric::Dot => 1.0 - cosine(query, centroid.as_slice()),
+                // Squared L2 orders identically to L2.
+                Metric::L2 => l2_squared(query, centroid.as_slice()),
+            };
+            (d, id)
+        })
+        .collect();
+    scored.sort_unstable_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    scored.truncate(knn);
+    scored.into_iter().map(|(_, id)| id).collect()
+}
+
+/// Transient build-time HNSW over the trained centroids, used to pick a
+/// vector's `replicas - 1` nearest non-primary cells when the centroid set
+/// is large enough that an approximate index beats the brute scan (see
+/// [`ReplicaSelector`]). The distance must match how the primary is
+/// assigned: angular (cosine) for Cosine/Dot — both clustered in angular
+/// space — and L2 for L2. `DistCosine` handles un-normalized centroids, so
+/// no normalized copy is kept.
+enum CentroidHnsw {
+    Angular(Hnsw<'static, f32, DistCosine>),
+    L2(Hnsw<'static, f32, DistL2>),
+}
+
+impl CentroidHnsw {
+    fn build(metric: Metric, centroids: &[Vec<f32>]) -> Self {
+        let n = centroids.len();
+        // hnsw_rs caps `max_nb_connection` at 256; small centroid sets need it
+        // below `n`. ef_construction/max_layer are standard build-quality knobs.
+        let max_nb_connection = 24.min(n.saturating_sub(1)).max(1);
+        let ef_construction = 200;
+        let max_layer = 16;
+        let data: Vec<(&[f32], usize)> = centroids
+            .iter()
+            .enumerate()
+            .map(|(id, c)| (c.as_slice(), id))
+            .collect();
+        if matches!(metric, Metric::Cosine | Metric::Dot) {
+            let hnsw = Hnsw::<f32, DistCosine>::new(
+                max_nb_connection,
+                n,
+                max_layer,
+                ef_construction,
+                DistCosine {},
+            );
+            hnsw.parallel_insert_slice(&data);
+            CentroidHnsw::Angular(hnsw)
+        } else {
+            let hnsw = Hnsw::<f32, DistL2>::new(
+                max_nb_connection,
+                n,
+                max_layer,
+                ef_construction,
+                DistL2 {},
+            );
+            hnsw.parallel_insert_slice(&data);
+            CentroidHnsw::L2(hnsw)
+        }
+    }
+
+    /// Centroid ids of the `knn` nearest centroids to `query`, nearest first.
+    fn nearest(&self, query: &[f32], knn: usize, ef: usize) -> Vec<usize> {
+        let neighbours = match self {
+            CentroidHnsw::Angular(h) => h.search(query, knn, ef),
+            CentroidHnsw::L2(h) => h.search(query, knn, ef),
+        };
+        neighbours.into_iter().map(|nb| nb.d_id).collect()
+    }
+}
+
 /// Per-field IVF build timings (one phase per field), emitted at end of build
 /// as a parseable `log::info!` line on target `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
     train: Duration,
+    hnsw_build: Duration,
     assign: Duration,
+    replica_knn: Duration,
     posting_write: Duration,
 }
 
@@ -130,6 +242,7 @@ pub(crate) fn merge_ivf(
             VectorDType::F32 => {
                 let field_build_start = Instant::now();
                 let mut timings = IvfBuildTimings::default();
+                let replicas = settings.replicas.max(1);
                 let mut training_values = Vec::with_capacity(training_sample_size * opts.dim());
                 let mut training_doc_ids = Vec::with_capacity(training_sample_size);
                 let mut target_doc_id: DocId = 0;
@@ -194,22 +307,39 @@ pub(crate) fn merge_ivf(
                         centroid_matrix.rows
                     )));
                 }
-                let encoded_centroids = centroid_matrix
+                // Float working copy of the trained centroids — the replica
+                // HNSW indexes float rows. Encoding + Cosine normalization
+                // happen at the `.centroids` write below.
+                let centroid_rows: Vec<Vec<f32>> = centroid_matrix
                     .values
                     .chunks_exact(opts.dim())
-                    .map(|centroid| {
-                        let mut bytes = encode_vector(centroid, opts.dim())?;
-                        // K-means cluster means are not unit-norm; for
-                        // Cosine+F32 normalize them here so the search
-                        // path can score both docs and centroids with
-                        // the same `dot * inv_norm_q` fast kernel.
-                        opts.maybe_normalize_bytes(&mut bytes);
-                        Ok::<_, TantivyError>(bytes)
-                    })
-                    .collect::<crate::Result<Vec<_>>>()?;
+                    .map(|centroid| centroid.to_vec())
+                    .collect();
+
+                // Fixed-k replication: pick a selector ONCE before the assign
+                // loop, and only when `replicas > 1`. At `replicas == 1`
+                // nothing is built or allocated — the layout stays
+                // primary-only. Small centroid sets — anything the search's
+                // own `ef` budget would visit wholesale anyway — use the
+                // exact scan; only larger sets pay for a transient HNSW.
+                let dim = opts.dim();
+                let ef_search = (replicas * 4).max(64);
+                let replica_selector = if replicas <= 1 {
+                    None
+                } else if num_centroids <= ef_search {
+                    Some(ReplicaSelector::Exact)
+                } else {
+                    let hnsw_start = Instant::now();
+                    let hnsw = CentroidHnsw::build(opts.metric(), &centroid_rows);
+                    timings.hnsw_build = hnsw_start.elapsed();
+                    Some(ReplicaSelector::Hnsw(hnsw))
+                };
+                // Replica cells accumulated during assign; appended as extra
+                // entries AFTER the primary pass so primary membership is
+                // untouched. Empty at `replicas == 1`.
+                let mut replica_entries: Vec<AssignedVector> = Vec::new();
 
                 let mut assigned_vectors = Vec::with_capacity(vector_count);
-                let mut cluster_counts = vec![0usize; num_centroids];
                 let mut target_doc_id: DocId = 0;
                 {
                     let mut batch_values = Vec::with_capacity(
@@ -249,8 +379,13 @@ pub(crate) fn merge_ivf(
                                     batch_len
                                 )));
                             }
-                            for (cluster, (target_doc_id, source_segment_ord, source_doc_id)) in
-                                clusters.into_iter().zip(batch_sources.drain(..))
+                            for (
+                                i,
+                                (cluster, (target_doc_id, source_segment_ord, source_doc_id)),
+                            ) in clusters
+                                .into_iter()
+                                .zip(batch_sources.drain(..))
+                                .enumerate()
                             {
                                 let cluster = cluster as usize;
                                 if cluster >= num_centroids {
@@ -265,7 +400,43 @@ pub(crate) fn merge_ivf(
                                     source_segment_ord,
                                     source_doc_id,
                                 });
-                                cluster_counts[cluster] += 1;
+                                // Fixed-k replication: take the `replicas - 1`
+                                // nearest NON-primary centroids from the
+                                // selector. The top-k includes the primary;
+                                // drop it (build-time dedup) so a vector is
+                                // never written into its primary list twice.
+                                if let Some(selector) = replica_selector.as_ref() {
+                                    let v = &batch_values[i * dim..(i + 1) * dim];
+                                    let knn_start = Instant::now();
+                                    let nearest = match selector {
+                                        ReplicaSelector::Exact => exact_nearest_centroids(
+                                            opts.metric(),
+                                            &centroid_rows,
+                                            v,
+                                            replicas,
+                                        ),
+                                        ReplicaSelector::Hnsw(hnsw) => {
+                                            hnsw.nearest(v, replicas, ef_search)
+                                        }
+                                    };
+                                    timings.replica_knn += knn_start.elapsed();
+                                    let mut added = 0usize;
+                                    for cell in nearest {
+                                        if added >= replicas - 1 {
+                                            break;
+                                        }
+                                        if cell == cluster {
+                                            continue;
+                                        }
+                                        replica_entries.push(AssignedVector {
+                                            cluster: cell,
+                                            target_doc_id,
+                                            source_segment_ord,
+                                            source_doc_id,
+                                        });
+                                        added += 1;
+                                    }
+                                }
                             }
                             batch_values.clear();
                             batch_doc_ids.clear();
@@ -295,6 +466,23 @@ pub(crate) fn merge_ivf(
                 }
                 debug_assert_eq!(target_doc_id, num_target_docs);
                 debug_assert_eq!(assigned_vectors.len(), vector_count);
+
+                // Fixed-k replication: append the accumulated replica cells as
+                // extra entries — the write path below already tolerates more
+                // than one entry per vector. Cells index the trained centroids,
+                // whose count is fixed here; guard anyway so a bad cell id can
+                // never index out of bounds.
+                for entry in replica_entries.drain(..) {
+                    if entry.cluster < num_centroids {
+                        assigned_vectors.push(entry);
+                    }
+                }
+
+                let mut cluster_counts = vec![0usize; num_centroids];
+                for assigned_vector in &assigned_vectors {
+                    cluster_counts[assigned_vector.cluster] += 1;
+                }
+
                 assigned_vectors
                     .sort_unstable_by_key(|vector| (vector.cluster, vector.target_doc_id));
 
@@ -348,8 +536,17 @@ pub(crate) fn merge_ivf(
                 timings.posting_write = posting_start.elapsed();
 
                 // `.centroids`: routing — centroids in slot [0], cluster
-                // offsets in slot [1].
-                let centroid_bytes: Vec<u8> = encoded_centroids.into_iter().flatten().collect();
+                // offsets in slot [1]. K-means cluster means are not
+                // unit-norm; for Cosine+F32 normalize each centroid here so
+                // the search path can score both docs and centroids with the
+                // same `dot * inv_norm_q` fast kernel.
+                let mut centroid_bytes =
+                    Vec::with_capacity(num_centroids * opts.bytes_per_vector());
+                for centroid in &centroid_rows {
+                    let mut bytes = encode_vector(centroid, opts.dim())?;
+                    opts.maybe_normalize_bytes(&mut bytes);
+                    centroid_bytes.extend_from_slice(&bytes);
+                }
                 {
                     let centroids_w = centroids_write.for_field_with_idx(field, 0);
                     CentroidsMeta::serialize_centroids(
@@ -368,12 +565,15 @@ pub(crate) fn merge_ivf(
 
                 log::info!(
                     target: "paradedb::ivf_build",
-                    "ivf_build timings_ms train={} assign={} posting_write={} total={} \
-                     centroids={} vectors={}",
+                    "ivf_build timings_ms train={} hnsw_build={} assign={} replica_knn={} \
+                     posting_write={} total={} replicas={} centroids={} vectors={}",
                     timings.train.as_millis(),
+                    timings.hnsw_build.as_millis(),
                     timings.assign.as_millis(),
+                    timings.replica_knn.as_millis(),
                     timings.posting_write.as_millis(),
                     field_build_start.elapsed().as_millis(),
+                    replicas,
                     num_centroids,
                     vector_count,
                 );

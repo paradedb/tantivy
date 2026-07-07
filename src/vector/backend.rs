@@ -720,6 +720,7 @@ mod tests {
 
     struct InlineClusterer {
         centroids: Vec<[f32; 2]>,
+        replicas: usize,
     }
 
     impl IvfClusterer for InlineClusterer {
@@ -734,6 +735,7 @@ mod tests {
                 num_centroids: self.centroids.len(),
                 training_samples_per_centroid: self.training_samples_per_centroid(),
                 assign_batch_size: self.assign_batch_size(),
+                replicas: self.replicas,
             })
         }
         fn train(
@@ -793,6 +795,7 @@ mod tests {
         metric: Metric,
         centroids: &[[f32; 2]],
         docs: &[(&str, [f32; 2])],
+        replicas: usize,
     ) -> crate::Result<(Index, Field, Field)> {
         assert!(docs.len() >= 2, "need ≥ 2 docs for ≥ 2 source segments");
         let mut sb = Schema::builder();
@@ -812,6 +815,7 @@ mod tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.to_vec(),
+                replicas,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -831,6 +835,306 @@ mod tests {
         writer.merge(&segment_ids).wait()?;
         writer.wait_merging_threads()?;
         Ok((index, embed_field, label_field))
+    }
+
+    /// Fixed-k replication is additive and, at small centroid counts, EXACT:
+    /// the fixture's 6 centroids sit far below the exact-selection threshold
+    /// (the search's `ef` budget), so replica cells come from a brute k-NN
+    /// scan, not the approximate HNSW — every vector is written into exactly
+    /// `min(replicas, num_centroids)` distinct cells: its primary (once) plus
+    /// the `replicas - 1` next-nearest centroids. Total posting entries are
+    /// exactly `replicas × N`. `replicas == 1` is the identity: every doc in
+    /// exactly its primary cluster, no replica selector constructed at all
+    /// (`replica_selector` stays `None`) — byte-identical to no replication.
+    /// Query results never repeat a doc id (the `seen` dedup).
+    ///
+    /// Every assertion here is deterministic — no envelopes, no retries.
+    #[test]
+    fn ivf_fixed_k_replication_is_additive() -> crate::Result<()> {
+        // Six well-separated centroids (3×2 grid); docs sit tightly around each
+        // (offsets ≤ 0.05 against a grid gap of 10) so the primary and the
+        // next-nearest ranking are unambiguous.
+        let centroids = [
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let n_per = 6usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+        let n = docs.len();
+        let replicas = 3usize;
+        assert!(
+            centroids.len() >= replicas,
+            "fixture needs >= replicas centroids for full fill"
+        );
+
+        // L2-nearest centroid with first-wins tie-break — the same rule
+        // `InlineClusterer::assign` uses for the primary.
+        let nearest = |bytes: &[u8]| -> usize {
+            let p = [
+                f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+                f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            ];
+            let mut best = 0;
+            let mut best_d2 = f32::INFINITY;
+            for (i, c) in centroids.iter().enumerate() {
+                let dx = p[0] - c[0];
+                let dy = p[1] - c[1];
+                let d2 = dx * dx + dy * dy;
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best = i;
+                }
+            }
+            best
+        };
+
+        // A replicated build read back through Ming's cluster iteration:
+        // each doc's cluster memberships plus its primary (recomputed from
+        // the stored vector).
+        struct ReplicatedBuild {
+            index: Index,
+            embed_field: Field,
+            memberships: Vec<Vec<usize>>,
+            primaries: Vec<usize>,
+        }
+        let build_and_read = |replicas: usize| -> crate::Result<ReplicatedBuild> {
+            let (index, embed_field, _label) =
+                build_inline_ivf(Metric::L2, &centroids, &docs, replicas)?;
+            let searcher = index.reader()?.searcher();
+            assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
+            let segment_reader = &searcher.segment_readers()[0];
+            let vec_reader = VectorReader::open(segment_reader)?;
+            let column = match vec_reader.open_column(embed_field)? {
+                VectorColumn::Ivf(c) => c,
+                VectorColumn::Flat(_) => panic!("expected IVF segment"),
+            };
+            assert_eq!(column.num_clusters(), centroids.len());
+            let max_doc = segment_reader.max_doc() as usize;
+            assert_eq!(max_doc, n, "every fixture doc must survive the merge");
+            let mut memberships: Vec<Vec<usize>> = vec![Vec::new(); max_doc];
+            for cluster in 0..column.num_clusters() {
+                for &doc in column.cluster_doc_ids(cluster)?.expect("in-bounds cluster") {
+                    memberships[doc as usize].push(cluster);
+                }
+            }
+            let primaries: Vec<usize> = (0..max_doc)
+                .map(|doc| {
+                    nearest(
+                        column
+                            .vector_bytes_at(doc as u32)
+                            .expect("stored vector bytes"),
+                    )
+                })
+                .collect();
+            Ok(ReplicatedBuild {
+                index,
+                embed_field,
+                memberships,
+                primaries,
+            })
+        };
+
+        // replicas = 3: exact fill. Per doc — ceiling and fill
+        // (exactly min(replicas, num_centroids) = 3 cells), dedup (cells
+        // distinct, primary present exactly once). Corpus-wide — total
+        // memberships exactly replicas × N.
+        let built3 = build_and_read(replicas)?;
+        let mut total = 0usize;
+        for (doc, cells) in built3.memberships.iter().enumerate() {
+            assert_eq!(
+                cells.len(),
+                replicas,
+                "doc {doc}: expected exactly {replicas} cells, got {cells:?}"
+            );
+            let mut distinct = cells.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                replicas,
+                "doc {doc}: duplicate cells in {cells:?}"
+            );
+            assert_eq!(
+                cells
+                    .iter()
+                    .filter(|&&c| c == built3.primaries[doc])
+                    .count(),
+                1,
+                "doc {doc}: primary {} must appear exactly once in {cells:?}",
+                built3.primaries[doc]
+            );
+            total += cells.len();
+        }
+        assert_eq!(
+            total,
+            replicas * n,
+            "total memberships must be replicas × N"
+        );
+
+        // Query-time dedup: a doc sits in several probed clusters, but a
+        // search must return each doc id exactly once — and with exhaustive
+        // params over an all-alive corpus, all N of them.
+        let hits = search(
+            &built3.index,
+            built3.embed_field,
+            &AllQuery,
+            vec![10.0, 10.0],
+            n,
+            exhaustive_params(centroids.len()),
+        )?;
+        assert_eq!(hits.len(), n, "exhaustive top-N must return every doc");
+        let mut ids: Vec<_> = hits.iter().map(|(_, addr)| addr.doc_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "search returned duplicate doc ids");
+
+        // replicas = 1: identity. Every doc lives in exactly one cluster —
+        // its primary — which is the byte-level content of the primary-only
+        // layout (the id-map and rows are fully determined by these
+        // memberships plus the merge's (cluster, doc) sort).
+        let built1 = build_and_read(1)?;
+        for (doc, cells) in built1.memberships.iter().enumerate() {
+            assert_eq!(
+                cells.as_slice(),
+                &[built1.primaries[doc]],
+                "replicas=1: doc {doc} must live only in its primary cluster"
+            );
+        }
+        Ok(())
+    }
+
+    /// Replica dedup is counted, exactly: exact small-set selection puts
+    /// every doc in exactly `replicas` cells, so exhaustive probing visits
+    /// `replicas × N` entries, re-encounters each doc exactly `replicas - 1`
+    /// times (`pruned_seen`), scores each exactly once, and the counter
+    /// invariant holds with zero filter/dead prunes.
+    #[test]
+    fn ivf_probe_stats_counts_replica_dedup() -> crate::Result<()> {
+        let centroids = [
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let n_per = 6usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+        let n = docs.len();
+        let replicas = 4usize;
+        let (index, embed_field, _label) =
+            build_inline_ivf(Metric::L2, &centroids, &docs, replicas)?;
+
+        let (_, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            vec![10.0, 10.0],
+            n,
+            exhaustive_params(centroids.len()),
+        )?;
+        // Every doc sits in exactly `replicas` probed cells; the
+        // `replicas - 1` re-encounters are deduped.
+        assert_eq!(
+            stats.vectors_visited,
+            replicas * n,
+            "exhaustive probe must touch every posting entry: {stats:?}"
+        );
+        assert_eq!(
+            stats.pruned_seen,
+            (replicas - 1) * n,
+            "replica dedup must fire exactly replicas-1 times per doc: {stats:?}"
+        );
+        // Still scored exactly once each; nothing filtered or dead here.
+        assert_eq!(stats.candidates_scored, n);
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
+            "visited must equal filter+dead+seen+scored ({stats:?})"
+        );
+        Ok(())
+    }
+
+    /// Captures `paradedb::ivf_build` log records so a test can read back the
+    /// timings line the merge emits.
+    struct CaptureLogger;
+    static CAPTURED_IVF_BUILD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.target() == "paradedb::ivf_build"
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                CAPTURED_IVF_BUILD
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}", r.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+    /// The merge emits one parseable `ivf_build timings_ms ...` line per field,
+    /// with `replica_knn` non-trivial at `replicas > 1`. Builds a larger index
+    /// so the phase timings are measurable, captures the line, and prints it
+    /// (run with `--nocapture`) so we can see where build time goes.
+    #[test]
+    fn ivf_build_emits_timings_log() -> crate::Result<()> {
+        let _ = log::set_logger(&CAPTURE_LOGGER);
+        log::set_max_level(log::LevelFilter::Info);
+
+        // 200 centroids on a 20×10 grid; ~5000 docs clustered around them.
+        let mut centroids: Vec<[f32; 2]> = Vec::new();
+        for x in 0..20 {
+            for y in 0..10 {
+                centroids.push([x as f32 * 10.0, y as f32 * 10.0]);
+            }
+        }
+        let n_per = 25usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.05;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+
+        let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
+        let _ = build_inline_ivf(Metric::L2, &centroids, &docs, 8)?;
+        let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
+        let line = lines
+            .iter()
+            .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
+            .expect("expected an ivf_build timings line for the 200-centroid build");
+        assert!(line.contains("replicas=8"));
+        assert!(line.contains("replica_knn="));
+        eprintln!("IVF_BUILD_SAMPLE {line}");
+        Ok(())
     }
 
     // ---- IVF top_n correctness tests ----
@@ -939,7 +1243,7 @@ mod tests {
             ("trap_b", [5.0, 5.01]),
             ("anchor_b", [10.0, 10.0]),
         ];
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
         let query = [1.0_f32, 1.0];
 
         // Setup assertions.
@@ -1182,7 +1486,7 @@ mod tests {
             ("b_far", [10.0_f32, 10.0]),
             ("b_far2", [11.0_f32, 9.5]),
         ];
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
         let query = [1.0_f32, 1.0];
         let top_k = 1;
 
@@ -1387,7 +1691,7 @@ mod tests {
                 (labels[i].as_str(), [c[0] + off, c[1] + off])
             })
             .collect();
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
 
         // max_probe_fanout 1/6 → ceiling at the first probe; huge epsilon keeps
         // the gate from firing first.

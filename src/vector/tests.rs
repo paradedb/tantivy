@@ -188,6 +188,9 @@ impl IvfClusterer for Grid2DClusterer {
             num_centroids: self.centroids.len().min(total_target_docs),
             training_samples_per_centroid: self.training_samples_per_centroid(),
             assign_batch_size: self.assign_batch_size(),
+            // The grid fixture asserts exact cluster membership; keep
+            // replication off so the 3×3 grid assignment stays primary-only.
+            replicas: 1,
         })
     }
 
