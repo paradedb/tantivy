@@ -611,6 +611,20 @@ where
         self.segment_sort_key_computer
             .convert_segment_sort_key(sort_key)
     }
+
+    fn supports_bm25_pruning(&self) -> bool {
+        self.segment_sort_key_computer.supports_bm25_pruning()
+    }
+
+    fn bm25_pruning_threshold(
+        &self,
+        threshold: &Self::SegmentSortKey,
+        segment_ord: crate::SegmentOrdinal,
+        threshold_ord: crate::SegmentOrdinal,
+    ) -> Option<Score> {
+        self.segment_sort_key_computer
+            .bm25_pruning_threshold(threshold, segment_ord, threshold_ord)
+    }
 }
 
 #[cfg(test)]
