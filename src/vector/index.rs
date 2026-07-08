@@ -25,7 +25,7 @@ use crate::schema::Metric;
 use crate::Executor;
 
 use super::graph::{EdgeListMut, Graph, NodeId};
-use super::VectorElement;
+use super::{VectorArena, VectorElement};
 
 /// Tuning knobs for a [`RelativeNeighborhoodGraph`].
 #[derive(Clone, Copy, Debug)]
@@ -61,14 +61,12 @@ impl Default for NeighborhoodGraphConfig {
     }
 }
 
-/// A relative neighborhood graph (RNG) index over `dim`-strided vector storage
-/// `S` (any `Deref<Target = [T]>`, borrowed or owned) with element type `T`.
+/// A relative neighborhood graph (RNG) index over vector storage `S` (any
+/// [`VectorArena`]); queries are `&[S::Elem]` of the same dimension.
 ///
-/// The inner [`Graph`] never copies the vectors: a merge-time build borrows the
-/// clusterer's centroid matrix (`S = &[f32]`), a reload owns its decoded arena
-/// (`S = Vec<T>`). Queries are `&[T]` of the same element type and dimension.
-/// This type owns the metric and parameters; per-query scratch is supplied by
-/// the caller as a [`Workspace`].
+/// Scoring goes through [`VectorArena::similarity`], so each storage shape
+/// uses its native kernel. This type owns the metric and parameters;
+/// per-query scratch is supplied by the caller as a [`Workspace`].
 pub struct RelativeNeighborhoodGraph<S> {
     /// Vector arena and directed adjacency.
     graph: Graph<S>,
@@ -79,7 +77,7 @@ pub struct RelativeNeighborhoodGraph<S> {
     config: NeighborhoodGraphConfig,
 }
 
-impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
+impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
     /// Creates an edge-less index over `vectors`, a flat `dim`-strided arena
     /// whose length fixes the node count, using `metric` and the given tuning
     /// `params`.
@@ -100,7 +98,7 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     pub fn search(
         &self,
         ws: &mut Workspace,
-        query: &[T],
+        query: &[S::Elem],
         seeds: &[NodeId],
         k: usize,
     ) -> Vec<Candidate> {
@@ -110,6 +108,9 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
         }
         let ef = self.config.ef.max(k);
         let n = self.graph.len();
+        let arena = self.graph.arena();
+        let dim = self.graph.dim();
+        let metric = self.metric;
         let epoch = ws.begin_query(n);
 
         let visited = &mut ws.visited;
@@ -126,7 +127,7 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
                 continue;
             }
             visited[idx] = epoch;
-            let sim = self.metric.similarity(query, self.graph.payload(node_id));
+            let sim = arena.similarity(metric, dim, node_id, query);
             let c = Candidate { sim, node: node_id };
             frontier.push(c);
             results.push(Reverse(c));
@@ -144,7 +145,7 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
                     continue;
                 }
                 visited[idx] = epoch;
-                let sim = self.metric.similarity(query, self.graph.payload(nb));
+                let sim = arena.similarity(metric, dim, nb, query);
                 let c = Candidate { sim, node: nb };
                 // A candidate earns a frontier slot exactly when it enters the
                 // top-`ef` results, so the single comparison against the worst
@@ -176,7 +177,12 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         self.graph.serialize(out)
     }
+}
 
+/// Refinement requires typed storage: a node's stored vector doubles as its
+/// search query, and edge selection scores stored vectors against each other.
+/// A graph over raw file bytes is search-only.
+impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     /// Refines every node against the current graph: each node searches from
     /// itself to gather a candidate pool, applies the RNG occlusion rule to
     /// reselect its edges, and the new adjacencies are written back. This pass is
@@ -277,11 +283,9 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
 }
 
 /// Build is `f32`-only and borrow-only for now: the TPT partitioner does
-/// floating-point math over the vectors, and borrowed storage is what lets the
-/// partitioner keep reading the arena while the graph's edge lists are mutated
-/// — `&[f32]` is `Copy`, so [`Graph::arena`] hands back a reference independent
-/// of `&mut self`. The rest of the index stays generic over storage and
-/// [`VectorElement`].
+/// floating-point math over the vectors, and `&[f32]` is `Copy`, so the arena
+/// can be read while edge lists are mutated. The rest of the index stays
+/// generic over [`VectorArena`] storage.
 impl RelativeNeighborhoodGraph<&[f32]> {
     /// Builds the RNG index over the borrowed arena: seeds a raw KNN graph with
     /// a TPT forest, then prunes it into an RNG. Expects a freshly constructed,
@@ -300,7 +304,7 @@ impl RelativeNeighborhoodGraph<&[f32]> {
     /// [`max_edges`](NeighborhoodGraphConfig::max_edges), so memory stays
     /// bounded by the graph itself.
     fn build_init_knn(&mut self, executor: &Executor) {
-        let vectors = self.graph.arena();
+        let vectors = *self.graph.arena();
         let dim = self.graph.dim();
         let n = self.graph.len();
         if n == 0 {
@@ -794,7 +798,7 @@ mod tests {
         assert!(ids[1] == 3 || ids[1] == 5); // then its nearest neighbors
     }
 
-    fn sorted_neighbors<S: Deref<Target = [f32]>>(
+    fn sorted_neighbors<S: VectorArena>(
         rng: &RelativeNeighborhoodGraph<S>,
         node: NodeId,
     ) -> Vec<NodeId> {

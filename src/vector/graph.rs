@@ -15,18 +15,19 @@
 //!   ([`Graph::for_reload`]) carries no distance buffer and is filled in stored
 //!   order via [`Graph::push_edge`].
 //!
-//! `Graph<S>` never owns vector data of its own: `S` is any flat, `dim`-strided
-//! arena that derefs to `[T]` — node `i`'s vector is `vectors[i * dim ..][.. dim]`,
-//! contiguous and prefetchable rather than a heap-scattered allocation per
-//! node. A merge-time build borrows the clusterer's matrix (`S = &[f32]`),
-//! while a reload owns its decoded arena (`S = Vec<T>`); both are zero-cost.
-//! [`payload`](Graph::payload) hands back the `&[T]` slice; the graph has no
-//! notion of a metric and never computes a distance itself.
+//! `Graph<S>` never owns vector data of its own: `S` is any [`VectorArena`] —
+//! a flat, `dim`-strided arena where node `i`'s vector is
+//! `vectors[i * dim ..][.. dim]`. A build borrows the clusterer's matrix
+//! (`S = &[f32]`); a reload can wrap owned or file-resident storage. Scoring
+//! goes through [`VectorArena::similarity`]; the graph itself has no notion
+//! of a metric and never computes a distance.
 
 use std::io::{self, Write};
 use std::ops::Deref;
 
 use common::BinarySerializable;
+
+use super::VectorArena;
 
 /// A dense node identifier, indexing straight into the backing arrays.
 pub type NodeId = u32;
@@ -35,7 +36,7 @@ pub type NodeId = u32;
 pub const EMPTY: NodeId = NodeId::MAX;
 
 /// A single-threaded *k*-nearest-neighbor graph over `dim`-dimensional vectors
-/// stored in the arena `S` (any `Deref<Target = [T]>`, borrowed or owned).
+/// stored in the arena `S` (any [`VectorArena`], typed or byte-backed).
 ///
 /// See the [module docs](self) for the layout and design rationale.
 pub struct Graph<S> {
@@ -54,7 +55,7 @@ pub struct Graph<S> {
     dists: Vec<f32>,
 }
 
-impl<T, S: Deref<Target = [T]>> Graph<S> {
+impl<S: VectorArena> Graph<S> {
     /// Creates a build graph over `vectors`, a flat `dim`-strided arena whose
     /// length fixes the node count. Every node starts with no edges; the flat
     /// edge arrays are allocated here, once. Panics if `vectors` is not a
@@ -89,8 +90,7 @@ impl<T, S: Deref<Target = [T]>> Graph<S> {
     fn node_count(vectors: &S, dim: usize, max_edges: usize) -> usize {
         assert!(max_edges > 0, "max_edges must be non-zero");
         assert!(dim > 0, "dim must be non-zero");
-        assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
-        let n = vectors.len() / dim;
+        let n = vectors.num_vectors(dim);
         // Ids must stay below the EMPTY sentinel (NodeId::MAX).
         assert!(n < NodeId::MAX as usize, "arena exceeds NodeId space");
         n
@@ -175,13 +175,6 @@ impl<T, S: Deref<Target = [T]>> Graph<S> {
         run[neighbors.len()..].fill(EMPTY);
     }
 
-    /// Borrows `node`'s vector — a contiguous `dim`-length slice of the arena.
-    #[inline]
-    pub fn payload(&self, node: NodeId) -> &[T] {
-        let start = node as usize * self.dim;
-        &self.vectors[start..start + self.dim]
-    }
-
     /// The number of neighbors currently recorded for `node`.
     #[inline]
     pub fn degree(&self, node: NodeId) -> usize {
@@ -202,13 +195,13 @@ impl<T, S: Deref<Target = [T]>> Graph<S> {
     /// The number of nodes in the graph.
     #[inline]
     pub fn len(&self) -> usize {
-        self.vectors.len() / self.dim
+        self.vectors.num_vectors(self.dim)
     }
 
     /// Whether the graph has no nodes.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
+        self.len() == 0
     }
 
     /// The vector dimensionality.
@@ -245,6 +238,25 @@ impl<T, S: Deref<Target = [T]>> Graph<S> {
         Ok(())
     }
 
+    /// Borrows the arena storage. For `Copy` storage like `&[T]`, dereferencing
+    /// the borrow yields a reference with the *arena's* lifetime, so the TPT
+    /// build can read vectors while mutating edge lists.
+    #[inline]
+    pub fn arena(&self) -> &S {
+        &self.vectors
+    }
+}
+
+/// Typed-arena views: only `[T]`-shaped storage can hand out `&[T]` borrows
+/// (file bytes have no alignment guarantee).
+impl<T, S: Deref<Target = [T]>> Graph<S> {
+    /// Borrows `node`'s vector — a contiguous `dim`-length slice of the arena.
+    #[inline]
+    pub fn payload(&self, node: NodeId) -> &[T] {
+        let start = node as usize * self.dim;
+        &self.vectors[start..start + self.dim]
+    }
+
     /// Iterates every node's vector in id order — node `0`, then `1`, and so on.
     /// Each item is that node's contiguous `dim`-length slice of the arena; pair
     /// with [`Iterator::enumerate`] to recover the [`NodeId`]. This is the build
@@ -252,17 +264,6 @@ impl<T, S: Deref<Target = [T]>> Graph<S> {
     #[inline]
     pub fn iter(&self) -> std::slice::ChunksExact<'_, T> {
         self.vectors.chunks_exact(self.dim)
-    }
-}
-
-impl<T, S: Deref<Target = [T]> + Copy> Graph<S> {
-    /// Hands back the arena storage itself. For `Copy` storage like `&[T]` this
-    /// is a reference whose lifetime is the *arena's*, not `&self`'s — so a
-    /// caller can keep reading the vectors while it mutates the graph's edge
-    /// lists (the property the TPT build relies on).
-    #[inline]
-    pub fn arena(&self) -> S {
-        self.vectors
     }
 }
 
@@ -388,7 +389,7 @@ mod tests {
         // exactly what the TPT build needs.
         let matrix: Vec<f32> = vec![0.0, 1.0, 2.0];
         let mut g: Graph<&[f32]> = Graph::new(&matrix, 1, 2);
-        let vectors = g.arena();
+        let vectors = *g.arena();
         g.add_edge(0, 1, 1.0); // mutate while `vectors` is still borrowed
         assert_eq!(vectors, matrix.as_slice());
         assert_eq!(g.neighbors(0), &[1]);
