@@ -2,7 +2,8 @@
 //!
 //! The schema-level field configuration ([`VectorOptions`](crate::schema::VectorOptions),
 //! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema module and is
-//! re-exported here; the element trait [`VectorElement`] and the distance kernels live here.
+//! re-exported here; the element trait [`VectorElement`], the vector storage abstraction
+//! [`VectorArena`], and the distance kernels live here.
 //! The on-disk formats live in submodules: [`flat`] for the dense full-precision layout and
 //! [`ivf`] for the partitioned/clustered accelerator. Both are owned by a single
 //! [`VectorPlugin`] which picks between them per merge based on
@@ -94,5 +95,39 @@ impl VectorElement for f32 {
     #[inline(always)]
     fn product(a: Self, b: Self) -> f32 {
         a * b
+    }
+}
+
+/// A flat, `dim`-strided arena of vectors a [`Graph`] is built over or
+/// searched against.
+///
+/// The arena owns its representation — typed slices via the blanket impl,
+/// raw little-endian file bytes for reloaded storage — and scores a typed
+/// query against a stored vector with the kernel matching that
+/// representation. The [`Metric`] is a parameter: an arena never holds one.
+pub trait VectorArena {
+    /// Element type of the vectors; queries are `&[Elem]`.
+    type Elem: VectorElement;
+
+    /// The number of vectors held, at `dim` elements each.
+    fn num_vectors(&self, dim: usize) -> usize;
+
+    /// Similarity of `query` to vector `node` (higher is better).
+    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[Self::Elem]) -> f32;
+}
+
+/// Any `[T]`-shaped storage (`&[T]`, `Vec<T>`, …), scored with the typed kernels.
+impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
+    type Elem = T;
+
+    #[inline]
+    fn num_vectors(&self, dim: usize) -> usize {
+        assert_eq!(self.len() % dim, 0, "arena not a multiple of dim");
+        self.len() / dim
+    }
+
+    #[inline]
+    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> f32 {
+        metric.similarity(query, &self[node as usize * dim..][..dim])
     }
 }
