@@ -418,6 +418,50 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
 }
 
 #[test]
+fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
+    use crate::directory::CompositeFile;
+    use crate::index::SegmentComponent;
+    use crate::vector::graph::EMPTY;
+    use crate::vector::ivf::CENTROIDS_EXT;
+    use crate::vector::NeighborhoodGraphConfig;
+
+    let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Ivf)
+        .centroids(&centroids)
+        .build()?;
+    let searcher = index.index.reader()?.searcher();
+    assert!(!searcher.segment_readers().is_empty());
+
+    for segment_reader in searcher.segment_readers() {
+        let centroids_file =
+            segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
+        let composite = CompositeFile::open(&centroids_file)?;
+        let graph_bytes = composite
+            .open_read_with_idx(index.embedding_field(), 2)
+            .expect("IVF merge should write the centroid graph slot")
+            .read_bytes()?;
+
+        let words: Vec<u32> = graph_bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("u32 word")))
+            .collect();
+        assert_eq!(words.len() * 4, graph_bytes.len(), "whole number of u32s");
+        let max_edges = words[0] as usize;
+        assert_eq!(max_edges, NeighborhoodGraphConfig::default().max_edges);
+        let adjacency = &words[1..];
+        assert_eq!(adjacency.len(), centroids.len() * max_edges);
+        // Two distinct centroids prune to each other's single neighbor; the
+        // rest of each run is EMPTY padding.
+        assert_eq!(adjacency[0], 1);
+        assert!(adjacency[1..max_edges].iter().all(|&id| id == EMPTY));
+        assert_eq!(adjacency[max_edges], 0);
+        assert!(adjacency[max_edges + 1..].iter().all(|&id| id == EMPTY));
+    }
+    Ok(())
+}
+
+#[test]
 fn ground_truth_orders_by_metric() -> crate::Result<()> {
     let index = TestVectorIndex::builder(VectorDType::F32)
         .metric(Metric::L2)

@@ -1,16 +1,21 @@
 //! The `.centroids` file: IVF cluster routing, written per field.
 //!
-//! Present only for IVF segments (⟺ the field's `.vec` `IdMap` is `Explicit`).
-//! A [`CompositeFile`](crate::directory::CompositeFile) with two slots per
+//! Present only for IVF segments (⟺   the field's `.vec` `IdMap` is `Explicit`).
+//! A [`CompositeFile`](crate::directory::CompositeFile) with three slots per
 //! field:
 //!
 //! ```text
 //! [0] num_centroids (u32) + centroid_bytes (N · stride)
 //! [1] cluster_offsets (u64[N+1], prefix sum)
+//! [2] RNG over the centroids (see `Graph::serialize` for the layout)
 //! ```
 //!
-//! One dense `centroid_id = 0..N` indexes both: `cluster_offsets[c]` is the
-//! first row of cluster `c` in the parallel `.vec` rows/`IdMap`.
+//! One dense `centroid_id = 0..N` indexes all three: `cluster_offsets[c]` is
+//! the first row of cluster `c` in the parallel `.vec` rows/`IdMap`, and graph
+//! node `c` is centroid `c` (its vector is row `c` of slot `[0]`, which is why
+//! the graph slot stores no vectors of its own). Slot `[2]` is optional —
+//! absent for degenerate centroid counts, where routing falls back to a linear
+//! scan of the centroids.
 
 use std::io::{self, Write};
 use std::mem;

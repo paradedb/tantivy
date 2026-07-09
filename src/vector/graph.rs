@@ -4,7 +4,9 @@
 //! graph built on top of it in the sibling `index` module — and carries no edge
 //! semantics of its own beyond "node `i`'s nearest neighbors, in order".
 //!
-//! - Node ids are dense indices straight into the backing arrays.
+//! - Node ids are dense indices straight into the backing arrays. The node set
+//!   is fixed at construction: the arena's length determines the node count,
+//!   and every node starts with no edges.
 //! - Adjacency is one flat array: node `i` owns the contiguous, nearest-first,
 //!   [`EMPTY`]-padded run `neighbors[i * max_edges ..][.. max_edges]`.
 //! - Edges store only ids. Distances drive bounded top-*k* insertion at build
@@ -13,11 +15,19 @@
 //!   ([`Graph::for_reload`]) carries no distance buffer and is filled in stored
 //!   order via [`Graph::push_edge`].
 //!
-//! `Graph<T>` owns its vectors in one flat, `dim`-strided arena — node `i`'s
-//! vector is `vectors[i * dim ..][.. dim]`, contiguous and prefetchable rather
-//! than a heap-scattered allocation per node. [`payload`](Graph::payload) hands
-//! back that `&[T]` slice; the graph has no notion of a metric and never
-//! computes a distance itself.
+//! `Graph<S>` never owns vector data of its own: `S` is any [`VectorArena`] —
+//! a flat, `dim`-strided arena where node `i`'s vector is
+//! `vectors[i * dim ..][.. dim]`. A build borrows the clusterer's matrix
+//! (`S = &[f32]`); a reload can wrap owned or file-resident storage. Scoring
+//! goes through [`VectorArena::similarity`]; the graph itself has no notion
+//! of a metric and never computes a distance.
+
+use std::io::{self, Write};
+use std::ops::Deref;
+
+use common::BinarySerializable;
+
+use super::VectorArena;
 
 /// A dense node identifier, indexing straight into the backing arrays.
 pub type NodeId = u32;
@@ -26,17 +36,17 @@ pub type NodeId = u32;
 pub const EMPTY: NodeId = NodeId::MAX;
 
 /// A single-threaded *k*-nearest-neighbor graph over `dim`-dimensional vectors
-/// of element type `T`.
+/// stored in the arena `S` (any [`VectorArena`], typed or byte-backed).
 ///
 /// See the [module docs](self) for the layout and design rationale.
-pub struct Graph<T> {
+pub struct Graph<S> {
     /// Maximum out-degree per node (the *k* in *k*-NN).
     max_edges: usize,
     /// Vector dimensionality; the stride of the `vectors` arena.
     dim: usize,
     /// Flat vector arena: node `i`'s vector is `vectors[i * dim ..][.. dim]`.
-    /// One allocation, contiguous, indexed by node id.
-    vectors: Vec<T>,
+    /// One contiguous buffer, indexed by node id, borrowed or owned via `S`.
+    vectors: S,
     /// Flat adjacency: node `i` owns `neighbors[i * max_edges ..][.. max_edges]`,
     /// sorted nearest-first and [`EMPTY`]-padded. The durable search structure.
     neighbors: Vec<NodeId>,
@@ -45,53 +55,45 @@ pub struct Graph<T> {
     dists: Vec<f32>,
 }
 
-impl<T> Graph<T> {
-    /// Creates an empty graph with room for `capacity` nodes of `dim`-dimensional
-    /// vectors and up to `max_edges` neighbors each. The flat edge arrays are
-    /// allocated once here, so `capacity` is a hard cap: adding more than
-    /// `capacity` nodes panics.
-    pub fn new(capacity: usize, dim: usize, max_edges: usize) -> Self {
-        assert!(max_edges > 0, "max_edges must be non-zero");
-        assert!(dim > 0, "dim must be non-zero");
+impl<S: VectorArena> Graph<S> {
+    /// Creates a build graph over `vectors`, a flat `dim`-strided arena whose
+    /// length fixes the node count. Every node starts with no edges; the flat
+    /// edge arrays are allocated here, once. Panics if `vectors` is not a
+    /// multiple of `dim` long.
+    pub fn new(vectors: S, dim: usize, max_edges: usize) -> Self {
+        let n = Self::node_count(&vectors, dim, max_edges);
         Graph {
             max_edges,
             dim,
-            vectors: Vec::with_capacity(capacity * dim),
-            neighbors: vec![EMPTY; capacity * max_edges],
-            dists: vec![f32::INFINITY; capacity * max_edges],
+            vectors,
+            neighbors: vec![EMPTY; n * max_edges],
+            dists: vec![f32::INFINITY; n * max_edges],
         }
     }
 
-    /// Creates a graph for reconstruction from disk: same capacity as
+    /// Creates a graph for reconstruction from disk: same shape as
     /// [`new`](Graph::new) but with no distance buffer. Edges are filled in their
     /// stored, nearest-first order via [`push_edge`](Graph::push_edge);
     /// [`add_edge`](Graph::add_edge) must not be used.
-    pub fn for_reload(capacity: usize, dim: usize, max_edges: usize) -> Self {
-        assert!(max_edges > 0, "max_edges must be non-zero");
-        assert!(dim > 0, "dim must be non-zero");
+    pub fn for_reload(vectors: S, dim: usize, max_edges: usize) -> Self {
+        let n = Self::node_count(&vectors, dim, max_edges);
         Graph {
             max_edges,
             dim,
-            vectors: Vec::with_capacity(capacity * dim),
-            neighbors: vec![EMPTY; capacity * max_edges],
+            vectors,
+            neighbors: vec![EMPTY; n * max_edges],
             dists: Vec::new(),
         }
     }
 
-    /// Copies `vector` in as a new node and returns its id. The node starts with
-    /// no edges. Panics if `vector.len() != dim` or the graph is at `capacity`.
-    pub fn add_node(&mut self, vector: &[T]) -> NodeId
-    where
-        T: Clone,
-    {
-        assert_eq!(vector.len(), self.dim, "vector dimension mismatch");
-        let id = self.len() as NodeId;
-        assert!(
-            (id as usize + 1) * self.max_edges <= self.neighbors.len(),
-            "graph is at capacity"
-        );
-        self.vectors.extend_from_slice(vector);
-        id
+    /// Validates the constructor arguments and derives the node count.
+    fn node_count(vectors: &S, dim: usize, max_edges: usize) -> usize {
+        assert!(max_edges > 0, "max_edges must be non-zero");
+        assert!(dim > 0, "dim must be non-zero");
+        let n = vectors.num_vectors(dim);
+        // Ids must stay below the EMPTY sentinel (NodeId::MAX).
+        assert!(n < NodeId::MAX as usize, "arena exceeds NodeId space");
+        n
     }
 
     /// Considers the directed edge `from -> to`, keeping it only if `from` has a
@@ -138,7 +140,6 @@ impl<T> Graph<T> {
         self.neighbors
             .chunks_mut(k)
             .zip(self.dists.chunks_mut(k))
-            .take(self.vectors.len() / self.dim)
             .enumerate()
             .map(|(node, (neighbors, dists))| EdgeListMut {
                 node: node as NodeId,
@@ -174,13 +175,6 @@ impl<T> Graph<T> {
         run[neighbors.len()..].fill(EMPTY);
     }
 
-    /// Borrows `node`'s vector — a contiguous `dim`-length slice of the arena.
-    #[inline]
-    pub fn payload(&self, node: NodeId) -> &[T] {
-        let start = node as usize * self.dim;
-        &self.vectors[start..start + self.dim]
-    }
-
     /// The number of neighbors currently recorded for `node`.
     #[inline]
     pub fn degree(&self, node: NodeId) -> usize {
@@ -201,13 +195,13 @@ impl<T> Graph<T> {
     /// The number of nodes in the graph.
     #[inline]
     pub fn len(&self) -> usize {
-        self.vectors.len() / self.dim
+        self.vectors.num_vectors(self.dim)
     }
 
     /// Whether the graph has no nodes.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
+        self.len() == 0
     }
 
     /// The vector dimensionality.
@@ -222,6 +216,47 @@ impl<T> Graph<T> {
         self.max_edges
     }
 
+    /// Writes the durable part of the graph — `max_edges`, then the flat
+    /// adjacency exactly as held in memory — as little-endian `u32`s:
+    ///
+    /// ```text
+    /// max_edges (u32) + neighbors (u32[len · max_edges], nearest-first,
+    ///                              EMPTY-padded runs of max_edges per node)
+    /// ```
+    ///
+    /// Neither the vectors nor the node count are written: the arena is
+    /// persisted (and the count derived) elsewhere, and a reload wraps it via
+    /// [`for_reload`](Graph::for_reload). Distances aren't durable at all —
+    /// see the [module docs](self).
+    pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+        let max_edges = u32::try_from(self.max_edges)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "max_edges exceeds u32"))?;
+        max_edges.serialize(out)?;
+        for &neighbor in &self.neighbors {
+            neighbor.serialize(out)?;
+        }
+        Ok(())
+    }
+
+    /// Borrows the arena storage. For `Copy` storage like `&[T]`, dereferencing
+    /// the borrow yields a reference with the *arena's* lifetime, so the TPT
+    /// build can read vectors while mutating edge lists.
+    #[inline]
+    pub fn arena(&self) -> &S {
+        &self.vectors
+    }
+}
+
+/// Typed-arena views: only `[T]`-shaped storage can hand out `&[T]` borrows
+/// (file bytes have no alignment guarantee).
+impl<T, S: Deref<Target = [T]>> Graph<S> {
+    /// Borrows `node`'s vector — a contiguous `dim`-length slice of the arena.
+    #[inline]
+    pub fn payload(&self, node: NodeId) -> &[T] {
+        let start = node as usize * self.dim;
+        &self.vectors[start..start + self.dim]
+    }
+
     /// Iterates every node's vector in id order — node `0`, then `1`, and so on.
     /// Each item is that node's contiguous `dim`-length slice of the arena; pair
     /// with [`Iterator::enumerate`] to recover the [`NodeId`]. This is the build
@@ -232,7 +267,7 @@ impl<T> Graph<T> {
     }
 }
 
-impl<'a, T> IntoIterator for &'a Graph<T> {
+impl<'a, T: 'a, S: Deref<Target = [T]>> IntoIterator for &'a Graph<S> {
     type Item = &'a [T];
     type IntoIter = std::slice::ChunksExact<'a, T>;
 
@@ -303,12 +338,8 @@ mod tests {
 
     /// Builds a graph of `n` 1-dimensional nodes (vector = `[id]`), for terse
     /// edge tests that only care about topology.
-    fn graph_with_nodes(n: NodeId, max_edges: usize) -> Graph<f32> {
-        let mut g = Graph::new(n as usize, 1, max_edges);
-        for i in 0..n {
-            assert_eq!(g.add_node(&[i as f32]), i);
-        }
-        g
+    fn graph_with_nodes(n: NodeId, max_edges: usize) -> Graph<Vec<f32>> {
+        Graph::new((0..n).map(|i| i as f32).collect(), 1, max_edges)
     }
 
     #[test]
@@ -336,16 +367,38 @@ mod tests {
     }
 
     #[test]
-    fn add_node_returns_dense_ids_and_vectors() {
-        let mut g: Graph<f32> = Graph::new(4, 2, 8);
-        assert!(g.is_empty());
-        assert_eq!(g.add_node(&[1.0, 2.0]), 0);
-        assert_eq!(g.add_node(&[3.0, 4.0]), 1);
+    fn new_derives_nodes_from_the_arena() {
+        let g: Graph<Vec<f32>> = Graph::new(vec![1.0, 2.0, 3.0, 4.0], 2, 8);
         assert_eq!(g.len(), 2);
+        assert!(!g.is_empty());
         assert_eq!(g.payload(0), &[1.0, 2.0]);
         assert_eq!(g.payload(1), &[3.0, 4.0]);
         assert_eq!(g.degree(0), 0);
         assert!(g.neighbors(0).is_empty());
+
+        let empty: Graph<Vec<f32>> = Graph::new(Vec::new(), 2, 8);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn borrowed_storage_leaves_the_arena_with_the_caller() {
+        // The merge-time shape: the graph borrows the caller's matrix, and
+        // `arena` hands back a reference independent of the graph borrow — so
+        // the vectors stay readable while edge lists are mutated, which is
+        // exactly what the TPT build needs.
+        let matrix: Vec<f32> = vec![0.0, 1.0, 2.0];
+        let mut g: Graph<&[f32]> = Graph::new(&matrix, 1, 2);
+        let vectors = *g.arena();
+        g.add_edge(0, 1, 1.0); // mutate while `vectors` is still borrowed
+        assert_eq!(vectors, matrix.as_slice());
+        assert_eq!(g.neighbors(0), &[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "arena not a multiple of dim")]
+    fn new_rejects_a_misaligned_arena() {
+        let _ = Graph::new(vec![1.0f32, 2.0, 3.0], 2, 4);
     }
 
     #[test]
@@ -397,10 +450,7 @@ mod tests {
 
     #[test]
     fn iter_yields_vectors_in_node_order() {
-        let mut g: Graph<f32> = Graph::new(3, 2, 4);
-        g.add_node(&[1.0, 2.0]);
-        g.add_node(&[3.0, 4.0]);
-        g.add_node(&[5.0, 6.0]);
+        let g: Graph<Vec<f32>> = Graph::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 4);
 
         let collected: Vec<&[f32]> = g.iter().collect();
         assert_eq!(collected.len(), 3);
@@ -416,10 +466,8 @@ mod tests {
 
     #[test]
     fn for_reload_pushes_edges_in_stored_order() {
-        let mut g: Graph<f32> = Graph::for_reload(4, 1, 4);
-        for i in 0..4 {
-            g.add_node(&[i as f32]);
-        }
+        let arena: Vec<f32> = (0..4).map(|i| i as f32).collect();
+        let mut g = Graph::for_reload(arena, 1, 4);
         // Edges arrive already nearest-first; push them blindly, no distances.
         g.push_edge(0, 1);
         g.push_edge(0, 2);
@@ -451,5 +499,57 @@ mod tests {
     fn set_neighbors_rejects_more_than_max_edges() {
         let mut g = graph_with_nodes(4, 2);
         g.set_neighbors(0, &[1, 2, 3]); // 3 > max_edges 2
+    }
+
+    /// Decodes a serialized graph back into (max_edges, neighbors) u32s.
+    fn decode(bytes: &[u8]) -> (u32, Vec<NodeId>) {
+        assert_eq!(bytes.len() % 4, 0, "serialization is a whole number of u32s");
+        let mut words = bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()));
+        let max_edges = words.next().expect("missing max_edges header");
+        (max_edges, words.collect())
+    }
+
+    #[test]
+    fn serialize_writes_max_edges_then_padded_adjacency() {
+        let mut g = graph_with_nodes(3, 2);
+        g.add_edge(0, 2, 0.9);
+        g.add_edge(0, 1, 0.2); // closer: sorts ahead of 2
+        g.add_edge(1, 0, 0.2);
+        // node 2 keeps an all-EMPTY run
+
+        let mut bytes = Vec::new();
+        g.serialize(&mut bytes).unwrap();
+
+        let (max_edges, neighbors) = decode(&bytes);
+        assert_eq!(max_edges, 2);
+        assert_eq!(neighbors, vec![1, 2, 0, EMPTY, EMPTY, EMPTY]);
+    }
+
+    #[test]
+    fn reloaded_graph_serializes_byte_identically() {
+        // The durable invariant behind slot reuse across merges: serialize →
+        // reload (push edges in stored order) → serialize must be a fixed
+        // point, so nothing drifts however many times a graph round-trips.
+        let mut built = graph_with_nodes(4, 3);
+        built.add_edge(0, 1, 0.1);
+        built.add_edge(0, 3, 0.4);
+        built.add_edge(2, 0, 0.2);
+
+        let mut bytes = Vec::new();
+        built.serialize(&mut bytes).unwrap();
+
+        let arena: Vec<f32> = (0..4).map(|i| i as f32).collect();
+        let mut reloaded = Graph::for_reload(arena, 1, built.max_edges());
+        for node in 0..built.len() as NodeId {
+            for &to in built.neighbors(node) {
+                reloaded.push_edge(node, to);
+            }
+        }
+
+        let mut reloaded_bytes = Vec::new();
+        reloaded.serialize(&mut reloaded_bytes).unwrap();
+        assert_eq!(bytes, reloaded_bytes);
     }
 }
