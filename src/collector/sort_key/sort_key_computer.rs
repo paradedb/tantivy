@@ -178,9 +178,10 @@ pub trait SortKeyComputer: Sync {
     ) -> crate::Result<()> {
         let with_scoring = self.requires_scoring();
 
-        if !segment_collector
-            .segment_sort_key_computer
-            .supports_bm25_pruning()
+        if !with_scoring
+            || !segment_collector
+                .segment_sort_key_computer
+                .supports_bm25_pruning()
         {
             default_collect_segment_impl(segment_collector, weight, reader, with_scoring)?;
             return Ok(());

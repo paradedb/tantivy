@@ -524,9 +524,14 @@ where
         segment_reader: &crate::SegmentReader,
     ) -> crate::Result<Self::Child> {
         let child = self.0.segment_sort_key_computer(segment_reader)?;
+        let bmw_supported = matches!(
+            self.1,
+            ComparatorEnum::Natural | ComparatorEnum::NaturalNoneHigher
+        );
         Ok(SegmentSortKeyComputerWithComparator {
             segment_sort_key_computer: child,
             comparator: self.comparator(),
+            bmw_supported,
         })
     }
 }
@@ -570,9 +575,11 @@ where
         segment_reader: &crate::SegmentReader,
     ) -> crate::Result<Self::Child> {
         let child = self.0.segment_sort_key_computer(segment_reader)?;
+        let bmw_supported = self.1 == Order::Desc;
         Ok(SegmentSortKeyComputerWithComparator {
             segment_sort_key_computer: child,
             comparator: self.comparator(),
+            bmw_supported,
         })
     }
 }
@@ -581,6 +588,7 @@ where
 pub struct SegmentSortKeyComputerWithComparator<TSegmentSortKeyComputer, TComparator> {
     segment_sort_key_computer: TSegmentSortKeyComputer,
     comparator: TComparator,
+    bmw_supported: bool,
 }
 
 impl<TSegmentSortKeyComputer, TSegmentSortKey, TComparator> SegmentSortKeyComputer
@@ -613,7 +621,7 @@ where
     }
 
     fn supports_bm25_pruning(&self) -> bool {
-        self.segment_sort_key_computer.supports_bm25_pruning()
+        self.bmw_supported && self.segment_sort_key_computer.supports_bm25_pruning()
     }
 
     fn bm25_pruning_threshold(
