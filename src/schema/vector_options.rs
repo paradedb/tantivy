@@ -63,8 +63,8 @@ impl VectorOptions {
     }
 
     /// Whether this field's `(metric, dtype)` requires write-time
-    /// unit-normalization (see `maybe_normalize_bytes` in
-    /// `crate::vector::distance`). Currently only `Cosine + F32`.
+    /// unit-normalization (see `vector::distance::maybe_normalize_bytes`).
+    /// Currently only `Cosine + F32`.
     pub fn needs_normalization(&self) -> bool {
         matches!(
             (self.metric, self.dtype),

@@ -9,7 +9,7 @@ use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{TantivyDocument, Value};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::distance::maybe_normalize_bytes;
+use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::header::write_header;
 use crate::vector::VEC_EXT;
 use crate::{DocId, TantivyError};
@@ -34,13 +34,13 @@ struct FieldBuffer {
 }
 
 impl FieldBuffer {
-    fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) {
+    fn push_bytes(&mut self, doc_id: DocId, bytes: &[u8]) -> NormalizeOutcome {
         let stride = self.opts.bytes_per_vector();
         debug_assert_eq!(bytes.len(), stride);
         self.present_doc_ids.push(doc_id);
         let start = self.row_bytes.len();
         self.row_bytes.extend_from_slice(bytes);
-        maybe_normalize_bytes(&self.opts, &mut self.row_bytes[start..start + stride]);
+        maybe_normalize_bytes(&self.opts, &mut self.row_bytes[start..start + stride])
     }
 
     fn mem_usage(&self) -> usize {
@@ -110,7 +110,17 @@ impl PluginWriter for FlatVecWriter {
                     bytes.len(),
                 )));
             }
-            buf.push_bytes(doc_id, bytes);
+            // NonFinite is a hard ingest error: bad data is rejected at the
+            // boundary so merge and query never have to re-classify it. The
+            // offending row is still in the buffer, but an add_document error
+            // aborts the segment build — it is never serialized.
+            if buf.push_bytes(doc_id, bytes) == NormalizeOutcome::NonFinite {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "non-finite element in vector field '{}' (doc {doc_id}): vectors must contain \
+                     only finite values",
+                    schema.get_field_entry(*field).name(),
+                )));
+            }
         }
         Ok(())
     }

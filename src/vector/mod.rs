@@ -51,6 +51,43 @@ pub use reader::{
 // resolves for callers and tests that work entirely within the vector module.
 pub use crate::schema::{Metric, VectorDType, VectorOptions};
 
+/// Wide accumulator used by the reduction kernels (norms). Element
+/// types choose their accumulator via [`VectorElement::Acc`]; this
+/// trait is the vocabulary a kernel needs to *use* that choice:
+/// make a zero, add, read out as f64 at the fold.
+///
+/// Deliberately a custom trait rather than std bounds: the natural
+/// accumulator for a future quantized element is an integer (e.g.
+/// `u64` for `u8` elements — exact, matches integer-SIMD hardware),
+/// and `Into<f64>` does not exist for `u64` because std reserves
+/// `From`/`Into` for lossless conversions. `to_f64` is explicitly
+/// the lossy read-out at the end of a reduction.
+///
+/// Kept separate from `VectorElement` because these operations never
+/// mention the element type — how to sum two `f64`s is a fact about
+/// `f64` — and because accumulator impls are shared: `f32` and a
+/// future `f16` would both declare `type Acc = f64` and reuse this
+/// one impl.
+pub trait Accumulator: Copy + Send + Sync + 'static {
+    const ZERO: Self;
+    fn add(self, rhs: Self) -> Self;
+    fn to_f64(self) -> f64;
+}
+
+impl Accumulator for f64 {
+    const ZERO: Self = 0.0;
+
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        self + rhs
+    }
+
+    #[inline(always)]
+    fn to_f64(self) -> f64 {
+        self
+    }
+}
+
 /// A vector element type with the primitives needed by the storage
 /// layer and the distance kernels.
 ///
@@ -58,10 +95,18 @@ pub use crate::schema::{Metric, VectorDType, VectorOptions};
 /// `DTYPE` associated constant lets callers reject mismatches between
 /// the declared schema dtype and the type passed at runtime. The
 /// arithmetic methods (`squared_diff`, `product`) return `f32` so that
-/// kernels can use a uniform accumulator type across dtypes.
+/// kernels can use a uniform accumulator type across dtypes; the
+/// reduction kernels (norms) instead accumulate in [`Self::Acc`] via
+/// [`Self::mul_wide`].
 pub trait VectorElement: Copy + Send + Sync + 'static {
     const DTYPE: VectorDType;
     const SIZE_BYTES: usize;
+
+    /// Accumulator for this element's squares in reduction kernels.
+    /// Each element type declares how much headroom it needs: f32 -> f64
+    /// (squaring doubles the exponent, so |v| > ~1.8e19 overflows an f32
+    /// product; f64 makes any sum of finite-f32 squares finite).
+    type Acc: Accumulator;
 
     fn encode_le<W: io::Write + ?Sized>(&self, buf: &mut W) -> io::Result<()>;
 
@@ -76,11 +121,25 @@ pub trait VectorElement: Copy + Send + Sync + 'static {
 
     /// `a * b` promoted to `f32`. Same rationale as `squared_diff`.
     fn product(a: Self, b: Self) -> f32;
+
+    /// Widen-THEN-multiply: the cast happens before the square so the
+    /// product cannot overflow the narrow type. One operation, so the
+    /// ordering invariant is unforgettable per element type.
+    fn mul_wide(a: Self, b: Self) -> Self::Acc;
+
+    /// Lossless widening to `f32`.
+    fn to_f32(self) -> f32;
+
+    /// Narrowing from `f32`; used at normalization write-back where
+    /// values are already `<= 1`.
+    fn from_f32(v: f32) -> Self;
 }
 
 impl VectorElement for f32 {
     const DTYPE: VectorDType = VectorDType::F32;
     const SIZE_BYTES: usize = 4;
+
+    type Acc = f64;
 
     #[inline(always)]
     fn encode_le<W: io::Write + ?Sized>(&self, buf: &mut W) -> io::Result<()> {
@@ -101,6 +160,21 @@ impl VectorElement for f32 {
     #[inline(always)]
     fn product(a: Self, b: Self) -> f32 {
         a * b
+    }
+
+    #[inline(always)]
+    fn mul_wide(a: Self, b: Self) -> f64 {
+        (a as f64) * (b as f64)
+    }
+
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        self
+    }
+
+    #[inline(always)]
+    fn from_f32(v: f32) -> Self {
+        v
     }
 }
 

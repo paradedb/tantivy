@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use super::distance::{dot_bytes, l2_squared_bytes, norm_squared};
+use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
 use super::VectorElement;
 use crate::schema::Metric;
 
@@ -44,11 +44,14 @@ impl<T: VectorElement> PreparedQuery<T> {
             Metric::L2 => QueryKind::L2,
             Metric::Dot => QueryKind::Dot,
             Metric::Cosine => {
-                let nq = norm_squared::<T>(&query).sqrt();
+                // Wide accumulation, so a huge-but-finite query norm stays
+                // finite. The degenerate guard remains load-bearing: queries
+                // are user input at search time, not ingest-validated.
+                let nq = norm_squared_wide::<T>(&query).sqrt();
                 let inv_norm_q = if nq == 0.0 || !nq.is_finite() {
                     0.0
                 } else {
-                    1.0 / nq
+                    (1.0 / nq) as f32
                 };
                 QueryKind::Cosine { inv_norm_q }
             }

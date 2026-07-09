@@ -483,6 +483,73 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
     Ok(())
 }
 
+/// Non-finite elements are rejected at ingest on normalizing fields
+/// (Cosine+F32) and accepted on non-normalizing ones (L2) — validation
+/// rides the normalize path only. `IndexWriter::add_document` enqueues
+/// to a worker, so the rejection may surface either from the enqueue or
+/// from the following `commit`.
+#[test]
+fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        // L2: same vector is accepted; nothing normalizes, data is stored raw.
+        let mut schema_builder = Schema::builder();
+        let l2_field = schema_builder.add_vector_field("l2", VectorOptions::new(2, Metric::L2));
+        let schema = schema_builder.build();
+        let index = Index::builder().schema(schema).create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(l2_field, &[bad, 1.0]);
+        writer.add_document(doc)?;
+        writer.commit()?;
+
+        // Cosine: rejected.
+        let mut schema_builder = Schema::builder();
+        let cos_field =
+            schema_builder.add_vector_field("cos", VectorOptions::new(2, Metric::Cosine));
+        let schema = schema_builder.build();
+        let index = Index::builder().schema(schema).create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(cos_field, &[bad, 1.0]);
+        let err = match writer.add_document(doc) {
+            Err(err) => err.to_string(),
+            Ok(_) => writer
+                .commit()
+                .expect_err("non-finite vector must fail ingest")
+                .to_string(),
+        };
+        assert!(err.contains("non-finite"), "bad={bad}, err={err}");
+    }
+    Ok(())
+}
+
+/// A zero vector is honest data: ingest accepts it (`ZeroSkipped`), and
+/// at query time it scores exactly 0.0 — behind any non-zero doc.
+#[test]
+fn ingest_accepts_zero_vector() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let embedding_field =
+        schema_builder.add_vector_field("embedding", VectorOptions::new(2, Metric::Cosine));
+    let schema = schema_builder.build();
+    let index = Index::builder().schema(schema).create_in_ram()?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut zero_doc = TantivyDocument::new();
+    zero_doc.add_vector(embedding_field, &[0.0_f32, 0.0]);
+    writer.add_document(zero_doc)?;
+    let mut unit_doc = TantivyDocument::new();
+    unit_doc.add_vector(embedding_field, &[0.6_f32, 0.8]);
+    writer.add_document(unit_doc)?;
+    writer.commit()?;
+
+    let searcher = index.reader()?.searcher();
+    let collector = TopDocs::with_limit(2).order_by_similarity(embedding_field, vec![1.0_f32, 0.0]);
+    let hits = searcher.search(&AllQuery, &collector)?;
+    assert_eq!(hits.len(), 2, "zero vector must be ingested and returned");
+    assert!(hits[0].0 > 0.0, "non-zero doc must rank first: {hits:?}");
+    assert_eq!(hits[1].0, 0.0, "zero vector scores 0.0: {hits:?}");
+    Ok(())
+}
+
 /// Wide-epsilon + 100% fanout probe params: every probe gate stays
 /// open, so the IVF backend visits every cluster. Used by
 /// oracle-equality tests where any kind of pruning would make the

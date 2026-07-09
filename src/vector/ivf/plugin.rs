@@ -19,7 +19,7 @@ use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::{FieldType, Metric, VectorDType};
-use crate::vector::distance::{cosine, l2_squared, maybe_normalize_bytes};
+use crate::vector::distance::{cosine, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
 use crate::vector::reader::{VectorColumnReader, VectorReader};
@@ -530,10 +530,26 @@ pub(crate) fn merge_ivf(
                         // ingest-time normalization existed. Idempotent. L2/Dot
                         // don't normalize and write the source bytes directly;
                         // Cosine+F32 copies into one buffer reused across rows.
+                        //
+                        // Ingest rejects non-finite vectors, so NonFinite here
+                        // is a should-never-happen path: erroring would wedge
+                        // merge retries forever on one poison doc, and dropping
+                        // the row would desync the already-computed assignments
+                        // and IdMap. Warn-and-write-as-is is visible,
+                        // self-limiting, and non-desyncing.
                         if needs_norm {
                             row_buf.clear();
                             row_buf.extend_from_slice(bytes);
-                            maybe_normalize_bytes(opts, &mut row_buf);
+                            if maybe_normalize_bytes(opts, &mut row_buf)
+                                == NormalizeOutcome::NonFinite
+                            {
+                                log::warn!(
+                                    "non-finite vector in field '{}' (doc {}) written \
+                                     un-normalized during merge",
+                                    entry.name(),
+                                    assigned_vector.target_doc_id,
+                                );
+                            }
                             rows_w.write_all(&row_buf)?;
                         } else {
                             rows_w.write_all(bytes)?;
@@ -550,9 +566,18 @@ pub(crate) fn merge_ivf(
                 // same `dot * inv_norm_q` fast kernel.
                 let mut centroid_bytes =
                     Vec::with_capacity(num_centroids * opts.bytes_per_vector());
-                for centroid in &centroid_rows {
+                for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
                     let mut bytes = encode_vector(centroid, opts.dim())?;
-                    maybe_normalize_bytes(opts, &mut bytes);
+                    // Centroids are means of ingest-validated rows, so
+                    // NonFinite is should-never-happen; same warn-and-write
+                    // policy as the posting rows above.
+                    if maybe_normalize_bytes(opts, &mut bytes) == NormalizeOutcome::NonFinite {
+                        log::warn!(
+                            "non-finite centroid {centroid_ord} in field '{}' written \
+                             un-normalized during merge",
+                            entry.name(),
+                        );
+                    }
                     centroid_bytes.extend_from_slice(&bytes);
                 }
                 {

@@ -14,8 +14,8 @@
 //! methods compile to plain `fsub` / `fmul` / `fadd`; quantized dtypes
 //! plug in their own decode + arithmetic via the trait.
 
-use crate::schema::{Metric, VectorOptions};
-use crate::vector::VectorElement;
+use crate::schema::{Metric, VectorDType, VectorOptions};
+use crate::vector::{Accumulator, VectorElement};
 
 /// 16 = 512 (avx512 register width) / 32 (sizeof::<f32>() in bits).
 const LANES: usize = 16;
@@ -67,20 +67,32 @@ pub fn dot<T: VectorElement>(a: &[T], b: &[T]) -> f32 {
 /// Sum of squares (squared L2 norm).
 #[inline]
 pub fn norm_squared<T: VectorElement>(a: &[T]) -> f32 {
+    norm_squared_wide(a) as f32
+}
+
+/// `norm_squared` with wide per-lane accumulation: elements widen to
+/// [`VectorElement::Acc`] *before* squaring ([`VectorElement::mul_wide`]),
+/// so no finite input can overflow the narrow element type — for f32,
+/// any sum of finite squares is finite in f64.
+#[inline]
+pub(crate) fn norm_squared_wide<T: VectorElement>(a: &[T]) -> f64 {
     let chunks = a.chunks_exact(LANES);
     let tail = chunks.remainder();
 
-    let mut sums = [0f32; LANES];
+    let mut sums = [T::Acc::ZERO; LANES];
     for c in chunks {
         for i in 0..LANES {
-            sums[i] += T::product(c[i], c[i]);
+            sums[i] = sums[i].add(T::mul_wide(c[i], c[i]));
         }
     }
-    let mut acc: f32 = sums.iter().sum();
-    for &x in tail {
-        acc += T::product(x, x);
+    let mut acc = T::Acc::ZERO;
+    for s in sums {
+        acc = acc.add(s);
     }
-    acc
+    for &x in tail {
+        acc = acc.add(T::mul_wide(x, x));
+    }
+    acc.to_f64()
 }
 
 /// Cosine similarity: `dot(a, b) / (||a|| * ||b||)`. Returns 0.0 if either
@@ -157,41 +169,71 @@ pub fn dot_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {
 /// `norm_squared` over little-endian bytes encoding `T`.
 #[inline]
 pub fn norm_squared_bytes<T: VectorElement>(doc_bytes: &[u8]) -> f32 {
+    norm_squared_bytes_wide::<T>(doc_bytes) as f32
+}
+
+/// [`norm_squared_wide`] over little-endian bytes encoding `T`.
+#[inline]
+pub(crate) fn norm_squared_bytes_wide<T: VectorElement>(doc_bytes: &[u8]) -> f64 {
     debug_assert_eq!(doc_bytes.len() % T::SIZE_BYTES, 0);
     let b_chunks = doc_bytes.chunks_exact(LANES * T::SIZE_BYTES);
     let b_tail = b_chunks.remainder();
 
-    let mut sums = [0f32; LANES];
+    let mut sums = [T::Acc::ZERO; LANES];
     for bc in b_chunks {
         for i in 0..LANES {
             let v = T::decode_le(&bc[i * T::SIZE_BYTES..(i + 1) * T::SIZE_BYTES]);
-            sums[i] += T::product(v, v);
+            sums[i] = sums[i].add(T::mul_wide(v, v));
         }
     }
-    let mut acc: f32 = sums.iter().sum();
+    let mut acc = T::Acc::ZERO;
+    for s in sums {
+        acc = acc.add(s);
+    }
     let tail_dim = b_tail.len() / T::SIZE_BYTES;
     for i in 0..tail_dim {
         let v = T::decode_le(&b_tail[i * T::SIZE_BYTES..(i + 1) * T::SIZE_BYTES]);
-        acc += T::product(v, v);
+        acc = acc.add(T::mul_wide(v, v));
     }
-    acc
+    acc.to_f64()
 }
 
-/// L2-normalize a little-endian f32 row in place. No-op (row left
-/// unchanged) when the norm is zero or non-finite, so a degenerate
-/// row can never become NaN. Reuses `norm_squared_bytes` for the
-/// reduction pass.
-pub(crate) fn normalize_f32_bytes_inplace(row: &mut [u8]) {
-    debug_assert_eq!(row.len() % 4, 0);
-    let norm = norm_squared_bytes::<f32>(row).sqrt();
-    if norm == 0.0 || !norm.is_finite() {
-        return;
+/// Outcome of an in-place normalization attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NormalizeOutcome {
+    /// Row rescaled to unit norm.
+    Normalized,
+    /// Zero vector: normalization is undefined but the data is honest;
+    /// row left unchanged. `dot(q, 0) = 0`, so it scores 0 everywhere.
+    ZeroSkipped,
+    /// With wide accumulation, a non-finite norm occurs IF AND ONLY IF
+    /// the input contains a NaN or ±inf element (finite f32 elements
+    /// sum to at most ~1.8e80, always finite in f64). Row left
+    /// unchanged; the caller decides policy.
+    NonFinite,
+}
+
+/// L2-normalize a little-endian `T` row in place, with all internal
+/// arithmetic in f64 (see [`norm_squared_bytes_wide`]). Elements narrow
+/// back to `T` only at write-back, where every value is `<= 1`.
+pub(crate) fn normalize_bytes_inplace<T: VectorElement>(row: &mut [u8]) -> NormalizeOutcome {
+    debug_assert_eq!(row.len() % T::SIZE_BYTES, 0);
+    let norm = norm_squared_bytes_wide::<T>(row).sqrt();
+    if norm == 0.0 {
+        return NormalizeOutcome::ZeroSkipped;
+    }
+    if !norm.is_finite() {
+        return NormalizeOutcome::NonFinite;
     }
     let inv = 1.0 / norm;
-    for chunk in row.chunks_exact_mut(4) {
-        let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) * inv;
-        chunk.copy_from_slice(&v.to_le_bytes());
+    for chunk in row.chunks_exact_mut(T::SIZE_BYTES) {
+        let scaled = (T::decode_le(chunk).to_f32() as f64 * inv) as f32;
+        let mut sink: &mut [u8] = chunk;
+        T::from_f32(scaled)
+            .encode_le(&mut sink)
+            .expect("row chunk is exactly element-sized");
     }
+    NormalizeOutcome::Normalized
 }
 
 /// L2-normalize `row` in place if `opts` requires write-time
@@ -201,11 +243,14 @@ pub(crate) fn normalize_f32_bytes_inplace(row: &mut [u8]) {
 /// [`PreparedQuery::score_doc_bytes`](crate::vector::PreparedQuery::score_doc_bytes)
 /// reduce per-doc cosine work to `dot * inv_norm_q` — no per-doc
 /// `norm_squared_bytes` pass.
-pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) {
+pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) -> NormalizeOutcome {
     debug_assert_eq!(row.len(), opts.bytes_per_vector());
-    if opts.needs_normalization() {
-        normalize_f32_bytes_inplace(row);
+    if !opts.needs_normalization() {
+        return NormalizeOutcome::Normalized; // no-op metrics count as fine
     }
+    match opts.dtype() {
+        VectorDType::F32 => normalize_bytes_inplace::<f32>(row),
+    } // exhaustive: a new dtype variant must decide its policy here
 }
 
 /// `cosine` where the doc side is little-endian bytes encoding `T`.
@@ -346,7 +391,10 @@ mod tests {
     #[test]
     fn normalize_scales_to_unit_norm() {
         let mut buf = bytes(&[3.0_f32, 0.0, 4.0]);
-        normalize_f32_bytes_inplace(&mut buf);
+        assert_eq!(
+            normalize_bytes_inplace::<f32>(&mut buf),
+            NormalizeOutcome::Normalized
+        );
         let out = floats(&buf);
         let n: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((n - 1.0).abs() < 1e-6, "norm={n}, out={out:?}");
@@ -358,7 +406,10 @@ mod tests {
     #[test]
     fn normalize_zero_vector_is_unchanged() {
         let mut buf = bytes(&[0.0_f32, 0.0, 0.0]);
-        normalize_f32_bytes_inplace(&mut buf);
+        assert_eq!(
+            normalize_bytes_inplace::<f32>(&mut buf),
+            NormalizeOutcome::ZeroSkipped
+        );
         assert_eq!(floats(&buf), vec![0.0_f32, 0.0, 0.0]);
     }
 
@@ -366,7 +417,10 @@ mod tests {
     fn normalize_already_unit_is_idempotent() {
         let unit = [1.0_f32 / 2.0_f32.sqrt(), 1.0 / 2.0_f32.sqrt()];
         let mut buf = bytes(&unit);
-        normalize_f32_bytes_inplace(&mut buf);
+        assert_eq!(
+            normalize_bytes_inplace::<f32>(&mut buf),
+            NormalizeOutcome::Normalized
+        );
         let out = floats(&buf);
         for (a, b) in unit.iter().zip(out.iter()) {
             assert!((a - b).abs() < 1e-6, "drift: {a} -> {b}");
@@ -377,7 +431,10 @@ mod tests {
     fn maybe_normalize_routes_only_cosine_f32() {
         let opts = VectorOptions::new(3, Metric::Cosine);
         let mut buf = bytes(&[3.0_f32, 0.0, 4.0]);
-        maybe_normalize_bytes(&opts, &mut buf);
+        assert_eq!(
+            maybe_normalize_bytes(&opts, &mut buf),
+            NormalizeOutcome::Normalized
+        );
         let out = floats(&buf);
         let n: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(
@@ -410,5 +467,93 @@ mod tests {
             input.to_vec(),
             "Dot must not mutate stored rows"
         );
+    }
+
+    #[test]
+    fn wide_accumulation_single_square() {
+        // 1e20² = 1e40 overflows f32 (max ~3.4e38); the old narrow kernel
+        // returned inf and the guard left the row raw.
+        let mut buf = bytes(&[1e20_f32, 1.0]);
+        let n2 = norm_squared_bytes_wide::<f32>(&buf);
+        assert!(n2.is_finite(), "n2={n2}");
+        assert!((n2 - 1e40).abs() / 1e40 < 1e-3, "n2={n2}");
+        assert_eq!(
+            normalize_bytes_inplace::<f32>(&mut buf),
+            NormalizeOutcome::Normalized
+        );
+        let out = floats(&buf);
+        let n: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((n - 1.0).abs() < 1e-3, "norm={n}, out={out:?}");
+        // Direction preserved: dominated by the first component.
+        assert!((out[0] - 1.0).abs() < 1e-3, "out={out:?}");
+        assert!(out[1] >= 0.0, "out={out:?}");
+    }
+
+    #[test]
+    fn wide_accumulation_sum_across_dims() {
+        // Each square (2.5e35) is a finite f32, but 1536 of them sum to
+        // ~3.8e38 > f32::MAX — the old fold overflowed across dimensions.
+        let v = vec![5e17_f32; 1536];
+        let mut buf = bytes(&v);
+        assert!(norm_squared_bytes_wide::<f32>(&buf).is_finite());
+        assert_eq!(
+            normalize_bytes_inplace::<f32>(&mut buf),
+            NormalizeOutcome::Normalized
+        );
+        let out = floats(&buf);
+        let n: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((n - 1.0).abs() < 1e-3, "norm={n}");
+    }
+
+    #[test]
+    fn normalize_extreme_norm_exceeding_f32_max() {
+        // Norm ≈ 5.2e38 exceeds f32::MAX: the f64 inv multiply is load-
+        // bearing all the way to the final narrowing.
+        let mut buf = bytes(&[3e38_f32, 3e38, 3e38]);
+        assert_eq!(
+            normalize_bytes_inplace::<f32>(&mut buf),
+            NormalizeOutcome::Normalized
+        );
+        let out = floats(&buf);
+        let n: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((n - 1.0).abs() < 1e-3, "norm={n}");
+        let expected = 1.0 / 3.0_f32.sqrt();
+        for v in &out {
+            assert!((v - expected).abs() < 1e-3, "out={out:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_classifies_nan_as_non_finite() {
+        let original = bytes(&[1.0_f32, f32::NAN, 2.0]);
+        let mut buf = original.clone();
+        assert_eq!(
+            normalize_bytes_inplace::<f32>(&mut buf),
+            NormalizeOutcome::NonFinite
+        );
+        assert_eq!(buf, original, "row must be left byte-identical");
+    }
+
+    #[test]
+    fn norm_squared_consistency() {
+        // The wide-backed wrappers must agree with plain f32 arithmetic
+        // on ordinary data.
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![3.0, 4.0],
+            vec![0.1; 33],
+            (0..40).map(|i| (i as f32).sin()).collect(),
+            vec![-2.5, 7.25, 0.0, 1e-3],
+        ];
+        for v in vectors {
+            let expected: f32 = v.iter().map(|x| x * x).sum();
+            let typed = norm_squared(&v);
+            let from_bytes = norm_squared_bytes::<f32>(&bytes(&v));
+            for got in [typed, from_bytes] {
+                assert!(
+                    (got - expected).abs() <= expected.abs() * 1e-6,
+                    "got={got}, expected={expected}, v={v:?}"
+                );
+            }
+        }
     }
 }
