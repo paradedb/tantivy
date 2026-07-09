@@ -210,23 +210,12 @@ mod ivf_e2e_tests {
     use crate::query::AllQuery;
     use crate::schema::{Schema, STORED, STRING};
     use crate::vector::ivf::AdaptiveProbeParams;
-    use crate::vector::tests::{ground_truth, Grid2DClusterer, TestVectorIndex};
+    use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{
         Metric, VectorColumn, VectorColumnReader, VectorDType, VectorOptions, VectorReader,
         VectorStorageFormat,
     };
     use crate::{Index, TantivyDocument};
-
-    /// Probe every cluster and use a wide enough epsilon that the
-    /// threshold gate can't trip.
-    fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
-        AdaptiveProbeParams {
-            epsilon: 1e6,
-            min_candidates: 0,
-            min_probe_fanout: 1.0,
-            max_probe_fanout: 1.0,
-        }
-    }
 
     /// IVF + exhaustive probing matches the global oracle. The shared
     /// fixture produces multiple IVF segments (it merges raw segments

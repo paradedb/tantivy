@@ -7,6 +7,7 @@ use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
+use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric, VectorColumn,
     VectorColumnReader, VectorDType, VectorOptions, VectorReader,
@@ -436,6 +437,19 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
     }
 
     Ok(())
+}
+
+/// Wide-epsilon + 100% fanout probe params: every probe gate stays
+/// open, so the IVF backend visits every cluster. Used by
+/// oracle-equality tests where any kind of pruning would make the
+/// equality check fail.
+pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
+    AdaptiveProbeParams {
+        epsilon: 1e6,
+        min_candidates: 0,
+        min_probe_fanout: 1.0,
+        max_probe_fanout: 1.0,
+    }
 }
 
 pub(crate) mod ground_truth {

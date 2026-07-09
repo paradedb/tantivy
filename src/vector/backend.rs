@@ -638,7 +638,7 @@ mod tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
-    use crate::vector::tests::TestVectorIndex;
+    use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
         IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, VectorColumn,
         VectorColumnReader, VectorDType, VectorOptions, VectorReader, VectorStorageFormat,
@@ -650,19 +650,6 @@ mod tests {
     /// 3×3 `grid2d::centroids()` grid). Used by tests that need an
     /// "exhaustive" probe ceiling.
     const DEFAULT_NUM_CENTROIDS: usize = 9;
-
-    /// Wide-epsilon + 100% fanout params: every probe gate
-    /// stays open, so the IVF backend visits every cluster. Used by
-    /// oracle-equality tests where any kind of pruning would make the
-    /// equality check fail.
-    fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
-        AdaptiveProbeParams {
-            epsilon: 1e6,
-            min_candidates: 0,
-            min_probe_fanout: 1.0,
-            max_probe_fanout: 1.0,
-        }
-    }
 
     /// Run the full collector path with the given filter and adaptive
     /// params. Returns the global top-K (already merged across
@@ -837,6 +824,68 @@ mod tests {
         Ok((index, embed_field, label_field))
     }
 
+    /// Decode a stored little-endian `[f32; 2]` row.
+    fn decode_2d(bytes: &[u8]) -> [f32; 2] {
+        [
+            f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        ]
+    }
+
+    /// L2-nearest centroid with first-wins tie-break on strict `<` — the
+    /// same rule `InlineClusterer::assign` uses for the primary.
+    fn nearest_centroid(p: [f32; 2], centroids: &[[f32; 2]]) -> usize {
+        let mut best = 0;
+        let mut best_d2 = f32::INFINITY;
+        for (i, c) in centroids.iter().enumerate() {
+            let dx = p[0] - c[0];
+            let dy = p[1] - c[1];
+            let d2 = dx * dx + dy * dy;
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = i;
+            }
+        }
+        best
+    }
+
+    /// Docs per centroid in the replication fixture.
+    const REPLICATION_N_PER: usize = 6;
+
+    /// Six well-separated centroids (3×2 grid, gap 10) and one label per
+    /// doc. Docs sit tightly around their centroid (offsets ≤ 0.05
+    /// against the grid gap of 10 — see [`replication_docs`]) so the
+    /// primary and the next-nearest replica ranking are unambiguous.
+    fn replication_fixture() -> (Vec<[f32; 2]>, Vec<String>) {
+        let centroids = vec![
+            [0.0f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [20.0, 10.0],
+        ];
+        let labels = (0..centroids.len() * REPLICATION_N_PER)
+            .map(|i| format!("d{i}"))
+            .collect();
+        (centroids, labels)
+    }
+
+    /// The replication fixture's docs: `REPLICATION_N_PER` per centroid,
+    /// at offset `(i % REPLICATION_N_PER) * 0.01` along both axes.
+    fn replication_docs<'a>(
+        centroids: &[[f32; 2]],
+        labels: &'a [String],
+    ) -> Vec<(&'a str, [f32; 2])> {
+        (0..labels.len())
+            .map(|i| {
+                let c = centroids[i / REPLICATION_N_PER];
+                let off = (i % REPLICATION_N_PER) as f32 * 0.01;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect()
+    }
+
     /// Fixed-k replication is additive and, at small centroid counts, EXACT:
     /// the fixture's 6 centroids sit far below the exact-selection threshold
     /// (the search's `ef` budget), so replica cells come from a brute k-NN
@@ -851,55 +900,14 @@ mod tests {
     /// Every assertion here is deterministic — no envelopes, no retries.
     #[test]
     fn ivf_fixed_k_replication_is_additive() -> crate::Result<()> {
-        // Six well-separated centroids (3×2 grid); docs sit tightly around each
-        // (offsets ≤ 0.05 against a grid gap of 10) so the primary and the
-        // next-nearest ranking are unambiguous.
-        let centroids = [
-            [0.0f32, 0.0],
-            [10.0, 0.0],
-            [20.0, 0.0],
-            [0.0, 10.0],
-            [10.0, 10.0],
-            [20.0, 10.0],
-        ];
-        let n_per = 6usize;
-        let labels: Vec<String> = (0..centroids.len() * n_per)
-            .map(|i| format!("d{i}"))
-            .collect();
-        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
-            .map(|i| {
-                let c = centroids[i / n_per];
-                let off = (i % n_per) as f32 * 0.01;
-                (labels[i].as_str(), [c[0] + off, c[1] + off])
-            })
-            .collect();
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
         let n = docs.len();
         let replicas = 3usize;
         assert!(
             centroids.len() >= replicas,
             "fixture needs >= replicas centroids for full fill"
         );
-
-        // L2-nearest centroid with first-wins tie-break — the same rule
-        // `InlineClusterer::assign` uses for the primary.
-        let nearest = |bytes: &[u8]| -> usize {
-            let p = [
-                f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-                f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            ];
-            let mut best = 0;
-            let mut best_d2 = f32::INFINITY;
-            for (i, c) in centroids.iter().enumerate() {
-                let dx = p[0] - c[0];
-                let dy = p[1] - c[1];
-                let d2 = dx * dx + dy * dy;
-                if d2 < best_d2 {
-                    best_d2 = d2;
-                    best = i;
-                }
-            }
-            best
-        };
 
         // A replicated build read back through Ming's cluster iteration:
         // each doc's cluster memberships plus its primary (recomputed from
@@ -932,11 +940,10 @@ mod tests {
             }
             let primaries: Vec<usize> = (0..max_doc)
                 .map(|doc| {
-                    nearest(
-                        column
-                            .vector_bytes_at(doc as u32)
-                            .expect("stored vector bytes"),
-                    )
+                    let bytes = column
+                        .vector_bytes_at(doc as u32)
+                        .expect("stored vector bytes");
+                    nearest_centroid(decode_2d(bytes), &centroids)
                 })
                 .collect();
             Ok(ReplicatedBuild {
@@ -1023,25 +1030,8 @@ mod tests {
     /// invariant holds with zero filter/dead prunes.
     #[test]
     fn ivf_probe_stats_counts_replica_dedup() -> crate::Result<()> {
-        let centroids = [
-            [0.0f32, 0.0],
-            [10.0, 0.0],
-            [20.0, 0.0],
-            [0.0, 10.0],
-            [10.0, 10.0],
-            [20.0, 10.0],
-        ];
-        let n_per = 6usize;
-        let labels: Vec<String> = (0..centroids.len() * n_per)
-            .map(|i| format!("d{i}"))
-            .collect();
-        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
-            .map(|i| {
-                let c = centroids[i / n_per];
-                let off = (i % n_per) as f32 * 0.01;
-                (labels[i].as_str(), [c[0] + off, c[1] + off])
-            })
-            .collect();
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
         let n = docs.len();
         let replicas = 4usize;
         let (index, embed_field, _label) =
@@ -1499,25 +1489,6 @@ mod tests {
             VectorColumn::Ivf(c) => c,
             VectorColumn::Flat(_) => panic!("expected IVF segment for this test"),
         };
-        let nearest = |bytes: &[u8]| {
-            let p = [
-                f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-                f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            ];
-            let mut best = 0;
-            let mut best_d2 = f32::INFINITY;
-            for (i, c) in centroids.iter().enumerate() {
-                let dx = p[0] - c[0];
-                let dy = p[1] - c[1];
-                let d2 = dx * dx + dy * dy;
-                if d2 < best_d2 {
-                    best_d2 = d2;
-                    best = i;
-                }
-            }
-            best
-        };
-
         // Setup assertion (i): b_close is the brute-force top-1, and
         // its vector maps to cluster B (index 1). Mirrors the trap
         // test's `assert_eq!(oracle[0].1, trap_doc)` — this is the
@@ -1533,7 +1504,7 @@ mod tests {
             .vector_bytes_at(oracle_addr.doc_id)
             .expect("oracle vector bytes");
         assert_eq!(
-            nearest(oracle_bytes),
+            nearest_centroid(decode_2d(oracle_bytes), &centroids),
             1,
             "oracle top-1 must live in cluster B — the far cluster the floor has to reach",
         );
@@ -2066,21 +2037,9 @@ mod tests {
     fn nearest_centroid_to(query: &[f32; 2]) -> usize {
         // Match the grid in `crate::vector::tests::grid2d::centroids()`:
         // origin=(0,0), 3×3, gap=3.0, row-major.
-        let mut best = 0;
-        let mut best_d2 = f32::INFINITY;
-        for row in 0..3 {
-            for col in 0..3 {
-                let cx = (col as f32) * 3.0;
-                let cy = (row as f32) * 3.0;
-                let dx = query[0] - cx;
-                let dy = query[1] - cy;
-                let d2 = dx * dx + dy * dy;
-                if d2 < best_d2 {
-                    best = row * 3 + col;
-                    best_d2 = d2;
-                }
-            }
-        }
-        best
+        let centroids: Vec<[f32; 2]> = (0..3)
+            .flat_map(|row| (0..3).map(move |col| [col as f32 * 3.0, row as f32 * 3.0]))
+            .collect();
+        nearest_centroid(*query, &centroids)
     }
 }

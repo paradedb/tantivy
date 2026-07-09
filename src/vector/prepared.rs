@@ -7,7 +7,7 @@
 //!
 //! Stored vectors — including IVF centroids — are unit-normalized at
 //! write time for `Cosine + F32` (see
-//! [`VectorOptions::maybe_normalize_bytes`](crate::schema::VectorOptions::maybe_normalize_bytes)),
+//! [`maybe_normalize_bytes`](super::distance::maybe_normalize_bytes)),
 //! so a single scoring entry point covers both per-doc and centroid
 //! scans.
 //!

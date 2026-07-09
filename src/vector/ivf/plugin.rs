@@ -19,7 +19,7 @@ use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::{FieldType, Metric, VectorDType};
-use crate::vector::distance::{cosine, l2_squared};
+use crate::vector::distance::{cosine, l2_squared, maybe_normalize_bytes};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
 use crate::vector::reader::{VectorColumnReader, VectorReader};
@@ -510,6 +510,8 @@ pub(crate) fn merge_ivf(
                 // `.vec` slot [1]: the cluster-sorted vector rows.
                 {
                     let rows_w = vec_write.for_field_with_idx(field, 1);
+                    let needs_norm = opts.needs_normalization();
+                    let mut row_buf: Vec<u8> = Vec::with_capacity(opts.bytes_per_vector());
                     for assigned_vector in &assigned_vectors {
                         let column = &columns[assigned_vector.source_segment_ord];
                         let bytes = column
@@ -525,11 +527,17 @@ pub(crate) fn merge_ivf(
                         // the way into the cluster rows so the IVF invariant —
                         // the query path scores pre-normalized rows — holds
                         // locally, even for a source segment written before
-                        // ingest-time normalization existed. Idempotent, and a
-                        // no-op for L2/Dot.
-                        let mut row = bytes.to_vec();
-                        opts.maybe_normalize_bytes(&mut row);
-                        rows_w.write_all(&row)?;
+                        // ingest-time normalization existed. Idempotent. L2/Dot
+                        // don't normalize and write the source bytes directly;
+                        // Cosine+F32 copies into one buffer reused across rows.
+                        if needs_norm {
+                            row_buf.clear();
+                            row_buf.extend_from_slice(bytes);
+                            maybe_normalize_bytes(opts, &mut row_buf);
+                            rows_w.write_all(&row_buf)?;
+                        } else {
+                            rows_w.write_all(bytes)?;
+                        }
                     }
                     rows_w.flush()?;
                 }
@@ -544,7 +552,7 @@ pub(crate) fn merge_ivf(
                     Vec::with_capacity(num_centroids * opts.bytes_per_vector());
                 for centroid in &centroid_rows {
                     let mut bytes = encode_vector(centroid, opts.dim())?;
-                    opts.maybe_normalize_bytes(&mut bytes);
+                    maybe_normalize_bytes(opts, &mut bytes);
                     centroid_bytes.extend_from_slice(&bytes);
                 }
                 {

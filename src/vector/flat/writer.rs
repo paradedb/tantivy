@@ -9,6 +9,7 @@ use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{TantivyDocument, Value};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
+use crate::vector::distance::maybe_normalize_bytes;
 use crate::vector::header::write_header;
 use crate::vector::VEC_EXT;
 use crate::{DocId, TantivyError};
@@ -39,8 +40,7 @@ impl FieldBuffer {
         self.present_doc_ids.push(doc_id);
         let start = self.row_bytes.len();
         self.row_bytes.extend_from_slice(bytes);
-        self.opts
-            .maybe_normalize_bytes(&mut self.row_bytes[start..start + stride]);
+        maybe_normalize_bytes(&self.opts, &mut self.row_bytes[start..start + stride]);
     }
 
     fn mem_usage(&self) -> usize {
