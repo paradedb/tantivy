@@ -5,8 +5,8 @@
 //! its top-N loop: [`FlatBackend`] iterates the filter `Scorer` doc-by-doc, [`IvfBackend`] drains
 //! the filter into a bitmap and probes clusters adaptively.
 //!
-//! Adding a new format (HNSW, etc.) is a new enum variant — the
-//! collector layer doesn't change.
+//! Adding a new format (a graph-traversal index, etc.) is a new enum
+//! variant — the collector layer doesn't change.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -889,7 +889,7 @@ mod tests {
     /// Fixed-k replication is additive and, at small centroid counts, EXACT:
     /// the fixture's 6 centroids sit far below the exact-selection threshold
     /// (the search's `ef` budget), so replica cells come from a brute k-NN
-    /// scan, not the approximate HNSW — every vector is written into exactly
+    /// scan, not the approximate graph selector — every vector is written into exactly
     /// `min(replicas, num_centroids)` distinct cells: its primary (once) plus
     /// the `replicas - 1` next-nearest centroids. Total posting entries are
     /// exactly `replicas × N`. `replicas == 1` is the identity: every doc in

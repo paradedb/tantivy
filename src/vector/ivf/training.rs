@@ -66,9 +66,9 @@ pub struct IvfMergeSettings {
     /// Total number of cells a vector is written into (SPANN `ReplicaCount`):
     /// the primary plus up to `replicas - 1` additional cells taken from the
     /// nearest centroids — selected exactly for small centroid sets, via a
-    /// transient build-time HNSW for large ones. `1` (the default) disables
-    /// replication entirely — no selector is built and the output is the
-    /// primary-only layout.
+    /// transient build-time neighborhood graph for large ones. `1` (the
+    /// default) disables replication entirely — no selector is built and the
+    /// output is the primary-only layout.
     pub replicas: usize,
 }
 

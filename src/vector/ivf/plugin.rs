@@ -9,8 +9,6 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
-
 use super::{
     decode_row, encode_vector, CentroidsMeta, IvfCentroids, IvfClusterer, IvfMatrixView,
     IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
@@ -19,11 +17,13 @@ use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::{FieldType, Metric, VectorDType};
-use crate::vector::distance::{cosine, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
 use crate::vector::reader::{VectorColumnReader, VectorReader};
-use crate::vector::{NeighborhoodGraphConfig, RelativeNeighborhoodGraph, VEC_EXT};
+use crate::vector::{
+    NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace, VEC_EXT,
+};
 use crate::{DocId, Executor, TantivyError};
 
 struct AssignedVector {
@@ -34,23 +34,26 @@ struct AssignedVector {
 }
 
 /// How a vector's `replicas - 1` non-primary cells are picked from the
-/// trained centroids. Constructed once per field when `replicas > 1`,
-/// queried during the assign loop, then dropped — never serialized.
+/// trained centroids. Constructed once per field when `replicas > 1` and
+/// queried during the assign loop. A `Graph` selector is not transient:
+/// the same instance is serialized as the `.centroids` slot [2] routing
+/// graph afterwards.
 ///
-/// HNSW is a recall structure for *large* centroid sets. When the whole set
-/// fits within the search's own `ef` visit budget the brute scan is at most
-/// as expensive — and exact: a parallel-built HNSW over a handful of points
-/// can come out sparse enough that `search` returns fewer than `knn`
-/// neighbours, silently under-replicating small indexes.
-enum ReplicaSelector {
+/// The graph index is a recall structure for *large* centroid sets. When
+/// the whole set fits within the search's own `ef` visit budget the brute
+/// scan is at most as expensive — and exact: an approximate graph over a
+/// handful of points can return fewer than `knn` neighbours, silently
+/// under-replicating small indexes.
+enum ReplicaSelector<'a> {
     /// Exact k-NN scan over the trained centroids (small centroid sets).
     Exact,
-    /// Approximate k-NN via a transient HNSW (large centroid sets).
-    Hnsw(CentroidHnsw),
+    /// Approximate k-NN via a [`RelativeNeighborhoodGraph`] (large
+    /// centroid sets).
+    Graph(CentroidGraph<'a>),
 }
 
 /// Centroid ids of the `knn` nearest centroids to `query`, nearest first —
-/// the exact counterpart of [`CentroidHnsw::nearest`], same distance family
+/// the exact counterpart of [`CentroidGraph::nearest`], same distance family
 /// per metric. Ties break on centroid id so selection is deterministic.
 fn exact_nearest_centroids(
     metric: Metric,
@@ -62,10 +65,15 @@ fn exact_nearest_centroids(
         .iter()
         .enumerate()
         .map(|(id, centroid)| {
+            // Each arm is the negated `Metric::similarity` ordering the
+            // graph selector ranks by.
             let d = match metric {
-                // Angular distance, like `DistCosine`; handles un-normalized
-                // centroids the same way.
-                Metric::Cosine | Metric::Dot => 1.0 - cosine(query, centroid.as_slice()),
+                // `1 - cosine` orders identically to descending cosine.
+                Metric::Cosine => 1.0 - cosine(query, centroid.as_slice()),
+                // Negated raw dot: the query-time router ranks by dot, and
+                // dot ordering is ||q||-invariant (see
+                // [`CentroidGraph::build`]).
+                Metric::Dot => -dot(query, centroid.as_slice()),
                 // Squared L2 orders identically to L2.
                 Metric::L2 => l2_squared(query, centroid.as_slice()),
             };
@@ -81,61 +89,70 @@ fn exact_nearest_centroids(
     scored.into_iter().map(|(_, id)| id).collect()
 }
 
-/// Transient build-time HNSW over the trained centroids, used to pick a
-/// vector's `replicas - 1` nearest non-primary cells when the centroid set
-/// is large enough that an approximate index beats the brute scan (see
-/// [`ReplicaSelector`]). The distance must match how the primary is
-/// assigned: angular (cosine) for Cosine/Dot — both clustered in angular
-/// space — and L2 for L2. `DistCosine` handles un-normalized centroids, so
-/// no normalized copy is kept.
-enum CentroidHnsw {
-    Angular(Hnsw<'static, f32, DistCosine>),
-    L2(Hnsw<'static, f32, DistL2>),
+/// A multi-threaded [`Executor`] when the host has the parallelism, the
+/// single-threaded one otherwise.
+fn build_executor(name: &'static str) -> crate::Result<Executor> {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if num_threads > 1 {
+        Executor::multi_thread(num_threads, name)
+    } else {
+        Ok(Executor::single_thread())
+    }
 }
 
-impl CentroidHnsw {
-    fn build(metric: Metric, centroids: &[Vec<f32>]) -> Self {
-        let n = centroids.len();
-        // hnsw_rs caps `max_nb_connection` at 256; small centroid sets need it
-        // below `n`. ef_construction/max_layer are standard build-quality knobs.
-        let max_nb_connection = 24.min(n.saturating_sub(1)).max(1);
-        let ef_construction = 200;
-        let max_layer = 16;
-        let data: Vec<(&[f32], usize)> = centroids
-            .iter()
-            .enumerate()
-            .map(|(id, c)| (c.as_slice(), id))
+/// Build-time [`RelativeNeighborhoodGraph`] over the trained centroids,
+/// used to pick a vector's `replicas - 1` nearest non-primary cells when
+/// the centroid set is large enough that an approximate index beats the
+/// brute scan (see [`ReplicaSelector`]). Borrows the flat centroid arena;
+/// after the assign loop the same graph is persisted as the `.centroids`
+/// slot [2] routing graph.
+struct CentroidGraph<'a> {
+    rng: RelativeNeighborhoodGraph<&'a [f32]>,
+    /// Deterministic, evenly spaced entry points, computed once at build.
+    seeds: Vec<NodeId>,
+}
+
+impl<'a> CentroidGraph<'a> {
+    /// Builds the graph over `centroids` (flat, `dim`-strided) with search
+    /// beam `ef`.
+    fn build(metric: Metric, centroids: &'a [f32], dim: usize, ef: usize) -> crate::Result<Self> {
+        // Replica cells must predict the query-time router
+        // (`rank_centroids`), which ranks centroids by the field metric —
+        // so the graph selects with that metric directly. For Dot,
+        // centroid ranking by dot(q, c) is invariant to ||q||: a
+        // v-directed query ranks cells by dot(v, c), so raw dot IS the
+        // query-consistent criterion, and its magnitude bias mirrors the
+        // router's. The pathological case — one dominant long centroid
+        // attracting many replicas — is a cluster-balance concern, not a
+        // selection concern. Must stay consistent with
+        // `exact_nearest_centroids`.
+        let config = NeighborhoodGraphConfig {
+            ef,
+            ..Default::default()
+        };
+        let mut rng = RelativeNeighborhoodGraph::new(centroids, dim, metric, config);
+        rng.build(&build_executor("replica-rng-")?);
+        // Evenly spaced entry points; 8 <= the minimum `ef` (64), which
+        // `search` requires of its seed count.
+        let num_centroids = centroids.len() / dim;
+        let seeds = (0..num_centroids)
+            .step_by((num_centroids / 8).max(1))
+            .take(8)
+            .map(|i| i as NodeId)
             .collect();
-        if matches!(metric, Metric::Cosine | Metric::Dot) {
-            let hnsw = Hnsw::<f32, DistCosine>::new(
-                max_nb_connection,
-                n,
-                max_layer,
-                ef_construction,
-                DistCosine {},
-            );
-            hnsw.parallel_insert_slice(&data);
-            CentroidHnsw::Angular(hnsw)
-        } else {
-            let hnsw = Hnsw::<f32, DistL2>::new(
-                max_nb_connection,
-                n,
-                max_layer,
-                ef_construction,
-                DistL2 {},
-            );
-            hnsw.parallel_insert_slice(&data);
-            CentroidHnsw::L2(hnsw)
-        }
+        Ok(CentroidGraph { rng, seeds })
     }
 
-    /// Centroid ids of the `knn` nearest centroids to `query`, nearest first.
-    fn nearest(&self, query: &[f32], knn: usize, ef: usize) -> Vec<usize> {
-        let neighbours = match self {
-            CentroidHnsw::Angular(h) => h.search(query, knn, ef),
-            CentroidHnsw::L2(h) => h.search(query, knn, ef),
-        };
-        neighbours.into_iter().map(|nb| nb.d_id).collect()
+    /// Centroid ids of the `knn` nearest centroids to `query`, nearest
+    /// first. `ws` is the caller's reusable per-query scratch.
+    fn nearest(&self, ws: &mut Workspace, query: &[f32], knn: usize) -> Vec<usize> {
+        self.rng
+            .search(ws, query, &self.seeds, knn)
+            .into_iter()
+            .map(|candidate| candidate.node as usize)
+            .collect()
     }
 }
 
@@ -144,7 +161,7 @@ impl CentroidHnsw {
 #[derive(Default)]
 struct IvfBuildTimings {
     train: Duration,
-    hnsw_build: Duration,
+    selector_build: Duration,
     assign: Duration,
     replica_knn: Duration,
     posting_write: Duration,
@@ -307,9 +324,10 @@ pub(crate) fn merge_ivf(
                         centroid_matrix.rows
                     )));
                 }
-                // Float working copy of the trained centroids — the replica
-                // HNSW indexes float rows. Encoding + Cosine normalization
-                // happen at the `.centroids` write below.
+                // Float working copy of the trained centroids — the exact
+                // replica scan and the `.centroids` encode below read
+                // per-row slices. Encoding + Cosine normalization happen at
+                // the `.centroids` write below.
                 let centroid_rows: Vec<Vec<f32>> = centroid_matrix
                     .values
                     .chunks_exact(opts.dim())
@@ -321,7 +339,8 @@ pub(crate) fn merge_ivf(
                 // nothing is built or allocated — the layout stays
                 // primary-only. Small centroid sets — anything the search's
                 // own `ef` budget would visit wholesale anyway — use the
-                // exact scan; only larger sets pay for a transient HNSW.
+                // exact scan; only larger sets pay for a transient
+                // neighborhood graph.
                 let dim = opts.dim();
                 let ef_search = (replicas * 4).max(64);
                 let replica_selector = if replicas <= 1 {
@@ -329,11 +348,19 @@ pub(crate) fn merge_ivf(
                 } else if num_centroids <= ef_search {
                     Some(ReplicaSelector::Exact)
                 } else {
-                    let hnsw_start = Instant::now();
-                    let hnsw = CentroidHnsw::build(opts.metric(), &centroid_rows);
-                    timings.hnsw_build = hnsw_start.elapsed();
-                    Some(ReplicaSelector::Hnsw(hnsw))
+                    let build_start = Instant::now();
+                    let graph = CentroidGraph::build(
+                        opts.metric(),
+                        centroid_matrix.values.as_slice(),
+                        dim,
+                        ef_search,
+                    )?;
+                    timings.selector_build = build_start.elapsed();
+                    Some(ReplicaSelector::Graph(graph))
                 };
+                // One per-query scratch reused across every graph replica
+                // lookup in this field's assign loop — never per vector.
+                let mut replica_ws = Workspace::new();
                 // Replica cells accumulated during assign; appended as extra
                 // entries AFTER the primary pass so primary membership is
                 // untouched. Empty at `replicas == 1`.
@@ -415,8 +442,8 @@ pub(crate) fn merge_ivf(
                                             v,
                                             replicas,
                                         ),
-                                        ReplicaSelector::Hnsw(hnsw) => {
-                                            hnsw.nearest(v, replicas, ef_search)
+                                        ReplicaSelector::Graph(graph) => {
+                                            graph.nearest(&mut replica_ws, v, replicas)
                                         }
                                     };
                                     timings.replica_knn += knn_start.elapsed();
@@ -600,36 +627,44 @@ pub(crate) fn merge_ivf(
                 // can route to its nearest clusters without scanning all of
                 // them. Skipped for degenerate centroid counts — the reader
                 // treats the absent slot as "route by linear scan".
+                //
+                // A graph replica selector is the same graph over the same
+                // arena with the same metric, so it is serialized directly
+                // instead of rebuilding. Its config differs only in `ef`,
+                // which affects the query beam width, not the built edges
+                // (build/refine search with a beam of
+                // `max(ef, num_candidates)`, and `ef <= num_candidates` for
+                // any realistic `replicas`) — the persisted graph is
+                // unchanged either way.
                 if num_centroids > 1 {
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
-                    let num_threads = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1);
-                    let executor = if num_threads > 1 {
-                        Executor::multi_thread(num_threads, "rng-build-")?
-                    } else {
-                        Executor::single_thread()
-                    };
-                    let mut rng = RelativeNeighborhoodGraph::new(
-                        centroid_matrix.values.as_slice(),
-                        opts.dim(),
-                        opts.metric(),
-                        NeighborhoodGraphConfig::default(),
-                    );
-                    rng.build(&executor);
                     let graph_w = centroids_write.for_field_with_idx(field, 2);
-                    rng.serialize(graph_w)?;
+                    match replica_selector.as_ref() {
+                        Some(ReplicaSelector::Graph(graph)) => graph.rng.serialize(graph_w)?,
+                        // `replicas == 1` or the exact-selector regime: no
+                        // graph exists yet, build one just for routing.
+                        _ => {
+                            let mut rng = RelativeNeighborhoodGraph::new(
+                                centroid_matrix.values.as_slice(),
+                                opts.dim(),
+                                opts.metric(),
+                                NeighborhoodGraphConfig::default(),
+                            );
+                            rng.build(&build_executor("rng-build-")?);
+                            rng.serialize(graph_w)?;
+                        }
+                    }
                     graph_w.flush()?;
                 }
 
                 log::info!(
                     target: "paradedb::ivf_build",
-                    "ivf_build timings_ms train={} hnsw_build={} assign={} replica_knn={} \
+                    "ivf_build timings_ms train={} selector_build={} assign={} replica_knn={} \
                      posting_write={} total={} replicas={} centroids={} vectors={}",
                     timings.train.as_millis(),
-                    timings.hnsw_build.as_millis(),
+                    timings.selector_build.as_millis(),
                     timings.assign.as_millis(),
                     timings.replica_knn.as_millis(),
                     timings.posting_write.as_millis(),
@@ -645,4 +680,68 @@ pub(crate) fn merge_ivf(
     vec_write.close()?;
     centroids_write.close()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The graph selector must land in the same neighborhood as the exact
+    /// scan: beam search is approximate, so the contract is a loose
+    /// envelope — every cell it picks is within the exact top-(k + 2) —
+    /// not exact equality.
+    #[test]
+    fn graph_selector_matches_exact_on_moderate_set() -> crate::Result<()> {
+        // 9×9 grid of well-separated 2-D centroids (gap 10), above the
+        // exact-path cutoff of max(64, replicas * 4). All 81 fit in one
+        // TPT leaf, so the init KNN is exact and the build deterministic.
+        let dim = 2;
+        let side = 9;
+        let centroid_rows: Vec<Vec<f32>> = (0..side * side)
+            .map(|i| vec![(i % side) as f32 * 10.0, (i / side) as f32 * 10.0])
+            .collect();
+        let flat: Vec<f32> = centroid_rows.iter().flatten().copied().collect();
+        let replicas = 3;
+        let ef = (replicas * 4).max(64);
+        assert!(
+            centroid_rows.len() > ef,
+            "fixture must exceed the exact-path cutoff"
+        );
+
+        let graph = CentroidGraph::build(Metric::L2, &flat, dim, ef)?;
+        let mut ws = Workspace::new();
+        for (ord, centroid) in centroid_rows.iter().enumerate().step_by(5) {
+            let query = [centroid[0] + 0.3, centroid[1] - 0.2];
+            let picked = graph.nearest(&mut ws, &query, replicas);
+            assert_eq!(picked.len(), replicas, "query near centroid {ord}");
+            let envelope =
+                exact_nearest_centroids(Metric::L2, &centroid_rows, &query, replicas + 2);
+            for cell in &picked {
+                assert!(
+                    envelope.contains(cell),
+                    "query near centroid {ord}: graph picked {picked:?}, exact top-{} is \
+                     {envelope:?}",
+                    replicas + 2,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Pins the Dot selection semantics: replica cells follow RAW dot —
+    /// the query-time router's ranking — not angular order. Centroid
+    /// norms are deliberately unequal so the two orderings disagree.
+    #[test]
+    fn dot_selector_uses_raw_dot_not_angular() {
+        let centroid_rows: Vec<Vec<f32>> = vec![
+            vec![10.0, 0.0], // long, off-direction: dot 10, cosine 0.45
+            vec![0.0, 1.0],  // short, near-direction: dot 2, cosine 0.89
+            vec![7.0, 7.0],  // long, near-direction: dot 21, cosine 0.95
+        ];
+        let query = [1.0_f32, 2.0];
+        let picked = exact_nearest_centroids(Metric::Dot, &centroid_rows, &query, 3);
+        // Raw-dot order: [7,7] (21), then [10,0] (10), then [0,1] (2).
+        // Angular order would put [0,1] ahead of [10,0].
+        assert_eq!(picked, vec![2, 0, 1], "must rank by raw dot");
+    }
 }
