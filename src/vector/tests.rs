@@ -550,16 +550,18 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     Ok(())
 }
 
-/// Wide-epsilon + 100% fanout probe params: every probe gate stays
-/// open, so the IVF backend visits every cluster. Used by
-/// oracle-equality tests where any kind of pruning would make the
-/// equality check fail.
+/// "Scan everything" probe params: the ceiling clamps to the segment's
+/// cluster count and the survivor floor is unsatisfiable, so the gate
+/// can never fire and every cluster is probed. Used by oracle-equality
+/// tests where any pruning would make the equality check fail. (A
+/// "huge epsilon" is NOT a reliable way to express this across
+/// metrics — e.g. an L2 query sitting exactly on a centroid arms the
+/// gate at any epsilon.)
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
-        epsilon: 1e6,
-        min_candidates: 0,
-        min_probe_fanout: 1.0,
-        max_probe_fanout: 1.0,
+        epsilon: 0.0,
+        min_candidates: usize::MAX,
+        max_probe_count: usize::MAX,
     }
 }
 

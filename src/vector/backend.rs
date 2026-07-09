@@ -162,9 +162,9 @@ impl<T: VectorElement> FlatBackend<T> {
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ProbeTermination {
-    /// `probe_count >= max_probe_count` — the hard fanout ceiling.
+    /// `probe_count >= max_probe_count` — the absolute probe ceiling.
     Ceiling,
-    /// The epsilon threshold + survivor-floor gate fired.
+    /// The distance-ratio gate fired with the survivor floor met.
     Gate,
     /// The ranked centroids were exhausted without hitting either stop.
     #[default]
@@ -281,8 +281,7 @@ impl<T: VectorElement> IvfBackend<T> {
             .adaptive
             .min_candidates
             .max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n);
-        let (min_probe_count, max_probe_count) =
-            self.adaptive.resolved_probe_counts(num_centroids)?;
+        let max_probe_count = self.adaptive.resolved_probe_ceiling(num_centroids)?;
 
         // Navigation cost + the resolved survivor floor are known here, once.
         if let Some(s) = stats.as_deref_mut() {
@@ -298,7 +297,6 @@ impl<T: VectorElement> IvfBackend<T> {
             ranked,
             threshold,
             min_candidates,
-            min_probe_count,
             max_probe_count,
             stride,
             &filter,
@@ -360,7 +358,6 @@ impl<T: VectorElement> IvfBackend<T> {
         ranked: Vec<(f32, usize)>,
         threshold: f32,
         min_candidates: usize,
-        min_probe_count: usize,
         max_probe_count: usize,
         stride: usize,
         filter: &BitSet,
@@ -391,10 +388,7 @@ impl<T: VectorElement> IvfBackend<T> {
                 termination = ProbeTermination::Ceiling;
                 break;
             }
-            if centroid_score < threshold
-                && candidates >= min_candidates
-                && probe_count >= min_probe_count
-            {
+            if centroid_score < threshold && candidates >= min_candidates {
                 termination = ProbeTermination::Gate;
                 break;
             }
@@ -525,28 +519,30 @@ fn lookup_metric(schema: &Schema, field: Field) -> crate::Result<Metric> {
     }
 }
 
-/// SPANN-style stopping threshold: how far below the best centroid
-/// score the per-cluster similarity may drop before the adaptive
-/// probe loop is allowed to terminate (given the other floors).
+/// Per-metric distance-ratio pruning threshold (SPANN eq. 3): a posting
+/// list is searched iff `Dist(q, c) <= (1 + epsilon) * Dist(q, c_closest)`,
+/// re-expressed on the similarity scale (higher = better) so the probe
+/// loop compares scores directly. `best` is the top-ranked centroid's
+/// score.
 ///
-/// Per-metric because the relationship between "similarity score" and
-/// "distance one wants to widen by `(1 + epsilon)`" differs:
+/// - **L2:** `score = -d²`, so `threshold = best - epsilon * best.abs()` is `d² > (1 + eps) *
+///   d²_min` — SPANN's inequality verbatim (their `Dist` is squared L2).
+/// - **Cosine:** `threshold = best - epsilon * (1 - best)` gates on `(1 - score) > (1 + eps) * (1 -
+///   best)`. For unit vectors `d² = 2(1 - cos)` and the 2 cancels in the ratio, so this IS SPANN's
+///   rule applied to our (write-time-normalized) data.
+/// - **Dot:** no natural distance for raw MIPS; a pragmatic linear widening `best - epsilon *
+///   best.abs()`. With paper-scale epsilon the gate rarely fires and the ceiling governs. NOTE:
+///   with unnormalized dot, the IVF locality assumption itself is heuristic — that's the
+///   clusterer's problem, not the threshold's.
 ///
-/// - **L2:** `similarity = -d²`. Widening distance by `(1 + eps)` squares to `(1 + eps)²` on the d²
-///   side, so the threshold is `best * (1 + eps)²` (more negative ⇒ more permissive).
-/// - **Cosine:** `distance = 1 - similarity`. Widening that distance by `(1 + eps)` gives
-///   `threshold = 1 - (1 - best) * (1 + eps)`.
-/// - **Dot:** has no bounded distance interpretation (raw dot isn't a metric — no triangle
-///   inequality). The threshold here is a pragmatic linear widening of the score floor: `best -
-///   epsilon * best.abs()`. NOTE: with unnormalized dot, the IVF locality assumption itself is
-///   heuristic — "query near a centroid ⇒ true nearest neighbors live in that cluster" can fail
-///   when a high-magnitude vector in a far cluster outscores nearby ones. That's the clusterer's
-///   problem, not the threshold's; this function just controls when probing stops.
+/// Degenerate scales: L2 with `d_min = 0` and Cosine with `best = 1.0`
+/// both give `threshold = best` — the gate arms immediately and only
+/// the candidate floor keeps probing. Known property of ratio pruning;
+/// do not "fix".
 fn adaptive_threshold(metric: Metric, best: f32, epsilon: f32) -> f32 {
     match metric {
-        Metric::L2 => best * (1.0 + epsilon) * (1.0 + epsilon),
-        Metric::Cosine => 1.0 - (1.0 - best) * (1.0 + epsilon),
-        Metric::Dot => best - epsilon * best.abs(),
+        Metric::L2 | Metric::Dot => best - epsilon * best.abs(),
+        Metric::Cosine => best - epsilon * (1.0 - best),
     }
 }
 
@@ -556,8 +552,8 @@ mod tests {
 
     #[test]
     fn adaptive_threshold_identity_at_zero_epsilon() {
-        // With epsilon = 0 the threshold is exactly `best` for the
-        // bounded-distance metrics — no widening, no permissiveness.
+        // With epsilon = 0 the threshold is exactly `best` for every
+        // metric — no ratio slack, no permissiveness.
         for &best in &[-10.0_f32, -1.0, 0.0, 0.5, 1.0] {
             assert_eq!(adaptive_threshold(Metric::L2, best, 0.0), best);
             assert_eq!(adaptive_threshold(Metric::Cosine, best, 0.0), best);
@@ -567,14 +563,13 @@ mod tests {
 
     #[test]
     fn adaptive_threshold_lowers_with_positive_epsilon() {
-        // "Higher score = closer" convention; widening means the
+        // "Higher score = closer" convention; ratio slack means the
         // threshold is *lower* (more permissive) than `best`.
         let eps = 0.1;
-        // L2 similarity is `-d²`, so `best` is always ≤ 0. Multiplying
-        // a non-positive value by `(1+eps)² > 1` makes it more negative
-        // (= lower / more permissive). For best = 0 the threshold is
-        // also 0 (zero distance gives zero similarity, nothing to
-        // widen).
+        // L2 similarity is `-d²`, so `best` is always ≤ 0 and
+        // `best - eps * |best|` is more negative (= more permissive).
+        // For best = 0 the threshold is also 0 (d_min = 0 — the
+        // degenerate ratio scale; the gate arms immediately).
         for &best in &[-10.0_f32, -1.0, -0.001] {
             let l2 = adaptive_threshold(Metric::L2, best, eps);
             assert!(l2 < best, "L2 threshold {l2} should be < best {best}");
@@ -599,13 +594,21 @@ mod tests {
 
     #[test]
     fn adaptive_threshold_hand_checked_values() {
-        // L2: best = -10, eps = 0.1 ⇒ -10 * 1.21 = -12.1.
+        // L2: best = -10 (d² = 10), eps = 0.1 ⇒ -10 - 0.1·10 = -11,
+        // i.e. gate at d² > 1.1 · d²_min.
         let l2 = adaptive_threshold(Metric::L2, -10.0, 0.1);
-        assert!((l2 - -12.1).abs() < 1e-5, "got {l2}");
+        assert!((l2 - -11.0).abs() < 1e-5, "got {l2}");
 
-        // Cosine: best = 0.8, eps = 0.1 ⇒ 1 - 0.2 * 1.1 = 0.78.
+        // Cosine: best = 0.8, eps = 0.1 ⇒ 0.8 - 0.1 · 0.2 = 0.78.
         let cos = adaptive_threshold(Metric::Cosine, 0.8, 0.1);
         assert!((cos - 0.78).abs() < 1e-5, "got {cos}");
+
+        // Cosine at paper-scale epsilon: best = 0.9, eps = 7.0 ⇒
+        // 0.9 - 7 · 0.1 = 0.2 — the gate CAN fire on realistic angular
+        // gaps (a |best|-scaled threshold would sit at -5.4 and never
+        // trip on the cosine range).
+        let cos_wide = adaptive_threshold(Metric::Cosine, 0.9, 7.0);
+        assert!((cos_wide - 0.2).abs() < 1e-5, "got {cos_wide}");
 
         // Dot: pinned `best - eps * |best|`.
         // best =  10, eps = 0.1 ⇒  9.0
@@ -1215,7 +1218,7 @@ mod tests {
     }
 
     /// The trap: query closest to centroid A, true NN in cluster B.
-    /// Adaptive probing finds it; 50% max fanout must miss. Setup
+    /// Adaptive probing finds it; a 1-cluster probe ceiling must miss. Setup
     /// assertions confirm the geometry is genuinely a trap before
     /// the behavioral check — a slightly-off geometry could trivialize
     /// the test. INLINE because the shared fixture's 100-doc grid
@@ -1251,19 +1254,18 @@ mod tests {
         // directly — the geometry says distance to A = √2 ≈ 1.41,
         // distance to B = √162 ≈ 12.73, so A wins decisively.
 
-        // Behavioral check 1: 50% max fanout misses the trap.
+        // Behavioral check 1: a probe ceiling of 1 misses the trap.
         let one_probe = AdaptiveProbeParams {
-            epsilon: 1e6,
-            min_candidates: 0,
-            min_probe_fanout: 0.5,
-            max_probe_fanout: 0.5,
+            epsilon: 0.0,
+            min_candidates: usize::MAX,
+            max_probe_count: 1,
         };
         let hits1 = search(&index, embed_field, &AllQuery, query.to_vec(), 1, one_probe)?;
         assert_eq!(hits1.len(), 1);
         assert_ne!(
             stored_label_at(&index, label_field, hits1[0].1)?,
             "trap_b",
-            "50% max fanout should miss the trap (probes only cluster A)",
+            "a 1-cluster probe ceiling should miss the trap (probes only cluster A)",
         );
 
         // Behavioral check 2: exhaustive probing finds it.
@@ -1550,8 +1552,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: 0,
-            min_probe_fanout: 0.5,
-            max_probe_fanout: 1.0,
+            max_probe_count: usize::MAX,
         };
         let hits = search(
             &index,
@@ -1632,15 +1633,16 @@ mod tests {
         );
         // Navigation cost == the centroids ranked for this query.
         assert_eq!(stats.centroids_ranked, DEFAULT_NUM_CENTROIDS);
-        // Exhaustive params (fanout 1.0, huge epsilon) drain the ranked list.
+        // Exhaustive params (unclamped ceiling, unsatisfiable floor)
+        // drain the ranked list.
         assert_eq!(stats.termination, ProbeTermination::Exhausted);
         Ok(())
     }
 
-    /// A tiny `max_probe_fanout` forces the hard ceiling: the loop stops with
-    /// `termination == Ceiling`, having probed fewer than all centroids, and the
-    /// counter invariant still holds. Uses the deterministic `build_inline_ivf`
-    /// fixture (fixed 6 centroids) so the cutoff is stable.
+    /// A `max_probe_count` below the cluster count forces the hard ceiling:
+    /// the loop stops with `termination == Ceiling`, having probed exactly
+    /// the cap, and the counter invariant still holds. Uses the deterministic
+    /// `build_inline_ivf` fixture (fixed 6 centroids) so the cutoff is stable.
     #[test]
     fn ivf_probe_stats_termination_ceiling() -> crate::Result<()> {
         let centroids = [
@@ -1664,18 +1666,17 @@ mod tests {
             .collect();
         let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
 
-        // max_probe_fanout 1/6 → ceiling at the first probe; huge epsilon keeps
-        // the gate from firing first.
+        // Cap 1 → ceiling at the first probe; an unsatisfiable survivor
+        // floor keeps the gate from firing first.
         let params = AdaptiveProbeParams {
-            epsilon: 1e6,
-            min_candidates: 0,
-            min_probe_fanout: 0.0,
-            max_probe_fanout: 1.0 / centroids.len() as f32,
+            epsilon: 0.0,
+            min_candidates: usize::MAX,
+            max_probe_count: 1,
         };
         let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![10.0, 10.0], 3, params)?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
-        // Stopped short of exhausting the ranked list.
-        assert!(stats.probed_clusters.len() < centroids.len());
+        // Stopped at exactly the cap, short of the ranked list.
+        assert_eq!(stats.probed_clusters.len(), 1);
         assert_eq!(stats.centroids_ranked, centroids.len());
         assert_eq!(
             stats.vectors_visited,
@@ -1751,36 +1752,30 @@ mod tests {
     // ============================================================
     // Adaptive-probing parameter contracts.
     //
-    // The stop condition couples all four adaptive knobs. Each test
-    // below holds three of them permissive so the fourth becomes the
-    // binding constraint, then asserts the contract (an inequality
-    // implied by the knob's definition) — never an exact emergent
-    // count.
+    // The stop condition couples the three adaptive knobs. Each test
+    // below holds the others permissive so one becomes the binding
+    // constraint, then asserts the contract implied by the knob's
+    // definition — exact only where the knob pins it (the absolute
+    // ceiling), an inequality otherwise.
     // ============================================================
 
-    /// 2 / 9 max fanout ⇒ probing never exceeds the resolved ceiling,
-    /// regardless of how generous the other gates are. The expected
-    /// ceiling is read back through `resolved_probe_counts` — the same
-    /// rounding the backend applies — rather than hand-computed:
-    /// `2.0 / 9.0` is not exactly representable as f32, so widening it
-    /// to f64 and multiplying by 9 lands a hair above 2.0 and the
-    /// resolved count is `ceil` = 3, not the naive 2.
+    /// A cap of 2 on the 9-centroid fixture ⇒ the loop probes exactly
+    /// the cap and attributes the stop to the ceiling, regardless of
+    /// how generous the other knobs are.
     #[test]
-    fn probe_stats_max_fanout_ceiling() -> crate::Result<()> {
+    fn probe_stats_max_probe_count_ceiling() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
         let params = AdaptiveProbeParams {
-            epsilon: 1e6,
-            min_candidates: 0,
-            min_probe_fanout: 0.0,
-            max_probe_fanout: 2.0 / DEFAULT_NUM_CENTROIDS as f32,
+            epsilon: 0.0,
+            min_candidates: usize::MAX,
+            max_probe_count: 2,
         };
-        let (_, max_probe_count) = params.resolved_probe_counts(DEFAULT_NUM_CENTROIDS)?;
-        // The ceiling must actually bind for this test to mean anything.
+        // The cap must actually bind for this test to mean anything.
         assert!(
-            max_probe_count < DEFAULT_NUM_CENTROIDS,
-            "resolved ceiling {max_probe_count} does not bind",
+            params.resolved_probe_ceiling(DEFAULT_NUM_CENTROIDS)? < DEFAULT_NUM_CENTROIDS,
+            "resolved ceiling does not bind",
         );
         let (_, stats) = run_top_n_instrumented(
             &index.index,
@@ -1789,42 +1784,11 @@ mod tests {
             3,
             params,
         )?;
-        assert!(
-            stats.probed_clusters.len() <= max_probe_count,
-            "max fanout ⇒ ≤ {max_probe_count} probed, got {} ({:?})",
+        assert_eq!(stats.termination, ProbeTermination::Ceiling);
+        assert_eq!(
             stats.probed_clusters.len(),
-            stats.probed_clusters,
-        );
-        Ok(())
-    }
-
-    /// 5 / 9 min fanout keeps the loop going even after the candidate
-    /// floor and threshold gates both want to terminate. The shared
-    /// fixture's 9-centroid grid yields ~2 docs per cluster per IVF
-    /// segment; with `top_k = 1` the floor (4) is met after 2 probes,
-    /// but min fanout forces 5.
-    #[test]
-    fn probe_stats_min_fanout_floor() -> crate::Result<()> {
-        let index = TestVectorIndex::builder(VectorDType::F32)
-            .vector_storage_format(VectorStorageFormat::Ivf)
-            .build()?;
-        let params = AdaptiveProbeParams {
-            epsilon: 0.0,
-            min_candidates: 0,
-            min_probe_fanout: 5.0 / DEFAULT_NUM_CENTROIDS as f32,
-            max_probe_fanout: 1.0,
-        };
-        let (_, stats) = run_top_n_instrumented(
-            &index.index,
-            index.embedding_field(),
-            vec![0.0_f32, 0.0],
-            1,
-            params,
-        )?;
-        assert!(
-            stats.probed_clusters.len() >= 5,
-            "5 / 9 min fanout ⇒ ≥ 5 probed, got {} ({:?})",
-            stats.probed_clusters.len(),
+            2,
+            "absolute cap ⇒ exactly 2 probed, got {:?}",
             stats.probed_clusters,
         );
         Ok(())
@@ -1832,13 +1796,8 @@ mod tests {
 
     /// Candidate floor: regardless of how stingy the threshold gate
     /// is, the loop scores at least `min(total_docs, resolved_floor)`
-    /// docs. Threshold maximally stingy (`epsilon = 0`) and both fanout
-    /// gates permissive so the floor is the binding constraint — with
-    /// the *default* `max_probe_fanout` the ceiling resolves to a
-    /// single probe on the 9-centroid fixture and always beats the
-    /// floor, starving it to zero whenever segment 0's docs happen to
-    /// live far from the query (each fixture segment populates only
-    /// ~2 of the 9 clusters).
+    /// docs. Threshold maximally stingy (`epsilon = 0`) and the
+    /// ceiling unbounded, so the floor is the binding constraint.
     #[test]
     fn probe_stats_min_candidates_floor_scores_floor_or_total() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
@@ -1853,8 +1812,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: 0,
-            min_probe_fanout: 0.0,
-            max_probe_fanout: 1.0,
+            max_probe_count: usize::MAX,
         };
         let (_, stats) = run_top_n_instrumented(
             &index.index,
@@ -1868,6 +1826,44 @@ mod tests {
             "candidate floor (resolved {resolved_floor}, segment {segment_doc_count}) ⇒ ≥ \
              {expected_min} candidates scored; got {}",
             stats.candidates_scored,
+        );
+        Ok(())
+    }
+
+    /// The distance-ratio gate fires on Cosine at paper-scale epsilon:
+    /// with write-time-normalized centroids, a wide angular gap puts
+    /// the far centroid below `best - eps * (1 - best)` once the
+    /// survivor floor is met. (Under a `|best|`-scaled threshold the
+    /// gate could never fire on the [0, 1] cosine range at eps = 7.)
+    #[test]
+    fn probe_stats_cosine_gate_fires() -> crate::Result<()> {
+        // Cluster A hugs the x-axis (4 docs — exactly the 4·top_k
+        // floor); cluster B hugs the y-axis, far outside the ratio.
+        let centroids = vec![[10.0_f32, 0.0], [0.0, 10.0]];
+        let docs = [
+            ("a0", [10.0_f32, 0.0]),
+            ("a1", [10.0_f32, 0.2]),
+            ("a2", [9.8_f32, 0.1]),
+            ("a3", [10.1_f32, 0.3]),
+            ("b0", [0.0_f32, 10.0]),
+            ("b1", [0.2_f32, 9.9]),
+        ];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::Cosine, &centroids, &docs, 1)?;
+
+        // Query ~17° off the x-axis: best ≈ cos 17° ≈ 0.958, threshold
+        // ≈ 0.958 - 7 · 0.042 ≈ 0.66; centroid B scores ≈ 0.29 < 0.66.
+        let params = AdaptiveProbeParams {
+            epsilon: 7.0,
+            min_candidates: 0,
+            max_probe_count: usize::MAX,
+        };
+        let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![1.0, 0.3], 1, params)?;
+        assert_eq!(stats.termination, ProbeTermination::Gate);
+        assert_eq!(
+            stats.probed_clusters.len(),
+            1,
+            "gate must stop before the far angular cluster ({:?})",
+            stats.probed_clusters,
         );
         Ok(())
     }

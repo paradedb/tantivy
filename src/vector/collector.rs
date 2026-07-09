@@ -209,7 +209,6 @@ mod ivf_e2e_tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
     use crate::schema::{Schema, STORED, STRING};
-    use crate::vector::ivf::AdaptiveProbeParams;
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{
         Metric, VectorColumn, VectorColumnReader, VectorDType, VectorOptions, VectorReader,
@@ -419,12 +418,7 @@ mod ivf_e2e_tests {
         // Exhaustive probing on the Ivf side so the only thing being
         // tested here is per-segment dispatch + merge_fruits — not the
         // adaptive loop, which is covered separately.
-        let params = AdaptiveProbeParams {
-            epsilon: 1e6,
-            min_candidates: 0,
-            min_probe_fanout: 1.0,
-            max_probe_fanout: 1.0,
-        };
+        let params = exhaustive_params(9);
         for query in [[0.0_f32, 0.0], [10.0, 10.0], [5.0, 5.0]] {
             for k in [1usize, 3, 6] {
                 let expected = ground_truth::top_k(&index, embedding_field, metric, &query, k)?;
