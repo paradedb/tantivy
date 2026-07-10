@@ -1,3 +1,4 @@
+use super::scorer::PruningScorer;
 use super::Scorer;
 use crate::docset::TERMINATED;
 use crate::index::SegmentReader;
@@ -27,6 +28,15 @@ impl Query for EmptyQuery {
 pub struct EmptyWeight;
 impl Weight for EmptyWeight {
     fn scorer(&self, _reader: &SegmentReader, _boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        Ok(Box::new(EmptyScorer))
+    }
+
+    fn pruning_scorer(
+        &self,
+        _reader: &SegmentReader,
+        _boost: Score,
+        _init_threshold: Score,
+    ) -> crate::Result<Box<dyn PruningScorer>> {
         Ok(Box::new(EmptyScorer))
     }
 
@@ -68,6 +78,10 @@ impl Scorer for EmptyScorer {
     fn constant_score(&self) -> Option<Score> {
         Some(0.0)
     }
+}
+
+impl PruningScorer for EmptyScorer {
+    fn set_threshold(&mut self, _score: Score) {}
 }
 
 #[cfg(test)]

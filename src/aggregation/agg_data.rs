@@ -886,7 +886,13 @@ fn prepare_multi_terms_missing(
     let (column, column_type) = &columns[column_idx];
     if !matches!(missing, Key::Str(_)) && *column_type != ColumnType::Str {
         // Validate the same lenient numeric coercions as a terms aggregation.
-        get_missing_val_as_u64_lenient(*column_type, column.max_value(), missing, field_name)?;
+        get_missing_val_as_u64_lenient(
+            *column_type,
+            column.max_value(),
+            column.values.num_vals() as u64,
+            missing,
+            field_name,
+        )?;
     }
 
     // Reuse an existing term ordinal so real and missing values enter the same bucket before the
