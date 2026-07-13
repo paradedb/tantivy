@@ -32,7 +32,9 @@ pub(crate) const VEC_EXT: &str = "vec";
 
 pub use backend::{ProbeStats, ProbeTermination, VectorBackend};
 pub use collector::TopDocsByVectorSimilarity;
-pub use distance::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
+pub use distance::{
+    cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
+};
 pub use flat::{FlatVecReader, FlatVecWriter, FlatVectorColumn};
 pub use graph::{Graph, NodeId};
 pub use index::{Candidate, NeighborhoodGraphConfig, RelativeNeighborhoodGraph, Workspace};
@@ -192,8 +194,14 @@ pub trait VectorArena {
     /// The number of vectors held, at `dim` elements each.
     fn num_vectors(&self, dim: usize) -> usize;
 
-    /// Similarity of `query` to vector `node` (higher is better).
-    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[Self::Elem]) -> f32;
+    /// [`Similarity`] of `query` to vector `node`.
+    fn similarity(
+        &self,
+        metric: Metric,
+        dim: usize,
+        node: NodeId,
+        query: &[Self::Elem],
+    ) -> Similarity;
 }
 
 /// Any `[T]`-shaped storage (`&[T]`, `Vec<T>`, …), scored with the typed kernels.
@@ -207,7 +215,7 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
     }
 
     #[inline]
-    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> f32 {
+    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> Similarity {
         metric.similarity(query, &self[node as usize * dim..][..dim])
     }
 }

@@ -25,7 +25,7 @@ use crate::schema::Metric;
 use crate::Executor;
 
 use super::graph::{EdgeListMut, Graph, NodeId};
-use super::{VectorArena, VectorElement};
+use super::{Similarity, VectorArena, VectorElement};
 
 /// Tuning knobs for a [`RelativeNeighborhoodGraph`].
 #[derive(Clone, Copy, Debug)]
@@ -70,8 +70,8 @@ impl Default for NeighborhoodGraphConfig {
 pub struct RelativeNeighborhoodGraph<S> {
     /// Vector arena and directed adjacency.
     graph: Graph<S>,
-    /// Similarity metric (higher is better). Search ranks by similarity; build
-    /// orders edges by its negation, so smaller is closer.
+    /// Similarity metric. Search results and stored edges share one ranking
+    /// convention: descending [`Similarity`], best first.
     metric: Metric,
     /// Search, build, and refine tuning knobs.
     config: NeighborhoodGraphConfig,
@@ -166,7 +166,7 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         }
 
         let mut out: Vec<Candidate> = results.drain().map(|Reverse(c)| c).collect();
-        out.sort_unstable_by(|a, b| b.sim.total_cmp(&a.sim).then_with(|| a.node.cmp(&b.node)));
+        out.sort_unstable_by(|a, b| b.sim.cmp(&a.sim).then_with(|| a.node.cmp(&b.node)));
         out.truncate(k);
         out
     }
@@ -347,9 +347,9 @@ impl RelativeNeighborhoodGraph<&[f32]> {
             }
             debug_assert!(rest.is_empty(), "leaves must tile all of indices");
 
-            // Each leaf brute-forces its pairwise distances and inserts both
+            // Each leaf brute-forces its pairwise similarities and inserts both
             // directions of each edge; the lists dedup re-encounters across
-            // trees and keep only the nearest `max_edges`.
+            // trees and keep only the best `max_edges`.
             executor
                 .map(
                     move |(members, edge_lists): (&[NodeId], &mut [EdgeListMut])| {
@@ -357,9 +357,9 @@ impl RelativeNeighborhoodGraph<&[f32]> {
                             let vec_a = &vectors[members[i] as usize * dim..][..dim];
                             for j in (i + 1)..members.len() {
                                 let vec_b = &vectors[members[j] as usize * dim..][..dim];
-                                let dist = -metric.similarity(vec_a, vec_b);
-                                edge_lists[i].add_edge(members[j], dist);
-                                edge_lists[j].add_edge(members[i], dist);
+                                let sim = metric.similarity(vec_a, vec_b);
+                                edge_lists[i].add_edge(members[j], sim);
+                                edge_lists[j].add_edge(members[i], sim);
                             }
                         }
                         Ok(())
@@ -418,8 +418,8 @@ impl Workspace {
 /// type [`search`](RelativeNeighborhoodGraph::search) returns.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Candidate {
-    /// Similarity to the query (higher is closer); `-sim` is the distance.
-    pub sim: f32,
+    /// Similarity to the query (higher is more similar).
+    pub sim: Similarity,
     /// The graph node this candidate refers to.
     pub node: NodeId,
 }
@@ -429,7 +429,7 @@ impl Eq for Candidate {}
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
         self.sim
-            .total_cmp(&other.sim)
+            .cmp(&other.sim)
             .then_with(|| self.node.cmp(&other.node))
     }
 }
@@ -729,7 +729,7 @@ mod tests {
     use super::*;
 
     /// A line of `n` 1-D points at positions `0..n`, each connected to its ±1 and
-    /// ±2 neighbors (edge "distance" = squared gap, matching `-L2` similarity).
+    /// ±2 neighbors, with edges scored by L2 similarity.
     fn line_index(n: NodeId) -> RelativeNeighborhoodGraph<Vec<f32>> {
         let params = NeighborhoodGraphConfig {
             max_edges: 4,
@@ -743,8 +743,8 @@ mod tests {
             for off in [-2i64, -1, 1, 2] {
                 let nb = i + off;
                 if (0..n as i64).contains(&nb) {
-                    let d = ((i - nb) * (i - nb)) as f32;
-                    rng.graph.add_edge(i as NodeId, nb as NodeId, d);
+                    let sim = Metric::L2.similarity(&[i as f32], &[nb as f32]);
+                    rng.graph.add_edge(i as NodeId, nb as NodeId, sim);
                 }
             }
         }
@@ -823,8 +823,8 @@ mod tests {
         for i in 0..3i64 {
             for j in 0..3i64 {
                 if i != j {
-                    let d = ((i - j) * (i - j)) as f32;
-                    rng.graph.add_edge(i as NodeId, j as NodeId, d);
+                    let sim = Metric::L2.similarity(&[i as f32], &[j as f32]);
+                    rng.graph.add_edge(i as NodeId, j as NodeId, sim);
                 }
             }
         }
@@ -855,8 +855,8 @@ mod tests {
         for i in 0..N as i64 {
             for j in 0..N as i64 {
                 if i != j {
-                    rng.graph
-                        .add_edge(i as NodeId, j as NodeId, ((i - j) * (i - j)) as f32);
+                    let sim = Metric::L2.similarity(&[i as f32], &[j as f32]);
+                    rng.graph.add_edge(i as NodeId, j as NodeId, sim);
                 }
             }
         }
@@ -870,13 +870,13 @@ mod tests {
         }
     }
 
-    /// Fully connect every node to every other with `-L2` edge distances.
+    /// Fully connect every node to every other, scored by L2 similarity.
     fn fully_connect(rng: &mut RelativeNeighborhoodGraph<Vec<f32>>, pts: &[[f32; 2]]) {
         for i in 0..pts.len() {
             for j in 0..pts.len() {
                 if i != j {
-                    let d = (pts[i][0] - pts[j][0]).powi(2) + (pts[i][1] - pts[j][1]).powi(2);
-                    rng.graph.add_edge(i as NodeId, j as NodeId, d);
+                    let sim = Metric::L2.similarity(&pts[i], &pts[j]);
+                    rng.graph.add_edge(i as NodeId, j as NodeId, sim);
                 }
             }
         }
