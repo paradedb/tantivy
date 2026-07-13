@@ -97,8 +97,8 @@ impl VectorColumnReader for IvfVecReader {
             }
         };
         let centroids = self.centroids_meta(field, &options)?;
-        let num_vectors = centroids.num_vectors();
-        if row_doc_id_bytes.len() != num_vectors * size_of::<DocId>() {
+        let num_rows = centroids.num_rows();
+        if row_doc_id_bytes.len() != num_rows * size_of::<DocId>() {
             return Err(TantivyError::InternalError(
                 "IVF id-map length does not match the cluster offsets".to_string(),
             ));
@@ -114,9 +114,12 @@ impl VectorColumnReader for IvfVecReader {
         })
     }
 
+    /// Distinct docs with a vector — NOT the posting-row total, which
+    /// replication multiplies (that's [`CentroidsMeta::num_rows`], surfaced
+    /// per column as [`IvfVectorColumn::num_rows`]).
     fn count(&self, field: Field) -> crate::Result<usize> {
         let options = self.field_options(field)?;
-        Ok(self.centroids_meta(field, options)?.num_vectors())
+        Ok(self.centroids_meta(field, options)?.num_docs)
     }
 
     fn dim(&self, field: Field) -> crate::Result<usize> {
@@ -143,12 +146,23 @@ impl IvfVectorColumn {
         self.options.dim()
     }
 
+    /// Number of distinct docs that have a vector value — the same quantity
+    /// [`FlatVectorColumn::len`](crate::vector::flat::FlatVectorColumn::len)
+    /// reports, so the two layouts agree. Posting rows (memberships) are
+    /// [`Self::num_rows`].
     pub fn len(&self) -> usize {
-        self.centroids.num_vectors()
+        self.centroids.num_docs
     }
 
     pub fn is_empty(&self) -> bool {
-        self.centroids.num_vectors() == 0
+        self.centroids.num_docs == 0
+    }
+
+    /// Total posting rows across all clusters — memberships, counting a
+    /// replicated doc once per cell it lives in. Equals the sum of the
+    /// per-cluster sizes; `>= self.len()` whenever replication is on.
+    pub fn num_rows(&self) -> usize {
+        self.centroids.num_rows()
     }
 
     pub fn num_clusters(&self) -> usize {
