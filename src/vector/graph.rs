@@ -7,27 +7,28 @@
 //! - Node ids are dense indices straight into the backing arrays. The node set
 //!   is fixed at construction: the arena's length determines the node count,
 //!   and every node starts with no edges.
-//! - Adjacency is one flat array: node `i` owns the contiguous, nearest-first,
-//!   [`EMPTY`]-padded run `neighbors[i * max_edges ..][.. max_edges]`.
-//! - Edges store only ids. Distances drive bounded top-*k* insertion at build
-//!   time but aren't durable — the order is baked in and search recomputes
-//!   distances against the live query. A graph reconstructed from disk
-//!   ([`Graph::for_reload`]) carries no distance buffer and is filled in stored
-//!   order via [`Graph::push_edge`].
+//! - Adjacency is one flat array: node `i` owns the contiguous, best-first
+//!   (most similar first), [`EMPTY`]-padded run
+//!   `neighbors[i * max_edges ..][.. max_edges]`.
+//! - Edges store only ids. [`Similarity`] scores drive bounded top-*k*
+//!   insertion at build time but aren't durable — the order is baked in and
+//!   search rescores against the live query. A graph reconstructed from disk
+//!   ([`Graph::for_reload`]) carries no similarity buffer and is filled in
+//!   stored order via [`Graph::push_edge`].
 //!
 //! `Graph<S>` never owns vector data of its own: `S` is any [`VectorArena`] —
 //! a flat, `dim`-strided arena where node `i`'s vector is
 //! `vectors[i * dim ..][.. dim]`. A build borrows the clusterer's matrix
 //! (`S = &[f32]`); a reload can wrap owned or file-resident storage. Scoring
 //! goes through [`VectorArena::similarity`]; the graph itself has no notion
-//! of a metric and never computes a distance.
+//! of a metric and only ever *compares* the [`Similarity`] values handed to it.
 
 use std::io::{self, Write};
 use std::ops::Deref;
 
 use common::BinarySerializable;
 
-use super::VectorArena;
+use super::{Similarity, VectorArena};
 
 /// A dense node identifier, indexing straight into the backing arrays.
 pub type NodeId = u32;
@@ -48,11 +49,12 @@ pub struct Graph<S> {
     /// One contiguous buffer, indexed by node id, borrowed or owned via `S`.
     vectors: S,
     /// Flat adjacency: node `i` owns `neighbors[i * max_edges ..][.. max_edges]`,
-    /// sorted nearest-first and [`EMPTY`]-padded. The durable search structure.
+    /// sorted best-first (most similar first) and [`EMPTY`]-padded. The durable
+    /// search structure.
     neighbors: Vec<NodeId>,
-    /// Per-edge distances driving top-*k* eviction during construction. Empty
-    /// for a graph reconstructed via [`for_reload`](Graph::for_reload).
-    dists: Vec<f32>,
+    /// Per-edge similarities driving top-*k* eviction during construction.
+    /// Empty for a graph reconstructed via [`for_reload`](Graph::for_reload).
+    sims: Vec<Similarity>,
 }
 
 impl<S: VectorArena> Graph<S> {
@@ -67,13 +69,13 @@ impl<S: VectorArena> Graph<S> {
             dim,
             vectors,
             neighbors: vec![EMPTY; n * max_edges],
-            dists: vec![f32::INFINITY; n * max_edges],
+            sims: vec![Similarity::WORST; n * max_edges],
         }
     }
 
     /// Creates a graph for reconstruction from disk: same shape as
-    /// [`new`](Graph::new) but with no distance buffer. Edges are filled in their
-    /// stored, nearest-first order via [`push_edge`](Graph::push_edge);
+    /// [`new`](Graph::new) but with no similarity buffer. Edges are filled in
+    /// their stored, best-first order via [`push_edge`](Graph::push_edge);
     /// [`add_edge`](Graph::add_edge) must not be used.
     pub fn for_reload(vectors: S, dim: usize, max_edges: usize) -> Self {
         let n = Self::node_count(&vectors, dim, max_edges);
@@ -82,7 +84,7 @@ impl<S: VectorArena> Graph<S> {
             dim,
             vectors,
             neighbors: vec![EMPTY; n * max_edges],
-            dists: Vec::new(),
+            sims: Vec::new(),
         }
     }
 
@@ -97,22 +99,23 @@ impl<S: VectorArena> Graph<S> {
     }
 
     /// Considers the directed edge `from -> to`, keeping it only if `from` has a
-    /// free slot or `dist` beats its farthest neighbor (which is evicted) — so
-    /// each node retains its closest `max_edges`, nearest-first. Only `from`'s
-    /// adjacency is touched; the builder adds the reverse edge for symmetry.
+    /// free slot or `sim` beats its least-similar neighbor (which is evicted) —
+    /// so each node retains its `max_edges` most similar, best-first. Only
+    /// `from`'s adjacency is touched; the builder adds the reverse edge for
+    /// symmetry.
     ///
-    /// Re-adding an existing `to` keeps the closer distance; self-edges are
+    /// Re-adding an existing `to` keeps the more similar score; self-edges are
     /// ignored. Only valid on a build graph ([`new`](Graph::new)); use
     /// [`push_edge`](Graph::push_edge) on a reloaded one.
-    pub fn add_edge(&mut self, from: NodeId, to: NodeId, dist: f32) {
+    pub fn add_edge(&mut self, from: NodeId, to: NodeId, sim: Similarity) {
         debug_assert_eq!(
-            self.dists.len(),
+            self.sims.len(),
             self.neighbors.len(),
-            "add_edge requires the build-time distance buffer; use push_edge"
+            "add_edge requires the build-time similarity buffer; use push_edge"
         );
         debug_assert!((from as usize) < self.len(), "from out of range");
         debug_assert!((to as usize) < self.len(), "to out of range");
-        self.edge_list_mut(from).add_edge(to, dist);
+        self.edge_list_mut(from).add_edge(to, sim);
     }
 
     /// Mutable view of `node`'s edge list.
@@ -122,35 +125,36 @@ impl<S: VectorArena> Graph<S> {
         EdgeListMut {
             node,
             neighbors: &mut self.neighbors[start..start + k],
-            dists: &mut self.dists[start..start + k],
+            sims: &mut self.sims[start..start + k],
         }
     }
 
     /// Mutable views of every node's edge list, in id order. The views are
     /// disjoint, so they can be split across threads and mutated concurrently
     /// without locks. Only valid on a build graph ([`new`](Graph::new)), which
-    /// has the distance buffer.
+    /// has the similarity buffer.
     pub(crate) fn edge_lists_mut(&mut self) -> impl Iterator<Item = EdgeListMut<'_>> {
         debug_assert_eq!(
-            self.dists.len(),
+            self.sims.len(),
             self.neighbors.len(),
-            "edge_lists_mut requires the build-time distance buffer"
+            "edge_lists_mut requires the build-time similarity buffer"
         );
         let k = self.max_edges;
         self.neighbors
             .chunks_mut(k)
-            .zip(self.dists.chunks_mut(k))
+            .zip(self.sims.chunks_mut(k))
             .enumerate()
-            .map(|(node, (neighbors, dists))| EdgeListMut {
+            .map(|(node, (neighbors, sims))| EdgeListMut {
                 node: node as NodeId,
                 neighbors,
-                dists,
+                sims,
             })
     }
 
     /// Blindly appends `to` as `from`'s next neighbor, with no top-*k* or
-    /// distance rules. For reconstructing a graph whose edges are already stored
-    /// in nearest-first order. Panics if `from` already has `max_edges` neighbors.
+    /// similarity rules. For reconstructing a graph whose edges are already
+    /// stored in best-first order. Panics if `from` already has `max_edges`
+    /// neighbors.
     pub fn push_edge(&mut self, from: NodeId, to: NodeId) {
         debug_assert!((from as usize) < self.len(), "from out of range");
         let k = self.max_edges;
@@ -160,10 +164,10 @@ impl<S: VectorArena> Graph<S> {
     }
 
     /// Overwrites `node`'s adjacency with `neighbors` (already in the desired,
-    /// nearest-first order), padding the remaining slots with [`EMPTY`]. Used by
+    /// best-first order), padding the remaining slots with [`EMPTY`]. Used by
     /// the RNG rebuild to replace a node's edge set in one shot.
     ///
-    /// Does not maintain the build-time distance buffer, so it must not be
+    /// Does not maintain the build-time similarity buffer, so it must not be
     /// interleaved with [`add_edge`](Graph::add_edge) on the same node.
     pub fn set_neighbors(&mut self, node: NodeId, neighbors: &[NodeId]) {
         let k = self.max_edges;
@@ -185,7 +189,7 @@ impl<S: VectorArena> Graph<S> {
             .count()
     }
 
-    /// Borrows `node`'s neighbor ids, nearest-first. Excludes empty slots.
+    /// Borrows `node`'s neighbor ids, best-first. Excludes empty slots.
     #[inline]
     pub fn neighbors(&self, node: NodeId) -> &[NodeId] {
         let base = node as usize * self.max_edges;
@@ -220,13 +224,13 @@ impl<S: VectorArena> Graph<S> {
     /// adjacency exactly as held in memory — as little-endian `u32`s:
     ///
     /// ```text
-    /// max_edges (u32) + neighbors (u32[len · max_edges], nearest-first,
+    /// max_edges (u32) + neighbors (u32[len · max_edges], best-first,
     ///                              EMPTY-padded runs of max_edges per node)
     /// ```
     ///
     /// Neither the vectors nor the node count are written: the arena is
     /// persisted (and the count derived) elsewhere, and a reload wraps it via
-    /// [`for_reload`](Graph::for_reload). Distances aren't durable at all —
+    /// [`for_reload`](Graph::for_reload). Similarities aren't durable at all —
     /// see the [module docs](self).
     pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         let max_edges = u32::try_from(self.max_edges)
@@ -277,58 +281,59 @@ impl<'a, T: 'a, S: Deref<Target = [T]>> IntoIterator for &'a Graph<S> {
     }
 }
 
-/// Mutable view of one node's edge list: its neighbor-id and distance runs,
-/// nearest-first. Views of different nodes are disjoint, so a set of them
+/// Mutable view of one node's edge list: its neighbor-id and similarity runs,
+/// best-first. Views of different nodes are disjoint, so a set of them
 /// (from [`Graph::edge_lists_mut`]) can be mutated by different threads
 /// without locks.
 pub(crate) struct EdgeListMut<'a> {
     /// The node this list belongs to; self-edges to it are rejected.
     node: NodeId,
     neighbors: &'a mut [NodeId],
-    dists: &'a mut [f32],
+    sims: &'a mut [Similarity],
 }
 
 impl EdgeListMut<'_> {
     /// Considers the directed edge `self.node -> to` — the same bounded
-    /// nearest-first insert as [`Graph::add_edge`], which delegates here.
-    pub(crate) fn add_edge(&mut self, to: NodeId, dist: f32) {
+    /// best-first insert as [`Graph::add_edge`], which delegates here.
+    pub(crate) fn add_edge(&mut self, to: NodeId, sim: Similarity) {
         if to == self.node {
             return;
         }
 
-        // Reject when the list is full and this edge is no closer than the
-        // farthest neighbor.
-        let last = self.dists.len() - 1;
-        if dist >= self.dists[last] {
+        // Reject when the list is full and this edge is no more similar than
+        // the least-similar neighbor. (Empty slots hold `Similarity::WORST`,
+        // which any real score beats.)
+        let last = self.sims.len() - 1;
+        if sim <= self.sims[last] {
             return;
         }
 
-        // Deduplicate: if `to` is already a neighbor, keep only the closer copy
-        // and let it bubble back into sorted position.
+        // Deduplicate: if `to` is already a neighbor, keep only the more
+        // similar copy and let it bubble back into sorted position.
         if let Some(pos) = self.neighbors.iter().position(|&n| n == to) {
-            if dist >= self.dists[pos] {
+            if sim <= self.sims[pos] {
                 return;
             }
-            self.dists[pos] = dist;
+            self.sims[pos] = sim;
             let mut j = pos;
-            while j > 0 && self.dists[j - 1] > self.dists[j] {
+            while j > 0 && self.sims[j - 1] < self.sims[j] {
                 self.neighbors.swap(j - 1, j);
-                self.dists.swap(j - 1, j);
+                self.sims.swap(j - 1, j);
                 j -= 1;
             }
             return;
         }
 
-        // Insertion sort: slide `dist` into place from the back, shifting larger
-        // distances up and dropping whatever falls off the last slot.
+        // Insertion sort: slide `sim` into place from the back, shifting less
+        // similar entries down and dropping whatever falls off the last slot.
         let mut j = last;
-        while j > 0 && self.dists[j - 1] > dist {
+        while j > 0 && self.sims[j - 1] < sim {
             self.neighbors[j] = self.neighbors[j - 1];
-            self.dists[j] = self.dists[j - 1];
+            self.sims[j] = self.sims[j - 1];
             j -= 1;
         }
         self.neighbors[j] = to;
-        self.dists[j] = dist;
+        self.sims[j] = sim;
     }
 }
 
@@ -342,6 +347,11 @@ mod tests {
         Graph::new((0..n).map(|i| i as f32).collect(), 1, max_edges)
     }
 
+    /// Shorthand for a raw similarity score (higher is better).
+    fn sim(score: f32) -> Similarity {
+        Similarity::new(score)
+    }
+
     #[test]
     fn edge_lists_mut_allows_disjoint_parallel_writes() {
         // Two threads each own half the edge lists. The borrows are disjoint,
@@ -351,12 +361,12 @@ mod tests {
         let (left, right) = lists.split_at_mut(2);
         std::thread::scope(|scope| {
             scope.spawn(move || {
-                left[0].add_edge(1, 1.0);
-                left[1].add_edge(0, 1.0);
+                left[0].add_edge(1, sim(1.0));
+                left[1].add_edge(0, sim(1.0));
             });
             scope.spawn(move || {
-                right[0].add_edge(3, 1.0);
-                right[1].add_edge(2, 1.0);
+                right[0].add_edge(3, sim(1.0));
+                right[1].add_edge(2, sim(1.0));
             });
         });
         drop(lists);
@@ -390,7 +400,7 @@ mod tests {
         let matrix: Vec<f32> = vec![0.0, 1.0, 2.0];
         let mut g: Graph<&[f32]> = Graph::new(&matrix, 1, 2);
         let vectors = *g.arena();
-        g.add_edge(0, 1, 1.0); // mutate while `vectors` is still borrowed
+        g.add_edge(0, 1, sim(1.0)); // mutate while `vectors` is still borrowed
         assert_eq!(vectors, matrix.as_slice());
         assert_eq!(g.neighbors(0), &[1]);
     }
@@ -402,49 +412,49 @@ mod tests {
     }
 
     #[test]
-    fn edges_are_sorted_nearest_first() {
+    fn edges_are_sorted_best_first() {
         let mut g = graph_with_nodes(5, 8);
-        g.add_edge(0, 3, 0.9);
-        g.add_edge(0, 1, 0.2);
-        g.add_edge(0, 4, 0.5);
-        g.add_edge(0, 2, 0.1);
+        g.add_edge(0, 3, sim(0.1));
+        g.add_edge(0, 1, sim(0.8));
+        g.add_edge(0, 4, sim(0.5));
+        g.add_edge(0, 2, sim(0.9));
         assert_eq!(g.neighbors(0), &[2, 1, 4, 3]);
         assert_eq!(g.degree(0), 4);
     }
 
     #[test]
-    fn bounded_top_k_evicts_the_farthest() {
+    fn bounded_top_k_evicts_the_least_similar() {
         let mut g = graph_with_nodes(5, 2);
-        g.add_edge(0, 1, 0.5);
-        g.add_edge(0, 2, 0.4);
-        // Full now with {2:0.4, 1:0.5}. A closer edge evicts the farthest (1).
-        g.add_edge(0, 3, 0.1);
+        g.add_edge(0, 1, sim(0.5));
+        g.add_edge(0, 2, sim(0.6));
+        // Full now with {2:0.6, 1:0.5}. A better edge evicts the worst (1).
+        g.add_edge(0, 3, sim(0.9));
         assert_eq!(g.neighbors(0), &[3, 2]);
-        // A farther edge than the current max is rejected outright.
-        g.add_edge(0, 4, 0.9);
+        // An edge worse than the current minimum is rejected outright.
+        g.add_edge(0, 4, sim(0.1));
         assert_eq!(g.neighbors(0), &[3, 2]);
     }
 
     #[test]
-    fn re_adding_keeps_the_closer_distance() {
+    fn re_adding_keeps_the_more_similar_score() {
         let mut g = graph_with_nodes(4, 4);
-        g.add_edge(0, 1, 0.8);
-        g.add_edge(0, 2, 0.5);
-        // Re-add 1 closer: it must move ahead of 2 and not duplicate.
-        g.add_edge(0, 1, 0.1);
+        g.add_edge(0, 1, sim(0.2));
+        g.add_edge(0, 2, sim(0.5));
+        // Re-add 1 with a better score: it must move ahead of 2 and not duplicate.
+        g.add_edge(0, 1, sim(0.9));
         assert_eq!(g.neighbors(0), &[1, 2]);
-        // Re-add 1 farther: ignored.
-        g.add_edge(0, 1, 0.9);
+        // Re-add 1 with a worse score: ignored.
+        g.add_edge(0, 1, sim(0.1));
         assert_eq!(g.neighbors(0), &[1, 2]);
     }
 
     #[test]
     fn edges_are_directed_and_self_edges_ignored() {
         let mut g = graph_with_nodes(3, 4);
-        g.add_edge(0, 1, 0.3);
+        g.add_edge(0, 1, sim(0.3));
         assert_eq!(g.neighbors(0), &[1]);
         assert!(g.neighbors(1).is_empty());
-        g.add_edge(2, 2, 0.0);
+        g.add_edge(2, 2, sim(1.0));
         assert!(g.neighbors(2).is_empty());
     }
 
@@ -468,7 +478,7 @@ mod tests {
     fn for_reload_pushes_edges_in_stored_order() {
         let arena: Vec<f32> = (0..4).map(|i| i as f32).collect();
         let mut g = Graph::for_reload(arena, 1, 4);
-        // Edges arrive already nearest-first; push them blindly, no distances.
+        // Edges arrive already best-first; push them blindly, no similarities.
         g.push_edge(0, 1);
         g.push_edge(0, 2);
         g.push_edge(0, 3);
@@ -514,9 +524,9 @@ mod tests {
     #[test]
     fn serialize_writes_max_edges_then_padded_adjacency() {
         let mut g = graph_with_nodes(3, 2);
-        g.add_edge(0, 2, 0.9);
-        g.add_edge(0, 1, 0.2); // closer: sorts ahead of 2
-        g.add_edge(1, 0, 0.2);
+        g.add_edge(0, 2, sim(0.2));
+        g.add_edge(0, 1, sim(0.9)); // more similar: sorts ahead of 2
+        g.add_edge(1, 0, sim(0.9));
         // node 2 keeps an all-EMPTY run
 
         let mut bytes = Vec::new();
@@ -533,9 +543,9 @@ mod tests {
         // reload (push edges in stored order) → serialize must be a fixed
         // point, so nothing drifts however many times a graph round-trips.
         let mut built = graph_with_nodes(4, 3);
-        built.add_edge(0, 1, 0.1);
-        built.add_edge(0, 3, 0.4);
-        built.add_edge(2, 0, 0.2);
+        built.add_edge(0, 1, sim(0.9));
+        built.add_edge(0, 3, sim(0.6));
+        built.add_edge(2, 0, sim(0.8));
 
         let mut bytes = Vec::new();
         built.serialize(&mut bytes).unwrap();

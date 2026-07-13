@@ -470,7 +470,7 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
     let hits = index.ground_truth(query, 5)?;
     let mut expected_scores: Vec<Score> = grid2d::vectors(NUM_DOCS)
         .iter()
-        .map(|vector| Metric::L2.similarity(&query, vector))
+        .map(|vector| Metric::L2.similarity(&query, vector).score())
         .collect();
     expected_scores
         .sort_by(|left, right| right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal));

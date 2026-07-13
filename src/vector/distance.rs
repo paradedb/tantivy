@@ -14,8 +14,62 @@
 //! methods compile to plain `fsub` / `fmul` / `fadd`; quantized dtypes
 //! plug in their own decode + arithmetic via the trait.
 
+use std::cmp::Ordering;
+
 use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::{Accumulator, VectorElement};
+
+/// A "higher is better" similarity score — the one ranking convention of the
+/// whole vector module.
+///
+/// The raw kernels below ([`l2_squared`], [`dot`], …) return bare `f32`s in
+/// whatever space the math lives in; [`Metric::similarity`] is the boundary
+/// that folds them all into similarity space (negating L2) and wraps the
+/// result. Downstream code — edge ordering, beam search, RNG occlusion —
+/// compares `Similarity` values directly and never re-negates, so a distance
+/// can't be confused for a similarity without an explicit
+/// [`Similarity::new`].
+///
+/// Ordered totally via [`f32::total_cmp`], so it works directly in heaps and
+/// sorts: greater means more similar, and "best-first" always means
+/// descending `Similarity`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Similarity(f32);
+
+impl Similarity {
+    /// Less similar than any real score (`-∞`); the empty-slot sentinel.
+    pub const WORST: Similarity = Similarity(f32::NEG_INFINITY);
+
+    /// Wraps a raw score that is *already* in similarity space (higher is
+    /// better). Callers converting from a distance must negate first — that
+    /// negation is exactly what this type exists to make explicit.
+    #[inline]
+    pub fn new(score: f32) -> Self {
+        Similarity(score)
+    }
+
+    /// The raw score, e.g. to hand off as a document [`Score`](crate::Score).
+    #[inline]
+    pub fn score(self) -> f32 {
+        self.0
+    }
+}
+
+impl Eq for Similarity {}
+
+impl Ord for Similarity {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Similarity {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// 16 = 512 (avx512 register width) / 32 (sizeof::<f32>() in bits).
 const LANES: usize = 16;
@@ -265,30 +319,30 @@ pub fn cosine_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {
 }
 
 impl Metric {
-    /// Compute a "higher is better" similarity score between two vectors.
+    /// Compute the [`Similarity`] of two vectors.
     ///
-    /// L2 distance is negated (squared, then sign-flipped) so all metrics
-    /// share the same ranking convention. Magnitude differences across
-    /// metrics are the caller's problem.
+    /// L2 distance is negated (squared, then sign-flipped) here, and only
+    /// here, so all metrics share the same "higher is better" convention.
+    /// Magnitude differences across metrics are the caller's problem.
     #[inline]
-    pub fn similarity<T: VectorElement>(self, query: &[T], doc: &[T]) -> f32 {
-        match self {
+    pub fn similarity<T: VectorElement>(self, query: &[T], doc: &[T]) -> Similarity {
+        Similarity(match self {
             Metric::L2 => -l2_squared(query, doc),
             Metric::Cosine => cosine(query, doc),
             Metric::Dot => dot(query, doc),
-        }
+        })
     }
 
     /// Like [`similarity`](Self::similarity), but the doc side is
     /// little-endian bytes — typically a borrowed slice straight out
     /// of the segment's file.
     #[inline]
-    pub fn similarity_bytes<T: VectorElement>(self, query: &[T], doc_bytes: &[u8]) -> f32 {
-        match self {
+    pub fn similarity_bytes<T: VectorElement>(self, query: &[T], doc_bytes: &[u8]) -> Similarity {
+        Similarity(match self {
             Metric::L2 => -l2_squared_bytes(query, doc_bytes),
             Metric::Cosine => cosine_bytes(query, doc_bytes),
             Metric::Dot => dot_bytes(query, doc_bytes),
-        }
+        })
     }
 }
 
@@ -348,7 +402,7 @@ mod tests {
         for m in [Metric::L2, Metric::Cosine, Metric::Dot] {
             let s_near = m.similarity(&query, &near);
             let s_far = m.similarity(&query, &far);
-            assert!(s_near > s_far, "metric {m:?}: {s_near} vs {s_far}");
+            assert!(s_near > s_far, "metric {m:?}: {s_near:?} vs {s_far:?}");
         }
     }
 
