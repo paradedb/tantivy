@@ -120,4 +120,10 @@ impl CentroidsMeta {
     pub(crate) fn num_vectors(&self) -> usize {
         self.cluster_offset(self.num_centroids) as usize
     }
+
+    pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.num_centroids).map(|cluster| {
+            (self.cluster_offset(cluster + 1) - self.cluster_offset(cluster)) as usize
+        })
+    }
 }

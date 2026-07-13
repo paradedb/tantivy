@@ -6,6 +6,7 @@
 //! which defaults to 10k docs.
 
 mod centroids;
+mod params;
 mod plugin;
 mod reader;
 mod training;
@@ -14,6 +15,7 @@ mod training;
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
 pub(crate) use centroids::CentroidsMeta;
+pub use params::AdaptiveProbeParams;
 pub(crate) use plugin::merge_ivf;
 pub use reader::{IvfVecReader, IvfVectorColumn};
 pub(crate) use training::{decode_row, encode_vector};

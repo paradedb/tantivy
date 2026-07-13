@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
-use crate::collector::Count;
+use crate::collector::{Count, TopDocs};
 use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
-use crate::query::TermQuery;
+use crate::query::{AllQuery, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
+use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric, VectorColumn,
     VectorColumnReader, VectorDType, VectorOptions, VectorReader,
@@ -18,14 +19,11 @@ const LABEL_FIELD_NAME: &str = "label";
 const NUM_DOCS: usize = 100;
 const DOCS_PER_SEGMENT: usize = 10;
 
-/// Which on-disk layout the fixture should produce. Selected via the index
-/// settings (clustering threshold + clusterer); the resulting segment is
-/// self-describing through its `.vec` `IdMap`, so this is purely a build knob.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum VectorStorageFormat {
-    Flat,
-    Ivf,
-}
+// Which on-disk layout the fixture should produce, reusing the public
+// descriptor enum. Selected via the index settings (clustering threshold +
+// clusterer); the resulting segment is self-describing through its `.vec`
+// `IdMap`, so this is purely a build knob here.
+pub(crate) use crate::vector::VectorStorageFormat;
 
 pub(crate) struct TestVectorIndex {
     pub(crate) index: Index,
@@ -173,8 +171,8 @@ impl TestVectorIndex {
     }
 }
 
-struct Grid2DClusterer {
-    centroids: Vec<[f32; grid2d::DIM]>,
+pub(crate) struct Grid2DClusterer {
+    pub(crate) centroids: Vec<[f32; grid2d::DIM]>,
 }
 
 impl IvfClusterer for Grid2DClusterer {
@@ -191,6 +189,9 @@ impl IvfClusterer for Grid2DClusterer {
             num_centroids: self.centroids.len().min(total_target_docs),
             training_samples_per_centroid: self.training_samples_per_centroid(),
             assign_batch_size: self.assign_batch_size(),
+            // The grid fixture asserts exact cluster membership; keep
+            // replication off so the 3×3 grid assignment stays primary-only.
+            replicas: 1,
         })
     }
 
@@ -389,6 +390,33 @@ fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
     Ok(())
 }
 
+/// Regression for `FlatBackend::top_n` under truncation. A bare
+/// `TopNComputer::new` defaults to `ReverseComparator`, which keeps
+/// the K *smallest* sort_keys — for our "higher = closer" similarity
+/// convention that returned the K *farthest* docs once a segment had
+/// more than K matches. Latent before the fix because every previous
+/// flat test had ≤ K docs per segment, so the truncate_top_n path
+/// never fired. The backend now wires `NaturalComparator` explicitly;
+/// this test would fail under the old code.
+///
+/// The shared fixture commits every `DOCS_PER_SEGMENT = 10` docs, so
+/// each segment has 10 > K = 3 docs — the truncation path is on.
+#[test]
+fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Flat)
+        .build()?;
+    let query = grid2d::centroids()[0];
+    let top_k = 3;
+    let expected = index.ground_truth(query, top_k)?;
+    let hits = index.index.reader()?.searcher().search(
+        &AllQuery,
+        &TopDocs::with_limit(top_k).order_by_similarity(index.embedding_field(), query.to_vec()),
+    )?;
+    assert_eq!(hits, expected);
+    Ok(())
+}
+
 #[test]
 fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
     use crate::directory::CompositeFile;
@@ -455,11 +483,94 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
     Ok(())
 }
 
-mod ground_truth {
+/// Non-finite elements are rejected at ingest on normalizing fields
+/// (Cosine+F32) and accepted on non-normalizing ones (L2) — validation
+/// rides the normalize path only. `IndexWriter::add_document` enqueues
+/// to a worker, so the rejection may surface either from the enqueue or
+/// from the following `commit`.
+#[test]
+fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        // L2: same vector is accepted; nothing normalizes, data is stored raw.
+        let mut schema_builder = Schema::builder();
+        let l2_field = schema_builder.add_vector_field("l2", VectorOptions::new(2, Metric::L2));
+        let schema = schema_builder.build();
+        let index = Index::builder().schema(schema).create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(l2_field, &[bad, 1.0]);
+        writer.add_document(doc)?;
+        writer.commit()?;
+
+        // Cosine: rejected.
+        let mut schema_builder = Schema::builder();
+        let cos_field =
+            schema_builder.add_vector_field("cos", VectorOptions::new(2, Metric::Cosine));
+        let schema = schema_builder.build();
+        let index = Index::builder().schema(schema).create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(cos_field, &[bad, 1.0]);
+        let err = match writer.add_document(doc) {
+            Err(err) => err.to_string(),
+            Ok(_) => writer
+                .commit()
+                .expect_err("non-finite vector must fail ingest")
+                .to_string(),
+        };
+        assert!(err.contains("non-finite"), "bad={bad}, err={err}");
+    }
+    Ok(())
+}
+
+/// A zero vector is honest data: ingest accepts it (`ZeroSkipped`), and
+/// at query time it scores exactly 0.0 — behind any non-zero doc.
+#[test]
+fn ingest_accepts_zero_vector() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let embedding_field =
+        schema_builder.add_vector_field("embedding", VectorOptions::new(2, Metric::Cosine));
+    let schema = schema_builder.build();
+    let index = Index::builder().schema(schema).create_in_ram()?;
+    let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+    let mut zero_doc = TantivyDocument::new();
+    zero_doc.add_vector(embedding_field, &[0.0_f32, 0.0]);
+    writer.add_document(zero_doc)?;
+    let mut unit_doc = TantivyDocument::new();
+    unit_doc.add_vector(embedding_field, &[0.6_f32, 0.8]);
+    writer.add_document(unit_doc)?;
+    writer.commit()?;
+
+    let searcher = index.reader()?.searcher();
+    let collector = TopDocs::with_limit(2).order_by_similarity(embedding_field, vec![1.0_f32, 0.0]);
+    let hits = searcher.search(&AllQuery, &collector)?;
+    assert_eq!(hits.len(), 2, "zero vector must be ingested and returned");
+    assert!(hits[0].0 > 0.0, "non-zero doc must rank first: {hits:?}");
+    assert_eq!(hits[1].0, 0.0, "zero vector scores 0.0: {hits:?}");
+    Ok(())
+}
+
+/// "Scan everything" probe params: the ceiling clamps to the segment's
+/// cluster count and the survivor floor is unsatisfiable, so the gate
+/// can never fire and every cluster is probed. Used by oracle-equality
+/// tests where any pruning would make the equality check fail. (A
+/// "huge epsilon" is NOT a reliable way to express this across
+/// metrics — e.g. an L2 query sitting exactly on a centroid arms the
+/// gate at any epsilon.)
+pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
+    AdaptiveProbeParams {
+        epsilon: 0.0,
+        min_candidates: usize::MAX,
+        max_probe_count: usize::MAX,
+    }
+}
+
+pub(crate) mod ground_truth {
     use std::cmp::Ordering;
+    use std::sync::Arc;
 
     use crate::schema::Field;
-    use crate::vector::{Metric, VectorColumnReader, VectorReader};
+    use crate::vector::{Metric, PreparedQuery, VectorColumnReader, VectorReader};
     use crate::{DocAddress, Index, Score};
 
     pub(crate) fn top_k(
@@ -469,6 +580,7 @@ mod ground_truth {
         query: &[f32],
         top_k: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        let query = PreparedQuery::<f32>::new(metric, Arc::new(query.to_vec()));
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
@@ -483,7 +595,7 @@ mod ground_truth {
                 }
                 if let Some(bytes) = column.vector_bytes_at(doc) {
                     scored.push((
-                        metric.similarity_bytes(query, bytes),
+                        query.score_doc_bytes(bytes),
                         DocAddress::new(seg_ord as u32, doc),
                     ));
                 }

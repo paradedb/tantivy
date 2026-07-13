@@ -61,6 +61,16 @@ impl VectorOptions {
     pub fn bytes_per_vector(&self) -> usize {
         self.dim * self.dtype.size_bytes()
     }
+
+    /// Whether this field's `(metric, dtype)` requires write-time
+    /// unit-normalization (see `vector::distance::maybe_normalize_bytes`).
+    /// Currently only `Cosine + F32`.
+    pub fn needs_normalization(&self) -> bool {
+        matches!(
+            (self.metric, self.dtype),
+            (Metric::Cosine, VectorDType::F32)
+        )
+    }
 }
 
 #[cfg(test)]
