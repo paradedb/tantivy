@@ -88,6 +88,46 @@ impl<S: VectorArena> Graph<S> {
         }
     }
 
+    /// Reconstructs a graph serialized by [`serialize`](Graph::serialize)
+    /// over `vectors` — the arena is persisted separately, and its length
+    /// fixes the node count the adjacency is validated against. The stored
+    /// adjacency is exactly the in-memory layout (best-first, EMPTY-padded),
+    /// so this is a validate-and-decode, not a rebuild. Like
+    /// [`for_reload`](Graph::for_reload), the result carries no similarity
+    /// buffer and is search-only.
+    pub fn open(adjacency: &[u8], vectors: S, dim: usize) -> io::Result<Graph<S>> {
+        let mut cursor = adjacency;
+        let max_edges = u32::deserialize(&mut cursor)? as usize;
+        if max_edges == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serialized graph has zero max_edges",
+            ));
+        }
+        let n = Self::node_count(&vectors, dim, max_edges);
+        let expected = n * max_edges * std::mem::size_of::<NodeId>();
+        if cursor.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "serialized graph adjacency is {} bytes, expected {expected} for {n} nodes",
+                    cursor.len()
+                ),
+            ));
+        }
+        let neighbors: Vec<NodeId> = cursor
+            .chunks_exact(std::mem::size_of::<NodeId>())
+            .map(|chunk| NodeId::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        Ok(Graph {
+            max_edges,
+            dim,
+            vectors,
+            neighbors,
+            sims: Vec::new(),
+        })
+    }
+
     /// Validates the constructor arguments and derives the node count.
     fn node_count(vectors: &S, dim: usize, max_edges: usize) -> usize {
         assert!(max_edges > 0, "max_edges must be non-zero");

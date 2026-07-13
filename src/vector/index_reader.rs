@@ -16,9 +16,10 @@
 //! - The **index** ([`IvfIndex`]) exists iff the segment was merged with IVF
 //!   clustering, and is loaded from the sibling `.centroids` composite:
 //!   centroids + `num_docs` in slot `[0]`, the cluster offsets prefix sum in
-//!   slot `[1]`, and (optionally) the RNG routing graph in slot `[2]`. Its
-//!   job is to tell a query which clusters — contiguous row ranges of slot
-//!   `[1]` — to probe. Without it, search falls back to an exact scan.
+//!   slot `[1]`, and (for segments with enough centroids to need routing)
+//!   the RNG routing graph in slot `[2]`. Its job is to tell a query which
+//!   clusters — contiguous row ranges of slot `[1]` — to probe. Without it,
+//!   search falls back to an exact scan.
 //!
 //! The pairing is an invariant of the write path (`VectorPlugin`): the IVF
 //! merge writes cluster-sorted rows + an `Explicit` id-map + `.centroids`;
@@ -26,23 +27,22 @@
 //! sidecar. [`VectorIndexReader::open`] validates the two signals agree and
 //! everything downstream relies on it.
 
-use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::cmp::Ordering;
 use std::ops::Range;
 
-use common::{BinarySerializable, HasLen, OwnedBytes};
+use common::{HasLen, OwnedBytes};
 
 use super::flat::IdMap;
-use super::graph::EMPTY;
 use super::header::read_header;
-use super::index::Candidate;
 use super::ivf::{CentroidsMeta, CENTROIDS_EXT};
-use super::prepared::PreparedQuery;
-use super::{NodeId, Similarity, VectorElement, VEC_EXT};
+use super::{
+    evenly_spaced_seeds, FileSliceArena, NeighborhoodGraphConfig, NodeId,
+    RelativeNeighborhoodGraph, VectorArena, Workspace, VEC_EXT,
+};
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
 use crate::index::SegmentComponent;
-use crate::schema::{Field, FieldType, VectorOptions};
+use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
 
 /// Which on-disk layout a segment's vector data uses. Purely descriptive —
@@ -114,12 +114,12 @@ impl VectorIndexReader {
             }
         };
 
-        let vec_file =
-            match segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string())) {
-                Ok(file) => file,
-                Err(OpenReadError::FileDoesNotExist(_)) => return Ok(Self::empty(options)),
-                Err(err) => return Err(err.into()),
-            };
+        let vec_file = match segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))
+        {
+            Ok(file) => file,
+            Err(OpenReadError::FileDoesNotExist(_)) => return Ok(Self::empty(options)),
+            Err(err) => return Err(err.into()),
+        };
         let (_version, body) = read_header(&vec_file)?;
         let vec_composite = CompositeFile::open(&body)?;
         let (Some(id_map_slice), Some(rows_slice)) = (
@@ -130,24 +130,27 @@ impl VectorIndexReader {
         };
         let id_map = IdMap::open(id_map_slice, segment_reader.max_doc())?;
 
-        let centroid_slots = match segment_reader
-            .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
-        {
-            Ok(file) => {
-                let composite = CompositeFile::open(&file)?;
-                match (
-                    composite.open_read_with_idx(field, 0),
-                    composite.open_read_with_idx(field, 1),
-                ) {
-                    (Some(centroids), Some(offsets)) => {
-                        Some((centroids, offsets, composite.open_read_with_idx(field, 2)))
+        // TODO: Add a version header to the centroids file
+        let centroid_slots =
+            match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
+                Ok(file) => {
+                    let composite = CompositeFile::open(&file)?;
+                    match (
+                        composite.open_read_with_idx(field, 0),
+                        composite.open_read_with_idx(field, 1),
+                    ) {
+                        // Slot [2] (the routing graph) is optional: the
+                        // write side skips it for degenerate centroid
+                        // counts, which route by linear scan instead.
+                        (Some(centroids), Some(offsets)) => {
+                            Some((centroids, offsets, composite.open_read_with_idx(field, 2)))
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 }
-            }
-            Err(OpenReadError::FileDoesNotExist(_)) => None,
-            Err(err) => return Err(err.into()),
-        };
+                Err(OpenReadError::FileDoesNotExist(_)) => None,
+                Err(err) => return Err(err.into()),
+            };
 
         // The id-map variant and the `.centroids` sidecar are two signals of
         // one write-path decision; a mismatch means a corrupt segment, never a
@@ -394,25 +397,26 @@ impl VectorIndexReader {
     }
 }
 
-/// Beam width floor for RNG routing, matching the write-side
-/// [`NeighborhoodGraphConfig`](super::NeighborhoodGraphConfig) default `ef`.
-const ROUTING_EF_FLOOR: usize = 64;
-
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
 ///
-/// Pinned state is small and touched by every query: the cluster offsets, the
-/// RNG adjacency (edges only, ~`k × max_edges × 4` bytes), and the centroid
-/// vectors. Everything row-scale stays out (the rows and id-map live on
-/// [`VectorIndexReader`]).
+/// Pinned state is small and touched by every query: the cluster offsets and
+/// the RNG adjacency (edges only, ~`k × max_edges × 4` bytes). The centroid
+/// vectors stay behind a [`FileSliceArena`] and are fetched one node at a
+/// time as routing visits them. Everything row-scale stays out entirely (the
+/// rows and id-map live on [`VectorIndexReader`]).
 pub struct IvfIndex {
     meta: CentroidsMeta,
-    /// `options.bytes_per_vector()`, cached for centroid addressing.
-    stride: usize,
-    /// The RNG over the centroids (`.centroids` slot `[2]`). Absent for
-    /// degenerate centroid counts or segments written before the graph was
-    /// persisted — routing then falls back to a linear centroid scan.
-    graph: Option<RoutingGraph>,
+    dim: usize,
+    metric: Metric,
+    /// The persisted RNG over the centroids (`.centroids` slot `[2]`),
+    /// reloaded search-only over the lazy centroid arena. `None` for
+    /// degenerate centroid counts, where the write side skips the slot and
+    /// routing falls back to a linear scan of the (few) centroids.
+    graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
+    /// Evenly spaced routing entry points — the same formula the write-side
+    /// replica selector searches with.
+    seeds: Vec<NodeId>,
 }
 
 impl IvfIndex {
@@ -423,14 +427,32 @@ impl IvfIndex {
         options: &VectorOptions,
     ) -> crate::Result<Self> {
         let meta = CentroidsMeta::open(centroids_slice, offsets_slice, options)?;
+        match options.dtype() {
+            VectorDType::F32 => {}
+        } // exhaustive: a new dtype must pick its arena element type here
         let graph = match graph_slice {
-            Some(slice) => Some(RoutingGraph::open(slice, meta.num_centroids)?),
+            Some(slice) => {
+                // The adjacency is pinned; the centroid rows behind the
+                // arena are not. Node count and adjacency length are
+                // cross-validated against the arena inside `Graph::open`.
+                let adjacency = slice.read_bytes()?;
+                Some(RelativeNeighborhoodGraph::open(
+                    &adjacency,
+                    FileSliceArena::<f32>::new(meta.centroids_slice.clone()),
+                    options.dim(),
+                    options.metric(),
+                    NeighborhoodGraphConfig::default(),
+                )?)
+            }
             None => None,
         };
+        let seeds = evenly_spaced_seeds(meta.num_centroids);
         Ok(IvfIndex {
-            stride: options.bytes_per_vector(),
             meta,
+            dim: options.dim(),
+            metric: options.metric(),
             graph,
+            seeds,
         })
     }
 
@@ -461,19 +483,11 @@ impl IvfIndex {
         self.meta.cluster_sizes()
     }
 
-    /// The pinned centroid vectors, `num_clusters` rows of `stride` bytes.
-    pub fn centroid_bytes(&self) -> &[u8] {
-        &self.meta.centroid_bytes
-    }
-
-    /// Whether the persisted RNG is available for routing.
-    pub fn has_routing_graph(&self) -> bool {
-        self.graph.is_some()
-    }
-
-    #[inline]
-    fn centroid(&self, cluster: usize) -> &[u8] {
-        &self.meta.centroid_bytes[cluster * self.stride..(cluster + 1) * self.stride]
+    /// The centroid rows, materialized in one read — for introspection and
+    /// tests. The search path never calls this; routing fetches per-node
+    /// ranges through the graph's lazy arena instead.
+    pub fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
+        Ok(self.meta.centroids_slice.read_bytes()?)
     }
 
     /// Clusters to probe for `query`, best routing score first, as
@@ -481,162 +495,38 @@ impl IvfIndex {
     /// produce them (the navigation cost, surfaced as
     /// `ProbeStats::centroids_ranked`).
     ///
-    /// When the RNG is present and the segment has more clusters than
-    /// `limit`, routes via beam search over the graph and returns at most
-    /// `limit` candidates; otherwise every centroid is scored exactly (and
-    /// all of them are returned, ranked). The exact path is both the
-    /// no-graph fallback and the small-segment fast path — below `limit`
-    /// clusters the probe loop could visit them all anyway, and the brute
-    /// scan is at most as expensive as a beam search that would visit the
-    /// whole set.
-    pub(crate) fn rank_clusters<T: VectorElement>(
-        &self,
-        query: &PreparedQuery<T>,
-        limit: usize,
-    ) -> (Vec<(f32, u32)>, usize) {
-        let num_centroids = self.meta.num_centroids;
+    /// With a persisted RNG this is a beam search
+    /// ([`RelativeNeighborhoodGraph::search`]) with a beam of
+    /// `max(ef, limit)`, returning at most `limit` clusters. Without one
+    /// (degenerate centroid counts) every centroid is scored exactly. Both
+    /// paths fetch centroid rows lazily through the same
+    /// [`FileSliceArena`] and score with the same kernels, so their
+    /// rankings agree.
+    pub(crate) fn rank_clusters(&self, query: &[f32], limit: usize) -> (Vec<(f32, u32)>, usize) {
         match &self.graph {
-            Some(graph) if num_centroids > limit => self.route_via_graph(graph, query, limit),
-            _ => {
+            Some(graph) => {
+                let mut ws = Workspace::new();
+                let candidates = graph.search(&mut ws, query, &self.seeds, limit);
+                let ranked = candidates
+                    .into_iter()
+                    .map(|candidate| (candidate.sim.score(), candidate.node))
+                    .collect();
+                (ranked, ws.num_visited())
+            }
+            None => {
+                let num_centroids = self.meta.num_centroids;
+                let arena = FileSliceArena::<f32>::new(self.meta.centroids_slice.clone());
                 let mut ranked: Vec<(f32, u32)> = (0..num_centroids)
                     .map(|cluster| {
-                        (
-                            query.score_doc_bytes(self.centroid(cluster)),
-                            cluster as u32,
-                        )
+                        let sim =
+                            arena.similarity(self.metric, self.dim, cluster as NodeId, query);
+                        (sim.score(), cluster as u32)
                     })
                     .collect();
-                ranked
-                    .sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+                ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+                ranked.truncate(limit);
                 (ranked, num_centroids)
             }
         }
-    }
-
-    /// Greedy beam search over the RNG for the `k` best clusters — the same
-    /// loop as [`RelativeNeighborhoodGraph::search`](super::RelativeNeighborhoodGraph::search),
-    /// restated over the pinned adjacency + centroid bytes so it can score
-    /// through [`PreparedQuery`] (typed query against raw little-endian rows)
-    /// instead of a typed arena. Also returns the visited-node count — the
-    /// centroids actually scored.
-    fn route_via_graph<T: VectorElement>(
-        &self,
-        graph: &RoutingGraph,
-        query: &PreparedQuery<T>,
-        k: usize,
-    ) -> (Vec<(f32, u32)>, usize) {
-        let num_centroids = self.meta.num_centroids;
-        let ef = k.max(ROUTING_EF_FLOOR);
-        let mut visited = vec![false; num_centroids];
-        let mut scored = 0usize;
-        let mut frontier: BinaryHeap<Candidate> = BinaryHeap::new();
-        let mut results: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
-
-        for &seed in &graph.seeds {
-            let node = seed as usize;
-            if node >= num_centroids || visited[node] {
-                continue;
-            }
-            visited[node] = true;
-            scored += 1;
-            let sim = Similarity::new(query.score_doc_bytes(self.centroid(node)));
-            let candidate = Candidate { sim, node: seed };
-            frontier.push(candidate);
-            results.push(Reverse(candidate));
-        }
-
-        while let Some(candidate) = frontier.pop() {
-            if results.len() >= ef && results.peek().is_some_and(|w| candidate.sim < w.0.sim) {
-                break;
-            }
-            for &neighbor in graph.neighbors(candidate.node) {
-                let node = neighbor as usize;
-                if node >= num_centroids || visited[node] {
-                    continue;
-                }
-                visited[node] = true;
-                scored += 1;
-                let sim = Similarity::new(query.score_doc_bytes(self.centroid(node)));
-                let next = Candidate {
-                    sim,
-                    node: neighbor,
-                };
-                if results.len() < ef {
-                    results.push(Reverse(next));
-                    frontier.push(next);
-                } else if let Some(mut worst) = results.peek_mut() {
-                    if next.sim > worst.0.sim {
-                        *worst = Reverse(next);
-                        frontier.push(next);
-                    }
-                }
-            }
-        }
-
-        let mut out: Vec<Candidate> = results.drain().map(|Reverse(c)| c).collect();
-        out.sort_unstable_by(|a, b| b.sim.cmp(&a.sim).then_with(|| a.node.cmp(&b.node)));
-        out.truncate(k);
-        let ranked = out
-            .into_iter()
-            .map(|candidate| (candidate.sim.score(), candidate.node))
-            .collect();
-        (ranked, scored)
-    }
-}
-
-/// The pinned RNG adjacency, reconstructed from `.centroids` slot `[2]`
-/// (see [`Graph::serialize`](super::Graph::serialize) for the layout —
-/// `max_edges` then the flat, best-first, EMPTY-padded neighbor runs).
-struct RoutingGraph {
-    max_edges: usize,
-    /// `num_centroids × max_edges` node ids; node `i` owns
-    /// `neighbors[i * max_edges ..][.. max_edges]`.
-    neighbors: Vec<NodeId>,
-    /// Deterministic, evenly spaced entry points — the same formula the
-    /// write-side selector uses, so routing behaves like the build-time
-    /// searches that shaped the graph.
-    seeds: Vec<NodeId>,
-}
-
-impl RoutingGraph {
-    fn open(slice: FileSlice, num_centroids: usize) -> crate::Result<Self> {
-        let bytes = slice.read_bytes()?;
-        let mut cursor = bytes.as_slice();
-        let max_edges = u32::deserialize(&mut cursor)? as usize;
-        if max_edges == 0 {
-            return Err(TantivyError::InternalError(
-                "IVF routing graph has zero max_edges".to_string(),
-            ));
-        }
-        let expected = num_centroids * max_edges * std::mem::size_of::<NodeId>();
-        if cursor.len() != expected {
-            return Err(TantivyError::InternalError(format!(
-                "IVF routing graph adjacency is {} bytes, expected {expected}",
-                cursor.len()
-            )));
-        }
-        let neighbors: Vec<NodeId> = cursor
-            .chunks_exact(std::mem::size_of::<NodeId>())
-            .map(|chunk| NodeId::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
-        let seeds = (0..num_centroids)
-            .step_by((num_centroids / 8).max(1))
-            .take(8)
-            .map(|node| node as NodeId)
-            .collect();
-        Ok(RoutingGraph {
-            max_edges,
-            neighbors,
-            seeds,
-        })
-    }
-
-    /// `node`'s neighbor ids, best-first, excluding empty slots.
-    #[inline]
-    fn neighbors(&self, node: NodeId) -> &[NodeId] {
-        let base = node as usize * self.max_edges;
-        let run = &self.neighbors[base..base + self.max_edges];
-        let degree = run.iter().take_while(|&&n| n != EMPTY).count();
-        &run[..degree]
     }
 }

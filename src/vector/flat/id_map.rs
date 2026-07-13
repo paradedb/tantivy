@@ -137,19 +137,11 @@ impl IdMap {
         }
     }
 
-    /// Read just the variant tag and report whether it is `Explicit` (IVF)
-    /// without parsing the whole id-map.
-    pub(crate) fn peek_is_explicit(file_slice: &FileSlice) -> io::Result<bool> {
-        if file_slice.len() == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "id map section is empty",
-            ));
-        }
-        Ok(file_slice.slice(0..1).read_bytes()?[0] == VARIANT_EXPLICIT)
-    }
-
-    /// `true` if `doc_id` has a value.
+    /// `true` if `doc_id` has a value. The `Explicit` arm is a linear scan —
+    /// the reference semantics the format tests exercise; the read path
+    /// ([`VectorIndexReader`](crate::vector::VectorIndexReader)) uses
+    /// cluster-local binary search instead.
+    #[cfg(test)]
     #[inline]
     pub fn contains(&self, doc_id: DocId) -> bool {
         match self {

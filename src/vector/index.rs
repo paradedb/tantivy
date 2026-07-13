@@ -114,6 +114,7 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         let epoch = ws.begin_query(n);
 
         let visited = &mut ws.visited;
+        let num_visited = &mut ws.num_visited;
         let frontier = &mut ws.frontier;
         let results = &mut ws.results;
 
@@ -127,6 +128,7 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
                 continue;
             }
             visited[idx] = epoch;
+            *num_visited += 1;
             let sim = arena.similarity(metric, dim, node_id, query);
             let c = Candidate { sim, node: node_id };
             frontier.push(c);
@@ -145,6 +147,7 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
                     continue;
                 }
                 visited[idx] = epoch;
+                *num_visited += 1;
                 let sim = arena.similarity(metric, dim, nb, query);
                 let c = Candidate { sim, node: nb };
                 // A candidate earns a frontier slot exactly when it enters the
@@ -177,6 +180,50 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
     pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         self.graph.serialize(out)
     }
+
+    /// Opens a serialized RNG (see [`serialize`](Self::serialize)) over
+    /// `vectors` — typically a
+    /// [`FileSliceArena`](super::FileSliceArena) so search fetches centroid
+    /// rows lazily. The metric and knobs were never persisted: supply the
+    /// same `metric` the graph was built with; of `params`, only `ef`
+    /// affects search (the persisted `max_edges` governs the adjacency).
+    /// The result is search-only — see [`Graph::open`].
+    pub fn open(
+        adjacency: &[u8],
+        vectors: S,
+        dim: usize,
+        metric: Metric,
+        params: NeighborhoodGraphConfig,
+    ) -> io::Result<Self> {
+        Ok(RelativeNeighborhoodGraph {
+            graph: Graph::open(adjacency, vectors, dim)?,
+            metric,
+            config: params,
+        })
+    }
+
+    /// The number of nodes in the graph.
+    pub fn len(&self) -> usize {
+        self.graph.len()
+    }
+
+    /// Whether the graph has no nodes.
+    pub fn is_empty(&self) -> bool {
+        self.graph.is_empty()
+    }
+}
+
+/// Deterministic, evenly spaced search entry points for a graph of `n`
+/// nodes: up to 8 seeds, the same formula on the build side (replica
+/// selection) and the read side (query routing), so routing behaves like
+/// the searches that shaped the graph. 8 stays under the minimum search
+/// beam (`ef >= 64`), which `search` requires of its seed count.
+pub(crate) fn evenly_spaced_seeds(n: usize) -> Vec<NodeId> {
+    (0..n)
+        .step_by((n / 8).max(1))
+        .take(8)
+        .map(|node| node as NodeId)
+        .collect()
 }
 
 /// Refinement requires typed storage: a node's stored vector doubles as its
@@ -380,6 +427,9 @@ pub struct Workspace {
     /// bump) instead of re-zeroing all `n` slots.
     visited: Vec<u32>,
     visited_epoch: u32,
+    /// Nodes visited — and therefore scored — by the current query; the
+    /// search's navigation cost, surfaced through [`Self::num_visited`].
+    num_visited: usize,
     /// Max-heap by similarity: the frontier of candidates left to expand.
     frontier: BinaryHeap<Candidate>,
     /// Min-heap by similarity (via `Reverse`): the best `ef` results so far, with
@@ -391,6 +441,12 @@ impl Workspace {
     /// Creates an empty workspace. It grows to fit on first use.
     pub fn new() -> Self {
         Workspace::default()
+    }
+
+    /// Nodes visited (scored) by the most recent search — the navigation
+    /// cost. Reset at the start of each query.
+    pub fn num_visited(&self) -> usize {
+        self.num_visited
     }
 
     /// Prepares the workspace for a query over `n` nodes: grows the visited
@@ -406,6 +462,7 @@ impl Workspace {
             self.visited.iter_mut().for_each(|v| *v = 0);
             self.visited_epoch = 1;
         }
+        self.num_visited = 0;
         self.frontier.clear();
         self.results.clear();
         self.visited_epoch

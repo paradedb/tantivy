@@ -20,7 +20,7 @@
 use std::io::{self, Write};
 use std::mem;
 
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use crate::directory::FileSlice;
 use crate::schema::VectorOptions;
@@ -31,7 +31,11 @@ pub(crate) struct CentroidsMeta {
     /// vector count, written at merge time. Rows including replicas are
     /// [`Self::num_rows`].
     pub(crate) num_docs: usize,
-    pub(crate) centroid_bytes: OwnedBytes,
+    /// The centroid rows (slot `[0]` past the two count words), deferred:
+    /// routing fetches per-node ranges through a
+    /// [`FileSliceArena`](crate::vector::FileSliceArena) rather than
+    /// materializing `num_centroids × stride` bytes.
+    pub(crate) centroids_slice: FileSlice,
     pub(crate) cluster_offsets: OwnedBytes,
 }
 
@@ -79,14 +83,23 @@ impl CentroidsMeta {
         Ok(())
     }
 
-    /// Parse a field's two `.centroids` slots.
+    /// Parse a field's two `.centroids` slots. Only the count words and the
+    /// offsets are materialized; the centroid rows stay behind the returned
+    /// [`FileSlice`] for lazy per-node reads.
     pub(crate) fn open(
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         options: &VectorOptions,
     ) -> io::Result<Self> {
-        let centroids_bytes = centroids_slice.read_bytes()?;
-        let mut reader = centroids_bytes.as_slice();
+        let count_words = 2 * mem::size_of::<u32>();
+        if centroids_slice.len() < count_words {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF centroids slot is smaller than its count words",
+            ));
+        }
+        let header = centroids_slice.slice_to(count_words).read_bytes()?;
+        let mut reader = header.as_slice();
         let num_centroids = u32::deserialize(&mut reader)? as usize;
         let num_docs = u32::deserialize(&mut reader)? as usize;
         let centroid_len = num_centroids
@@ -94,14 +107,13 @@ impl CentroidsMeta {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "centroid byte length overflow")
             })?;
-        if reader.len() != centroid_len {
+        let centroids_slice = centroids_slice.slice_from(count_words);
+        if centroids_slice.len() != centroid_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "IVF centroid byte length mismatch",
             ));
         }
-        let centroid_start = centroids_bytes.len() - reader.len();
-        let centroid_bytes = centroids_bytes.slice(centroid_start..centroids_bytes.len());
 
         let cluster_offsets = offsets_slice.read_bytes()?;
         let expected_offsets = (num_centroids + 1)
@@ -118,7 +130,7 @@ impl CentroidsMeta {
         let meta = Self {
             num_centroids,
             num_docs,
-            centroid_bytes,
+            centroids_slice,
             cluster_offsets,
         };
         // Every distinct doc owns at least its primary row, so a doc count

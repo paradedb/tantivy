@@ -21,7 +21,8 @@ use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, No
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
 use crate::vector::{
-    NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace, VEC_EXT,
+    evenly_spaced_seeds, NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace,
+    VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -133,14 +134,7 @@ impl<'a> CentroidGraph<'a> {
         };
         let mut rng = RelativeNeighborhoodGraph::new(centroids, dim, metric, config);
         rng.build(&build_executor("replica-rng-")?);
-        // Evenly spaced entry points; 8 <= the minimum `ef` (64), which
-        // `search` requires of its seed count.
-        let num_centroids = centroids.len() / dim;
-        let seeds = (0..num_centroids)
-            .step_by((num_centroids / 8).max(1))
-            .take(8)
-            .map(|i| i as NodeId)
-            .collect();
+        let seeds = evenly_spaced_seeds(centroids.len() / dim);
         Ok(CentroidGraph { rng, seeds })
     }
 
@@ -667,7 +661,8 @@ pub(crate) fn merge_ivf(
                 // `.centroids` slot [2]: the RNG over the centroids, so a query
                 // can route to its nearest clusters without scanning all of
                 // them. Skipped for degenerate centroid counts — the reader
-                // treats the absent slot as "route by linear scan".
+                // treats the absent slot as "route by linear scan", which a
+                // 0-or-1-centroid segment doesn't need a graph for.
                 //
                 // A graph replica selector is the same graph over the same
                 // arena with the same metric, so it is serialized directly

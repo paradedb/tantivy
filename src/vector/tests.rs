@@ -353,7 +353,7 @@ fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
         let vec_reader = segment_reader.vector_index(index.embedding_field())?;
         let ivf = vec_reader.index().expect("expected IVF storage");
         assert_eq!(
-            ivf.centroid_bytes()
+            ivf.centroid_bytes()?
                 .chunks_exact(VectorDType::F32.size_bytes())
                 .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
                 .collect::<Vec<_>>(),

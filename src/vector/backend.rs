@@ -261,12 +261,10 @@ impl<T: VectorElement> VectorBackend<T> {
         let max_probe_count = self.adaptive.resolved_probe_ceiling(num_centroids)?;
 
         // Rank the clusters to probe, best first — a beam search over the
-        // persisted RNG when the segment is large enough to route, a full
-        // centroid scan otherwise. Extracted into a `#[inline(never)]` method
-        // so this phase shows as its own flamegraph frame (carrying its own
-        // `score_doc_bytes` cost). Asking for one candidate past the ceiling
-        // keeps the `Ceiling` termination attribution meaningful on the
-        // routed path.
+        // persisted RNG. Extracted into a `#[inline(never)]` method so this
+        // phase shows as its own flamegraph frame (carrying its own
+        // similarity cost). Asking for one candidate past the ceiling keeps
+        // the `Ceiling` termination attribution meaningful.
         let (ranked, centroids_ranked) =
             self.rank_clusters(index, max_probe_count.saturating_add(1));
         if ranked.is_empty() {
@@ -323,13 +321,15 @@ impl<T: VectorElement> VectorBackend<T> {
 
     /// Phase 1: rank the clusters to probe, best routing score first, plus
     /// the number of centroids scored to do it (the navigation cost).
-    /// Delegates to [`IvfIndex::rank_clusters`] — RNG beam search when the
-    /// graph exists and the cluster count exceeds the request, exact centroid
-    /// scan otherwise. `#[inline(never)]` so it forms its own flamegraph
-    /// frame carrying its `score_doc_bytes` cost.
+    /// Delegates to [`IvfIndex::rank_clusters`] — a beam search over the
+    /// persisted RNG. Routing operates in `f32` (centroid rows are `f32`
+    /// today), so the query is widened losslessly per element.
+    /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
+    /// similarity cost.
     #[inline(never)]
     fn rank_clusters(&self, index: &IvfIndex, limit: usize) -> (Vec<(f32, u32)>, usize) {
-        index.rank_clusters(&self.query, limit)
+        let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
+        index.rank_clusters(&query_f32, limit)
     }
 
     /// Phase 2: adaptive probe loop. Cluster-order arrival of survivors
@@ -1952,6 +1952,42 @@ mod tests {
         Ok(())
     }
 
+    /// A single-centroid IVF merge skips the `.centroids` graph slot
+    /// (nothing to route between), so the reader must take the linear
+    /// fallback: rank the lone cluster without a graph and still return the
+    /// exact top-K.
+    #[test]
+    fn ivf_single_centroid_routes_without_graph() -> crate::Result<()> {
+        let centroids = [[0.0f32, 0.0]];
+        let labels: Vec<String> = (0..5).map(|i| format!("d{i}")).collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..5)
+            .map(|i| (labels[i].as_str(), [i as f32 * 0.01, 0.0]))
+            .collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        assert!(
+            segment_reader.vector_index(embed_field)?.index().is_some(),
+            "expected IVF storage"
+        );
+
+        let query = [0.0f32, 0.0];
+        let k = 3;
+        let expected = ground_truth_top_k(&index, embed_field, Metric::L2, &query, k)?;
+        let (hits, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            query.to_vec(),
+            k,
+            AdaptiveProbeParams::default(),
+        )?;
+        assert_eq!(hits, expected, "linear fallback must match the oracle");
+        assert_eq!(stats.probed_clusters, vec![0], "one cluster, one probe");
+        assert_eq!(stats.centroids_ranked, 1);
+        Ok(())
+    }
+
     /// When the probe ceiling is below the cluster count, cluster ranking
     /// routes via the persisted RNG instead of scanning every centroid. With
     /// 16 well-separated clusters and only 8 beam seeds, the router must
@@ -1986,7 +2022,6 @@ mod tests {
         let segment_reader = &searcher.segment_readers()[0];
         let vec_reader = segment_reader.vector_index(embed_field)?;
         let ivf = vec_reader.index().expect("expected IVF segment");
-        assert!(ivf.has_routing_graph(), "merge must persist the RNG");
         assert_eq!(ivf.num_clusters(), centroids.len());
 
         let params = AdaptiveProbeParams {
