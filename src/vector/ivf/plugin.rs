@@ -16,7 +16,7 @@ use super::{
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
-use crate::schema::{FieldType, Metric, VectorDType};
+use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
@@ -167,6 +167,42 @@ struct IvfBuildTimings {
     posting_write: Duration,
 }
 
+/// Write `field`'s slots in both composites as an empty IVF field: empty
+/// Explicit id-map, empty rows, zero centroids, zero docs, and a single
+/// zero cluster offset. Every vector field must own its slots in every
+/// IVF segment — the reader treats a missing slot as corruption — so both
+/// the "sources report no vectors" fast path and the "every vector-bearing
+/// doc is deleted" path write this same shape.
+fn write_empty_field_slots(
+    vec_write: &mut CompositeWrite,
+    centroids_write: &mut CompositeWrite,
+    field: Field,
+    opts: &VectorOptions,
+) -> crate::Result<()> {
+    // `.vec`: empty Explicit id-map + empty rows.
+    {
+        let id_map_w = vec_write.for_field_with_idx(field, 0);
+        IdMap::serialize_explicit(&[], id_map_w)?;
+        id_map_w.flush()?;
+    }
+    {
+        let rows_w = vec_write.for_field_with_idx(field, 1);
+        rows_w.flush()?;
+    }
+    // `.centroids`: zero centroids, zero docs, single zero offset.
+    {
+        let centroids_w = centroids_write.for_field_with_idx(field, 0);
+        CentroidsMeta::serialize_centroids(0, 0, &[], opts, centroids_w)?;
+        centroids_w.flush()?;
+    }
+    {
+        let offsets_w = centroids_write.for_field_with_idx(field, 1);
+        CentroidsMeta::serialize_offsets(&[0u64], offsets_w)?;
+        offsets_w.flush()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn merge_ivf(
     ctx: &PluginMergeContext,
     clusterer: Option<&dyn IvfClusterer>,
@@ -224,27 +260,7 @@ pub(crate) fn merge_ivf(
             .map(|reader| reader.count(field))
             .sum::<crate::Result<usize>>()?;
         if vector_count == 0 {
-            // `.vec`: empty Explicit id-map + empty rows.
-            {
-                let id_map_w = vec_write.for_field_with_idx(field, 0);
-                IdMap::serialize_explicit(&[], id_map_w)?;
-                id_map_w.flush()?;
-            }
-            {
-                let rows_w = vec_write.for_field_with_idx(field, 1);
-                rows_w.flush()?;
-            }
-            // `.centroids`: zero centroids, single zero offset.
-            {
-                let centroids_w = centroids_write.for_field_with_idx(field, 0);
-                CentroidsMeta::serialize_centroids(0, &[], opts, centroids_w)?;
-                centroids_w.flush()?;
-            }
-            {
-                let offsets_w = centroids_write.for_field_with_idx(field, 1);
-                CentroidsMeta::serialize_offsets(&[0u64], offsets_w)?;
-                offsets_w.flush()?;
-            }
+            write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
             continue;
         }
         let columns: Vec<_> = source_readers
@@ -281,8 +297,29 @@ pub(crate) fn merge_ivf(
                     target_doc_id += 1;
                 }
                 debug_assert_eq!(target_doc_id, num_target_docs);
-                debug_assert_eq!(present_vector_ord, vector_count);
+                // Rows written for docs deleted afterwards still count toward
+                // the sources' `count()` (neither layout rewrites `.vec` on
+                // delete), so the alive-doc walk can come up short of
+                // `vector_count` — never over. Equality holds exactly when no
+                // source carries deletes.
+                debug_assert!(
+                    if ctx.readers.iter().any(|reader| reader.has_deletes()) {
+                        present_vector_ord <= vector_count
+                    } else {
+                        present_vector_ord == vector_count
+                    },
+                    "{present_vector_ord} alive docs with vectors vs {vector_count} reported by \
+                     source count()"
+                );
                 if training_doc_ids.is_empty() {
+                    // `vector_count > 0`, yet the alive-doc walk found
+                    // nothing to sample: every vector-bearing doc was
+                    // deleted. Write the same empty slots as the
+                    // no-vectors fast path — skipping the field would
+                    // leave its slots missing from composites the other
+                    // fields still write, and the reader errors on
+                    // missing slots.
+                    write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
                     continue;
                 }
 
@@ -492,7 +529,14 @@ pub(crate) fn merge_ivf(
                     flush_assign_batch(&mut batch_values, &mut batch_doc_ids, &mut batch_sources)?;
                 }
                 debug_assert_eq!(target_doc_id, num_target_docs);
-                debug_assert_eq!(assigned_vectors.len(), vector_count);
+                // Same alive-doc walk as the training pass above — it must
+                // have found the same vectors (deletes make both fall short
+                // of `vector_count` together, so compare them to each other).
+                debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
+                // The `.centroids` doc count: distinct docs assigned, captured
+                // before the replica append turns `assigned_vectors` into
+                // posting rows (one entry per cell a doc lives in).
+                let num_present_docs = assigned_vectors.len();
 
                 // Fixed-k replication: append the accumulated replica cells as
                 // extra entries — the write path below already tolerates more
@@ -611,6 +655,7 @@ pub(crate) fn merge_ivf(
                     let centroids_w = centroids_write.for_field_with_idx(field, 0);
                     CentroidsMeta::serialize_centroids(
                         num_centroids,
+                        num_present_docs,
                         &centroid_bytes,
                         opts,
                         centroids_w,

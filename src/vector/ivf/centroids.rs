@@ -5,7 +5,7 @@
 //! field:
 //!
 //! ```text
-//! [0] num_centroids (u32) + centroid_bytes (N · stride)
+//! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride)
 //! [1] cluster_offsets (u64[N+1], prefix sum)
 //! [2] RNG over the centroids (see `Graph::serialize` for the layout)
 //! ```
@@ -27,15 +27,22 @@ use crate::schema::VectorOptions;
 
 pub(crate) struct CentroidsMeta {
     pub(crate) num_centroids: usize,
+    /// Distinct documents with a vector in this field — the segment's logical
+    /// vector count, written at merge time. Rows including replicas are
+    /// [`Self::num_rows`].
+    pub(crate) num_docs: usize,
     pub(crate) centroid_bytes: OwnedBytes,
     pub(crate) cluster_offsets: OwnedBytes,
 }
 
 impl CentroidsMeta {
-    /// Write slot `[0]` (num_centroids + centroid bytes) of the `.centroids`
-    /// composite for a field.
+    /// Write slot `[0]` (num_centroids + num_docs + centroid bytes) of the
+    /// `.centroids` composite for a field. `num_docs` is the number of
+    /// distinct docs assigned — NOT the posting-row total, which replication
+    /// can multiply and which slot `[1]`'s offsets already encode.
     pub(crate) fn serialize_centroids<W: Write + ?Sized>(
         num_centroids: usize,
+        num_docs: usize,
         centroid_bytes: &[u8],
         options: &VectorOptions,
         out: &mut W,
@@ -53,6 +60,9 @@ impl CentroidsMeta {
         }
         u32::try_from(num_centroids)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "centroid count exceeds u32"))?
+            .serialize(out)?;
+        u32::try_from(num_docs)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "doc count exceeds u32"))?
             .serialize(out)?;
         out.write_all(centroid_bytes)
     }
@@ -78,6 +88,7 @@ impl CentroidsMeta {
         let centroids_bytes = centroids_slice.read_bytes()?;
         let mut reader = centroids_bytes.as_slice();
         let num_centroids = u32::deserialize(&mut reader)? as usize;
+        let num_docs = u32::deserialize(&mut reader)? as usize;
         let centroid_len = num_centroids
             .checked_mul(options.bytes_per_vector())
             .ok_or_else(|| {
@@ -104,11 +115,21 @@ impl CentroidsMeta {
                 "IVF cluster offset byte length mismatch",
             ));
         }
-        Ok(Self {
+        let meta = Self {
             num_centroids,
+            num_docs,
             centroid_bytes,
             cluster_offsets,
-        })
+        };
+        // Every distinct doc owns at least its primary row, so a doc count
+        // above the row total means a corrupt (or differently-framed) file.
+        if meta.num_docs > meta.num_rows() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF doc count exceeds the posting-row total",
+            ));
+        }
+        Ok(meta)
     }
 
     pub(crate) fn cluster_offset(&self, cluster: usize) -> u64 {
@@ -117,7 +138,10 @@ impl CentroidsMeta {
         u64::from_le_bytes(self.cluster_offsets[start..end].try_into().unwrap())
     }
 
-    pub(crate) fn num_vectors(&self) -> usize {
+    /// Total posting rows across all clusters — memberships, counting a
+    /// replicated doc once per cell it lives in. Distinct docs are
+    /// `self.num_docs`.
+    pub(crate) fn num_rows(&self) -> usize {
         self.cluster_offset(self.num_centroids) as usize
     }
 

@@ -45,6 +45,11 @@ pub enum VectorStorageFormat {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorInfo {
     pub format: VectorStorageFormat,
+    /// Distinct documents with a vector in this field — the same quantity for
+    /// both storage formats. The IVF per-cluster numbers (`cluster_stats`
+    /// here, [`VectorReader::cluster_sizes`]) count memberships — posting
+    /// rows, one per cell a doc lives in — so with replication their sum
+    /// exceeds `num_vectors`.
     pub num_vectors: usize,
     pub num_centroids: Option<usize>,
     pub cluster_stats: Option<VectorClusterStats>,
@@ -130,7 +135,7 @@ impl VectorReader {
                 };
                 Ok(Some(VectorInfo {
                     format: VectorStorageFormat::Ivf,
-                    num_vectors: meta.num_vectors(),
+                    num_vectors: meta.num_docs,
                     num_centroids: Some(meta.num_centroids),
                     cluster_stats: Some(VectorClusterStats {
                         min_cluster_size,

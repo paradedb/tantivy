@@ -643,8 +643,9 @@ mod tests {
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, VectorColumn,
-        VectorColumnReader, VectorDType, VectorOptions, VectorReader, VectorStorageFormat,
+        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, VectorClusterStats,
+        VectorColumn, VectorColumnReader, VectorDType, VectorInfo, VectorOptions, VectorReader,
+        VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -1066,6 +1067,288 @@ mod tests {
             stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
             "visited must equal filter+dead+seen+scored ({stats:?})"
         );
+        Ok(())
+    }
+
+    /// Re-merging a replicated IVF segment must account in DISTINCT docs, not
+    /// posting entries. Regression test for `IvfVecReader::count()` returning
+    /// memberships (rows incl. replicas): with `replicas = 3` the IVF source
+    /// used to report 3 × 36 = 108 "vectors" into the next merge's
+    /// `vector_count`, tripping the `present_vector_ord == vector_count`
+    /// debug_asserts (and, in release, inflating the centroid count and the
+    /// training sample interval).
+    #[test]
+    fn remerge_replicated_segment() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let n = docs.len();
+        let replicas = 3usize;
+        let (index, embed_field, label_field) =
+            build_inline_ivf(Metric::L2, &centroids, &docs, replicas)?;
+
+        // Two more docs in a fresh (flat) segment, then merge everything —
+        // the replicated IVF segment is now a merge SOURCE.
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for (label, v) in [("extra0", [5.0_f32, 5.0]), ("extra1", [15.0, 5.0])] {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(label_field, label);
+            doc.add_vector(embed_field, v.as_slice());
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        let segment_ids = index.searchable_segment_ids()?;
+        assert_eq!(segment_ids.len(), 2, "IVF segment + fresh flat segment");
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let total = n + 2;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
+        let segment_reader = &searcher.segment_readers()[0];
+
+        // count()/num_vectors report distinct docs; per-cluster sizes keep
+        // membership semantics (each doc exact-fills `replicas` cells here).
+        let vec_reader = VectorReader::open(segment_reader)?;
+        assert_eq!(vec_reader.count(embed_field)?, total);
+        let info = segment_reader
+            .vector_info(embed_field)?
+            .expect("vector info");
+        assert_eq!(info.format, VectorStorageFormat::Ivf);
+        assert_eq!(info.num_vectors, total, "num_vectors counts distinct docs");
+        let sizes = segment_reader
+            .vector_cluster_sizes(embed_field)?
+            .expect("ivf cluster sizes");
+        let memberships: usize = sizes.iter().map(|&s| s as usize).sum();
+        assert_eq!(
+            memberships,
+            replicas * total,
+            "per-cluster sizes keep membership semantics"
+        );
+
+        // Exhaustive search returns every distinct doc exactly once.
+        let hits = search(
+            &index,
+            embed_field,
+            &AllQuery,
+            vec![10.0, 10.0],
+            total,
+            exhaustive_params(centroids.len()),
+        )?;
+        assert_eq!(hits.len(), total, "exhaustive top-N must return every doc");
+        let mut ids: Vec<_> = hits.iter().map(|(_, addr)| addr.doc_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "search returned duplicate doc ids");
+        Ok(())
+    }
+
+    /// Merging flat segments with deletes past the clustering threshold: rows
+    /// written for since-deleted docs still count toward the sources'
+    /// `count()` (tombstones don't rewrite `.vec`), so the alive-doc merge
+    /// iteration legitimately comes up short of `vector_count`. The merge
+    /// must tolerate that, and the resulting IVF segment must hold — and
+    /// count — the alive docs only.
+    #[test]
+    fn merge_flat_segments_with_deletes_into_ivf() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let n = docs.len();
+
+        // Same shape as `build_inline_ivf`, but the two flat source segments
+        // stay unmerged so the deletes land BEFORE the clustering merge.
+        let mut sb = Schema::builder();
+        let embed_field = sb.add_vector_field(
+            "embedding",
+            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .ivf_clusterer(Arc::new(InlineClusterer {
+                centroids: centroids.clone(),
+                replicas: 1,
+            }))
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let mid = n / 2;
+        for chunk in [&docs[..mid], &docs[mid..]] {
+            for (label, v) in chunk {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(label_field, label);
+                doc.add_vector(embed_field, v.as_slice());
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+
+        // Tombstone docs in BOTH flat sources (d0/d7 in the first commit,
+        // d35 in the second), then merge everything into one IVF segment.
+        let deleted = ["d0", "d7", "d35"];
+        for label in deleted {
+            writer.delete_term(Term::from_field_text(label_field, label));
+        }
+        writer.commit()?;
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let alive = n - deleted.len();
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
+        let segment_reader = &searcher.segment_readers()[0];
+        let info = segment_reader
+            .vector_info(embed_field)?
+            .expect("vector info");
+        assert_eq!(info.format, VectorStorageFormat::Ivf, "merge must cluster");
+        assert_eq!(info.num_vectors, alive, "deleted docs must not be counted");
+        let vec_reader = VectorReader::open(segment_reader)?;
+        assert_eq!(vec_reader.count(embed_field)?, alive);
+
+        // Every alive doc comes back exactly once; no deleted label survives.
+        let hits = search(
+            &index,
+            embed_field,
+            &AllQuery,
+            vec![10.0, 10.0],
+            n,
+            exhaustive_params(centroids.len()),
+        )?;
+        assert_eq!(hits.len(), alive, "exhaustive top-N must return alive docs");
+        let mut seen_labels = std::collections::HashSet::new();
+        for (_, addr) in &hits {
+            let label = stored_label_at(&index, label_field, *addr)?;
+            assert!(
+                !deleted.contains(&label.as_str()),
+                "deleted doc {label} surfaced in results"
+            );
+            assert!(seen_labels.insert(label), "duplicate doc in results");
+        }
+        Ok(())
+    }
+
+    /// Merging past the clustering threshold when every doc carrying a
+    /// vector for ONE field is deleted, while another field keeps live
+    /// vectors. The sources still report `vector_count > 0` for the emptied
+    /// field (tombstones don't rewrite `.vec`), so it takes the training
+    /// path, collects nothing — and used to `continue` without writing the
+    /// field's `.vec`/`.centroids` slots. The live field still wrote, so the
+    /// composites existed but the emptied field's slots were missing:
+    /// `count()`, `open_column()` and `vector_info()` all failed with
+    /// InternalError. The merge must instead write the same empty slots as
+    /// the no-vectors-at-all fast path.
+    #[test]
+    fn merge_deleting_every_doc_of_one_field_writes_empty_ivf() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let n = docs.len();
+
+        // The doomed field comes FIRST in the schema, so it is also the
+        // field the reader's `is_ivf` mode detection peeks at.
+        let mut sb = Schema::builder();
+        let doomed_field = sb.add_vector_field(
+            "embedding_doomed",
+            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let kept_field = sb.add_vector_field(
+            "embedding_kept",
+            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .ivf_clusterer(Arc::new(InlineClusterer {
+                centroids: centroids.clone(),
+                replicas: 1,
+            }))
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        // Even docs carry the doomed field, odd docs the kept one, split
+        // across two flat commits so BOTH sources hold doomed vectors.
+        let mid = n / 2;
+        for (i, (label, v)) in docs.iter().enumerate() {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(label_field, label);
+            let field = if i % 2 == 0 { doomed_field } else { kept_field };
+            doc.add_vector(field, v.as_slice());
+            writer.add_document(doc)?;
+            if i + 1 == mid {
+                writer.commit()?;
+            }
+        }
+        writer.commit()?;
+
+        // Tombstone every doomed-field doc, then merge everything into one
+        // IVF segment.
+        for (i, (label, _)) in docs.iter().enumerate() {
+            if i % 2 == 0 {
+                writer.delete_term(Term::from_field_text(label_field, label));
+            }
+        }
+        writer.commit()?;
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
+        let segment_reader = &searcher.segment_readers()[0];
+
+        // The emptied field reads back as a zeroed IVF field — not an error.
+        let vec_reader = VectorReader::open(segment_reader)?;
+        assert_eq!(vec_reader.count(doomed_field)?, 0);
+        let info = segment_reader
+            .vector_info(doomed_field)?
+            .expect("vector info");
+        assert_eq!(
+            info,
+            VectorInfo {
+                format: VectorStorageFormat::Ivf,
+                num_vectors: 0,
+                num_centroids: Some(0),
+                cluster_stats: Some(VectorClusterStats {
+                    min_cluster_size: 0,
+                    max_cluster_size: 0,
+                    avg_cluster_size: 0.0,
+                    empty_clusters: 0,
+                }),
+            },
+        );
+        let column = match vec_reader.open_column(doomed_field)? {
+            VectorColumn::Ivf(column) => column,
+            VectorColumn::Flat(_) => panic!("expected IVF storage"),
+        };
+        assert!(column.is_empty(), "no rows in the emptied field");
+        assert_eq!(column.num_rows(), 0);
+        assert_eq!(column.num_clusters(), 0);
+
+        // The live field is untouched: every alive doc is counted and found.
+        let kept_count = n / 2;
+        assert_eq!(vec_reader.count(kept_field)?, kept_count);
+        let hits = search(
+            &index,
+            kept_field,
+            &AllQuery,
+            vec![10.0, 10.0],
+            n,
+            exhaustive_params(centroids.len()),
+        )?;
+        assert_eq!(hits.len(), kept_count, "kept field returns alive docs");
         Ok(())
     }
 
@@ -1717,7 +2000,15 @@ mod tests {
             let empty = sizes.iter().filter(|&&s| s == 0).count();
             let avg = sum as f64 / sizes.len() as f64;
 
-            assert_eq!(sum as usize, info.num_vectors, "sizes sum to num_vectors");
+            // Per-cluster sizes count posting rows (memberships)...
+            let column = match VectorReader::open(segment_reader)?.open_column(field)? {
+                VectorColumn::Ivf(c) => c,
+                VectorColumn::Flat(_) => panic!("expected IVF segment"),
+            };
+            assert_eq!(sum as usize, column.num_rows(), "sizes sum to rows");
+            // ...and the shared fixture runs replicas=1 with no deletes, so
+            // the row total coincides with the distinct-doc `num_vectors`.
+            assert_eq!(sum as usize, info.num_vectors, "replicas=1: rows == docs");
             assert_eq!(min, stats.min_cluster_size, "min");
             assert_eq!(max, stats.max_cluster_size, "max");
             assert_eq!(empty, stats.empty_clusters, "empty");
