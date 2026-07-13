@@ -9,8 +9,8 @@ use crate::query::{AllQuery, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric, VectorColumn,
-    VectorColumnReader, VectorDType, VectorOptions, VectorReader,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric, VectorDType,
+    VectorOptions,
 };
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
@@ -273,15 +273,13 @@ fn fixture_uses_selected_storage_format() -> crate::Result<()> {
             .vector_storage_format(vector_storage_format)
             .build()?;
         let searcher = index.index.reader()?.searcher();
-        let vec_reader = VectorReader::open(&searcher.segment_readers()[0])?;
-        assert!(matches!(
-            (
-                vector_storage_format,
-                vec_reader.open_column(index.embedding_field())?
-            ),
-            (VectorStorageFormat::Flat, VectorColumn::Flat(_))
-                | (VectorStorageFormat::Ivf, VectorColumn::Ivf(_))
-        ));
+        let vec_reader = searcher.segment_readers()[0].vector_index(index.embedding_field())?;
+        let is_ivf = vec_reader.index().is_some();
+        assert_eq!(
+            is_ivf,
+            vector_storage_format == VectorStorageFormat::Ivf,
+            "storage format mismatch: index present = {is_ivf}, expected {vector_storage_format:?}"
+        );
     }
 
     Ok(())
@@ -308,10 +306,9 @@ fn fixture_vectors_round_trip_from_readers() -> crate::Result<()> {
         let searcher = index.index.reader()?.searcher();
         let mut got = Vec::new();
         for segment_reader in searcher.segment_readers() {
-            let vec_reader = VectorReader::open(segment_reader)?;
-            let column = vec_reader.open_column(index.embedding_field())?;
+            let vec_reader = segment_reader.vector_index(index.embedding_field())?;
             for doc in 0..segment_reader.max_doc() {
-                if let Some(bytes) = column.vector_bytes_at(doc) {
+                if let Some(bytes) = vec_reader.vector_bytes(doc)? {
                     let vector: [f32; grid2d::DIM] = bytes
                         .chunks_exact(VectorDType::F32.size_bytes())
                         .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
@@ -353,26 +350,22 @@ fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
     let mut assigned_docs = 0;
 
     for segment_reader in searcher.segment_readers() {
-        let vec_reader = VectorReader::open(segment_reader)?;
-        let column = vec_reader.open_column(index.embedding_field())?;
-        let VectorColumn::Ivf(column) = column else {
-            panic!("expected IVF column");
-        };
+        let vec_reader = segment_reader.vector_index(index.embedding_field())?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
         assert_eq!(
-            column
-                .centroid_bytes()
+            ivf.centroid_bytes()
                 .chunks_exact(VectorDType::F32.size_bytes())
                 .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
                 .collect::<Vec<_>>(),
             centroid_values
         );
         for cluster_ord in 0..centroids.len() {
-            let doc_ids = column
-                .cluster_doc_ids(cluster_ord)?
+            let doc_ids = vec_reader
+                .cluster_doc_ids(cluster_ord)
                 .expect("in-bounds cluster");
-            for &doc in doc_ids {
-                let vector: Vec<f32> = column
-                    .vector_bytes_at(doc)
+            for doc in doc_ids {
+                let vector: Vec<f32> = vec_reader
+                    .vector_bytes(doc)?
                     .expect("vector bytes")
                     .chunks_exact(VectorDType::F32.size_bytes())
                     .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
@@ -570,7 +563,7 @@ pub(crate) mod ground_truth {
     use std::sync::Arc;
 
     use crate::schema::Field;
-    use crate::vector::{Metric, PreparedQuery, VectorColumnReader, VectorReader};
+    use crate::vector::{Metric, PreparedQuery};
     use crate::{DocAddress, Index, Score};
 
     pub(crate) fn top_k(
@@ -584,8 +577,7 @@ pub(crate) mod ground_truth {
         let searcher = index.reader()?.searcher();
         let mut scored = Vec::new();
         for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
-            let vec_reader = VectorReader::open(segment_reader)?;
-            let column = vec_reader.open_column(vec_field)?;
+            let vec_reader = segment_reader.vector_index(vec_field)?;
             let alive = segment_reader.alive_bitset();
             for doc in 0..segment_reader.max_doc() {
                 if let Some(alive) = alive {
@@ -593,9 +585,9 @@ pub(crate) mod ground_truth {
                         continue;
                     }
                 }
-                if let Some(bytes) = column.vector_bytes_at(doc) {
+                if let Some(bytes) = vec_reader.vector_bytes(doc)? {
                     scored.push((
-                        query.score_doc_bytes(bytes),
+                        query.score_doc_bytes(&bytes),
                         DocAddress::new(seg_ord as u32, doc),
                     ));
                 }

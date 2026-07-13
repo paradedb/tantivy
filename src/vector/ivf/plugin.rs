@@ -20,7 +20,6 @@ use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
-use crate::vector::reader::{VectorColumnReader, VectorReader};
 use crate::vector::{
     NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace, VEC_EXT,
 };
@@ -232,12 +231,6 @@ pub(crate) fn merge_ivf(
     }
 
     let settings = clusterer.merge_settings(num_target_docs as usize)?;
-    let source_readers: Vec<VectorReader> = ctx
-        .readers
-        .iter()
-        .map(VectorReader::open)
-        .collect::<crate::Result<Vec<_>>>()?;
-
     let directory = ctx.target_segment.index().directory();
     let vec_path = ctx
         .target_segment
@@ -255,18 +248,20 @@ pub(crate) fn merge_ivf(
             FieldType::Vector(opts) => opts,
             _ => continue,
         };
-        let vector_count = source_readers
+        // Per-segment readers for this field (cached on the SegmentReaders).
+        let field_readers: Vec<_> = ctx
+            .readers
             .iter()
-            .map(|reader| reader.count(field))
-            .sum::<crate::Result<usize>>()?;
+            .map(|reader| reader.vector_index(field))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let vector_count = field_readers
+            .iter()
+            .map(|reader| reader.num_vectors())
+            .sum::<usize>();
         if vector_count == 0 {
             write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
             continue;
         }
-        let columns: Vec<_> = source_readers
-            .iter()
-            .map(|reader| reader.open_column(field))
-            .collect::<crate::Result<Vec<_>>>()?;
         let num_centroids = settings.num_centroids.min(vector_count);
         let training_sample_size =
             vector_count.min(num_centroids.saturating_mul(settings.training_samples_per_centroid));
@@ -282,14 +277,14 @@ pub(crate) fn merge_ivf(
                 let mut present_vector_ord = 0usize;
                 let mut sampled_count = 0usize;
                 for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                    let column = &columns[old_doc_addr.segment_ord as usize];
-                    if let Some(bytes) = column.vector_bytes_at(old_doc_addr.doc_id) {
+                    let reader = &field_readers[old_doc_addr.segment_ord as usize];
+                    if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
                         let should_sample = sampled_count < training_sample_size
                             && present_vector_ord % training_sample_interval == 0;
                         if should_sample {
                             training_doc_ids.push(target_doc_id);
                             training_values
-                                .extend_from_slice(&decode_row::<f32>(bytes, opts.dim())?);
+                                .extend_from_slice(&decode_row::<f32>(&bytes, opts.dim())?);
                             sampled_count += 1;
                         }
                         present_vector_ord += 1;
@@ -507,10 +502,11 @@ pub(crate) fn merge_ivf(
                             Ok(())
                         };
                     for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                        let column = &columns[old_doc_addr.segment_ord as usize];
-                        if let Some(bytes) = column.vector_bytes_at(old_doc_addr.doc_id) {
+                        let reader = &field_readers[old_doc_addr.segment_ord as usize];
+                        if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
                             batch_doc_ids.push(target_doc_id);
-                            batch_values.extend_from_slice(&decode_row::<f32>(bytes, opts.dim())?);
+                            batch_values
+                                .extend_from_slice(&decode_row::<f32>(&bytes, opts.dim())?);
                             batch_sources.push((
                                 target_doc_id,
                                 old_doc_addr.segment_ord as usize,
@@ -584,9 +580,9 @@ pub(crate) fn merge_ivf(
                     let needs_norm = opts.needs_normalization();
                     let mut row_buf: Vec<u8> = Vec::with_capacity(opts.bytes_per_vector());
                     for assigned_vector in &assigned_vectors {
-                        let column = &columns[assigned_vector.source_segment_ord];
-                        let bytes = column
-                            .vector_bytes_at(assigned_vector.source_doc_id)
+                        let reader = &field_readers[assigned_vector.source_segment_ord];
+                        let bytes = reader
+                            .vector_bytes(assigned_vector.source_doc_id)?
                             .ok_or_else(|| {
                                 TantivyError::InternalError(format!(
                                     "missing source vector for doc {:?}",
@@ -610,7 +606,7 @@ pub(crate) fn merge_ivf(
                         // self-limiting, and non-desyncing.
                         if needs_norm {
                             row_buf.clear();
-                            row_buf.extend_from_slice(bytes);
+                            row_buf.extend_from_slice(&bytes);
                             if maybe_normalize_bytes(opts, &mut row_buf)
                                 == NormalizeOutcome::NonFinite
                             {
@@ -623,7 +619,7 @@ pub(crate) fn merge_ivf(
                             }
                             rows_w.write_all(&row_buf)?;
                         } else {
-                            rows_w.write_all(bytes)?;
+                            rows_w.write_all(&bytes)?;
                         }
                     }
                     rows_w.flush()?;

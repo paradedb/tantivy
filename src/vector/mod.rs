@@ -18,9 +18,9 @@ mod distance;
 mod graph;
 mod header;
 mod index;
+mod index_reader;
 mod plugin;
 mod prepared;
-mod reader;
 
 pub mod flat;
 pub mod ivf;
@@ -35,19 +35,18 @@ pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
-pub use flat::{FlatVecReader, FlatVecWriter, FlatVectorColumn};
+pub use flat::FlatVecWriter;
 pub use graph::{Graph, NodeId};
 pub use index::{Candidate, NeighborhoodGraphConfig, RelativeNeighborhoodGraph, Workspace};
+pub use index_reader::{
+    IvfIndex, VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat,
+};
 pub use ivf::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
     IvfVectors,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
-pub use reader::{
-    VectorClusterStats, VectorColumn, VectorColumnReader, VectorInfo, VectorReader,
-    VectorStorageFormat,
-};
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
 // resolves for callers and tests that work entirely within the vector module.
