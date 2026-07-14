@@ -808,6 +808,17 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         })
     }
 
+    /// The `k` nodes most similar to `query`, most similar first — a
+    /// [`search`](Self::search) entered at the graph's own deterministic,
+    /// evenly spaced seed nodes. This is the shared entry policy for callers
+    /// without a better starting point: replica selection at build time and
+    /// cluster routing at query time both go through here, so routing
+    /// behaves like the searches that shaped the graph.
+    pub fn nearest(&self, ws: &mut Workspace, query: &[S::Elem], k: usize) -> Vec<Candidate> {
+        let seeds = evenly_spaced_seeds(self.graph.len());
+        self.search(ws, query, &seeds, k)
+    }
+
     /// The number of nodes in the graph.
     pub fn len(&self) -> usize {
         self.graph.len()
@@ -820,11 +831,10 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
 }
 
 /// Deterministic, evenly spaced search entry points for a graph of `n`
-/// nodes: up to 8 seeds, the same formula on the build side (replica
-/// selection) and the read side (query routing), so routing behaves like
-/// the searches that shaped the graph. 8 stays under the minimum search
+/// nodes: up to 8 seeds — the entry policy behind
+/// [`RelativeNeighborhoodGraph::nearest`]. 8 stays under the minimum search
 /// beam (`ef >= 64`), which `search` requires of its seed count.
-pub(crate) fn evenly_spaced_seeds(n: usize) -> Vec<NodeId> {
+fn evenly_spaced_seeds(n: usize) -> Vec<NodeId> {
     (0..n)
         .step_by((n / 8).max(1))
         .take(8)

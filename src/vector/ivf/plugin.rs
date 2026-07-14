@@ -10,7 +10,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::{
-    decode_row, encode_vector, evenly_spaced_seeds, IvfCentroids, IvfClusterer, IvfIndex,
+    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfIndex,
     IvfMatrixView, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
@@ -20,9 +20,7 @@ use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
-use crate::vector::{
-    NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace, VEC_EXT,
-};
+use crate::vector::{NeighborhoodGraphConfig, RelativeNeighborhoodGraph, Workspace, VEC_EXT};
 use crate::{DocId, Executor, TantivyError};
 
 struct AssignedVector {
@@ -46,14 +44,15 @@ struct AssignedVector {
 enum ReplicaSelector<'a> {
     /// Exact k-NN scan over the trained centroids (small centroid sets).
     Exact,
-    /// Approximate k-NN via a [`RelativeNeighborhoodGraph`] (large
-    /// centroid sets).
-    Graph(CentroidGraph<'a>),
+    /// Approximate k-NN via a [`RelativeNeighborhoodGraph`] borrowing the
+    /// flat centroid arena (large centroid sets).
+    Graph(RelativeNeighborhoodGraph<&'a [f32]>),
 }
 
 /// Centroid ids of the `knn` nearest centroids to `query`, nearest first —
-/// the exact counterpart of [`CentroidGraph::nearest`], same distance family
-/// per metric. Ties break on centroid id so selection is deterministic.
+/// the exact counterpart of [`RelativeNeighborhoodGraph::nearest`], same
+/// distance family per metric. Ties break on centroid id so selection is
+/// deterministic.
 fn exact_nearest_centroids(
     metric: Metric,
     centroid_rows: &[Vec<f32>],
@@ -71,7 +70,7 @@ fn exact_nearest_centroids(
                 Metric::Cosine => 1.0 - cosine(query, centroid.as_slice()),
                 // Negated raw dot: the query-time router ranks by dot, and
                 // dot ordering is ||q||-invariant (see
-                // [`CentroidGraph::build`]).
+                // [`build_centroid_graph`]).
                 Metric::Dot => -dot(query, centroid.as_slice()),
                 // Squared L2 orders identically to L2.
                 Metric::L2 => l2_squared(query, centroid.as_slice()),
@@ -101,51 +100,33 @@ fn build_executor(name: &'static str) -> crate::Result<Executor> {
     }
 }
 
-/// Build-time [`RelativeNeighborhoodGraph`] over the trained centroids,
-/// used to pick a vector's `replicas - 1` nearest non-primary cells when
-/// the centroid set is large enough that an approximate index beats the
-/// brute scan (see [`ReplicaSelector`]). Borrows the flat centroid arena;
-/// after the assign loop the same graph is persisted as the `.centroids`
-/// slot [2] routing graph.
-struct CentroidGraph<'a> {
-    rng: RelativeNeighborhoodGraph<&'a [f32]>,
-    /// Deterministic, evenly spaced entry points, computed once at build.
-    seeds: Vec<NodeId>,
-}
-
-impl<'a> CentroidGraph<'a> {
-    /// Builds the graph over `centroids` (flat, `dim`-strided) with search
-    /// beam `ef`.
-    fn build(metric: Metric, centroids: &'a [f32], dim: usize, ef: usize) -> crate::Result<Self> {
-        // Replica cells must predict the query-time router
-        // (`rank_centroids`), which ranks centroids by the field metric —
-        // so the graph selects with that metric directly. For Dot,
-        // centroid ranking by dot(q, c) is invariant to ||q||: a
-        // v-directed query ranks cells by dot(v, c), so raw dot IS the
-        // query-consistent criterion, and its magnitude bias mirrors the
-        // router's. The pathological case — one dominant long centroid
-        // attracting many replicas — is a cluster-balance concern, not a
-        // selection concern. Must stay consistent with
-        // `exact_nearest_centroids`.
-        let config = NeighborhoodGraphConfig {
-            ef,
-            ..Default::default()
-        };
-        let mut rng = RelativeNeighborhoodGraph::new(centroids, dim, metric, config);
-        rng.build(&build_executor("replica-rng-")?);
-        let seeds = evenly_spaced_seeds(centroids.len() / dim);
-        Ok(CentroidGraph { rng, seeds })
-    }
-
-    /// Centroid ids of the `knn` nearest centroids to `query`, nearest
-    /// first. `ws` is the caller's reusable per-query scratch.
-    fn nearest(&self, ws: &mut Workspace, query: &[f32], knn: usize) -> Vec<usize> {
-        self.rng
-            .search(ws, query, &self.seeds, knn)
-            .into_iter()
-            .map(|candidate| candidate.node as usize)
-            .collect()
-    }
+/// Builds the replica-selection [`RelativeNeighborhoodGraph`] over the
+/// trained `centroids` (flat, `dim`-strided) with search beam `ef`. Borrows
+/// the flat centroid arena; after the assign loop the same graph is
+/// persisted as the `.centroids` slot [2] routing graph.
+fn build_centroid_graph<'a>(
+    metric: Metric,
+    centroids: &'a [f32],
+    dim: usize,
+    ef: usize,
+) -> crate::Result<RelativeNeighborhoodGraph<&'a [f32]>> {
+    // Replica cells must predict the query-time router
+    // (`rank_clusters`), which ranks centroids by the field metric —
+    // so the graph selects with that metric directly. For Dot,
+    // centroid ranking by dot(q, c) is invariant to ||q||: a
+    // v-directed query ranks cells by dot(v, c), so raw dot IS the
+    // query-consistent criterion, and its magnitude bias mirrors the
+    // router's. The pathological case — one dominant long centroid
+    // attracting many replicas — is a cluster-balance concern, not a
+    // selection concern. Must stay consistent with
+    // `exact_nearest_centroids`.
+    let config = NeighborhoodGraphConfig {
+        ef,
+        ..Default::default()
+    };
+    let mut rng = RelativeNeighborhoodGraph::new(centroids, dim, metric, config);
+    rng.build(&build_executor("replica-rng-")?);
+    Ok(rng)
 }
 
 /// Per-field IVF build timings (one phase per field), emitted at end of build
@@ -374,7 +355,7 @@ pub(crate) fn merge_ivf(
                     Some(ReplicaSelector::Exact)
                 } else {
                     let build_start = Instant::now();
-                    let graph = CentroidGraph::build(
+                    let graph = build_centroid_graph(
                         opts.metric(),
                         centroid_matrix.values.as_slice(),
                         dim,
@@ -467,9 +448,11 @@ pub(crate) fn merge_ivf(
                                             v,
                                             replicas,
                                         ),
-                                        ReplicaSelector::Graph(graph) => {
-                                            graph.nearest(&mut replica_ws, v, replicas)
-                                        }
+                                        ReplicaSelector::Graph(graph) => graph
+                                            .nearest(&mut replica_ws, v, replicas)
+                                            .into_iter()
+                                            .map(|candidate| candidate.node as usize)
+                                            .collect(),
                                     };
                                     timings.replica_knn += knn_start.elapsed();
                                     let mut added = 0usize;
@@ -676,7 +659,7 @@ pub(crate) fn merge_ivf(
                     }
                     let graph_w = centroids_write.for_field_with_idx(field, 2);
                     match replica_selector.as_ref() {
-                        Some(ReplicaSelector::Graph(graph)) => graph.rng.serialize(graph_w)?,
+                        Some(ReplicaSelector::Graph(graph)) => graph.serialize(graph_w)?,
                         // `replicas == 1` or the exact-selector regime: no
                         // graph exists yet, build one just for routing.
                         _ => {
@@ -742,11 +725,15 @@ mod tests {
             "fixture must exceed the exact-path cutoff"
         );
 
-        let graph = CentroidGraph::build(Metric::L2, &flat, dim, ef)?;
+        let graph = build_centroid_graph(Metric::L2, &flat, dim, ef)?;
         let mut ws = Workspace::new();
         for (ord, centroid) in centroid_rows.iter().enumerate().step_by(5) {
             let query = [centroid[0] + 0.3, centroid[1] - 0.2];
-            let picked = graph.nearest(&mut ws, &query, replicas);
+            let picked: Vec<usize> = graph
+                .nearest(&mut ws, &query, replicas)
+                .into_iter()
+                .map(|candidate| candidate.node as usize)
+                .collect();
             assert_eq!(picked.len(), replicas, "query near centroid {ord}");
             let envelope =
                 exact_nearest_centroids(Metric::L2, &centroid_rows, &query, replicas + 2);

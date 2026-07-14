@@ -14,7 +14,6 @@ mod training;
 /// The IVF cluster-routing file. Written per field, only for IVF segments.
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
-pub(crate) use graph::evenly_spaced_seeds;
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace,
 };

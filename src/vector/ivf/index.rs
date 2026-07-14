@@ -27,9 +27,7 @@ use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
-use super::graph::{
-    evenly_spaced_seeds, NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace,
-};
+use super::graph::{NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::{FileSliceArena, VectorArena};
@@ -62,9 +60,6 @@ pub struct IvfIndex {
     /// centroid counts, where the write side skips the slot and routing
     /// falls back to a linear scan of the (few) centroids.
     graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
-    /// Evenly spaced routing entry points — the same formula the write-side
-    /// replica selector searches with.
-    seeds: Vec<NodeId>,
 }
 
 impl IvfIndex {
@@ -188,7 +183,6 @@ impl IvfIndex {
             dim: options.dim(),
             metric: options.metric(),
             graph,
-            seeds: evenly_spaced_seeds(num_centroids),
         };
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt (or differently-framed) file.
@@ -252,7 +246,7 @@ impl IvfIndex {
     /// `ProbeStats::centroids_ranked`).
     ///
     /// With a persisted RNG this is a beam search
-    /// ([`RelativeNeighborhoodGraph::search`]) with a beam of
+    /// ([`RelativeNeighborhoodGraph::nearest`]) with a beam of
     /// `max(ef, limit)`, returning at most `limit` clusters. Without one
     /// (degenerate centroid counts) every centroid is scored exactly. Both
     /// paths fetch centroid rows lazily through the same [`FileSliceArena`]
@@ -261,7 +255,7 @@ impl IvfIndex {
         match &self.graph {
             Some(graph) => {
                 let mut ws = Workspace::new();
-                let candidates = graph.search(&mut ws, query, &self.seeds, limit);
+                let candidates = graph.nearest(&mut ws, query, limit);
                 let ranked = candidates
                     .into_iter()
                     .map(|candidate| (candidate.sim.score(), candidate.node))
