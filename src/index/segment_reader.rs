@@ -16,11 +16,11 @@ use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
 use crate::index::{Index, InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
-use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Type};
+use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::{VectorIndexReader, VectorInfo};
+use crate::vector::VectorIndexReader;
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -181,31 +181,6 @@ impl SegmentReader {
             .expect("Lock poisoned. This should never happen")
             .insert(field, Arc::clone(&reader));
         Ok(reader)
-    }
-
-    /// Returns vector storage info for `field`, or `None` if the segment has no
-    /// vector data for it (or the field is not a vector field).
-    pub fn vector_info(&self, field: Field) -> crate::Result<Option<VectorInfo>> {
-        if !matches!(
-            self.schema.get_field_entry(field).field_type(),
-            FieldType::Vector(_)
-        ) {
-            return Ok(None);
-        }
-        Ok(self.vector_index(field)?.info())
-    }
-
-    /// Returns the raw per-cluster posting-list sizes for an IVF `field`, or
-    /// `None` if the segment has no IVF vector data for it. The un-collapsed
-    /// distribution behind [`Self::vector_info`]'s cluster stats.
-    pub fn vector_cluster_sizes(&self, field: Field) -> crate::Result<Option<Vec<u32>>> {
-        if !matches!(
-            self.schema.get_field_entry(field).field_type(),
-            FieldType::Vector(_)
-        ) {
-            return Ok(None);
-        }
-        Ok(self.vector_index(field)?.cluster_sizes())
     }
 
     /// Open a new segment for reading.

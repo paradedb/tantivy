@@ -55,7 +55,7 @@ pub struct VectorInfo {
     pub format: VectorStorageFormat,
     /// Distinct documents with a vector in this field — the same quantity for
     /// both storage formats. The IVF per-cluster numbers (`cluster_stats`
-    /// here, [`SegmentReader::vector_cluster_sizes`]) count memberships —
+    /// here, [`VectorIndexReader::cluster_sizes`]) count memberships —
     /// posting rows, one per cell a doc lives in — so with replication their
     /// sum exceeds `num_vectors`.
     pub num_vectors: usize,
@@ -239,7 +239,7 @@ impl VectorIndexReader {
 
     /// Storage info for tooling; `None` if the segment has no vector data for
     /// the field.
-    pub(crate) fn info(&self) -> Option<VectorInfo> {
+    pub fn info(&self) -> Option<VectorInfo> {
         if !self.present {
             return None;
         }
@@ -286,8 +286,9 @@ impl VectorIndexReader {
     }
 
     /// Raw per-cluster posting-list sizes in cluster order; `None` when the
-    /// field's storage is not IVF.
-    pub(crate) fn cluster_sizes(&self) -> Option<Vec<u32>> {
+    /// field's storage is not IVF. The un-collapsed distribution behind
+    /// [`Self::info`]'s aggregate cluster stats.
+    pub fn cluster_sizes(&self) -> Option<Vec<u32>> {
         self.index
             .as_ref()
             .map(|index| index.cluster_sizes().map(|size| size as u32).collect())

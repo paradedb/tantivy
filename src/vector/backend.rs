@@ -1099,14 +1099,10 @@ mod tests {
         // membership semantics (each doc exact-fills `replicas` cells here).
         let vec_reader = segment_reader.vector_index(embed_field)?;
         assert_eq!(vec_reader.num_vectors(), total);
-        let info = segment_reader
-            .vector_info(embed_field)?
-            .expect("vector info");
+        let info = vec_reader.info().expect("vector info");
         assert_eq!(info.format, VectorStorageFormat::Ivf);
         assert_eq!(info.num_vectors, total, "num_vectors counts distinct docs");
-        let sizes = segment_reader
-            .vector_cluster_sizes(embed_field)?
-            .expect("ivf cluster sizes");
+        let sizes = vec_reader.cluster_sizes().expect("ivf cluster sizes");
         let memberships: usize = sizes.iter().map(|&s| s as usize).sum();
         assert_eq!(
             memberships,
@@ -1192,12 +1188,10 @@ mod tests {
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
         let segment_reader = &searcher.segment_readers()[0];
-        let info = segment_reader
-            .vector_info(embed_field)?
-            .expect("vector info");
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let info = vec_reader.info().expect("vector info");
         assert_eq!(info.format, VectorStorageFormat::Ivf, "merge must cluster");
         assert_eq!(info.num_vectors, alive, "deleted docs must not be counted");
-        let vec_reader = segment_reader.vector_index(embed_field)?;
         assert_eq!(vec_reader.num_vectors(), alive);
 
         // Every alive doc comes back exactly once; no deleted label survives.
@@ -1298,9 +1292,7 @@ mod tests {
         // The emptied field reads back as a zeroed IVF field — not an error.
         let vec_reader = segment_reader.vector_index(doomed_field)?;
         assert_eq!(vec_reader.num_vectors(), 0);
-        let info = segment_reader
-            .vector_info(doomed_field)?
-            .expect("vector info");
+        let info = vec_reader.info().expect("vector info");
         assert_eq!(
             info,
             VectorInfo {
@@ -2049,10 +2041,10 @@ mod tests {
         Ok(())
     }
 
-    /// The raw per-cluster sizes from `vector_cluster_sizes` must be exactly the
-    /// un-collapsed array behind `vector_info`'s aggregate cluster stats — the
-    /// invariant `paradedb.ivf_cluster_sizes` relies on to reconcile with
-    /// `paradedb.index_info`. Flat segments expose no sizes.
+    /// The raw per-cluster sizes from the reader's `cluster_sizes` must be
+    /// exactly the un-collapsed array behind `info`'s aggregate cluster stats
+    /// — the invariant `paradedb.ivf_cluster_sizes` relies on to reconcile
+    /// with `paradedb.index_info`. Flat segments expose no sizes.
     #[test]
     fn ivf_cluster_sizes_match_vector_info() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
@@ -2064,10 +2056,11 @@ mod tests {
 
         let mut segments_checked = 0;
         for segment_reader in searcher.segment_readers() {
-            let sizes = segment_reader
-                .vector_cluster_sizes(field)?
+            let vec_reader = segment_reader.vector_index(field)?;
+            let sizes = vec_reader
+                .cluster_sizes()
                 .expect("ivf segment exposes cluster sizes");
-            let info = segment_reader.vector_info(field)?.expect("vector info");
+            let info = vec_reader.info().expect("vector info");
             assert_eq!(info.format, VectorStorageFormat::Ivf);
             let stats = info.cluster_stats.expect("ivf cluster stats");
 
@@ -2081,7 +2074,6 @@ mod tests {
             let avg = sum as f64 / sizes.len() as f64;
 
             // Per-cluster sizes count posting rows (memberships)...
-            let vec_reader = segment_reader.vector_index(field)?;
             let ivf = vec_reader.index().expect("expected IVF segment");
             assert_eq!(sum as usize, ivf.num_rows(), "sizes sum to rows");
             // ...and the shared fixture runs replicas=1 with no deletes, so
@@ -2111,7 +2103,10 @@ mod tests {
         let flat_searcher = flat.index.reader()?.searcher();
         for segment_reader in flat_searcher.segment_readers() {
             assert!(
-                segment_reader.vector_cluster_sizes(flat_field)?.is_none(),
+                segment_reader
+                    .vector_index(flat_field)?
+                    .cluster_sizes()
+                    .is_none(),
                 "flat segments expose no cluster sizes"
             );
         }
