@@ -20,7 +20,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::{VectorInfo, VectorReader};
+use crate::vector::VectorIndexReader;
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -40,6 +40,7 @@ pub struct SegmentReader {
     custom_alive_bitset: Option<AliveBitSet>,
 
     inv_idx_reader_cache: Arc<RwLock<HashMap<Field, Arc<InvertedIndexReader>>>>,
+    vector_reader_cache: Arc<RwLock<HashMap<Field, Arc<VectorIndexReader>>>>,
     delete_opstamp: Option<Opstamp>,
 
     max_doc: DocId,
@@ -156,17 +157,30 @@ impl SegmentReader {
         StoreReader::open(self.store_file().clone(), cache_num_blocks)
     }
 
-    /// Returns vector storage info for `field`, or `None` if the segment has no
-    /// vector data for it.
-    pub fn vector_info(&self, field: Field) -> crate::Result<Option<VectorInfo>> {
-        VectorReader::open(self)?.info(field)
-    }
-
-    /// Returns the raw per-cluster posting-list sizes for an IVF `field`, or
-    /// `None` if the segment has no IVF vector data for it. The un-collapsed
-    /// distribution behind [`Self::vector_info`]'s cluster stats.
-    pub fn vector_cluster_sizes(&self, field: Field) -> crate::Result<Option<Vec<u32>>> {
-        VectorReader::open(self)?.cluster_sizes(field)
+    /// Accessor to the [`VectorIndexReader`] for a vector `field` — the
+    /// vector analogue of [`Self::inverted_index`]: opened once per segment
+    /// per field, cached, and shared across queries as an `Arc`. The reader
+    /// pins the field's small routing state (cluster offsets, RNG adjacency,
+    /// centroids) and defers the row payload behind ranged reads.
+    ///
+    /// A segment with no vector data for the field yields an empty reader
+    /// (zero vectors, no index) rather than an error, so callers never branch
+    /// on presence. Requesting a non-vector field is an error.
+    pub fn vector_index(&self, field: Field) -> crate::Result<Arc<VectorIndexReader>> {
+        if let Some(reader) = self
+            .vector_reader_cache
+            .read()
+            .expect("Lock poisoned. This should never happen")
+            .get(&field)
+        {
+            return Ok(Arc::clone(reader));
+        }
+        let reader = Arc::new(VectorIndexReader::open(self, field)?);
+        self.vector_reader_cache
+            .write()
+            .expect("Lock poisoned. This should never happen")
+            .insert(field, Arc::clone(&reader));
+        Ok(reader)
     }
 
     /// Open a new segment for reading.
@@ -185,6 +199,7 @@ impl SegmentReader {
             custom_alive_bitset: custom_bitset,
 
             inv_idx_reader_cache: Default::default(),
+            vector_reader_cache: Default::default(),
             delete_opstamp: segment.meta().delete_opstamp(),
 
             max_doc: segment.meta().max_doc(),

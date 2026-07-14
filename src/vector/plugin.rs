@@ -7,8 +7,9 @@
 //!   [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold)
 //!   it copies vectors forward into a flat `.vec`; at or above the threshold it writes an IVF
 //!   `.vec` (with `IdMap::Explicit`) plus a `.centroids` file.
-//! - During reads, [`VectorReader`](super::reader::VectorReader) opens `.vec` and learns the
-//!   storage mode from its self-describing `IdMap` header.
+//! - During reads, [`VectorIndexReader`](super::VectorIndexReader) opens the field's `.vec`
+//!   slots (and the `.centroids` sidecar when present) via
+//!   [`SegmentReader::vector_index`](crate::SegmentReader::vector_index).
 //!
 //! Owning both flat and IVF extensions on one plugin keeps the "exactly one
 //! format per segment" invariant right by construction: the dispatch is one

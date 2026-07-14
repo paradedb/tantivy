@@ -137,20 +137,11 @@ impl IdMap {
         }
     }
 
-    /// Read just the variant tag and report whether it is `Explicit` (IVF).
-    /// Used by [`VectorReader`](crate::vector::VectorReader) to pick a backend
-    /// without parsing the whole id-map.
-    pub(crate) fn peek_is_explicit(file_slice: &FileSlice) -> io::Result<bool> {
-        if file_slice.len() == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "id map section is empty",
-            ));
-        }
-        Ok(file_slice.slice(0..1).read_bytes()?[0] == VARIANT_EXPLICIT)
-    }
-
-    /// `true` if `doc_id` has a value.
+    /// `true` if `doc_id` has a value. The `Explicit` arm is a linear scan —
+    /// the reference semantics the format tests exercise; the read path
+    /// ([`VectorIndexReader`](crate::vector::VectorIndexReader)) uses
+    /// cluster-local binary search instead.
+    #[cfg(test)]
     #[inline]
     pub fn contains(&self, doc_id: DocId) -> bool {
         match self {
@@ -165,8 +156,9 @@ impl IdMap {
 
     /// Returns the dense row id for `doc_id` if it has a value, else `None`.
     /// For `Identity`, this is the identity map — no bitmap consulted. For
-    /// `Explicit` this is a linear scan; the IVF reader uses cluster-local
-    /// binary search instead (see [`IvfVectorColumn`](crate::vector::ivf)).
+    /// `Explicit` this is a linear scan; the IVF read path uses cluster-local
+    /// binary search instead (see
+    /// [`VectorIndexReader`](crate::vector::VectorIndexReader)).
     /// Callers must pass a `doc_id` within the segment (`doc_id < max_doc`);
     /// this is asserted in debug builds.
     #[inline]

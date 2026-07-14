@@ -5,19 +5,22 @@
 //! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold),
 //! which defaults to 10k docs.
 
-mod centroids;
+pub(crate) mod graph;
+mod index;
 mod params;
+mod partition;
 mod plugin;
-mod reader;
 mod training;
 
 /// The IVF cluster-routing file. Written per field, only for IVF segments.
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
-pub(crate) use centroids::CentroidsMeta;
+pub use graph::{
+    Candidate, Graph, NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace,
+};
+pub use index::IvfIndex;
 pub use params::AdaptiveProbeParams;
 pub(crate) use plugin::merge_ivf;
-pub use reader::{IvfVecReader, IvfVectorColumn};
 pub(crate) use training::{decode_row, encode_vector};
 pub use training::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,

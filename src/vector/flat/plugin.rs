@@ -14,7 +14,6 @@ use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::FieldType;
 use crate::vector::header::write_header;
-use crate::vector::reader::{VectorColumnReader, VectorReader};
 use crate::vector::VEC_EXT;
 use crate::DocId;
 
@@ -39,12 +38,6 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
         .relative_path(SegmentComponent::Custom(VEC_EXT.to_string()));
     let mut write = ctx.target_segment.index().directory().open_write(&path)?;
     write_header(&mut write)?;
-    let source_readers: Vec<VectorReader> = ctx
-        .readers
-        .iter()
-        .map(VectorReader::open)
-        .collect::<crate::Result<Vec<_>>>()?;
-
     let mut composite = CompositeWrite::wrap(write);
 
     // num_docs in the target segment = number of alive docs aggregated
@@ -58,10 +51,11 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             _ => continue,
         };
 
-        // Per-segment column views for this field (lazy open).
-        let columns: Vec<_> = source_readers
+        // Per-segment readers for this field (cached on the SegmentReaders).
+        let field_readers: Vec<_> = ctx
+            .readers
             .iter()
-            .map(|reader| reader.open_column(field))
+            .map(|reader| reader.vector_index(field))
             .collect::<crate::Result<Vec<_>>>()?;
 
         let mut target_present: Vec<DocId> = Vec::new();
@@ -69,10 +63,10 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
         {
             let rows_w = composite.for_field_with_idx(field, 1);
             for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                let column = &columns[old_doc_addr.segment_ord as usize];
-                if let Some(bytes) = column.vector_bytes_at(old_doc_addr.doc_id) {
+                let reader = &field_readers[old_doc_addr.segment_ord as usize];
+                if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
                     target_present.push(new_doc_id);
-                    rows_w.write_all(bytes)?;
+                    rows_w.write_all(&bytes)?;
                 }
                 new_doc_id += 1;
             }

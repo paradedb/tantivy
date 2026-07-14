@@ -15,12 +15,10 @@ use std::io;
 mod backend;
 mod collector;
 mod distance;
-mod graph;
 mod header;
-mod index;
+mod index_reader;
 mod plugin;
 mod prepared;
-mod reader;
 
 pub mod flat;
 pub mod ivf;
@@ -33,21 +31,17 @@ pub(crate) const VEC_EXT: &str = "vec";
 pub use backend::{ProbeStats, ProbeTermination, VectorBackend};
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{
-    cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
+    Similarity, cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes,
 };
-pub use flat::{FlatVecReader, FlatVecWriter, FlatVectorColumn};
-pub use graph::{Graph, NodeId};
-pub use index::{Candidate, NeighborhoodGraphConfig, RelativeNeighborhoodGraph, Workspace};
+pub use flat::FlatVecWriter;
+pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
-    IvfVectors,
+    Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
+    IvfMergeSettings, IvfVectorBatch, IvfVectors, NeighborhoodGraphConfig, NodeId,
+    RelativeNeighborhoodGraph, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
-pub use reader::{
-    VectorClusterStats, VectorColumn, VectorColumnReader, VectorInfo, VectorReader,
-    VectorStorageFormat,
-};
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
 // resolves for callers and tests that work entirely within the vector module.
@@ -217,5 +211,62 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
     #[inline]
     fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> Similarity {
         metric.similarity(query, &self[node as usize * dim..][..dim])
+    }
+}
+
+/// A [`VectorArena`] over raw little-endian `T` rows behind a
+/// [`FileSlice`](crate::directory::FileSlice): each [`similarity`] call
+/// fetches only that node's row with one stride-sized ranged read, scored
+/// with the byte kernels ([`Metric::similarity_bytes`]). The arena is never
+/// materialized whole — under `MmapDirectory` a read is a zero-copy view,
+/// and under a copying `Directory` only the visited nodes' bytes are fetched.
+///
+/// This is the search-time counterpart of the typed blanket impl: a
+/// [`Graph`] reloaded from disk wraps its file-resident vectors in one of
+/// these and is search-only (refinement needs typed storage).
+///
+/// [`similarity`]: VectorArena::similarity
+pub struct FileSliceArena<T> {
+    slice: crate::directory::FileSlice,
+    _elem: std::marker::PhantomData<T>,
+}
+
+impl<T> FileSliceArena<T> {
+    /// Wraps a slice of contiguous `dim`-strided little-endian `T` rows.
+    pub fn new(slice: crate::directory::FileSlice) -> Self {
+        FileSliceArena {
+            slice,
+            _elem: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: VectorElement> VectorArena for FileSliceArena<T> {
+    type Elem = T;
+
+    #[inline]
+    fn num_vectors(&self, dim: usize) -> usize {
+        use common::HasLen;
+        let stride = dim * T::SIZE_BYTES;
+        assert_eq!(self.slice.len() % stride, 0, "arena not a multiple of dim");
+        self.slice.len() / stride
+    }
+
+    /// # Panics
+    ///
+    /// The trait has no error channel, so a failed read panics. Row bounds
+    /// are guaranteed by the graph (node ids come from the adjacency, which
+    /// is length-validated against this arena at open); an I/O failure here
+    /// means the underlying `Directory` could not produce bytes it already
+    /// promised via the slice.
+    #[inline]
+    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> Similarity {
+        let stride = dim * T::SIZE_BYTES;
+        let bytes = self
+            .slice
+            .slice(node as usize * stride..(node as usize + 1) * stride)
+            .read_bytes()
+            .expect("failed to read vector arena row");
+        metric.similarity_bytes(query, &bytes)
     }
 }

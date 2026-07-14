@@ -210,10 +210,7 @@ mod ivf_e2e_tests {
     use crate::query::AllQuery;
     use crate::schema::{Schema, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
-    use crate::vector::{
-        Metric, VectorColumn, VectorColumnReader, VectorDType, VectorOptions, VectorReader,
-        VectorStorageFormat,
-    };
+    use crate::vector::{Metric, VectorDType, VectorOptions, VectorStorageFormat};
     use crate::{Index, TantivyDocument};
 
     /// IVF + exhaustive probing matches the global oracle. The shared
@@ -404,10 +401,9 @@ mod ivf_e2e_tests {
         let mut flat_count = 0usize;
         let mut ivf_count = 0usize;
         for reader in searcher.segment_readers() {
-            let vec_reader = VectorReader::open(reader)?;
-            match vec_reader.open_column(embedding_field)? {
-                VectorColumn::Flat(_) => flat_count += 1,
-                VectorColumn::Ivf(_) => ivf_count += 1,
+            match reader.vector_index(embedding_field)?.index() {
+                None => flat_count += 1,
+                Some(_) => ivf_count += 1,
             }
         }
         assert!(
