@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use common::BitSet;
 
-use super::index_reader::{IvfIndex, VectorIndexReader};
-use super::ivf::AdaptiveProbeParams;
+use super::index_reader::VectorIndexReader;
+use super::ivf::{AdaptiveProbeParams, IvfIndex};
 use super::prepared::PreparedQuery;
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;

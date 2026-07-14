@@ -414,7 +414,7 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
 fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
-    use crate::vector::graph::EMPTY;
+    use crate::vector::ivf::graph::EMPTY;
     use crate::vector::ivf::CENTROIDS_EXT;
     use crate::vector::NeighborhoodGraphConfig;
 

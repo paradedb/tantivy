@@ -15,9 +15,7 @@ use std::io;
 mod backend;
 mod collector;
 mod distance;
-mod graph;
 mod header;
-mod index;
 mod index_reader;
 mod plugin;
 mod prepared;
@@ -33,18 +31,14 @@ pub(crate) const VEC_EXT: &str = "vec";
 pub use backend::{ProbeStats, ProbeTermination, VectorBackend};
 pub use collector::TopDocsByVectorSimilarity;
 pub use distance::{
-    cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
+    Similarity, cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes,
 };
 pub use flat::FlatVecWriter;
-pub use graph::{Graph, NodeId};
-pub(crate) use index::evenly_spaced_seeds;
-pub use index::{Candidate, NeighborhoodGraphConfig, RelativeNeighborhoodGraph, Workspace};
-pub use index_reader::{
-    IvfIndex, VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat,
-};
+pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
-    IvfVectors,
+    Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
+    IvfMergeSettings, IvfVectorBatch, IvfVectors, NeighborhoodGraphConfig, NodeId,
+    RelativeNeighborhoodGraph, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;

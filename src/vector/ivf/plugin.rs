@@ -10,8 +10,8 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::{
-    decode_row, encode_vector, CentroidsMeta, IvfCentroids, IvfClusterer, IvfMatrixView,
-    IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
+    decode_row, encode_vector, evenly_spaced_seeds, IvfCentroids, IvfClusterer, IvfIndex,
+    IvfMatrixView, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
@@ -21,8 +21,7 @@ use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, No
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
 use crate::vector::{
-    evenly_spaced_seeds, NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace,
-    VEC_EXT,
+    NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace, VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -185,12 +184,12 @@ fn write_empty_field_slots(
     // `.centroids`: zero centroids, zero docs, single zero offset.
     {
         let centroids_w = centroids_write.for_field_with_idx(field, 0);
-        CentroidsMeta::serialize_centroids(0, 0, &[], opts, centroids_w)?;
+        IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
         centroids_w.flush()?;
     }
     {
         let offsets_w = centroids_write.for_field_with_idx(field, 1);
-        CentroidsMeta::serialize_offsets(&[0u64], offsets_w)?;
+        IvfIndex::serialize_offsets(&[0u64], offsets_w)?;
         offsets_w.flush()?;
     }
     Ok(())
@@ -499,8 +498,7 @@ pub(crate) fn merge_ivf(
                         let reader = &field_readers[old_doc_addr.segment_ord as usize];
                         if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
                             batch_doc_ids.push(target_doc_id);
-                            batch_values
-                                .extend_from_slice(&decode_row::<f32>(&bytes, opts.dim())?);
+                            batch_values.extend_from_slice(&decode_row::<f32>(&bytes, opts.dim())?);
                             batch_sources.push((
                                 target_doc_id,
                                 old_doc_addr.segment_ord as usize,
@@ -643,7 +641,7 @@ pub(crate) fn merge_ivf(
                 }
                 {
                     let centroids_w = centroids_write.for_field_with_idx(field, 0);
-                    CentroidsMeta::serialize_centroids(
+                    IvfIndex::serialize_centroids(
                         num_centroids,
                         num_present_docs,
                         &centroid_bytes,
@@ -654,7 +652,7 @@ pub(crate) fn merge_ivf(
                 }
                 {
                     let offsets_w = centroids_write.for_field_with_idx(field, 1);
-                    CentroidsMeta::serialize_offsets(&cluster_offsets, offsets_w)?;
+                    IvfIndex::serialize_offsets(&cluster_offsets, offsets_w)?;
                     offsets_w.flush()?;
                 }
 

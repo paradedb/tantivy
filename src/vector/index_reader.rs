@@ -28,21 +28,17 @@
 //! everything downstream relies on it.
 
 use std::cmp::Ordering;
-use std::ops::Range;
 
 use common::{HasLen, OwnedBytes};
 
 use super::flat::IdMap;
 use super::header::read_header;
-use super::ivf::{CentroidsMeta, CENTROIDS_EXT};
-use super::{
-    evenly_spaced_seeds, FileSliceArena, NeighborhoodGraphConfig, NodeId,
-    RelativeNeighborhoodGraph, VectorArena, Workspace, VEC_EXT,
-};
+use super::ivf::{IvfIndex, CENTROIDS_EXT};
+use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
 use crate::index::SegmentComponent;
-use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
+use crate::schema::{Field, FieldType, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
 
 /// Which on-disk layout a segment's vector data uses. Purely descriptive —
@@ -87,12 +83,11 @@ pub struct VectorIndexReader {
     /// `false` for the placeholder built by [`Self::empty`] — the segment has
     /// no vector data for this field at all.
     present: bool,
+    /// `.vec` slot `[0]`
+    id_map: IdMap,
     /// `.vec` slot `[1]`: the dense vector rows. Never materialized whole;
     /// queries fetch per-cluster (or per-doc) ranges.
     rows_slice: FileSlice,
-    /// `.vec` slot `[0]`: row→doc_id map. `Identity`/`Bitmap` ⟺ doc-ordered
-    /// rows and no index; `Explicit` ⟺ cluster-sorted rows and `Some` index.
-    id_map: IdMap,
     index: Option<IvfIndex>,
 }
 
@@ -110,7 +105,7 @@ impl VectorIndexReader {
                 return Err(TantivyError::InvalidArgument(format!(
                     "field {:?} is not a vector field",
                     entry.name()
-                )))
+                )));
             }
         };
 
@@ -157,19 +152,19 @@ impl VectorIndexReader {
         // fallback.
         let index = match (&id_map, centroid_slots) {
             (IdMap::Explicit(_), Some((centroids, offsets, graph))) => {
-                Some(IvfIndex::open(centroids, offsets, graph, &options)?)
+                Some(IvfIndex::open(&options, centroids, offsets, graph)?)
             }
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
                     "vector field {:?} has cluster-sorted rows but no `.centroids` data",
                     entry.name()
-                )))
+                )));
             }
             (_, Some(_)) => {
                 return Err(TantivyError::InternalError(format!(
                     "vector field {:?} has `.centroids` data but doc-ordered rows",
                     entry.name()
-                )))
+                )));
             }
             (_, None) => None,
         };
@@ -392,140 +387,6 @@ impl VectorIndexReader {
                     }
                 }
                 None
-            }
-        }
-    }
-}
-
-/// The IVF routing index over one field's clusters: says which clusters —
-/// contiguous row ranges of the `.vec` rows — a query should probe.
-///
-/// Pinned state is small and touched by every query: the cluster offsets and
-/// the RNG adjacency (edges only, ~`k × max_edges × 4` bytes). The centroid
-/// vectors stay behind a [`FileSliceArena`] and are fetched one node at a
-/// time as routing visits them. Everything row-scale stays out entirely (the
-/// rows and id-map live on [`VectorIndexReader`]).
-pub struct IvfIndex {
-    meta: CentroidsMeta,
-    dim: usize,
-    metric: Metric,
-    /// The persisted RNG over the centroids (`.centroids` slot `[2]`),
-    /// reloaded search-only over the lazy centroid arena. `None` for
-    /// degenerate centroid counts, where the write side skips the slot and
-    /// routing falls back to a linear scan of the (few) centroids.
-    graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
-    /// Evenly spaced routing entry points — the same formula the write-side
-    /// replica selector searches with.
-    seeds: Vec<NodeId>,
-}
-
-impl IvfIndex {
-    fn open(
-        centroids_slice: FileSlice,
-        offsets_slice: FileSlice,
-        graph_slice: Option<FileSlice>,
-        options: &VectorOptions,
-    ) -> crate::Result<Self> {
-        let meta = CentroidsMeta::open(centroids_slice, offsets_slice, options)?;
-        match options.dtype() {
-            VectorDType::F32 => {}
-        } // exhaustive: a new dtype must pick its arena element type here
-        let graph = match graph_slice {
-            Some(slice) => {
-                // The adjacency is pinned; the centroid rows behind the
-                // arena are not. Node count and adjacency length are
-                // cross-validated against the arena inside `Graph::open`.
-                let adjacency = slice.read_bytes()?;
-                Some(RelativeNeighborhoodGraph::open(
-                    &adjacency,
-                    FileSliceArena::<f32>::new(meta.centroids_slice.clone()),
-                    options.dim(),
-                    options.metric(),
-                    NeighborhoodGraphConfig::default(),
-                )?)
-            }
-            None => None,
-        };
-        let seeds = evenly_spaced_seeds(meta.num_centroids);
-        Ok(IvfIndex {
-            meta,
-            dim: options.dim(),
-            metric: options.metric(),
-            graph,
-            seeds,
-        })
-    }
-
-    pub fn num_clusters(&self) -> usize {
-        self.meta.num_centroids
-    }
-
-    /// Distinct docs with a vector (the persisted count; replication inflates
-    /// the row total, [`Self::num_rows`]).
-    pub(crate) fn num_docs(&self) -> usize {
-        self.meta.num_docs
-    }
-
-    /// Total posting rows across all clusters — memberships, counting a
-    /// replicated doc once per cell it lives in.
-    pub fn num_rows(&self) -> usize {
-        self.meta.num_rows()
-    }
-
-    /// The contiguous row range of `cluster` within the `.vec` rows.
-    #[inline]
-    pub fn cluster_range(&self, cluster: usize) -> Range<usize> {
-        debug_assert!(cluster < self.meta.num_centroids, "cluster out of bounds");
-        self.meta.cluster_offset(cluster) as usize..self.meta.cluster_offset(cluster + 1) as usize
-    }
-
-    pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = usize> + '_ {
-        self.meta.cluster_sizes()
-    }
-
-    /// The centroid rows, materialized in one read — for introspection and
-    /// tests. The search path never calls this; routing fetches per-node
-    /// ranges through the graph's lazy arena instead.
-    pub fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
-        Ok(self.meta.centroids_slice.read_bytes()?)
-    }
-
-    /// Clusters to probe for `query`, best routing score first, as
-    /// `(score, cluster)` pairs, plus the number of centroids scored to
-    /// produce them (the navigation cost, surfaced as
-    /// `ProbeStats::centroids_ranked`).
-    ///
-    /// With a persisted RNG this is a beam search
-    /// ([`RelativeNeighborhoodGraph::search`]) with a beam of
-    /// `max(ef, limit)`, returning at most `limit` clusters. Without one
-    /// (degenerate centroid counts) every centroid is scored exactly. Both
-    /// paths fetch centroid rows lazily through the same
-    /// [`FileSliceArena`] and score with the same kernels, so their
-    /// rankings agree.
-    pub(crate) fn rank_clusters(&self, query: &[f32], limit: usize) -> (Vec<(f32, u32)>, usize) {
-        match &self.graph {
-            Some(graph) => {
-                let mut ws = Workspace::new();
-                let candidates = graph.search(&mut ws, query, &self.seeds, limit);
-                let ranked = candidates
-                    .into_iter()
-                    .map(|candidate| (candidate.sim.score(), candidate.node))
-                    .collect();
-                (ranked, ws.num_visited())
-            }
-            None => {
-                let num_centroids = self.meta.num_centroids;
-                let arena = FileSliceArena::<f32>::new(self.meta.centroids_slice.clone());
-                let mut ranked: Vec<(f32, u32)> = (0..num_centroids)
-                    .map(|cluster| {
-                        let sim =
-                            arena.similarity(self.metric, self.dim, cluster as NodeId, query);
-                        (sim.score(), cluster as u32)
-                    })
-                    .collect();
-                ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-                ranked.truncate(limit);
-                (ranked, num_centroids)
             }
         }
     }
