@@ -8,6 +8,7 @@
 pub(crate) mod graph;
 mod index;
 mod params;
+mod partition;
 mod plugin;
 mod training;
 
