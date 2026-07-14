@@ -54,11 +54,10 @@ impl<T: VectorElement> VectorBackend<T> {
         })
     }
 
-    /// Top-N within this segment. The strategy branches on the reader's
-    /// index: probe routed clusters when it exists, exact-scan otherwise.
-    /// Hits come back already tagged with `DocAddress` (the backend
-    /// holds its own `SegmentOrdinal`), so the collector doesn't need
-    /// a second pass to attach the segment.
+    /// Top-N within this segment: probe routed clusters when the reader has
+    /// an index, exact-scan otherwise. Hits come back already tagged with
+    /// `DocAddress`, so the collector doesn't need a second pass to attach
+    /// the segment.
     pub fn top_n(
         &self,
         weight: &dyn Weight,
@@ -68,10 +67,9 @@ impl<T: VectorElement> VectorBackend<T> {
         self.top_n_with_stats(weight, segment_reader, top_n, None)
     }
 
-    /// Like [`Self::top_n`] but threads an optional [`ProbeStats`] sink into the
-    /// IVF probe loop. `None` is identical in behavior and cost to `top_n` (no
-    /// allocation, the per-doc hot loop unchanged). The exact path ignores
-    /// `stats` — no probe stats apply there.
+    /// Like [`Self::top_n`] but threads an optional [`ProbeStats`] sink into
+    /// the IVF probe loop; `None` is identical in behavior and cost to
+    /// `top_n`. The exact path ignores `stats`.
     pub fn top_n_with_stats(
         &self,
         weight: &dyn Weight,
@@ -91,23 +89,10 @@ impl<T: VectorElement> VectorBackend<T> {
         segment_reader: &SegmentReader,
         top_n: usize,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
-        // `for_each_no_score` walks the filter DocSet in ascending doc
-        // order, which lets us use the fast `TopNComputer::push` path
-        // (strict-greater threshold short-circuit, valid only under
-        // ascending-D pushes). IVF's cluster-order iteration would use
-        // `push_unordered` instead.
-        //
-        // The heap keys on segment-local `DocId` (cheaper compares than
-        // `DocAddress`); we tag with `self.segment_ord` at drain time
-        // so the collector returns ready-to-use `DocAddress`es without
-        // a second pass.
-        //
-        // `NaturalComparator` is required: vector similarity is
-        // "higher = better", so we want top-N *largest*. The default
-        // `TopNComputer::new()` wires `ReverseComparator`, which keeps
-        // top-N *smallest* — for our convention that returns the K
-        // *farthest* docs under truncation. See the matching note in
-        // `probe_top_n`.
+        // `for_each_no_score` walks the filter DocSet in ascending doc order,
+        // which permits the fast `TopNComputer::push` path (valid only under
+        // ascending-doc pushes). `NaturalComparator` because similarity is
+        // "higher = better" — see the note on `scan_clusters`.
         let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
             top_n,
             NaturalComparator,
@@ -166,9 +151,8 @@ pub enum ProbeTermination {
 
 /// Per-segment probe-loop instrumentation: which clusters were probed
 /// (in probe order) and a prune breakdown of every doc the inner loop
-/// touched. Filled by [`VectorBackend::top_n_with_stats`] when a sink
-/// is supplied; the production `top_n` entry point passes `None` and
-/// pays no allocation for stats accumulation.
+/// touched. Filled by [`VectorBackend::top_n_with_stats`] when a sink is
+/// supplied.
 #[derive(Debug, Default)]
 pub struct ProbeStats {
     /// Clusters visited by the probe loop, in probe order. A cluster
@@ -225,9 +209,8 @@ impl<T: VectorElement> VectorBackend<T> {
     }
 
     /// Top-N by IVF probe. When `stats` is `Some`, it is filled with this
-    /// segment's probe-loop counters; `None` is the zero-cost production path —
-    /// no allocation, the per-doc hot loop unchanged (the counts `scan_one_cluster`
-    /// already computes are simply discarded).
+    /// segment's probe-loop counters; `None` is the zero-cost production
+    /// path.
     fn probe_top_n(
         &self,
         index: &IvfIndex,
@@ -244,9 +227,6 @@ impl<T: VectorElement> VectorBackend<T> {
             return Ok(Vec::new());
         }
 
-        // Materialize the filter `DocSet` into a dense BitSet. Its own
-        // `#[inline(never)]` frame: at low selectivity over a large segment
-        // this drain is real cost otherwise hidden in the search entry.
         let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
         if filter.len() == 0 {
             return Ok(Vec::new());
@@ -260,11 +240,8 @@ impl<T: VectorElement> VectorBackend<T> {
         }
         let max_probe_count = self.adaptive.resolved_probe_ceiling(num_centroids)?;
 
-        // Rank the clusters to probe, best first — a beam search over the
-        // persisted RNG. Extracted into a `#[inline(never)]` method so this
-        // phase shows as its own flamegraph frame (carrying its own
-        // similarity cost). Asking for one candidate past the ceiling keeps
-        // the `Ceiling` termination attribution meaningful.
+        // Asking for one candidate past the ceiling keeps the `Ceiling`
+        // termination attribution meaningful.
         let (ranked, centroids_ranked) =
             self.rank_clusters(index, max_probe_count.saturating_add(1));
         if ranked.is_empty() {
@@ -273,27 +250,18 @@ impl<T: VectorElement> VectorBackend<T> {
 
         let best = ranked[0].0;
         let threshold = adaptive_threshold(self.query.metric(), best, self.adaptive.epsilon);
-        // Resolve the candidate floor at the call site so a default
-        // `min_candidates = 0` still gives a sane
-        // `CANDIDATE_OVERFETCH_MULTIPLIER * top_n` floor. Critical for
-        // selective filters where a single near cluster yields few
-        // survivors — without the floor the loop trips the threshold
-        // gate immediately and returns < K results.
+        // Without this floor, a selective filter can trip the threshold gate
+        // immediately and return < K results.
         let min_candidates = self
             .adaptive
             .min_candidates
             .max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n);
 
-        // Navigation cost + the resolved survivor floor are known here, once.
         if let Some(s) = stats.as_deref_mut() {
             s.centroids_ranked = centroids_ranked;
             s.min_candidates = min_candidates;
         }
 
-        // Adaptive probe loop, extracted into a `#[inline(never)]`
-        // method so this phase shows as its own flamegraph frame
-        // (carrying its own `score_doc_bytes` cost), distinct from the
-        // cluster-ranking frame above.
         let topn = self.scan_clusters(
             index,
             ranked,
@@ -308,9 +276,6 @@ impl<T: VectorElement> VectorBackend<T> {
             stats,
         )?;
 
-        // Drain best-first, tag with our segment_ord. The collector's
-        // `merge_fruits` flattens across segments, sorts descending,
-        // and applies offset/limit.
         let segment_ord = self.segment_ord;
         Ok(topn
             .into_sorted_vec()
@@ -320,12 +285,10 @@ impl<T: VectorElement> VectorBackend<T> {
     }
 
     /// Phase 1: rank the clusters to probe, best routing score first, plus
-    /// the number of centroids scored to do it (the navigation cost).
-    /// Delegates to [`IvfIndex::rank_clusters`] — a beam search over the
-    /// persisted RNG. Routing operates in `f32` (centroid rows are `f32`
-    /// today), so the query is widened losslessly per element.
-    /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
-    /// similarity cost.
+    /// the number of centroids scored to do it. Delegates to
+    /// [`IvfIndex::rank_clusters`]; routing operates in `f32` (centroid rows
+    /// are `f32` today), so the query is widened losslessly per element.
+    /// `#[inline(never)]` so it forms its own flamegraph frame.
     #[inline(never)]
     fn rank_clusters(&self, index: &IvfIndex, limit: usize) -> (Vec<(f32, u32)>, usize) {
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
@@ -333,18 +296,16 @@ impl<T: VectorElement> VectorBackend<T> {
     }
 
     /// Phase 2: adaptive probe loop. Cluster-order arrival of survivors
-    /// forbids the ascending-D shortcut in `push`; use `push_unordered`. The
-    /// filter check is cheap (constant-time bitset lookup) so we do it before
-    /// the more expensive alive check + similarity score.
+    /// forbids the ascending-doc shortcut in `push`; use `push_unordered`.
     ///
     /// Note on `NaturalComparator` (vs the `TopNComputer::new` default):
     /// vector similarity is "higher = better", so we want top-N *largest*
-    /// scores in descending order. The default `new()` wires
-    /// `ReverseComparator`, which keeps top-N *smallest* in ascending order —
-    /// correct for ascending-distance metrics but inverted for our convention.
+    /// scores. The default `new()` wires `ReverseComparator`, which keeps
+    /// top-N *smallest* — correct for ascending-distance metrics but inverted
+    /// for our convention.
     ///
     /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
-    /// `score_doc_bytes` cost, distinct from `rank_centroids`.
+    /// `score_doc_bytes` cost, distinct from `rank_clusters`.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn scan_clusters(
@@ -390,9 +351,7 @@ impl<T: VectorElement> VectorBackend<T> {
             let cluster = cluster as usize;
 
             // Record the probe before doing any work, so even an empty
-            // cluster counts as "probed" — that's the right unit for the
-            // efficiency assertions. Per-cluster, so this `Option` check is
-            // O(clusters), not in the hot per-doc path.
+            // cluster counts as "probed".
             if let Some(s) = stats.as_deref_mut() {
                 s.probed_clusters.push(cluster);
             }
@@ -418,8 +377,6 @@ impl<T: VectorElement> VectorBackend<T> {
             candidates += scored;
         }
 
-        // Fold the locally-accumulated counters into `ProbeStats` once (the
-        // `Option` check lives here at write-back, never per doc).
         if let Some(s) = stats {
             s.vectors_visited += visited;
             s.pruned_filter += pruned_filter;
@@ -434,11 +391,9 @@ impl<T: VectorElement> VectorBackend<T> {
 
     /// Phase 2 inner: scan one cluster's docs through the
     /// `filter → alive → seen → score` gate, pushing survivors into `topn`.
-    /// Returns `(visited, pruned_filter, pruned_dead, pruned_seen, scored)` so
-    /// the caller folds the counters locally. `#[inline(never)]` so per-cluster
-    /// scan cost forms its own frame — but the per-doc loop itself stays inlined
-    /// here (a non-inlined call per doc would distort the profile and add real
-    /// latency). Called O(clusters) times.
+    /// Returns `(visited, pruned_filter, pruned_dead, pruned_seen, scored)`.
+    /// `#[inline(never)]` so per-cluster scan cost forms its own frame, while
+    /// the per-doc loop stays inlined inside it.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn scan_one_cluster(

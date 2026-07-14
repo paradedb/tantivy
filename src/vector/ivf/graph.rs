@@ -1,8 +1,8 @@
 //! A generic, single-threaded *k*-nearest-neighbor graph: a flat vector arena
 //! plus fixed-degree adjacency. It is the storage substrate for graph-based
-//! approximate-nearest-neighbor indexes — such as the relative neighborhood
-//! graph built on top of it in the sibling `index` module — and carries no edge
-//! semantics of its own beyond "node `i`'s nearest neighbors, in order".
+//! approximate-nearest-neighbor indexes — the [`RelativeNeighborhoodGraph`]
+//! built on top of it below — and carries no edge semantics of its own beyond
+//! "node `i`'s nearest neighbors, in order".
 //!
 //! - Node ids are dense indices straight into the backing arrays. The node set
 //!   is fixed at construction: the arena's length determines the node count,
@@ -96,9 +96,8 @@ impl<S: VectorArena> Graph<S> {
     /// Reconstructs a graph serialized by [`serialize`](Graph::serialize)
     /// over `vectors` — the arena is persisted separately, and its length
     /// fixes the node count the adjacency is validated against. The stored
-    /// adjacency is exactly the in-memory layout (best-first, EMPTY-padded),
-    /// so this is a validate-and-decode, not a rebuild. Like
-    /// [`for_reload`](Graph::for_reload), the result carries no similarity
+    /// adjacency is exactly the in-memory layout, so this is a
+    /// validate-and-decode, not a rebuild; the result carries no similarity
     /// buffer and is search-only.
     pub fn open(adjacency: &[u8], vectors: S, dim: usize) -> io::Result<Graph<S>> {
         let mut cursor = adjacency;
@@ -306,10 +305,8 @@ impl<T, S: Deref<Target = [T]>> Graph<S> {
         &self.vectors[start..start + self.dim]
     }
 
-    /// Iterates every node's vector in id order — node `0`, then `1`, and so on.
-    /// Each item is that node's contiguous `dim`-length slice of the arena; pair
-    /// with [`Iterator::enumerate`] to recover the [`NodeId`]. This is the build
-    /// loop's entry point for visiting every node.
+    /// Iterates every node's vector in id order; pair with
+    /// [`Iterator::enumerate`] to recover the [`NodeId`].
     #[inline]
     pub fn iter(&self) -> std::slice::ChunksExact<'_, T> {
         self.vectors.chunks_exact(self.dim)
@@ -379,6 +376,466 @@ impl EdgeListMut<'_> {
         }
         self.neighbors[j] = to;
         self.sims[j] = sim;
+    }
+}
+
+// ============================================================
+// The relative neighborhood graph (RNG) index over a Graph.
+// ============================================================
+// `Graph` is the pure storage layer; `RelativeNeighborhoodGraph` layers on the
+// metric and the search/build parameters. Per-query working buffers live in a
+// caller-owned `Workspace` rather than being borrowed from the index, so
+// `search` needs only `&self`: queries can run concurrently, which is what
+// lets `build` and `refine` fan their per-leaf / per-node search work across
+// an `Executor`, serializing only the cheap graph mutation.
+
+/// Tuning knobs for a [`RelativeNeighborhoodGraph`].
+#[derive(Clone, Copy, Debug)]
+pub struct NeighborhoodGraphConfig {
+    /// Maximum out-degree per node (the *k* in *k*-NN graph).
+    pub max_edges: usize,
+    /// Beam width for query-time search; the effective beam is `max(ef, k)`.
+    pub ef: usize,
+    /// Size of the candidate pool gathered per node during [`refine`]: each
+    /// node runs a top-`num_candidates` search of the current graph, and those
+    /// candidates feed RNG edge selection.
+    ///
+    /// [`refine`]: RelativeNeighborhoodGraph::refine
+    pub num_candidates: usize,
+    /// Number of independent TPT partitions [`build`] unions to seed the initial
+    /// KNN graph. Each tree splits along different random directions; unioning
+    /// their per-leaf edges stitches across any single tree's split boundaries,
+    /// so more trees means fewer missed neighbors (better init recall) at linear
+    /// build cost.
+    ///
+    /// [`build`]: RelativeNeighborhoodGraph::build
+    pub num_trees: usize,
+}
+
+impl Default for NeighborhoodGraphConfig {
+    fn default() -> Self {
+        NeighborhoodGraphConfig {
+            max_edges: 32,
+            ef: 64,
+            num_candidates: 256,
+            num_trees: 32,
+        }
+    }
+}
+
+/// A relative neighborhood graph (RNG) index over vector storage `S` (any
+/// [`VectorArena`]); queries are `&[S::Elem]` of the same dimension.
+///
+/// Scoring goes through [`VectorArena::similarity`], so each storage shape
+/// uses its native kernel. This type owns the metric and parameters;
+/// per-query scratch is supplied by the caller as a [`Workspace`].
+pub struct RelativeNeighborhoodGraph<S> {
+    /// Vector arena and directed adjacency.
+    graph: Graph<S>,
+    /// Similarity metric. Search results and stored edges share one ranking
+    /// convention: descending [`Similarity`], best first.
+    metric: Metric,
+    /// Search, build, and refine tuning knobs.
+    config: NeighborhoodGraphConfig,
+}
+
+impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
+    /// Creates an edge-less index over `vectors`, a flat `dim`-strided arena
+    /// whose length fixes the node count, using `metric` and the given tuning
+    /// `params`.
+    pub fn new(vectors: S, dim: usize, metric: Metric, params: NeighborhoodGraphConfig) -> Self {
+        RelativeNeighborhoodGraph {
+            graph: Graph::new(vectors, dim, params.max_edges),
+            metric,
+            config: params,
+        }
+    }
+
+    /// Greedy beam search for the `k` nodes most similar to `query`, expanding
+    /// outward from `seeds`. Returns [`Candidate`]s most similar first, with a
+    /// beam width of `max(ef, k)`.
+    ///
+    /// `ws` holds the per-query scratch; reuse one across queries to avoid
+    /// reallocating. It is reset at the start of each call.
+    pub fn search(
+        &self,
+        ws: &mut Workspace,
+        query: &[S::Elem],
+        seeds: &[NodeId],
+        k: usize,
+    ) -> Vec<Candidate> {
+        debug_assert_eq!(query.len(), self.graph.dim(), "query dimension mismatch");
+        if self.graph.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let ef = self.config.ef.max(k);
+        let n = self.graph.len();
+        let arena = self.graph.arena();
+        let dim = self.graph.dim();
+        let metric = self.metric;
+        let epoch = ws.begin_query(n);
+
+        let visited = &mut ws.visited;
+        let num_visited = &mut ws.num_visited;
+        let frontier = &mut ws.frontier;
+        let results = &mut ws.results;
+
+        // Seeds always fit under the beam, so push them blindly rather than
+        // paying the bounded-insert path.
+        debug_assert!(seeds.len() <= ef, "seed count exceeds beam width");
+        for &node_id in seeds {
+            let idx = node_id as usize;
+            if idx >= n || visited[idx] == epoch {
+                continue;
+            }
+            visited[idx] = epoch;
+            *num_visited += 1;
+            let sim = arena.similarity(metric, dim, node_id, query);
+            let c = Candidate { sim, node: node_id };
+            frontier.push(c);
+            results.push(Reverse(c));
+        }
+
+        while let Some(cand) = frontier.pop() {
+            // Stop once the best unexpanded candidate can't beat the worst kept
+            // result and the result set is already full.
+            if results.len() >= ef && results.peek().is_some_and(|w| cand.sim < w.0.sim) {
+                break;
+            }
+            for &nb in self.graph.neighbors(cand.node) {
+                let idx = nb as usize;
+                if visited[idx] == epoch {
+                    continue;
+                }
+                visited[idx] = epoch;
+                *num_visited += 1;
+                let sim = arena.similarity(metric, dim, nb, query);
+                let c = Candidate { sim, node: nb };
+                // A candidate earns a frontier slot exactly when it enters the
+                // top-`ef` results, so the single comparison against the worst
+                // kept result is admission test, in-place eviction, and frontier
+                // gate at once. `peek_mut` only re-sifts if we mutate through it:
+                // a loser costs one compare and no reheapify; a winner costs one
+                // sift-down on drop (versus pop + push, which is two).
+                if results.len() < ef {
+                    results.push(Reverse(c));
+                    frontier.push(c);
+                } else if let Some(mut worst) = results.peek_mut() {
+                    if c.sim > worst.0.sim {
+                        *worst = Reverse(c);
+                        frontier.push(c);
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<Candidate> = results.drain().map(|Reverse(c)| c).collect();
+        out.sort_unstable_by(|a, b| b.sim.cmp(&a.sim).then_with(|| a.node.cmp(&b.node)));
+        out.truncate(k);
+        out
+    }
+
+    /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
+    /// see [`Graph::serialize`] for the format. The metric and tuning knobs are
+    /// configuration, not data, so they are not persisted.
+    pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+        self.graph.serialize(out)
+    }
+
+    /// Opens a serialized RNG (see [`serialize`](Self::serialize)) over
+    /// `vectors` — typically a
+    /// [`FileSliceArena`](crate::vector::FileSliceArena) so search fetches centroid
+    /// rows lazily. The metric and knobs were never persisted: supply the
+    /// same `metric` the graph was built with; of `params`, only `ef`
+    /// affects search (the persisted `max_edges` governs the adjacency).
+    /// The result is search-only — see [`Graph::open`].
+    pub fn open(
+        adjacency: &[u8],
+        vectors: S,
+        dim: usize,
+        metric: Metric,
+        params: NeighborhoodGraphConfig,
+    ) -> io::Result<Self> {
+        Ok(RelativeNeighborhoodGraph {
+            graph: Graph::open(adjacency, vectors, dim)?,
+            metric,
+            config: params,
+        })
+    }
+
+    /// The number of nodes in the graph.
+    pub fn len(&self) -> usize {
+        self.graph.len()
+    }
+
+    /// Whether the graph has no nodes.
+    pub fn is_empty(&self) -> bool {
+        self.graph.is_empty()
+    }
+}
+
+/// Refinement requires typed storage: a node's stored vector doubles as its
+/// search query, and edge selection scores stored vectors against each other.
+/// A graph over raw file bytes is search-only.
+impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
+    /// Refines every node against the current graph: each node searches from
+    /// itself to gather a candidate pool, applies the RNG occlusion rule to
+    /// reselect its edges, and the new adjacencies are written back. This pass
+    /// is what turns a raw KNN graph into an RNG.
+    ///
+    /// The search-and-select phase is read-only over the graph, so it runs in
+    /// parallel on the `executor`; the write-back is applied serially
+    /// afterward. Every node reads the same pre-pass snapshot — a
+    /// *synchronous* refinement, the shape that parallelizes.
+    pub fn refine(&mut self, executor: &Executor)
+    where
+        S: Sync,
+    {
+        let len = self.graph.len();
+        if len == 0 {
+            return;
+        }
+
+        // Phase 1 (parallel, read-only): each node searches the snapshot and
+        // RNG-selects its new neighbors. One chunk per executor thread;
+        // `max(1)` guards more threads than nodes.
+        let chunk = (len / executor.num_threads()).max(1);
+        let ranges = (0..len)
+            .step_by(chunk)
+            .map(|s| (s as NodeId, (s + chunk).min(len) as NodeId));
+        let chunked_selected: Vec<Vec<Vec<NodeId>>> = {
+            let rng = &*self;
+            executor
+                .map(
+                    move |(start, end): (NodeId, NodeId)| {
+                        let mut ws = Workspace::new();
+                        let mut out = Vec::with_capacity((end - start) as usize);
+                        for node in start..end {
+                            let query = rng.graph.payload(node);
+                            let candidates =
+                                rng.search(&mut ws, query, &[node], rng.config.num_candidates);
+                            out.push(rng.select_neighbors(node, &candidates));
+                        }
+                        Ok(out)
+                    },
+                    ranges,
+                )
+                .expect("refine search panicked")
+        };
+
+        // Phase 2 (serial): write each node's selection back. Disjoint per node
+        // and a bounded copy each, so the serial cost is negligible.
+        let mut node: NodeId = 0;
+        for chunk in &chunked_selected {
+            for selected in chunk {
+                self.graph.set_neighbors(node, selected);
+                node += 1;
+            }
+        }
+    }
+
+    /// Applies the relative-neighborhood-graph occlusion rule to `candidates`
+    /// (nearest-first) and returns the survivors — `node`'s new adjacency, at most
+    /// `max_edges`, skipping `node` itself. Read-only, so it can run concurrently
+    /// across nodes; the caller writes the result back into the graph.
+    ///
+    /// Everything is in similarity space (higher is better): a candidate `c` is
+    /// kept unless some already-selected neighbor `r` is *more* similar to `c`
+    /// than `node` is — then `r` makes the direct `node -> c` edge redundant and
+    /// occludes it (the classic RNG "lune" emptiness test). The comparison is
+    /// non-strict (`<=`), so an `r` *exactly* as similar as `node` does not
+    /// occlude — the canonical RNG definition, and what keeps duplicate vectors
+    /// from wiping out a node's whole edge set.
+    fn select_neighbors(&self, node: NodeId, candidates: &[Candidate]) -> Vec<NodeId> {
+        let max_edges = self.config.max_edges;
+        let mut selected: Vec<NodeId> = Vec::with_capacity(max_edges);
+        for &Candidate { sim, node: cand } in candidates {
+            if cand == node {
+                continue; // the query node itself is never its own neighbor
+            }
+            if selected.len() >= max_edges {
+                break;
+            }
+            let cand_vec = self.graph.payload(cand);
+            let keep = selected
+                .iter()
+                .all(|&r| self.metric.similarity(self.graph.payload(r), cand_vec) <= sim);
+            if keep {
+                selected.push(cand);
+            }
+        }
+
+        debug_assert!(!selected.is_empty(), "selected nodes should not be empty");
+        selected
+    }
+}
+
+/// Build is `f32`-only and borrow-only for now: the TPT partitioner does
+/// floating-point math over the vectors, and `&[f32]` is `Copy`, so the arena
+/// can be read while edge lists are mutated. The rest of the index stays
+/// generic over [`VectorArena`] storage.
+impl RelativeNeighborhoodGraph<&[f32]> {
+    /// Builds the RNG index over the borrowed arena: seeds a raw KNN graph with
+    /// a TPT forest, then prunes it into an RNG. Expects a freshly constructed,
+    /// edge-less index.
+    pub fn build(&mut self, executor: &Executor) {
+        self.build_init_knn(executor);
+        self.refine(executor);
+    }
+
+    /// Seeds the raw KNN graph: unions a forest of
+    /// [`num_trees`](NeighborhoodGraphConfig::num_trees) TPT partitions,
+    /// brute-forcing KNN within each leaf. Leaves run in parallel on the
+    /// `executor`, writing edges directly into their members' edge lists —
+    /// leaves partition the nodes, so the lists touched by different leaves are
+    /// disjoint, and each list keeps only the node's nearest
+    /// [`max_edges`](NeighborhoodGraphConfig::max_edges), so memory stays
+    /// bounded by the graph itself.
+    fn build_init_knn(&mut self, executor: &Executor) {
+        let vectors = *self.graph.arena();
+        let dim = self.graph.dim();
+        let n = self.graph.len();
+        if n == 0 {
+            return;
+        }
+
+        // One TPTree reused across trees: its RNG advances between partitions,
+        // so each tree splits along different directions.
+        let metric = self.metric;
+        let mut tpt = partition::TPTree::new(partition::TPTreeConfig::default(), dim, vectors);
+        let mut indices: Vec<NodeId> = (0..n as NodeId).collect();
+        for _ in 0..self.config.num_trees {
+            let leaves = tpt.partition(&mut indices);
+
+            // Rearrange the graph's edge-list borrows into `indices` order.
+            // `indices` is a permutation, so every list is claimed exactly once,
+            // and afterwards the leaf ranges partition `edge_lists` — the
+            // disjointness the borrow checker needs to let leaves run in
+            // parallel.
+            let mut unclaimed: Vec<Option<EdgeListMut>> =
+                self.graph.edge_lists_mut().map(Some).collect();
+            let mut edge_lists: Vec<EdgeListMut> = indices
+                .iter()
+                .map(|&node| {
+                    unclaimed[node as usize]
+                        .take()
+                        .expect("indices is a permutation")
+                })
+                .collect();
+
+            // One task per leaf: its member ids and their edge lists.
+            // `partition` returns the leaves in order, tiling `0..n`.
+            let mut leaf_tasks: Vec<(&[NodeId], &mut [EdgeListMut])> =
+                Vec::with_capacity(leaves.len());
+            let mut rest = edge_lists.as_mut_slice();
+            for leaf in &leaves {
+                let (leaf_lists, tail) = std::mem::take(&mut rest).split_at_mut(leaf.len());
+                leaf_tasks.push((&indices[leaf.clone()], leaf_lists));
+                rest = tail;
+            }
+            debug_assert!(rest.is_empty(), "leaves must tile all of indices");
+
+            // Each leaf brute-forces its pairwise similarities and inserts both
+            // directions of each edge; the lists dedup re-encounters across
+            // trees and keep only the best `max_edges`.
+            executor
+                .map(
+                    move |(members, edge_lists): (&[NodeId], &mut [EdgeListMut])| {
+                        for i in 0..members.len() {
+                            let vec_a = &vectors[members[i] as usize * dim..][..dim];
+                            for j in (i + 1)..members.len() {
+                                let vec_b = &vectors[members[j] as usize * dim..][..dim];
+                                let sim = metric.similarity(vec_a, vec_b);
+                                edge_lists[i].add_edge(members[j], sim);
+                                edge_lists[j].add_edge(members[i], sim);
+                            }
+                        }
+                        Ok(())
+                    },
+                    leaf_tasks.into_iter(),
+                )
+                .expect("leaf KNN computation panicked");
+        }
+    }
+}
+
+/// Reusable per-query working buffers for
+/// [`RelativeNeighborhoodGraph::search`]; reuse one across queries to avoid
+/// reallocating.
+#[derive(Default)]
+pub struct Workspace {
+    /// `visited[node] == visited_epoch` marks a node seen in the current query.
+    /// The epoch stamp resets the buffer in O(1) between queries (just a counter
+    /// bump) instead of re-zeroing all `n` slots.
+    visited: Vec<u32>,
+    visited_epoch: u32,
+    /// Nodes visited — and therefore scored — by the current query; the
+    /// search's navigation cost, surfaced through [`Self::num_visited`].
+    num_visited: usize,
+    /// Max-heap by similarity: the frontier of candidates left to expand.
+    frontier: BinaryHeap<Candidate>,
+    /// Min-heap by similarity (via `Reverse`): the best `ef` results so far, with
+    /// the least-similar on top for eviction.
+    results: BinaryHeap<Reverse<Candidate>>,
+}
+
+impl Workspace {
+    /// Creates an empty workspace. It grows to fit on first use.
+    pub fn new() -> Self {
+        Workspace::default()
+    }
+
+    /// Nodes visited (scored) by the most recent search — the navigation
+    /// cost. Reset at the start of each query.
+    pub fn num_visited(&self) -> usize {
+        self.num_visited
+    }
+
+    /// Prepares the workspace for a query over `n` nodes: grows the visited
+    /// buffer, advances the epoch (resetting stamps on wraparound), clears the
+    /// heaps, and returns the epoch to stamp this query's visits with.
+    fn begin_query(&mut self, n: usize) -> u32 {
+        if self.visited.len() < n {
+            self.visited.resize(n, 0);
+        }
+        self.visited_epoch = self.visited_epoch.wrapping_add(1);
+        if self.visited_epoch == 0 {
+            // Wrapped: clear so no stale stamp collides with the new epoch.
+            self.visited.iter_mut().for_each(|v| *v = 0);
+            self.visited_epoch = 1;
+        }
+        self.num_visited = 0;
+        self.frontier.clear();
+        self.results.clear();
+        self.visited_epoch
+    }
+}
+
+/// A `(similarity, node)` pair ordered by similarity (ties broken by node id for
+/// determinism). Ordered ascending, so a plain max-heap yields most-similar
+/// first and `Reverse<Candidate>` yields least-similar first. Also the element
+/// type [`search`](RelativeNeighborhoodGraph::search) returns.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Candidate {
+    /// Similarity to the query (higher is more similar).
+    pub sim: Similarity,
+    /// The graph node this candidate refers to.
+    pub node: NodeId,
+}
+
+impl Eq for Candidate {}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sim
+            .cmp(&other.sim)
+            .then_with(|| self.node.cmp(&other.node))
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -610,507 +1067,6 @@ mod tests {
         let mut reloaded_bytes = Vec::new();
         reloaded.serialize(&mut reloaded_bytes).unwrap();
         assert_eq!(bytes, reloaded_bytes);
-    }
-}
-
-// ============================================================
-// The relative neighborhood graph (RNG) index over a Graph.
-// ============================================================
-// The relative neighborhood graph index over a [`Graph`]: greedy beam
-// [`search`](RelativeNeighborhoodGraph::search), KNN
-// [`build`](RelativeNeighborhoodGraph::build), and RNG
-// [`refine`](RelativeNeighborhoodGraph::refine) (pruning).
-//
-// [`Graph`] is the pure storage layer; this type layers on the metric and the
-// search/build parameters. The per-query working buffers live in a separate
-// [`Workspace`] the caller owns and threads through `search`. Because the
-// workspace is a parameter rather than borrowed from the index, `search` only
-// needs `&self` — so a query can run while the caller still borrows the graph
-// (e.g. `refine` uses each node's vector as the query straight from the arena,
-// with no copy), one workspace can be reused across many queries, and many
-// queries can run *concurrently*. That last property is what lets
-// [`build`](RelativeNeighborhoodGraph::build) and
-// [`refine`](RelativeNeighborhoodGraph::refine) fan their per-leaf / per-node
-// search work across an [`Executor`](crate::Executor), serializing only the
-// cheap graph mutation.
-
-/// Tuning knobs for a [`RelativeNeighborhoodGraph`].
-#[derive(Clone, Copy, Debug)]
-pub struct NeighborhoodGraphConfig {
-    /// Maximum out-degree per node (the *k* in *k*-NN graph).
-    pub max_edges: usize,
-    /// Beam width for query-time search (`>= k`).
-    pub ef: usize,
-    /// Size of the candidate pool gathered per node during [`refine`]: each
-    /// node runs a top-`num_candidates` search of the current graph, and those
-    /// candidates feed RNG edge selection.
-    ///
-    /// [`refine`]: RelativeNeighborhoodGraph::refine
-    pub num_candidates: usize,
-    /// Number of independent TPT partitions [`build`] unions to seed the initial
-    /// KNN graph. Each tree splits along different random directions; unioning
-    /// their per-leaf edges stitches across any single tree's split boundaries,
-    /// so more trees means fewer missed neighbors (better init recall) at linear
-    /// build cost.
-    ///
-    /// [`build`]: RelativeNeighborhoodGraph::build
-    pub num_trees: usize,
-}
-
-impl Default for NeighborhoodGraphConfig {
-    fn default() -> Self {
-        NeighborhoodGraphConfig {
-            max_edges: 32,
-            ef: 64,
-            num_candidates: 256,
-            num_trees: 32,
-        }
-    }
-}
-
-/// A relative neighborhood graph (RNG) index over vector storage `S` (any
-/// [`VectorArena`]); queries are `&[S::Elem]` of the same dimension.
-///
-/// Scoring goes through [`VectorArena::similarity`], so each storage shape
-/// uses its native kernel. This type owns the metric and parameters;
-/// per-query scratch is supplied by the caller as a [`Workspace`].
-pub struct RelativeNeighborhoodGraph<S> {
-    /// Vector arena and directed adjacency.
-    graph: Graph<S>,
-    /// Similarity metric. Search results and stored edges share one ranking
-    /// convention: descending [`Similarity`], best first.
-    metric: Metric,
-    /// Search, build, and refine tuning knobs.
-    config: NeighborhoodGraphConfig,
-}
-
-impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
-    /// Creates an edge-less index over `vectors`, a flat `dim`-strided arena
-    /// whose length fixes the node count, using `metric` and the given tuning
-    /// `params`.
-    pub fn new(vectors: S, dim: usize, metric: Metric, params: NeighborhoodGraphConfig) -> Self {
-        RelativeNeighborhoodGraph {
-            graph: Graph::new(vectors, dim, params.max_edges),
-            metric,
-            config: params,
-        }
-    }
-
-    /// Greedy beam search for the `k` nodes most similar to `query`, expanding
-    /// outward from `seeds`. Returns [`Candidate`]s most similar first, with a
-    /// beam width of `max(ef, k)`.
-    ///
-    /// `ws` holds the per-query scratch; reuse one across queries to avoid
-    /// reallocating. It is reset at the start of each call.
-    pub fn search(
-        &self,
-        ws: &mut Workspace,
-        query: &[S::Elem],
-        seeds: &[NodeId],
-        k: usize,
-    ) -> Vec<Candidate> {
-        debug_assert_eq!(query.len(), self.graph.dim(), "query dimension mismatch");
-        if self.graph.is_empty() || k == 0 {
-            return Vec::new();
-        }
-        let ef = self.config.ef.max(k);
-        let n = self.graph.len();
-        let arena = self.graph.arena();
-        let dim = self.graph.dim();
-        let metric = self.metric;
-        let epoch = ws.begin_query(n);
-
-        let visited = &mut ws.visited;
-        let num_visited = &mut ws.num_visited;
-        let frontier = &mut ws.frontier;
-        let results = &mut ws.results;
-
-        // Seeds are few (one per entry point) and unique after the visited
-        // filter, so they always fit under the beam — push them blindly rather
-        // than paying the bounded-insert path.
-        debug_assert!(seeds.len() <= ef, "seed count exceeds beam width");
-        for &node_id in seeds {
-            let idx = node_id as usize;
-            if idx >= n || visited[idx] == epoch {
-                continue;
-            }
-            visited[idx] = epoch;
-            *num_visited += 1;
-            let sim = arena.similarity(metric, dim, node_id, query);
-            let c = Candidate { sim, node: node_id };
-            frontier.push(c);
-            results.push(Reverse(c));
-        }
-
-        while let Some(cand) = frontier.pop() {
-            // Stop once the best unexpanded candidate can't beat the worst kept
-            // result and the result set is already full.
-            if results.len() >= ef && results.peek().is_some_and(|w| cand.sim < w.0.sim) {
-                break;
-            }
-            for &nb in self.graph.neighbors(cand.node) {
-                let idx = nb as usize;
-                if visited[idx] == epoch {
-                    continue;
-                }
-                visited[idx] = epoch;
-                *num_visited += 1;
-                let sim = arena.similarity(metric, dim, nb, query);
-                let c = Candidate { sim, node: nb };
-                // A candidate earns a frontier slot exactly when it enters the
-                // top-`ef` results, so the single comparison against the worst
-                // kept result is admission test, in-place eviction, and frontier
-                // gate at once. `peek_mut` only re-sifts if we mutate through it:
-                // a loser costs one compare and no reheapify; a winner costs one
-                // sift-down on drop (versus pop + push, which is two).
-                if results.len() < ef {
-                    results.push(Reverse(c));
-                    frontier.push(c);
-                } else if let Some(mut worst) = results.peek_mut() {
-                    if c.sim > worst.0.sim {
-                        *worst = Reverse(c);
-                        frontier.push(c);
-                    }
-                }
-            }
-        }
-
-        let mut out: Vec<Candidate> = results.drain().map(|Reverse(c)| c).collect();
-        out.sort_unstable_by(|a, b| b.sim.cmp(&a.sim).then_with(|| a.node.cmp(&b.node)));
-        out.truncate(k);
-        out
-    }
-
-    /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
-    /// see [`Graph::serialize`] for the format. The metric and tuning knobs are
-    /// configuration, not data, so they are not persisted.
-    pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
-        self.graph.serialize(out)
-    }
-
-    /// Opens a serialized RNG (see [`serialize`](Self::serialize)) over
-    /// `vectors` — typically a
-    /// [`FileSliceArena`](crate::vector::FileSliceArena) so search fetches centroid
-    /// rows lazily. The metric and knobs were never persisted: supply the
-    /// same `metric` the graph was built with; of `params`, only `ef`
-    /// affects search (the persisted `max_edges` governs the adjacency).
-    /// The result is search-only — see [`Graph::open`].
-    pub fn open(
-        adjacency: &[u8],
-        vectors: S,
-        dim: usize,
-        metric: Metric,
-        params: NeighborhoodGraphConfig,
-    ) -> io::Result<Self> {
-        Ok(RelativeNeighborhoodGraph {
-            graph: Graph::open(adjacency, vectors, dim)?,
-            metric,
-            config: params,
-        })
-    }
-
-    /// The `k` nodes most similar to `query`, most similar first — a
-    /// [`search`](Self::search) entered at the graph's own deterministic,
-    /// evenly spaced seed nodes. This is the shared entry policy for callers
-    /// without a better starting point: replica selection at build time and
-    /// cluster routing at query time both go through here, so routing
-    /// behaves like the searches that shaped the graph.
-    pub fn nearest(&self, ws: &mut Workspace, query: &[S::Elem], k: usize) -> Vec<Candidate> {
-        let seeds = evenly_spaced_seeds(self.graph.len());
-        self.search(ws, query, &seeds, k)
-    }
-
-    /// The number of nodes in the graph.
-    pub fn len(&self) -> usize {
-        self.graph.len()
-    }
-
-    /// Whether the graph has no nodes.
-    pub fn is_empty(&self) -> bool {
-        self.graph.is_empty()
-    }
-}
-
-/// Deterministic, evenly spaced search entry points for a graph of `n`
-/// nodes: up to 8 seeds — the entry policy behind
-/// [`RelativeNeighborhoodGraph::nearest`]. 8 stays under the minimum search
-/// beam (`ef >= 64`), which `search` requires of its seed count.
-fn evenly_spaced_seeds(n: usize) -> Vec<NodeId> {
-    (0..n)
-        .step_by((n / 8).max(1))
-        .take(8)
-        .map(|node| node as NodeId)
-        .collect()
-}
-
-/// Refinement requires typed storage: a node's stored vector doubles as its
-/// search query, and edge selection scores stored vectors against each other.
-/// A graph over raw file bytes is search-only.
-impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
-    /// Refines every node against the current graph: each node searches from
-    /// itself to gather a candidate pool, applies the RNG occlusion rule to
-    /// reselect its edges, and the new adjacencies are written back. This pass is
-    /// what turns a raw KNN graph into an RNG.
-    ///
-    /// The search-and-select phase is read-only over the graph, so it runs in
-    /// parallel on the `executor`; the cheap write-back is applied serially
-    /// afterward (a node's adjacency must not be mutated while other nodes are
-    /// still reading it). Because every node reads the same pre-pass snapshot,
-    /// this is a *synchronous* refinement — all nodes see the original edges, not
-    /// each other's updates — which is the shape that parallelizes and is
-    /// equivalent in quality on a single pass. Nodes are processed in chunks so
-    /// each task reuses one [`Workspace`] instead of allocating a per-node
-    /// `O(len)` visited buffer.
-    pub fn refine(&mut self, executor: &Executor)
-    where
-        S: Sync,
-    {
-        let len = self.graph.len();
-        if len == 0 {
-            return;
-        }
-
-        // Phase 1 (parallel, read-only): each node searches the snapshot and
-        // RNG-selects its new neighbors. One chunk per executor thread, so a
-        // single Workspace is reused across the chunk's nodes rather than
-        // allocating a per-node visited buffer. `max(1)` guards the degenerate
-        // case of more threads than nodes.
-        let chunk = (len / executor.num_threads()).max(1);
-        let ranges = (0..len)
-            .step_by(chunk)
-            .map(|s| (s as NodeId, (s + chunk).min(len) as NodeId));
-        let chunked_selected: Vec<Vec<Vec<NodeId>>> = {
-            let rng = &*self;
-            executor
-                .map(
-                    move |(start, end): (NodeId, NodeId)| {
-                        let mut ws = Workspace::new();
-                        let mut out = Vec::with_capacity((end - start) as usize);
-                        for node in start..end {
-                            let query = rng.graph.payload(node);
-                            let candidates =
-                                rng.search(&mut ws, query, &[node], rng.config.num_candidates);
-                            out.push(rng.select_neighbors(node, &candidates));
-                        }
-                        Ok(out)
-                    },
-                    ranges,
-                )
-                .expect("refine search panicked")
-        };
-
-        // Phase 2 (serial): write each node's selection back. Disjoint per node
-        // and a bounded copy each, so the serial cost is negligible.
-        let mut node: NodeId = 0;
-        for chunk in &chunked_selected {
-            for selected in chunk {
-                self.graph.set_neighbors(node, selected);
-                node += 1;
-            }
-        }
-    }
-
-    /// Applies the relative-neighborhood-graph occlusion rule to `candidates`
-    /// (nearest-first) and returns the survivors — `node`'s new adjacency, at most
-    /// `max_edges`, skipping `node` itself. Read-only, so it can run concurrently
-    /// across nodes; the caller writes the result back into the graph.
-    ///
-    /// Everything is in similarity space (higher is better): a candidate `c` is
-    /// kept unless some already-selected neighbor `r` is *more* similar to `c`
-    /// than `node` is — then `r` makes the direct `node -> c` edge redundant and
-    /// occludes it (the classic RNG "lune" emptiness test). The comparison is
-    /// non-strict (`<=`), so an `r` *exactly* as similar as `node` does not
-    /// occlude — the canonical RNG definition, and what keeps duplicate vectors
-    /// from wiping out a node's whole edge set.
-    fn select_neighbors(&self, node: NodeId, candidates: &[Candidate]) -> Vec<NodeId> {
-        let max_edges = self.config.max_edges;
-        let mut selected: Vec<NodeId> = Vec::with_capacity(max_edges);
-        for &Candidate { sim, node: cand } in candidates {
-            if cand == node {
-                continue; // the query node itself is never its own neighbor
-            }
-            if selected.len() >= max_edges {
-                break;
-            }
-            let cand_vec = self.graph.payload(cand);
-            let keep = selected
-                .iter()
-                .all(|&r| self.metric.similarity(self.graph.payload(r), cand_vec) <= sim);
-            if keep {
-                selected.push(cand);
-            }
-        }
-
-        debug_assert!(!selected.is_empty(), "selected nodes should not be empty");
-        selected
-    }
-}
-
-/// Build is `f32`-only and borrow-only for now: the TPT partitioner does
-/// floating-point math over the vectors, and `&[f32]` is `Copy`, so the arena
-/// can be read while edge lists are mutated. The rest of the index stays
-/// generic over [`VectorArena`] storage.
-impl RelativeNeighborhoodGraph<&[f32]> {
-    /// Builds the RNG index over the borrowed arena: seeds a raw KNN graph with
-    /// a TPT forest, then prunes it into an RNG. Expects a freshly constructed,
-    /// edge-less index.
-    pub fn build(&mut self, executor: &Executor) {
-        self.build_init_knn(executor);
-        self.refine(executor);
-    }
-
-    /// Seeds the raw KNN graph: unions a forest of
-    /// [`num_trees`](NeighborhoodGraphConfig::num_trees) TPT partitions,
-    /// brute-forcing KNN within each leaf. Leaves run in parallel on the
-    /// `executor`, writing edges directly into their members' edge lists —
-    /// leaves partition the nodes, so the lists touched by different leaves are
-    /// disjoint, and each list keeps only the node's nearest
-    /// [`max_edges`](NeighborhoodGraphConfig::max_edges), so memory stays
-    /// bounded by the graph itself.
-    fn build_init_knn(&mut self, executor: &Executor) {
-        let vectors = *self.graph.arena();
-        let dim = self.graph.dim();
-        let n = self.graph.len();
-        if n == 0 {
-            return;
-        }
-
-        // One TPTree reused across trees: its RNG advances between partitions,
-        // so each tree splits along different directions.
-        let metric = self.metric;
-        let mut tpt = partition::TPTree::new(partition::TPTreeConfig::default(), dim, vectors);
-        let mut indices: Vec<NodeId> = (0..n as NodeId).collect();
-        for _ in 0..self.config.num_trees {
-            let leaves = tpt.partition(&mut indices);
-
-            // Rearrange the graph's edge-list borrows into `indices` order.
-            // `indices` is a permutation, so every list is claimed exactly once,
-            // and afterwards the leaf ranges partition `edge_lists` — the
-            // disjointness the borrow checker needs to let leaves run in
-            // parallel.
-            let mut unclaimed: Vec<Option<EdgeListMut>> =
-                self.graph.edge_lists_mut().map(Some).collect();
-            let mut edge_lists: Vec<EdgeListMut> = indices
-                .iter()
-                .map(|&node| {
-                    unclaimed[node as usize]
-                        .take()
-                        .expect("indices is a permutation")
-                })
-                .collect();
-
-            // One task per leaf: its member ids and their edge lists.
-            // `partition` returns the leaves in order, tiling `0..n`.
-            let mut leaf_tasks: Vec<(&[NodeId], &mut [EdgeListMut])> =
-                Vec::with_capacity(leaves.len());
-            let mut rest = edge_lists.as_mut_slice();
-            for leaf in &leaves {
-                let (leaf_lists, tail) = std::mem::take(&mut rest).split_at_mut(leaf.len());
-                leaf_tasks.push((&indices[leaf.clone()], leaf_lists));
-                rest = tail;
-            }
-            debug_assert!(rest.is_empty(), "leaves must tile all of indices");
-
-            // Each leaf brute-forces its pairwise similarities and inserts both
-            // directions of each edge; the lists dedup re-encounters across
-            // trees and keep only the best `max_edges`.
-            executor
-                .map(
-                    move |(members, edge_lists): (&[NodeId], &mut [EdgeListMut])| {
-                        for i in 0..members.len() {
-                            let vec_a = &vectors[members[i] as usize * dim..][..dim];
-                            for j in (i + 1)..members.len() {
-                                let vec_b = &vectors[members[j] as usize * dim..][..dim];
-                                let sim = metric.similarity(vec_a, vec_b);
-                                edge_lists[i].add_edge(members[j], sim);
-                                edge_lists[j].add_edge(members[i], sim);
-                            }
-                        }
-                        Ok(())
-                    },
-                    leaf_tasks.into_iter(),
-                )
-                .expect("leaf KNN computation panicked");
-        }
-    }
-}
-
-/// Reusable per-query working buffers. The caller owns it and passes `&mut` it to [`RelativeNeighborhoodGraph::search`];
-/// reuse one across queries to avoid reallocating. It holds only data, no logic.
-#[derive(Default)]
-pub struct Workspace {
-    /// `visited[node] == visited_epoch` marks a node seen in the current query.
-    /// The epoch stamp resets the buffer in O(1) between queries (just a counter
-    /// bump) instead of re-zeroing all `n` slots.
-    visited: Vec<u32>,
-    visited_epoch: u32,
-    /// Nodes visited — and therefore scored — by the current query; the
-    /// search's navigation cost, surfaced through [`Self::num_visited`].
-    num_visited: usize,
-    /// Max-heap by similarity: the frontier of candidates left to expand.
-    frontier: BinaryHeap<Candidate>,
-    /// Min-heap by similarity (via `Reverse`): the best `ef` results so far, with
-    /// the least-similar on top for eviction.
-    results: BinaryHeap<Reverse<Candidate>>,
-}
-
-impl Workspace {
-    /// Creates an empty workspace. It grows to fit on first use.
-    pub fn new() -> Self {
-        Workspace::default()
-    }
-
-    /// Nodes visited (scored) by the most recent search — the navigation
-    /// cost. Reset at the start of each query.
-    pub fn num_visited(&self) -> usize {
-        self.num_visited
-    }
-
-    /// Prepares the workspace for a query over `n` nodes: grows the visited
-    /// buffer, advances the epoch (resetting stamps on wraparound), clears the
-    /// heaps, and returns the epoch to stamp this query's visits with.
-    fn begin_query(&mut self, n: usize) -> u32 {
-        if self.visited.len() < n {
-            self.visited.resize(n, 0);
-        }
-        self.visited_epoch = self.visited_epoch.wrapping_add(1);
-        if self.visited_epoch == 0 {
-            // Wrapped: clear so no stale stamp collides with the new epoch.
-            self.visited.iter_mut().for_each(|v| *v = 0);
-            self.visited_epoch = 1;
-        }
-        self.num_visited = 0;
-        self.frontier.clear();
-        self.results.clear();
-        self.visited_epoch
-    }
-}
-
-/// A `(similarity, node)` pair ordered by similarity (ties broken by node id for
-/// determinism). Ordered ascending, so a plain max-heap yields most-similar
-/// first and `Reverse<Candidate>` yields least-similar first. Also the element
-/// type [`search`](RelativeNeighborhoodGraph::search) returns.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Candidate {
-    /// Similarity to the query (higher is more similar).
-    pub sim: Similarity,
-    /// The graph node this candidate refers to.
-    pub node: NodeId,
-}
-
-impl Eq for Candidate {}
-
-impl Ord for Candidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.sim
-            .cmp(&other.sim)
-            .then_with(|| self.node.cmp(&other.node))
-    }
-}
-
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
     }
 }
 

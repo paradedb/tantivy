@@ -36,37 +36,30 @@ use crate::vector::{FileSliceArena, VectorArena};
 /// contiguous row ranges of the `.vec` rows — a query should probe.
 ///
 /// Pinned state is small and touched by every query: the cluster offsets and
-/// the RNG adjacency (edges only, ~`k × max_edges × 4` bytes). The centroid
-/// vectors stay behind a [`FileSliceArena`] and are fetched one node at a
-/// time as routing visits them. Everything row-scale stays out entirely (the
-/// rows and id-map live on
-/// [`VectorIndexReader`](crate::vector::VectorIndexReader)).
+/// the RNG adjacency (edges only, `num_centroids × max_edges × 4` bytes). The
+/// centroid vectors stay behind a [`FileSliceArena`] and are fetched one node
+/// at a time as routing visits them. Everything row-scale (the rows and
+/// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
     num_centroids: usize,
-    /// Distinct documents with a vector in this field — the segment's logical
-    /// vector count, written at merge time. Rows including replicas are
-    /// [`Self::num_rows`].
+    /// Distinct documents with a vector in this field. Rows including
+    /// replicas are [`Self::num_rows`].
     num_docs: usize,
-    /// The centroid rows (slot `[0]` past the two count words), deferred:
-    /// routing fetches per-node ranges rather than materializing
-    /// `num_centroids × stride` bytes.
+    /// The centroid rows (slot `[0]` past the two count words).
     centroids_slice: FileSlice,
     /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
     cluster_offsets: OwnedBytes,
     dim: usize,
     metric: Metric,
-    /// The persisted RNG over the centroids (slot `[2]`), reloaded
-    /// search-only over the lazy centroid arena. `None` for degenerate
-    /// centroid counts, where the write side skips the slot and routing
-    /// falls back to a linear scan of the (few) centroids.
+    /// The persisted RNG over the centroids (slot `[2]`). `None` for
+    /// degenerate centroid counts, where routing falls back to a linear scan.
     graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
 }
 
 impl IvfIndex {
-    /// Write slot `[0]` (num_centroids + num_docs + centroid bytes) of the
-    /// `.centroids` composite for a field. `num_docs` is the number of
-    /// distinct docs assigned — NOT the posting-row total, which replication
-    /// can multiply and which slot `[1]`'s offsets already encode.
+    /// Write slot `[0]` of the `.centroids` composite for a field. `num_docs`
+    /// is the number of distinct docs assigned — NOT the posting-row total,
+    /// which replication can multiply.
     pub(crate) fn serialize_centroids<W: Write + ?Sized>(
         num_centroids: usize,
         num_docs: usize,
@@ -94,8 +87,7 @@ impl IvfIndex {
         out.write_all(centroid_bytes)
     }
 
-    /// Write slot `[1]` (cluster offsets prefix sum) of the `.centroids`
-    /// composite for a field.
+    /// Write slot `[1]` of the `.centroids` composite for a field.
     pub(crate) fn serialize_offsets<W: Write + ?Sized>(
         cluster_offsets: &[u64],
         out: &mut W,
@@ -160,9 +152,8 @@ impl IvfIndex {
                 let vectors = match options.dtype() {
                     VectorDType::F32 => FileSliceArena::<f32>::new(centroids_slice.clone()),
                 };
-                // The adjacency is pinned; the centroid rows behind the
-                // arena are not. Node count and adjacency length are
-                // cross-validated against the arena inside `Graph::open`.
+                // Adjacency length is validated against the arena's node
+                // count inside `Graph::open`.
                 let adjacency = slice.read_bytes()?;
                 Some(RelativeNeighborhoodGraph::open(
                     &adjacency,
@@ -185,7 +176,7 @@ impl IvfIndex {
             graph,
         };
         // Every distinct doc owns at least its primary row, so a doc count
-        // above the row total means a corrupt (or differently-framed) file.
+        // above the row total means a corrupt file.
         if index.num_docs > index.num_rows() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -200,8 +191,8 @@ impl IvfIndex {
         self.num_centroids
     }
 
-    /// Distinct docs with a vector (the persisted count; replication inflates
-    /// the row total, [`Self::num_rows`]).
+    /// Distinct docs with a vector; replication inflates the row total,
+    /// [`Self::num_rows`].
     pub(crate) fn num_docs(&self) -> usize {
         self.num_docs
     }
@@ -234,28 +225,32 @@ impl IvfIndex {
     }
 
     /// The centroid rows, materialized in one read — for introspection and
-    /// tests. The search path never calls this; routing fetches per-node
-    /// ranges through the lazy arena instead.
+    /// tests only. Routing fetches per-node ranges through the lazy arena.
     pub fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
     /// Clusters to probe for `query`, best routing score first, as
-    /// `(score, cluster)` pairs, plus the number of centroids scored to
-    /// produce them (the navigation cost, surfaced as
-    /// `ProbeStats::centroids_ranked`).
+    /// `(score, cluster)` pairs, plus the number of centroids scored
+    /// (surfaced as `ProbeStats::centroids_ranked`).
     ///
     /// With a persisted RNG this is a beam search
-    /// ([`RelativeNeighborhoodGraph::nearest`]) with a beam of
-    /// `max(ef, limit)`, returning at most `limit` clusters. Without one
-    /// (degenerate centroid counts) every centroid is scored exactly. Both
-    /// paths fetch centroid rows lazily through the same [`FileSliceArena`]
-    /// and score with the same kernels, so their rankings agree.
+    /// ([`RelativeNeighborhoodGraph::nearest`]); without one every centroid
+    /// is scored exactly. Both paths score through the same
+    /// [`FileSliceArena`], so their rankings agree.
     pub(crate) fn rank_clusters(&self, query: &[f32], limit: usize) -> (Vec<(f32, u32)>, usize) {
         match &self.graph {
             Some(graph) => {
                 let mut ws = Workspace::new();
-                let candidates = graph.nearest(&mut ws, query, limit);
+                // TODO: Replace with proper seed generation
+                let seeds: Vec<NodeId> = {
+                    (0..graph.len())
+                        .step_by((graph.len() / 8).max(1))
+                        .take(8)
+                        .map(|node| node as NodeId)
+                        .collect()
+                };
+                let candidates = graph.search(&mut ws, query, &seeds, limit);
                 let ranked = candidates
                     .into_iter()
                     .map(|candidate| (candidate.sim.score(), candidate.node))

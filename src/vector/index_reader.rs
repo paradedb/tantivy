@@ -1,31 +1,24 @@
 //! Per-(segment, field) vector reader, modeled on
 //! [`InvertedIndexReader`](crate::index::InvertedIndexReader).
 //!
-//! One [`VectorIndexReader`] serves one vector field of one segment. It is
-//! opened (and cached) via
-//! [`SegmentReader::vector_index`](crate::SegmentReader::vector_index), the
-//! same shape as `SegmentReader::inverted_index`: small routing state is
-//! parsed once and pinned in memory, while the bulk payload stays behind
-//! [`FileSlice`]s and is fetched with ranged reads at query time — under a
-//! copying [`Directory`](crate::directory::Directory) (block storage rather
-//! than mmap), only the bytes a query actually touches are materialized.
+//! One [`VectorIndexReader`] serves one vector field of one segment, opened
+//! (and cached) via
+//! [`SegmentReader::vector_index`](crate::SegmentReader::vector_index). Small
+//! routing state is parsed once and pinned in memory, while the bulk payload
+//! stays behind [`FileSlice`]s and is fetched with ranged reads at query time.
 //!
 //! The reader is "store + optional index":
 //! - The **store** is the segment's `.vec` composite: slot `[0]` is the
 //!   row→doc_id [`IdMap`], slot `[1]` the dense vector rows (deferred).
-//! - The **index** ([`IvfIndex`]) exists iff the segment was merged with IVF
-//!   clustering, and is loaded from the sibling `.centroids` composite:
-//!   centroids + `num_docs` in slot `[0]`, the cluster offsets prefix sum in
-//!   slot `[1]`, and (for segments with enough centroids to need routing)
-//!   the RNG routing graph in slot `[2]`. Its job is to tell a query which
-//!   clusters — contiguous row ranges of slot `[1]` — to probe. Without it,
-//!   search falls back to an exact scan.
+//! - The **index** ([`IvfIndex`]) exists if the segment was merged with IVF
+//!   clustering, and is loaded from the sibling `.centroids` composite. It
+//!   tells a query which clusters — contiguous row ranges of slot `[1]` — to
+//!   probe. Without it, search falls back to an exact scan.
 //!
 //! The pairing is an invariant of the write path (`VectorPlugin`): the IVF
 //! merge writes cluster-sorted rows + an `Explicit` id-map + `.centroids`;
 //! every other writer produces doc-ordered rows + `Identity`/`Bitmap` and no
-//! sidecar. [`VectorIndexReader::open`] validates the two signals agree and
-//! everything downstream relies on it.
+//! sidecar. [`VectorIndexReader::open`] validates the two signals agree.
 
 use std::cmp::Ordering;
 
@@ -41,8 +34,7 @@ use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
 
-/// Which on-disk layout a segment's vector data uses. Purely descriptive —
-/// derived from whether the field has an [`IvfIndex`] — and surfaced through
+/// Which on-disk layout a segment's vector data uses, surfaced through
 /// [`VectorInfo`] for tooling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VectorStorageFormat {
@@ -53,11 +45,9 @@ pub enum VectorStorageFormat {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorInfo {
     pub format: VectorStorageFormat,
-    /// Distinct documents with a vector in this field — the same quantity for
-    /// both storage formats. The IVF per-cluster numbers (`cluster_stats`
-    /// here, [`VectorIndexReader::cluster_sizes`]) count memberships —
-    /// posting rows, one per cell a doc lives in — so with replication their
-    /// sum exceeds `num_vectors`.
+    /// Distinct documents with a vector in this field. The per-cluster
+    /// numbers (`cluster_stats`, [`VectorIndexReader::cluster_sizes`]) count
+    /// posting rows, so with replication their sum exceeds `num_vectors`.
     pub num_vectors: usize,
     pub num_centroids: Option<usize>,
     pub cluster_stats: Option<VectorClusterStats>,
@@ -76,9 +66,8 @@ pub struct VectorClusterStats {
 /// pinned-vs-deferred split.
 pub struct VectorIndexReader {
     options: VectorOptions,
-    /// Distinct docs with a vector — resolved once at open (`IdMap` row count
-    /// for flat storage, the persisted doc count for IVF, whose row total is
-    /// inflated by replication).
+    /// Distinct docs with a vector (the IdMap row count for flat storage; the
+    /// persisted doc count for IVF, whose row total replication inflates).
     num_vectors: usize,
     /// `false` for the placeholder built by [`Self::empty`] — the segment has
     /// no vector data for this field at all.
@@ -94,9 +83,8 @@ pub struct VectorIndexReader {
 impl VectorIndexReader {
     /// Opens `field`'s vector data in `segment_reader`'s segment. Returns the
     /// [`empty`](Self::empty) placeholder when the segment carries no vector
-    /// data for the field (no `.vec` file, or the field has no slots in it —
-    /// e.g. the segment predates the field), mirroring how
-    /// `SegmentReader::inverted_index` returns an empty reader.
+    /// data for the field (no `.vec` file, or the field has no slots in it),
+    /// mirroring `SegmentReader::inverted_index`.
     pub(crate) fn open(segment_reader: &SegmentReader, field: Field) -> crate::Result<Self> {
         let entry = segment_reader.schema().get_field_entry(field);
         let options = match entry.field_type() {
@@ -134,9 +122,8 @@ impl VectorIndexReader {
                         composite.open_read_with_idx(field, 0),
                         composite.open_read_with_idx(field, 1),
                     ) {
-                        // Slot [2] (the routing graph) is optional: the
-                        // write side skips it for degenerate centroid
-                        // counts, which route by linear scan instead.
+                        // Slot [2] (the routing graph) is optional: the write
+                        // side skips it for degenerate centroid counts.
                         (Some(centroids), Some(offsets)) => {
                             Some((centroids, offsets, composite.open_read_with_idx(field, 2)))
                         }
@@ -177,7 +164,6 @@ impl VectorIndexReader {
                 ));
             }
         }
-        // Cheap (length-only) corruption check on the deferred payload.
         if rows_slice.len() != num_rows * options.bytes_per_vector() {
             return Err(TantivyError::InternalError(format!(
                 "vector rows length {} does not match {} rows of {} bytes",
@@ -285,9 +271,9 @@ impl VectorIndexReader {
         })
     }
 
-    /// Raw per-cluster posting-list sizes in cluster order; `None` when the
-    /// field's storage is not IVF. The un-collapsed distribution behind
-    /// [`Self::info`]'s aggregate cluster stats.
+    /// Per-cluster posting-list sizes in cluster order — the distribution
+    /// behind [`Self::info`]'s aggregate cluster stats. `None` when the
+    /// field's storage is not IVF.
     pub fn cluster_sizes(&self) -> Option<Vec<u32>> {
         self.index
             .as_ref()

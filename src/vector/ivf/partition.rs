@@ -5,8 +5,8 @@
 //! A TPT recursively splits a slice of node ids along a sparse random
 //! hyperplane — only the few highest-variance dimensions carry a weight, the
 //! rest are implicitly zero (the "trinary" sparsity). Each split direction is
-//! *fit on a sample* of the slice but *applied to the whole slice*, so the cost
-//! is independent of node count. Recursion bottoms out at
+//! *fit on a sample* of the slice but *applied to the whole slice*, so the fit
+//! cost is independent of slice size. Recursion bottoms out at
 //! [`leaf_size`](TPTreeConfig::leaf_size); the leaves are small contiguous index
 //! ranges the builder brute-forces into exact KNN edges.
 
@@ -44,9 +44,7 @@ impl Default for TPTreeConfig {
     }
 }
 
-/// A single TPT over a flat, `dim`-strided vector arena. Borrows the arena
-/// and owns the RNG; [`partition`](TPTree::partition) permutes a caller-owned
-/// `indices` slice in place and returns the leaf ranges into it.
+/// A single TPT over a flat, `dim`-strided vector arena.
 pub struct TPTree<'a> {
     vectors: &'a [f32],
     dim: usize,
@@ -55,8 +53,8 @@ pub struct TPTree<'a> {
 }
 
 impl<'a> TPTree<'a> {
-    /// Wraps an arena for partitioning. `vectors` is the flat `dim`-strided
-    /// buffer (its length must be a multiple of `dim`).
+    /// `vectors` is the flat `dim`-strided buffer (its length must be a
+    /// multiple of `dim`).
     pub fn new(config: TPTreeConfig, dim: usize, vectors: &'a [f32]) -> Self {
         debug_assert!(dim > 0, "dim must be non-zero");
         debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
@@ -79,7 +77,6 @@ impl<'a> TPTree<'a> {
         leaves
     }
 
-    /// Coordinate `d` of `node`.
     #[inline]
     fn coord(&self, node: NodeId, d: usize) -> f32 {
         self.vectors[node as usize * self.dim + d]
@@ -108,7 +105,6 @@ impl<'a> TPTree<'a> {
         let sample = n.min(self.config.samples);
         let top_dims = self.config.top_dims.min(dim).max(1);
 
-        // Per-dimension mean over the sample.
         let mut mean = vec![0.0f32; dim];
         for &node in &indices[..sample] {
             for (d, m) in mean.iter_mut().enumerate() {
@@ -119,7 +115,7 @@ impl<'a> TPTree<'a> {
             *m /= sample as f32;
         }
 
-        // Per-dimension variance (sum of squared deviations) over the sample.
+        // Sum of squared deviations; comparisons only, so never normalized.
         let mut variance = vec![0.0f32; dim];
         for &node in &indices[..sample] {
             for (d, var) in variance.iter_mut().enumerate() {
@@ -128,8 +124,6 @@ impl<'a> TPTree<'a> {
             }
         }
 
-        // The top-`top_dims` highest-variance dimensions; only these carry a
-        // projection weight.
         let mut dims: Vec<usize> = (0..dim).collect();
         dims.sort_unstable_by(|&a, &b| variance[b].total_cmp(&variance[a]));
         dims.truncate(top_dims);
@@ -140,8 +134,7 @@ impl<'a> TPTree<'a> {
         let mut best_mean = mean[dims[0]];
         let mut best_var = variance[dims[0]];
 
-        // Try random unit-norm projections over the top dims; keep whichever
-        // spreads the sample the most.
+        // Random unit-norm projections; keep whichever spreads the sample most.
         let mut proj = vec![0.0f32; sample];
         let mut weight = vec![0.0f32; top_dims];
         for _ in 0..self.config.iterations {
@@ -181,9 +174,8 @@ impl<'a> TPTree<'a> {
             }
         }
 
-        // Partition the WHOLE slice around the chosen hyperplane: below the
-        // threshold stays left, at-or-above swaps to the tail (two-pointer,
-        // in place). `i`/`j` are signed so the right pointer can cross zero.
+        // Partition the whole slice (not just the sample) around the chosen
+        // hyperplane. Signed so `j` can cross below zero.
         let mut i: isize = 0;
         let mut j: isize = n as isize - 1;
         while i <= j {

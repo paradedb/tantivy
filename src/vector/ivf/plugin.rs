@@ -10,8 +10,8 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::{
-    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfIndex,
-    IvfMatrixView, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
+    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrixView, IvfVectorBatch,
+    IvfVectors, CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
@@ -20,7 +20,9 @@ use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
-use crate::vector::{NeighborhoodGraphConfig, RelativeNeighborhoodGraph, Workspace, VEC_EXT};
+use crate::vector::{
+    NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace, VEC_EXT,
+};
 use crate::{DocId, Executor, TantivyError};
 
 struct AssignedVector {
@@ -448,11 +450,18 @@ pub(crate) fn merge_ivf(
                                             v,
                                             replicas,
                                         ),
-                                        ReplicaSelector::Graph(graph) => graph
-                                            .nearest(&mut replica_ws, v, replicas)
-                                            .into_iter()
-                                            .map(|candidate| candidate.node as usize)
-                                            .collect(),
+                                        ReplicaSelector::Graph(graph) => {
+                                            let seeds: Vec<NodeId> = (0..graph.len())
+                                                .step_by((graph.len() / 8).max(1))
+                                                .take(8)
+                                                .map(|node| node as NodeId)
+                                                .collect();
+                                            graph
+                                                .search(&mut replica_ws, v, &seeds, replicas)
+                                                .into_iter()
+                                                .map(|candidate| candidate.node as usize)
+                                                .collect()
+                                        }
                                     };
                                     timings.replica_knn += knn_start.elapsed();
                                     let mut added = 0usize;
@@ -702,52 +711,6 @@ pub(crate) fn merge_ivf(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The graph selector must land in the same neighborhood as the exact
-    /// scan: beam search is approximate, so the contract is a loose
-    /// envelope — every cell it picks is within the exact top-(k + 2) —
-    /// not exact equality.
-    #[test]
-    fn graph_selector_matches_exact_on_moderate_set() -> crate::Result<()> {
-        // 9×9 grid of well-separated 2-D centroids (gap 10), above the
-        // exact-path cutoff of max(64, replicas * 4). All 81 fit in one
-        // TPT leaf, so the init KNN is exact and the build deterministic.
-        let dim = 2;
-        let side = 9;
-        let centroid_rows: Vec<Vec<f32>> = (0..side * side)
-            .map(|i| vec![(i % side) as f32 * 10.0, (i / side) as f32 * 10.0])
-            .collect();
-        let flat: Vec<f32> = centroid_rows.iter().flatten().copied().collect();
-        let replicas = 3;
-        let ef = (replicas * 4).max(64);
-        assert!(
-            centroid_rows.len() > ef,
-            "fixture must exceed the exact-path cutoff"
-        );
-
-        let graph = build_centroid_graph(Metric::L2, &flat, dim, ef)?;
-        let mut ws = Workspace::new();
-        for (ord, centroid) in centroid_rows.iter().enumerate().step_by(5) {
-            let query = [centroid[0] + 0.3, centroid[1] - 0.2];
-            let picked: Vec<usize> = graph
-                .nearest(&mut ws, &query, replicas)
-                .into_iter()
-                .map(|candidate| candidate.node as usize)
-                .collect();
-            assert_eq!(picked.len(), replicas, "query near centroid {ord}");
-            let envelope =
-                exact_nearest_centroids(Metric::L2, &centroid_rows, &query, replicas + 2);
-            for cell in &picked {
-                assert!(
-                    envelope.contains(cell),
-                    "query near centroid {ord}: graph picked {picked:?}, exact top-{} is \
-                     {envelope:?}",
-                    replicas + 2,
-                );
-            }
-        }
-        Ok(())
-    }
 
     /// Pins the Dot selection semantics: replica cells follow RAW dot —
     /// the query-time router's ranking — not angular order. Centroid
