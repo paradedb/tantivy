@@ -291,12 +291,26 @@ impl VectorIndexReader {
         let Some(row) = self.row_id(doc_id) else {
             return Ok(None);
         };
+        self.vector_bytes_for_row(row).map(Some)
+    }
+
+    /// The raw bytes of the single vector row at `row` of the dense rows
+    /// slot, fetched with one stride-sized ranged read
+    /// (`row * stride..(row + 1) * stride`). The caller resolves `row`
+    /// beforehand (e.g. from a cluster's row range), so no doc→row lookup
+    /// happens here.
+    pub fn vector_bytes_for_row(&self, row: usize) -> crate::Result<OwnedBytes> {
+        if row >= self.id_map.num_rows() as usize {
+            return Err(TantivyError::InvalidArgument(format!(
+                "vector row {row} is out of bounds"
+            )));
+        }
         let stride = self.options.bytes_per_vector();
         let bytes = self
             .rows_slice
             .slice(row * stride..(row + 1) * stride)
             .read_bytes()?;
-        Ok(Some(bytes))
+        Ok(bytes)
     }
 
     /// The raw vector rows of `cluster`, contiguous in `.vec` row order,
