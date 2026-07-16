@@ -21,6 +21,9 @@
 //! sidecar. [`VectorIndexReader::open`] validates the two signals agree.
 
 use std::cmp::Ordering;
+use std::ops::Range;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 use common::{HasLen, OwnedBytes};
 
@@ -33,6 +36,20 @@ use crate::directory::{CompositeFile, FileSlice};
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
+
+/// Ranged-read block granularity assumed by the fetch cost model
+/// ([`read_blocks`] here; the dispatch and run policies in `backend.rs`) —
+/// `Directory` implementations fetch in roughly 8 KiB blocks. The exact
+/// figure only moves the sparse/dense crossovers; it carries no
+/// correctness weight.
+pub(crate) const FETCH_BLOCK_BYTES: usize = 8192;
+
+/// Blocks one contiguous ranged read of `bytes` touches at arbitrary
+/// alignment: `ceil(bytes / FETCH_BLOCK_BYTES) + 1` (the `+ 1` covers the
+/// range straddling one extra block boundary).
+pub(crate) const fn read_blocks(bytes: usize) -> usize {
+    bytes.div_ceil(FETCH_BLOCK_BYTES) + 1
+}
 
 /// Which on-disk layout a segment's vector data uses, surfaced through
 /// [`VectorInfo`] for tooling.
@@ -78,6 +95,10 @@ pub struct VectorIndexReader {
     /// queries fetch per-cluster (or per-doc) ranges.
     rows_slice: FileSlice,
     index: Option<IvfIndex>,
+    /// Test-only: cumulative [`read_blocks`]-priced block touches of every
+    /// row read served by this reader, for asserting fetch-strategy wins.
+    #[cfg(test)]
+    read_block_touches: AtomicUsize,
 }
 
 impl VectorIndexReader {
@@ -184,6 +205,8 @@ impl VectorIndexReader {
             rows_slice,
             id_map,
             index,
+            #[cfg(test)]
+            read_block_touches: AtomicUsize::new(0),
         })
     }
 
@@ -197,6 +220,8 @@ impl VectorIndexReader {
             rows_slice: FileSlice::empty(),
             id_map: IdMap::Identity { num_docs: 0 },
             index: None,
+            #[cfg(test)]
+            read_block_touches: AtomicUsize::new(0),
         }
     }
 
@@ -300,17 +325,39 @@ impl VectorIndexReader {
     /// beforehand (e.g. from a cluster's row range), so no doc→row lookup
     /// happens here.
     pub fn vector_bytes_for_row(&self, row: usize) -> crate::Result<OwnedBytes> {
-        if row >= self.id_map.num_rows() as usize {
+        self.vector_bytes_for_rows(row..row + 1)
+    }
+
+    /// The raw bytes of the contiguous run of vector rows `rows` of the
+    /// dense rows slot, fetched with one ranged read
+    /// (`rows.start * stride..rows.end * stride`). The caller resolves the
+    /// row range beforehand; it must be in-bounds.
+    pub fn vector_bytes_for_rows(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
+        if rows.start > rows.end || rows.end > self.id_map.num_rows() as usize {
             return Err(TantivyError::InvalidArgument(format!(
-                "vector row {row} is out of bounds"
+                "vector rows {rows:?} are out of bounds"
             )));
         }
         let stride = self.options.bytes_per_vector();
+        #[cfg(test)]
+        self.read_block_touches.fetch_add(
+            read_blocks(rows.len() * stride),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let bytes = self
             .rows_slice
-            .slice(row * stride..(row + 1) * stride)
+            .slice(rows.start * stride..rows.end * stride)
             .read_bytes()?;
         Ok(bytes)
+    }
+
+    /// Test-only: the cumulative cost-model block touches
+    /// ([`read_blocks`]-priced) of every row read served by this reader.
+    /// Tests compare deltas between fetch strategies.
+    #[cfg(test)]
+    pub(crate) fn read_block_touches(&self) -> usize {
+        self.read_block_touches
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The raw vector rows of `cluster`, contiguous in `.vec` row order,
@@ -326,13 +373,7 @@ impl VectorIndexReader {
                 "cluster {cluster} is out of bounds"
             )));
         }
-        let stride = self.options.bytes_per_vector();
-        let rows = index.cluster_range(cluster);
-        let bytes = self
-            .rows_slice
-            .slice(rows.start * stride..rows.end * stride)
-            .read_bytes()?;
-        Ok(bytes)
+        self.vector_bytes_for_rows(index.cluster_range(cluster))
     }
 
     /// The doc id stored at `row` of the cluster-sorted permutation, decoded
@@ -367,8 +408,10 @@ impl VectorIndexReader {
 
     /// Doc → dense row. For clustered storage, rows are cluster-sorted and
     /// ascending by doc id within each cluster, so this scans clusters and
-    /// binary-searches each one over the pinned id-map bytes.
-    fn row_id(&self, doc_id: DocId) -> Option<usize> {
+    /// binary-searches each one over the pinned id-map bytes. For the flat
+    /// id-maps (`Identity`/`Bitmap`) the mapping is strictly ascending in
+    /// doc id — the property the exact path's run builder leans on.
+    pub(crate) fn row_id(&self, doc_id: DocId) -> Option<usize> {
         match &self.id_map {
             IdMap::Identity { num_docs } => (doc_id < *num_docs).then_some(doc_id as usize),
             IdMap::Bitmap(_) => self.id_map.rank_if_exists(doc_id).map(|row| row as usize),

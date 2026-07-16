@@ -6,14 +6,15 @@
 //! branches once, on whether the reader carries an [`IvfIndex`]: with it, the
 //! filter is drained into a bitmap and the routed clusters are probed
 //! adaptively; without it, the filter `Scorer` is iterated doc-by-doc and
-//! every vector is scored exactly.
+//! every vector is scored exactly, with survivor reads coalesced into
+//! contiguous row runs where the filter is dense.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use common::BitSet;
 
-use super::index_reader::VectorIndexReader;
+use super::index_reader::{read_blocks, VectorIndexReader};
 use super::ivf::{AdaptiveProbeParams, IvfIndex};
 use super::prepared::PreparedQuery;
 use super::VectorElement;
@@ -37,6 +38,10 @@ pub struct VectorBackend<T: VectorElement> {
     /// [`row_fetch_is_cheaper`].
     #[cfg(test)]
     forced_fetch: Option<ForcedFetch>,
+    /// Test-only override of the flat/exact path's run batching. `None` —
+    /// always, in production — applies [`absorb_into_run`].
+    #[cfg(test)]
+    forced_exact: Option<ForcedExactRead>,
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -59,6 +64,8 @@ impl<T: VectorElement> VectorBackend<T> {
             segment_ord,
             #[cfg(test)]
             forced_fetch: None,
+            #[cfg(test)]
+            forced_exact: None,
         })
     }
 
@@ -77,7 +84,8 @@ impl<T: VectorElement> VectorBackend<T> {
 
     /// Like [`Self::top_n`] but threads an optional [`ProbeStats`] sink into
     /// the IVF probe loop; `None` is identical in behavior and cost to
-    /// `top_n`. The exact path ignores `stats`.
+    /// `top_n`. The exact path fills only the `exact_reads_*` counters and
+    /// leaves every probe-loop field untouched.
     pub fn top_n_with_stats(
         &self,
         weight: &dyn Weight,
@@ -87,31 +95,41 @@ impl<T: VectorElement> VectorBackend<T> {
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
         match self.reader.index() {
             Some(index) => self.probe_top_n(index, weight, segment_reader, top_n, stats),
-            None => self.exact_top_n(weight, segment_reader, top_n),
+            None => self.exact_top_n(weight, segment_reader, top_n, stats),
         }
     }
 
-    // Follow-up: this flat path has no survivor-density fetch dispatch —
-    // it always issues one stride-sized ranged read per admitted doc, the
-    // fixed policy the IVF probe loop's `fetch_mode` replaced. At dense
-    // filters that pays per-row read overhead where one bulk read of the
-    // rows slot would win; wire it through the same dispatch when it
-    // comes up.
+    /// Flat/exact scan: drain the filter DocSet doc-by-doc, but batch the
+    /// survivors' row reads into contiguous runs grown by
+    /// [`absorb_into_run`] — one ranged read per run, sized to survivor
+    /// density. A selective filter degrades to length-1 runs (exactly the
+    /// per-doc reads this replaced); a dense one coalesces consecutive
+    /// rows into few large reads. Fills only the `exact_reads_*` stats.
     fn exact_top_n(
         &self,
         weight: &dyn Weight,
         segment_reader: &SegmentReader,
         top_n: usize,
+        stats: Option<&mut ProbeStats>,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
         // `for_each_no_score` walks the filter DocSet in ascending doc order,
         // which permits the fast `TopNComputer::push` path (valid only under
-        // ascending-doc pushes). `NaturalComparator` because similarity is
-        // "higher = better" — see the note on `scan_clusters`.
+        // ascending-doc pushes) — the flat id-maps (`Identity`/`Bitmap`) keep
+        // rows ascending with doc ids, so run flushes preserve that order.
+        // `NaturalComparator` because similarity is "higher = better" — see
+        // the note on `scan_clusters`.
         let mut topn = TopNComputer::<Score, DocId, NaturalComparator>::new_with_comparator(
             top_n,
             NaturalComparator,
         );
         let alive = segment_reader.alive_bitset();
+        let stride = self.reader.options().bytes_per_vector();
+        let mut reads_chunked = 0usize;
+        let mut reads_single = 0usize;
+        // The pending run of survivors, `(doc, row)` with rows ascending;
+        // flushed (one ranged read, one score per member) when the next
+        // survivor doesn't absorb, and once more after the drain.
+        let mut run: Vec<(DocId, usize)> = Vec::new();
         // Row reads are ranged and can fail; the `for_each` closure can't
         // return an error, so the first one is parked here and re-raised
         // after the walk.
@@ -126,21 +144,37 @@ impl<T: VectorElement> VectorBackend<T> {
                         continue;
                     }
                 }
-                match self.reader.vector_bytes(doc) {
-                    Ok(Some(bytes)) => {
-                        let score = self.query.score_doc_bytes(&bytes);
-                        topn.push(score, doc);
+                let Some(row) = self.reader.row_id(doc) else {
+                    continue;
+                };
+                if let Some(&(_, last_row)) = run.last() {
+                    debug_assert!(row > last_row, "flat rows must ascend with doc ids");
+                    if self.absorb_next_survivor(run[0].1, last_row, row, stride) {
+                        run.push((doc, row));
+                        continue;
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        read_err = Some(err);
-                        return;
+                    match self.score_run(&run, stride, &mut topn) {
+                        Ok(()) => tally_run(run.len(), &mut reads_chunked, &mut reads_single),
+                        Err(err) => {
+                            read_err = Some(err);
+                            return;
+                        }
                     }
+                    run.clear();
                 }
+                run.push((doc, row));
             }
         })?;
         if let Some(err) = read_err {
             return Err(err);
+        }
+        if !run.is_empty() {
+            self.score_run(&run, stride, &mut topn)?;
+            tally_run(run.len(), &mut reads_chunked, &mut reads_single);
+        }
+        if let Some(s) = stats {
+            s.exact_reads_chunked += reads_chunked;
+            s.exact_reads_single += reads_single;
         }
         let segment_ord = self.segment_ord;
         Ok(topn
@@ -148,6 +182,55 @@ impl<T: VectorElement> VectorBackend<T> {
             .into_iter()
             .map(|cd| (cd.sort_key, DocAddress::new(segment_ord, cd.doc)))
             .collect())
+    }
+
+    /// Flush one run: a single ranged read spanning `run[0].1..=last.1`,
+    /// then score each member from its slice offset. Rows inside the span
+    /// that belong to no member — holes [`absorb_into_run`] chose to
+    /// absorb — are fetched but never scored; that cost is exactly what
+    /// the run rule priced against a separate read.
+    fn score_run(
+        &self,
+        run: &[(DocId, usize)],
+        stride: usize,
+        topn: &mut TopNComputer<Score, DocId, NaturalComparator>,
+    ) -> crate::Result<()> {
+        let first = run[0].1;
+        let last = run[run.len() - 1].1;
+        let bytes = self.reader.vector_bytes_for_rows(first..last + 1)?;
+        for &(doc, row) in run {
+            let vbytes = &bytes[(row - first) * stride..(row - first + 1) * stride];
+            topn.push(self.query.score_doc_bytes(vbytes), doc);
+        }
+        Ok(())
+    }
+
+    /// Run-absorption decision for the flat path (see [`absorb_into_run`]).
+    fn absorb_next_survivor(
+        &self,
+        first_row: usize,
+        last_row: usize,
+        next_row: usize,
+        stride: usize,
+    ) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_exact {
+            return match forced {
+                ForcedExactRead::PerDoc => false,
+                ForcedExactRead::Chunked => true,
+            };
+        }
+        absorb_into_run(first_row, last_row, next_row, stride)
+    }
+}
+
+/// Bump the flushed-run counters: a run of `len > 1` survivors was one
+/// chunked read; `len == 1` is the per-doc-equivalent single read.
+fn tally_run(len: usize, chunked: &mut usize, single: &mut usize) {
+    if len > 1 {
+        *chunked += 1;
+    } else {
+        *single += 1;
     }
 }
 
@@ -166,7 +249,8 @@ pub enum ProbeTermination {
 /// Per-segment probe-loop instrumentation: which clusters were probed
 /// (in probe order) and a prune breakdown of every doc the inner loop
 /// touched. Filled by [`VectorBackend::top_n_with_stats`] when a sink is
-/// supplied.
+/// supplied. The flat/exact path fills only `exact_reads_chunked` /
+/// `exact_reads_single`; every other field is IVF-probe-only.
 #[derive(Debug, Default)]
 pub struct ProbeStats {
     /// Clusters visited by the probe loop, in probe order. A cluster
@@ -202,6 +286,15 @@ pub struct ProbeStats {
     /// `postings_bulk + postings_row + postings_skipped ==
     /// probed_clusters.len()`.
     pub postings_skipped: usize,
+    /// Flat/exact-path ranged reads that covered a run of two or more
+    /// surviving rows — one merged read scored several survivors (see
+    /// [`absorb_into_run`]). Filled only by the exact (non-IVF) path;
+    /// counts reads, not rows.
+    pub exact_reads_chunked: usize,
+    /// Flat/exact-path ranged reads that covered exactly one surviving
+    /// row — byte-identical to the pre-chunking per-doc read. Filled only
+    /// by the exact (non-IVF) path; counts reads, not rows.
+    pub exact_reads_single: usize,
     /// Centroids scored to route this query (the navigation cost):
     /// `num_centroids` on the exact path, the beam-visited count when routed
     /// via the RNG.
@@ -223,12 +316,6 @@ pub struct ProbeStats {
 /// short-circuit recall. Provisional; revisit alongside the other
 /// adaptive defaults once real benchmarks land.
 pub(crate) const CANDIDATE_OVERFETCH_MULTIPLIER: usize = 4;
-
-/// Ranged-read block granularity assumed by [`row_fetch_is_cheaper`]'s
-/// cost model — `Directory` implementations fetch in roughly 8 KiB
-/// blocks. The exact figure only moves the sparse/dense crossover; it
-/// carries no correctness weight.
-const FETCH_BLOCK_BYTES: usize = 8192;
 
 /// How a probed cluster's posting bytes get fetched, decided per cluster
 /// from the gate pre-pass's survivor count (see
@@ -256,6 +343,19 @@ enum ForcedFetch {
     Row,
 }
 
+/// Test-only forcing of the flat/exact path's run batching, set through
+/// [`VectorBackend::forced_exact`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForcedExactRead {
+    /// Never absorb — every survivor is its own length-1 run: the
+    /// pre-chunking per-doc baseline.
+    PerDoc,
+    /// Always absorb — one run from the first survivor to the last,
+    /// regardless of hole cost.
+    Chunked,
+}
+
 /// One gate survivor from the pre-pass over a cluster's rows: `local_i`
 /// indexes into the cluster's bulk byte buffer, `row` into the
 /// segment-wide dense rows slot (`row == cluster_range.start + local_i`).
@@ -266,20 +366,62 @@ struct Survivor {
     doc: DocId,
 }
 
-/// The sparse/dense fetch cutoff: per-row reads win while the survivors
-/// touch fewer ranged-read blocks than one bulk read of the cluster.
+/// Blocks one row read touches under the cost model:
+/// `read_blocks(stride) = ceil(stride / 8192) + 1` — 2 for any stride up
+/// to one `FETCH_BLOCK_BYTES` block (e.g. a 768-dim f32 row, 3072 B), 3
+/// for a 3072-dim f32 row (12288 B), and so on. Named separately from
+/// [`read_blocks`] because it prices the *per-survivor* alternative in
+/// both fetch policies below.
+const fn per_row_blocks(stride: usize) -> usize {
+    read_blocks(stride)
+}
+
+/// The IVF sparse/dense fetch cutoff: per-row reads win while the
+/// survivors touch fewer ranged-read blocks than one bulk read of the
+/// cluster.
 ///
-/// In [`FETCH_BLOCK_BYTES`] ≈ 8 KiB blocks, a bulk read of a cluster of
-/// `n` rows × `stride` bytes touches at most
-/// `ceil(n * stride / 8192) + 1` blocks (`+ 1` for arbitrary block
-/// alignment of the range), while each per-row read touches at most 2
-/// (its own block, plus one more when the row straddles a boundary). So
-/// `s` per-row reads are the cheaper fetch while
+/// One bulk read of a cluster of `n` rows × `stride` bytes touches
+/// `read_blocks(n * stride) = ceil(n * stride / 8192) + 1` blocks at
+/// arbitrary alignment, while each per-row read touches
+/// [`per_row_blocks`]`(stride)`. So `s` per-row reads are the cheaper
+/// fetch while
 ///
-/// `s * 2 < ceil(n * stride / 8192) + 1`
+/// `s * per_row_blocks(stride) < ceil(n * stride / 8192) + 1`
+///
+/// Worked examples on a 100-row cluster:
+/// - 768-dim f32 rows (stride 3072, 2 blocks/row): bulk = 300 KiB → 38 + 1 = 39 blocks; per-row
+///   wins through s = 19.
+/// - 3072-dim f32 rows (stride 12288, 3 blocks/row): bulk = 1.2 MiB → 150 + 1 = 151 blocks; per-row
+///   wins only through s = 50. A flat 2-blocks-per-row pricing would have oversold per-row fetching
+///   through s = 75 — fat rows justify bulk at fewer survivors.
 const fn row_fetch_is_cheaper(survivors: usize, cluster_rows: usize, stride: usize) -> bool {
-    let bulk_blocks = (cluster_rows * stride).div_ceil(FETCH_BLOCK_BYTES) + 1;
-    survivors * 2 < bulk_blocks
+    survivors * per_row_blocks(stride) < read_blocks(cluster_rows * stride)
+}
+
+/// The flat/exact path's greedy run rule: absorb `next_row` into the
+/// current run `[first_row, last_row]` iff one merged ranged read over the
+/// grown span costs no more block touches than reading the run as it
+/// stands plus the newcomer separately:
+///
+/// `read_blocks((next - first + 1) * stride) <= read_blocks((last - first + 1) * stride) +
+/// per_row_blocks(stride)`
+///
+/// Rows inside the grown span that belong to no survivor (filtered,
+/// deleted, or vectorless docs between them) are fetched but never scored
+/// — that is exactly the trade this inequality prices: the hole's bytes
+/// must cost no more block touches than a separate read for the newcomer
+/// would. Adjacent survivors always absorb (the span grows by strictly
+/// fewer blocks than a separate read); a run of length 1 reads exactly
+/// the bytes a per-doc read would, so sparse filters degrade to the
+/// pre-chunking behavior by construction.
+const fn absorb_into_run(
+    first_row: usize,
+    last_row: usize,
+    next_row: usize,
+    stride: usize,
+) -> bool {
+    read_blocks((next_row - first_row + 1) * stride)
+        <= read_blocks((last_row - first_row + 1) * stride) + per_row_blocks(stride)
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -2500,10 +2642,193 @@ mod tests {
         assert_eq!(stats.termination, baseline.termination, "termination");
     }
 
-    /// Hand-checked values for the sparse/dense fetch cutoff
-    /// `s * 2 < ceil(n * stride / 8192) + 1`.
+    /// Build a single-segment FLAT index (one commit, never merged past
+    /// the clustering threshold): `docs` are `(label, Some(vector))`, or
+    /// `(label, None)` for vectorless docs — mixing the two forces the
+    /// `Bitmap` id-map.
+    fn build_flat(
+        dim: usize,
+        docs: &[(&str, Option<Vec<f32>>)],
+    ) -> crate::Result<(Index, Field, Field)> {
+        let mut sb = Schema::builder();
+        let embed_field = sb.add_vector_field(
+            "embedding",
+            VectorOptions::new(dim, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let index = Index::create_in_ram(sb.build());
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 30_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for (label, v) in docs {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(label_field, label);
+            if let Some(v) = v {
+                doc.add_vector(embed_field, v.as_slice());
+            }
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        Ok((index, embed_field, label_field))
+    }
+
+    /// Run the flat/exact path against `segment_reader` with a
+    /// caller-supplied filter weight and an optional [`ForcedExactRead`]
+    /// override (`None` = the production run rule). Takes the segment
+    /// reader — not the index — so callers can watch one
+    /// `VectorIndexReader`'s `read_block_touches` across several runs.
+    fn run_exact_on_segment(
+        segment_reader: &SegmentReader,
+        embed_field: Field,
+        query: Vec<f32>,
+        k: usize,
+        weight: &dyn Weight,
+        forced_exact: Option<ForcedExactRead>,
+    ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+        let mut backend = VectorBackend::<f32>::for_segment(
+            segment_reader,
+            0,
+            embed_field,
+            Arc::new(query),
+            AdaptiveProbeParams::default(),
+        )?;
+        backend.forced_exact = forced_exact;
+        assert!(
+            segment_reader.vector_index(embed_field)?.index().is_none(),
+            "expected flat storage"
+        );
+        backend.top_n_instrumented(weight, segment_reader, k)
+    }
+
+    /// Dim-generic inline clusterer for fat-stride fixtures: centroids
+    /// spaced 100 apart along the first axis, docs assigned by full-L2
+    /// nearest centroid.
+    struct WideClusterer {
+        dim: usize,
+        num_centroids: usize,
+    }
+
+    impl IvfClusterer for WideClusterer {
+        fn centroid_ratio(&self) -> f32 {
+            1.0
+        }
+        fn training_samples_per_centroid(&self) -> usize {
+            2
+        }
+        fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
+            Ok(IvfMergeSettings {
+                num_centroids: self.num_centroids,
+                training_samples_per_centroid: self.training_samples_per_centroid(),
+                assign_batch_size: self.assign_batch_size(),
+                replicas: 1,
+            })
+        }
+        fn train(
+            &self,
+            options: &VectorOptions,
+            _vectors: IvfVectors<'_>,
+            num_centroids: usize,
+        ) -> crate::Result<IvfCentroids> {
+            assert_eq!(options.dim(), self.dim);
+            let mut values = vec![0.0f32; num_centroids * self.dim];
+            for k in 0..num_centroids {
+                values[k * self.dim] = k as f32 * 100.0;
+            }
+            Ok(IvfCentroids::F32(IvfMatrix {
+                values,
+                rows: num_centroids,
+                dims: self.dim,
+            }))
+        }
+        fn assign(
+            &self,
+            options: &VectorOptions,
+            vectors: IvfVectors<'_>,
+            centroids: &IvfCentroids,
+        ) -> crate::Result<Vec<u32>> {
+            assert_eq!(options.dim(), self.dim);
+            let IvfVectors::F32(vectors) = vectors;
+            let IvfCentroids::F32(centroids) = centroids;
+            Ok(vectors
+                .matrix
+                .values
+                .chunks_exact(self.dim)
+                .map(|v| {
+                    let mut best = 0u32;
+                    let mut best_d2 = f32::INFINITY;
+                    for (i, c) in centroids.values.chunks_exact(self.dim).enumerate() {
+                        let d2: f32 = v.iter().zip(c).map(|(a, b)| (a - b) * (a - b)).sum();
+                        if d2 < best_d2 {
+                            best = i as u32;
+                            best_d2 = d2;
+                        }
+                    }
+                    best
+                })
+                .collect())
+        }
+    }
+
+    /// Single-IVF-segment index of `num_clusters × n_per` docs carrying
+    /// `dim`-wide f32 vectors (stride = 4 · dim), clustered by
+    /// [`WideClusterer`]. Doc `i` sits near centroid `i / n_per`.
+    fn build_wide_ivf(
+        dim: usize,
+        num_clusters: usize,
+        n_per: usize,
+    ) -> crate::Result<(Index, Field)> {
+        let mut sb = Schema::builder();
+        let embed_field = sb.add_vector_field(
+            "embedding",
+            VectorOptions::new(dim, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        };
+        let index = Index::builder()
+            .schema(sb.build())
+            .settings(settings)
+            .ivf_clusterer(Arc::new(WideClusterer {
+                dim,
+                num_centroids: num_clusters,
+            }))
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 30_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let total = num_clusters * n_per;
+        for i in 0..total {
+            let mut v = vec![0.0f32; dim];
+            v[0] = (i / n_per) as f32 * 100.0 + (i % n_per) as f32 * 0.001;
+            let mut doc = TantivyDocument::new();
+            doc.add_text(label_field, format!("d{i}"));
+            doc.add_vector(embed_field, v.as_slice());
+            writer.add_document(doc)?;
+            // Two source segments so `merge_ivf` has ≥ 2 inputs.
+            if i + 1 == total / 2 {
+                writer.commit()?;
+            }
+        }
+        writer.commit()?;
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+        Ok((index, embed_field))
+    }
+
+    /// Hand-checked values for the fetch pricing: the IVF sparse/dense
+    /// cutoff `s * per_row_blocks(stride) < ceil(n * stride / 8192) + 1`
+    /// and the flat path's run-absorption inequality.
     #[test]
     fn row_fetch_threshold_math() {
+        // Stride-aware per-row pricing: one row read costs
+        // ceil(stride / 8192) + 1 blocks.
+        assert_eq!(per_row_blocks(8), 2);
+        assert_eq!(per_row_blocks(3072), 2);
+        assert_eq!(per_row_blocks(8192), 2);
+        assert_eq!(per_row_blocks(8193), 3);
+        assert_eq!(per_row_blocks(12288), 3);
+
         // Tiny cluster: 6 rows × 8 B = 48 B → 1 + 1 = 2 bulk blocks. One
         // survivor already touches up to 2 blocks — bulk.
         assert!(!row_fetch_is_cheaper(1, 6, 8));
@@ -2520,6 +2845,27 @@ mod tests {
         // 300 KiB → 38 + 1 = 39 bulk blocks — per-row wins through s = 19.
         assert!(row_fetch_is_cheaper(19, 100, 3072));
         assert!(!row_fetch_is_cheaper(20, 100, 3072));
+        // Fat rows (3072-dim f32 = 12288 B, 3 blocks/row): 100-row bulk =
+        // 150 + 1 = 151 blocks; per-row wins only through s = 50
+        // (3 · 50 = 150 < 151). The old flat 2-blocks-per-row pricing
+        // would have oversold per-row through s = 75 — fewer survivors
+        // justify bulk when rows are fat.
+        assert!(row_fetch_is_cheaper(50, 100, 12288));
+        assert!(!row_fetch_is_cheaper(51, 100, 12288));
+
+        // Run absorption, fat stride: a 1-row hole merges (span of 3 rows
+        // = 36864 B → 5 + 1 = 6 blocks, vs 3 + 3 for run-plus-separate),
+        // a 2-row hole splits (49152 B → 6 + 1 = 7 > 6). Flat 2-block row
+        // pricing would have split even the 1-row hole (6 > 3 + 2).
+        assert!(absorb_into_run(0, 0, 2, 12288));
+        assert!(!absorb_into_run(0, 0, 3, 12288));
+        // Adjacent survivors always absorb, at any stride.
+        assert!(absorb_into_run(0, 0, 1, 8));
+        assert!(absorb_into_run(0, 0, 1, 12288));
+        // Thin rows absorb holes generously: 8 B rows pack 1024 per
+        // block, so the gap only splits past ~2 blocks' worth of rows.
+        assert!(absorb_into_run(0, 0, 3071, 8));
+        assert!(!absorb_into_run(0, 0, 3072, 8));
     }
 
     /// Result equivalence across filter selectivities: on the replicated
@@ -2927,6 +3273,353 @@ mod tests {
             "an empty cluster contributes no visited rows"
         );
         assert_stats_identities(&stats);
+        Ok(())
+    }
+
+    /// Flat-path result equivalence across filter selectivities: natural
+    /// run chunking returns doc-id- and score-identical hits to the
+    /// forced-per-doc (pre-change) baseline for hand-built filters
+    /// admitting {0, 1, 50, 100}% of docs, the probe-loop counters stay
+    /// zeroed on both runs, and at dense selectivities the merged reads
+    /// touch strictly fewer cost-model blocks than per-doc reads.
+    #[test]
+    fn flat_chunked_reads_match_per_doc_across_selectivities() -> crate::Result<()> {
+        let n = 40usize;
+        let labels: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+        let docs: Vec<(&str, Option<Vec<f32>>)> = (0..n)
+            .map(|i| (labels[i].as_str(), Some(vec![i as f32 * 0.1, 1.0])))
+            .collect();
+        let (index, embed_field, _label) = build_flat(2, &docs)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let max_doc = segment_reader.max_doc();
+        assert_eq!(max_doc as usize, n, "one segment holding every doc");
+
+        for pct in [0usize, 1, 50, 100] {
+            let weight = FixedDocsWeight {
+                max_doc,
+                docs: (0..max_doc)
+                    .filter(|&doc| (doc as usize) * 100 < pct * n)
+                    .collect(),
+            };
+            let admitted = weight.docs.len();
+
+            let before = vec_reader.read_block_touches();
+            let (hits, stats) = run_exact_on_segment(
+                segment_reader,
+                embed_field,
+                vec![0.0, 0.0],
+                n,
+                &weight,
+                None,
+            )?;
+            let chunked_touches = vec_reader.read_block_touches() - before;
+
+            let before = vec_reader.read_block_touches();
+            let (pd_hits, pd_stats) = run_exact_on_segment(
+                segment_reader,
+                embed_field,
+                vec![0.0, 0.0],
+                n,
+                &weight,
+                Some(ForcedExactRead::PerDoc),
+            )?;
+            let perdoc_touches = vec_reader.read_block_touches() - before;
+
+            assert_eq!(hits, pd_hits, "{pct}%: hits must match per-doc reads");
+            assert_eq!(hits.len(), admitted, "{pct}%");
+            // The exact path fills only the read counters; the probe-loop
+            // fields must stay zeroed on both runs.
+            assert_eq!(stats.vectors_visited, 0, "{pct}%: {stats:?}");
+            assert_eq!(stats.candidates_scored, 0, "{pct}%: {stats:?}");
+            assert!(stats.probed_clusters.is_empty(), "{pct}%: {stats:?}");
+            assert_eq!(
+                (pd_stats.exact_reads_chunked, pd_stats.exact_reads_single),
+                (0, admitted),
+                "{pct}%: the baseline reads once per survivor"
+            );
+            match pct {
+                0 => {
+                    assert_eq!(
+                        (stats.exact_reads_chunked, stats.exact_reads_single),
+                        (0, 0)
+                    );
+                    assert_eq!(chunked_touches, 0, "no survivors, no reads");
+                }
+                1 => {
+                    assert_eq!(
+                        (stats.exact_reads_chunked, stats.exact_reads_single),
+                        (0, 1)
+                    );
+                    assert_eq!(
+                        chunked_touches, perdoc_touches,
+                        "a lone survivor reads exactly the per-doc bytes"
+                    );
+                }
+                _ => {
+                    // Consecutive survivors coalesce into one merged read
+                    // touching strictly fewer blocks.
+                    assert_eq!(
+                        (stats.exact_reads_chunked, stats.exact_reads_single),
+                        (1, 0),
+                        "{pct}%: {stats:?}"
+                    );
+                    assert!(
+                        chunked_touches < perdoc_touches,
+                        "{pct}%: chunked {chunked_touches} must beat per-doc {perdoc_touches}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Flat runs over a `Bitmap` id-map with tombstoned docs: vectorless
+    /// and deleted docs leave holes between surviving rows, which 8-byte
+    /// rows absorb into a single merged read whose hole bytes are fetched
+    /// but never scored. Results are identical to per-doc reads and to
+    /// force-merged reads, and match the brute-force oracle.
+    #[test]
+    fn flat_runs_handle_bitmap_holes_and_deletes() -> crate::Result<()> {
+        let n = 30usize;
+        let labels: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+        // Every third doc carries no vector at all → the id-map is Bitmap
+        // and those docs own no row.
+        let docs: Vec<(&str, Option<Vec<f32>>)> = (0..n)
+            .map(|i| {
+                let v = (i % 3 != 2).then(|| vec![i as f32 * 0.1, 1.0]);
+                (labels[i].as_str(), v)
+            })
+            .collect();
+        let (index, embed_field, label_field) = build_flat(2, &docs)?;
+        // Tombstone a few vectored docs → alive holes between rows that
+        // do exist.
+        {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for i in [0usize, 6, 7, 12] {
+                writer.delete_term(Term::from_field_text(label_field, &format!("d{i}")));
+            }
+            writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        // Setup: mixed vector coverage (Bitmap id-map: fewer rows than
+        // docs) and the tombstones landed.
+        assert!(vec_reader.num_vectors() < segment_reader.max_doc() as usize);
+        assert!(segment_reader.alive_bitset().is_some());
+
+        let max_doc = segment_reader.max_doc();
+        let weight = FixedDocsWeight {
+            max_doc,
+            docs: (0..max_doc).collect(),
+        };
+        let query = vec![0.0f32, 0.0];
+        let (hits, stats) =
+            run_exact_on_segment(segment_reader, embed_field, query.clone(), n, &weight, None)?;
+        let (pd_hits, pd_stats) = run_exact_on_segment(
+            segment_reader,
+            embed_field,
+            query.clone(),
+            n,
+            &weight,
+            Some(ForcedExactRead::PerDoc),
+        )?;
+        let (fc_hits, fc_stats) = run_exact_on_segment(
+            segment_reader,
+            embed_field,
+            query.clone(),
+            n,
+            &weight,
+            Some(ForcedExactRead::Chunked),
+        )?;
+
+        assert_eq!(hits, pd_hits, "natural chunking must match per-doc");
+        assert_eq!(hits, fc_hits, "forced chunking must match per-doc");
+        // Oracle: every alive doc with a vector, exactly once.
+        let expected = ground_truth_top_k(&index, embed_field, Metric::L2, &query, n)?;
+        assert_eq!(hits, expected);
+
+        // 8-byte rows absorb every hole here (gap tolerance ≫ segment):
+        // one merged read; the baseline reads once per survivor.
+        let survivors = hits.len();
+        assert!(survivors > 0, "fixture must leave survivors");
+        assert_eq!(
+            (stats.exact_reads_chunked, stats.exact_reads_single),
+            (1, 0),
+            "{stats:?}"
+        );
+        assert_eq!(
+            (pd_stats.exact_reads_chunked, pd_stats.exact_reads_single),
+            (0, survivors)
+        );
+        assert_eq!(
+            (fc_stats.exact_reads_chunked, fc_stats.exact_reads_single),
+            (1, 0)
+        );
+        Ok(())
+    }
+
+    /// Fat rows (3072-dim f32, stride 12288 = 3 blocks/row) shift the IVF
+    /// sparse/dense crossover: a 100-row cluster bulk-reads at 151
+    /// blocks, so 50 survivors still fetch per-row (150 < 151) while 51
+    /// flip to bulk — the flat 2-block pricing would have kept per-row
+    /// through 75.
+    #[test]
+    fn ivf_dispatch_prices_fat_rows() -> crate::Result<()> {
+        let dim = 3072usize;
+        let n_per = 100usize;
+        let (index, embed_field) = build_wide_ivf(dim, 2, n_per)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let stride = vec_reader.options().bytes_per_vector();
+        assert_eq!(stride, 12288, "3072-dim f32 stride");
+        assert_eq!(per_row_blocks(stride), 3);
+        let cluster0 = vec_reader.cluster_doc_ids(0).expect("ivf cluster 0");
+        assert_eq!(cluster0.len(), n_per, "cluster 0 holds its 100 docs");
+
+        let max_doc = segment_reader.max_doc();
+        let params = exhaustive_params(2);
+        let mut query = vec![0.0f32; dim];
+        query[0] = 0.05;
+        for (admit, expect_row, expect_bulk) in [(50usize, 1, 0), (51, 0, 1)] {
+            let weight = FixedDocsWeight {
+                max_doc,
+                docs: cluster0[..admit].to_vec(),
+            };
+            let (hits, stats) = run_top_n_forced(
+                &index,
+                embed_field,
+                query.clone(),
+                admit,
+                params.clone(),
+                &weight,
+                None,
+            )?;
+            let (bulk_hits, bulk_stats) = run_top_n_forced(
+                &index,
+                embed_field,
+                query.clone(),
+                admit,
+                params.clone(),
+                &weight,
+                Some(ForcedFetch::Bulk),
+            )?;
+            assert_eq!(hits, bulk_hits, "s = {admit}");
+            assert_eq!(hits.len(), admit);
+            assert_eq!(
+                (stats.postings_row, stats.postings_bulk),
+                (expect_row, expect_bulk),
+                "s = {admit}: {stats:?}"
+            );
+            assert_eq!(
+                stats.postings_skipped, 1,
+                "cluster 1 admits nothing: {stats:?}"
+            );
+            assert_prune_counters_match(&stats, &bulk_stats);
+            assert_stats_identities(&stats);
+        }
+        Ok(())
+    }
+
+    /// Fat rows in the flat run builder: with 3-block rows a 1-row hole
+    /// absorbs into the run (a 6-block merged read vs 3 + 3 separate)
+    /// while a 2-row hole splits (7 > 6) — under a flat 2-block row
+    /// pricing even the 1-row hole would have split. Forced modes stay
+    /// hit-identical throughout.
+    #[test]
+    fn flat_run_builder_prices_fat_rows() -> crate::Result<()> {
+        let dim = 3072usize;
+        let n = 6usize;
+        let labels: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+        let docs: Vec<(&str, Option<Vec<f32>>)> = (0..n)
+            .map(|i| {
+                let mut v = vec![0.0f32; dim];
+                v[0] = i as f32;
+                (labels[i].as_str(), Some(v))
+            })
+            .collect();
+        let (index, embed_field, _label) = build_flat(dim, &docs)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let stride = vec_reader.options().bytes_per_vector();
+        assert_eq!(stride, 12288, "3072-dim f32 stride");
+        // Identity id-map (every doc has a vector): row == doc id, so the
+        // filters below place survivors at exactly these rows.
+        assert_eq!(vec_reader.num_vectors(), n);
+        let max_doc = segment_reader.max_doc();
+        let query = vec![0.0f32; dim];
+
+        // Survivors at rows {0, 2}: the 1-row hole absorbs → one chunked
+        // read (row 1 fetched but never scored).
+        let w_gap1 = FixedDocsWeight {
+            max_doc,
+            docs: vec![0, 2],
+        };
+        let (h1, s1) =
+            run_exact_on_segment(segment_reader, embed_field, query.clone(), n, &w_gap1, None)?;
+        let (h1_pd, s1_pd) = run_exact_on_segment(
+            segment_reader,
+            embed_field,
+            query.clone(),
+            n,
+            &w_gap1,
+            Some(ForcedExactRead::PerDoc),
+        )?;
+        assert_eq!(h1, h1_pd, "gap-1 chunking must match per-doc");
+        assert_eq!(h1.len(), 2);
+        assert_eq!(
+            (s1.exact_reads_chunked, s1.exact_reads_single),
+            (1, 0),
+            "{s1:?}"
+        );
+        assert_eq!(
+            (s1_pd.exact_reads_chunked, s1_pd.exact_reads_single),
+            (0, 2)
+        );
+
+        // Survivors at rows {0, 3}: the 2-row hole splits → two single
+        // reads, per-doc-equivalent.
+        let w_gap2 = FixedDocsWeight {
+            max_doc,
+            docs: vec![0, 3],
+        };
+        let (h2, s2) =
+            run_exact_on_segment(segment_reader, embed_field, query.clone(), n, &w_gap2, None)?;
+        let (h2_pd, _) = run_exact_on_segment(
+            segment_reader,
+            embed_field,
+            query.clone(),
+            n,
+            &w_gap2,
+            Some(ForcedExactRead::PerDoc),
+        )?;
+        assert_eq!(h2, h2_pd, "gap-2 split must match per-doc");
+        assert_eq!(
+            (s2.exact_reads_chunked, s2.exact_reads_single),
+            (0, 2),
+            "{s2:?}"
+        );
+
+        // Force-merging across the 2-row hole reads more but must stay
+        // hit-identical.
+        let (h2_fc, s2_fc) = run_exact_on_segment(
+            segment_reader,
+            embed_field,
+            query,
+            n,
+            &w_gap2,
+            Some(ForcedExactRead::Chunked),
+        )?;
+        assert_eq!(h2, h2_fc, "forced chunking must match per-doc");
+        assert_eq!(
+            (s2_fc.exact_reads_chunked, s2_fc.exact_reads_single),
+            (1, 0)
+        );
         Ok(())
     }
 
