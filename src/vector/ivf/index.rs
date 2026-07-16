@@ -20,7 +20,6 @@
 //! node `c` is centroid `c` (its vector is row `c` of slot `[0]`, which is why
 //! the graph slot stores no vectors of its own).
 
-use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;
@@ -28,8 +27,8 @@ use std::ops::Range;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use super::graph::{
-    NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph,
-    Workspace,
+    Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
+    RelativeNeighborhoodGraph, Workspace,
 };
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
@@ -234,8 +233,9 @@ impl IvfIndex {
     }
 
     /// Clusters to probe for `query`, best routing score first, as
-    /// `(score, cluster)` pairs, plus the routing cost as
-    /// [`IvfSearchMetrics`] (surfaced as `ProbeStats::routing`).
+    /// [`Candidate`]s (graph node `c` *is* cluster `c`, so `Candidate::node`
+    /// is the cluster id), plus the routing cost as [`IvfSearchMetrics`]
+    /// (surfaced as `ProbeStats::routing`).
     ///
     /// With a persisted RNG this is a beam search
     /// ([`RelativeNeighborhoodGraph::search`]); without one every centroid
@@ -245,7 +245,7 @@ impl IvfIndex {
         &self,
         query: &[f32],
         limit: usize,
-    ) -> (Vec<(f32, u32)>, IvfSearchMetrics) {
+    ) -> (Vec<Candidate>, IvfSearchMetrics) {
         match &self.graph {
             Some(graph) => {
                 let mut ws = Workspace::new();
@@ -257,11 +257,7 @@ impl IvfIndex {
                         .map(|node| node as NodeId)
                         .collect()
                 };
-                let (candidates, metrics) = graph.search(&mut ws, query, &seeds, limit);
-                let ranked = candidates
-                    .into_iter()
-                    .map(|candidate| (candidate.sim.score(), candidate.node))
-                    .collect();
+                let (ranked, metrics) = graph.search(&mut ws, query, &seeds, limit);
                 (
                     ranked,
                     IvfSearchMetrics {
@@ -272,13 +268,13 @@ impl IvfIndex {
             }
             None => {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
-                let mut ranked: Vec<(f32, u32)> = (0..self.num_centroids)
-                    .map(|cluster| {
-                        let sim = arena.similarity(self.metric, self.dim, cluster as NodeId, query);
-                        (sim.score(), cluster as u32)
+                let mut ranked: Vec<Candidate> = (0..self.num_centroids)
+                    .map(|cluster| Candidate {
+                        sim: arena.similarity(self.metric, self.dim, cluster as NodeId, query),
+                        node: cluster as NodeId,
                     })
                     .collect();
-                ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+                ranked.sort_unstable_by(|a, b| b.cmp(a));
                 ranked.truncate(limit);
                 (
                     ranked,
