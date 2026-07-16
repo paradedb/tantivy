@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use common::BitSet;
 
-use super::index_reader::{read_blocks, VectorIndexReader};
+use super::index_reader::{read_blocks, VectorIndexReader, MAX_FETCH_SPAN_BYTES};
 use super::ivf::{AdaptiveProbeParams, IvfIndex};
 use super::prepared::PreparedQuery;
 use super::VectorElement;
@@ -42,6 +42,11 @@ pub struct VectorBackend<T: VectorElement> {
     /// always, in production — applies [`absorb_into_run`].
     #[cfg(test)]
     forced_exact: Option<ForcedExactRead>,
+    /// Test-only shrink of [`MAX_FETCH_SPAN_BYTES`], so span splitting is
+    /// exercisable on small fixtures. `None` — always, in production —
+    /// uses the constant.
+    #[cfg(test)]
+    forced_span_cap: Option<usize>,
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -66,6 +71,8 @@ impl<T: VectorElement> VectorBackend<T> {
             forced_fetch: None,
             #[cfg(test)]
             forced_exact: None,
+            #[cfg(test)]
+            forced_span_cap: None,
         })
     }
 
@@ -104,7 +111,8 @@ impl<T: VectorElement> VectorBackend<T> {
     /// [`absorb_into_run`] — one ranged read per run, sized to survivor
     /// density. A selective filter degrades to length-1 runs (exactly the
     /// per-doc reads this replaced); a dense one coalesces consecutive
-    /// rows into few large reads. Fills only the `exact_reads_*` stats.
+    /// rows into [`MAX_FETCH_SPAN_BYTES`]-bounded reads. Fills only the
+    /// `exact_reads_*` stats.
     fn exact_top_n(
         &self,
         weight: &dyn Weight,
@@ -220,7 +228,18 @@ impl<T: VectorElement> VectorBackend<T> {
                 ForcedExactRead::Chunked => true,
             };
         }
-        absorb_into_run(first_row, last_row, next_row, stride)
+        absorb_into_run(first_row, last_row, next_row, stride, self.fetch_span_cap())
+    }
+
+    /// The span ceiling one posting-tier ranged read may cover —
+    /// [`MAX_FETCH_SPAN_BYTES`], shrinkable in tests so splitting is
+    /// exercisable on small fixtures.
+    fn fetch_span_cap(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cap) = self.forced_span_cap {
+            return cap;
+        }
+        MAX_FETCH_SPAN_BYTES
     }
 }
 
@@ -352,7 +371,7 @@ enum ForcedExactRead {
     /// pre-chunking per-doc baseline.
     PerDoc,
     /// Always absorb — one run from the first survivor to the last,
-    /// regardless of hole cost.
+    /// regardless of hole cost or span cap.
     Chunked,
 }
 
@@ -399,29 +418,33 @@ const fn row_fetch_is_cheaper(survivors: usize, cluster_rows: usize, stride: usi
 }
 
 /// The flat/exact path's greedy run rule: absorb `next_row` into the
-/// current run `[first_row, last_row]` iff one merged ranged read over the
-/// grown span costs no more block touches than reading the run as it
-/// stands plus the newcomer separately:
+/// current run `[first_row, last_row]` iff the merged span stays within
+/// `span_cap` (in production [`MAX_FETCH_SPAN_BYTES`]) AND one merged
+/// ranged read over the grown span costs no more block touches than
+/// reading the run as it stands plus the newcomer separately:
 ///
-/// `read_blocks((next - first + 1) * stride) <= read_blocks((last - first + 1) * stride) +
-/// per_row_blocks(stride)`
+/// `(next - first + 1) * stride <= span_cap && read_blocks((next - first + 1) * stride) <=
+/// read_blocks((last - first + 1) * stride) + per_row_blocks(stride)`
 ///
 /// Rows inside the grown span that belong to no survivor (filtered,
 /// deleted, or vectorless docs between them) are fetched but never scored
-/// — that is exactly the trade this inequality prices: the hole's bytes
-/// must cost no more block touches than a separate read for the newcomer
-/// would. Adjacent survivors always absorb (the span grows by strictly
-/// fewer blocks than a separate read); a run of length 1 reads exactly
-/// the bytes a per-doc read would, so sparse filters degrade to the
-/// pre-chunking behavior by construction.
+/// — that is exactly the trade the block inequality prices: the hole's
+/// bytes must cost no more block touches than a separate read for the
+/// newcomer would. Adjacent survivors always absorb until the cap (the
+/// span grows by strictly fewer blocks than a separate read), so a dense
+/// filter produces `ceil(span / span_cap)` sequential ranged reads; a run
+/// of length 1 reads exactly the bytes a per-doc read would, so sparse
+/// filters degrade to the pre-chunking behavior by construction.
 const fn absorb_into_run(
     first_row: usize,
     last_row: usize,
     next_row: usize,
     stride: usize,
+    span_cap: usize,
 ) -> bool {
-    read_blocks((next_row - first_row + 1) * stride)
-        <= read_blocks((last_row - first_row + 1) * stride) + per_row_blocks(stride)
+    (next_row - first_row + 1) * stride <= span_cap
+        && read_blocks((next_row - first_row + 1) * stride)
+            <= read_blocks((last_row - first_row + 1) * stride) + per_row_blocks(stride)
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -606,8 +629,13 @@ impl<T: VectorElement> VectorBackend<T> {
             // scored. Gate order, the `seen` marking point, and every
             // prune counter are exactly the fetch-then-gate scan's; only
             // the byte fetch moved.
-            let (v, pf, pd, ps) =
-                self.collect_cluster_survivors(rows, filter, alive, &mut seen, &mut survivors);
+            let (v, pf, pd, ps) = self.collect_cluster_survivors(
+                rows.clone(),
+                filter,
+                alive,
+                &mut seen,
+                &mut survivors,
+            );
             visited += v;
             pruned_filter += pf;
             pruned_dead += pd;
@@ -624,14 +652,11 @@ impl<T: VectorElement> VectorBackend<T> {
                 }
                 FetchMode::Bulk => {
                     postings_bulk += 1;
-                    // One contiguous ranged read for the whole cluster —
+                    // Contiguous ranged reads over the cluster's rows,
+                    // split into spans of at most `MAX_FETCH_SPAN_BYTES` —
                     // under a copying `Directory`, only this cluster's
-                    // bytes are materialized.
-                    let cluster_vec_bytes = self.reader.cluster_vector_bytes(cluster)?;
-                    for &Survivor { local_i, doc, .. } in &survivors {
-                        let vbytes = &cluster_vec_bytes[local_i * stride..(local_i + 1) * stride];
-                        topn.push_unordered(self.query.score_doc_bytes(vbytes), doc);
-                    }
+                    // bytes are materialized, at most one span at a time.
+                    self.score_cluster_bulk(rows, stride, &survivors, &mut topn)?;
                 }
             }
             candidates += survivors.len();
@@ -696,6 +721,39 @@ impl<T: VectorElement> VectorBackend<T> {
             survivors.push(Survivor { local_i, row, doc });
         }
         (visited, pruned_filter, pruned_dead, pruned_seen)
+    }
+
+    /// Bulk-score one cluster: its rows are read as cap-aligned windows
+    /// of at most [`MAX_FETCH_SPAN_BYTES`] (`ceil(cluster_bytes / cap)`
+    /// windows for a full cluster), and each survivor is scored from the
+    /// sub-slice of the window it falls in, `local_i` rebased to the
+    /// window's start. Windows holding no survivor are never read.
+    /// Clusters within the cap keep their single whole-cluster read.
+    fn score_cluster_bulk(
+        &self,
+        rows: Range<usize>,
+        stride: usize,
+        survivors: &[Survivor],
+        topn: &mut TopNComputer<Score, DocId, NaturalComparator>,
+    ) -> crate::Result<()> {
+        // A row is scored from contiguous bytes, so a single row wider
+        // than the cap is still read whole.
+        let rows_per_read = (self.fetch_span_cap() / stride).max(1);
+        let mut i = 0;
+        while i < survivors.len() {
+            let window_ord = survivors[i].local_i / rows_per_read;
+            let win_start = rows.start + window_ord * rows_per_read;
+            let win_end = rows.end.min(win_start + rows_per_read);
+            let bytes = self.reader.vector_bytes_for_rows(win_start..win_end)?;
+            while i < survivors.len() && survivors[i].local_i / rows_per_read == window_ord {
+                let Survivor { local_i, doc, .. } = survivors[i];
+                let off = local_i - window_ord * rows_per_read;
+                let vbytes = &bytes[off * stride..(off + 1) * stride];
+                topn.push_unordered(self.query.score_doc_bytes(vbytes), doc);
+                i += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Per-cluster posting-fetch dispatch from the pre-pass survivor
@@ -2592,6 +2650,32 @@ mod tests {
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
+        run_top_n_capped(
+            segment_reader,
+            embed_field,
+            query,
+            k,
+            params,
+            weight,
+            forced_fetch,
+            None,
+        )
+    }
+
+    /// [`run_top_n_forced`] against a caller-held segment reader — so one
+    /// `VectorIndexReader`'s test counters span several runs — with an
+    /// optional [`VectorBackend::forced_span_cap`] shrink.
+    #[allow(clippy::too_many_arguments)]
+    fn run_top_n_capped(
+        segment_reader: &SegmentReader,
+        embed_field: Field,
+        query: Vec<f32>,
+        k: usize,
+        params: AdaptiveProbeParams,
+        weight: &dyn Weight,
+        forced_fetch: Option<ForcedFetch>,
+        forced_span_cap: Option<usize>,
+    ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let mut backend = VectorBackend::<f32>::for_segment(
             segment_reader,
             0,
@@ -2600,6 +2684,7 @@ mod tests {
             params,
         )?;
         backend.forced_fetch = forced_fetch;
+        backend.forced_span_cap = forced_span_cap;
         assert!(
             segment_reader.vector_index(embed_field)?.index().is_some(),
             "expected IVF storage"
@@ -2684,6 +2769,28 @@ mod tests {
         weight: &dyn Weight,
         forced_exact: Option<ForcedExactRead>,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+        run_exact_capped(
+            segment_reader,
+            embed_field,
+            query,
+            k,
+            weight,
+            forced_exact,
+            None,
+        )
+    }
+
+    /// [`run_exact_on_segment`] with an optional
+    /// [`VectorBackend::forced_span_cap`] shrink.
+    fn run_exact_capped(
+        segment_reader: &SegmentReader,
+        embed_field: Field,
+        query: Vec<f32>,
+        k: usize,
+        weight: &dyn Weight,
+        forced_exact: Option<ForcedExactRead>,
+        forced_span_cap: Option<usize>,
+    ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let mut backend = VectorBackend::<f32>::for_segment(
             segment_reader,
             0,
@@ -2692,6 +2799,7 @@ mod tests {
             AdaptiveProbeParams::default(),
         )?;
         backend.forced_exact = forced_exact;
+        backend.forced_span_cap = forced_span_cap;
         assert!(
             segment_reader.vector_index(embed_field)?.index().is_none(),
             "expected flat storage"
@@ -2857,15 +2965,27 @@ mod tests {
         // = 36864 B → 5 + 1 = 6 blocks, vs 3 + 3 for run-plus-separate),
         // a 2-row hole splits (49152 B → 6 + 1 = 7 > 6). Flat 2-block row
         // pricing would have split even the 1-row hole (6 > 3 + 2).
-        assert!(absorb_into_run(0, 0, 2, 12288));
-        assert!(!absorb_into_run(0, 0, 3, 12288));
+        let cap = MAX_FETCH_SPAN_BYTES;
+        assert!(absorb_into_run(0, 0, 2, 12288, cap));
+        assert!(!absorb_into_run(0, 0, 3, 12288, cap));
         // Adjacent survivors always absorb, at any stride.
-        assert!(absorb_into_run(0, 0, 1, 8));
-        assert!(absorb_into_run(0, 0, 1, 12288));
+        assert!(absorb_into_run(0, 0, 1, 8, cap));
+        assert!(absorb_into_run(0, 0, 1, 12288, cap));
         // Thin rows absorb holes generously: 8 B rows pack 1024 per
         // block, so the gap only splits past ~2 blocks' worth of rows.
-        assert!(absorb_into_run(0, 0, 3071, 8));
-        assert!(!absorb_into_run(0, 0, 3072, 8));
+        assert!(absorb_into_run(0, 0, 3071, 8, cap));
+        assert!(!absorb_into_run(0, 0, 3072, 8, cap));
+
+        // The span-cap conjunct refuses growth past the cap even where
+        // the block inequality would happily absorb: with a 32 B cap and
+        // 8 B rows, a 4-row span (32 B) is the ceiling and a 5th adjacent
+        // row must start a new run.
+        assert!(absorb_into_run(0, 2, 3, 8, 32));
+        assert!(!absorb_into_run(0, 3, 4, 8, 32));
+        // The production cap splits adjacent fat rows at
+        // floor(1 MiB / 12288) = 85 rows per run.
+        assert!(absorb_into_run(0, 83, 84, 12288, cap));
+        assert!(!absorb_into_run(0, 84, 85, 12288, cap));
     }
 
     /// Result equivalence across filter selectivities: on the replicated
@@ -3619,6 +3739,221 @@ mod tests {
         assert_eq!(
             (s2_fc.exact_reads_chunked, s2_fc.exact_reads_single),
             (1, 0)
+        );
+        Ok(())
+    }
+
+    /// A dense filter whose adjacent survivors span more than the fetch
+    /// cap splits into exactly `ceil(span / cap)` sequential chunked
+    /// reads, none larger than the cap, with hits and scores identical to
+    /// per-doc reads. Uses a shrunken test cap (256 B over 8 B rows → 32
+    /// rows per read) so a 100-doc fixture exercises the split.
+    #[test]
+    fn flat_dense_filter_splits_at_span_cap() -> crate::Result<()> {
+        let n = 100usize;
+        let labels: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+        let docs: Vec<(&str, Option<Vec<f32>>)> = (0..n)
+            .map(|i| (labels[i].as_str(), Some(vec![i as f32 * 0.1, 1.0])))
+            .collect();
+        let (index, embed_field, _label) = build_flat(2, &docs)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let stride = vec_reader.options().bytes_per_vector();
+        assert_eq!(stride, 8);
+        let cap = 256usize;
+
+        let max_doc = segment_reader.max_doc();
+        let weight = FixedDocsWeight {
+            max_doc,
+            docs: (0..max_doc).collect(),
+        };
+        let query = vec![0.0f32, 0.0];
+        let (hits, stats) = run_exact_capped(
+            segment_reader,
+            embed_field,
+            query.clone(),
+            n,
+            &weight,
+            None,
+            Some(cap),
+        )?;
+        // No single read may exceed the cap (the per-doc baseline's 8 B
+        // reads can't raise this afterwards).
+        assert!(
+            vec_reader.max_read_bytes() <= cap,
+            "peak read {} must stay within the cap {cap}",
+            vec_reader.max_read_bytes()
+        );
+        let (pd_hits, pd_stats) = run_exact_capped(
+            segment_reader,
+            embed_field,
+            query,
+            n,
+            &weight,
+            Some(ForcedExactRead::PerDoc),
+            Some(cap),
+        )?;
+
+        assert_eq!(hits, pd_hits, "capped chunking must match per-doc");
+        assert_eq!(hits.len(), n);
+        let span = n * stride;
+        assert_eq!(
+            stats.exact_reads_chunked,
+            span.div_ceil(cap),
+            "dense adjacent survivors split into ceil(span/cap) reads: {stats:?}"
+        );
+        assert_eq!(stats.exact_reads_single, 0, "{stats:?}");
+        assert_eq!(
+            (pd_stats.exact_reads_chunked, pd_stats.exact_reads_single),
+            (0, n)
+        );
+        Ok(())
+    }
+
+    /// An IVF cluster whose rows exceed the fetch cap bulk-reads as
+    /// cap-sized windows: hits, scores, and every counter identical to a
+    /// forced-bulk run under the production (effectively unlimited here)
+    /// cap, `postings_bulk` still counting one per cluster — not one per
+    /// window — and no single capped read exceeding the cap.
+    #[test]
+    fn ivf_giant_cluster_reads_are_span_capped() -> crate::Result<()> {
+        const BIG: usize = 3000;
+        let centroids = vec![[0.0f32, 0.0], [50.0, 0.0]];
+        let labels: Vec<String> = (0..BIG + 4).map(|i| format!("d{i}")).collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..labels.len())
+            .map(|i| {
+                let (c, j) = if i < BIG {
+                    (centroids[0], i)
+                } else {
+                    (centroids[1], i - BIG)
+                };
+                (labels[i].as_str(), [c[0] + j as f32 * 0.001, c[1]])
+            })
+            .collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let stride = vec_reader.options().bytes_per_vector();
+        assert_eq!(vec_reader.cluster_sizes(), Some(vec![BIG as u32, 4]));
+        // 4 KiB cap over 8 B rows → 512-row windows; the cluster needs
+        // several.
+        let cap = 4096usize;
+        assert!(BIG * stride > cap, "fixture must exceed the test cap");
+        // Admitting the whole big cluster keeps the dispatch on Bulk.
+        assert!(!row_fetch_is_cheaper(BIG, BIG, stride));
+
+        let cluster0 = vec_reader.cluster_doc_ids(0).expect("ivf cluster 0");
+        let weight = FixedDocsWeight {
+            max_doc: segment_reader.max_doc(),
+            docs: cluster0,
+        };
+        let params = exhaustive_params(centroids.len());
+        let query = vec![0.0f32, 0.0];
+
+        let (capped_hits, capped_stats) = run_top_n_capped(
+            segment_reader,
+            embed_field,
+            query.clone(),
+            BIG,
+            params.clone(),
+            &weight,
+            None,
+            Some(cap),
+        )?;
+        // Assert the peak BEFORE the uncapped baseline runs on this same
+        // reader (its whole-cluster read legitimately exceeds the cap).
+        assert!(
+            vec_reader.max_read_bytes() <= cap,
+            "peak read {} must stay within the cap {cap}",
+            vec_reader.max_read_bytes()
+        );
+        let (bulk_hits, bulk_stats) = run_top_n_capped(
+            segment_reader,
+            embed_field,
+            query,
+            BIG,
+            params,
+            &weight,
+            Some(ForcedFetch::Bulk),
+            None,
+        )?;
+
+        assert_eq!(
+            capped_hits, bulk_hits,
+            "windowed bulk must be hit-identical"
+        );
+        assert_eq!(capped_hits.len(), BIG);
+        assert_eq!(
+            capped_stats.postings_bulk, 1,
+            "one bulk cluster, not one count per window: {capped_stats:?}"
+        );
+        // The forced-bulk baseline takes the bulk arm for every probed
+        // cluster by definition — both of them here.
+        assert_eq!(bulk_stats.postings_bulk, 2);
+        assert_eq!(capped_stats.postings_skipped, 1, "cluster 1 admits nothing");
+        assert_prune_counters_match(&capped_stats, &bulk_stats);
+        assert_stats_identities(&capped_stats);
+        Ok(())
+    }
+
+    /// Fat-stride span capping (12288 B rows, production 1 MiB cap): 100
+    /// adjacent fat survivors span 1.2 MiB, so the run builder splits at
+    /// floor(cap / stride) = 85 rows — ceil(span/cap) = 2 chunked reads,
+    /// per-row pricing still governing hole absorption within each run.
+    #[test]
+    fn flat_span_cap_splits_fat_rows() -> crate::Result<()> {
+        let dim = 3072usize;
+        let n = 100usize;
+        let labels: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
+        let docs: Vec<(&str, Option<Vec<f32>>)> = (0..n)
+            .map(|i| {
+                let mut v = vec![0.0f32; dim];
+                v[0] = i as f32;
+                (labels[i].as_str(), Some(v))
+            })
+            .collect();
+        let (index, embed_field, _label) = build_flat(dim, &docs)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let stride = vec_reader.options().bytes_per_vector();
+        assert_eq!(stride, 12288, "3072-dim f32 stride");
+        let span = n * stride;
+        assert!(span > MAX_FETCH_SPAN_BYTES, "fixture must exceed the cap");
+
+        let max_doc = segment_reader.max_doc();
+        let weight = FixedDocsWeight {
+            max_doc,
+            docs: (0..max_doc).collect(),
+        };
+        let query = vec![0.0f32; dim];
+        let (hits, stats) =
+            run_exact_on_segment(segment_reader, embed_field, query.clone(), n, &weight, None)?;
+        let (pd_hits, _) = run_exact_on_segment(
+            segment_reader,
+            embed_field,
+            query,
+            n,
+            &weight,
+            Some(ForcedExactRead::PerDoc),
+        )?;
+
+        assert_eq!(hits, pd_hits, "capped fat-row chunking must match per-doc");
+        assert_eq!(hits.len(), n);
+        assert_eq!(
+            stats.exact_reads_chunked,
+            span.div_ceil(MAX_FETCH_SPAN_BYTES),
+            "production cap splits the dense fat-row span: {stats:?}"
+        );
+        assert_eq!(stats.exact_reads_single, 0, "{stats:?}");
+        // Every read — the 85-row and 15-row runs, and the 12288 B
+        // per-doc baseline reads — respects the production cap.
+        assert!(
+            vec_reader.max_read_bytes() <= MAX_FETCH_SPAN_BYTES,
+            "peak read {} must stay within MAX_FETCH_SPAN_BYTES",
+            vec_reader.max_read_bytes()
         );
         Ok(())
     }

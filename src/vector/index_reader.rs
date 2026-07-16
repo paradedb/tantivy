@@ -51,6 +51,23 @@ pub(crate) const fn read_blocks(bytes: usize) -> usize {
     bytes.div_ceil(FETCH_BLOCK_BYTES) + 1
 }
 
+/// Upper bound on the span of one posting-tier ranged read — the flat
+/// path's survivor runs and the IVF bulk path's cluster reads both split
+/// at this size.
+///
+/// Amortization: a 1 MiB read spans ~128 [`FETCH_BLOCK_BYTES`] blocks, so
+/// the fixed per-read toll (the `+ 1` in [`read_blocks`]) is already
+/// under 1% — growing reads further saves only rounding error, while
+/// peak memory under a copying `Directory` keeps scaling linearly with
+/// the span. A single row wider than the cap is still read whole (a row
+/// is scored from contiguous bytes); the cap bounds multi-row spans.
+///
+/// Deliberately NOT a runtime knob: read sizing is not a tuning
+/// dimension worth a config surface. If this ever needs to adapt, derive
+/// it from `work_mem` through the query-time adaptive-params plumbing —
+/// do not add a GUC.
+pub(crate) const MAX_FETCH_SPAN_BYTES: usize = 1 << 20;
+
 /// Which on-disk layout a segment's vector data uses, surfaced through
 /// [`VectorInfo`] for tooling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +116,10 @@ pub struct VectorIndexReader {
     /// row read served by this reader, for asserting fetch-strategy wins.
     #[cfg(test)]
     read_block_touches: AtomicUsize,
+    /// Test-only: the largest single row-range read served, in bytes —
+    /// for asserting span-cap compliance.
+    #[cfg(test)]
+    max_read_bytes: AtomicUsize,
 }
 
 impl VectorIndexReader {
@@ -207,6 +228,8 @@ impl VectorIndexReader {
             index,
             #[cfg(test)]
             read_block_touches: AtomicUsize::new(0),
+            #[cfg(test)]
+            max_read_bytes: AtomicUsize::new(0),
         })
     }
 
@@ -222,6 +245,8 @@ impl VectorIndexReader {
             index: None,
             #[cfg(test)]
             read_block_touches: AtomicUsize::new(0),
+            #[cfg(test)]
+            max_read_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -340,10 +365,14 @@ impl VectorIndexReader {
         }
         let stride = self.options.bytes_per_vector();
         #[cfg(test)]
-        self.read_block_touches.fetch_add(
-            read_blocks(rows.len() * stride),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        {
+            self.read_block_touches.fetch_add(
+                read_blocks(rows.len() * stride),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.max_read_bytes
+                .fetch_max(rows.len() * stride, std::sync::atomic::Ordering::Relaxed);
+        }
         let bytes = self
             .rows_slice
             .slice(rows.start * stride..rows.end * stride)
@@ -360,8 +389,19 @@ impl VectorIndexReader {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Test-only: the largest single row-range read served by this
+    /// reader, in bytes — asserts span-cap compliance.
+    #[cfg(test)]
+    pub(crate) fn max_read_bytes(&self) -> usize {
+        self.max_read_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The raw vector rows of `cluster`, contiguous in `.vec` row order,
-    /// fetched with one ranged read. IVF storage only.
+    /// fetched with one ranged read. IVF storage only. Materializes the
+    /// whole cluster regardless of size; the probe loop instead reads
+    /// [`MAX_FETCH_SPAN_BYTES`]-bounded sub-ranges via
+    /// [`Self::vector_bytes_for_rows`].
     pub fn cluster_vector_bytes(&self, cluster: usize) -> crate::Result<OwnedBytes> {
         let Some(index) = &self.index else {
             return Err(TantivyError::InvalidArgument(
