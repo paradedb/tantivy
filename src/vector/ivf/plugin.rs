@@ -458,6 +458,7 @@ pub(crate) fn merge_ivf(
                                                 .collect();
                                             graph
                                                 .search(&mut replica_ws, v, &seeds, replicas)
+                                                .0
                                                 .into_iter()
                                                 .map(|candidate| candidate.node as usize)
                                                 .collect()

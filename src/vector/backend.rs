@@ -15,7 +15,7 @@ use std::sync::Arc;
 use common::BitSet;
 
 use super::index_reader::{read_blocks, VectorIndexReader, MAX_FETCH_SPAN_BYTES};
-use super::ivf::{AdaptiveProbeParams, IvfIndex};
+use super::ivf::{AdaptiveProbeParams, IvfIndex, IvfSearchMetrics};
 use super::prepared::PreparedQuery;
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;
@@ -314,10 +314,10 @@ pub struct ProbeStats {
     /// row — byte-identical to the pre-chunking per-doc read. Filled only
     /// by the exact (non-IVF) path; counts reads, not rows.
     pub exact_reads_single: usize,
-    /// Centroids scored to route this query (the navigation cost):
-    /// `num_centroids` on the exact path, the beam-visited count when routed
-    /// via the RNG.
-    pub centroids_ranked: usize,
+    /// Routing cost of ranking the clusters to probe: centroids scored
+    /// (`routing.visited_count`), plus the centroid-graph beam counters when
+    /// routing went through the RNG. See [`IvfSearchMetrics`].
+    pub routing: IvfSearchMetrics,
     /// The resolved survivor floor the gate used for this query.
     pub min_candidates: usize,
     /// How the probe loop terminated. Per-segment; does not sum.
@@ -495,8 +495,7 @@ impl<T: VectorElement> VectorBackend<T> {
 
         // Asking for one candidate past the ceiling keeps the `Ceiling`
         // termination attribution meaningful.
-        let (ranked, centroids_ranked) =
-            self.rank_clusters(index, max_probe_count.saturating_add(1));
+        let (ranked, routing) = self.rank_clusters(index, max_probe_count.saturating_add(1));
         if ranked.is_empty() {
             return Ok(Vec::new());
         }
@@ -511,7 +510,7 @@ impl<T: VectorElement> VectorBackend<T> {
             .max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n);
 
         if let Some(s) = stats.as_deref_mut() {
-            s.centroids_ranked = centroids_ranked;
+            s.routing = routing;
             s.min_candidates = min_candidates;
         }
 
@@ -538,12 +537,12 @@ impl<T: VectorElement> VectorBackend<T> {
     }
 
     /// Phase 1: rank the clusters to probe, best routing score first, plus
-    /// the number of centroids scored to do it. Delegates to
+    /// the routing cost as [`IvfSearchMetrics`]. Delegates to
     /// [`IvfIndex::rank_clusters`]; routing operates in `f32` (centroid rows
     /// are `f32` today), so the query is widened losslessly per element.
     /// `#[inline(never)]` so it forms its own flamegraph frame.
     #[inline(never)]
-    fn rank_clusters(&self, index: &IvfIndex, limit: usize) -> (Vec<(f32, u32)>, usize) {
+    fn rank_clusters(&self, index: &IvfIndex, limit: usize) -> (Vec<(f32, u32)>, IvfSearchMetrics) {
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
         index.rank_clusters(&query_f32, limit)
     }
@@ -2187,7 +2186,7 @@ mod tests {
             "visited must equal filter+dead+seen+scored ({stats:?})"
         );
         // Navigation cost == the centroids ranked for this query.
-        assert_eq!(stats.centroids_ranked, DEFAULT_NUM_CENTROIDS);
+        assert_eq!(stats.routing.visited_count, DEFAULT_NUM_CENTROIDS);
         // Exhaustive params (unclamped ceiling, unsatisfiable floor)
         // drain the ranked list.
         assert_eq!(stats.termination, ProbeTermination::Exhausted);
@@ -2232,7 +2231,7 @@ mod tests {
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
         // Stopped at exactly the cap, short of the ranked list.
         assert_eq!(stats.probed_clusters.len(), 1);
-        assert_eq!(stats.centroids_ranked, centroids.len());
+        assert_eq!(stats.routing.visited_count, centroids.len());
         assert_eq!(
             stats.vectors_visited,
             stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
@@ -2273,7 +2272,7 @@ mod tests {
         )?;
         assert_eq!(hits, expected, "linear fallback must match the oracle");
         assert_eq!(stats.probed_clusters, vec![0], "one cluster, one probe");
-        assert_eq!(stats.centroids_ranked, 1);
+        assert_eq!(stats.routing.visited_count, 1);
         Ok(())
     }
 
@@ -2331,7 +2330,7 @@ mod tests {
                 stats.probed_clusters
             );
             assert!(
-                stats.centroids_ranked <= centroids.len(),
+                stats.routing.visited_count <= centroids.len(),
                 "navigation cost is the beam-visited count"
             );
         }
