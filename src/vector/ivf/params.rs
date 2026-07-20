@@ -4,11 +4,18 @@
 ///
 /// Stop condition, evaluated for the NEXT ranked centroid between
 /// clusters — so the first cluster is always scanned: stop at the
-/// absolute probe-count ceiling, OR once the `min_candidates` floor is
+/// probe-budget ceiling, OR once the `min_candidates` floor is
 /// met AND the next centroid breaches the per-metric distance-ratio
 /// gate (SPANN eq. 3). The ceiling is checked first — the
 /// [`ProbeTermination`](crate::vector::ProbeTermination) attribution
 /// contract.
+///
+/// The ceiling is measured in filter-effective clusters, not raw
+/// clusters: a probed cluster consumes budget equal to the fraction of
+/// its rows that pass the filter (all-filtered ⇒ 0, half-filtered ⇒
+/// 0.5, unfiltered ⇒ 1.0). A selective filter therefore probes deeper
+/// into the ranked list before the ceiling binds, since the clusters it
+/// skips over cost almost nothing.
 ///
 /// All defaults are provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
@@ -24,10 +31,12 @@ pub struct AdaptiveProbeParams {
     /// `min_candidates.max(4 * top_n)`, so a 0 default still gives a
     /// sane `4 × top_n` floor.
     pub min_candidates: usize,
-    /// Absolute cluster ceiling, clamped to the segment's cluster count
-    /// — segments with `C <= cap` scan exhaustively unless the gate
-    /// stops earlier. SPANN Fig. 2: 99% of SIFT1M queries reach perfect
-    /// recall@1 within 114 postings; 128 clears that. Default 128,
+    /// Filter-effective cluster ceiling, clamped to the segment's cluster
+    /// count. Each probed cluster consumes budget equal to its filter
+    /// pass rate (`(rows - filtered) / rows`), so an unfiltered query
+    /// probes at most this many clusters while a selective filter probes
+    /// proportionally more. SPANN Fig. 2: 99% of SIFT1M queries reach
+    /// perfect recall@1 within 114 postings; 128 clears that. Default 128,
     /// PROVISIONAL.
     pub max_probe_count: usize,
 }

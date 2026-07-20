@@ -256,7 +256,10 @@ fn tally_run(len: usize, chunked: &mut usize, single: &mut usize) {
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ProbeTermination {
-    /// `probe_count >= max_probe_count` — the absolute probe ceiling.
+    /// The filter-effective probe budget reached `max_probe_count` — the
+    /// probe ceiling. Each probed cluster charges its filter pass rate, so
+    /// this bounds unfiltered clusters probed but lets a selective filter
+    /// walk deeper.
     Ceiling,
     /// The distance-ratio gate fired with the survivor floor met.
     Gate,
@@ -493,10 +496,12 @@ impl<T: VectorElement> VectorBackend<T> {
         }
         let max_probe_count = self.adaptive.resolved_probe_ceiling(num_centroids)?;
 
-        // Asking for one candidate past the ceiling keeps the `Ceiling`
-        // termination attribution meaningful.
-        let (ranked, centroids_ranked) =
-            self.rank_clusters(index, max_probe_count.saturating_add(1));
+        // Rank every cluster: with the filter-effective budget below, a
+        // selective filter can probe far past `max_probe_count` raw
+        // clusters (each skipped cluster costs ~0 budget), so the loop
+        // needs the full ranked list to walk into. Unfiltered queries
+        // still stop at `max_probe_count` clusters via the budget.
+        let (ranked, centroids_ranked) = self.rank_clusters(index, num_centroids);
         if ranked.is_empty() {
             return Ok(Vec::new());
         }
@@ -602,9 +607,15 @@ impl<T: VectorElement> VectorBackend<T> {
         // The probed cluster's gate survivors; allocated once, reused
         // across clusters.
         let mut survivors: Vec<Survivor> = Vec::new();
+        // Filter-effective probe budget: each probed cluster adds its
+        // filter pass rate (`(rows - pruned_filter) / rows`), so an
+        // all-filtered cluster costs ~0 and a selective filter walks
+        // deeper before the ceiling binds.
+        let mut probe_budget = 0.0f32;
+        let max_probe_budget = max_probe_count as f32;
 
-        for (probe_count, (centroid_score, cluster)) in ranked.into_iter().enumerate() {
-            if probe_count >= max_probe_count {
+        for (centroid_score, cluster) in ranked.into_iter() {
+            if probe_budget >= max_probe_budget {
                 termination = ProbeTermination::Ceiling;
                 break;
             }
@@ -640,6 +651,14 @@ impl<T: VectorElement> VectorBackend<T> {
             pruned_filter += pf;
             pruned_dead += pd;
             pruned_seen += ps;
+
+            // Charge the ceiling by the fraction of rows that passed the
+            // filter — dead/already-seen rows still count as "probed work"
+            // and keep their full weight, so an unfiltered query bills 1.0
+            // per cluster exactly as before. An empty cluster bills 0.
+            if num_rows > 0 {
+                probe_budget += (num_rows - pf) as f32 / num_rows as f32;
+            }
 
             match self.fetch_mode(survivors.len(), num_rows, stride) {
                 FetchMode::Skip => postings_skipped += 1,
@@ -2420,9 +2439,12 @@ mod tests {
     // ceiling), an inequality otherwise.
     // ============================================================
 
-    /// A cap of 2 on the 9-centroid fixture ⇒ the loop probes exactly
-    /// the cap and attributes the stop to the ceiling, regardless of
-    /// how generous the other knobs are.
+    /// A cap of 2 on the 9-centroid fixture ⇒ the loop consumes exactly
+    /// the cap in filter-effective budget and attributes the stop to the
+    /// ceiling, regardless of how generous the other knobs are. With an
+    /// `AllQuery` filter every non-empty probed cluster bills a full 1.0,
+    /// so the ceiling binds at exactly 2 non-empty clusters — empty
+    /// clusters interleaved in the ranked list bill 0 and don't count.
     #[test]
     fn probe_stats_max_probe_count_ceiling() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
@@ -2446,11 +2468,91 @@ mod tests {
             params,
         )?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
+
+        let searcher = index.index.reader()?.searcher();
+        let sizes = searcher.segment_readers()[0]
+            .vector_index(index.embedding_field())?
+            .cluster_sizes()
+            .expect("ivf segment exposes cluster sizes");
+        let non_empty_probed = stats
+            .probed_clusters
+            .iter()
+            .filter(|&&c| sizes[c] > 0)
+            .count();
         assert_eq!(
-            stats.probed_clusters.len(),
-            2,
-            "absolute cap ⇒ exactly 2 probed, got {:?}",
+            non_empty_probed, 2,
+            "cap ⇒ exactly 2 non-empty (filter-effective) clusters probed, got {:?}",
             stats.probed_clusters,
+        );
+        Ok(())
+    }
+
+    /// Filter-effective ceiling: a selective filter probes proportionally
+    /// deeper than the same cap unfiltered. On a uniform 6-cluster fixture
+    /// (6 rows each, replicas = 1) with a cap of 2 and the gate disabled,
+    /// an all-admitting filter bills 1.0 per cluster and stops at 2 probed;
+    /// a filter admitting half of every cluster bills 0.5 each and walks to
+    /// 4 before the same budget binds.
+    #[test]
+    fn probe_ceiling_scales_with_filter_selectivity() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+
+        let searcher = index.reader()?.searcher();
+        let seg = &searcher.segment_readers()[0];
+        let vr = seg.vector_index(embed_field)?;
+        let num_clusters = vr.index().expect("ivf segment").num_clusters();
+        let sizes = vr.cluster_sizes().expect("ivf sizes");
+        let max_doc = seg.max_doc();
+
+        // Per-cluster doc ids, so we can admit exactly half of each cluster
+        // regardless of the merge's doc-id permutation.
+        let mut all = Vec::new();
+        let mut half = Vec::new();
+        for c in 0..num_clusters {
+            let ids = vr.cluster_doc_ids(c).expect("cluster doc ids");
+            let take = ids.len() / 2;
+            half.extend(ids.iter().copied().take(take));
+            all.extend(ids);
+        }
+
+        let params = AdaptiveProbeParams {
+            epsilon: 0.0,
+            min_candidates: usize::MAX, // disable the gate — only the ceiling stops us
+            max_probe_count: 2,
+        };
+        let query = vec![10.0_f32, 10.0];
+        let non_empty = |stats: &ProbeStats| {
+            stats
+                .probed_clusters
+                .iter()
+                .filter(|&&c| sizes[c] > 0)
+                .count()
+        };
+
+        let all_w = FixedDocsWeight { max_doc, docs: all };
+        let (_, all_stats) = run_top_n_forced(
+            &index,
+            embed_field,
+            query.clone(),
+            docs.len(),
+            params.clone(),
+            &all_w,
+            None,
+        )?;
+        assert_eq!(all_stats.termination, ProbeTermination::Ceiling);
+        assert_eq!(non_empty(&all_stats), 2, "unfiltered: cap 2 ⇒ 2 clusters");
+
+        let half_w = FixedDocsWeight { max_doc, docs: half };
+        let (_, half_stats) =
+            run_top_n_forced(&index, embed_field, query, docs.len(), params, &half_w, None)?;
+        assert_eq!(half_stats.termination, ProbeTermination::Ceiling);
+        assert_eq!(
+            non_empty(&half_stats),
+            4,
+            "50% filter: cap 2 ⇒ 4 clusters at 0.5 budget each, got {:?}",
+            half_stats.probed_clusters,
         );
         Ok(())
     }
