@@ -11,11 +11,12 @@
 /// contract.
 ///
 /// The ceiling is measured in filter-effective clusters, not raw
-/// clusters: a probed cluster consumes budget equal to the fraction of
-/// its rows that pass the filter (all-filtered ⇒ 0, half-filtered ⇒
-/// 0.5, unfiltered ⇒ 1.0). A selective filter therefore probes deeper
-/// into the ranked list before the ceiling binds, since the clusters it
-/// skips over cost almost nothing.
+/// clusters: a probed cluster consumes budget on an affine map of its
+/// filter pass rate — `SKIPPED_CLUSTER_COST` (a small floor, since the
+/// gate pre-pass still scans the cluster) when all rows are filtered,
+/// `1.0` when none are, in between otherwise. A selective filter
+/// therefore probes deeper into the ranked list before the ceiling
+/// binds, since the clusters it skips over cost little (but not nothing).
 ///
 /// All defaults are provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]

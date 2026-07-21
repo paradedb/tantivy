@@ -339,6 +339,17 @@ pub struct ProbeStats {
 /// adaptive defaults once real benchmarks land.
 pub(crate) const CANDIDATE_OVERFETCH_MULTIPLIER: usize = 4;
 
+/// The fixed cost a probed cluster charges the probe-count ceiling even
+/// when the filter skips every one of its rows — the gate pre-pass still
+/// scans the cluster's ids against the filter bitmap. A cluster bills
+/// `SKIPPED_CLUSTER_COST + (1 - SKIPPED_CLUSTER_COST) * pass_fraction`,
+/// an affine map of its filter pass rate: fully filtered ⇒ this floor,
+/// fully unfiltered ⇒ 1.0, partial ⇒ in between. Without it a heavily
+/// filtered cluster billed ≈0, so a selective filter could sweep the
+/// whole ranked list "for free"; this reflects that opening/scanning
+/// each cluster is not actually free. Provisional.
+pub(crate) const SKIPPED_CLUSTER_COST: f32 = 0.05;
+
 /// How a probed cluster's posting bytes get fetched, decided per cluster
 /// from the gate pre-pass's survivor count (see
 /// [`VectorBackend::fetch_mode`]).
@@ -652,12 +663,15 @@ impl<T: VectorElement> VectorBackend<T> {
             pruned_dead += pd;
             pruned_seen += ps;
 
-            // Charge the ceiling by the fraction of rows that passed the
-            // filter — dead/already-seen rows still count as "probed work"
-            // and keep their full weight, so an unfiltered query bills 1.0
-            // per cluster exactly as before. An empty cluster bills 0.
+            // Charge the ceiling on an affine map of the cluster's filter
+            // pass rate: SKIPPED_CLUSTER_COST when everything was filtered
+            // (the gate pre-pass still scanned it), 1.0 when nothing was,
+            // in between otherwise. Dead/already-seen rows keep their full
+            // weight (only `pf` is discounted), so an unfiltered query
+            // bills 1.0 per cluster. An empty cluster bills 0.
             if num_rows > 0 {
-                probe_budget += (num_rows - pf) as f32 / num_rows as f32;
+                let pass_fraction = (num_rows - pf) as f32 / num_rows as f32;
+                probe_budget += SKIPPED_CLUSTER_COST + (1.0 - SKIPPED_CLUSTER_COST) * pass_fraction;
             }
 
             match self.fetch_mode(survivors.len(), num_rows, stride) {
