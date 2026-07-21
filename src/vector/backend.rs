@@ -257,9 +257,7 @@ fn tally_run(len: usize, chunked: &mut usize, single: &mut usize) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ProbeTermination {
     /// The filter-effective probe budget reached `max_probe_count` — the
-    /// probe ceiling. Each probed cluster charges its filter pass rate, so
-    /// this bounds unfiltered clusters probed but lets a selective filter
-    /// walk deeper.
+    /// probe ceiling.
     Ceiling,
     /// The distance-ratio gate fired with the survivor floor met.
     Gate,
@@ -339,15 +337,10 @@ pub struct ProbeStats {
 /// adaptive defaults once real benchmarks land.
 pub(crate) const CANDIDATE_OVERFETCH_MULTIPLIER: usize = 4;
 
-/// The fixed cost a probed cluster charges the probe-count ceiling even
-/// when the filter skips every one of its rows — the gate pre-pass still
-/// scans the cluster's ids against the filter bitmap. A cluster bills
-/// `SKIPPED_CLUSTER_COST + (1 - SKIPPED_CLUSTER_COST) * pass_fraction`,
-/// an affine map of its filter pass rate: fully filtered ⇒ this floor,
-/// fully unfiltered ⇒ 1.0, partial ⇒ in between. Without it a heavily
-/// filtered cluster billed ≈0, so a selective filter could sweep the
-/// whole ranked list "for free"; this reflects that opening/scanning
-/// each cluster is not actually free. Provisional.
+/// Floor a probed cluster charges the ceiling even when the filter skips
+/// all its rows (the gate pre-pass still scans them). A cluster bills
+/// `SKIPPED_CLUSTER_COST + (1 - SKIPPED_CLUSTER_COST) * pass_fraction`:
+/// 0.05 fully filtered, 1.0 unfiltered. Provisional.
 pub(crate) const SKIPPED_CLUSTER_COST: f32 = 0.05;
 
 /// How a probed cluster's posting bytes get fetched, decided per cluster
@@ -618,10 +611,6 @@ impl<T: VectorElement> VectorBackend<T> {
         // The probed cluster's gate survivors; allocated once, reused
         // across clusters.
         let mut survivors: Vec<Survivor> = Vec::new();
-        // Filter-effective probe budget: each probed cluster adds its
-        // filter pass rate (`(rows - pruned_filter) / rows`), so an
-        // all-filtered cluster costs ~0 and a selective filter walks
-        // deeper before the ceiling binds.
         let mut probe_budget = 0.0f32;
         let max_probe_budget = max_probe_count as f32;
 
@@ -663,12 +652,6 @@ impl<T: VectorElement> VectorBackend<T> {
             pruned_dead += pd;
             pruned_seen += ps;
 
-            // Charge the ceiling on an affine map of the cluster's filter
-            // pass rate: SKIPPED_CLUSTER_COST when everything was filtered
-            // (the gate pre-pass still scanned it), 1.0 when nothing was,
-            // in between otherwise. Dead/already-seen rows keep their full
-            // weight (only `pf` is discounted), so an unfiltered query
-            // bills 1.0 per cluster. An empty cluster bills 0.
             if num_rows > 0 {
                 let pass_fraction = (num_rows - pf) as f32 / num_rows as f32;
                 probe_budget += SKIPPED_CLUSTER_COST + (1.0 - SKIPPED_CLUSTER_COST) * pass_fraction;
