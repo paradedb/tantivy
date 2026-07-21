@@ -17,7 +17,8 @@ pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, SearchTerminationReason, Workspace,
+    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
+    Workspace,
 };
 pub use index::{IvfIndex, IvfSearchMetrics};
 pub use params::AdaptiveProbeParams;

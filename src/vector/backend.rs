@@ -17,7 +17,7 @@ use common::BitSet;
 
 use super::distance::Similarity;
 use super::index_reader::VectorIndexReader;
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics};
+use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
 use super::prepared::PreparedQuery;
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;
@@ -203,7 +203,9 @@ pub struct ProbeStats {
     pub exact_rows_read: usize,
     /// Routing cost of ranking the clusters to probe: centroids scored
     /// (`routing.visited_count`), plus the centroid-graph beam counters when
-    /// routing went through the RNG. See [`IvfSearchMetrics`].
+    /// routing went through the RNG. Ranking is lazy, so this covers only as
+    /// much routing as the probe loop actually pulled. See
+    /// [`IvfSearchMetrics`].
     pub routing: IvfSearchMetrics,
     /// The resolved survivor floor the gate used for this query.
     pub min_candidates: usize,
@@ -276,17 +278,21 @@ impl<T: VectorElement> VectorBackend<T> {
         }
         let max_probe_count = self.adaptive.resolved_probe_ceiling(num_centroids)?;
 
-        // Asking for one candidate past the ceiling keeps the `Ceiling`
-        // termination attribution meaningful.
-        let (ranked, routing) = self.rank_clusters(index, max_probe_count.saturating_add(1));
-        if ranked.is_empty() {
-            return Ok(Vec::new());
-        }
+        // Phase 1: rank the clusters to probe, lazily — the scan below pulls
+        // ranked clusters on demand, so routing cost is paid only as far as
+        // probing actually reaches. Routing operates in `f32` (centroid rows
+        // are `f32` today), so the query is widened losslessly per element.
+        let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
+        let mut routing_ws = Workspace::new();
+        let mut ranked = index.rank_clusters(&mut routing_ws, &query_f32);
 
-        let best = ranked[0].sim.score();
+        // The best-routed cluster anchors the distance-ratio gate.
+        let Some(best) = ranked.next() else {
+            return Ok(Vec::new());
+        };
         let threshold = Similarity::new(adaptive_threshold(
             self.query.metric(),
-            best,
+            best.sim.score(),
             self.adaptive.epsilon,
         ));
         // Without this floor, a selective filter can trip the threshold gate
@@ -297,13 +303,12 @@ impl<T: VectorElement> VectorBackend<T> {
             .max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n);
 
         if let Some(s) = stats.as_deref_mut() {
-            s.routing = routing;
             s.min_candidates = min_candidates;
         }
 
         let topn = self.scan_clusters(
             index,
-            ranked,
+            std::iter::once(best).chain(&mut ranked),
             threshold,
             min_candidates,
             max_probe_count,
@@ -311,8 +316,13 @@ impl<T: VectorElement> VectorBackend<T> {
             max_doc,
             alive,
             top_n,
-            stats,
+            stats.as_deref_mut(),
         )?;
+
+        // The routing cost is only known once the scan stops pulling.
+        if let Some(s) = stats {
+            s.routing = ranked.metrics();
+        }
 
         let segment_ord = self.segment_ord;
         Ok(topn
@@ -320,17 +330,6 @@ impl<T: VectorElement> VectorBackend<T> {
             .into_iter()
             .map(|cd| (cd.sort_key, DocAddress::new(segment_ord, cd.doc)))
             .collect())
-    }
-
-    /// Phase 1: rank the clusters to probe, best routing score first, plus
-    /// the routing cost as [`IvfSearchMetrics`]. Delegates to
-    /// [`IvfIndex::rank_clusters`]; routing operates in `f32` (centroid rows
-    /// are `f32` today), so the query is widened losslessly per element.
-    /// `#[inline(never)]` so it forms its own flamegraph frame.
-    #[inline(never)]
-    fn rank_clusters(&self, index: &IvfIndex, limit: usize) -> (Vec<Candidate>, IvfSearchMetrics) {
-        let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
-        index.rank_clusters(&query_f32, limit)
     }
 
     /// Phase 2: adaptive probe loop. Each probed cluster is gated first —
@@ -346,14 +345,18 @@ impl<T: VectorElement> VectorBackend<T> {
     /// top-N *smallest* — correct for ascending-distance metrics but inverted
     /// for our convention.
     ///
+    /// `ranked` is pulled lazily, one cluster per probe: with graph routing,
+    /// pulling past a converged batch resumes the beam search, so routing
+    /// work interleaves with (and is bounded by) probing.
+    ///
     /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
-    /// `score_doc_bytes` cost, distinct from `rank_clusters`.
+    /// `score_doc_bytes` cost.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn scan_clusters(
         &self,
         index: &IvfIndex,
-        ranked: Vec<Candidate>,
+        ranked: impl Iterator<Item = Candidate>,
         threshold: Similarity,
         min_candidates: usize,
         max_probe_count: usize,
@@ -385,7 +388,9 @@ impl<T: VectorElement> VectorBackend<T> {
         // across clusters.
         let mut survivors: Vec<Survivor> = Vec::new();
 
-        for (probe_count, Candidate { sim, node: cluster }) in ranked.into_iter().enumerate() {
+        for (probe_count, Candidate { sim, node: cluster }) in ranked.enumerate() {
+            // The pull that trips the ceiling proves another ranked cluster
+            // existed, keeping `Ceiling` distinct from `Exhausted`.
             if probe_count >= max_probe_count {
                 termination = ProbeTermination::Ceiling;
                 break;
