@@ -398,7 +398,9 @@ pub struct NeighborhoodGraphSearchMetrics {
     /// navigation cost.
     pub visited_count: usize,
     /// Frontier candidates that survived the convergence check and had their
-    /// adjacency scanned: the number of hops the search took.
+    /// adjacency scanned: the number of hops the search took. On a resumed
+    /// [`SearchIterator`], evictions re-admitted through the frontier rescan
+    /// their (fully visited) adjacency and are counted again.
     pub expanded_count: usize,
     /// Neighbor entries iterated across all expansions, including
     /// already-visited ones; `edges_scanned - visited_count` is traversal
@@ -408,7 +410,9 @@ pub struct NeighborhoodGraphSearchMetrics {
     /// churn means the beam width was generous; constant churn means it was
     /// tight.
     pub evictions: usize,
-    /// Candidates returned, after truncation to `k`.
+    /// Candidates actually returned: after truncation to `k` for
+    /// [`search`](RelativeNeighborhoodGraph::search), yielded so far for a
+    /// [`SearchIterator`].
     pub result_count: usize,
     /// Why the expansion loop stopped.
     pub termination_reason: SearchTerminationReason,
@@ -471,6 +475,177 @@ impl Default for NeighborhoodGraphConfig {
     }
 }
 
+/// A beam search over a [`RelativeNeighborhoodGraph`] that yields
+/// [`Candidate`]s on demand.
+///
+/// Results arrive in converged batches: each batch is one beam round run to
+/// convergence, drained most similar first by [`next`](Iterator::next). Once
+/// a batch is empty, pulling again initiates another round from where the
+/// search stopped.
+///
+/// `RESUMABLE` selects the eviction policy at compile time. When `true` (the
+/// [`ResumableSearchIterator`] returned by
+/// [`search_iter`](RelativeNeighborhoodGraph::search_iter)), no scored node
+/// is ever dropped — candidates evicted from the beam return to the frontier
+/// — so every reachable node is yielded exactly once and the stream ends only
+/// when the graph is exhausted. When `false`, evictions are dropped: the beam
+/// minimum only rises within a round, so a search that stops at its first
+/// converged round — the one-shot
+/// [`search`](RelativeNeighborhoodGraph::search) — never needs them again and
+/// skips the bookkeeping.
+///
+/// Each batch is yielded most similar first, but the stream as a whole is not
+/// globally sorted: a resumed round can discover a node more similar than one
+/// already yielded.
+pub struct SearchIterator<'g, 'w, S: VectorArena, const RESUMABLE: bool> {
+    rng: &'g RelativeNeighborhoodGraph<S>,
+    workspace: &'w mut Workspace,
+    query: &'g [S::Elem],
+    /// Beam width of each round.
+    ef: usize,
+    /// The current converged batch, sorted ascending so popping from the back
+    /// yields most similar first.
+    batch: Vec<Candidate>,
+    /// Counters accumulated across all rounds so far.
+    metrics: NeighborhoodGraphSearchMetrics,
+}
+
+/// A [`SearchIterator`] that retains beam evictions so it can keep yielding
+/// past its first converged round, to graph exhaustion. Returned by
+/// [`search_iter`](RelativeNeighborhoodGraph::search_iter).
+pub type ResumableSearchIterator<'g, 'w, S> = SearchIterator<'g, 'w, S, true>;
+
+/// A [`SearchIterator`] that drops beam evictions; only sound for a single
+/// converged round, which is exactly how the one-shot
+/// [`search`](RelativeNeighborhoodGraph::search) drives it.
+type OneShotSearchIterator<'g, 'w, S> = SearchIterator<'g, 'w, S, false>;
+
+impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RESUMABLE> {
+    fn new(
+        rng: &'g RelativeNeighborhoodGraph<S>,
+        workspace: &'w mut Workspace,
+        query: &'g [S::Elem],
+        seeds: &[NodeId],
+        ef: usize,
+    ) -> Self {
+        debug_assert_eq!(query.len(), rng.graph.dim(), "query dimension mismatch");
+        let n = rng.graph.len();
+        workspace.begin_query(n);
+
+        let arena = rng.graph.arena();
+        let dim = rng.graph.dim();
+        let mut metrics = NeighborhoodGraphSearchMetrics::default();
+
+        for &node_id in seeds {
+            if node_id as usize >= n || workspace.visited.contains(node_id) {
+                continue;
+            }
+            workspace.visited.insert(node_id);
+            metrics.visited_count += 1;
+            let sim = arena.similarity(rng.metric, dim, node_id, query);
+            workspace.frontier.push(Candidate { sim, node: node_id });
+        }
+
+        SearchIterator {
+            rng,
+            workspace,
+            query,
+            ef,
+            batch: Vec::new(),
+            metrics,
+        }
+    }
+
+    /// The counters accumulated so far: totals across every round run to this
+    /// point, with `result_count` counting candidates actually yielded and
+    /// `termination_reason` describing why the latest round stopped.
+    pub fn metrics(&self) -> NeighborhoodGraphSearchMetrics {
+        self.metrics
+    }
+
+    /// Runs one beam round to convergence and drains it into `self.batch`.
+    fn run_round(&mut self) {
+        let graph = &self.rng.graph;
+        let arena = graph.arena();
+        let dim = graph.dim();
+        let metric = self.rng.metric;
+        let ws = &mut *self.workspace;
+
+        self.metrics.termination_reason = SearchTerminationReason::GraphExhausted;
+
+        while let Some(&candidate) = ws.frontier.peek() {
+            // Stop once the best unexpanded candidate can't beat the worst
+            // kept result and the result set is already full. Whole-candidate
+            // comparisons (not raw sims) make the order strict: two distinct
+            // nodes are never equal, so a node tied with the beam minimum
+            // can't keep displacing it and cycle forever. Peek, don't pop:
+            // the candidate stays for the next round to commit.
+            if ws.results.len() >= self.ef
+                && ws.results.peek().is_some_and(|worst| candidate < worst.0)
+            {
+                self.metrics.termination_reason = SearchTerminationReason::SearchConverged;
+                break;
+            }
+
+            ws.frontier.pop();
+            if ws.results.len() < self.ef {
+                ws.results.push(Reverse(candidate));
+            } else if let Some(mut worst) = ws.results.peek_mut() {
+                let evicted = std::mem::replace(&mut *worst, Reverse(candidate)).0;
+                drop(worst);
+                if RESUMABLE {
+                    ws.frontier.push(evicted);
+                }
+                self.metrics.evictions += 1;
+            }
+
+            // Expand. An eviction re-admitted through the frontier scans its
+            // adjacency a second time, but every neighbor it could contribute
+            // was already visited by its first expansion, so the rescan is a
+            // no-op beyond the visited checks (still counted as scanned
+            // edges, since the work is done).
+            let neighbors = graph.neighbors(candidate.node);
+            self.metrics.expanded_count += 1;
+            self.metrics.edges_scanned += neighbors.len();
+
+            for &neighbor in neighbors {
+                if ws.visited.contains(neighbor) {
+                    continue;
+                }
+                ws.visited.insert(neighbor);
+                self.metrics.visited_count += 1;
+
+                let sim = arena.similarity(metric, dim, neighbor, self.query);
+                ws.frontier.push(Candidate {
+                    sim,
+                    node: neighbor,
+                });
+            }
+        }
+
+        self.batch.extend(ws.results.drain().map(|Reverse(c)| c));
+        // Ascending similarity with descending-id ties, so popping from the
+        // back yields descending similarity with ascending-id ties.
+        self.batch
+            .sort_unstable_by(|a, b| a.sim.cmp(&b.sim).then_with(|| b.node.cmp(&a.node)));
+    }
+}
+
+impl<S: VectorArena, const RESUMABLE: bool> Iterator for SearchIterator<'_, '_, S, RESUMABLE> {
+    type Item = Candidate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.batch.is_empty() {
+            // On an exhausted graph the frontier is empty and this is a cheap
+            // no-op; the batch stays empty and the stream ends below.
+            self.run_round();
+        }
+        let candidate = self.batch.pop()?;
+        self.metrics.result_count += 1;
+        Some(candidate)
+    }
+}
+
 /// A relative neighborhood graph (RNG) index over vector storage `S` (any
 /// [`VectorArena`]); queries are `&[S::Elem]` of the same dimension.
 ///
@@ -503,9 +678,6 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
     /// outward from `seeds`. Returns [`Candidate`]s most similar first, with a
     /// beam width of `max(ef, k)`, plus the query's
     /// [`NeighborhoodGraphSearchMetrics`].
-    ///
-    /// `ws` holds the per-query scratch; reuse one across queries to avoid
-    /// reallocating. It is reset at the start of each call.
     pub fn search(
         &self,
         ws: &mut Workspace,
@@ -513,80 +685,34 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         seeds: &[NodeId],
         k: usize,
     ) -> (Vec<Candidate>, NeighborhoodGraphSearchMetrics) {
-        debug_assert_eq!(query.len(), self.graph.dim(), "query dimension mismatch");
         if self.graph.is_empty() || k == 0 {
             return (Vec::new(), NeighborhoodGraphSearchMetrics::default());
         }
-        let ef = self.config.ef.max(k);
-        let n = self.graph.len();
-        let arena = self.graph.arena();
-        let dim = self.graph.dim();
-        let metric = self.metric;
-        ws.begin_query(n);
+        let mut iter = OneShotSearchIterator::new(self, ws, query, seeds, self.config.ef.max(k));
+        let out: Vec<Candidate> = iter.by_ref().take(k).collect();
+        let metrics = iter.metrics();
+        (out, metrics)
+    }
 
-        let mut search_metrics = NeighborhoodGraphSearchMetrics::default();
-
-        let visited = &mut ws.visited;
-        let frontier = &mut ws.frontier;
-        let results = &mut ws.results;
-
-        // Seeds always fit under the beam, so push them blindly rather than
-        // paying the bounded-insert path.
-        debug_assert!(seeds.len() <= ef, "seed count exceeds beam width");
-        for &node_id in seeds {
-            if node_id as usize >= n || visited.contains(node_id) {
-                continue;
-            }
-            visited.insert(node_id);
-            search_metrics.visited_count += 1;
-            let sim = arena.similarity(metric, dim, node_id, query);
-            let c = Candidate { sim, node: node_id };
-            frontier.push(c);
-            results.push(Reverse(c));
-        }
-
-        while let Some(cand) = frontier.pop() {
-            // Stop once the best unexpanded candidate can't beat the worst kept
-            // result and the result set is already full.
-            if results.len() >= ef && results.peek().is_some_and(|w| cand.sim < w.0.sim) {
-                search_metrics.termination_reason = SearchTerminationReason::SearchConverged;
-                break;
-            }
-            search_metrics.expanded_count += 1;
-            let neighbors = self.graph.neighbors(cand.node);
-            search_metrics.edges_scanned += neighbors.len();
-            for &nb in neighbors {
-                if visited.contains(nb) {
-                    continue;
-                }
-                visited.insert(nb);
-                search_metrics.visited_count += 1;
-                let sim = arena.similarity(metric, dim, nb, query);
-                let c = Candidate { sim, node: nb };
-                // A candidate earns a frontier slot exactly when it enters the
-                // top-`ef` results, so the single comparison against the worst
-                // kept result is admission test, in-place eviction, and frontier
-                // gate at once. `peek_mut` only re-sifts if we mutate through it:
-                // a loser costs one compare and no reheapify; a winner costs one
-                // sift-down on drop (versus pop + push, which is two).
-                if results.len() < ef {
-                    results.push(Reverse(c));
-                    frontier.push(c);
-                } else if let Some(mut worst) = results.peek_mut() {
-                    if c.sim > worst.0.sim {
-                        *worst = Reverse(c);
-                        frontier.push(c);
-                        search_metrics.evictions += 1;
-                    }
-                }
-            }
-        }
-
-        let mut out: Vec<Candidate> = results.drain().map(|Reverse(c)| c).collect();
-        out.sort_unstable_by(|a, b| b.sim.cmp(&a.sim).then_with(|| a.node.cmp(&b.node)));
-        out.truncate(k);
-        search_metrics.result_count = out.len();
-        (out, search_metrics)
+    /// Resumable beam search: like [`search`](Self::search), but instead of a
+    /// fixed `k` the returned [`SearchIterator`] yields [`Candidate`]s on
+    /// demand, resuming expansion whenever the caller pulls past what has been
+    /// found so far — see [`SearchIterator`] for the batch and ordering
+    /// semantics. Callers that don't know their cutoff up front (e.g.
+    /// adaptive cluster probing) can start with a beam of
+    /// [`ef`](NeighborhoodGraphConfig::ef) and keep pulling instead of paying
+    /// for a worst-case beam width.
+    ///
+    /// `ws` is reset here and borrowed for the iterator's lifetime;
+    /// [`SearchIterator::metrics`] exposes the accumulated counters at any
+    /// point.
+    pub fn search_iter<'g, 'w>(
+        &'g self,
+        ws: &'w mut Workspace,
+        query: &'g [S::Elem],
+        seeds: &[NodeId],
+    ) -> ResumableSearchIterator<'g, 'w, S> {
+        ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef)
     }
 
     /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
@@ -817,12 +943,13 @@ impl RelativeNeighborhoodGraph<&[f32]> {
 /// [`RelativeNeighborhoodGraph::search`]; reuse one across queries to avoid
 /// reallocating.
 pub struct Workspace {
-    /// Nodes seen in the current query, 1 bit per node.
+    /// Nodes scored in the current query, 1 bit per node.
     visited: BitSet,
-    /// Max-heap by similarity: the frontier of candidates left to expand.
+    /// Max-heap by similarity: every scored candidate not currently committed
+    /// to `results` — the pool the search pops from, best first.
     frontier: BinaryHeap<Candidate>,
-    /// Min-heap by similarity (via `Reverse`): the best `ef` results so far, with
-    /// the least-similar on top for eviction.
+    /// Min-heap by similarity (via `Reverse`): the current beam — the best
+    /// `width` committed results, with the least-similar on top for eviction.
     results: BinaryHeap<Reverse<Candidate>>,
 }
 
@@ -1180,6 +1307,118 @@ mod rng_tests {
         let (a, _) = rng.search(&mut ws, &[4.2], &[0], 3);
         let (b, _) = rng.search(&mut ws, &[4.2], &[0], 3);
         assert_eq!(a, b); // epoch reset means repeated queries match exactly
+    }
+
+    #[test]
+    fn search_iter_first_batch_matches_search() {
+        let rng = line_index(8);
+        let mut ws = Workspace::new();
+        let (batch, _) = rng.search(&mut ws, &[4.2], &[0], 3);
+        let iterated: Vec<Candidate> = rng.search_iter(&mut ws, &[4.2], &[0]).take(3).collect();
+        assert_eq!(batch, iterated);
+    }
+
+    #[test]
+    fn search_iter_first_batch_is_the_true_top_ef_sorted() {
+        // Query at 10.2 on a 0..20 line with ef = 8: the first batch must be
+        // the true top 8 in descending similarity, even though the search
+        // seeds from the far end of the line.
+        let rng = line_index(20);
+        let mut ws = Workspace::new();
+        let first_batch: Vec<NodeId> = rng
+            .search_iter(&mut ws, &[10.2], &[0])
+            .take(8)
+            .map(|c| c.node)
+            .collect();
+        assert_eq!(first_batch, vec![10, 11, 9, 12, 8, 13, 7, 14]);
+    }
+
+    #[test]
+    fn search_iter_resumes_past_the_first_batch() {
+        // Pulling past ef (8) must resume the search and surface the next
+        // nearest nodes — including beam evictions retained in the frontier.
+        let rng = line_index(20);
+        let mut ws = Workspace::new();
+        let mut ids: Vec<NodeId> = rng
+            .search_iter(&mut ws, &[10.2], &[0])
+            .take(12)
+            .map(|c| c.node)
+            .collect();
+        ids.sort_unstable();
+        // The 12 pulled candidates are exactly the 12 nearest to 10.2.
+        assert_eq!(ids, (5..=16).collect::<Vec<NodeId>>());
+    }
+
+    #[test]
+    fn search_iter_yields_every_reachable_node_exactly_once() {
+        // ef (8) < n (20): draining the iterator must keep resuming until the
+        // whole connected line has been yielded, then stop.
+        let n: NodeId = 20;
+        let rng = line_index(n);
+        let mut ws = Workspace::new();
+        let mut iter = rng.search_iter(&mut ws, &[4.2], &[0]);
+        let mut ids: Vec<NodeId> = iter.by_ref().map(|c| c.node).collect();
+
+        ids.sort_unstable();
+        assert_eq!(ids, (0..n).collect::<Vec<NodeId>>());
+
+        let metrics = iter.metrics();
+        assert_eq!(metrics.result_count, n as usize);
+        assert_eq!(metrics.visited_count, n as usize);
+        // Every node is expanded; re-admitted evictions may rescan.
+        assert!(metrics.expanded_count >= n as usize);
+        assert_eq!(
+            metrics.termination_reason,
+            SearchTerminationReason::GraphExhausted
+        );
+        // Exhausted iterators stay exhausted.
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn search_iter_handles_degenerate_inputs() {
+        let rng = line_index(5);
+        let mut ws = Workspace::new();
+        assert_eq!(rng.search_iter(&mut ws, &[1.0], &[]).next(), None); // no seeds
+
+        let empty: RelativeNeighborhoodGraph<Vec<f32>> = RelativeNeighborhoodGraph::new(
+            Vec::new(),
+            1,
+            Metric::L2,
+            NeighborhoodGraphConfig::default(),
+        );
+        assert_eq!(empty.search_iter(&mut ws, &[1.0], &[0]).next(), None); // empty graph
+    }
+
+    #[test]
+    fn search_iter_survives_duplicate_vectors() {
+        // Duplicate vectors produce boundary ties; the total order on
+        // `Candidate` must keep resumed rounds from cycling and yield each
+        // copy exactly once.
+        let params = NeighborhoodGraphConfig {
+            max_edges: 4,
+            ef: 2,
+            num_candidates: 4,
+            num_trees: 1,
+        };
+        // Nodes 0..6 in a line, but every position duplicated: 0,0,1,1,2,2.
+        let vectors: Vec<f32> = (0..6).map(|i| (i / 2) as f32).collect();
+        let mut rng = RelativeNeighborhoodGraph::new(vectors, 1, Metric::L2, params);
+        for i in 0..6u32 {
+            for j in 0..6u32 {
+                if i != j {
+                    let sim = Metric::L2.similarity(&[(i / 2) as f32], &[(j / 2) as f32]);
+                    rng.graph.add_edge(i, j, sim);
+                }
+            }
+        }
+        let mut ws = Workspace::new();
+        let mut ids: Vec<NodeId> = rng
+            .search_iter(&mut ws, &[0.9], &[0])
+            .map(|c| c.node)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..6).collect::<Vec<NodeId>>());
     }
 
     #[test]

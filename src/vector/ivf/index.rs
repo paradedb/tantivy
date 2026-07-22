@@ -28,7 +28,7 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use super::graph::{
     Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, Workspace,
+    RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
 };
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
@@ -232,23 +232,29 @@ impl IvfIndex {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
-    /// Clusters to probe for `query`, best routing score first, as
-    /// [`Candidate`]s (graph node `c` *is* cluster `c`, so `Candidate::node`
-    /// is the cluster id), plus the routing cost as [`IvfSearchMetrics`]
-    /// (surfaced as `ProbeStats::routing`).
+    /// Clusters to probe for `query`, ranked lazily — a [`ClusterRanking`]
+    /// yielding [`Candidate`]s best routing score first (graph node `c` *is*
+    /// cluster `c`, so `Candidate::node` is the cluster id).
     ///
-    /// With a persisted RNG this is a beam search
-    /// ([`RelativeNeighborhoodGraph::search`]); without one every centroid
-    /// is scored exactly. Both paths score through the same
-    /// [`FileSliceArena`], so their rankings agree.
-    pub(crate) fn rank_clusters(
-        &self,
-        query: &[f32],
-        limit: usize,
-    ) -> (Vec<Candidate>, IvfSearchMetrics) {
+    /// With a persisted RNG this is a resumable beam search
+    /// ([`RelativeNeighborhoodGraph::search_iter`]): the first batch is one
+    /// converged round at the configured
+    /// [`ef`](NeighborhoodGraphConfig::ef), and pulling past it resumes the
+    /// search, so routing cost is paid only as far as probing actually
+    /// reaches. Without one every centroid is scored exactly, up front. Both
+    /// paths score through the same [`FileSliceArena`], so their rankings
+    /// agree.
+    ///
+    /// `ws` holds the routing search's scratch and is borrowed for the
+    /// ranking's lifetime; [`ClusterRanking::metrics`] reports the cost
+    /// incurred so far (surfaced as `ProbeStats::routing`).
+    pub(crate) fn rank_clusters<'a>(
+        &'a self,
+        ws: &'a mut Workspace,
+        query: &'a [f32],
+    ) -> ClusterRanking<'a> {
         match &self.graph {
             Some(graph) => {
-                let mut ws = Workspace::new();
                 // TODO: Replace with proper seed generation
                 let seeds: Vec<NodeId> = {
                     (0..graph.len())
@@ -257,14 +263,7 @@ impl IvfIndex {
                         .map(|node| node as NodeId)
                         .collect()
                 };
-                let (ranked, metrics) = graph.search(&mut ws, query, &seeds, limit);
-                (
-                    ranked,
-                    IvfSearchMetrics {
-                        visited_count: metrics.visited_count,
-                        graph: Some(metrics),
-                    },
-                )
+                ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
             }
             None => {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
@@ -275,23 +274,62 @@ impl IvfIndex {
                     })
                     .collect();
                 ranked.sort_unstable_by(|a, b| b.cmp(a));
-                ranked.truncate(limit);
-                (
-                    ranked,
-                    IvfSearchMetrics {
-                        visited_count: self.num_centroids,
-                        graph: None,
-                    },
-                )
+                ClusterRanking::Exact {
+                    ranked: ranked.into_iter(),
+                    num_centroids: self.num_centroids,
+                }
             }
         }
     }
 }
 
-/// Routing cost of one [`IvfIndex::rank_clusters`] call: how many centroids
-/// were scored to pick the probe order, and — when routing went through the
-/// centroid RNG — the beam search's full
-/// [`NeighborhoodGraphSearchMetrics`].
+/// Lazily ranked clusters for one query, yielded best routing score first;
+/// returned by [`IvfIndex::rank_clusters`], which documents the two paths.
+pub(crate) enum ClusterRanking<'a> {
+    /// Beam-searched routing over the persisted centroid RNG; pulling past a
+    /// converged batch resumes the search.
+    Graph(ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>),
+    /// Exact fallback for graph-less segments: every centroid scored and
+    /// sorted up front.
+    Exact {
+        ranked: std::vec::IntoIter<Candidate>,
+        num_centroids: usize,
+    },
+}
+
+impl ClusterRanking<'_> {
+    /// The routing cost incurred so far: fixed for the exact path, growing
+    /// with each pull that resumes the beam search on the graph path — so
+    /// take the snapshot after the last pull.
+    pub(crate) fn metrics(&self) -> IvfSearchMetrics {
+        match self {
+            ClusterRanking::Graph(iter) => IvfSearchMetrics {
+                visited_count: iter.metrics().visited_count,
+                graph: Some(iter.metrics()),
+            },
+            ClusterRanking::Exact { num_centroids, .. } => IvfSearchMetrics {
+                visited_count: *num_centroids,
+                graph: None,
+            },
+        }
+    }
+}
+
+impl Iterator for ClusterRanking<'_> {
+    type Item = Candidate;
+
+    fn next(&mut self) -> Option<Candidate> {
+        match self {
+            ClusterRanking::Graph(iter) => iter.next(),
+            ClusterRanking::Exact { ranked, .. } => ranked.next(),
+        }
+    }
+}
+
+/// Routing cost of one [`IvfIndex::rank_clusters`] ranking (a
+/// [`ClusterRanking::metrics`] snapshot): how many centroids were scored to
+/// pick the probe order, and — when routing went through the centroid RNG —
+/// the beam search's full [`NeighborhoodGraphSearchMetrics`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IvfSearchMetrics {
     /// Centroids scored to route the query (the navigation cost):

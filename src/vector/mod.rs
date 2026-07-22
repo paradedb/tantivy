@@ -38,8 +38,8 @@ pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, Vector
 pub use ivf::{
     Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
     IvfMergeSettings, IvfSearchMetrics, IvfVectorBatch, IvfVectors, NeighborhoodGraphConfig,
-    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, SearchTerminationReason,
-    Workspace,
+    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
+    SearchIterator, SearchTerminationReason, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
