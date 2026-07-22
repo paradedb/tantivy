@@ -28,7 +28,7 @@ use std::collections::BinaryHeap;
 use std::io::{self, Write};
 use std::ops::Deref;
 
-use common::BinarySerializable;
+use common::{BinarySerializable, BitSet};
 
 use super::partition;
 use crate::schema::Metric;
@@ -522,7 +522,7 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         let arena = self.graph.arena();
         let dim = self.graph.dim();
         let metric = self.metric;
-        let epoch = ws.begin_query(n);
+        ws.begin_query(n);
 
         let mut search_metrics = NeighborhoodGraphSearchMetrics::default();
 
@@ -534,11 +534,10 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         // paying the bounded-insert path.
         debug_assert!(seeds.len() <= ef, "seed count exceeds beam width");
         for &node_id in seeds {
-            let idx = node_id as usize;
-            if idx >= n || visited[idx] == epoch {
+            if node_id as usize >= n || visited.contains(node_id) {
                 continue;
             }
-            visited[idx] = epoch;
+            visited.insert(node_id);
             search_metrics.visited_count += 1;
             let sim = arena.similarity(metric, dim, node_id, query);
             let c = Candidate { sim, node: node_id };
@@ -557,11 +556,10 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
             let neighbors = self.graph.neighbors(cand.node);
             search_metrics.edges_scanned += neighbors.len();
             for &nb in neighbors {
-                let idx = nb as usize;
-                if visited[idx] == epoch {
+                if visited.contains(nb) {
                     continue;
                 }
-                visited[idx] = epoch;
+                visited.insert(nb);
                 search_metrics.visited_count += 1;
                 let sim = arena.similarity(metric, dim, nb, query);
                 let c = Candidate { sim, node: nb };
@@ -818,18 +816,24 @@ impl RelativeNeighborhoodGraph<&[f32]> {
 /// Reusable per-query working buffers for
 /// [`RelativeNeighborhoodGraph::search`]; reuse one across queries to avoid
 /// reallocating.
-#[derive(Default)]
 pub struct Workspace {
-    /// `visited[node] == visited_epoch` marks a node seen in the current query.
-    /// The epoch stamp resets the buffer in O(1) between queries (just a counter
-    /// bump) instead of re-zeroing all `n` slots.
-    visited: Vec<u32>,
-    visited_epoch: u32,
+    /// Nodes seen in the current query, 1 bit per node.
+    visited: BitSet,
     /// Max-heap by similarity: the frontier of candidates left to expand.
     frontier: BinaryHeap<Candidate>,
     /// Min-heap by similarity (via `Reverse`): the best `ef` results so far, with
     /// the least-similar on top for eviction.
     results: BinaryHeap<Reverse<Candidate>>,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Workspace {
+            visited: BitSet::with_max_value(0),
+            frontier: BinaryHeap::new(),
+            results: BinaryHeap::new(),
+        }
+    }
 }
 
 impl Workspace {
@@ -838,22 +842,16 @@ impl Workspace {
         Workspace::default()
     }
 
-    /// Prepares the workspace for a query over `n` nodes: grows the visited
-    /// buffer, advances the epoch (resetting stamps on wraparound), clears the
-    /// heaps, and returns the epoch to stamp this query's visits with.
-    fn begin_query(&mut self, n: usize) -> u32 {
-        if self.visited.len() < n {
-            self.visited.resize(n, 0);
-        }
-        self.visited_epoch = self.visited_epoch.wrapping_add(1);
-        if self.visited_epoch == 0 {
-            // Wrapped: clear so no stale stamp collides with the new epoch.
-            self.visited.iter_mut().for_each(|v| *v = 0);
-            self.visited_epoch = 1;
+    /// Prepares the workspace for a query over `n` nodes: zeroes the visited
+    /// bitset (growing it if needed) and clears the heaps.
+    fn begin_query(&mut self, n: usize) {
+        if (self.visited.max_value() as usize) < n {
+            self.visited = BitSet::with_max_value(n as u32);
+        } else {
+            self.visited.clear();
         }
         self.frontier.clear();
         self.results.clear();
-        self.visited_epoch
     }
 }
 
