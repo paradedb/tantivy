@@ -39,14 +39,19 @@ pub struct AdaptiveProbeParams {
     /// target recall stays roughly constant across K instead of shrinking
     /// with it. Default 32, PROVISIONAL.
     pub overfetch_margin: usize,
-    /// Filter-effective cluster ceiling, clamped to the segment's cluster
-    /// count. Each probed cluster consumes budget equal to its filter
-    /// pass rate (`(rows - filtered) / rows`), so an unfiltered query
-    /// probes at most this many clusters while a selective filter probes
-    /// proportionally more. SPANN Fig. 2: 99% of SIFT1M queries reach
-    /// perfect recall@1 within 114 postings; 128 clears that. Default 128,
-    /// PROVISIONAL.
-    pub max_probe_count: usize,
+    /// Filter-effective cluster ceiling, expressed as a FRACTION of the
+    /// segment's cluster count and resolved per-segment: a segment with
+    /// `num_clusters` clusters probes at most `ceil(max_probe_fraction *
+    /// num_clusters)` of them (clamped to `[1, num_clusters]`). A fraction
+    /// rather than an absolute count because cluster counts vary segment to
+    /// segment — an absolute cap over-probes small segments (clamping to a
+    /// full scan) and under-probes large ones. Each probed cluster still
+    /// consumes budget equal to its filter pass rate (`(rows - filtered) /
+    /// rows`), so an unfiltered query probes at most this fraction while a
+    /// selective filter probes proportionally more. SPANN Fig. 2: 99% of
+    /// SIFT1M queries reach perfect recall@1 within 114 postings, ~1% of a
+    /// 1%-centroid-ratio index's clusters. Default 0.01, PROVISIONAL.
+    pub max_probe_fraction: f32,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -55,22 +60,25 @@ impl Default for AdaptiveProbeParams {
             epsilon: 7.0,
             min_candidates: 0,
             overfetch_margin: 32,
-            max_probe_count: 128,
+            max_probe_fraction: 0.01,
         }
     }
 }
 
 impl AdaptiveProbeParams {
-    /// The probe ceiling for a segment with `num_clusters` IVF
-    /// clusters: `max_probe_count` clamped to the cluster count. Zero
-    /// is a configuration error, not "no probing".
+    /// The probe ceiling for a segment with `num_clusters` IVF clusters:
+    /// `ceil(max_probe_fraction * num_clusters)`, clamped to
+    /// `[1, num_clusters]` (a positive fraction always probes at least the
+    /// best cluster). A non-positive fraction is a configuration error, not
+    /// "no probing".
     pub(crate) fn resolved_probe_ceiling(&self, num_clusters: usize) -> crate::Result<usize> {
-        if self.max_probe_count == 0 {
+        if !(self.max_probe_fraction > 0.0) {
             return Err(crate::TantivyError::InvalidArgument(
-                "max_probe_count must be greater than 0".to_string(),
+                "max_probe_fraction must be greater than 0".to_string(),
             ));
         }
-        Ok(self.max_probe_count.min(num_clusters))
+        let ceiling = (self.max_probe_fraction * num_clusters as f32).ceil() as usize;
+        Ok(ceiling.min(num_clusters).max(1))
     }
 }
 
@@ -81,23 +89,31 @@ mod tests {
     #[test]
     fn probe_ceiling_resolves_against_cluster_count() -> crate::Result<()> {
         let params = AdaptiveProbeParams {
-            max_probe_count: 128,
+            max_probe_fraction: 0.25,
             ..Default::default()
         };
-        // Cap above the cluster count clamps — small segments scan
-        // exhaustively.
-        assert_eq!(params.resolved_probe_ceiling(10)?, 10);
-        // Cap below the cluster count binds.
-        assert_eq!(params.resolved_probe_ceiling(1000)?, 128);
+        // A quarter of the clusters, rounded up.
+        assert_eq!(params.resolved_probe_ceiling(1000)?, 250);
+        // Sub-cluster fractions still probe the single best cluster.
+        assert_eq!(params.resolved_probe_ceiling(2)?, 1);
+        // A fraction above 1.0 clamps to the cluster count — small segments
+        // scan exhaustively.
+        let all = AdaptiveProbeParams {
+            max_probe_fraction: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(all.resolved_probe_ceiling(10)?, 10);
         Ok(())
     }
 
     #[test]
-    fn zero_probe_ceiling_errors() {
-        let params = AdaptiveProbeParams {
-            max_probe_count: 0,
-            ..Default::default()
-        };
-        assert!(params.resolved_probe_ceiling(9).is_err());
+    fn non_positive_probe_fraction_errors() {
+        for fraction in [0.0, -1.0] {
+            let params = AdaptiveProbeParams {
+                max_probe_fraction: fraction,
+                ..Default::default()
+            };
+            assert!(params.resolved_probe_ceiling(9).is_err());
+        }
     }
 }

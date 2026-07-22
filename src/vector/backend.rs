@@ -1549,7 +1549,7 @@ mod tests {
             epsilon: 0.0,
             min_candidates: usize::MAX,
             overfetch_margin: 0,
-            max_probe_count: 1,
+            max_probe_fraction: 0.5,
         };
         let hits1 = search(&index, embed_field, &AllQuery, query.to_vec(), 1, one_probe)?;
         assert_eq!(hits1.len(), 1);
@@ -1842,7 +1842,7 @@ mod tests {
             epsilon: 0.0,
             min_candidates: 0,
             overfetch_margin: margin,
-            max_probe_count: usize::MAX,
+            max_probe_fraction: 1.0,
         };
         let hits = search(
             &index,
@@ -1929,10 +1929,11 @@ mod tests {
         Ok(())
     }
 
-    /// A `max_probe_count` below the cluster count forces the hard ceiling:
-    /// the loop stops with `termination == Ceiling`, having probed exactly
-    /// the cap, and the counter invariant still holds. Uses the deterministic
-    /// `build_inline_ivf` fixture (fixed 6 centroids) so the cutoff is stable.
+    /// A `max_probe_fraction` resolving below the cluster count forces the
+    /// hard ceiling: the loop stops with `termination == Ceiling`, having
+    /// probed exactly the cap, and the counter invariant still holds. Uses the
+    /// deterministic `build_inline_ivf` fixture (fixed 6 centroids) so the
+    /// cutoff is stable.
     #[test]
     fn ivf_probe_stats_termination_ceiling() -> crate::Result<()> {
         let centroids = [
@@ -1962,7 +1963,7 @@ mod tests {
             epsilon: 0.0,
             min_candidates: usize::MAX,
             overfetch_margin: 0,
-            max_probe_count: 1,
+            max_probe_fraction: 0.1,
         };
         let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![10.0, 10.0], 3, params)?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
@@ -2053,7 +2054,7 @@ mod tests {
             epsilon: 7.0,
             min_candidates: 0,
             overfetch_margin: 32,
-            max_probe_count: 2,
+            max_probe_fraction: 0.1,
         };
         let k = 3usize;
         for (ord, centroid) in centroids.iter().enumerate().step_by(3) {
@@ -2164,7 +2165,7 @@ mod tests {
     /// so the ceiling binds at exactly 2 non-empty clusters — empty
     /// clusters interleaved in the ranked list bill 0 and don't count.
     #[test]
-    fn probe_stats_max_probe_count_ceiling() -> crate::Result<()> {
+    fn probe_stats_max_probe_fraction_ceiling() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
@@ -2172,7 +2173,7 @@ mod tests {
             epsilon: 0.0,
             min_candidates: usize::MAX,
             overfetch_margin: 0,
-            max_probe_count: 2,
+            max_probe_fraction: 0.2,
         };
         // The cap must actually bind for this test to mean anything.
         assert!(
@@ -2226,7 +2227,7 @@ mod tests {
             epsilon: 0.0,
             min_candidates: 0,
             overfetch_margin: margin,
-            max_probe_count: usize::MAX,
+            max_probe_fraction: 1.0,
         };
         let (_, stats) = run_top_n_instrumented(
             &index.index,
@@ -2270,7 +2271,7 @@ mod tests {
             epsilon: 7.0,
             min_candidates: 0,
             overfetch_margin: 3,
-            max_probe_count: usize::MAX,
+            max_probe_fraction: 1.0,
         };
         let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![1.0, 0.3], 1, params)?;
         assert_eq!(stats.termination, ProbeTermination::Gate);
