@@ -214,18 +214,6 @@ pub struct ProbeStats {
     pub termination: ProbeTermination,
 }
 
-/// How many candidate docs the IVF probe loop is willing to score per
-/// requested top-K result before the threshold gate is allowed to
-/// terminate it. Combined with the user-supplied `min_candidates` at
-/// the call site as `min_candidates.max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n)`,
-/// so a default `min_candidates = 0` still gives a sane floor.
-///
-/// The "4×" rule of thumb is intentionally conservative — enough
-/// overfetch that one near-cluster with a tail of duplicates can't
-/// short-circuit recall. Provisional; revisit alongside the other
-/// adaptive defaults once real benchmarks land.
-pub(crate) const CANDIDATE_OVERFETCH_MULTIPLIER: usize = 4;
-
 /// Floor a probed cluster charges the ceiling even when the filter skips
 /// all its rows (the gate pre-pass still scans them). A cluster bills
 /// `SKIPPED_CLUSTER_COST + (1 - SKIPPED_CLUSTER_COST) * pass_fraction`:
@@ -306,11 +294,13 @@ impl<T: VectorElement> VectorBackend<T> {
             self.adaptive.epsilon,
         ));
         // Without this floor, a selective filter can trip the threshold gate
-        // immediately and return < K results.
+        // immediately and return < K results. Additive margin (not m×top_n)
+        // so the over-probe cushion stays K-independent — see
+        // `AdaptiveProbeParams::overfetch_margin`.
         let min_candidates = self
             .adaptive
             .min_candidates
-            .max(CANDIDATE_OVERFETCH_MULTIPLIER * top_n);
+            .max(top_n + self.adaptive.overfetch_margin);
 
         if let Some(s) = stats.as_deref_mut() {
             s.min_candidates = min_candidates;
@@ -1558,6 +1548,7 @@ mod tests {
         let one_probe = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: usize::MAX,
+            overfetch_margin: 0,
             max_probe_count: 1,
         };
         let hits1 = search(&index, embed_field, &AllQuery, query.to_vec(), 1, one_probe)?;
@@ -1753,7 +1744,7 @@ mod tests {
     /// `min_candidates` floor: cluster A has one doc near the query;
     /// cluster B holds the true NN. Without the floor, the threshold
     /// trips immediately after A (epsilon=0) and the loop stops; the
-    /// floor (`CANDIDATE_OVERFETCH_MULTIPLIER * top_n`) forces it to
+    /// floor (`top_n + overfetch_margin`) forces it to
     /// keep probing into B. INLINE because the shared fixture's
     /// uniform-grid points don't naturally produce a "near cluster
     /// with one survivor" geometry.
@@ -1832,15 +1823,16 @@ mod tests {
         );
 
         // Setup assertion (iii): the near cluster has fewer survivors
-        // than the candidate floor (4 × top_k = 4). Combined with (i),
+        // than the candidate floor (top_k + margin). Combined with (i),
         // reaching the oracle's top-1 REQUIRES probing B — which only
         // the floor causes, since epsilon=0 trips the threshold gate
         // immediately after A.
+        let margin = 4usize;
         assert!(
-            cluster_a_docs.len() < CANDIDATE_OVERFETCH_MULTIPLIER * top_k,
+            cluster_a_docs.len() < top_k + margin,
             "cluster A must have fewer than the candidate floor ({}) for the floor to actually \
              have to probe out — got {} docs",
-            CANDIDATE_OVERFETCH_MULTIPLIER * top_k,
+            top_k + margin,
             cluster_a_docs.len(),
         );
 
@@ -1849,6 +1841,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: 0,
+            overfetch_margin: margin,
             max_probe_count: usize::MAX,
         };
         let hits = search(
@@ -1968,6 +1961,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: usize::MAX,
+            overfetch_margin: 0,
             max_probe_count: 1,
         };
         let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![10.0, 10.0], 3, params)?;
@@ -2058,6 +2052,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 7.0,
             min_candidates: 0,
+            overfetch_margin: 32,
             max_probe_count: 2,
         };
         let k = 3usize;
@@ -2176,6 +2171,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: usize::MAX,
+            overfetch_margin: 0,
             max_probe_count: 2,
         };
         // The cap must actually bind for this test to mean anything.
@@ -2220,7 +2216,8 @@ mod tests {
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
         let top_k = 4;
-        let resolved_floor = CANDIDATE_OVERFETCH_MULTIPLIER * top_k;
+        let margin = 12usize;
+        let resolved_floor = top_k + margin;
         let segment_doc_count =
             index.index.reader()?.searcher().segment_readers()[0].max_doc() as usize;
         let expected_min = segment_doc_count.min(resolved_floor);
@@ -2228,6 +2225,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: 0,
+            overfetch_margin: margin,
             max_probe_count: usize::MAX,
         };
         let (_, stats) = run_top_n_instrumented(
@@ -2253,8 +2251,8 @@ mod tests {
     /// gate could never fire on the [0, 1] cosine range at eps = 7.)
     #[test]
     fn probe_stats_cosine_gate_fires() -> crate::Result<()> {
-        // Cluster A hugs the x-axis (4 docs — exactly the 4·top_k
-        // floor); cluster B hugs the y-axis, far outside the ratio.
+        // Cluster A hugs the x-axis (4 docs — exactly the top_k + margin
+        // floor, margin=3); cluster B hugs the y-axis, far outside the ratio.
         let centroids = vec![[10.0_f32, 0.0], [0.0, 10.0]];
         let docs = [
             ("a0", [10.0_f32, 0.0]),
@@ -2271,6 +2269,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 7.0,
             min_candidates: 0,
+            overfetch_margin: 3,
             max_probe_count: usize::MAX,
         };
         let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![1.0, 0.3], 1, params)?;
@@ -2284,10 +2283,14 @@ mod tests {
         Ok(())
     }
 
-    /// With default adaptive params and a query right on one cluster's
+    /// With a lean candidate floor (margin 0, so the threshold gate —
+    /// not the floor — governs) and a query right on one cluster's
     /// centroid, the probe loop should prune — visit strictly fewer
     /// clusters than the segment's total. Loose contract: no exact
-    /// number, stays stable when defaults are tuned.
+    /// number, stays stable when defaults are tuned. (The default
+    /// `overfetch_margin` alone would gather a floor comparable to this
+    /// tiny fixture's whole corpus, forcing near-exhaustive probing — so
+    /// this isolates the gate.)
     #[test]
     fn probe_stats_pruning_happens() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
@@ -2295,12 +2298,16 @@ mod tests {
             .build()?;
         // Query at the first centroid — maximally biased toward cluster 0.
         let query = grid2d_first_centroid();
+        let params = AdaptiveProbeParams {
+            overfetch_margin: 0,
+            ..Default::default()
+        };
         let (_, stats) = run_top_n_instrumented(
             &index.index,
             index.embedding_field(),
             query.to_vec(),
             4,
-            AdaptiveProbeParams::default(),
+            params,
         )?;
         assert!(
             stats.probed_clusters.len() < DEFAULT_NUM_CENTROIDS,
