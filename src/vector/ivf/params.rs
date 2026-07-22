@@ -72,12 +72,6 @@ impl Default for AdaptiveProbeParams {
     }
 }
 
-/// Minimum clusters a probe is allowed to reach, before the
-/// `num_clusters` clamp. Without it a small segment resolves
-/// `ceil(max_probe_fraction * num_clusters)` to 1 (any segment with
-/// `num_clusters <= 1 / max_probe_fraction`, e.g. `<= 100` at the 0.01
-/// default), probing a single cluster regardless of `top_n` — too few to
-/// fill the survivor floor or reach usable recall. Provisional.
 pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 
 impl AdaptiveProbeParams {
