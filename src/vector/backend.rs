@@ -1550,6 +1550,7 @@ mod tests {
             min_candidates: usize::MAX,
             overfetch_margin: 0,
             max_probe_fraction: 0.5,
+            min_probe_clusters: 1,
         };
         let hits1 = search(&index, embed_field, &AllQuery, query.to_vec(), 1, one_probe)?;
         assert_eq!(hits1.len(), 1);
@@ -1843,6 +1844,7 @@ mod tests {
             min_candidates: 0,
             overfetch_margin: margin,
             max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
         };
         let hits = search(
             &index,
@@ -1964,6 +1966,7 @@ mod tests {
             min_candidates: usize::MAX,
             overfetch_margin: 0,
             max_probe_fraction: 0.1,
+            min_probe_clusters: 1,
         };
         let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![10.0, 10.0], 3, params)?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
@@ -2055,6 +2058,7 @@ mod tests {
             min_candidates: 0,
             overfetch_margin: 32,
             max_probe_fraction: 0.1,
+            min_probe_clusters: 1,
         };
         let k = 3usize;
         for (ord, centroid) in centroids.iter().enumerate().step_by(3) {
@@ -2174,6 +2178,7 @@ mod tests {
             min_candidates: usize::MAX,
             overfetch_margin: 0,
             max_probe_fraction: 0.2,
+            min_probe_clusters: 1,
         };
         // The cap must actually bind for this test to mean anything.
         assert!(
@@ -2228,6 +2233,7 @@ mod tests {
             min_candidates: 0,
             overfetch_margin: margin,
             max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
         };
         let (_, stats) = run_top_n_instrumented(
             &index.index,
@@ -2272,6 +2278,7 @@ mod tests {
             min_candidates: 0,
             overfetch_margin: 3,
             max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
         };
         let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![1.0, 0.3], 1, params)?;
         assert_eq!(stats.termination, ProbeTermination::Gate);

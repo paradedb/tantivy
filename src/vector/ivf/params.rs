@@ -52,6 +52,12 @@ pub struct AdaptiveProbeParams {
     /// SIFT1M queries reach perfect recall@1 within 114 postings, ~1% of a
     /// 1%-centroid-ratio index's clusters. Default 0.01, PROVISIONAL.
     pub max_probe_fraction: f32,
+    /// Lower bound on the resolved probe ceiling, applied before the
+    /// `num_clusters` clamp — see [`Self::resolved_probe_ceiling`]. Keeps
+    /// small segments, where `max_probe_fraction` rounds down to a single
+    /// cluster, probing enough to fill the survivor floor. Defaults to
+    /// [`MIN_PROBE_CLUSTERS`].
+    pub min_probe_clusters: usize,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -61,16 +67,25 @@ impl Default for AdaptiveProbeParams {
             min_candidates: 0,
             overfetch_margin: 32,
             max_probe_fraction: 0.01,
+            min_probe_clusters: MIN_PROBE_CLUSTERS,
         }
     }
 }
 
+/// Minimum clusters a probe is allowed to reach, before the
+/// `num_clusters` clamp. Without it a small segment resolves
+/// `ceil(max_probe_fraction * num_clusters)` to 1 (any segment with
+/// `num_clusters <= 1 / max_probe_fraction`, e.g. `<= 100` at the 0.01
+/// default), probing a single cluster regardless of `top_n` — too few to
+/// fill the survivor floor or reach usable recall. Provisional.
+pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
+
 impl AdaptiveProbeParams {
     /// The probe ceiling for a segment with `num_clusters` IVF clusters:
-    /// `ceil(max_probe_fraction * num_clusters)`, clamped to
-    /// `[1, num_clusters]` (a positive fraction always probes at least the
-    /// best cluster). A non-positive fraction is a configuration error, not
-    /// "no probing".
+    /// `ceil(max_probe_fraction * num_clusters)`, lifted to at least
+    /// `min_probe_clusters` then clamped to `num_clusters` (so a segment
+    /// with fewer clusters than the floor just scans them all). A
+    /// non-positive fraction is a configuration error, not "no probing".
     pub(crate) fn resolved_probe_ceiling(&self, num_clusters: usize) -> crate::Result<usize> {
         if !(self.max_probe_fraction > 0.0) {
             return Err(crate::TantivyError::InvalidArgument(
@@ -78,7 +93,7 @@ impl AdaptiveProbeParams {
             ));
         }
         let ceiling = (self.max_probe_fraction * num_clusters as f32).ceil() as usize;
-        Ok(ceiling.min(num_clusters).max(1))
+        Ok(ceiling.max(self.min_probe_clusters).min(num_clusters))
     }
 }
 
@@ -92,10 +107,12 @@ mod tests {
             max_probe_fraction: 0.25,
             ..Default::default()
         };
-        // A quarter of the clusters, rounded up.
+        // A quarter of the clusters, rounded up — well above the floor.
         assert_eq!(params.resolved_probe_ceiling(1000)?, 250);
-        // Sub-cluster fractions still probe the single best cluster.
-        assert_eq!(params.resolved_probe_ceiling(2)?, 1);
+        // A fraction resolving below MIN_PROBE_CLUSTERS is lifted to it...
+        assert_eq!(params.resolved_probe_ceiling(40)?, super::MIN_PROBE_CLUSTERS);
+        // ...but the floor never exceeds the cluster count.
+        assert_eq!(params.resolved_probe_ceiling(2)?, 2);
         // A fraction above 1.0 clamps to the cluster count — small segments
         // scan exhaustively.
         let all = AdaptiveProbeParams {
