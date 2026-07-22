@@ -554,7 +554,7 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
         epsilon: 0.0,
         min_candidates: usize::MAX,
-        max_probe_count: usize::MAX,
+        max_probe_fraction: 1.0,
     }
 }
 

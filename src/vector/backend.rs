@@ -1829,10 +1829,11 @@ mod tests {
         // distance to B = √162 ≈ 12.73, so A wins decisively.
 
         // Behavioral check 1: a probe ceiling of 1 misses the trap.
+        // 0.5 of the fixture's 2 clusters resolves to a single probe.
         let one_probe = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: usize::MAX,
-            max_probe_count: 1,
+            max_probe_fraction: 0.5,
         };
         let hits1 = search(&index, embed_field, &AllQuery, query.to_vec(), 1, one_probe)?;
         assert_eq!(hits1.len(), 1);
@@ -2123,7 +2124,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: 0,
-            max_probe_count: usize::MAX,
+            max_probe_fraction: 1.0,
         };
         let hits = search(
             &index,
@@ -2210,10 +2211,11 @@ mod tests {
         Ok(())
     }
 
-    /// A `max_probe_count` below the cluster count forces the hard ceiling:
-    /// the loop stops with `termination == Ceiling`, having probed exactly
-    /// the cap, and the counter invariant still holds. Uses the deterministic
-    /// `build_inline_ivf` fixture (fixed 6 centroids) so the cutoff is stable.
+    /// A `max_probe_fraction` resolving below the cluster count forces the
+    /// hard ceiling: the loop stops with `termination == Ceiling`, having
+    /// probed exactly the cap, and the counter invariant still holds. Uses the
+    /// deterministic `build_inline_ivf` fixture (fixed 6 centroids) so the
+    /// cutoff is stable.
     #[test]
     fn ivf_probe_stats_termination_ceiling() -> crate::Result<()> {
         let centroids = [
@@ -2237,12 +2239,12 @@ mod tests {
             .collect();
         let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
 
-        // Cap 1 → ceiling at the first probe; an unsatisfiable survivor
-        // floor keeps the gate from firing first.
+        // 0.1 of 6 clusters → ceiling of 1, hit at the first probe; an
+        // unsatisfiable survivor floor keeps the gate from firing first.
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: usize::MAX,
-            max_probe_count: 1,
+            max_probe_fraction: 0.1,
         };
         let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![10.0, 10.0], 3, params)?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
@@ -2321,8 +2323,8 @@ mod tests {
             .collect();
         let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
 
-        // The merged segment must carry the routing graph, and cap 2 (< 16
-        // clusters) must engage it.
+        // The merged segment must carry the routing graph, and a ceiling of 2
+        // (0.1 of 16 clusters) must engage it.
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
         let vec_reader = segment_reader.vector_index(embed_field)?;
@@ -2332,7 +2334,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 7.0,
             min_candidates: 0,
-            max_probe_count: 2,
+            max_probe_fraction: 0.1,
         };
         let k = 3usize;
         for (ord, centroid) in centroids.iter().enumerate().step_by(3) {
@@ -2436,21 +2438,22 @@ mod tests {
     // ceiling), an inequality otherwise.
     // ============================================================
 
-    /// A cap of 2 on the 9-centroid fixture ⇒ the loop consumes exactly
-    /// the cap in filter-effective budget and attributes the stop to the
-    /// ceiling, regardless of how generous the other knobs are. With an
-    /// `AllQuery` filter every non-empty probed cluster bills a full 1.0,
-    /// so the ceiling binds at exactly 2 non-empty clusters — empty
+    /// A fraction resolving to 2 on the 9-centroid fixture ⇒ the loop
+    /// consumes exactly the cap in filter-effective budget and attributes the
+    /// stop to the ceiling, regardless of how generous the other knobs are.
+    /// With an `AllQuery` filter every non-empty probed cluster bills a full
+    /// 1.0, so the ceiling binds at exactly 2 non-empty clusters — empty
     /// clusters interleaved in the ranked list bill 0 and don't count.
     #[test]
-    fn probe_stats_max_probe_count_ceiling() -> crate::Result<()> {
+    fn probe_stats_max_probe_fraction_ceiling() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
+        // 0.2 of 9 clusters resolves to a ceiling of 2.
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: usize::MAX,
-            max_probe_count: 2,
+            max_probe_fraction: 0.2,
         };
         // The cap must actually bind for this test to mean anything.
         assert!(
@@ -2502,7 +2505,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 0.0,
             min_candidates: 0,
-            max_probe_count: usize::MAX,
+            max_probe_fraction: 1.0,
         };
         let (_, stats) = run_top_n_instrumented(
             &index.index,
@@ -2545,7 +2548,7 @@ mod tests {
         let params = AdaptiveProbeParams {
             epsilon: 7.0,
             min_candidates: 0,
-            max_probe_count: usize::MAX,
+            max_probe_fraction: 1.0,
         };
         let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![1.0, 0.3], 1, params)?;
         assert_eq!(stats.termination, ProbeTermination::Gate);
