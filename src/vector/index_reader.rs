@@ -21,9 +21,6 @@
 //! sidecar. [`VectorIndexReader::open`] validates the two signals agree.
 
 use std::cmp::Ordering;
-use std::ops::Range;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 
 use common::{HasLen, OwnedBytes};
 
@@ -36,37 +33,6 @@ use crate::directory::{CompositeFile, FileSlice};
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
-
-/// Ranged-read block granularity assumed by the fetch cost model
-/// ([`read_blocks`] here; the dispatch and run policies in `backend.rs`) —
-/// `Directory` implementations fetch in roughly 8 KiB blocks. The exact
-/// figure only moves the sparse/dense crossovers; it carries no
-/// correctness weight.
-pub(crate) const FETCH_BLOCK_BYTES: usize = 8192;
-
-/// Blocks one contiguous ranged read of `bytes` touches at arbitrary
-/// alignment: `ceil(bytes / FETCH_BLOCK_BYTES) + 1` (the `+ 1` covers the
-/// range straddling one extra block boundary).
-pub(crate) const fn read_blocks(bytes: usize) -> usize {
-    bytes.div_ceil(FETCH_BLOCK_BYTES) + 1
-}
-
-/// Upper bound on the span of one posting-tier ranged read — the flat
-/// path's survivor runs and the IVF bulk path's cluster reads both split
-/// at this size.
-///
-/// Amortization: a 1 MiB read spans ~128 [`FETCH_BLOCK_BYTES`] blocks, so
-/// the fixed per-read toll (the `+ 1` in [`read_blocks`]) is already
-/// under 1% — growing reads further saves only rounding error, while
-/// peak memory under a copying `Directory` keeps scaling linearly with
-/// the span. A single row wider than the cap is still read whole (a row
-/// is scored from contiguous bytes); the cap bounds multi-row spans.
-///
-/// Deliberately NOT a runtime knob: read sizing is not a tuning
-/// dimension worth a config surface. If this ever needs to adapt, derive
-/// it from `work_mem` through the query-time adaptive-params plumbing —
-/// do not add a GUC.
-pub(crate) const MAX_FETCH_SPAN_BYTES: usize = 1 << 20;
 
 /// Which on-disk layout a segment's vector data uses, surfaced through
 /// [`VectorInfo`] for tooling.
@@ -112,14 +78,6 @@ pub struct VectorIndexReader {
     /// queries fetch per-cluster (or per-doc) ranges.
     rows_slice: FileSlice,
     index: Option<IvfIndex>,
-    /// Test-only: cumulative [`read_blocks`]-priced block touches of every
-    /// row read served by this reader, for asserting fetch-strategy wins.
-    #[cfg(test)]
-    read_block_touches: AtomicUsize,
-    /// Test-only: the largest single row-range read served, in bytes —
-    /// for asserting span-cap compliance.
-    #[cfg(test)]
-    max_read_bytes: AtomicUsize,
 }
 
 impl VectorIndexReader {
@@ -226,10 +184,6 @@ impl VectorIndexReader {
             rows_slice,
             id_map,
             index,
-            #[cfg(test)]
-            read_block_touches: AtomicUsize::new(0),
-            #[cfg(test)]
-            max_read_bytes: AtomicUsize::new(0),
         })
     }
 
@@ -243,10 +197,6 @@ impl VectorIndexReader {
             rows_slice: FileSlice::empty(),
             id_map: IdMap::Identity { num_docs: 0 },
             index: None,
-            #[cfg(test)]
-            read_block_touches: AtomicUsize::new(0),
-            #[cfg(test)]
-            max_read_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -350,70 +300,17 @@ impl VectorIndexReader {
     /// beforehand (e.g. from a cluster's row range), so no doc→row lookup
     /// happens here.
     pub fn vector_bytes_for_row(&self, row: usize) -> crate::Result<OwnedBytes> {
-        self.vector_bytes_for_rows(row..row + 1)
-    }
-
-    /// The raw bytes of the contiguous run of vector rows `rows` of the
-    /// dense rows slot, fetched with one ranged read
-    /// (`rows.start * stride..rows.end * stride`). The caller resolves the
-    /// row range beforehand; it must be in-bounds.
-    pub fn vector_bytes_for_rows(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
-        if rows.start > rows.end || rows.end > self.id_map.num_rows() as usize {
+        if row >= self.id_map.num_rows() as usize {
             return Err(TantivyError::InvalidArgument(format!(
-                "vector rows {rows:?} are out of bounds"
+                "vector row {row} is out of bounds"
             )));
         }
         let stride = self.options.bytes_per_vector();
-        #[cfg(test)]
-        {
-            self.read_block_touches.fetch_add(
-                read_blocks(rows.len() * stride),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            self.max_read_bytes
-                .fetch_max(rows.len() * stride, std::sync::atomic::Ordering::Relaxed);
-        }
         let bytes = self
             .rows_slice
-            .slice(rows.start * stride..rows.end * stride)
+            .slice(row * stride..(row + 1) * stride)
             .read_bytes()?;
         Ok(bytes)
-    }
-
-    /// Test-only: the cumulative cost-model block touches
-    /// ([`read_blocks`]-priced) of every row read served by this reader.
-    /// Tests compare deltas between fetch strategies.
-    #[cfg(test)]
-    pub(crate) fn read_block_touches(&self) -> usize {
-        self.read_block_touches
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Test-only: the largest single row-range read served by this
-    /// reader, in bytes — asserts span-cap compliance.
-    #[cfg(test)]
-    pub(crate) fn max_read_bytes(&self) -> usize {
-        self.max_read_bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// The raw vector rows of `cluster`, contiguous in `.vec` row order,
-    /// fetched with one ranged read. IVF storage only. Materializes the
-    /// whole cluster regardless of size; the probe loop instead reads
-    /// [`MAX_FETCH_SPAN_BYTES`]-bounded sub-ranges via
-    /// [`Self::vector_bytes_for_rows`].
-    pub fn cluster_vector_bytes(&self, cluster: usize) -> crate::Result<OwnedBytes> {
-        let Some(index) = &self.index else {
-            return Err(TantivyError::InvalidArgument(
-                "vector storage is not clustered".to_string(),
-            ));
-        };
-        if cluster >= index.num_clusters() {
-            return Err(TantivyError::InvalidArgument(format!(
-                "cluster {cluster} is out of bounds"
-            )));
-        }
-        self.vector_bytes_for_rows(index.cluster_range(cluster))
     }
 
     /// The doc id stored at `row` of the cluster-sorted permutation, decoded
