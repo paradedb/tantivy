@@ -155,7 +155,8 @@ impl<T: VectorElement> VectorBackend<T> {
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ProbeTermination {
-    /// `probe_count >= max_probe_count` — the absolute probe ceiling.
+    /// The filter-effective probe budget reached `max_probe_count` — the
+    /// probe ceiling.
     Ceiling,
     /// The distance-ratio gate fired with the survivor floor met.
     Gate,
@@ -225,6 +226,12 @@ pub struct ProbeStats {
 /// adaptive defaults once real benchmarks land.
 pub(crate) const CANDIDATE_OVERFETCH_MULTIPLIER: usize = 4;
 
+/// Floor a probed cluster charges the ceiling even when the filter skips
+/// all its rows (the gate pre-pass still scans them). A cluster bills
+/// `SKIPPED_CLUSTER_COST + (1 - SKIPPED_CLUSTER_COST) * pass_fraction`:
+/// 0.05 fully filtered, 1.0 unfiltered. Provisional.
+pub(crate) const SKIPPED_CLUSTER_COST: f32 = 0.05;
+
 /// One gate survivor from the pre-pass over a cluster's rows: `row`
 /// indexes into the segment-wide dense rows slot.
 #[derive(Clone, Copy)]
@@ -280,8 +287,11 @@ impl<T: VectorElement> VectorBackend<T> {
 
         // Phase 1: rank the clusters to probe, lazily — the scan below pulls
         // ranked clusters on demand, so routing cost is paid only as far as
-        // probing actually reaches. Routing operates in `f32` (centroid rows
-        // are `f32` today), so the query is widened losslessly per element.
+        // probing actually reaches. The filter-effective budget can pull far
+        // past `max_probe_count` raw clusters on a selective filter (each
+        // skipped cluster costs ~0), and lazy routing keeps that cheap.
+        // Routing operates in `f32` (centroid rows are `f32` today), so the
+        // query is widened losslessly per element.
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
         let mut routing_ws = Workspace::new();
         let mut ranked = index.rank_clusters(&mut routing_ws, &query_f32);
@@ -387,11 +397,15 @@ impl<T: VectorElement> VectorBackend<T> {
         // The probed cluster's gate survivors; allocated once, reused
         // across clusters.
         let mut survivors: Vec<Survivor> = Vec::new();
+        let mut probe_budget = 0.0f32;
+        let max_probe_budget = max_probe_count as f32;
 
-        for (probe_count, Candidate { sim, node: cluster }) in ranked.enumerate() {
+        for Candidate { sim, node: cluster } in ranked {
             // The pull that trips the ceiling proves another ranked cluster
-            // existed, keeping `Ceiling` distinct from `Exhausted`.
-            if probe_count >= max_probe_count {
+            // existed, keeping `Ceiling` distinct from `Exhausted`. The budget
+            // is filter-effective (see the per-cluster charge below), so a
+            // selective filter walks far past `max_probe_count` raw clusters.
+            if probe_budget >= max_probe_budget {
                 termination = ProbeTermination::Ceiling;
                 break;
             }
@@ -408,6 +422,7 @@ impl<T: VectorElement> VectorBackend<T> {
             }
 
             let rows = index.cluster_range(cluster);
+            let num_rows = rows.len();
 
             // Pre-pass: run the gate off the pinned id-map alone, BEFORE
             // any posting bytes are fetched, so the fetch below can be
@@ -420,6 +435,14 @@ impl<T: VectorElement> VectorBackend<T> {
             pruned_filter += pf;
             pruned_dead += pd;
             pruned_seen += ps;
+
+            // Charge the ceiling by the cluster's filter pass rate: a
+            // fully-skipped cluster still costs `SKIPPED_CLUSTER_COST` (the
+            // gate pre-pass scanned it), a fully-unfiltered one costs 1.0.
+            if num_rows > 0 {
+                let pass_fraction = (num_rows - pf) as f32 / num_rows as f32;
+                probe_budget += SKIPPED_CLUSTER_COST + (1.0 - SKIPPED_CLUSTER_COST) * pass_fraction;
+            }
 
             if survivors.is_empty() {
                 postings_skipped += 1;
@@ -2139,9 +2162,12 @@ mod tests {
     // ceiling), an inequality otherwise.
     // ============================================================
 
-    /// A cap of 2 on the 9-centroid fixture ⇒ the loop probes exactly
-    /// the cap and attributes the stop to the ceiling, regardless of
-    /// how generous the other knobs are.
+    /// A cap of 2 on the 9-centroid fixture ⇒ the loop consumes exactly
+    /// the cap in filter-effective budget and attributes the stop to the
+    /// ceiling, regardless of how generous the other knobs are. With an
+    /// `AllQuery` filter every non-empty probed cluster bills a full 1.0,
+    /// so the ceiling binds at exactly 2 non-empty clusters — empty
+    /// clusters interleaved in the ranked list bill 0 and don't count.
     #[test]
     fn probe_stats_max_probe_count_ceiling() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
@@ -2165,10 +2191,20 @@ mod tests {
             params,
         )?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
+
+        let searcher = index.index.reader()?.searcher();
+        let sizes = searcher.segment_readers()[0]
+            .vector_index(index.embedding_field())?
+            .cluster_sizes()
+            .expect("ivf segment exposes cluster sizes");
+        let non_empty_probed = stats
+            .probed_clusters
+            .iter()
+            .filter(|&&c| sizes[c] > 0)
+            .count();
         assert_eq!(
-            stats.probed_clusters.len(),
-            2,
-            "absolute cap ⇒ exactly 2 probed, got {:?}",
+            non_empty_probed, 2,
+            "cap ⇒ exactly 2 non-empty (filter-effective) clusters probed, got {:?}",
             stats.probed_clusters,
         );
         Ok(())
