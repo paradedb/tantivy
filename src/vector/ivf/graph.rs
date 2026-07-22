@@ -379,6 +379,54 @@ impl EdgeListMut<'_> {
     }
 }
 
+/// Why a [`RelativeNeighborhoodGraph::search`] stopped expanding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchTerminationReason {
+    /// The best unexpanded candidate could not beat the worst kept result of
+    /// a full beam: the search converged.
+    SearchConverged,
+    /// The frontier drained before the beam converged: every node reachable
+    /// from the seeds was visited.
+    GraphExhausted,
+}
+
+/// Per-query cost and convergence counters returned by
+/// [`RelativeNeighborhoodGraph::search`].
+#[derive(Clone, Copy, Debug)]
+pub struct NeighborhoodGraphSearchMetrics {
+    /// Nodes visited — and therefore scored — by the query; the search's
+    /// navigation cost.
+    pub visited_count: usize,
+    /// Frontier candidates that survived the convergence check and had their
+    /// adjacency scanned: the number of hops the search took.
+    pub expanded_count: usize,
+    /// Neighbor entries iterated across all expansions, including
+    /// already-visited ones; `edges_scanned - visited_count` is traversal
+    /// spent on redundant edges.
+    pub edges_scanned: usize,
+    /// Candidates that displaced a worse result after the beam filled. Low
+    /// churn means the beam width was generous; constant churn means it was
+    /// tight.
+    pub evictions: usize,
+    /// Candidates returned, after truncation to `k`.
+    pub result_count: usize,
+    /// Why the expansion loop stopped.
+    pub termination_reason: SearchTerminationReason,
+}
+
+impl Default for NeighborhoodGraphSearchMetrics {
+    fn default() -> Self {
+        Self {
+            visited_count: 0,
+            expanded_count: 0,
+            edges_scanned: 0,
+            evictions: 0,
+            result_count: 0,
+            termination_reason: SearchTerminationReason::GraphExhausted,
+        }
+    }
+}
+
 // ============================================================
 // The relative neighborhood graph (RNG) index over a Graph.
 // ============================================================
@@ -453,7 +501,8 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
 
     /// Greedy beam search for the `k` nodes most similar to `query`, expanding
     /// outward from `seeds`. Returns [`Candidate`]s most similar first, with a
-    /// beam width of `max(ef, k)`.
+    /// beam width of `max(ef, k)`, plus the query's
+    /// [`NeighborhoodGraphSearchMetrics`].
     ///
     /// `ws` holds the per-query scratch; reuse one across queries to avoid
     /// reallocating. It is reset at the start of each call.
@@ -463,10 +512,10 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         query: &[S::Elem],
         seeds: &[NodeId],
         k: usize,
-    ) -> Vec<Candidate> {
+    ) -> (Vec<Candidate>, NeighborhoodGraphSearchMetrics) {
         debug_assert_eq!(query.len(), self.graph.dim(), "query dimension mismatch");
         if self.graph.is_empty() || k == 0 {
-            return Vec::new();
+            return (Vec::new(), NeighborhoodGraphSearchMetrics::default());
         }
         let ef = self.config.ef.max(k);
         let n = self.graph.len();
@@ -475,8 +524,9 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         let metric = self.metric;
         let epoch = ws.begin_query(n);
 
+        let mut search_metrics = NeighborhoodGraphSearchMetrics::default();
+
         let visited = &mut ws.visited;
-        let num_visited = &mut ws.num_visited;
         let frontier = &mut ws.frontier;
         let results = &mut ws.results;
 
@@ -489,7 +539,7 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
                 continue;
             }
             visited[idx] = epoch;
-            *num_visited += 1;
+            search_metrics.visited_count += 1;
             let sim = arena.similarity(metric, dim, node_id, query);
             let c = Candidate { sim, node: node_id };
             frontier.push(c);
@@ -500,15 +550,19 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
             // Stop once the best unexpanded candidate can't beat the worst kept
             // result and the result set is already full.
             if results.len() >= ef && results.peek().is_some_and(|w| cand.sim < w.0.sim) {
+                search_metrics.termination_reason = SearchTerminationReason::SearchConverged;
                 break;
             }
-            for &nb in self.graph.neighbors(cand.node) {
+            search_metrics.expanded_count += 1;
+            let neighbors = self.graph.neighbors(cand.node);
+            search_metrics.edges_scanned += neighbors.len();
+            for &nb in neighbors {
                 let idx = nb as usize;
                 if visited[idx] == epoch {
                     continue;
                 }
                 visited[idx] = epoch;
-                *num_visited += 1;
+                search_metrics.visited_count += 1;
                 let sim = arena.similarity(metric, dim, nb, query);
                 let c = Candidate { sim, node: nb };
                 // A candidate earns a frontier slot exactly when it enters the
@@ -524,6 +578,7 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
                     if c.sim > worst.0.sim {
                         *worst = Reverse(c);
                         frontier.push(c);
+                        search_metrics.evictions += 1;
                     }
                 }
             }
@@ -532,7 +587,8 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         let mut out: Vec<Candidate> = results.drain().map(|Reverse(c)| c).collect();
         out.sort_unstable_by(|a, b| b.sim.cmp(&a.sim).then_with(|| a.node.cmp(&b.node)));
         out.truncate(k);
-        out
+        search_metrics.result_count = out.len();
+        (out, search_metrics)
     }
 
     /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
@@ -612,7 +668,7 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
                         let mut out = Vec::with_capacity((end - start) as usize);
                         for node in start..end {
                             let query = rng.graph.payload(node);
-                            let candidates =
+                            let (candidates, _) =
                                 rng.search(&mut ws, query, &[node], rng.config.num_candidates);
                             out.push(rng.select_neighbors(node, &candidates));
                         }
@@ -769,9 +825,6 @@ pub struct Workspace {
     /// bump) instead of re-zeroing all `n` slots.
     visited: Vec<u32>,
     visited_epoch: u32,
-    /// Nodes visited — and therefore scored — by the current query; the
-    /// search's navigation cost, surfaced through [`Self::num_visited`].
-    num_visited: usize,
     /// Max-heap by similarity: the frontier of candidates left to expand.
     frontier: BinaryHeap<Candidate>,
     /// Min-heap by similarity (via `Reverse`): the best `ef` results so far, with
@@ -783,12 +836,6 @@ impl Workspace {
     /// Creates an empty workspace. It grows to fit on first use.
     pub fn new() -> Self {
         Workspace::default()
-    }
-
-    /// Nodes visited (scored) by the most recent search — the navigation
-    /// cost. Reset at the start of each query.
-    pub fn num_visited(&self) -> usize {
-        self.num_visited
     }
 
     /// Prepares the workspace for a query over `n` nodes: grows the visited
@@ -804,7 +851,6 @@ impl Workspace {
             self.visited.iter_mut().for_each(|v| *v = 0);
             self.visited_epoch = 1;
         }
-        self.num_visited = 0;
         self.frontier.clear();
         self.results.clear();
         self.visited_epoch
@@ -1102,9 +1148,13 @@ mod rng_tests {
         let rng = line_index(8);
         let mut ws = Workspace::new();
         // Query at 4.2 → nearest points are 4, 5, 3, in that order.
-        let res = rng.search(&mut ws, &[4.2], &[0], 3);
+        let (res, metrics) = rng.search(&mut ws, &[4.2], &[0], 3);
         let ids: Vec<NodeId> = res.iter().map(|c| c.node).collect();
         assert_eq!(ids, vec![4, 5, 3]);
+        assert_eq!(metrics.result_count, 3);
+        assert!(metrics.visited_count >= 3);
+        assert!(metrics.expanded_count >= 1);
+        assert!(metrics.edges_scanned >= metrics.visited_count - 1);
         // Similarities are returned in descending order.
         assert!(res[0].sim >= res[1].sim && res[1].sim >= res[2].sim);
     }
@@ -1113,8 +1163,8 @@ mod rng_tests {
     fn search_handles_degenerate_inputs() {
         let rng = line_index(5);
         let mut ws = Workspace::new();
-        assert!(rng.search(&mut ws, &[1.0], &[0], 0).is_empty()); // k == 0
-        assert!(rng.search(&mut ws, &[1.0], &[], 3).is_empty()); // no seeds
+        assert!(rng.search(&mut ws, &[1.0], &[0], 0).0.is_empty()); // k == 0
+        assert!(rng.search(&mut ws, &[1.0], &[], 3).0.is_empty()); // no seeds
 
         let empty: RelativeNeighborhoodGraph<Vec<f32>> = RelativeNeighborhoodGraph::new(
             Vec::new(),
@@ -1122,15 +1172,15 @@ mod rng_tests {
             Metric::L2,
             NeighborhoodGraphConfig::default(),
         );
-        assert!(empty.search(&mut ws, &[1.0], &[0], 3).is_empty()); // empty graph
+        assert!(empty.search(&mut ws, &[1.0], &[0], 3).0.is_empty()); // empty graph
     }
 
     #[test]
     fn search_reuses_workspace_deterministically() {
         let rng = line_index(8);
         let mut ws = Workspace::new();
-        let a = rng.search(&mut ws, &[4.2], &[0], 3);
-        let b = rng.search(&mut ws, &[4.2], &[0], 3);
+        let (a, _) = rng.search(&mut ws, &[4.2], &[0], 3);
+        let (b, _) = rng.search(&mut ws, &[4.2], &[0], 3);
         assert_eq!(a, b); // epoch reset means repeated queries match exactly
     }
 
@@ -1138,7 +1188,7 @@ mod rng_tests {
     fn search_from_a_node_returns_it_then_nearest() {
         let rng = line_index(8);
         let mut ws = Workspace::new();
-        let res = rng.search(&mut ws, &[4.0], &[4], 4);
+        let (res, _) = rng.search(&mut ws, &[4.0], &[4], 4);
         let ids: Vec<NodeId> = res.iter().map(|c| c.node).collect();
         assert_eq!(ids[0], 4); // the query point itself ranks first
         assert!(ids[1] == 3 || ids[1] == 5); // then its nearest neighbors

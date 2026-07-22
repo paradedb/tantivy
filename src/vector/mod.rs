@@ -37,8 +37,9 @@ pub use flat::FlatVecWriter;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
     Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfMergeSettings, IvfVectorBatch, IvfVectors, NeighborhoodGraphConfig, NodeId,
-    RelativeNeighborhoodGraph, Workspace,
+    IvfMergeSettings, IvfSearchMetrics, IvfVectorBatch, IvfVectors, NeighborhoodGraphConfig,
+    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, SearchTerminationReason,
+    Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;

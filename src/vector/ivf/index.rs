@@ -27,7 +27,10 @@ use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
-use super::graph::{NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace};
+use super::graph::{
+    NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph,
+    Workspace,
+};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::{FileSliceArena, VectorArena};
@@ -231,14 +234,18 @@ impl IvfIndex {
     }
 
     /// Clusters to probe for `query`, best routing score first, as
-    /// `(score, cluster)` pairs, plus the number of centroids scored
-    /// (surfaced as `ProbeStats::centroids_ranked`).
+    /// `(score, cluster)` pairs, plus the routing cost as
+    /// [`IvfSearchMetrics`] (surfaced as `ProbeStats::routing`).
     ///
     /// With a persisted RNG this is a beam search
-    /// ([`RelativeNeighborhoodGraph::nearest`]); without one every centroid
+    /// ([`RelativeNeighborhoodGraph::search`]); without one every centroid
     /// is scored exactly. Both paths score through the same
     /// [`FileSliceArena`], so their rankings agree.
-    pub(crate) fn rank_clusters(&self, query: &[f32], limit: usize) -> (Vec<(f32, u32)>, usize) {
+    pub(crate) fn rank_clusters(
+        &self,
+        query: &[f32],
+        limit: usize,
+    ) -> (Vec<(f32, u32)>, IvfSearchMetrics) {
         match &self.graph {
             Some(graph) => {
                 let mut ws = Workspace::new();
@@ -250,12 +257,18 @@ impl IvfIndex {
                         .map(|node| node as NodeId)
                         .collect()
                 };
-                let candidates = graph.search(&mut ws, query, &seeds, limit);
+                let (candidates, metrics) = graph.search(&mut ws, query, &seeds, limit);
                 let ranked = candidates
                     .into_iter()
                     .map(|candidate| (candidate.sim.score(), candidate.node))
                     .collect();
-                (ranked, ws.num_visited())
+                (
+                    ranked,
+                    IvfSearchMetrics {
+                        visited_count: metrics.visited_count,
+                        graph: Some(metrics),
+                    },
+                )
             }
             None => {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
@@ -267,8 +280,29 @@ impl IvfIndex {
                     .collect();
                 ranked.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
                 ranked.truncate(limit);
-                (ranked, self.num_centroids)
+                (
+                    ranked,
+                    IvfSearchMetrics {
+                        visited_count: self.num_centroids,
+                        graph: None,
+                    },
+                )
             }
         }
     }
+}
+
+/// Routing cost of one [`IvfIndex::rank_clusters`] call: how many centroids
+/// were scored to pick the probe order, and — when routing went through the
+/// centroid RNG — the beam search's full
+/// [`NeighborhoodGraphSearchMetrics`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IvfSearchMetrics {
+    /// Centroids scored to route the query (the navigation cost):
+    /// `num_centroids` on the exact path, the beam-visited count when routed
+    /// via the RNG.
+    pub visited_count: usize,
+    /// The centroid-graph beam search's counters; `None` when routing fell
+    /// back to a linear scan of the centroids.
+    pub graph: Option<NeighborhoodGraphSearchMetrics>,
 }

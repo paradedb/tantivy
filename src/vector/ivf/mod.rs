@@ -16,9 +16,10 @@ mod training;
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
 pub use graph::{
-    Candidate, Graph, NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace,
+    Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
+    RelativeNeighborhoodGraph, SearchTerminationReason, Workspace,
 };
-pub use index::IvfIndex;
+pub use index::{IvfIndex, IvfSearchMetrics};
 pub use params::AdaptiveProbeParams;
 pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, encode_vector};
