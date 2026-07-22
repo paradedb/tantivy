@@ -226,3 +226,7 @@ harness = false
 [[bench]]
 name = "distance"
 harness = false
+
+[[bench]]
+name = "graph"
+harness = false

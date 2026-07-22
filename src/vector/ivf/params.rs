@@ -29,9 +29,16 @@ pub struct AdaptiveProbeParams {
     /// PROVISIONAL pending our own benchmarks.
     pub epsilon: f32,
     /// Absolute survivor floor. The call site widens this to
-    /// `min_candidates.max(4 * top_n)`, so a 0 default still gives a
-    /// sane `4 × top_n` floor.
+    /// `min_candidates.max(top_n + overfetch_margin)`, so a 0 default
+    /// still gives a sane `top_n + overfetch_margin` floor.
     pub min_candidates: usize,
+    /// Additive over-fetch margin: the resolved survivor floor is
+    /// `top_n + overfetch_margin`. Unlike a multiplicative `m × top_n`
+    /// floor, an additive margin keeps the over-probe cushion a *fixed*
+    /// number of clusters as `top_n` grows, so the `epsilon` needed for a
+    /// target recall stays roughly constant across K instead of shrinking
+    /// with it. Default 32, PROVISIONAL.
+    pub overfetch_margin: usize,
     /// Filter-effective cluster ceiling, expressed as a FRACTION of the
     /// segment's cluster count and resolved per-segment: a segment with
     /// `num_clusters` clusters probes at most `ceil(max_probe_fraction *
@@ -52,6 +59,7 @@ impl Default for AdaptiveProbeParams {
         Self {
             epsilon: 7.0,
             min_candidates: 0,
+            overfetch_margin: 32,
             max_probe_fraction: 0.01,
         }
     }
