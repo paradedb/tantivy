@@ -392,6 +392,13 @@ pub(crate) fn merge_ivf(
                             if batch_doc_ids.is_empty() {
                                 return Ok(());
                             }
+                            // Poll for cancellation once per batch so a large
+                            // assign phase (minutes on a big segment) stays
+                            // interruptible instead of only checking at phase
+                            // boundaries.
+                            if ctx.cancel.wants_cancel() {
+                                return Err(TantivyError::Cancelled);
+                            }
                             let batch_len = batch_doc_ids.len();
                             let assign_start = Instant::now();
                             let clusters = clusterer.assign(
@@ -458,6 +465,7 @@ pub(crate) fn merge_ivf(
                                                 .collect();
                                             graph
                                                 .search(&mut replica_ws, v, &seeds, replicas)
+                                                .0
                                                 .into_iter()
                                                 .map(|candidate| candidate.node as usize)
                                                 .collect()
@@ -560,10 +568,18 @@ pub(crate) fn merge_ivf(
 
                 // `.vec` slot [1]: the cluster-sorted vector rows.
                 {
+                    // Poll for cancellation every this-many rows during the
+                    // posting-write phase — often enough to stay responsive,
+                    // rare enough to keep the FFI cancel check off the per-row
+                    // path.
+                    const CANCEL_POLL_ROWS: usize = 4096;
                     let rows_w = vec_write.for_field_with_idx(field, 1);
                     let needs_norm = opts.needs_normalization();
                     let mut row_buf: Vec<u8> = Vec::with_capacity(opts.bytes_per_vector());
-                    for assigned_vector in &assigned_vectors {
+                    for (row_idx, assigned_vector) in assigned_vectors.iter().enumerate() {
+                        if row_idx % CANCEL_POLL_ROWS == 0 && ctx.cancel.wants_cancel() {
+                            return Err(TantivyError::Cancelled);
+                        }
                         let reader = &field_readers[assigned_vector.source_segment_ord];
                         let bytes = reader
                             .vector_bytes(assigned_vector.source_doc_id)?
