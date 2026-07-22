@@ -269,7 +269,7 @@ mod ivf_e2e_tests {
                 s.pruned_filter + s.pruned_dead + s.pruned_seen + s.candidates_scored,
                 "invariant per segment: {s:?}"
             );
-            assert!(s.centroids_ranked > 0);
+            assert!(s.routing.visited_count > 0);
             total_visited += s.vectors_visited;
         }
         assert!(total_visited > 0, "exhaustive probe should visit docs");

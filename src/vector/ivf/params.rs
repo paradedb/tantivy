@@ -4,11 +4,19 @@
 ///
 /// Stop condition, evaluated for the NEXT ranked centroid between
 /// clusters — so the first cluster is always scanned: stop at the
-/// absolute probe-count ceiling, OR once the `min_candidates` floor is
+/// probe-budget ceiling, OR once the `min_candidates` floor is
 /// met AND the next centroid breaches the per-metric distance-ratio
 /// gate (SPANN eq. 3). The ceiling is checked first — the
 /// [`ProbeTermination`](crate::vector::ProbeTermination) attribution
 /// contract.
+///
+/// The ceiling is measured in filter-effective clusters, not raw
+/// clusters: a probed cluster consumes budget on an affine map of its
+/// filter pass rate — `SKIPPED_CLUSTER_COST` (a small floor, since the
+/// gate pre-pass still scans the cluster) when all rows are filtered,
+/// `1.0` when none are, in between otherwise. A selective filter
+/// therefore probes deeper into the ranked list before the ceiling
+/// binds, since the clusters it skips over cost little (but not nothing).
 ///
 /// All defaults are provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
@@ -31,10 +39,12 @@ pub struct AdaptiveProbeParams {
     /// target recall stays roughly constant across K instead of shrinking
     /// with it. Default 32, PROVISIONAL.
     pub overfetch_margin: usize,
-    /// Absolute cluster ceiling, clamped to the segment's cluster count
-    /// — segments with `C <= cap` scan exhaustively unless the gate
-    /// stops earlier. SPANN Fig. 2: 99% of SIFT1M queries reach perfect
-    /// recall@1 within 114 postings; 128 clears that. Default 128,
+    /// Filter-effective cluster ceiling, clamped to the segment's cluster
+    /// count. Each probed cluster consumes budget equal to its filter
+    /// pass rate (`(rows - filtered) / rows`), so an unfiltered query
+    /// probes at most this many clusters while a selective filter probes
+    /// proportionally more. SPANN Fig. 2: 99% of SIFT1M queries reach
+    /// perfect recall@1 within 114 postings; 128 clears that. Default 128,
     /// PROVISIONAL.
     pub max_probe_count: usize,
 }
