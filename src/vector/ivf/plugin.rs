@@ -17,7 +17,9 @@ use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
-use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::distance::{
+    cosine, dot, l2_squared, l2_squared_bytes, maybe_normalize_bytes, NormalizeOutcome,
+};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
 use crate::vector::{
@@ -164,7 +166,8 @@ fn write_empty_field_slots(
         let rows_w = vec_write.for_field_with_idx(field, 1);
         rows_w.flush()?;
     }
-    // `.centroids`: zero centroids, zero docs, single zero offset.
+    // `.centroids`: zero centroids, zero docs, single zero offset, zero
+    // radii.
     {
         let centroids_w = centroids_write.for_field_with_idx(field, 0);
         IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
@@ -174,6 +177,11 @@ fn write_empty_field_slots(
         let offsets_w = centroids_write.for_field_with_idx(field, 1);
         IvfIndex::serialize_offsets(&[0u64], offsets_w)?;
         offsets_w.flush()?;
+    }
+    {
+        let radii_w = centroids_write.for_field_with_idx(field, 3);
+        IvfIndex::serialize_radii(&[], radii_w)?;
+        radii_w.flush()?;
     }
     Ok(())
 }
@@ -341,6 +349,27 @@ pub(crate) fn merge_ivf(
                     .chunks_exact(opts.dim())
                     .map(|centroid| centroid.to_vec())
                     .collect();
+
+                // Radius reference for slot [3]: each centroid exactly as
+                // the `.centroids` write below will store it (encode, then
+                // Cosine-normalize; a NonFinite centroid stays raw under
+                // the same warn-and-write policy). Radii must bound
+                // distances between the STORED member bytes the query path
+                // scores and the STORED centroid it routes by — for L2/Dot
+                // that is the raw L2 displacement, for write-time-normalized
+                // Cosine the chord — and all three reduce to L2 distance
+                // between the stored representations.
+                let radius_reference: Vec<Vec<f32>> = centroid_rows
+                    .iter()
+                    .map(|centroid| {
+                        let mut bytes = encode_vector(centroid, opts.dim())?;
+                        maybe_normalize_bytes(opts, &mut bytes);
+                        decode_row::<f32>(&bytes, opts.dim())
+                    })
+                    .collect::<crate::Result<_>>()?;
+                // Per-cluster running max of the SQUARED displacement; one
+                // sqrt per cluster at the end.
+                let mut radius_sq = vec![0.0f32; num_centroids];
 
                 // Fixed-k replication: pick a selector ONCE before the assign
                 // loop, and only when `replicas > 1`. At `replicas == 1`
@@ -604,7 +633,7 @@ pub(crate) fn merge_ivf(
                         // the row would desync the already-computed assignments
                         // and IdMap. Warn-and-write-as-is is visible,
                         // self-limiting, and non-desyncing.
-                        if needs_norm {
+                        let row_bytes: &[u8] = if needs_norm {
                             row_buf.clear();
                             row_buf.extend_from_slice(&bytes);
                             if maybe_normalize_bytes(opts, &mut row_buf)
@@ -617,10 +646,23 @@ pub(crate) fn merge_ivf(
                                     assigned_vector.target_doc_id,
                                 );
                             }
-                            rows_w.write_all(&row_buf)?;
+                            &row_buf
                         } else {
-                            rows_w.write_all(&bytes)?;
-                        }
+                            &bytes[..]
+                        };
+                        rows_w.write_all(row_bytes)?;
+                        // Track the cluster radius against the exact bytes
+                        // just written — replica rows included, since a
+                        // query-time radius skip skips the whole posting
+                        // list. One distance per posting row, off the byte
+                        // kernel (no decode allocation); `f32::max` ignores
+                        // a NaN from a non-finite row.
+                        let d_sq = l2_squared_bytes::<f32>(
+                            &radius_reference[assigned_vector.cluster],
+                            row_bytes,
+                        );
+                        let slot = &mut radius_sq[assigned_vector.cluster];
+                        *slot = slot.max(d_sq);
                     }
                     rows_w.flush()?;
                 }
@@ -699,6 +741,19 @@ pub(crate) fn merge_ivf(
                         }
                     }
                     graph_w.flush()?;
+                }
+
+                // `.centroids` slot [3]: per-cluster radii, accumulated as
+                // squared displacements in the posting write above; one
+                // sqrt per cluster here. Written for every centroid count
+                // (a single-cluster segment still has a radius) — only
+                // pre-radius segments lack the slot, and they load as
+                // all-zero.
+                {
+                    let radii: Vec<f32> = radius_sq.into_iter().map(f32::sqrt).collect();
+                    let radii_w = centroids_write.for_field_with_idx(field, 3);
+                    IvfIndex::serialize_radii(&radii, radii_w)?;
+                    radii_w.flush()?;
                 }
 
                 log::info!(

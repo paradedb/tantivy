@@ -2546,6 +2546,142 @@ mod tests {
     }
 
     // ============================================================
+    // Cluster radii (`.centroids` slot [3]).
+    //
+    // One f32 per cluster, computed during the merge's posting write
+    // against the STORED representations: max L2 displacement between a
+    // stored member row (replicas included) and the stored centroid —
+    // true L2 for L2/Dot, chord for write-time-normalized Cosine.
+    // ============================================================
+
+    /// Hand-computed radii per metric. L2/Dot: raw displacement of the
+    /// farthest member. Cosine: the chord against the NORMALIZED centroid,
+    /// measured on the normalized stored rows — an unnormalized ingest
+    /// vector contributes its normalized chord, not its raw displacement.
+    #[test]
+    fn ivf_radii_hand_computed_per_metric() -> crate::Result<()> {
+        // L2 and Dot share the raw-displacement definition.
+        for metric in [Metric::L2, Metric::Dot] {
+            let centroids = vec![[0.0_f32, 0.0], [10.0, 0.0]];
+            let docs = [
+                ("a0", [0.0_f32, 0.0]),
+                ("a1", [3.0_f32, 4.0]), // ‖p − μ_A‖ = 5
+                ("b0", [10.0_f32, 0.0]),
+                ("b1", [10.0_f32, 2.0]), // ‖p − μ_B‖ = 2
+            ];
+            let (index, embed_field, _label) = build_inline_ivf(metric, &centroids, &docs, 1)?;
+            let searcher = index.reader()?.searcher();
+            let ivf_reader = searcher.segment_readers()[0].vector_index(embed_field)?;
+            let ivf = ivf_reader.index().expect("expected IVF storage");
+            assert!(
+                (ivf.cluster_radius(0) - 5.0).abs() < 1e-5,
+                "{metric:?}: cluster A radius {}",
+                ivf.cluster_radius(0)
+            );
+            assert!(
+                (ivf.cluster_radius(1) - 2.0).abs() < 1e-5,
+                "{metric:?}: cluster B radius {}",
+                ivf.cluster_radius(1)
+            );
+            assert!((ivf.max_radius() - 5.0).abs() < 1e-5, "{metric:?}");
+        }
+
+        // Cosine: a single cluster around [1, 0]; [0, 3] stores as the unit
+        // vector [0, 1], whose chord to the (normalized) centroid is
+        // sqrt(2·(1 − cos 90°)) = sqrt(2) — NOT its raw displacement.
+        let centroids = vec![[1.0_f32, 0.0]];
+        let docs = [("u0", [1.0_f32, 0.0]), ("u1", [0.0_f32, 3.0])];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::Cosine, &centroids, &docs, 1)?;
+        let searcher = index.reader()?.searcher();
+        let ivf_reader = searcher.segment_readers()[0].vector_index(embed_field)?;
+        let ivf = ivf_reader.index().expect("expected IVF storage");
+        let expected = 2.0_f32.sqrt();
+        assert!(
+            (ivf.cluster_radius(0) - expected).abs() < 1e-5,
+            "cosine chord radius: got {}, want {expected}",
+            ivf.cluster_radius(0)
+        );
+        Ok(())
+    }
+
+    /// The stored radius equals the true max displacement over the
+    /// cluster's STORED rows — replica rows included (a query-time radius
+    /// skip skips the whole posting list, so replicas must be covered) —
+    /// and stays sound when the segment is re-merged.
+    #[test]
+    fn ivf_radii_cover_replica_rows_and_survive_remerge() -> crate::Result<()> {
+        // Every cluster's radius must equal the max displacement of its
+        // stored rows from its stored centroid.
+        fn assert_radii_match_stored_rows(
+            segment_reader: &SegmentReader,
+            embed_field: Field,
+        ) -> crate::Result<()> {
+            let vec_reader = segment_reader.vector_index(embed_field)?;
+            let ivf = vec_reader.index().expect("expected IVF storage");
+            let centroid_bytes = ivf.centroid_bytes()?;
+            let mut checked = 0usize;
+            for cluster in 0..ivf.num_clusters() {
+                let centroid = decode_2d(&centroid_bytes[cluster * 8..cluster * 8 + 8]);
+                let mut true_max = 0.0f32;
+                for row in ivf.cluster_range(cluster) {
+                    let row_vec = decode_2d(&vec_reader.vector_bytes_for_row(row)?);
+                    let dx = row_vec[0] - centroid[0];
+                    let dy = row_vec[1] - centroid[1];
+                    true_max = true_max.max((dx * dx + dy * dy).sqrt());
+                    checked += 1;
+                }
+                assert!(
+                    (ivf.cluster_radius(cluster) - true_max).abs() < 1e-4,
+                    "cluster {cluster}: stored radius {} vs true max {true_max}",
+                    ivf.cluster_radius(cluster)
+                );
+            }
+            assert!(checked > 0, "invariant must cover actual rows");
+            Ok(())
+        }
+
+        // replicas = 3: each cluster's rows include far-away replica
+        // members (grid gap 10), so replica coverage dominates the radius.
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 3)?;
+        {
+            let searcher = index.reader()?.searcher();
+            let segment_reader = &searcher.segment_readers()[0];
+            assert_radii_match_stored_rows(segment_reader, embed_field)?;
+            // Replica coverage sanity: with 6 primaries within 0.05·√2 of
+            // their centroid, a primaries-only radius would be < 0.1;
+            // replica members sit a grid gap (≥ 10) away.
+            let vec_reader = segment_reader.vector_index(embed_field)?;
+            let ivf = vec_reader.index().expect("ivf");
+            assert!(
+                ivf.max_radius() > 5.0,
+                "replica rows must widen the radius, got {}",
+                ivf.max_radius()
+            );
+        }
+
+        // Re-merge with two extra docs: the merge re-trains and re-assigns,
+        // so radii are recomputed fresh — the invariant must hold again.
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for (label, v) in [("extra0", [5.0_f32, 5.0]), ("extra1", [15.0, 5.0])] {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(label_field, label);
+            doc.add_vector(embed_field, v.as_slice());
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
+        assert_radii_match_stored_rows(&searcher.segment_readers()[0], embed_field)?;
+        Ok(())
+    }
+
+    // ============================================================
     // Candidate-anchored gate (ProbeGateMode::Candidate).
     //
     // The gate is unarmed until the segment's top-N heap holds `top_n`

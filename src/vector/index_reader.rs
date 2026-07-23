@@ -8,12 +8,11 @@
 //! stays behind [`FileSlice`]s and is fetched with ranged reads at query time.
 //!
 //! The reader is "store + optional index":
-//! - The **store** is the segment's `.vec` composite: slot `[0]` is the
-//!   row→doc_id [`IdMap`], slot `[1]` the dense vector rows (deferred).
-//! - The **index** ([`IvfIndex`]) exists if the segment was merged with IVF
-//!   clustering, and is loaded from the sibling `.centroids` composite. It
-//!   tells a query which clusters — contiguous row ranges of slot `[1]` — to
-//!   probe. Without it, search falls back to an exact scan.
+//! - The **store** is the segment's `.vec` composite: slot `[0]` is the row→doc_id [`IdMap`], slot
+//!   `[1]` the dense vector rows (deferred).
+//! - The **index** ([`IvfIndex`]) exists if the segment was merged with IVF clustering, and is
+//!   loaded from the sibling `.centroids` composite. It tells a query which clusters — contiguous
+//!   row ranges of slot `[1]` — to probe. Without it, search falls back to an exact scan.
 //!
 //! The pairing is an invariant of the write path (`VectorPlugin`): the IVF
 //! merge writes cluster-sorted rows + an `Explicit` id-map + `.centroids`;
@@ -113,7 +112,11 @@ impl VectorIndexReader {
         };
         let id_map = IdMap::open(id_map_slice, segment_reader.max_doc())?;
 
-        // TODO: Add a version header to the centroids file
+        // TODO: Add a version header to the centroids file. Until one
+        // exists, per-slot presence in the composite footer is the
+        // compatibility mechanism: slot [2] (routing graph) and slot [3]
+        // (cluster radii) are optional, and pre-radius segments simply lack
+        // slot [3].
         let centroid_slots =
             match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
                 Ok(file) => {
@@ -123,10 +126,14 @@ impl VectorIndexReader {
                         composite.open_read_with_idx(field, 1),
                     ) {
                         // Slot [2] (the routing graph) is optional: the write
-                        // side skips it for degenerate centroid counts.
-                        (Some(centroids), Some(offsets)) => {
-                            Some((centroids, offsets, composite.open_read_with_idx(field, 2)))
-                        }
+                        // side skips it for degenerate centroid counts. Slot
+                        // [3] (radii) is optional: absent on old segments.
+                        (Some(centroids), Some(offsets)) => Some((
+                            centroids,
+                            offsets,
+                            composite.open_read_with_idx(field, 2),
+                            composite.open_read_with_idx(field, 3),
+                        )),
                         _ => None,
                     }
                 }
@@ -138,8 +145,8 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((centroids, offsets, graph))) => {
-                Some(IvfIndex::open(&options, centroids, offsets, graph)?)
+            (IdMap::Explicit(_), Some((centroids, offsets, graph, radii))) => {
+                Some(IvfIndex::open(&options, centroids, offsets, graph, radii)?)
             }
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
