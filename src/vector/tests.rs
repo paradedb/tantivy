@@ -454,36 +454,20 @@ fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
     Ok(())
 }
 
-/// A segment written before the radius slot existed — simulated by
-/// stripping slot [3] out of a freshly built segment's `.centroids`
-/// composite — must load with all-zero radii and still serve
-/// Candidate-mode queries end to end.
-#[test]
-fn ivf_radii_absent_slot_loads_zero_and_queries() -> crate::Result<()> {
+/// TEST SURGERY: strip the radius slot `[3]` out of every segment's
+/// `.centroids` composite in `index`, rewriting only slots `[0..=2]` —
+/// byte-identical to a pre-radius writer's output. Simulates an old-format
+/// segment for compatibility tests; reopen a fresh
+/// [`crate::Searcher`] afterwards (cached readers keep the old parse).
+pub(crate) fn strip_radius_slot(index: &Index, field: Field) -> crate::Result<()> {
     use std::io::Write;
     use std::path::PathBuf;
 
     use crate::directory::{CompositeFile, CompositeWrite, Directory};
     use crate::index::SegmentComponent;
-    use crate::vector::ivf::{ProbeGateMode, CENTROIDS_EXT};
+    use crate::vector::ivf::CENTROIDS_EXT;
 
-    let index = TestVectorIndex::builder(VectorDType::F32)
-        .vector_storage_format(VectorStorageFormat::Ivf)
-        .build()?;
-    let field = index.embedding_field();
-
-    // The current writer stores radii: the fixture's grid clusters have
-    // spread-out members, so the max radius is positive.
-    let searcher = index.index.reader()?.searcher();
-    for segment_reader in searcher.segment_readers() {
-        let vec_reader = segment_reader.vector_index(field)?;
-        let ivf = vec_reader.index().expect("expected IVF storage");
-        assert!(ivf.max_radius() > 0.0, "fixture must store real radii");
-    }
-
-    // Strip slot [3] from every segment's `.centroids` composite,
-    // rewriting only slots [0..=2] — byte-identical to a pre-radius
-    // writer's output.
+    let searcher = index.reader()?.searcher();
     for segment_reader in searcher.segment_readers() {
         let composite_slice =
             segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
@@ -498,14 +482,14 @@ fn ivf_radii_absent_slot_loads_zero_and_queries() -> crate::Result<()> {
             .collect::<crate::Result<_>>()?;
         assert!(
             composite.open_read_with_idx(field, 3).is_some(),
-            "setup: slot [3] must exist before the strip"
+            "strip_radius_slot: slot [3] must exist before the strip"
         );
 
         let path = PathBuf::from(format!(
             "{}.{CENTROIDS_EXT}",
             segment_reader.segment_id().uuid_string()
         ));
-        let directory = index.index.directory();
+        let directory = index.directory();
         directory.delete(&path).expect("delete .centroids");
         let mut rewrite = CompositeWrite::wrap(directory.open_write(&path)?);
         for (idx, bytes) in kept {
@@ -515,7 +499,33 @@ fn ivf_radii_absent_slot_loads_zero_and_queries() -> crate::Result<()> {
         }
         rewrite.close()?;
     }
+    Ok(())
+}
+
+/// A segment written before the radius slot existed — simulated by
+/// stripping slot [3] out of a freshly built segment's `.centroids`
+/// composite — must load with all-zero radii and still serve
+/// Candidate-mode queries end to end.
+#[test]
+fn ivf_radii_absent_slot_loads_zero_and_queries() -> crate::Result<()> {
+    use crate::vector::ivf::ProbeGateMode;
+
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Ivf)
+        .build()?;
+    let field = index.embedding_field();
+
+    // The current writer stores radii: the fixture's grid clusters have
+    // spread-out members, so the max radius is positive.
+    let searcher = index.index.reader()?.searcher();
+    for segment_reader in searcher.segment_readers() {
+        let vec_reader = segment_reader.vector_index(field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        assert!(ivf.max_radius() > 0.0, "fixture must store real radii");
+    }
     drop(searcher);
+
+    strip_radius_slot(&index.index, field)?;
 
     // A fresh reader parses the stripped composite: zero radii, and a
     // Candidate-mode query still runs end to end.

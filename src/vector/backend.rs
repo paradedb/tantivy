@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use common::BitSet;
 
-use super::distance::Similarity;
+use super::distance::{norm_squared, Similarity};
 use super::index_reader::VectorIndexReader;
 use super::ivf::{
     AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, ProbeGateMode, Workspace,
@@ -266,23 +266,39 @@ enum GateState {
         min_candidates: usize,
     },
     /// Band anchored on the result heap's current k-th best; unarmed until
-    /// the heap holds `top_n` candidates. Termination needs two CONSECUTIVE
-    /// violating yields (patience-2): within a converged batch yields are
-    /// sorted, so the second violation follows immediately and patience-2
-    /// degenerates to first-violation; across a batch boundary it buys
-    /// exactly one hedging beam round against the ranking stream's
+    /// the heap holds `top_n` candidates. Per-yield verdicts come from
+    /// [`radius_gate`]. Termination needs two CONSECUTIVE
+    /// Terminate-condition yields (patience-2): within a converged batch
+    /// yields are sorted, so the second violation follows immediately and
+    /// patience-2 degenerates to first-violation; across a batch boundary
+    /// it buys exactly one hedging beam round against the ranking stream's
     /// documented reordering; on the flat (fully sorted) path it costs one
     /// extra yield. No sound bound exists against UNVISITED graph nodes —
     /// graph-miss is a separate recall channel; the termination contract is
     /// defined on the yield stream.
     Candidate {
-        /// Band memo, keyed on the k-th best score it was computed from;
-        /// recomputed only when the k-th best improves.
-        band: Option<(Score, Similarity)>,
-        /// Consecutive Terminate-condition yields; any probed or skipped
-        /// non-violating yield resets it.
+        /// `‖q‖`, Dot's Cauchy–Schwarz factor for pricing raw-L2 radii in
+        /// dot units; 0.0 for the other metrics, which never read it.
+        q_norm: f32,
+        /// Consecutive Terminate-condition yields; any probed or
+        /// radius-skipped yield resets it.
         violation_streak: u8,
     },
+}
+
+/// [`radius_gate`]'s verdict for one gated yield.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateDecision {
+    /// The cluster's radius-adjusted best case can still beat the band.
+    Probe,
+    /// THIS cluster provably holds nothing better than the band
+    /// (`r_c`-bound), but a wider cluster at the same centroid distance
+    /// still could — skip it without feeding the terminate streak.
+    Skip,
+    /// No cluster at this centroid distance can beat the band even at the
+    /// segment's widest radius (`r_max`-bound); on a sorted stream nothing
+    /// later can either. Confirmed by patience-2 before terminating.
+    TerminateCondition,
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -383,8 +399,16 @@ impl<T: VectorElement> VectorBackend<T> {
                 if let Some(s) = stats.as_deref_mut() {
                     s.min_candidates = top_n;
                 }
+                // Dot's radius bound prices raw-L2 radii in dot units via
+                // Cauchy–Schwarz; `‖q‖` is computed once per query and never
+                // read by the other metrics.
+                let q_norm = if self.query.metric() == Metric::Dot {
+                    norm_squared(&query_f32).sqrt()
+                } else {
+                    0.0
+                };
                 GateState::Candidate {
-                    band: None,
+                    q_norm,
                     violation_streak: 0,
                 }
             }
@@ -476,6 +500,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut survivors: Vec<Survivor> = Vec::new();
         let mut probe_budget = 0.0f32;
         let max_probe_budget = max_probe_count as f32;
+        let max_radius = index.max_radius();
 
         for Candidate { sim, node: cluster } in ranked {
             // The pull that trips the ceiling proves another ranked cluster
@@ -487,9 +512,18 @@ impl<T: VectorElement> VectorBackend<T> {
             // the tie.
             if probe_budget >= max_probe_budget {
                 termination = ProbeTermination::Ceiling;
-                if let GateState::Candidate { band, .. } = &mut gate {
-                    gate_armed_at_ceiling =
-                        candidate_band(metric, epsilon, &mut topn, band).is_some_and(|b| sim < b);
+                if let GateState::Candidate { q_norm, .. } = &gate {
+                    gate_armed_at_ceiling = topn.kth_best().is_some_and(|kth| {
+                        radius_gate(
+                            metric,
+                            sim.score(),
+                            kth,
+                            epsilon,
+                            index.cluster_radius(cluster as usize),
+                            max_radius,
+                            *q_norm,
+                        ) == GateDecision::TerminateCondition
+                    });
                 }
                 break;
             }
@@ -504,33 +538,52 @@ impl<T: VectorElement> VectorBackend<T> {
                     }
                 }
                 GateState::Candidate {
-                    band,
+                    q_norm,
                     violation_streak,
                 } => {
                     // Unarmed (heap below `top_n`) ⇒ probe unconditionally:
                     // the gate can never fire before the heap is full.
-                    if let Some(band) = candidate_band(metric, epsilon, &mut topn, band) {
+                    if let Some(kth) = topn.kth_best() {
                         if gate_armed_at_probe.is_none() {
                             // Boundary-observed: the count of clusters probed
                             // before the heap was first seen saturated.
                             gate_armed_at_probe = Some(postings_row + postings_skipped);
                         }
-                        if sim < band {
-                            *violation_streak += 1;
-                            if *violation_streak >= 2 {
-                                termination = ProbeTermination::Gate;
-                                break;
+                        match radius_gate(
+                            metric,
+                            sim.score(),
+                            kth,
+                            epsilon,
+                            index.cluster_radius(cluster as usize),
+                            max_radius,
+                            *q_norm,
+                        ) {
+                            GateDecision::Probe => *violation_streak = 0,
+                            GateDecision::Skip => {
+                                // Per-cluster bound only: a wider cluster at
+                                // this centroid distance could still reach
+                                // the band, so the terminate streak resets.
+                                *violation_streak = 0;
+                                radius_skips += 1;
+                                probe_budget += SKIPPED_CLUSTER_COST;
+                                continue;
                             }
-                            // Pending confirmation (patience-2): the cluster
-                            // itself still can't beat the band, so it is
-                            // skipped, not probed — it charges only the
-                            // routing-pull floor and never reaches the
-                            // survivor pre-pass.
-                            radius_skips += 1;
-                            probe_budget += SKIPPED_CLUSTER_COST;
-                            continue;
+                            GateDecision::TerminateCondition => {
+                                *violation_streak += 1;
+                                if *violation_streak >= 2 {
+                                    termination = ProbeTermination::Gate;
+                                    break;
+                                }
+                                // Pending confirmation (patience-2): the
+                                // cluster itself still can't beat the band,
+                                // so it is skipped, not probed — it charges
+                                // only the routing-pull floor and never
+                                // reaches the survivor pre-pass.
+                                radius_skips += 1;
+                                probe_budget += SKIPPED_CLUSTER_COST;
+                                continue;
+                            }
                         }
-                        *violation_streak = 0;
                     }
                 }
             }
@@ -682,14 +735,18 @@ fn build_filter_bitset(
 ///   best)`. For unit vectors `d² = 2(1 - cos)` and the 2 cancels in the ratio, so this IS SPANN's
 ///   rule applied to our (write-time-normalized) data.
 /// - **Dot:** no natural distance for raw MIPS; a pragmatic linear widening `best - epsilon *
-///   best.abs()`. With paper-scale epsilon the gate rarely fires and the ceiling governs. NOTE:
-///   with unnormalized dot, the IVF locality assumption itself is heuristic — that's the
-///   clusterer's problem, not the threshold's.
+///   best.abs()`. On the CENTROID anchor, with paper-scale epsilon the gate rarely fires and the
+///   ceiling governs; the Candidate arm with per-cluster radii replaces this hack with a real
+///   Cauchy–Schwarz bound — see [`radius_gate`]. NOTE: with unnormalized dot, the IVF locality
+///   assumption itself is heuristic — that's the clusterer's problem, not the threshold's.
 ///
-/// Degenerate scales: L2 with `d_min = 0` and Cosine with `best = 1.0`
-/// both give `threshold = best` — the gate arms immediately and only
-/// the candidate floor keeps probing. Known property of ratio pruning;
-/// do not "fix".
+/// Degenerate scales, CENTROID anchor: L2 with `d_min = 0` and Cosine
+/// with `best = 1.0` both give `threshold = best` — the gate arms
+/// immediately and only the candidate floor keeps probing. Known
+/// property of ratio pruning on that anchor. On the Candidate anchor the
+/// same degeneracy is correct behavior: a heap holding `top_n` exact
+/// matches SHOULD gate everything farther out, and a cluster whose
+/// radius still reaches the query re-opens through [`radius_gate`].
 fn adaptive_threshold(metric: Metric, best: f32, epsilon: f32) -> f32 {
     match metric {
         Metric::L2 | Metric::Dot => best - epsilon * best.abs(),
@@ -697,28 +754,68 @@ fn adaptive_threshold(metric: Metric, best: f32, epsilon: f32) -> f32 {
     }
 }
 
-/// The Candidate-mode gate band for the heap's current k-th best, or `None`
-/// while the heap holds fewer than `top_n` entries (gate unarmed).
+/// Two-tier radius-aware verdict for one Candidate-mode gated yield.
 ///
-/// The band reuses [`adaptive_threshold`] verbatim — only the anchor value
-/// changes, from the first-ranked centroid's score to the k-th best doc
-/// score — and is memoized in `band` keyed on that anchor, so it is
-/// recomputed only when the k-th best improves. `TopNComputer::kth_best`
-/// force-truncates the heap as a side effect, which only tightens later
-/// `push_unordered` early-drops.
-fn candidate_band(
+/// Pure in `(sim, kth, ε, r_c, r_max, q_norm, metric)` — no coupling to the
+/// ranking iterator or the heap. A member `p` of a cluster with centroid
+/// distance `d_c` and radius `r` satisfies `d(q, p) ≥ (d_c − r)⁺` (triangle
+/// inequality in the stored representation's space, the one radii are
+/// measured in), so per metric:
+///
+/// - **L2** (`score = −d²`): with `d_c = sqrt(−sim)`, `d_k = sqrt(−kth)` and the band
+///   `sqrt(1+ε)·d_k` (ε keeps its squared-space meaning: `d² > (1+ε)·d_k²`), `(d_c − r_max)⁺ >
+///   band` is the Terminate condition and `(d_c − r_c)⁺ > band` the per-cluster Skip.
+/// - **Cosine**: both sides chord-convert (`d = sqrt(max(2·(1 − s), 0))`, exactly the space cosine
+///   radii are stored in), then as L2.
+/// - **Dot**: Cauchy–Schwarz — `⟨q,p⟩ = ⟨q,μ⟩ + ⟨q, p−μ⟩ ≤ sim + ‖q‖·r` (radii are raw L2
+///   displacements, so `‖q‖` prices them in dot units) — against the ε-widened threshold `kth −
+///   ε·|kth|`. A real bound, unlike the Centroid arm's linear-band heuristic.
+///
+/// With `r_c = r_max = 0` the two tiers coincide and the verdict reduces
+/// exactly to the radius-less candidate band (`sim < adaptive_threshold(kth)`,
+/// reported as TerminateCondition — Skip is unreachable), which is also how
+/// pre-radius segments behave. At ε = 0 with exact radii, Skip is a
+/// per-cluster certificate against the yield stream: a skipped cluster
+/// provably holds no doc better than the current k-th best.
+fn radius_gate(
     metric: Metric,
+    sim: f32,
+    kth: f32,
     epsilon: f32,
-    topn: &mut TopNComputer<Score, DocId, NaturalComparator>,
-    band: &mut Option<(Score, Similarity)>,
-) -> Option<Similarity> {
-    let kth = topn.kth_best()?;
-    match band {
-        Some((memo_kth, memo_band)) if *memo_kth == kth => Some(*memo_band),
-        _ => {
-            let fresh = Similarity::new(adaptive_threshold(metric, kth, epsilon));
-            *band = Some((kth, fresh));
-            Some(fresh)
+    r_c: f32,
+    r_max: f32,
+    q_norm: f32,
+) -> GateDecision {
+    match metric {
+        Metric::L2 | Metric::Cosine => {
+            let (d_c, d_k) = match metric {
+                Metric::L2 => ((-sim).max(0.0).sqrt(), (-kth).max(0.0).sqrt()),
+                Metric::Cosine => (
+                    (2.0 * (1.0 - sim)).max(0.0).sqrt(),
+                    (2.0 * (1.0 - kth)).max(0.0).sqrt(),
+                ),
+                Metric::Dot => unreachable!("handled by the outer match"),
+            };
+            let band = (1.0 + epsilon).sqrt() * d_k;
+            // Terminate ⊆ Skip (`r_c ≤ r_max`), so the wider bound is
+            // checked first.
+            if (d_c - r_max).max(0.0) > band {
+                GateDecision::TerminateCondition
+            } else if (d_c - r_c).max(0.0) > band {
+                GateDecision::Skip
+            } else {
+                GateDecision::Probe
+            }
+        }
+        Metric::Dot => {
+            let threshold = kth - epsilon * kth.abs();
+            if sim + q_norm * r_max < threshold {
+                GateDecision::TerminateCondition
+            } else if sim + q_norm * r_c < threshold {
+                GateDecision::Skip
+            } else {
+                GateDecision::Probe
+            }
         }
     }
 }
@@ -2713,23 +2810,10 @@ mod tests {
     /// ε = 0 version of this fixture (`trap_recovered_by_radius_at_eps0`).
     #[test]
     fn candidate_gate_eps0_misses_trap() -> crate::Result<()> {
-        let centroids = vec![[0.0_f32, 0.0], [10.0, 10.0]];
-        let docs = [
-            ("far_a", [0.0_f32, -10.0]),
-            ("far_a", [-10.0, 0.0]),
-            ("trap_b", [5.0, 5.01]),
-            ("anchor_b", [10.0, 10.0]),
-        ];
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let (index, embed_field, label_field) = trap_fixture()?;
+        // Strip slot [3]: an old-format (radius-less) segment.
+        crate::vector::tests::strip_radius_slot(&index, embed_field)?;
         let query = [1.0_f32, 1.0];
-
-        // Setup: the trap doc is genuinely the true top-1.
-        let oracle = ground_truth_top_k(&index, embed_field, Metric::L2, &query, 1)?;
-        assert_eq!(
-            stored_label_at(&index, label_field, oracle[0].1)?,
-            "trap_b",
-            "true NN must be the trap doc"
-        );
 
         let (hits, stats) = run_top_n_instrumented(
             &index,
@@ -2751,6 +2835,56 @@ mod tests {
         assert_eq!(stats.probed_clusters, vec![0], "only cluster A probed");
         assert!(stats.heap_saturated);
         assert_eq!(stats.min_candidates, 1, "candidate mode reports top_n");
+        Ok(())
+    }
+
+    /// The trap fixture shared by the ε = 0 miss/recovery pair: query
+    /// nearest centroid A, true NN in cluster B. Setup-asserts the trap
+    /// geometry.
+    fn trap_fixture() -> crate::Result<(Index, Field, Field)> {
+        let centroids = vec![[0.0_f32, 0.0], [10.0, 10.0]];
+        let docs = [
+            ("far_a", [0.0_f32, -10.0]),
+            ("far_a", [-10.0, 0.0]),
+            ("trap_b", [5.0, 5.01]),
+            ("anchor_b", [10.0, 10.0]),
+        ];
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let oracle = ground_truth_top_k(&index, embed_field, Metric::L2, &[1.0, 1.0], 1)?;
+        assert_eq!(
+            stored_label_at(&index, label_field, oracle[0].1)?,
+            "trap_b",
+            "true NN must be the trap doc"
+        );
+        Ok((index, embed_field, label_field))
+    }
+
+    /// The same fixture WITH stored radii: cluster B's radius covers its
+    /// member nearest the query (`‖trap_b − μ_B‖ ≈ 7.07`), so at ε = 0 the
+    /// radius gate's best case for B — `(d_c − r_B)⁺ ≈ 5.66` — beats the
+    /// k-th-best band (`≈ 11.05`) and B is probed: the true NN comes back.
+    /// The sound resurrection of the ε = 0 trap.
+    #[test]
+    fn trap_recovered_by_radius_at_eps0() -> crate::Result<()> {
+        let (index, embed_field, label_field) = trap_fixture()?;
+        let query = [1.0_f32, 1.0];
+
+        let (hits, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            query.to_vec(),
+            1,
+            candidate_params(0.0),
+        )?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            stored_label_at(&index, label_field, hits[0].1)?,
+            "trap_b",
+            "B's radius must reopen it at ε = 0",
+        );
+        assert_eq!(stats.probed_clusters, vec![0, 1], "both clusters probed");
+        assert_eq!(stats.radius_skips, 0, "{stats:?}");
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
         Ok(())
     }
 
@@ -2963,7 +3097,7 @@ mod tests {
             ivf,
             stream.into_iter(),
             GateState::Candidate {
-                band: None,
+                q_norm: 0.0,
                 violation_streak: 0,
             },
             100, // ceiling far out of reach
@@ -2989,6 +3123,326 @@ mod tests {
             hits[0].sort_key
         );
         Ok(())
+    }
+
+    /// Non-monotone LOWER BOUNDS across the ranked stream: a nearer
+    /// tight cluster is skipped while a farther wide one is probed, and
+    /// termination comes strictly after — the reason Skip must not feed
+    /// the terminate streak. Geometry (q at the origin, ε = 0, K = 1,
+    /// band = d_k = 3.5):
+    ///   A d=3.5 r=0    → probed, arms the gate
+    ///   B d=5   r≈0.05 → (5 − 0.05)⁺ > 3.5 but (5 − r_max=3)⁺ ≤ 3.5 → Skip
+    ///   C d=6   r=3    → (6 − 3)⁺ ≤ 3.5 → Probe (wider reaches back in)
+    ///   D d=15         → (15 − 3)⁺ > 3.5 → Terminate condition (streak 1)
+    ///   E d=16         → streak 2 → Gate
+    #[test]
+    fn radius_skip_does_not_terminate() -> crate::Result<()> {
+        let (index, embed_field, _label) = skip_probe_line_fixture(false)?;
+        let (hits, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            vec![0.0, 0.0],
+            1,
+            candidate_params(0.0),
+        )?;
+        assert_eq!(stats.termination, ProbeTermination::Gate);
+        assert_eq!(
+            stats.probed_clusters,
+            vec![0, 2],
+            "tight B skipped, wide C probed: {stats:?}"
+        );
+        // B (Skip) + D (pending Terminate condition); E confirmed the gate.
+        assert_eq!(stats.radius_skips, 2, "{stats:?}");
+        assert_eq!(hits.len(), 1);
+        assert!(
+            (hits[0].0 - -12.25).abs() < 1e-4,
+            "top-1 is a0 at d² = 12.25, got {}",
+            hits[0].0
+        );
+        Ok(())
+    }
+
+    /// A radius Skip between two Terminate-condition yields RESETS the
+    /// patience streak: hand-ordered stream A(probe) → D(T, streak 1) →
+    /// B(Skip, reset) → E(T, streak 1) → F(T, streak 2 → Gate). Without
+    /// the reset, the gate would have fired at E.
+    #[test]
+    fn radius_skip_resets_patience() -> crate::Result<()> {
+        let (index, embed_field, _label) = skip_probe_line_fixture(true)?;
+        let query = vec![0.0_f32, 0.0];
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let backend = VectorBackend::<f32>::for_segment(
+            segment_reader,
+            0,
+            embed_field,
+            Arc::new(query.clone()),
+            candidate_params(0.0),
+        )?;
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        // Setup: the fixture's radii really classify as the stream needs.
+        assert_eq!(ivf.max_radius(), 3.0, "C's wide member sets r_max");
+
+        let fixture_centroids = skip_probe_centroids(true);
+        let stream: Vec<Candidate> = [0usize, 3, 1, 4, 5]
+            .into_iter()
+            .map(|c| Candidate {
+                sim: Metric::L2.similarity(query.as_slice(), fixture_centroids[c].as_slice()),
+                node: c as u32,
+            })
+            .collect();
+
+        let max_doc = segment_reader.max_doc();
+        let mut filter = BitSet::with_max_value(max_doc);
+        for doc in 0..max_doc {
+            filter.insert(doc);
+        }
+        let mut stats = ProbeStats::default();
+        let _ = backend.scan_clusters(
+            ivf,
+            stream.into_iter(),
+            GateState::Candidate {
+                q_norm: 0.0,
+                violation_streak: 0,
+            },
+            100,
+            &filter,
+            max_doc,
+            None,
+            1,
+            Some(&mut stats),
+        )?;
+
+        assert_eq!(stats.termination, ProbeTermination::Gate);
+        assert_eq!(stats.probed_clusters, vec![0], "{stats:?}");
+        // D (pending T) + B (Skip) + E (pending T after the reset); F
+        // confirmed the gate.
+        assert_eq!(stats.radius_skips, 3, "{stats:?}");
+        Ok(())
+    }
+
+    /// Centroids for [`skip_probe_line_fixture`]: A..E on the x-axis, plus
+    /// a far F when `with_f`.
+    fn skip_probe_centroids(with_f: bool) -> Vec<[f32; 2]> {
+        let mut centroids = vec![
+            [3.5_f32, 0.0], // A
+            [5.0, 0.0],     // B: tight
+            [6.0, 0.0],     // C: wide (member at [6, 3] ⇒ r = 3 = r_max)
+            [15.0, 0.0],    // D
+            [16.0, 0.0],    // E
+        ];
+        if with_f {
+            centroids.push([17.0, 0.0]); // F
+        }
+        centroids
+    }
+
+    /// One doc per centroid at the centroid itself, plus B's near member
+    /// (r ≈ 0.05) and C's wide member (r = 3).
+    fn skip_probe_line_fixture(with_f: bool) -> crate::Result<(Index, Field, Field)> {
+        let centroids = skip_probe_centroids(with_f);
+        let mut docs: Vec<(&str, [f32; 2])> = vec![
+            ("a0", [3.5, 0.0]),
+            ("b0", [5.05, 0.0]),
+            ("c0", [6.0, 0.0]),
+            ("c1", [6.0, 3.0]),
+            ("d0", [15.0, 0.0]),
+            ("e0", [16.0, 0.0]),
+        ];
+        if with_f {
+            docs.push(("f0", [17.0, 0.0]));
+        }
+        build_inline_ivf(Metric::L2, &centroids, &docs, 1)
+    }
+
+    /// Radius skips charge `SKIPPED_CLUSTER_COST` to the filter-effective
+    /// budget: a long run of Skip-tier clusters (which never feed the
+    /// terminate streak) trips the CEILING on accumulated budget — not on
+    /// raw pulls, and not on the gate — bounding iterator pulls at
+    /// ~`1/SKIPPED_CLUSTER_COST` × the resolved ceiling. Probed clusters
+    /// stay a separate count.
+    #[test]
+    fn radius_skips_charge_budget() -> crate::Result<()> {
+        // A at d = 2 (probed, arms with band = 2); 30 tight far clusters at
+        // d = 5..34 whose Skip-tier verdict holds because Z's huge radius
+        // (member 30 off-axis) keeps the r_max bound satisfiable:
+        // (d − 30)⁺ = 0 ≤ 2 < d − 0. Ceiling resolves to 2: probing A
+        // costs 1.0, then each skip adds 0.05 — budget reaches 2.0 after
+        // ~20 skips and the next pull trips Ceiling.
+        let mut centroids: Vec<[f32; 2]> = vec![[2.0, 0.0]];
+        for i in 0..30 {
+            centroids.push([5.0 + i as f32, 0.0]);
+        }
+        centroids.push([40.0, 0.0]); // Z
+        let labels: Vec<String> = (0..centroids.len()).map(|i| format!("d{i}")).collect();
+        let mut docs: Vec<(&str, [f32; 2])> = centroids
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (labels[i].as_str(), *c))
+            .collect();
+        docs.push(("z_far", [40.0, 30.0])); // r_Z = 30 = r_max
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+
+        let params = AdaptiveProbeParams {
+            epsilon: 0.0,
+            // 32 clusters × 0.05 → ceil(1.6) = 2.
+            max_probe_fraction: 0.05,
+            min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Candidate,
+            ..Default::default()
+        };
+        assert_eq!(params.resolved_probe_ceiling(centroids.len())?, 2);
+        let (_, stats) = run_top_n_instrumented(&index, embed_field, vec![0.0, 0.0], 1, params)?;
+
+        assert_eq!(
+            stats.termination,
+            ProbeTermination::Ceiling,
+            "budget, not the gate, must stop the skip run: {stats:?}"
+        );
+        assert_eq!(stats.probed_clusters, vec![0], "only A probed: {stats:?}");
+        // 1.0 (probe) + 20 × 0.05 (skips) reaches the 2.0 budget; float
+        // accumulation may admit one skip more or fewer.
+        assert!(
+            (19..=21).contains(&stats.radius_skips),
+            "~20 charged skips before the ceiling binds: {stats:?}"
+        );
+        Ok(())
+    }
+
+    /// Dot's radius bound is real Cauchy–Schwarz, in both directions:
+    /// (a) small radii ⇒ `sim + ‖q‖·r` can't reach the k-th best and the
+    /// gate FIRES; (b) a high-norm member inflates its cluster's radius
+    /// until the bound admits it ⇒ the cluster is PROBED, never skipped.
+    #[test]
+    fn dot_gate_fires_with_radius_bound() -> crate::Result<()> {
+        // (a) q = [2, 0] (‖q‖ = 2), kth = dot(q, a0) = 20, ε = 0.
+        // B: sim 10, r_max = 1 → 10 + 2·1 = 12 < 20 → Terminate (streak 1).
+        // C: sim 8 → 8 + 2 = 10 < 20 → streak 2 → Gate.
+        let centroids = vec![[10.0_f32, 0.0], [5.0, 0.0], [4.0, 0.0]];
+        let docs = [
+            ("a0", [10.0_f32, 0.0]),
+            ("b0", [5.0_f32, 1.0]), // r_B = 1 = r_max
+            ("c0", [4.0_f32, 0.0]),
+        ];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::Dot, &centroids, &docs, 1)?;
+        let (hits, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            vec![2.0, 0.0],
+            1,
+            candidate_params(0.0),
+        )?;
+        assert_eq!(stats.termination, ProbeTermination::Gate, "{stats:?}");
+        assert_eq!(stats.probed_clusters, vec![0], "{stats:?}");
+        assert_eq!(stats.radius_skips, 1, "B pending, C confirmed");
+        assert!((hits[0].0 - 20.0).abs() < 1e-5);
+
+        // (b) same anchor, but D carries a high-norm member 8 away from its
+        // centroid: sim 6 + 2·8 = 22 ≥ 20 → the bound admits a member that
+        // COULD outscore the k-th best, so D must be probed.
+        let centroids = vec![[10.0_f32, 0.0], [3.0, 0.0]];
+        let docs = [
+            ("a0", [10.0_f32, 0.0]),
+            ("d0", [3.0_f32, 0.0]),
+            ("d1", [3.0_f32, 8.0]), // r_D = 8
+        ];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::Dot, &centroids, &docs, 1)?;
+        let (_, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            vec![2.0, 0.0],
+            1,
+            candidate_params(0.0),
+        )?;
+        assert_eq!(
+            stats.probed_clusters,
+            vec![0, 1],
+            "high-norm radius must force the probe: {stats:?}"
+        );
+        assert_eq!(stats.radius_skips, 0, "{stats:?}");
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        Ok(())
+    }
+
+    /// Cosine gates in chord space: tight angular clusters far from the
+    /// query violate the chord band (converted from the k-th best cosine)
+    /// and two consecutive violations fire the gate.
+    #[test]
+    fn cosine_chord_gate() -> crate::Result<()> {
+        // A hugs the x-axis (kth ≈ cos ≈ 0.9987 → chord band ≈ 0.051 at
+        // ε = 0); B and C hug ±y — chord ≈ 1.34 with tiny radii (≈ 0.05).
+        let centroids = vec![[10.0_f32, 0.0], [0.0, 10.0], [0.0, -10.0]];
+        let docs = [
+            ("a0", [10.0_f32, 0.5]),
+            ("b0", [0.5_f32, 10.0]),
+            ("c0", [0.5_f32, -10.0]),
+        ];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::Cosine, &centroids, &docs, 1)?;
+        let (hits, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            vec![1.0, 0.1],
+            1,
+            candidate_params(0.0),
+        )?;
+        assert_eq!(stats.termination, ProbeTermination::Gate, "{stats:?}");
+        assert_eq!(stats.probed_clusters, vec![0], "{stats:?}");
+        assert_eq!(stats.radius_skips, 1, "B pending, C confirmed");
+        assert_eq!(hits.len(), 1);
+        Ok(())
+    }
+
+    /// With all radii zero, [`radius_gate`] reduces exactly to the
+    /// radius-less candidate band `sim < adaptive_threshold(kth)` — and the
+    /// Skip tier is unreachable (both tiers coincide, and Terminate wins
+    /// the tie). This is precisely how pre-radius segments behave.
+    #[test]
+    fn zero_radii_equals_commit2_gate() {
+        let cases: &[(Metric, &[f32], &[f32], f32)] = &[
+            // Sim grids avoid exact `kth·(1+ε)` boundaries, where the
+            // sqrt-space and squared-space comparisons could disagree by
+            // one ulp.
+            (
+                Metric::L2,
+                &[-0.5, -2.0, -10.0],
+                &[-0.1, -1.0, -3.1, -9.0, -20.0, -100.0],
+                0.0,
+            ),
+            (
+                Metric::Cosine,
+                &[0.99, 0.8, 0.3],
+                &[0.999, 0.9, 0.5, 0.0, -0.5],
+                0.0,
+            ),
+            (
+                Metric::Dot,
+                &[20.0, 0.5, -5.0],
+                &[30.0, 19.0, 10.0, 0.0, -10.0],
+                2.0,
+            ),
+        ];
+        for &(metric, kths, sims, q_norm) in cases {
+            for &kth in kths {
+                for &sim in sims {
+                    for epsilon in [0.0_f32, 0.5, 3.0] {
+                        let plain_violates = sim < adaptive_threshold(metric, kth, epsilon);
+                        let decision = radius_gate(metric, sim, kth, epsilon, 0.0, 0.0, q_norm);
+                        assert_ne!(
+                            decision,
+                            GateDecision::Skip,
+                            "zero radii must never Skip: {metric:?} sim={sim} kth={kth} \
+                             eps={epsilon}"
+                        );
+                        assert_eq!(
+                            decision == GateDecision::TerminateCondition,
+                            plain_violates,
+                            "{metric:?} sim={sim} kth={kth} eps={epsilon}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The Centroid arm is the byte-exact A/B control: same first-yield
