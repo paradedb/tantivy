@@ -13,9 +13,16 @@
 //! [2] RNG over the centroids (see `Graph::serialize` for the layout;
 //!     absent for degenerate centroid counts — routing then falls back to a
 //!     linear scan of the centroids)
-//! [3] cluster radii (f32[N]; absent for segments written before radii
-//!     existed — they load as all-zero, which reduces the radius-aware
-//!     gate to the radius-less candidate gate)
+//! [3] cluster radii (f32[N]): per cluster, the max distance from its
+//!     NATIVE (rank-0) members' stored rows to the stored centroid —
+//!     replica spill is excluded, sound by closure through native homes
+//!     (see the merge's radius fold). Absent for segments written before
+//!     radii existed — they load as all-zero, which reduces the
+//!     radius-aware gate to the radius-less candidate gate. Segments
+//!     written by the earlier replica-INCLUSIVE fold carry values ≥ the
+//!     native ones — still sound, just conservative (both gate tiers only
+//!     get more permissive of probing) — so the format needs no version
+//!     bump.
 //! ```
 //!
 //! Slot presence is the format-compatibility mechanism: the composite footer
@@ -64,9 +71,10 @@ pub struct IvfIndex {
     /// degenerate centroid counts, where routing falls back to a linear scan.
     graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
     /// Slot `[3]`, pinned: per-cluster radii — max distance from a stored
-    /// member row to the stored centroid, in the stored representation's L2
-    /// space (chord for write-time-normalized Cosine). All zeros for
-    /// segments written before the slot existed.
+    /// NATIVE (rank-0) member row to the stored centroid, in the stored
+    /// representation's L2 space (chord for write-time-normalized Cosine).
+    /// All zeros for segments written before the slot existed;
+    /// replica-inclusive (larger, conservative) on pre-native segments.
     radii: Vec<f32>,
     /// Cached `radii` maximum (0.0 when radii are absent or the segment has
     /// no clusters), for the gate's stream-wide Terminate bound.
@@ -116,9 +124,9 @@ impl IvfIndex {
     }
 
     /// Write slot `[3]` of the `.centroids` composite for a field: one f32
-    /// per cluster, in cluster order — the max distance from a stored member
-    /// row to the stored centroid (the merge documents the per-metric
-    /// space).
+    /// per cluster, in cluster order — the max distance from a stored
+    /// NATIVE (rank-0) member row to the stored centroid (the merge
+    /// documents the per-metric space and the native-only soundness).
     pub(crate) fn serialize_radii<W: Write + ?Sized>(radii: &[f32], out: &mut W) -> io::Result<()> {
         for radius in radii {
             radius.serialize(out)?;
@@ -277,11 +285,14 @@ impl IvfIndex {
         self.cluster_offset(cluster) as usize..self.cluster_offset(cluster + 1) as usize
     }
 
-    /// The stored radius of `cluster`: the max distance from a stored member
-    /// row (replicas included) to the stored centroid, in the stored
+    /// The stored radius of `cluster`: the max distance from a stored
+    /// NATIVE (rank-0) member row to the stored centroid, in the stored
     /// representation's L2 space — true L2 for `L2`/`Dot`, chord
-    /// (`sqrt(2·(1 − cos))`) for write-time-normalized `Cosine`. `0.0` for
-    /// segments written before radii existed.
+    /// (`sqrt(2·(1 − cos))`) for write-time-normalized `Cosine`. Replica
+    /// spill is excluded (sound by closure through native homes — the
+    /// merge's radius fold has the argument); pre-native segments carry
+    /// the larger replica-inclusive values, which are conservative. `0.0`
+    /// for segments written before radii existed.
     #[inline]
     pub fn cluster_radius(&self, cluster: usize) -> f32 {
         self.radii[cluster]

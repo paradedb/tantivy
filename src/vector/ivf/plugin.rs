@@ -32,6 +32,10 @@ struct AssignedVector {
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_doc_id: DocId,
+    /// `true` for the rank-0 (primary) assignment — the cluster whose
+    /// centroid is this vector's nearest; `false` for fixed-k replica
+    /// copies. Provenance feeds the NATIVE-only radius fold (slot [3]).
+    native: bool,
 }
 
 /// How a vector's `replicas - 1` non-primary cells are picked from the
@@ -353,12 +357,13 @@ pub(crate) fn merge_ivf(
                 // Radius reference for slot [3]: each centroid exactly as
                 // the `.centroids` write below will store it (encode, then
                 // Cosine-normalize; a NonFinite centroid stays raw under
-                // the same warn-and-write policy). Radii must bound
-                // distances between the STORED member bytes the query path
-                // scores and the STORED centroid it routes by — for L2/Dot
-                // that is the raw L2 displacement, for write-time-normalized
-                // Cosine the chord — and all three reduce to L2 distance
-                // between the stored representations.
+                // the same warn-and-write policy). Radii bound distances
+                // between the STORED bytes of the cluster's NATIVE (rank-0)
+                // members and the STORED centroid it routes by — for L2/Dot
+                // the raw L2 displacement, for write-time-normalized Cosine
+                // the chord — and all three reduce to L2 distance between
+                // the stored representations. Native-only is sound by
+                // closure through native homes (see the fold below).
                 let radius_reference: Vec<Vec<f32>> = centroid_rows
                     .iter()
                     .map(|centroid| {
@@ -470,6 +475,7 @@ pub(crate) fn merge_ivf(
                                     target_doc_id,
                                     source_segment_ord,
                                     source_doc_id,
+                                    native: true,
                                 });
                                 // Fixed-k replication: take the `replicas - 1`
                                 // nearest NON-primary centroids from the
@@ -514,6 +520,7 @@ pub(crate) fn merge_ivf(
                                             target_doc_id,
                                             source_segment_ord,
                                             source_doc_id,
+                                            native: false,
                                         });
                                         added += 1;
                                     }
@@ -652,17 +659,39 @@ pub(crate) fn merge_ivf(
                         };
                         rows_w.write_all(row_bytes)?;
                         // Track the cluster radius against the exact bytes
-                        // just written — replica rows included, since a
-                        // query-time radius skip skips the whole posting
-                        // list. One distance per posting row, off the byte
-                        // kernel (no decode allocation); `f32::max` ignores
-                        // a NaN from a non-finite row.
-                        let d_sq = l2_squared_bytes::<f32>(
-                            &radius_reference[assigned_vector.cluster],
-                            row_bytes,
-                        );
-                        let slot = &mut radius_sq[assigned_vector.cluster];
-                        *slot = slot.max(d_sq);
+                        // just written — NATIVE (rank-0) rows only; replica
+                        // spill is excluded so replication cannot inflate
+                        // radii into uselessness.
+                        //
+                        // SOUNDNESS (closure through native homes): any
+                        // point `p` with `d(q, p) ≤ d_K` has a native
+                        // cluster `c_p` with `d(p, μ_{c_p}) ≤
+                        // r_native(c_p)` by membership, so `d(q, μ_{c_p}) ≤
+                        // d_K + r_native(c_p)`. Its native home therefore
+                        // (i) never Skips — the Skip test `d(q, μ_{c_p}) >
+                        // band + r_native(c_p)` with `band ≥ d_K` is false
+                        // by that inequality — and (ii) sits inside the
+                        // Terminate bound built from the native r_max. Every
+                        // reachable point is covered by its native home;
+                        // replica copies become pure bonus, freely
+                        // skippable. Same argument in chord space for
+                        // Cosine, and via Cauchy–Schwarz for Dot (a
+                        // qualifying `p` forces `⟨q, μ_{c_p}⟩ ≥ thr −
+                        // ‖q‖·r_native(c_p)`, clearing the dot Skip test).
+                        // Usual caveats unchanged: yield-order (patience-2)
+                        // and graph-miss.
+                        //
+                        // One distance per native row, off the byte kernel
+                        // (no decode allocation); `f32::max` ignores a NaN
+                        // from a non-finite row.
+                        if assigned_vector.native {
+                            let d_sq = l2_squared_bytes::<f32>(
+                                &radius_reference[assigned_vector.cluster],
+                                row_bytes,
+                            );
+                            let slot = &mut radius_sq[assigned_vector.cluster];
+                            *slot = slot.max(d_sq);
+                        }
                     }
                     rows_w.flush()?;
                 }
