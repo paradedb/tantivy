@@ -1,13 +1,41 @@
+/// Which value anchors the IVF probe loop's distance-ratio gate.
+///
+/// TEMPORARY A/B scaffolding: `Centroid` preserves the pre-candidate-gate
+/// behavior byte-exactly as the control arm while the candidate anchor is
+/// benchmarked; the losing arm (and this enum) is expected to be removed
+/// after the sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeGateMode {
+    /// SPANN eq. 3 verbatim: the band is `(1 + ε)` around the FIRST-ranked
+    /// centroid's distance, computed once and static for the whole scan.
+    /// Starvation under selective filters is patched by the
+    /// `min_candidates` / `overfetch_margin` survivor floor.
+    Centroid,
+    /// Result-side anchor: the gate stays unarmed until the segment's top-N
+    /// heap holds `top_n` filter-passing, deduped, scored candidates; once
+    /// armed, the band is `(1 + ε)` around the heap's current k-th best,
+    /// recomputed at each between-cluster boundary. The saturation
+    /// precondition subsumes the starvation problem the survivor floor
+    /// patches, so `min_candidates` / `overfetch_margin` are ignored.
+    /// Termination applies patience-2 against the ranking stream's
+    /// documented non-monotone yield order.
+    Candidate,
+}
+
 /// Query-time configuration for IVF adaptive probing — the SPANN shape
 /// (NeurIPS 2021), defaults aligned with the paper and SPTAG's shipped
 /// config.
 ///
 /// Stop condition, evaluated for the NEXT ranked centroid between
 /// clusters — so the first cluster is always scanned: stop at the
-/// probe-budget ceiling, OR once the `min_candidates` floor is
-/// met AND the next centroid breaches the per-metric distance-ratio
-/// gate (SPANN eq. 3). The ceiling is checked first — the
-/// [`ProbeTermination`](crate::vector::ProbeTermination) attribution
+/// probe-budget ceiling, OR once the distance-ratio gate (SPANN eq. 3)
+/// rejects the centroid. What anchors the gate depends on
+/// [`gate_mode`](Self::gate_mode): `Centroid` is SPANN's shape — a static
+/// band around the best-routed centroid, floored by the `min_candidates`
+/// survivor floor; `Candidate` is a deliberate departure — the band
+/// follows the result heap's k-th best and cannot fire before the heap is
+/// full, and the floor knobs are ignored. The ceiling is checked first —
+/// the [`ProbeTermination`](crate::vector::ProbeTermination) attribution
 /// contract.
 ///
 /// The ceiling is measured in filter-effective clusters, not raw
@@ -22,22 +50,29 @@
 #[derive(Clone, Debug)]
 pub struct AdaptiveProbeParams {
     /// SPANN's query-aware dynamic pruning coefficient — a posting list
-    /// is searched iff `Dist(q, c) <= (1 + epsilon) * Dist(q, c_closest)`,
-    /// on the per-metric distance defined in the backend gate. The
+    /// is searched iff `Dist(q, anchor) <= (1 + epsilon) * Dist(q,
+    /// anchor_best)`, on the per-metric distance defined in the backend
+    /// gate; the anchor is picked by [`gate_mode`](Self::gate_mode). The
     /// paper uses 0.6 (recall@1-tuned) to 7.0 (recall@10-tuned); SPTAG
     /// ships `MaxDistRatio = 8.0` = `(1 + 7.0)`. Default 7.0,
-    /// PROVISIONAL pending our own benchmarks.
+    /// PROVISIONAL pending our own benchmarks. In `Candidate` mode with
+    /// per-cluster radii, ε prices only cluster-radius + graph slack, so
+    /// its useful range sits far below the paper's centroid-anchored
+    /// values.
     pub epsilon: f32,
-    /// Absolute survivor floor. The call site widens this to
-    /// `min_candidates.max(top_n + overfetch_margin)`, so a 0 default
-    /// still gives a sane `top_n + overfetch_margin` floor.
+    /// Absolute survivor floor — CENTROID MODE ONLY; `Candidate` mode
+    /// ignores it (the gate's heap-saturation precondition subsumes the
+    /// starvation problem the floor patches). The Centroid call site
+    /// widens this to `min_candidates.max(top_n + overfetch_margin)`, so
+    /// a 0 default still gives a sane `top_n + overfetch_margin` floor.
     pub min_candidates: usize,
-    /// Additive over-fetch margin: the resolved survivor floor is
-    /// `top_n + overfetch_margin`. Unlike a multiplicative `m × top_n`
-    /// floor, an additive margin keeps the over-probe cushion a *fixed*
-    /// number of clusters as `top_n` grows, so the `epsilon` needed for a
-    /// target recall stays roughly constant across K instead of shrinking
-    /// with it. Default 32, PROVISIONAL.
+    /// Additive over-fetch margin — CENTROID MODE ONLY, ignored by
+    /// `Candidate` mode like `min_candidates`. The resolved survivor
+    /// floor is `top_n + overfetch_margin`. Unlike a multiplicative
+    /// `m × top_n` floor, an additive margin keeps the over-probe cushion
+    /// a *fixed* number of clusters as `top_n` grows, so the `epsilon`
+    /// needed for a target recall stays roughly constant across K instead
+    /// of shrinking with it. Default 32, PROVISIONAL.
     pub overfetch_margin: usize,
     /// Filter-effective cluster ceiling, expressed as a FRACTION of the
     /// segment's cluster count and resolved per-segment: a segment with
@@ -58,6 +93,9 @@ pub struct AdaptiveProbeParams {
     /// cluster, probing enough to fill the survivor floor. Defaults to
     /// [`MIN_PROBE_CLUSTERS`].
     pub min_probe_clusters: usize,
+    /// Which anchor the distance-ratio gate uses — see [`ProbeGateMode`].
+    /// TEMPORARY A/B scaffolding, default [`ProbeGateMode::Candidate`].
+    pub gate_mode: ProbeGateMode,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -68,6 +106,7 @@ impl Default for AdaptiveProbeParams {
             overfetch_margin: 32,
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
+            gate_mode: ProbeGateMode::Candidate,
         }
     }
 }
@@ -104,7 +143,10 @@ mod tests {
         // A quarter of the clusters, rounded up — well above the floor.
         assert_eq!(params.resolved_probe_ceiling(1000)?, 250);
         // A fraction resolving below MIN_PROBE_CLUSTERS is lifted to it...
-        assert_eq!(params.resolved_probe_ceiling(40)?, super::MIN_PROBE_CLUSTERS);
+        assert_eq!(
+            params.resolved_probe_ceiling(40)?,
+            super::MIN_PROBE_CLUSTERS
+        );
         // ...but the floor never exceeds the cluster count.
         assert_eq!(params.resolved_probe_ceiling(2)?, 2);
         // A fraction above 1.0 clamps to the cluster count — small segments
