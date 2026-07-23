@@ -233,9 +233,12 @@ pub struct ProbeStats {
     /// yield where the Ceiling fired — the two stops tied, and Ceiling won
     /// by the checked-first attribution contract.
     pub gate_armed_at_ceiling: bool,
-    /// Clusters the Candidate-mode gate skipped without probing: yields
-    /// whose (radius-adjusted) best-case similarity could not beat the
-    /// current band. Skipped clusters charge [`SKIPPED_CLUSTER_COST`] to
+    /// Clusters the Candidate-mode gate SKIP-tier rejected without probing:
+    /// their per-cluster `r_c` bound could not beat the current band. Skip
+    /// verdicts only — a pending Terminate-condition yield (patience streak
+    /// 1) is neither counted here nor budget-charged, so on a radius-less
+    /// segment (`r_c = r_max = 0`, where Skip is unreachable) this reads
+    /// exactly zero. Skipped clusters charge [`SKIPPED_CLUSTER_COST`] to
     /// the ceiling budget — they cost a routing pull and arithmetic but no
     /// survivor pre-pass — and are NOT in `probed_clusters`.
     pub radius_skips: usize,
@@ -575,12 +578,19 @@ impl<T: VectorElement> VectorBackend<T> {
                                     break;
                                 }
                                 // Pending confirmation (patience-2): the
-                                // cluster itself still can't beat the band,
-                                // so it is skipped, not probed — it charges
-                                // only the routing-pull floor and never
-                                // reaches the survivor pre-pass.
-                                radius_skips += 1;
-                                probe_budget += SKIPPED_CLUSTER_COST;
+                                // cluster is not probed, but it is NOT a
+                                // radius skip — Skip is a per-cluster
+                                // `r_c` verdict, and with zero radii it is
+                                // unreachable, so `radius_skips` must read
+                                // zero on radius-less fixtures. No budget
+                                // charge either: the yield is pure
+                                // arithmetic (no pre-pass), and the streak
+                                // resolves within two yields — a
+                                // non-terminating follow-up is itself a
+                                // paid Probe/Skip — so unpaid pulls are
+                                // bounded by one per paid pull and the
+                                // ~1/SKIPPED_CLUSTER_COST pulls-per-ceiling
+                                // bound only doubles its constant.
                                 continue;
                             }
                         }
@@ -2828,10 +2838,12 @@ mod tests {
             "trap_b",
             "ε = 0 without radii must miss the trap: B is gate-skipped",
         );
-        // B was skipped by the band, not terminated on: one violation is
-        // one short of patience-2, and the stream ended.
+        // B was withheld by a PENDING Terminate condition, not terminated
+        // on (one violation is one short of patience-2) and not
+        // radius-skipped (zero radii make Skip unreachable, so the counter
+        // must stay at zero); the stream then ended.
         assert_eq!(stats.termination, ProbeTermination::Exhausted);
-        assert_eq!(stats.radius_skips, 1, "{stats:?}");
+        assert_eq!(stats.radius_skips, 0, "{stats:?}");
         assert_eq!(stats.probed_clusters, vec![0], "only cluster A probed");
         assert!(stats.heap_saturated);
         assert_eq!(stats.min_candidates, 1, "candidate mode reports top_n");
@@ -2946,9 +2958,10 @@ mod tests {
         );
         // The gate armed only once cluster 2's docs filled the heap — at
         // the boundary after the third probe — and the fourth cluster was
-        // then gate-skipped (one violation; patience-2 unconfirmed).
+        // then withheld by a pending Terminate condition (one violation;
+        // patience-2 unconfirmed; not a radius Skip, so no count).
         assert_eq!(stats.gate_armed_at_probe, Some(3), "{stats:?}");
-        assert_eq!(stats.radius_skips, 1, "{stats:?}");
+        assert_eq!(stats.radius_skips, 0, "{stats:?}");
         assert_eq!(stats.termination, ProbeTermination::Exhausted);
         assert!(stats.heap_saturated);
         let _ = centroids;
@@ -3109,10 +3122,15 @@ mod tests {
         )?;
 
         assert_eq!(stats.termination, ProbeTermination::Gate);
-        // B was skipped (streak 1), C probed (streak reset), D skipped
-        // (streak 1), E confirmed (streak 2 → Gate, not counted as a skip).
+        // B pending (streak 1), C probed (streak reset), D pending
+        // (streak 1), E confirmed (streak 2 → Gate). All radii are zero, so
+        // NONE of these is a radius Skip — the counter must read zero even
+        // though two yields were withheld by pending Terminate conditions.
         assert_eq!(stats.probed_clusters, vec![0, 2], "{stats:?}");
-        assert_eq!(stats.radius_skips, 2, "{stats:?}");
+        assert_eq!(
+            stats.radius_skips, 0,
+            "pending Terminate yields must not count as radius skips: {stats:?}"
+        );
         assert_eq!(stats.gate_armed_at_probe, Some(1), "{stats:?}");
         assert!(stats.heap_saturated);
         let hits = topn.into_sorted_vec();
@@ -3122,6 +3140,36 @@ mod tests {
             "top-1 is a0 at d² = 1, got {}",
             hits[0].sort_key
         );
+        Ok(())
+    }
+
+    /// On a radius-less segment (`r_c = r_max = 0`) Skip is unreachable —
+    /// `(d_c − 0)⁺ > band && (d_c − 0)⁺ ≤ band` is a contradiction — so a
+    /// GATE-TERMINATING zero-radii scan must report `radius_skips == 0`:
+    /// its withheld yields are pending Terminate conditions, not skips.
+    /// Regression test for the telemetry bug where pending yields were
+    /// routed through the Skip accounting.
+    #[test]
+    fn zero_radii_reports_zero_skips() -> crate::Result<()> {
+        let (index, embed_field, _label) = skip_probe_line_fixture(false)?;
+        // Strip slot [3]: all radii zero, as on an old-format segment.
+        crate::vector::tests::strip_radius_slot(&index, embed_field)?;
+        let (hits, stats) = run_top_n_instrumented(
+            &index,
+            embed_field,
+            vec![0.0, 0.0],
+            1,
+            candidate_params(0.0),
+        )?;
+        // With zero radii the band (d_k = 3.5) rejects B (d = 5) and C
+        // (d = 6) back to back: pending at B, confirmed at C → Gate.
+        assert_eq!(stats.termination, ProbeTermination::Gate, "{stats:?}");
+        assert_eq!(stats.probed_clusters, vec![0], "{stats:?}");
+        assert_eq!(
+            stats.radius_skips, 0,
+            "zero radii make Skip unreachable; the counter must be exactly zero: {stats:?}"
+        );
+        assert_eq!(hits.len(), 1);
         Ok(())
     }
 
@@ -3151,8 +3199,9 @@ mod tests {
             vec![0, 2],
             "tight B skipped, wide C probed: {stats:?}"
         );
-        // B (Skip) + D (pending Terminate condition); E confirmed the gate.
-        assert_eq!(stats.radius_skips, 2, "{stats:?}");
+        // Only B is a radius Skip; D's pending Terminate condition is not
+        // counted, and E confirmed the gate.
+        assert_eq!(stats.radius_skips, 1, "{stats:?}");
         assert_eq!(hits.len(), 1);
         assert!(
             (hits[0].0 - -12.25).abs() < 1e-4,
@@ -3216,9 +3265,9 @@ mod tests {
 
         assert_eq!(stats.termination, ProbeTermination::Gate);
         assert_eq!(stats.probed_clusters, vec![0], "{stats:?}");
-        // D (pending T) + B (Skip) + E (pending T after the reset); F
-        // confirmed the gate.
-        assert_eq!(stats.radius_skips, 3, "{stats:?}");
+        // Only B (Skip) counts; D's and E's pending Terminate conditions do
+        // not. F confirmed the gate.
+        assert_eq!(stats.radius_skips, 1, "{stats:?}");
         Ok(())
     }
 
@@ -3335,7 +3384,10 @@ mod tests {
         )?;
         assert_eq!(stats.termination, ProbeTermination::Gate, "{stats:?}");
         assert_eq!(stats.probed_clusters, vec![0], "{stats:?}");
-        assert_eq!(stats.radius_skips, 1, "B pending, C confirmed");
+        assert_eq!(
+            stats.radius_skips, 0,
+            "B's pending Terminate condition is not a radius skip; C confirmed"
+        );
         assert!((hits[0].0 - 20.0).abs() < 1e-5);
 
         // (b) same anchor, but D carries a high-norm member 8 away from its
@@ -3388,7 +3440,10 @@ mod tests {
         )?;
         assert_eq!(stats.termination, ProbeTermination::Gate, "{stats:?}");
         assert_eq!(stats.probed_clusters, vec![0], "{stats:?}");
-        assert_eq!(stats.radius_skips, 1, "B pending, C confirmed");
+        assert_eq!(
+            stats.radius_skips, 0,
+            "B's pending Terminate condition is not a radius skip; C confirmed"
+        );
         assert_eq!(hits.len(), 1);
         Ok(())
     }
