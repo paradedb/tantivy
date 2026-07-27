@@ -17,7 +17,9 @@ use common::BitSet;
 
 use super::distance::Similarity;
 use super::index_reader::VectorIndexReader;
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
+use super::ivf::{
+    AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, ProbeGateMode, Workspace,
+};
 use super::prepared::PreparedQuery;
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;
@@ -196,10 +198,32 @@ pub struct ProbeStats {
     /// much routing as the probe loop actually pulled. See
     /// [`IvfSearchMetrics`].
     pub routing: IvfSearchMetrics,
-    /// The resolved survivor floor the gate used for this query.
+    /// The resolved survivor floor the gate used for this query. In
+    /// Candidate mode the floor knobs are ignored and this reports `top_n`
+    /// — the gate's saturation precondition — so the starvation reading
+    /// `candidates_scored < min_candidates` stays meaningful across modes.
     pub min_candidates: usize,
     /// How the probe loop terminated. Per-segment; does not sum.
     pub termination: ProbeTermination,
+    /// Whether the segment's top-N heap ended the scan holding `top_n`
+    /// scored candidates. `false` flags starvation — fewer filter-passing
+    /// docs than requested — under either gate mode.
+    pub heap_saturated: bool,
+    /// Candidate mode: how many clusters had been probed when the gate
+    /// armed (the heap first held `top_n` candidates, observed at a
+    /// between-cluster boundary). `None` when the gate never armed before
+    /// the loop stopped, and always `None` in Centroid mode.
+    pub gate_armed_at_probe: Option<usize>,
+    /// Candidate mode: the gate's Terminate condition held on the very
+    /// yield where the Ceiling fired — the two stops tied, and Ceiling won
+    /// by the checked-first attribution contract.
+    pub gate_armed_at_ceiling: bool,
+    /// Clusters the Candidate-mode gate SKIP-tier rejected without probing:
+    /// their per-cluster radius bound could not beat the current band. Skip
+    /// verdicts only — a pending Terminate-condition yield (patience streak
+    /// 1) is neither counted here nor budget-charged, so on a radius-less
+    /// segment this reads exactly zero. Zero until per-cluster radii land.
+    pub radius_skips: usize,
 }
 
 /// Floor a probed cluster charges the ceiling even when the filter skips
@@ -214,6 +238,48 @@ pub(crate) const SKIPPED_CLUSTER_COST: f32 = 0.05;
 struct Survivor {
     row: usize,
     doc: DocId,
+}
+
+/// Per-scan state of the distance-ratio gate, one variant per
+/// [`ProbeGateMode`]. Built by `probe_top_n`, mutated only by the
+/// Candidate arm (patience streak).
+enum GateState {
+    /// DEPRECATED(epsilon-gate): retained for benchmark comparison against
+    /// the candidate/radius gate; remove with ProbeGateMode::Centroid.
+    /// Static band anchored on the first-ranked centroid
+    /// ([`centroid_gate_threshold`]), floored by the resolved survivor
+    /// floor. First violation past the floor terminates.
+    Centroid {
+        threshold: Similarity,
+        min_candidates: usize,
+    },
+    /// Band anchored on the result heap's current k-th best; unarmed until
+    /// the heap holds `top_n` candidates. Termination needs two CONSECUTIVE
+    /// violating yields (patience-2): within a converged batch yields are
+    /// sorted, so the second violation follows immediately and patience-2
+    /// degenerates to first-violation; across a batch boundary it buys
+    /// exactly one hedging beam round against the ranking stream's
+    /// documented reordering; on the flat (fully sorted) path it costs one
+    /// extra yield. No sound bound exists against UNVISITED graph nodes —
+    /// graph-miss is a separate recall channel; the termination contract is
+    /// defined on the yield stream.
+    Candidate {
+        /// Consecutive Terminate-condition yields; any non-violating yield
+        /// resets it.
+        violation_streak: u8,
+    },
+}
+
+/// DEPRECATED(epsilon-gate): retained for benchmark comparison against the
+/// candidate/radius gate; remove with ProbeGateMode::Centroid.
+///
+/// The legacy Centroid-mode gate band: SPANN eq. 3's static threshold,
+/// `(1 + ε)` around the FIRST-ranked centroid's score, computed once for
+/// the whole scan. Isolated here so removing the legacy arm is deleting
+/// this function, the `Centroid` variants, and the marked GUC sites — no
+/// legacy logic lives inline in the scan loop.
+fn centroid_gate_threshold(metric: Metric, epsilon: f32, first_sim: f32) -> Similarity {
+    Similarity::new(adaptive_threshold(metric, first_sim, epsilon))
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -258,31 +324,55 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut routing_ws = Workspace::new();
         let mut ranked = index.rank_clusters(&mut routing_ws, &query_f32);
 
-        // The best-routed cluster anchors the distance-ratio gate.
-        let Some(best) = ranked.next() else {
+        // The first pull decides emptiness for both modes; only Centroid
+        // mode reads its score (as the gate anchor) — in Candidate mode it
+        // flows into the loop like any other yield.
+        let Some(first) = ranked.next() else {
             return Ok(Vec::new());
         };
-        let threshold = Similarity::new(adaptive_threshold(
-            self.query.metric(),
-            best.sim.score(),
-            self.adaptive.epsilon,
-        ));
-        // Without this floor, a selective filter can trip the threshold gate
-        // immediately and return < K results. Additive margin (not m×top_n)
-        // so the over-probe cushion stays K-independent — see
-        // `AdaptiveProbeParams::overfetch_margin`.
-        let min_candidates = self
-            .adaptive
-            .min_candidates
-            .max(top_n + self.adaptive.overfetch_margin);
-
-        stats.min_candidates = min_candidates;
+        let gate = match self.adaptive.gate_mode {
+            // DEPRECATED(epsilon-gate): retained for benchmark comparison
+            // against the candidate/radius gate; remove with
+            // ProbeGateMode::Centroid.
+            ProbeGateMode::Centroid => {
+                let threshold = centroid_gate_threshold(
+                    self.query.metric(),
+                    self.adaptive.epsilon,
+                    first.sim.score(),
+                );
+                // Without this floor, a selective filter can trip the
+                // threshold gate immediately and return < K results.
+                // Additive margin (not m×top_n) so the over-probe cushion
+                // stays K-independent — see
+                // `AdaptiveProbeParams::overfetch_margin`.
+                let min_candidates = self
+                    .adaptive
+                    .min_candidates
+                    .max(top_n + self.adaptive.overfetch_margin);
+                stats.min_candidates = min_candidates;
+                GateState::Centroid {
+                    threshold,
+                    min_candidates,
+                }
+            }
+            ProbeGateMode::Candidate => {
+                // Result-side anchor: the gate is unarmed until the heap
+                // holds `top_n` candidates, so it can never fire on a
+                // starved segment — which is why the survivor-floor knobs
+                // (`min_candidates` / `overfetch_margin`) are ignored here.
+                // Report `top_n` as the floor so the starvation reading
+                // `candidates_scored < min_candidates` stays meaningful.
+                stats.min_candidates = top_n;
+                GateState::Candidate {
+                    violation_streak: 0,
+                }
+            }
+        };
 
         let topn = self.scan_clusters(
             index,
-            std::iter::once(best).chain(&mut ranked),
-            threshold,
-            min_candidates,
+            std::iter::once(first).chain(&mut ranked),
+            gate,
             max_probe_count,
             &filter,
             max_doc,
@@ -327,8 +417,7 @@ impl<T: VectorElement> VectorBackend<T> {
         &self,
         index: &IvfIndex,
         ranked: impl Iterator<Item = Candidate>,
-        threshold: Similarity,
-        min_candidates: usize,
+        mut gate: GateState,
         max_probe_count: usize,
         filter: &BitSet,
         max_doc: DocId,
@@ -340,6 +429,8 @@ impl<T: VectorElement> VectorBackend<T> {
             top_n,
             NaturalComparator,
         );
+        let metric = self.query.metric();
+        let epsilon = self.adaptive.epsilon;
         // `candidates` is the cumulative scored count that drives the gate; the
         // prune counters accumulate into locals and fold into `ProbeStats` once
         // after the loop, keeping the hot per-doc path free of indirection.
@@ -351,6 +442,8 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut termination = ProbeTermination::Exhausted;
+        let mut gate_armed_at_probe: Option<usize> = None;
+        let mut gate_armed_at_ceiling = false;
         // Replication can place the same doc in several probed clusters; dedup
         // by doc id so a vector is scored at most once.
         let mut seen = BitSet::with_max_value(max_doc);
@@ -360,18 +453,70 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut probe_budget = 0.0f32;
         let max_probe_budget = max_probe_count as f32;
 
+        // The ranked stream is consumed exactly as the router yields it.
+        // FOLLOW-UP (owned by Ruchir): lower-bound `(d − r)` reordering of
+        // the yield stream is a deliberate non-goal of this change — do not
+        // "improve" the ordering here.
         for Candidate { sim, node: cluster } in ranked {
             // The pull that trips the ceiling proves another ranked cluster
             // existed, keeping `Ceiling` distinct from `Exhausted`. The budget
             // is filter-effective (see the per-cluster charge below), so a
             // selective filter walks far past `max_probe_count` raw clusters.
+            // Checked BEFORE the gate — the attribution contract; when both
+            // stops hold on the same yield, `gate_armed_at_ceiling` records
+            // the tie.
             if probe_budget >= max_probe_budget {
                 termination = ProbeTermination::Ceiling;
+                if let GateState::Candidate { .. } = &gate {
+                    gate_armed_at_ceiling = topn.kth_best().is_some_and(|kth| {
+                        sim < Similarity::new(adaptive_threshold(metric, kth, epsilon))
+                    });
+                }
                 break;
             }
-            if sim < threshold && candidates >= min_candidates {
-                termination = ProbeTermination::Gate;
-                break;
+            match &mut gate {
+                // DEPRECATED(epsilon-gate): retained for benchmark
+                // comparison against the candidate/radius gate; remove with
+                // ProbeGateMode::Centroid.
+                GateState::Centroid {
+                    threshold,
+                    min_candidates,
+                } => {
+                    if sim < *threshold && candidates >= *min_candidates {
+                        termination = ProbeTermination::Gate;
+                        break;
+                    }
+                }
+                GateState::Candidate { violation_streak } => {
+                    // Unarmed (heap below `top_n`) ⇒ probe unconditionally:
+                    // the gate can never fire before the heap is full.
+                    if let Some(kth) = topn.kth_best() {
+                        if gate_armed_at_probe.is_none() {
+                            // Boundary-observed: the count of clusters probed
+                            // before the heap was first seen saturated.
+                            gate_armed_at_probe = Some(postings_row + postings_skipped);
+                        }
+                        if sim < Similarity::new(adaptive_threshold(metric, kth, epsilon)) {
+                            *violation_streak += 1;
+                            if *violation_streak >= 2 {
+                                termination = ProbeTermination::Gate;
+                                break;
+                            }
+                            // Pending confirmation (patience-2): the cluster
+                            // is withheld, not probed — and it is NOT a
+                            // radius skip (no per-cluster bound fired) and
+                            // charges no budget: the yield is pure
+                            // arithmetic with no pre-pass, and the streak
+                            // resolves within two yields (a non-terminating
+                            // follow-up is itself a paid Probe), so unpaid
+                            // pulls are bounded by one per paid pull and the
+                            // ~1/SKIPPED_CLUSTER_COST pulls-per-ceiling
+                            // bound only doubles its constant.
+                            continue;
+                        }
+                        *violation_streak = 0;
+                    }
+                }
             }
             let cluster = cluster as usize;
 
@@ -425,6 +570,13 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += candidates;
         stats.termination = termination;
+        stats.gate_armed_at_probe = gate_armed_at_probe;
+        stats.gate_armed_at_ceiling = gate_armed_at_ceiling;
+        // Final-state saturation, exact even when the heap filled inside the
+        // last probed cluster (arming is only *observed* at boundaries). The
+        // forced truncation this implies is invisible past this point — the
+        // scan is over.
+        stats.heap_saturated = topn.kth_best().is_some();
 
         Ok(topn)
     }
@@ -1521,6 +1673,7 @@ mod tests {
             overfetch_margin: 0,
             max_probe_fraction: 0.5,
             min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Centroid,
         };
         let hits1 = search(&index, embed_field, &AllQuery, query.to_vec(), 1, one_probe)?;
         assert_eq!(hits1.len(), 1);
@@ -1815,6 +1968,7 @@ mod tests {
             overfetch_margin: margin,
             max_probe_fraction: 1.0,
             min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Centroid,
         };
         let hits = search(
             &index,
@@ -1937,6 +2091,7 @@ mod tests {
             overfetch_margin: 0,
             max_probe_fraction: 0.1,
             min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Centroid,
         };
         let (_, stats) = run_top_n(&index, embed_field, vec![10.0, 10.0], 3, params)?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
@@ -2029,6 +2184,7 @@ mod tests {
             overfetch_margin: 32,
             max_probe_fraction: 0.1,
             min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Centroid,
         };
         let k = 3usize;
         for (ord, centroid) in centroids.iter().enumerate().step_by(3) {
@@ -2148,6 +2304,7 @@ mod tests {
             overfetch_margin: 0,
             max_probe_fraction: 0.2,
             min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Centroid,
         };
         // The cap must actually bind for this test to mean anything.
         assert!(
@@ -2203,6 +2360,7 @@ mod tests {
             overfetch_margin: margin,
             max_probe_fraction: 1.0,
             min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Centroid,
         };
         let (_, stats) = run_top_n(
             &index.index,
@@ -2248,6 +2406,7 @@ mod tests {
             overfetch_margin: 3,
             max_probe_fraction: 1.0,
             min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Centroid,
         };
         let (_, stats) = run_top_n(&index, embed_field, vec![1.0, 0.3], 1, params)?;
         assert_eq!(stats.termination, ProbeTermination::Gate);
@@ -2277,6 +2436,7 @@ mod tests {
         let query = grid2d_first_centroid();
         let params = AdaptiveProbeParams {
             overfetch_margin: 0,
+            gate_mode: ProbeGateMode::Centroid,
             ..Default::default()
         };
         let (_, stats) = run_top_n(
@@ -2338,6 +2498,388 @@ mod tests {
              probed_clusters = {:?}",
             stats.probed_clusters,
         );
+        Ok(())
+    }
+
+    // ============================================================
+    // Candidate-anchored gate (ProbeGateMode::Candidate).
+    //
+    // The gate is unarmed until the segment's top-N heap holds `top_n`
+    // scored candidates; once armed, the band follows the heap's k-th
+    // best and termination needs two consecutive violating yields
+    // (patience-2). The Centroid arm stays byte-exact as the A/B
+    // control — see `centroid_mode_unchanged`.
+    // ============================================================
+
+    /// Candidate-mode params: ε and the ceiling knobs explicit, floor
+    /// knobs left at defaults (they are ignored in this mode).
+    fn candidate_params(epsilon: f32) -> AdaptiveProbeParams {
+        AdaptiveProbeParams {
+            epsilon,
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Candidate,
+            ..Default::default()
+        }
+    }
+
+    /// The trap fixture under the candidate gate at ε = 0: the trap is
+    /// legitimately missed. After probing cluster A the heap holds a far
+    /// A-side doc; B's centroid distance alone (ignoring how far B's
+    /// members spread toward the query) cannot beat that k-th best, so B
+    /// is withheld and the B-side true NN is never scored. Documents that
+    /// without per-cluster radii ε must carry the cluster-spread slack;
+    /// the radius-aware gate resurrects the sound ε = 0 version of this
+    /// fixture (`trap_recovered_by_radius_at_eps0`).
+    #[test]
+    fn candidate_gate_eps0_misses_trap() -> crate::Result<()> {
+        let centroids = vec![[0.0_f32, 0.0], [10.0, 10.0]];
+        let docs = [
+            ("far_a", [0.0_f32, -10.0]),
+            ("far_a", [-10.0, 0.0]),
+            ("trap_b", [5.0, 5.01]),
+            ("anchor_b", [10.0, 10.0]),
+        ];
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let query = [1.0_f32, 1.0];
+
+        // Setup: the trap doc is genuinely the true top-1.
+        let oracle = ground_truth_top_k(&index, embed_field, Metric::L2, &query, 1)?;
+        assert_eq!(
+            stored_label_at(&index, label_field, oracle[0].1)?,
+            "trap_b",
+            "true NN must be the trap doc"
+        );
+
+        let (hits, stats) = run_top_n(
+            &index,
+            embed_field,
+            query.to_vec(),
+            1,
+            candidate_params(0.0),
+        )?;
+        assert_eq!(hits.len(), 1);
+        assert_ne!(
+            stored_label_at(&index, label_field, hits[0].1)?,
+            "trap_b",
+            "ε = 0 without radii must miss the trap: B is withheld",
+        );
+        // B was withheld by a PENDING Terminate condition, not terminated
+        // on (one violation is one short of patience-2), and pending yields
+        // are neither radius skips nor budget-charged; the stream then
+        // ended.
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        assert_eq!(stats.radius_skips, 0, "{stats:?}");
+        assert_eq!(stats.probed_clusters, vec![0], "only cluster A probed");
+        assert!(stats.heap_saturated);
+        assert_eq!(stats.min_candidates, 1, "candidate mode reports top_n");
+        Ok(())
+    }
+
+    /// Line fixture for the arming/starvation tests: four well-separated
+    /// clusters along the x-axis, `n_per` docs tightly around each.
+    fn line_fixture(n_per: usize) -> crate::Result<(Index, Field, Field, Vec<[f32; 2]>)> {
+        let centroids = vec![[0.0_f32, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]];
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..labels.len())
+            .map(|i| {
+                let c = centroids[i / n_per];
+                (labels[i].as_str(), [c[0] + (i % n_per) as f32 * 0.01, c[1]])
+            })
+            .collect();
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        Ok((index, embed_field, label_field, centroids))
+    }
+
+    /// The gate NEVER fires before the heap is at capacity: with a filter
+    /// passing only docs in the third-ranked cluster, the earlier clusters
+    /// are scanned (they cannot arm the gate), the far cluster is reached
+    /// and its docs returned, and the gate arms only after it.
+    #[test]
+    fn gate_unarmed_until_saturation() -> crate::Result<()> {
+        let (index, embed_field, _label, centroids) = line_fixture(2)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let admitted = segment_reader
+            .vector_index(embed_field)?
+            .cluster_doc_ids(2)
+            .expect("cluster 2 doc ids");
+        assert_eq!(admitted.len(), 2, "setup: cluster 2 holds exactly 2 docs");
+        let weight = FixedDocsWeight {
+            max_doc: segment_reader.max_doc(),
+            docs: admitted.clone(),
+        };
+
+        let k = 2;
+        let (hits, stats) = run_top_n_with_weight(
+            &index,
+            embed_field,
+            vec![0.0, 0.0],
+            k,
+            candidate_params(0.0),
+            &weight,
+        )?;
+        // Every admitted doc surfaces; the ranked-earlier clusters were
+        // probed on the way (unarmed ⇒ no Gate could fire).
+        assert_eq!(hits.len(), k);
+        let hit_docs: std::collections::HashSet<DocId> =
+            hits.iter().map(|(_, addr)| addr.doc_id).collect();
+        assert_eq!(hit_docs, admitted.iter().copied().collect());
+        assert_eq!(
+            stats.probed_clusters,
+            vec![0, 1, 2],
+            "both empty-for-the-filter near clusters probed, then the far one"
+        );
+        // The gate armed only once cluster 2's docs filled the heap — at
+        // the boundary after the third probe — and the fourth cluster was
+        // then withheld by a pending Terminate condition (one violation;
+        // patience-2 unconfirmed; not a radius skip, so no count).
+        assert_eq!(stats.gate_armed_at_probe, Some(3), "{stats:?}");
+        assert_eq!(stats.radius_skips, 0, "{stats:?}");
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        assert!(stats.heap_saturated);
+        let _ = centroids;
+        Ok(())
+    }
+
+    /// Fewer passing docs than `top_n`: the gate can never arm, the loop
+    /// runs to exhaustion, and the partial results all surface — the
+    /// invariant the saturation precondition exists for.
+    #[test]
+    fn starvation_runs_to_exhaustion() -> crate::Result<()> {
+        let (index, embed_field, _label, centroids) = line_fixture(2)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let admitted = segment_reader
+            .vector_index(embed_field)?
+            .cluster_doc_ids(2)
+            .expect("cluster 2 doc ids");
+        let weight = FixedDocsWeight {
+            max_doc: segment_reader.max_doc(),
+            docs: admitted.clone(),
+        };
+
+        let k = 5; // > the 2 passing docs
+        let (hits, stats) = run_top_n_with_weight(
+            &index,
+            embed_field,
+            vec![0.0, 0.0],
+            k,
+            candidate_params(0.0),
+            &weight,
+        )?;
+        assert_eq!(hits.len(), admitted.len(), "partial results surface");
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        assert!(!stats.heap_saturated, "{stats:?}");
+        assert_eq!(stats.gate_armed_at_probe, None, "gate never armed");
+        assert_eq!(stats.radius_skips, 0, "unarmed ⇒ nothing withheld");
+        assert_eq!(
+            stats.probed_clusters.len(),
+            centroids.len(),
+            "every cluster probed: {stats:?}"
+        );
+        assert_eq!(stats.min_candidates, k, "candidate mode reports top_n");
+        Ok(())
+    }
+
+    /// A ceiling that binds before the heap fills is attributed to
+    /// `Ceiling` with `heap_saturated == false` — never `Gate`. And when
+    /// the heap IS full at the ceiling yield and the band also rejects it,
+    /// `gate_armed_at_ceiling` records the tie (Ceiling wins by the
+    /// checked-first contract).
+    #[test]
+    fn ceiling_starved_attribution() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        // fraction 0.1 of 6 clusters → ceiling 1: one full-price probe
+        // exhausts the budget.
+        let params = AdaptiveProbeParams {
+            epsilon: 0.0,
+            max_probe_fraction: 0.1,
+            min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Candidate,
+            ..Default::default()
+        };
+
+        // K larger than the probed cluster's 6 docs: the heap never fills.
+        let (_, stats) = run_top_n(&index, embed_field, vec![10.0, 10.0], 10, params.clone())?;
+        assert_eq!(stats.termination, ProbeTermination::Ceiling);
+        assert_eq!(stats.probed_clusters.len(), 1);
+        assert!(!stats.heap_saturated, "{stats:?}");
+        assert!(!stats.gate_armed_at_ceiling, "unarmed at the ceiling yield");
+
+        // K = 2: the first cluster saturates the heap, ε = 0 rejects the
+        // next centroid, and the ceiling fires on that same yield — the
+        // tie is recorded.
+        let (_, stats) = run_top_n(&index, embed_field, vec![10.0, 10.0], 2, params)?;
+        assert_eq!(stats.termination, ProbeTermination::Ceiling);
+        assert!(stats.heap_saturated);
+        assert!(
+            stats.gate_armed_at_ceiling,
+            "terminate condition held on the ceiling yield: {stats:?}"
+        );
+        Ok(())
+    }
+
+    /// Patience-2 against the ranking stream's documented non-monotone
+    /// yield order: a violating yield followed by a non-violating one must
+    /// not terminate — the violator is withheld, the follower probed — and
+    /// only two CONSECUTIVE violations fire the gate. Drives
+    /// `scan_clusters` directly with a hand-ordered stream, the shape a
+    /// resumed beam round can produce.
+    #[test]
+    fn patience_two_survives_one_violation() -> crate::Result<()> {
+        // Clusters at d² = {1, 9, 2.25, 10, 16} from the query. After
+        // probing A (kth = −1), the ε = 3 band is −(1+ε)·1 = −4: B, D, E
+        // violate, C does not.
+        let centroids = vec![
+            [1.0_f32, 0.0],
+            [3.0, 0.0],
+            [1.5, 0.0],
+            [3.0, 1.0],
+            [4.0, 0.0],
+        ];
+        let docs = [
+            ("a0", [1.0_f32, 0.0]),
+            ("b0", [3.0_f32, 0.0]),
+            ("c0", [1.5_f32, 0.0]),
+            ("d0", [3.0_f32, 1.0]),
+            ("e0", [4.0_f32, 0.0]),
+        ];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let query = vec![0.0_f32, 0.0];
+
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let backend = VectorBackend::<f32>::for_segment(
+            segment_reader,
+            0,
+            embed_field,
+            Arc::new(query.clone()),
+            candidate_params(3.0),
+        )?;
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+
+        // Hand-ordered stream A, B, C, D, E: violation (B), recovery (C),
+        // then two consecutive violations (D, E). InlineClusterer trains
+        // centroids in order, so cluster id == centroid index.
+        let stream: Vec<Candidate> = [0usize, 1, 2, 3, 4]
+            .into_iter()
+            .map(|c| Candidate {
+                sim: Metric::L2.similarity(query.as_slice(), centroids[c].as_slice()),
+                node: c as u32,
+            })
+            .collect();
+
+        let max_doc = segment_reader.max_doc();
+        let mut filter = BitSet::with_max_value(max_doc);
+        for doc in 0..max_doc {
+            filter.insert(doc);
+        }
+        let mut stats = ProbeStats::default();
+        let topn = backend.scan_clusters(
+            ivf,
+            stream.into_iter(),
+            GateState::Candidate {
+                violation_streak: 0,
+            },
+            100, // ceiling far out of reach
+            &filter,
+            max_doc,
+            None,
+            1,
+            &mut stats,
+        )?;
+
+        assert_eq!(stats.termination, ProbeTermination::Gate);
+        // B pending (streak 1), C probed (streak reset), D pending
+        // (streak 1), E confirmed (streak 2 → Gate). Pending yields are
+        // never counted as radius skips.
+        assert_eq!(stats.probed_clusters, vec![0, 2], "{stats:?}");
+        assert_eq!(
+            stats.radius_skips, 0,
+            "pending Terminate yields must not count as radius skips: {stats:?}"
+        );
+        assert_eq!(stats.gate_armed_at_probe, Some(1), "{stats:?}");
+        assert!(stats.heap_saturated);
+        let hits = topn.into_sorted_vec();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            (hits[0].sort_key - -1.0).abs() < 1e-6,
+            "top-1 is a0 at d² = 1, got {}",
+            hits[0].sort_key
+        );
+        Ok(())
+    }
+
+    /// The Centroid arm is the byte-exact A/B control: same first-yield
+    /// anchor, same static band, same survivor floor, same first-violation
+    /// termination as merged main. Restates main's pinned outcomes of the
+    /// cosine-gate and candidate-floor fixtures under an explicit
+    /// `ProbeGateMode::Centroid`, and confirms the Candidate-only stats
+    /// stay inert.
+    #[test]
+    fn centroid_mode_unchanged() -> crate::Result<()> {
+        // (a) Cosine gate fires at paper-scale ε exactly as on main.
+        let centroids = vec![[10.0_f32, 0.0], [0.0, 10.0]];
+        let docs = [
+            ("a0", [10.0_f32, 0.0]),
+            ("a1", [10.0_f32, 0.2]),
+            ("a2", [9.8_f32, 0.1]),
+            ("a3", [10.1_f32, 0.3]),
+            ("b0", [0.0_f32, 10.0]),
+            ("b1", [0.2_f32, 9.9]),
+        ];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::Cosine, &centroids, &docs, 1)?;
+        let params = AdaptiveProbeParams {
+            epsilon: 7.0,
+            min_candidates: 0,
+            overfetch_margin: 3,
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Centroid,
+        };
+        let (_, stats) = run_top_n(&index, embed_field, vec![1.0, 0.3], 1, params)?;
+        assert_eq!(stats.termination, ProbeTermination::Gate);
+        assert_eq!(stats.probed_clusters.len(), 1);
+        assert_eq!(stats.min_candidates, 4, "resolved floor = top_n + margin");
+        // Candidate-only telemetry is inert in Centroid mode.
+        assert_eq!(stats.gate_armed_at_probe, None);
+        assert_eq!(stats.radius_skips, 0);
+        assert!(!stats.gate_armed_at_ceiling);
+        assert!(stats.heap_saturated, "mode-agnostic saturation still fills");
+
+        // (b) The survivor floor still forces probing past a stingy ε = 0
+        // band to the B-side true NN, exactly as on main.
+        let centroids = vec![[0.0_f32, 0.0], [10.0, 10.0]];
+        let docs = [
+            ("a_only", [0.0_f32, -10.0]),
+            ("b_close", [5.0_f32, 5.01]),
+            ("b_far", [10.0_f32, 10.0]),
+            ("b_far2", [11.0_f32, 9.5]),
+        ];
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let params = AdaptiveProbeParams {
+            epsilon: 0.0,
+            min_candidates: 0,
+            overfetch_margin: 4,
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
+            gate_mode: ProbeGateMode::Centroid,
+        };
+        let (hits, stats) = run_top_n(&index, embed_field, vec![1.0, 1.0], 1, params)?;
+        assert_eq!(
+            stored_label_at(&index, label_field, hits[0].1)?,
+            "b_close",
+            "floor keeps probing into B"
+        );
+        assert_eq!(stats.min_candidates, 5, "resolved floor = top_n + margin");
+        assert_eq!(stats.gate_armed_at_probe, None);
+        assert_eq!(stats.radius_skips, 0);
         Ok(())
     }
 

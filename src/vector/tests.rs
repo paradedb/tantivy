@@ -555,7 +555,10 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
 /// tests where any pruning would make the equality check fail. (A
 /// "huge epsilon" is NOT a reliable way to express this across
 /// metrics — e.g. an L2 query sitting exactly on a centroid arms the
-/// gate at any epsilon.)
+/// gate at any epsilon.) Pinned to Centroid mode: the unsatisfiable
+/// floor is a Centroid-arm concept, and it is what guarantees the full
+/// drain — Candidate mode ignores the floor and could gate once the
+/// heap fills.
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
         epsilon: 0.0,
@@ -563,6 +566,7 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
         overfetch_margin: 0,
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
+        gate_mode: crate::vector::ivf::ProbeGateMode::Centroid,
     }
 }
 
