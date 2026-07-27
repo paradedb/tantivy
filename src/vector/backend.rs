@@ -2502,6 +2502,193 @@ mod tests {
     }
 
     // ============================================================
+    // Cluster radii (`.centroids` slot [3]).
+    //
+    // One f32 per cluster, computed during the merge's posting write
+    // against the STORED representations: max L2 displacement between a
+    // stored member row (replicas included) and the stored centroid —
+    // true L2 for L2/Dot, chord for write-time-normalized Cosine.
+    // ============================================================
+
+    /// Hand-computed radii per metric. L2/Dot: raw displacement of the
+    /// farthest member. Cosine: the chord against the NORMALIZED centroid,
+    /// measured on the normalized stored rows — an unnormalized ingest
+    /// vector contributes its normalized chord, not its raw displacement.
+    #[test]
+    fn ivf_radii_hand_computed_per_metric() -> crate::Result<()> {
+        // L2 and Dot share the raw-displacement definition. Built with
+        // replicas = 2, so every doc ALSO lands in the other cluster as a
+        // replica row: a replica-inclusive fold would read r_A ≈ 10.2
+        // (b1's spill into A) — the assertions pin the NATIVE maxima, so
+        // they double as the replica-exclusion check.
+        for metric in [Metric::L2, Metric::Dot] {
+            let centroids = vec![[0.0_f32, 0.0], [10.0, 0.0]];
+            let docs = [
+                ("a0", [0.0_f32, 0.0]),
+                ("a1", [3.0_f32, 4.0]), // ‖p − μ_A‖ = 5
+                ("b0", [10.0_f32, 0.0]),
+                ("b1", [10.0_f32, 2.0]), // ‖p − μ_B‖ = 2
+            ];
+            let (index, embed_field, _label) = build_inline_ivf(metric, &centroids, &docs, 2)?;
+            let searcher = index.reader()?.searcher();
+            let ivf_reader = searcher.segment_readers()[0].vector_index(embed_field)?;
+            let ivf = ivf_reader.index().expect("expected IVF storage");
+            // Setup: the replica rows really are there to be excluded —
+            // each 2-doc-native cluster holds 4 posting rows.
+            let sizes: Vec<usize> = ivf.cluster_sizes().collect();
+            assert_eq!(sizes, vec![4, 4], "{metric:?}: replicas must spill");
+            assert!(
+                (ivf.cluster_radius(0) - 5.0).abs() < 1e-5,
+                "{metric:?}: cluster A NATIVE radius {}",
+                ivf.cluster_radius(0)
+            );
+            assert!(
+                (ivf.cluster_radius(1) - 2.0).abs() < 1e-5,
+                "{metric:?}: cluster B NATIVE radius {}",
+                ivf.cluster_radius(1)
+            );
+            assert!((ivf.max_radius() - 5.0).abs() < 1e-5, "{metric:?}");
+        }
+
+        // Cosine: a single cluster around [1, 0]; [0, 3] stores as the unit
+        // vector [0, 1], whose chord to the (normalized) centroid is
+        // sqrt(2·(1 − cos 90°)) = sqrt(2) — NOT its raw displacement.
+        let centroids = vec![[1.0_f32, 0.0]];
+        let docs = [("u0", [1.0_f32, 0.0]), ("u1", [0.0_f32, 3.0])];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::Cosine, &centroids, &docs, 1)?;
+        let searcher = index.reader()?.searcher();
+        let ivf_reader = searcher.segment_readers()[0].vector_index(embed_field)?;
+        let ivf = ivf_reader.index().expect("expected IVF storage");
+        let expected = 2.0_f32.sqrt();
+        assert!(
+            (ivf.cluster_radius(0) - expected).abs() < 1e-5,
+            "cosine chord radius: got {}, want {expected}",
+            ivf.cluster_radius(0)
+        );
+        Ok(())
+    }
+
+    /// The stored radius equals the true max displacement over the
+    /// cluster's NATIVE rows only — a row is native iff this cluster's
+    /// centroid is its nearest — and stays correct when the segment is
+    /// re-merged (the merge re-trains and re-assigns, recomputing radii
+    /// fresh with the same native-only fold).
+    #[test]
+    fn ivf_radii_native_only_and_survive_remerge() -> crate::Result<()> {
+        // Every cluster's radius must equal the max displacement of its
+        // NATIVE stored rows from its stored centroid; replica rows (rows
+        // whose nearest centroid is elsewhere) are excluded. The nearest
+        // check reuses the first-wins tie-break the InlineClusterer
+        // assigns with; the fixture's offsets make ties impossible.
+        fn assert_radii_match_native_rows(
+            segment_reader: &SegmentReader,
+            embed_field: Field,
+        ) -> crate::Result<()> {
+            let vec_reader = segment_reader.vector_index(embed_field)?;
+            let ivf = vec_reader.index().expect("expected IVF storage");
+            let centroid_bytes = ivf.centroid_bytes()?;
+            let stored_centroids: Vec<[f32; 2]> = (0..ivf.num_clusters())
+                .map(|c| decode_2d(&centroid_bytes[c * 8..c * 8 + 8]))
+                .collect();
+            let mut native_checked = 0usize;
+            let mut spill_seen = 0usize;
+            for cluster in 0..ivf.num_clusters() {
+                let centroid = stored_centroids[cluster];
+                let mut native_max = 0.0f32;
+                for row in ivf.cluster_range(cluster) {
+                    let row_vec = decode_2d(&vec_reader.vector_bytes_for_row(row)?);
+                    if nearest_centroid(row_vec, &stored_centroids) == cluster {
+                        let dx = row_vec[0] - centroid[0];
+                        let dy = row_vec[1] - centroid[1];
+                        native_max = native_max.max((dx * dx + dy * dy).sqrt());
+                        native_checked += 1;
+                    } else {
+                        spill_seen += 1;
+                    }
+                }
+                assert!(
+                    (ivf.cluster_radius(cluster) - native_max).abs() < 1e-4,
+                    "cluster {cluster}: stored radius {} vs native max {native_max}",
+                    ivf.cluster_radius(cluster)
+                );
+            }
+            assert!(native_checked > 0, "invariant must cover native rows");
+            assert!(
+                spill_seen > 0,
+                "fixture must contain replica spill for the exclusion to bite"
+            );
+            Ok(())
+        }
+
+        // replicas = 3: each cluster's rows include far-away replica
+        // members (grid gap 10) that a replica-inclusive fold would let
+        // dominate the radius.
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 3)?;
+        {
+            let searcher = index.reader()?.searcher();
+            let segment_reader = &searcher.segment_readers()[0];
+            assert_radii_match_native_rows(segment_reader, embed_field)?;
+            // Native radii stay tight: primaries sit within 0.05·√2 of
+            // their centroid, while replica spill lies a grid gap (≥ 10)
+            // away — the old replica-inclusive fold read > 5 here.
+            let vec_reader = segment_reader.vector_index(embed_field)?;
+            let ivf = vec_reader.index().expect("ivf");
+            assert!(
+                ivf.max_radius() < 0.1,
+                "native radii must exclude replica spill, got {}",
+                ivf.max_radius()
+            );
+            assert!(ivf.max_radius() > 0.0, "offsets make radii nonzero");
+        }
+
+        // Re-merge with two extra docs: radii recomputed fresh — the
+        // native invariant must hold again.
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for (label, v) in [("extra0", [5.0_f32, 5.0]), ("extra1", [15.0, 5.0])] {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(label_field, label);
+            doc.add_vector(embed_field, v.as_slice());
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
+        assert_radii_match_native_rows(&searcher.segment_readers()[0], embed_field)?;
+        Ok(())
+    }
+
+    /// Replica spill must not inflate radii: on the replication fixture
+    /// (tight 6-doc blobs, grid gap 10, replicas = 3) every cluster's
+    /// native radius is the ≤ 0.05·√2 blob spread — where the
+    /// replica-inclusive definition read ≥ 10 (the spilled far members).
+    #[test]
+    fn replica_spill_does_not_inflate_radius() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 3)?;
+        let searcher = index.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(embed_field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        // Setup: spill is really present — memberships are 3× the natives.
+        assert_eq!(ivf.num_rows(), 3 * ivf.num_docs(), "replicas must spill");
+        for cluster in 0..ivf.num_clusters() {
+            let r = ivf.cluster_radius(cluster);
+            assert!(
+                (0.0..0.1).contains(&r),
+                "cluster {cluster}: native radius must be the blob spread, got {r}"
+            );
+        }
+        assert!(ivf.max_radius() < 0.1, "{}", ivf.max_radius());
+        Ok(())
+    }
+
+    // ============================================================
     // Candidate-anchored gate (ProbeGateMode::Candidate).
     //
     // The gate is unarmed until the segment's top-N heap holds `top_n`

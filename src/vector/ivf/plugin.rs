@@ -17,7 +17,9 @@ use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
-use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::distance::{
+    cosine, dot, l2_squared, l2_squared_bytes, maybe_normalize_bytes, NormalizeOutcome,
+};
 use crate::vector::flat::IdMap;
 use crate::vector::header::write_header;
 use crate::vector::{
@@ -30,6 +32,10 @@ struct AssignedVector {
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_doc_id: DocId,
+    /// `true` for the rank-0 (primary) assignment — the cluster whose
+    /// centroid is this vector's nearest; `false` for fixed-k replica
+    /// copies. Provenance feeds the NATIVE-only radius fold (slot [3]).
+    native: bool,
 }
 
 /// How a vector's `replicas - 1` non-primary cells are picked from the
@@ -164,7 +170,8 @@ fn write_empty_field_slots(
         let rows_w = vec_write.for_field_with_idx(field, 1);
         rows_w.flush()?;
     }
-    // `.centroids`: zero centroids, zero docs, single zero offset.
+    // `.centroids`: zero centroids, zero docs, single zero offset, zero
+    // radii.
     {
         let centroids_w = centroids_write.for_field_with_idx(field, 0);
         IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
@@ -174,6 +181,11 @@ fn write_empty_field_slots(
         let offsets_w = centroids_write.for_field_with_idx(field, 1);
         IvfIndex::serialize_offsets(&[0u64], offsets_w)?;
         offsets_w.flush()?;
+    }
+    {
+        let radii_w = centroids_write.for_field_with_idx(field, 3);
+        IvfIndex::serialize_radii(&[], radii_w)?;
+        radii_w.flush()?;
     }
     Ok(())
 }
@@ -342,6 +354,28 @@ pub(crate) fn merge_ivf(
                     .map(|centroid| centroid.to_vec())
                     .collect();
 
+                // Radius reference for slot [3]: each centroid exactly as
+                // the `.centroids` write below will store it (encode, then
+                // Cosine-normalize; a NonFinite centroid stays raw under
+                // the same warn-and-write policy). Radii bound distances
+                // between the STORED bytes of the cluster's NATIVE (rank-0)
+                // members and the STORED centroid it routes by — for L2/Dot
+                // the raw L2 displacement, for write-time-normalized Cosine
+                // the chord — and all three reduce to L2 distance between
+                // the stored representations. Native-only is sound by
+                // closure through native homes (see the fold below).
+                let radius_reference: Vec<Vec<f32>> = centroid_rows
+                    .iter()
+                    .map(|centroid| {
+                        let mut bytes = encode_vector(centroid, opts.dim())?;
+                        maybe_normalize_bytes(opts, &mut bytes);
+                        decode_row::<f32>(&bytes, opts.dim())
+                    })
+                    .collect::<crate::Result<_>>()?;
+                // Per-cluster running max of the SQUARED displacement; one
+                // sqrt per cluster at the end.
+                let mut radius_sq = vec![0.0f32; num_centroids];
+
                 // Fixed-k replication: pick a selector ONCE before the assign
                 // loop, and only when `replicas > 1`. At `replicas == 1`
                 // nothing is built or allocated — the layout stays
@@ -441,6 +475,7 @@ pub(crate) fn merge_ivf(
                                     target_doc_id,
                                     source_segment_ord,
                                     source_doc_id,
+                                    native: true,
                                 });
                                 // Fixed-k replication: take the `replicas - 1`
                                 // nearest NON-primary centroids from the
@@ -485,6 +520,7 @@ pub(crate) fn merge_ivf(
                                             target_doc_id,
                                             source_segment_ord,
                                             source_doc_id,
+                                            native: false,
                                         });
                                         added += 1;
                                     }
@@ -604,7 +640,7 @@ pub(crate) fn merge_ivf(
                         // the row would desync the already-computed assignments
                         // and IdMap. Warn-and-write-as-is is visible,
                         // self-limiting, and non-desyncing.
-                        if needs_norm {
+                        let row_bytes: &[u8] = if needs_norm {
                             row_buf.clear();
                             row_buf.extend_from_slice(&bytes);
                             if maybe_normalize_bytes(opts, &mut row_buf)
@@ -617,9 +653,44 @@ pub(crate) fn merge_ivf(
                                     assigned_vector.target_doc_id,
                                 );
                             }
-                            rows_w.write_all(&row_buf)?;
+                            &row_buf
                         } else {
-                            rows_w.write_all(&bytes)?;
+                            &bytes[..]
+                        };
+                        rows_w.write_all(row_bytes)?;
+                        // Track the cluster radius against the exact bytes
+                        // just written — NATIVE (rank-0) rows only; replica
+                        // spill is excluded so replication cannot inflate
+                        // radii into uselessness.
+                        //
+                        // SOUNDNESS (closure through native homes): any
+                        // point `p` with `d(q, p) ≤ d_K` has a native
+                        // cluster `c_p` with `d(p, μ_{c_p}) ≤
+                        // r_native(c_p)` by membership, so `d(q, μ_{c_p}) ≤
+                        // d_K + r_native(c_p)`. Its native home therefore
+                        // (i) never Skips — the Skip test `d(q, μ_{c_p}) >
+                        // band + r_native(c_p)` with `band ≥ d_K` is false
+                        // by that inequality — and (ii) sits inside the
+                        // Terminate bound built from the native r_max. Every
+                        // reachable point is covered by its native home;
+                        // replica copies become pure bonus, freely
+                        // skippable. Same argument in chord space for
+                        // Cosine, and via Cauchy–Schwarz for Dot (a
+                        // qualifying `p` forces `⟨q, μ_{c_p}⟩ ≥ thr −
+                        // ‖q‖·r_native(c_p)`, clearing the dot Skip test).
+                        // Usual caveats unchanged: yield-order (patience-2)
+                        // and graph-miss.
+                        //
+                        // One distance per native row, off the byte kernel
+                        // (no decode allocation); `f32::max` ignores a NaN
+                        // from a non-finite row.
+                        if assigned_vector.native {
+                            let d_sq = l2_squared_bytes::<f32>(
+                                &radius_reference[assigned_vector.cluster],
+                                row_bytes,
+                            );
+                            let slot = &mut radius_sq[assigned_vector.cluster];
+                            *slot = slot.max(d_sq);
                         }
                     }
                     rows_w.flush()?;
@@ -699,6 +770,19 @@ pub(crate) fn merge_ivf(
                         }
                     }
                     graph_w.flush()?;
+                }
+
+                // `.centroids` slot [3]: per-cluster radii, accumulated as
+                // squared displacements in the posting write above; one
+                // sqrt per cluster here. Written for every centroid count
+                // (a single-cluster segment still has a radius) — only
+                // pre-radius segments lack the slot, and they load as
+                // all-zero.
+                {
+                    let radii: Vec<f32> = radius_sq.into_iter().map(f32::sqrt).collect();
+                    let radii_w = centroids_write.for_field_with_idx(field, 3);
+                    IvfIndex::serialize_radii(&radii, radii_w)?;
+                    radii_w.flush()?;
                 }
 
                 log::info!(
