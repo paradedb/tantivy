@@ -141,7 +141,7 @@ impl<T: VectorElement> VectorBackend<T> {
 }
 
 /// How the probe loop stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProbeTermination {
     /// The filter-effective probe budget reached `max_probe_count` — the
     /// probe ceiling.
@@ -158,7 +158,7 @@ pub enum ProbeTermination {
 /// touched. Returned by [`VectorBackend::top_n`] alongside the hits.
 /// The flat/exact path fills only `exact_rows_read`; every other field
 /// is IVF-probe-only.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
     /// Clusters visited by the probe loop, in probe order. A cluster
     /// appears here once we've passed the stop-condition gate for it,
@@ -625,8 +625,9 @@ mod tests {
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, VectorClusterStats,
-        VectorDType, VectorInfo, VectorOptions, VectorStorageFormat,
+        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors,
+        NeighborhoodGraphSearchMetrics, SearchTerminationReason, VectorClusterStats, VectorDType,
+        VectorInfo, VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -2339,6 +2340,72 @@ mod tests {
             stats.probed_clusters,
         );
         Ok(())
+    }
+
+    /// `ProbeStats` (and nested routing / optional graph metrics) round-trip
+    /// through `serde_json` with the field names callers rely on.
+    #[test]
+    fn probe_stats_serializes_to_json() {
+        let stats = ProbeStats {
+            probed_clusters: vec![2, 5],
+            candidates_scored: 10,
+            vectors_visited: 20,
+            pruned_filter: 4,
+            pruned_dead: 3,
+            pruned_seen: 3,
+            postings_row: 1,
+            postings_skipped: 1,
+            exact_rows_read: 0,
+            routing: IvfSearchMetrics {
+                visited_count: 7,
+                graph: Some(NeighborhoodGraphSearchMetrics {
+                    visited_count: 7,
+                    expanded_count: 4,
+                    edges_scanned: 12,
+                    evictions: 1,
+                    result_count: 3,
+                    termination_reason: SearchTerminationReason::SearchConverged,
+                }),
+            },
+            min_candidates: 5,
+            termination: ProbeTermination::Gate,
+        };
+
+        let value = serde_json::to_value(&stats).expect("ProbeStats should serialize to JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "probed_clusters": [2, 5],
+                "candidates_scored": 10,
+                "vectors_visited": 20,
+                "pruned_filter": 4,
+                "pruned_dead": 3,
+                "pruned_seen": 3,
+                "postings_row": 1,
+                "postings_skipped": 1,
+                "exact_rows_read": 0,
+                "routing": {
+                    "visited_count": 7,
+                    "graph": {
+                        "visited_count": 7,
+                        "expanded_count": 4,
+                        "edges_scanned": 12,
+                        "evictions": 1,
+                        "result_count": 3,
+                        "termination_reason": "SearchConverged"
+                    }
+                },
+                "min_candidates": 5,
+                "termination": "Gate"
+            })
+        );
+
+        // Exact routing leaves `graph` unset — still must serialize as null.
+        let mut exact_routing = stats;
+        exact_routing.routing.graph = None;
+        let exact_value =
+            serde_json::to_value(&exact_routing).expect("ProbeStats should serialize to JSON");
+        assert_eq!(exact_value["routing"]["graph"], serde_json::Value::Null);
     }
 
     // ============================================================
