@@ -2,7 +2,8 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 
 use super::{Collector, SegmentCollector};
-use crate::collector::Fruit;
+use crate::collector::{collect_segment_single_pass, Fruit};
+use crate::query::Weight;
 use crate::schema::Schema;
 use crate::{DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
@@ -32,6 +33,23 @@ impl<TCollector: Collector> Collector for CollectorWrapper<TCollector> {
 
     fn requires_scoring(&self) -> bool {
         self.0.requires_scoring()
+    }
+
+    fn drives_own_iteration(&self) -> bool {
+        self.0.drives_own_iteration()
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> crate::Result<Box<dyn Fruit>> {
+        Ok(Box::new(self.0.collect_segment(
+            weight,
+            segment_ord,
+            reader,
+        )?))
     }
 
     fn merge_fruits(
@@ -224,6 +242,36 @@ impl Collector for MultiCollector<'_> {
             .iter()
             .map(Deref::deref)
             .any(Collector::requires_scoring)
+    }
+
+    fn drives_own_iteration(&self) -> bool {
+        self.collector_wrappers
+            .iter()
+            .map(Deref::deref)
+            .any(Collector::drives_own_iteration)
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> crate::Result<MultiFruit> {
+        if !self.drives_own_iteration() {
+            return collect_segment_single_pass(self, weight, segment_ord, reader);
+        }
+        let sub_fruits = self
+            .collector_wrappers
+            .iter()
+            .map(|collector_wrapper| {
+                Ok(Some(collector_wrapper.collect_segment(
+                    weight,
+                    segment_ord,
+                    reader,
+                )?))
+            })
+            .collect::<crate::Result<_>>()?;
+        Ok(MultiFruit { sub_fruits })
     }
 
     fn merge_fruits(&self, segments_multifruits: Vec<MultiFruit>) -> crate::Result<MultiFruit> {

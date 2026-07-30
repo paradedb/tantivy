@@ -172,6 +172,43 @@ pub trait Collector: Sync + Send {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
 
+    /// Returns true iff this collector overrides [`Collector::collect_segment`] to drive its
+    /// own document iteration rather than being fed by the shared walk over the filter
+    /// `DocSet`.
+    ///
+    /// Combining collectors (tuples, [`MultiCollector`]) feed all their children from a single
+    /// walk, which never reaches a child that owns its iteration. They check this flag to fall
+    /// back to one independent pass per child instead.
+    ///
+    /// A wrapper around another collector must handle this rather than inherit the default,
+    /// but forwarding is not automatically the right answer. Forward it when the wrapper only
+    /// combines or relabels results, so the inner collector's own `collect_segment` runs. When
+    /// the wrapper's own work happens per collected doc, reject the combination instead by
+    /// calling [`Collector::check_collectable_per_doc`] on the inner collector from
+    /// `check_schema` — a [`FilterCollector`]'s predicate never runs against a collector that
+    /// bypasses [`SegmentCollector::collect`], so forwarding there would silently drop the
+    /// filter.
+    fn drives_own_iteration(&self) -> bool {
+        false
+    }
+
+    /// Errors iff this collector cannot be fed per collected doc, i.e.
+    /// [`Collector::drives_own_iteration`] is true.
+    ///
+    /// A wrapper whose own work happens inside [`SegmentCollector::collect`] — a per-doc
+    /// predicate, for example — calls this on its inner collector from `check_schema`, so the
+    /// impossible combination fails up front instead of silently skipping either the wrapper's
+    /// work or the inner collector's results. `wrapper` names the caller in the error.
+    fn check_collectable_per_doc(&self, wrapper: &str) -> crate::Result<()> {
+        if self.drives_own_iteration() {
+            return Err(crate::TantivyError::InvalidArgument(format!(
+                "{wrapper} cannot wrap a collector that drives its own document iteration, \
+                 because the predicate is applied per collected doc and would never run"
+            )));
+        }
+        Ok(())
+    }
+
     /// Created a segment collector and
     fn collect_segment(
         &self,
@@ -179,11 +216,23 @@ pub trait Collector: Sync + Send {
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
-        let with_scoring = self.requires_scoring();
-        let mut segment_collector = self.for_segment(segment_ord, reader)?;
-        default_collect_segment_impl(&mut segment_collector, weight, reader, with_scoring)?;
-        Ok(segment_collector.harvest())
+        collect_segment_single_pass(self, weight, segment_ord, reader)
     }
+}
+
+/// The stock [`Collector::collect_segment`]: build the segment collector, feed it every doc the
+/// filter `DocSet` yields, harvest. Extracted so combining collectors can reach it from inside
+/// their own override.
+pub(crate) fn collect_segment_single_pass<TCollector: Collector + ?Sized>(
+    collector: &TCollector,
+    weight: &dyn Weight,
+    segment_ord: SegmentOrdinal,
+    reader: &SegmentReader,
+) -> crate::Result<<TCollector::Child as SegmentCollector>::Fruit> {
+    let with_scoring = collector.requires_scoring();
+    let mut segment_collector = collector.for_segment(segment_ord, reader)?;
+    default_collect_segment_impl(&mut segment_collector, weight, reader, with_scoring)?;
+    Ok(segment_collector.harvest())
 }
 
 pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
@@ -274,6 +323,26 @@ impl<TCollector: Collector> Collector for Option<TCollector> {
             .unwrap_or(false)
     }
 
+    fn drives_own_iteration(&self) -> bool {
+        self.as_ref()
+            .map(|inner| inner.drives_own_iteration())
+            .unwrap_or(false)
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        match self.as_ref() {
+            Some(inner) if inner.drives_own_iteration() => {
+                Ok(Some(inner.collect_segment(weight, segment_ord, reader)?))
+            }
+            _ => collect_segment_single_pass(self, weight, segment_ord, reader),
+        }
+    }
+
     fn merge_fruits(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
@@ -350,6 +419,25 @@ where
         self.0.requires_scoring() || self.1.requires_scoring()
     }
 
+    fn drives_own_iteration(&self) -> bool {
+        self.0.drives_own_iteration() || self.1.drives_own_iteration()
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        if !self.drives_own_iteration() {
+            return collect_segment_single_pass(self, weight, segment_ord, reader);
+        }
+        Ok((
+            self.0.collect_segment(weight, segment_ord, reader)?,
+            self.1.collect_segment(weight, segment_ord, reader)?,
+        ))
+    }
+
     fn merge_fruits(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
@@ -420,6 +508,28 @@ where
 
     fn requires_scoring(&self) -> bool {
         self.0.requires_scoring() || self.1.requires_scoring() || self.2.requires_scoring()
+    }
+
+    fn drives_own_iteration(&self) -> bool {
+        self.0.drives_own_iteration()
+            || self.1.drives_own_iteration()
+            || self.2.drives_own_iteration()
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        if !self.drives_own_iteration() {
+            return collect_segment_single_pass(self, weight, segment_ord, reader);
+        }
+        Ok((
+            self.0.collect_segment(weight, segment_ord, reader)?,
+            self.1.collect_segment(weight, segment_ord, reader)?,
+            self.2.collect_segment(weight, segment_ord, reader)?,
+        ))
     }
 
     fn merge_fruits(
@@ -504,6 +614,30 @@ where
             || self.1.requires_scoring()
             || self.2.requires_scoring()
             || self.3.requires_scoring()
+    }
+
+    fn drives_own_iteration(&self) -> bool {
+        self.0.drives_own_iteration()
+            || self.1.drives_own_iteration()
+            || self.2.drives_own_iteration()
+            || self.3.drives_own_iteration()
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        if !self.drives_own_iteration() {
+            return collect_segment_single_pass(self, weight, segment_ord, reader);
+        }
+        Ok((
+            self.0.collect_segment(weight, segment_ord, reader)?,
+            self.1.collect_segment(weight, segment_ord, reader)?,
+            self.2.collect_segment(weight, segment_ord, reader)?,
+            self.3.collect_segment(weight, segment_ord, reader)?,
+        ))
     }
 
     fn merge_fruits(

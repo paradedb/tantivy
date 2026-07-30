@@ -122,15 +122,29 @@ impl<T: VectorElement> Collector for TopDocsByVectorSimilarity<T> {
         _segment_local_id: SegmentOrdinal,
         _reader: &SegmentReader,
     ) -> crate::Result<Self::Child> {
-        // Never called at runtime — we override `collect_segment`. The
-        // child type exists only to satisfy the trait bound.
-        Ok(NoOpSegmentCollector)
+        // Unreachable via `collect_segment`, which builds the backend directly.
+        // Anything that gets here reached the per-doc pull path instead, and
+        // that path can never produce a vector hit. Returning an empty child
+        // would make such a caller look like a search with no matches; the
+        // error names the actual cause.
+        Err(TantivyError::InvalidArgument(
+            "vector similarity collection cannot be driven per document; a wrapping collector \
+             reached TopDocsByVectorSimilarity::for_segment instead of its collect_segment. The \
+             wrapper needs to forward Collector::drives_own_iteration, or reject the combination"
+                .to_string(),
+        ))
     }
 
     fn requires_scoring(&self) -> bool {
         // Similarity is computed from the stored vectors, not from the
         // filter's BM25 score — let tantivy take the no-score fast path.
         false
+    }
+
+    fn drives_own_iteration(&self) -> bool {
+        // `collect_segment` below hands the filter `Weight` to the backend and
+        // never yields to the shared per-doc walk.
+        true
     }
 
     fn collect_segment(
@@ -180,6 +194,7 @@ impl<T: VectorElement> Collector for TopDocsByVectorSimilarity<T> {
 /// Trait-bound shim: the collector overrides [`Collector::collect_segment`]
 /// so the per-doc path never fires, but the `Child: SegmentCollector`
 /// bound on `Collector` still has to be satisfied.
+#[derive(Debug)]
 pub struct NoOpSegmentCollector;
 
 impl SegmentCollector for NoOpSegmentCollector {
@@ -207,10 +222,10 @@ mod ivf_e2e_tests {
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
-    use crate::schema::{Schema, STORED, STRING};
+    use crate::schema::{Schema, FAST, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
     use crate::vector::{Metric, VectorDType, VectorOptions, VectorStorageFormat};
-    use crate::{Index, TantivyDocument};
+    use crate::{Index, TantivyDocument, TantivyError};
 
     /// IVF + exhaustive probing matches the global oracle. The shared
     /// fixture produces multiple IVF segments (it merges raw segments
@@ -312,6 +327,147 @@ mod ivf_e2e_tests {
                 let actual = searcher.search(&AllQuery, &collector)?;
                 assert_eq!(actual.results, expected, "Flat query={query:?} k={k}");
             }
+        }
+        Ok(())
+    }
+
+    /// A wrapper that neither forwards `drives_own_iteration` nor rejects the
+    /// combination lands on the per-doc pull path, which cannot produce a vector
+    /// hit. That has to fail loudly: an empty child would make the bug look like
+    /// a query that simply matched nothing.
+    #[test]
+    fn per_doc_collection_path_errors_instead_of_returning_empty() -> crate::Result<()> {
+        let vector_options = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
+        let mut schema_builder = Schema::builder();
+        let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(embedding_field, &[0.0_f32, 0.0]);
+        writer.add_document(doc)?;
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let collector =
+            TopDocs::with_limit(2).order_by_similarity(embedding_field, vec![0.0_f32, 0.0]);
+        let err =
+            super::Collector::for_segment(&collector, 0, searcher.segment_reader(0)).unwrap_err();
+        assert!(
+            matches!(err, TantivyError::InvalidArgument(ref msg) if msg.contains("per document")),
+            "unexpected error: {err:?}"
+        );
+        Ok(())
+    }
+
+    /// `FilterCollector` applies its predicate per collected doc, which the
+    /// vector collector never routes through. Wrapping one would silently drop
+    /// either the predicate or every hit, so it is refused up front.
+    #[test]
+    fn filter_collector_refuses_to_wrap_the_vector_collector() -> crate::Result<()> {
+        use crate::collector::FilterCollector;
+
+        let vector_options = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
+        let mut schema_builder = Schema::builder();
+        let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
+        let id_field = schema_builder.add_u64_field("id", FAST);
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_vector(embedding_field, &[0.0_f32, 0.0]);
+        doc.add_u64(id_field, 1);
+        writer.add_document(doc)?;
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let err = searcher
+            .search(
+                &AllQuery,
+                &FilterCollector::new(
+                    "id".to_string(),
+                    |value: u64| value > 0,
+                    TopDocs::with_limit(2).order_by_similarity(embedding_field, vec![0.0_f32, 0.0]),
+                ),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, TantivyError::InvalidArgument(ref msg) if msg.contains("drives its own")),
+            "unexpected error: {err:?}"
+        );
+        Ok(())
+    }
+
+    /// Tupled with another collector, the vector arm still returns its hits.
+    /// The tuple `Collector` feeds all its children from one shared walk over
+    /// the filter `DocSet`, which never reaches a child that overrides
+    /// `collect_segment` — without the `drives_own_iteration` split this
+    /// returns zero results while the sibling collector looks perfectly fine.
+    #[test]
+    fn e2e_tupled_with_another_collector_still_returns_hits() -> crate::Result<()> {
+        use crate::collector::{Count, DocSetCollector, MultiCollector};
+
+        for format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
+            let index = TestVectorIndex::builder(VectorDType::F32)
+                .metric(Metric::L2)
+                .vector_storage_format(format)
+                .build()?;
+            let searcher = index.index.reader()?.searcher();
+            let query = [0.5_f32, 0.5];
+            let k = 4;
+            let expected = index.ground_truth(query, k)?;
+            let collector = || {
+                TopDocs::with_limit(k)
+                    .order_by_similarity(index.embedding_field(), query.to_vec())
+                    .with_adaptive_params(exhaustive_params(9))
+            };
+
+            let alone = searcher.search(&AllQuery, &collector())?;
+            assert_eq!(alone.results, expected, "{format:?} standalone");
+
+            // Every tuple arity the `Collector` trait is implemented for, since
+            // each is a separate impl that has to forward the flag.
+            let (tupled, count) = searcher.search(&AllQuery, &(collector(), Count))?;
+            assert_eq!(tupled.results, expected, "{format:?} 2-tuple");
+            assert_eq!(
+                count,
+                searcher.num_docs() as usize,
+                "{format:?} 2-tuple sibling"
+            );
+
+            let (three, _, _) =
+                searcher.search(&AllQuery, &(collector(), Count, DocSetCollector))?;
+            assert_eq!(three.results, expected, "{format:?} 3-tuple");
+
+            let (four, _, _, _) =
+                searcher.search(&AllQuery, &(collector(), Count, DocSetCollector, Count))?;
+            assert_eq!(four.results, expected, "{format:?} 4-tuple");
+
+            // Option<C> is a wrapper with the same inheritance.
+            let optional = searcher.search(&AllQuery, &Some(collector()))?;
+            assert_eq!(
+                optional.map(|fruit| fruit.results),
+                Some(expected.clone()),
+                "{format:?} Option"
+            );
+
+            // And through the dynamic path, which boxes each collector.
+            let mut multi = MultiCollector::new();
+            let handle = multi.add_collector(collector());
+            let count_handle = multi.add_collector(Count);
+            let mut fruit = searcher.search(&AllQuery, &multi)?;
+            assert_eq!(
+                handle.extract(&mut fruit).results,
+                expected,
+                "{format:?} MultiCollector"
+            );
+            assert_eq!(
+                count_handle.extract(&mut fruit),
+                searcher.num_docs() as usize,
+                "{format:?} MultiCollector sibling"
+            );
         }
         Ok(())
     }

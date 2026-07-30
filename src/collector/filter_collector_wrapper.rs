@@ -106,6 +106,8 @@ where
     type Child = FilterSegmentCollector<TCollector::Child, TPredicate, TPredicateValue>;
 
     fn check_schema(&self, schema: &Schema) -> crate::Result<()> {
+        self.collector
+            .check_collectable_per_doc("FilterCollector")?;
         self.collector.check_schema(schema)?;
         Ok(())
     }
@@ -281,6 +283,8 @@ where
     type Child = BytesFilterSegmentCollector<TCollector::Child, TPredicate>;
 
     fn check_schema(&self, schema: &Schema) -> crate::Result<()> {
+        self.collector
+            .check_collectable_per_doc("BytesFilterCollector")?;
         self.collector.check_schema(schema)
     }
 
