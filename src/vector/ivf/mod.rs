@@ -21,7 +21,7 @@ pub use graph::{
     Workspace,
 };
 pub use index::{IvfIndex, IvfSearchMetrics};
-pub use params::ProbeBudget;
+pub use params::{ProbeBudget, WorkModel};
 pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, encode_vector};
 pub use training::{

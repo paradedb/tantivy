@@ -598,16 +598,14 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     Ok(())
 }
 
-/// Full-budget probe params: fraction 1.0 clamps the ceiling to the
-/// segment's cluster count. On radius-less trees this is a full drain.
-/// Once stored radii exist, the certificate may still (soundly)
-/// terminate early - tests that must visit every row use a
-/// radius-stripped fixture (`strip_radius_slot`), the sanctioned
-/// gateless control.
+/// Full-budget probe params: fraction 1.0 resolves to the segment's whole
+/// capacity (the normalization identity makes that exactly its cluster
+/// count), so the scan visits every cluster the router yields.
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeBudget {
     ProbeBudget {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
+        work_model: None,
     }
 }
 
