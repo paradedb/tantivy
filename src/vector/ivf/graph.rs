@@ -846,6 +846,14 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     }
 }
 
+/// Fixed seed for the TPT forest that initializes the KNN graph - the one
+/// RNG in the vector build path (the k-means clusterer is seeded by its own
+/// crate). A fixed seed makes segment builds a pure function of
+/// (data, config, code), which fingerprint-based acceptance protocols and
+/// A/B recall comparisons depend on. The value is arbitrary and matches the
+/// clusterer crate's documented default.
+const KNN_INIT_TPT_SEED: u64 = 42;
+
 /// Build is `f32`-only and borrow-only for now: the TPT partitioner does
 /// floating-point math over the vectors, and `&[f32]` is `Copy`, so the arena
 /// can be read while edge lists are mutated. The rest of the index stays
@@ -876,9 +884,20 @@ impl RelativeNeighborhoodGraph<&[f32]> {
         }
 
         // One TPTree reused across trees: its RNG advances between partitions,
-        // so each tree splits along different directions.
+        // so each tree splits along different directions. The seed is FIXED:
+        // this is the only randomness in the whole vector build path (k-means
+        // is seeded upstream), and an unseeded draw here made every segment
+        // build unrepeatable - centroid-graph edges shift, replica selection
+        // shifts, posting layout shifts, and identical queries return
+        // different ids across two builds of the same data. Reproducibility
+        // is the requirement; which constant it is does not matter.
         let metric = self.metric;
-        let mut tpt = partition::TPTree::new(partition::TPTreeConfig::default(), dim, vectors);
+        let mut tpt = partition::TPTree::new(
+            partition::TPTreeConfig::default(),
+            dim,
+            vectors,
+            KNN_INIT_TPT_SEED,
+        );
         let mut indices: Vec<NodeId> = (0..n as NodeId).collect();
         for _ in 0..self.config.num_trees {
             let leaves = tpt.partition(&mut indices);

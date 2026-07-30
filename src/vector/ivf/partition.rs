@@ -55,14 +55,23 @@ pub struct TPTree<'a> {
 impl<'a> TPTree<'a> {
     /// `vectors` is the flat `dim`-strided buffer (its length must be a
     /// multiple of `dim`).
-    pub fn new(config: TPTreeConfig, dim: usize, vectors: &'a [f32]) -> Self {
+    ///
+    /// `seed` fixes the split-direction RNG. The tree's quality does not
+    /// depend on which seed it is, only on the directions being spread -
+    /// but BUILD REPRODUCIBILITY depends on it being fixed: identical
+    /// (data, config, code) must produce an identical graph, or no
+    /// downstream result can be compared across two builds. Callers that
+    /// union several trees reuse one `TPTree` so the RNG advances from
+    /// tree to tree - diversity between trees comes from the stream, not
+    /// from re-seeding.
+    pub fn new(config: TPTreeConfig, dim: usize, vectors: &'a [f32], seed: u64) -> Self {
         debug_assert!(dim > 0, "dim must be non-zero");
         debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
         TPTree {
             vectors,
             dim,
             config,
-            rng: fastrand::Rng::new(),
+            rng: fastrand::Rng::with_seed(seed),
         }
     }
 
@@ -233,7 +242,7 @@ mod tests {
             top_dims: 2,
             iterations: 100,
         };
-        let mut tpt = TPTree::new(config, 3, &v);
+        let mut tpt = TPTree::new(config, 3, &v, 42);
         let mut indices: Vec<NodeId> = (0..8).collect();
 
         let leaves = tpt.partition(&mut indices);
@@ -259,7 +268,7 @@ mod tests {
             top_dims: 2,
             iterations: 8,
         };
-        let mut tpt = TPTree::new(config, 3, &v);
+        let mut tpt = TPTree::new(config, 3, &v, 42);
         let mut indices: Vec<NodeId> = (0..8).collect();
 
         let leaves = tpt.partition(&mut indices);
