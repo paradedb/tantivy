@@ -306,9 +306,9 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
             let vec_file =
                 segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
             let (version, body) = read_header(&vec_file)?;
-            assert_eq!(version, VectorFileVersion::V1);
-            // Body must be a valid composite — proves the stamp sits in front
-            // of the framing, not inside a slot.
+            assert_eq!(version, VectorFileVersion::V2, "the current generation");
+            // Body must be a valid composite - proves the stamp sits in
+            // front of the framing, not inside a slot.
             CompositeFile::open(&body)?;
 
             match format {
@@ -324,7 +324,10 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
                     let centroids_file = segment_reader
                         .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
                     let (version, body) = read_header(&centroids_file)?;
-                    assert_eq!(version, VectorFileVersion::V1);
+                    // V2 is the generation in which slot [3] became
+                    // required; a `.centroids` stamped below it is
+                    // refused at open.
+                    assert_eq!(version, VectorFileVersion::V2);
                     CompositeFile::open(&body)?;
                 }
             }
@@ -595,6 +598,101 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     assert_eq!(hits.len(), 2, "zero vector must be ingested and returned");
     assert!(hits[0].0 > 0.0, "non-zero doc must rank first: {hits:?}");
     assert_eq!(hits[1].0, 0.0, "zero vector scores 0.0: {hits:?}");
+    Ok(())
+}
+
+
+/// TEST SURGERY: rewrite every segment's `.centroids` composite in
+/// `index` as a genuine pre-V2 file - a `V1` version stamp and only slots
+/// `[0..=2]`, byte-identical to what a pre-radius writer produced.
+/// Reopen a fresh [`crate::Searcher`] afterwards; cached readers keep the
+/// old parse.
+pub(crate) fn write_v1_centroids(index: &Index, field: Field) -> crate::Result<()> {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use common::BinarySerializable;
+
+    use crate::directory::{CompositeFile, CompositeWrite, Directory};
+    use crate::index::SegmentComponent;
+    use crate::vector::header::{read_header, VectorFileVersion};
+    use crate::vector::ivf::CENTROIDS_EXT;
+
+    let searcher = index.reader()?.searcher();
+    for segment_reader in searcher.segment_readers() {
+        let composite_slice =
+            segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
+        let (_version, body) = read_header(&composite_slice)?;
+        let composite = CompositeFile::open(&body)?;
+        let kept: Vec<(usize, Vec<u8>)> = (0..=2)
+            .filter_map(|idx| {
+                composite
+                    .open_read_with_idx(field, idx)
+                    .map(|slice| (idx, slice))
+            })
+            .map(|(idx, slice)| Ok((idx, slice.read_bytes()?.to_vec())))
+            .collect::<crate::Result<_>>()?;
+        assert!(
+            composite.open_read_with_idx(field, 3).is_some(),
+            "write_v1_centroids: the current writer must have stored radii"
+        );
+
+        let path = PathBuf::from(format!(
+            "{}.{CENTROIDS_EXT}",
+            segment_reader.segment_id().uuid_string()
+        ));
+        let directory = index.directory();
+        directory.delete(&path).expect("delete .centroids");
+        let mut rewrite_file = directory.open_write(&path)?;
+        // The old generation's stamp, not the current one: this is what a
+        // pre-radius writer left on disk.
+        (VectorFileVersion::V1 as u32).serialize(&mut rewrite_file)?;
+        let mut rewrite = CompositeWrite::wrap(rewrite_file);
+        for (idx, bytes) in kept {
+            let w = rewrite.for_field_with_idx(field, idx);
+            w.write_all(&bytes)?;
+            w.flush()?;
+        }
+        rewrite.close()?;
+    }
+    Ok(())
+}
+
+/// A `.centroids` file from before radii were required is refused at open,
+/// with the one remedy there is. The failure is a clean error at reader
+/// construction - not a panic, and not a silent fall back to some
+/// radius-less behavior, because none exists.
+#[test]
+fn v1_file_errors_with_reindex_hint() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Ivf)
+        .build()?;
+    let field = index.embedding_field();
+
+    // The current writer stamps V2 and stores real radii.
+    let searcher = index.index.reader()?.searcher();
+    for segment_reader in searcher.segment_readers() {
+        let vec_reader = segment_reader.vector_index(field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        assert!(ivf.max_radius() > 0.0, "fixture must store real radii");
+    }
+    drop(searcher);
+
+    write_v1_centroids(&index.index, field)?;
+
+    let searcher = index.index.reader()?.searcher();
+    let Err(err) = searcher.segment_readers()[0].vector_index(field) else {
+        panic!("a pre-V2 .centroids must not open");
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("REINDEX"),
+        "the error must name the remedy: {message}"
+    );
+    assert!(
+        message.contains("pre-V2"),
+        "the error must name the cause: {message}"
+    );
     Ok(())
 }
 

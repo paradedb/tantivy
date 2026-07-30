@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 use common::{HasLen, OwnedBytes};
 
 use super::flat::IdMap;
-use super::header::read_header;
+use super::header::{read_header, VectorFileVersion};
 use super::ivf::{IvfIndex, CENTROIDS_EXT};
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
@@ -115,16 +115,41 @@ impl VectorIndexReader {
         let centroid_slots =
             match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
                 Ok(file) => {
-                    let (_version, body) = read_header(&file)?;
+                    let (version, body) = read_header(&file)?;
+                    // Radii are mandatory: the probe budget meters work
+                    // against them and the gate policy certifies against
+                    // them, so there is no radius-less execution path to
+                    // fall back to. A pre-V2 `.centroids` is refused here,
+                    // once, with the only remedy there is.
+                    if version < VectorFileVersion::V2 {
+                        return Err(TantivyError::InvalidArgument(format!(
+                            "vector field {:?} has a pre-V2 `.centroids` file (format version \
+                             {version:?}), written before per-cluster radii became required. \
+                             REINDEX this index to rebuild it in the current format.",
+                            entry.name()
+                        )));
+                    }
                     let composite = CompositeFile::open(&body)?;
                     match (
                         composite.open_read_with_idx(field, 0),
                         composite.open_read_with_idx(field, 1),
+                        composite.open_read_with_idx(field, 3),
                     ) {
-                        // Slot [2] (the routing graph) is optional: the write
-                        // side skips it for degenerate centroid counts.
-                        (Some(centroids), Some(offsets)) => {
-                            Some((centroids, offsets, composite.open_read_with_idx(field, 2)))
+                        // Slot [2] (the routing graph) stays optional: the
+                        // write side skips it for degenerate centroid
+                        // counts. Slot [3] (radii) does not - a V2 file
+                        // without it is corrupt, not old.
+                        (Some(centroids), Some(offsets), Some(radii)) => Some((
+                            centroids,
+                            offsets,
+                            composite.open_read_with_idx(field, 2),
+                            radii,
+                        )),
+                        (Some(_), Some(_), None) => {
+                            return Err(TantivyError::InternalError(format!(
+                                "vector field {:?} has a V2 `.centroids` file with no radius slot",
+                                entry.name()
+                            )));
                         }
                         _ => None,
                     }
@@ -137,8 +162,8 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((centroids, offsets, graph))) => {
-                Some(IvfIndex::open(&options, centroids, offsets, graph)?)
+            (IdMap::Explicit(_), Some((centroids, offsets, graph, radii))) => {
+                Some(IvfIndex::open(&options, centroids, offsets, graph, radii)?)
             }
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
