@@ -698,12 +698,15 @@ fn v1_file_errors_with_reindex_hint() -> crate::Result<()> {
 
 /// Full-budget probe params: fraction 1.0 resolves to the segment's whole
 /// capacity (the normalization identity makes that exactly its cluster
-/// count), so the scan visits every cluster the router yields.
+/// count), so the BUDGET never binds. The gate policy still can: a test
+/// whose contract is "every cluster is visited" also needs the gateless
+/// control arm (`ProbeBudget::disable_gate`).
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeBudget {
     ProbeBudget {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
         work_model: None,
+        ..Default::default()
     }
 }
 

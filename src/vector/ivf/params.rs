@@ -78,6 +78,12 @@ pub struct ProbeBudget {
     /// holding a [`Searcher`](crate::Searcher) - see [`WorkModel`]. `None`
     /// falls back to per-segment normalization.
     pub work_model: Option<WorkModel>,
+    /// Run the probe loop with NO gate policy - the gateless control arm
+    /// for gate-vs-gateless comparisons on one binary. TEST AND BENCH
+    /// ONLY: this field does not exist in a shipped build, and neither
+    /// does the branch that reads it.
+    #[cfg(any(test, feature = "bench-control"))]
+    pub disable_gate: bool,
 }
 
 impl Default for ProbeBudget {
@@ -86,6 +92,8 @@ impl Default for ProbeBudget {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
+            #[cfg(any(test, feature = "bench-control"))]
+            disable_gate: false,
         }
     }
 }
@@ -198,6 +206,7 @@ mod tests {
             max_probe_fraction: 0.5,
             min_probe_clusters: 1,
             work_model: Some(WorkModel { n_bar: 62.5 }),
+            ..Default::default()
         };
         let (big, _, _) = params.resolved_work_budget(8, 800)?;
         let (small, _, _) = params.resolved_work_budget(8, 200)?;
