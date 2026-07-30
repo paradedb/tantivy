@@ -122,10 +122,14 @@ impl VectorIndexReader {
                         composite.open_read_with_idx(field, 1),
                     ) {
                         // Slot [2] (the routing graph) is optional: the write
-                        // side skips it for degenerate centroid counts.
-                        (Some(centroids), Some(offsets)) => {
-                            Some((centroids, offsets, composite.open_read_with_idx(field, 2)))
-                        }
+                        // side skips it for degenerate centroid counts. Slot
+                        // [3] (radii) is optional: absent on old segments.
+                        (Some(centroids), Some(offsets)) => Some((
+                            centroids,
+                            offsets,
+                            composite.open_read_with_idx(field, 2),
+                            composite.open_read_with_idx(field, 3),
+                        )),
                         _ => None,
                     }
                 }
@@ -137,8 +141,8 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((centroids, offsets, graph))) => {
-                Some(IvfIndex::open(&options, centroids, offsets, graph)?)
+            (IdMap::Explicit(_), Some((centroids, offsets, graph, radii))) => {
+                Some(IvfIndex::open(&options, centroids, offsets, graph, radii)?)
             }
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(

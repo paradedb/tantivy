@@ -509,6 +509,119 @@ fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
     Ok(())
 }
 
+/// TEST SURGERY: strip the radius slot `[3]` out of every segment's
+/// `.centroids` composite in `index`, rewriting only slots `[0..=2]` —
+/// byte-identical to a pre-radius writer's output. Simulates an old-format
+/// segment for compatibility tests; reopen a fresh
+/// [`crate::Searcher`] afterwards (cached readers keep the old parse).
+pub(crate) fn strip_radius_slot(index: &Index, field: Field) -> crate::Result<()> {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use crate::directory::{CompositeFile, CompositeWrite, Directory};
+    use crate::index::SegmentComponent;
+    use crate::vector::header::{read_header, write_header};
+    use crate::vector::ivf::CENTROIDS_EXT;
+
+    let searcher = index.reader()?.searcher();
+    for segment_reader in searcher.segment_readers() {
+        let composite_slice =
+            segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
+        let (_version, body) = read_header(&composite_slice)?;
+        let composite = CompositeFile::open(&body)?;
+        let kept: Vec<(usize, Vec<u8>)> = (0..=2)
+            .filter_map(|idx| {
+                composite
+                    .open_read_with_idx(field, idx)
+                    .map(|slice| (idx, slice))
+            })
+            .map(|(idx, slice)| Ok((idx, slice.read_bytes()?.to_vec())))
+            .collect::<crate::Result<_>>()?;
+        assert!(
+            composite.open_read_with_idx(field, 3).is_some(),
+            "strip_radius_slot: slot [3] must exist before the strip"
+        );
+
+        let path = PathBuf::from(format!(
+            "{}.{CENTROIDS_EXT}",
+            segment_reader.segment_id().uuid_string()
+        ));
+        let directory = index.directory();
+        directory.delete(&path).expect("delete .centroids");
+        // Re-stamp the format-version header (#186) ahead of the rewritten
+        // composite — the strip simulates an old-format WRITER, which still
+        // wrote the current generation header, just no slot [3].
+        let mut rewrite_file = directory.open_write(&path)?;
+        write_header(&mut rewrite_file)?;
+        let mut rewrite = CompositeWrite::wrap(rewrite_file);
+        for (idx, bytes) in kept {
+            let w = rewrite.for_field_with_idx(field, idx);
+            w.write_all(&bytes)?;
+            w.flush()?;
+        }
+        rewrite.close()?;
+    }
+    Ok(())
+}
+
+/// A segment written before the radius slot existed — simulated by
+/// stripping slot [3] out of a freshly built segment's `.centroids`
+/// composite — must load with all-zero radii and still serve
+/// Candidate-mode queries end to end.
+#[test]
+fn ivf_radii_absent_slot_loads_zero_and_queries() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Ivf)
+        .build()?;
+    let field = index.embedding_field();
+
+    // The current writer stores radii: the fixture's grid clusters have
+    // spread-out members, so the max radius is positive.
+    let searcher = index.index.reader()?.searcher();
+    for segment_reader in searcher.segment_readers() {
+        let vec_reader = segment_reader.vector_index(field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        assert!(ivf.max_radius() > 0.0, "fixture must store real radii");
+    }
+    drop(searcher);
+
+    strip_radius_slot(&index.index, field)?;
+
+    // A fresh reader parses the stripped composite: zero radii, and a
+    // Candidate-mode query still runs end to end.
+    let searcher = index.index.reader()?.searcher();
+    let mut clusters_seen = 0usize;
+    for segment_reader in searcher.segment_readers() {
+        let vec_reader = segment_reader.vector_index(field)?;
+        let ivf = vec_reader.index().expect("still IVF after the strip");
+        assert_eq!(ivf.max_radius(), 0.0);
+        for cluster in 0..ivf.num_clusters() {
+            assert_eq!(ivf.cluster_radius(cluster), 0.0);
+            clusters_seen += 1;
+        }
+    }
+    assert!(clusters_seen > 0, "strip must cover real clusters");
+
+    let k = 5;
+    let query = grid2d::centroids()[0];
+    let collector = crate::collector::TopDocs::with_limit(k)
+        .order_by_similarity(field, query.to_vec())
+        .with_probe_budget(crate::vector::ivf::ProbeBudget {
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
+        });
+    let fruit = searcher.search(&crate::query::AllQuery, &collector)?;
+    assert_eq!(
+        fruit.results.len(),
+        k,
+        "old-format segment must keep serving"
+    );
+    for pair in fruit.results.windows(2) {
+        assert!(pair[0].0 >= pair[1].0, "scores must be descending");
+    }
+    Ok(())
+}
+
 #[test]
 fn ground_truth_orders_by_metric() -> crate::Result<()> {
     let index = TestVectorIndex::builder(VectorDType::F32)
