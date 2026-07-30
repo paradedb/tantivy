@@ -215,6 +215,13 @@ pub struct ProbeStats {
     /// 1) is neither counted here nor budget-charged, so on a radius-less
     /// segment this reads exactly zero. Zero until per-cluster radii land.
     pub radius_skips: usize,
+    /// Work units this segment's probe loop charged against its resolved
+    /// budget (unit regime: opens at `x`, first-seen rows at `(1−x)/n̄`,
+    /// Skips at `x`; legacy count regime: the filter-effective cluster
+    /// count). The budget identity is per segment:
+    /// `budget < work_charged ≤ budget + last cluster's charge` on
+    /// Ceiling terminations.
+    pub work_charged: f32,
 }
 
 impl ProbeStats {
@@ -383,6 +390,27 @@ pub(crate) const OPEN_SHARE_X: f32 = 0.07;
 /// charge individually.
 pub(crate) const LEGACY_SKIPPED_CLUSTER_COST: f32 = 0.05;
 
+/// Which budget regime a segment's probe loop runs — decided once per
+/// segment by slot [3] presence (see the regime line in the work-unit
+/// model docs above).
+#[derive(Clone, Copy, Debug)]
+enum ChargeModel {
+    /// Work units: opens and Skips charge `x`, first-seen rows charge
+    /// `row_charge = (1−x)/n̄`. `budget = f × units_seg`.
+    Units { budget: f64, row_charge: f64 },
+    /// Radius-less segments: the pre-unit filter-effective cluster count.
+    LegacyCounts { budget: f64 },
+}
+
+impl ChargeModel {
+    fn budget(&self) -> f64 {
+        match self {
+            ChargeModel::Units { budget, .. } => *budget,
+            ChargeModel::LegacyCounts { budget } => *budget,
+        }
+    }
+}
+
 /// One gate survivor from the pre-pass over a cluster's rows: `row`
 /// indexes into the segment-wide dense rows slot.
 #[derive(Clone, Copy)]
@@ -420,7 +448,26 @@ impl<T: VectorElement> VectorBackend<T> {
         if num_centroids == 0 {
             return Ok(Vec::new());
         }
-        let max_probe_count = self.adaptive.resolved_probe_ceiling(num_centroids)?;
+        // Regime line: stored radii ⇒ certificate + work-unit budget;
+        // no radii ⇒ gateless + the legacy cluster-count budget. Old
+        // segments keep old everything; REINDEX crosses both at once.
+        let charge_model = if index.max_radius() > 0.0 {
+            // Capacity counts native docs as written (deleted rows still
+            // charge on first touch — see WorkModel::for_searcher).
+            let (budget, n_bar) = self.adaptive.resolved_work_budget(
+                num_centroids,
+                index.num_docs(),
+                OPEN_SHARE_X,
+            )?;
+            ChargeModel::Units {
+                budget,
+                row_charge: (1.0 - OPEN_SHARE_X as f64) / n_bar,
+            }
+        } else {
+            ChargeModel::LegacyCounts {
+                budget: self.adaptive.resolved_probe_ceiling(num_centroids)? as f64,
+            }
+        };
 
         // Phase 1: rank the clusters to probe, lazily — the scan below pulls
         // ranked clusters on demand, so routing cost is paid only as far as
@@ -436,7 +483,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let topn = self.scan_clusters(
             index,
             &mut ranked,
-            max_probe_count,
+            charge_model,
             &filter,
             max_doc,
             alive,
@@ -480,7 +527,7 @@ impl<T: VectorElement> VectorBackend<T> {
         &self,
         index: &IvfIndex,
         ranked: impl Iterator<Item = Candidate>,
-        max_probe_count: usize,
+        charge_model: ChargeModel,
         filter: &BitSet,
         max_doc: DocId,
         alive: Option<&AliveBitSet>,
@@ -536,8 +583,8 @@ impl<T: VectorElement> VectorBackend<T> {
         // resolved budget. In this legacy count-regime every probed cluster
         // charges its filter-effective share (≤ 1 unit); the certificate
         // regime's event-wise unit charges arrive with the radii.
-        let mut work_spent = 0.0f32;
-        let work_budget = max_probe_count as f32;
+        let mut work_spent = 0.0f64;
+        let work_budget = charge_model.budget();
 
         // The ranked stream is consumed exactly as the router yields it.
         // FOLLOW-UP (owned by Ruchir): lower-bound `(d − r)` reordering of
@@ -597,7 +644,7 @@ impl<T: VectorElement> VectorBackend<T> {
                             // The open-decision cost without the rows —
                             // same pull-bounding character as an open
                             // (pulls ≤ budget/x, exhaustion-capped).
-                            work_spent += OPEN_SHARE_X;
+                            work_spent += OPEN_SHARE_X as f64;
                             continue;
                         }
                         GateDecision::TerminateCondition => {
@@ -624,6 +671,14 @@ impl<T: VectorElement> VectorBackend<T> {
             }
             let cluster = cluster as usize;
 
+            // Event-wise charging, part 1: the open. Deducted before any
+            // row work — the boundary check above already admitted this
+            // cluster, and atomicity means it runs to completion whatever
+            // it turns out to cost.
+            if let ChargeModel::Units { .. } = charge_model {
+                work_spent += OPEN_SHARE_X as f64;
+            }
+
             let rows = index.cluster_range(cluster);
             let num_rows = rows.len();
 
@@ -632,20 +687,33 @@ impl<T: VectorElement> VectorBackend<T> {
             // skipped for rows that won't be scored. Gate order, the
             // `seen` marking point, and every prune counter are exactly
             // the fetch-then-gate scan's; only the byte fetch moved.
-            let (v, pf, pd, ps) =
+            let (v, pf, pd, ps, first_seen) =
                 self.collect_cluster_survivors(rows, filter, alive, &mut seen, &mut survivors);
             visited += v;
             pruned_filter += pf;
             pruned_dead += pd;
             pruned_seen += ps;
 
-            // Charge the ceiling by the cluster's filter pass rate: a
-            // fully-skipped cluster still costs the legacy floor (the
-            // gate pre-pass scanned it), a fully-unfiltered one costs 1.0.
-            if num_rows > 0 {
-                let pass_fraction = (num_rows - pf) as f32 / num_rows as f32;
-                work_spent += LEGACY_SKIPPED_CLUSTER_COST
-                    + (1.0 - LEGACY_SKIPPED_CLUSTER_COST) * pass_fraction;
+            match charge_model {
+                // Event-wise charging, part 2: dedup-unique rows, filter
+                // verdict irrelevant — the row was read and checked; work
+                // is work. Replica re-encounters charge nothing, so a doc
+                // costs exactly one row-deduction, whichever copy arrives
+                // first.
+                ChargeModel::Units { row_charge, .. } => {
+                    work_spent += first_seen as f64 * row_charge;
+                }
+                // Legacy: charge by the cluster's filter pass rate — a
+                // fully-filtered cluster still costs the floor (the
+                // pre-pass scanned it), a fully-unfiltered one costs 1.0.
+                ChargeModel::LegacyCounts { .. } => {
+                    if num_rows > 0 {
+                        let pass_fraction = (num_rows - pf) as f32 / num_rows as f32;
+                        work_spent += (LEGACY_SKIPPED_CLUSTER_COST
+                            + (1.0 - LEGACY_SKIPPED_CLUSTER_COST) * pass_fraction)
+                            as f64;
+                    }
+                }
             }
 
             if survivors.is_empty() {
@@ -673,6 +741,9 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.termination = termination;
         stats.gate_armed_at_probe = gate_armed_at_probe;
         stats.gate_armed_at_ceiling = gate_armed_at_ceiling;
+        // f64 accumulation in the loop (the normalization identity is
+        // asserted to 1e-6·C); f32 is plenty for telemetry.
+        stats.work_charged += work_spent as f32;
         stats.radius_skips += radius_skips;
         // Final-state saturation, exact even when the heap filled inside the
         // last probed cluster (arming is only *observed* at boundaries). The
@@ -700,15 +771,31 @@ impl<T: VectorElement> VectorBackend<T> {
         alive: Option<&AliveBitSet>,
         seen: &mut BitSet,
         survivors: &mut Vec<Survivor>,
-    ) -> (usize, usize, usize, usize) {
+    ) -> (usize, usize, usize, usize, usize) {
         survivors.clear();
         let mut visited = 0usize;
         let mut pruned_filter = 0usize;
         let mut pruned_dead = 0usize;
         let mut pruned_seen = 0usize;
+        let mut first_seen = 0usize;
         for row in rows {
             let doc = self.reader.doc_id_at(row);
             visited += 1;
+            // Dedup FIRST, and mark on first structural encounter whatever
+            // the later verdicts say: `first_seen` is the work-unit charge
+            // basis (a doc costs one row-deduction index-wide, whichever
+            // copy arrives first), and marking rejected docs too means a
+            // replica's second copy is never re-checked. Consequence for
+            // the prune buckets: a re-encountered copy of a
+            // filter-rejected doc counts as `pruned_seen`, not
+            // `pruned_filter`; the partition identity
+            // `visited == filter + dead + seen + scored` is unchanged.
+            if seen.contains(doc) {
+                pruned_seen += 1;
+                continue;
+            }
+            seen.insert(doc);
+            first_seen += 1;
             if !filter.contains(doc) {
                 pruned_filter += 1;
                 continue;
@@ -719,14 +806,9 @@ impl<T: VectorElement> VectorBackend<T> {
                     continue;
                 }
             }
-            if seen.contains(doc) {
-                pruned_seen += 1;
-                continue;
-            }
-            seen.insert(doc);
             survivors.push(Survivor { row, doc });
         }
-        (visited, pruned_filter, pruned_dead, pruned_seen)
+        (visited, pruned_filter, pruned_dead, pruned_seen, first_seen)
     }
 }
 
@@ -1671,6 +1753,7 @@ mod tests {
         let one_probe = ProbeBudget {
             max_probe_fraction: 0.5,
             min_probe_clusters: 1,
+            work_model: None,
         };
         let hits1 = search(&index, embed_field, &AllQuery, query.to_vec(), 1, one_probe)?;
         assert_eq!(hits1.len(), 1);
@@ -1963,6 +2046,7 @@ mod tests {
         let params = ProbeBudget {
             max_probe_fraction: 0.1,
             min_probe_clusters: 1,
+            work_model: None,
         };
         let (_, stats) = run_top_n(&index, embed_field, vec![10.0, 10.0], 3, params)?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
@@ -2052,6 +2136,7 @@ mod tests {
         let params = ProbeBudget {
             max_probe_fraction: 0.1,
             min_probe_clusters: 1,
+            work_model: None,
         };
         let k = 3usize;
         for (ord, centroid) in centroids.iter().enumerate().step_by(3) {
@@ -2171,6 +2256,7 @@ mod tests {
         let params = ProbeBudget {
             max_probe_fraction: 0.2,
             min_probe_clusters: 1,
+            work_model: None,
         };
         // The cap must actually bind for this test to mean anything.
         assert!(
@@ -2215,6 +2301,7 @@ mod tests {
             // ceil(0.4 * 9) = 4 — below the raw cluster count on purpose.
             max_probe_fraction: 0.4,
             min_probe_clusters: 1,
+            work_model: None,
         };
         let ceiling = params.resolved_probe_ceiling(DEFAULT_NUM_CENTROIDS)?;
         assert!(
@@ -2272,6 +2359,7 @@ mod tests {
             gate_armed_at_probe: Some(3),
             gate_armed_at_ceiling: false,
             radius_skips: 2,
+            work_charged: 12.5,
         };
 
         let value = serde_json::to_value(&stats).expect("ProbeStats should serialize to JSON");
@@ -2301,7 +2389,8 @@ mod tests {
                 "heap_saturated": true,
                 "gate_armed_at_probe": 3,
                 "gate_armed_at_ceiling": false,
-                "radius_skips": 2
+                "radius_skips": 2,
+                "work_charged": 12.5
             })
         );
         assert_eq!(stats.clusters_probed(), 2);
@@ -2518,6 +2607,7 @@ mod tests {
         ProbeBudget {
             max_probe_fraction: 1.0,
             min_probe_clusters: 1,
+            work_model: None,
         }
     }
 
@@ -2559,6 +2649,7 @@ mod tests {
             let params = ProbeBudget {
                 max_probe_fraction: fraction,
                 min_probe_clusters: 1,
+                work_model: None,
             };
             let (_, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 2, params.clone())?;
             assert_eq!(stats.termination, expect_term, "f={fraction}: {stats:?}");
@@ -2692,6 +2783,7 @@ mod tests {
         let params = ProbeBudget {
             max_probe_fraction: 0.1,
             min_probe_clusters: 1,
+            work_model: None,
         };
 
         // K larger than the probed cluster's 6 docs: the heap never fills.
@@ -2715,6 +2807,186 @@ mod tests {
 
     /// Pure-function verdicts, hand-checked per metric. The band is the
     /// k-th best exactly; Terminate ⊆ Skip because `r_c ≤ r_max`.
+    // ============================================================
+    // Work-unit budget properties. Unprimed (single-segment) runs use the
+    // segment-local n̄, under which units_seg ≡ C_seg — the normalization
+    // identity, per segment.
+    // ============================================================
+
+    /// An exhaustive scan charges `C·x + (1−x)·N/n̄ = exactly C` units —
+    /// capacity is the cluster count, whatever the size skew.
+    #[test]
+    fn unit_normalization_exact() -> crate::Result<()> {
+        // Uneven sizes on purpose: [5, 2, 2, 1] docs across 4 clusters.
+        let centroids = vec![[0.0_f32, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]];
+        let mut docs: Vec<(String, [f32; 2])> = Vec::new();
+        for (c, count) in [(0usize, 5usize), (1, 2), (2, 2), (3, 1)] {
+            for i in 0..count {
+                docs.push((
+                    format!("d{c}_{i}"),
+                    [centroids[c][0] + i as f32 * 0.01, 0.0],
+                ));
+            }
+        }
+        let docs: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        // K > N: the heap never saturates, the certificate never arms, and
+        // the walk is genuinely exhaustive — the identity under test is the
+        // BUDGET's, not the gate's.
+        let (_, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 11, budget_params())?;
+        let c = centroids.len() as f32;
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        assert!(
+            (stats.work_charged - c).abs() <= 1e-6 * c,
+            "exhaustive scan must charge exactly C units: {stats:?}"
+        );
+        Ok(())
+    }
+
+    /// Replicas charge nothing on re-encounter: at replicas = 2 a full scan
+    /// still charges exactly C units — every doc costs one row-deduction,
+    /// whichever copy arrives first — and every second copy lands in
+    /// `pruned_seen`.
+    #[test]
+    fn replicas_charge_once() -> crate::Result<()> {
+        let centroids = vec![[0.0_f32, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]];
+        let mut docs: Vec<(String, [f32; 2])> = Vec::new();
+        for (c, count) in [(0usize, 4usize), (1, 2), (2, 2), (3, 2)] {
+            for i in 0..count {
+                docs.push((
+                    format!("d{c}_{i}"),
+                    [centroids[c][0] + i as f32 * 0.01, 0.0],
+                ));
+            }
+        }
+        let docs: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+        let n_docs = docs.len();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 2)?;
+        // K > N keeps the certificate unarmed (see unit_normalization_exact).
+        let (_, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 11, budget_params())?;
+        let c = centroids.len() as f32;
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        assert!(
+            (stats.work_charged - c).abs() <= 1e-6 * c,
+            "replica copies must not re-charge: {stats:?}"
+        );
+        assert_eq!(
+            stats.pruned_seen, n_docs,
+            "each doc's second copy prunes as seen: {stats:?}"
+        );
+        Ok(())
+    }
+
+    /// On balanced geometry every cluster charges exactly 1.0 unit, so the
+    /// probed set under units equals the probed set under the legacy count
+    /// budget at equal `f` — pinned by running the same geometry with its
+    /// radii stripped (the count-regime control) and comparing.
+    #[test]
+    fn balanced_fixture_equivalence() -> crate::Result<()> {
+        fn balanced() -> (Vec<[f32; 2]>, Vec<(String, [f32; 2])>) {
+            let centroids = vec![[0.0_f32, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]];
+            let mut docs = Vec::new();
+            for (c, centroid) in centroids.iter().enumerate() {
+                for i in 0..3 {
+                    docs.push((format!("d{c}_{i}"), [centroid[0] + i as f32 * 0.01, 0.0]));
+                }
+            }
+            (centroids, docs)
+        }
+        let params = ProbeBudget {
+            max_probe_fraction: 0.5,
+            min_probe_clusters: 1,
+            work_model: None,
+        };
+        // K = 6 > any cluster's 3 docs: the heap cannot saturate before the
+        // ceiling binds, so the certificate never fires and the comparison
+        // isolates the BUDGET regimes.
+        let (centroids, docs) = balanced();
+        let docs_ref: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs_ref, 1)?;
+        let (unit_hits, unit_stats) =
+            run_top_n(&index, embed_field, vec![0.0, 0.0], 6, params.clone())?;
+
+        let (centroids, docs) = balanced();
+        let docs_ref: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+        let (index2, embed_field2, _label2) =
+            build_inline_ivf(Metric::L2, &centroids, &docs_ref, 1)?;
+        crate::vector::tests::strip_radius_slot(&index2, embed_field2)?;
+        let (count_hits, count_stats) =
+            run_top_n(&index2, embed_field2, vec![0.0, 0.0], 6, params)?;
+
+        assert_eq!(
+            unit_stats.clusters_probed(),
+            count_stats.clusters_probed(),
+            "balanced ⇒ same stop point: {unit_stats:?} vs {count_stats:?}"
+        );
+        let unit_scores: Vec<Score> = unit_hits.iter().map(|(s, _)| *s).collect();
+        let count_scores: Vec<Score> = count_hits.iter().map(|(s, _)| *s).collect();
+        assert_eq!(unit_scores, count_scores, "identical results at equal f");
+        Ok(())
+    }
+
+    /// Skew charges proportionally: a 30-doc cluster consumes most of the
+    /// budget the count regime would spread over five clusters, and the
+    /// stop point shifts — hand-verified numbers. Also pins the overshoot
+    /// bound: the final overrun is at most the last cluster's charge.
+    #[test]
+    fn imbalance_charges_proportionally() -> crate::Result<()> {
+        // Sizes [30, 2, 2, 2, 2, 2]: C = 6, N = 40, n̄ = 20/3,
+        // row_charge = (1 − 0.07)·3/20 = 0.1395. units_seg = 6·0.07 +
+        // 0.93·40/(20/3) = 0.42 + 5.58 = 6.0 (identity). Query sits on the
+        // big centroid, so it opens first: charge 0.07 + 30·0.1395 = 4.255.
+        // Each small cluster charges 0.07 + 2·0.1395 = 0.349. At f = 0.8
+        // (budget 4.8): big → 4.255, small → 4.604, small → 4.953 ≥ 4.8 at
+        // the next boundary ⇒ 3 clusters probed. The legacy count budget at
+        // f = 0.8 would probe ceil(4.8) = 5.
+        let centroids = vec![
+            [0.0_f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [30.0, 0.0],
+            [40.0, 0.0],
+            [50.0, 0.0],
+        ];
+        let mut docs: Vec<(String, [f32; 2])> = Vec::new();
+        for (c, count) in [(0usize, 30usize), (1, 2), (2, 2), (3, 2), (4, 2), (5, 2)] {
+            for i in 0..count {
+                docs.push((
+                    format!("d{c}_{i}"),
+                    [centroids[c][0] + i as f32 * 0.001, 0.0],
+                ));
+            }
+        }
+        let docs: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let params = ProbeBudget {
+            max_probe_fraction: 0.8,
+            min_probe_clusters: 1,
+            work_model: None,
+        };
+        // K = 41 > N: the heap never saturates, so the certificate cannot
+        // fire and the stop point is the BUDGET's alone.
+        let (_, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 41, params)?;
+        assert_eq!(stats.termination, ProbeTermination::Ceiling, "{stats:?}");
+        assert_eq!(
+            stats.clusters_probed(),
+            3,
+            "big cluster eats the budget the count regime spreads over 5: {stats:?}"
+        );
+        assert!(
+            (stats.work_charged - 4.953).abs() < 1e-3,
+            "hand-computed spend: {stats:?}"
+        );
+        // Overshoot bound: overrun ≤ the last (small) cluster's charge.
+        let budget = 0.8f32 * 6.0;
+        let last_charge = 0.07 + 2.0 * 0.1395;
+        assert!(
+            stats.work_charged > budget && stats.work_charged - budget <= last_charge + 1e-4,
+            "overshoot bounded by the last cluster's charge: {stats:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn radius_gate_hand_verdicts() {
         use GateDecision::*;
@@ -2896,8 +3168,19 @@ mod tests {
         }
         let mut stats = ProbeStats::default();
         let _ = backend.scan_clusters(
-            ivf, counted, 100, // ceiling far out of reach
-            &filter, max_doc, None, 1, &mut stats,
+            ivf,
+            counted,
+            // Ceiling far out of reach; row_charge 0 keeps this drive's
+            // accounting on opens/Skips alone — patience is the subject.
+            ChargeModel::Units {
+                budget: 100.0,
+                row_charge: 0.0,
+            },
+            &filter,
+            max_doc,
+            None,
+            1,
+            &mut stats,
         )?;
 
         assert_eq!(stats.termination, ProbeTermination::Gate);
@@ -2975,8 +3258,19 @@ mod tests {
         }
         let mut stats = ProbeStats::default();
         let topn = backend.scan_clusters(
-            ivf, counted, 100, // ceiling far out of reach
-            &filter, max_doc, None, 1, &mut stats,
+            ivf,
+            counted,
+            // Ceiling far out of reach; row_charge 0 keeps this drive's
+            // accounting on opens/Skips alone — patience is the subject.
+            ChargeModel::Units {
+                budget: 100.0,
+                row_charge: 0.0,
+            },
+            &filter,
+            max_doc,
+            None,
+            1,
+            &mut stats,
         )?;
 
         assert_eq!(stats.termination, ProbeTermination::Gate);
@@ -3063,6 +3357,7 @@ mod tests {
             // 32 clusters × 0.05 → ceil(1.6) = 2.
             max_probe_fraction: 0.05,
             min_probe_clusters: 1,
+            work_model: None,
         };
         assert_eq!(params.resolved_probe_ceiling(centroids.len())?, 2);
         let (_, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 1, params)?;
@@ -3073,11 +3368,13 @@ mod tests {
             "budget, not the gate, must stop the skip run: {stats:?}"
         );
         assert_eq!(stats.clusters_probed(), 1, "only A probed: {stats:?}");
-        // 1.0 (probe) + ~14 × OPEN_SHARE_X (0.07) reaches the 2.0 budget;
-        // float accumulation may admit one skip more or fewer.
+        // Units regime: budget = 0.05 × 32 units = 1.6. Opening A charges
+        // x (0.07) + one first-seen row ((1−x)/n̄ ≈ 0.902) ≈ 0.972; each
+        // Skip then charges x, so (1.6 − 0.972)/0.07 ≈ 9 skips before the
+        // ceiling binds; float accumulation may admit one more or fewer.
         assert!(
-            (14..=16).contains(&stats.radius_skips),
-            "~15 charged skips before the ceiling binds: {stats:?}"
+            (8..=10).contains(&stats.radius_skips),
+            "~9 charged skips before the ceiling binds: {stats:?}"
         );
         Ok(())
     }
@@ -3367,10 +3664,14 @@ mod tests {
 
         assert_eq!(hits.len(), 1, "the admitted doc must return exactly once");
         assert_eq!(stats.candidates_scored, 1, "scored on first encounter only");
+        // First-touch marking (work-unit charge basis): EVERY doc marks
+        // `seen` on its first structural encounter, filter verdict
+        // irrelevant — so all replica re-encounters land in `pruned_seen`
+        // (visited × (replicas−1)/replicas), not just the admitted doc's.
         assert_eq!(
             stats.pruned_seen,
-            replicas - 1,
-            "each later cell prunes it as seen: {stats:?}"
+            stats.vectors_visited * (replicas - 1) / replicas,
+            "every later cell prunes as seen: {stats:?}"
         );
         // Only the first-probed cell fetches anything.
         assert_eq!(stats.postings_row, 1, "{stats:?}");

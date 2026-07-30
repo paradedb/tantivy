@@ -609,6 +609,7 @@ fn ivf_radii_absent_slot_loads_zero_and_queries() -> crate::Result<()> {
         .with_probe_budget(crate::vector::ivf::ProbeBudget {
             max_probe_fraction: 1.0,
             min_probe_clusters: 1,
+            work_model: None,
         });
     let fruit = searcher.search(&crate::query::AllQuery, &collector)?;
     assert_eq!(
@@ -721,6 +722,7 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeBudget {
     ProbeBudget {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
+        work_model: None,
     }
 }
 
