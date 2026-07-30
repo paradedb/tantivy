@@ -7,7 +7,8 @@
 //! For `.vec`, the version is orthogonal to the
 //! [`IdMap`](super::flat::id_map) variant, which selects the storage *mode*
 //! (flat vs IVF) within a generation. For `.centroids`, it versions the IVF
-//! routing composite (centroids, cluster offsets, optional graph).
+//! routing composite (centroids, cluster offsets, required radii, optional
+//! graph).
 
 use std::io::{self, Read, Write};
 
@@ -22,10 +23,17 @@ pub(crate) const HEADER_LEN: usize = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum VectorFileVersion {
     V1 = 1,
+    /// `.centroids` carries per-cluster radii (slot `[3]`) as a REQUIRED
+    /// slot. A V1 `.centroids` is rejected at open: the probe budget and
+    /// the gate policy both assume radii exist, so there is no
+    /// radius-less execution path left to fall back to. `.vec` is
+    /// unaffected by the change and V1 `.vec` files stay readable - flat
+    /// segments have no clusters and no radii.
+    V2 = 2,
 }
 
 /// Version stamped into newly written vector files.
-pub(crate) const CURRENT: VectorFileVersion = VectorFileVersion::V1;
+pub(crate) const CURRENT: VectorFileVersion = VectorFileVersion::V2;
 
 impl BinarySerializable for VectorFileVersion {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
@@ -35,6 +43,7 @@ impl BinarySerializable for VectorFileVersion {
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         match u32::deserialize(reader)? {
             1 => Ok(VectorFileVersion::V1),
+            2 => Ok(VectorFileVersion::V2),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported vector file format version: {other}"),
@@ -74,10 +83,10 @@ mod tests {
         let mut buf = Vec::new();
         write_header(&mut buf).unwrap();
         assert_eq!(buf.len(), HEADER_LEN);
-        assert_eq!(buf, vec![1, 0, 0, 0]);
+        assert_eq!(buf, vec![2, 0, 0, 0]);
 
         let (version, body) = read_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V1);
+        assert_eq!(version, VectorFileVersion::V2);
         assert_eq!(body.len(), 0);
     }
 
@@ -88,20 +97,30 @@ mod tests {
         buf.extend_from_slice(b"composite-bytes");
 
         let (version, body) = read_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V1);
+        assert_eq!(version, VectorFileVersion::V2);
         assert_eq!(body.read_bytes().unwrap().as_slice(), b"composite-bytes");
+    }
+
+    /// A prior generation still PARSES here - the header module knows
+    /// versions, not policy. Rejecting a V1 `.centroids` is the vector
+    /// reader's job, where the REINDEX hint can be phrased.
+    #[test]
+    fn test_prior_version_parses() {
+        let buf = 1u32.to_le_bytes().to_vec();
+        let (version, _) = read_header(&FileSlice::from(buf)).unwrap();
+        assert_eq!(version, VectorFileVersion::V1);
     }
 
     #[test]
     fn test_future_version_rejected() {
-        let buf = 2u32.to_le_bytes().to_vec();
+        let buf = 3u32.to_le_bytes().to_vec();
         let err = read_header(&FileSlice::from(buf)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn test_truncated_header_rejected() {
-        let buf = vec![1u8, 0];
+        let buf = vec![2u8, 0];
         let err = read_header(&FileSlice::from(buf)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
