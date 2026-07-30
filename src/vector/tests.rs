@@ -7,7 +7,7 @@ use crate::index::IndexSettings;
 use crate::indexer::NoMergePolicy;
 use crate::query::{AllQuery, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
-use crate::vector::ivf::AdaptiveProbeParams;
+use crate::vector::ivf::ProbeBudget;
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors, Metric, VectorDType,
     VectorOptions,
@@ -598,18 +598,14 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     Ok(())
 }
 
-/// "Scan everything" probe params: the ceiling clamps to the segment's
-/// cluster count and the survivor floor is unsatisfiable, so the gate
-/// can never fire and every cluster is probed. Used by oracle-equality
-/// tests where any pruning would make the equality check fail. (A
-/// "huge epsilon" is NOT a reliable way to express this across
-/// metrics — e.g. an L2 query sitting exactly on a centroid arms the
-/// gate at any epsilon.)
-pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
-    AdaptiveProbeParams {
-        epsilon: 0.0,
-        min_candidates: usize::MAX,
-        overfetch_margin: 0,
+/// Full-budget probe params: fraction 1.0 clamps the ceiling to the
+/// segment's cluster count. On radius-less trees this is a full drain.
+/// Once stored radii exist, the certificate may still (soundly)
+/// terminate early — tests that must visit every row use a
+/// radius-stripped fixture (`strip_radius_slot`), the sanctioned
+/// gateless control.
+pub(crate) fn exhaustive_params(_num_centroids: usize) -> ProbeBudget {
+    ProbeBudget {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
     }
