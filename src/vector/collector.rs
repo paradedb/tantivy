@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use super::backend::{ProbeStats, VectorBackend};
-use super::ivf::AdaptiveProbeParams;
+use super::ivf::ProbeBudget;
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;
@@ -50,7 +50,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     query: Arc<Vec<T>>,
     limit: usize,
     offset: usize,
-    adaptive: AdaptiveProbeParams,
+    adaptive: ProbeBudget,
     tie_break: S,
 }
 
@@ -61,7 +61,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             query: Arc::new(query),
             limit,
             offset: 0,
-            adaptive: AdaptiveProbeParams::default(),
+            adaptive: ProbeBudget::default(),
             tie_break: NoTieBreak,
         }
     }
@@ -78,7 +78,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
 
     /// Override the adaptive probing parameters (ignored by flat-only
     /// segments).
-    pub fn with_adaptive_params(mut self, params: AdaptiveProbeParams) -> Self {
+    pub fn with_probe_budget(mut self, params: ProbeBudget) -> Self {
         self.adaptive = params;
         self
     }
@@ -131,8 +131,7 @@ pub struct VectorSimilarityFruit {
     pub results: Vec<(Score, DocAddress)>,
     /// One [`ProbeStats`] per collected segment, in segment-ordinal order
     /// after [`Collector::merge_fruits`]. The counter fields are summable
-    /// across segments; `min_candidates` and `termination` only carry
-    /// per-segment meaning.
+    /// across segments; `termination` only carries per-segment meaning.
     pub stats: Vec<ProbeStats>,
 }
 
@@ -345,7 +344,7 @@ mod ivf_e2e_tests {
                 let expected = index.ground_truth(query, k)?;
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(index.embedding_field(), query.to_vec())
-                    .with_adaptive_params(params.clone());
+                    .with_probe_budget(params.clone());
                 let actual = searcher.search(&AllQuery, &collector)?;
                 assert_eq!(actual.results, expected, "IVF query={query:?} k={k}");
             }
@@ -368,7 +367,7 @@ mod ivf_e2e_tests {
 
         let collector = TopDocs::with_limit(4)
             .order_by_similarity(index.embedding_field(), vec![0.5_f32, 0.5])
-            .with_adaptive_params(exhaustive_params(9));
+            .with_probe_budget(exhaustive_params(9));
         let fruit = searcher.search(&AllQuery, &collector)?;
 
         // One ProbeStats per searched segment.
@@ -403,7 +402,7 @@ mod ivf_e2e_tests {
         let collector = TopDocs::with_limit(k)
             .and_offset(offset)
             .order_by_similarity(index.embedding_field(), query.to_vec())
-            .with_adaptive_params(exhaustive_params(9));
+            .with_probe_budget(exhaustive_params(9));
         let actual = searcher.search(&AllQuery, &collector)?;
         assert_eq!(actual.results, expected);
         Ok(())
@@ -544,7 +543,7 @@ mod ivf_e2e_tests {
                     &AllQuery,
                     &TopDocs::with_limit(k)
                         .order_by_similarity(embedding_field, query.to_vec())
-                        .with_adaptive_params(exhaustive_params(9))
+                        .with_probe_budget(exhaustive_params(9))
                         .with_tie_break(tie_break()),
                 )?;
                 let actual: Vec<DocAddress> =
@@ -639,7 +638,7 @@ mod ivf_e2e_tests {
             &AllQuery,
             &TopDocs::with_limit(1)
                 .order_by_similarity(embedding_field, query.to_vec())
-                .with_adaptive_params(exhaustive_params(2)),
+                .with_probe_budget(exhaustive_params(2)),
         )?;
         // All four docs tie at distance 1, so the lowest DocAddress wins.
         let scores: Vec<Score> = fruit.results.iter().map(|(score, _)| *score).collect();
@@ -846,7 +845,7 @@ mod ivf_e2e_tests {
                 let expected = ground_truth::top_k(&index, embedding_field, metric, &query, k)?;
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(embedding_field, query.to_vec())
-                    .with_adaptive_params(params.clone());
+                    .with_probe_budget(params.clone());
                 let actual = searcher.search(&AllQuery, &collector)?;
                 assert_eq!(actual.results, expected, "mixed query={query:?} k={k}");
             }

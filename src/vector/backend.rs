@@ -15,9 +15,8 @@ use std::sync::Arc;
 
 use common::BitSet;
 
-use super::distance::Similarity;
 use super::index_reader::VectorIndexReader;
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
+use super::ivf::{Candidate, IvfIndex, IvfSearchMetrics, ProbeBudget, Workspace};
 use super::prepared::PreparedQuery;
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
@@ -25,7 +24,7 @@ use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::fastfield::AliveBitSet;
 use crate::query::Weight;
-use crate::schema::{Field, Metric};
+use crate::schema::Field;
 use crate::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 /// The settled result.
@@ -46,7 +45,7 @@ type TieBreakHeap<K, CTail> = TopNComputer<
 pub struct VectorBackend<T: VectorElement> {
     reader: Arc<VectorIndexReader>,
     query: Arc<PreparedQuery<T>>,
-    adaptive: AdaptiveProbeParams,
+    adaptive: ProbeBudget,
     segment_ord: SegmentOrdinal,
 }
 
@@ -59,7 +58,7 @@ impl<T: VectorElement> VectorBackend<T> {
         segment_ord: SegmentOrdinal,
         field: Field,
         query: Arc<Vec<T>>,
-        adaptive: AdaptiveProbeParams,
+        adaptive: ProbeBudget,
     ) -> crate::Result<Self> {
         let reader = segment_reader.vector_index(field)?;
         let query = Arc::new(PreparedQuery::<T>::new(reader.options().metric(), query));
@@ -246,10 +245,10 @@ where
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProbeTermination {
-    /// The filter-effective probe budget reached `max_probe_count` — the
-    /// probe ceiling.
+    /// The probe budget was spent: the ceiling bound the scan.
     Ceiling,
-    /// The distance-ratio gate fired with the survivor floor met.
+    /// The gate policy terminated the scan: it proved no remaining ranked
+    /// cluster can improve the current top-N.
     Gate,
     /// The ranked centroids were exhausted without hitting either stop.
     #[default]
@@ -264,7 +263,8 @@ pub enum ProbeTermination {
 pub struct ProbeStats {
     /// Docs that passed filter + alive + seen and were scored against the
     /// query. This stays the "scored" bucket and equals the final survivor
-    /// `candidates`, so starvation is just `candidates_scored < min_candidates`.
+    /// count; starvation reads as `candidates_scored < top_n`, and
+    /// [`heap_saturated`](Self::heap_saturated) is its per-segment flag.
     pub candidates_scored: usize,
     /// Every doc-id the inner loop touched, before any gate — the denominator
     /// for the prune breakdown.
@@ -294,10 +294,26 @@ pub struct ProbeStats {
     /// much routing as the probe loop actually pulled. See
     /// [`IvfSearchMetrics`].
     pub routing: IvfSearchMetrics,
-    /// The resolved survivor floor the gate used for this query.
-    pub min_candidates: usize,
     /// How the probe loop terminated. Per-segment; does not sum.
     pub termination: ProbeTermination,
+    /// Whether the segment's top-N heap ended the scan holding `top_n`
+    /// scored candidates. `false` flags starvation - fewer filter-passing
+    /// docs than requested reached the heap.
+    pub heap_saturated: bool,
+    /// How many clusters had been probed when the gate armed: the heap
+    /// first held `top_n` candidates, observed at a between-cluster
+    /// boundary. `None` when the heap never saturated before the loop
+    /// stopped.
+    pub gate_armed_at_probe: Option<usize>,
+    /// The gate's Terminate verdict held on the very yield where the
+    /// Ceiling fired: the two stops tied, and Ceiling won by the
+    /// checked-first attribution contract.
+    pub gate_armed_at_ceiling: bool,
+    /// Clusters the gate passed over with a Skip verdict, without opening
+    /// them. Skips only: a Defer (the policy's unpaid hedge) is neither
+    /// counted here nor charged. The control policy never skips, so this
+    /// reads zero until the certificate lands.
+    pub radius_skips: usize,
 }
 
 impl ProbeStats {
@@ -309,10 +325,172 @@ impl ProbeStats {
     }
 }
 
+/// What the probe loop does with the ranked cluster it is holding. The
+/// loop owns no policy of its own: it asks the gate for one of these,
+/// prices it through the [`ChargeModel`], and acts.
+// The policy this tree ships produces only `Probe`. The loop and the
+// pricing table handle the whole verdict set from the start, so the seam
+// is complete before a policy that exercises it exists.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Open the cluster: stream its rows and score the survivors.
+    Probe,
+    /// Pass over this cluster without opening it. A verdict about THIS
+    /// cluster alone -- the scan continues with the next yield.
+    Skip,
+    /// Pass over without opening AND without charging: the policy wants
+    /// one more yield before it commits to stopping. Priced (at zero) by
+    /// [`ChargeModel::verdict_charge`] like every verdict - the accounting
+    /// contract that keeps unpaid pulls bounded at one per paid pull,
+    /// since a non-deferring follow-up is itself a paid Probe or Skip.
+    /// A Defer never reorders the stream and never stashes the deferred
+    /// cluster for later: hardening against adversarial yield order (a
+    /// deferred-frontier or lower-bound-reordered stream) is out of scope
+    /// here, pending the routing-interface discussion. The control policy
+    /// (`NoGate`) never emits this verdict.
+    Defer,
+    /// Stop the scan.
+    Terminate,
+}
+
+/// One ranked cluster as a gate policy sees it: what the policy may read,
+/// and nothing of the loop's own accounting.
+#[derive(Clone, Copy, Debug)]
+struct GateContext {
+    /// The current k-th best score; `None` while the heap is unsaturated.
+    kth: Option<Score>,
+    /// Clusters opened or skipped so far -- the arming clock's tick.
+    clusters_probed: usize,
+}
+
+/// Gate policy: the probe loop's skip/stop authority, and the only place
+/// early termination can come from.
+///
+/// This is one half of the probe loop's seam. The other half is the
+/// [`ChargeModel`], which prices verdicts. The split is deliberate and
+/// load-bearing for review: a policy decides WHETHER a cluster is worth
+/// opening and never touches the budget; the charge model decides what
+/// that decision COSTS and never inspects geometry. Neither can silently
+/// become the other, and the loop between them branches on nothing but
+/// the verdict it is handed.
+///
+/// Arming is policy-side by the same rule: a heap holding fewer than
+/// `top_n` candidates has no band to certify against, so saturation is a
+/// policy's precondition to reason about (see [`ArmingClock`]), not a
+/// condition the loop imposes on it.
+trait ProbeGate {
+    /// The verdict for the cluster the loop is holding. `&mut` because a
+    /// policy may carry state across yields (arming, patience).
+    fn verdict(&mut self, ctx: GateContext) -> Verdict;
+
+    /// Would this same yield have terminated? Consulted only when the
+    /// budget ceiling fired first, to record that the two stops tied --
+    /// see the attribution contract on [`VectorBackend::scan_clusters`].
+    /// Pure: it must not disturb the policy's state.
+    fn would_terminate(&self, ctx: GateContext) -> bool;
+
+    /// Fold policy-owned telemetry into the segment's stats once the scan
+    /// has stopped.
+    fn fold_stats(&self, stats: &mut ProbeStats);
+}
+
+/// Heap-saturation clock: the boundary at which the top-N heap was first
+/// seen holding `top_n` candidates. Shared by every policy, since every
+/// policy needs the same precondition, and reported as
+/// [`ProbeStats::gate_armed_at_probe`].
+#[derive(Clone, Copy, Debug, Default)]
+struct ArmingClock {
+    at: Option<usize>,
+}
+
+impl ArmingClock {
+    /// Observe this boundary; returns whether the heap is saturated.
+    #[inline]
+    fn observe(&mut self, ctx: GateContext) -> bool {
+        let saturated = ctx.kth.is_some();
+        if saturated && self.at.is_none() {
+            self.at = Some(ctx.clusters_probed);
+        }
+        saturated
+    }
+}
+
+/// The policy that never gates: every yield is probed and the scan ends
+/// at the budget ceiling or at stream exhaustion. The loop is then a pure
+/// budget-taker -- which is what this tree ships, and what the envelope
+/// study measured as the old gate's only zero-regret configuration: no
+/// setting of the deleted distance-ratio gate beat gateless probing at
+/// matched cost. A certificate that can prove its skips is the successor;
+/// a heuristic band is not.
+#[derive(Debug, Default)]
+struct NoGate {
+    arming: ArmingClock,
+}
+
+impl ProbeGate for NoGate {
+    #[inline]
+    fn verdict(&mut self, ctx: GateContext) -> Verdict {
+        self.arming.observe(ctx);
+        Verdict::Probe
+    }
+
+    #[inline]
+    fn would_terminate(&self, _ctx: GateContext) -> bool {
+        false
+    }
+
+    fn fold_stats(&self, stats: &mut ProbeStats) {
+        stats.gate_armed_at_probe = self.arming.at;
+    }
+}
+
+/// What one opened cluster's pre-pass turned up, as the charge model
+/// prices it.
+#[derive(Clone, Copy, Debug)]
+struct RowCounts {
+    /// Rows the pre-pass walked.
+    scanned: usize,
+    /// Of those, rows the filter rejected.
+    filtered: usize,
+}
+
+/// Work accounting: the segment's budget, and the price of everything the
+/// probe loop does against it. The other half of the seam (see
+/// [`ProbeGate`]) -- every verdict is priced here, never in a policy.
+#[derive(Clone, Copy, Debug)]
+struct ChargeModel {
+    /// What this segment may spend before the ceiling binds.
+    budget: f64,
+}
+
+impl ChargeModel {
+    /// The price of a verdict, settled before the cluster's rows are
+    /// known. This budget charges an opened cluster by what its rows turn
+    /// out to be (see [`Self::cluster_charge`]), so the verdict itself is
+    /// free; a Skip that never opens anything is therefore free too.
+    #[inline]
+    fn verdict_charge(&self, _verdict: Verdict) -> f64 {
+        0.0
+    }
+
+    /// The price of an opened cluster, filter-effective: a cluster whose
+    /// rows the filter all rejected still costs the floor below (the
+    /// pre-pass scanned them), a fully-unfiltered one costs 1.0, and the
+    /// map between is affine in the pass rate. A selective filter thus
+    /// probes deeper into the ranked list before the ceiling binds.
+    #[inline]
+    fn cluster_charge(&self, rows: RowCounts) -> f64 {
+        if rows.scanned == 0 {
+            return 0.0;
+        }
+        let pass_fraction = (rows.scanned - rows.filtered) as f32 / rows.scanned as f32;
+        (SKIPPED_CLUSTER_COST + (1.0 - SKIPPED_CLUSTER_COST) * pass_fraction) as f64
+    }
+}
+
 /// Floor a probed cluster charges the ceiling even when the filter skips
-/// all its rows (the gate pre-pass still scans them). A cluster bills
-/// `SKIPPED_CLUSTER_COST + (1 - SKIPPED_CLUSTER_COST) * pass_fraction`:
-/// 0.05 fully filtered, 1.0 unfiltered. Provisional.
+/// all its rows (the gate pre-pass still scans them). Provisional.
 pub(crate) const SKIPPED_CLUSTER_COST: f32 = 0.05;
 
 /// One gate survivor from the pre-pass over a cluster's rows: `row`
@@ -359,45 +537,30 @@ impl<T: VectorElement> VectorBackend<T> {
         if num_centroids == 0 {
             return Ok(Vec::new());
         }
-        let max_probe_count = self.adaptive.resolved_probe_ceiling(num_centroids)?;
+        let charge = ChargeModel {
+            budget: self.adaptive.resolved_probe_ceiling(num_centroids)? as f64,
+        };
 
         // Phase 1: rank the clusters to probe, lazily — the scan below pulls
         // ranked clusters on demand, so routing cost is paid only as far as
         // probing actually reaches. The filter-effective budget can pull far
-        // past `max_probe_count` raw clusters on a selective filter (each
-        // skipped cluster costs ~0), and lazy routing keeps that cheap.
+        // past its nominal cluster count on a selective filter (each skipped
+        // cluster costs ~0), and lazy routing keeps that cheap.
         // Routing operates in `f32` (centroid rows are `f32` today), so the
         // query is widened losslessly per element.
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
         let mut routing_ws = Workspace::new();
         let mut ranked = index.rank_clusters(&mut routing_ws, &query_f32);
 
-        // The best-routed cluster anchors the distance-ratio gate.
-        let Some(best) = ranked.next() else {
-            return Ok(Vec::new());
-        };
-        let threshold = Similarity::new(adaptive_threshold(
-            self.query.metric(),
-            best.sim.score(),
-            self.adaptive.epsilon,
-        ));
-        // Without this floor, a selective filter can trip the threshold gate
-        // immediately and return < K results. Additive margin (not m×top_n)
-        // so the over-probe cushion stays K-independent — see
-        // `AdaptiveProbeParams::overfetch_margin`.
-        let min_candidates = self
-            .adaptive
-            .min_candidates
-            .max(top_n + self.adaptive.overfetch_margin);
-
-        stats.min_candidates = min_candidates;
+        // The production policy. One implementor, chosen here, at query
+        // init - the loop below never asks which policy it is holding.
+        let mut gate = NoGate::default();
 
         let topn = self.scan_clusters(
             index,
-            std::iter::once(best).chain(&mut ranked),
-            threshold,
-            min_candidates,
-            max_probe_count,
+            &mut ranked,
+            &mut gate,
+            charge,
             &filter,
             max_doc,
             alive,
@@ -435,6 +598,13 @@ impl<T: VectorElement> VectorBackend<T> {
     /// pulling past a converged batch resumes the beam search, so routing
     /// work interleaves with (and is bounded by) probing.
     ///
+    /// ATTRIBUTION CONTRACT (interface, not code order): the budget
+    /// ceiling is the checked-first stop. When the ceiling and the gate's
+    /// Terminate hold on the same yield the termination is `Ceiling`, and
+    /// [`ProbeStats::gate_armed_at_ceiling`] records the tie - so a
+    /// budget-starved query is never mistaken for a certified one in the
+    /// telemetry, whichever order a future rewrite evaluates them in.
+    ///
     /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
     /// `score_doc_bytes` cost.
     #[inline(never)]
@@ -443,9 +613,8 @@ impl<T: VectorElement> VectorBackend<T> {
         &self,
         index: &IvfIndex,
         ranked: impl Iterator<Item = Candidate>,
-        threshold: Similarity,
-        min_candidates: usize,
-        max_probe_count: usize,
+        gate: &mut impl ProbeGate,
+        charge: ChargeModel,
         filter: &BitSet,
         max_doc: DocId,
         alive: Option<&AliveBitSet>,
@@ -460,9 +629,9 @@ impl<T: VectorElement> VectorBackend<T> {
     {
         let mut topn =
             TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
-        // `candidates` is the cumulative scored count that drives the gate; the
-        // prune counters accumulate into locals and fold into `ProbeStats` once
-        // after the loop, keeping the hot per-doc path free of indirection.
+        // The prune counters accumulate into locals and fold into `ProbeStats`
+        // once after the loop, keeping the hot per-doc path free of
+        // indirection.
         let mut candidates = 0usize;
         let mut visited = 0usize;
         let mut pruned_filter = 0usize;
@@ -471,27 +640,63 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut termination = ProbeTermination::Exhausted;
+        let mut gate_armed_at_ceiling = false;
         // Replication can place the same doc in several probed clusters; dedup
         // by doc id so a vector is scored at most once.
         let mut seen = BitSet::with_max_value(max_doc);
         // The probed cluster's gate survivors; allocated once, reused
         // across clusters.
         let mut survivors: Vec<Survivor> = Vec::new();
-        let mut probe_budget = 0.0f32;
-        let max_probe_budget = max_probe_count as f32;
+        // Accounting: `work_spent` accrues against the resolved budget, all
+        // of it priced by `charge` - the loop adds up what it is told.
+        let mut work_spent = 0.0f64;
+        let work_budget = charge.budget;
 
-        for Candidate { sim, node: cluster } in ranked {
+        // The ranked stream is consumed exactly as the router yields it.
+        // FOLLOW-UP (owned by Ruchir): lower-bound `(d - r)` reordering of
+        // the yield stream is a deliberate non-goal of this change - do not
+        // "improve" the ordering here.
+        for Candidate {
+            sim: _,
+            node: cluster,
+        } in ranked
+        {
+            // The heap key is the composite `(similarity, tie_break)`;
+            // lexicographic order means the composite minimum carries the
+            // minimum SIMILARITY in the top-N, so its score component is
+            // exactly the k-th best the gate needs. Ties stay sound: the
+            // strict `>` bounds only pass over clusters that cannot reach
+            // the k-th score, and equal-score candidates - the ones a tie
+            // key could still admit - are never behind a Skip.
+            let ctx = GateContext {
+                kth: topn.kth_best().map(|(score, _)| score),
+                clusters_probed: postings_row + postings_skipped,
+            };
             // The pull that trips the ceiling proves another ranked cluster
-            // existed, keeping `Ceiling` distinct from `Exhausted`. The budget
-            // is filter-effective (see the per-cluster charge below), so a
-            // selective filter walks far past `max_probe_count` raw clusters.
-            if probe_budget >= max_probe_budget {
+            // existed, keeping `Ceiling` distinct from `Exhausted`. The
+            // budget is filter-effective (see `ChargeModel::cluster_charge`),
+            // so a selective filter walks far past its nominal cluster count.
+            // Checked first - the attribution contract above.
+            // Boundary rule: open iff remaining > 0 - never truncate
+            // mid-cluster; overshoot is bounded by the last cluster's charge.
+            if work_spent >= work_budget {
                 termination = ProbeTermination::Ceiling;
+                gate_armed_at_ceiling = gate.would_terminate(ctx);
                 break;
             }
-            if sim < threshold && candidates >= min_candidates {
-                termination = ProbeTermination::Gate;
-                break;
+
+            let verdict = gate.verdict(ctx);
+            work_spent += charge.verdict_charge(verdict);
+            match verdict {
+                Verdict::Terminate => {
+                    termination = ProbeTermination::Gate;
+                    break;
+                }
+                // Passed over: `Skip` paid its price above, `Defer` is the
+                // policy's unpaid hedge. Neither opens the cluster, so
+                // neither touches the prune counters.
+                Verdict::Skip | Verdict::Defer => continue,
+                Verdict::Probe => {}
             }
             let cluster = cluster as usize;
 
@@ -510,13 +715,10 @@ impl<T: VectorElement> VectorBackend<T> {
             pruned_dead += pd;
             pruned_seen += ps;
 
-            // Charge the ceiling by the cluster's filter pass rate: a
-            // fully-skipped cluster still costs `SKIPPED_CLUSTER_COST` (the
-            // gate pre-pass scanned it), a fully-unfiltered one costs 1.0.
-            if num_rows > 0 {
-                let pass_fraction = (num_rows - pf) as f32 / num_rows as f32;
-                probe_budget += SKIPPED_CLUSTER_COST + (1.0 - SKIPPED_CLUSTER_COST) * pass_fraction;
-            }
+            work_spent += charge.cluster_charge(RowCounts {
+                scanned: num_rows,
+                filtered: pf,
+            });
 
             if survivors.is_empty() {
                 postings_skipped += 1;
@@ -544,6 +746,13 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += candidates;
         stats.termination = termination;
+        stats.gate_armed_at_ceiling = gate_armed_at_ceiling;
+        gate.fold_stats(stats);
+        // Final-state saturation, exact even when the heap filled inside the
+        // last probed cluster (arming is only *observed* at boundaries). The
+        // forced truncation this implies is invisible past this point - the
+        // scan is over.
+        stats.heap_saturated = topn.kth_best().is_some();
 
         Ok(topn)
     }
@@ -616,110 +825,8 @@ fn build_filter_bitset(
     Ok(filter)
 }
 
-/// Per-metric distance-ratio pruning threshold (SPANN eq. 3): a posting
-/// list is searched iff `Dist(q, c) <= (1 + epsilon) * Dist(q, c_closest)`,
-/// re-expressed on the similarity scale (higher = better) so the probe
-/// loop compares scores directly. `best` is the top-ranked centroid's
-/// score.
-///
-/// - **L2:** `score = -d²`, so `threshold = best - epsilon * best.abs()` is `d² > (1 + eps) *
-///   d²_min` — SPANN's inequality verbatim (their `Dist` is squared L2).
-/// - **Cosine:** `threshold = best - epsilon * (1 - best)` gates on `(1 - score) > (1 + eps) * (1 -
-///   best)`. For unit vectors `d² = 2(1 - cos)` and the 2 cancels in the ratio, so this IS SPANN's
-///   rule applied to our (write-time-normalized) data.
-/// - **Dot:** no natural distance for raw MIPS; a pragmatic linear widening `best - epsilon *
-///   best.abs()`. With paper-scale epsilon the gate rarely fires and the ceiling governs. NOTE:
-///   with unnormalized dot, the IVF locality assumption itself is heuristic — that's the
-///   clusterer's problem, not the threshold's.
-///
-/// Degenerate scales: L2 with `d_min = 0` and Cosine with `best = 1.0`
-/// both give `threshold = best` — the gate arms immediately and only
-/// the candidate floor keeps probing. Known property of ratio pruning;
-/// do not "fix".
-fn adaptive_threshold(metric: Metric, best: f32, epsilon: f32) -> f32 {
-    match metric {
-        Metric::L2 | Metric::Dot => best - epsilon * best.abs(),
-        Metric::Cosine => best - epsilon * (1.0 - best),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn adaptive_threshold_identity_at_zero_epsilon() {
-        // With epsilon = 0 the threshold is exactly `best` for every
-        // metric — no ratio slack, no permissiveness.
-        for &best in &[-10.0_f32, -1.0, 0.0, 0.5, 1.0] {
-            assert_eq!(adaptive_threshold(Metric::L2, best, 0.0), best);
-            assert_eq!(adaptive_threshold(Metric::Cosine, best, 0.0), best);
-            assert_eq!(adaptive_threshold(Metric::Dot, best, 0.0), best);
-        }
-    }
-
-    #[test]
-    fn adaptive_threshold_lowers_with_positive_epsilon() {
-        // "Higher score = closer" convention; ratio slack means the
-        // threshold is *lower* (more permissive) than `best`.
-        let eps = 0.1;
-        // L2 similarity is `-d²`, so `best` is always ≤ 0 and
-        // `best - eps * |best|` is more negative (= more permissive).
-        // For best = 0 the threshold is also 0 (d_min = 0 — the
-        // degenerate ratio scale; the gate arms immediately).
-        for &best in &[-10.0_f32, -1.0, -0.001] {
-            let l2 = adaptive_threshold(Metric::L2, best, eps);
-            assert!(l2 < best, "L2 threshold {l2} should be < best {best}");
-        }
-        let cos_best = 0.8;
-        let cos = adaptive_threshold(Metric::Cosine, cos_best, eps);
-        assert!(
-            cos < cos_best,
-            "Cosine threshold {cos} should be < {cos_best}"
-        );
-
-        // Dot: pinned linear widening. Lower than `best` for positive
-        // `best`; *also* lower (more negative) for negative `best`,
-        // because we subtract `eps * |best|`, never add. This is the
-        // intentional behavior — `best - eps * |best|` is monotonic
-        // in the "more permissive" direction regardless of sign.
-        let pos = adaptive_threshold(Metric::Dot, 10.0, eps);
-        assert!(pos < 10.0, "Dot threshold {pos} should be < 10.0");
-        let neg = adaptive_threshold(Metric::Dot, -10.0, eps);
-        assert!(neg < -10.0, "Dot threshold {neg} should be < -10.0");
-    }
-
-    #[test]
-    fn adaptive_threshold_hand_checked_values() {
-        // L2: best = -10 (d² = 10), eps = 0.1 ⇒ -10 - 0.1·10 = -11,
-        // i.e. gate at d² > 1.1 · d²_min.
-        let l2 = adaptive_threshold(Metric::L2, -10.0, 0.1);
-        assert!((l2 - -11.0).abs() < 1e-5, "got {l2}");
-
-        // Cosine: best = 0.8, eps = 0.1 ⇒ 0.8 - 0.1 · 0.2 = 0.78.
-        let cos = adaptive_threshold(Metric::Cosine, 0.8, 0.1);
-        assert!((cos - 0.78).abs() < 1e-5, "got {cos}");
-
-        // Cosine at paper-scale epsilon: best = 0.9, eps = 7.0 ⇒
-        // 0.9 - 7 · 0.1 = 0.2 — the gate CAN fire on realistic angular
-        // gaps (a |best|-scaled threshold would sit at -5.4 and never
-        // trip on the cosine range).
-        let cos_wide = adaptive_threshold(Metric::Cosine, 0.9, 7.0);
-        assert!((cos_wide - 0.2).abs() < 1e-5, "got {cos_wide}");
-
-        // Dot: pinned `best - eps * |best|`.
-        // best =  10, eps = 0.1 ⇒  9.0
-        // best = -10, eps = 0.1 ⇒ -11.0
-        let dot_pos = adaptive_threshold(Metric::Dot, 10.0, 0.1);
-        assert!((dot_pos - 9.0).abs() < 1e-5, "got {dot_pos}");
-        let dot_neg = adaptive_threshold(Metric::Dot, -10.0, 0.1);
-        assert!((dot_neg - -11.0).abs() < 1e-5, "got {dot_neg}");
-        // Origin: degenerate (query orthogonal to nearest centroid);
-        // threshold collapses to 0 because |0| = 0.
-        let dot_zero = adaptive_threshold(Metric::Dot, 0.0, 0.5);
-        assert_eq!(dot_zero, 0.0);
-    }
-
     // ============================================================
     // IVF `top_n` test gate.
     //
@@ -727,21 +834,21 @@ mod tests {
     // shared fixture) where the geometry fits — the 100-doc grid +
     // selectivity-based labels covers oracle / filter / delete /
     // overflow / zero-K. The handful of tests that need crafted point
-    // geometry (the trap case + the result-level candidate-floor
-    // demonstration) build a tiny IVF index inline via `build_inline_ivf`
-    // and an `InlineClusterer` that's compatible with the batched
-    // IvfClusterer trait.
+    // geometry (the trap case and the certificate-tier fixtures) build a
+    // tiny IVF index inline via `build_inline_ivf` and an
+    // `InlineClusterer` that's compatible with the batched IvfClusterer
+    // trait.
     // ============================================================
-
     use std::cmp::Ordering;
 
+    use super::*;
     use crate::collector::TopDocs;
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::{
         AllQuery, BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, TermQuery,
     };
-    use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
+    use crate::schema::{IndexRecordOption, Metric, Schema, Term, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
         IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfVectors,
@@ -767,11 +874,11 @@ mod tests {
         filter: &dyn Query,
         query: Vec<f32>,
         k: usize,
-        params: AdaptiveProbeParams,
+        params: ProbeBudget,
     ) -> crate::Result<Vec<(Score, DocAddress)>> {
         let collector = TopDocs::with_limit(k)
             .order_by_similarity(field, query)
-            .with_adaptive_params(params);
+            .with_probe_budget(params);
         Ok(index
             .reader()?
             .searcher()
@@ -788,7 +895,7 @@ mod tests {
         embed_field: Field,
         query: Vec<f32>,
         k: usize,
-        params: AdaptiveProbeParams,
+        params: ProbeBudget,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
@@ -811,9 +918,9 @@ mod tests {
     //
     // The shared fixture's `grid2d::vectors` lays 100 deterministic
     // points around a 3×3 grid; it doesn't expose a per-doc-vector
-    // override. The trap-case and result-level candidate-floor tests
-    // need points at specific coordinates, so they build a small IVF
-    // index inline via the helper below.
+    // override. Tests that need points at specific coordinates (the trap
+    // case, the certificate tiers) build a small IVF index inline via
+    // the helper below.
 
     struct InlineClusterer {
         centroids: Vec<[f32; 2]>,
@@ -1635,10 +1742,7 @@ mod tests {
         // distance to B = √162 ≈ 12.73, so A wins decisively.
 
         // Behavioral check 1: a probe ceiling of 1 misses the trap.
-        let one_probe = AdaptiveProbeParams {
-            epsilon: 0.0,
-            min_candidates: usize::MAX,
-            overfetch_margin: 0,
+        let one_probe = ProbeBudget {
             max_probe_fraction: 0.5,
             min_probe_clusters: 1,
         };
@@ -1832,127 +1936,6 @@ mod tests {
         Ok(())
     }
 
-    /// `min_candidates` floor: cluster A has one doc near the query;
-    /// cluster B holds the true NN. Without the floor, the threshold
-    /// trips immediately after A (epsilon=0) and the loop stops; the
-    /// floor (`top_n + overfetch_margin`) forces it to
-    /// keep probing into B. INLINE because the shared fixture's
-    /// uniform-grid points don't naturally produce a "near cluster
-    /// with one survivor" geometry.
-    ///
-    /// Setup assertions below pin the geometry so the test can't quietly
-    /// rot vacuous if a doc drifts across the bisector x+y=10 — it has
-    /// happened before (a_only was originally close enough to the query
-    /// to BE the top-1, which let A alone satisfy top-k and made the
-    /// floor irrelevant). The assertions enforce: top-1 lives in B,
-    /// `a_only` lives in A, and A has fewer survivors than the floor —
-    /// jointly, reaching the answer REQUIRES probing B.
-    #[test]
-    fn ivf_top_n_min_candidates_floor() -> crate::Result<()> {
-        let centroids = vec![[0.0_f32, 0.0], [10.0, 10.0]];
-        // a_only is on the A side (closer to (0,0) than (10,10)) but
-        // *deliberately far* from the query so b_close is the true
-        // NN. Without the floor, the loop stops after A — recall = 0.
-        // With the floor, it probes B and finds b_close.
-        let docs = [
-            ("a_only", [0.0_f32, -10.0]), // A-side, far from query
-            ("b_close", [5.0_f32, 5.01]), // B-side, true NN
-            ("b_far", [10.0_f32, 10.0]),
-            ("b_far2", [11.0_f32, 9.5]),
-        ];
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
-        let query = [1.0_f32, 1.0];
-        let top_k = 1;
-
-        // Open segment 0's IVF reader for the geometry assertions.
-        // After `build_inline_ivf`'s merge, all docs sit in segment 0.
-        let searcher = index.reader()?.searcher();
-        let segment_reader = &searcher.segment_readers()[0];
-        let vec_reader = segment_reader.vector_index(embed_field)?;
-        assert!(
-            vec_reader.index().is_some(),
-            "expected IVF segment for this test"
-        );
-        // Setup assertion (i): b_close is the brute-force top-1, and
-        // its vector maps to cluster B (index 1). Mirrors the trap
-        // test's `assert_eq!(oracle[0].1, trap_doc)` — this is the
-        // assertion whose absence let the test rot vacuous.
-        let expected = ground_truth_top_k(&index, embed_field, Metric::L2, &query, 1)?;
-        let oracle_addr = expected[0].1;
-        assert_eq!(
-            stored_label_at(&index, label_field, oracle_addr)?,
-            "b_close",
-            "test geometry: b_close must be the true NN",
-        );
-        let oracle_bytes = vec_reader
-            .vector_bytes(oracle_addr.doc_id)?
-            .expect("oracle vector bytes");
-        assert_eq!(
-            nearest_centroid(decode_2d(&oracle_bytes), &centroids),
-            1,
-            "oracle top-1 must live in cluster B — the far cluster the floor has to reach",
-        );
-
-        // Setup assertion (ii): a_only still lands in cluster A. If
-        // [0,-10] ever drifts across the bisector x+y=10 (it won't with
-        // these coords, but coordinates evolve), the premise "the near
-        // cluster has too few survivors" stops holding — the test
-        // would no longer exercise the floor.
-        let cluster_a_docs = vec_reader.cluster_doc_ids(0).unwrap_or_default();
-        let mut a_only_doc = None;
-        for doc in 0..segment_reader.max_doc() {
-            if stored_label_at(&index, label_field, DocAddress::new(0, doc))? == "a_only" {
-                a_only_doc = Some(doc);
-                break;
-            }
-        }
-        let a_only_doc = a_only_doc.expect("a_only must exist in segment 0");
-        assert!(
-            cluster_a_docs.contains(&a_only_doc),
-            "a_only must land in cluster A (index 0) — got cluster_a = {cluster_a_docs:?}, a_only \
-             doc = {a_only_doc}",
-        );
-
-        // Setup assertion (iii): the near cluster has fewer survivors
-        // than the candidate floor (top_k + margin). Combined with (i),
-        // reaching the oracle's top-1 REQUIRES probing B — which only
-        // the floor causes, since epsilon=0 trips the threshold gate
-        // immediately after A.
-        let margin = 4usize;
-        assert!(
-            cluster_a_docs.len() < top_k + margin,
-            "cluster A must have fewer than the candidate floor ({}) for the floor to actually \
-             have to probe out — got {} docs",
-            top_k + margin,
-            cluster_a_docs.len(),
-        );
-
-        // Behavioral check: epsilon=0 trips the threshold after A;
-        // only the candidate floor keeps the loop probing into B.
-        let params = AdaptiveProbeParams {
-            epsilon: 0.0,
-            min_candidates: 0,
-            overfetch_margin: margin,
-            max_probe_fraction: 1.0,
-            min_probe_clusters: 1,
-        };
-        let hits = search(
-            &index,
-            embed_field,
-            &AllQuery,
-            query.to_vec(),
-            top_k,
-            params,
-        )?;
-        assert_eq!(hits, expected);
-        assert_eq!(
-            stored_label_at(&index, label_field, hits[0].1)?,
-            "b_close",
-            "floor must keep probing past A to find the B-side true NN",
-        );
-        Ok(())
-    }
-
     /// `top_n == 0` returns empty without touching the column. The
     /// collector layer rejects `TopDocs::with_limit(0)` before it
     /// reaches the backend, so this test calls the backend directly
@@ -1969,7 +1952,7 @@ mod tests {
             index.embedding_field(),
             vec![0.0_f32, 0.0],
             0,
-            AdaptiveProbeParams::default(),
+            ProbeBudget::default(),
         )?;
         assert!(hits.is_empty());
         // Short-circuit fires before the probe loop, so no clusters
@@ -2048,10 +2031,7 @@ mod tests {
 
         // Cap 1 → ceiling at the first probe; an unsatisfiable survivor
         // floor keeps the gate from firing first.
-        let params = AdaptiveProbeParams {
-            epsilon: 0.0,
-            min_candidates: usize::MAX,
-            overfetch_margin: 0,
+        let params = ProbeBudget {
             max_probe_fraction: 0.1,
             min_probe_clusters: 1,
         };
@@ -2096,7 +2076,7 @@ mod tests {
             embed_field,
             query.to_vec(),
             k,
-            AdaptiveProbeParams::default(),
+            ProbeBudget::default(),
         )?;
         assert_eq!(hits, expected, "linear fallback must match the oracle");
         assert_eq!(stats.clusters_probed(), 1, "one cluster, one probe");
@@ -2140,10 +2120,7 @@ mod tests {
         let ivf = vec_reader.index().expect("expected IVF segment");
         assert_eq!(ivf.num_clusters(), centroids.len());
 
-        let params = AdaptiveProbeParams {
-            epsilon: 7.0,
-            min_candidates: 0,
-            overfetch_margin: 32,
+        let params = ProbeBudget {
             max_probe_fraction: 0.1,
             min_probe_clusters: 1,
         };
@@ -2259,10 +2236,7 @@ mod tests {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
-        let params = AdaptiveProbeParams {
-            epsilon: 0.0,
-            min_candidates: usize::MAX,
-            overfetch_margin: 0,
+        let params = ProbeBudget {
             max_probe_fraction: 0.2,
             min_probe_clusters: 1,
         };
@@ -2290,103 +2264,29 @@ mod tests {
         Ok(())
     }
 
-    /// Candidate floor: regardless of how stingy the threshold gate
-    /// is, the loop scores at least `min(total_docs, resolved_floor)`
-    /// docs. Threshold maximally stingy (`epsilon = 0`) and the
-    /// ceiling unbounded, so the floor is the binding constraint.
+    /// The ceiling is filter-EFFECTIVE, not a raw probe count: on the grid
+    /// fixture's first segment (20 docs in 2 of 9 clusters), a resolved
+    /// ceiling of 4 does not stop the scan at 4 probes - the 7 empty
+    /// clusters charge only `SKIPPED_CLUSTER_COST` each, total spend stays
+    /// under the ceiling, and the stream exhausts with every cluster
+    /// probed. Raw-count ceiling behavior on uniformly full clusters is
+    /// pinned by `probe_loop_is_a_pure_budget_taker`.
     #[test]
-    fn probe_stats_min_candidates_floor_scores_floor_or_total() -> crate::Result<()> {
+    fn empty_clusters_barely_charge_the_ceiling() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .vector_storage_format(VectorStorageFormat::Ivf)
             .build()?;
-        let top_k = 4;
-        let margin = 12usize;
-        let resolved_floor = top_k + margin;
-        let segment_doc_count =
-            index.index.reader()?.searcher().segment_readers()[0].max_doc() as usize;
-        let expected_min = segment_doc_count.min(resolved_floor);
-
-        let params = AdaptiveProbeParams {
-            epsilon: 0.0,
-            min_candidates: 0,
-            overfetch_margin: margin,
-            max_probe_fraction: 1.0,
-            min_probe_clusters: 1,
-        };
-        let (_, stats) = run_top_n(
-            &index.index,
-            index.embedding_field(),
-            vec![0.0_f32, 0.0],
-            top_k,
-            params,
-        )?;
-        assert!(
-            stats.candidates_scored >= expected_min,
-            "candidate floor (resolved {resolved_floor}, segment {segment_doc_count}) ⇒ ≥ \
-             {expected_min} candidates scored; got {}",
-            stats.candidates_scored,
-        );
-        Ok(())
-    }
-
-    /// The distance-ratio gate fires on Cosine at paper-scale epsilon:
-    /// with write-time-normalized centroids, a wide angular gap puts
-    /// the far centroid below `best - eps * (1 - best)` once the
-    /// survivor floor is met. (Under a `|best|`-scaled threshold the
-    /// gate could never fire on the [0, 1] cosine range at eps = 7.)
-    #[test]
-    fn probe_stats_cosine_gate_fires() -> crate::Result<()> {
-        // Cluster A hugs the x-axis (4 docs — exactly the top_k + margin
-        // floor, margin=3); cluster B hugs the y-axis, far outside the ratio.
-        let centroids = vec![[10.0_f32, 0.0], [0.0, 10.0]];
-        let docs = [
-            ("a0", [10.0_f32, 0.0]),
-            ("a1", [10.0_f32, 0.2]),
-            ("a2", [9.8_f32, 0.1]),
-            ("a3", [10.1_f32, 0.3]),
-            ("b0", [0.0_f32, 10.0]),
-            ("b1", [0.2_f32, 9.9]),
-        ];
-        let (index, embed_field, _label) = build_inline_ivf(Metric::Cosine, &centroids, &docs, 1)?;
-
-        // Query ~17° off the x-axis: best ≈ cos 17° ≈ 0.958, threshold
-        // ≈ 0.958 - 7 · 0.042 ≈ 0.66; centroid B scores ≈ 0.29 < 0.66.
-        let params = AdaptiveProbeParams {
-            epsilon: 7.0,
-            min_candidates: 0,
-            overfetch_margin: 3,
-            max_probe_fraction: 1.0,
-            min_probe_clusters: 1,
-        };
-        let (_, stats) = run_top_n(&index, embed_field, vec![1.0, 0.3], 1, params)?;
-        assert_eq!(stats.termination, ProbeTermination::Gate);
-        assert_eq!(
-            stats.clusters_probed(),
-            1,
-            "gate must stop before the far angular cluster ({stats:?})",
-        );
-        Ok(())
-    }
-
-    /// With a lean candidate floor (margin 0, so the threshold gate —
-    /// not the floor — governs) and a query right on one cluster's
-    /// centroid, the probe loop should prune — visit strictly fewer
-    /// clusters than the segment's total. Loose contract: no exact
-    /// number, stays stable when defaults are tuned. (The default
-    /// `overfetch_margin` alone would gather a floor comparable to this
-    /// tiny fixture's whole corpus, forcing near-exhaustive probing — so
-    /// this isolates the gate.)
-    #[test]
-    fn probe_stats_pruning_happens() -> crate::Result<()> {
-        let index = TestVectorIndex::builder(VectorDType::F32)
-            .vector_storage_format(VectorStorageFormat::Ivf)
-            .build()?;
-        // Query at the first centroid — maximally biased toward cluster 0.
         let query = grid2d_first_centroid();
-        let params = AdaptiveProbeParams {
-            overfetch_margin: 0,
-            ..Default::default()
+        let params = ProbeBudget {
+            // ceil(0.4 * 9) = 4 - below the raw cluster count on purpose.
+            max_probe_fraction: 0.4,
+            min_probe_clusters: 1,
         };
+        let ceiling = params.resolved_probe_ceiling(DEFAULT_NUM_CENTROIDS)?;
+        assert!(
+            ceiling < DEFAULT_NUM_CENTROIDS,
+            "setup: raw budget must bind"
+        );
         let (_, stats) = run_top_n(
             &index.index,
             index.embedding_field(),
@@ -2394,11 +2294,17 @@ mod tests {
             4,
             params,
         )?;
+        // The probed segment holds 20 docs concentrated in a few of its 9
+        // clusters (which few is a per-build draw - the pairwise merge
+        // sorts random segment UUIDs - so the exact split is not pinned).
+        // Populated clusters spend 1.0 each, empties 0.05: with <= 3
+        // populated the total stays under the ceiling of 4 and exhaustion
+        // wins even though the raw cluster count (9) is far past it.
+        assert_eq!(stats.termination, ProbeTermination::Exhausted, "{stats:?}");
+        assert_eq!(stats.clusters_probed(), DEFAULT_NUM_CENTROIDS, "{stats:?}");
         assert!(
-            stats.clusters_probed() < DEFAULT_NUM_CENTROIDS,
-            "default-params pruning should visit strictly fewer than {DEFAULT_NUM_CENTROIDS} \
-             clusters; got {} ({stats:?})",
-            stats.clusters_probed(),
+            stats.postings_row <= 3 && stats.postings_skipped >= 6,
+            "grid docs concentrate in a few clusters; empties dominate: {stats:?}"
         );
         Ok(())
     }
@@ -2427,8 +2333,11 @@ mod tests {
                     termination_reason: SearchTerminationReason::SearchConverged,
                 }),
             },
-            min_candidates: 5,
             termination: ProbeTermination::Gate,
+            heap_saturated: true,
+            gate_armed_at_probe: Some(3),
+            gate_armed_at_ceiling: false,
+            radius_skips: 2,
         };
 
         let value = serde_json::to_value(&stats).expect("ProbeStats should serialize to JSON");
@@ -2454,8 +2363,11 @@ mod tests {
                         "termination_reason": "SearchConverged"
                     }
                 },
-                "min_candidates": 5,
-                "termination": "Gate"
+                "termination": "Gate",
+                "heap_saturated": true,
+                "gate_armed_at_probe": 3,
+                "gate_armed_at_ceiling": false,
+                "radius_skips": 2
             })
         );
         assert_eq!(stats.clusters_probed(), 2);
@@ -2466,6 +2378,445 @@ mod tests {
         let exact_value =
             serde_json::to_value(&exact_routing).expect("ProbeStats should serialize to JSON");
         assert_eq!(exact_value["routing"]["graph"], serde_json::Value::Null);
+    }
+
+    // ============================================================
+    // Result-anchored termination scaffold.
+    //
+    // This tree has no gate: termination is Ceiling or Exhausted only,
+    // and the scaffold's job is the shared plumbing the radius
+    // certificate slots into - heap-saturation arming telemetry,
+    // ceiling-first attribution, and the budget identity. The
+    // certificate itself (and `ProbeTermination::Gate`) arrives with the
+    // stored radii.
+    // ============================================================
+
+    /// Full-visibility budget params: fraction 1.0 (ceiling = every
+    /// cluster), floor 1.
+    fn budget_params() -> ProbeBudget {
+        ProbeBudget {
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 1,
+        }
+    }
+
+    /// Line fixture for the arming/starvation tests: four well-separated
+    /// clusters along the x-axis, `n_per` docs tightly around each.
+    fn line_fixture(n_per: usize) -> crate::Result<(Index, Field, Field, Vec<[f32; 2]>)> {
+        let centroids = vec![[0.0_f32, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]];
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..labels.len())
+            .map(|i| {
+                let c = centroids[i / n_per];
+                (labels[i].as_str(), [c[0] + (i % n_per) as f32 * 0.01, c[1]])
+            })
+            .collect();
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        Ok((index, embed_field, label_field, centroids))
+    }
+
+    /// The scaffold is a pure budget-taker: with no certificate to consult,
+    /// `ProbeTermination::Gate` is unreachable - every scan ends at the
+    /// filter-effective ceiling or stream exhaustion, the probed count
+    /// equals the resolved budget exactly whenever the ceiling binds, and
+    /// the certificate-only telemetry stays inert.
+    #[test]
+    fn probe_loop_is_a_pure_budget_taker() -> crate::Result<()> {
+        let (index, embed_field, _label, centroids) = line_fixture(3)?;
+        for (fraction, expect_probed, expect_term) in [
+            // ceil(0.3 * 4) = 2 of 4 clusters -> the ceiling binds.
+            (0.3, 2, ProbeTermination::Ceiling),
+            // full fraction -> the stream runs dry first.
+            (1.0, centroids.len(), ProbeTermination::Exhausted),
+        ] {
+            let params = ProbeBudget {
+                max_probe_fraction: fraction,
+                min_probe_clusters: 1,
+            };
+            let (_, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 2, params.clone())?;
+            assert_eq!(stats.termination, expect_term, "f={fraction}: {stats:?}");
+            assert_eq!(
+                stats.clusters_probed(),
+                expect_probed,
+                "probed must equal the resolved budget: f={fraction}, {stats:?}"
+            );
+            assert_eq!(
+                params
+                    .resolved_probe_ceiling(centroids.len())?
+                    .min(centroids.len()),
+                if expect_term == ProbeTermination::Ceiling {
+                    stats.clusters_probed()
+                } else {
+                    centroids.len()
+                },
+            );
+            assert_eq!(stats.radius_skips, 0, "no certificate, no skips: {stats:?}");
+            assert!(
+                !stats.gate_armed_at_ceiling,
+                "no certificate, no tie: {stats:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Arming telemetry is boundary-observed: with a filter passing only
+    /// docs in the third-ranked cluster, the heap first reads full at the
+    /// boundary after the third probe - and arming is telemetry only; the
+    /// scan keeps probing to exhaustion.
+    #[test]
+    fn arming_waits_for_heap_saturation() -> crate::Result<()> {
+        let (index, embed_field, _label, centroids) = line_fixture(2)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let admitted = segment_reader
+            .vector_index(embed_field)?
+            .cluster_doc_ids(2)
+            .expect("cluster 2 doc ids");
+        assert_eq!(admitted.len(), 2, "setup: cluster 2 holds exactly 2 docs");
+        let weight = FixedDocsWeight {
+            max_doc: segment_reader.max_doc(),
+            docs: admitted.clone(),
+        };
+
+        let k = 2;
+        let (hits, stats) = run_top_n_with_weight(
+            &index,
+            embed_field,
+            vec![0.0, 0.0],
+            k,
+            budget_params(),
+            &weight,
+        )?;
+        // Every admitted doc surfaces; the ranked-earlier clusters were
+        // probed on the way (their fetches skip under the filter).
+        assert_eq!(hits.len(), k);
+        let hit_docs: std::collections::HashSet<DocId> =
+            hits.iter().map(|(_, addr)| addr.doc_id).collect();
+        assert_eq!(hit_docs, admitted.iter().copied().collect());
+        assert_eq!(
+            (stats.postings_skipped, stats.postings_row),
+            (3, 1),
+            "{stats:?}"
+        );
+        assert_eq!(
+            stats.gate_armed_at_probe,
+            Some(3),
+            "armed at the boundary after the third probe: {stats:?}"
+        );
+        assert_eq!(
+            stats.clusters_probed(),
+            centroids.len(),
+            "arming is telemetry, not termination: the scan ran on to exhaustion"
+        );
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        assert!(stats.heap_saturated);
+        Ok(())
+    }
+
+    /// Fewer passing docs than `top_n`: the heap never fills, arming never
+    /// happens, the loop runs to exhaustion, and the partial results all
+    /// surface - the invariant the saturation precondition exists for.
+    #[test]
+    fn starvation_runs_to_exhaustion() -> crate::Result<()> {
+        let (index, embed_field, _label, centroids) = line_fixture(2)?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let admitted = segment_reader
+            .vector_index(embed_field)?
+            .cluster_doc_ids(2)
+            .expect("cluster 2 doc ids");
+        let weight = FixedDocsWeight {
+            max_doc: segment_reader.max_doc(),
+            docs: admitted.clone(),
+        };
+
+        let k = 5; // > the 2 passing docs
+        let (hits, stats) = run_top_n_with_weight(
+            &index,
+            embed_field,
+            vec![0.0, 0.0],
+            k,
+            budget_params(),
+            &weight,
+        )?;
+        assert_eq!(hits.len(), admitted.len(), "partial results surface");
+        assert_eq!(stats.termination, ProbeTermination::Exhausted);
+        assert!(!stats.heap_saturated, "{stats:?}");
+        assert_eq!(stats.gate_armed_at_probe, None, "starved heap never arms");
+        assert_eq!(stats.radius_skips, 0);
+        assert_eq!(
+            stats.clusters_probed(),
+            centroids.len(),
+            "every cluster probed: {stats:?}"
+        );
+        Ok(())
+    }
+
+    /// A ceiling that binds before the heap fills is attributed to
+    /// `Ceiling` with `heap_saturated == false` - starvation and the
+    /// ceiling are separately visible.
+    #[test]
+    fn ceiling_starved_attribution() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        // fraction 0.1 of 6 clusters -> ceiling 1: one full-price probe
+        // exhausts the budget.
+        let params = ProbeBudget {
+            max_probe_fraction: 0.1,
+            min_probe_clusters: 1,
+        };
+
+        // K larger than the probed cluster's 6 docs: the heap never fills.
+        let (_, stats) = run_top_n(&index, embed_field, vec![10.0, 10.0], 10, params)?;
+        assert_eq!(stats.termination, ProbeTermination::Ceiling);
+        assert_eq!(stats.clusters_probed(), 1);
+        assert!(!stats.heap_saturated, "{stats:?}");
+        assert!(!stats.gate_armed_at_ceiling, "no certificate exists to tie");
+        Ok(())
+    }
+
+    // ============================================================
+    // The probe-loop seam.
+    //
+    // These drive `scan_clusters` with a SCRIPTED policy, so they pin the
+    // loop's half of the contract - what each verdict makes it do, and
+    // what the pricing table charges - with no policy geometry in the
+    // way. They stay valid whatever policy ships.
+    // ============================================================
+
+    /// A policy that replays a fixed verdict script, one verdict per
+    /// yield, and probes once the script runs out.
+    struct ScriptedGate {
+        script: Vec<Verdict>,
+        calls: usize,
+        skips: usize,
+        arming: ArmingClock,
+        /// What [`ProbeGate::would_terminate`] answers at the ceiling.
+        terminates_at_ceiling: bool,
+    }
+
+    impl ScriptedGate {
+        fn new(script: &[Verdict]) -> Self {
+            Self {
+                script: script.to_vec(),
+                calls: 0,
+                skips: 0,
+                arming: ArmingClock::default(),
+                terminates_at_ceiling: false,
+            }
+        }
+
+        fn terminating_at_ceiling(mut self) -> Self {
+            self.terminates_at_ceiling = true;
+            self
+        }
+    }
+
+    impl ProbeGate for ScriptedGate {
+        fn verdict(&mut self, ctx: GateContext) -> Verdict {
+            self.arming.observe(ctx);
+            let verdict = self
+                .script
+                .get(self.calls)
+                .copied()
+                .unwrap_or(Verdict::Probe);
+            self.calls += 1;
+            if verdict == Verdict::Skip {
+                self.skips += 1;
+            }
+            verdict
+        }
+
+        fn would_terminate(&self, _ctx: GateContext) -> bool {
+            self.terminates_at_ceiling
+        }
+
+        fn fold_stats(&self, stats: &mut ProbeStats) {
+            stats.gate_armed_at_probe = self.arming.at;
+            stats.radius_skips = self.skips;
+        }
+    }
+
+    /// Five clusters on a line, two tight docs each.
+    fn seam_fixture() -> crate::Result<(Index, Field, Vec<[f32; 2]>)> {
+        let centroids = vec![
+            [0.0_f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [30.0, 0.0],
+            [40.0, 0.0],
+        ];
+        let labels: Vec<String> = (0..centroids.len() * 2).map(|i| format!("d{i}")).collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..labels.len())
+            .map(|i| {
+                let c = centroids[i / 2];
+                (labels[i].as_str(), [c[0] + (i % 2) as f32 * 0.01, c[1]])
+            })
+            .collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        Ok((index, embed_field, centroids))
+    }
+
+    /// Drive the loop over `order`'s clusters with `gate` deciding and
+    /// `budget` to spend, filter passing everything.
+    fn drive_scan(
+        index: &Index,
+        embed_field: Field,
+        centroids: &[[f32; 2]],
+        order: &[usize],
+        gate: &mut impl ProbeGate,
+        budget: f64,
+        top_n: usize,
+    ) -> crate::Result<ProbeStats> {
+        let query = vec![0.0_f32, 0.0];
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let backend = VectorBackend::<f32>::for_segment(
+            segment_reader,
+            0,
+            embed_field,
+            Arc::new(query.clone()),
+            budget_params(),
+        )?;
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        let stream: Vec<Candidate> = order
+            .iter()
+            .map(|&c| Candidate {
+                sim: Metric::L2.similarity(query.as_slice(), centroids[c].as_slice()),
+                node: c as u32,
+            })
+            .collect();
+        let max_doc = segment_reader.max_doc();
+        let mut filter = BitSet::with_max_value(max_doc);
+        for doc in 0..max_doc {
+            filter.insert(doc);
+        }
+        let mut stats = ProbeStats::default();
+        backend.scan_clusters(
+            ivf,
+            stream.into_iter(),
+            gate,
+            ChargeModel { budget },
+            &filter,
+            max_doc,
+            None,
+            top_n,
+            &mut NoTieBreak,
+            NaturalComparator,
+            &mut stats,
+        )?;
+        Ok(stats)
+    }
+
+    /// Every verdict does exactly one thing to the loop: `Probe` opens
+    /// the cluster, `Skip` and `Defer` pass over it unopened, `Terminate`
+    /// stops the scan. Nothing else in the loop reads the policy.
+    #[test]
+    fn seam_acts_on_every_verdict() -> crate::Result<()> {
+        let (index, embed_field, centroids) = seam_fixture()?;
+        let mut gate = ScriptedGate::new(&[
+            Verdict::Probe,
+            Verdict::Skip,
+            Verdict::Defer,
+            Verdict::Probe,
+            Verdict::Terminate,
+        ]);
+        let stats = drive_scan(
+            &index,
+            embed_field,
+            &centroids,
+            &[0, 1, 2, 3, 4],
+            &mut gate,
+            100.0,
+            1,
+        )?;
+        assert_eq!(stats.termination, ProbeTermination::Gate);
+        assert_eq!(
+            stats.clusters_probed(),
+            2,
+            "only Probe opens a cluster: {stats:?}"
+        );
+        assert_eq!(
+            stats.vectors_visited, 4,
+            "two opened clusters, two rows each: {stats:?}"
+        );
+        assert_eq!(
+            stats.radius_skips, 1,
+            "the policy folds its own Skip tally: {stats:?}"
+        );
+        Ok(())
+    }
+
+    /// The ceiling is checked before the policy is consulted, and when
+    /// both stops hold on one yield the termination is `Ceiling` with the
+    /// tie recorded. One full-price open spends the whole budget, so the
+    /// second yield trips it.
+    #[test]
+    fn ceiling_wins_the_tie_and_records_it() -> crate::Result<()> {
+        let (index, embed_field, centroids) = seam_fixture()?;
+        let mut gate = ScriptedGate::new(&[Verdict::Probe]).terminating_at_ceiling();
+        let stats = drive_scan(
+            &index,
+            embed_field,
+            &centroids,
+            &[0, 1, 2],
+            &mut gate,
+            1.0,
+            1,
+        )?;
+        assert_eq!(stats.termination, ProbeTermination::Ceiling);
+        assert_eq!(stats.clusters_probed(), 1, "{stats:?}");
+        assert!(
+            stats.gate_armed_at_ceiling,
+            "the tie must be recorded: {stats:?}"
+        );
+        Ok(())
+    }
+
+    /// Cost lives in the pricing table, never in a policy: this budget
+    /// charges an opened cluster by its filter pass rate, and prices no
+    /// verdict before that cluster's rows are known.
+    #[test]
+    fn charge_model_prices_the_pass_rate() {
+        let charge = ChargeModel { budget: 1.0 };
+        assert_eq!(
+            charge.cluster_charge(RowCounts {
+                scanned: 0,
+                filtered: 0
+            }),
+            0.0,
+            "an empty cluster charges nothing"
+        );
+        assert!(
+            (charge.cluster_charge(RowCounts {
+                scanned: 10,
+                filtered: 10
+            }) - SKIPPED_CLUSTER_COST as f64)
+                .abs()
+                < 1e-6,
+            "fully filtered charges the floor"
+        );
+        assert!(
+            (charge.cluster_charge(RowCounts {
+                scanned: 10,
+                filtered: 0
+            }) - 1.0)
+                .abs()
+                < 1e-6,
+            "unfiltered charges one full cluster"
+        );
+        for verdict in [
+            Verdict::Probe,
+            Verdict::Skip,
+            Verdict::Defer,
+            Verdict::Terminate,
+        ] {
+            assert_eq!(charge.verdict_charge(verdict), 0.0, "{verdict:?}");
+        }
     }
 
     // ============================================================
@@ -2507,7 +2858,7 @@ mod tests {
         embed_field: Field,
         query: Vec<f32>,
         k: usize,
-        params: AdaptiveProbeParams,
+        params: ProbeBudget,
         weight: &dyn Weight,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = index.reader()?.searcher();
@@ -2578,7 +2929,7 @@ mod tests {
             0,
             embed_field,
             Arc::new(query),
-            AdaptiveProbeParams::default(),
+            ProbeBudget::default(),
         )?;
         assert!(
             segment_reader.vector_index(embed_field)?.index().is_none(),
