@@ -226,6 +226,38 @@ pub fn norm_squared_bytes<T: VectorElement>(doc_bytes: &[u8]) -> f32 {
     norm_squared_bytes_wide::<T>(doc_bytes) as f32
 }
 
+/// [`l2_squared_bytes`] with the accumulation widened to
+/// [`VectorElement::Acc`]. Squaring happens before the caller's `sqrt`, so
+/// an f32 accumulator saturates at a coordinate magnitude whose DISTANCE
+/// would still fit in f32 comfortably; accumulating wide moves the limit
+/// out to the accumulator's range. Off the query-scoring hot path on
+/// purpose - see [`l2_squared_bytes`], which stays narrow.
+#[inline]
+pub(crate) fn l2_squared_bytes_wide<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f64 {
+    debug_assert_eq!(doc_bytes.len(), query.len() * T::SIZE_BYTES);
+    let q_chunks = query.chunks_exact(LANES);
+    let b_chunks = doc_bytes.chunks_exact(LANES * T::SIZE_BYTES);
+    let q_tail = q_chunks.remainder();
+    let b_tail = b_chunks.remainder();
+
+    let mut sums = [T::Acc::ZERO; LANES];
+    for (qc, bc) in q_chunks.zip(b_chunks) {
+        for i in 0..LANES {
+            let v = T::decode_le(&bc[i * T::SIZE_BYTES..(i + 1) * T::SIZE_BYTES]);
+            sums[i] = sums[i].add(T::squared_diff_wide(qc[i], v));
+        }
+    }
+    let mut acc = T::Acc::ZERO;
+    for s in sums {
+        acc = acc.add(s);
+    }
+    for (i, &q) in q_tail.iter().enumerate() {
+        let v = T::decode_le(&b_tail[i * T::SIZE_BYTES..(i + 1) * T::SIZE_BYTES]);
+        acc = acc.add(T::squared_diff_wide(q, v));
+    }
+    acc.to_f64()
+}
+
 /// [`norm_squared_wide`] over little-endian bytes encoding `T`.
 #[inline]
 pub(crate) fn norm_squared_bytes_wide<T: VectorElement>(doc_bytes: &[u8]) -> f64 {
@@ -250,6 +282,60 @@ pub(crate) fn norm_squared_bytes_wide<T: VectorElement>(doc_bytes: &[u8]) -> f64
         acc = acc.add(T::mul_wide(v, v));
     }
     acc.to_f64()
+}
+
+/// A cluster's native radius: the greatest displacement of any native
+/// member from its centroid, in the stored representation's L2 space.
+///
+/// INVARIANT: non-negative, and either finite or [`SATURATED`](Self::SATURATED).
+/// Both halves matter. A negative radius would make the ball's near surface
+/// `d_c + |r|` instead of `d_c - r`, pushing the bound the WRONG way and
+/// sorting the cluster behind where it belongs; the type makes that
+/// unrepresentable rather than guarded against.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Radius(f32);
+
+impl Radius {
+    /// Every native member sits exactly on the centroid. A real value, not
+    /// a disabled bound: it makes the bound exact.
+    pub const ZERO: Radius = Radius(0.0);
+
+    /// The cluster could not be bounded - a centroid that is not a usable
+    /// origin, or a member whose displacement is not finite. Saturating
+    /// rather than flagging keeps it out of every branch: the bound it
+    /// produces is the metric's maximum, so the cluster always qualifies
+    /// and can never be the basis of a termination proof.
+    pub const SATURATED: Radius = Radius(f32::INFINITY);
+
+    /// The single validating boundary, for values read off disk.
+    ///
+    /// FAIL OPEN: anything that is not a trustworthy non-negative
+    /// magnitude - negative, or NaN - becomes [`SATURATED`](Self::SATURATED)
+    /// rather than an error or a clamp. Same reasoning as a gate resolving
+    /// ambiguity to probe: a bound we cannot trust must never be allowed to
+    /// exclude anything.
+    #[inline]
+    pub fn from_stored(raw: f32) -> Radius {
+        if raw >= 0.0 {
+            Radius(raw)
+        } else {
+            // Catches negatives AND NaN, since every NaN comparison is
+            // false.
+            Radius::SATURATED
+        }
+    }
+
+    /// Whether the ball is a point, which is what makes the bound exact.
+    #[inline]
+    pub fn is_zero(self) -> bool {
+        self.0 == 0.0
+    }
+
+    /// The magnitude, for storage and for the telemetry/SRF path.
+    #[inline]
+    pub fn get(self) -> f32 {
+        self.0
+    }
 }
 
 /// Outcome of an in-place normalization attempt.
@@ -348,6 +434,35 @@ impl Metric {
 
 #[cfg(test)]
 mod tests {
+
+    /// `from_stored` is the only way a radius enters from disk, and it
+    /// FAILS OPEN: anything that is not a trustworthy non-negative
+    /// magnitude becomes SATURATED rather than being clamped or trusted.
+    /// A negative radius would otherwise put the ball's near surface at
+    /// `d_c + |r|` - the wrong direction - and sort the cluster behind
+    /// where it belongs.
+    #[test]
+    fn from_stored_fails_open_on_untrustworthy_values() {
+        assert_eq!(Radius::from_stored(-0.0), Radius::ZERO, "-0.0 is zero");
+        for bad in [-1.0f32, -1e-30, f32::NAN, f32::NEG_INFINITY, -f32::MAX] {
+            assert_eq!(
+                Radius::from_stored(bad),
+                Radius::SATURATED,
+                "{bad} must not be trusted as a magnitude"
+            );
+        }
+        for good in [0.0f32, 1e-30, 2.5, f32::MAX] {
+            assert_eq!(
+                Radius::from_stored(good).get(),
+                good,
+                "{good} passes through"
+            );
+        }
+        assert_eq!(Radius::from_stored(f32::INFINITY), Radius::SATURATED);
+        assert!(Radius::ZERO.is_zero());
+        assert!(!Radius::SATURATED.is_zero());
+        assert!(!Radius::from_stored(1e-30).is_zero());
+    }
     use super::*;
     use crate::schema::{Metric, VectorOptions};
 

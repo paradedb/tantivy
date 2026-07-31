@@ -306,7 +306,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
             let vec_file =
                 segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
             let (version, body) = read_header(&vec_file)?;
-            assert_eq!(version, VectorFileVersion::V1);
+            assert_eq!(version, VectorFileVersion::V2, "the current generation");
             // Body must be a valid composite — proves the stamp sits in front
             // of the framing, not inside a slot.
             CompositeFile::open(&body)?;
@@ -324,7 +324,10 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
                     let centroids_file = segment_reader
                         .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
                     let (version, body) = read_header(&centroids_file)?;
-                    assert_eq!(version, VectorFileVersion::V1);
+                    // V2 is the generation in which slot [3] became
+                    // required; a `.centroids` stamped below it is
+                    // refused at open.
+                    assert_eq!(version, VectorFileVersion::V2);
                     CompositeFile::open(&body)?;
                 }
             }
@@ -598,18 +601,162 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     Ok(())
 }
 
+/// TEST SURGERY: rewrite every segment's `.centroids` composite in
+/// `index` as a genuine pre-V2 file - a `V1` version stamp and only slots
+/// `[0..=2]`, byte-identical to what a pre-radius writer produced.
+/// Reopen a fresh [`crate::Searcher`] afterwards; cached readers keep the
+/// old parse.
+#[cfg(test)]
+pub(crate) fn write_v1_centroids(index: &Index, field: Field) -> crate::Result<()> {
+    write_legacy_centroids(
+        index,
+        field,
+        crate::vector::header::VectorFileVersion::V1 as u32,
+    )
+}
+
+/// As [`write_v1_centroids`], but stamps `stamp` instead of a valid version.
+/// Models a `.centroids` written before the header existed: the reader's
+/// first four bytes are field data, so the version decode fails outright
+/// rather than yielding V1.
+pub(crate) fn write_headerless_centroids(
+    index: &Index,
+    field: Field,
+    stamp: u32,
+) -> crate::Result<()> {
+    write_legacy_centroids(index, field, stamp)
+}
+
+fn write_legacy_centroids(index: &Index, field: Field, stamp: u32) -> crate::Result<()> {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use common::BinarySerializable;
+
+    use crate::directory::{CompositeFile, CompositeWrite, Directory};
+    use crate::index::SegmentComponent;
+    use crate::vector::header::read_header;
+    use crate::vector::ivf::CENTROIDS_EXT;
+
+    let searcher = index.reader()?.searcher();
+    for segment_reader in searcher.segment_readers() {
+        let composite_slice =
+            segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
+        let (_version, body) = read_header(&composite_slice)?;
+        let composite = CompositeFile::open(&body)?;
+        let kept: Vec<(usize, Vec<u8>)> = (0..=2)
+            .filter_map(|idx| {
+                composite
+                    .open_read_with_idx(field, idx)
+                    .map(|slice| (idx, slice))
+            })
+            .map(|(idx, slice)| Ok((idx, slice.read_bytes()?.to_vec())))
+            .collect::<crate::Result<_>>()?;
+        assert!(
+            composite.open_read_with_idx(field, 3).is_some(),
+            "write_v1_centroids: the current writer must have stored radii"
+        );
+
+        let path = PathBuf::from(format!(
+            "{}.{CENTROIDS_EXT}",
+            segment_reader.segment_id().uuid_string()
+        ));
+        let directory = index.directory();
+        directory.delete(&path).expect("delete .centroids");
+        let mut rewrite_file = directory.open_write(&path)?;
+        // The old generation's stamp, not the current one: this is what a
+        // pre-radius writer left on disk.
+        stamp.serialize(&mut rewrite_file)?;
+        let mut rewrite = CompositeWrite::wrap(rewrite_file);
+        for (idx, bytes) in kept {
+            let w = rewrite.for_field_with_idx(field, idx);
+            w.write_all(&bytes)?;
+            w.flush()?;
+        }
+        rewrite.close()?;
+    }
+    Ok(())
+}
+
+/// A `.centroids` file from before radii were required is refused at open,
+/// with the one remedy there is. The failure is a clean error at reader
+/// construction - not a panic, and not a silent fall back to some
+/// radius-less behavior, because none exists.
+#[test]
+fn v1_file_errors_with_reindex_hint() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Ivf)
+        .build()?;
+    let field = index.embedding_field();
+
+    // The current writer stamps V2 and stores real radii.
+    let searcher = index.index.reader()?.searcher();
+    for segment_reader in searcher.segment_readers() {
+        let vec_reader = segment_reader.vector_index(field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        let widest = (0..ivf.num_clusters())
+            .map(|c| ivf.cluster_radius(c).get())
+            .fold(0.0f32, f32::max);
+        assert!(widest > 0.0, "fixture must store real radii");
+    }
+    drop(searcher);
+
+    write_v1_centroids(&index.index, field)?;
+
+    let searcher = index.index.reader()?.searcher();
+    let Err(err) = searcher.segment_readers()[0].vector_index(field) else {
+        panic!("a pre-V2 .centroids must not open");
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("REINDEX"),
+        "the error must name the remedy: {message}"
+    );
+    assert!(
+        message.contains("pre-V2"),
+        "the error must name the cause: {message}"
+    );
+    Ok(())
+}
+
+/// The other shape of old file: one written before `.centroids` carried a
+/// version header at all. Its leading bytes are field data, so the version
+/// decode fails before the pre-V2 check can run - and the decoder's own
+/// message names no remedy. The reader must still hand back one. The stamp
+/// here is the value a real pre-header 100k index decoded to.
+#[test]
+fn headerless_file_errors_with_reindex_hint() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Ivf)
+        .build()?;
+    let field = index.embedding_field();
+    write_headerless_centroids(&index.index, field, 2301)?;
+
+    let searcher = index.index.reader()?.searcher();
+    let Err(err) = searcher.segment_readers()[0].vector_index(field) else {
+        panic!("an unreadable .centroids must not open");
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("REINDEX"),
+        "the error must name the remedy: {message}"
+    );
+    assert!(
+        message.contains("unreadable"),
+        "the error must name the cause: {message}"
+    );
+    Ok(())
+}
+
 /// "Scan everything" probe params: the ceiling clamps to the segment's
-/// cluster count and the survivor floor is unsatisfiable, so the gate
-/// can never fire and every cluster is probed. Used by oracle-equality
-/// tests where any pruning would make the equality check fail. (A
-/// "huge epsilon" is NOT a reliable way to express this across
-/// metrics — e.g. an L2 query sitting exactly on a centroid arms the
-/// gate at any epsilon.)
+/// cluster count, so the budget can never stop the scan. Used by
+/// oracle-equality tests. The certificate stays live and may still skip
+/// clusters, which is sound - a skipped cluster provably holds no
+/// qualifier - so the equality still holds. Tests that need a literal
+/// full drain (every cluster opened, counted) must additionally park the
+/// gate with `disable_gate`.
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
-        epsilon: 0.0,
-        min_candidates: usize::MAX,
-        overfetch_margin: 0,
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
         ..Default::default()

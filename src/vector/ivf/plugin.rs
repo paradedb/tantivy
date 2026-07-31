@@ -17,11 +17,13 @@ use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
-use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::distance::{
+    cosine, dot, l2_squared, l2_squared_bytes_wide, maybe_normalize_bytes, NormalizeOutcome,
+};
 use crate::vector::flat::IdMap;
-use crate::vector::header::write_header;
+use crate::vector::header::{centroid_slot, write_header};
 use crate::vector::{
-    NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace, VEC_EXT,
+    NeighborhoodGraphConfig, NodeId, Radius, RelativeNeighborhoodGraph, Workspace, VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -30,6 +32,10 @@ struct AssignedVector {
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_doc_id: DocId,
+    /// `true` for the rank-0 (primary) assignment - the cluster whose
+    /// centroid is this vector's nearest; `false` for fixed-k replica
+    /// copies. Provenance feeds the NATIVE-only radius fold (slot [3]).
+    native: bool,
 }
 
 /// How a vector's `replicas - 1` non-primary cells are picked from the
@@ -164,16 +170,22 @@ fn write_empty_field_slots(
         let rows_w = vec_write.for_field_with_idx(field, 1);
         rows_w.flush()?;
     }
-    // `.centroids`: zero centroids, zero docs, single zero offset.
+    // `.centroids`: zero centroids, zero docs, single zero offset, zero
+    // radii.
     {
-        let centroids_w = centroids_write.for_field_with_idx(field, 0);
+        let centroids_w = centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
         IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
         centroids_w.flush()?;
     }
     {
-        let offsets_w = centroids_write.for_field_with_idx(field, 1);
+        let offsets_w = centroids_write.for_field_with_idx(field, centroid_slot::OFFSETS);
         IvfIndex::serialize_offsets(&[0u64], offsets_w)?;
         offsets_w.flush()?;
+    }
+    {
+        let radii_w = centroids_write.for_field_with_idx(field, centroid_slot::RADII);
+        IvfIndex::serialize_radii(&[], radii_w)?;
+        radii_w.flush()?;
     }
     Ok(())
 }
@@ -344,6 +356,45 @@ pub(crate) fn merge_ivf(
                     .map(|centroid| centroid.to_vec())
                     .collect();
 
+                // Radius reference for slot [3]: each centroid exactly as
+                // the `.centroids` write below will store it (encode, then
+                // Cosine-normalize; a NonFinite centroid stays raw under
+                // the same warn-and-write policy). Radii bound distances
+                // between the STORED bytes of the cluster's NATIVE (rank-0)
+                // members and the STORED centroid it routes by - for L2/Dot
+                // the raw L2 displacement, for write-time-normalized Cosine
+                // the chord - and all three reduce to L2 distance between
+                // the stored representations. Native-only is sound by
+                // closure through native homes (see the fold below).
+                //
+                // PRECONDITION on the bound: the centroid has to be a usable
+                // origin to measure from. For Cosine that means unit-norm,
+                // since the query side converts a centroid SIMILARITY into a
+                // chord and subtracts the radius from it. A zero-norm
+                // centroid is not: normalization leaves it unchanged
+                // (`ZeroSkipped`) and `cosine` then returns a hardcoded 0.0
+                // against any query, a fixed value that bounds nothing.
+                // `NonFinite` is unusable for the same reason. Such clusters
+                // are flagged here and get an INFINITE radius below.
+                let mut degenerate = vec![false; num_centroids];
+                let radius_reference: Vec<Vec<f32>> = centroid_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(centroid_ord, centroid)| {
+                        let mut bytes = encode_vector(centroid, opts.dim())?;
+                        if maybe_normalize_bytes(opts, &mut bytes) != NormalizeOutcome::Normalized {
+                            degenerate[centroid_ord] = true;
+                        }
+                        decode_row::<f32>(&bytes, opts.dim())
+                    })
+                    .collect::<crate::Result<_>>()?;
+                // Per-cluster running max of the SQUARED displacement; one
+                // sqrt per cluster at the end. Accumulated WIDE (f64): the
+                // square is taken before that sqrt, so an f32 accumulator
+                // would saturate at a coordinate magnitude whose distance
+                // still fits in f32 with room to spare.
+                let mut radius_sq = vec![0.0f64; num_centroids];
+
                 // Fixed-k replication: pick a selector ONCE before the assign
                 // loop, and only when `replicas > 1`. At `replicas == 1`
                 // nothing is built or allocated — the layout stays
@@ -443,6 +494,7 @@ pub(crate) fn merge_ivf(
                                     target_doc_id,
                                     source_segment_ord,
                                     source_doc_id,
+                                    native: true,
                                 });
                                 // Fixed-k replication: take the `replicas - 1`
                                 // nearest NON-primary centroids from the
@@ -487,6 +539,7 @@ pub(crate) fn merge_ivf(
                                             target_doc_id,
                                             source_segment_ord,
                                             source_doc_id,
+                                            native: false,
                                         });
                                         added += 1;
                                     }
@@ -606,7 +659,7 @@ pub(crate) fn merge_ivf(
                         // the row would desync the already-computed assignments
                         // and IdMap. Warn-and-write-as-is is visible,
                         // self-limiting, and non-desyncing.
-                        if needs_norm {
+                        let row_bytes: &[u8] = if needs_norm {
                             row_buf.clear();
                             row_buf.extend_from_slice(&bytes);
                             if maybe_normalize_bytes(opts, &mut row_buf)
@@ -619,9 +672,62 @@ pub(crate) fn merge_ivf(
                                     assigned_vector.target_doc_id,
                                 );
                             }
-                            rows_w.write_all(&row_buf)?;
+                            &row_buf
                         } else {
-                            rows_w.write_all(&bytes)?;
+                            &bytes[..]
+                        };
+                        rows_w.write_all(row_bytes)?;
+                        // Track the cluster radius against the exact bytes
+                        // just written - NATIVE (rank-0) rows only; replica
+                        // spill is excluded so replication cannot inflate
+                        // radii into uselessness.
+                        //
+                        // SOUNDNESS (closure through native homes), which
+                        // holds GIVEN a usable bound origin and finite
+                        // displacements. Both degenerate cases - a centroid
+                        // that is not a usable origin, and a native row
+                        // whose displacement is not finite - are handled by
+                        // storing an INFINITE radius for that cluster, which
+                        // makes it unskippable and so trivially closed. For
+                        // every other cluster: any
+                        // point `p` whose similarity reaches `kth` has a native
+                        // cluster `c_p` with `d(p, mu_{c_p}) <=
+                        // r_native(c_p)` by membership, so `d(q, mu_{c_p}) <=
+                        // kth_distance + r_native(c_p)`. Its native home therefore
+                        // never skips: the skip test
+                        // `d(q, mu_{c_p}) - r_native(c_p) > kth_distance` is false by
+                        // that inequality. Every reachable point is covered
+                        // by its native home, so a skipped cluster can only
+                        // be holding REPLICA copies of points whose homes
+                        // are still probeable - replicas are pure bonus,
+                        // freely skippable. Same argument in chord space for
+                        // Cosine, and via Cauchy-Schwarz for Dot (a
+                        // qualifying `p` forces `<q, mu_{c_p}> >= kth -
+                        // ||q||*r_native(c_p)`, clearing the dot skip test).
+                        // Caveat unchanged: graph-miss is a separate recall
+                        // channel from the skip decision.
+                        //
+                        // One distance per native row, off the byte kernel
+                        // (no decode allocation). `f32::max` returns the
+                        // non-NaN operand, so a non-finite displacement would
+                        // be silently DROPPED and its row left outside the
+                        // radius that is supposed to cover it - flag the
+                        // cluster instead, so it gets an infinite radius
+                        // below rather than a bound with a hole in it. With
+                        // wide accumulation, reaching that branch takes a
+                        // genuinely non-finite coordinate, not merely a
+                        // large one.
+                        if assigned_vector.native {
+                            let d_sq = l2_squared_bytes_wide::<f32>(
+                                &radius_reference[assigned_vector.cluster],
+                                row_bytes,
+                            );
+                            if d_sq.is_finite() {
+                                let slot = &mut radius_sq[assigned_vector.cluster];
+                                *slot = slot.max(d_sq);
+                            } else {
+                                degenerate[assigned_vector.cluster] = true;
+                            }
                         }
                     }
                     rows_w.flush()?;
@@ -638,19 +744,24 @@ pub(crate) fn merge_ivf(
                 for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
                     let mut bytes = encode_vector(centroid, opts.dim())?;
                     // Centroids are means of ingest-validated rows, so
-                    // NonFinite is should-never-happen; same warn-and-write
-                    // policy as the posting rows above.
-                    if maybe_normalize_bytes(opts, &mut bytes) == NormalizeOutcome::NonFinite {
+                    // anything but `Normalized` is should-never-happen; same
+                    // warn-and-write policy as the posting rows above. Both
+                    // off-normal outcomes matter: `NonFinite` and the
+                    // zero-norm `ZeroSkipped` are equally unusable as a
+                    // bound origin, and both already forced this cluster's
+                    // radius to infinity above.
+                    if maybe_normalize_bytes(opts, &mut bytes) != NormalizeOutcome::Normalized {
                         log::warn!(
-                            "non-finite centroid {centroid_ord} in field '{}' written \
-                             un-normalized during merge",
+                            "degenerate centroid {centroid_ord} in field '{}' written \
+                             un-normalized during merge; its cluster's radius is infinite",
                             entry.name(),
                         );
                     }
                     centroid_bytes.extend_from_slice(&bytes);
                 }
                 {
-                    let centroids_w = centroids_write.for_field_with_idx(field, 0);
+                    let centroids_w =
+                        centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
                     IvfIndex::serialize_centroids(
                         num_centroids,
                         num_present_docs,
@@ -661,7 +772,8 @@ pub(crate) fn merge_ivf(
                     centroids_w.flush()?;
                 }
                 {
-                    let offsets_w = centroids_write.for_field_with_idx(field, 1);
+                    let offsets_w =
+                        centroids_write.for_field_with_idx(field, centroid_slot::OFFSETS);
                     IvfIndex::serialize_offsets(&cluster_offsets, offsets_w)?;
                     offsets_w.flush()?;
                 }
@@ -684,7 +796,7 @@ pub(crate) fn merge_ivf(
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
-                    let graph_w = centroids_write.for_field_with_idx(field, 2);
+                    let graph_w = centroids_write.for_field_with_idx(field, centroid_slot::GRAPH);
                     match replica_selector.as_ref() {
                         Some(ReplicaSelector::Graph(graph)) => graph.serialize(graph_w)?,
                         // `replicas == 1` or the exact-selector regime: no
@@ -701,6 +813,43 @@ pub(crate) fn merge_ivf(
                         }
                     }
                     graph_w.flush()?;
+                }
+
+                // `.centroids` slot [3]: per-cluster radii, accumulated as
+                // squared displacements in the posting write above; one
+                // sqrt per cluster here. Written unconditionally, for
+                // every centroid count - a single-cluster segment still
+                // has a radius, and a segment whose members all sit on
+                // their centroids has an honest zero. The reader requires
+                // the slot (V2), so there is no "absent" case to handle.
+                {
+                    // Infinity is the sentinel for "this cluster cannot be
+                    // bounded", not a flag: the query side's surface
+                    // distance is `max(0, d_c - r_c)`, which is 0 for an
+                    // infinite radius, so the cluster always qualifies and
+                    // is never skipped. No new field, no format change, no
+                    // branch in the gate.
+                    //
+                    // Narrowing to f32 happens here, once, after the wide
+                    // sqrt. Storage stays f32 because a radius is a
+                    // distance and fits; in the residual case where the
+                    // DISTANCE itself exceeds f32 the cast overflows, and
+                    // `from_stored` reads that back as SATURATED - the
+                    // same unbounded outcome, reached by the same rule.
+                    let radii: Vec<Radius> = radius_sq
+                        .into_iter()
+                        .zip(degenerate)
+                        .map(|(sq, degenerate)| {
+                            if degenerate {
+                                Radius::SATURATED
+                            } else {
+                                Radius::from_stored(sq.sqrt() as f32)
+                            }
+                        })
+                        .collect();
+                    let radii_w = centroids_write.for_field_with_idx(field, centroid_slot::RADII);
+                    IvfIndex::serialize_radii(&radii, radii_w)?;
+                    radii_w.flush()?;
                 }
 
                 log::info!(

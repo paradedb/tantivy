@@ -6,7 +6,7 @@
 //! The on-disk file is a 4-byte format-version stamp (see `vector::header`)
 //! followed by a [`CompositeFile`](crate::directory::CompositeFile). Written
 //! per field, only for IVF segments (⟺ the field's `.vec` `IdMap` is
-//! `Explicit`). The composite has three slots per field:
+//! `Explicit`). The composite has four slots per field:
 //!
 //! ```text
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride)
@@ -14,9 +14,23 @@
 //! [2] RNG over the centroids (see `Graph::serialize` for the layout;
 //!     absent for degenerate centroid counts — routing then falls back to a
 //!     linear scan of the centroids)
+//! [3] cluster radii (f32[N]), REQUIRED: per cluster, the max distance
+//!     from its NATIVE (rank-0) members' stored rows to the stored
+//!     centroid - replica spill is excluded, sound by closure through
+//!     native homes (see the merge's radius fold).
 //! ```
 //!
-//! One dense `centroid_id = 0..N` indexes all three: `cluster_offsets[c]` is
+//! Slot presence is the compatibility mechanism WITHIN a generation: the
+//! composite footer maps `(field, slot)` to ranges, so a reader probes an
+//! optional slot and an older segment simply lacks it. Slot [2] works
+//! that way. Slot [3] does not, which is why it costs a generation:
+//! absence would have to mean "no radii", and there is no radius-less
+//! execution path left - the gate policy certifies every skip against
+//! them. So `.centroids` stamps `V2`, a
+//! pre-V2 file is refused at open with a REINDEX message, and a V2 file
+//! missing the slot is corrupt rather than old.
+//!
+//! One dense `centroid_id = 0..N` indexes all four: `cluster_offsets[c]` is
 //! the first row of cluster `c` in the parallel `.vec` rows/`IdMap`, and graph
 //! node `c` is centroid `c` (its vector is row `c` of slot `[0]`, which is why
 //! the graph slot stores no vectors of its own).
@@ -33,7 +47,7 @@ use super::graph::{
 };
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
-use crate::vector::{FileSliceArena, VectorArena};
+use crate::vector::{FileSliceArena, Radius, VectorArena};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -57,6 +71,10 @@ pub struct IvfIndex {
     /// The persisted RNG over the centroids (slot `[2]`). `None` for
     /// degenerate centroid counts, where routing falls back to a linear scan.
     graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
+    /// Slot `[3]`, pinned: per-cluster radii - max distance from a stored
+    /// NATIVE (rank-0) member row to the stored centroid, in the stored
+    /// representation's L2 space (chord for write-time-normalized Cosine).
+    radii: Vec<Radius>,
 }
 
 impl IvfIndex {
@@ -101,14 +119,31 @@ impl IvfIndex {
         Ok(())
     }
 
+    /// Write slot `[3]` of the `.centroids` composite for a field: one f32
+    /// per cluster, in cluster order - the max distance from a stored
+    /// NATIVE (rank-0) member row to the stored centroid (the merge
+    /// documents the per-metric space and the native-only soundness).
+    pub(crate) fn serialize_radii<W: Write + ?Sized>(
+        radii: &[Radius],
+        out: &mut W,
+    ) -> io::Result<()> {
+        for radius in radii {
+            radius.get().serialize(out)?;
+        }
+        Ok(())
+    }
+
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
-    /// and the graph adjacency are materialized; the centroid rows stay
-    /// behind a [`FileSlice`] for lazy per-node reads.
+    /// the radii, and the graph adjacency are materialized; the centroid rows
+    /// stay behind a [`FileSlice`] for lazy per-node reads. `radii_slice` is
+    /// required: the caller has already refused any file old enough to lack
+    /// it (see the V2 check in `VectorIndexReader::open`).
     pub(crate) fn open(
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         graph_slice: Option<FileSlice>,
+        radii_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
         if centroids_slice.len() < count_words {
@@ -169,6 +204,27 @@ impl IvfIndex {
             None => None,
         };
 
+        let radii: Vec<Radius> = {
+            let bytes = radii_slice.read_bytes()?;
+            let expected = num_centroids
+                .checked_mul(mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "radius byte length overflow")
+                })?;
+            if bytes.len() != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IVF cluster radius byte length mismatch",
+                )
+                .into());
+            }
+            let mut reader = bytes.as_slice();
+            // `from_stored` is the validating boundary: a negative or NaN
+            // radius on disk reads as SATURATED rather than being trusted.
+            (0..num_centroids)
+                .map(|_| f32::deserialize(&mut reader).map(Radius::from_stored))
+                .collect::<io::Result<_>>()?
+        };
         let index = IvfIndex {
             num_centroids,
             num_docs,
@@ -177,6 +233,7 @@ impl IvfIndex {
             dim: options.dim(),
             metric: options.metric(),
             graph,
+            radii,
         };
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt file.
@@ -217,6 +274,19 @@ impl IvfIndex {
     pub fn cluster_range(&self, cluster: usize) -> Range<usize> {
         debug_assert!(cluster < self.num_centroids, "cluster out of bounds");
         self.cluster_offset(cluster) as usize..self.cluster_offset(cluster + 1) as usize
+    }
+
+    /// The stored radius of `cluster`: the max distance from a stored
+    /// NATIVE (rank-0) member row to the stored centroid, in the stored
+    /// representation's L2 space - true L2 for `L2`/`Dot`, chord
+    /// (`sqrt(2*(1 - cos))`) for write-time-normalized `Cosine`. Replica
+    /// spill is excluded (sound by closure through native homes - the
+    /// merge's radius fold has the argument). `0.0` is a legal value: it
+    /// says every native member sits on the centroid, which makes the
+    /// bound exact rather than disabled.
+    #[inline]
+    pub fn cluster_radius(&self, cluster: usize) -> Radius {
+        self.radii[cluster]
     }
 
     /// Per-cluster posting-list sizes, in cluster order — memberships, like
@@ -340,4 +410,97 @@ pub struct IvfSearchMetrics {
     /// The centroid-graph beam search's counters; `None` when routing fell
     /// back to a linear scan of the centroids.
     pub graph: Option<NeighborhoodGraphSearchMetrics>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common::OwnedBytes;
+
+    use super::IvfIndex;
+    use crate::directory::FileSlice;
+    use crate::schema::{Metric, VectorDType, VectorOptions};
+    use crate::vector::Radius;
+
+    fn slice(bytes: Vec<u8>) -> FileSlice {
+        FileSlice::new(Arc::new(OwnedBytes::new(bytes)))
+    }
+
+    /// Two 2-D centroids, three posting rows split [2, 1], no graph slot.
+    fn open_with_radii(radii_slot: Vec<u8>) -> crate::Result<IvfIndex> {
+        let options = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
+        let centroid_bytes: Vec<u8> = [0.0_f32, 0.0, 10.0, 0.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mut centroids = Vec::new();
+        IvfIndex::serialize_centroids(2, 3, &centroid_bytes, &options, &mut centroids)?;
+        let mut offsets = Vec::new();
+        IvfIndex::serialize_offsets(&[0, 2, 3], &mut offsets)?;
+        IvfIndex::open(
+            &options,
+            slice(centroids),
+            slice(offsets),
+            None,
+            slice(radii_slot),
+        )
+    }
+
+    #[test]
+    fn radii_roundtrip_through_slot() -> crate::Result<()> {
+        let mut radii_bytes = Vec::new();
+        IvfIndex::serialize_radii(
+            &[Radius::from_stored(1.5), Radius::from_stored(2.5)],
+            &mut radii_bytes,
+        )?;
+        let index = open_with_radii(radii_bytes)?;
+        assert_eq!(index.cluster_radius(0), Radius::from_stored(1.5));
+        assert_eq!(index.cluster_radius(1), Radius::from_stored(2.5));
+        Ok(())
+    }
+
+    /// An INFINITE radius is the write side's sentinel for a cluster it
+    /// could not bound - a centroid that is not a usable origin, or a
+    /// native row whose displacement is not finite. It has to survive the
+    /// slot: no reader validation may reject it as corruption, because the
+    /// query side relies on reading it back to keep that cluster
+    /// unskippable.
+    #[test]
+    fn infinite_radius_roundtrips_through_slot() -> crate::Result<()> {
+        let mut radii_bytes = Vec::new();
+        IvfIndex::serialize_radii(
+            &[Radius::SATURATED, Radius::from_stored(2.5)],
+            &mut radii_bytes,
+        )?;
+        let index = open_with_radii(radii_bytes)?;
+        assert_eq!(index.cluster_radius(0), Radius::SATURATED);
+        assert_eq!(index.cluster_radius(1), Radius::from_stored(2.5));
+        Ok(())
+    }
+
+    /// All-zero radii are VALUES, not an absent slot: every native member
+    /// sits on its centroid, which is a legal (and exactly-gateable)
+    /// segment. The absent-slot case no longer exists - see the V2 check
+    /// in `VectorIndexReader::open`.
+    #[test]
+    fn zero_radius_values_load_as_zero() -> crate::Result<()> {
+        let mut radii_bytes = Vec::new();
+        IvfIndex::serialize_radii(&[Radius::ZERO, Radius::ZERO], &mut radii_bytes)?;
+        let index = open_with_radii(radii_bytes)?;
+        assert_eq!(index.num_clusters(), 2);
+        assert_eq!(index.cluster_radius(0), Radius::from_stored(0.0));
+        assert_eq!(index.cluster_radius(1), Radius::from_stored(0.0));
+        Ok(())
+    }
+
+    /// A radius slot whose length disagrees with the centroid count is
+    /// corruption, not a fallback.
+    #[test]
+    fn radii_length_mismatch_errors() -> crate::Result<()> {
+        let mut radii_bytes = Vec::new();
+        IvfIndex::serialize_radii(&[Radius::from_stored(1.5)], &mut radii_bytes)?; // 1 radius, 2 clusters
+        assert!(open_with_radii(radii_bytes).is_err());
+        Ok(())
+    }
 }

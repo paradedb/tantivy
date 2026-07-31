@@ -29,10 +29,12 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
-pub use backend::{ProbeStats, ProbeTermination, VectorBackend};
+pub use backend::{
+    ClusterCandidate, ProbeGate, ProbeStats, ProbeTermination, ScanState, VectorBackend, Verdict,
+};
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
-    cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
+    cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Radius, Similarity,
 };
 pub use flat::FlatVecWriter;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
@@ -126,6 +128,14 @@ pub trait VectorElement: Copy + Send + Sync + 'static {
     /// ordering invariant is unforgettable per element type.
     fn mul_wide(a: Self, b: Self) -> Self::Acc;
 
+    /// [`squared_diff`](Self::squared_diff) with BOTH the subtraction and
+    /// the square taken in [`Self::Acc`]. Squaring happens before any
+    /// `sqrt`, so a narrow accumulator saturates at a coordinate
+    /// magnitude far below the one whose distance would actually overflow
+    /// the narrow type; widening moves that limit out to the accumulator's
+    /// range.
+    fn squared_diff_wide(a: Self, b: Self) -> Self::Acc;
+
     /// Lossless widening to `f32`.
     fn to_f32(self) -> f32;
 
@@ -164,6 +174,12 @@ impl VectorElement for f32 {
     #[inline(always)]
     fn mul_wide(a: Self, b: Self) -> f64 {
         (a as f64) * (b as f64)
+    }
+
+    #[inline(always)]
+    fn squared_diff_wide(a: Self, b: Self) -> f64 {
+        let d = (a as f64) - (b as f64);
+        d * d
     }
 
     #[inline(always)]
