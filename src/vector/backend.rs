@@ -17,7 +17,9 @@ use common::BitSet;
 
 use super::distance::{norm_squared, Similarity};
 use super::index_reader::VectorIndexReader;
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
+use super::ivf::{
+    AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, RankedCluster, Workspace,
+};
 use super::prepared::PreparedQuery;
 use super::tie_break::NoTieBreak;
 use super::{Radius, VectorElement};
@@ -482,6 +484,11 @@ pub enum Verdict {
 /// One ranked cluster, as a gate policy sees it.
 #[derive(Clone, Copy, Debug)]
 pub struct ClusterCandidate {
+    /// The most optimistic score any point in this cluster could achieve -
+    /// the ordering key the searcher ranked the stream by, so the stream is
+    /// non-increasing in it. A policy that wants to prove something about
+    /// the clusters it has NOT seen reads this and nothing else.
+    pub best_possible: Similarity,
     /// The router's similarity between the query and this centroid.
     pub centroid_sim: Similarity,
     /// This cluster's stored native radius: the max displacement of its
@@ -827,7 +834,7 @@ impl<T: VectorElement> VectorBackend<T> {
     fn scan_with_policy<K, CTail>(
         &self,
         index: &IvfIndex,
-        ranked: impl Iterator<Item = Candidate>,
+        ranked: impl Iterator<Item = RankedCluster>,
         pricing: UnitPricing,
         filter: &BitSet,
         max_doc: DocId,
@@ -900,7 +907,7 @@ impl<T: VectorElement> VectorBackend<T> {
     fn scan_clusters<G, K, CTail>(
         &self,
         index: &IvfIndex,
-        ranked: impl Iterator<Item = Candidate>,
+        ranked: impl Iterator<Item = RankedCluster>,
         gate: &mut G,
         pricing: UnitPricing,
         filter: &BitSet,
@@ -951,7 +958,13 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut work_spent = WorkUnits::ZERO;
         let work_budget = pricing.budget;
 
-        for Candidate { sim, node: cluster } in ranked {
+        for RankedCluster {
+            node: cluster,
+            best_possible,
+            sim,
+            radius,
+        } in ranked
+        {
             // The pull that trips the ceiling proves another ranked cluster
             // existed, keeping `Ceiling` distinct from `Exhausted`. The
             // budget is filter-effective (a passed-over cluster streams few
@@ -971,8 +984,9 @@ impl<T: VectorElement> VectorBackend<T> {
             }
             let verdict = gate.verdict(
                 ClusterCandidate {
+                    best_possible,
                     centroid_sim: sim,
-                    radius: index.cluster_radius(cluster),
+                    radius,
                 },
                 ScanState {
                     // The heap key is the composite `(similarity,
@@ -2983,11 +2997,20 @@ mod tests {
         )?;
         let vec_reader = segment_reader.vector_index(embed_field)?;
         let ivf = vec_reader.index().expect("expected IVF storage");
-        let stream: Vec<Candidate> = order
+        // The synthetic stream stands in for the ranking layer: it carries
+        // the same fields a real yield would, with `best_possible` derived
+        // from the stored radius exactly as `rank_clusters` derives it.
+        let stream: Vec<RankedCluster> = order
             .iter()
-            .map(|&c| Candidate {
-                sim: Metric::L2.similarity(query.as_slice(), centroids[c].as_slice()),
-                node: c as u32,
+            .map(|&c| {
+                let sim = Metric::L2.similarity(query.as_slice(), centroids[c].as_slice());
+                let radius = ivf.cluster_radius(c);
+                RankedCluster {
+                    node: c as u32,
+                    best_possible: Metric::L2.best_possible(sim, radius, 0.0),
+                    sim,
+                    radius,
+                }
             })
             .collect();
         let max_doc = segment_reader.max_doc();
@@ -3541,6 +3564,7 @@ mod tests {
             exact_rows_read: 0,
             routing: IvfSearchMetrics {
                 visited_count: 7,
+                saturated_clusters: 0,
                 graph: Some(NeighborhoodGraphSearchMetrics {
                     visited_count: 7,
                     expanded_count: 4,
@@ -3570,6 +3594,7 @@ mod tests {
                 "exact_rows_read": 0,
                 "routing": {
                     "visited_count": 7,
+                    "saturated_clusters": 0,
                     "graph": {
                         "visited_count": 7,
                         "expanded_count": 4,
@@ -3605,6 +3630,187 @@ mod tests {
     // closure-through-native-homes soundness argument rests on. True L2
     // for L2/Dot, chord for write-time-normalized Cosine.
     // ============================================================
+
+    /// The emitted order is by `best_possible`, not by centroid similarity,
+    /// and on this fixture the two orders share no position.
+    ///
+    /// Five clusters on the x-axis, query at the origin, L2. Radii come
+    /// from a single native member offset in y, so `d_c` and `r` are
+    /// independent and hand-checkable:
+    ///
+    /// | node | centroid | radius | sim = -d^2 | surface | best_possible |
+    /// |------|----------|--------|------------|---------|---------------|
+    /// | 0 A  | x = 10   | 0      | -100       | 10      | -100          |
+    /// | 1 B  | x = 21   | 12     | -441       | 9       | -81           |
+    /// | 2 C  | x = 30   | 5      | -900       | 25      | -625          |
+    /// | 3 D  | x = 16   | 0      | -256       | 16      | -256          |
+    /// | 4 E  | x = 40   | 38     | -1600      | 2       | -4            |
+    ///
+    /// By `best_possible`: `[4, 1, 0, 3, 2]`. By centroid similarity it
+    /// would have been `[0, 3, 1, 2, 4]` - E, the widest and farthest, is
+    /// last under the old key and first under this one.
+    #[test]
+    fn ranking_emits_best_possible_order() -> crate::Result<()> {
+        let centroids = vec![
+            [10.0_f32, 0.0],
+            [21.0, 0.0],
+            [30.0, 0.0],
+            [16.0, 0.0],
+            [40.0, 0.0],
+        ];
+        // Each cluster gets a doc ON its centroid, plus one offset in y by
+        // the radius it should end up with. Every offset member is still
+        // nearest its own centroid, so `assign` places them as intended.
+        let docs = [
+            ("a0", [10.0_f32, 0.0]),
+            ("b0", [21.0_f32, 0.0]),
+            ("b1", [21.0_f32, 12.0]),
+            ("c0", [30.0_f32, 0.0]),
+            ("c1", [30.0_f32, 5.0]),
+            ("d0", [16.0_f32, 0.0]),
+            ("e0", [40.0_f32, 0.0]),
+            ("e1", [40.0_f32, 38.0]),
+        ];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let searcher = index.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(embed_field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+
+        // Setup: the radii really are the hand-written ones.
+        let radii: Vec<f32> = (0..5).map(|c| ivf.cluster_radius(c).get()).collect();
+        assert_eq!(radii, vec![0.0, 12.0, 5.0, 0.0, 38.0], "fixture radii");
+
+        let mut ws = Workspace::new();
+        let ranked: Vec<_> = ivf.rank_clusters(&mut ws, &[0.0, 0.0]).collect();
+        let order: Vec<u32> = ranked.iter().map(|r| r.node).collect();
+        assert_eq!(order, vec![4, 1, 0, 3, 2], "best_possible order");
+        let keys: Vec<f32> = ranked.iter().map(|r| r.best_possible.score()).collect();
+        assert_eq!(keys, vec![-4.0, -81.0, -100.0, -256.0, -625.0]);
+        // Non-increasing is the property termination will rest on.
+        assert!(keys.windows(2).all(|w| w[0] >= w[1]));
+        // The raw similarity rides along and is NOT the order.
+        let sims: Vec<f32> = ranked.iter().map(|r| r.sim.score()).collect();
+        assert_eq!(sims, vec![-1600.0, -441.0, -100.0, -256.0, -900.0]);
+        Ok(())
+    }
+
+    /// The motivating case: a far, WIDE cluster holds the true nearest
+    /// neighbour, and four near, tight clusters do not.
+    ///
+    /// Query at the origin. `W`'s centroid sits at `x = 11` - the FARTHEST
+    /// of the five - but it owns a member at `[1, 0]`, distance 1 from the
+    /// query, giving it radius 10 and a surface at `11 - 10 = 1`. The other
+    /// four sit 10.5 to 10.8 away with every member on the centroid, so
+    /// their radius is 0 and their surface is their full distance.
+    ///
+    /// | node | d_c   | radius | sim      | best_possible |
+    /// |------|-------|--------|----------|---------------|
+    /// | 0 N  | 10.5  | 0      | -110.25  | -110.25       |
+    /// | 1 F1 | 10.6  | 0      | -112.36  | -112.36       |
+    /// | 2 F2 | 10.6  | 0      | -112.36  | -112.36       |
+    /// | 3 F3 | 10.8  | 0      | -116.64  | -116.64       |
+    /// | 4 W  | 11.0  | 10     | -121.00  | -1.00         |
+    ///
+    /// Centroid similarity ranks W LAST; `best_possible` ranks it FIRST.
+    /// The budget below buys 2 of the 5 units of capacity. Under this key
+    /// the first opening lands on W and returns the true nearest
+    /// neighbour; a centroid-ordered stream would have spent that budget
+    /// on N and F1, stopped four clusters short of W, and returned a doc
+    /// 10.5 away.
+    #[test]
+    fn wide_far_cluster_holding_the_nearest_neighbour_is_reached_first() -> crate::Result<()> {
+        let centroids = vec![
+            [0.0_f32, 10.5],
+            [0.0, -10.6],
+            [-10.6, 0.0],
+            [0.0, 10.8],
+            [11.0, 0.0],
+        ];
+        let docs = [
+            ("n0", [0.0_f32, 10.5]),
+            ("f1", [0.0_f32, -10.6]),
+            ("f2", [-10.6_f32, 0.0]),
+            ("f3", [0.0_f32, 10.8]),
+            ("p_true", [1.0_f32, 0.0]),
+        ];
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let searcher = index.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(embed_field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        assert_eq!(
+            (0..5)
+                .map(|c| ivf.cluster_radius(c).get())
+                .collect::<Vec<_>>(),
+            vec![0.0, 0.0, 0.0, 0.0, 10.0],
+            "only W is wide"
+        );
+
+        let mut ws = Workspace::new();
+        let ranked: Vec<_> = ivf.rank_clusters(&mut ws, &[0.0, 0.0]).collect();
+        assert_eq!(ranked[0].node, 4, "the wide cluster leads the stream");
+        // ...while being the worst centroid match of the five.
+        assert!(
+            ranked.iter().all(|r| r.sim >= ranked[0].sim),
+            "W has the lowest centroid similarity: {:?}",
+            ranked.iter().map(|r| r.sim.score()).collect::<Vec<_>>()
+        );
+        drop(searcher);
+
+        // C = 5, N = 5 -> n_avg = 1, x clamps to 0.5, so a cluster costs
+        // 0.5 (open) + 0.5 (its one row) = 1.0 unit and capacity is 5.
+        // f = 0.4 buys 2.0 units: exactly two clusters.
+        let params = AdaptiveProbeParams {
+            max_probe_fraction: 0.4,
+            ..budget_only_params()
+        };
+        let (hits, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 1, params)?;
+        // W leads, so its member becomes the band immediately and the four
+        // tight clusters behind it are provably useless: one cluster's
+        // postings are read and the rest are passed over.
+        assert_eq!(stats.postings_row, 1, "one cluster opened: {stats:?}");
+        assert!(stats.radius_skips >= 1, "{stats:?}");
+        assert_eq!(stats.termination, ProbeTermination::Ceiling, "{stats:?}");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            stored_label_at(&index, label_field, hits[0].1)?,
+            "p_true",
+            "the true nearest neighbour comes back within the budget"
+        );
+        Ok(())
+    }
+
+    /// Unbounded clusters are counted, because they degrade the stream
+    /// silently: each one saturates to the maximum key, sorts ahead of
+    /// every bounded cluster, and can never be a termination basis. The
+    /// count is a property of the segment, so it is the same on every
+    /// query against it.
+    #[test]
+    fn saturated_clusters_are_counted() -> crate::Result<()> {
+        // Cluster 0 takes a non-finite native row, so its radius is
+        // infinite; cluster 1 is ordinary.
+        let centroids = vec![[0.0_f32, 0.0], [100.0, 0.0]];
+        let docs = [
+            ("a0", [3.0_f32, 4.0]),
+            ("wild", [f32::INFINITY, 0.0]),
+            ("b0", [100.0_f32, 0.0]),
+            ("b1", [100.0_f32, 2.0]),
+        ];
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let searcher = index.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(embed_field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+
+        let mut ws = Workspace::new();
+        let mut ranking = ivf.rank_clusters(&mut ws, &[0.0, 0.0]);
+        let order: Vec<u32> = ranking.by_ref().map(|r| r.node).collect();
+        assert_eq!(order[0], 0, "the unbounded cluster sorts first");
+        assert_eq!(
+            ranking.metrics().saturated_clusters,
+            1,
+            "one of the two clusters could not be bounded"
+        );
+        Ok(())
+    }
 
     /// A Cosine centroid that is not a usable bound ORIGIN gets an
     /// infinite radius, and the query side then always probes it.

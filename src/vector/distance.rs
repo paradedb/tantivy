@@ -40,6 +40,10 @@ impl Similarity {
     /// Less similar than any real score (`-∞`); the empty-slot sentinel.
     pub const WORST: Similarity = Similarity(f32::NEG_INFINITY);
 
+    /// More similar than any real score (`+inf`); the saturation value for
+    /// a bound that cannot be computed. See [`Metric::best_possible`].
+    pub const BEST: Similarity = Similarity(f32::INFINITY);
+
     /// Wraps a raw score that is *already* in similarity space (higher is
     /// better). Callers converting from a distance must negate first — that
     /// negation is exactly what this type exists to make explicit.
@@ -404,7 +408,87 @@ pub fn cosine_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {
     dot_bytes(query, doc_bytes) / (nq * nd)
 }
 
+/// A metric that HAS a distance space: the similarity is a monotone
+/// transform of a distance, so a bound can be taken there and brought
+/// back. `Dot` deliberately has no entry - an inner product is not a
+/// distance, and a uniform conversion that lies for one metric is exactly
+/// how a sign error gets in.
+#[derive(Clone, Copy)]
+enum BallSpace {
+    /// `sim = -d^2`.
+    NegativeSquared,
+    /// `sim = 1 - d^2/2`, the chord of a unit-norm pair.
+    Chord,
+}
+
+impl BallSpace {
+    #[inline]
+    fn to_distance(self, sim: Similarity) -> f32 {
+        match self {
+            BallSpace::NegativeSquared => (-sim.score()).max(0.0).sqrt(),
+            BallSpace::Chord => (2.0 * (1.0 - sim.score())).max(0.0).sqrt(),
+        }
+    }
+
+    #[inline]
+    fn to_similarity(self, distance: f32) -> Similarity {
+        match self {
+            BallSpace::NegativeSquared => Similarity(-(distance * distance)),
+            BallSpace::Chord => Similarity(1.0 - distance * distance / 2.0),
+        }
+    }
+}
+
 impl Metric {
+    /// The distance space this metric's similarities live in, if it has
+    /// one.
+    #[inline]
+    fn ball_space(self) -> Option<BallSpace> {
+        match self {
+            Metric::L2 => Some(BallSpace::NegativeSquared),
+            Metric::Cosine => Some(BallSpace::Chord),
+            Metric::Dot => None,
+        }
+    }
+
+    /// The best score any point inside the cluster's ball could achieve:
+    /// the centroid's similarity relaxed by the cluster's radius.
+    ///
+    /// NAMING: higher is better, so this is an UPPER bound on achievable
+    /// similarity. It is never a "lower bound" - the conversion passes
+    /// through distance space, where the sign inverts.
+    ///
+    /// Two exactness rules, both early returns rather than arithmetic
+    /// coincidences:
+    ///
+    /// * A [`SATURATED`](Radius::SATURATED) radius, or a non-finite `centroid` or `query_norm`,
+    ///   yields [`Similarity::BEST`]. A bound that cannot be computed must never exclude anything.
+    /// * A [`ZERO`](Radius::ZERO) radius returns `centroid` UNCHANGED. The ball is a point, so its
+    ///   best member is the centroid itself. Round-tripping through `sqrt` and back would not be
+    ///   bit-exact for most values, and this key is a sort order.
+    #[inline]
+    pub fn best_possible(
+        self,
+        centroid: Similarity,
+        radius: Radius,
+        query_norm: f32,
+    ) -> Similarity {
+        if radius == Radius::SATURATED || !centroid.score().is_finite() || !query_norm.is_finite() {
+            return Similarity::BEST;
+        }
+        if radius.is_zero() {
+            return centroid;
+        }
+        match self.ball_space() {
+            Some(space) => {
+                let surface = (space.to_distance(centroid) - radius.get()).max(0.0);
+                space.to_similarity(surface)
+            }
+            // Cauchy-Schwarz: `<q, p> <= <q, mu> + ||q|| * r`.
+            None => Similarity(centroid.score() + query_norm * radius.get()),
+        }
+    }
+
     /// Compute the [`Similarity`] of two vectors.
     ///
     /// L2 distance is negated (squared, then sign-flipped) here, and only
@@ -434,6 +518,109 @@ impl Metric {
 
 #[cfg(test)]
 mod tests {
+
+    /// Hand-computed `best_possible` per metric: the surface is
+    /// `max(0, d_c - r)`, converted back to similarity space.
+    #[test]
+    fn best_possible_hand_computed_per_metric() {
+        // L2: sim = -d^2. sim = -25 -> d_c = 5. r = 2 -> surface 3 -> -9.
+        assert_eq!(
+            Metric::L2.best_possible(Similarity::new(-25.0), Radius::from_stored(2.0), 0.0),
+            Similarity::new(-9.0)
+        );
+        // Cosine: chord d_c = sqrt(2*(1 - s)). s = 0.5 -> d_c = 1.
+        // r = 0.25 -> surface 0.75 -> 1 - 0.75^2/2 = 0.71875.
+        assert_eq!(
+            Metric::Cosine.best_possible(Similarity::new(0.5), Radius::from_stored(0.25), 0.0),
+            Similarity::new(0.71875)
+        );
+        // Dot: Cauchy-Schwarz, sim + ||q||*r = 10 + 2*3 = 16.
+        assert_eq!(
+            Metric::Dot.best_possible(Similarity::new(10.0), Radius::from_stored(3.0), 2.0),
+            Similarity::new(16.0)
+        );
+    }
+
+    /// A zero radius returns the centroid similarity UNCHANGED, bit for
+    /// bit. The ball is a point, so its best member is the centroid.
+    ///
+    /// The values here are chosen to DRIFT through the conversion, which
+    /// is what makes this test load-bearing: `sqrt` then square fails to
+    /// round-trip for about half of L2 similarities and two thirds of
+    /// cosine ones. `-25` and `0.5` are perfect squares and would pass
+    /// either way. Delete the `is_zero` early return and this fails:
+    /// L2 `-0.2` comes back `-0.19999999`, cosine `0.3` comes back
+    /// `0.29999995`.
+    #[test]
+    fn zero_radius_is_the_centroid_similarity() {
+        for (metric, sim, query_norm) in [
+            (Metric::L2, Similarity::new(-0.2), 0.0),
+            (Metric::Cosine, Similarity::new(0.3), 0.0),
+            (Metric::Dot, Similarity::new(10.0), 2.0),
+        ] {
+            assert_eq!(
+                metric.best_possible(sim, Radius::ZERO, query_norm),
+                sim,
+                "{metric:?}: a zero radius must return the centroid exactly"
+            );
+        }
+    }
+
+    /// A radius that reaches past the query clamps the surface to zero, so
+    /// the key saturates at the metric's maximum. Every such cluster ties
+    /// there; the ranking breaks those ties by node id rather than
+    /// inventing an ordering the geometry does not have.
+    #[test]
+    fn radius_past_the_query_clamps_to_the_metric_maximum() {
+        // L2: d_c = 5, r = 7 -> surface 0 -> 0.0, the largest L2 score.
+        assert_eq!(
+            Metric::L2.best_possible(Similarity::new(-25.0), Radius::from_stored(7.0), 0.0),
+            Similarity::new(0.0)
+        );
+        // Cosine: d_c = 1, r = 2 -> surface 0 -> 1.0, a perfect cosine.
+        assert_eq!(
+            Metric::Cosine.best_possible(Similarity::new(0.5), Radius::from_stored(2.0), 0.0),
+            Similarity::new(1.0)
+        );
+        // Two clusters at different distances both clamp: they tie.
+        assert_eq!(
+            Metric::L2.best_possible(Similarity::new(-100.0), Radius::from_stored(30.0), 0.0),
+            Metric::L2.best_possible(Similarity::new(-25.0), Radius::from_stored(7.0), 0.0),
+        );
+    }
+
+    /// A radius we could not compute saturates the key on EVERY metric, so
+    /// the cluster sorts ahead of every bounded one and can never be the
+    /// basis of a termination proof. Dot needs the guard rather than the
+    /// arithmetic: `0.0 * inf` is NaN, which would sort as garbage.
+    #[test]
+    fn saturated_radius_yields_the_best_possible_similarity() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            assert_eq!(
+                metric.best_possible(Similarity::new(-25.0), Radius::SATURATED, 0.0),
+                Similarity::BEST,
+                "{metric:?}: an unbounded cluster must sort first"
+            );
+            assert_eq!(
+                metric.best_possible(Similarity::new(-25.0), Radius::SATURATED, 1.0),
+                Similarity::BEST,
+                "{metric:?}: with a non-zero query norm too"
+            );
+            // A negative radius on disk arrives here as SATURATED, so the
+            // "surface = d_c + |r|" inversion is unrepresentable.
+            assert_eq!(
+                metric.best_possible(Similarity::new(-25.0), Radius::from_stored(-3.0), 1.0),
+                Similarity::BEST,
+                "{metric:?}: a negative stored radius fails open"
+            );
+            assert_eq!(
+                metric.best_possible(Similarity::new(f32::NAN), Radius::from_stored(1.0), 1.0),
+                Similarity::BEST,
+                "{metric:?}: an uncomputable bound saturates"
+            );
+        }
+        assert!(Similarity::BEST > Similarity::new(f32::MAX));
+    }
 
     /// `from_stored` is the only way a radius enters from disk, and it
     /// FAILS OPEN: anything that is not a trustworthy non-negative

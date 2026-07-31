@@ -30,7 +30,8 @@ use common::{BinarySerializable, BitSet};
 
 use super::partition;
 use crate::schema::Metric;
-use crate::vector::{Similarity, VectorArena, VectorElement};
+use crate::vector::distance::norm_squared;
+use crate::vector::{Radius, Similarity, VectorArena, VectorElement};
 use crate::Executor;
 
 /// A dense node identifier, indexing straight into the backing arrays.
@@ -501,6 +502,16 @@ pub struct SearchIterator<'g, 'w, S: VectorArena, const RESUMABLE: bool> {
     query: &'g [S::Elem],
     /// Beam width of each round.
     ef: usize,
+    /// Per-cluster radii, when the caller wants the search ordered by
+    /// [`best_possible`] instead of raw similarity. Empty means "order by
+    /// similarity", which is what the one-shot
+    /// [`search`](RelativeNeighborhoodGraph::search) and every non-routing
+    /// caller want. `Candidate::sim` then carries the ORDERING KEY, not
+    /// necessarily the raw similarity - the ranking layer recovers the raw
+    /// value where it needs it.
+    radii: &'g [Radius],
+    /// `||query||`, needed only by the Dot relaxation; computed once.
+    query_norm: f32,
     /// The current converged batch, sorted ascending so popping from the back
     /// yields most similar first.
     batch: Vec<Candidate>,
@@ -525,10 +536,18 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         query: &'g [S::Elem],
         seeds: &[NodeId],
         ef: usize,
+        radii: &'g [Radius],
     ) -> Self {
         debug_assert_eq!(query.len(), rng.graph.dim(), "query dimension mismatch");
         let n = rng.graph.len();
         workspace.begin_query(n);
+        // Only the Dot relaxation reads it, and only when ordering by
+        // `best_possible`; one sqrt per query either way.
+        let query_norm = if radii.is_empty() {
+            0.0
+        } else {
+            norm_squared(query).sqrt()
+        };
 
         let arena = rng.graph.arena();
         let dim = rng.graph.dim();
@@ -541,7 +560,11 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
             workspace.visited.insert(node_id);
             metrics.visited_count += 1;
             let sim = arena.similarity(rng.metric, dim, node_id, query);
-            workspace.frontier.push(Candidate { sim, node: node_id });
+            let key = order_key(rng.metric, sim, radii, node_id, query_norm);
+            workspace.frontier.push(Candidate {
+                sim: key,
+                node: node_id,
+            });
         }
 
         SearchIterator {
@@ -549,6 +572,8 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
             workspace,
             query,
             ef,
+            radii,
+            query_norm,
             batch: Vec::new(),
             metrics,
         }
@@ -567,6 +592,8 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         let arena = graph.arena();
         let dim = graph.dim();
         let metric = self.rng.metric;
+        let radii = self.radii;
+        let query_norm = self.query_norm;
         let ws = &mut *self.workspace;
 
         self.metrics.termination_reason = SearchTerminationReason::GraphExhausted;
@@ -614,8 +641,9 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
                 self.metrics.visited_count += 1;
 
                 let sim = arena.similarity(metric, dim, neighbor, self.query);
+                let key = order_key(metric, sim, radii, neighbor, query_norm);
                 ws.frontier.push(Candidate {
-                    sim,
+                    sim: key,
                     node: neighbor,
                 });
             }
@@ -686,7 +714,8 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         if self.graph.is_empty() || k == 0 {
             return (Vec::new(), NeighborhoodGraphSearchMetrics::default());
         }
-        let mut iter = OneShotSearchIterator::new(self, ws, query, seeds, self.config.ef.max(k));
+        let mut iter =
+            OneShotSearchIterator::new(self, ws, query, seeds, self.config.ef.max(k), &[]);
         let out: Vec<Candidate> = iter.by_ref().take(k).collect();
         let metrics = iter.metrics();
         (out, metrics)
@@ -709,8 +738,14 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         ws: &'w mut Workspace,
         query: &'g [S::Elem],
         seeds: &[NodeId],
+        radii: &'g [Radius],
+        metric: Metric,
     ) -> ResumableSearchIterator<'g, 'w, S> {
-        ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef)
+        debug_assert_eq!(
+            metric, self.metric,
+            "the ranking metric must be the one the graph was opened with"
+        );
+        ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef, radii)
     }
 
     /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
@@ -994,6 +1029,25 @@ impl Workspace {
         }
         self.frontier.clear();
         self.results.clear();
+    }
+}
+
+/// The heap key for one scored node: the raw similarity when `radii` is
+/// empty, otherwise [`best_possible`] - the most optimistic score any point
+/// in that cluster could reach. Ordering by the latter is what lets a
+/// consumer stop at the first cluster that fails its test, since every
+/// cluster behind it has a key no larger.
+#[inline]
+fn order_key(
+    metric: Metric,
+    sim: Similarity,
+    radii: &[Radius],
+    node: NodeId,
+    query_norm: f32,
+) -> Similarity {
+    match radii.get(node as usize) {
+        Some(&radius) => metric.best_possible(sim, radius, query_norm),
+        None => sim,
     }
 }
 
@@ -1329,7 +1383,10 @@ mod rng_tests {
         let rng = line_index(8);
         let mut ws = Workspace::new();
         let (batch, _) = rng.search(&mut ws, &[4.2], &[0], 3);
-        let iterated: Vec<Candidate> = rng.search_iter(&mut ws, &[4.2], &[0]).take(3).collect();
+        let iterated: Vec<Candidate> = rng
+            .search_iter(&mut ws, &[4.2], &[0], &[], rng.metric)
+            .take(3)
+            .collect();
         assert_eq!(batch, iterated);
     }
 
@@ -1341,7 +1398,7 @@ mod rng_tests {
         let rng = line_index(20);
         let mut ws = Workspace::new();
         let first_batch: Vec<NodeId> = rng
-            .search_iter(&mut ws, &[10.2], &[0])
+            .search_iter(&mut ws, &[10.2], &[0], &[], Metric::L2)
             .take(8)
             .map(|c| c.node)
             .collect();
@@ -1355,7 +1412,7 @@ mod rng_tests {
         let rng = line_index(20);
         let mut ws = Workspace::new();
         let mut ids: Vec<NodeId> = rng
-            .search_iter(&mut ws, &[10.2], &[0])
+            .search_iter(&mut ws, &[10.2], &[0], &[], Metric::L2)
             .take(12)
             .map(|c| c.node)
             .collect();
@@ -1371,7 +1428,7 @@ mod rng_tests {
         let n: NodeId = 20;
         let rng = line_index(n);
         let mut ws = Workspace::new();
-        let mut iter = rng.search_iter(&mut ws, &[4.2], &[0]);
+        let mut iter = rng.search_iter(&mut ws, &[4.2], &[0], &[], rng.metric);
         let mut ids: Vec<NodeId> = iter.by_ref().map(|c| c.node).collect();
 
         ids.sort_unstable();
@@ -1394,7 +1451,11 @@ mod rng_tests {
     fn search_iter_handles_degenerate_inputs() {
         let rng = line_index(5);
         let mut ws = Workspace::new();
-        assert_eq!(rng.search_iter(&mut ws, &[1.0], &[]).next(), None); // no seeds
+        assert_eq!(
+            rng.search_iter(&mut ws, &[1.0], &[], &[], rng.metric)
+                .next(),
+            None
+        ); // no seeds
 
         let empty: RelativeNeighborhoodGraph<Vec<f32>> = RelativeNeighborhoodGraph::new(
             Vec::new(),
@@ -1402,7 +1463,12 @@ mod rng_tests {
             Metric::L2,
             NeighborhoodGraphConfig::default(),
         );
-        assert_eq!(empty.search_iter(&mut ws, &[1.0], &[0]).next(), None); // empty graph
+        assert_eq!(
+            empty
+                .search_iter(&mut ws, &[1.0], &[0], &[], empty.metric)
+                .next(),
+            None
+        ); // empty graph
     }
 
     #[test]
@@ -1429,7 +1495,7 @@ mod rng_tests {
         }
         let mut ws = Workspace::new();
         let mut ids: Vec<NodeId> = rng
-            .search_iter(&mut ws, &[0.9], &[0])
+            .search_iter(&mut ws, &[0.9], &[0], &[], Metric::L2)
             .map(|c| c.node)
             .collect();
         ids.sort_unstable();

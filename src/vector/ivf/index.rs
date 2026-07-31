@@ -42,12 +42,13 @@ use std::ops::Range;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use super::graph::{
-    Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
+    NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph,
+    ResumableSearchIterator, Workspace,
 };
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
-use crate::vector::{FileSliceArena, Radius, VectorArena};
+use crate::vector::distance::norm_squared;
+use crate::vector::{FileSliceArena, Radius, Similarity, VectorArena};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -324,6 +325,17 @@ impl IvfIndex {
         ws: &'a mut Workspace,
         query: &'a [f32],
     ) -> ClusterRanking<'a> {
+        // A radius the merge could not compute is stored as infinity, which
+        // saturates `best_possible` and pins that cluster to the front of
+        // the stream forever. Correct, but it also means the stream stops
+        // being a termination basis, so the count is reported rather than
+        // left to be inferred from a recall drop.
+        let saturated_clusters = self
+            .radii
+            .iter()
+            .filter(|r| **r == Radius::SATURATED)
+            .count();
+        let query_norm = norm_squared(query).sqrt();
         match &self.graph {
             Some(graph) => {
                 // TODO: Replace with proper seed generation
@@ -334,20 +346,43 @@ impl IvfIndex {
                         .map(|node| node as NodeId)
                         .collect()
                 };
-                ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
+                ClusterRanking::Graph {
+                    iter: graph.search_iter(ws, query, &seeds, &self.radii, self.metric),
+                    arena: FileSliceArena::<f32>::new(self.centroids_slice.clone()),
+                    radii: &self.radii,
+                    metric: self.metric,
+                    dim: self.dim,
+                    query,
+                    saturated_clusters,
+                }
             }
             None => {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
-                let mut ranked: Vec<Candidate> = (0..self.num_centroids)
-                    .map(|cluster| Candidate {
-                        sim: arena.similarity(self.metric, self.dim, cluster as NodeId, query),
-                        node: cluster as NodeId,
+                let mut ranked: Vec<RankedCluster> = (0..self.num_centroids)
+                    .map(|cluster| {
+                        let node = cluster as NodeId;
+                        let sim = arena.similarity(self.metric, self.dim, node, query);
+                        let radius = self.radii[cluster];
+                        RankedCluster {
+                            node,
+                            best_possible: self.metric.best_possible(sim, radius, query_norm),
+                            sim,
+                            radius,
+                        }
                     })
                     .collect();
-                ranked.sort_unstable_by(|a, b| b.cmp(a));
+                // Best `best_possible` first, ties broken by node id so the
+                // order is deterministic - a cluster whose radius reaches
+                // the query ties every other such cluster at the maximum.
+                ranked.sort_unstable_by(|a, b| {
+                    b.best_possible
+                        .cmp(&a.best_possible)
+                        .then_with(|| a.node.cmp(&b.node))
+                });
                 ClusterRanking::Exact {
                     ranked: ranked.into_iter(),
                     num_centroids: self.num_centroids,
+                    saturated_clusters,
                 }
             }
         }
@@ -359,13 +394,43 @@ impl IvfIndex {
 pub(crate) enum ClusterRanking<'a> {
     /// Beam-searched routing over the persisted centroid RNG; pulling past a
     /// converged batch resumes the search.
-    Graph(ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>),
+    Graph {
+        iter: ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>,
+        /// The search's `Candidate::sim` carries the ORDERING KEY
+        /// (`best_possible`), so the raw centroid similarity is re-scored
+        /// here for the clusters actually yielded - one centroid scoring
+        /// per yield, against a full posting scan.
+        arena: FileSliceArena<f32>,
+        radii: &'a [Radius],
+        metric: Metric,
+        dim: usize,
+        query: &'a [f32],
+        saturated_clusters: usize,
+    },
     /// Exact fallback for graph-less segments: every centroid scored and
     /// sorted up front.
     Exact {
-        ranked: std::vec::IntoIter<Candidate>,
+        ranked: std::vec::IntoIter<RankedCluster>,
         num_centroids: usize,
+        saturated_clusters: usize,
     },
+}
+
+/// One cluster in probe order, carrying everything the probe loop and its
+/// gate policy need: no consumer looks a radius up again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RankedCluster {
+    /// Graph node id, which for the centroid RNG *is* the cluster id.
+    pub node: NodeId,
+    /// The ordering key: the most optimistic score any point in this
+    /// cluster could achieve. Non-increasing across the stream up to the
+    /// beam's own approximation.
+    pub best_possible: Similarity,
+    /// The query-to-centroid similarity itself.
+    pub sim: Similarity,
+    /// The cluster's stored radius; infinite when the merge could not
+    /// compute one.
+    pub radius: Radius,
 }
 
 impl ClusterRanking<'_> {
@@ -374,24 +439,51 @@ impl ClusterRanking<'_> {
     /// take the snapshot after the last pull.
     pub(crate) fn metrics(&self) -> IvfSearchMetrics {
         match self {
-            ClusterRanking::Graph(iter) => IvfSearchMetrics {
+            ClusterRanking::Graph {
+                iter,
+                saturated_clusters,
+                ..
+            } => IvfSearchMetrics {
                 visited_count: iter.metrics().visited_count,
                 graph: Some(iter.metrics()),
+                saturated_clusters: *saturated_clusters,
             },
-            ClusterRanking::Exact { num_centroids, .. } => IvfSearchMetrics {
+            ClusterRanking::Exact {
+                num_centroids,
+                saturated_clusters,
+                ..
+            } => IvfSearchMetrics {
                 visited_count: *num_centroids,
                 graph: None,
+                saturated_clusters: *saturated_clusters,
             },
         }
     }
 }
 
 impl Iterator for ClusterRanking<'_> {
-    type Item = Candidate;
+    type Item = RankedCluster;
 
-    fn next(&mut self) -> Option<Candidate> {
+    fn next(&mut self) -> Option<RankedCluster> {
         match self {
-            ClusterRanking::Graph(iter) => iter.next(),
+            ClusterRanking::Graph {
+                iter,
+                arena,
+                radii,
+                metric,
+                dim,
+                query,
+                ..
+            } => iter.next().map(|candidate| {
+                let node = candidate.node;
+                RankedCluster {
+                    node,
+                    // The search ordered by this; it is already the key.
+                    best_possible: candidate.sim,
+                    sim: arena.similarity(*metric, *dim, node, query),
+                    radius: radii[node as usize],
+                }
+            }),
             ClusterRanking::Exact { ranked, .. } => ranked.next(),
         }
     }
@@ -410,6 +502,13 @@ pub struct IvfSearchMetrics {
     /// The centroid-graph beam search's counters; `None` when routing fell
     /// back to a linear scan of the centroids.
     pub graph: Option<NeighborhoodGraphSearchMetrics>,
+    /// Clusters in this segment whose stored radius is not finite, so their
+    /// `best_possible` saturates and they sort ahead of every bounded
+    /// cluster. A per-segment property of the index, not of the query. Any
+    /// non-zero value front-loads the stream; large enough and the gate
+    /// stops terminating at all, which is safe but would otherwise be
+    /// invisible.
+    pub saturated_clusters: usize,
 }
 
 #[cfg(test)]
