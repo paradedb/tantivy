@@ -381,6 +381,128 @@ pub(crate) fn open_share(n_avg: f64) -> f64 {
     (ROWS_PER_OPEN / (ROWS_PER_OPEN + n_avg.max(0.0))).min(0.5)
 }
 
+/// What the probe loop does with the ranked cluster it is holding. The
+/// loop owns no policy of its own: it asks the gate for one of these,
+/// prices it through [`UnitPricing::verdict_charge`], and acts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Open the cluster: stream its rows and score the survivors.
+    Probe,
+    /// Pass over this cluster without opening it. A verdict about THIS
+    /// cluster alone - the scan continues with the next yield. No current
+    /// policy emits it; the price is fixed now (an open) so the pricing
+    /// table is complete before a policy that skips exists.
+    Skip,
+    /// Pass over without opening AND without charging: the policy wants
+    /// one more yield before it commits to stopping. Priced (at zero) by
+    /// [`UnitPricing::verdict_charge`] like every verdict - the
+    /// accounting contract that keeps unpaid pulls bounded at one per
+    /// paid pull, since a non-deferring follow-up is itself a paid Probe
+    /// or Skip. A Defer never reorders the stream and never stashes the
+    /// deferred cluster for later: hardening against adversarial yield
+    /// order (a deferred-frontier or lower-bound-reordered stream) is out
+    /// of scope here, pending the routing-interface discussion. No
+    /// current policy emits it.
+    Defer,
+    /// Stop the scan.
+    Terminate,
+}
+
+/// One ranked cluster as a gate policy sees it: what the policy may read,
+/// and nothing of the loop's own accounting.
+#[derive(Clone, Copy, Debug)]
+struct GateContext {
+    /// The router's similarity between the query and this centroid.
+    sim: Score,
+    /// Docs scored so far across the scan - the distance-ratio gate's
+    /// survivor-floor clock.
+    candidates_scored: usize,
+}
+
+/// Gate policy: the probe loop's skip/stop authority, and the only place
+/// early termination can come from.
+///
+/// This is one half of the probe loop's seam. The other half is
+/// [`UnitPricing`], which prices verdicts and rows. The split is
+/// deliberate and load-bearing for review: a policy decides WHETHER a
+/// cluster is worth opening and never touches the budget; the pricing
+/// decides what that decision COSTS and never inspects geometry. Neither
+/// can silently become the other, and the loop between them branches on
+/// nothing but the verdict it is handed.
+trait ProbeGate {
+    /// The verdict for the cluster the loop is holding. `&mut` because a
+    /// policy may carry state across yields.
+    fn verdict(&mut self, ctx: GateContext) -> Verdict;
+}
+
+/// The SPANN distance-ratio gate, wrapped behind the seam - the
+/// production policy, behavior-faithful to the inline predicate it
+/// replaces: Terminate iff the yield's similarity breaches the
+/// epsilon-derived threshold AND the survivor floor is met; Probe
+/// otherwise. It never emits Skip or Defer. The floor semantics live
+/// here: the resolved floor is `min_candidates.max(top_n +
+/// overfetch_margin)`, computed at construction.
+struct EpsilonGate {
+    /// The per-metric threshold derived from the best-routed centroid
+    /// and `epsilon` - see [`adaptive_threshold`].
+    threshold: Similarity,
+    /// The resolved survivor floor: the gate may not fire below it, so a
+    /// selective filter cannot starve the result set.
+    min_candidates: usize,
+}
+
+impl EpsilonGate {
+    /// `best_sim` anchors the threshold; the floor resolves from the
+    /// query's `top_n` and the configured floor/margin.
+    fn new(params: &AdaptiveProbeParams, metric: Metric, best_sim: Score, top_n: usize) -> Self {
+        EpsilonGate {
+            threshold: Similarity::new(adaptive_threshold(metric, best_sim, params.epsilon)),
+            // Without this floor, a selective filter can trip the
+            // threshold gate immediately and return < K results. Additive
+            // margin (not m*top_n) so the over-probe cushion stays
+            // K-independent - see `AdaptiveProbeParams::overfetch_margin`.
+            min_candidates: params.min_candidates.max(top_n + params.overfetch_margin),
+        }
+    }
+
+    /// The resolved survivor floor, reported as
+    /// [`ProbeStats::min_candidates`].
+    fn resolved_floor(&self) -> usize {
+        self.min_candidates
+    }
+}
+
+impl ProbeGate for EpsilonGate {
+    #[inline]
+    fn verdict(&mut self, ctx: GateContext) -> Verdict {
+        if ctx.sim < self.threshold.score() && ctx.candidates_scored >= self.min_candidates {
+            Verdict::Terminate
+        } else {
+            Verdict::Probe
+        }
+    }
+}
+
+/// The policy that never gates: every yield is probed and the scan ends
+/// at the budget ceiling or at stream exhaustion, making the loop a pure
+/// budget-taker.
+///
+/// TEST AND BENCH ONLY. It is the control arm for gate-vs-gateless
+/// comparisons on ONE binary, and it is the policy-free ground truth the
+/// budget's own tests run against. Shipped binaries do not compile it:
+/// no `bench-control`, no `NoGate`, no branch selecting one.
+#[cfg(any(test, feature = "bench-control"))]
+#[derive(Debug, Default)]
+struct NoGate;
+
+#[cfg(any(test, feature = "bench-control"))]
+impl ProbeGate for NoGate {
+    #[inline]
+    fn verdict(&mut self, _ctx: GateContext) -> Verdict {
+        Verdict::Probe
+    }
+}
+
 /// The resolved per-segment prices the probe loop charges against its
 /// budget: an open costs `open`, a first-seen row costs `row`. Built once
 /// per segment from [`AdaptiveProbeParams::resolved_work_budget`]'s
@@ -393,6 +515,23 @@ struct UnitPricing {
     open: f64,
     /// `(1 - x)/n_avg`: what one first-seen row costs.
     row: f64,
+}
+
+impl UnitPricing {
+    /// The price of a verdict, settled before the cluster's rows are
+    /// known. A Skip pays the open share: deciding not to open a cluster
+    /// costs what deciding to open one costs, which is what bounds pulls
+    /// per ceiling at ~1/x whether a policy skips or probes. (No current
+    /// policy skips; the price is part of the interface, not dead
+    /// tuning.) A Defer is the policy's unpaid hedge and a Terminate
+    /// ends the scan: neither reads a row or opens anything.
+    #[inline]
+    fn verdict_charge(&self, verdict: Verdict) -> f64 {
+        match verdict {
+            Verdict::Probe | Verdict::Skip => self.open,
+            Verdict::Defer | Verdict::Terminate => 0.0,
+        }
+    }
 }
 
 /// One gate survivor from the pre-pass over a cluster's rows: `row`
@@ -464,31 +603,20 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut routing_ws = Workspace::new();
         let mut ranked = index.rank_clusters(&mut routing_ws, &query_f32);
 
-        // The best-routed cluster anchors the distance-ratio gate.
+        // The best-routed cluster anchors the distance-ratio gate. The
+        // production policy is constructed here, at query init - the loop
+        // below never asks which policy it is holding.
         let Some(best) = ranked.next() else {
             return Ok(Vec::new());
         };
-        let threshold = Similarity::new(adaptive_threshold(
-            self.query.metric(),
-            best.sim.score(),
-            self.adaptive.epsilon,
-        ));
-        // Without this floor, a selective filter can trip the threshold gate
-        // immediately and return < K results. Additive margin (not m×top_n)
-        // so the over-probe cushion stays K-independent — see
-        // `AdaptiveProbeParams::overfetch_margin`.
-        let min_candidates = self
-            .adaptive
-            .min_candidates
-            .max(top_n + self.adaptive.overfetch_margin);
-
-        stats.min_candidates = min_candidates;
+        let mut gate =
+            EpsilonGate::new(&self.adaptive, self.query.metric(), best.sim.score(), top_n);
+        stats.min_candidates = gate.resolved_floor();
 
         let topn = self.scan_clusters(
             index,
             std::iter::once(best).chain(&mut ranked),
-            threshold,
-            min_candidates,
+            &mut gate,
             pricing,
             &filter,
             max_doc,
@@ -527,6 +655,12 @@ impl<T: VectorElement> VectorBackend<T> {
     /// pulling past a converged batch resumes the beam search, so routing
     /// work interleaves with (and is bounded by) probing.
     ///
+    /// ATTRIBUTION CONTRACT (interface, not code order): the budget
+    /// ceiling is the checked-first stop. When the ceiling and the gate's
+    /// Terminate would hold on the same yield, the termination is
+    /// `Ceiling` - a budget-starved query is never read as a gated one,
+    /// whichever order a future rewrite evaluates the two stops in.
+    ///
     /// `#[inline(never)]` so it forms its own flamegraph frame carrying its
     /// `score_doc_bytes` cost.
     #[inline(never)]
@@ -535,8 +669,7 @@ impl<T: VectorElement> VectorBackend<T> {
         &self,
         index: &IvfIndex,
         ranked: impl Iterator<Item = Candidate>,
-        threshold: Similarity,
-        min_candidates: usize,
+        gate: &mut impl ProbeGate,
         pricing: UnitPricing,
         filter: &BitSet,
         max_doc: DocId,
@@ -587,17 +720,28 @@ impl<T: VectorElement> VectorBackend<T> {
                 termination = ProbeTermination::Ceiling;
                 break;
             }
-            if sim < threshold && candidates >= min_candidates {
-                termination = ProbeTermination::Gate;
-                break;
+
+            let verdict = gate.verdict(GateContext {
+                sim: sim.score(),
+                candidates_scored: candidates,
+            });
+            // Event-wise charging, part 1: the verdict. A Probe's price is
+            // the open share, deducted before any row work - the boundary
+            // check above already admitted this cluster, and atomicity
+            // means it runs to completion whatever it turns out to cost.
+            work_spent += pricing.verdict_charge(verdict);
+            match verdict {
+                Verdict::Terminate => {
+                    termination = ProbeTermination::Gate;
+                    break;
+                }
+                // Passed over: `Skip` paid its price above, `Defer` is
+                // the policy's unpaid hedge. Neither opens the cluster,
+                // so neither touches the prune counters.
+                Verdict::Skip | Verdict::Defer => continue,
+                Verdict::Probe => {}
             }
             let cluster = cluster as usize;
-
-            // Event-wise charging, part 1: the open. Deducted before any
-            // row work - the boundary check above already admitted this
-            // cluster, and atomicity means it runs to completion whatever
-            // it turns out to cost.
-            work_spent += pricing.open;
 
             let rows = index.cluster_range(cluster);
 
@@ -2372,6 +2516,208 @@ mod tests {
     // (top_n + overfetch_margin) unreachable, and a huge epsilon makes the
     // threshold vacuous - the stop point under test is the budget's alone.
     // ============================================================
+
+    // ============================================================
+    // The probe-loop seam.
+    //
+    // These drive `scan_clusters` with a SCRIPTED policy, so they pin the
+    // loop's half of the contract - what each verdict makes it do, and
+    // what the pricing table charges - with no policy geometry in the
+    // way. They stay valid whatever policy ships.
+    // ============================================================
+
+    /// A policy that replays a fixed verdict script, one verdict per
+    /// yield, and probes once the script runs out.
+    struct ScriptedGate {
+        script: Vec<Verdict>,
+        calls: usize,
+    }
+
+    impl ScriptedGate {
+        fn new(script: &[Verdict]) -> Self {
+            Self {
+                script: script.to_vec(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl ProbeGate for ScriptedGate {
+        fn verdict(&mut self, _ctx: GateContext) -> Verdict {
+            let verdict = self
+                .script
+                .get(self.calls)
+                .copied()
+                .unwrap_or(Verdict::Probe);
+            self.calls += 1;
+            verdict
+        }
+    }
+
+    /// Five clusters on a line, two tight docs each.
+    fn seam_fixture() -> crate::Result<(Index, Field, Vec<[f32; 2]>)> {
+        let centroids = vec![
+            [0.0_f32, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [30.0, 0.0],
+            [40.0, 0.0],
+        ];
+        let labels: Vec<String> = (0..centroids.len() * 2).map(|i| format!("d{i}")).collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..labels.len())
+            .map(|i| {
+                let c = centroids[i / 2];
+                (labels[i].as_str(), [c[0] + (i % 2) as f32 * 0.01, c[1]])
+            })
+            .collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        Ok((index, embed_field, centroids))
+    }
+
+    /// Drive the loop over `order`'s clusters with `gate` deciding and
+    /// `pricing` charging, filter passing everything.
+    fn drive_scan(
+        index: &Index,
+        embed_field: Field,
+        centroids: &[[f32; 2]],
+        order: &[usize],
+        gate: &mut impl ProbeGate,
+        pricing: UnitPricing,
+        top_n: usize,
+    ) -> crate::Result<ProbeStats> {
+        let query = vec![0.0_f32, 0.0];
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let backend = VectorBackend::<f32>::for_segment(
+            segment_reader,
+            0,
+            embed_field,
+            Arc::new(query.clone()),
+            budget_only_params(),
+        )?;
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        let stream: Vec<Candidate> = order
+            .iter()
+            .map(|&c| Candidate {
+                sim: Metric::L2.similarity(query.as_slice(), centroids[c].as_slice()),
+                node: c as u32,
+            })
+            .collect();
+        let max_doc = segment_reader.max_doc();
+        let mut filter = BitSet::with_max_value(max_doc);
+        for doc in 0..max_doc {
+            filter.insert(doc);
+        }
+        let mut stats = ProbeStats::default();
+        backend.scan_clusters(
+            ivf,
+            stream.into_iter(),
+            gate,
+            pricing,
+            &filter,
+            max_doc,
+            None,
+            top_n,
+            &mut NoTieBreak,
+            NaturalComparator,
+            &mut stats,
+        )?;
+        Ok(stats)
+    }
+
+    /// Every verdict does exactly one thing to the loop: `Probe` opens
+    /// the cluster, `Skip` and `Defer` pass over it unopened, `Terminate`
+    /// stops the scan. Nothing else in the loop reads the policy.
+    #[test]
+    fn seam_acts_on_every_verdict() -> crate::Result<()> {
+        let (index, embed_field, centroids) = seam_fixture()?;
+        let mut gate = ScriptedGate::new(&[
+            Verdict::Probe,
+            Verdict::Skip,
+            Verdict::Defer,
+            Verdict::Probe,
+            Verdict::Terminate,
+        ]);
+        let stats = drive_scan(
+            &index,
+            embed_field,
+            &centroids,
+            &[0, 1, 2, 3, 4],
+            &mut gate,
+            // Opens and rows both free: this test is about what each
+            // verdict makes the loop DO, not what it costs.
+            UnitPricing {
+                budget: 100.0,
+                open: 0.0,
+                row: 0.0,
+            },
+            1,
+        )?;
+        assert_eq!(stats.termination, ProbeTermination::Gate);
+        assert_eq!(
+            stats.clusters_probed(),
+            2,
+            "only Probe opens a cluster: {stats:?}"
+        );
+        assert_eq!(
+            stats.vectors_visited, 4,
+            "two opened clusters, two rows each: {stats:?}"
+        );
+        Ok(())
+    }
+
+    /// The ceiling is checked before the policy is consulted - the
+    /// attribution contract. One full-price open spends the whole budget,
+    /// so the second yield trips the ceiling even though the script says
+    /// Terminate.
+    #[test]
+    fn ceiling_is_checked_first() -> crate::Result<()> {
+        let (index, embed_field, centroids) = seam_fixture()?;
+        let mut gate = ScriptedGate::new(&[Verdict::Probe, Verdict::Terminate]);
+        let stats = drive_scan(
+            &index,
+            embed_field,
+            &centroids,
+            &[0, 1, 2],
+            &mut gate,
+            UnitPricing {
+                budget: 1.0,
+                open: 1.0,
+                row: 0.0,
+            },
+            1,
+        )?;
+        assert_eq!(stats.termination, ProbeTermination::Ceiling, "{stats:?}");
+        assert_eq!(stats.clusters_probed(), 1, "{stats:?}");
+        Ok(())
+    }
+
+    /// Cost lives in the pricing table, never in a policy: a Skip pays an
+    /// open, a Defer and a Terminate pay nothing, and the unit identity
+    /// (one open plus n_avg rows = 1 unit) holds by construction.
+    #[test]
+    fn pricing_table_prices_every_verdict() {
+        let n_avg = 4.0;
+        let x = open_share(n_avg);
+        let pricing = UnitPricing {
+            budget: 1.0,
+            open: x,
+            row: (1.0 - x) / n_avg,
+        };
+        assert_eq!(pricing.verdict_charge(Verdict::Probe), x);
+        assert_eq!(
+            pricing.verdict_charge(Verdict::Skip),
+            x,
+            "deciding not to open costs what deciding to open costs"
+        );
+        assert_eq!(pricing.verdict_charge(Verdict::Defer), 0.0);
+        assert_eq!(pricing.verdict_charge(Verdict::Terminate), 0.0);
+        assert!(
+            (pricing.verdict_charge(Verdict::Probe) + n_avg * pricing.row - 1.0).abs() < 1e-12,
+            "the unit is one average cluster, by construction"
+        );
+    }
 
     /// Full-budget params with the gate parked - the shared configuration
     /// for the budget properties.

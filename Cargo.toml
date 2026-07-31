@@ -133,6 +133,10 @@ columnar-zstd-compression = ["columnar/zstd-compression"]
 
 failpoints = ["fail", "fail/failpoints"]
 unstable = []                            # useful for benches.
+# Compiles the gateless control arm for IVF probe benchmarks. Not a
+# shipped configuration: it exists so a build can be measured against
+# itself with the gate policy removed.
+bench-control = []
 
 paradedb = ["columnar/paradedb"]
 
