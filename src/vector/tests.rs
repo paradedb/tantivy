@@ -612,6 +612,7 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
         overfetch_margin: 0,
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
+        ..Default::default()
     }
 }
 
