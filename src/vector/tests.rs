@@ -696,18 +696,13 @@ fn v1_file_errors_with_reindex_hint() -> crate::Result<()> {
     Ok(())
 }
 
-/// "Scan everything" probe params: the ceiling clamps to the segment's
-/// cluster count and the survivor floor is unsatisfiable, so the gate
-/// can never fire and every cluster is probed. Used by oracle-equality
-/// tests where any pruning would make the equality check fail. (A
-/// "huge epsilon" is NOT a reliable way to express this across
-/// metrics — e.g. an L2 query sitting exactly on a centroid arms the
-/// gate at any epsilon.)
+/// Full-budget probe params: fraction 1.0 resolves to the segment's whole
+/// capacity (the normalization identity makes that exactly its cluster
+/// count), so the BUDGET never binds. The gate policy still can: a test
+/// whose contract is "every cluster is visited" also needs the gateless
+/// control arm (`AdaptiveProbeParams::disable_gate`).
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
-        epsilon: 0.0,
-        min_candidates: usize::MAX,
-        overfetch_margin: 0,
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
         ..Default::default()

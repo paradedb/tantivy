@@ -131,7 +131,7 @@ pub struct VectorSimilarityFruit {
     pub results: Vec<(Score, DocAddress)>,
     /// One [`ProbeStats`] per collected segment, in segment-ordinal order
     /// after [`Collector::merge_fruits`]. The counter fields are summable
-    /// across segments; `min_candidates` and `termination` only carry
+    /// across segments; `termination` and the gate telemetry only carry
     /// per-segment meaning.
     pub stats: Vec<ProbeStats>,
 }

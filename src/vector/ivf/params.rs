@@ -42,17 +42,14 @@ impl WorkModel {
     }
 }
 
-/// Query-time configuration for IVF adaptive probing — the SPANN shape
-/// (NeurIPS 2021), defaults aligned with the paper and SPTAG's shipped
-/// config.
+/// Query-time probe budget for IVF vector search.
 ///
-/// Stop condition, evaluated for the NEXT ranked centroid between
-/// clusters — so the first cluster is always scanned: stop at the
-/// probe-budget ceiling, OR once the `min_candidates` floor is
-/// met AND the next centroid breaches the per-metric distance-ratio
-/// gate (SPANN eq. 3). The ceiling is checked first — the
-/// [`ProbeTermination`](crate::vector::ProbeTermination) attribution
-/// contract.
+/// The probe loop visits clusters best-routed-first and stops at the
+/// budget ceiling this struct resolves, or when the ranked stream is
+/// exhausted. There is no distance-ratio knob and no second stop
+/// condition: what a query may spend is the whole of this configuration.
+/// A gate policy that proves a query can stop early spends LESS than the
+/// ceiling; nothing raises it.
 ///
 /// The ceiling is measured in WORK UNITS, not raw clusters: 1 unit is
 /// one average cluster of work, charged event-wise as probing proceeds
@@ -60,28 +57,8 @@ impl WorkModel {
 /// row - see the work-unit model in `backend`). A selective filter
 /// therefore probes deeper into the ranked list before the ceiling
 /// binds, since the clusters it passes over stream few unseen rows.
-///
-/// All defaults are provisional pending real-data benchmarking.
 #[derive(Clone, Debug)]
 pub struct AdaptiveProbeParams {
-    /// SPANN's query-aware dynamic pruning coefficient — a posting list
-    /// is searched iff `Dist(q, c) <= (1 + epsilon) * Dist(q, c_closest)`,
-    /// on the per-metric distance defined in the backend gate. The
-    /// paper uses 0.6 (recall@1-tuned) to 7.0 (recall@10-tuned); SPTAG
-    /// ships `MaxDistRatio = 8.0` = `(1 + 7.0)`. Default 7.0,
-    /// PROVISIONAL pending our own benchmarks.
-    pub epsilon: f32,
-    /// Absolute survivor floor. The call site widens this to
-    /// `min_candidates.max(top_n + overfetch_margin)`, so a 0 default
-    /// still gives a sane `top_n + overfetch_margin` floor.
-    pub min_candidates: usize,
-    /// Additive over-fetch margin: the resolved survivor floor is
-    /// `top_n + overfetch_margin`. Unlike a multiplicative `m × top_n`
-    /// floor, an additive margin keeps the over-probe cushion a *fixed*
-    /// number of clusters as `top_n` grows, so the `epsilon` needed for a
-    /// target recall stays roughly constant across K instead of shrinking
-    /// with it. Default 32, PROVISIONAL.
-    pub overfetch_margin: usize,
     /// Filter-effective cluster ceiling, expressed as a FRACTION of the
     /// segment's cluster count and resolved per-segment: a segment with
     /// `num_clusters` clusters probes at most `ceil(max_probe_fraction *
@@ -105,17 +82,22 @@ pub struct AdaptiveProbeParams {
     /// holding a [`Searcher`](crate::Searcher) - see [`WorkModel`]. `None`
     /// falls back to per-segment normalization.
     pub work_model: Option<WorkModel>,
+    /// Run the probe loop with NO gate policy - the gateless control arm
+    /// for gate-vs-gateless comparisons on one binary. TEST AND BENCH
+    /// ONLY: this field does not exist in a shipped build, and neither
+    /// does the branch that reads it.
+    #[cfg(any(test, feature = "bench-control"))]
+    pub disable_gate: bool,
 }
 
 impl Default for AdaptiveProbeParams {
     fn default() -> Self {
         Self {
-            epsilon: 7.0,
-            min_candidates: 0,
-            overfetch_margin: 32,
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
+            #[cfg(any(test, feature = "bench-control"))]
+            disable_gate: false,
         }
     }
 }
