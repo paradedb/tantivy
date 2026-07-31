@@ -17,9 +17,7 @@ use common::BitSet;
 
 use super::distance::{norm_squared, Similarity};
 use super::index_reader::VectorIndexReader;
-use super::ivf::{
-    AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, RankedCluster, Workspace,
-};
+use super::ivf::{AdaptiveProbeParams, IvfIndex, IvfSearchMetrics, RankedCluster, Workspace};
 use super::prepared::PreparedQuery;
 use super::tie_break::NoTieBreak;
 use super::{Radius, VectorElement};
@@ -250,12 +248,11 @@ where
 pub enum ProbeTermination {
     /// The work-unit probe budget was spent - the probe ceiling.
     Ceiling,
-    /// A gate policy ended the scan. UNREACHABLE in production today:
-    /// the radius certificate is skip-only, because deciding that
-    /// nothing FURTHER can qualify needs an assumption about the
-    /// router's yield order. The variant stays for the follow-up that
-    /// sorts the stream by the same lower bound, which makes
-    /// terminating sound again.
+    /// A gate policy ended the scan: the radius certificate proved that
+    /// no cluster at this stream depth or behind it can reach the band.
+    /// Sound because the searcher ranks the stream by `best_possible`,
+    /// so the key is non-increasing and the first failure settles the
+    /// rest.
     Gate,
     /// The ranked centroids were exhausted without hitting either stop.
     #[default]
@@ -301,7 +298,11 @@ pub struct ProbeStats {
     /// [`IvfSearchMetrics`].
     pub routing: IvfSearchMetrics,
     /// Clusters the gate passed over with a Skip verdict, without
-    /// opening them: it proved they could not improve the result.
+    /// opening them. Always 0 under the shipped policy: with the stream
+    /// ordered by `best_possible`, a cluster that cannot improve the
+    /// result proves the same of every cluster behind it, so the
+    /// certificate terminates instead of skipping. The counter and the
+    /// verdict both remain for a policy that skips out of order.
     pub radius_skips: usize,
     /// How many clusters had been probed when the gate first armed - the
     /// boundary at which the top-N heap filled and a band existed to
@@ -542,83 +543,6 @@ pub trait ProbeGate {
     fn name(&self) -> &'static str;
 }
 
-/// Can any point in this cluster beat the current k-th best?
-///
-/// THE TWO-BALLS TEST. The query ball (every point within the `kth` similarity of `q`,
-/// the band the heap currently holds) and the cluster ball (every native
-/// member, within `r_c` of the centroid `mu`) either intersect or they
-/// do not. When they are disjoint - the distance from `q` to the
-/// cluster's SURFACE is worse than `kth` - no member of that cluster can
-/// qualify and the cluster is provably skippable. When they touch or
-/// overlap, something might qualify and the cluster is probed. There is
-/// no tuning parameter: the band is the k-th best exactly.
-///
-/// Per metric, all three reducing to that one question:
-/// - **L2** (`score = -d^2`): `d_c = sqrt(-sim)`, `kth_distance = sqrt(-kth)`; the surface sits at
-///   `max(d_c
-///   - r_c, 0)`.
-/// - **Cosine**: both sides chord-convert (`d = sqrt(max(2*(1 - s), 0))`, exactly the space
-///   write-time-normalized radii are stored in), then as L2.
-/// - **Dot**: no distance exists, so Cauchy-Schwarz bounds the best achievable similarity instead -
-///   `<q,p> = <q,mu> + <q, p-mu> <= sim + norm(q)*r_c` - and the cluster qualifies iff that bound
-///   reaches `kth`.
-///
-/// Exactly-touching balls PROBE: the comparison is non-strict here (a
-/// skip needs the surface to be STRICTLY beyond the band), so a cluster
-/// that could hold a point tying the k-th best is never skipped. That is
-/// what keeps the composite tie-break heap sound - an equal-score
-/// candidate a secondary key would admit stays reachable.
-///
-/// SOUNDNESS is closure through native homes. Radii cover native
-/// (rank-0) members only, so a skipped cluster may hold REPLICA copies
-/// of qualifying points - but any point `p` whose similarity reaches `kth` has a
-/// native home `c_p` with `d(p, mu_{c_p}) <= r_native(c_p)` by
-/// membership, so its home's surface also reaches `kth`: that home
-/// fails this skip test and stays probeable. Nothing reachable is lost;
-/// replicas are pure bonus.
-fn cluster_can_qualify(
-    metric: Metric,
-    centroid_sim: Similarity,
-    radius: Radius,
-    kth: Similarity,
-    query_norm: f32,
-) -> bool {
-    // A skip is irreversible, so anything we cannot reason about resolves
-    // to "can qualify". A SATURATED radius is the write side's marker for
-    // a cluster it could not bound (degenerate centroid, or a non-finite
-    // member displacement) and lands here by construction; the other two
-    // are defence for inputs the reference index cannot produce. This
-    // sits in the helper, not in a policy, so every future policy
-    // inherits it.
-    if radius == Radius::SATURATED
-        || !kth.score().is_finite()
-        || !centroid_sim.score().is_finite()
-        || !query_norm.is_finite()
-    {
-        return true;
-    }
-    match metric {
-        Metric::L2 | Metric::Cosine => {
-            // Both operands converted to distances; `kth` is a similarity
-            // everywhere else, so the local name says where it has been
-            // taken.
-            let (centroid_distance, kth_distance) = match metric {
-                Metric::L2 => (
-                    (-centroid_sim.score()).max(0.0).sqrt(),
-                    (-kth.score()).max(0.0).sqrt(),
-                ),
-                Metric::Cosine => (
-                    (2.0 * (1.0 - centroid_sim.score())).max(0.0).sqrt(),
-                    (2.0 * (1.0 - kth.score())).max(0.0).sqrt(),
-                ),
-                Metric::Dot => unreachable!("handled by the outer match"),
-            };
-            (centroid_distance - radius.get()).max(0.0) <= kth_distance
-        }
-        Metric::Dot => centroid_sim.score() + query_norm * radius.get() >= kth.score(),
-    }
-}
-
 /// The production policy: skip a cluster when the stored geometry PROVES
 /// it cannot improve the result.
 ///
@@ -644,22 +568,26 @@ pub struct RadiusCertificate;
 impl ProbeGate for RadiusCertificate {
     #[inline]
     fn verdict(&mut self, cluster: ClusterCandidate, scan: ScanState) -> Verdict {
-        // Not armed: an unsaturated heap has no band to certify against,
-        // so a starved query never skips and its partial results still
-        // surface.
-        let Some(kth) = scan.kth else {
-            return Verdict::Probe;
-        };
-        if cluster_can_qualify(
-            scan.metric,
-            cluster.centroid_sim,
-            cluster.radius,
-            kth,
-            scan.query_norm,
-        ) {
-            Verdict::Probe
-        } else {
-            Verdict::Skip
+        // The searcher ranked the stream by `best_possible`, so it is
+        // non-increasing: a cluster whose most optimistic point cannot
+        // reach the band proves the same of every cluster behind it. One
+        // comparison on two `Similarity` values - no geometry, no floats.
+        // The per-metric conversion lives in the ranking layer that
+        // produced this key, and `Ord` carries the higher-is-better
+        // convention so the comparison cannot be read backwards.
+        //
+        // Unarmed probes: an unsaturated heap has no band to certify
+        // against, so a starved query never stops early and its partial
+        // results still surface.
+        //
+        // STRICTLY less. A cluster whose key EQUALS the band can still
+        // hold a doc that ties the k-th and wins on the tie-break, and
+        // the collector's contract is that the lowest doc id takes a tie.
+        // Terminating on equality would drop those, so equality probes.
+        match scan.kth {
+            None => Verdict::Probe,
+            Some(kth) if cluster.best_possible < kth => Verdict::Terminate,
+            Some(_) => Verdict::Probe,
         }
     }
 
@@ -2589,168 +2517,6 @@ mod tests {
     // the end-to-end tests only have to confirm the loop honors them.
     // ============================================================
 
-    /// Hand-verified verdicts per metric, at the three geometries that
-    /// matter: balls that are DISJOINT (skip), that OVERLAP (probe), and
-    /// that EXACTLY TOUCH (probe - the boundary belongs to the probeable
-    /// side so a tying candidate is never skipped).
-    /// Ambiguity resolves to Probe, in the helper, for every metric. An
-    /// infinite radius is the sentinel the write side stores for a cluster
-    /// it could not bound; the other three inputs are defence. The Dot arm
-    /// is the one that needs an explicit guard rather than falling out of
-    /// the arithmetic: `query_norm = 0` against an infinite radius gives
-    /// `0.0 * inf = NaN`, and `sim + NaN >= kth` is false, which without
-    /// this guard would SKIP an explicitly unbounded cluster.
-    #[test]
-    fn non_finite_inputs_always_qualify() {
-        let kth = Similarity::new(0.9);
-        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
-            assert!(
-                cluster_can_qualify(metric, Similarity::new(-100.0), Radius::SATURATED, kth, 1.0),
-                "{metric:?}: an unbounded cluster must always qualify"
-            );
-            assert!(
-                cluster_can_qualify(metric, Similarity::new(-100.0), Radius::SATURATED, kth, 0.0),
-                "{metric:?}: unbounded, zero-norm query - the 0*inf = NaN case"
-            );
-            assert!(
-                cluster_can_qualify(
-                    metric,
-                    Similarity::new(f32::NAN),
-                    Radius::from_stored(1.0),
-                    kth,
-                    1.0
-                ),
-                "{metric:?}: non-finite centroid similarity"
-            );
-            assert!(
-                cluster_can_qualify(
-                    metric,
-                    Similarity::new(-100.0),
-                    Radius::from_stored(f32::NAN),
-                    kth,
-                    1.0
-                ),
-                "{metric:?}: non-finite radius"
-            );
-            assert!(
-                cluster_can_qualify(
-                    metric,
-                    Similarity::new(-100.0),
-                    Radius::from_stored(1.0),
-                    Similarity::new(f32::NAN),
-                    1.0
-                ),
-                "{metric:?}: non-finite kth"
-            );
-            assert!(
-                cluster_can_qualify(
-                    metric,
-                    Similarity::new(-100.0),
-                    Radius::from_stored(1.0),
-                    kth,
-                    f32::INFINITY
-                ),
-                "{metric:?}: non-finite query norm"
-            );
-        }
-    }
-
-    #[test]
-    fn certificate_verdicts_hand_checked() {
-        // L2: score = -d^2. kth = -4, i.e. a band 2 away.
-        let kth = Similarity::new(-4.0);
-        // Cluster at d_c = 10, radius 3: surface at 7 > 2 -> disjoint.
-        assert!(!cluster_can_qualify(
-            Metric::L2,
-            Similarity::new(-100.0),
-            Radius::from_stored(3.0),
-            kth,
-            0.0
-        ));
-        // Same centroid, radius 9: surface at 1 <= 2 -> overlap.
-        assert!(cluster_can_qualify(
-            Metric::L2,
-            Similarity::new(-100.0),
-            Radius::from_stored(9.0),
-            kth,
-            0.0
-        ));
-        // Exactly touching: surface at 10 - 8 = 2, the band -> probe.
-        assert!(cluster_can_qualify(
-            Metric::L2,
-            Similarity::new(-100.0),
-            Radius::from_stored(8.0),
-            kth,
-            0.0
-        ));
-        // A centroid inside the band always probes, whatever the radius.
-        assert!(cluster_can_qualify(
-            Metric::L2,
-            Similarity::new(-1.0),
-            Radius::from_stored(0.0),
-            kth,
-            0.0
-        ));
-
-        // Cosine: chord d = sqrt(2*(1 - s)). Values chosen so every
-        // chord is exact in f32 - the touching case must not turn on
-        // rounding dust. kth = 0.5 is 1 away; sim = -1 ->
-        // d_c = sqrt(4) = 2.
-        let kth = Similarity::new(0.5);
-        // radius 0.5: surface 1.5 > 1 -> disjoint.
-        assert!(!cluster_can_qualify(
-            Metric::Cosine,
-            Similarity::new(-1.0),
-            Radius::from_stored(0.5),
-            kth,
-            0.0
-        ));
-        // radius 1.5: surface 0.5 <= 1 -> overlap.
-        assert!(cluster_can_qualify(
-            Metric::Cosine,
-            Similarity::new(-1.0),
-            Radius::from_stored(1.5),
-            kth,
-            0.0
-        ));
-        // Exactly touching: radius 1 -> surface 1, the band -> probe.
-        assert!(cluster_can_qualify(
-            Metric::Cosine,
-            Similarity::new(-1.0),
-            Radius::from_stored(1.0),
-            kth,
-            0.0
-        ));
-
-        // Dot: Cauchy-Schwarz, best achievable = sim + norm(q)*r.
-        // norm(q) = 2, kth = 20.
-        let kth = Similarity::new(20.0);
-        // sim 10, r 1 -> 12 < 20 -> skip.
-        assert!(!cluster_can_qualify(
-            Metric::Dot,
-            Similarity::new(10.0),
-            Radius::from_stored(1.0),
-            kth,
-            2.0
-        ));
-        // sim 10, r 6 -> 22 >= 20 -> probe.
-        assert!(cluster_can_qualify(
-            Metric::Dot,
-            Similarity::new(10.0),
-            Radius::from_stored(6.0),
-            kth,
-            2.0
-        ));
-        // Exactly touching: sim 10, r 5 -> exactly 20 -> probe.
-        assert!(cluster_can_qualify(
-            Metric::Dot,
-            Similarity::new(10.0),
-            Radius::from_stored(5.0),
-            kth,
-            2.0
-        ));
-    }
-
     /// Zero radii gate EXACTLY: with every native member on its centroid
     /// the ball degenerates to a point, so the test reduces to comparing
     /// the centroid distance against the band - and the answer still
@@ -2777,22 +2543,12 @@ mod tests {
         }
         drop(searcher);
 
-        // The point test: a cluster is skipped iff its centroid is
-        // strictly farther than the band.
-        assert!(!cluster_can_qualify(
-            Metric::L2,
-            Similarity::new(-100.0),
-            Radius::from_stored(0.0),
-            Similarity::new(-4.0),
-            0.0
-        ));
-        assert!(cluster_can_qualify(
-            Metric::L2,
-            Similarity::new(-4.0),
-            Radius::from_stored(0.0),
-            Similarity::new(-4.0),
-            0.0
-        ));
+        // With every radius 0 the key IS the centroid similarity, so the
+        // threshold test reads directly off the geometry.
+        assert_eq!(
+            Metric::L2.best_possible(Similarity::new(-100.0), Radius::ZERO, 0.0),
+            Similarity::new(-100.0)
+        );
 
         // End to end, the answer still matches the exact oracle.
         let query = [0.0_f32, 0.0];
@@ -2804,16 +2560,20 @@ mod tests {
             oracle.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
             "exact gating must not change the answer: {stats:?}"
         );
-        assert!(stats.radius_skips > 0, "far point-clusters skip: {stats:?}");
+        assert_eq!(
+            stats.termination,
+            ProbeTermination::Gate,
+            "far point-clusters settle the rest of the stream: {stats:?}"
+        );
+        assert_eq!(stats.radius_skips, 0, "the shipped policy never skips");
         Ok(())
     }
 
-    /// A long skip run ends on the BUDGET, never on the gate: the
-    /// certificate has no Terminate verdict, so a query whose band
-    /// excludes every remaining cluster still walks until its units run
-    /// out (each skip costing one open).
+    /// A band that excludes every remaining cluster now ends the scan at
+    /// the FIRST such cluster rather than walking the rest of the stream:
+    /// the key is non-increasing, so the first failure settles all of it.
     #[test]
-    fn skip_run_trips_the_ceiling_not_the_gate() -> crate::Result<()> {
+    fn excluded_run_terminates_at_the_first_failure() -> crate::Result<()> {
         // One near cluster arms the band; 30 far tight clusters are all
         // provably skippable.
         let mut centroids: Vec<[f32; 2]> = vec![[1.0, 0.0]];
@@ -2836,22 +2596,22 @@ mod tests {
         let (_, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 1, params)?;
         assert_eq!(
             stats.termination,
-            ProbeTermination::Ceiling,
-            "the gate cannot end a scan; only the budget can: {stats:?}"
+            ProbeTermination::Gate,
+            "the first excluded cluster ends the scan: {stats:?}"
         );
-        assert!(
-            stats.radius_skips > 0,
-            "far clusters were skipped: {stats:?}"
-        );
+        assert_eq!(stats.radius_skips, 0, "terminating, not skipping");
         assert!(
             stats.gate_armed_at_probe.is_some(),
-            "the band armed before any skip: {stats:?}"
+            "the band armed before the gate could act: {stats:?}"
         );
+        // The near cluster armed the band; the run behind it is settled by
+        // one verdict rather than 30.
+        assert_eq!(stats.postings_row, 1, "{stats:?}");
         Ok(())
     }
 
-    /// An unarmed scan never skips: with K larger than the corpus the
-    /// heap never fills, so there is no band and every cluster is
+    /// An unarmed scan never stops early: with K larger than the corpus
+    /// the heap never fills, so there is no band and every cluster is
     /// probed - the property that keeps partial results surfacing.
     #[test]
     fn unarmed_scan_never_skips() -> crate::Result<()> {
@@ -3764,18 +3524,111 @@ mod tests {
             ..budget_only_params()
         };
         let (hits, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 1, params)?;
-        // W leads, so its member becomes the band immediately and the four
-        // tight clusters behind it are provably useless: one cluster's
-        // postings are read and the rest are passed over.
+        // W leads, so its member becomes the band immediately, and the
+        // four tight clusters behind it are settled by one verdict: the
+        // scan ends on the gate, one opening in, well inside the budget.
         assert_eq!(stats.postings_row, 1, "one cluster opened: {stats:?}");
-        assert!(stats.radius_skips >= 1, "{stats:?}");
-        assert_eq!(stats.termination, ProbeTermination::Ceiling, "{stats:?}");
+        assert_eq!(stats.termination, ProbeTermination::Gate, "{stats:?}");
+        assert!(
+            (stats.work_charged as f64) < 2.0,
+            "ended under the budget: {stats:?}"
+        );
         assert_eq!(hits.len(), 1);
         assert_eq!(
             stored_label_at(&index, label_field, hits[0].1)?,
             "p_true",
             "the true nearest neighbour comes back within the budget"
         );
+        Ok(())
+    }
+
+    /// The gate is a threshold on one number. Hand-verified at the
+    /// boundary and on both sides of it, with `kth = -100`:
+    ///
+    /// * key `-101` is below the band       -> Terminate
+    /// * key `-100` EQUALS the band         -> Probe (a doc there can tie the k-th and win on the
+    ///   lower doc id, which the collector guarantees; terminating would drop it)
+    /// * key `-99` is above the band        -> Probe
+    ///
+    /// The verdict reads `best_possible` alone: `sim` and `radius` are set
+    /// to values that would flip a geometry-based decision, and do not.
+    #[test]
+    fn certificate_is_a_threshold_on_best_possible() {
+        let mut gate = RadiusCertificate;
+        let scan = |kth: Option<Similarity>| ScanState {
+            kth,
+            metric: Metric::L2,
+            query_norm: 0.0,
+            collected: 0,
+        };
+        let cluster = |best: f32| ClusterCandidate {
+            best_possible: Similarity::new(best),
+            // Deliberately inconsistent with `best`: the gate must not
+            // read these.
+            centroid_sim: Similarity::new(0.0),
+            radius: Radius::from_stored(1000.0),
+        };
+        let band = Some(Similarity::new(-100.0));
+        assert_eq!(
+            gate.verdict(cluster(-101.0), scan(band)),
+            Verdict::Terminate
+        );
+        assert_eq!(gate.verdict(cluster(-100.0), scan(band)), Verdict::Probe);
+        assert_eq!(gate.verdict(cluster(-99.0), scan(band)), Verdict::Probe);
+        // Unarmed: no band, so nothing can be proven and everything probes.
+        assert_eq!(gate.verdict(cluster(-1e9), scan(None)), Verdict::Probe);
+        // An unbounded cluster saturates to BEST and always probes.
+        assert_eq!(
+            gate.verdict(cluster(f32::INFINITY), scan(band)),
+            Verdict::Probe
+        );
+    }
+
+    /// A synthetic stream, non-increasing in `best_possible`, terminates at
+    /// the first cluster below the band and not before.
+    ///
+    /// Six clusters keyed `[-1, -4, -9, -16, -25, -36]`. Top-1 over a
+    /// fixture whose every cluster holds one doc AT its centroid means the
+    /// band after pull `i` is that cluster's own score. The stream is
+    /// hand-built, so the pull index where the key first drops below the
+    /// band is arithmetic, not a guess.
+    #[test]
+    fn synthetic_stream_terminates_at_the_expected_pull() -> crate::Result<()> {
+        // Clusters on the x-axis at 1, 2, 3, 4, 5, 6 with one member each,
+        // sitting on the centroid: radius 0, so key == sim == -x^2.
+        let centroids: Vec<[f32; 2]> = (1..=6).map(|i| [i as f32, 0.0]).collect();
+        let labels: Vec<String> = (1..=6).map(|i| format!("c{i}")).collect();
+        let docs: Vec<(&str, [f32; 2])> =
+            (0..6).map(|i| (labels[i].as_str(), centroids[i])).collect();
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let searcher = index.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(embed_field)?;
+        let ivf = vec_reader.index().expect("expected IVF storage");
+        for c in 0..6 {
+            assert_eq!(
+                ivf.cluster_radius(c),
+                Radius::ZERO,
+                "cluster {c} is a point"
+            );
+        }
+        let mut ws = Workspace::new();
+        let keys: Vec<f32> = ivf
+            .rank_clusters(&mut ws, &[0.0, 0.0])
+            .map(|r| r.best_possible.score())
+            .collect();
+        assert_eq!(keys, vec![-1.0, -4.0, -9.0, -16.0, -25.0, -36.0]);
+        drop(searcher);
+
+        // Pull 1 opens key -1 and its doc sets the band to -1. Pull 2's key
+        // is -4 < -1, so the gate settles the whole tail there: exactly one
+        // cluster's postings are read.
+        let (hits, stats) =
+            run_top_n(&index, embed_field, vec![0.0, 0.0], 1, budget_only_params())?;
+        assert_eq!(stats.termination, ProbeTermination::Gate, "{stats:?}");
+        assert_eq!(stats.postings_row, 1, "terminated on the second pull");
+        assert_eq!(stats.radius_skips, 0, "{stats:?}");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, -1.0, "the nearest doc, at distance 1");
         Ok(())
     }
 
