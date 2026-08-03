@@ -297,6 +297,18 @@ pub struct ProbeStats {
     /// much routing as the probe loop actually pulled. See
     /// [`IvfSearchMetrics`].
     pub routing: IvfSearchMetrics,
+    /// Clusters the bounds gate passed over with a Skip verdict, without
+    /// opening them: their margins proved they could not improve the
+    /// armed result. Each charged the open share. Disjoint from the
+    /// `postings_*` partition, which only counts opened clusters.
+    pub bounds_skips: u32,
+    /// Probe index (0-based, counting opened clusters) at which the
+    /// query bound first armed - the boundary where the heap filled and
+    /// margins existed to certify against. `None` = never armed (the
+    /// heap never held k results), serialized as JSON null - the
+    /// harness's armed-share column depends on the null contract.
+    /// Per-segment; does not sum.
+    pub bound_armed_at_probe: Option<u32>,
     /// How the probe loop terminated. Per-segment; does not sum.
     pub termination: ProbeTermination,
     /// Work units this segment's probe loop charged against its resolved
@@ -598,6 +610,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut pruned_seen = 0usize;
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
+        let mut bounds_skips = 0u32;
         let mut termination = ProbeTermination::Exhausted;
         // P2: the query bound, maintained at cluster boundaries. The
         // bound-space conversion runs on kth improvement only, inside the
@@ -674,6 +687,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 // and free skips break the work identity (validated to
                 // +-0.03% in benchmarks). No row work is spent.
                 work_spent += pricing.open;
+                bounds_skips += 1;
                 continue;
             }
 
@@ -735,6 +749,8 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.postings_row += postings_row;
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += candidates;
+        stats.bounds_skips += bounds_skips;
+        stats.bound_armed_at_probe = bound_tracker.armed_at_probe();
         stats.termination = termination;
         stats.work_charged += work_spent.to_f32();
 
@@ -2545,6 +2561,8 @@ mod tests {
                     termination_reason: SearchTerminationReason::SearchConverged,
                 }),
             },
+            bounds_skips: 2,
+            bound_armed_at_probe: Some(1),
             termination: ProbeTermination::Ceiling,
             work_charged: 1.75,
         };
@@ -2572,6 +2590,8 @@ mod tests {
                         "termination_reason": "SearchConverged"
                     }
                 },
+                "bounds_skips": 2,
+                "bound_armed_at_probe": 1,
                 "termination": "Ceiling",
                 "work_charged": 1.75
             })
@@ -3133,7 +3153,7 @@ mod tests {
         /// ONE commit, then a single-segment merge — a multi-segment
         /// merge's source order varies across processes and permutes
         /// target doc ids, and these tests assert doc-id-level results.
-        fn single_segment_fixture(
+        pub(super) fn single_segment_fixture(
             metric: Metric,
             centroids: &[[f32; 2]],
             docs: &[[f32; 2]],
@@ -3496,6 +3516,96 @@ mod tests {
                 Some(2),
                 "later improvements never move the armed index"
             );
+        }
+    }
+
+    // ==================================================================
+    // P6: probe-stats telemetry
+    // ==================================================================
+
+    mod bounds_stats_tests {
+        use super::bounds_gate_tests::single_segment_fixture;
+        use super::*;
+
+        /// The six-centroid separated fixture: probing the home cluster
+        /// arms the bound and the other five clusters are provably
+        /// useless.
+        fn separated_fixture(metric: Metric) -> crate::Result<(Index, Field)> {
+            let centroids: Vec<[f32; 2]> = vec![
+                [1.0, 1.0],
+                [11.0, 1.0],
+                [21.0, 1.0],
+                [1.0, 11.0],
+                [11.0, 11.0],
+                [21.0, 11.0],
+            ];
+            let docs: Vec<[f32; 2]> = (0..36)
+                .map(|i| {
+                    let c = centroids[i / 6];
+                    let off = (i % 6) as f32 * 0.01;
+                    [c[0] + off, c[1] + off]
+                })
+                .collect();
+            single_segment_fixture(metric, &centroids, &docs, 1)
+        }
+
+        /// `bounds_skips` counts exactly the clusters the gate passed
+        /// over: all ranked clusters minus the probed ones on an
+        /// exhausted stream.
+        #[test]
+        fn skip_count_matches() -> crate::Result<()> {
+            let (index, field) = separated_fixture(Metric::L2)?;
+            let (_, stats) = run_top_n(&index, field, vec![0.2, 0.3], 5, exhaustive_params(6))?;
+            assert_eq!(stats.termination, ProbeTermination::Exhausted);
+            assert_eq!(stats.clusters_probed(), 1, "{stats:?}");
+            assert_eq!(
+                stats.bounds_skips, 5,
+                "every non-home cluster is a counted skip: {stats:?}"
+            );
+            Ok(())
+        }
+
+        /// Unarmed (k > N): zero skips, and the armed index serializes
+        /// as JSON null, not 0 - the harness's armed-share column
+        /// depends on the null contract.
+        #[test]
+        fn armed_null_when_unarmed() -> crate::Result<()> {
+            let (index, field) = separated_fixture(Metric::L2)?;
+            let (_, stats) = run_top_n(&index, field, vec![0.2, 0.3], 100, exhaustive_params(6))?;
+            assert_eq!(stats.bound_armed_at_probe, None);
+            assert_eq!(stats.bounds_skips, 0);
+            let value = serde_json::to_value(&stats).expect("ProbeStats serializes");
+            assert_eq!(
+                value["bound_armed_at_probe"],
+                serde_json::Value::Null,
+                "unarmed must serialize as null, not 0"
+            );
+            Ok(())
+        }
+
+        /// The armed index is the tracker's recorded value: the heap
+        /// fills inside the first probed cluster at k <= its size
+        /// (index 0), and spans into the second at larger k (index 1).
+        #[test]
+        fn armed_index_value() -> crate::Result<()> {
+            let (index, field) = separated_fixture(Metric::L2)?;
+            let (_, stats) = run_top_n(&index, field, vec![0.2, 0.3], 5, exhaustive_params(6))?;
+            assert_eq!(
+                stats.bound_armed_at_probe,
+                Some(0),
+                "k = 5 fills inside the 6-doc home cluster: {stats:?}"
+            );
+            let (_, stats) = run_top_n(&index, field, vec![0.2, 0.3], 10, exhaustive_params(6))?;
+            assert_eq!(
+                stats.bound_armed_at_probe,
+                Some(1),
+                "k = 10 needs the second probed cluster: {stats:?}"
+            );
+            assert!(
+                stats.bounds_skips > 0,
+                "armed late still skips the far tail"
+            );
+            Ok(())
         }
     }
 }
