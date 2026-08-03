@@ -217,6 +217,42 @@ pub fn residual_norm(row_bytes: &[u8], c: &[f32]) -> f32 {
     acc.sqrt() as f32
 }
 
+// ======================================================================
+// P2: heap peek
+// ======================================================================
+
+/// Collector-side peek: the kth ordering key iff the heap holds k results.
+///
+/// The key is in NATIVE heap space — the similarity the heap actually
+/// ranks by (`-d^2` for L2, cosine for cosine, the raw score for dot).
+/// Conversion into bound space is the query bound's job, downstream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HeapPeek {
+    /// Fewer than k results collected; no kth key exists.
+    Filling,
+    /// Exactly k results held; `kth_key` (`f32`) is the exact kth-best
+    /// heap key.
+    Full { kth_key: f32 },
+}
+
+impl HeapPeek {
+    /// Wraps a [`TopNComputer::kth_best`] snapshot of the similarity
+    /// component.
+    ///
+    /// * `kth` (`Option<f32>`) — the exact kth-best heap key; `None` while the heap holds fewer
+    ///   than k results.
+    ///
+    /// Returns (`HeapPeek`): `Full` iff the heap holds k results.
+    ///
+    /// [`TopNComputer::kth_best`]: crate::collector::TopNComputer::kth_best
+    pub fn from_kth(kth: Option<f32>) -> HeapPeek {
+        match kth {
+            Some(kth_key) => HeapPeek::Full { kth_key },
+            None => HeapPeek::Filling,
+        }
+    }
+}
+
 #[cfg(test)]
 mod bounds_storage_tests {
     use super::*;
@@ -288,5 +324,107 @@ mod bounds_storage_tests {
         assert_eq!(json, "\"native\"");
         let back: BoundsScope = serde_json::from_str(&json).unwrap();
         assert_eq!(back, BoundsScope::Native);
+    }
+}
+
+#[cfg(test)]
+mod bounds_peek_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::collector::sort_key::NaturalComparator;
+    use crate::collector::TopNComputer;
+    use crate::schema::Metric;
+    use crate::vector::PreparedQuery;
+
+    /// The vector heap: f32 similarity keys, "higher is better",
+    /// out-of-order pushes — the `scan_clusters` shape.
+    fn heap(k: usize) -> TopNComputer<f32, u32, NaturalComparator> {
+        TopNComputer::new_with_comparator(k, NaturalComparator)
+    }
+
+    /// Little-endian row bytes for `values`, as the row store holds them.
+    fn row(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// k-1 results peek `Filling`; the kth flips to `Full` with the exact
+    /// kth key; `Full` never appears earlier.
+    #[test]
+    fn filling_until_k() {
+        let k = 3;
+        let mut topn = heap(k);
+        for (doc, score) in [(0u32, 0.9f32), (1, 0.5)] {
+            topn.push_unordered(score, doc);
+            assert_eq!(
+                HeapPeek::from_kth(topn.kth_best()),
+                HeapPeek::Filling,
+                "no kth key below k results"
+            );
+        }
+        topn.push_unordered(0.7, 2);
+        assert_eq!(
+            HeapPeek::from_kth(topn.kth_best()),
+            HeapPeek::Full { kth_key: 0.5 },
+            "exactly k results arm the peek with the kth key"
+        );
+    }
+
+    /// The kth key is in NATIVE heap space per metric: `-d^2` for L2,
+    /// cosine similarity for cosine, the raw dot score for dot — the
+    /// values `PreparedQuery::score_doc_bytes` produces over known
+    /// vectors.
+    #[test]
+    fn kth_key_per_metric() {
+        let query = vec![1.0f32, 0.0];
+        // Stored rows: for cosine these must be unit-norm (the write path
+        // normalizes at ingest); L2/Dot store raw values.
+        let docs: [(&[f32], u32); 3] = [
+            (&[1.0, 0.0], 0),  // d^2 = 0,   cos = 1.0,       dot = 1.0
+            (&[0.0, 1.0], 1),  // d^2 = 2,   cos = 0.0,       dot = 0.0
+            (&[-1.0, 0.0], 2), // d^2 = 4,   cos = -1.0,      dot = -1.0
+        ];
+        let expected_kth = [
+            (Metric::L2, -2.0f32), // 2nd best of {0, -2, -4}
+            (Metric::Cosine, 0.0), // 2nd best of {1, 0, -1}
+            (Metric::Dot, 0.0),    // 2nd best of {1, 0, -1}
+        ];
+        for (metric, expected) in expected_kth {
+            let prepared = PreparedQuery::<f32>::new(metric, Arc::new(query.clone()));
+            let mut topn = heap(2);
+            for (values, doc) in docs {
+                topn.push_unordered(prepared.score_doc_bytes(&row(values)), doc);
+            }
+            let peek = HeapPeek::from_kth(topn.kth_best());
+            assert_eq!(
+                peek,
+                HeapPeek::Full { kth_key: expected },
+                "{metric:?}: kth key must be the native-space similarity"
+            );
+        }
+    }
+
+    /// A better result tightens the kth key; a worse one leaves it alone.
+    #[test]
+    fn improvement_updates_key() {
+        let mut topn = heap(2);
+        topn.push_unordered(0.2, 0);
+        topn.push_unordered(0.4, 1);
+        assert_eq!(
+            HeapPeek::from_kth(topn.kth_best()),
+            HeapPeek::Full { kth_key: 0.2 }
+        );
+        topn.push_unordered(0.9, 2);
+        assert_eq!(
+            HeapPeek::from_kth(topn.kth_best()),
+            HeapPeek::Full { kth_key: 0.4 },
+            "an improving push must raise the kth key"
+        );
+        topn.push_unordered(0.1, 3);
+        assert_eq!(
+            HeapPeek::from_kth(topn.kth_best()),
+            HeapPeek::Full { kth_key: 0.4 },
+            "a non-improving push must not move the kth key"
+        );
     }
 }
