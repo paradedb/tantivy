@@ -744,8 +744,7 @@ mod tests {
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors,
-        IvfVectors,
+        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
         NeighborhoodGraphSearchMetrics, SearchTerminationReason, VectorClusterStats, VectorDType,
         VectorInfo, VectorOptions, VectorStorageFormat,
     };

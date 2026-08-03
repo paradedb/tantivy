@@ -39,9 +39,9 @@ pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, Vector
 pub use ivf::{
     Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
     IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch,
-    IvfVectors, NeighborhoodGraphConfig,
-    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
-    SearchIterator, SearchTerminationReason, Workspace,
+    IvfVectors, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
+    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
+    Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;

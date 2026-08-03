@@ -10,8 +10,7 @@ use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, S
 use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-    Metric, VectorDType,
-    VectorOptions,
+    Metric, VectorDType, VectorOptions,
 };
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
