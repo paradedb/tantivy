@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 use common::{HasLen, OwnedBytes};
 
 use super::flat::IdMap;
-use super::header::read_header;
+use super::header::{centroid_slot, read_header, vec_slot, VectorFileVersion};
 use super::ivf::{IvfIndex, CENTROIDS_EXT};
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
@@ -105,8 +105,8 @@ impl VectorIndexReader {
         let (_version, body) = read_header(&vec_file)?;
         let vec_composite = CompositeFile::open(&body)?;
         let (Some(id_map_slice), Some(rows_slice)) = (
-            vec_composite.open_read_with_idx(field, 0),
-            vec_composite.open_read_with_idx(field, 1),
+            vec_composite.open_read_with_idx(field, vec_slot::ID_MAP),
+            vec_composite.open_read_with_idx(field, vec_slot::ROWS),
         ) else {
             return Ok(Self::empty(options));
         };
@@ -115,16 +115,38 @@ impl VectorIndexReader {
         let centroid_slots =
             match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
                 Ok(file) => {
-                    let (_version, body) = read_header(&file)?;
+                    let (version, body) = read_header(&file)?;
+                    // P1: the bounds gate certifies skips against slot [3],
+                    // and there is no bounds-less execution path to fall
+                    // back to — a pre-V2 `.centroids` is refused with the
+                    // one remedy there is.
+                    if version < VectorFileVersion::V2 {
+                        return Err(TantivyError::InvalidArgument(format!(
+                            "index predates V2 centroid bounds; REINDEX {:?}",
+                            entry.name()
+                        )));
+                    }
                     let composite = CompositeFile::open(&body)?;
                     match (
-                        composite.open_read_with_idx(field, 0),
-                        composite.open_read_with_idx(field, 1),
+                        composite.open_read_with_idx(field, centroid_slot::CENTROIDS),
+                        composite.open_read_with_idx(field, centroid_slot::OFFSETS),
+                        composite.open_read_with_idx(field, centroid_slot::BOUNDS),
                     ) {
-                        // Slot [2] (the routing graph) is optional: the write
-                        // side skips it for degenerate centroid counts.
-                        (Some(centroids), Some(offsets)) => {
-                            Some((centroids, offsets, composite.open_read_with_idx(field, 2)))
+                        // Slot [2] (the routing graph) stays optional: the
+                        // write side skips it for degenerate centroid
+                        // counts. Slot [3] (bounds) does not — a V2 file
+                        // without it is corrupt, not old.
+                        (Some(centroids), Some(offsets), Some(bounds)) => Some((
+                            centroids,
+                            offsets,
+                            composite.open_read_with_idx(field, centroid_slot::GRAPH),
+                            bounds,
+                        )),
+                        (Some(_), Some(_), None) => {
+                            return Err(TantivyError::InternalError(format!(
+                                "vector field {:?} has a V2 `.centroids` file with no bounds slot",
+                                entry.name()
+                            )));
                         }
                         _ => None,
                     }
@@ -137,8 +159,8 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((centroids, offsets, graph))) => {
-                Some(IvfIndex::open(&options, centroids, offsets, graph)?)
+            (IdMap::Explicit(_), Some((centroids, offsets, graph, bounds))) => {
+                Some(IvfIndex::open(&options, centroids, offsets, graph, bounds)?)
             }
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
