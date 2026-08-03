@@ -358,6 +358,96 @@ impl QueryBoundTracker {
     }
 }
 
+// ======================================================================
+// P4: collision
+// ======================================================================
+// Ball column: scalar-only. `separation` / `q_dot_c` is the routing key of
+// the ranked stream. Precondition (debug_assert at the call site): the
+// stream key is the EXACT centroid distance / dot -- an approximate key
+// makes a skip unsound.
+
+/// Signed probe margin for a ball cluster bound vs the armed ball region.
+/// Sphere-sphere: L2 (`separation = ||q - c||`) and cosine
+/// (`separation = chord(q_hat, c_hat)`).
+///
+/// * `t` (`f32`) — armed kth threshold in bound space (the query's extent).
+/// * `r` (`f32`) — cluster bound radius; `f32::INFINITY` = SATURATED (always probes).
+/// * `separation` (`f32`) — exact centroid distance from the routing stream key.
+///
+/// Returns (`f32`): the signed margin — `>= 0` probe, `< 0` skip-safe
+/// (strict). Magnitude = overlap quality; never an ordering key.
+#[inline]
+pub fn margin_ball_ball(t: f32, r: f32, separation: f32) -> f32 {
+    (t + r) - separation
+}
+
+/// Signed probe margin for a ball cluster bound vs the armed halfspace.
+/// Sphere-halfspace via Cauchy-Schwarz on the residual: the cluster's
+/// best possible score vs the kth score. Dot only.
+///
+/// * `q_dot_c` (`f32`) — exact `q . c` from the routing stream key.
+/// * `q_norm` (`f32`) — `||q||`, computed once per query.
+/// * `r` (`f32`) — cluster bound radius; `f32::INFINITY` = SATURATED (always probes).
+/// * `s_k` (`f32`) — armed kth score (the halfspace offset).
+///
+/// Returns (`f32`): the signed margin — `>= 0` probe, `< 0` skip-safe
+/// (strict). Magnitude = overlap quality; never an ordering key.
+#[inline]
+pub fn margin_ball_halfspace(q_dot_c: f32, q_norm: f32, r: f32, s_k: f32) -> f32 {
+    (q_dot_c + q_norm * r) - s_k
+}
+
+// ---- future box column (formulas fixed now, code lands with the kind) --
+//
+// BallRegion x Aabb: t - dist(q, box(c, h)); the box distance needs the
+// residual q - c:
+//   d2 = sum_i max(|q_i - c_i| - h_i, 0)^2;  margin = t - sqrt(d2)
+//
+// Halfspace x Aabb: support of the box in direction q:
+//   margin = (q . c + sum_i |q_i| * h_i) - s_k
+//
+// Both walk the dims per check: the box column does not get the
+// routing-key-free scalar path.
+
+// ======================================================================
+// P5: gate verdict
+// ======================================================================
+
+/// The gate's decision for one ranked cluster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Open and scan the cluster.
+    Probe,
+    /// Pass the cluster over — its bound proves it cannot improve the
+    /// armed result.
+    Skip,
+}
+
+/// The entire consumption surface of the bound.
+///
+/// * `qb` (`QueryBound`) — the current query bound; the bound is consumed only through `Armed` (the
+///   heap holds k results) — enforced by the enum, not a runtime check.
+/// * `margin` (`impl FnOnce() -> f32`) — lazily computes the cluster's signed margin; never called
+///   while `Filling`.
+///
+/// Returns (`Verdict`): skip only on STRICT negative — `margin == 0`
+/// (exact touch) probes, or a boundary tie breaks exactness. A NaN margin
+/// compares false and probes: fail-open is arithmetic. Margin magnitude
+/// is the overlap-quality number and is NEVER an ordering key.
+#[inline]
+pub fn bounds_verdict(qb: QueryBound, margin: impl FnOnce() -> f32) -> Verdict {
+    match qb {
+        QueryBound::Filling => Verdict::Probe,
+        QueryBound::Armed { .. } => {
+            if margin() < 0.0 {
+                Verdict::Skip
+            } else {
+                Verdict::Probe
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod bounds_storage_tests {
     use super::*;
@@ -531,5 +621,76 @@ mod bounds_peek_tests {
             HeapPeek::Full { kth_key: 0.4 },
             "a non-improving push must not move the kth key"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounds_margin_tests {
+    use super::*;
+
+    /// Sphere-sphere: disjoint is negative, exact touch is zero,
+    /// overlapping is positive.
+    #[test]
+    fn sphere_sphere_cases() {
+        // t = 1, r = 2: extents cover 3. Separation 5 -> disjoint by 2.
+        assert_eq!(margin_ball_ball(1.0, 2.0, 5.0), -2.0);
+        // Separation exactly 3 -> touching.
+        assert_eq!(margin_ball_ball(1.0, 2.0, 3.0), 0.0);
+        // Separation 2 -> overlap by 1.
+        assert_eq!(margin_ball_ball(1.0, 2.0, 2.0), 1.0);
+    }
+
+    /// Sphere-halfspace: the same trio through the dot margin — best
+    /// possible score below / at / above the kth score.
+    #[test]
+    fn halfspace_cases() {
+        // q.c = 1, ||q|| = 2, r = 0.5: best possible 2. s_k = 3 -> short
+        // by 1.
+        assert_eq!(margin_ball_halfspace(1.0, 2.0, 0.5, 3.0), -1.0);
+        // s_k = 2 -> exact touch.
+        assert_eq!(margin_ball_halfspace(1.0, 2.0, 0.5, 2.0), 0.0);
+        // s_k = 1.5 -> the cluster can beat the kth by 0.5.
+        assert_eq!(margin_ball_halfspace(1.0, 2.0, 0.5, 1.5), 0.5);
+    }
+
+    /// SATURATED (`r = +inf`) forces a `+inf` margin in both collision
+    /// functions, for any finite inputs — fail-open is arithmetic.
+    #[test]
+    fn saturated_probes() {
+        assert_eq!(margin_ball_ball(0.0, f32::INFINITY, 1.0e30), f32::INFINITY);
+        assert_eq!(
+            margin_ball_halfspace(-1.0e30, 1.0, f32::INFINITY, 1.0e30),
+            f32::INFINITY
+        );
+        assert_eq!(
+            bounds_verdict(QueryBound::Armed { t: 0.0 }, || margin_ball_ball(
+                0.0,
+                f32::INFINITY,
+                1.0e30
+            )),
+            Verdict::Probe
+        );
+    }
+
+    /// The verdict skips on STRICT negative only: an exact-touch margin
+    /// of zero probes, and NaN (degenerate arithmetic) probes.
+    #[test]
+    fn boundary_tie_probes() {
+        let armed = QueryBound::Armed { t: 1.0 };
+        assert_eq!(bounds_verdict(armed, || 0.0), Verdict::Probe);
+        assert_eq!(bounds_verdict(armed, || -0.0), Verdict::Probe);
+        assert_eq!(bounds_verdict(armed, || f32::NAN), Verdict::Probe);
+        assert_eq!(bounds_verdict(armed, || -1.0e-30), Verdict::Skip);
+        assert_eq!(bounds_verdict(armed, || 1.0e-30), Verdict::Probe);
+    }
+
+    /// While `Filling`, the margin closure is never even called — the
+    /// bound is consumed only through `Armed`.
+    #[test]
+    fn filling_never_consumes_margin() {
+        let verdict = bounds_verdict(QueryBound::Filling, || {
+            panic!("margin must not be computed while filling")
+        });
+        assert_eq!(verdict, Verdict::Probe);
     }
 }

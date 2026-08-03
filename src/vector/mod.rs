@@ -32,8 +32,8 @@ pub(crate) const VEC_EXT: &str = "vec";
 
 pub use backend::{ProbeStats, ProbeTermination, VectorBackend};
 pub use bounds::{
-    residual_norm, to_bound_space, BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek,
-    QueryBound,
+    bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
+    BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
