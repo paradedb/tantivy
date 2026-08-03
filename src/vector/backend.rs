@@ -15,9 +15,12 @@ use std::sync::Arc;
 
 use common::BitSet;
 
+use super::bounds::{HeapPeek, QueryBound, QueryBoundTracker};
 use super::distance::Similarity;
 use super::index_reader::VectorIndexReader;
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
+use super::ivf::{
+    AdaptiveProbeParams, Candidate, GateAnchor, IvfIndex, IvfSearchMetrics, Workspace,
+};
 use super::prepared::PreparedQuery;
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
@@ -610,6 +613,11 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut termination = ProbeTermination::Exhausted;
+        // P2: the query bound, maintained at cluster boundaries. The
+        // bound-space conversion runs on kth improvement only, inside the
+        // tracker.
+        let metric = self.query.metric();
+        let mut bound_tracker = QueryBoundTracker::new();
         // Replication can place the same doc in several probed clusters; dedup
         // by doc id so a vector is scored at most once.
         let mut seen = BitSet::with_max_value(max_doc);
@@ -628,7 +636,17 @@ impl<T: VectorElement> VectorBackend<T> {
                 termination = ProbeTermination::Ceiling;
                 break;
             }
-            if sim < threshold && candidates >= min_candidates {
+            // P2: anchor switch. `BestCentroid` gates on the routing-time
+            // threshold, unchanged; `TopK` re-anchors the epsilon band to
+            // the armed kth similarity — and falls back to `BestCentroid`
+            // while the heap is filling (no kth result exists yet).
+            let gate_threshold = match (self.adaptive.anchor, bound_tracker.raw_kth()) {
+                (GateAnchor::TopK, Some(kth)) => {
+                    Similarity::new(adaptive_threshold(metric, kth, self.adaptive.epsilon))
+                }
+                _ => threshold,
+            };
+            if sim < gate_threshold && candidates >= min_candidates {
                 termination = ProbeTermination::Gate;
                 break;
             }
@@ -669,7 +687,21 @@ impl<T: VectorElement> VectorBackend<T> {
                 }
             }
             candidates += survivors.len();
+
+            // P2: fold the exact kth into the bound at the cluster
+            // boundary. `kth_best` is O(buffer) and force-truncates —
+            // results and every counter above are unaffected (truncation
+            // only drops already-lost entries and tightens the push
+            // threshold, which prunes pushes, not scoring).
+            let probe_idx = (postings_row + postings_skipped - 1) as u32;
+            let peek = HeapPeek::from_kth(topn.kth_best().map(|(score, _tie)| score));
+            bound_tracker.observe(metric, peek, probe_idx);
         }
+        // The armed index exists exactly when the bound armed.
+        debug_assert!(
+            bound_tracker.armed_at_probe().is_some()
+                == matches!(bound_tracker.bound(), QueryBound::Armed { .. })
+        );
 
         stats.vectors_visited += visited;
         stats.pruned_filter += pruned_filter;
@@ -3410,5 +3442,353 @@ mod tests {
     /// The shared fixture's first centroid (top-left of the 3×3 grid).
     fn grid2d_first_centroid() -> [f32; 2] {
         [0.0, 0.0]
+    }
+
+    // ==================================================================
+    // P2: query bound + anchor switch
+    // ==================================================================
+
+    mod bounds_anchor_tests {
+        use super::*;
+        use crate::vector::bounds::{HeapPeek, QueryBound, QueryBoundTracker};
+        use crate::vector::ivf::GateAnchor;
+
+        /// One golden row: the fixture scan's full probe-decision
+        /// fingerprint, captured on this fixture at the heap-peek commit,
+        /// BEFORE the query bound existed. `default_anchor_identical`
+        /// holds the default anchor to it bit-for-bit.
+        struct Golden {
+            metric: Metric,
+            tight: bool,
+            hits: &'static [(u32, u32)],
+            scored: usize,
+            visited: usize,
+            postings_row: usize,
+            postings_skipped: usize,
+            min_candidates: usize,
+            termination: ProbeTermination,
+            work_bits: u32,
+            routed: usize,
+        }
+
+        /// Captured with the exact scan `default_anchor_identical` runs:
+        /// the 36-doc inline fixture below (6 centroids, commit-order
+        /// merge, replicas = 1 - deterministic doc ids), query
+        /// [0.2, 0.3], k = 5, params default / tight.
+        const GOLDENS: &[Golden] = &[
+            Golden {
+                metric: Metric::L2,
+                tight: false,
+                hits: &[
+                    (3213927383, 0),
+                    (3214180718, 1),
+                    (3214437410, 2),
+                    (3214697456, 3),
+                    (3214960858, 4),
+                ],
+                scored: 36,
+                visited: 36,
+                postings_row: 6,
+                postings_skipped: 0,
+                min_candidates: 37,
+                termination: ProbeTermination::Exhausted,
+                work_bits: 1086324736,
+                routed: 6,
+            },
+            Golden {
+                metric: Metric::L2,
+                tight: true,
+                hits: &[
+                    (3213927383, 0),
+                    (3214180718, 1),
+                    (3214437410, 2),
+                    (3214697456, 3),
+                    (3214960858, 4),
+                ],
+                scored: 12,
+                visited: 12,
+                postings_row: 2,
+                postings_skipped: 0,
+                min_candidates: 7,
+                termination: ProbeTermination::Gate,
+                work_bits: 1073741824,
+                routed: 6,
+            },
+            Golden {
+                metric: Metric::Cosine,
+                tight: false,
+                hits: &[
+                    (1065027415, 0),
+                    (1065027415, 1),
+                    (1065027415, 2),
+                    (1065027415, 3),
+                    (1065027415, 4),
+                ],
+                scored: 36,
+                visited: 36,
+                postings_row: 1,
+                postings_skipped: 5,
+                min_candidates: 37,
+                termination: ProbeTermination::Exhausted,
+                work_bits: 1086324736,
+                routed: 6,
+            },
+            Golden {
+                metric: Metric::Cosine,
+                tight: true,
+                hits: &[
+                    (1065027415, 0),
+                    (1065027415, 1),
+                    (1065027415, 2),
+                    (1065027415, 3),
+                    (1065027415, 4),
+                ],
+                scored: 36,
+                visited: 36,
+                postings_row: 1,
+                postings_skipped: 0,
+                min_candidates: 7,
+                termination: ProbeTermination::Ceiling,
+                work_bits: 1084073866,
+                routed: 6,
+            },
+            Golden {
+                metric: Metric::Dot,
+                tight: false,
+                hits: &[
+                    (1089522894, 35),
+                    (1089512408, 34),
+                    (1089501922, 33),
+                    (1089491436, 32),
+                    (1089480950, 31),
+                ],
+                scored: 36,
+                visited: 36,
+                postings_row: 6,
+                postings_skipped: 0,
+                min_candidates: 37,
+                termination: ProbeTermination::Exhausted,
+                work_bits: 1086324736,
+                routed: 6,
+            },
+            Golden {
+                metric: Metric::Dot,
+                tight: true,
+                hits: &[
+                    (1089522894, 35),
+                    (1089512408, 34),
+                    (1089501922, 33),
+                    (1089491436, 32),
+                    (1089480950, 31),
+                ],
+                scored: 12,
+                visited: 12,
+                postings_row: 2,
+                postings_skipped: 0,
+                min_candidates: 7,
+                termination: ProbeTermination::Gate,
+                work_bits: 1073741824,
+                routed: 6,
+            },
+        ];
+
+        fn golden_params(tight: bool) -> AdaptiveProbeParams {
+            if tight {
+                AdaptiveProbeParams {
+                    epsilon: 0.05,
+                    overfetch_margin: 2,
+                    min_probe_clusters: 2,
+                    max_probe_fraction: 0.5,
+                    ..Default::default()
+                }
+            } else {
+                AdaptiveProbeParams::default()
+            }
+        }
+
+        /// THE test of this commit: with the default anchor, every probe
+        /// decision — hits, prune breakdown, termination, work charge —
+        /// is bit-identical to the pre-query-bound scan. The bound is
+        /// maintained but consumes nothing at `BestCentroid`.
+        /// The golden fixture: 6 well-separated centroids, 6 docs each
+        /// at deterministic offsets. ONE commit, then a single-segment
+        /// merge to IVF - a multi-segment merge's source order varies
+        /// across processes and permutes target doc ids, so the golden
+        /// fingerprint requires the one-segment shape (target ids equal
+        /// insertion order).
+        fn golden_fixture(metric: Metric) -> crate::Result<(Index, Field)> {
+            let centroids: Vec<[f32; 2]> = vec![
+                [1.0, 1.0],
+                [11.0, 1.0],
+                [21.0, 1.0],
+                [1.0, 11.0],
+                [11.0, 11.0],
+                [21.0, 11.0],
+            ];
+            let mut sb = Schema::builder();
+            let embed_field = sb.add_vector_field(
+                "embedding",
+                VectorOptions::new(2, metric).with_dtype(VectorDType::F32),
+            );
+            let label_field = sb.add_text_field("label", STRING | STORED);
+            let schema = sb.build();
+            let settings = IndexSettings {
+                vector_clustering_threshold: 1,
+                ..IndexSettings::default()
+            };
+            let index = Index::builder()
+                .schema(schema)
+                .settings(settings)
+                .ivf_clusterer(Arc::new(InlineClusterer {
+                    centroids: centroids.clone(),
+                    replicas: 1,
+                }))
+                .create_in_ram()?;
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for i in 0..36usize {
+                let c = centroids[i / 6];
+                let off = (i % 6) as f32 * 0.01;
+                let mut doc = TantivyDocument::new();
+                doc.add_text(label_field, format!("d{i}"));
+                doc.add_vector(embed_field, [c[0] + off, c[1] + off].as_slice());
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+            let segment_ids = index.searchable_segment_ids()?;
+            assert_eq!(segment_ids.len(), 1, "single flat segment");
+            writer.merge(&segment_ids).wait()?;
+            writer.wait_merging_threads()?;
+            Ok((index, embed_field))
+        }
+
+        #[test]
+        fn default_anchor_identical() -> crate::Result<()> {
+            for golden in GOLDENS {
+                let (index, field) = golden_fixture(golden.metric)?;
+                let params = golden_params(golden.tight);
+                assert_eq!(params.anchor, GateAnchor::BestCentroid, "default anchor");
+                let (hits, stats) = run_top_n(&index, field, vec![0.2, 0.3], 5, params)?;
+                let hit_bits: Vec<(u32, u32)> = hits
+                    .iter()
+                    .map(|(score, addr)| (score.to_bits(), addr.doc_id))
+                    .collect();
+                let label = format!("{:?} tight={}", golden.metric, golden.tight);
+                assert_eq!(hit_bits, golden.hits, "{label}: hits");
+                assert_eq!(stats.candidates_scored, golden.scored, "{label}: scored");
+                assert_eq!(stats.vectors_visited, golden.visited, "{label}: visited");
+                assert_eq!(stats.pruned_filter, 0, "{label}: pruned_filter");
+                assert_eq!(stats.pruned_dead, 0, "{label}: pruned_dead");
+                assert_eq!(stats.pruned_seen, 0, "{label}: pruned_seen");
+                assert_eq!(stats.postings_row, golden.postings_row, "{label}: rows");
+                assert_eq!(
+                    stats.postings_skipped, golden.postings_skipped,
+                    "{label}: skipped"
+                );
+                assert_eq!(
+                    stats.min_candidates, golden.min_candidates,
+                    "{label}: min_candidates"
+                );
+                assert_eq!(
+                    stats.termination, golden.termination,
+                    "{label}: termination"
+                );
+                assert_eq!(
+                    stats.work_charged.to_bits(),
+                    golden.work_bits,
+                    "{label}: work_charged"
+                );
+                assert_eq!(
+                    stats.routing.visited_count, golden.routed,
+                    "{label}: routed"
+                );
+            }
+            Ok(())
+        }
+
+        /// The experiment arm stays functional: on the well-separated
+        /// fixture the re-anchored band keeps the same top-K (the true
+        /// neighbors sit in the first-probed clusters), while arming can
+        /// only tighten the stream's tail.
+        #[test]
+        fn topk_anchor_returns_same_hits_here() -> crate::Result<()> {
+            for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+                let (index, field) = golden_fixture(metric)?;
+                let query = vec![0.2, 0.3];
+                let (default_hits, _) =
+                    run_top_n(&index, field, query.clone(), 5, golden_params(true))?;
+                let topk_params = AdaptiveProbeParams {
+                    anchor: GateAnchor::TopK,
+                    ..golden_params(true)
+                };
+                let (topk_hits, _) = run_top_n(&index, field, query, 5, topk_params)?;
+                assert_eq!(topk_hits, default_hits, "{metric:?}: TopK arm hits");
+            }
+            Ok(())
+        }
+
+        /// `t` tracks kth improvements in bound space per metric, and an
+        /// unchanged kth leaves the bound untouched. The bound-space
+        /// conversion runs inside the improvement branch only, so the
+        /// cosine sqrt is paid per improvement — asserted here by value
+        /// (the cached and recomputed paths are indistinguishable by
+        /// construction when the key is unchanged).
+        #[test]
+        fn t_maintenance_per_metric() {
+            // (metric, first kth key, expected t, improved key, expected t)
+            let cases = [
+                // L2 keys -d^2: d = 2, then d = 1.
+                (Metric::L2, -4.0f32, 2.0f32, -1.0f32, 1.0f32),
+                // Cosine keys cos: chord sqrt(2*(1-cos)).
+                (Metric::Cosine, 0.5, 1.0, 0.875, 0.5),
+                // Dot keys the score; identity.
+                (Metric::Dot, 3.0, 3.0, 4.5, 4.5),
+            ];
+            for (metric, first, t_first, improved, t_improved) in cases {
+                let mut tracker = QueryBoundTracker::new();
+                assert_eq!(tracker.bound(), QueryBound::Filling);
+                tracker.observe(metric, HeapPeek::Filling, 0);
+                assert_eq!(
+                    tracker.bound(),
+                    QueryBound::Filling,
+                    "{metric:?}: no arm on Filling"
+                );
+
+                tracker.observe(metric, HeapPeek::Full { kth_key: first }, 1);
+                assert_eq!(
+                    tracker.bound(),
+                    QueryBound::Armed { t: t_first },
+                    "{metric:?}: t from first kth"
+                );
+                // Unchanged kth: bound bit-identical.
+                tracker.observe(metric, HeapPeek::Full { kth_key: first }, 2);
+                assert_eq!(tracker.bound(), QueryBound::Armed { t: t_first });
+
+                tracker.observe(metric, HeapPeek::Full { kth_key: improved }, 3);
+                assert_eq!(
+                    tracker.bound(),
+                    QueryBound::Armed { t: t_improved },
+                    "{metric:?}: t tracks the improvement"
+                );
+            }
+        }
+
+        /// The armed index is the first probe at which the heap held k
+        /// results, and never moves after.
+        #[test]
+        fn armed_index_recorded() {
+            let mut tracker = QueryBoundTracker::new();
+            tracker.observe(Metric::L2, HeapPeek::Filling, 0);
+            tracker.observe(Metric::L2, HeapPeek::Filling, 1);
+            assert_eq!(tracker.armed_at_probe(), None, "unarmed while filling");
+            tracker.observe(Metric::L2, HeapPeek::Full { kth_key: -1.0 }, 2);
+            assert_eq!(tracker.armed_at_probe(), Some(2), "arms at the first Full");
+            tracker.observe(Metric::L2, HeapPeek::Full { kth_key: -0.5 }, 3);
+            assert_eq!(
+                tracker.armed_at_probe(),
+                Some(2),
+                "later improvements never move the armed index"
+            );
+        }
     }
 }

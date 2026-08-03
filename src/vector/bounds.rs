@@ -26,6 +26,8 @@
 
 use std::io;
 
+use crate::schema::Metric;
+
 /// Segment-level bound shape, captured in the `.centroids` V2 bounds slot
 /// at build time — one kind for every cluster of a field's segment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -218,7 +220,7 @@ pub fn residual_norm(row_bytes: &[u8], c: &[f32]) -> f32 {
 }
 
 // ======================================================================
-// P2: heap peek
+// P2: query bound
 // ======================================================================
 
 /// Collector-side peek: the kth ordering key iff the heap holds k results.
@@ -250,6 +252,109 @@ impl HeapPeek {
             Some(kth_key) => HeapPeek::Full { kth_key },
             None => HeapPeek::Filling,
         }
+    }
+}
+
+/// The armed kth threshold in BOUND space. Lives next to the collector
+/// heap; the conversion runs only when the kth result improves, so the
+/// cosine sqrt is paid per heap update, not per cluster. `Filling` makes
+/// armed-only structural: no threshold exists before k results.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum QueryBound {
+    /// Fewer than k results; no threshold exists.
+    Filling,
+    /// The heap holds k results; `t` (`f32`) is the kth threshold in
+    /// bound space — the query region's extent.
+    Armed { t: f32 },
+}
+
+/// Heap key -> bound space, per metric.
+///
+/// * `metric` (`Metric`) — the field's metric, which fixes the heap's key space.
+/// * `heap_key` (`f32`) — the exact kth heap key ([`HeapPeek::Full`]): `-d^2` for L2, cosine for
+///   cosine, the raw score for dot.
+///
+/// Returns (`f32`): the threshold in bound space — the L2 distance
+/// `sqrt(-key)` for L2, the chord `sqrt(2 * (1 - key))` for cosine (unit
+/// vectors: `||q - x||^2 = 2 * (1 - cos)`), the key itself for dot (the
+/// halfspace offset `s_k`). Float-noise excursions past the metric's key
+/// range clamp to `0.0`; a NaN key propagates and fails open downstream.
+#[inline]
+pub fn to_bound_space(metric: Metric, heap_key: f32) -> f32 {
+    match metric {
+        Metric::L2 => (-heap_key).max(0.0).sqrt(),
+        Metric::Cosine => (2.0 * (1.0 - heap_key).max(0.0)).sqrt(),
+        Metric::Dot => heap_key,
+    }
+}
+
+/// Maintains the [`QueryBound`] beside the probe loop: converts heap
+/// peeks into bound space on kth improvement only, and records the probe
+/// index at which the bound first armed.
+pub(crate) struct QueryBoundTracker {
+    bound: QueryBound,
+    /// The raw kth heap key behind the current `t` — the improvement
+    /// detector that keeps [`to_bound_space`] off the per-cluster path.
+    raw_kth: Option<f32>,
+    armed_at_probe: Option<u32>,
+}
+
+impl QueryBoundTracker {
+    /// Starts unarmed.
+    ///
+    /// Returns (`QueryBoundTracker`): `Filling`, no kth key, no armed
+    /// index.
+    pub(crate) fn new() -> Self {
+        Self {
+            bound: QueryBound::Filling,
+            raw_kth: None,
+            armed_at_probe: None,
+        }
+    }
+
+    /// Folds one cluster-boundary peek into the bound.
+    ///
+    /// * `metric` (`Metric`) — the field's metric, for the key conversion.
+    /// * `peek` (`HeapPeek`) — the heap's exact kth snapshot after the cluster's rows were scored.
+    /// * `probe_idx` (`u32`) — 0-based index of the cluster just probed; captured once, at the
+    ///   arming transition.
+    pub(crate) fn observe(&mut self, metric: Metric, peek: HeapPeek, probe_idx: u32) {
+        let HeapPeek::Full { kth_key } = peek else {
+            return;
+        };
+        if self.raw_kth != Some(kth_key) {
+            self.raw_kth = Some(kth_key);
+            self.bound = QueryBound::Armed {
+                t: to_bound_space(metric, kth_key),
+            };
+        }
+        if self.armed_at_probe.is_none() {
+            self.armed_at_probe = Some(probe_idx);
+        }
+    }
+
+    /// The current bound.
+    ///
+    /// Returns (`QueryBound`): `Armed` iff a `Full` peek has been
+    /// observed.
+    pub(crate) fn bound(&self) -> QueryBound {
+        self.bound
+    }
+
+    /// The raw kth heap key behind the current bound.
+    ///
+    /// Returns (`Option<f32>`): the last observed kth key; `None` while
+    /// filling.
+    pub(crate) fn raw_kth(&self) -> Option<f32> {
+        self.raw_kth
+    }
+
+    /// The probe index at which the bound armed.
+    ///
+    /// Returns (`Option<u32>`): 0-based probed-cluster index of the first
+    /// `Full` peek; `None` if the heap never filled.
+    pub(crate) fn armed_at_probe(&self) -> Option<u32> {
+        self.armed_at_probe
     }
 }
 

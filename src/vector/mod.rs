@@ -31,7 +31,10 @@ pub(crate) mod tests;
 pub(crate) const VEC_EXT: &str = "vec";
 
 pub use backend::{ProbeStats, ProbeTermination, VectorBackend};
-pub use bounds::{residual_norm, BoundKind, BoundStore, BoundsBuilder, BoundsScope};
+pub use bounds::{
+    residual_norm, to_bound_space, BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek,
+    QueryBound,
+};
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,

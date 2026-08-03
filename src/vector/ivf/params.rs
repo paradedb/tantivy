@@ -38,6 +38,21 @@ impl WorkModel {
     }
 }
 
+/// Which similarity the distance-ratio gate's threshold is anchored to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GateAnchor {
+    /// The best-routed centroid's similarity — the SPANN shape, and
+    /// today's behavior.
+    #[default]
+    BestCentroid,
+    /// The armed kth result's similarity: once the heap holds k results,
+    /// the epsilon band re-anchors to what the search actually found
+    /// instead of the closest centroid. EXPERIMENT ARM for gate
+    /// benchmarking; identical to `BestCentroid` while the heap is
+    /// filling (no kth result exists to anchor on).
+    TopK,
+}
+
 /// Query-time configuration for IVF adaptive probing — the SPANN shape
 /// (NeurIPS 2021), defaults aligned with the paper and SPTAG's shipped
 /// config.
@@ -78,6 +93,9 @@ pub struct AdaptiveProbeParams {
     /// target recall stays roughly constant across K instead of shrinking
     /// with it. Default 32, PROVISIONAL.
     pub overfetch_margin: usize,
+    /// Where the gate's threshold anchors — see [`GateAnchor`]. Default
+    /// [`GateAnchor::BestCentroid`], the unchanged SPANN behavior.
+    pub anchor: GateAnchor,
     /// Filter-effective work ceiling, as a FRACTION of the segment's
     /// capacity and resolved per segment - a fraction tracks each
     /// segment's own cluster count where an absolute cap cannot; a
@@ -103,6 +121,7 @@ impl Default for AdaptiveProbeParams {
             epsilon: 7.0,
             min_candidates: 0,
             overfetch_margin: 32,
+            anchor: GateAnchor::default(),
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
