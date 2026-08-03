@@ -598,18 +598,13 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     Ok(())
 }
 
-/// "Scan everything" probe params: the ceiling clamps to the segment's
-/// cluster count and the survivor floor is unsatisfiable, so the gate
-/// can never fire and every cluster is probed. Used by oracle-equality
-/// tests where any pruning would make the equality check fail. (A
-/// "huge epsilon" is NOT a reliable way to express this across
-/// metrics — e.g. an L2 query sitting exactly on a centroid arms the
-/// gate at any epsilon.)
+/// "Scan everything" probe params: the full-capacity ceiling, so the
+/// budget never binds before the stream is exhausted. Used by
+/// oracle-equality tests, where every cluster the bounds gate cannot
+/// PROVE useless must be probed - provable skips never change the
+/// top-K, so oracle equality still holds under them.
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
-        epsilon: 0.0,
-        min_candidates: usize::MAX,
-        overfetch_margin: 0,
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
         ..Default::default()

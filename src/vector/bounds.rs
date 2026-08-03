@@ -341,14 +341,6 @@ impl QueryBoundTracker {
         self.bound
     }
 
-    /// The raw kth heap key behind the current bound.
-    ///
-    /// Returns (`Option<f32>`): the last observed kth key; `None` while
-    /// filling.
-    pub(crate) fn raw_kth(&self) -> Option<f32> {
-        self.raw_kth
-    }
-
     /// The probe index at which the bound armed.
     ///
     /// Returns (`Option<u32>`): 0-based probed-cluster index of the first
