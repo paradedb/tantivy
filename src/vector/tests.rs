@@ -854,7 +854,7 @@ mod bounds_storage_tests {
     use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
     use crate::vector::{
         residual_norm, BoundKind, IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings,
-        IvfVectors, Metric, VectorDType, VectorOptions, VectorStorageFormat,
+        IvfTrainingVectors, IvfVectors, Metric, VectorDType, VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -963,7 +963,7 @@ mod bounds_storage_tests {
         fn train(
             &self,
             options: &VectorOptions,
-            vectors: IvfVectors<'_>,
+            vectors: IvfTrainingVectors,
             num_centroids: usize,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), 2);
@@ -974,7 +974,7 @@ mod bounds_storage_tests {
                     .flat_map(|centroid| centroid.iter().copied())
                     .collect(),
                 None => {
-                    let IvfVectors::F32(batch) = vectors;
+                    let IvfTrainingVectors::F32(batch) = vectors;
                     batch.matrix.values[..num_centroids * 2].to_vec()
                 }
             };
@@ -1245,7 +1245,8 @@ mod bounds_storage_tests {
             Err(err) => err.to_string(),
         };
         assert!(
-            message.contains("index predates V2 centroid bounds; REINDEX \"embedding\""),
+            message.contains("predates the V2 centroid-bounds format")
+                && message.contains("\"embedding\""),
             "unexpected error text: {message}"
         );
         Ok(())

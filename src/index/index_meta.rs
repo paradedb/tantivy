@@ -523,6 +523,7 @@ mod tests {
     use crate::store::Compressor;
     #[cfg(feature = "zstd-compression")]
     use crate::store::ZstdCompressor;
+    #[cfg(feature = "lz4-compression")]
     use crate::vector::BoundsScope;
     use crate::{IndexSettings, IndexSortByField, Order};
 
