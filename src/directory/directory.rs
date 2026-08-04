@@ -11,7 +11,7 @@ use log::Level;
 use crate::directory::directory_lock::Lock;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use crate::directory::{
-    FileHandle, FileSlice, InnerWritePtr, TerminatingWrite, WatchCallback, WatchHandle, WritePtr,
+    FileHandle, FileSlice, InnerWritePtr, WatchCallback, WatchHandle, WritePtr,
 };
 use crate::index::SegmentMetaInventory;
 use crate::IndexMeta;

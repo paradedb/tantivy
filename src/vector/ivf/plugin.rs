@@ -19,9 +19,10 @@ use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
-use crate::vector::header::write_header;
+use crate::vector::header::{centroid_slot, vec_slot, write_header};
 use crate::vector::{
-    NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace, VEC_EXT,
+    residual_norm, BoundKind, BoundsBuilder, BoundsScope, NeighborhoodGraphConfig, NodeId,
+    RelativeNeighborhoodGraph, Workspace, VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -30,6 +31,9 @@ struct AssignedVector {
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_doc_id: DocId,
+    /// `true` for the primary assignment, `false` for a replica entry.
+    /// The bounds fold covers native rows only (`bounds_scope = native`).
+    native: bool,
 }
 
 /// How a vector's `replicas - 1` non-primary cells are picked from the
@@ -156,24 +160,30 @@ fn write_empty_field_slots(
 ) -> crate::Result<()> {
     // `.vec`: empty Explicit id-map + empty rows.
     {
-        let id_map_w = vec_write.for_field_with_idx(field, 0);
+        let id_map_w = vec_write.for_field_with_idx(field, vec_slot::ID_MAP);
         IdMap::serialize_explicit(&[], id_map_w)?;
         id_map_w.flush()?;
     }
     {
-        let rows_w = vec_write.for_field_with_idx(field, 1);
+        let rows_w = vec_write.for_field_with_idx(field, vec_slot::ROWS);
         rows_w.flush()?;
     }
-    // `.centroids`: zero centroids, zero docs, single zero offset.
+    // `.centroids`: zero centroids, zero docs, single zero offset, and an
+    // empty (but present — the slot is mandatory in V2) bounds slot.
     {
-        let centroids_w = centroids_write.for_field_with_idx(field, 0);
+        let centroids_w = centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
         IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
         centroids_w.flush()?;
     }
     {
-        let offsets_w = centroids_write.for_field_with_idx(field, 1);
+        let offsets_w = centroids_write.for_field_with_idx(field, centroid_slot::OFFSETS);
         IvfIndex::serialize_offsets(&[0u64], offsets_w)?;
         offsets_w.flush()?;
+    }
+    {
+        let bounds_w = centroids_write.for_field_with_idx(field, centroid_slot::BOUNDS);
+        IvfIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
+        bounds_w.flush()?;
     }
     Ok(())
 }
@@ -244,6 +254,14 @@ pub(crate) fn merge_ivf(
         let training_sample_size =
             vector_count.min(num_centroids.saturating_mul(settings.training_samples_per_centroid));
         let training_sample_interval = (vector_count / training_sample_size).max(1);
+
+        let residual: fn(&[u8], &[f32]) -> f32 = match opts.dtype() {
+            VectorDType::F32 => residual_norm::<f32>,
+        };
+        let centroid_stride = opts.bytes_per_vector();
+        let mut current_cluster = usize::MAX;
+        let mut current_centroid: Vec<f32> = Vec::new();
+
         match opts.dtype() {
             VectorDType::F32 => {
                 let field_build_start = Instant::now();
@@ -444,6 +462,7 @@ pub(crate) fn merge_ivf(
                                     target_doc_id,
                                     source_segment_ord,
                                     source_doc_id,
+                                    native: true,
                                 });
                                 // Fixed-k replication: take the `replicas - 1`
                                 // nearest NON-primary centroids from the
@@ -488,6 +507,7 @@ pub(crate) fn merge_ivf(
                                             target_doc_id,
                                             source_segment_ord,
                                             source_doc_id,
+                                            native: false,
                                         });
                                         added += 1;
                                     }
@@ -556,11 +576,56 @@ pub(crate) fn merge_ivf(
                     cluster_offsets.push(next_offset);
                 }
 
+                // `.centroids` slot [0] payload, built BEFORE the posting
+                // rows so the bounds fold below measures residuals against
+                // the STORED centroid. K-means cluster means are not
+                // unit-norm; for Cosine+F32 normalize each centroid here so
+                // the search path can score both docs and centroids with
+                // the same `dot * inv_norm_q` fast kernel.
+                let mut centroid_bytes =
+                    Vec::with_capacity(num_centroids * opts.bytes_per_vector());
+                // P1: `BoundsBuilder` is the ONLY producer of bounds. The
+                // fold runs over THIS merge's re-assignment output against
+                // the NEW centroids — combining the sources' stored bounds
+                // would be unsound (their centroids no longer exist), which
+                // is why no bound-combining API exists.
+                let mut bounds_builder = BoundsBuilder::new(num_centroids);
+                // The scope captured in the stored settings at build.
+                // `native` — fold primary assignments only — is the only
+                // variant; a future scope must decide its fold here.
+                let BoundsScope::Native = ctx.settings.vector_bounds_scope;
+                for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
+                    let mut bytes = encode_vector(centroid, opts.dim())?;
+                    // Centroids are means of ingest-validated rows, so
+                    // NonFinite is should-never-happen; same warn-and-write
+                    // policy as the posting rows below.
+                    let outcome = maybe_normalize_bytes(opts, &mut bytes);
+                    if outcome == NormalizeOutcome::NonFinite {
+                        log::warn!(
+                            "non-finite centroid {centroid_ord} in field '{}' written \
+                             un-normalized during merge",
+                            entry.name(),
+                        );
+                    }
+                    let stored = decode_row::<f32>(&bytes, opts.dim())?;
+                    // A degenerate centroid — non-finite, or zero-norm under
+                    // cosine renormalization — anchors no residual geometry:
+                    // SATURATE, so the cluster always probes. (A non-finite
+                    // centroid would also self-saturate through non-finite
+                    // residuals, but only if the cluster has members.)
+                    if outcome != NormalizeOutcome::Normalized
+                        || stored.iter().any(|value| !value.is_finite())
+                    {
+                        bounds_builder.saturate(centroid_ord);
+                    }
+                    centroid_bytes.extend_from_slice(&bytes);
+                }
+
                 let posting_start = Instant::now();
                 // `.vec` slot [0]: the row→doc_id permutation (Explicit), in
                 // cluster-sorted row order — parallel to the rows in slot [1].
                 {
-                    let id_map_w = vec_write.for_field_with_idx(field, 0);
+                    let id_map_w = vec_write.for_field_with_idx(field, vec_slot::ID_MAP);
                     let row_doc_ids: Vec<DocId> = assigned_vectors
                         .iter()
                         .map(|assigned_vector| assigned_vector.target_doc_id)
@@ -576,7 +641,7 @@ pub(crate) fn merge_ivf(
                     // rare enough to keep the FFI cancel check off the per-row
                     // path.
                     const CANCEL_POLL_ROWS: usize = 4096;
-                    let rows_w = vec_write.for_field_with_idx(field, 1);
+                    let rows_w = vec_write.for_field_with_idx(field, vec_slot::ROWS);
                     let needs_norm = opts.needs_normalization();
                     let mut row_buf: Vec<u8> = Vec::with_capacity(opts.bytes_per_vector());
                     for (row_idx, assigned_vector) in assigned_vectors.iter().enumerate() {
@@ -607,7 +672,7 @@ pub(crate) fn merge_ivf(
                         // the row would desync the already-computed assignments
                         // and IdMap. Warn-and-write-as-is is visible,
                         // self-limiting, and non-desyncing.
-                        if needs_norm {
+                        let written_bytes: &[u8] = if needs_norm {
                             row_buf.clear();
                             row_buf.extend_from_slice(&bytes);
                             if maybe_normalize_bytes(opts, &mut row_buf)
@@ -620,38 +685,37 @@ pub(crate) fn merge_ivf(
                                     assigned_vector.target_doc_id,
                                 );
                             }
-                            rows_w.write_all(&row_buf)?;
+                            &row_buf
                         } else {
-                            rows_w.write_all(&bytes)?;
+                            &bytes
+                        };
+                        rows_w.write_all(written_bytes)?;
+                        // P1: the bounds fold — NATIVE rows only, the exact
+                        // bytes written above against the stored centroid.
+                        // A non-finite row residual saturates its cluster
+                        // inside `add_native`.
+                        if assigned_vector.native {
+                            if assigned_vector.cluster != current_cluster {
+                                current_cluster = assigned_vector.cluster;
+                                current_centroid = decode_row::<f32>(
+                                    &centroid_bytes[current_cluster * centroid_stride..]
+                                        [..centroid_stride],
+                                    opts.dim(),
+                                )?;
+                            }
+                            bounds_builder.add_native(
+                                assigned_vector.cluster,
+                                residual(written_bytes, &current_centroid),
+                            );
                         }
                     }
                     rows_w.flush()?;
                 }
                 timings.posting_write = posting_start.elapsed();
 
-                // `.centroids`: routing — centroids in slot [0], cluster
-                // offsets in slot [1]. K-means cluster means are not
-                // unit-norm; for Cosine+F32 normalize each centroid here so
-                // the search path can score both docs and centroids with the
-                // same `dot * inv_norm_q` fast kernel.
-                let mut centroid_bytes =
-                    Vec::with_capacity(num_centroids * opts.bytes_per_vector());
-                for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
-                    let mut bytes = encode_vector(centroid, opts.dim())?;
-                    // Centroids are means of ingest-validated rows, so
-                    // NonFinite is should-never-happen; same warn-and-write
-                    // policy as the posting rows above.
-                    if maybe_normalize_bytes(opts, &mut bytes) == NormalizeOutcome::NonFinite {
-                        log::warn!(
-                            "non-finite centroid {centroid_ord} in field '{}' written \
-                             un-normalized during merge",
-                            entry.name(),
-                        );
-                    }
-                    centroid_bytes.extend_from_slice(&bytes);
-                }
                 {
-                    let centroids_w = centroids_write.for_field_with_idx(field, 0);
+                    let centroids_w =
+                        centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
                     IvfIndex::serialize_centroids(
                         num_centroids,
                         num_present_docs,
@@ -662,9 +726,21 @@ pub(crate) fn merge_ivf(
                     centroids_w.flush()?;
                 }
                 {
-                    let offsets_w = centroids_write.for_field_with_idx(field, 1);
+                    let offsets_w =
+                        centroids_write.for_field_with_idx(field, centroid_slot::OFFSETS);
                     IvfIndex::serialize_offsets(&cluster_offsets, offsets_w)?;
                     offsets_w.flush()?;
+                }
+                // `.centroids` slot [3]: the per-cluster centroid bounds
+                // this merge's fold produced.
+                {
+                    let bounds_w = centroids_write.for_field_with_idx(field, centroid_slot::BOUNDS);
+                    IvfIndex::serialize_bounds(
+                        BoundKind::Ball,
+                        &bounds_builder.finish(),
+                        bounds_w,
+                    )?;
+                    bounds_w.flush()?;
                 }
 
                 // `.centroids` slot [2]: the RNG over the centroids, so a query
@@ -685,7 +761,7 @@ pub(crate) fn merge_ivf(
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
-                    let graph_w = centroids_write.for_field_with_idx(field, 2);
+                    let graph_w = centroids_write.for_field_with_idx(field, centroid_slot::GRAPH);
                     match replica_selector.as_ref() {
                         Some(ReplicaSelector::Graph(graph)) => graph.serialize(graph_w)?,
                         // `replicas == 1` or the exact-selector regime: no
