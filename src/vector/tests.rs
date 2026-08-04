@@ -1035,16 +1035,13 @@ mod bounds_storage_tests {
             vector_clustering_threshold: 1,
             ..IndexSettings::default()
         };
-        let mut builder = Index::builder()
+        let builder = Index::builder()
             .schema(schema)
             .settings(settings)
             .ivf_clusterer(Arc::new(clusterer));
         let index = match directory {
             Some(directory) => builder.open_or_create(directory)?,
-            None => {
-                builder = builder;
-                builder.create_in_ram()?
-            }
+            None => builder.create_in_ram()?,
         };
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
