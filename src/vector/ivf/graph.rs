@@ -846,6 +846,10 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     }
 }
 
+/// Fixed seed for the KNN-init TPT forest: builds must be reproducible;
+/// the value doesn't matter.
+const KNN_INIT_TPT_SEED: u64 = 42;
+
 /// Build is `f32`-only and borrow-only for now: the TPT partitioner does
 /// floating-point math over the vectors, and `&[f32]` is `Copy`, so the arena
 /// can be read while edge lists are mutated. The rest of the index stays
@@ -877,8 +881,14 @@ impl RelativeNeighborhoodGraph<&[f32]> {
 
         // One TPTree reused across trees: its RNG advances between partitions,
         // so each tree splits along different directions.
+        // Fixed seed: builds must be reproducible; the value doesn't matter.
         let metric = self.metric;
-        let mut tpt = partition::TPTree::new(partition::TPTreeConfig::default(), dim, vectors);
+        let mut tpt = partition::TPTree::new(
+            partition::TPTreeConfig::default(),
+            dim,
+            vectors,
+            KNN_INIT_TPT_SEED,
+        );
         let mut indices: Vec<NodeId> = (0..n as NodeId).collect();
         for _ in 0..self.config.num_trees {
             let leaves = tpt.partition(&mut indices);
