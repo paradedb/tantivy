@@ -254,6 +254,14 @@ pub(crate) fn merge_ivf(
         let training_sample_size =
             vector_count.min(num_centroids.saturating_mul(settings.training_samples_per_centroid));
         let training_sample_interval = (vector_count / training_sample_size).max(1);
+
+        let residual: fn(&[u8], &[f32]) -> f32 = match opts.dtype() {
+            VectorDType::F32 => residual_norm::<f32>,
+        };
+        let centroid_stride = opts.bytes_per_vector();
+        let mut current_cluster = usize::MAX;
+        let mut current_centroid: Vec<f32> = Vec::new();
+
         match opts.dtype() {
             VectorDType::F32 => {
                 let field_build_start = Instant::now();
@@ -576,9 +584,6 @@ pub(crate) fn merge_ivf(
                 // the same `dot * inv_norm_q` fast kernel.
                 let mut centroid_bytes =
                     Vec::with_capacity(num_centroids * opts.bytes_per_vector());
-                // The stored centroid values, decoded from the exact bytes
-                // written — the `c` side of the bounds fold.
-                let mut stored_centroids: Vec<Vec<f32>> = Vec::with_capacity(num_centroids);
                 // P1: `BoundsBuilder` is the ONLY producer of bounds. The
                 // fold runs over THIS merge's re-assignment output against
                 // the NEW centroids — combining the sources' stored bounds
@@ -614,7 +619,6 @@ pub(crate) fn merge_ivf(
                         bounds_builder.saturate(centroid_ord);
                     }
                     centroid_bytes.extend_from_slice(&bytes);
-                    stored_centroids.push(stored);
                 }
 
                 let posting_start = Instant::now();
@@ -691,12 +695,16 @@ pub(crate) fn merge_ivf(
                         // A non-finite row residual saturates its cluster
                         // inside `add_native`.
                         if assigned_vector.native {
+                            if assigned_vector.cluster != current_cluster {
+                                current_cluster = assigned_vector.cluster;
+                                current_centroid = decode_row::<f32>(
+                                    &centroid_bytes[current_cluster * centroid_stride..][..centroid_stride],
+                                    opts.dim(),
+                                )?;
+                            }
                             bounds_builder.add_native(
                                 assigned_vector.cluster,
-                                residual_norm(
-                                    written_bytes,
-                                    &stored_centroids[assigned_vector.cluster],
-                                ),
+                                residual(written_bytes, &current_centroid),
                             );
                         }
                     }

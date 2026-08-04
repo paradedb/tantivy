@@ -887,7 +887,7 @@ mod bounds_storage_tests {
             }
             for row in ivf.cluster_range(cluster) {
                 let row_bytes = vec_reader.vector_bytes_for_row(row)?;
-                let residual = residual_norm(&row_bytes, &centroid);
+                let residual = residual_norm::<f32>(&row_bytes, &centroid);
                 if !residual.is_finite() {
                     expected[cluster] = f32::INFINITY;
                 } else if residual > expected[cluster] {

@@ -27,6 +27,7 @@
 use std::io;
 
 use crate::schema::Metric;
+use crate::vector::VectorElement;
 
 /// Segment-level bound shape, captured in the `.centroids` V2 bounds slot
 /// at build time — one kind for every cluster of a field's segment.
@@ -208,11 +209,11 @@ impl BoundsBuilder {
 /// Returns (`f32`): the L2 residual norm, accumulated in `f64` so no
 /// finite input overflows; non-finite inputs propagate to a non-finite
 /// result (which saturates at the builder).
-pub fn residual_norm(row_bytes: &[u8], c: &[f32]) -> f32 {
-    debug_assert_eq!(row_bytes.len(), std::mem::size_of_val(c));
+pub fn residual_norm<T: VectorElement>(row_bytes: &[u8], c: &[f32]) -> f32 {
+    debug_assert_eq!(row_bytes.len(), c.len() * T::SIZE_BYTES);
     let mut acc = 0.0f64;
-    for (chunk, &ci) in row_bytes.chunks_exact(4).zip(c.iter()) {
-        let xi = f32::from_le_bytes(chunk.try_into().unwrap());
+    for (chunk, &ci) in row_bytes.chunks_exact(T::SIZE_BYTES).zip(c) {
+        let xi = T::decode_le(chunk.try_into().unwrap()).to_f32();
         let d = xi as f64 - ci as f64;
         acc += d * d;
     }
@@ -495,11 +496,11 @@ mod bounds_storage_tests {
 
     #[test]
     fn residual_norm_matches_hand_values() {
-        assert_eq!(residual_norm(&row(&[3.0, 4.0]), &[0.0, 0.0]), 5.0);
-        assert_eq!(residual_norm(&row(&[1.0, 1.0]), &[1.0, 1.0]), 0.0);
-        assert!(residual_norm(&row(&[f32::NAN, 0.0]), &[0.0, 0.0]).is_nan());
+        assert_eq!(residual_norm::<f32>(&row(&[3.0, 4.0]), &[0.0, 0.0]), 5.0);
+        assert_eq!(residual_norm::<f32>(&row(&[1.0, 1.0]), &[1.0, 1.0]), 0.0);
+        assert!(residual_norm::<f32>(&row(&[f32::NAN, 0.0]), &[0.0, 0.0]).is_nan());
         assert_eq!(
-            residual_norm(&row(&[f32::INFINITY, 0.0]), &[0.0, 0.0]),
+            residual_norm::<f32>(&row(&[f32::INFINITY, 0.0]), &[0.0, 0.0]),
             f32::INFINITY
         );
     }
