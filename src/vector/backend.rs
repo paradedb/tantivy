@@ -591,7 +591,7 @@ impl<T: VectorElement> VectorBackend<T> {
         top_n: usize,
         tie_break: &mut K,
         tie_comparator: CTail,
-        _routing_query: &[f32],
+        routing_query: &[f32],
         stats: &mut ProbeStats,
     ) -> crate::Result<TieBreakHeap<K, CTail>>
     where
@@ -666,7 +666,7 @@ impl<T: VectorElement> VectorBackend<T> {
                     let stride = self.reader.options().bytes_per_vector();
                     let centroid_bytes = index.centroid_bytes().expect("readable centroid rows");
                     let exact = metric.similarity_bytes::<f32>(
-                        _routing_query,
+                        routing_query,
                         &centroid_bytes[cluster * stride..(cluster + 1) * stride],
                     );
                     debug_assert_eq!(

@@ -33,7 +33,7 @@ use crate::schema::Metric;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum BoundKind {
-    /// One `f32` per cluster: max `||x - c||` over NATIVE members, in the
+    /// One `f32` per cluster: max `||x - c||` over members, in the
     /// stored representation. Metric-uniform by the cosine
     /// write-normalization invariant (unit members + renormalized
     /// centroid make the residual norm the chord).

@@ -122,7 +122,7 @@ impl VectorIndexReader {
                     // one remedy there is.
                     if version < VectorFileVersion::V2 {
                         return Err(TantivyError::InvalidArgument(format!(
-                            "index predates V2 centroid bounds; REINDEX {:?}",
+                            "Vector index file predates the V2 centroid-bounds format; the segment must be rebuilt with the current index version: <{:?}>",
                             entry.name()
                         )));
                     }
