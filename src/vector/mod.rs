@@ -20,6 +20,7 @@ mod header;
 mod index_reader;
 mod plugin;
 mod prepared;
+mod sq4;
 mod tie_break;
 
 pub mod flat;
@@ -46,10 +47,14 @@ pub use ivf::{
     IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch,
     IvfVectors, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    Workspace,
+    Sq4Centroids, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
+pub use sq4::{
+    cosine_sq4, dot_sq4, l2_squared_sq4, norm_squared_sq4, similarity_sq4, sq4_row_norms,
+    sq4_stride, Sq4Arena, Sq4Params, Sq4Scorer, Sq4SliceArena,
+};
 pub use tie_break::NoTieBreak;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
@@ -194,22 +199,90 @@ pub trait VectorArena {
     /// Element type of the vectors; queries are `&[Elem]`.
     type Elem: VectorElement;
 
+    /// The per-query scorer over this arena; see [`Self::scorer`].
+    type Scorer<'a>: ArenaScorer
+    where Self: 'a;
+
     /// The number of vectors held, at `dim` elements each.
     fn num_vectors(&self, dim: usize) -> usize;
 
-    /// [`Similarity`] of `query` to vector `node`.
+    /// Builds the per-query scorer for `query`: any preparation whose cost
+    /// amortizes across a query's many [`ArenaScorer::score`] calls happens
+    /// here, once — for plain storage that is nothing, for quantized
+    /// storage it folds the query with the quantization params (the ADC
+    /// transform) so the per-row loop touches only the codes.
+    ///
+    /// Construction must be deterministic: two scorers built from the same
+    /// `(metric, dim, query)` return bit-identical scores, which is what
+    /// lets separate paths (routing, margin checks, tests) agree exactly.
+    fn scorer<'a>(
+        &'a self,
+        metric: Metric,
+        dim: usize,
+        query: &'a [Self::Elem],
+    ) -> Self::Scorer<'a>;
+
+    /// [`Similarity`] of `query` to vector `node` — a one-shot
+    /// [`scorer`](Self::scorer); callers scoring more than one node per
+    /// query should hold the scorer instead.
     fn similarity(
         &self,
         metric: Metric,
         dim: usize,
         node: NodeId,
         query: &[Self::Elem],
-    ) -> Similarity;
+    ) -> Similarity {
+        self.scorer(metric, dim, query).score(node)
+    }
+}
+
+/// One query's scorer over one arena, returned by [`VectorArena::scorer`]:
+/// scores nodes against the query it was built from.
+pub trait ArenaScorer {
+    /// [`Similarity`] of the prepared query to vector `node`.
+    fn score(&self, node: NodeId) -> Similarity;
+}
+
+/// A [`VectorArena`] whose rows decode to f32 on demand — what the RNG
+/// build and refine passes need beyond search: a node's stored vector
+/// doubles as its search query ([`decode_into`](Self::decode_into)), and
+/// the TPT partitioner reads single coordinates ([`coord`](Self::coord)).
+///
+/// Implementations decode into caller-owned `O(dim)` scratch, never
+/// materializing the arena, so a build over quantized storage keeps only
+/// the codes in memory. Decoded values are the reconstruction the arena's
+/// scoring represents; every scoring path — build, refine, query-time
+/// search — goes through the same [`VectorArena::scorer`], so the build's
+/// edge decisions and query-time rankings agree exactly even where the
+/// scorer's accumulation differs from scoring the reconstruction directly
+/// at float-rounding level.
+pub trait BuildArena: VectorArena<Elem = f32> {
+    /// Coordinate `d` of `node`'s vector.
+    fn coord(&self, dim: usize, node: NodeId, d: usize) -> f32;
+
+    /// Decodes `node`'s vector into `out` (`dim` f32s).
+    fn decode_into(&self, dim: usize, node: NodeId, out: &mut [f32]);
+}
+
+/// Any `[f32]`-shaped storage: coord is an index, decode is a copy.
+impl<S: std::ops::Deref<Target = [f32]>> BuildArena for S {
+    #[inline(always)]
+    fn coord(&self, dim: usize, node: NodeId, d: usize) -> f32 {
+        self[node as usize * dim + d]
+    }
+
+    #[inline]
+    fn decode_into(&self, dim: usize, node: NodeId, out: &mut [f32]) {
+        out.copy_from_slice(&self[node as usize * dim..][..dim]);
+    }
 }
 
 /// Any `[T]`-shaped storage (`&[T]`, `Vec<T>`, …), scored with the typed kernels.
 impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
     type Elem = T;
+    type Scorer<'a>
+        = TypedSliceScorer<'a, T>
+    where Self: 'a;
 
     #[inline]
     fn num_vectors(&self, dim: usize) -> usize {
@@ -218,8 +291,37 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
     }
 
     #[inline]
+    fn scorer<'a>(&'a self, metric: Metric, dim: usize, query: &'a [T]) -> TypedSliceScorer<'a, T> {
+        TypedSliceScorer {
+            vectors: self,
+            metric,
+            dim,
+            query,
+        }
+    }
+
+    #[inline]
     fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> Similarity {
         metric.similarity(query, &self[node as usize * dim..][..dim])
+    }
+}
+
+/// The typed-slice arena's scorer: no per-query preparation, the typed
+/// kernels are already at memory speed.
+pub struct TypedSliceScorer<'a, T> {
+    vectors: &'a [T],
+    metric: Metric,
+    dim: usize,
+    query: &'a [T],
+}
+
+impl<T: VectorElement> ArenaScorer for TypedSliceScorer<'_, T> {
+    #[inline]
+    fn score(&self, node: NodeId) -> Similarity {
+        self.metric.similarity(
+            self.query,
+            &self.vectors[node as usize * self.dim..][..self.dim],
+        )
     }
 }
 
@@ -240,6 +342,15 @@ pub struct FileSliceArena<T> {
     _elem: std::marker::PhantomData<T>,
 }
 
+impl<T> Clone for FileSliceArena<T> {
+    fn clone(&self) -> Self {
+        FileSliceArena {
+            slice: self.slice.clone(),
+            _elem: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<T> FileSliceArena<T> {
     /// Wraps a slice of contiguous `dim`-strided little-endian `T` rows.
     pub fn new(slice: crate::directory::FileSlice) -> Self {
@@ -252,6 +363,9 @@ impl<T> FileSliceArena<T> {
 
 impl<T: VectorElement> VectorArena for FileSliceArena<T> {
     type Elem = T;
+    type Scorer<'a>
+        = FileSliceScorer<'a, T>
+    where Self: 'a;
 
     #[inline]
     fn num_vectors(&self, dim: usize) -> usize {
@@ -259,6 +373,16 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
         let stride = dim * T::SIZE_BYTES;
         assert_eq!(self.slice.len() % stride, 0, "arena not a multiple of dim");
         self.slice.len() / stride
+    }
+
+    #[inline]
+    fn scorer<'a>(&'a self, metric: Metric, dim: usize, query: &'a [T]) -> FileSliceScorer<'a, T> {
+        FileSliceScorer {
+            slice: &self.slice,
+            metric,
+            dim,
+            query,
+        }
     }
 
     /// # Panics
@@ -277,5 +401,28 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
             .read_bytes()
             .expect("failed to read vector arena row");
         metric.similarity_bytes(query, &bytes)
+    }
+}
+
+/// The file-backed arena's scorer: no per-query preparation, each score is
+/// one ranged row read into the byte kernels — panics on a failed read,
+/// same contract as [`FileSliceArena::similarity`].
+pub struct FileSliceScorer<'a, T> {
+    slice: &'a crate::directory::FileSlice,
+    metric: Metric,
+    dim: usize,
+    query: &'a [T],
+}
+
+impl<T: VectorElement> ArenaScorer for FileSliceScorer<'_, T> {
+    #[inline]
+    fn score(&self, node: NodeId) -> Similarity {
+        let stride = self.dim * T::SIZE_BYTES;
+        let bytes = self
+            .slice
+            .slice(node as usize * stride..(node as usize + 1) * stride)
+            .read_bytes()
+            .expect("failed to read vector arena row");
+        self.metric.similarity_bytes(self.query, &bytes)
     }
 }

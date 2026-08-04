@@ -30,6 +30,12 @@ pub(crate) enum VectorFileVersion {
     /// is unaffected by the change and V1 `.vec` files stay readable —
     /// flat segments have no clusters and no bounds.
     V2 = 2,
+    /// `.centroids` slot `[0]` gains a codec byte after the count words:
+    /// `0` = f32 rows (the V2 payload), `1` = SQ4 — per-dim quantization
+    /// params (`2 * dim` f32s) then packed 4-bit rows. The writer emits
+    /// SQ4 only; V2 files stay readable (their slot `[0]` is implicitly
+    /// the f32 codec). `.vec` is unaffected — doc rows stay f32.
+    V3 = 3,
 }
 
 /// `.centroids` composite slot indices. Slot `[2]` is OPTIONAL and slot
@@ -61,7 +67,7 @@ pub(crate) mod vec_slot {
 }
 
 /// Version stamped into newly written vector files.
-pub(crate) const CURRENT: VectorFileVersion = VectorFileVersion::V2;
+pub(crate) const CURRENT: VectorFileVersion = VectorFileVersion::V3;
 
 impl BinarySerializable for VectorFileVersion {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
@@ -72,6 +78,7 @@ impl BinarySerializable for VectorFileVersion {
         match u32::deserialize(reader)? {
             1 => Ok(VectorFileVersion::V1),
             2 => Ok(VectorFileVersion::V2),
+            3 => Ok(VectorFileVersion::V3),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported vector file format version: {other}"),
@@ -111,10 +118,10 @@ mod tests {
         let mut buf = Vec::new();
         write_header(&mut buf).unwrap();
         assert_eq!(buf.len(), HEADER_LEN);
-        assert_eq!(buf, vec![2, 0, 0, 0]);
+        assert_eq!(buf, vec![3, 0, 0, 0]);
 
         let (version, body) = read_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V2);
+        assert_eq!(version, VectorFileVersion::V3);
         assert_eq!(body.len(), 0);
     }
 
@@ -125,7 +132,7 @@ mod tests {
         buf.extend_from_slice(b"composite-bytes");
 
         let (version, body) = read_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V2);
+        assert_eq!(version, VectorFileVersion::V3);
         assert_eq!(body.read_bytes().unwrap().as_slice(), b"composite-bytes");
     }
 
@@ -141,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_future_version_rejected() {
-        let buf = 3u32.to_le_bytes().to_vec();
+        let buf = 4u32.to_le_bytes().to_vec();
         let err = read_header(&FileSlice::from(buf)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }

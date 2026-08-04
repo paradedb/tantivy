@@ -1,5 +1,5 @@
 use crate::schema::VectorOptions;
-use crate::vector::VectorElement;
+use crate::vector::{sq4_stride, Sq4Params, VectorElement};
 use crate::{DocId, TantivyError};
 
 pub trait IvfClusterer: Send + Sync + 'static {
@@ -74,7 +74,62 @@ pub struct IvfMergeSettings {
 
 #[derive(Clone, Debug)]
 pub enum IvfCentroids {
+    /// Full-precision centroids — what [`IvfClusterer::train`] returns.
     F32(IvfMatrix<f32>),
+    /// SQ4-quantized centroids — what the merge hands to
+    /// [`IvfClusterer::assign`] after compressing the trained set, so the
+    /// full f32 matrix never persists past training. Score against them
+    /// with the `sq4` kernels (e.g. via
+    /// [`Sq4Arena`](crate::vector::Sq4Arena)) or decode rows on demand
+    /// with [`Sq4Params::decode_row_into`].
+    Sq4(Sq4Centroids),
+}
+
+impl IvfCentroids {
+    /// The number of centroid rows.
+    pub fn rows(&self) -> usize {
+        match self {
+            IvfCentroids::F32(matrix) => matrix.rows,
+            IvfCentroids::Sq4(sq4) => sq4.rows,
+        }
+    }
+
+    /// The vector dimensionality.
+    pub fn dims(&self) -> usize {
+        match self {
+            IvfCentroids::F32(matrix) => matrix.dims,
+            IvfCentroids::Sq4(sq4) => sq4.params.dim(),
+        }
+    }
+
+    /// Decodes centroid `row` into `out` (`dims` f32s) — a copy for `F32`,
+    /// the reconstruction for `Sq4`. Codec-agnostic scoring for `assign`
+    /// implementations that don't use the SQ4 kernels directly.
+    pub fn decode_row_into(&self, row: usize, out: &mut [f32]) {
+        match self {
+            IvfCentroids::F32(matrix) => {
+                out.copy_from_slice(&matrix.values[row * matrix.dims..][..matrix.dims])
+            }
+            IvfCentroids::Sq4(sq4) => sq4.params.decode_row_into(sq4.row(row), out),
+        }
+    }
+}
+
+/// Packed SQ4 centroid rows plus their quantization params; row `i` is
+/// `codes[i * sq4_stride(dim)..][..sq4_stride(dim)]`.
+#[derive(Clone, Debug)]
+pub struct Sq4Centroids {
+    pub codes: Vec<u8>,
+    pub params: Sq4Params,
+    pub rows: usize,
+}
+
+impl Sq4Centroids {
+    /// The packed codes of centroid `row`.
+    pub fn row(&self, row: usize) -> &[u8] {
+        let stride = sq4_stride(self.params.dim());
+        &self.codes[row * stride..][..stride]
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,18 +182,4 @@ pub(crate) fn decode_row<T: VectorElement>(bytes: &[u8], dim: usize) -> crate::R
         .chunks_exact(T::SIZE_BYTES)
         .map(T::decode_le)
         .collect())
-}
-
-pub(crate) fn encode_vector<T: VectorElement>(vector: &[T], dim: usize) -> crate::Result<Vec<u8>> {
-    if vector.len() != dim {
-        return Err(TantivyError::InvalidArgument(format!(
-            "centroid length mismatch: expected {dim} elements, got {}",
-            vector.len()
-        )));
-    }
-    let mut bytes = Vec::with_capacity(dim * T::SIZE_BYTES);
-    for element in vector {
-        element.encode_le(&mut bytes)?;
-    }
-    Ok(bytes)
 }

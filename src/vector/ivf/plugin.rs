@@ -5,24 +5,24 @@
 //! This module exposes the merge body so the parent plugin can call it
 //! after the threshold check.
 
-use std::cmp::Ordering;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::{
-    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
+    decode_row, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView, IvfTrainingBatch,
+    IvfTrainingVectors, IvfVectorBatch, IvfVectors, Sq4Centroids, CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
-use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::distance::{maybe_normalize_bytes, normalize_f32_inplace, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header};
 use crate::vector::{
-    residual_norm, BoundKind, BoundsBuilder, BoundsScope, NeighborhoodGraphConfig, NodeId,
-    RelativeNeighborhoodGraph, Workspace, VEC_EXT,
+    residual_norm, sq4_row_norms, sq4_stride, ArenaScorer, BoundKind, BoundsBuilder, BoundsScope,
+    NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Similarity, Sq4Arena, Sq4Params,
+    VectorArena, Workspace, VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -48,47 +48,31 @@ struct AssignedVector {
 /// handful of points can return fewer than `knn` neighbours, silently
 /// under-replicating small indexes.
 enum ReplicaSelector<'a> {
-    /// Exact k-NN scan over the trained centroids (small centroid sets).
+    /// Exact k-NN scan over the quantized centroids (small centroid sets).
     Exact,
     /// Approximate k-NN via a [`RelativeNeighborhoodGraph`] borrowing the
-    /// flat centroid arena (large centroid sets).
-    Graph(RelativeNeighborhoodGraph<&'a [f32]>),
+    /// packed SQ4 centroid arena (large centroid sets).
+    Graph(RelativeNeighborhoodGraph<Sq4Arena<'a>>),
 }
 
-/// Centroid ids of the `knn` nearest centroids to `query`, nearest first —
-/// the exact counterpart of [`RelativeNeighborhoodGraph::nearest`], same
-/// distance family per metric. Ties break on centroid id so selection is
-/// deterministic.
-fn exact_nearest_centroids(
+/// Centroid ids of the `knn` centroids most similar to `query`, best
+/// first — the exact counterpart of the graph selector's search, ranked by
+/// the same [`VectorArena::similarity`] key the query-time router uses
+/// (raw dot for Dot — ||q||-invariant, see [`build_centroid_graph`]). Ties
+/// break on centroid id so selection is deterministic.
+fn exact_nearest_centroids<A: VectorArena<Elem = f32>>(
     metric: Metric,
-    centroid_rows: &[Vec<f32>],
+    arena: &A,
+    num_centroids: usize,
+    dim: usize,
     query: &[f32],
     knn: usize,
 ) -> Vec<usize> {
-    let mut scored: Vec<(f32, usize)> = centroid_rows
-        .iter()
-        .enumerate()
-        .map(|(id, centroid)| {
-            // Each arm is the negated `Metric::similarity` ordering the
-            // graph selector ranks by.
-            let d = match metric {
-                // `1 - cosine` orders identically to descending cosine.
-                Metric::Cosine => 1.0 - cosine(query, centroid.as_slice()),
-                // Negated raw dot: the query-time router ranks by dot, and
-                // dot ordering is ||q||-invariant (see
-                // [`build_centroid_graph`]).
-                Metric::Dot => -dot(query, centroid.as_slice()),
-                // Squared L2 orders identically to L2.
-                Metric::L2 => l2_squared(query, centroid.as_slice()),
-            };
-            (d, id)
-        })
+    let scorer = arena.scorer(metric, dim, query);
+    let mut scored: Vec<(Similarity, usize)> = (0..num_centroids)
+        .map(|id| (scorer.score(id as NodeId), id))
         .collect();
-    scored.sort_unstable_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(Ordering::Equal)
-            .then(a.1.cmp(&b.1))
-    });
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.truncate(knn);
     scored.into_iter().map(|(_, id)| id).collect()
 }
@@ -107,15 +91,15 @@ fn build_executor(name: &'static str) -> crate::Result<Executor> {
 }
 
 /// Builds the replica-selection [`RelativeNeighborhoodGraph`] over the
-/// trained `centroids` (flat, `dim`-strided) with search beam `ef`. Borrows
-/// the flat centroid arena; after the assign loop the same graph is
-/// persisted as the `.centroids` slot [2] routing graph.
+/// quantized centroid `arena` with search beam `ef`. Borrows the packed
+/// codes; after the assign loop the same graph is persisted as the
+/// `.centroids` slot [2] routing graph.
 fn build_centroid_graph<'a>(
     metric: Metric,
-    centroids: &'a [f32],
+    arena: Sq4Arena<'a>,
     dim: usize,
     ef: usize,
-) -> crate::Result<RelativeNeighborhoodGraph<&'a [f32]>> {
+) -> crate::Result<RelativeNeighborhoodGraph<Sq4Arena<'a>>> {
     // Replica cells must predict the query-time router
     // (`rank_clusters`), which ranks centroids by the field metric —
     // so the graph selects with that metric directly. For Dot,
@@ -130,7 +114,7 @@ fn build_centroid_graph<'a>(
         ef,
         ..Default::default()
     };
-    let mut rng = RelativeNeighborhoodGraph::new(centroids, dim, metric, config);
+    let mut rng = RelativeNeighborhoodGraph::new(arena, dim, metric, config);
     rng.build(&build_executor("replica-rng-")?);
     Ok(rng)
 }
@@ -172,7 +156,15 @@ fn write_empty_field_slots(
     // empty (but present — the slot is mandatory in V2) bounds slot.
     {
         let centroids_w = centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
-        IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
+        IvfIndex::serialize_centroids(
+            0,
+            0,
+            &Sq4Params::fit(&[], opts.dim()),
+            &[],
+            &[],
+            opts,
+            centroids_w,
+        )?;
         centroids_w.flush()?;
     }
     {
@@ -258,7 +250,6 @@ pub(crate) fn merge_ivf(
         let residual: fn(&[u8], &[f32]) -> f32 = match opts.dtype() {
             VectorDType::F32 => residual_norm::<f32>,
         };
-        let centroid_stride = opts.bytes_per_vector();
         let mut current_cluster = usize::MAX;
         let mut current_centroid: Vec<f32> = Vec::new();
 
@@ -324,14 +315,19 @@ pub(crate) fn merge_ivf(
                     },
                 });
                 let train_start = Instant::now();
-                let centroids = clusterer.train(opts, training_vectors, num_centroids)?;
+                let trained = clusterer.train(opts, training_vectors, num_centroids)?;
                 timings.train = train_start.elapsed();
 
                 if ctx.cancel.wants_cancel() {
                     return Err(TantivyError::Cancelled);
                 }
 
-                let IvfCentroids::F32(centroid_matrix) = &centroids;
+                let IvfCentroids::F32(mut centroid_matrix) = trained else {
+                    return Err(TantivyError::InvalidArgument(
+                        "IvfClusterer::train must return F32 centroids; the merge quantizes them"
+                            .to_string(),
+                    ));
+                };
                 if centroid_matrix.dims != opts.dim() {
                     return Err(TantivyError::InvalidArgument(format!(
                         "IvfClusterer produced centroids with {} dimensions, expected {}",
@@ -353,15 +349,58 @@ pub(crate) fn merge_ivf(
                         centroid_matrix.rows
                     )));
                 }
-                // Float working copy of the trained centroids — the exact
-                // replica scan and the `.centroids` encode below read
-                // per-row slices. Encoding + Cosine normalization happen at
-                // the `.centroids` write below.
-                let centroid_rows: Vec<Vec<f32>> = centroid_matrix
-                    .values
-                    .chunks_exact(opts.dim())
-                    .map(|centroid| centroid.to_vec())
-                    .collect();
+
+                // Cosine: normalize the trained centroids BEFORE fitting
+                // the quantizer — k-means cluster means are not unit-norm,
+                // and the codes should reconstruct (near-)unit directions.
+                // A degenerate row (zero-norm, or non-finite anywhere)
+                // saturates its cluster's bound below; SQ4 cannot encode
+                // non-finite values, so such rows quantize as code 0.
+                let mut degenerate = vec![false; num_centroids];
+                if opts.needs_normalization() {
+                    for (ord, row) in centroid_matrix
+                        .values
+                        .chunks_exact_mut(opts.dim())
+                        .enumerate()
+                    {
+                        if normalize_f32_inplace(row) != NormalizeOutcome::Normalized {
+                            degenerate[ord] = true;
+                        }
+                    }
+                }
+                for (ord, row) in centroid_matrix.values.chunks_exact(opts.dim()).enumerate() {
+                    if row.iter().any(|value| !value.is_finite()) {
+                        degenerate[ord] = true;
+                        log::warn!(
+                            "non-finite centroid {ord} in field '{}' quantized lossily during \
+                             merge; its cluster bound is saturated",
+                            entry.name(),
+                        );
+                    }
+                }
+
+                // SQ4-compress the trained set and DROP the f32 matrix.
+                // Everything downstream — replica selection, assignment,
+                // the routing RNG build, the bounds fold — sees only the
+                // packed codes (via `Sq4Arena` or per-row decode into
+                // O(dim) scratch), so the merge's persistent centroid
+                // footprint is the codes plus the 2·dim params.
+                let params = Sq4Params::fit(&centroid_matrix.values, opts.dim());
+                let mut codes = Vec::with_capacity(num_centroids * sq4_stride(opts.dim()));
+                for row in centroid_matrix.values.chunks_exact(opts.dim()) {
+                    params.quantize_row_into(row, &mut codes);
+                }
+                drop(centroid_matrix);
+                let norms_sq = sq4_row_norms(&codes, &params);
+                let centroids = IvfCentroids::Sq4(Sq4Centroids {
+                    codes,
+                    params,
+                    rows: num_centroids,
+                });
+                let IvfCentroids::Sq4(sq4) = &centroids else {
+                    unreachable!("constructed as Sq4 above")
+                };
+                let centroid_arena = Sq4Arena::new(&sq4.codes, &sq4.params, &norms_sq);
 
                 // Fixed-k replication: pick a selector ONCE before the assign
                 // loop, and only when `replicas > 1`. At `replicas == 1`
@@ -378,12 +417,8 @@ pub(crate) fn merge_ivf(
                     Some(ReplicaSelector::Exact)
                 } else {
                     let build_start = Instant::now();
-                    let graph = build_centroid_graph(
-                        opts.metric(),
-                        centroid_matrix.values.as_slice(),
-                        dim,
-                        ef_search,
-                    )?;
+                    let graph =
+                        build_centroid_graph(opts.metric(), centroid_arena, dim, ef_search)?;
                     timings.selector_build = build_start.elapsed();
                     Some(ReplicaSelector::Graph(graph))
                 };
@@ -475,7 +510,9 @@ pub(crate) fn merge_ivf(
                                     let nearest = match selector {
                                         ReplicaSelector::Exact => exact_nearest_centroids(
                                             opts.metric(),
-                                            &centroid_rows,
+                                            &centroid_arena,
+                                            num_centroids,
+                                            dim,
                                             v,
                                             replicas,
                                         ),
@@ -576,14 +613,6 @@ pub(crate) fn merge_ivf(
                     cluster_offsets.push(next_offset);
                 }
 
-                // `.centroids` slot [0] payload, built BEFORE the posting
-                // rows so the bounds fold below measures residuals against
-                // the STORED centroid. K-means cluster means are not
-                // unit-norm; for Cosine+F32 normalize each centroid here so
-                // the search path can score both docs and centroids with
-                // the same `dot * inv_norm_q` fast kernel.
-                let mut centroid_bytes =
-                    Vec::with_capacity(num_centroids * opts.bytes_per_vector());
                 // P1: `BoundsBuilder` is the ONLY producer of bounds. The
                 // fold runs over THIS merge's re-assignment output against
                 // the NEW centroids — combining the sources' stored bounds
@@ -594,31 +623,13 @@ pub(crate) fn merge_ivf(
                 // `native` — fold primary assignments only — is the only
                 // variant; a future scope must decide its fold here.
                 let BoundsScope::Native = ctx.settings.vector_bounds_scope;
-                for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
-                    let mut bytes = encode_vector(centroid, opts.dim())?;
-                    // Centroids are means of ingest-validated rows, so
-                    // NonFinite is should-never-happen; same warn-and-write
-                    // policy as the posting rows below.
-                    let outcome = maybe_normalize_bytes(opts, &mut bytes);
-                    if outcome == NormalizeOutcome::NonFinite {
-                        log::warn!(
-                            "non-finite centroid {centroid_ord} in field '{}' written \
-                             un-normalized during merge",
-                            entry.name(),
-                        );
-                    }
-                    let stored = decode_row::<f32>(&bytes, opts.dim())?;
-                    // A degenerate centroid — non-finite, or zero-norm under
-                    // cosine renormalization — anchors no residual geometry:
-                    // SATURATE, so the cluster always probes. (A non-finite
-                    // centroid would also self-saturate through non-finite
-                    // residuals, but only if the cluster has members.)
-                    if outcome != NormalizeOutcome::Normalized
-                        || stored.iter().any(|value| !value.is_finite())
-                    {
+                // A degenerate source centroid — non-finite, or zero-norm
+                // under cosine renormalization — anchors no residual
+                // geometry: SATURATE, so the cluster always probes.
+                for (centroid_ord, &is_degenerate) in degenerate.iter().enumerate() {
+                    if is_degenerate {
                         bounds_builder.saturate(centroid_ord);
                     }
-                    centroid_bytes.extend_from_slice(&bytes);
                 }
 
                 let posting_start = Instant::now();
@@ -691,17 +702,30 @@ pub(crate) fn merge_ivf(
                         };
                         rows_w.write_all(written_bytes)?;
                         // P1: the bounds fold — NATIVE rows only, the exact
-                        // bytes written above against the stored centroid.
-                        // A non-finite row residual saturates its cluster
-                        // inside `add_native`.
+                        // bytes written above against the RECONSTRUCTED
+                        // centroid: the anchor must be the point the router
+                        // scores, and the router scores the codes. For
+                        // cosine the routing key cos(q, recon) is
+                        // scale-invariant — anchored at the NORMALIZED
+                        // reconstruction — so the decoded centroid is
+                        // renormalized to match; a reconstruction that
+                        // cannot be (zero-norm) anchors no chord geometry
+                        // and saturates. A non-finite row residual
+                        // saturates its cluster inside `add_native`.
                         if assigned_vector.native {
                             if assigned_vector.cluster != current_cluster {
                                 current_cluster = assigned_vector.cluster;
-                                current_centroid = decode_row::<f32>(
-                                    &centroid_bytes[current_cluster * centroid_stride..]
-                                        [..centroid_stride],
-                                    opts.dim(),
-                                )?;
+                                current_centroid.resize(opts.dim(), 0.0);
+                                sq4.params.decode_row_into(
+                                    sq4.row(current_cluster),
+                                    &mut current_centroid,
+                                );
+                                if opts.needs_normalization()
+                                    && normalize_f32_inplace(&mut current_centroid)
+                                        != NormalizeOutcome::Normalized
+                                {
+                                    bounds_builder.saturate(current_cluster);
+                                }
                             }
                             bounds_builder.add_native(
                                 assigned_vector.cluster,
@@ -719,7 +743,9 @@ pub(crate) fn merge_ivf(
                     IvfIndex::serialize_centroids(
                         num_centroids,
                         num_present_docs,
-                        &centroid_bytes,
+                        &sq4.params,
+                        &norms_sq,
+                        &sq4.codes,
                         opts,
                         centroids_w,
                     )?;
@@ -768,7 +794,7 @@ pub(crate) fn merge_ivf(
                         // graph exists yet, build one just for routing.
                         _ => {
                             let mut rng = RelativeNeighborhoodGraph::new(
-                                centroid_matrix.values.as_slice(),
+                                centroid_arena,
                                 opts.dim(),
                                 opts.metric(),
                                 NeighborhoodGraphConfig::default(),
@@ -812,13 +838,13 @@ mod tests {
     /// norms are deliberately unequal so the two orderings disagree.
     #[test]
     fn dot_selector_uses_raw_dot_not_angular() {
-        let centroid_rows: Vec<Vec<f32>> = vec![
-            vec![10.0, 0.0], // long, off-direction: dot 10, cosine 0.45
-            vec![0.0, 1.0],  // short, near-direction: dot 2, cosine 0.89
-            vec![7.0, 7.0],  // long, near-direction: dot 21, cosine 0.95
+        let centroids: Vec<f32> = vec![
+            10.0, 0.0, // long, off-direction: dot 10, cosine 0.45
+            0.0, 1.0, // short, near-direction: dot 2, cosine 0.89
+            7.0, 7.0, // long, near-direction: dot 21, cosine 0.95
         ];
         let query = [1.0_f32, 2.0];
-        let picked = exact_nearest_centroids(Metric::Dot, &centroid_rows, &query, 3);
+        let picked = exact_nearest_centroids(Metric::Dot, &centroids, 3, 2, &query, 3);
         // Raw-dot order: [7,7] (21), then [10,0] (10), then [0,1] (2).
         // Angular order would put [0,1] ahead of [10,0].
         assert_eq!(picked, vec![2, 0, 1], "must rank by raw dot");

@@ -663,12 +663,7 @@ impl<T: VectorElement> VectorBackend<T> {
                     // Precondition of every margin: the stream key is the
                     // EXACT centroid similarity — an approximate key
                     // makes a skip unsound.
-                    let stride = self.reader.options().bytes_per_vector();
-                    let centroid_bytes = index.centroid_bytes().expect("readable centroid rows");
-                    let exact = metric.similarity_bytes::<f32>(
-                        routing_query,
-                        &centroid_bytes[cluster * stride..(cluster + 1) * stride],
-                    );
+                    let exact = index.centroid_similarity(cluster, routing_query);
                     debug_assert_eq!(
                         sim, exact,
                         "routing stream key must be the exact centroid similarity"
@@ -984,7 +979,7 @@ mod tests {
         ) -> crate::Result<Vec<u32>> {
             assert_eq!(options.dim(), 2);
             let IvfVectors::F32(vectors) = vectors;
-            let IvfCentroids::F32(centroids) = centroids;
+            let mut c = [0f32; 2];
             Ok(vectors
                 .matrix
                 .values
@@ -992,7 +987,8 @@ mod tests {
                 .map(|v| {
                     let mut best = 0u32;
                     let mut best_d2 = f32::INFINITY;
-                    for (i, c) in centroids.values.chunks_exact(2).enumerate() {
+                    for i in 0..centroids.rows() {
+                        centroids.decode_row_into(i, &mut c);
                         let dx = v[0] - c[0];
                         let dy = v[1] - c[1];
                         let d2 = dx * dx + dy * dy;
@@ -3257,9 +3253,9 @@ mod tests {
 
                     // (b): the theorem, cluster by cluster. Homes are
                     // recomputed with the clusterer's own rule: stored
-                    // (post-normalization) doc values against the RAW
-                    // trained centroids - the values `assign` saw. The
-                    // margin then runs against the STORED (normalized)
+                    // (post-normalization) doc values against the
+                    // QUANTIZED centroids - the reconstructions `assign`
+                    // saw. The margin then runs against the STORED
                     // centroid, exactly as the gate does; the fold covers
                     // members whatever rule assigned them, so the
                     // triangle argument is assignment-rule-agnostic.
@@ -3268,8 +3264,14 @@ mod tests {
                     let vec_reader = segment_reader.vector_index(field)?;
                     let ivf = vec_reader.index().expect("IVF segment");
                     let bounds = ivf.bounds();
-                    let centroid_bytes = ivf.centroid_bytes()?;
-                    let stride = 2 * std::mem::size_of::<f32>();
+                    let assign_centroids: Vec<[f32; 2]> = (0..ivf.num_clusters())
+                        .map(|cluster| {
+                            let mut decoded = [0f32; 2];
+                            ivf.decode_centroid(cluster, &mut decoded)
+                                .expect("readable centroid");
+                            decoded
+                        })
+                        .collect();
                     let kth_key = brute[k - 1].0;
                     let t_final = to_bound_space(metric, kth_key);
                     let q_norm = (query[0] * query[0] + query[1] * query[1]).sqrt();
@@ -3279,12 +3281,8 @@ mod tests {
                                 .vector_bytes(addr.doc_id)?
                                 .expect("stored vector"),
                         );
-                        let home = nearest_centroid(stored, &centroids);
-                        let sim = Metric::similarity_bytes::<f32>(
-                            metric,
-                            &query,
-                            &centroid_bytes[home * stride..(home + 1) * stride],
-                        );
+                        let home = nearest_centroid(stored, &assign_centroids);
+                        let sim = ivf.centroid_similarity(home, &query);
                         let r = bounds.ball_r(home);
                         let margin = match metric {
                             Metric::L2 | Metric::Cosine => {

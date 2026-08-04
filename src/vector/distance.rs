@@ -72,7 +72,7 @@ impl PartialOrd for Similarity {
 }
 
 /// 16 = 512 (avx512 register width) / 32 (sizeof::<f32>() in bits).
-const LANES: usize = 16;
+pub(crate) const LANES: usize = 16;
 
 /// Squared Euclidean distance.
 #[inline]
@@ -286,6 +286,23 @@ pub(crate) fn normalize_bytes_inplace<T: VectorElement>(row: &mut [u8]) -> Norma
         T::from_f32(scaled)
             .encode_le(&mut sink)
             .expect("row chunk is exactly element-sized");
+    }
+    NormalizeOutcome::Normalized
+}
+
+/// L2-normalize a typed f32 row in place — the slice counterpart of
+/// [`normalize_bytes_inplace`], same f64 arithmetic and outcome policy.
+pub(crate) fn normalize_f32_inplace(row: &mut [f32]) -> NormalizeOutcome {
+    let norm = norm_squared_wide(row).sqrt();
+    if norm == 0.0 {
+        return NormalizeOutcome::ZeroSkipped;
+    }
+    if !norm.is_finite() {
+        return NormalizeOutcome::NonFinite;
+    }
+    let inv = 1.0 / norm;
+    for v in row.iter_mut() {
+        *v = (*v as f64 * inv) as f32;
     }
     NormalizeOutcome::Normalized
 }
