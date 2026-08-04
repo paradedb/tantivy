@@ -698,7 +698,8 @@ pub(crate) fn merge_ivf(
                             if assigned_vector.cluster != current_cluster {
                                 current_cluster = assigned_vector.cluster;
                                 current_centroid = decode_row::<f32>(
-                                    &centroid_bytes[current_cluster * centroid_stride..][..centroid_stride],
+                                    &centroid_bytes[current_cluster * centroid_stride..]
+                                        [..centroid_stride],
                                     opts.dim(),
                                 )?;
                             }
