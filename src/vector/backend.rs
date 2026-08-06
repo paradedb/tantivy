@@ -11,6 +11,8 @@
 //! — the unit the pg-backed `Directory` can serve zero-copy.
 
 use std::ops::Range;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use common::BitSet;
@@ -361,23 +363,48 @@ impl ProbeStats {
 /// budget and stream exhaustion are the only stops.
 ///
 /// ROWS_PER_OPEN is how many rows of full work one cluster OPEN costs,
-/// fitted on the reference fixture; `x = ROWS_PER_OPEN /
-/// (ROWS_PER_OPEN + n_avg)` self-calibrates to the index's granularity.
-/// Internal constant, not a knob. Covers the open only - routing/search
-/// cost is NOT modeled; removed once search is costed.
-pub(crate) const ROWS_PER_OPEN: f64 = 1.64;
+/// fitted on the reference fixture; `x = rows_per_open() /
+/// (rows_per_open() + n_avg)` self-calibrates to the index's granularity.
+/// Defaults to this fitted value; runtime-settable via
+/// [`set_rows_per_open`] for testing/calibration only. Covers the open
+/// only - routing/search cost is NOT modeled; removed once search is
+/// costed.
+pub const DEFAULT_ROWS_PER_OPEN: f64 = 1.64;
+
+/// Current ROWS_PER_OPEN value, stored as f64 bits. See
+/// [`DEFAULT_ROWS_PER_OPEN`].
+static ROWS_PER_OPEN_BITS: AtomicU64 = AtomicU64::new(DEFAULT_ROWS_PER_OPEN.to_bits());
+
+/// Overrides the modeled cost of one cluster OPEN, in rows of full work.
+/// Testing/calibration knob; non-finite or non-positive values reset to
+/// [`DEFAULT_ROWS_PER_OPEN`].
+pub fn set_rows_per_open(v: f64) {
+    let v = if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        DEFAULT_ROWS_PER_OPEN
+    };
+    ROWS_PER_OPEN_BITS.store(v.to_bits(), Relaxed);
+}
+
+/// The current modeled cost of one cluster OPEN, in rows of full work.
+/// See [`DEFAULT_ROWS_PER_OPEN`].
+pub(crate) fn rows_per_open() -> f64 {
+    f64::from_bits(ROWS_PER_OPEN_BITS.load(Relaxed))
+}
 
 /// The per-index open share: what fraction of one average cluster's work
 /// opening it costs. Covers the open only - routing/search cost is NOT
-/// modeled (see [`ROWS_PER_OPEN`]).
+/// modeled (see [`DEFAULT_ROWS_PER_OPEN`]).
 ///
 /// * `n_avg` (`f64`) — native docs per cluster (see [`WorkModel`]).
 ///
-/// Returns (`f64`): `ROWS_PER_OPEN / (ROWS_PER_OPEN + n_avg)`, clamped to
-/// (0, 0.5] — a share above one half would mean opens dominate rows,
+/// Returns (`f64`): `rows_per_open() / (rows_per_open() + n_avg)`, clamped
+/// to (0, 0.5] — a share above one half would mean opens dominate rows,
 /// which only degenerate sub-2-row clusters produce.
 pub(crate) fn open_share(n_avg: f64) -> f64 {
-    (ROWS_PER_OPEN / (ROWS_PER_OPEN + n_avg.max(0.0))).min(0.5)
+    let rpo = rows_per_open();
+    (rpo / (rpo + n_avg.max(0.0))).min(0.5)
 }
 
 /// An amount of probe WORK, in the model's own unit: 1 unit is one
@@ -2423,7 +2450,8 @@ mod tests {
         let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
 
         let n_avg = 22.0 / 2.0;
-        let x = ROWS_PER_OPEN / (ROWS_PER_OPEN + n_avg);
+        let rpo = rows_per_open();
+        let x = rpo / (rpo + n_avg);
         let row = (1.0 - x) / n_avg;
 
         // Unfiltered: every cluster opened, every row scored - the

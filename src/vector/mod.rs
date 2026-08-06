@@ -30,7 +30,9 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
-pub use backend::{ProbeStats, ProbeTermination, VectorBackend};
+pub use backend::{
+    set_rows_per_open, ProbeStats, ProbeTermination, VectorBackend, DEFAULT_ROWS_PER_OPEN,
+};
 pub use bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
     BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
