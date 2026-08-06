@@ -250,9 +250,11 @@ pub(crate) fn merge_ivf(
             write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
             continue;
         }
-        let num_centroids = settings.num_centroids.min(vector_count);
-        let training_sample_size =
-            vector_count.min(num_centroids.saturating_mul(settings.training_samples_per_centroid));
+        let training_sample_size = {
+            let ratio = f64::from(settings.training_sample_ratio).clamp(f64::MIN_POSITIVE, 1.0);
+            let target = ((vector_count as f64) * ratio).ceil() as usize;
+            target.clamp(1, vector_count)
+        };
         let training_sample_interval = (vector_count / training_sample_size).max(1);
 
         let residual: fn(&[u8], &[f32]) -> f32 = match opts.dtype() {
@@ -324,7 +326,7 @@ pub(crate) fn merge_ivf(
                     },
                 });
                 let train_start = Instant::now();
-                let centroids = clusterer.train(opts, training_vectors, num_centroids)?;
+                let centroids = clusterer.train(opts, training_vectors)?;
                 timings.train = train_start.elapsed();
 
                 if ctx.cancel.wants_cancel() {
@@ -347,12 +349,14 @@ pub(crate) fn merge_ivf(
                         centroid_matrix.dims
                     )));
                 }
-                if centroid_matrix.rows != num_centroids {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "IvfClusterer produced {} centroids, but {num_centroids} were requested",
-                        centroid_matrix.rows
-                    )));
+                if centroid_matrix.rows == 0 {
+                    return Err(TantivyError::InvalidArgument(
+                        "IvfClusterer produced zero centroids".to_string(),
+                    ));
                 }
+                // Leaf count is emergent from the clusterer; the rest of the
+                // merge uses whatever train returned.
+                let num_centroids = centroid_matrix.rows;
                 // Float working copy of the trained centroids — the exact
                 // replica scan and the `.centroids` encode below read
                 // per-row slices. Encoding + Cosine normalization happen at
