@@ -31,7 +31,8 @@ pub(crate) mod tests;
 pub(crate) const VEC_EXT: &str = "vec";
 
 pub use backend::{
-    set_rows_per_open, ProbeStats, ProbeTermination, VectorBackend, DEFAULT_ROWS_PER_OPEN,
+    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, VectorBackend,
+    DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 pub use bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
