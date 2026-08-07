@@ -650,7 +650,11 @@ impl<T: VectorElement> VectorBackend<T> {
         // query is widened losslessly per element.
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
         let mut routing_ws = Workspace::new();
-        let mut ranked = index.rank_clusters(&mut routing_ws, &query_f32);
+        let mut ranked = index.rank_clusters_bootstrapped(
+            &mut routing_ws,
+            &query_f32,
+            self.adaptive.routing_bootstrap_ef,
+        );
 
         let topn = self.scan_clusters(
             index,

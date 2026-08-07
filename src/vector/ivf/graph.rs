@@ -499,8 +499,14 @@ pub struct SearchIterator<'g, 'w, S: VectorArena, const RESUMABLE: bool> {
     rng: &'g RelativeNeighborhoodGraph<S>,
     workspace: &'w mut Workspace,
     query: &'g [S::Elem],
-    /// Beam width of each round.
+    /// Beam width of the NEXT round. Normally `full_ef`; a bootstrapped
+    /// iterator starts smaller so its first round converges cheaply, and
+    /// every resumed round widens back — the frontier and visited set
+    /// carry over, so the narrow first round is pure laziness, not a
+    /// different search.
     ef: usize,
+    /// Beam width every round after the first runs at.
+    full_ef: usize,
     /// The current converged batch, sorted ascending so popping from the back
     /// yields most similar first.
     batch: Vec<Candidate>,
@@ -549,9 +555,18 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
             workspace,
             query,
             ef,
+            full_ef: ef,
             batch: Vec::new(),
             metrics,
         }
+    }
+
+    /// Caps the FIRST round's beam width at `first_ef` (floored at one);
+    /// resumed rounds run at the full width. Only meaningful before the
+    /// first pull.
+    fn with_first_batch_ef(mut self, first_ef: usize) -> Self {
+        self.ef = first_ef.clamp(1, self.full_ef);
+        self
     }
 
     /// The counters accumulated so far: totals across every round run to this
@@ -637,6 +652,9 @@ impl<S: VectorArena, const RESUMABLE: bool> Iterator for SearchIterator<'_, '_, 
             // On an exhausted graph the frontier is empty and this is a cheap
             // no-op; the batch stays empty and the stream ends below.
             self.run_round();
+            // A bootstrapped first round ran narrow; every later round
+            // resumes at the full beam. Idempotent otherwise.
+            self.ef = self.full_ef;
         }
         let candidate = self.batch.pop()?;
         self.metrics.result_count += 1;
@@ -711,6 +729,22 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         seeds: &[NodeId],
     ) -> ResumableSearchIterator<'g, 'w, S> {
         ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef)
+    }
+
+    /// [`search_iter`](Self::search_iter) with the first round's beam
+    /// capped at `first_batch_ef`: the stream head materializes after a
+    /// cheap narrow round, and pulling past it resumes at the full
+    /// [`ef`](NeighborhoodGraphConfig::ef). For callers that open a
+    /// ranked stream but may consume only a few candidates from it.
+    pub fn search_iter_bootstrapped<'g, 'w>(
+        &'g self,
+        ws: &'w mut Workspace,
+        query: &'g [S::Elem],
+        seeds: &[NodeId],
+        first_batch_ef: usize,
+    ) -> ResumableSearchIterator<'g, 'w, S> {
+        ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef)
+            .with_first_batch_ef(first_batch_ef)
     }
 
     /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
@@ -1379,6 +1413,49 @@ mod rng_tests {
         );
         // Exhausted iterators stay exhausted.
         assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn bootstrapped_first_round_is_narrow_then_widens() {
+        // A bootstrapped stream must (a) cost visibly less to produce its
+        // head than a full-ef first round, and (b) still yield every
+        // reachable node exactly once when drained — the narrow round is
+        // laziness, not a different search.
+        let n: NodeId = 20;
+        let rng = line_index(n);
+
+        let mut ws = Workspace::new();
+        let mut full = rng.search_iter(&mut ws, &[4.2], &[0]);
+        full.next();
+        let full_head_visits = full.metrics().visited_count;
+
+        let mut ws2 = Workspace::new();
+        let mut boot = rng.search_iter_bootstrapped(&mut ws2, &[4.2], &[0], 2);
+        let head = boot.next().expect("non-empty graph yields a head");
+        assert!(
+            boot.metrics().visited_count < full_head_visits,
+            "bootstrap head must visit fewer nodes: {} vs {}",
+            boot.metrics().visited_count,
+            full_head_visits
+        );
+        // The narrow head is still a sensible one: within the first batch
+        // of the full search.
+        let mut ws3 = Workspace::new();
+        let full_batch: Vec<NodeId> = rng
+            .search_iter(&mut ws3, &[4.2], &[0])
+            .take(8)
+            .map(|c| c.node)
+            .collect();
+        assert!(full_batch.contains(&head.node));
+
+        // Draining still reaches every node exactly once.
+        let mut ids: Vec<NodeId> = std::iter::once(head)
+            .chain(boot.by_ref())
+            .map(|c| c.node)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..n).collect::<Vec<NodeId>>());
+        assert_eq!(boot.next(), None);
     }
 
     #[test]

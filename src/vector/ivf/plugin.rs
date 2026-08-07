@@ -117,7 +117,7 @@ fn build_centroid_graph<'a>(
     ef: usize,
 ) -> crate::Result<RelativeNeighborhoodGraph<&'a [f32]>> {
     // Replica cells must predict the query-time router
-    // (`rank_clusters`), which ranks centroids by the field metric —
+    // (`rank_clusters_bootstrapped`), which ranks centroids by the field metric —
     // so the graph selects with that metric directly. For Dot,
     // centroid ranking by dot(q, c) is invariant to ||q||: a
     // v-directed query ranks cells by dot(v, c), so raw dot IS the

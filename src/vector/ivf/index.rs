@@ -349,10 +349,16 @@ impl IvfIndex {
     /// `ws` holds the routing search's scratch and is borrowed for the
     /// ranking's lifetime; [`ClusterRanking::metrics`] reports the cost
     /// incurred so far (surfaced as `ProbeStats::routing`).
-    pub(crate) fn rank_clusters<'a>(
+    /// `first_batch_ef` caps the graph path's first beam round (`0` =
+    /// full width): the stream head costs a narrow converged round
+    /// instead of a full-`ef` one, and pulling deeper resumes at full
+    /// width. The exact (graph-less) path is unaffected — it scores
+    /// every centroid up front either way.
+    pub(crate) fn rank_clusters_bootstrapped<'a>(
         &'a self,
         ws: &'a mut Workspace,
         query: &'a [f32],
+        first_batch_ef: usize,
     ) -> ClusterRanking<'a> {
         match &self.graph {
             Some(graph) => {
@@ -364,6 +370,14 @@ impl IvfIndex {
                         .map(|node| node as NodeId)
                         .collect()
                 };
+                if first_batch_ef > 0 {
+                    return ClusterRanking::Graph(graph.search_iter_bootstrapped(
+                        ws,
+                        query,
+                        &seeds,
+                        first_batch_ef,
+                    ));
+                }
                 ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
             }
             None => {
@@ -385,7 +399,7 @@ impl IvfIndex {
 }
 
 /// Lazily ranked clusters for one query, yielded best routing score first;
-/// returned by [`IvfIndex::rank_clusters`], which documents the two paths.
+/// returned by [`IvfIndex::rank_clusters_bootstrapped`], which documents the two paths.
 pub(crate) enum ClusterRanking<'a> {
     /// Beam-searched routing over the persisted centroid RNG; pulling past a
     /// converged batch resumes the search.
@@ -427,7 +441,7 @@ impl Iterator for ClusterRanking<'_> {
     }
 }
 
-/// Routing cost of one [`IvfIndex::rank_clusters`] ranking (a
+/// Routing cost of one [`IvfIndex::rank_clusters_bootstrapped`] ranking (a
 /// [`ClusterRanking::metrics`] snapshot): how many centroids were scored to
 /// pick the probe order, and — when routing went through the centroid RNG —
 /// the beam search's full [`NeighborhoodGraphSearchMetrics`].

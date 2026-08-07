@@ -78,6 +78,13 @@ pub struct AdaptiveProbeParams {
     /// qualify, so small values trade recall for routing; `u32::MAX`
     /// disables the cap and restores exact-by-construction probing.
     pub max_consecutive_bounds_skips: u32,
+    /// Beam width of each segment's FIRST routing round, so the ranked
+    /// stream's head costs a narrow converged round instead of a
+    /// full-`ef` one; pulling deeper resumes at full width. Cuts the
+    /// fixed routing floor for segments the scan barely consumes, at
+    /// the price of a noisier first batch per segment. `0` disables
+    /// (full width).
+    pub routing_bootstrap_ef: usize,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -87,6 +94,7 @@ impl Default for AdaptiveProbeParams {
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
             max_consecutive_bounds_skips: crate::vector::backend::MAX_CONSECUTIVE_BOUNDS_SKIPS,
+            routing_bootstrap_ef: 8,
         }
     }
 }
