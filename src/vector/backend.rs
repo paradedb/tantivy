@@ -27,7 +27,9 @@ use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Wor
 use super::prepared::PreparedQuery;
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
-use crate::collector::sort_key::{Comparator, NaturalComparator};
+use crate::collector::sort_key::{
+    Comparator, NaturalComparator, SharedThreshold, SharedThresholdArcOpt,
+};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::fastfield::AliveBitSet;
 use crate::query::Weight;
@@ -54,6 +56,7 @@ pub struct VectorBackend<T: VectorElement> {
     query: Arc<PreparedQuery<T>>,
     adaptive: AdaptiveProbeParams,
     segment_ord: SegmentOrdinal,
+    shared_threshold: SharedThresholdArcOpt<Score>,
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -74,7 +77,22 @@ impl<T: VectorElement> VectorBackend<T> {
             query,
             adaptive,
             segment_ord,
+            shared_threshold: None,
         })
+    }
+
+    /// Attaches the cross-segment kth cell. The IVF probe loop seeds its
+    /// bounds gate from it before the first probe, folds it at cluster
+    /// boundaries, and publishes local kth improvements back; the exact
+    /// path publishes its final kth. Every backend sharing one cell MUST
+    /// run the same query at the same `top_n`: the cell's key is a
+    /// certificate that k results at least that good exist somewhere, and
+    /// a differing query or k voids it.
+    /// [`TopDocsByVectorSimilarity`](super::collector::TopDocsByVectorSimilarity)
+    /// guarantees this by construction.
+    pub fn with_shared_threshold(mut self, shared: SharedThresholdArcOpt<Score>) -> Self {
+        self.shared_threshold = shared;
+        self
     }
 
     /// Top-N within this segment: probe routed clusters when the reader has
@@ -211,6 +229,13 @@ impl<T: VectorElement> VectorBackend<T> {
             return Err(err);
         }
         stats.exact_rows_read += rows_read;
+        // A flat segment can't consume the bound (no clusters to skip),
+        // but its exact kth is the strongest certificate a segment can
+        // publish — later IVF segments seed their gates from it.
+        if let Some(shared) = self.shared_threshold.as_deref() {
+            let kth = topn.kth_best().map(|(score, _tie)| score);
+            sync_shared_kth(shared, kth, self.segment_ord);
+        }
         let segment_ord = self.segment_ord;
         Ok(topn
             .into_sorted_vec()
@@ -247,6 +272,42 @@ where
         }
     }
     Some((score, tie_break.segment_sort_key(doc, score)))
+}
+
+/// One round-trip with the cross-segment kth cell: publishes this segment's
+/// exact kth similarity if it beats what's there, and returns the freshest
+/// key observed either way, for the caller to fold into its own bound.
+/// Keys are raw kth heap keys in NATIVE heap space; only finite kths are
+/// published — a non-finite kth certifies nothing.
+///
+/// * `shared` (`&dyn SharedThreshold<Score>`) — the cell every segment of this search shares.
+/// * `local_kth` (`Option<f32>`) — this segment's exact kth heap key, `None` while its heap holds
+///   fewer than k results.
+/// * `segment_ord` (`SegmentOrdinal`) — published alongside the key. Exact key ties do not update
+///   the cell: consumers read only the key, so the ordinal is provenance, not an ordering input.
+///
+/// Returns (`Option<Score>`): the best key the cell holds after the
+/// exchange, `None` if it is empty and nothing was published.
+fn sync_shared_kth(
+    shared: &dyn SharedThreshold<Score>,
+    local_kth: Option<f32>,
+    segment_ord: SegmentOrdinal,
+) -> Option<Score> {
+    let mut current = shared.load();
+    if let Some(kth) = local_kth.filter(|kth| kth.is_finite()) {
+        loop {
+            if let Some((cur_key, _)) = current {
+                if kth <= cur_key {
+                    break;
+                }
+            }
+            match shared.try_update(&current, (kth, segment_ord)) {
+                Ok(()) => return Some(kth),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+    current.map(|(key, _)| key)
 }
 
 /// How the probe loop stopped.
@@ -305,12 +366,18 @@ pub struct ProbeStats {
     /// `postings_*` partition, which only counts opened clusters.
     pub bounds_skips: u32,
     /// Probe index (0-based, counting opened clusters) at which the
-    /// query bound first armed - the boundary where the heap filled and
-    /// margins existed to certify against. `None` = never armed (the
-    /// heap never held k results), serialized as JSON null - the
-    /// harness's armed-share column depends on the null contract.
+    /// query bound first armed from this segment's OWN heap - the
+    /// boundary where the heap filled and margins existed to certify
+    /// against. `None` = never armed locally (the heap never held k
+    /// results), serialized as JSON null - the harness's armed-share
+    /// column depends on the null contract. A seeded bound
+    /// ([`bound_seeded`](Self::bound_seeded)) gates earlier than this.
     /// Per-segment; does not sum.
     pub bound_armed_at_probe: Option<u32>,
+    /// Whether the bounds gate armed from the cross-segment shared kth
+    /// BEFORE this segment's first probe, so every cluster faced a
+    /// margin check. Per-segment; does not sum.
+    pub bound_seeded: bool,
     /// How the probe loop terminated. Per-segment; does not sum.
     pub termination: ProbeTermination,
     /// Work units this segment's probe loop charged against its resolved
@@ -646,6 +713,14 @@ impl<T: VectorElement> VectorBackend<T> {
         // tracker.
         let metric = self.query.metric();
         let mut bound_tracker = QueryBoundTracker::new();
+        // Cross-segment seed: a kth certified by another segment's full
+        // heap arms the gate before the first probe, so every cluster —
+        // including the first — faces a margin check.
+        if let Some(shared) = self.shared_threshold.as_deref() {
+            if let Some((key, _)) = shared.load() {
+                bound_tracker.seed(metric, key);
+            }
+        }
         // P4: `||q||` for the dot margin's Cauchy-Schwarz term; once per
         // segment-query.
         let q_norm = norm_squared_wide(self.query.query()).sqrt() as f32;
@@ -764,11 +839,26 @@ impl<T: VectorElement> VectorBackend<T> {
             let probe_idx = (postings_row + postings_skipped - 1) as u32;
             let peek = HeapPeek::from_kth(topn.kth_best().map(|(score, _tie)| score));
             bound_tracker.observe(metric, peek, probe_idx);
+            // Cross-segment sync, same cadence as the local fold: publish
+            // the local kth if it improves the cell, fold back whatever
+            // the cell holds (a concurrent segment may have tightened it).
+            if let Some(shared) = self.shared_threshold.as_deref() {
+                let local_kth = match peek {
+                    HeapPeek::Full { kth_key } => Some(kth_key),
+                    HeapPeek::Filling => None,
+                };
+                if let Some(key) = sync_shared_kth(shared, local_kth, self.segment_ord) {
+                    bound_tracker.observe_shared(metric, key);
+                }
+            }
         }
-        // The armed index exists exactly when the bound armed.
+        // Arming sources are exactly: the seed, a local heap fill, or a
+        // shared fold (which requires the cell).
         debug_assert!(
-            bound_tracker.armed_at_probe().is_some()
-                == matches!(bound_tracker.bound(), QueryBound::Armed { .. })
+            !matches!(bound_tracker.bound(), QueryBound::Armed { .. })
+                || bound_tracker.seeded()
+                || bound_tracker.armed_at_probe().is_some()
+                || self.shared_threshold.is_some()
         );
 
         stats.vectors_visited += visited;
@@ -780,6 +870,7 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.candidates_scored += candidates;
         stats.bounds_skips += bounds_skips;
         stats.bound_armed_at_probe = bound_tracker.armed_at_probe();
+        stats.bound_seeded = bound_tracker.seeded();
         stats.termination = termination;
         stats.work_charged += work_spent.to_f32();
 
@@ -2593,6 +2684,7 @@ mod tests {
             },
             bounds_skips: 2,
             bound_armed_at_probe: Some(1),
+            bound_seeded: true,
             termination: ProbeTermination::Ceiling,
             work_charged: 1.75,
         };
@@ -2622,6 +2714,7 @@ mod tests {
                 },
                 "bounds_skips": 2,
                 "bound_armed_at_probe": 1,
+                "bound_seeded": true,
                 "termination": "Ceiling",
                 "work_charged": 1.75
             })
@@ -3635,6 +3728,227 @@ mod tests {
                 stats.bounds_skips > 0,
                 "armed late still skips the far tail"
             );
+            Ok(())
+        }
+    }
+
+    // ==================================================================
+    // P7: cross-segment threshold sharing
+    // ==================================================================
+
+    mod shared_threshold_tests {
+        use super::bounds_gate_tests::single_segment_fixture;
+        use super::*;
+        use crate::collector::sort_key::{AtomicSharedThreshold, SharedThresholdArc};
+
+        fn cell() -> SharedThresholdArc<Score> {
+            Arc::new(AtomicSharedThreshold::default())
+        }
+
+        /// Six docs per centroid, offset along x so kths are exact and
+        /// tiny.
+        fn docs_around(centroids: &[[f32; 2]]) -> Vec<[f32; 2]> {
+            centroids
+                .iter()
+                .flat_map(|c| (0..6).map(move |i| [c[0] + i as f32 * 0.01, c[1]]))
+                .collect()
+        }
+
+        /// `run_top_n` with a shared cell attached and a caller-chosen
+        /// segment ordinal.
+        fn run_with_cell(
+            index: &Index,
+            field: Field,
+            segment_ord: SegmentOrdinal,
+            query: Vec<f32>,
+            k: usize,
+            params: AdaptiveProbeParams,
+            cell: &SharedThresholdArc<Score>,
+        ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+            let searcher = index.reader()?.searcher();
+            let segment_reader = &searcher.segment_readers()[0];
+            let weight = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            let backend = VectorBackend::<f32>::for_segment(
+                segment_reader,
+                segment_ord,
+                field,
+                Arc::new(query),
+                params,
+            )?
+            .with_shared_threshold(Some(Arc::clone(cell)));
+            backend.top_n(weight.as_ref(), segment_reader, k)
+        }
+
+        /// The headline behavior: a segment whose every cluster is
+        /// provably outside another segment's published kth opens
+        /// nothing — zero rows scored, every doc-bearing cluster a
+        /// counted skip — purely from the seeded bound.
+        #[test]
+        fn seeded_gate_skips_every_cluster_of_a_hopeless_segment() -> crate::Result<()> {
+            let near_centroids = [[1.0f32, 1.0], [3.0, 1.0]];
+            let far_centroids = [[101.0f32, 1.0], [111.0, 1.0]];
+            let (near, near_field) = single_segment_fixture(
+                Metric::L2,
+                &near_centroids,
+                &docs_around(&near_centroids),
+                1,
+            )?;
+            let (far, far_field) = single_segment_fixture(
+                Metric::L2,
+                &far_centroids,
+                &docs_around(&far_centroids),
+                1,
+            )?;
+            let query = vec![1.0f32, 1.0];
+            let k = 5;
+
+            let shared = cell();
+            let (near_hits, near_stats) = run_with_cell(
+                &near,
+                near_field,
+                0,
+                query.clone(),
+                k,
+                exhaustive_params(2),
+                &shared,
+            )?;
+            assert_eq!(near_hits.len(), k);
+            assert!(
+                !near_stats.bound_seeded,
+                "the first segment finds an empty cell"
+            );
+            let (published, published_ord) =
+                shared.load().expect("a filled heap must publish its kth");
+            assert_eq!(published_ord, 0);
+            // kth of the home cluster's offsets {0, .01, .., .05}: d = .04.
+            assert!(
+                published > -0.01,
+                "published kth must be the near segment's tight key, got {published}"
+            );
+
+            let (far_hits, far_stats) = run_with_cell(
+                &far,
+                far_field,
+                1,
+                query.clone(),
+                k,
+                exhaustive_params(2),
+                &shared,
+            )?;
+            assert!(far_hits.is_empty(), "no far doc can beat the seeded kth");
+            assert!(far_stats.bound_seeded);
+            assert_eq!(
+                far_stats.candidates_scored, 0,
+                "the seeded gate must open nothing: {far_stats:?}"
+            );
+            assert_eq!(far_stats.postings_row, 0);
+            assert_eq!(
+                far_stats.bounds_skips, 2,
+                "both far clusters are certified skips: {far_stats:?}"
+            );
+            // The cell still holds the near kth — the far segment had
+            // nothing better to publish.
+            assert_eq!(shared.load().expect("cell stays armed").0, published);
+
+            // Control: the same far segment with an empty cell probes
+            // normally and publishes its own (weak) kth.
+            let lone = cell();
+            let (control_hits, control_stats) =
+                run_with_cell(&far, far_field, 1, query, k, exhaustive_params(2), &lone)?;
+            assert_eq!(control_hits.len(), k);
+            assert!(!control_stats.bound_seeded);
+            assert!(
+                control_stats.candidates_scored > 0,
+                "unseeded, the far segment must do real work: {control_stats:?}"
+            );
+            assert!(lone.load().is_some());
+            Ok(())
+        }
+
+        /// A flat segment consumes nothing but publishes its exact kth —
+        /// the strongest certificate a segment can produce — and a later
+        /// IVF segment's gate runs on it.
+        #[test]
+        fn flat_segment_publishes_its_exact_kth() -> crate::Result<()> {
+            let mut sb = Schema::builder();
+            let flat_field = sb.add_vector_field(
+                "embedding",
+                VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+            );
+            let index = Index::builder().schema(sb.build()).create_in_ram()?;
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            for i in 0..6 {
+                let mut doc = TantivyDocument::new();
+                doc.add_vector(flat_field, &[1.0 + i as f32 * 0.01, 1.0]);
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+            let searcher = index.reader()?.searcher();
+            let segment_reader = &searcher.segment_readers()[0];
+            assert!(
+                segment_reader.vector_index(flat_field)?.index().is_none(),
+                "expected flat storage"
+            );
+            let weight = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+
+            // Underfilled heap (k > N): nothing to certify, nothing
+            // published.
+            let empty = cell();
+            let backend = VectorBackend::<f32>::for_segment(
+                segment_reader,
+                0,
+                flat_field,
+                Arc::new(vec![1.0f32, 1.0]),
+                AdaptiveProbeParams::default(),
+            )?
+            .with_shared_threshold(Some(Arc::clone(&empty)));
+            backend.top_n(weight.as_ref(), segment_reader, 100)?;
+            assert_eq!(
+                empty.load(),
+                None,
+                "an underfilled heap must not publish a kth"
+            );
+
+            let shared = cell();
+            let backend = VectorBackend::<f32>::for_segment(
+                segment_reader,
+                0,
+                flat_field,
+                Arc::new(vec![1.0f32, 1.0]),
+                AdaptiveProbeParams::default(),
+            )?
+            .with_shared_threshold(Some(Arc::clone(&shared)));
+            let (hits, stats) = backend.top_n(weight.as_ref(), segment_reader, 5)?;
+            assert_eq!(hits.len(), 5);
+            assert_eq!(stats.exact_rows_read, 6);
+            let (key, ord) = shared.load().expect("the exact scan must publish its kth");
+            assert_eq!(ord, 0);
+            // 5th best of d^2 in {0, 1e-4, 4e-4, 9e-4, 16e-4, 25e-4}.
+            assert!(
+                (key + 0.0016).abs() < 1e-5,
+                "published key must be -kth d^2, got {key}"
+            );
+
+            // The flat kth seeds a hopeless IVF segment into full skip.
+            let far_centroids = [[101.0f32, 1.0], [111.0, 1.0]];
+            let (far, far_field) = single_segment_fixture(
+                Metric::L2,
+                &far_centroids,
+                &docs_around(&far_centroids),
+                1,
+            )?;
+            let (far_hits, far_stats) = run_with_cell(
+                &far,
+                far_field,
+                1,
+                vec![1.0f32, 1.0],
+                5,
+                exhaustive_params(2),
+                &shared,
+            )?;
+            assert!(far_hits.is_empty());
+            assert!(far_stats.bound_seeded);
+            assert_eq!(far_stats.candidates_scored, 0, "{far_stats:?}");
             Ok(())
         }
     }

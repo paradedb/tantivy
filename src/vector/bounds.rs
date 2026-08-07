@@ -289,65 +289,119 @@ pub fn to_bound_space(metric: Metric, heap_key: f32) -> f32 {
     }
 }
 
-/// Maintains the [`QueryBound`] beside the probe loop: converts heap
-/// peeks into bound space on kth improvement only, and records the probe
-/// index at which the bound first armed.
+/// Maintains the [`QueryBound`] beside the probe loop. The bound is a
+/// monotone-max fold over every certified kth key it is shown — the local
+/// heap's exact kth at cluster boundaries, and any cross-segment shared
+/// kth ([`seed`](Self::seed) before probe 0, [`observe_shared`](Self::observe_shared)
+/// at boundaries). All keys live in the same NATIVE heap space, so the max
+/// is metric-uniform; the [`to_bound_space`] conversion runs on
+/// improvement only. Non-finite keys are ignored — the bound stays put
+/// and clusters keep probing, so fail-open needs no degenerate `t`.
 pub(crate) struct QueryBoundTracker {
     bound: QueryBound,
-    /// The raw kth heap key behind the current `t` — the improvement
-    /// detector that keeps [`to_bound_space`] off the per-cluster path.
+    /// The best raw kth heap key folded so far, local or shared — the
+    /// improvement detector that keeps [`to_bound_space`] off the
+    /// per-cluster path.
     raw_kth: Option<f32>,
     armed_at_probe: Option<u32>,
+    seeded: bool,
 }
 
 impl QueryBoundTracker {
     /// Starts unarmed.
     ///
     /// Returns (`QueryBoundTracker`): `Filling`, no kth key, no armed
-    /// index.
+    /// index, unseeded.
     pub(crate) fn new() -> Self {
         Self {
             bound: QueryBound::Filling,
             raw_kth: None,
             armed_at_probe: None,
+            seeded: false,
         }
     }
 
-    /// Folds one cluster-boundary peek into the bound.
+    /// The monotone-max fold: `key` is a raw kth heap key in NATIVE heap
+    /// space, certified by SOME full heap of the search's k. Finite
+    /// improvements tighten the bound; everything else is a no-op.
+    ///
+    /// Returns (`bool`): whether the bound moved.
+    fn fold_key(&mut self, metric: Metric, key: f32) -> bool {
+        if !key.is_finite() {
+            return false;
+        }
+        if self.raw_kth.is_some_and(|cur| key <= cur) {
+            return false;
+        }
+        self.raw_kth = Some(key);
+        self.bound = QueryBound::Armed {
+            t: to_bound_space(metric, key),
+        };
+        true
+    }
+
+    /// Arms the bound from a cross-segment shared kth BEFORE any probe,
+    /// so the gate can certify skips from the very first ranked cluster.
+    /// Sound because the shared key is itself a full-heap kth: k results
+    /// at least this good already exist somewhere in the index.
+    ///
+    /// * `metric` (`Metric`) — the field's metric, for the key conversion.
+    /// * `key` (`f32`) — the shared kth key in NATIVE heap space.
+    pub(crate) fn seed(&mut self, metric: Metric, key: f32) {
+        if self.fold_key(metric, key) {
+            self.seeded = true;
+        }
+    }
+
+    /// Folds one cluster-boundary peek of the LOCAL heap into the bound.
     ///
     /// * `metric` (`Metric`) — the field's metric, for the key conversion.
     /// * `peek` (`HeapPeek`) — the heap's exact kth snapshot after the cluster's rows were scored.
-    /// * `probe_idx` (`u32`) — 0-based index of the cluster just probed; captured once, at the
-    ///   arming transition.
+    /// * `probe_idx` (`u32`) — 0-based index of the cluster just probed; captured once, when the
+    ///   local heap first fills.
     pub(crate) fn observe(&mut self, metric: Metric, peek: HeapPeek, probe_idx: u32) {
         let HeapPeek::Full { kth_key } = peek else {
             return;
         };
-        if self.raw_kth != Some(kth_key) {
-            self.raw_kth = Some(kth_key);
-            self.bound = QueryBound::Armed {
-                t: to_bound_space(metric, kth_key),
-            };
-        }
+        self.fold_key(metric, kth_key);
         if self.armed_at_probe.is_none() {
             self.armed_at_probe = Some(probe_idx);
         }
     }
 
+    /// Folds a fresh read of the cross-segment shared kth at a cluster
+    /// boundary — a no-op unless another segment tightened it past
+    /// everything folded so far.
+    ///
+    /// * `metric` (`Metric`) — the field's metric, for the key conversion.
+    /// * `key` (`f32`) — the shared kth key in NATIVE heap space.
+    pub(crate) fn observe_shared(&mut self, metric: Metric, key: f32) {
+        self.fold_key(metric, key);
+    }
+
     /// The current bound.
     ///
-    /// Returns (`QueryBound`): `Armed` iff a `Full` peek has been
-    /// observed.
+    /// Returns (`QueryBound`): `Armed` iff a finite certified kth has
+    /// been folded, from any source.
     pub(crate) fn bound(&self) -> QueryBound {
         self.bound
     }
 
-    /// The probe index at which the bound armed.
+    /// The probe index at which the LOCAL heap first held k results.
     ///
     /// Returns (`Option<u32>`): 0-based probed-cluster index of the first
-    /// `Full` peek; `None` if the heap never filled.
+    /// `Full` peek; `None` if this segment's heap never filled. A seeded
+    /// bound arms earlier than this — see [`Self::seeded`].
     pub(crate) fn armed_at_probe(&self) -> Option<u32> {
         self.armed_at_probe
+    }
+
+    /// Whether the bound armed from a shared cross-segment kth before any
+    /// probe.
+    ///
+    /// Returns (`bool`): true iff [`Self::seed`] moved the bound.
+    pub(crate) fn seeded(&self) -> bool {
+        self.seeded
     }
 }
 
@@ -614,6 +668,87 @@ mod bounds_peek_tests {
             HeapPeek::Full { kth_key: 0.4 },
             "a non-improving push must not move the kth key"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounds_tracker_tests {
+    use super::*;
+    use crate::schema::Metric;
+
+    /// A seed arms the bound before any probe: `Armed` with the converted
+    /// t, `seeded` set, and no local armed-at-probe index.
+    #[test]
+    fn seed_arms_before_any_probe() {
+        let mut tracker = QueryBoundTracker::new();
+        tracker.seed(Metric::L2, -4.0); // d = 2
+        assert_eq!(tracker.bound(), QueryBound::Armed { t: 2.0 });
+        assert!(tracker.seeded());
+        assert_eq!(tracker.armed_at_probe(), None);
+    }
+
+    /// Non-finite keys never move the bound, from any source — the
+    /// tracker stays `Filling` (probe-everything) rather than arming with
+    /// a degenerate t.
+    #[test]
+    fn non_finite_keys_are_ignored() {
+        let mut tracker = QueryBoundTracker::new();
+        tracker.seed(Metric::L2, f32::NAN);
+        assert_eq!(tracker.bound(), QueryBound::Filling);
+        assert!(!tracker.seeded());
+        tracker.observe_shared(Metric::L2, f32::NEG_INFINITY);
+        tracker.observe(Metric::L2, HeapPeek::Full { kth_key: f32::NAN }, 0);
+        assert_eq!(tracker.bound(), QueryBound::Filling);
+        // A finite key afterwards still arms — no NaN poisoning.
+        tracker.observe(Metric::L2, HeapPeek::Full { kth_key: -1.0 }, 1);
+        assert_eq!(tracker.bound(), QueryBound::Armed { t: 1.0 });
+    }
+
+    /// The fold is a monotone max over keys whatever their source: worse
+    /// keys — shared or local — never loosen the bound, better ones
+    /// tighten it.
+    #[test]
+    fn fold_is_monotone_across_sources() {
+        let mut tracker = QueryBoundTracker::new();
+        tracker.seed(Metric::L2, -4.0); // t = 2
+        tracker.observe_shared(Metric::L2, -9.0); // worse, ignored
+        assert_eq!(tracker.bound(), QueryBound::Armed { t: 2.0 });
+        tracker.observe(Metric::L2, HeapPeek::Full { kth_key: -9.0 }, 0);
+        assert_eq!(
+            tracker.bound(),
+            QueryBound::Armed { t: 2.0 },
+            "a local kth looser than the shared bound must not widen t"
+        );
+        tracker.observe(Metric::L2, HeapPeek::Full { kth_key: -1.0 }, 1);
+        assert_eq!(tracker.bound(), QueryBound::Armed { t: 1.0 });
+        tracker.observe_shared(Metric::L2, -0.25);
+        assert_eq!(tracker.bound(), QueryBound::Armed { t: 0.5 });
+    }
+
+    /// `armed_at_probe` records the LOCAL heap fill only: `observe` sets
+    /// it even when the shared bound already covers its key, and
+    /// `observe_shared`/`seed` never touch it.
+    #[test]
+    fn armed_at_probe_is_local_only() {
+        let mut tracker = QueryBoundTracker::new();
+        tracker.seed(Metric::L2, -1.0);
+        tracker.observe_shared(Metric::L2, -0.5);
+        assert_eq!(tracker.armed_at_probe(), None);
+        tracker.observe(Metric::L2, HeapPeek::Full { kth_key: -4.0 }, 3);
+        assert_eq!(tracker.armed_at_probe(), Some(3));
+        // First fill wins; later boundaries don't move it.
+        tracker.observe(Metric::L2, HeapPeek::Full { kth_key: -0.1 }, 5);
+        assert_eq!(tracker.armed_at_probe(), Some(3));
+        assert!(tracker.seeded());
+    }
+
+    /// A bound armed purely by local observation reports unseeded.
+    #[test]
+    fn local_arming_is_not_seeded() {
+        let mut tracker = QueryBoundTracker::new();
+        tracker.observe(Metric::L2, HeapPeek::Full { kth_key: -1.0 }, 0);
+        assert_eq!(tracker.bound(), QueryBound::Armed { t: 1.0 });
+        assert!(!tracker.seeded());
     }
 }
 

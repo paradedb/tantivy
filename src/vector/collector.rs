@@ -23,7 +23,7 @@ use super::backend::{ProbeStats, VectorBackend};
 use super::ivf::AdaptiveProbeParams;
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
-use crate::collector::sort_key::NaturalComparator;
+use crate::collector::sort_key::{AtomicSharedThreshold, NaturalComparator, SharedThresholdArcOpt};
 use crate::collector::{
     compare_for_top_k, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
     SortKeyComputer,
@@ -52,6 +52,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     adaptive: AdaptiveProbeParams,
     tie_break: S,
+    shared_threshold: SharedThresholdArcOpt<Score>,
 }
 
 impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
@@ -63,6 +64,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             offset: 0,
             adaptive: AdaptiveProbeParams::default(),
             tie_break: NoTieBreak,
+            shared_threshold: Some(Arc::new(AtomicSharedThreshold::default())),
         }
     }
 }
@@ -80,6 +82,28 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// segments).
     pub fn with_adaptive_params(mut self, params: AdaptiveProbeParams) -> Self {
         self.adaptive = params;
+        self
+    }
+
+    /// Override the cross-segment kth cell — `None` disables sharing.
+    ///
+    /// On by default: segments publish their exact kth-best similarity
+    /// into the cell, and IVF segments arm their centroid-bounds gate from
+    /// it before their first probe, so clusters provably unable to beat
+    /// the k results found by earlier segments are skipped by radius
+    /// without opening them. Skips are certified against exact kths, so
+    /// results are identical with sharing on or off; only the work done
+    /// (and the [`ProbeStats`]) changes. Under a multithreaded executor
+    /// the cell tightens racily, which makes the stats — never the
+    /// results — timing-dependent.
+    ///
+    /// The cell certifies "k results at least this good exist for THIS
+    /// query at THIS k", so it must not outlive a search: a collector is
+    /// built per query, and reusing one across index mutations would let
+    /// a stale certificate over-prune. Pass a fresh cell (or `None`) if
+    /// you must reuse a collector.
+    pub fn with_shared_threshold(mut self, shared: SharedThresholdArcOpt<Score>) -> Self {
+        self.shared_threshold = shared;
         self
     }
 
@@ -114,6 +138,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             offset: self.offset,
             adaptive: self.adaptive,
             tie_break,
+            shared_threshold: self.shared_threshold,
         }
     }
 
@@ -224,7 +249,8 @@ where
             self.field,
             Arc::clone(&self.query),
             self.adaptive.clone(),
-        )?;
+        )?
+        .with_shared_threshold(self.shared_threshold.clone());
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         let (hits, stats) = backend.top_n_by(
             weight,
@@ -252,10 +278,12 @@ where
         &self,
         segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
     ) -> crate::Result<Self::Fruit> {
-        // Per-segment fruits are each already top-(limit+offset) under this
-        // same composite order, so the global window is a plain sort of their
-        // union. Stats concatenate untouched — one entry per segment, kept
-        // even when the offset swallows every result.
+        // Per-segment fruits are each cut under this same composite order to
+        // top-(limit+offset) — possibly minus entries the shared kth proved
+        // outside the global window — so the union still contains the global
+        // window and a plain sort settles it. Stats concatenate untouched —
+        // one entry per segment, kept even when the offset swallows every
+        // result.
         let comparator = (NaturalComparator, self.tie_break.comparator());
         let mut stats = Vec::with_capacity(segment_fruits.len());
         let mut all: Vec<ComparableDoc<(Score, S::SortKey), DocAddress>> = Vec::new();
@@ -744,6 +772,122 @@ mod ivf_e2e_tests {
             )?;
             assert_eq!(cities(&fruit), want, "k={k}");
         }
+        Ok(())
+    }
+
+    /// Cross-segment threshold sharing, end to end through
+    /// `searcher.search`: with two IVF segments in distant regions and
+    /// the query aimed at segment 0's region, segment 1 must arm its
+    /// gate from segment 0's published kth and open no cluster at all —
+    /// while returning exactly the results an unshared search returns.
+    #[test]
+    fn e2e_shared_threshold_lets_later_segment_skip_by_radius() -> crate::Result<()> {
+        use std::collections::HashSet;
+
+        let centroids: Vec<[f32; 2]> = vec![[0.0, 0.0], [3.0, 0.0], [100.0, 0.0], [103.0, 0.0]];
+        let vector_options = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
+        let mut schema_builder = Schema::builder();
+        let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        };
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .settings(settings)
+            .ivf_clusterer(Arc::new(Grid2DClusterer { centroids }))
+            .create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        // Six docs around each of a region's two centroids per commit;
+        // two commits merged per region -> one IVF segment per region.
+        let mut add_region = |writer: &mut crate::IndexWriter, base_x: f32, base_y: f32| {
+            for cx in [0.0f32, 3.0] {
+                for i in 0..6 {
+                    let mut doc = TantivyDocument::new();
+                    doc.add_vector(embedding_field, &[base_x + cx + i as f32 * 0.01, base_y]);
+                    writer.add_document(doc).unwrap();
+                }
+            }
+        };
+        add_region(&mut writer, 0.0, 0.0);
+        writer.commit()?;
+        add_region(&mut writer, 0.0, 0.05);
+        writer.commit()?;
+        let mut region_a_ids = index.searchable_segment_ids()?;
+        region_a_ids.sort();
+        writer.merge(&region_a_ids).wait()?;
+        let after_a: HashSet<_> = index.searchable_segment_ids()?.into_iter().collect();
+        add_region(&mut writer, 100.0, 0.0);
+        writer.commit()?;
+        add_region(&mut writer, 100.0, 0.05);
+        writer.commit()?;
+        let mut region_b_ids: Vec<_> = index
+            .searchable_segment_ids()?
+            .into_iter()
+            .filter(|id| !after_a.contains(id))
+            .collect();
+        region_b_ids.sort();
+        writer.merge(&region_b_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 2);
+        // Segment order after two merges isn't pinned by the fixture, so
+        // aim the query at whichever region segment ORDINAL 0 holds —
+        // the serial executor then guarantees segment 1 is the hopeless
+        // one that runs second.
+        let segment_region_x = |ord: u32| -> crate::Result<f32> {
+            let reader = searcher.segment_reader(ord);
+            let vectors = reader.vector_index(embedding_field)?;
+            assert!(vectors.index().is_some(), "expected IVF segments");
+            let row = vectors.row_id(0).unwrap();
+            let bytes = vectors.vector_bytes_for_row(row)?;
+            Ok(f32::from_le_bytes(bytes[0..4].try_into().unwrap()))
+        };
+        let query = if segment_region_x(0)? < 50.0 {
+            vec![0.02f32, 0.0]
+        } else {
+            vec![100.02f32, 0.0]
+        };
+        assert!(segment_region_x(0)? < 50.0 || segment_region_x(1)? < 50.0);
+
+        let k = 5;
+        let collector = || {
+            TopDocs::with_limit(k)
+                .order_by_similarity(embedding_field, query.clone())
+                .with_adaptive_params(exhaustive_params(4))
+        };
+        let shared = searcher.search(&AllQuery, &collector())?;
+        let unshared = searcher.search(&AllQuery, &collector().with_shared_threshold(None))?;
+        assert_eq!(
+            shared.results, unshared.results,
+            "sharing must never change results, only work"
+        );
+        assert_eq!(shared.results.len(), k);
+
+        let near = &shared.stats[0];
+        let far = &shared.stats[1];
+        assert!(!near.bound_seeded, "segment 0 starts on an empty cell");
+        assert!(near.candidates_scored > 0);
+        assert!(
+            far.bound_seeded,
+            "segment 1 must arm from segment 0's kth: {far:?}"
+        );
+        assert_eq!(
+            far.candidates_scored, 0,
+            "the seeded gate must score nothing in the far segment: {far:?}"
+        );
+        assert_eq!(far.postings_row, 0);
+        assert!(far.bounds_skips >= 1);
+
+        let far_unshared = &unshared.stats[1];
+        assert!(!far_unshared.bound_seeded);
+        assert!(
+            far_unshared.candidates_scored > 0,
+            "without sharing the far segment does real work: {far_unshared:?}"
+        );
         Ok(())
     }
 
