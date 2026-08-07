@@ -11,6 +11,8 @@
 //! — the unit the pg-backed `Directory` can serve zero-copy.
 
 use std::ops::Range;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use common::BitSet;
@@ -360,24 +362,51 @@ impl ProbeStats {
 /// identity), spends no row work, and never terminates the scan - the
 /// budget and stream exhaustion are the only stops.
 ///
-/// ROWS_PER_OPEN is how many rows of full work one cluster OPEN costs,
-/// fitted on the reference fixture; `x = ROWS_PER_OPEN /
-/// (ROWS_PER_OPEN + n_avg)` self-calibrates to the index's granularity.
-/// Internal constant, not a knob. Covers the open only - routing/search
-/// cost is NOT modeled; removed once search is costed.
-pub(crate) const ROWS_PER_OPEN: f64 = 1.64;
+/// FIXED_PROBE_COST_ROWS is the fixed component of a probe — the cluster
+/// OPEN — denominated in rows of full work, fitted on the reference
+/// fixture; `x = fixed_probe_cost_rows() / (fixed_probe_cost_rows() +
+/// n_avg)` self-calibrates to the index's granularity. Defaults to this
+/// fitted value; runtime-settable via [`set_fixed_probe_cost_rows`] for
+/// testing/calibration only. Despite "probe" in the name it covers ONLY
+/// the open - routing/search cost is NOT modeled; removed once search is
+/// costed.
+pub const DEFAULT_FIXED_PROBE_COST_ROWS: f64 = 1.64;
+
+/// Current FIXED_PROBE_COST_ROWS value, stored as f64 bits. See
+/// [`DEFAULT_FIXED_PROBE_COST_ROWS`].
+static FIXED_PROBE_COST_ROWS_BITS: AtomicU64 =
+    AtomicU64::new(DEFAULT_FIXED_PROBE_COST_ROWS.to_bits());
+
+/// Overrides the fixed per-probe cost (the cluster OPEN), in rows of full
+/// work. Testing/calibration knob; non-finite or non-positive values reset
+/// to [`DEFAULT_FIXED_PROBE_COST_ROWS`].
+pub fn set_fixed_probe_cost_rows(v: f64) {
+    let v = if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        DEFAULT_FIXED_PROBE_COST_ROWS
+    };
+    FIXED_PROBE_COST_ROWS_BITS.store(v.to_bits(), Relaxed);
+}
+
+/// The current fixed per-probe cost (the cluster OPEN), in rows of full
+/// work. See [`DEFAULT_FIXED_PROBE_COST_ROWS`].
+pub(crate) fn fixed_probe_cost_rows() -> f64 {
+    f64::from_bits(FIXED_PROBE_COST_ROWS_BITS.load(Relaxed))
+}
 
 /// The per-index open share: what fraction of one average cluster's work
 /// opening it costs. Covers the open only - routing/search cost is NOT
-/// modeled (see [`ROWS_PER_OPEN`]).
+/// modeled (see [`DEFAULT_FIXED_PROBE_COST_ROWS`]).
 ///
 /// * `n_avg` (`f64`) — native docs per cluster (see [`WorkModel`]).
 ///
-/// Returns (`f64`): `ROWS_PER_OPEN / (ROWS_PER_OPEN + n_avg)`, clamped to
-/// (0, 0.5] — a share above one half would mean opens dominate rows,
-/// which only degenerate sub-2-row clusters produce.
+/// Returns (`f64`): `fixed_probe_cost_rows() / (fixed_probe_cost_rows() +
+/// n_avg)`, clamped to (0, 0.5] — a share above one half would mean opens
+/// dominate rows, which only degenerate sub-2-row clusters produce.
 pub(crate) fn open_share(n_avg: f64) -> f64 {
-    (ROWS_PER_OPEN / (ROWS_PER_OPEN + n_avg.max(0.0))).min(0.5)
+    let fixed = fixed_probe_cost_rows();
+    (fixed / (fixed + n_avg.max(0.0))).min(0.5)
 }
 
 /// An amount of probe WORK, in the model's own unit: 1 unit is one
@@ -2423,7 +2452,8 @@ mod tests {
         let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
 
         let n_avg = 22.0 / 2.0;
-        let x = ROWS_PER_OPEN / (ROWS_PER_OPEN + n_avg);
+        let fixed = fixed_probe_cost_rows();
+        let x = fixed / (fixed + n_avg);
         let row = (1.0 - x) / n_avg;
 
         // Unfiltered: every cluster opened, every row scored - the
