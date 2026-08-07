@@ -147,6 +147,74 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     }
 }
 
+impl<T, S> TopDocsByVectorSimilarity<T, S>
+where
+    T: VectorElement,
+    S: SortKeyComputer + Send + Sync + 'static,
+{
+    /// Collects every given segment through ONE merged probe loop instead
+    /// of the per-segment [`Collector::collect_segment`] path: all
+    /// segments' lazily ranked cluster streams K-way-merge on the exact
+    /// routing key, one work budget resolved from the combined capacity
+    /// replaces the per-segment budgets (and their per-segment min-probe
+    /// floors), and one result heap keyed on the lifted global sort key
+    /// replaces the per-segment cut + merge. Probes land globally
+    /// best-first, so the query bound tightens as fast as it possibly
+    /// can and the gate/anchored-stop apply with global meaning.
+    ///
+    /// Returns the same [`VectorSimilarityFruit`] shape as a
+    /// `searcher.search`: the global window after offset/limit, plus one
+    /// [`ProbeStats`] per segment in input order (see
+    /// [`merged_top_n_by`](super::backend) for the merged-stats
+    /// semantics).
+    ///
+    /// The caller drives segment iteration, so this composes with
+    /// executors that partition segments across workers: each worker
+    /// merges the segments it owns, and the shared threshold cell knits
+    /// the workers together.
+    pub fn collect_segments_merged(
+        &self,
+        weight: &dyn Weight,
+        segments: &[(SegmentOrdinal, &SegmentReader)],
+    ) -> crate::Result<VectorSimilarityFruit>
+    where
+        S::Comparator: Clone,
+    {
+        let mut backends = Vec::with_capacity(segments.len());
+        let mut readers = Vec::with_capacity(segments.len());
+        let mut tie_breaks = Vec::with_capacity(segments.len());
+        for &(segment_ord, reader) in segments {
+            backends.push(
+                VectorBackend::<T>::for_segment(
+                    reader,
+                    segment_ord,
+                    self.field,
+                    Arc::clone(&self.query),
+                    self.adaptive.clone(),
+                )?
+                .with_shared_threshold(self.shared_threshold.clone()),
+            );
+            tie_breaks.push(self.tie_break.segment_sort_key_computer(reader)?);
+            readers.push(reader);
+        }
+        let (hits, stats) = super::backend::merged_top_n_by(
+            &backends,
+            &readers,
+            weight,
+            self.segment_top_n(),
+            &mut tie_breaks,
+            self.tie_break.comparator(),
+        )?;
+        let results = hits
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .map(|((score, _key), address)| (score, address))
+            .collect();
+        Ok(VectorSimilarityFruit { results, stats })
+    }
+}
+
 /// What a [`TopDocsByVectorSimilarity`] search returns: the global top-N
 /// plus each searched segment's [`ProbeStats`], so callers can inspect or
 /// aggregate probe metrics without a side channel.
@@ -995,6 +1063,322 @@ mod ivf_e2e_tests {
                 assert_eq!(actual.results, expected, "mixed query={query:?} k={k}");
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod merged_scan_tests {
+    //! The merged cluster stream through `collect_segments_merged`:
+    //! exactness against the same oracles the per-segment path answers
+    //! to, plus the merged-only economics (one global floor, one global
+    //! anchored stop) and the push-time tie-break lifting.
+
+    use std::sync::Arc;
+
+    use super::VectorSimilarityFruit;
+    use crate::collector::sort_key::SortByString;
+    use crate::collector::TopDocs;
+    use crate::index::IndexSettings;
+    use crate::indexer::NoMergePolicy;
+    use crate::query::{AllQuery, EnableScoring, Query, Weight};
+    use crate::vector::backend::ProbeTermination;
+    use crate::vector::ivf::AdaptiveProbeParams;
+    use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
+    use crate::vector::{Metric, VectorDType, VectorOptions, VectorStorageFormat};
+    use crate::{Index, Order, SegmentReader, TantivyDocument};
+
+    /// Runs `collector` over every segment of `index` through the merged
+    /// driver, with an AllQuery filter.
+    macro_rules! collect_merged {
+        ($index:expr, $collector:expr) => {{
+            let searcher = $index.reader()?.searcher();
+            let weight: Box<dyn Weight> =
+                AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            let segments: Vec<(u32, &SegmentReader)> = searcher
+                .segment_readers()
+                .iter()
+                .enumerate()
+                .map(|(ord, reader)| (ord as u32, reader))
+                .collect();
+            $collector.collect_segments_merged(weight.as_ref(), &segments)
+        }};
+    }
+
+    /// Merged results match the brute-force oracle on the shared
+    /// multi-segment IVF fixture, across queries and k — the merged
+    /// analogue of `e2e_ivf_matches_global_oracle`. Stats arrive one per
+    /// segment with the cluster denominators filled.
+    #[test]
+    fn merged_matches_global_oracle() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .build()?;
+        for query in [[0.5_f32, 0.5], [9.7, 10.3]] {
+            for k in [1usize, 4, 8] {
+                let expected = index.ground_truth(query, k)?;
+                let collector = TopDocs::with_limit(k)
+                    .order_by_similarity(index.embedding_field(), query.to_vec())
+                    .with_adaptive_params(exhaustive_params(9));
+                let fruit = collect_merged!(index.index, collector)?;
+                assert_eq!(fruit.results, expected, "merged query={query:?} k={k}");
+                let searcher = index.index.reader()?.searcher();
+                assert_eq!(fruit.stats.len(), searcher.segment_readers().len());
+                assert!(fruit.stats.iter().all(|s| s.segment_clusters > 0));
+                assert!(
+                    fruit
+                        .stats
+                        .iter()
+                        .map(|s| s.candidates_scored)
+                        .sum::<usize>()
+                        > 0
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Mixed flat + IVF: flat segments exact-scan first and seed the
+    /// bound; the union still matches the oracle.
+    #[test]
+    fn merged_mixed_flat_and_ivf_matches_oracle() -> crate::Result<()> {
+        let centroids: Vec<[f32; 2]> = vec![[0.0, 0.0], [10.0, 10.0]];
+        let metric = Metric::L2;
+        let vector_options = VectorOptions::new(2, metric).with_dtype(VectorDType::F32);
+        let mut schema_builder = crate::schema::Schema::builder();
+        let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
+        };
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .settings(settings)
+            .ivf_clusterer(Arc::new(Grid2DClusterer {
+                centroids: centroids.clone(),
+            }))
+            .create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        fn add(
+            writer: &mut crate::IndexWriter,
+            field: crate::schema::Field,
+            vals: &[[f32; 2]],
+        ) -> crate::Result<()> {
+            for v in vals {
+                let mut doc = TantivyDocument::new();
+                doc.add_vector(field, v.as_slice());
+                writer.add_document(doc)?;
+            }
+            Ok(())
+        }
+        add(
+            &mut writer,
+            embedding_field,
+            &[[0.1, 0.1], [0.3, -0.2], [10.1, 9.9]],
+        )?;
+        writer.commit()?;
+        add(
+            &mut writer,
+            embedding_field,
+            &[[9.9, 10.1], [-0.2, 0.3], [10.4, 9.8]],
+        )?;
+        writer.commit()?;
+        let mut targets = index.searchable_segment_ids()?;
+        targets.sort();
+        writer.merge(&targets).wait()?;
+        // One more un-merged commit stays flat.
+        add(
+            &mut writer,
+            embedding_field,
+            &[[0.4, 0.4], [10.3, 10.3], [-0.1, 0.2]],
+        )?;
+        writer.commit()?;
+        writer.wait_merging_threads()?;
+
+        for query in [[0.0_f32, 0.0], [10.0, 10.0], [5.0, 5.0]] {
+            for k in [1usize, 3, 6] {
+                let expected = ground_truth::top_k(&index, embedding_field, metric, &query, k)?;
+                let collector = TopDocs::with_limit(k)
+                    .order_by_similarity(embedding_field, query.to_vec())
+                    .with_adaptive_params(exhaustive_params(2));
+                let fruit = collect_merged!(index, collector)?;
+                assert_eq!(
+                    fruit.results, expected,
+                    "mixed merged query={query:?} k={k}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Segment-local term ordinals must be lifted at push time: "b" holds
+    /// a different ordinal in each segment, so any ordinal leak into the
+    /// global heap breaks the string order.
+    #[test]
+    fn merged_lifts_tie_breaks_across_segments() -> crate::Result<()> {
+        let vector_options = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
+        let mut schema_builder = crate::schema::Schema::builder();
+        let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
+        let city_field =
+            schema_builder.add_text_field("city", crate::schema::STRING | crate::schema::FAST);
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for batch in [["b", "c"], ["a", "b"]] {
+            for city in batch {
+                let mut doc = TantivyDocument::new();
+                doc.add_vector(embedding_field, &[0.0_f32, 0.0]);
+                doc.add_text(city_field, city);
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 2);
+
+        let cities = |fruit: &VectorSimilarityFruit| -> Vec<String> {
+            fruit
+                .results
+                .iter()
+                .map(|(_, address)| {
+                    let column = searcher
+                        .segment_reader(address.segment_ord)
+                        .fast_fields()
+                        .str("city")
+                        .unwrap()
+                        .unwrap();
+                    let ord = column.term_ords(address.doc_id).next().unwrap();
+                    let mut out = String::new();
+                    column.ord_to_str(ord, &mut out).unwrap();
+                    out
+                })
+                .collect()
+        };
+        for (k, want) in [
+            (4usize, vec!["a", "b", "b", "c"]),
+            (2, vec!["a", "b"]),
+            (1, vec!["a"]),
+        ] {
+            let collector = TopDocs::with_limit(k)
+                .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
+                .with_tie_break((SortByString::for_field("city"), Order::Asc));
+            let fruit = collect_merged!(index, collector)?;
+            assert_eq!(cities(&fruit), want, "k={k}");
+        }
+        Ok(())
+    }
+
+    /// The min-probe floor applies ONCE globally: at a floor-bound budget
+    /// with `min_probe_clusters = 1`, the merged scan opens ~one cluster
+    /// TOTAL across all segments — where the per-segment path is forced
+    /// to open at least one per segment.
+    #[test]
+    fn merged_budget_floor_is_global() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .build()?;
+        let searcher = index.index.reader()?.searcher();
+        let num_segments = searcher.segment_readers().len();
+        assert!(num_segments > 1, "fixture must be multi-segment");
+        let params = || AdaptiveProbeParams {
+            max_probe_fraction: 0.000001,
+            min_probe_clusters: 1,
+            ..AdaptiveProbeParams::default()
+        };
+        let collector = || {
+            TopDocs::with_limit(1)
+                .order_by_similarity(index.embedding_field(), vec![0.5_f32, 0.5])
+                .with_adaptive_params(params())
+        };
+        let merged = collect_merged!(index.index, collector())?;
+        let merged_probed: usize = merged.stats.iter().map(|s| s.clusters_probed()).sum();
+        // The same floor-bound budget through the per-segment path pays
+        // the floor once PER SEGMENT; merged pays it once per QUERY.
+        // Sharing is disabled on the per-segment side so its gate cannot
+        // shortcut the comparison: unseeded, every segment's first
+        // cluster must probe, making its floor count deterministic.
+        let per_segment = searcher.search(&AllQuery, &collector().with_shared_threshold(None))?;
+        let per_segment_probed: usize = per_segment.stats.iter().map(|s| s.clusters_probed()).sum();
+        assert!(per_segment_probed >= num_segments);
+        assert!(
+            merged_probed < per_segment_probed,
+            "one global floor must beat {num_segments} per-segment floors: merged {merged_probed} \
+             vs per-segment {per_segment_probed}"
+        );
+        assert!(
+            merged
+                .stats
+                .iter()
+                .any(|s| s.termination == ProbeTermination::Ceiling),
+            "a floor-bound budget must trip the global ceiling"
+        );
+        assert_eq!(merged.results.len(), 1, "stats: {:#?}", merged.stats);
+        Ok(())
+    }
+
+    /// The anchored stop ends the WHOLE merged stream once: with the
+    /// query inside one region and every other cluster far past `β * t`,
+    /// only the home region is probed, every IVF segment reports
+    /// `Anchored`, and results still match the unanchored merged run.
+    #[test]
+    fn merged_anchor_stops_globally() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .vector_storage_format(VectorStorageFormat::Ivf)
+            .build()?;
+        let query = vec![0.5_f32, 0.5];
+        let k = 4;
+        let anchored_params = AdaptiveProbeParams {
+            anchor_factor: 1.5,
+            ..exhaustive_params(9)
+        };
+        let anchored = collect_merged!(
+            index.index,
+            TopDocs::with_limit(k)
+                .order_by_similarity(index.embedding_field(), query.clone())
+                .with_adaptive_params(anchored_params)
+        )?;
+        let unanchored = collect_merged!(
+            index.index,
+            TopDocs::with_limit(k)
+                .order_by_similarity(index.embedding_field(), query.clone())
+                .with_adaptive_params(exhaustive_params(9))
+        )?;
+        assert_eq!(
+            anchored.results, unanchored.results,
+            "the stopped tail must be irrelevant in this geometry"
+        );
+        assert!(
+            anchored
+                .stats
+                .iter()
+                .filter(|s| s.segment_clusters > 0)
+                .all(|s| s.termination == ProbeTermination::Anchored),
+            "global termination lands on every IVF segment: {:?}",
+            anchored.stats
+        );
+        // In this geometry the gate already caps PROBES either way; the
+        // anchor's saving is ending the stream instead of skipping the
+        // far tail cluster by cluster — fewer clusters considered
+        // (probed + gate-skipped) in total.
+        let considered = |fruit: &VectorSimilarityFruit| -> usize {
+            fruit
+                .stats
+                .iter()
+                .map(|s| s.clusters_probed() + s.bounds_skips as usize)
+                .sum()
+        };
+        assert!(
+            considered(&anchored) < considered(&unanchored),
+            "anchoring must cut clusters considered: {} vs {}",
+            considered(&anchored),
+            considered(&unanchored)
+        );
         Ok(())
     }
 }

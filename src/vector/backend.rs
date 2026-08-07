@@ -23,7 +23,9 @@ use super::bounds::{
 };
 use super::distance::norm_squared_wide;
 use super::index_reader::VectorIndexReader;
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
+use super::ivf::{
+    AdaptiveProbeParams, Candidate, ClusterRanking, IvfIndex, IvfSearchMetrics, Workspace,
+};
 use super::prepared::PreparedQuery;
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
@@ -994,6 +996,378 @@ fn build_filter_bitset(
         }
     })?;
     Ok(filter)
+}
+
+// ======================================================================
+// Merged cluster stream: one probe loop over every segment
+// ======================================================================
+//
+// The per-segment loop above decides depth locally: each segment ranks
+// its own centroids, spends its own budget (with its own min-probe
+// floor), and arms its own bound. With many statistically-identical
+// segments that composes a globally wasteful probe set — every segment
+// pays the floor, and no segment knows where its clusters rank against
+// the others'. The merged driver below inverts the nesting: a K-way
+// merge of every segment's lazy ranked stream by the (comparable,
+// exact) routing key, ONE work budget resolved from the combined
+// capacity, ONE query bound, and ONE result heap keyed on the lifted
+// global sort key. Per-segment machinery below the cluster level —
+// filter bitsets, alive checks, replica dedup, row reads — is reused
+// unchanged, and filter bitsets build lazily on a segment's first
+// popped cluster.
+
+/// One segment's lazily-built probe-side state in the merged scan; exists
+/// only once the global order first probes one of the segment's clusters.
+struct MergedSegmentScan {
+    filter: BitSet,
+    seen: BitSet,
+}
+
+/// Per-IVF-segment constants of the merged scan. `open`/`row` are the
+/// segment's own granularity prices; the budget they charge against is
+/// global.
+struct MergedIvfState {
+    /// Position in the caller's segment slice (indexes backends/stats).
+    seg: usize,
+    open: WorkUnits,
+    row: WorkUnits,
+    /// A dead stream is drained without probing: an empty filter or an
+    /// empty index means nothing in the segment can ever match.
+    dead: bool,
+}
+
+/// Top-N across `backends` through one merged probe loop. Flat segments
+/// are exact-scanned first (their kths are the strongest possible seed);
+/// IVF segments then stream through the global K-way merge. Returns the
+/// global top-`top_n` under `(similarity, lifted tie-break, DocAddress)`
+/// plus one [`ProbeStats`] per input segment, in input order.
+///
+/// Every backend must carry the same query, metric, and adaptive params
+/// (the collector constructs them so); `tie_breaks[i]` must be built on
+/// `segment_readers[i]`.
+///
+/// Stats semantics under merging: `termination` and `bound_seeded` are
+/// global values copied onto every IVF segment; `bound_armed_at_probe`
+/// is the GLOBAL popped-cluster index at which the merged heap first
+/// held k results, recorded on the segment whose probe filled it;
+/// per-counter fields attribute to the segment that did the work.
+pub(crate) fn merged_top_n_by<T, K, CTail>(
+    backends: &[VectorBackend<T>],
+    segment_readers: &[&SegmentReader],
+    weight: &dyn Weight,
+    top_n: usize,
+    tie_breaks: &mut [K],
+    tie_comparator: CTail,
+) -> crate::Result<(Vec<((Score, K::SortKey), DocAddress)>, Vec<ProbeStats>)>
+where
+    T: VectorElement,
+    K: SegmentSortKeyComputer,
+    CTail: Comparator<K::SortKey> + Comparator<K::SegmentSortKey> + Clone,
+{
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    debug_assert_eq!(backends.len(), segment_readers.len());
+    debug_assert_eq!(backends.len(), tie_breaks.len());
+    let num_segments = backends.len();
+    let mut stats: Vec<ProbeStats> = std::iter::repeat_with(ProbeStats::default)
+        .take(num_segments)
+        .collect();
+    if top_n == 0 || num_segments == 0 {
+        return Ok((Vec::new(), stats));
+    }
+    let metric = backends[0].query.metric();
+    let adaptive = &backends[0].adaptive;
+
+    // One heap for the whole query, keyed on the GLOBAL sort key: a
+    // segment-local key (e.g. a term ordinal) means nothing at a
+    // cross-segment eviction, so keys are lifted at push time — only for
+    // candidates that survive the Score-only reject below.
+    let mut topn: TopNComputer<(Score, K::SortKey), DocAddress, (NaturalComparator, CTail)> =
+        TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator.clone()));
+
+    // One query bound. The shared cell (every backend carries the same
+    // one) is redundant within this loop but still folds in concurrent
+    // workers' improvements under parallel executors.
+    let mut bound_tracker = QueryBoundTracker::new();
+    let shared = backends[0].shared_threshold.clone();
+    if let Some(cell) = shared.as_deref() {
+        if let Some((key, _)) = cell.load() {
+            bound_tracker.seed(metric, key);
+        }
+    }
+
+    // Flat segments first: their scans are exact and unavoidable, and
+    // the union's kth is the strongest possible arm for the IVF loop.
+    let mut ivf_segments: Vec<usize> = Vec::new();
+    for seg in 0..num_segments {
+        if backends[seg].reader.index().is_some() {
+            ivf_segments.push(seg);
+            continue;
+        }
+        let hits = backends[seg].exact_top_n(
+            weight,
+            segment_readers[seg],
+            top_n,
+            &mut tie_breaks[seg],
+            tie_comparator.clone(),
+            &mut stats[seg],
+        )?;
+        for ((score, seg_key), address) in hits {
+            let key = tie_breaks[seg].convert_segment_sort_key(seg_key);
+            topn.push_unordered((score, key), address);
+        }
+    }
+    if let Some((kth, _)) = topn.kth_best() {
+        bound_tracker.observe_shared(metric, kth);
+    }
+    if ivf_segments.is_empty() {
+        let results = topn
+            .into_sorted_vec()
+            .into_iter()
+            .map(|cd| (cd.sort_key, cd.doc))
+            .collect();
+        return Ok((results, stats));
+    }
+
+    // Global budget: one pool resolved from the combined IVF capacity,
+    // so the min-probe floor applies once per query instead of once per
+    // segment. Charges use each segment's own granularity prices.
+    let mut total_clusters = 0usize;
+    let mut total_docs = 0usize;
+    let mut ivf: Vec<MergedIvfState> = Vec::with_capacity(ivf_segments.len());
+    for &seg in &ivf_segments {
+        let index = backends[seg].reader.index().expect("partitioned above");
+        let clusters = index.num_clusters();
+        let docs = index.num_docs();
+        stats[seg].segment_clusters = clusters;
+        total_clusters += clusters;
+        total_docs += docs;
+        if clusters == 0 || docs == 0 {
+            ivf.push(MergedIvfState {
+                seg,
+                open: WorkUnits::ZERO,
+                row: WorkUnits::ZERO,
+                dead: true,
+            });
+            continue;
+        }
+        let (_, n_avg, x) = adaptive.resolved_work_budget(clusters, docs)?;
+        debug_assert!(n_avg > 0.0);
+        ivf.push(MergedIvfState {
+            seg,
+            open: WorkUnits::new(x),
+            row: WorkUnits::new((1.0 - x) / n_avg),
+            dead: false,
+        });
+    }
+    let (budget, _, _) = adaptive.resolved_work_budget(total_clusters.max(1), total_docs)?;
+    let work_budget = WorkUnits::new(budget);
+
+    // Routing: one lazy stream per live segment. The workspaces are
+    // pinned in their own Vec so each ranking holds a disjoint mutable
+    // borrow; `query_f32` and `backends` outlive the rankings.
+    let query_f32: Vec<f32> = backends[0]
+        .query
+        .query()
+        .iter()
+        .map(|e| e.to_f32())
+        .collect();
+    let mut workspaces: Vec<Workspace> = std::iter::repeat_with(Workspace::new)
+        .take(ivf.len())
+        .collect();
+    let mut rankings: Vec<Option<ClusterRanking>> = Vec::with_capacity(ivf.len());
+    for (state, ws) in ivf.iter().zip(workspaces.iter_mut()) {
+        if state.dead {
+            rankings.push(None);
+            continue;
+        }
+        let index = backends[state.seg].reader.index().expect("ivf");
+        rankings.push(Some(index.rank_clusters(ws, &query_f32)));
+    }
+
+    // The merge heap holds one head per live stream; `Reverse(i)` breaks
+    // exact routing-key ties toward the lower slice position for
+    // deterministic pop order.
+    let mut heads: BinaryHeap<(Candidate, Reverse<usize>)> = BinaryHeap::new();
+    for (i, ranking) in rankings.iter_mut().enumerate() {
+        if let Some(next) = ranking.as_mut().and_then(|r| r.next()) {
+            heads.push((next, Reverse(i)));
+        }
+    }
+
+    let anchor_factor = match metric {
+        Metric::L2 | Metric::Cosine => adaptive.anchor_factor,
+        Metric::Dot => f32::INFINITY,
+    };
+    let anchored_stop = anchor_factor.is_finite();
+    let q_norm = norm_squared_wide(backends[0].query.query()).sqrt() as f32;
+    let mut scans: Vec<Option<MergedSegmentScan>> = (0..ivf.len()).map(|_| None).collect();
+    let mut survivors: Vec<Survivor> = Vec::new();
+    let mut work_spent = WorkUnits::ZERO;
+    let mut probes_done: u32 = 0;
+    let mut termination = ProbeTermination::Exhausted;
+
+    let mut heap_full = matches!(
+        HeapPeek::from_kth(topn.kth_best().map(|(score, _tie)| score)),
+        HeapPeek::Full { .. }
+    );
+    while let Some((candidate, Reverse(i))) = heads.pop() {
+        // A retired stream drains without refilling.
+        if ivf[i].dead {
+            continue;
+        }
+        // The budget is a ceiling on WORK, not a license to return
+        // fewer than k results: one global pool can be small enough to
+        // drain on empty or hopeless clusters near the query, so an
+        // underfilled heap keeps probing — the merged analogue of the
+        // per-segment floor's "every segment still probes" guarantee.
+        // The streams running dry remains the only under-k exit.
+        if work_spent >= work_budget && heap_full {
+            termination = ProbeTermination::Ceiling;
+            break;
+        }
+        // The anchored stop is finally global: the merged key is
+        // monotone across ALL segments, so the first cluster past
+        // `β * t` ends the whole query, not one segment's stream.
+        if anchored_stop {
+            if let QueryBound::Armed { t } = bound_tracker.bound() {
+                if to_bound_space(metric, candidate.sim.score()) > anchor_factor * t {
+                    termination = ProbeTermination::Anchored;
+                    break;
+                }
+            }
+        }
+        // Refill this stream's head before any continue path below.
+        if let Some(next) = rankings[i].as_mut().and_then(|r| r.next()) {
+            heads.push((next, Reverse(i)));
+        }
+        let seg = ivf[i].seg;
+        let backend = &backends[seg];
+        let index = backend.reader.index().expect("ivf");
+        let cluster = candidate.node as usize;
+
+        let qb = bound_tracker.bound();
+        let verdict = bounds_verdict(qb, || {
+            let QueryBound::Armed { t } = qb else {
+                return f32::INFINITY;
+            };
+            let r = index.bounds().ball_r(cluster);
+            match metric {
+                Metric::L2 | Metric::Cosine => {
+                    margin_ball_ball(t, r, to_bound_space(metric, candidate.sim.score()))
+                }
+                Metric::Dot => margin_ball_halfspace(candidate.sim.score(), q_norm, r, t),
+            }
+        });
+        if let Verdict::Skip = verdict {
+            work_spent += ivf[i].open;
+            stats[seg].work_charged += ivf[i].open.to_f32();
+            stats[seg].bounds_skips += 1;
+            continue;
+        }
+
+        // Lazy filter build, BEFORE the open charge so an empty-filter
+        // segment retires uncharged — mirroring the per-segment path's
+        // early return.
+        if scans[i].is_none() {
+            let max_doc = segment_readers[seg].max_doc();
+            let filter = build_filter_bitset(weight, segment_readers[seg], max_doc)?;
+            scans[i] = Some(MergedSegmentScan {
+                filter,
+                seen: BitSet::with_max_value(max_doc),
+            });
+        }
+        let scan = scans[i].as_mut().expect("built above");
+        if scan.filter.len() == 0 {
+            ivf[i].dead = true;
+            continue;
+        }
+
+        work_spent += ivf[i].open;
+        stats[seg].work_charged += ivf[i].open.to_f32();
+
+        let rows = index.cluster_range(cluster);
+        let alive = segment_readers[seg].alive_bitset();
+        let (v, pf, pd, ps, scored_rows) = backend.collect_cluster_survivors(
+            rows,
+            &scan.filter,
+            alive,
+            &mut scan.seen,
+            &mut survivors,
+        );
+        stats[seg].vectors_visited += v;
+        stats[seg].pruned_filter += pf;
+        stats[seg].pruned_dead += pd;
+        stats[seg].pruned_seen += ps;
+        work_spent += ivf[i].row * scored_rows as f64;
+        stats[seg].work_charged += (ivf[i].row * scored_rows as f64).to_f32();
+
+        if survivors.is_empty() {
+            stats[seg].postings_skipped += 1;
+        } else {
+            stats[seg].postings_row += 1;
+            let ord = backend.segment_ord;
+            for &Survivor { row, doc } in &survivors {
+                let vbytes = backend.reader.vector_bytes_for_row(row)?;
+                let score = backend.query.score_doc_bytes(&vbytes);
+                // Score-only reject against the global threshold, then
+                // lift the tie-break for competitive candidates only —
+                // the exactness argument of `tie_break_key` carries over
+                // verbatim to the lifted key.
+                let competitive = match &topn.threshold {
+                    Some(((threshold_score, _), _)) => score >= *threshold_score,
+                    None => true,
+                };
+                if competitive {
+                    let seg_key = tie_breaks[seg].segment_sort_key(doc, score);
+                    let key = tie_breaks[seg].convert_segment_sort_key(seg_key);
+                    topn.push_unordered((score, key), DocAddress::new(ord, doc));
+                }
+            }
+        }
+        stats[seg].candidates_scored += survivors.len();
+
+        let probe_idx = probes_done;
+        probes_done += 1;
+        let peek = HeapPeek::from_kth(topn.kth_best().map(|(score, _tie)| score));
+        heap_full = matches!(peek, HeapPeek::Full { .. });
+        let was_armed = bound_tracker.armed_at_probe().is_some();
+        bound_tracker.observe(metric, peek, probe_idx);
+        if !was_armed {
+            if let Some(armed_at) = bound_tracker.armed_at_probe() {
+                stats[seg].bound_armed_at_probe = Some(armed_at);
+            }
+        }
+        if let Some(cell) = shared.as_deref() {
+            let local_kth = match peek {
+                HeapPeek::Full { kth_key } => Some(kth_key),
+                HeapPeek::Filling => None,
+            };
+            if let Some(key) = sync_shared_kth(cell, local_kth, backend.segment_ord) {
+                bound_tracker.observe_shared(metric, key);
+            }
+        }
+    }
+
+    // Routing cost is only known once the loop stops pulling.
+    for (i, ranking) in rankings.iter().enumerate() {
+        if let Some(ranking) = ranking {
+            stats[ivf[i].seg].routing = ranking.metrics();
+        }
+    }
+    let seeded = bound_tracker.seeded();
+    for state in &ivf {
+        stats[state.seg].termination = termination;
+        stats[state.seg].bound_seeded = seeded;
+    }
+
+    let results = topn
+        .into_sorted_vec()
+        .into_iter()
+        .map(|cd| (cd.sort_key, cd.doc))
+        .collect();
+    Ok((results, stats))
 }
 
 #[cfg(test)]
