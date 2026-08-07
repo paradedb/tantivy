@@ -72,6 +72,18 @@ pub struct AdaptiveProbeParams {
     /// holding a [`Searcher`](crate::Searcher) - see [`WorkModel`]. `None`
     /// falls back to per-segment normalization.
     pub work_model: Option<WorkModel>,
+    /// K-anchored early-stop factor β. Once the query bound is armed at
+    /// threshold `t`, the ranked pull stops at the first cluster whose
+    /// centroid distance in bound space exceeds `β * t` — the stream is
+    /// sorted by that key, so every later cluster is farther still.
+    /// Unlike the bounds gate this is a HEURISTIC: a top-k member can
+    /// hide in a stopped cluster (it needs a residual above
+    /// `(β - 1) * t`), so β prices recall against work. The budget
+    /// remains the ceiling; the anchor only ever stops earlier.
+    /// `f32::INFINITY` (the default) disables the stop. Distance
+    /// metrics only (L2/cosine); ignored under dot, whose routing key
+    /// is not a distance.
+    pub anchor_factor: f32,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -80,6 +92,7 @@ impl Default for AdaptiveProbeParams {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
+            anchor_factor: f32::INFINITY,
         }
     }
 }

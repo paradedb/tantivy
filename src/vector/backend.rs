@@ -317,9 +317,16 @@ pub enum ProbeTermination {
     Ceiling,
     /// The ranked centroids were exhausted before the ceiling bound. The
     /// bounds gate never terminates the scan - a skip is per-cluster and
-    /// charges the open share; only the ceiling and the stream end it.
+    /// charges the open share; only the ceiling, the stream, and the
+    /// anchored stop end it.
     #[default]
     Exhausted,
+    /// The k-anchored early stop: the next ranked cluster's centroid
+    /// distance exceeded `anchor_factor * t`, and the stream key is
+    /// monotone, so every remaining cluster is farther still. Heuristic,
+    /// unlike the bounds gate - see
+    /// [`AdaptiveProbeParams::anchor_factor`].
+    Anchored,
 }
 
 /// Per-segment probe-loop instrumentation: a prune breakdown of every
@@ -734,6 +741,14 @@ impl<T: VectorElement> VectorBackend<T> {
         // f64 accumulation in the loop; f32 only at the telemetry fold.
         let mut work_spent = WorkUnits::ZERO;
         let work_budget = pricing.budget;
+        // β for the k-anchored stop; INFINITY disables. Dot is excluded:
+        // its routing key is a raw score, not a distance, so `β * t` has
+        // no geometric meaning there.
+        let anchor_factor = match metric {
+            Metric::L2 | Metric::Cosine => self.adaptive.anchor_factor,
+            Metric::Dot => f32::INFINITY,
+        };
+        let anchored_stop = anchor_factor.is_finite();
 
         for Candidate { sim, node: cluster } in ranked {
             // Boundary rule: open iff remaining > 0. The tripping pull
@@ -742,6 +757,20 @@ impl<T: VectorElement> VectorBackend<T> {
             if work_spent >= work_budget {
                 termination = ProbeTermination::Ceiling;
                 break;
+            }
+
+            // K-anchored early stop: the ranked key is monotone, so the
+            // first cluster past `β * t` proves every later one is
+            // farther. Strict greater — an exact touch keeps probing —
+            // and a NaN product (degenerate t or key) compares false and
+            // keeps probing: fail-open is arithmetic, like the gate.
+            if anchored_stop {
+                if let QueryBound::Armed { t } = bound_tracker.bound() {
+                    if to_bound_space(metric, sim.score()) > anchor_factor * t {
+                        termination = ProbeTermination::Anchored;
+                        break;
+                    }
+                }
             }
             let cluster = cluster as usize;
 
@@ -3741,13 +3770,13 @@ mod tests {
         use super::*;
         use crate::collector::sort_key::{AtomicSharedThreshold, SharedThresholdArc};
 
-        fn cell() -> SharedThresholdArc<Score> {
+        pub(super) fn cell() -> SharedThresholdArc<Score> {
             Arc::new(AtomicSharedThreshold::default())
         }
 
         /// Six docs per centroid, offset along x so kths are exact and
         /// tiny.
-        fn docs_around(centroids: &[[f32; 2]]) -> Vec<[f32; 2]> {
+        pub(super) fn docs_around(centroids: &[[f32; 2]]) -> Vec<[f32; 2]> {
             centroids
                 .iter()
                 .flat_map(|c| (0..6).map(move |i| [c[0] + i as f32 * 0.01, c[1]]))
@@ -3756,7 +3785,7 @@ mod tests {
 
         /// `run_top_n` with a shared cell attached and a caller-chosen
         /// segment ordinal.
-        fn run_with_cell(
+        pub(super) fn run_with_cell(
             index: &Index,
             field: Field,
             segment_ord: SegmentOrdinal,
@@ -3949,6 +3978,136 @@ mod tests {
             assert!(far_hits.is_empty());
             assert!(far_stats.bound_seeded);
             assert_eq!(far_stats.candidates_scored, 0, "{far_stats:?}");
+            Ok(())
+        }
+    }
+
+    // ==================================================================
+    // P8: k-anchored early stop
+    // ==================================================================
+
+    mod anchored_stop_tests {
+        use super::bounds_gate_tests::single_segment_fixture;
+        use super::shared_threshold_tests::{cell, docs_around, run_with_cell};
+        use super::*;
+
+        fn anchored(beta: f32) -> AdaptiveProbeParams {
+            AdaptiveProbeParams {
+                anchor_factor: beta,
+                ..exhaustive_params(2)
+            }
+        }
+
+        /// Separated two-cluster fixture: the home cluster arms a tiny t,
+        /// and the second cluster's separation (~10) is far past `β * t`,
+        /// so the scan stops without consulting the gate — same hits, one
+        /// probed cluster, zero gate skips.
+        #[test]
+        fn anchored_stop_after_home_cluster() -> crate::Result<()> {
+            let centroids = [[1.0f32, 1.0], [11.0, 1.0]];
+            let (index, field) =
+                single_segment_fixture(Metric::L2, &centroids, &docs_around(&centroids), 1)?;
+            let query = vec![1.0f32, 1.0];
+
+            let (anchored_hits, stats) = run_top_n(&index, field, query.clone(), 5, anchored(1.5))?;
+            assert_eq!(stats.termination, ProbeTermination::Anchored, "{stats:?}");
+            assert_eq!(stats.clusters_probed(), 1);
+            assert_eq!(stats.bounds_skips, 0, "the anchor fires before the gate");
+
+            let (default_hits, default_stats) =
+                run_top_n(&index, field, query, 5, exhaustive_params(2))?;
+            assert_ne!(default_stats.termination, ProbeTermination::Anchored);
+            assert_eq!(
+                anchored_hits, default_hits,
+                "in this geometry the stopped tail is provably irrelevant"
+            );
+            Ok(())
+        }
+
+        /// `anchor_factor` defaults to INFINITY: no `Anchored`
+        /// termination ever, identical behavior to before the feature.
+        #[test]
+        fn anchor_disabled_by_default() -> crate::Result<()> {
+            let centroids = [[1.0f32, 1.0], [11.0, 1.0]];
+            let (index, field) =
+                single_segment_fixture(Metric::L2, &centroids, &docs_around(&centroids), 1)?;
+            let (_, stats) = run_top_n(&index, field, vec![1.0f32, 1.0], 5, exhaustive_params(2))?;
+            assert_eq!(stats.termination, ProbeTermination::Exhausted, "{stats:?}");
+            Ok(())
+        }
+
+        /// No armed bound, no anchor: a heap that never fills (k > N)
+        /// keeps the scan running to exhaustion however small β is.
+        #[test]
+        fn anchor_waits_for_arming() -> crate::Result<()> {
+            let centroids = [[1.0f32, 1.0], [11.0, 1.0]];
+            let (index, field) =
+                single_segment_fixture(Metric::L2, &centroids, &docs_around(&centroids), 1)?;
+            let (_, stats) = run_top_n(&index, field, vec![1.0f32, 1.0], 100, anchored(1.01))?;
+            assert_eq!(stats.termination, ProbeTermination::Exhausted, "{stats:?}");
+            assert_eq!(stats.clusters_probed(), 2, "unarmed probes everything");
+            Ok(())
+        }
+
+        /// The headline composition: a segment seeded from the shared
+        /// cell stops at probe ZERO — it never opens, skips, or scores
+        /// anything, unlike the gate path which pays an open share per
+        /// skipped cluster.
+        #[test]
+        fn seeded_anchor_stops_with_zero_probes() -> crate::Result<()> {
+            let near_centroids = [[1.0f32, 1.0], [3.0, 1.0]];
+            let far_centroids = [[101.0f32, 1.0], [111.0, 1.0]];
+            let (near, near_field) = single_segment_fixture(
+                Metric::L2,
+                &near_centroids,
+                &docs_around(&near_centroids),
+                1,
+            )?;
+            let (far, far_field) = single_segment_fixture(
+                Metric::L2,
+                &far_centroids,
+                &docs_around(&far_centroids),
+                1,
+            )?;
+            let query = vec![1.0f32, 1.0];
+
+            let shared = cell();
+            run_with_cell(
+                &near,
+                near_field,
+                0,
+                query.clone(),
+                5,
+                anchored(1.5),
+                &shared,
+            )?;
+            let (far_hits, far_stats) =
+                run_with_cell(&far, far_field, 1, query, 5, anchored(1.5), &shared)?;
+            assert!(far_hits.is_empty());
+            assert_eq!(
+                far_stats.termination,
+                ProbeTermination::Anchored,
+                "{far_stats:?}"
+            );
+            assert!(far_stats.bound_seeded);
+            assert_eq!(far_stats.clusters_probed(), 0, "stopped before any probe");
+            assert_eq!(far_stats.candidates_scored, 0);
+            assert_eq!(
+                far_stats.bounds_skips, 0,
+                "anchored stop ends the stream instead of skipping cluster by cluster"
+            );
+            Ok(())
+        }
+
+        /// Dot has no distance-space routing key; the anchor must never
+        /// fire there, whatever β says.
+        #[test]
+        fn anchor_ignored_for_dot() -> crate::Result<()> {
+            let centroids = [[1.0f32, 1.0], [11.0, 1.0]];
+            let (index, field) =
+                single_segment_fixture(Metric::Dot, &centroids, &docs_around(&centroids), 1)?;
+            let (_, stats) = run_top_n(&index, field, vec![1.0f32, 1.0], 5, anchored(1.0001))?;
+            assert_ne!(stats.termination, ProbeTermination::Anchored, "{stats:?}");
             Ok(())
         }
     }
