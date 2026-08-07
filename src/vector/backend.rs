@@ -358,6 +358,11 @@ pub struct ProbeStats {
     /// `postings_*` counters partition the probed clusters:
     /// [`clusters_probed`](Self::clusters_probed) `== postings_row + postings_skipped`.
     pub postings_skipped: usize,
+    /// Cluster count of this segment's IVF index — the denominator that
+    /// turns the probed-cluster counters into a probe share. `0` on the
+    /// flat path (no clusters exist). Summable: the total across
+    /// segments is the searchable index's cluster count.
+    pub segment_clusters: usize,
     /// Flat/exact-path stride-sized row reads — one per survivor scored.
     /// Filled only by the exact (non-IVF) path.
     pub exact_rows_read: usize,
@@ -604,6 +609,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let alive = segment_reader.alive_bitset();
 
         let num_centroids = index.num_clusters();
+        stats.segment_clusters = num_centroids;
         if num_centroids == 0 {
             return Ok(Vec::new());
         }
@@ -2716,6 +2722,7 @@ mod tests {
             bound_seeded: true,
             termination: ProbeTermination::Ceiling,
             work_charged: 1.75,
+            segment_clusters: 6,
         };
 
         let value = serde_json::to_value(&stats).expect("ProbeStats should serialize to JSON");
@@ -2729,6 +2736,7 @@ mod tests {
                 "pruned_seen": 3,
                 "postings_row": 1,
                 "postings_skipped": 1,
+                "segment_clusters": 6,
                 "exact_rows_read": 0,
                 "routing": {
                     "visited_count": 7,
