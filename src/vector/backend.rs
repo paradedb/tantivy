@@ -976,13 +976,12 @@ mod tests {
         fn centroid_ratio(&self) -> f32 {
             1.0
         }
-        fn training_samples_per_centroid(&self) -> usize {
-            2
+        fn training_sample_ratio(&self) -> f32 {
+            1.0
         }
         fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
             Ok(IvfMergeSettings {
-                num_centroids: self.centroids.len(),
-                training_samples_per_centroid: self.training_samples_per_centroid(),
+                training_sample_ratio: self.training_sample_ratio(),
                 assign_batch_size: self.assign_batch_size(),
                 replicas: self.replicas,
             })
@@ -991,14 +990,13 @@ mod tests {
             &self,
             options: &VectorOptions,
             _vectors: IvfTrainingVectors,
-            num_centroids: usize,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), 2);
+            let num_centroids = self.centroids.len();
             Ok(IvfCentroids::F32(IvfMatrix {
                 values: self
                     .centroids
                     .iter()
-                    .take(num_centroids)
                     .flat_map(|c| c.iter().copied())
                     .collect(),
                 rows: num_centroids,
