@@ -84,6 +84,13 @@ pub struct AdaptiveProbeParams {
     /// metrics only (L2/cosine); ignored under dot, whose routing key
     /// is not a distance.
     pub anchor_factor: f32,
+    /// MERGED SCAN ONLY: beam width of each segment's FIRST routing
+    /// round, so materializing a stream head costs a narrow converged
+    /// round instead of a full-`ef` one; pulling deeper resumes at full
+    /// width. Cuts the fixed routing floor for segments the global order
+    /// barely touches, at the price of a noisier first head per segment.
+    /// `0` disables (full width). The per-segment path never bootstraps.
+    pub routing_bootstrap_ef: usize,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -93,6 +100,7 @@ impl Default for AdaptiveProbeParams {
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
             anchor_factor: f32::INFINITY,
+            routing_bootstrap_ef: 8,
         }
     }
 }

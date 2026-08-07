@@ -1183,7 +1183,11 @@ where
             continue;
         }
         let index = backends[state.seg].reader.index().expect("ivf");
-        rankings.push(Some(index.rank_clusters(ws, &query_f32)));
+        rankings.push(Some(index.rank_clusters_bootstrapped(
+            ws,
+            &query_f32,
+            adaptive.routing_bootstrap_ef,
+        )));
     }
 
     // The merge heap holds one head per live stream; `Reverse(i)` breaks

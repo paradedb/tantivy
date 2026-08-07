@@ -354,6 +354,21 @@ impl IvfIndex {
         ws: &'a mut Workspace,
         query: &'a [f32],
     ) -> ClusterRanking<'a> {
+        self.rank_clusters_bootstrapped(ws, query, 0)
+    }
+
+    /// [`rank_clusters`](Self::rank_clusters) with the graph path's first
+    /// beam round capped at `first_batch_ef` (`0` = full width): the
+    /// stream head costs a narrow converged round instead of a full-`ef`
+    /// one, and pulling deeper resumes at full width. The exact
+    /// (graph-less) path is unaffected — it scores every centroid up
+    /// front either way.
+    pub(crate) fn rank_clusters_bootstrapped<'a>(
+        &'a self,
+        ws: &'a mut Workspace,
+        query: &'a [f32],
+        first_batch_ef: usize,
+    ) -> ClusterRanking<'a> {
         match &self.graph {
             Some(graph) => {
                 // TODO: Replace with proper seed generation
@@ -364,6 +379,14 @@ impl IvfIndex {
                         .map(|node| node as NodeId)
                         .collect()
                 };
+                if first_batch_ef > 0 {
+                    return ClusterRanking::Graph(graph.search_iter_bootstrapped(
+                        ws,
+                        query,
+                        &seeds,
+                        first_batch_ef,
+                    ));
+                }
                 ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
             }
             None => {
