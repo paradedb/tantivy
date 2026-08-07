@@ -30,7 +30,7 @@ use common::{BinarySerializable, BitSet};
 
 use super::partition;
 use crate::schema::Metric;
-use crate::vector::{Similarity, VectorArena, VectorElement};
+use crate::vector::{ArenaScorer, BuildArena, Similarity, VectorArena};
 use crate::Executor;
 
 /// A dense node identifier, indexing straight into the backing arrays.
@@ -498,7 +498,10 @@ impl Default for NeighborhoodGraphConfig {
 pub struct SearchIterator<'g, 'w, S: VectorArena, const RESUMABLE: bool> {
     rng: &'g RelativeNeighborhoodGraph<S>,
     workspace: &'w mut Workspace,
-    query: &'g [S::Elem],
+    /// The query's prepared scorer over the arena — built once at
+    /// construction, so per-query preparation (e.g. the SQ4 ADC
+    /// transform) amortizes across every node the search visits.
+    scorer: S::Scorer<'g>,
     /// Beam width of each round.
     ef: usize,
     /// The current converged batch, sorted ascending so popping from the back
@@ -530,8 +533,7 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         let n = rng.graph.len();
         workspace.begin_query(n);
 
-        let arena = rng.graph.arena();
-        let dim = rng.graph.dim();
+        let scorer = rng.graph.arena().scorer(rng.metric, rng.graph.dim(), query);
         let mut metrics = NeighborhoodGraphSearchMetrics::default();
 
         for &node_id in seeds {
@@ -540,14 +542,14 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
             }
             workspace.visited.insert(node_id);
             metrics.visited_count += 1;
-            let sim = arena.similarity(rng.metric, dim, node_id, query);
+            let sim = scorer.score(node_id);
             workspace.frontier.push(Candidate { sim, node: node_id });
         }
 
         SearchIterator {
             rng,
             workspace,
-            query,
+            scorer,
             ef,
             batch: Vec::new(),
             metrics,
@@ -564,9 +566,7 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
     /// Runs one beam round to convergence and drains it into `self.batch`.
     fn run_round(&mut self) {
         let graph = &self.rng.graph;
-        let arena = graph.arena();
-        let dim = graph.dim();
-        let metric = self.rng.metric;
+        let scorer = &self.scorer;
         let ws = &mut *self.workspace;
 
         self.metrics.termination_reason = SearchTerminationReason::GraphExhausted;
@@ -613,7 +613,7 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
                 ws.visited.insert(neighbor);
                 self.metrics.visited_count += 1;
 
-                let sim = arena.similarity(metric, dim, neighbor, self.query);
+                let sim = scorer.score(neighbor);
                 ws.frontier.push(Candidate {
                     sim,
                     node: neighbor,
@@ -752,10 +752,11 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
     }
 }
 
-/// Refinement requires typed storage: a node's stored vector doubles as its
-/// search query, and edge selection scores stored vectors against each other.
-/// A graph over raw file bytes is search-only.
-impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
+/// Refinement decodes stored vectors on demand: a node's vector doubles as
+/// its search query, and edge selection scores stored vectors against each
+/// other — both through `O(dim)` scratch, never a materialized arena. A
+/// graph over raw file bytes is search-only.
+impl<S: BuildArena + Sync> RelativeNeighborhoodGraph<S> {
     /// Refines every node against the current graph: each node searches from
     /// itself to gather a candidate pool, applies the RNG occlusion rule to
     /// reselect its edges, and the new adjacencies are written back. This pass
@@ -765,12 +766,12 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     /// parallel on the `executor`; the write-back is applied serially
     /// afterward. Every node reads the same pre-pass snapshot — a
     /// *synchronous* refinement, the shape that parallelizes.
-    pub fn refine(&mut self, executor: &Executor)
-    where S: Sync {
+    pub fn refine(&mut self, executor: &Executor) {
         let len = self.graph.len();
         if len == 0 {
             return;
         }
+        let dim = self.graph.dim();
 
         // Phase 1 (parallel, read-only): each node searches the snapshot and
         // RNG-selects its new neighbors. One chunk per executor thread;
@@ -785,12 +786,14 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
                 .map(
                     move |(start, end): (NodeId, NodeId)| {
                         let mut ws = Workspace::new();
+                        let mut query = vec![0f32; dim];
+                        let mut cand_scratch = vec![0f32; dim];
                         let mut out = Vec::with_capacity((end - start) as usize);
                         for node in start..end {
-                            let query = rng.graph.payload(node);
+                            rng.graph.arena().decode_into(dim, node, &mut query);
                             let (candidates, _) =
-                                rng.search(&mut ws, query, &[node], rng.config.num_candidates);
-                            out.push(rng.select_neighbors(node, &candidates));
+                                rng.search(&mut ws, &query, &[node], rng.config.num_candidates);
+                            out.push(rng.select_neighbors(node, &candidates, &mut cand_scratch));
                         }
                         Ok(out)
                     },
@@ -814,6 +817,7 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     /// (nearest-first) and returns the survivors — `node`'s new adjacency, at most
     /// `max_edges`, skipping `node` itself. Read-only, so it can run concurrently
     /// across nodes; the caller writes the result back into the graph.
+    /// `cand_scratch` holds the candidate's decoded vector (`dim` f32s).
     ///
     /// Everything is in similarity space (higher is better): a candidate `c` is
     /// kept unless some already-selected neighbor `r` is *more* similar to `c`
@@ -822,7 +826,14 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     /// non-strict (`<=`), so an `r` *exactly* as similar as `node` does not
     /// occlude — the canonical RNG definition, and what keeps duplicate vectors
     /// from wiping out a node's whole edge set.
-    fn select_neighbors(&self, node: NodeId, candidates: &[Candidate]) -> Vec<NodeId> {
+    fn select_neighbors(
+        &self,
+        node: NodeId,
+        candidates: &[Candidate],
+        cand_scratch: &mut [f32],
+    ) -> Vec<NodeId> {
+        let arena = self.graph.arena();
+        let dim = self.graph.dim();
         let max_edges = self.config.max_edges;
         let mut selected: Vec<NodeId> = Vec::with_capacity(max_edges);
         for &Candidate { sim, node: cand } in candidates {
@@ -832,10 +843,9 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
             if selected.len() >= max_edges {
                 break;
             }
-            let cand_vec = self.graph.payload(cand);
-            let keep = selected
-                .iter()
-                .all(|&r| self.metric.similarity(self.graph.payload(r), cand_vec) <= sim);
+            arena.decode_into(dim, cand, cand_scratch);
+            let cand_scorer = arena.scorer(self.metric, dim, cand_scratch);
+            let keep = selected.iter().all(|&r| cand_scorer.score(r) <= sim);
             if keep {
                 selected.push(cand);
             }
@@ -850,12 +860,12 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
 /// the value doesn't matter.
 const KNN_INIT_TPT_SEED: u64 = 42;
 
-/// Build is `f32`-only and borrow-only for now: the TPT partitioner does
-/// floating-point math over the vectors, and `&[f32]` is `Copy`, so the arena
-/// can be read while edge lists are mutated. The rest of the index stays
-/// generic over [`VectorArena`] storage.
-impl RelativeNeighborhoodGraph<&[f32]> {
-    /// Builds the RNG index over the borrowed arena: seeds a raw KNN graph with
+/// Build requires `Copy` storage (`&[f32]`, `Sq4Arena`, …): the arena
+/// handle is copied out so vectors can be read while edge lists are
+/// mutated. All vector access goes through [`BuildArena`], so quantized
+/// storage builds without ever materializing f32 rows.
+impl<S: BuildArena + Copy + Send + Sync> RelativeNeighborhoodGraph<S> {
+    /// Builds the RNG index over the arena: seeds a raw KNN graph with
     /// a TPT forest, then prunes it into an RNG. Expects a freshly constructed,
     /// edge-less index.
     pub fn build(&mut self, executor: &Executor) {
@@ -886,7 +896,7 @@ impl RelativeNeighborhoodGraph<&[f32]> {
         let mut tpt = partition::TPTree::new(
             partition::TPTreeConfig::default(),
             dim,
-            vectors,
+            &vectors,
             KNN_INIT_TPT_SEED,
         );
         let mut indices: Vec<NodeId> = (0..n as NodeId).collect();
@@ -923,15 +933,18 @@ impl RelativeNeighborhoodGraph<&[f32]> {
 
             // Each leaf brute-forces its pairwise similarities and inserts both
             // directions of each edge; the lists dedup re-encounters across
-            // trees and keep only the best `max_edges`.
+            // trees and keep only the best `max_edges`. The outer vector is
+            // decoded once into scratch and prepared as a scorer, so the
+            // inner loop is pure per-row scoring.
             executor
                 .map(
                     move |(members, edge_lists): (&[NodeId], &mut [EdgeListMut])| {
+                        let mut scratch = vec![0f32; dim];
                         for i in 0..members.len() {
-                            let vec_a = &vectors[members[i] as usize * dim..][..dim];
+                            vectors.decode_into(dim, members[i], &mut scratch);
+                            let scorer = vectors.scorer(metric, dim, &scratch);
                             for j in (i + 1)..members.len() {
-                                let vec_b = &vectors[members[j] as usize * dim..][..dim];
-                                let sim = metric.similarity(vec_a, vec_b);
+                                let sim = scorer.score(members[j]);
                                 edge_lists[i].add_edge(members[j], sim);
                                 edge_lists[j].add_edge(members[i], sim);
                             }

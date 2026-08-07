@@ -23,8 +23,8 @@ pub use graph::{
 pub use index::{IvfIndex, IvfSearchMetrics};
 pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;
-pub(crate) use training::{decode_row, encode_vector};
+pub(crate) use training::decode_row;
 pub use training::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfTrainingBatch,
-    IvfTrainingVectors, IvfVectorBatch, IvfVectors,
+    IvfTrainingVectors, IvfVectorBatch, IvfVectors, Sq4Centroids,
 };

@@ -13,6 +13,7 @@
 use std::ops::Range;
 
 use super::graph::NodeId;
+use crate::vector::BuildArena;
 
 /// Tuning knobs for [`TPTree`].
 #[derive(Clone, Copy, Debug)]
@@ -44,26 +45,31 @@ impl Default for TPTreeConfig {
     }
 }
 
-/// A single TPT over a flat, `dim`-strided vector arena.
-pub struct TPTree<'a> {
-    vectors: &'a [f32],
+/// A single TPT over a flat, `dim`-strided vector arena — any
+/// [`BuildArena`], so quantized storage partitions without materializing
+/// f32 rows (splits read single coordinates).
+pub struct TPTree<'a, A> {
+    vectors: &'a A,
     dim: usize,
     config: TPTreeConfig,
     rng: fastrand::Rng,
 }
 
-impl<'a> TPTree<'a> {
+impl<'a, A: BuildArena> TPTree<'a, A> {
     /// * `config` (`TPTreeConfig`) — split and leaf-size configuration.
     /// * `dim` (`usize`) — vector dimensionality; must be non-zero.
-    /// * `vectors` (`&[f32]`) — flat `dim`-strided buffer; length must be a multiple of `dim`.
+    /// * `vectors` (`&A`) — flat `dim`-strided arena.
     /// * `seed` (`u64`) — fixed split-direction RNG seed: builds must be reproducible; the value
     ///   doesn't matter.
     ///
     /// Returns (`TPTree`): the tree; callers that union several trees reuse
     /// one instance so the RNG advances from tree to tree.
-    pub fn new(config: TPTreeConfig, dim: usize, vectors: &'a [f32], seed: u64) -> Self {
+    pub fn new(config: TPTreeConfig, dim: usize, vectors: &'a A, seed: u64) -> Self {
         debug_assert!(dim > 0, "dim must be non-zero");
-        debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
+        debug_assert!(
+            vectors.num_vectors(dim) < NodeId::MAX as usize,
+            "arena exceeds NodeId space"
+        );
         TPTree {
             vectors,
             dim,
@@ -85,7 +91,7 @@ impl<'a> TPTree<'a> {
 
     #[inline]
     fn coord(&self, node: NodeId, d: usize) -> f32 {
-        self.vectors[node as usize * self.dim + d]
+        self.vectors.coord(self.dim, node, d)
     }
 
     /// Recursively splits `indices` (whose first element sits at absolute

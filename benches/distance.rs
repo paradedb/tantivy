@@ -19,7 +19,10 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use tantivy::vector::{cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes};
+use tantivy::vector::{
+    cosine, cosine_bytes, cosine_sq4, dot, dot_bytes, dot_sq4, l2_squared, l2_squared_bytes,
+    l2_squared_sq4, Sq4Params,
+};
 
 const DIMS: &[usize] = &[1024, 2048];
 
@@ -121,9 +124,54 @@ fn bench_pairwise_bytes(c: &mut Criterion) {
     group.finish();
 }
 
+/// f32 query × packed SQ4 row — the centroid-routing shape from V3 on.
+/// Throughput counts the bytes actually touched (4 B/dim query + 0.5
+/// B/dim codes), so MB/s is comparable against the byte kernels' cache
+/// pressure, not their arithmetic.
+///
+/// The `*_sq4` cases are the one-shot reference kernels; the `adc_*`
+/// cases hold a prepared [`Sq4Scorer`] across scores — the shape routing
+/// actually runs, with the per-query prep amortized away.
+fn bench_pairwise_sq4(c: &mut Criterion) {
+    use tantivy::vector::{ArenaScorer, Sq4Arena, VectorArena};
+
+    let mut group = c.benchmark_group("pairwise_sq4");
+    for &dim in DIMS {
+        let q = make_f32(dim, 1);
+        let d = make_f32(dim, 2);
+        let params = Sq4Params::fit(&d, dim);
+        let mut codes = Vec::new();
+        params.quantize_row_into(&d, &mut codes);
+        let norms = tantivy::vector::sq4_row_norms(&codes, &params);
+        let arena = Sq4Arena::new(&codes, &params, &norms);
+        group.throughput(Throughput::Bytes((dim * 4 + dim / 2) as u64));
+        group.bench_with_input(BenchmarkId::new("l2_squared_sq4", dim), &dim, |bn, _| {
+            bn.iter(|| l2_squared_sq4(black_box(&q), black_box(&codes), black_box(&params)))
+        });
+        group.bench_with_input(BenchmarkId::new("dot_sq4", dim), &dim, |bn, _| {
+            bn.iter(|| dot_sq4(black_box(&q), black_box(&codes), black_box(&params)))
+        });
+        group.bench_with_input(BenchmarkId::new("cosine_sq4", dim), &dim, |bn, _| {
+            bn.iter(|| cosine_sq4(black_box(&q), black_box(&codes), black_box(&params)))
+        });
+        for metric in [
+            tantivy::schema::Metric::L2,
+            tantivy::schema::Metric::Dot,
+            tantivy::schema::Metric::Cosine,
+        ] {
+            let scorer = arena.scorer(metric, dim, &q);
+            let name = format!("adc_{metric:?}").to_lowercase();
+            group.bench_with_input(BenchmarkId::new(name, dim), &dim, |bn, _| {
+                bn.iter(|| black_box(&scorer).score(black_box(0)))
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(100);
-    targets = bench_pairwise_f32, bench_pairwise_bytes
+    targets = bench_pairwise_f32, bench_pairwise_bytes, bench_pairwise_sq4
 }
 criterion_main!(benches);

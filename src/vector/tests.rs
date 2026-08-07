@@ -222,12 +222,18 @@ impl IvfClusterer for Grid2DClusterer {
     ) -> crate::Result<Vec<u32>> {
         assert_eq!(options.dim(), grid2d::DIM);
         let IvfVectors::F32(vectors) = vectors;
-        let IvfCentroids::F32(centroids) = centroids;
+        let mut decoded = vec![0f32; centroids.rows() * centroids.dims()];
+        for row in 0..centroids.rows() {
+            centroids.decode_row_into(
+                row,
+                &mut decoded[row * centroids.dims()..][..centroids.dims()],
+            );
+        }
         Ok(vectors
             .matrix
             .values
             .chunks_exact(vectors.matrix.dims)
-            .map(|vector| grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32)
+            .map(|vector| grid2d::nearest_centroid(vector, decoded.as_slice()) as u32)
             .collect())
     }
 }
@@ -287,6 +293,110 @@ fn fixture_uses_selected_storage_format() -> crate::Result<()> {
 
 /// Both vector segment files must stamp the current format-generation header
 /// ahead of their composite body, so future layout changes can be gated.
+/// A V2 `.centroids` slot [0] — no codec byte, raw f32 rows — must stay
+/// readable: existing segments route through the f32 arena without a
+/// reindex.
+#[test]
+fn v2_f32_centroid_slot_stays_readable() -> crate::Result<()> {
+    use common::BinarySerializable;
+
+    use crate::directory::FileSlice;
+    use crate::vector::header::VectorFileVersion;
+    use crate::vector::ivf::IvfIndex;
+    use crate::vector::BoundKind;
+
+    let dim = 3;
+    let opts = VectorOptions::new(dim, Metric::L2);
+    let centroids: Vec<f32> = vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.5, 0.5, 0.0];
+
+    let mut slot0 = Vec::new();
+    3u32.serialize(&mut slot0)?;
+    5u32.serialize(&mut slot0)?;
+    for value in &centroids {
+        slot0.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut slot1 = Vec::new();
+    IvfIndex::serialize_offsets(&[0, 2, 4, 5], &mut slot1)?;
+    let mut slot3 = Vec::new();
+    IvfIndex::serialize_bounds(BoundKind::Ball, &[0.1, 0.2, 0.3], &mut slot3)?;
+
+    let ivf = IvfIndex::open(
+        &opts,
+        VectorFileVersion::V2,
+        FileSlice::from(slot0),
+        FileSlice::from(slot1),
+        None,
+        FileSlice::from(slot3),
+    )?;
+    assert_eq!(ivf.num_clusters(), 3);
+    assert_eq!(ivf.num_rows(), 5);
+    let mut decoded = vec![0f32; dim];
+    for cluster in 0..3 {
+        ivf.decode_centroid(cluster, &mut decoded)?;
+        assert_eq!(decoded, centroids[cluster * dim..][..dim]);
+    }
+    let query = [1.0f32, 0.0, 0.0];
+    assert_eq!(
+        ivf.centroid_similarity(1, &query),
+        Metric::L2.similarity(&query, &centroids[dim..2 * dim])
+    );
+    Ok(())
+}
+
+/// V3 slot [0] roundtrip through the writer's own serializer: SQ4 codes +
+/// params in, the reconstruction and its kernel scores out.
+#[test]
+fn v3_sq4_centroid_slot_roundtrip() -> crate::Result<()> {
+    use crate::directory::FileSlice;
+    use crate::vector::header::VectorFileVersion;
+    use crate::vector::ivf::IvfIndex;
+    use crate::vector::{sq4_row_norms, sq4_stride, BoundKind, Sq4Arena, Sq4Params, VectorArena};
+
+    let dim = 5;
+    let opts = VectorOptions::new(dim, Metric::Cosine);
+    let values: Vec<f32> = (0..4 * dim).map(|i| ((i as f32) * 0.7).sin()).collect();
+    let params = Sq4Params::fit(&values, dim);
+    let mut codes = Vec::new();
+    for row in values.chunks_exact(dim) {
+        params.quantize_row_into(row, &mut codes);
+    }
+    let norms = sq4_row_norms(&codes, &params);
+
+    let mut slot0 = Vec::new();
+    IvfIndex::serialize_centroids(4, 4, &params, &norms, &codes, &opts, &mut slot0)?;
+    let mut slot1 = Vec::new();
+    IvfIndex::serialize_offsets(&[0, 1, 2, 3, 4], &mut slot1)?;
+    let mut slot3 = Vec::new();
+    IvfIndex::serialize_bounds(BoundKind::Ball, &[0.0; 4], &mut slot3)?;
+
+    let ivf = IvfIndex::open(
+        &opts,
+        VectorFileVersion::V3,
+        FileSlice::from(slot0),
+        FileSlice::from(slot1),
+        None,
+        FileSlice::from(slot3),
+    )?;
+    assert_eq!(ivf.num_clusters(), 4);
+    let stride = sq4_stride(dim);
+    let query: Vec<f32> = (0..dim).map(|i| (i as f32).cos()).collect();
+    // The reader's scoring must agree bitwise with an in-memory arena
+    // over the same codes — the routing/margin consistency contract.
+    let arena = Sq4Arena::new(&codes, &params, &norms);
+    let mut expected = vec![0f32; dim];
+    let mut decoded = vec![0f32; dim];
+    for cluster in 0..4 {
+        params.decode_row_into(&codes[cluster * stride..][..stride], &mut expected);
+        ivf.decode_centroid(cluster, &mut decoded)?;
+        assert_eq!(decoded, expected);
+        assert_eq!(
+            ivf.centroid_similarity(cluster, &query),
+            arena.similarity(Metric::Cosine, dim, cluster as u32, &query)
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn vector_files_stamp_format_version_header() -> crate::Result<()> {
     use crate::directory::CompositeFile;
@@ -306,7 +416,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
             let vec_file =
                 segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
             let (version, body) = read_header(&vec_file)?;
-            assert_eq!(version, VectorFileVersion::V2);
+            assert_eq!(version, VectorFileVersion::V3);
             // Body must be a valid composite — proves the stamp sits in front
             // of the framing, not inside a slot.
             CompositeFile::open(&body)?;
@@ -324,7 +434,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
                     let centroids_file = segment_reader
                         .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
                     let (version, body) = read_header(&centroids_file)?;
-                    assert_eq!(version, VectorFileVersion::V2);
+                    assert_eq!(version, VectorFileVersion::V3);
                     CompositeFile::open(&body)?;
                 }
             }
@@ -400,13 +510,18 @@ fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
     for segment_reader in searcher.segment_readers() {
         let vec_reader = segment_reader.vector_index(index.embedding_field())?;
         let ivf = vec_reader.index().expect("expected IVF storage");
-        assert_eq!(
-            ivf.centroid_bytes()?
-                .chunks_exact(VectorDType::F32.size_bytes())
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
-                .collect::<Vec<_>>(),
-            centroid_values
-        );
+        // Stored centroids are SQ4; range endpoints reconstruct up to
+        // float rounding of the quantization step.
+        let mut decoded = [0f32; grid2d::DIM];
+        for (cluster, expected) in centroids.iter().enumerate() {
+            ivf.decode_centroid(cluster, &mut decoded)?;
+            for (got, want) in decoded.iter().zip(expected) {
+                assert!(
+                    (got - want).abs() <= 1e-5,
+                    "cluster {cluster}: reconstructed {decoded:?}, expected {expected:?}"
+                );
+            }
+        }
         for cluster_ord in 0..centroids.len() {
             let doc_ids = vec_reader
                 .cluster_doc_ids(cluster_ord)
@@ -868,19 +983,17 @@ mod bounds_storage_tests {
         dim: usize,
         metric: Metric,
     ) -> crate::Result<Vec<f32>> {
-        let centroid_bytes = ivf.centroid_bytes()?;
-        let stride = dim * std::mem::size_of::<f32>();
+        use crate::vector::distance::{normalize_f32_inplace, NormalizeOutcome};
         let mut expected = vec![0.0f32; ivf.num_clusters()];
         for cluster in 0..ivf.num_clusters() {
-            let centroid: Vec<f32> = centroid_bytes[cluster * stride..(cluster + 1) * stride]
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                .collect();
-            // The writer's degenerate-centroid rule: non-finite, or
-            // zero-norm under cosine renormalization, saturates.
-            let zero_norm = centroid.iter().all(|&value| value == 0.0);
-            if centroid.iter().any(|value| !value.is_finite())
-                || (metric == Metric::Cosine && zero_norm)
+            let mut centroid = vec![0.0f32; dim];
+            ivf.decode_centroid(cluster, &mut centroid)?;
+            // The writer's anchor rule: the fold measures against the
+            // reconstruction, renormalized for cosine (the routing key is
+            // scale-invariant); a zero-norm reconstruction under cosine
+            // anchors no chord geometry and saturates.
+            if metric == Metric::Cosine
+                && normalize_f32_inplace(&mut centroid) != NormalizeOutcome::Normalized
             {
                 expected[cluster] = f32::INFINITY;
                 continue;
@@ -992,7 +1105,7 @@ mod bounds_storage_tests {
         ) -> crate::Result<Vec<u32>> {
             assert_eq!(options.dim(), 2);
             let IvfVectors::F32(vectors) = vectors;
-            let IvfCentroids::F32(centroids) = centroids;
+            let mut centroid = [0f32; 2];
             Ok(vectors
                 .matrix
                 .values
@@ -1000,7 +1113,8 @@ mod bounds_storage_tests {
                 .map(|vector| {
                     let mut best = 0u32;
                     let mut best_d2 = f32::INFINITY;
-                    for (i, centroid) in centroids.values.chunks_exact(2).enumerate() {
+                    for i in 0..centroids.rows() {
+                        centroids.decode_row_into(i, &mut centroid);
                         let dx = vector[0] - centroid[0];
                         let dy = vector[1] - centroid[1];
                         let d2 = dx * dx + dy * dy;
