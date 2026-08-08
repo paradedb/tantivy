@@ -880,7 +880,21 @@ mod ivf_e2e_tests {
             "the seeded gate must score nothing in the far segment: {far:?}"
         );
         assert_eq!(far.postings_row, 0);
-        assert!(far.bounds_skips >= 1);
+        assert_eq!(
+            far.termination,
+            crate::vector::backend::ProbeTermination::RadiusCutoff,
+            "the seeded bound must cut the far segment's stream off: {far:?}"
+        );
+        // The far segment's EMPTY cluster at the near-region centroid sits
+        // inside the query ball and legitimately opens (yielding nothing);
+        // the next pull — the first doc-bearing far cluster — trips the
+        // cutoff.
+        assert_eq!(
+            far.clusters_probed(),
+            1,
+            "only the empty near-centroid cluster opens"
+        );
+        assert_eq!(far.postings_skipped, 1, "and it opens empty: {far:?}");
 
         let far_unshared = &unshared.stats[1];
         assert!(!far_unshared.bound_seeded);

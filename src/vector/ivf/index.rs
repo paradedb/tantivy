@@ -77,6 +77,13 @@ pub struct IvfIndex {
     /// Slot `[3]`, pinned: the per-cluster bound payload,
     /// `num_centroids * bound_kind.stride(dim)` f32s in cluster order.
     bounds: Vec<f32>,
+    /// Max over the ball bounds — the widest any cluster in this segment
+    /// reaches. Derived from `bounds` at open (never stored: a second
+    /// copy of the truth would have to be kept consistent by every write
+    /// path forever). `f32::INFINITY` when any cluster is SATURATED or
+    /// the segment is empty of bounds — the radius cutoff then never
+    /// fires, matching the gate's fail-open convention.
+    max_ball_r: f32,
 }
 
 impl IvfIndex {
@@ -257,6 +264,19 @@ impl IvfIndex {
             (kind, values)
         };
 
+        // One fold, at open: the payload is one f32 per cluster, so this
+        // is a sub-microsecond scan of data the gate reads anyway. NaN is
+        // mapped to INFINITY explicitly — `f32::max` would silently drop
+        // it and understate the max, turning a corrupt bound into an
+        // unsound cutoff instead of a disarmed one.
+        let max_ball_r = if bounds.is_empty() {
+            f32::INFINITY
+        } else {
+            bounds
+                .iter()
+                .map(|&r| if r.is_nan() { f32::INFINITY } else { r })
+                .fold(0.0f32, f32::max)
+        };
         let index = IvfIndex {
             num_centroids,
             num_docs,
@@ -267,6 +287,7 @@ impl IvfIndex {
             graph,
             bound_kind,
             bounds,
+            max_ball_r,
         };
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt file.
@@ -282,6 +303,14 @@ impl IvfIndex {
 
     pub fn num_clusters(&self) -> usize {
         self.num_centroids
+    }
+
+    /// Max over the segment's ball bounds — the widest any cluster
+    /// reaches. `f32::INFINITY` when any bound is SATURATED (or the
+    /// payload is degenerate), which disarms the radius cutoff:
+    /// fail-open is arithmetic, as at the gate.
+    pub fn max_ball_r(&self) -> f32 {
+        self.max_ball_r
     }
 
     /// Distinct docs with a vector; replication inflates the row total,

@@ -317,9 +317,17 @@ pub enum ProbeTermination {
     Ceiling,
     /// The ranked centroids were exhausted before the ceiling bound. The
     /// bounds gate never terminates the scan - a skip is per-cluster and
-    /// charges the open share; only the ceiling and the stream end it.
+    /// charges the open share; only the ceiling, the stream, and the
+    /// radius cutoff end it.
     #[default]
     Exhausted,
+    /// The radius cutoff: the next ranked cluster's separation exceeded
+    /// `t + max_ball_r`, and the stream key is monotone, so EVERY
+    /// remaining cluster provably fails the gate whatever its own
+    /// radius. Exact, like the gate — a proof, not a heuristic; the
+    /// stream is over in every sense that matters, without pulling (and
+    /// routing) its tail cluster by cluster.
+    RadiusCutoff,
 }
 
 /// Per-segment probe-loop instrumentation: a prune breakdown of every
@@ -735,6 +743,9 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut work_spent = WorkUnits::ZERO;
         let work_budget = pricing.budget;
 
+        // The widest bound in the segment: the radius cutoff's worst case.
+        let max_ball_r = index.max_ball_r();
+
         for Candidate { sim, node: cluster } in ranked {
             // Boundary rule: open iff remaining > 0. The tripping pull
             // proves another ranked cluster existed, keeping `Ceiling`
@@ -742,6 +753,27 @@ impl<T: VectorElement> VectorBackend<T> {
             if work_spent >= work_budget {
                 termination = ProbeTermination::Ceiling;
                 break;
+            }
+
+            // Radius cutoff: the gate's own margin, evaluated at the
+            // worst case `r = max_ball_r`. Strictly negative here means
+            // this cluster fails the gate whatever its radius — and the
+            // stream key is monotone, so every LATER cluster fails it
+            // too. The stream is proven dry; stop pulling (and routing)
+            // it. SATURATED (`max_ball_r = +inf`) yields a +inf margin
+            // and never fires; NaN compares false and keeps probing —
+            // fail-open is arithmetic, exactly as at the gate.
+            if let QueryBound::Armed { t } = bound_tracker.bound() {
+                let worst_case_margin = match metric {
+                    Metric::L2 | Metric::Cosine => {
+                        margin_ball_ball(t, max_ball_r, to_bound_space(metric, sim.score()))
+                    }
+                    Metric::Dot => margin_ball_halfspace(sim.score(), q_norm, max_ball_r, t),
+                };
+                if worst_case_margin < 0.0 {
+                    termination = ProbeTermination::RadiusCutoff;
+                    break;
+                }
             }
             let cluster = cluster as usize;
 
@@ -3431,7 +3463,10 @@ mod tests {
         /// values powers of two — the arithmetic is exact) holds a doc
         /// tying the kth at d == t. Exact touch must PROBE: the tie doc
         /// is scored and the doc-id tie-break decides, identically to
-        /// brute force. The far cluster is provably useless and skipped.
+        /// brute force. The touching cluster also sits exactly ON the
+        /// radius-cutoff line (its radius IS max_ball_r), so this pins
+        /// the cutoff's strictness too; the far cluster then ends the
+        /// stream by cutoff.
         #[test]
         fn boundary_tie_probes_l2() -> crate::Result<()> {
             let centroids = [[0.0f32, 4.0], [4.0, 0.0], [8.0, 0.0]];
@@ -3460,9 +3495,13 @@ mod tests {
             assert_eq!(
                 stats.clusters_probed(),
                 2,
-                "the disjoint cluster is skipped, the touching one is not"
+                "the touching cluster probes; the disjoint one never opens"
             );
-            assert_eq!(stats.termination, ProbeTermination::Exhausted);
+            assert_eq!(
+                stats.termination,
+                ProbeTermination::RadiusCutoff,
+                "the disjoint cluster's pull proves the stream dry"
+            );
             Ok(())
         }
 
@@ -3493,11 +3532,13 @@ mod tests {
             Ok(())
         }
 
-        /// Forced skips charge exactly the open share: on well-separated
-        /// clusters the scan probes one cluster and proves the other five
-        /// useless, and the work charge equals
-        /// `probed*x + skipped*x + scored*(1 - x)/n_avg` — free skips
-        /// would break this identity.
+        /// Forced skips charge exactly the open share. One wide doc lifts
+        /// the segment's max radius, so the radius cutoff cannot end the
+        /// stream early and the mid clusters are individually
+        /// gate-skipped; the wide cluster's own radius reaches the query
+        /// ball, so it probes. The work charge equals
+        /// `opens*x + scored*(1 - x)/n_avg` with skips charged as opens —
+        /// free skips would break this identity.
         #[test]
         fn skips_charge_open_share() -> crate::Result<()> {
             let centroids: Vec<[f32; 2]> = vec![
@@ -3508,30 +3549,39 @@ mod tests {
                 [11.0, 11.0],
                 [21.0, 11.0],
             ];
-            let docs: Vec<[f32; 2]> = (0..36)
+            let mut docs: Vec<[f32; 2]> = (0..36)
                 .map(|i| {
                     let c = centroids[i / 6];
                     let off = (i % 6) as f32 * 0.01;
                     [c[0] + off, c[1] + off]
                 })
                 .collect();
+            // The wide doc: home is [21, 11] (residual 25 vs 26.9 to
+            // [11, 11]), lifting max_ball_r to 25 so the cutoff line
+            // (t + 25) sits beyond every centroid and the gate does the
+            // per-cluster skipping this test is about.
+            docs.push([21.0, 36.0]);
             let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs, 1)?;
             let (_, stats) = run_top_n(&index, field, vec![0.2, 0.3], 5, exhaustive_params(6))?;
 
             assert_eq!(stats.termination, ProbeTermination::Exhausted);
             assert_eq!(
                 stats.clusters_probed(),
-                1,
-                "only the home cluster survives the margins: {stats:?}"
+                2,
+                "home probes, and so does the wide cluster: {stats:?}"
             );
-            assert_eq!(stats.candidates_scored, 6);
-            // All six ranked clusters were pulled (Exhausted); five were
-            // passed over by the gate.
-            let skipped = 6 - stats.clusters_probed();
-            let n_avg = 36.0f64 / 6.0;
+            assert_eq!(
+                stats.bounds_skips, 4,
+                "the four mid clusters are gate-skipped: {stats:?}"
+            );
+            assert_eq!(
+                stats.candidates_scored, 13,
+                "home's six docs plus the wide cluster's seven"
+            );
+            let n_avg = 37.0f64 / 6.0;
             let x = open_share(n_avg);
             let row = (1.0 - x) / n_avg;
-            let expected = (stats.clusters_probed() + skipped) as f64 * x
+            let expected = (stats.clusters_probed() + stats.bounds_skips as usize) as f64 * x
                 + stats.candidates_scored as f64 * row;
             assert!(
                 (stats.work_charged as f64 - expected).abs() < 1e-5,
@@ -3672,18 +3722,24 @@ mod tests {
             single_segment_fixture(metric, &centroids, &docs, 1)
         }
 
-        /// `bounds_skips` counts exactly the clusters the gate passed
-        /// over: all ranked clusters minus the probed ones on an
-        /// exhausted stream.
+        /// On uniformly tight clusters the radius cutoff subsumes
+        /// per-cluster skipping: the first far pull proves the whole
+        /// stream dry, so nothing is stamped skip cluster by cluster.
+        /// (Per-cluster gate skips need a mixed-radius segment — see
+        /// `skips_charge_open_share`.)
         #[test]
-        fn skip_count_matches() -> crate::Result<()> {
+        fn cutoff_replaces_skip_stamps_on_tight_clusters() -> crate::Result<()> {
             let (index, field) = separated_fixture(Metric::L2)?;
             let (_, stats) = run_top_n(&index, field, vec![0.2, 0.3], 5, exhaustive_params(6))?;
-            assert_eq!(stats.termination, ProbeTermination::Exhausted);
+            assert_eq!(
+                stats.termination,
+                ProbeTermination::RadiusCutoff,
+                "{stats:?}"
+            );
             assert_eq!(stats.clusters_probed(), 1, "{stats:?}");
             assert_eq!(
-                stats.bounds_skips, 5,
-                "every non-home cluster is a counted skip: {stats:?}"
+                stats.bounds_skips, 0,
+                "the stream ends by proof, not skip by skip: {stats:?}"
             );
             Ok(())
         }
@@ -3724,9 +3780,10 @@ mod tests {
                 Some(1),
                 "k = 10 needs the second probed cluster: {stats:?}"
             );
-            assert!(
-                stats.bounds_skips > 0,
-                "armed late still skips the far tail"
+            assert_eq!(
+                stats.termination,
+                ProbeTermination::RadiusCutoff,
+                "armed late still ends the stream by proof: {stats:?}"
             );
             Ok(())
         }
@@ -3780,11 +3837,13 @@ mod tests {
         }
 
         /// The headline behavior: a segment whose every cluster is
-        /// provably outside another segment's published kth opens
-        /// nothing — zero rows scored, every doc-bearing cluster a
-        /// counted skip — purely from the seeded bound.
+        /// provably outside another segment's published kth does no
+        /// probe work at all — the seeded bound plus the segment's max
+        /// radius prove the whole stream dry at its first pull, so zero
+        /// rows are scored, zero clusters open, and routing stops after
+        /// one round.
         #[test]
-        fn seeded_gate_skips_every_cluster_of_a_hopeless_segment() -> crate::Result<()> {
+        fn seeded_bound_cuts_off_a_hopeless_segment() -> crate::Result<()> {
             let near_centroids = [[1.0f32, 1.0], [3.0, 1.0]];
             let far_centroids = [[101.0f32, 1.0], [111.0, 1.0]];
             let (near, near_field) = single_segment_fixture(
@@ -3843,8 +3902,14 @@ mod tests {
             );
             assert_eq!(far_stats.postings_row, 0);
             assert_eq!(
-                far_stats.bounds_skips, 2,
-                "both far clusters are certified skips: {far_stats:?}"
+                far_stats.termination,
+                ProbeTermination::RadiusCutoff,
+                "the seeded bound proves the whole stream dry at its first pull: {far_stats:?}"
+            );
+            assert_eq!(far_stats.clusters_probed(), 0);
+            assert_eq!(
+                far_stats.bounds_skips, 0,
+                "cutoff before any per-cluster skip stamp: {far_stats:?}"
             );
             // The cell still holds the near kth — the far segment had
             // nothing better to publish.
