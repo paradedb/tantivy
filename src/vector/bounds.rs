@@ -403,6 +403,17 @@ impl QueryBoundTracker {
     pub(crate) fn seeded(&self) -> bool {
         self.seeded
     }
+
+    /// The threshold in BOUND space, for telemetry.
+    ///
+    /// Returns (`Option<f32>`): `t` while `Armed`, `None` while
+    /// `Filling`.
+    pub(crate) fn t(&self) -> Option<f32> {
+        match self.bound {
+            QueryBound::Armed { t } => Some(t),
+            QueryBound::Filling => None,
+        }
+    }
 }
 
 // ======================================================================

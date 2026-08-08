@@ -386,6 +386,17 @@ pub struct ProbeStats {
     /// BEFORE this segment's first probe, so every cluster faced a
     /// margin check. Per-segment; does not sum.
     pub bound_seeded: bool,
+    /// The query bound's final threshold for this segment's scan, in
+    /// BOUND space (L2 distance / cosine chord / dot offset) — the value
+    /// the gate and the radius cutoff certified against, cross-segment
+    /// seed included. `None` = the bound never armed, serialized as JSON
+    /// null. Per-segment; does not sum.
+    pub bound_t: Option<f32>,
+    /// The segment's widest ball bound ([`IvfIndex::max_ball_r`]);
+    /// `bound_t + max_ball_r` is the radius-cutoff line, so the pair
+    /// explains every RadiusCutoff (or its absence) directly. `None` on
+    /// the flat path, where no bounds exist. Per-segment; does not sum.
+    pub max_ball_r: Option<f32>,
     /// How the probe loop terminated. Per-segment; does not sum.
     pub termination: ProbeTermination,
     /// Work units this segment's probe loop charged against its resolved
@@ -903,6 +914,8 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.bounds_skips += bounds_skips;
         stats.bound_armed_at_probe = bound_tracker.armed_at_probe();
         stats.bound_seeded = bound_tracker.seeded();
+        stats.bound_t = bound_tracker.t();
+        stats.max_ball_r = Some(max_ball_r);
         stats.termination = termination;
         stats.work_charged += work_spent.to_f32();
 
@@ -2717,6 +2730,8 @@ mod tests {
             bounds_skips: 2,
             bound_armed_at_probe: Some(1),
             bound_seeded: true,
+            bound_t: Some(1.5),
+            max_ball_r: Some(0.5),
             termination: ProbeTermination::Ceiling,
             work_charged: 1.75,
         };
@@ -2747,6 +2762,8 @@ mod tests {
                 "bounds_skips": 2,
                 "bound_armed_at_probe": 1,
                 "bound_seeded": true,
+                "bound_t": 1.5,
+                "max_ball_r": 0.5,
                 "termination": "Ceiling",
                 "work_charged": 1.75
             })
@@ -3502,6 +3519,10 @@ mod tests {
                 ProbeTermination::RadiusCutoff,
                 "the disjoint cluster's pull proves the stream dry"
             );
+            // Exact arithmetic pins the telemetry pair that locates the
+            // cutoff line: t = 2 (the tied kth), max_ball_r = 2.
+            assert_eq!(stats.bound_t, Some(2.0));
+            assert_eq!(stats.max_ball_r, Some(2.0));
             Ok(())
         }
 
