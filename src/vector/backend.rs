@@ -654,6 +654,7 @@ impl<T: VectorElement> VectorBackend<T> {
             &mut routing_ws,
             &query_f32,
             self.adaptive.routing_bootstrap_ef,
+            self.adaptive.routing_ef,
         );
 
         let topn = self.scan_clusters(

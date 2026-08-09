@@ -352,13 +352,15 @@ impl IvfIndex {
     /// `first_batch_ef` caps the graph path's first beam round (`0` =
     /// full width): the stream head costs a narrow converged round
     /// instead of a full-`ef` one, and pulling deeper resumes at full
-    /// width. The exact (graph-less) path is unaffected — it scores
-    /// every centroid up front either way.
+    /// width. `ef_override` replaces the configured beam width for every
+    /// round (`0` = keep it). The exact (graph-less) path is unaffected —
+    /// it scores every centroid up front either way.
     pub(crate) fn rank_clusters_bootstrapped<'a>(
         &'a self,
         ws: &'a mut Workspace,
         query: &'a [f32],
         first_batch_ef: usize,
+        ef_override: usize,
     ) -> ClusterRanking<'a> {
         match &self.graph {
             Some(graph) => {
@@ -370,15 +372,13 @@ impl IvfIndex {
                         .map(|node| node as NodeId)
                         .collect()
                 };
-                if first_batch_ef > 0 {
-                    return ClusterRanking::Graph(graph.search_iter_bootstrapped(
-                        ws,
-                        query,
-                        &seeds,
-                        first_batch_ef,
-                    ));
-                }
-                ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
+                ClusterRanking::Graph(graph.search_iter_bootstrapped(
+                    ws,
+                    query,
+                    &seeds,
+                    first_batch_ef,
+                    ef_override,
+                ))
             }
             None => {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());

@@ -85,6 +85,11 @@ pub struct AdaptiveProbeParams {
     /// the price of a noisier first batch per segment. `0` disables
     /// (full width).
     pub routing_bootstrap_ef: usize,
+    /// Beam width of EVERY routing round on the graph path, overriding
+    /// the graph's configured `ef`. Smaller widths route cheaper but cap
+    /// ranking quality at the top-`ef` order the narrower beam certifies.
+    /// `0` keeps the configured width.
+    pub routing_ef: usize,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -94,7 +99,8 @@ impl Default for AdaptiveProbeParams {
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
             max_consecutive_bounds_skips: crate::vector::backend::MAX_CONSECUTIVE_BOUNDS_SKIPS,
-            routing_bootstrap_ef: 8,
+            routing_bootstrap_ef: 0,
+            routing_ef: 0,
         }
     }
 }

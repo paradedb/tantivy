@@ -731,20 +731,33 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef)
     }
 
-    /// [`search_iter`](Self::search_iter) with the first round's beam
-    /// capped at `first_batch_ef`: the stream head materializes after a
-    /// cheap narrow round, and pulling past it resumes at the full
-    /// [`ef`](NeighborhoodGraphConfig::ef). For callers that open a
-    /// ranked stream but may consume only a few candidates from it.
+    /// [`search_iter`](Self::search_iter) with the beam width overridden
+    /// (`ef_override`, `0` = the configured
+    /// [`ef`](NeighborhoodGraphConfig::ef)) and the first round's beam
+    /// capped at `first_batch_ef` (`0` = no cap): the stream head
+    /// materializes after a cheap narrow round, and pulling past it
+    /// resumes at the (possibly overridden) full width. For callers that
+    /// open a ranked stream but may consume only a few candidates from
+    /// it.
     pub fn search_iter_bootstrapped<'g, 'w>(
         &'g self,
         ws: &'w mut Workspace,
         query: &'g [S::Elem],
         seeds: &[NodeId],
         first_batch_ef: usize,
+        ef_override: usize,
     ) -> ResumableSearchIterator<'g, 'w, S> {
-        ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef)
-            .with_first_batch_ef(first_batch_ef)
+        let ef = if ef_override > 0 {
+            ef_override
+        } else {
+            self.config.ef
+        };
+        let iter = ResumableSearchIterator::new(self, ws, query, seeds, ef);
+        if first_batch_ef > 0 {
+            iter.with_first_batch_ef(first_batch_ef)
+        } else {
+            iter
+        }
     }
 
     /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
@@ -1430,7 +1443,7 @@ mod rng_tests {
         let full_head_visits = full.metrics().visited_count;
 
         let mut ws2 = Workspace::new();
-        let mut boot = rng.search_iter_bootstrapped(&mut ws2, &[4.2], &[0], 2);
+        let mut boot = rng.search_iter_bootstrapped(&mut ws2, &[4.2], &[0], 2, 0);
         let head = boot.next().expect("non-empty graph yields a head");
         assert!(
             boot.metrics().visited_count < full_head_visits,
