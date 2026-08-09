@@ -365,6 +365,12 @@ pub struct ProbeStats {
     /// armed result. Each charged the open share. Disjoint from the
     /// `postings_*` partition, which only counts opened clusters.
     pub bounds_skips: u32,
+    /// Ranked-stream positions (0-based pull order) of the clusters that
+    /// were OPENED, in probe order. Gaps are the gate's skips: `[0, 2, 4]`
+    /// means pulls 1 and 3 were proven unable to improve the result and
+    /// passed over. Bounded by the probe budget, and empty when nothing
+    /// opened. Per-segment; does not sum.
+    pub probed_cluster_ranks: Vec<u32>,
     /// Probe index (0-based, counting opened clusters) at which the
     /// query bound first armed from this segment's OWN heap - the
     /// boundary where the heap filled and margins existed to certify
@@ -707,6 +713,8 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut bounds_skips = 0u32;
+        let mut probed_cluster_ranks: Vec<u32> = Vec::new();
+        let mut ranked_pulls = 0u32;
         let mut termination = ProbeTermination::Exhausted;
         // P2: the query bound, maintained at cluster boundaries. The
         // bound-space conversion runs on kth improvement only, inside the
@@ -743,6 +751,8 @@ impl<T: VectorElement> VectorBackend<T> {
                 termination = ProbeTermination::Ceiling;
                 break;
             }
+            let pull_rank = ranked_pulls;
+            ranked_pulls += 1;
             let cluster = cluster as usize;
 
             // P5: the bounds verdict. The bound is consumed only through
@@ -797,6 +807,7 @@ impl<T: VectorElement> VectorBackend<T> {
 
             // Event-wise charging, part 1: the open.
             work_spent += pricing.open;
+            probed_cluster_ranks.push(pull_rank);
 
             let rows = index.cluster_range(cluster);
 
@@ -869,6 +880,7 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += candidates;
         stats.bounds_skips += bounds_skips;
+        stats.probed_cluster_ranks = probed_cluster_ranks;
         stats.bound_armed_at_probe = bound_tracker.armed_at_probe();
         stats.bound_seeded = bound_tracker.seeded();
         stats.termination = termination;
@@ -2683,6 +2695,7 @@ mod tests {
                 }),
             },
             bounds_skips: 2,
+            probed_cluster_ranks: vec![0, 2],
             bound_armed_at_probe: Some(1),
             bound_seeded: true,
             termination: ProbeTermination::Ceiling,
@@ -2713,6 +2726,7 @@ mod tests {
                     }
                 },
                 "bounds_skips": 2,
+                "probed_cluster_ranks": [0, 2],
                 "bound_armed_at_probe": 1,
                 "bound_seeded": true,
                 "termination": "Ceiling",
@@ -3684,6 +3698,11 @@ mod tests {
             assert_eq!(
                 stats.bounds_skips, 5,
                 "every non-home cluster is a counted skip: {stats:?}"
+            );
+            assert_eq!(
+                stats.probed_cluster_ranks,
+                vec![0],
+                "only the first ranked pull opened; the gap 1..=5 is the skips: {stats:?}"
             );
             Ok(())
         }
