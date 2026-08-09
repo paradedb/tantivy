@@ -607,6 +607,9 @@ pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
         max_probe_fraction: 1.0,
         min_probe_clusters: 1,
+        // Exhaustive means exhaustive: the skip-run cap is a heuristic
+        // and stays out of oracle-equality fixtures.
+        max_consecutive_bounds_skips: u32::MAX,
         ..Default::default()
     }
 }

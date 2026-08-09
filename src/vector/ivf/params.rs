@@ -72,6 +72,12 @@ pub struct AdaptiveProbeParams {
     /// holding a [`Searcher`](crate::Searcher) - see [`WorkModel`]. `None`
     /// falls back to per-segment normalization.
     pub work_model: Option<WorkModel>,
+    /// Consecutive gate skips tolerated before the scan stops pulling
+    /// the ranked stream (`ProbeTermination::SkipRun`). HEURISTIC: a
+    /// farther cluster with a larger radius than any seen can still
+    /// qualify, so small values trade recall for routing; `u32::MAX`
+    /// disables the cap and restores exact-by-construction probing.
+    pub max_consecutive_bounds_skips: u32,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -80,6 +86,7 @@ impl Default for AdaptiveProbeParams {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
+            max_consecutive_bounds_skips: crate::vector::backend::MAX_CONSECUTIVE_BOUNDS_SKIPS,
         }
     }
 }

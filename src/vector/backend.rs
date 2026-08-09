@@ -310,16 +310,30 @@ fn sync_shared_kth(
     current.map(|(key, _)| key)
 }
 
+/// Consecutive gate skips tolerated before the scan stops pulling the
+/// ranked stream — see [`ProbeTermination::SkipRun`].
+pub const MAX_CONSECUTIVE_BOUNDS_SKIPS: u32 = 2;
+
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProbeTermination {
     /// The work-unit probe budget was spent - the probe ceiling.
     Ceiling,
-    /// The ranked centroids were exhausted before the ceiling bound. The
-    /// bounds gate never terminates the scan - a skip is per-cluster and
-    /// charges the open share; only the ceiling and the stream end it.
+    /// The ranked centroids were exhausted before the ceiling bound. A
+    /// lone gate skip never terminates the scan - it is per-cluster and
+    /// charges the open share; the ceiling, the stream, and a skip RUN
+    /// end it.
     #[default]
     Exhausted,
+    /// More than [`MAX_CONSECUTIVE_BOUNDS_SKIPS`] gate skips in a row
+    /// ended the scan: the stream key is monotone, so after K straight
+    /// provable rejections every later cluster is farther still and
+    /// near-certain to be rejected too - stop pulling (and paying
+    /// routing for) the tail instead of stamping it skip by skip.
+    /// Heuristic in principle: a farther cluster whose radius exceeds
+    /// every radius seen so far could still qualify; the run length
+    /// prices that bet.
+    SkipRun,
 }
 
 /// Per-segment probe-loop instrumentation: a prune breakdown of every
@@ -713,6 +727,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut bounds_skips = 0u32;
+        let mut consecutive_skips = 0u32;
         let mut probed_cluster_ranks: Vec<u32> = Vec::new();
         let mut ranked_pulls = 0u32;
         let mut termination = ProbeTermination::Exhausted;
@@ -802,11 +817,20 @@ impl<T: VectorElement> VectorBackend<T> {
                 // +-0.03% in benchmarks). No row work is spent.
                 work_spent += pricing.open;
                 bounds_skips += 1;
+                consecutive_skips += 1;
+                // A skip RUN ends the scan: the stream only gets
+                // farther, so after K straight rejections stop pulling
+                // (and routing) the tail entirely.
+                if consecutive_skips > self.adaptive.max_consecutive_bounds_skips {
+                    termination = ProbeTermination::SkipRun;
+                    break;
+                }
                 continue;
             }
 
             // Event-wise charging, part 1: the open.
             work_spent += pricing.open;
+            consecutive_skips = 0;
             probed_cluster_ranks.push(pull_rank);
 
             let rows = index.cluster_range(cluster);
@@ -3684,6 +3708,30 @@ mod tests {
                 })
                 .collect();
             single_segment_fixture(metric, &centroids, &docs, 1)
+        }
+
+        /// The skip-run cap: at the default
+        /// [`MAX_CONSECUTIVE_BOUNDS_SKIPS`], a third consecutive gate
+        /// skip ends the scan — the far tail is never pulled, stamped,
+        /// or routed. (Oracle fixtures disable the cap via
+        /// `exhaustive_params`; this pins the default behavior.)
+        #[test]
+        fn skip_run_caps_the_stream() -> crate::Result<()> {
+            let (index, field) = separated_fixture(Metric::L2)?;
+            let params = AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 1,
+                ..AdaptiveProbeParams::default()
+            };
+            let (_, stats) = run_top_n(&index, field, vec![0.2, 0.3], 5, params)?;
+            assert_eq!(stats.termination, ProbeTermination::SkipRun, "{stats:?}");
+            assert_eq!(
+                stats.bounds_skips, 3,
+                "two tolerated skips plus the run-ending third: {stats:?}"
+            );
+            assert_eq!(stats.clusters_probed(), 1);
+            assert_eq!(stats.probed_cluster_ranks, vec![0]);
+            Ok(())
         }
 
         /// `bounds_skips` counts exactly the clusters the gate passed
