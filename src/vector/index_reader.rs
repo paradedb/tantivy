@@ -26,6 +26,7 @@ use common::{HasLen, OwnedBytes};
 use super::flat::IdMap;
 use super::header::{centroid_slot, read_header, vec_slot, VectorFileVersion};
 use super::ivf::{IvfIndex, CENTROIDS_EXT};
+use super::sq::SqCodes;
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
@@ -76,6 +77,9 @@ pub struct VectorIndexReader {
     /// `.vec` slot `[1]`: the dense vector rows. Never materialized whole;
     /// queries fetch per-cluster (or per-doc) ranges.
     rows_slice: FileSlice,
+    /// `.vec` slot `[2]`: SQ4 row sketches for the certified row gate.
+    /// Absent on flat and pre-SQ segments — the gate then never arms.
+    sq: Option<SqCodes>,
     index: Option<IvfIndex>,
 }
 
@@ -195,6 +199,16 @@ impl VectorIndexReader {
             )));
         }
 
+        // Slot [2] is optional by design (fail-open gate), but only
+        // meaningful on cluster-sorted rows; ignore it elsewhere.
+        let sq = match (
+            &index,
+            vec_composite.open_read_with_idx(field, vec_slot::SQ),
+        ) {
+            (Some(_), Some(slice)) => Some(SqCodes::open(slice, options.dim(), num_rows)?),
+            _ => None,
+        };
+
         let num_vectors = match &index {
             Some(index) => index.num_docs(),
             None => num_rows,
@@ -204,6 +218,7 @@ impl VectorIndexReader {
             num_vectors,
             present: true,
             rows_slice,
+            sq,
             id_map,
             index,
         })
@@ -217,6 +232,7 @@ impl VectorIndexReader {
             num_vectors: 0,
             present: false,
             rows_slice: FileSlice::empty(),
+            sq: None,
             id_map: IdMap::Identity { num_docs: 0 },
             index: None,
         }
@@ -243,6 +259,12 @@ impl VectorIndexReader {
     /// `None` means search must scan the rows exactly.
     pub fn index(&self) -> Option<&IvfIndex> {
         self.index.as_ref()
+    }
+
+    /// The SQ4 row sketches backing the certified row gate; `None` on
+    /// flat or pre-SQ segments (the gate fails open).
+    pub(crate) fn sq(&self) -> Option<&SqCodes> {
+        self.sq.as_ref()
     }
 
     /// Storage info for tooling; `None` if the segment has no vector data for

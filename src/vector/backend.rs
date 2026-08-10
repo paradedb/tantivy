@@ -381,6 +381,10 @@ pub struct ProbeStats {
     pub pruned_dead: usize,
     /// Touched docs rejected by the replica `seen` dedup.
     pub pruned_seen: usize,
+    /// Survivor rows whose SQ4 sketch PROVED they cannot beat the
+    /// current kth — their full-precision reads were skipped. Exact:
+    /// results are identical with the gate on or off.
+    pub pruned_sq: usize,
     /// Probed clusters whose surviving rows' posting bytes were fetched —
     /// one stride-sized ranged read per surviving row. Counts clusters,
     /// not rows.
@@ -799,6 +803,17 @@ impl<T: VectorElement> VectorBackend<T> {
         // segment-query.
         let q_norm = norm_squared_wide(self.query.query()).sqrt() as f32;
         let bounds = index.bounds();
+        // SQ row gate inputs: the segment's sketches (absent on pre-SQ
+        // segments — gate never arms) and `1/||q||` for the cosine key
+        // space; `0.0` for a degenerate query norm, whose bound then
+        // never exceeds any real kth (fail-open, matching PreparedQuery).
+        let sq = self.reader.sq();
+        let inv_norm_q = if q_norm > 0.0 && q_norm.is_finite() {
+            1.0 / q_norm as f64
+        } else {
+            0.0
+        };
+        let mut pruned_sq = 0usize;
         // Replication can place the same doc in several probed clusters; dedup
         // by doc id so a vector is scored at most once.
         let mut seen = BitSet::with_max_value(max_doc);
@@ -910,17 +925,17 @@ impl<T: VectorElement> VectorBackend<T> {
 
             // Pre-pass: gate off the pinned id-map BEFORE fetching any
             // posting bytes, so only rows that will be scored are read.
-            let (v, pf, pd, ps, scored_rows) =
-                self.collect_cluster_survivors(rows, filter, alive, &mut seen, &mut survivors);
+            let (v, pf, pd, ps, _survivor_rows) = self.collect_cluster_survivors(
+                rows.clone(),
+                filter,
+                alive,
+                &mut seen,
+                &mut survivors,
+            );
             visited += v;
             pruned_filter += pf;
             pruned_dead += pd;
             pruned_seen += ps;
-
-            // Event-wise charging, part 2: the rows that survive the
-            // pre-pass — exactly the rows fetched and scored below.
-            // Rejected and deduped rows charge nothing.
-            work_spent += pricing.row * scored_rows as f64;
 
             let audit_t = match bound_tracker.bound() {
                 QueryBound::Armed { t } => t,
@@ -928,16 +943,49 @@ impl<T: VectorElement> VectorBackend<T> {
             };
             let mut best_score = f32::NEG_INFINITY;
             let mut contributed = false;
+            let mut fetched_rows = 0usize;
             if survivors.is_empty() {
                 postings_skipped += 1;
             } else {
                 postings_row += 1;
+                // SQ row gate: armed iff the segment has sketches AND a
+                // certified kth exists (the tracker's fold covers both
+                // the local heap and any shared seed, in NATIVE key
+                // space with no lossy round trip). One contiguous read
+                // each for the cluster's codes and errors.
+                let sq_gate = match (sq, bound_tracker.raw_kth()) {
+                    (Some(sq), Some(gate_key)) => {
+                        Some((sq, gate_key as f64, sq.cluster_slices(rows.clone())?))
+                    }
+                    _ => None,
+                };
                 // One stride-sized read per survivor — the unit the
                 // pg-backed `Directory` serves zero-copy (see
                 // `vector_bytes_for_row`).
                 for &Survivor { row, doc } in &survivors {
+                    // The certified skip: an upper bound on this row's
+                    // heap key, from its 4-bit sketch alone. Strictly
+                    // below the kth ⇒ the full-precision row cannot
+                    // enter the heap and is never read. NaN compares
+                    // false ⇒ degenerate rows fail open and are read.
+                    if let Some((sq, gate_key, (ccodes, cerrs))) = &sq_gate {
+                        let ub = sq.upper_bound_key(
+                            metric,
+                            routing_query,
+                            inv_norm_q,
+                            q_norm as f64,
+                            ccodes,
+                            cerrs,
+                            row - rows.start,
+                        );
+                        if ub < *gate_key {
+                            pruned_sq += 1;
+                            continue;
+                        }
+                    }
                     let vbytes = self.reader.vector_bytes_for_row(row)?;
                     let score = self.query.score_doc_bytes(&vbytes);
+                    fetched_rows += 1;
                     best_score = best_score.max(score);
                     if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
                         topn.push_unordered(key, doc);
@@ -948,6 +996,12 @@ impl<T: VectorElement> VectorBackend<T> {
                     contributing_cluster_ranks.push(pull_rank);
                 }
             }
+
+            // Event-wise charging, part 2: the rows actually fetched and
+            // scored. Rejected, deduped, and sketch-pruned rows charge
+            // nothing — the gate stretches the same budget further.
+            work_spent += pricing.row * fetched_rows as f64;
+
             cluster_bound_audit.push(ClusterBoundAudit {
                 t: audit_t,
                 d: to_bound_space(metric, sim.score()),
@@ -959,7 +1013,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 },
                 contributed,
             });
-            candidates += survivors.len();
+            candidates += fetched_rows;
 
             // P2: fold the exact kth into the bound at the cluster
             // boundary. `kth_best` is O(buffer) and force-truncates —
@@ -995,6 +1049,7 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.pruned_filter += pruned_filter;
         stats.pruned_dead += pruned_dead;
         stats.pruned_seen += pruned_seen;
+        stats.pruned_sq += pruned_sq;
         stats.postings_row += postings_row;
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += candidates;
@@ -2801,6 +2856,7 @@ mod tests {
             pruned_filter: 4,
             pruned_dead: 3,
             pruned_seen: 3,
+            pruned_sq: 5,
             postings_row: 1,
             postings_skipped: 1,
             exact_rows_read: 0,
@@ -2835,6 +2891,7 @@ mod tests {
                 "pruned_filter": 4,
                 "pruned_dead": 3,
                 "pruned_seen": 3,
+                "pruned_sq": 5,
                 "postings_row": 1,
                 "postings_skipped": 1,
                 "segment_clusters": 6,

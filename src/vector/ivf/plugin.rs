@@ -20,6 +20,7 @@ use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header};
+use crate::vector::sq::{code_stride as sq_code_stride, serialize as sq_serialize, SqGrid};
 use crate::vector::{
     residual_norm, BoundKind, BoundsBuilder, BoundsScope, NeighborhoodGraphConfig, NodeId,
     RelativeNeighborhoodGraph, Workspace, VEC_EXT,
@@ -621,6 +622,34 @@ pub(crate) fn merge_ivf(
                     centroid_bytes.extend_from_slice(&bytes);
                 }
 
+                // SQ4 grid: per-dim ranges from a bounded stride-sample of
+                // the rows about to be written (normalized exactly as the
+                // write loop will normalize them). A sampled grid is sound
+                // regardless of coverage — out-of-range rows clamp and
+                // their stored per-row error absorbs the miss.
+                const SQ_GRID_SAMPLE_ROWS: usize = 4096;
+                let sq_grid = {
+                    let sample_step = assigned_vectors.len().div_ceil(SQ_GRID_SAMPLE_ROWS).max(1);
+                    let mut sample_rows: Vec<Vec<f32>> = Vec::new();
+                    for assigned_vector in assigned_vectors.iter().step_by(sample_step) {
+                        let reader = &field_readers[assigned_vector.source_segment_ord];
+                        let Some(bytes) = reader.vector_bytes(assigned_vector.source_doc_id)?
+                        else {
+                            continue;
+                        };
+                        let mut buf = bytes.as_slice().to_vec();
+                        maybe_normalize_bytes(opts, &mut buf);
+                        sample_rows.push(decode_row::<f32>(&buf, opts.dim())?);
+                    }
+                    SqGrid::from_sample(opts.dim(), sample_rows.iter().map(|r| r.as_slice()))
+                };
+                // Codes and errors buffer in memory until the rows slot is
+                // fully written (composite slots are sequential): ~dim/2
+                // bytes per row, i.e. ~0.5GB per million 1024-d rows.
+                let mut sq_codes: Vec<u8> =
+                    Vec::with_capacity(assigned_vectors.len() * sq_code_stride(opts.dim()));
+                let mut sq_errors: Vec<f32> = Vec::with_capacity(assigned_vectors.len());
+
                 let posting_start = Instant::now();
                 // `.vec` slot [0]: the row→doc_id permutation (Explicit), in
                 // cluster-sorted row order — parallel to the rows in slot [1].
@@ -690,6 +719,12 @@ pub(crate) fn merge_ivf(
                             &bytes
                         };
                         rows_w.write_all(written_bytes)?;
+                        // SQ4: encode the EXACT bytes just written, so the
+                        // stored error certifies against what queries read.
+                        sq_errors.push(sq_grid.encode_row(
+                            &decode_row::<f32>(written_bytes, opts.dim())?,
+                            &mut sq_codes,
+                        ));
                         // P1: the bounds fold — NATIVE rows only, the exact
                         // bytes written above against the stored centroid.
                         // A non-finite row residual saturates its cluster
@@ -710,6 +745,12 @@ pub(crate) fn merge_ivf(
                         }
                     }
                     rows_w.flush()?;
+                }
+                // `.vec` slot [2]: the SQ4 sketches, row-parallel to slot [1].
+                {
+                    let sq_w = vec_write.for_field_with_idx(field, vec_slot::SQ);
+                    sq_serialize(&sq_grid, &sq_codes, &sq_errors, sq_w)?;
+                    sq_w.flush()?;
                 }
                 timings.posting_write = posting_start.elapsed();
 

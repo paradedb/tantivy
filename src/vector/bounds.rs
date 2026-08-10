@@ -403,6 +403,13 @@ impl QueryBoundTracker {
     pub(crate) fn seeded(&self) -> bool {
         self.seeded
     }
+
+    /// The best certified kth key folded so far — local or shared — in
+    /// NATIVE heap space, exactly as folded (no bound-space round trip).
+    /// The SQ row gate's threshold source.
+    pub(crate) fn raw_kth(&self) -> Option<f32> {
+        self.raw_kth
+    }
 }
 
 // ======================================================================

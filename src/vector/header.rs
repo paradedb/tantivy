@@ -58,6 +58,11 @@ pub(crate) mod vec_slot {
     pub(crate) const ID_MAP: usize = 0;
     /// The stored vector rows.
     pub(crate) const ROWS: usize = 1;
+    /// SQ4 row sketches: per-dim grid, nibble-packed codes, per-row
+    /// error bounds (see `vector::sq`). OPTIONAL: written by the IVF
+    /// merge; absent on flat and pre-SQ segments, where the row gate
+    /// simply never arms.
+    pub(crate) const SQ: usize = 2;
 }
 
 /// Version stamped into newly written vector files.

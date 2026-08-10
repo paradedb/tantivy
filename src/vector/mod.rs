@@ -20,6 +20,7 @@ mod header;
 mod index_reader;
 mod plugin;
 mod prepared;
+mod sq;
 mod tie_break;
 
 pub mod flat;

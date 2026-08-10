@@ -405,7 +405,7 @@ mod ivf_e2e_tests {
         for s in &fruit.stats {
             assert_eq!(
                 s.vectors_visited,
-                s.pruned_filter + s.pruned_dead + s.pruned_seen + s.candidates_scored,
+                s.pruned_filter + s.pruned_dead + s.pruned_seen + s.pruned_sq + s.candidates_scored,
                 "invariant per segment: {s:?}"
             );
             assert!(s.routing.visited_count > 0);
