@@ -176,10 +176,6 @@ pub(crate) struct Grid2DClusterer {
 }
 
 impl IvfClusterer for Grid2DClusterer {
-    fn centroid_ratio(&self) -> f32 {
-        0.1
-    }
-
     fn training_sample_ratio(&self) -> f32 {
         1.0
     }
@@ -944,9 +940,6 @@ mod bounds_storage_tests {
     }
 
     impl IvfClusterer for TestClusterer {
-        fn centroid_ratio(&self) -> f32 {
-            1.0
-        }
         fn training_sample_ratio(&self) -> f32 {
             1.0
         }

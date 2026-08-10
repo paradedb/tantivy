@@ -4,8 +4,6 @@ use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
 
 pub trait IvfClusterer: Send + Sync + 'static {
-    fn centroid_ratio(&self) -> f32;
-
     /// Fraction of vectors sampled for training, in `(0, 1]`.
     fn training_sample_ratio(&self) -> f32;
 
@@ -40,15 +38,9 @@ pub trait IvfClusterer: Send + Sync + 'static {
     }
 
     fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-        let centroid_ratio = self.centroid_ratio();
         let training_sample_ratio = self.training_sample_ratio();
         let assign_batch_size = self.assign_batch_size();
 
-        assert!(
-            centroid_ratio > 0.0 && centroid_ratio <= 1.0,
-            "IvfClusterer centroid_ratio must be greater than 0 and less than or equal to 1, got \
-             {centroid_ratio}"
-        );
         assert!(
             training_sample_ratio > 0.0 && training_sample_ratio <= 1.0,
             "IvfClusterer training_sample_ratio must be greater than 0 and less than or equal to \

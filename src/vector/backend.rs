@@ -973,9 +973,6 @@ mod tests {
     }
 
     impl IvfClusterer for InlineClusterer {
-        fn centroid_ratio(&self) -> f32 {
-            1.0
-        }
         fn training_sample_ratio(&self) -> f32 {
             1.0
         }
