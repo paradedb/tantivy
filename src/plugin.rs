@@ -532,7 +532,7 @@ mod tests {
             .create_in_ram()?;
 
         let segment = index.new_segment();
-        let mut segment_writer = SegmentWriter::for_segment(15_000_000, segment)?;
+        let mut segment_writer = SegmentWriter::for_segment(15_000_000, segment, false)?;
 
         // A custom (non-`TantivyDocument`) document type indexes fine even with a custom plugin
         // registered: built-ins take it generically, and the custom plugin receives it
@@ -621,9 +621,13 @@ mod tests {
         let with_marker = build(true)?;
         let without_marker = build(false)?;
 
-        let err = merge_indices(&[with_marker, without_marker], RamDirectory::create())
-            .err()
-            .expect("merge should fail when source indices register different plugin sets");
+        let err = merge_indices(
+            &[with_marker, without_marker],
+            RamDirectory::create(),
+            Box::new(|| false),
+        )
+        .err()
+        .expect("merge should fail when source indices register different plugin sets");
         assert!(
             matches!(err, TantivyError::InvalidArgument(ref msg) if msg.contains("plugin sets")),
             "expected InvalidArgument about plugin sets, got {err:?}"

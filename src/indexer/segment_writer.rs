@@ -33,7 +33,9 @@ pub struct SegmentWriter {
     pub(crate) inverted_index: InvertedIndexPluginWriter,
     pub(crate) fast_fields: FastFieldsPluginWriter,
     pub(crate) store_writer: StorePluginWriter,
-    custom_plugins: Vec<Box<dyn PluginWriter>>,
+    /// Writers for `Index::erased_plugins()`, in that order: the erased built-ins
+    /// (currently the vector plugin), then the registered custom plugins.
+    erased_plugin_writers: Vec<Box<dyn PluginWriter>>,
     pub(crate) doc_opstamps: Vec<Opstamp>,
     schema: Schema,
     ignore_store: bool,
@@ -63,9 +65,9 @@ impl SegmentWriter {
         let inverted_index = InvertedIndexPluginWriter::new(&ctx)?;
         let fast_fields = FastFieldsPluginWriter::new(&ctx)?;
         let store_writer = StorePluginWriter::new(&ctx)?;
-        let custom_plugins = segment
+        let erased_plugin_writers = segment
             .index()
-            .custom_plugins()
+            .erased_plugins()
             .iter()
             .map(|plugin| plugin.create_writer(&ctx))
             .collect::<crate::Result<Vec<_>>>()?;
@@ -75,7 +77,7 @@ impl SegmentWriter {
             inverted_index,
             fast_fields,
             store_writer,
-            custom_plugins,
+            erased_plugin_writers,
             doc_opstamps: Vec::with_capacity(1_000),
             schema,
             ignore_store,
@@ -88,10 +90,10 @@ impl SegmentWriter {
         let idx = self
             .segment
             .index()
-            .custom_plugins()
+            .erased_plugins()
             .iter()
             .position(|plugin| plugin.extensions().contains(&extension))?;
-        self.custom_plugins
+        self.erased_plugin_writers
             .get_mut(idx)
             .map(|writer| writer.as_mut())
     }
@@ -156,7 +158,7 @@ impl SegmentWriter {
         Box::new(self.inverted_index).serialize(segment, mapping)?;
         Box::new(self.fast_fields).serialize(segment, mapping)?;
         Box::new(self.store_writer).serialize(segment, mapping)?;
-        for writer in self.custom_plugins {
+        for writer in self.erased_plugin_writers {
             writer.serialize(segment, mapping)?;
         }
 
@@ -171,7 +173,7 @@ impl SegmentWriter {
             + self.fast_fields.mem_usage()
             + self.store_writer.mem_usage()
             + self
-                .custom_plugins
+                .erased_plugin_writers
                 .iter()
                 .map(|writer| writer.mem_usage())
                 .sum::<usize>()
@@ -193,11 +195,11 @@ impl SegmentWriter {
         self.fast_fields.index_document(&document)?;
         self.store_writer.store(&document, &self.schema)?;
 
-        // Custom plugins are trait objects, so they take the document type-erased. Leaves stay
+        // Erased plugins are trait objects, so they take the document type-erased. Leaves stay
         // borrowed; a plugin that knows the concrete type recovers it for free via `as_any`.
-        if !self.custom_plugins.is_empty() {
+        if !self.erased_plugin_writers.is_empty() {
             let erased: &dyn ErasedDocument = &document;
-            for writer in &mut self.custom_plugins {
+            for writer in &mut self.erased_plugin_writers {
                 writer.add_document(doc_id, erased, &self.schema)?;
             }
         }

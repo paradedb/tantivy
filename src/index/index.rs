@@ -65,12 +65,20 @@ fn load_metas(
 
 /// The built-in plugins, in write order.
 pub(crate) fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
-    vec![
+    let mut plugins: Vec<Arc<dyn SegmentPlugin>> = vec![
         Arc::new(InvertedIndexPlugin),
         Arc::new(FastFieldsPlugin),
         Arc::new(StorePlugin),
-        Arc::new(VectorPlugin),
-    ]
+    ];
+    plugins.extend(erased_builtin_plugins());
+    plugins
+}
+
+/// The built-in plugins whose writers are driven entirely through the type-erased
+/// [`PluginWriter`](crate::plugin::PluginWriter) interface, unlike the first three
+/// built-ins, whose concrete writer types the `SegmentWriter` constructs directly.
+pub(crate) fn erased_builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
+    vec![Arc::new(VectorPlugin)]
 }
 
 /// The files owned by the given segments: one per plugin extension (the built-in
@@ -773,6 +781,17 @@ impl Index {
     /// The custom (non-built-in) plugins registered on this index.
     pub fn custom_plugins(&self) -> &[Arc<dyn SegmentPlugin>] {
         &self.custom_plugins
+    }
+
+    /// The plugins whose writers are driven through the type-erased
+    /// [`PluginWriter`](crate::plugin::PluginWriter) interface, in write order: the
+    /// erased built-ins (currently the vector plugin) followed by the registered
+    /// custom plugins.
+    pub(crate) fn erased_plugins(&self) -> Vec<Arc<dyn SegmentPlugin>> {
+        erased_builtin_plugins()
+            .into_iter()
+            .chain(self.custom_plugins.iter().cloned())
+            .collect()
     }
 
     /// The sorted set of extensions claimed by the registered custom (non-built-in) plugins.
