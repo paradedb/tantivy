@@ -900,7 +900,7 @@ mod tests {
         let order = index.schema().get_field("order").unwrap();
         let text = index.schema().get_field("text").unwrap();
         let mut segment_writer =
-            super::SegmentWriter::for_segment(15_000_000, segment.clone()).unwrap();
+            super::SegmentWriter::for_segment(15_000_000, segment.clone(), false).unwrap();
         for (opstamp, text_opt) in texts.iter().enumerate() {
             let mut doc = TantivyDocument::default();
             doc.add_u64(order, opstamp as u64);
@@ -946,7 +946,7 @@ mod tests {
         let segment = index.new_segment();
         let order = index.schema().get_field("order").unwrap();
         let mut segment_writer =
-            super::SegmentWriter::for_segment(15_000_000, segment.clone()).unwrap();
+            super::SegmentWriter::for_segment(15_000_000, segment.clone(), false).unwrap();
         for opstamp in 0..2 {
             let mut doc = TantivyDocument::default();
             doc.add_u64(order, opstamp as u64);
