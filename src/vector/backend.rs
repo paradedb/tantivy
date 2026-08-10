@@ -342,6 +342,26 @@ pub enum ProbeTermination {
     Anchored,
 }
 
+/// One opened cluster's bound-looseness audit, all in bound space:
+/// the gate's lower bound `d - r` versus the true nearest member the
+/// probe went on to score. `margin = true_nearest - (d - r)` is the
+/// bound's looseness for this (query, cluster); `d - true_nearest` is
+/// the radius that would have made it tight.
+#[derive(Debug, serde::Serialize)]
+pub struct ClusterBoundAudit {
+    /// Armed threshold when this cluster was gated; NaN while filling.
+    pub t: f32,
+    /// Exact query-to-centroid distance (the routing key).
+    pub d: f32,
+    /// The cluster's stored ball radius.
+    pub r: f32,
+    /// Bound-space distance of the closest row actually scored; NaN if
+    /// every row was pruned before scoring.
+    pub nearest: f32,
+    /// Whether any scored row entered the top-k heap.
+    pub contributed: bool,
+}
+
 /// Per-segment probe-loop instrumentation: a prune breakdown of every
 /// doc the inner loop touched, plus posting-fetch counters. Returned by
 /// [`VectorBackend::top_n`] alongside the hits. The flat/exact path fills
@@ -403,6 +423,11 @@ pub struct ProbeStats {
     /// lost to results already held. Early ranks over-qualify (a filling
     /// heap admits anything). Per-segment; does not sum.
     pub contributing_cluster_ranks: Vec<u32>,
+    /// DIAGNOSTIC: one record per OPENED cluster, in probe order — how
+    /// loose the ball bound was against ground truth for this query. All
+    /// distances in bound space (chord for cosine). Per-segment; does
+    /// not sum.
+    pub cluster_bound_audit: Vec<ClusterBoundAudit>,
     /// Probe index (0-based, counting opened clusters) at which the
     /// query bound first armed from this segment's OWN heap - the
     /// boundary where the heap filled and margins existed to certify
@@ -754,6 +779,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut consecutive_skips = 0u32;
         let mut probed_cluster_ranks: Vec<u32> = Vec::new();
         let mut contributing_cluster_ranks: Vec<u32> = Vec::new();
+        let mut cluster_bound_audit: Vec<ClusterBoundAudit> = Vec::new();
         let mut ranked_pulls = 0u32;
         let mut termination = ProbeTermination::Exhausted;
         // P2: the query bound, maintained at cluster boundaries. The
@@ -896,6 +922,12 @@ impl<T: VectorElement> VectorBackend<T> {
             // Rejected and deduped rows charge nothing.
             work_spent += pricing.row * scored_rows as f64;
 
+            let audit_t = match bound_tracker.bound() {
+                QueryBound::Armed { t } => t,
+                _ => f32::NAN,
+            };
+            let mut best_score = f32::NEG_INFINITY;
+            let mut contributed = false;
             if survivors.is_empty() {
                 postings_skipped += 1;
             } else {
@@ -903,10 +935,10 @@ impl<T: VectorElement> VectorBackend<T> {
                 // One stride-sized read per survivor — the unit the
                 // pg-backed `Directory` serves zero-copy (see
                 // `vector_bytes_for_row`).
-                let mut contributed = false;
                 for &Survivor { row, doc } in &survivors {
                     let vbytes = self.reader.vector_bytes_for_row(row)?;
                     let score = self.query.score_doc_bytes(&vbytes);
+                    best_score = best_score.max(score);
                     if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
                         topn.push_unordered(key, doc);
                         contributed = true;
@@ -916,6 +948,17 @@ impl<T: VectorElement> VectorBackend<T> {
                     contributing_cluster_ranks.push(pull_rank);
                 }
             }
+            cluster_bound_audit.push(ClusterBoundAudit {
+                t: audit_t,
+                d: to_bound_space(metric, sim.score()),
+                r: bounds.ball_r(cluster),
+                nearest: if best_score.is_finite() {
+                    to_bound_space(metric, best_score)
+                } else {
+                    f32::NAN
+                },
+                contributed,
+            });
             candidates += survivors.len();
 
             // P2: fold the exact kth into the bound at the cluster
@@ -958,6 +1001,7 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.bounds_skips += bounds_skips;
         stats.probed_cluster_ranks = probed_cluster_ranks;
         stats.contributing_cluster_ranks = contributing_cluster_ranks;
+        stats.cluster_bound_audit = cluster_bound_audit;
         stats.bound_armed_at_probe = bound_tracker.armed_at_probe();
         stats.bound_seeded = bound_tracker.seeded();
         stats.termination = termination;
@@ -2775,6 +2819,7 @@ mod tests {
             segment_clusters: 6,
             probed_cluster_ranks: vec![0, 2],
             contributing_cluster_ranks: vec![0],
+            cluster_bound_audit: Vec::new(),
             bound_armed_at_probe: Some(1),
             bound_seeded: true,
             termination: ProbeTermination::Ceiling,
@@ -2808,6 +2853,7 @@ mod tests {
                 "bounds_skips": 2,
                 "probed_cluster_ranks": [0, 2],
                 "contributing_cluster_ranks": [0],
+                "cluster_bound_audit": [],
                 "bound_armed_at_probe": 1,
                 "bound_seeded": true,
                 "termination": "Ceiling",
