@@ -1,60 +1,90 @@
-//! Balanced k-means tree (BKT) over IVF centroids — topology for seed
-//! generation into the centroid RNG.
+//! Balanced k-means tree (BKT) over IVF centroids.
 //!
-//! Build-time trees own center rows (`BKTree<Vec<f32>>`). Query-time reload
-//! (deferred) pins nodes/members and wraps the trailing center blob in a
-//! [`FileSliceArena`](crate::vector::FileSliceArena), matching the RNG.
+//! Leaves hold IVF / RNG graph [`NodeId`](super::NodeId)s for seed generation.
+//! Tree topology uses this module's [`NodeId`].
+
+use std::collections::{BinaryHeap, VecDeque};
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Deref;
 
 use common::BinarySerializable;
 
-use super::NodeId;
+use super::graph::Candidate;
+use super::NodeId as GraphNodeId;
 use crate::schema::Metric;
 use crate::vector::VectorArena;
+
+/// Default per-round member budget for [`BKTree::search_iter`].
+const DEFAULT_MAX_LEAVES: usize = 50;
 
 const NODE_INTERNAL: u8 = 0;
 const NODE_LEAF: u8 = 1;
 
-/// One node in a [`BKTree`].
+/// Index into [`BKTree::nodes`]. Distinct from graph [`NodeId`](super::NodeId).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeId(pub u32);
+
+impl NodeId {
+    /// Index into [`BKTree::nodes`].
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl From<u32> for NodeId {
+    #[inline]
+    fn from(value: u32) -> Self {
+        NodeId(value)
+    }
+}
+
+impl From<NodeId> for u32 {
+    #[inline]
+    fn from(value: NodeId) -> Self {
+        value.0
+    }
+}
+
+/// A node in a [`BKTree`].
 ///
-/// Direct children of an internal node are contiguous in [`BKTree::nodes`].
-/// Leaf members are contiguous in [`BKTree::members`] and name IVF / RNG
-/// [`NodeId`]s (centroid indices into `.centroids` slot `[0]`).
+/// An internal node's children are contiguous in [`BKTree::nodes`].
+/// A leaf's members are contiguous in [`BKTree::members`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BKTreeNode {
     Internal {
-        /// Row in the centers arena.
+        /// Row in [`BKTree::centers`].
         centroid_id: u32,
-        /// Index of the first child in [`BKTree::nodes`].
+        /// First child index in [`BKTree::nodes`].
         children_offset: u32,
         /// Number of direct children.
         children_size: u32,
     },
     Leaf {
-        /// Row in the centers arena (leaf mean / center).
+        /// Row in [`BKTree::centers`].
         centroid_id: u32,
         /// Start of this leaf's members in [`BKTree::members`].
         members_offset: u32,
-        /// Number of IVF centroid ids owned by this leaf.
+        /// Number of members in this leaf.
         members_size: u32,
     },
 }
 
 /// Balanced k-means tree over IVF centroids.
 ///
-/// `S` is the center store: owned / borrowed floats at build time, a
+/// `S` is the center store: typically `Vec<f32>` at build time, or a
 /// [`FileSliceArena`](crate::vector::FileSliceArena) after reload.
 #[derive(Clone, Debug)]
 pub struct BKTree<S: VectorArena> {
     pub dim: usize,
-    /// Scoring family; not persisted — supplied again at open from field options.
+    /// Distance / similarity metric. Not persisted; supply again on open.
     pub metric: Metric,
-    /// Tree nodes; index `0` is the root.
+    /// Tree nodes. Root is [`NodeId(0)`] when non-empty.
     pub nodes: Vec<BKTreeNode>,
-    /// IVF / RNG node ids; each leaf owns a contiguous slice.
-    pub members: Vec<NodeId>,
+    /// IVF / RNG graph node ids. Each leaf owns a contiguous slice.
+    pub members: Vec<GraphNodeId>,
+    /// One center vector per tree node (`len == nodes.len() * dim`).
     pub centers: S,
 }
 
@@ -71,27 +101,131 @@ impl<S: VectorArena> BKTree<S> {
         self.nodes.is_empty()
     }
 
-    /// Root node id — always `0` while the tree is non-empty.
+    /// Root node id ([`NodeId(0)`]). Panics in debug if the tree is empty.
     #[inline]
     pub fn root(&self) -> NodeId {
         debug_assert!(!self.nodes.is_empty());
-        0
+        NodeId(0)
     }
 
-    /// Contiguous member slice for a leaf, or empty for an internal node.
-    pub fn leaf_members(&self, node: &BKTreeNode) -> &[NodeId] {
-        match node {
-            BKTreeNode::Leaf {
-                members_offset,
-                members_size,
-                ..
-            } => {
-                let start = *members_offset as usize;
-                let end = start + *members_size as usize;
-                &self.members[start..end]
+    /// Row index of `node`'s center in [`BKTree::centers`].
+    #[inline]
+    fn center_row(&self, node: NodeId) -> u32 {
+        match &self.nodes[node.index()] {
+            BKTreeNode::Internal { centroid_id, .. } | BKTreeNode::Leaf { centroid_id, .. } => {
+                *centroid_id
             }
-            BKTreeNode::Internal { .. } => &[],
         }
+    }
+
+    /// Best-first search yielding graph [`NodeId`](super::NodeId)s nearest the
+    /// query, in approximate nearest-leaf order. Continue pulling to request
+    /// more seeds; the iterator resumes from where it left off.
+    pub fn search_iter<'g>(&'g self, query: &'g [S::Elem]) -> BKTreeSearchIterator<'g, S> {
+        self.search_iter_n(query, DEFAULT_MAX_LEAVES)
+    }
+
+    /// Same as [`search_iter`](Self::search_iter) with a custom per-round
+    /// member budget of `max_leaves`.
+    pub fn search_iter_n<'g>(
+        &'g self,
+        query: &'g [S::Elem],
+        max_leaves: usize,
+    ) -> BKTreeSearchIterator<'g, S> {
+        BKTreeSearchIterator::new(self, query, max_leaves.max(1))
+    }
+}
+
+/// Yields graph [`NodeId`](super::NodeId)s from a [`BKTree`] search.
+///
+/// Produced by [`BKTree::search_iter`] / [`BKTree::search_iter_n`].
+pub struct BKTreeSearchIterator<'g, S: VectorArena> {
+    tree: &'g BKTree<S>,
+    query: &'g [S::Elem],
+    max_leaves: usize,
+    frontier: BinaryHeap<Candidate<NodeId>>,
+    results: VecDeque<GraphNodeId>,
+}
+
+impl<'g, S: VectorArena> BKTreeSearchIterator<'g, S> {
+    fn new(tree: &'g BKTree<S>, query: &'g [S::Elem], max_leaves: usize) -> Self {
+        debug_assert_eq!(query.len(), tree.dim, "query dimension mismatch");
+
+        let mut frontier = BinaryHeap::new();
+        if !tree.is_empty() {
+            let root = tree.root();
+            let sim = tree
+                .centers
+                .similarity(tree.metric, tree.dim, tree.center_row(root), query);
+            frontier.push(Candidate { sim, node: root });
+        }
+
+        BKTreeSearchIterator {
+            tree,
+            query,
+            max_leaves,
+            frontier,
+            results: VecDeque::new(),
+        }
+    }
+
+    fn run_round(&mut self) {
+        debug_assert!(self.results.is_empty());
+
+        let tree = self.tree;
+        let centers = &tree.centers;
+        let dim = tree.dim;
+        let metric = tree.metric;
+
+        while let Some(candidate) = self.frontier.pop() {
+            match &tree.nodes[candidate.node.index()] {
+                BKTreeNode::Internal {
+                    children_offset,
+                    children_size,
+                    ..
+                } => {
+                    let child_start = *children_offset as usize;
+                    let child_count = *children_size as usize;
+                    for child in child_start..child_start + child_count {
+                        let child_id = NodeId(child as u32);
+                        let sim =
+                            centers.similarity(metric, dim, tree.center_row(child_id), self.query);
+                        self.frontier.push(Candidate {
+                            sim,
+                            node: child_id,
+                        });
+                    }
+                }
+                BKTreeNode::Leaf {
+                    members_offset,
+                    members_size,
+                    ..
+                } => {
+                    let start = *members_offset as usize;
+                    let end = start + *members_size as usize;
+                    self.results
+                        .extend(tree.members[start..end].iter().copied());
+                    if self.results.len() > self.max_leaves {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<S: VectorArena> Iterator for BKTreeSearchIterator<'_, S> {
+    type Item = GraphNodeId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.results.is_empty() {
+            if self.frontier.is_empty() {
+                return None;
+            }
+            self.run_round();
+        }
+        let node = self.results.pop_front()?;
+        Some(node)
     }
 }
 
@@ -99,7 +233,7 @@ impl<S> BKTree<S>
 where
     S: VectorArena<Elem = f32> + Deref<Target = [f32]>,
 {
-    /// Writes the durable BKT payload for `.centroids` slot `[4]`:
+    /// Serialize the tree for `.centroids` slot `[4]`.
     ///
     /// ```text
     /// centers_byte_offset: u64
@@ -107,11 +241,11 @@ where
     /// nodes… (tag u8 + fields)
     /// num_members: u32
     /// members: u32[num_members]
-    /// centers: f32[num_nodes · dim]   // trailing blob for FileSliceArena
+    /// centers: f32[num_nodes · dim]
     /// ```
     ///
-    /// The root is implicit (`nodes[0]`). Metric and `dim` are not written;
-    /// the reader takes them from [`VectorOptions`](crate::schema::VectorOptions).
+    /// `dim` and `metric` are not written; pass them to the reader from field
+    /// options.
     pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         let num_nodes = self.nodes.len();
         let expected_centers = num_nodes.checked_mul(self.dim).ok_or_else(|| {
@@ -216,11 +350,9 @@ where
 }
 
 impl BKTree<Vec<f32>> {
-    /// Decode a payload produced by [`BKTree::serialize`] into an owned tree.
+    /// Deserialize a payload from [`BKTree::serialize`] into an owned tree.
     ///
-    /// `dim` and `metric` are not on the wire (same as the RNG); the caller
-    /// supplies the field options. Used for write-side round-trip tests and as
-    /// a reference for the future `FileSlice` open path.
+    /// `dim` and `metric` must match the field options used at write time.
     pub fn deserialize_owned(bytes: &[u8], dim: usize, metric: Metric) -> io::Result<Self> {
         if bytes.len() < mem::size_of::<u64>() {
             return Err(io::Error::new(
@@ -368,6 +500,8 @@ mod tests {
     use crate::schema::Metric;
 
     /// Tiny tree: root internal → two leaves, four IVF member ids.
+    ///
+    /// Centers: root at origin, leaf 1 at `(1,0)`, leaf 2 at `(0,1)`.
     fn sample_tree() -> BKTree<Vec<f32>> {
         let dim = 2;
         BKTree {
@@ -402,7 +536,7 @@ mod tests {
         let mut bytes = Vec::new();
         tree.serialize(&mut bytes).unwrap();
         let decoded = BKTree::deserialize_owned(&bytes, tree.dim, tree.metric).unwrap();
-        assert_eq!(decoded.root(), 0);
+        assert_eq!(decoded.root(), NodeId(0));
         assert_eq!(decoded.dim, tree.dim);
         assert_eq!(decoded.metric, tree.metric);
         assert_eq!(decoded.nodes, tree.nodes);
@@ -429,10 +563,42 @@ mod tests {
     }
 
     #[test]
-    fn leaf_members_slices_match_offsets() {
+    fn search_iter_yields_graph_member_ids() {
         let tree = sample_tree();
-        assert_eq!(tree.leaf_members(&tree.nodes[1]), &[10, 11]);
-        assert_eq!(tree.leaf_members(&tree.nodes[2]), &[20, 21]);
-        assert!(tree.leaf_members(&tree.nodes[0]).is_empty());
+        // Query near leaf 1's center `(1, 0)` → members 10, 11 first.
+        let first = tree
+            .search_iter(&[1.0, 0.0])
+            .next()
+            .expect("expected a graph member");
+        assert!(first == 10 || first == 11);
+    }
+
+    #[test]
+    fn search_iter_yields_each_member_exactly_once() {
+        let tree = sample_tree();
+        let mut members: Vec<GraphNodeId> = tree.search_iter(&[0.5, 0.5]).collect();
+        members.sort_unstable();
+        assert_eq!(members, vec![10, 11, 20, 21]);
+    }
+
+    #[test]
+    fn search_iter_empty_tree_yields_nothing() {
+        let tree = BKTree {
+            dim: 1,
+            metric: Metric::L2,
+            nodes: vec![],
+            members: vec![],
+            centers: vec![],
+        };
+        assert_eq!(tree.search_iter(&[0.0]).next(), None);
+    }
+
+    #[test]
+    fn search_iter_n_respects_result_budget() {
+        let tree = sample_tree();
+        // max_leaves=1 → stop once results.len() > 1 (first leaf has 2 members).
+        let first_round: Vec<_> = tree.search_iter_n(&[1.0, 0.0], 1).take(2).collect();
+        assert_eq!(first_round.len(), 2);
+        assert!(first_round.iter().all(|&n| n == 10 || n == 11));
     }
 }

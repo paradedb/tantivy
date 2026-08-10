@@ -16,7 +16,7 @@ mod training;
 /// The IVF cluster-routing file. Written per field, only for IVF segments.
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
-pub use bkt::{BKTree, BKTreeNode};
+pub use bkt::{BKTree, BKTreeNode, BKTreeSearchIterator, NodeId as BktNodeId};
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,

@@ -366,7 +366,7 @@ impl IvfIndex {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
                 let mut ranked: Vec<Candidate> = (0..self.num_centroids)
                     .map(|cluster| Candidate {
-                        sim: arena.similarity(self.metric, self.dim, cluster as NodeId, query),
+                        sim: arena.similarity(self.metric, self.dim, cluster as u32, query),
                         node: cluster as NodeId,
                     })
                     .collect();
