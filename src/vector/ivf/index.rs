@@ -6,7 +6,7 @@
 //! The on-disk file is a 4-byte format-version stamp (see `vector::header`)
 //! followed by a [`CompositeFile`](crate::directory::CompositeFile). Written
 //! per field, only for IVF segments (⟺ the field's `.vec` `IdMap` is
-//! `Explicit`). The composite has four slots per field:
+//! `Explicit`). The composite has five slots per field:
 //!
 //! ```text
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride)
@@ -20,22 +20,18 @@
 //!     rows against the stored centroid (the merge documents the
 //!     metric-uniform fold; replica spill is excluded per the stored
 //!     `bounds_scope = native`)
+//! [4] BKT over the centroids (see `BKTree::serialize`); OPTIONAL — absence
+//!     means seed generation falls back to strided / exact seeds
 //! ```
 //!
 //! Slot presence is the compatibility mechanism WITHIN a generation: the
 //! composite footer maps `(field, slot)` to ranges, so a reader probes an
-//! optional slot and an older segment simply lacks it. Slot `[2]` works
-//! that way. Slot `[3]` does not, which is why it costs a generation:
+//! optional slot and an older segment simply lacks it. Slots `[2]` and `[4]`
+//! work that way. Slot `[3]` does not, which is why it costs a generation:
 //! absence would have to mean "no bounds", and a silently absent bound is
 //! indistinguishable from a zero one. So `.centroids` stamps `V2`, a
 //! pre-V2 file is refused at open with a REINDEX message, and a V2 file
 //! missing the slot is corrupt rather than old.
-//!
-//! One dense `centroid_id = 0..N` indexes all four: `cluster_offsets[c]` is
-//! the first row of cluster `c` in the parallel `.vec` rows/`IdMap`, and graph
-//! node `c` is centroid `c` (its vector is row `c` of slot `[0]`, which is why
-//! the graph slot stores no vectors of its own).
-
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;

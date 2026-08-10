@@ -45,9 +45,9 @@ pub use distance::{
 pub use flat::FlatVecWriter;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
-    Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch,
-    IvfVectors, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
+    BKTree, BKTreeNode, Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
+    IvfMatrixView, IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors,
+    IvfVectorBatch, IvfVectors, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
     Workspace,
 };
