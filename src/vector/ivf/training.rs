@@ -22,11 +22,10 @@ pub trait IvfClusterer: Send + Sync + 'static {
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
 
-    /// Optional balanced k-means tree over the trained IVF `centroids` for
-    /// RNG seed generation. Default `None` — merge omits `.centroids` slot
-    /// `[4]`. Producers (e.g. pg_search) train+assign and return an owned
-    /// [`BKTree`] whose leaf `members` are IVF / RNG
-    /// [`NodeId`](super::NodeId)s.
+    /// Optional BKT over `centroids` for RNG seeding.
+    ///
+    /// Default `None` omits `.centroids` slot `[4]`. When present, leaf
+    /// `members` are IVF / RNG [`NodeId`](super::NodeId)s.
     fn build_bkt(
         &self,
         options: &VectorOptions,

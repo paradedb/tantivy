@@ -766,7 +766,9 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     /// afterward. Every node reads the same pre-pass snapshot — a
     /// *synchronous* refinement, the shape that parallelizes.
     pub fn refine(&mut self, executor: &Executor)
-    where S: Sync {
+    where
+        S: Sync,
+    {
         let len = self.graph.len();
         if len == 0 {
             return;
@@ -950,13 +952,13 @@ impl RelativeNeighborhoodGraph<&[f32]> {
 /// reallocating.
 pub struct Workspace {
     /// Nodes scored in the current query, 1 bit per node.
-    visited: BitSet,
+    pub(crate) visited: BitSet,
     /// Max-heap by similarity: every scored candidate not currently committed
     /// to `results` — the pool the search pops from, best first.
-    frontier: BinaryHeap<Candidate>,
+    pub(crate) frontier: BinaryHeap<Candidate>,
     /// Min-heap by similarity (via `Reverse`): the current beam — the best
     /// `width` committed results, with the least-similar on top for eviction.
-    results: BinaryHeap<Reverse<Candidate>>,
+    pub(crate) results: BinaryHeap<Reverse<Candidate>>,
 }
 
 impl Default for Workspace {
@@ -977,7 +979,7 @@ impl Workspace {
 
     /// Prepares the workspace for a query over `n` nodes: zeroes the visited
     /// bitset (growing it if needed) and clears the heaps.
-    fn begin_query(&mut self, n: usize) {
+    pub(crate) fn begin_query(&mut self, n: usize) {
         if (self.visited.max_value() as usize) < n {
             self.visited = BitSet::with_max_value(n as u32);
         } else {
@@ -988,21 +990,20 @@ impl Workspace {
     }
 }
 
-/// A `(similarity, node)` pair ordered by similarity (ties broken by node id for
-/// determinism). Ordered ascending, so a plain max-heap yields most-similar
-/// first and `Reverse<Candidate>` yields least-similar first. Also the element
-/// type [`search`](RelativeNeighborhoodGraph::search) returns.
+/// A `(similarity, node)` pair ordered by similarity (ties broken by node id).
+///
+/// Higher similarity sorts greater, so a max-heap yields most-similar first.
+/// Generic over the id type (`NodeId` by default).
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Candidate {
+pub struct Candidate<N = NodeId> {
     /// Similarity to the query (higher is more similar).
     pub sim: Similarity,
-    /// The graph node this candidate refers to.
-    pub node: NodeId,
+    pub node: N,
 }
 
-impl Eq for Candidate {}
+impl<N: Eq> Eq for Candidate<N> {}
 
-impl Ord for Candidate {
+impl<N: Ord> Ord for Candidate<N> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.sim
             .cmp(&other.sim)
@@ -1010,7 +1011,7 @@ impl Ord for Candidate {
     }
 }
 
-impl PartialOrd for Candidate {
+impl<N: Ord> PartialOrd for Candidate<N> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
