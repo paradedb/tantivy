@@ -813,6 +813,15 @@ impl<T: VectorElement> VectorBackend<T> {
         } else {
             0.0
         };
+        // A sketch record's real read cost as a fraction of a full row,
+        // so gated clusters charge the budget for the bytes they touch —
+        // without this the gate silently stretches `max_probe` into a
+        // several-fold deeper scan.
+        let sq_row_share = sq
+            .map(|sq| {
+                sq.row_record_bytes() as f64 / self.reader.options().bytes_per_vector() as f64
+            })
+            .unwrap_or(0.0);
         let mut pruned_sq = 0usize;
         // Replication can place the same doc in several probed clusters; dedup
         // by doc id so a vector is scored at most once.
@@ -951,11 +960,13 @@ impl<T: VectorElement> VectorBackend<T> {
                 // SQ row gate: armed iff the segment has sketches AND a
                 // certified kth exists (the tracker's fold covers both
                 // the local heap and any shared seed, in NATIVE key
-                // space with no lossy round trip). One contiguous read
-                // each for the cluster's codes and errors.
+                // space with no lossy round trip). ONE contiguous read
+                // for the cluster's records — codes and errors together
+                // — charged to the budget at its real byte fraction.
                 let sq_gate = match (sq, bound_tracker.raw_kth()) {
                     (Some(sq), Some(gate_key)) => {
-                        Some((sq, gate_key as f64, sq.cluster_slices(rows.clone())?))
+                        work_spent += pricing.row * sq_row_share * (rows.end - rows.start) as f64;
+                        Some((sq, gate_key as f64, sq.cluster_records(rows.clone())?))
                     }
                     _ => None,
                 };
@@ -968,14 +979,13 @@ impl<T: VectorElement> VectorBackend<T> {
                     // below the kth ⇒ the full-precision row cannot
                     // enter the heap and is never read. NaN compares
                     // false ⇒ degenerate rows fail open and are read.
-                    if let Some((sq, gate_key, (ccodes, cerrs))) = &sq_gate {
+                    if let Some((sq, gate_key, records)) = &sq_gate {
                         let ub = sq.upper_bound_key(
                             metric,
                             routing_query,
                             inv_norm_q,
                             q_norm as f64,
-                            ccodes,
-                            cerrs,
+                            records,
                             row - rows.start,
                         );
                         if ub < *gate_key {

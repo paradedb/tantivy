@@ -7,13 +7,17 @@
 //! grid:
 //!
 //! ```text
-//! [lo:   f32 * dim]                    // grid origin per dimension
-//! [step: f32 * dim]                    // grid step per dimension
-//! [codes: num_rows * ceil(dim/2) B]    // nibble-packed, row-major —
-//!                                      // rows are cluster-sorted, so a
-//!                                      // cluster's codes are contiguous
-//! [errors: f32 * num_rows]             // e_i >= ||x_i - x̂_i||, rounded UP
+//! [lo:   f32 * dim]                     // grid origin per dimension
+//! [step: f32 * dim]                     // grid step per dimension
+//! [records: num_rows * record_bytes]    // one PER-ROW record:
+//!     [codes: ceil(dim/2) B]            //   nibble-packed 4-bit codes
+//!     [e: f32]                          //   e >= ||x - x̂||, rounded UP
 //! ```
+//!
+//! Records are row-major in cluster-sorted row order with the error
+//! INTERLEAVED after its codes, so gating a probed cluster is ONE
+//! contiguous ranged read — codes and errors arrive together instead of
+//! a second (page-touch-sized) read for 4 bytes per row.
 //!
 //! The gate's proof is the triangle inequality: `x` lies within `e` of the
 //! reconstruction `x̂`, so any similarity upper bound computed from `x̂`
@@ -43,6 +47,11 @@ const LEVELS: u32 = 15;
 /// Bytes per row of nibble-packed codes.
 pub(crate) fn code_stride(dim: usize) -> usize {
     dim.div_ceil(2)
+}
+
+/// Bytes per full row record: codes plus the interleaved f32 error.
+pub(crate) fn record_bytes(dim: usize) -> usize {
+    code_stride(dim) + 4
 }
 
 /// The segment-wide per-dimension grid. Built from a SAMPLE of the
@@ -139,7 +148,8 @@ fn round_error_up(e: f64) -> f32 {
     ((e * (1.0 + 1e-6)) as f32).next_up()
 }
 
-/// Serialize the slot: grid, then all rows' codes, then all errors.
+/// Serialize the slot: grid, then one interleaved `[codes][e]` record
+/// per row.
 pub(crate) fn serialize<W: Write + ?Sized>(
     grid: &SqGrid,
     codes: &[u8],
@@ -149,30 +159,33 @@ pub(crate) fn serialize<W: Write + ?Sized>(
     for v in grid.lo.iter().chain(grid.step.iter()) {
         v.serialize(out)?;
     }
-    out.write_all(codes)?;
-    for e in errors {
+    let stride = code_stride(grid.lo.len());
+    debug_assert_eq!(codes.len(), errors.len() * stride);
+    for (row_codes, e) in codes.chunks_exact(stride).zip(errors) {
+        out.write_all(row_codes)?;
         e.serialize(out)?;
     }
     Ok(())
 }
 
-/// The reader half: pinned grid + deferred codes/errors, opened from
-/// `.vec` slot `[2]`. Codes are row-major in the same cluster-sorted row
-/// order as the vector rows, so a probed cluster's codes and errors are
-/// each one contiguous ranged read.
+/// The reader half: pinned grid + deferred row records, opened from
+/// `.vec` slot `[2]`. Records are row-major in the same cluster-sorted
+/// row order as the vector rows, so a probed cluster's codes AND errors
+/// are together one contiguous ranged read.
 pub struct SqCodes {
     grid: SqGrid,
-    codes: FileSlice,
-    errors: FileSlice,
+    records: FileSlice,
     stride: usize,
+    record: usize,
     dim: usize,
 }
 
 impl SqCodes {
     pub(crate) fn open(slice: FileSlice, dim: usize, num_rows: usize) -> crate::Result<SqCodes> {
         let stride = code_stride(dim);
+        let record = record_bytes(dim);
         let grid_bytes = 2 * dim * 4;
-        let expected = grid_bytes + num_rows * stride + num_rows * 4;
+        let expected = grid_bytes + num_rows * record;
         if slice.len() != expected {
             return Err(crate::TantivyError::InternalError(format!(
                 "SQ slot length {} does not match {} rows of dim {} (expected {})",
@@ -191,28 +204,29 @@ impl SqCodes {
         let step = read_dims(dim)?;
         Ok(SqCodes {
             grid: SqGrid { lo, step },
-            codes: slice.slice(grid_bytes..grid_bytes + num_rows * stride),
-            errors: slice.slice_from(grid_bytes + num_rows * stride),
+            records: slice.slice_from(grid_bytes),
             stride,
+            record,
             dim,
         })
     }
 
-    /// One contiguous read each for a cluster's codes and errors,
-    /// `rows` being the cluster's posting-row range.
-    pub(crate) fn cluster_slices(
+    /// Bytes per row record — the gate's real per-row read cost, for
+    /// work-unit pricing against the full vector stride.
+    pub(crate) fn row_record_bytes(&self) -> usize {
+        self.record
+    }
+
+    /// ONE contiguous read for a cluster's records (codes + errors
+    /// interleaved), `rows` being the cluster's posting-row range.
+    pub(crate) fn cluster_records(
         &self,
         rows: std::ops::Range<usize>,
-    ) -> crate::Result<(OwnedBytes, OwnedBytes)> {
-        let codes = self
-            .codes
-            .slice(rows.start * self.stride..rows.end * self.stride)
-            .read_bytes()?;
-        let errors = self
-            .errors
-            .slice(rows.start * 4..rows.end * 4)
-            .read_bytes()?;
-        Ok((codes, errors))
+    ) -> crate::Result<OwnedBytes> {
+        Ok(self
+            .records
+            .slice(rows.start * self.record..rows.end * self.record)
+            .read_bytes()?)
     }
 
     /// Certified upper bound, in NATIVE heap-key space, on what row
@@ -234,17 +248,13 @@ impl SqCodes {
         query: &[f32],
         inv_norm_q: f64,
         q_norm: f64,
-        cluster_codes: &[u8],
-        cluster_errors: &[u8],
+        cluster_records: &[u8],
         row_in_cluster: usize,
     ) -> f64 {
-        let codes =
-            &cluster_codes[row_in_cluster * self.stride..(row_in_cluster + 1) * self.stride];
-        let e = f32::from_le_bytes(
-            cluster_errors[row_in_cluster * 4..row_in_cluster * 4 + 4]
-                .try_into()
-                .unwrap(),
-        ) as f64;
+        let record =
+            &cluster_records[row_in_cluster * self.record..(row_in_cluster + 1) * self.record];
+        let (codes, e_bytes) = record.split_at(self.stride);
+        let e = f32::from_le_bytes(e_bytes.try_into().unwrap()) as f64;
         let mut dot = 0.0f64;
         let mut l2_sq = 0.0f64;
         let want_l2 = metric == Metric::L2;
@@ -274,7 +284,7 @@ impl std::fmt::Debug for SqCodes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqCodes")
             .field("dim", &self.dim)
-            .field("rows", &(self.errors.len() / 4))
+            .field("rows", &(self.records.len() / self.record))
             .finish()
     }
 }
@@ -319,7 +329,7 @@ mod tests {
             row.iter_mut().for_each(|v| *v /= n);
         }
         let (sq, _) = roundtrip(&rows, dim);
-        let (codes, errs) = sq.cluster_slices(0..rows.len()).unwrap();
+        let recs = sq.cluster_records(0..rows.len()).unwrap();
 
         for _ in 0..200 {
             let q: Vec<f32> = (0..dim).map(|_| rand() as f32 * 2.0).collect();
@@ -340,7 +350,7 @@ mod tests {
                     if metric == Metric::Cosine && i >= 32 {
                         continue;
                     }
-                    let ub = sq.upper_bound_key(metric, &q, 1.0 / q_norm, q_norm, &codes, &errs, i);
+                    let ub = sq.upper_bound_key(metric, &q, 1.0 / q_norm, q_norm, &recs, i);
                     assert!(
                         ub >= true_key - 1e-9,
                         "{metric:?} bound {ub} undershoots true key {true_key} for row {i}"
@@ -377,15 +387,15 @@ mod tests {
             .collect();
         let (sq, errors) = roundtrip(&rows, 7);
         assert_eq!(sq.stride, 4);
-        let (codes, errs) = sq.cluster_slices(2..5).unwrap();
-        assert_eq!(codes.len(), 3 * 4);
-        assert_eq!(errs.len(), 3 * 4);
+        assert_eq!(sq.row_record_bytes(), 8);
+        let recs = sq.cluster_records(2..5).unwrap();
+        assert_eq!(recs.len(), 3 * 8);
         assert!(errors.iter().all(|e| e.is_finite()));
         // Row 3's bound against itself as the query must not undershoot.
         let q = &rows[3];
         let q_norm = q.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
         let true_dot: f64 = q.iter().map(|v| (*v as f64).powi(2)).sum();
-        let ub = sq.upper_bound_key(Metric::Dot, q, 1.0 / q_norm, q_norm, &codes, &errs, 1);
+        let ub = sq.upper_bound_key(Metric::Dot, q, 1.0 / q_norm, q_norm, &recs, 1);
         assert!(ub >= true_dot - 1e-9);
     }
 
@@ -397,9 +407,9 @@ mod tests {
         rows[1][3] = f32::NAN;
         let (sq, errors) = roundtrip(&rows, 8);
         assert!(errors[1].is_infinite());
-        let (codes, errs) = sq.cluster_slices(0..4).unwrap();
+        let recs = sq.cluster_records(0..4).unwrap();
         let q = vec![1.0f32; 8];
-        let ub = sq.upper_bound_key(Metric::Dot, &q, 1.0, 1.0, &codes, &errs, 1);
+        let ub = sq.upper_bound_key(Metric::Dot, &q, 1.0, 1.0, &recs, 1);
         assert!(
             ub.is_infinite() && ub > 0.0,
             "infinite error must never gate"
