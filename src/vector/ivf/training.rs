@@ -1,3 +1,4 @@
+use super::BKTree;
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
@@ -20,6 +21,20 @@ pub trait IvfClusterer: Send + Sync + 'static {
         vectors: IvfVectors<'_>,
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
+
+    /// Optional balanced k-means tree over the trained IVF `centroids` for
+    /// RNG seed generation. Default `None` — merge omits `.centroids` slot
+    /// `[4]`. Producers (e.g. pg_search) train+assign and return an owned
+    /// [`BKTree`] whose leaf `members` are IVF / RNG
+    /// [`NodeId`](super::NodeId)s.
+    fn build_bkt(
+        &self,
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<Option<BKTree<Vec<f32>>>> {
+        let _ = (options, centroids);
+        Ok(None)
+    }
 
     fn assign_batch_size(&self) -> usize {
         2048

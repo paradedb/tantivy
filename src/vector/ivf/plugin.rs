@@ -327,6 +327,7 @@ pub(crate) fn merge_ivf(
                 });
                 let train_start = Instant::now();
                 let centroids = clusterer.train(opts, training_vectors)?;
+
                 timings.train = train_start.elapsed();
 
                 if ctx.cancel.wants_cancel() {
@@ -354,6 +355,12 @@ pub(crate) fn merge_ivf(
                         "IvfClusterer produced zero centroids".to_string(),
                     ));
                 }
+                // Optional BKT for RNG seed generation. Default clusterers
+                // return `None` and slot `[4]` is omitted; producers that
+                // implement `build_bkt` supply an owned tree whose leaf
+                // members are IVF centroid ids.
+                let bkt = clusterer.build_bkt(opts, &centroids)?;
+
                 // Leaf count is emergent from the clusterer; the rest of the
                 // merge uses whatever train returned.
                 let num_centroids = centroid_matrix.rows;
@@ -782,6 +789,17 @@ pub(crate) fn merge_ivf(
                         }
                     }
                     graph_w.flush()?;
+                }
+
+                // `.centroids` slot [4]: optional BKT for seed generation.
+                // Omitted when the clusterer returns `None` (default).
+                if let Some(tree) = bkt.as_ref() {
+                    if ctx.cancel.wants_cancel() {
+                        return Err(TantivyError::Cancelled);
+                    }
+                    let bkt_w = centroids_write.for_field_with_idx(field, centroid_slot::BKT);
+                    tree.serialize(bkt_w)?;
+                    bkt_w.flush()?;
                 }
 
                 log::info!(
