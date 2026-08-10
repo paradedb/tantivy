@@ -390,6 +390,13 @@ pub struct ProbeStats {
     /// passed over. Bounded by the probe budget, and empty when nothing
     /// opened. Per-segment; does not sum.
     pub probed_cluster_ranks: Vec<u32>,
+    /// The subset of [`probed_cluster_ranks`](Self::probed_cluster_ranks)
+    /// where at least one scored row entered the top-k heap — it beat the
+    /// then-current kth (or the heap was still filling). Opened clusters
+    /// absent here were pure cost in hindsight: every row they streamed
+    /// lost to results already held. Early ranks over-qualify (a filling
+    /// heap admits anything). Per-segment; does not sum.
+    pub contributing_cluster_ranks: Vec<u32>,
     /// Probe index (0-based, counting opened clusters) at which the
     /// query bound first armed from this segment's OWN heap - the
     /// boundary where the heap filled and margins existed to certify
@@ -740,6 +747,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut bounds_skips = 0u32;
         let mut consecutive_skips = 0u32;
         let mut probed_cluster_ranks: Vec<u32> = Vec::new();
+        let mut contributing_cluster_ranks: Vec<u32> = Vec::new();
         let mut ranked_pulls = 0u32;
         let mut termination = ProbeTermination::Exhausted;
         // P2: the query bound, maintained at cluster boundaries. The
@@ -867,12 +875,17 @@ impl<T: VectorElement> VectorBackend<T> {
                 // One stride-sized read per survivor — the unit the
                 // pg-backed `Directory` serves zero-copy (see
                 // `vector_bytes_for_row`).
+                let mut contributed = false;
                 for &Survivor { row, doc } in &survivors {
                     let vbytes = self.reader.vector_bytes_for_row(row)?;
                     let score = self.query.score_doc_bytes(&vbytes);
                     if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
                         topn.push_unordered(key, doc);
+                        contributed = true;
                     }
+                }
+                if contributed {
+                    contributing_cluster_ranks.push(pull_rank);
                 }
             }
             candidates += survivors.len();
@@ -916,6 +929,7 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.candidates_scored += candidates;
         stats.bounds_skips += bounds_skips;
         stats.probed_cluster_ranks = probed_cluster_ranks;
+        stats.contributing_cluster_ranks = contributing_cluster_ranks;
         stats.bound_armed_at_probe = bound_tracker.armed_at_probe();
         stats.bound_seeded = bound_tracker.seeded();
         stats.termination = termination;
@@ -2732,6 +2746,7 @@ mod tests {
             bounds_skips: 2,
             segment_clusters: 6,
             probed_cluster_ranks: vec![0, 2],
+            contributing_cluster_ranks: vec![0],
             bound_armed_at_probe: Some(1),
             bound_seeded: true,
             termination: ProbeTermination::Ceiling,
@@ -2764,6 +2779,7 @@ mod tests {
                 },
                 "bounds_skips": 2,
                 "probed_cluster_ranks": [0, 2],
+                "contributing_cluster_ranks": [0],
                 "bound_armed_at_probe": 1,
                 "bound_seeded": true,
                 "termination": "Ceiling",
