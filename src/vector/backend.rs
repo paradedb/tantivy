@@ -779,8 +779,13 @@ impl<T: VectorElement> VectorBackend<T> {
 
             // Pre-pass: gate off the pinned id-map BEFORE fetching any
             // posting bytes, so only rows that will be scored are read.
-            let (v, pf, pd, ps, scored_rows) =
-                self.collect_cluster_survivors(rows, filter, alive, &mut seen, &mut survivors);
+            let (v, pf, pd, ps, scored_rows) = self.collect_cluster_survivors(
+                rows.clone(),
+                filter,
+                alive,
+                &mut seen,
+                &mut survivors,
+            );
             visited += v;
             pruned_filter += pf;
             pruned_dead += pd;
@@ -825,13 +830,21 @@ impl<T: VectorElement> VectorBackend<T> {
                 if let Some((radii, t, key)) = row_gate {
                     let gate_start = std::time::Instant::now();
                     radius_gate_rows += survivors.len();
-                    match &sketch_query {
-                        Some((store, prepared)) => {
+                    // One contiguous ranged read per array for this
+                    // cluster's sketch rows; row offsets are relative
+                    // to the cluster's first row.
+                    let sketch_view = match &sketch_query {
+                        Some((store, _)) => Some(store.cluster_view(rows.clone())?),
+                        None => None,
+                    };
+                    match (&sketch_query, &sketch_view) {
+                        (Some((_, prepared)), Some(view)) => {
                             sketch_rows += survivors.len();
                             let t2 = t * t;
+                            let first_row = rows.start;
                             survivors.retain(|&Survivor { row, .. }| {
                                 let r = radii[row];
-                                let cos_up = prepared.cos_upper_bound(store, row, key);
+                                let cos_up = prepared.cos_upper_bound(view, row - first_row, key);
                                 let lb2 = key * key + r * r - 2.0 * key * r * cos_up;
                                 // Strict: prune only on lb^2 > t^2; NaN
                                 // compares false and keeps the row.
@@ -842,7 +855,7 @@ impl<T: VectorElement> VectorBackend<T> {
                                 keep
                             });
                         }
-                        None => {
+                        _ => {
                             survivors.retain(|&Survivor { row, .. }| {
                                 let margin = match metric {
                                     Metric::L2 | Metric::Cosine => {

@@ -348,10 +348,13 @@ impl IvfIndex {
             }
             index.row_radii = Some(radii);
         }
-        // Slot [5] (optional): the residual-direction sketches.
+        // Slot [5] (optional): the residual-direction sketches. Open
+        // parses only the 9-byte header — the arrays stay behind lazy
+        // slices, fetched per probed cluster at query time (the reader
+        // may be rebuilt per query, so eager materialization here would
+        // be paid every time).
         if let Some(slice) = sketch_slice {
-            let bytes = slice.read_bytes()?;
-            index.sketches = Some(SketchStore::open(bytes, options.dim(), index.num_rows())?);
+            index.sketches = Some(SketchStore::open(slice, options.dim(), index.num_rows())?);
         }
         Ok(index)
     }

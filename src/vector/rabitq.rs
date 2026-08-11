@@ -54,7 +54,9 @@
 
 use std::io::{self, Write};
 
-use common::BinarySerializable;
+use common::{BinarySerializable, HasLen, OwnedBytes};
+
+use crate::directory::FileSlice;
 
 /// The gate's tail multiplier `t`. Per gate decision the wrong-prune
 /// probability is bounded by the sub-Gaussian tail `~exp(-t^2/2)`
@@ -302,16 +304,55 @@ pub(crate) fn serialize_sketches<W: Write + ?Sized>(
     Ok(())
 }
 
-/// The pinned, parsed sketch slot of one segment-field.
+/// The sketch slot of one segment-field. Only the 9-byte header is read
+/// at open — the SoA arrays stay behind [`FileSlice`]s and are fetched
+/// per probed cluster as one contiguous ranged read each
+/// ([`Self::cluster_view`]), because the caller may rebuild the reader
+/// per query (pg_search's per-snapshot directory does) and an eager
+/// slot-wide materialization would be paid every time.
 pub struct SketchStore {
     rotation: Rotation,
     /// SoA: all sign codes, `code_stride` bytes each.
-    codes: common::OwnedBytes,
-    /// SoA: per-row fixed-point `a`.
-    a_values: Vec<u16>,
-    /// SoA: per-row fixed-point `b = <s_hat, Rc>`.
-    b_values: Vec<u16>,
+    codes: FileSlice,
+    /// SoA: per-row fixed-point `a` (u16 LE).
+    a_values: FileSlice,
+    /// SoA: per-row fixed-point `b = <s_hat, Rc>` (u16 LE).
+    b_values: FileSlice,
     code_stride: usize,
+}
+
+/// One probed cluster's sketch rows, fetched with three contiguous
+/// ranged reads; row indices are relative to the cluster's first row.
+pub struct SketchClusterView {
+    codes: OwnedBytes,
+    a_values: OwnedBytes,
+    b_values: OwnedBytes,
+    code_stride: usize,
+}
+
+impl SketchClusterView {
+    #[inline]
+    fn code(&self, offset: usize) -> &[u8] {
+        &self.codes[offset * self.code_stride..(offset + 1) * self.code_stride]
+    }
+
+    #[inline]
+    fn a(&self, offset: usize) -> u16 {
+        u16::from_le_bytes(
+            self.a_values[offset * 2..offset * 2 + 2]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    #[inline]
+    fn b(&self, offset: usize) -> u16 {
+        u16::from_le_bytes(
+            self.b_values[offset * 2..offset * 2 + 2]
+                .try_into()
+                .unwrap(),
+        )
+    }
 }
 
 impl SketchStore {
@@ -323,12 +364,19 @@ impl SketchStore {
     ///
     /// Returns (`io::Result<SketchStore>`): the store, or `InvalidData`
     /// on an unknown kind or a length mismatch.
-    pub(crate) fn open(
-        bytes: common::OwnedBytes,
-        dim: usize,
-        num_rows: usize,
-    ) -> io::Result<SketchStore> {
-        let mut reader = bytes.as_slice();
+    pub(crate) fn open(slot: FileSlice, dim: usize, num_rows: usize) -> io::Result<SketchStore> {
+        const HEADER: usize = 9; // kind u8 + seed u64
+        if slot.len() < HEADER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sketch slot is smaller than its header",
+            ));
+        }
+        let header_bytes = slot
+            .slice_to(HEADER)
+            .read_bytes()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut reader = header_bytes.as_slice();
         let kind = u8::deserialize(&mut reader)?;
         if kind != KIND_SIGN_RABITQ {
             return Err(io::Error::new(
@@ -344,30 +392,21 @@ impl SketchStore {
             ));
         }
         let code_stride = dim / 8;
-        let header = bytes.len() - reader.len();
         let codes_len = num_rows.checked_mul(code_stride).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "sketch codes length overflow")
         })?;
-        let expected = codes_len + num_rows * 4;
-        if reader.len() != expected {
+        if slot.len() - HEADER != codes_len + num_rows * 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "sketch slot byte length mismatch",
             ));
         }
-        let codes = bytes.slice(header..header + codes_len);
-        let mut tail = &bytes.as_slice()[header + codes_len..];
-        let a_values: Vec<u16> = (0..num_rows)
-            .map(|_| u16::deserialize(&mut tail))
-            .collect::<io::Result<_>>()?;
-        let b_values: Vec<u16> = (0..num_rows)
-            .map(|_| u16::deserialize(&mut tail))
-            .collect::<io::Result<_>>()?;
+        let body = slot.slice_from(HEADER);
         Ok(SketchStore {
             rotation: Rotation::new(seed, dim),
-            codes,
-            a_values,
-            b_values,
+            codes: body.slice_to(codes_len),
+            a_values: body.slice(codes_len..codes_len + num_rows * 2),
+            b_values: body.slice_from(codes_len + num_rows * 2),
             code_stride,
         })
     }
@@ -377,10 +416,25 @@ impl SketchStore {
         &self.rotation
     }
 
-    /// One row's packed sign code.
-    #[inline]
-    fn code(&self, row: usize) -> &[u8] {
-        &self.codes[row * self.code_stride..(row + 1) * self.code_stride]
+    /// Fetches one cluster's sketch rows: three contiguous ranged reads
+    /// over `rows` (a cluster's row range in the segment-wide dense
+    /// numbering).
+    pub fn cluster_view(&self, rows: std::ops::Range<usize>) -> crate::Result<SketchClusterView> {
+        Ok(SketchClusterView {
+            codes: self
+                .codes
+                .slice(rows.start * self.code_stride..rows.end * self.code_stride)
+                .read_bytes()?,
+            a_values: self
+                .a_values
+                .slice(rows.start * 2..rows.end * 2)
+                .read_bytes()?,
+            b_values: self
+                .b_values
+                .slice(rows.start * 2..rows.end * 2)
+                .read_bytes()?,
+            code_stride: self.code_stride,
+        })
     }
 }
 
@@ -492,8 +546,8 @@ impl PreparedSketchQuery {
     /// conservative endpoint (see the module docs for why the
     /// division-free identity form is NOT sound here).
     ///
-    /// * `store` (`&SketchStore`) — the segment's sketches.
-    /// * `row` (`usize`) — dense row id.
+    /// * `view` (`&SketchClusterView`) — the probed cluster's fetched sketch rows.
+    /// * `offset` (`usize`) — row index RELATIVE to the cluster's first row.
     /// * `d_c` (`f32`) — `||q - c||` of the row's cluster, from the routing key.
     ///
     /// Returns (`f32`): the upper bound, clamped to 1; `1.0` for rows
@@ -501,14 +555,14 @@ impl PreparedSketchQuery {
     /// radius-only bound then applies unchanged. NaN inputs propagate to
     /// a non-pruning bound.
     #[inline]
-    pub fn cos_upper_bound(&self, store: &SketchStore, row: usize, d_c: f32) -> f32 {
-        let a_lo = store.a_values[row] as f32 / u16::MAX as f32;
+    pub fn cos_upper_bound(&self, view: &SketchClusterView, offset: usize, d_c: f32) -> f32 {
+        let a_lo = view.a(offset) as f32 / u16::MAX as f32;
         if a_lo <= 0.0 || !(d_c > 0.0) {
             return 1.0;
         }
         let a_hi = a_lo + 1.0 / u16::MAX as f32;
-        let b_lo = decode_b(store.b_values[row]) - B_ULP / 2.0;
-        let num_up = self.code_dot(store.code(row)) - b_lo + self.num_err;
+        let b_lo = decode_b(view.b(offset)) - B_ULP / 2.0;
+        let num_up = self.code_dot(view.code(offset)) - b_lo + self.num_err;
         // <u, s_hat> upper endpoint; |<u, s_hat>| <= 1 always.
         let v_up = (num_up / d_c).clamp(-1.0, 1.0);
         // z_up = (v_up + concentration) / a, the division taking the
@@ -641,7 +695,8 @@ mod tests {
         }
         let mut buf = Vec::new();
         serialize_sketches(21, &codes, &a_values, &b_values, &mut buf).unwrap();
-        let store = SketchStore::open(common::OwnedBytes::new(buf), dim, 200).unwrap();
+        let store = SketchStore::open(FileSlice::from(buf), dim, 200).unwrap();
+        let view = store.cluster_view(0..200).unwrap();
 
         let mut state = 77u64;
         let mut below_one = 0usize;
@@ -676,7 +731,7 @@ mod tests {
             let prepared = PreparedSketchQuery::prepare(&rot, &mut q.clone()).unwrap();
             for (row, x) in residuals.iter().enumerate() {
                 let true_cos = dot(&q_res, x) / (d_c * norm(x));
-                let bound = prepared.cos_upper_bound(&store, row, d_c);
+                let bound = prepared.cos_upper_bound(&view, row, d_c);
                 assert!(
                     bound >= true_cos - 1e-4,
                     "row {row}: bound {bound} below true cos {true_cos}"
@@ -716,12 +771,13 @@ mod tests {
 
         let mut buf = Vec::new();
         serialize_sketches(4, &encoded.code, &[encoded.a], &[encoded.b], &mut buf).unwrap();
-        let store = SketchStore::open(common::OwnedBytes::new(buf), dim, 1).unwrap();
+        let store = SketchStore::open(FileSlice::from(buf), dim, 1).unwrap();
+        let view = store.cluster_view(0..1).unwrap();
         let mut q = vec![1.0; dim];
         let prepared = PreparedSketchQuery::prepare(&rot, &mut q).unwrap();
-        assert_eq!(prepared.cos_upper_bound(&store, 0, 1.0), 1.0);
+        assert_eq!(prepared.cos_upper_bound(&view, 0, 1.0), 1.0);
         // Degenerate separation also fails open.
-        assert_eq!(prepared.cos_upper_bound(&store, 0, 0.0), 1.0);
+        assert_eq!(prepared.cos_upper_bound(&view, 0, 0.0), 1.0);
     }
 
     /// Slot round-trip and the corrupt-length rejections.
@@ -733,12 +789,12 @@ mod tests {
         let encoded = encode_row(&rot, &mut residual, &vec![0.25; dim]);
         let mut buf = Vec::new();
         serialize_sketches(1, &encoded.code, &[encoded.a], &[encoded.b], &mut buf).unwrap();
-        assert!(SketchStore::open(common::OwnedBytes::new(buf.clone()), dim, 1).is_ok());
-        assert!(SketchStore::open(common::OwnedBytes::new(buf.clone()), dim, 2).is_err());
+        assert!(SketchStore::open(FileSlice::from(buf.clone()), dim, 1).is_ok());
+        assert!(SketchStore::open(FileSlice::from(buf.clone()), dim, 2).is_err());
         let mut bad_kind = buf.clone();
         bad_kind[0] = 9;
-        assert!(SketchStore::open(common::OwnedBytes::new(bad_kind), dim, 1).is_err());
+        assert!(SketchStore::open(FileSlice::from(bad_kind), dim, 1).is_err());
         buf.pop();
-        assert!(SketchStore::open(common::OwnedBytes::new(buf), dim, 1).is_err());
+        assert!(SketchStore::open(FileSlice::from(buf), dim, 1).is_err());
     }
 }
