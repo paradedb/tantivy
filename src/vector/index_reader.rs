@@ -133,15 +133,17 @@ impl VectorIndexReader {
                         composite.open_read_with_idx(field, centroid_slot::OFFSETS),
                         composite.open_read_with_idx(field, centroid_slot::BOUNDS),
                     ) {
-                        // Slot [2] (the routing graph) stays optional: the
-                        // write side skips it for degenerate centroid
-                        // counts. Slot [3] (bounds) does not — a V2 file
-                        // without it is corrupt, not old.
+                        // Slots [2] (RNG) and [4] (BKT) stay optional: the
+                        // write side skips them for degenerate centroid
+                        // counts / when the clusterer omits a BKT. Slot [3]
+                        // (bounds) does not — a V2 file without it is
+                        // corrupt, not old.
                         (Some(centroids), Some(offsets), Some(bounds)) => Some((
                             centroids,
                             offsets,
                             composite.open_read_with_idx(field, centroid_slot::GRAPH),
                             bounds,
+                            composite.open_read_with_idx(field, centroid_slot::BKT),
                         )),
                         (Some(_), Some(_), None) => {
                             return Err(TantivyError::InternalError(format!(
@@ -160,9 +162,9 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((centroids, offsets, graph, bounds))) => {
-                Some(IvfIndex::open(&options, centroids, offsets, graph, bounds)?)
-            }
+            (IdMap::Explicit(_), Some((centroids, offsets, graph, bounds, bkt))) => Some(
+                IvfIndex::open(&options, centroids, offsets, graph, bounds, bkt)?,
+            ),
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
                     "vector field {:?} has cluster-sorted rows but no `.centroids` data",

@@ -8,15 +8,16 @@ use std::io::{self, Write};
 use std::mem;
 use std::ops::Deref;
 
-use common::BinarySerializable;
+use common::{BinarySerializable, HasLen};
 
 use super::graph::Candidate;
 use super::NodeId as GraphNodeId;
+use crate::directory::FileSlice;
 use crate::schema::Metric;
-use crate::vector::VectorArena;
+use crate::vector::{FileSliceArena, VectorArena};
 
 /// Default per-round member budget for [`BKTree::search_iter`].
-const DEFAULT_MAX_LEAVES: usize = 50;
+pub(crate) const DEFAULT_MAX_LEAVES: usize = 50;
 
 const NODE_INTERNAL: u8 = 0;
 const NODE_LEAF: u8 = 1;
@@ -349,6 +350,153 @@ where
     }
 }
 
+fn deserialize_nodes_and_members(
+    mut bytes: &[u8],
+) -> io::Result<(Vec<BKTreeNode>, Vec<GraphNodeId>)> {
+    let num_nodes = u32::deserialize(&mut bytes)? as usize;
+    if num_nodes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BKT has zero nodes",
+        ));
+    }
+
+    let mut nodes = Vec::with_capacity(num_nodes);
+    for _ in 0..num_nodes {
+        let tag = u8::deserialize(&mut bytes)?;
+        let centroid_id = u32::deserialize(&mut bytes)?;
+        match tag {
+            NODE_INTERNAL => {
+                let children_offset = u32::deserialize(&mut bytes)?;
+                let children_size = u32::deserialize(&mut bytes)?;
+                nodes.push(BKTreeNode::Internal {
+                    centroid_id,
+                    children_offset,
+                    children_size,
+                });
+            }
+            NODE_LEAF => {
+                let members_offset = u32::deserialize(&mut bytes)?;
+                let members_size = u32::deserialize(&mut bytes)?;
+                nodes.push(BKTreeNode::Leaf {
+                    centroid_id,
+                    members_offset,
+                    members_size,
+                });
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown BKT node tag {tag}"),
+                ));
+            }
+        }
+    }
+
+    let num_members = u32::deserialize(&mut bytes)? as usize;
+    let mut members = Vec::with_capacity(num_members);
+    for _ in 0..num_members {
+        members.push(u32::deserialize(&mut bytes)?);
+    }
+    if !bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BKT topology has trailing bytes before centers",
+        ));
+    }
+
+    for node in &nodes {
+        match node {
+            BKTreeNode::Internal {
+                children_offset,
+                children_size,
+                ..
+            } => {
+                let start = *children_offset as usize;
+                let end = start.saturating_add(*children_size as usize);
+                if end > nodes.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "BKT children range out of bounds",
+                    ));
+                }
+            }
+            BKTreeNode::Leaf {
+                members_offset,
+                members_size,
+                ..
+            } => {
+                let start = *members_offset as usize;
+                let end = start.saturating_add(*members_size as usize);
+                if end > members.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "BKT members range out of bounds",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok((nodes, members))
+}
+
+fn expected_center_bytes(num_nodes: usize, dim: usize) -> io::Result<usize> {
+    num_nodes
+        .checked_mul(dim)
+        .and_then(|n| n.checked_mul(mem::size_of::<f32>()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "BKT center length overflow"))
+}
+
+impl BKTree<FileSliceArena<f32>> {
+    /// Open a serialized BKT (`.centroids` slot `[4]`).
+    ///
+    /// Pins nodes and members; centers stay behind a [`FileSliceArena`] for
+    /// lazy per-row reads. `dim` and `metric` must match the field options
+    /// used at write time.
+    pub fn open(slice: FileSlice, dim: usize, metric: Metric) -> io::Result<Self> {
+        let offset_len = mem::size_of::<u64>();
+        if slice.len() < offset_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BKT payload shorter than centers_byte_offset",
+            ));
+        }
+        let header = slice.slice_to(offset_len).read_bytes()?;
+        let mut header_reader = header.as_slice();
+        let centers_byte_offset = u64::deserialize(&mut header_reader)? as usize;
+        if centers_byte_offset > slice.len() || centers_byte_offset < offset_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BKT centers_byte_offset out of range",
+            ));
+        }
+
+        let topology = slice.slice(offset_len..centers_byte_offset).read_bytes()?;
+        let (nodes, members) = deserialize_nodes_and_members(&topology)?;
+
+        let centers_slice = slice.slice_from(centers_byte_offset);
+        let expected = expected_center_bytes(nodes.len(), dim)?;
+        if centers_slice.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "BKT centers blob is {} bytes, expected {expected}",
+                    centers_slice.len()
+                ),
+            ));
+        }
+
+        Ok(BKTree {
+            dim,
+            metric,
+            nodes,
+            members,
+            centers: FileSliceArena::new(centers_slice),
+        })
+    }
+}
+
 impl BKTree<Vec<f32>> {
     /// Deserialize a payload from [`BKTree::serialize`] into an owned tree.
     ///
@@ -362,126 +510,30 @@ impl BKTree<Vec<f32>> {
         }
         let mut cursor = bytes;
         let centers_byte_offset = u64::deserialize(&mut cursor)? as usize;
-        if centers_byte_offset > bytes.len() {
+        if centers_byte_offset > bytes.len() || centers_byte_offset < mem::size_of::<u64>() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "BKT centers_byte_offset past end of payload",
+                "BKT centers_byte_offset out of range",
             ));
         }
-        let topology_end = centers_byte_offset;
-        let topology_bytes = &bytes[mem::size_of::<u64>()..topology_end];
+        let (nodes, members) =
+            deserialize_nodes_and_members(&bytes[mem::size_of::<u64>()..centers_byte_offset])?;
         let centers_bytes = &bytes[centers_byte_offset..];
 
-        let mut topo = topology_bytes;
-        let num_nodes = u32::deserialize(&mut topo)? as usize;
-        if num_nodes == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "BKT has zero nodes",
-            ));
-        }
-
-        let mut nodes = Vec::with_capacity(num_nodes);
-        for _ in 0..num_nodes {
-            let tag = u8::deserialize(&mut topo)?;
-            let centroid_id = u32::deserialize(&mut topo)?;
-            match tag {
-                NODE_INTERNAL => {
-                    let children_offset = u32::deserialize(&mut topo)?;
-                    let children_size = u32::deserialize(&mut topo)?;
-                    nodes.push(BKTreeNode::Internal {
-                        centroid_id,
-                        children_offset,
-                        children_size,
-                    });
-                }
-                NODE_LEAF => {
-                    let members_offset = u32::deserialize(&mut topo)?;
-                    let members_size = u32::deserialize(&mut topo)?;
-                    nodes.push(BKTreeNode::Leaf {
-                        centroid_id,
-                        members_offset,
-                        members_size,
-                    });
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unknown BKT node tag {tag}"),
-                    ));
-                }
-            }
-        }
-
-        let num_members = u32::deserialize(&mut topo)? as usize;
-        let mut members = Vec::with_capacity(num_members);
-        for _ in 0..num_members {
-            members.push(u32::deserialize(&mut topo)?);
-        }
-        if !topo.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "BKT topology has trailing bytes before centers",
-            ));
-        }
-
-        let expected_centers = num_nodes.checked_mul(dim).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "BKT center length overflow")
-        })?;
-        let expected_center_bytes = expected_centers
-            .checked_mul(mem::size_of::<f32>())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "BKT center byte length overflow",
-                )
-            })?;
-        if centers_bytes.len() != expected_center_bytes {
+        let expected = expected_center_bytes(nodes.len(), dim)?;
+        if centers_bytes.len() != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "BKT centers blob is {} bytes, expected {expected_center_bytes}",
+                    "BKT centers blob is {} bytes, expected {expected}",
                     centers_bytes.len()
                 ),
             ));
         }
         let mut center_cursor = centers_bytes;
-        let mut centers = Vec::with_capacity(expected_centers);
-        for _ in 0..expected_centers {
+        let mut centers = Vec::with_capacity(nodes.len() * dim);
+        for _ in 0..nodes.len() * dim {
             centers.push(f32::deserialize(&mut center_cursor)?);
-        }
-
-        for node in &nodes {
-            match node {
-                BKTreeNode::Internal {
-                    children_offset,
-                    children_size,
-                    ..
-                } => {
-                    let start = *children_offset as usize;
-                    let end = start.saturating_add(*children_size as usize);
-                    if end > nodes.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "BKT children range out of bounds",
-                        ));
-                    }
-                }
-                BKTreeNode::Leaf {
-                    members_offset,
-                    members_size,
-                    ..
-                } => {
-                    let start = *members_offset as usize;
-                    let end = start.saturating_add(*members_size as usize);
-                    if end > members.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "BKT members range out of bounds",
-                        ));
-                    }
-                }
-            }
         }
 
         Ok(BKTree {
@@ -542,6 +594,20 @@ mod tests {
         assert_eq!(decoded.nodes, tree.nodes);
         assert_eq!(decoded.members, tree.members);
         assert_eq!(decoded.centers, tree.centers);
+    }
+
+    #[test]
+    fn open_round_trips_via_file_slice() {
+        let tree = sample_tree();
+        let mut bytes = Vec::new();
+        tree.serialize(&mut bytes).unwrap();
+        let opened = BKTree::open(FileSlice::from(bytes), tree.dim, tree.metric).unwrap();
+        assert_eq!(opened.nodes, tree.nodes);
+        assert_eq!(opened.members, tree.members);
+        assert_eq!(opened.dim, tree.dim);
+        let mut members: Vec<_> = opened.search_iter(&[1.0, 0.0]).collect();
+        members.sort_unstable();
+        assert_eq!(members, vec![10, 11, 20, 21]);
     }
 
     #[test]
