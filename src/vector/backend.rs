@@ -794,35 +794,35 @@ impl<T: VectorElement> VectorBackend<T> {
                 }
                 _ => None,
             };
-            // The sketch tightener: rotate + quantize this cluster's
-            // query residual once. `sketch_query` is `None` whenever the
-            // gate should fall back to radius-only.
-            let sketch_query = match (&row_gate, index.sketches(), metric) {
-                (Some(_), Some(store), Metric::L2 | Metric::Cosine) => {
-                    let prepare_start = std::time::Instant::now();
-                    let prepared = self
-                        .cluster_query_residual(
-                            index,
-                            cluster,
-                            routing_query,
-                            q_norm,
-                            &mut sketch_residual,
-                        )?
-                        .then(|| {
-                            PreparedSketchQuery::prepare(store.rotation(), &mut sketch_residual)
-                        })
-                        .flatten()
-                        .map(|prepared| (store, prepared));
-                    sketch_prepare_nanos += prepare_start.elapsed().as_nanos() as u64;
-                    prepared
-                }
-                _ => None,
-            };
-
             if survivors.is_empty() {
                 postings_skipped += 1;
             } else {
                 postings_row += 1;
+                // The sketch tightener: rotate + quantize this cluster's
+                // query residual, once, and only when there are rows to
+                // gate. `sketch_query` is `None` whenever the gate
+                // should fall back to radius-only.
+                let sketch_query = match (&row_gate, index.sketches(), metric) {
+                    (Some(_), Some(store), Metric::L2 | Metric::Cosine) => {
+                        let prepare_start = std::time::Instant::now();
+                        let prepared = self
+                            .cluster_query_residual(
+                                index,
+                                cluster,
+                                routing_query,
+                                q_norm,
+                                &mut sketch_residual,
+                            )?
+                            .then(|| {
+                                PreparedSketchQuery::prepare(store.rotation(), &mut sketch_residual)
+                            })
+                            .flatten()
+                            .map(|prepared| (store, prepared));
+                        sketch_prepare_nanos += prepare_start.elapsed().as_nanos() as u64;
+                        prepared
+                    }
+                    _ => None,
+                };
                 // Gate pass over the pinned metadata (radii + sketch
                 // codes), separate from the fetch pass below so the
                 // popcount loop streams the SoA arrays and its cost is
