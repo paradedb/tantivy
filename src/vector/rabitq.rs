@@ -20,19 +20,27 @@
 //! <s_hat, u> = <s_hat, R(q - c)> / d_c = (<s_hat, Rq> - b) / d_c
 //! ```
 //!
-//! The bound uses the exact decomposition `s = a * s_hat + e`
-//! (`e` orthogonal to `s_hat`, `||e|| = sqrt(1 - a^2)`):
+//! The bound is the RaBitQ `/a` estimator. Decomposing the QUERY side
+//! `u = z * s + w` (with `w` orthogonal to `s`) gives
+//! `<u, s_hat> = z * a + <w, s_hat>`, where `<w, s_hat>` is genuinely
+//! zero-mean over the rotation (`w` is orthogonal to `s`, so it only
+//! meets the `sqrt(1 - a^2)` off-axis part of `s_hat`):
 //!
 //! ```text
-//! cos = a * <u, s_hat> + <u, e>
-//! cos_up = a * v_up + t * sqrt((1 - a^2)/(d - 1))
+//! z_up = (v_up + t * sqrt((1 - a^2)/(d - 1))) / a
 //! ```
 //!
-//! where `v_up` folds the kernel numerator, the stored-b decode step,
+//! with `v_up` folding the kernel numerator, the stored-b decode step,
 //! and the query-quantization dither (whose rounding-error vector is
 //! uncorrelated with any row's sign pattern, so it concentrates like
-//! the code-side term). The failure probability per gate decision is
-//! the sub-Gaussian tail at `t`; [`SKETCH_T`] fixes the budget.
+//! the code-side term), and the division taking the conservative `a`
+//! interval endpoint by the numerator's sign. The tempting identity
+//! form `cos = a * <u, s_hat> + <u, e>` is NOT usable with a zero-mean
+//! model for `<u, e>`: `e` correlates with `u` through `s`
+//! (`E[<u, e>] = z * (1 - a^2)`), which biases high-z rows — exactly
+//! the rows a wrong prune costs recall on. The failure probability per
+//! gate decision is the sub-Gaussian tail at `t`; [`SKETCH_T`] fixes
+//! the budget.
 //!
 //! Everything is fail-open: a degenerate `a` (zero residual, corrupt
 //! metadata) blows up `eps`, the upper bound clamps to 1, and the gate's
@@ -61,10 +69,11 @@ pub const SKETCH_T: f32 = 4.5;
 const ROTATION_ROUNDS: usize = 3;
 
 /// Query-side scalar quantization width, in bits. The query is
-/// quantized ONCE globally (not per cluster-residual), so the grid is
-/// finer: 6 bits keeps the dither term negligible against the code-side
-/// concentration term.
-const QUERY_BITS: u32 = 6;
+/// quantized ONCE globally (not per cluster-residual), and the dither
+/// is amplified by `1/d_c` per cluster, so the grid is finer than the
+/// per-cluster form needs: 8 bits restores full parity with exact-query
+/// pruning on the cohere replica (4 bits costs ~9pp there).
+const QUERY_BITS: u32 = 8;
 const QUERY_LEVELS: u32 = (1 << QUERY_BITS) - 1;
 
 /// Deterministic splitmix64 — the sign diagonals must reproduce across
@@ -478,14 +487,10 @@ impl PreparedSketchQuery {
     }
 
     /// Conservative upper bound on `cos = <u, s>` for one row, with
-    /// `u = (q - c)/d_c` and `s` the row's unit residual direction.
-    ///
-    /// Identity form: `s = a * s_hat + e` (with `e` orthogonal to
-    /// `s_hat`, `||e|| = sqrt(1 - a^2)`) gives EXACTLY
-    /// `cos = a * <u, s_hat> + <u, e>`; `<u, s_hat>` is computed to
-    /// within `num_err / d_c` from the kernel and the stored `b`, and
-    /// `<u, e>` concentrates at `sqrt((1 - a^2)/(d - 1))` over the
-    /// rotation. No division by `a` anywhere.
+    /// `u = (q - c)/d_c` and `s` the row's unit residual direction —
+    /// the RaBitQ `/a` estimator plus every stored/quantized term's
+    /// conservative endpoint (see the module docs for why the
+    /// division-free identity form is NOT sound here).
     ///
     /// * `store` (`&SketchStore`) — the segment's sketches.
     /// * `row` (`usize`) — dense row id.
@@ -506,10 +511,11 @@ impl PreparedSketchQuery {
         let num_up = self.code_dot(store.code(row)) - b_lo + self.num_err;
         // <u, s_hat> upper endpoint; |<u, s_hat>| <= 1 always.
         let v_up = (num_up / d_c).clamp(-1.0, 1.0);
-        // a * v_up maximized over the a interval, by v_up's sign.
-        let a_pick = if v_up >= 0.0 { a_hi } else { a_lo };
-        let conc = SKETCH_T * ((1.0 - a_lo * a_lo).max(0.0) / (self.dim as f32 - 1.0)).sqrt();
-        (a_pick * v_up + conc).min(1.0)
+        // z_up = (v_up + concentration) / a, the division taking the
+        // conservative interval endpoint by the numerator's sign.
+        let zn = v_up + SKETCH_T * ((1.0 - a_lo * a_lo).max(0.0) / (self.dim as f32 - 1.0)).sqrt();
+        let z_up = if zn >= 0.0 { zn / a_lo } else { zn / a_hi };
+        z_up.min(1.0)
     }
 }
 
@@ -639,14 +645,32 @@ mod tests {
 
         let mut state = 77u64;
         let mut below_one = 0usize;
-        for _ in 0..5 {
+        let mut high_z_seen = 0usize;
+        for probe in 0..10 {
             // The query lives in the original basis; its residual
-            // against the centroid defines u and d_c.
-            let q: Vec<f32> = lcg_vec(&mut state, dim)
-                .iter()
-                .zip(&centroid)
-                .map(|(&r, &c)| c + r)
-                .collect();
+            // against the centroid defines u and d_c. Half the queries
+            // are CORRELATED with a stored row (query residual = that
+            // row's residual + small noise), driving z toward 1 — the
+            // regime where a biased estimator (e.g. the identity form's
+            // zero-mean <u, e> assumption, off by z * (1 - a^2)) breaks
+            // the bound on exactly the rows that cost recall.
+            let q: Vec<f32> = if probe % 2 == 0 {
+                lcg_vec(&mut state, dim)
+                    .iter()
+                    .zip(&centroid)
+                    .map(|(&r, &c)| c + r)
+                    .collect()
+            } else {
+                let anchor = &residuals[probe * 17 % residuals.len()];
+                let noise = lcg_vec(&mut state, dim);
+                let anchor_norm = norm(anchor);
+                anchor
+                    .iter()
+                    .zip(&noise)
+                    .zip(&centroid)
+                    .map(|((&r, &n), &c)| c + r + 0.05 * anchor_norm * n)
+                    .collect()
+            };
             let q_res: Vec<f32> = q.iter().zip(&centroid).map(|(&qi, &ci)| qi - ci).collect();
             let d_c = norm(&q_res);
             let prepared = PreparedSketchQuery::prepare(&rot, &mut q.clone()).unwrap();
@@ -660,12 +684,18 @@ mod tests {
                 if bound < 0.9 {
                     below_one += 1;
                 }
+                if true_cos > 0.7 {
+                    high_z_seen += 1;
+                }
             }
         }
+        // The correlated queries must actually produce high-z pairs, or
+        // the bias regime went untested.
+        assert!(high_z_seen >= 5, "want high-z coverage, got {high_z_seen}");
         // Uncorrelated 1024-dim pairs: the bound must actually bite.
         assert!(
-            below_one > 800,
-            "bound should be informative for most random pairs, got {below_one}/1000"
+            below_one > 1500,
+            "bound should be informative for most random pairs, got {below_one}/2000"
         );
     }
 
