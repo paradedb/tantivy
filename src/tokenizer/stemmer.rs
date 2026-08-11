@@ -49,7 +49,10 @@ impl Language {
                 StemmerAlgorithm::Tantivy(tantivy_stemmers::algorithms::czech_dolamic_aggressive)
             }
             Danish => StemmerAlgorithm::Frostem(Algorithm::Danish),
-            Dutch => StemmerAlgorithm::Frostem(Algorithm::Dutch),
+            // Snowball 3.0 replaced the Dutch algorithm with one that produces different
+            // stems (e.g. "lokaal" no longer stems to "lokal"). Existing indexes carry
+            // old-algorithm stems, so stay on the legacy variant to keep them matching.
+            Dutch => StemmerAlgorithm::Frostem(Algorithm::DutchPorter),
             English => StemmerAlgorithm::Frostem(Algorithm::English),
             Finnish => StemmerAlgorithm::Frostem(Algorithm::Finnish),
             French => StemmerAlgorithm::Frostem(Algorithm::French),

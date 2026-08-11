@@ -38,10 +38,10 @@ fs4 = { version = "0.13.1", optional = true }
 levenshtein_automata = "0.2.1"
 uuid = { version = "1.0.0", features = ["v4", "serde"] }
 crossbeam-channel = "0.5.4"
-frostem = { version = "1.20260804.0", optional = true, default-features = false, features = [
+frostem = { version = "1.20260804.2", optional = true, default-features = false, features = [
     "arabic",
     "danish",
-    "dutch",
+    "dutch_porter",
     "english",
     "finnish",
     "french",
