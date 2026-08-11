@@ -560,12 +560,19 @@ mod ivf_e2e_tests {
                 // gate/ceiling logic actually runs.
                 let collector =
                     || TopDocs::with_limit(k).order_by_similarity(embedding_field, query.to_vec());
-                let untied = searcher.search(&AllQuery, &collector())?;
-                let tied = searcher.search(&AllQuery, &collector().with_tie_break(tie_break()))?;
+                let mut untied = searcher.search(&AllQuery, &collector())?;
+                let mut tied =
+                    searcher.search(&AllQuery, &collector().with_tie_break(tie_break()))?;
                 assert!(
                     untied.stats.iter().any(|s| s.candidates_scored > 0),
                     "no probe activity to compare for query={query:?} k={k}"
                 );
+                // Wall-clock gate timers are not probe decisions; zero
+                // them so the invariance check compares only counters.
+                for s in untied.stats.iter_mut().chain(tied.stats.iter_mut()) {
+                    s.sketch_prepare_nanos = 0;
+                    s.sketch_gate_nanos = 0;
+                }
                 assert_eq!(
                     format!("{:?}", untied.stats),
                     format!("{:?}", tied.stats),

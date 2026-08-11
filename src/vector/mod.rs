@@ -20,6 +20,7 @@ mod header;
 mod index_reader;
 mod plugin;
 mod prepared;
+mod rabitq;
 mod tie_break;
 
 pub mod flat;
@@ -54,6 +55,7 @@ pub use ivf::{
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
+pub use rabitq::{PreparedSketchQuery, Rotation, SketchStore, SKETCH_T};
 pub use tie_break::NoTieBreak;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`

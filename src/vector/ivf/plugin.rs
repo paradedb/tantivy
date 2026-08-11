@@ -20,6 +20,7 @@ use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header};
+use crate::vector::rabitq::{self, encode_row, Rotation};
 use crate::vector::{
     residual_norm, BoundKind, BoundsBuilder, BoundsScope, NeighborhoodGraphConfig, NodeId,
     RelativeNeighborhoodGraph, Workspace, VEC_EXT,
@@ -598,6 +599,17 @@ pub(crate) fn merge_ivf(
                 // Slot [4] accumulator: one residual per posting row, in
                 // the cluster-sorted row order the write loop below walks.
                 let mut row_radii: Vec<f32> = Vec::new();
+                // Slot [5] accumulators. The rotation seed is a fixed
+                // constant: determinism across rebuilds beats per-segment
+                // variation, which buys nothing statistically (each row
+                // is one independent draw either way).
+                const SKETCH_SEED: u64 = 0x5EED_AB17;
+                let sketch_rotation = (rabitq::dim_supported(opts.dim())
+                    && matches!(opts.metric(), Metric::L2 | Metric::Cosine))
+                .then(|| Rotation::new(SKETCH_SEED, opts.dim()));
+                let mut sketch_codes: Vec<u8> = Vec::new();
+                let mut sketch_a: Vec<u16> = Vec::new();
+                let mut sketch_scratch: Vec<f32> = Vec::new();
                 // The scope captured in the stored settings at build.
                 // `native` — fold primary assignments only — is the only
                 // variant; a future scope must decide its fold here.
@@ -708,6 +720,20 @@ pub(crate) fn merge_ivf(
                             )?;
                         }
                         let row_residual = residual(written_bytes, &current_centroid);
+                        // Slot [5]: sign-encode the residual DIRECTION of
+                        // the exact bytes written above.
+                        if let Some(rotation) = &sketch_rotation {
+                            sketch_scratch.clear();
+                            sketch_scratch.extend(
+                                decode_row::<f32>(written_bytes, opts.dim())?
+                                    .iter()
+                                    .zip(&current_centroid)
+                                    .map(|(&xi, &ci)| xi - ci),
+                            );
+                            let encoded = encode_row(rotation, &mut sketch_scratch);
+                            sketch_codes.extend_from_slice(&encoded.code);
+                            sketch_a.push(encoded.a);
+                        }
                         // Slot [4]: every posting row's residual against its
                         // own cell's centroid, replicas included. Non-finite
                         // becomes NaN so the row gate's strict compare fails
@@ -765,6 +791,14 @@ pub(crate) fn merge_ivf(
                     let radii_w = centroids_write.for_field_with_idx(field, centroid_slot::RADII);
                     IvfIndex::serialize_radii(&row_radii, radii_w)?;
                     radii_w.flush()?;
+                }
+                // `.centroids` slot [5]: the residual-direction sketches,
+                // when the field's geometry supports them.
+                if sketch_rotation.is_some() {
+                    debug_assert_eq!(sketch_a.len(), assigned_vectors.len());
+                    let sketch_w = centroids_write.for_field_with_idx(field, centroid_slot::SKETCH);
+                    rabitq::serialize_sketches(SKETCH_SEED, &sketch_codes, &sketch_a, sketch_w)?;
+                    sketch_w.flush()?;
                 }
 
                 // `.centroids` slot [2]: the RNG over the centroids, so a query

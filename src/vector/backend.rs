@@ -25,6 +25,7 @@ use super::distance::norm_squared_wide;
 use super::index_reader::VectorIndexReader;
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
 use super::prepared::PreparedQuery;
+use super::rabitq::PreparedSketchQuery;
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
 use crate::collector::sort_key::{Comparator, NaturalComparator};
@@ -293,6 +294,16 @@ pub struct ProbeStats {
     /// scored before the bound armed, or in segments without the radii
     /// slot, are not counted.
     pub radius_gate_rows: usize,
+    /// The subset of `radius_gate_rows` evaluated through the
+    /// residual-direction sketch (slot [5]); the rest used the
+    /// radius-only shell bound.
+    pub sketch_rows: usize,
+    /// Nanoseconds spent rotating + quantizing the per-cluster query
+    /// residual for the sketch gate (once per probed armed cluster).
+    pub sketch_prepare_nanos: u64,
+    /// Nanoseconds spent in the row-gate pass (popcount estimator +
+    /// bound arithmetic; excludes row fetches and exact scoring).
+    pub sketch_gate_nanos: u64,
     /// Probed clusters whose surviving rows' posting bytes were fetched —
     /// one stride-sized ranged read per surviving row. Counts clusters,
     /// not rows.
@@ -652,6 +663,12 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut pruned_seen = 0usize;
         let mut pruned_radius = 0usize;
         let mut radius_gate_rows = 0usize;
+        let mut sketch_rows = 0usize;
+        let mut sketch_prepare_nanos = 0u64;
+        let mut sketch_gate_nanos = 0u64;
+        // Scratch for the per-cluster query residual `q - c`; reused
+        // across clusters.
+        let mut sketch_residual: Vec<f32> = Vec::new();
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut bounds_skips = 0u32;
@@ -757,11 +774,16 @@ impl<T: VectorElement> VectorBackend<T> {
             // A/B-able; revisit the charge if the gate earns its keep.
             work_spent += pricing.row * scored_rows as f64;
 
-            // P4b: the per-row shell gate, armed only, and only under a
-            // finite cluster bound — a SATURATED cluster (degenerate
-            // centroid) anchors no residual geometry, per-row included.
-            // The separation key is the same exact routing key the
-            // cluster margin consumed above.
+            // P4b: the per-row gate, armed only, and only under a finite
+            // cluster bound — a SATURATED cluster (degenerate centroid)
+            // anchors no residual geometry, per-row included. The
+            // separation key is the same exact routing key the cluster
+            // margin consumed above. With sketches the bound is
+            // `d^2 >= sep^2 + r^2 - 2 sep r cos_up` (law of cosines with
+            // a conservative directional term); without them `cos_up`
+            // is pinned at 1, which is exactly the radius-only shell
+            // bound `|sep - r|`. Dot has no sketch path and keeps the
+            // per-row halfspace margin.
             let row_gate = match (row_radii, qb) {
                 (Some(radii), QueryBound::Armed { t }) if bounds.ball_r(cluster).is_finite() => {
                     let key = match metric {
@@ -772,28 +794,83 @@ impl<T: VectorElement> VectorBackend<T> {
                 }
                 _ => None,
             };
+            // The sketch tightener: rotate + quantize this cluster's
+            // query residual once. `sketch_query` is `None` whenever the
+            // gate should fall back to radius-only.
+            let sketch_query = match (&row_gate, index.sketches(), metric) {
+                (Some(_), Some(store), Metric::L2 | Metric::Cosine) => {
+                    let prepare_start = std::time::Instant::now();
+                    let prepared = self
+                        .cluster_query_residual(
+                            index,
+                            cluster,
+                            routing_query,
+                            q_norm,
+                            &mut sketch_residual,
+                        )?
+                        .then(|| {
+                            PreparedSketchQuery::prepare(store.rotation(), &mut sketch_residual)
+                        })
+                        .flatten()
+                        .map(|prepared| (store, prepared));
+                    sketch_prepare_nanos += prepare_start.elapsed().as_nanos() as u64;
+                    prepared
+                }
+                _ => None,
+            };
 
             if survivors.is_empty() {
                 postings_skipped += 1;
             } else {
                 postings_row += 1;
-                // One stride-sized read per survivor — the unit the
+                // Gate pass over the pinned metadata (radii + sketch
+                // codes), separate from the fetch pass below so the
+                // popcount loop streams the SoA arrays and its cost is
+                // measured apart from row I/O.
+                if let Some((radii, t, key)) = row_gate {
+                    let gate_start = std::time::Instant::now();
+                    radius_gate_rows += survivors.len();
+                    match &sketch_query {
+                        Some((store, prepared)) => {
+                            sketch_rows += survivors.len();
+                            let t2 = t * t;
+                            survivors.retain(|&Survivor { row, .. }| {
+                                let r = radii[row];
+                                let cos_up = prepared.cos_upper_bound(store, row);
+                                let lb2 = key * key + r * r - 2.0 * key * r * cos_up;
+                                // Strict: prune only on lb^2 > t^2; NaN
+                                // compares false and keeps the row.
+                                let keep = !(lb2 > t2);
+                                if !keep {
+                                    pruned_radius += 1;
+                                }
+                                keep
+                            });
+                        }
+                        None => {
+                            survivors.retain(|&Survivor { row, .. }| {
+                                let margin = match metric {
+                                    Metric::L2 | Metric::Cosine => {
+                                        margin_row_shell(t, radii[row], key)
+                                    }
+                                    Metric::Dot => {
+                                        margin_ball_halfspace(key, q_norm, radii[row], t)
+                                    }
+                                };
+                                let keep = !(margin < 0.0);
+                                if !keep {
+                                    pruned_radius += 1;
+                                }
+                                keep
+                            });
+                        }
+                    }
+                    sketch_gate_nanos += gate_start.elapsed().as_nanos() as u64;
+                }
+                // One stride-sized read per surviving row — the unit the
                 // pg-backed `Directory` serves zero-copy (see
                 // `vector_bytes_for_row`).
                 for &Survivor { row, doc } in &survivors {
-                    if let Some((radii, t, key)) = row_gate {
-                        radius_gate_rows += 1;
-                        let margin = match metric {
-                            Metric::L2 | Metric::Cosine => margin_row_shell(t, radii[row], key),
-                            Metric::Dot => margin_ball_halfspace(key, q_norm, radii[row], t),
-                        };
-                        // Strict negative only; a NaN radius makes a NaN
-                        // margin, which compares false and scores.
-                        if margin < 0.0 {
-                            pruned_radius += 1;
-                            continue;
-                        }
-                    }
                     let vbytes = self.reader.vector_bytes_for_row(row)?;
                     let score = self.query.score_doc_bytes(&vbytes);
                     candidates += 1;
@@ -824,6 +901,9 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.pruned_seen += pruned_seen;
         stats.pruned_radius += pruned_radius;
         stats.radius_gate_rows += radius_gate_rows;
+        stats.sketch_rows += sketch_rows;
+        stats.sketch_prepare_nanos += sketch_prepare_nanos;
+        stats.sketch_gate_nanos += sketch_gate_nanos;
         stats.postings_row += postings_row;
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += candidates;
@@ -833,6 +913,40 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.work_charged += work_spent.to_f32();
 
         Ok(topn)
+    }
+
+    /// Fills `out` with this cluster's query residual `q - c` in the
+    /// ORIGINAL basis — the sketch gate's input. For cosine the query is
+    /// unit-normalized first so the residual lives in the same chord
+    /// geometry as the stored radii and the armed threshold.
+    /// Returns `Ok(false)` (gate falls back to radius-only) when the
+    /// query norm is degenerate.
+    fn cluster_query_residual(
+        &self,
+        index: &IvfIndex,
+        cluster: usize,
+        routing_query: &[f32],
+        q_norm: f32,
+        out: &mut Vec<f32>,
+    ) -> crate::Result<bool> {
+        let inv_q = match self.query.metric() {
+            Metric::Cosine => {
+                if !(q_norm.is_finite() && q_norm > 0.0) {
+                    return Ok(false);
+                }
+                1.0 / q_norm
+            }
+            _ => 1.0,
+        };
+        let centroid = index.centroid_values(cluster)?;
+        out.clear();
+        out.extend(
+            routing_query
+                .iter()
+                .zip(&centroid)
+                .map(|(&qi, &ci)| qi * inv_q - ci),
+        );
+        Ok(true)
     }
 
     /// Phase 2 pre-pass: run one cluster's rows through the
@@ -2628,6 +2742,9 @@ mod tests {
             pruned_seen: 3,
             pruned_radius: 5,
             radius_gate_rows: 9,
+            sketch_rows: 6,
+            sketch_prepare_nanos: 1500,
+            sketch_gate_nanos: 800,
             postings_row: 1,
             postings_skipped: 1,
             exact_rows_read: 0,
@@ -2659,6 +2776,9 @@ mod tests {
                 "pruned_seen": 3,
                 "pruned_radius": 5,
                 "radius_gate_rows": 9,
+                "sketch_rows": 6,
+                "sketch_prepare_nanos": 1500,
+                "sketch_gate_nanos": 800,
                 "postings_row": 1,
                 "postings_skipped": 1,
                 "exact_rows_read": 0,
@@ -3704,6 +3824,194 @@ mod tests {
         use super::bounds_gate_tests::single_segment_fixture;
         use super::*;
 
+        /// Dim-`D` clusterer with fixed flat centroids and nearest-L2
+        /// assignment — the sketch slot needs a power-of-two dim >= 64,
+        /// which the 2D fixtures can't provide.
+        struct HighDimClusterer {
+            centroids: Vec<f32>,
+            dim: usize,
+        }
+
+        impl IvfClusterer for HighDimClusterer {
+            fn centroid_ratio(&self) -> f32 {
+                1.0
+            }
+            fn training_samples_per_centroid(&self) -> usize {
+                2
+            }
+            fn merge_settings(&self, _total: usize) -> crate::Result<IvfMergeSettings> {
+                Ok(IvfMergeSettings {
+                    num_centroids: self.centroids.len() / self.dim,
+                    training_samples_per_centroid: self.training_samples_per_centroid(),
+                    assign_batch_size: self.assign_batch_size(),
+                    replicas: 1,
+                })
+            }
+            fn train(
+                &self,
+                options: &VectorOptions,
+                _vectors: IvfTrainingVectors,
+                num_centroids: usize,
+            ) -> crate::Result<IvfCentroids> {
+                assert_eq!(options.dim(), self.dim);
+                Ok(IvfCentroids::F32(IvfMatrix {
+                    values: self.centroids[..num_centroids * self.dim].to_vec(),
+                    rows: num_centroids,
+                    dims: self.dim,
+                }))
+            }
+            fn assign(
+                &self,
+                options: &VectorOptions,
+                vectors: IvfVectors<'_>,
+                centroids: &IvfCentroids,
+            ) -> crate::Result<Vec<u32>> {
+                assert_eq!(options.dim(), self.dim);
+                let IvfVectors::F32(vectors) = vectors;
+                let IvfCentroids::F32(centroids) = centroids;
+                Ok(vectors
+                    .matrix
+                    .values
+                    .chunks_exact(self.dim)
+                    .map(|v| {
+                        let mut best = 0u32;
+                        let mut best_d2 = f32::INFINITY;
+                        for (i, c) in centroids.values.chunks_exact(self.dim).enumerate() {
+                            let d2: f32 = v.iter().zip(c).map(|(&x, &y)| (x - y) * (x - y)).sum();
+                            if d2 < best_d2 {
+                                best = i as u32;
+                                best_d2 = d2;
+                            }
+                        }
+                        best
+                    })
+                    .collect())
+            }
+        }
+
+        /// Deterministic pseudo-random unit-ish vector components.
+        fn splitmix_unit(state: &mut u64, dim: usize) -> Vec<f32> {
+            let mut v: Vec<f32> = (0..dim)
+                .map(|_| {
+                    *state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((*state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+                })
+                .collect();
+            let norm = v.iter().map(|&x| x * x).sum::<f32>().sqrt();
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+            v
+        }
+
+        /// End-to-end sketch gate at dim 64 (the smallest supported):
+        /// tight clusters around well-separated random unit centers, so
+        /// the directional bound must certify prunes that the results
+        /// cannot show — top-1 equals the exact oracle while a large
+        /// share of gated rows is pruned through the sketch path.
+        #[test]
+        fn sketch_prunes_high_dim_clusters() -> crate::Result<()> {
+            const DIM: usize = 64;
+            const CLUSTERS: usize = 4;
+            const PER_CLUSTER: usize = 8;
+            let mut state = 0xC0FFEEu64;
+            let centers: Vec<Vec<f32>> = (0..CLUSTERS)
+                .map(|_| splitmix_unit(&mut state, DIM))
+                .collect();
+            let mut docs: Vec<Vec<f32>> = Vec::new();
+            for (g, center) in centers.iter().enumerate() {
+                for _ in 0..PER_CLUSTER {
+                    let noise = splitmix_unit(&mut state, DIM);
+                    docs.push(
+                        center
+                            .iter()
+                            .zip(&noise)
+                            .map(|(&c, &n)| c + 0.05 * n)
+                            .collect(),
+                    );
+                }
+                // Every non-home cluster gets one far outlier that
+                // inflates its BALL past the cluster gate — the probe
+                // then reaches the row gate, which must prune the tight
+                // members individually.
+                if g != 0 {
+                    let noise = splitmix_unit(&mut state, DIM);
+                    docs.push(
+                        center
+                            .iter()
+                            .zip(&noise)
+                            .map(|(&c, &n)| c + 2.0 * n)
+                            .collect(),
+                    );
+                }
+            }
+
+            let mut sb = Schema::builder();
+            let embed_field = sb.add_vector_field(
+                "embedding",
+                VectorOptions::new(DIM, Metric::L2).with_dtype(VectorDType::F32),
+            );
+            sb.add_text_field("label", STRING | STORED);
+            let settings = IndexSettings {
+                vector_clustering_threshold: 1,
+                ..IndexSettings::default()
+            };
+            let index = Index::builder()
+                .schema(sb.build())
+                .settings(settings)
+                .ivf_clusterer(Arc::new(HighDimClusterer {
+                    centroids: centers.iter().flatten().copied().collect(),
+                    dim: DIM,
+                }))
+                .create_in_ram()?;
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for (i, vector) in docs.iter().enumerate() {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(index.schema().get_field("label").unwrap(), format!("d{i}"));
+                doc.add_vector(embed_field, vector.as_slice());
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+            let segment_ids = index.searchable_segment_ids()?;
+            writer.merge(&segment_ids).wait()?;
+            writer.wait_merging_threads()?;
+
+            // Query near cluster 0's center; the exact 1-NN by L2.
+            let query: Vec<f32> = centers[0].iter().map(|&c| c * 1.01).collect();
+            let oracle = docs
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let da: f32 = a.iter().zip(&query).map(|(&x, &q)| (x - q) * (x - q)).sum();
+                    let db: f32 = b.iter().zip(&query).map(|(&x, &q)| (x - q) * (x - q)).sum();
+                    da.partial_cmp(&db).unwrap()
+                })
+                .map(|(i, _)| i as u32)
+                .unwrap();
+
+            let (hits, stats) =
+                run_top_n(&index, embed_field, query, 1, exhaustive_params(CLUSTERS))?;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(
+                hits[0].1.doc_id, oracle,
+                "sketch gate must not change the result"
+            );
+            assert!(
+                stats.sketch_rows > 0,
+                "the sketch path must have engaged: {stats:?}"
+            );
+            assert!(
+                stats.pruned_radius * 2 >= stats.sketch_rows,
+                "tight high-dim clusters should prune most gated rows: {stats:?}"
+            );
+            assert!(stats.sketch_prepare_nanos > 0 && stats.sketch_gate_nanos > 0);
+            assert_stats_identities(&stats);
+            Ok(())
+        }
+
         /// Crafted L2 geometry pinning both prune directions and the
         /// counters. Query at the origin, k = 1.
         ///
@@ -3797,8 +4105,8 @@ mod tests {
         /// Cluster B `(0,1)` (separation `chord(90°) = sqrt(2)`):
         /// - `b1` at 85°: radius `chord(5°) ~= 0.0872`, lower bound `|1.4142 - 0.0872| = 1.327 > t`
         ///   — pruned;
-        /// - `b2` at 173°: radius `chord(83°) ~= 1.3252`, lower bound `|1.4142 - 1.3252| = 0.089
-        ///   <= t` — scored (and loses: its true chord is ~1.997).
+        /// - `b2` at 173°: radius `chord(83°) ~= 1.3252`, lower bound `|1.4142 - 1.3252| = 0.089 <=
+        ///   t` — scored (and loses: its true chord is ~1.997).
         ///
         /// `b2` also widens B's ball to 1.3252, making the cluster margin
         /// `(t + r) - sep ~= +0.011` — B probes, so the prune must come
@@ -3824,7 +4132,10 @@ mod tests {
             );
             assert_eq!(stats.bounds_skips, 0);
             assert_eq!(stats.radius_gate_rows, 2, "B's two rows are gated");
-            assert_eq!(stats.pruned_radius, 1, "b1's shell excludes the query: {stats:?}");
+            assert_eq!(
+                stats.pruned_radius, 1,
+                "b1's shell excludes the query: {stats:?}"
+            );
             assert_stats_identities(&stats);
             Ok(())
         }

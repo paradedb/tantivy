@@ -27,6 +27,11 @@
 //!     row gate's strict compare. Absence disables the row gate — a
 //!     missing radius only costs pruning, never correctness, so this
 //!     slot rides the within-generation presence mechanism.
+//! [5] per-row residual-direction sketches, OPTIONAL: a kind byte, the
+//!     rotation seed, then SoA sign codes (dim/8 bytes per row) and u16
+//!     correction factors — see `vector::rabitq` for the layout and the
+//!     estimator. Written only for power-of-two dims and L2/Cosine;
+//!     absence leaves the row gate radius-only.
 //! ```
 //!
 //! Slot presence is the compatibility mechanism WITHIN a generation: the
@@ -55,6 +60,7 @@ use super::graph::{
 };
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
+use crate::vector::rabitq::SketchStore;
 use crate::vector::{BoundKind, BoundStore, FileSliceArena, VectorArena};
 
 /// The IVF routing index over one field's clusters: says which clusters —
@@ -88,6 +94,10 @@ pub struct IvfIndex {
     /// per posting row). `None` when the segment predates the slot — the
     /// row gate is then disabled.
     row_radii: Option<Vec<f32>>,
+    /// Slot `[5]`, pinned: per-row residual-direction sketches. `None`
+    /// when absent (older segment, or unsupported dim/metric) — the row
+    /// gate is then radius-only.
+    sketches: Option<SketchStore>,
 }
 
 impl IvfIndex {
@@ -184,6 +194,7 @@ impl IvfIndex {
         graph_slice: Option<FileSlice>,
         bounds_slice: FileSlice,
         radii_slice: Option<FileSlice>,
+        sketch_slice: Option<FileSlice>,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
         if centroids_slice.len() < count_words {
@@ -296,6 +307,7 @@ impl IvfIndex {
             bound_kind,
             bounds,
             row_radii: None,
+            sketches: None,
         };
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt file.
@@ -335,6 +347,11 @@ impl IvfIndex {
                 .into());
             }
             index.row_radii = Some(radii);
+        }
+        // Slot [5] (optional): the residual-direction sketches.
+        if let Some(slice) = sketch_slice {
+            let bytes = slice.read_bytes()?;
+            index.sketches = Some(SketchStore::open(bytes, options.dim(), index.num_rows())?);
         }
         Ok(index)
     }
@@ -388,6 +405,16 @@ impl IvfIndex {
         self.row_radii.as_deref()
     }
 
+    /// Per-row residual-direction sketches (slot `[5]`), indexed by the
+    /// same dense row ids as the `.vec` rows.
+    ///
+    /// Returns (`Option<&SketchStore>`): `None` when the segment has no
+    /// sketch slot — the row gate then runs radius-only.
+    #[inline]
+    pub fn sketches(&self) -> Option<&SketchStore> {
+        self.sketches.as_ref()
+    }
+
     /// Per-cluster posting-list sizes, in cluster order — memberships, like
     /// [`Self::num_rows`].
     pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = usize> + '_ {
@@ -400,6 +427,22 @@ impl IvfIndex {
     /// tests only. Routing fetches per-node ranges through the lazy arena.
     pub fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
         Ok(self.centroids_slice.read_bytes()?)
+    }
+
+    /// One cluster's stored centroid values, from a single stride-sized
+    /// ranged read — the sketch gate's per-probed-cluster fetch.
+    pub(crate) fn centroid_values(&self, cluster: usize) -> crate::Result<Vec<f32>> {
+        debug_assert!(cluster < self.num_centroids, "cluster out of bounds");
+        let stride = self.dim * mem::size_of::<f32>();
+        let bytes = self
+            .centroids_slice
+            .slice(cluster * stride..(cluster + 1) * stride)
+            .read_bytes()?;
+        Ok(bytes
+            .as_slice()
+            .chunks_exact(mem::size_of::<f32>())
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect())
     }
 
     /// Clusters to probe for `query`, ranked lazily — a [`ClusterRanking`]

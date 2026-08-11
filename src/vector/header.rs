@@ -54,6 +54,11 @@ pub(crate) mod centroid_slot {
     /// construction — a missing radius only costs pruning, never
     /// correctness.
     pub(crate) const RADII: usize = 4;
+    /// Per-posting-row residual-direction sketches (RaBitQ-style sign
+    /// codes + correction factor; see `vector::rabitq`). OPTIONAL: the
+    /// write side skips it for unsupported dims/metrics, and absence
+    /// just leaves the row gate radius-only.
+    pub(crate) const SKETCH: usize = 5;
 }
 
 /// `.vec` composite slot indices. A different file with a different
