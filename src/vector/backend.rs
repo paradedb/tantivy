@@ -18,8 +18,8 @@ use std::sync::Arc;
 use common::BitSet;
 
 use super::bounds::{
-    bounds_verdict, margin_ball_ball, margin_ball_halfspace, to_bound_space, HeapPeek, QueryBound,
-    QueryBoundTracker, Verdict,
+    bounds_verdict, margin_ball_ball, margin_ball_halfspace, margin_row_shell, to_bound_space,
+    HeapPeek, QueryBound, QueryBoundTracker, Verdict,
 };
 use super::distance::norm_squared_wide;
 use super::index_reader::VectorIndexReader;
@@ -267,9 +267,10 @@ pub enum ProbeTermination {
 /// only `exact_rows_read`; every other field is IVF-probe-only.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
-    /// Docs that passed filter + alive + seen and were scored against the
-    /// query. This stays the "scored" bucket and equals the final survivor
-    /// `candidates`.
+    /// Docs that passed filter + alive + seen + radius gate and were
+    /// scored against the query. This stays the "scored" bucket; the
+    /// partition identity is
+    /// `visited == filter + dead + seen + radius + scored`.
     pub candidates_scored: usize,
     /// Every doc-id the inner loop touched, before any gate — the denominator
     /// for the prune breakdown.
@@ -280,6 +281,18 @@ pub struct ProbeStats {
     pub pruned_dead: usize,
     /// Touched docs rejected by the replica `seen` dedup.
     pub pruned_seen: usize,
+    /// Pre-pass survivors the row-level triangle-inequality gate skipped
+    /// without fetching or scoring: their stored radius proved
+    /// `||q - x|| > t` (L2/cosine shell bound) or capped their best
+    /// possible score below the kth (dot). Lossless by construction —
+    /// strict inequality, so a pruned row could never have entered the
+    /// heap or shifted a tie.
+    pub pruned_radius: usize,
+    /// Pre-pass survivors the armed row gate evaluated (its denominator:
+    /// `pruned_radius / radius_gate_rows` is the gate's hit rate). Rows
+    /// scored before the bound armed, or in segments without the radii
+    /// slot, are not counted.
+    pub radius_gate_rows: usize,
     /// Probed clusters whose surviving rows' posting bytes were fetched —
     /// one stride-sized ranged read per surviving row. Counts clusters,
     /// not rows.
@@ -637,6 +650,8 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut pruned_filter = 0usize;
         let mut pruned_dead = 0usize;
         let mut pruned_seen = 0usize;
+        let mut pruned_radius = 0usize;
+        let mut radius_gate_rows = 0usize;
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut bounds_skips = 0u32;
@@ -650,6 +665,7 @@ impl<T: VectorElement> VectorBackend<T> {
         // segment-query.
         let q_norm = norm_squared_wide(self.query.query()).sqrt() as f32;
         let bounds = index.bounds();
+        let row_radii = index.row_radii();
         // Replication can place the same doc in several probed clusters; dedup
         // by doc id so a vector is scored at most once.
         let mut seen = BitSet::with_max_value(max_doc);
@@ -735,9 +751,27 @@ impl<T: VectorElement> VectorBackend<T> {
             pruned_seen += ps;
 
             // Event-wise charging, part 2: the rows that survive the
-            // pre-pass — exactly the rows fetched and scored below.
-            // Rejected and deduped rows charge nothing.
+            // pre-pass. Radius-pruned rows below still charge row work —
+            // keeping the budget trajectory identical to a gate-less run
+            // makes the experiment a pure fetch+score saving, cleanly
+            // A/B-able; revisit the charge if the gate earns its keep.
             work_spent += pricing.row * scored_rows as f64;
+
+            // P4b: the per-row shell gate, armed only, and only under a
+            // finite cluster bound — a SATURATED cluster (degenerate
+            // centroid) anchors no residual geometry, per-row included.
+            // The separation key is the same exact routing key the
+            // cluster margin consumed above.
+            let row_gate = match (row_radii, qb) {
+                (Some(radii), QueryBound::Armed { t }) if bounds.ball_r(cluster).is_finite() => {
+                    let key = match metric {
+                        Metric::L2 | Metric::Cosine => to_bound_space(metric, sim.score()),
+                        Metric::Dot => sim.score(),
+                    };
+                    Some((radii, t, key))
+                }
+                _ => None,
+            };
 
             if survivors.is_empty() {
                 postings_skipped += 1;
@@ -747,14 +781,27 @@ impl<T: VectorElement> VectorBackend<T> {
                 // pg-backed `Directory` serves zero-copy (see
                 // `vector_bytes_for_row`).
                 for &Survivor { row, doc } in &survivors {
+                    if let Some((radii, t, key)) = row_gate {
+                        radius_gate_rows += 1;
+                        let margin = match metric {
+                            Metric::L2 | Metric::Cosine => margin_row_shell(t, radii[row], key),
+                            Metric::Dot => margin_ball_halfspace(key, q_norm, radii[row], t),
+                        };
+                        // Strict negative only; a NaN radius makes a NaN
+                        // margin, which compares false and scores.
+                        if margin < 0.0 {
+                            pruned_radius += 1;
+                            continue;
+                        }
+                    }
                     let vbytes = self.reader.vector_bytes_for_row(row)?;
                     let score = self.query.score_doc_bytes(&vbytes);
+                    candidates += 1;
                     if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
                         topn.push_unordered(key, doc);
                     }
                 }
             }
-            candidates += survivors.len();
 
             // P2: fold the exact kth into the bound at the cluster
             // boundary. `kth_best` is O(buffer) and force-truncates —
@@ -775,6 +822,8 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.pruned_filter += pruned_filter;
         stats.pruned_dead += pruned_dead;
         stats.pruned_seen += pruned_seen;
+        stats.pruned_radius += pruned_radius;
+        stats.radius_gate_rows += radius_gate_rows;
         stats.postings_row += postings_row;
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += candidates;
@@ -2573,10 +2622,12 @@ mod tests {
     fn probe_stats_serializes_to_json() {
         let stats = ProbeStats {
             candidates_scored: 10,
-            vectors_visited: 20,
+            vectors_visited: 25,
             pruned_filter: 4,
             pruned_dead: 3,
             pruned_seen: 3,
+            pruned_radius: 5,
+            radius_gate_rows: 9,
             postings_row: 1,
             postings_skipped: 1,
             exact_rows_read: 0,
@@ -2602,10 +2653,12 @@ mod tests {
             value,
             serde_json::json!({
                 "candidates_scored": 10,
-                "vectors_visited": 20,
+                "vectors_visited": 25,
                 "pruned_filter": 4,
                 "pruned_dead": 3,
                 "pruned_seen": 3,
+                "pruned_radius": 5,
+                "radius_gate_rows": 9,
                 "postings_row": 1,
                 "postings_skipped": 1,
                 "exact_rows_read": 0,
@@ -2698,8 +2751,12 @@ mod tests {
     fn assert_stats_identities(stats: &ProbeStats) {
         assert_eq!(
             stats.vectors_visited,
-            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
-            "visited must equal filter+dead+seen+scored ({stats:?})"
+            stats.pruned_filter
+                + stats.pruned_dead
+                + stats.pruned_seen
+                + stats.pruned_radius
+                + stats.candidates_scored,
+            "visited must equal filter+dead+seen+radius+scored ({stats:?})"
         );
     }
 
@@ -3635,6 +3692,131 @@ mod tests {
                 stats.bounds_skips > 0,
                 "armed late still skips the far tail"
             );
+            Ok(())
+        }
+    }
+
+    // ==================================================================
+    // P4b: the per-row triangle-inequality gate
+    // ==================================================================
+
+    mod row_gate_tests {
+        use super::bounds_gate_tests::single_segment_fixture;
+        use super::*;
+
+        /// Crafted L2 geometry pinning both prune directions and the
+        /// counters. Query at the origin, k = 1.
+        ///
+        /// Cluster A `(0,0)`: `a = (0.1, 0)` — probed first (fills the
+        /// heap, so its rows are never gated), arms `t = 0.1`.
+        /// Cluster B `(1,0)` (separation 1) holds all three gate cases:
+        /// - `b1 = (0.9, 0)`, radius 0.1: `|1 - 0.1| = 0.9 > t` — pruned, query OUTSIDE the shell;
+        /// - `b3 = (3.5, 0)`, radius 2.5: `|1 - 2.5| = 1.5 > t` — pruned, query INSIDE the shell,
+        ///   which the one-sided cluster ball can never certify;
+        /// - `b2 = (1, 1)`, radius 1: `|1 - 1| = 0 <= t` — scored.
+        ///
+        /// B's cluster ball (`r = 2.5`) overlaps the query region, so the
+        /// cluster gate probes B and the per-row gate is what saves the
+        /// two fetches. The result is untouched: pruning is strict.
+        #[test]
+        fn radius_prunes_both_shell_sides() -> crate::Result<()> {
+            let centroids: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0]];
+            let docs: Vec<[f32; 2]> = vec![[0.1, 0.0], [0.9, 0.0], [1.0, 1.0], [3.5, 0.0]];
+            let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs, 1)?;
+            let (hits, stats) = run_top_n(&index, field, vec![0.0, 0.0], 1, exhaustive_params(2))?;
+
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].1.doc_id, 0, "doc a is the 1-NN");
+            assert_eq!(
+                stats.clusters_probed(),
+                2,
+                "B's ball overlaps: no cluster skip"
+            );
+            assert_eq!(stats.bounds_skips, 0);
+            assert_eq!(
+                stats.radius_gate_rows, 3,
+                "B's rows are gated, A's fill the heap"
+            );
+            assert_eq!(
+                stats.pruned_radius, 2,
+                "b1 (outside) and b3 (inside): {stats:?}"
+            );
+            assert_eq!(stats.candidates_scored, 2, "a and b2");
+            assert_stats_identities(&stats);
+            Ok(())
+        }
+
+        /// The gate's saving is fetch+score only — the budget still
+        /// charges every pre-pass survivor, so a gated run's work equals
+        /// a gate-less run's and A/B comparisons stay trajectory-clean.
+        #[test]
+        fn pruned_rows_still_charge_row_work() -> crate::Result<()> {
+            let centroids: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0]];
+            let docs: Vec<[f32; 2]> = vec![[0.1, 0.0], [0.9, 0.0], [1.0, 1.0], [3.5, 0.0]];
+            let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs, 1)?;
+            let (_, stats) = run_top_n(&index, field, vec![0.0, 0.0], 1, exhaustive_params(2))?;
+
+            assert_eq!(stats.pruned_radius, 2);
+            let n_avg = docs.len() as f64 / centroids.len() as f64;
+            let x = open_share(n_avg);
+            let row = (1.0 - x) / n_avg;
+            let survivors = stats.candidates_scored + stats.pruned_radius;
+            let expected = stats.clusters_probed() as f64 * x + survivors as f64 * row;
+            assert!(
+                (stats.work_charged as f64 - expected).abs() < 1e-5,
+                "pruned rows charge row work: expected {expected}, got {}",
+                stats.work_charged
+            );
+            Ok(())
+        }
+
+        /// Unarmed means ungated: with k unreachable the heap never
+        /// fills, and every survivor is fetched and scored.
+        #[test]
+        fn unarmed_never_gates_rows() -> crate::Result<()> {
+            let centroids: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0]];
+            let docs: Vec<[f32; 2]> = vec![[0.1, 0.0], [0.9, 0.0], [1.0, 1.0], [3.5, 0.0]];
+            let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs, 1)?;
+            let (hits, stats) =
+                run_top_n(&index, field, vec![0.0, 0.0], 100, exhaustive_params(2))?;
+
+            assert_eq!(hits.len(), 4, "every doc is a hit at k > N");
+            assert_eq!(stats.radius_gate_rows, 0);
+            assert_eq!(stats.pruned_radius, 0);
+            assert_eq!(stats.candidates_scored, 4);
+            Ok(())
+        }
+
+        /// Dot wires the per-row radius through the halfspace margin:
+        /// the row's best possible score `q.c + ||q||·r` below the kth
+        /// prunes it. Long vectors near the query direction win dot; a
+        /// short row in a probed far cluster can't reach the kth score.
+        #[test]
+        fn radius_prunes_dot_rows() -> crate::Result<()> {
+            let centroids: Vec<[f32; 2]> = vec![[10.0, 0.0], [-1.0, 0.0]];
+            // Query (1,0) ranks cluster 0 first; its rows score 12 and 8,
+            // arming s_k = 12. Cluster 1 (q.c = -1) probes only because
+            // (-1, 40) widens its ball to r = 40 (cluster best
+            // -1 + 40 = 39 > 12); that wide row survives the row gate
+            // (best 39) while (-1, 0.5) is pruned: radius 0.5 caps its
+            // best possible score at -1 + 0.5 = -0.5 < 12.
+            let docs: Vec<[f32; 2]> = vec![[12.0, 0.0], [8.0, 0.0], [-1.0, 0.5], [-1.0, 40.0]];
+            let (index, field) = single_segment_fixture(Metric::Dot, &centroids, &docs, 1)?;
+            let (hits, stats) = run_top_n(&index, field, vec![1.0, 0.0], 1, exhaustive_params(2))?;
+
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].1.doc_id, 0, "(12,0) wins dot against (1,0)");
+            assert_eq!(
+                stats.clusters_probed(),
+                2,
+                "the widened ball forces the probe"
+            );
+            assert_eq!(
+                stats.pruned_radius, 1,
+                "(-1, 0.5) can't reach the kth: {stats:?}"
+            );
+            assert_eq!(stats.radius_gate_rows, 2);
+            assert_stats_identities(&stats);
             Ok(())
         }
     }

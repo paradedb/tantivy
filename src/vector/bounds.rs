@@ -374,6 +374,27 @@ pub fn margin_ball_ball(t: f32, r: f32, separation: f32) -> f32 {
     (t + r) - separation
 }
 
+/// Signed probe margin for one ROW vs the armed ball region, from the
+/// row's stored radius alone. Triangle inequality: `x` sits exactly at
+/// distance `r` from `c` (a shell, not a ball), so
+/// `||q - x|| >= |separation - r|` — both sides of the absolute value,
+/// which is strictly stronger than the cluster ball's one-sided
+/// `separation - r` when the query lands inside the shell. L2
+/// (`separation = ||q - c||`) and cosine (`separation = chord`, radii
+/// stored over unit rows against the renormalized centroid).
+///
+/// * `t` (`f32`) — armed kth threshold in bound space.
+/// * `r` (`f32`) — the row's stored residual norm `||x - c||`; NaN (a non-finite residual at write)
+///   makes the margin NaN, which fails open at the strict compare.
+/// * `separation` (`f32`) — exact centroid distance from the routing stream key.
+///
+/// Returns (`f32`): the signed margin — `>= 0` score the row, `< 0`
+/// skip-safe (strict).
+#[inline]
+pub fn margin_row_shell(t: f32, r: f32, separation: f32) -> f32 {
+    t - (separation - r).abs()
+}
+
 /// Signed probe margin for a ball cluster bound vs the armed halfspace.
 /// Sphere-halfspace via Cauchy-Schwarz on the residual: the cluster's
 /// best possible score vs the kth score. Dot only.
@@ -631,6 +652,32 @@ mod bounds_margin_tests {
         assert_eq!(margin_ball_ball(1.0, 2.0, 3.0), 0.0);
         // Separation 2 -> overlap by 1.
         assert_eq!(margin_ball_ball(1.0, 2.0, 2.0), 1.0);
+    }
+
+    /// Row shell: two-sided — the row is prunable when the query sits far
+    /// OUTSIDE its shell or deep INSIDE it; the cluster ball only ever
+    /// catches the outside case.
+    #[test]
+    fn row_shell_cases() {
+        // t = 1, r = 2. Separation 5: |5 - 2| = 3 > 1 -> skip by 2.
+        assert_eq!(margin_row_shell(1.0, 2.0, 5.0), -2.0);
+        // Separation 3: exact touch.
+        assert_eq!(margin_row_shell(1.0, 2.0, 3.0), 0.0);
+        // Separation 2.5: overlap by 0.5.
+        assert_eq!(margin_row_shell(1.0, 2.0, 2.5), 0.5);
+        // INSIDE the shell: separation 0.5, |0.5 - 2| = 1.5 > 1 -> skip —
+        // the one-sided ball margin would have probed here.
+        assert_eq!(margin_row_shell(1.0, 2.0, 0.5), -0.5);
+        assert!(margin_ball_ball(1.0, 2.0, 0.5) > 0.0);
+        // NaN radius (non-finite residual at write) fails open.
+        assert_eq!(
+            bounds_verdict(QueryBound::Armed { t: 1.0 }, || margin_row_shell(
+                1.0,
+                f32::NAN,
+                5.0
+            )),
+            Verdict::Probe
+        );
     }
 
     /// Sphere-halfspace: the same trio through the dot margin — best

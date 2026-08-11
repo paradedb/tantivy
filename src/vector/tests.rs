@@ -936,6 +936,53 @@ mod bounds_storage_tests {
         Ok(())
     }
 
+    /// Build, write, reopen: the stored per-row radii (slot `[4]`) are
+    /// bit-equal to a fresh [`residual_norm`] of every posting row
+    /// against its own cluster's stored centroid — for every metric.
+    #[test]
+    fn radii_roundtrip_per_metric() -> crate::Result<()> {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let fixture = TestVectorIndex::builder(VectorDType::F32)
+                .metric(metric)
+                .vector_storage_format(VectorStorageFormat::Ivf)
+                .build()?;
+            let field = fixture.embedding_field();
+            let dim = fixture.vector_options().dim();
+            let stride = dim * std::mem::size_of::<f32>();
+            let searcher = fixture.index.reader()?.searcher();
+            let mut ivf_segments = 0usize;
+            for segment_reader in searcher.segment_readers() {
+                let vec_reader = segment_reader.vector_index(field)?;
+                let Some(ivf) = vec_reader.index() else {
+                    continue;
+                };
+                ivf_segments += 1;
+                let radii = ivf.row_radii().expect("IVF merge writes the radii slot");
+                assert_eq!(radii.len(), ivf.num_rows());
+                let centroid_bytes = ivf.centroid_bytes()?;
+                for cluster in 0..ivf.num_clusters() {
+                    let centroid: Vec<f32> = centroid_bytes
+                        [cluster * stride..(cluster + 1) * stride]
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                        .collect();
+                    for row in ivf.cluster_range(cluster) {
+                        let row_bytes = vec_reader.vector_bytes_for_row(row)?;
+                        let expected = residual_norm::<f32>(&row_bytes, &centroid);
+                        assert_eq!(
+                            radii[row].to_bits(),
+                            expected.to_bits(),
+                            "{metric:?} cluster {cluster} row {row}: stored {} != fresh {expected}",
+                            radii[row]
+                        );
+                    }
+                }
+            }
+            assert!(ivf_segments > 0, "{metric:?}: fixture built no IVF segment");
+        }
+        Ok(())
+    }
+
     /// A clusterer with deterministic centroids for crafted-geometry
     /// builds: fixed rows when supplied, else the first
     /// `num_centroids` training samples — data-dependent, so a merge of

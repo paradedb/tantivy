@@ -35,8 +35,9 @@ pub use backend::{
     DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 pub use bounds::{
-    bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
-    BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
+    bounds_verdict, margin_ball_ball, margin_ball_halfspace, margin_row_shell, residual_norm,
+    to_bound_space, BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound,
+    Verdict,
 };
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{

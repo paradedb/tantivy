@@ -48,6 +48,12 @@ pub(crate) mod centroid_slot {
     /// Per-cluster centroid bounds. MANDATORY from V2 on: a V2 file
     /// without this slot is corrupt, not old.
     pub(crate) const BOUNDS: usize = 3;
+    /// Per-posting-row residual norms (`||x - c||` against the row's own
+    /// cluster centroid), in row order. OPTIONAL: absence disables the
+    /// row-level triangle-inequality gate, which is fail-open by
+    /// construction — a missing radius only costs pruning, never
+    /// correctness.
+    pub(crate) const RADII: usize = 4;
 }
 
 /// `.vec` composite slot indices. A different file with a different

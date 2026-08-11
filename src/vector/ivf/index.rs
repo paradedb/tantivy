@@ -20,6 +20,13 @@
 //!     rows against the stored centroid (the merge documents the
 //!     metric-uniform fold; replica spill is excluded per the stored
 //!     `bounds_scope = native`)
+//! [4] per-row radii, OPTIONAL: one f32 per posting row in row order —
+//!     ||x - c|| of the stored row against its own cluster's stored
+//!     centroid (replicas measured against the replica cell's centroid).
+//!     Non-finite residuals are stored as NaN, which fails open at the
+//!     row gate's strict compare. Absence disables the row gate — a
+//!     missing radius only costs pruning, never correctness, so this
+//!     slot rides the within-generation presence mechanism.
 //! ```
 //!
 //! Slot presence is the compatibility mechanism WITHIN a generation: the
@@ -77,6 +84,10 @@ pub struct IvfIndex {
     /// Slot `[3]`, pinned: the per-cluster bound payload,
     /// `num_centroids * bound_kind.stride(dim)` f32s in cluster order.
     bounds: Vec<f32>,
+    /// Slot `[4]`, pinned: per-row residual norms in row order (4 bytes
+    /// per posting row). `None` when the segment predates the slot — the
+    /// row gate is then disabled.
+    row_radii: Option<Vec<f32>>,
 }
 
 impl IvfIndex {
@@ -145,6 +156,22 @@ impl IvfIndex {
         Ok(())
     }
 
+    /// Write slot `[4]` of the `.centroids` composite for a field: the
+    /// per-row residual norms, one `f32` per posting row in row order.
+    ///
+    /// * `radii` (`&[f32]`) — `num_rows` values; the merge stores NaN for a non-finite residual so
+    ///   the row gate fails open on it.
+    /// * `out` (`&mut W`) — the slot writer.
+    ///
+    /// Returns (`io::Result<()>`): write errors only — the payload length
+    /// is validated at open, against the offsets of slot `[1]`.
+    pub(crate) fn serialize_radii<W: Write + ?Sized>(radii: &[f32], out: &mut W) -> io::Result<()> {
+        for value in radii {
+            value.serialize(out)?;
+        }
+        Ok(())
+    }
+
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
     /// the bounds, and the graph adjacency are materialized; the centroid
     /// rows stay behind a [`FileSlice`] for lazy per-node reads.
@@ -156,6 +183,7 @@ impl IvfIndex {
         offsets_slice: FileSlice,
         graph_slice: Option<FileSlice>,
         bounds_slice: FileSlice,
+        radii_slice: Option<FileSlice>,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
         if centroids_slice.len() < count_words {
@@ -257,7 +285,7 @@ impl IvfIndex {
             (kind, values)
         };
 
-        let index = IvfIndex {
+        let mut index = IvfIndex {
             num_centroids,
             num_docs,
             centroids_slice,
@@ -267,6 +295,7 @@ impl IvfIndex {
             graph,
             bound_kind,
             bounds,
+            row_radii: None,
         };
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt file.
@@ -276,6 +305,36 @@ impl IvfIndex {
                 "IVF doc count exceeds the posting-row total",
             )
             .into());
+        }
+        // Slot [4] (optional): per-row radii, validated against the row
+        // total the offsets define. Negative radii are corrupt (the write
+        // fold produces norms or NaN); NaN passes and fails open at the
+        // gate.
+        if let Some(slice) = radii_slice {
+            let bytes = slice.read_bytes()?;
+            let num_rows = index.num_rows();
+            let expected = num_rows.checked_mul(mem::size_of::<f32>()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "radii byte length overflow")
+            })?;
+            if bytes.len() != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IVF radii byte length mismatch",
+                )
+                .into());
+            }
+            let mut reader = bytes.as_slice();
+            let radii: Vec<f32> = (0..num_rows)
+                .map(|_| f32::deserialize(&mut reader))
+                .collect::<io::Result<_>>()?;
+            if radii.iter().any(|&value| value < 0.0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IVF radii slot holds a negative radius",
+                )
+                .into());
+            }
+            index.row_radii = Some(radii);
         }
         Ok(index)
     }
@@ -317,6 +376,16 @@ impl IvfIndex {
     #[inline]
     pub fn bounds(&self) -> BoundStore<'_> {
         BoundStore::new(self.bound_kind, &self.bounds)
+    }
+
+    /// Per-row residual norms in row order (slot `[4]`), indexed by the
+    /// same dense row ids as the `.vec` rows.
+    ///
+    /// Returns (`Option<&[f32]>`): `None` when the segment predates the
+    /// slot — the row-level triangle-inequality gate is then disabled.
+    #[inline]
+    pub fn row_radii(&self) -> Option<&[f32]> {
+        self.row_radii.as_deref()
     }
 
     /// Per-cluster posting-list sizes, in cluster order — memberships, like

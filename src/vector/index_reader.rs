@@ -137,11 +137,14 @@ impl VectorIndexReader {
                         // write side skips it for degenerate centroid
                         // counts. Slot [3] (bounds) does not — a V2 file
                         // without it is corrupt, not old.
+                        // Slot [4] (per-row radii) is likewise optional:
+                        // absence disables the row gate, never errors.
                         (Some(centroids), Some(offsets), Some(bounds)) => Some((
                             centroids,
                             offsets,
                             composite.open_read_with_idx(field, centroid_slot::GRAPH),
                             bounds,
+                            composite.open_read_with_idx(field, centroid_slot::RADII),
                         )),
                         (Some(_), Some(_), None) => {
                             return Err(TantivyError::InternalError(format!(
@@ -160,9 +163,9 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((centroids, offsets, graph, bounds))) => {
-                Some(IvfIndex::open(&options, centroids, offsets, graph, bounds)?)
-            }
+            (IdMap::Explicit(_), Some((centroids, offsets, graph, bounds, radii))) => Some(
+                IvfIndex::open(&options, centroids, offsets, graph, bounds, radii)?,
+            ),
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
                     "vector field {:?} has cluster-sorted rows but no `.centroids` data",

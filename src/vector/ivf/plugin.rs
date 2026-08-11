@@ -185,6 +185,11 @@ fn write_empty_field_slots(
         IvfIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
         bounds_w.flush()?;
     }
+    {
+        let radii_w = centroids_write.for_field_with_idx(field, centroid_slot::RADII);
+        IvfIndex::serialize_radii(&[], radii_w)?;
+        radii_w.flush()?;
+    }
     Ok(())
 }
 
@@ -590,6 +595,9 @@ pub(crate) fn merge_ivf(
                 // would be unsound (their centroids no longer exist), which
                 // is why no bound-combining API exists.
                 let mut bounds_builder = BoundsBuilder::new(num_centroids);
+                // Slot [4] accumulator: one residual per posting row, in
+                // the cluster-sorted row order the write loop below walks.
+                let mut row_radii: Vec<f32> = Vec::new();
                 // The scope captured in the stored settings at build.
                 // `native` — fold primary assignments only — is the only
                 // variant; a future scope must decide its fold here.
@@ -643,6 +651,7 @@ pub(crate) fn merge_ivf(
                     const CANCEL_POLL_ROWS: usize = 4096;
                     let rows_w = vec_write.for_field_with_idx(field, vec_slot::ROWS);
                     let needs_norm = opts.needs_normalization();
+                    row_radii.reserve(assigned_vectors.len());
                     let mut row_buf: Vec<u8> = Vec::with_capacity(opts.bytes_per_vector());
                     for (row_idx, assigned_vector) in assigned_vectors.iter().enumerate() {
                         if row_idx % CANCEL_POLL_ROWS == 0 && ctx.cancel.wants_cancel() {
@@ -690,23 +699,30 @@ pub(crate) fn merge_ivf(
                             &bytes
                         };
                         rows_w.write_all(written_bytes)?;
+                        if assigned_vector.cluster != current_cluster {
+                            current_cluster = assigned_vector.cluster;
+                            current_centroid = decode_row::<f32>(
+                                &centroid_bytes[current_cluster * centroid_stride..]
+                                    [..centroid_stride],
+                                opts.dim(),
+                            )?;
+                        }
+                        let row_residual = residual(written_bytes, &current_centroid);
+                        // Slot [4]: every posting row's residual against its
+                        // own cell's centroid, replicas included. Non-finite
+                        // becomes NaN so the row gate's strict compare fails
+                        // open (+inf would prune everything).
+                        row_radii.push(if row_residual.is_finite() {
+                            row_residual
+                        } else {
+                            f32::NAN
+                        });
                         // P1: the bounds fold — NATIVE rows only, the exact
                         // bytes written above against the stored centroid.
                         // A non-finite row residual saturates its cluster
                         // inside `add_native`.
                         if assigned_vector.native {
-                            if assigned_vector.cluster != current_cluster {
-                                current_cluster = assigned_vector.cluster;
-                                current_centroid = decode_row::<f32>(
-                                    &centroid_bytes[current_cluster * centroid_stride..]
-                                        [..centroid_stride],
-                                    opts.dim(),
-                                )?;
-                            }
-                            bounds_builder.add_native(
-                                assigned_vector.cluster,
-                                residual(written_bytes, &current_centroid),
-                            );
+                            bounds_builder.add_native(assigned_vector.cluster, row_residual);
                         }
                     }
                     rows_w.flush()?;
@@ -741,6 +757,14 @@ pub(crate) fn merge_ivf(
                         bounds_w,
                     )?;
                     bounds_w.flush()?;
+                }
+                // `.centroids` slot [4]: the per-row radii the posting
+                // write measured.
+                {
+                    debug_assert_eq!(row_radii.len(), assigned_vectors.len());
+                    let radii_w = centroids_write.for_field_with_idx(field, centroid_slot::RADII);
+                    IvfIndex::serialize_radii(&row_radii, radii_w)?;
+                    radii_w.flush()?;
                 }
 
                 // `.centroids` slot [2]: the RNG over the centroids, so a query
