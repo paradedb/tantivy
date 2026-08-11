@@ -11,20 +11,28 @@
 //! so a per-row estimate of `cos = <u, s>` with a conservative error
 //! bound yields a certified-probabilistic lower bound on the distance.
 //! Stored per row: the SIGN BITS of the rotated direction (`dim/8`
-//! bytes) plus `a = <s, s_hat>` (u16 fixed-point, rounded DOWN so the
-//! decoded interval `[a, a + ULP]` brackets the true value). The
-//! estimator is `z_hat = <s_hat, u> / a` — unbiased over the rotation —
-//! with error concentrating at
+//! bytes), `a = <s, s_hat>` (u16 fixed-point, rounded DOWN so the
+//! decoded interval brackets the true value), and `b = <s_hat, Rc>`
+//! (u16 fixed-point) — the per-row constant that makes the query side
+//! ONE global rotation + quantization:
 //!
 //! ```text
-//! eps = t * sqrt((1 - a^2)/(d - 1) + ||u - u_hat||^2 / d) / a
+//! <s_hat, u> = <s_hat, R(q - c)> / d_c = (<s_hat, Rq> - b) / d_c
 //! ```
 //!
-//! where the second variance term is the query-side `B_q`-bit
-//! quantization dither (`||u - u_hat||` is computed EXACTLY once per
-//! probed cluster, so nothing about the query side is estimated). The
-//! failure probability per gate decision is the sub-Gaussian tail at
-//! `t`; [`SKETCH_T`] fixes the budget.
+//! The bound uses the exact decomposition `s = a * s_hat + e`
+//! (`e` orthogonal to `s_hat`, `||e|| = sqrt(1 - a^2)`):
+//!
+//! ```text
+//! cos = a * <u, s_hat> + <u, e>
+//! cos_up = a * v_up + t * sqrt((1 - a^2)/(d - 1))
+//! ```
+//!
+//! where `v_up` folds the kernel numerator, the stored-b decode step,
+//! and the query-quantization dither (whose rounding-error vector is
+//! uncorrelated with any row's sign pattern, so it concentrates like
+//! the code-side term). The failure probability per gate decision is
+//! the sub-Gaussian tail at `t`; [`SKETCH_T`] fixes the budget.
 //!
 //! Everything is fail-open: a degenerate `a` (zero residual, corrupt
 //! metadata) blows up `eps`, the upper bound clamps to 1, and the gate's
@@ -52,9 +60,11 @@ pub const SKETCH_T: f32 = 4.5;
 /// concentration.
 const ROTATION_ROUNDS: usize = 3;
 
-/// Query-side scalar quantization width, in bits. 4 keeps the dither
-/// variance term negligible against the code-side concentration term.
-const QUERY_BITS: u32 = 4;
+/// Query-side scalar quantization width, in bits. The query is
+/// quantized ONCE globally (not per cluster-residual), so the grid is
+/// finer: 6 bits keeps the dither term negligible against the code-side
+/// concentration term.
+const QUERY_BITS: u32 = 6;
 const QUERY_LEVELS: u32 = (1 << QUERY_BITS) - 1;
 
 /// Deterministic splitmix64 — the sign diagonals must reproduce across
@@ -145,8 +155,8 @@ fn fwht(v: &mut [f32]) {
 // Build side
 // ======================================================================
 
-/// One row's sketch: the rotated direction's sign bits and the
-/// fixed-point `a`.
+/// One row's sketch: the rotated direction's sign bits, the fixed-point
+/// `a`, and the fixed-point centroid projection `b`.
 pub struct EncodedRow {
     /// `dim / 8` bytes, bit `i` = 1 iff rotated coordinate `i` is
     /// non-negative.
@@ -154,6 +164,29 @@ pub struct EncodedRow {
     /// `a = <s_rot, s_hat>` in u16 fixed-point over [0, 1], rounded
     /// DOWN. `0` = degenerate (zero/non-finite residual): fail-open.
     pub a: u16,
+    /// `b = <s_hat, R c>` in u16 fixed-point over [-B_RANGE, B_RANGE].
+    /// The per-row constant that turns the query side into ONE global
+    /// rotation + quantization: `<s_hat, R(q - c)> = <s_hat, Rq> - b`.
+    pub b: u16,
+}
+
+/// Fixed-point range of the stored `b`: `|<s_hat, Rc>| <= ||c||`, and
+/// stored centroids are unit for cosine and O(1) for realistic L2
+/// embeddings. Values outside the range saturate, which only loosens
+/// the bound (the decode interval still brackets the clamped truth
+/// conservatively via [`B_ULP`] + the clamp check below).
+const B_RANGE: f32 = 4.0;
+/// One decode step of the stored `b`.
+pub(crate) const B_ULP: f32 = 2.0 * B_RANGE / u16::MAX as f32;
+
+fn encode_b(b: f64) -> u16 {
+    (((b as f32).clamp(-B_RANGE, B_RANGE) + B_RANGE) / (2.0 * B_RANGE) * u16::MAX as f32).round()
+        as u16
+}
+
+#[inline]
+pub(crate) fn decode_b(code: u16) -> f32 {
+    code as f32 / u16::MAX as f32 * (2.0 * B_RANGE) - B_RANGE
 }
 
 /// Encodes one row's residual against its cluster centroid.
@@ -161,11 +194,17 @@ pub struct EncodedRow {
 /// * `rotation` (`&Rotation`) — the segment's shared rotation.
 /// * `residual` (`&mut [f32]`) — `x - c` in the ORIGINAL basis; consumed as scratch (rotated in
 ///   place). Need not be pre-normalized: the norm is divided out here.
+/// * `rotated_centroid` (`&[f32]`) — `R c`, the row's cluster centroid in the ROTATED basis (rotate
+///   once per cluster at build).
 ///
-/// Returns (`EncodedRow`): the packed sign code and conservative `a`.
-/// A zero or non-finite residual encodes as `a = 0`, which the query
-/// side treats as "no directional information" (fail-open).
-pub fn encode_row(rotation: &Rotation, residual: &mut [f32]) -> EncodedRow {
+/// Returns (`EncodedRow`): the packed sign code and conservative `a`,
+/// `b`. A zero or non-finite residual encodes as `a = 0`, which the
+/// query side treats as "no directional information" (fail-open).
+pub fn encode_row(
+    rotation: &Rotation,
+    residual: &mut [f32],
+    rotated_centroid: &[f32],
+) -> EncodedRow {
     let dim = residual.len();
     let norm = residual
         .iter()
@@ -174,25 +213,46 @@ pub fn encode_row(rotation: &Rotation, residual: &mut [f32]) -> EncodedRow {
         .sqrt();
     let mut code = vec![0u8; dim / 8];
     if !(norm.is_finite() && norm > 0.0) {
-        return EncodedRow { code, a: 0 };
+        return EncodedRow {
+            code,
+            a: 0,
+            b: encode_b(0.0),
+        };
     }
     rotation.apply(residual);
     // a = <s, sign(s)>/sqrt(dim) = ||s||_1 / (||s||_2 * sqrt(dim)).
+    // b = <sign(s), Rc>/sqrt(dim).
     let mut l1 = 0.0f64;
+    let mut b_acc = 0.0f64;
     for (i, &value) in residual.iter().enumerate() {
+        let ci = rotated_centroid[i] as f64;
         if value >= 0.0 {
             code[i / 8] |= 1 << (i % 8);
+            b_acc += ci;
+        } else {
+            b_acc -= ci;
         }
         l1 += value.abs() as f64;
     }
     let a = l1 / (norm * (dim as f64).sqrt());
-    if !a.is_finite() {
-        return EncodedRow { code, a: 0 };
+    let b = b_acc / (dim as f64).sqrt();
+    if !a.is_finite() || !b.is_finite() || b.abs() > B_RANGE as f64 {
+        // An out-of-range b cannot be bracketed by the fixed-point
+        // interval; drop the row's sketch instead of mis-bounding it.
+        return EncodedRow {
+            code,
+            a: 0,
+            b: encode_b(0.0),
+        };
     }
     // Round DOWN so the decoded interval [a_lo, a_lo + ULP] brackets the
     // true value; clamp to the representable range.
     let a_fixed = (a.clamp(0.0, 1.0) * u16::MAX as f64).floor() as u16;
-    EncodedRow { code, a: a_fixed }
+    EncodedRow {
+        code,
+        a: a_fixed,
+        b: encode_b(b),
+    }
 }
 
 // ======================================================================
@@ -217,13 +277,18 @@ pub(crate) fn serialize_sketches<W: Write + ?Sized>(
     seed: u64,
     codes: &[u8],
     a_values: &[u16],
+    b_values: &[u16],
     out: &mut W,
 ) -> io::Result<()> {
+    debug_assert_eq!(a_values.len(), b_values.len());
     KIND_SIGN_RABITQ.serialize(out)?;
     seed.serialize(out)?;
     out.write_all(codes)?;
     for a in a_values {
         a.serialize(out)?;
+    }
+    for b in b_values {
+        b.serialize(out)?;
     }
     Ok(())
 }
@@ -235,6 +300,8 @@ pub struct SketchStore {
     codes: common::OwnedBytes,
     /// SoA: per-row fixed-point `a`.
     a_values: Vec<u16>,
+    /// SoA: per-row fixed-point `b = <s_hat, Rc>`.
+    b_values: Vec<u16>,
     code_stride: usize,
 }
 
@@ -272,7 +339,7 @@ impl SketchStore {
         let codes_len = num_rows.checked_mul(code_stride).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "sketch codes length overflow")
         })?;
-        let expected = codes_len + num_rows * 2;
+        let expected = codes_len + num_rows * 4;
         if reader.len() != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -280,14 +347,18 @@ impl SketchStore {
             ));
         }
         let codes = bytes.slice(header..header + codes_len);
-        let mut a_reader = &bytes.as_slice()[header + codes_len..];
+        let mut tail = &bytes.as_slice()[header + codes_len..];
         let a_values: Vec<u16> = (0..num_rows)
-            .map(|_| u16::deserialize(&mut a_reader))
+            .map(|_| u16::deserialize(&mut tail))
+            .collect::<io::Result<_>>()?;
+        let b_values: Vec<u16> = (0..num_rows)
+            .map(|_| u16::deserialize(&mut tail))
             .collect::<io::Result<_>>()?;
         Ok(SketchStore {
             rotation: Rotation::new(seed, dim),
             codes,
             a_values,
+            b_values,
             code_stride,
         })
     }
@@ -308,51 +379,49 @@ impl SketchStore {
 // Query side
 // ======================================================================
 
-/// One probed cluster's prepared query: the rotated, normalized,
-/// `B_q`-bit-quantized residual direction in the bitplane layout the
-/// popcount kernel consumes, plus the EXACT dither norm.
+/// One QUERY's prepared sketch side: the rotated, `B_q`-bit-quantized
+/// query vector in the bitplane layout the popcount kernel consumes,
+/// plus the probabilistic dither bound. Built ONCE per segment-query;
+/// per probed cluster the gate only needs the routing separation `d_c`,
+/// because each row's `b = <s_hat, Rc>` was folded in at build:
+/// `<s_hat, u> = (<s_hat, Rq> - b) / d_c`.
 pub struct PreparedSketchQuery {
     /// `QUERY_BITS` bitplanes, each `dim / 64` u64 words: plane `j`
     /// holds bit `j` of every coordinate's quantized level.
     planes: Vec<u64>,
     words: usize,
-    /// Quantization grid: `u_hat_i = lo + delta * level_i`.
+    /// Quantization grid: `q_hat_i = lo + delta * level_i`.
     lo: f32,
     delta: f32,
     /// `sum(level_i)` — the kernel's constant term.
     level_sum: u32,
-    /// `||u - u_hat||^2 / dim`: the dither variance term, exact.
-    dither_var: f32,
+    /// `t * ||Rq - Rq_hat|| / sqrt(dim) + B_ULP/2`: the per-row bound on
+    /// the dither + stored-b decode error of the numerator
+    /// `<s_hat, Rq_hat> - b_hat`. The dither part is probabilistic (the
+    /// rounding-error vector is uncorrelated with any row's sign
+    /// pattern); the b part is deterministic.
+    num_err: f32,
     dim: usize,
 }
 
 impl PreparedSketchQuery {
-    /// Prepares one probed cluster's query residual.
+    /// Prepares the query side, once per segment-query.
     ///
     /// * `rotation` (`&Rotation`) — the store's rotation.
-    /// * `residual` (`&mut [f32]`) — `q - c` in the ORIGINAL basis; consumed as scratch.
+    /// * `query` (`&mut [f32]`) — the query in the ORIGINAL basis (unit-normalized upstream for
+    ///   cosine); consumed as scratch (rotated in place).
     ///
-    /// Returns (`Option<PreparedSketchQuery>`): `None` when the residual
-    /// is degenerate (zero/non-finite norm, or a flat rotated vector) —
-    /// the gate then falls back to the radius-only bound.
-    pub fn prepare(rotation: &Rotation, residual: &mut [f32]) -> Option<PreparedSketchQuery> {
-        let dim = residual.len();
-        let norm = residual
-            .iter()
-            .map(|&v| (v as f64).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        if !(norm.is_finite() && norm > 0.0) {
-            return None;
-        }
-        rotation.apply(residual);
-        let inv = (1.0 / norm) as f32;
+    /// Returns (`Option<PreparedSketchQuery>`): `None` when the query is
+    /// degenerate (non-finite, or a flat rotated vector) — the gate then
+    /// falls back to the radius-only bound.
+    pub fn prepare(rotation: &Rotation, query: &mut [f32]) -> Option<PreparedSketchQuery> {
+        let dim = query.len();
+        rotation.apply(query);
         let mut lo = f32::INFINITY;
         let mut hi = f32::NEG_INFINITY;
-        for value in residual.iter_mut() {
-            *value *= inv;
-            lo = lo.min(*value);
-            hi = hi.max(*value);
+        for &value in query.iter() {
+            lo = lo.min(value);
+            hi = hi.max(value);
         }
         if !(lo.is_finite() && hi.is_finite()) || hi <= lo {
             return None;
@@ -361,25 +430,26 @@ impl PreparedSketchQuery {
         let words = dim / 64;
         let mut planes = vec![0u64; QUERY_BITS as usize * words];
         let mut level_sum = 0u32;
-        let mut dither = 0.0f64;
-        for (i, &value) in residual.iter().enumerate() {
+        let mut dither2 = 0.0f64;
+        for (i, &value) in query.iter().enumerate() {
             let level = (((value - lo) / delta).round() as u32).min(QUERY_LEVELS);
             level_sum += level;
             let decoded = lo + delta * level as f32;
-            dither += ((value - decoded) as f64).powi(2);
+            dither2 += ((value - decoded) as f64).powi(2);
             for j in 0..QUERY_BITS as usize {
                 if level >> j & 1 == 1 {
                     planes[j * words + i / 64] |= 1 << (i % 64);
                 }
             }
         }
+        let num_err = SKETCH_T * (dither2.sqrt() as f32) / (dim as f32).sqrt() + B_ULP / 2.0;
         Some(PreparedSketchQuery {
             planes,
             words,
             lo,
             delta,
             level_sum,
-            dither_var: (dither / dim as f64) as f32,
+            num_err,
             dim,
         })
     }
@@ -407,29 +477,39 @@ impl PreparedSketchQuery {
         (signed_lo + signed_lv) / (self.dim as f32).sqrt()
     }
 
-    /// Conservative upper bound on `cos = <u, s>` for one row.
+    /// Conservative upper bound on `cos = <u, s>` for one row, with
+    /// `u = (q - c)/d_c` and `s` the row's unit residual direction.
+    ///
+    /// Identity form: `s = a * s_hat + e` (with `e` orthogonal to
+    /// `s_hat`, `||e|| = sqrt(1 - a^2)`) gives EXACTLY
+    /// `cos = a * <u, s_hat> + <u, e>`; `<u, s_hat>` is computed to
+    /// within `num_err / d_c` from the kernel and the stored `b`, and
+    /// `<u, e>` concentrates at `sqrt((1 - a^2)/(d - 1))` over the
+    /// rotation. No division by `a` anywhere.
     ///
     /// * `store` (`&SketchStore`) — the segment's sketches.
     /// * `row` (`usize`) — dense row id.
+    /// * `d_c` (`f32`) — `||q - c||` of the row's cluster, from the routing key.
     ///
-    /// Returns (`f32`): `min(1, z_hat + eps)` with the `a` interval and
-    /// both variance terms folded in conservatively; `1.0` for rows with
-    /// no usable sketch (`a = 0`) — the radius-only bound then applies
-    /// unchanged. NaN inputs propagate to a non-pruning bound.
+    /// Returns (`f32`): the upper bound, clamped to 1; `1.0` for rows
+    /// with no usable sketch (`a = 0`) or a degenerate `d_c` — the
+    /// radius-only bound then applies unchanged. NaN inputs propagate to
+    /// a non-pruning bound.
     #[inline]
-    pub fn cos_upper_bound(&self, store: &SketchStore, row: usize) -> f32 {
+    pub fn cos_upper_bound(&self, store: &SketchStore, row: usize, d_c: f32) -> f32 {
         let a_lo = store.a_values[row] as f32 / u16::MAX as f32;
-        if a_lo <= 0.0 {
+        if a_lo <= 0.0 || !(d_c > 0.0) {
             return 1.0;
         }
         let a_hi = a_lo + 1.0 / u16::MAX as f32;
-        let raw = self.code_dot(store.code(row));
-        // z_hat = raw / a: the interval endpoint that maximizes it.
-        let z_hat = if raw >= 0.0 { raw / a_lo } else { raw / a_hi };
-        let eps = SKETCH_T
-            * ((1.0 - a_lo * a_lo).max(0.0) / (self.dim as f32 - 1.0) + self.dither_var).sqrt()
-            / a_lo;
-        (z_hat + eps).min(1.0)
+        let b_lo = decode_b(store.b_values[row]) - B_ULP / 2.0;
+        let num_up = self.code_dot(store.code(row)) - b_lo + self.num_err;
+        // <u, s_hat> upper endpoint; |<u, s_hat>| <= 1 always.
+        let v_up = (num_up / d_c).clamp(-1.0, 1.0);
+        // a * v_up maximized over the a interval, by v_up's sign.
+        let a_pick = if v_up >= 0.0 { a_hi } else { a_lo };
+        let conc = SKETCH_T * ((1.0 - a_lo * a_lo).max(0.0) / (self.dim as f32 - 1.0)).sqrt();
+        (a_pick * v_up + conc).min(1.0)
     }
 }
 
@@ -492,11 +572,10 @@ mod tests {
         let mut state = 11u64;
         for _ in 0..10 {
             let mut q_res = lcg_vec(&mut state, dim);
-            let mut x_res = lcg_vec(&mut state, dim);
-            let encoded = encode_row(&rot, &mut x_res.clone());
+            let x_res = lcg_vec(&mut state, dim);
+            let encoded = encode_row(&rot, &mut x_res.clone(), &vec![0.0; dim]);
             let prepared = PreparedSketchQuery::prepare(&rot, &mut q_res).unwrap();
             // Float reference: rebuild s_hat and u_hat by hand.
-            rot.apply(&mut x_res);
             let s_hat: Vec<f32> = (0..dim)
                 .map(|i| {
                     let bit = encoded.code[i / 8] >> (i % 8) & 1;
@@ -529,43 +608,51 @@ mod tests {
         }
     }
 
-    /// The estimator concentrates: over random directions, the true cos
-    /// stays within the conservative bound and the bound stays useful
-    /// (well below 1 for uncorrelated pairs).
+    /// The estimator concentrates: over random cluster geometry, the
+    /// true cos of every (query residual, row residual) pair stays
+    /// within the conservative bound and the bound stays useful (well
+    /// below 1 for uncorrelated pairs).
     #[test]
     fn estimator_bounds_hold() {
         let dim = 1024;
         let rot = Rotation::new(21, dim);
-        let store = {
-            let mut state = 5u64;
-            let mut codes = Vec::new();
-            let mut a_values = Vec::new();
-            let mut residuals = Vec::new();
-            for _ in 0..200 {
-                let x = lcg_vec(&mut state, dim);
-                let encoded = encode_row(&rot, &mut x.clone());
-                codes.extend_from_slice(&encoded.code);
-                a_values.push(encoded.a);
-                residuals.push(x);
-            }
-            let mut buf = Vec::new();
-            serialize_sketches(21, &codes, &a_values, &mut buf).unwrap();
-            (
-                SketchStore::open(common::OwnedBytes::new(buf), dim, 200).unwrap(),
-                residuals,
-            )
-        };
-        let (store, residuals) = store;
+        let mut state = 5u64;
+        // One cluster centroid; rows are centroid + residual.
+        let centroid = lcg_vec(&mut state, dim);
+        let mut rotated_centroid = centroid.clone();
+        rot.apply(&mut rotated_centroid);
+        let mut codes = Vec::new();
+        let mut a_values = Vec::new();
+        let mut b_values = Vec::new();
+        let mut residuals = Vec::new();
+        for _ in 0..200 {
+            let x = lcg_vec(&mut state, dim);
+            let encoded = encode_row(&rot, &mut x.clone(), &rotated_centroid);
+            codes.extend_from_slice(&encoded.code);
+            a_values.push(encoded.a);
+            b_values.push(encoded.b);
+            residuals.push(x);
+        }
+        let mut buf = Vec::new();
+        serialize_sketches(21, &codes, &a_values, &b_values, &mut buf).unwrap();
+        let store = SketchStore::open(common::OwnedBytes::new(buf), dim, 200).unwrap();
+
         let mut state = 77u64;
         let mut below_one = 0usize;
         for _ in 0..5 {
-            let mut q = lcg_vec(&mut state, dim);
-            let q_unrot = q.clone();
-            let prepared = PreparedSketchQuery::prepare(&rot, &mut q).unwrap();
-            let qn = norm(&q_unrot);
+            // The query lives in the original basis; its residual
+            // against the centroid defines u and d_c.
+            let q: Vec<f32> = lcg_vec(&mut state, dim)
+                .iter()
+                .zip(&centroid)
+                .map(|(&r, &c)| c + r)
+                .collect();
+            let q_res: Vec<f32> = q.iter().zip(&centroid).map(|(&qi, &ci)| qi - ci).collect();
+            let d_c = norm(&q_res);
+            let prepared = PreparedSketchQuery::prepare(&rot, &mut q.clone()).unwrap();
             for (row, x) in residuals.iter().enumerate() {
-                let true_cos = dot(&q_unrot, x) / (qn * norm(x));
-                let bound = prepared.cos_upper_bound(&store, row);
+                let true_cos = dot(&q_res, x) / (d_c * norm(x));
+                let bound = prepared.cos_upper_bound(&store, row, d_c);
                 assert!(
                     bound >= true_cos - 1e-4,
                     "row {row}: bound {bound} below true cos {true_cos}"
@@ -588,18 +675,23 @@ mod tests {
     fn degenerate_inputs_fail_open() {
         let dim = 128;
         let rot = Rotation::new(4, dim);
-        let encoded = encode_row(&rot, &mut vec![0.0; dim]);
+        let zero_c = vec![0.0; dim];
+        let encoded = encode_row(&rot, &mut vec![0.0; dim], &zero_c);
         assert_eq!(encoded.a, 0);
-        let nan = encode_row(&rot, &mut vec![f32::NAN; dim]);
+        let nan = encode_row(&rot, &mut vec![f32::NAN; dim], &zero_c);
         assert_eq!(nan.a, 0);
+        // A flat (all-equal after rotation: all-zero) query refuses to
+        // prepare.
         assert!(PreparedSketchQuery::prepare(&rot, &mut vec![0.0; dim]).is_none());
 
         let mut buf = Vec::new();
-        serialize_sketches(4, &encoded.code, &[encoded.a], &mut buf).unwrap();
+        serialize_sketches(4, &encoded.code, &[encoded.a], &[encoded.b], &mut buf).unwrap();
         let store = SketchStore::open(common::OwnedBytes::new(buf), dim, 1).unwrap();
         let mut q = vec![1.0; dim];
         let prepared = PreparedSketchQuery::prepare(&rot, &mut q).unwrap();
-        assert_eq!(prepared.cos_upper_bound(&store, 0), 1.0);
+        assert_eq!(prepared.cos_upper_bound(&store, 0, 1.0), 1.0);
+        // Degenerate separation also fails open.
+        assert_eq!(prepared.cos_upper_bound(&store, 0, 0.0), 1.0);
     }
 
     /// Slot round-trip and the corrupt-length rejections.
@@ -608,9 +700,9 @@ mod tests {
         let dim = 64;
         let rot = Rotation::new(1, dim);
         let mut residual: Vec<f32> = (0..dim).map(|i| i as f32 - 31.5).collect();
-        let encoded = encode_row(&rot, &mut residual);
+        let encoded = encode_row(&rot, &mut residual, &vec![0.25; dim]);
         let mut buf = Vec::new();
-        serialize_sketches(1, &encoded.code, &[encoded.a], &mut buf).unwrap();
+        serialize_sketches(1, &encoded.code, &[encoded.a], &[encoded.b], &mut buf).unwrap();
         assert!(SketchStore::open(common::OwnedBytes::new(buf.clone()), dim, 1).is_ok());
         assert!(SketchStore::open(common::OwnedBytes::new(buf.clone()), dim, 2).is_err());
         let mut bad_kind = buf.clone();

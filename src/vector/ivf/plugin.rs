@@ -609,7 +609,10 @@ pub(crate) fn merge_ivf(
                 .then(|| Rotation::new(SKETCH_SEED, opts.dim()));
                 let mut sketch_codes: Vec<u8> = Vec::new();
                 let mut sketch_a: Vec<u16> = Vec::new();
+                let mut sketch_b: Vec<u16> = Vec::new();
                 let mut sketch_scratch: Vec<f32> = Vec::new();
+                let mut rotated_centroid: Vec<f32> = Vec::new();
+                let mut rotated_cluster = usize::MAX;
                 // The scope captured in the stored settings at build.
                 // `native` — fold primary assignments only — is the only
                 // variant; a future scope must decide its fold here.
@@ -723,6 +726,12 @@ pub(crate) fn merge_ivf(
                         // Slot [5]: sign-encode the residual DIRECTION of
                         // the exact bytes written above.
                         if let Some(rotation) = &sketch_rotation {
+                            if rotated_cluster != current_cluster {
+                                rotated_cluster = current_cluster;
+                                rotated_centroid.clear();
+                                rotated_centroid.extend_from_slice(&current_centroid);
+                                rotation.apply(&mut rotated_centroid);
+                            }
                             sketch_scratch.clear();
                             sketch_scratch.extend(
                                 decode_row::<f32>(written_bytes, opts.dim())?
@@ -730,9 +739,11 @@ pub(crate) fn merge_ivf(
                                     .zip(&current_centroid)
                                     .map(|(&xi, &ci)| xi - ci),
                             );
-                            let encoded = encode_row(rotation, &mut sketch_scratch);
+                            let encoded =
+                                encode_row(rotation, &mut sketch_scratch, &rotated_centroid);
                             sketch_codes.extend_from_slice(&encoded.code);
                             sketch_a.push(encoded.a);
+                            sketch_b.push(encoded.b);
                         }
                         // Slot [4]: every posting row's residual against its
                         // own cell's centroid, replicas included. Non-finite
@@ -797,7 +808,13 @@ pub(crate) fn merge_ivf(
                 if sketch_rotation.is_some() {
                     debug_assert_eq!(sketch_a.len(), assigned_vectors.len());
                     let sketch_w = centroids_write.for_field_with_idx(field, centroid_slot::SKETCH);
-                    rabitq::serialize_sketches(SKETCH_SEED, &sketch_codes, &sketch_a, sketch_w)?;
+                    rabitq::serialize_sketches(
+                        SKETCH_SEED,
+                        &sketch_codes,
+                        &sketch_a,
+                        &sketch_b,
+                        sketch_w,
+                    )?;
                     sketch_w.flush()?;
                 }
 

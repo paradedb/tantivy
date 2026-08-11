@@ -664,11 +664,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut pruned_radius = 0usize;
         let mut radius_gate_rows = 0usize;
         let mut sketch_rows = 0usize;
-        let mut sketch_prepare_nanos = 0u64;
         let mut sketch_gate_nanos = 0u64;
-        // Scratch for the per-cluster query residual `q - c`; reused
-        // across clusters.
-        let mut sketch_residual: Vec<f32> = Vec::new();
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut bounds_skips = 0u32;
@@ -683,6 +679,29 @@ impl<T: VectorElement> VectorBackend<T> {
         let q_norm = norm_squared_wide(self.query.query()).sqrt() as f32;
         let bounds = index.bounds();
         let row_radii = index.row_radii();
+        // The sketch query side: ONE rotation + quantization per
+        // segment-query. Each row's centroid projection b was folded in
+        // at build, so probed clusters need no per-cluster preparation.
+        let mut sketch_prepare_nanos = 0u64;
+        let sketch_query = match (index.sketches(), metric) {
+            (Some(store), Metric::L2 | Metric::Cosine) => {
+                let prepare_start = std::time::Instant::now();
+                let mut q_buf: Vec<f32> = match metric {
+                    Metric::Cosine if q_norm.is_finite() && q_norm > 0.0 => {
+                        routing_query.iter().map(|&v| v / q_norm).collect()
+                    }
+                    Metric::Cosine => Vec::new(),
+                    _ => routing_query.to_vec(),
+                };
+                let prepared = (!q_buf.is_empty())
+                    .then(|| PreparedSketchQuery::prepare(store.rotation(), &mut q_buf))
+                    .flatten()
+                    .map(|prepared| (store, prepared));
+                sketch_prepare_nanos += prepare_start.elapsed().as_nanos() as u64;
+                prepared
+            }
+            _ => None,
+        };
         // Replication can place the same doc in several probed clusters; dedup
         // by doc id so a vector is scored at most once.
         let mut seen = BitSet::with_max_value(max_doc);
@@ -798,31 +817,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 postings_skipped += 1;
             } else {
                 postings_row += 1;
-                // The sketch tightener: rotate + quantize this cluster's
-                // query residual, once, and only when there are rows to
-                // gate. `sketch_query` is `None` whenever the gate
-                // should fall back to radius-only.
-                let sketch_query = match (&row_gate, index.sketches(), metric) {
-                    (Some(_), Some(store), Metric::L2 | Metric::Cosine) => {
-                        let prepare_start = std::time::Instant::now();
-                        let prepared = self
-                            .cluster_query_residual(
-                                index,
-                                cluster,
-                                routing_query,
-                                q_norm,
-                                &mut sketch_residual,
-                            )?
-                            .then(|| {
-                                PreparedSketchQuery::prepare(store.rotation(), &mut sketch_residual)
-                            })
-                            .flatten()
-                            .map(|prepared| (store, prepared));
-                        sketch_prepare_nanos += prepare_start.elapsed().as_nanos() as u64;
-                        prepared
-                    }
-                    _ => None,
-                };
+
                 // Gate pass over the pinned metadata (radii + sketch
                 // codes), separate from the fetch pass below so the
                 // popcount loop streams the SoA arrays and its cost is
@@ -836,7 +831,7 @@ impl<T: VectorElement> VectorBackend<T> {
                             let t2 = t * t;
                             survivors.retain(|&Survivor { row, .. }| {
                                 let r = radii[row];
-                                let cos_up = prepared.cos_upper_bound(store, row);
+                                let cos_up = prepared.cos_upper_bound(store, row, key);
                                 let lb2 = key * key + r * r - 2.0 * key * r * cos_up;
                                 // Strict: prune only on lb^2 > t^2; NaN
                                 // compares false and keeps the row.
@@ -913,40 +908,6 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.work_charged += work_spent.to_f32();
 
         Ok(topn)
-    }
-
-    /// Fills `out` with this cluster's query residual `q - c` in the
-    /// ORIGINAL basis — the sketch gate's input. For cosine the query is
-    /// unit-normalized first so the residual lives in the same chord
-    /// geometry as the stored radii and the armed threshold.
-    /// Returns `Ok(false)` (gate falls back to radius-only) when the
-    /// query norm is degenerate.
-    fn cluster_query_residual(
-        &self,
-        index: &IvfIndex,
-        cluster: usize,
-        routing_query: &[f32],
-        q_norm: f32,
-        out: &mut Vec<f32>,
-    ) -> crate::Result<bool> {
-        let inv_q = match self.query.metric() {
-            Metric::Cosine => {
-                if !(q_norm.is_finite() && q_norm > 0.0) {
-                    return Ok(false);
-                }
-                1.0 / q_norm
-            }
-            _ => 1.0,
-        };
-        let centroid = index.centroid_values(cluster)?;
-        out.clear();
-        out.extend(
-            routing_query
-                .iter()
-                .zip(&centroid)
-                .map(|(&qi, &ci)| qi * inv_q - ci),
-        );
-        Ok(true)
     }
 
     /// Phase 2 pre-pass: run one cluster's rows through the
