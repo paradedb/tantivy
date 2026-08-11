@@ -294,11 +294,18 @@ pub(crate) fn serialize_sketches<W: Write + ?Sized>(
     debug_assert_eq!(a_values.len(), b_values.len());
     KIND_SIGN_RABITQ.serialize(out)?;
     seed.serialize(out)?;
-    out.write_all(codes)?;
-    for a in a_values {
+    // Interleaved rows: [code][a][b] per row, so one probed cluster is
+    // ONE contiguous ranged read. The gate always consumes all three
+    // together; parallel arrays would cost a read per array per cluster
+    // for zero benefit.
+    let code_stride = if a_values.is_empty() {
+        0
+    } else {
+        codes.len() / a_values.len()
+    };
+    for (i, (a, b)) in a_values.iter().zip(b_values).enumerate() {
+        out.write_all(&codes[i * code_stride..(i + 1) * code_stride])?;
         a.serialize(out)?;
-    }
-    for b in b_values {
         b.serialize(out)?;
     }
     Ok(())
@@ -312,46 +319,42 @@ pub(crate) fn serialize_sketches<W: Write + ?Sized>(
 /// slot-wide materialization would be paid every time.
 pub struct SketchStore {
     rotation: Rotation,
-    /// SoA: all sign codes, `code_stride` bytes each.
-    codes: FileSlice,
-    /// SoA: per-row fixed-point `a` (u16 LE).
-    a_values: FileSlice,
-    /// SoA: per-row fixed-point `b = <s_hat, Rc>` (u16 LE).
-    b_values: FileSlice,
+    /// Interleaved `[code][a][b]` rows, `row_stride` bytes each.
+    rows: FileSlice,
+    row_stride: usize,
     code_stride: usize,
 }
 
-/// One probed cluster's sketch rows, fetched with three contiguous
-/// ranged reads; row indices are relative to the cluster's first row.
+/// One probed cluster's sketch rows — ONE contiguous ranged read; row
+/// indices are relative to the cluster's first row.
 pub struct SketchClusterView {
-    codes: OwnedBytes,
-    a_values: OwnedBytes,
-    b_values: OwnedBytes,
+    rows: OwnedBytes,
+    row_stride: usize,
     code_stride: usize,
 }
 
 impl SketchClusterView {
+    /// The fetched payload size, for the caller's I/O accounting.
+    pub fn len_bytes(&self) -> usize {
+        self.rows.len()
+    }
+
     #[inline]
     fn code(&self, offset: usize) -> &[u8] {
-        &self.codes[offset * self.code_stride..(offset + 1) * self.code_stride]
+        let start = offset * self.row_stride;
+        &self.rows[start..start + self.code_stride]
     }
 
     #[inline]
     fn a(&self, offset: usize) -> u16 {
-        u16::from_le_bytes(
-            self.a_values[offset * 2..offset * 2 + 2]
-                .try_into()
-                .unwrap(),
-        )
+        let at = offset * self.row_stride + self.code_stride;
+        u16::from_le_bytes(self.rows[at..at + 2].try_into().unwrap())
     }
 
     #[inline]
     fn b(&self, offset: usize) -> u16 {
-        u16::from_le_bytes(
-            self.b_values[offset * 2..offset * 2 + 2]
-                .try_into()
-                .unwrap(),
-        )
+        let at = offset * self.row_stride + self.code_stride + 2;
+        u16::from_le_bytes(self.rows[at..at + 2].try_into().unwrap())
     }
 }
 
@@ -392,21 +395,20 @@ impl SketchStore {
             ));
         }
         let code_stride = dim / 8;
-        let codes_len = num_rows.checked_mul(code_stride).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "sketch codes length overflow")
+        let row_stride = code_stride + 4;
+        let rows_len = num_rows.checked_mul(row_stride).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "sketch rows length overflow")
         })?;
-        if slot.len() - HEADER != codes_len + num_rows * 4 {
+        if slot.len() - HEADER != rows_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "sketch slot byte length mismatch",
             ));
         }
-        let body = slot.slice_from(HEADER);
         Ok(SketchStore {
             rotation: Rotation::new(seed, dim),
-            codes: body.slice_to(codes_len),
-            a_values: body.slice(codes_len..codes_len + num_rows * 2),
-            b_values: body.slice_from(codes_len + num_rows * 2),
+            rows: slot.slice_from(HEADER),
+            row_stride,
             code_stride,
         })
     }
@@ -416,23 +418,16 @@ impl SketchStore {
         &self.rotation
     }
 
-    /// Fetches one cluster's sketch rows: three contiguous ranged reads
-    /// over `rows` (a cluster's row range in the segment-wide dense
-    /// numbering).
+    /// Fetches one cluster's sketch rows with ONE contiguous ranged
+    /// read over `rows` (a cluster's row range in the segment-wide
+    /// dense numbering).
     pub fn cluster_view(&self, rows: std::ops::Range<usize>) -> crate::Result<SketchClusterView> {
         Ok(SketchClusterView {
-            codes: self
-                .codes
-                .slice(rows.start * self.code_stride..rows.end * self.code_stride)
+            rows: self
+                .rows
+                .slice(rows.start * self.row_stride..rows.end * self.row_stride)
                 .read_bytes()?,
-            a_values: self
-                .a_values
-                .slice(rows.start * 2..rows.end * 2)
-                .read_bytes()?,
-            b_values: self
-                .b_values
-                .slice(rows.start * 2..rows.end * 2)
-                .read_bytes()?,
+            row_stride: self.row_stride,
             code_stride: self.code_stride,
         })
     }

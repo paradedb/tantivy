@@ -304,6 +304,17 @@ pub struct ProbeStats {
     /// Nanoseconds spent in the row-gate pass (popcount estimator +
     /// bound arithmetic; excludes row fetches and exact scoring).
     pub sketch_gate_nanos: u64,
+    /// Ranged reads issued for sketch cluster views (one per gated
+    /// cluster) and their total bytes — measured at the call sites, not
+    /// inferred from buffer counters.
+    pub sketch_read_calls: usize,
+    /// See [`Self::sketch_read_calls`].
+    pub sketch_bytes_read: usize,
+    /// Vector-payload row reads issued by the IVF scoring loop and
+    /// their total bytes (one stride-sized read per scored row).
+    pub payload_read_calls: usize,
+    /// See [`Self::payload_read_calls`].
+    pub payload_bytes_read: usize,
     /// Probed clusters whose surviving rows' posting bytes were fetched —
     /// one stride-sized ranged read per surviving row. Counts clusters,
     /// not rows.
@@ -665,6 +676,10 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut radius_gate_rows = 0usize;
         let mut sketch_rows = 0usize;
         let mut sketch_gate_nanos = 0u64;
+        let mut sketch_read_calls = 0usize;
+        let mut sketch_bytes_read = 0usize;
+        let mut payload_read_calls = 0usize;
+        let mut payload_bytes_read = 0usize;
         let mut postings_row = 0usize;
         let mut postings_skipped = 0usize;
         let mut bounds_skips = 0u32;
@@ -834,7 +849,12 @@ impl<T: VectorElement> VectorBackend<T> {
                     // cluster's sketch rows; row offsets are relative
                     // to the cluster's first row.
                     let sketch_view = match &sketch_query {
-                        Some((store, _)) => Some(store.cluster_view(rows.clone())?),
+                        Some((store, _)) => {
+                            let view = store.cluster_view(rows.clone())?;
+                            sketch_read_calls += 1;
+                            sketch_bytes_read += view.len_bytes();
+                            Some(view)
+                        }
                         None => None,
                     };
                     match (&sketch_query, &sketch_view) {
@@ -880,6 +900,8 @@ impl<T: VectorElement> VectorBackend<T> {
                 // `vector_bytes_for_row`).
                 for &Survivor { row, doc } in &survivors {
                     let vbytes = self.reader.vector_bytes_for_row(row)?;
+                    payload_read_calls += 1;
+                    payload_bytes_read += vbytes.len();
                     let score = self.query.score_doc_bytes(&vbytes);
                     candidates += 1;
                     if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
@@ -912,6 +934,10 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.sketch_rows += sketch_rows;
         stats.sketch_prepare_nanos += sketch_prepare_nanos;
         stats.sketch_gate_nanos += sketch_gate_nanos;
+        stats.sketch_read_calls += sketch_read_calls;
+        stats.sketch_bytes_read += sketch_bytes_read;
+        stats.payload_read_calls += payload_read_calls;
+        stats.payload_bytes_read += payload_bytes_read;
         stats.postings_row += postings_row;
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += candidates;
@@ -2719,6 +2745,10 @@ mod tests {
             sketch_rows: 6,
             sketch_prepare_nanos: 1500,
             sketch_gate_nanos: 800,
+            sketch_read_calls: 2,
+            sketch_bytes_read: 264,
+            payload_read_calls: 10,
+            payload_bytes_read: 40960,
             postings_row: 1,
             postings_skipped: 1,
             exact_rows_read: 0,
@@ -2753,6 +2783,10 @@ mod tests {
                 "sketch_rows": 6,
                 "sketch_prepare_nanos": 1500,
                 "sketch_gate_nanos": 800,
+                "sketch_read_calls": 2,
+                "sketch_bytes_read": 264,
+                "payload_read_calls": 10,
+                "payload_bytes_read": 40960,
                 "postings_row": 1,
                 "postings_skipped": 1,
                 "exact_rows_read": 0,
