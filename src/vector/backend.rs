@@ -3787,6 +3787,48 @@ mod tests {
             Ok(())
         }
 
+        /// Cosine works in chord space end to end: `t` is the kth chord,
+        /// the separation is `chord(q, c)`, and the stored radius is the
+        /// chord `||x - c_hat||` over unit rows. Unit-circle geometry,
+        /// query at angle 0, k = 1:
+        ///
+        /// Cluster A `(1,0)`: `a` at 0.1 rad — arms
+        /// `t = chord(0.1) ~= 0.09996`.
+        /// Cluster B `(0,1)` (separation `chord(90°) = sqrt(2)`):
+        /// - `b1` at 85°: radius `chord(5°) ~= 0.0872`, lower bound `|1.4142 - 0.0872| = 1.327 > t`
+        ///   — pruned;
+        /// - `b2` at 173°: radius `chord(83°) ~= 1.3252`, lower bound `|1.4142 - 1.3252| = 0.089
+        ///   <= t` — scored (and loses: its true chord is ~1.997).
+        ///
+        /// `b2` also widens B's ball to 1.3252, making the cluster margin
+        /// `(t + r) - sep ~= +0.011` — B probes, so the prune must come
+        /// from the row gate. A cosine-space units bug anywhere in the
+        /// chain fails open and turns the pruned_radius assert to 0.
+        #[test]
+        fn radius_prunes_cosine_rows() -> crate::Result<()> {
+            let unit = |deg: f32| {
+                let rad = deg.to_radians();
+                [rad.cos(), rad.sin()]
+            };
+            let centroids: Vec<[f32; 2]> = vec![unit(0.0), unit(90.0)];
+            let docs: Vec<[f32; 2]> = vec![unit(0.1_f32.to_degrees()), unit(85.0), unit(173.0)];
+            let (index, field) = single_segment_fixture(Metric::Cosine, &centroids, &docs, 1)?;
+            let (hits, stats) = run_top_n(&index, field, vec![1.0, 0.0], 1, exhaustive_params(2))?;
+
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].1.doc_id, 0, "doc a is the cosine 1-NN");
+            assert_eq!(
+                stats.clusters_probed(),
+                2,
+                "b2 widens B's ball past the cluster gate: {stats:?}"
+            );
+            assert_eq!(stats.bounds_skips, 0);
+            assert_eq!(stats.radius_gate_rows, 2, "B's two rows are gated");
+            assert_eq!(stats.pruned_radius, 1, "b1's shell excludes the query: {stats:?}");
+            assert_stats_identities(&stats);
+            Ok(())
+        }
+
         /// Dot wires the per-row radius through the halfspace margin:
         /// the row's best possible score `q.c + ||q||·r` below the kth
         /// prunes it. Long vectors near the query direction win dot; a
