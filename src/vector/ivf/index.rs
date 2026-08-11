@@ -11,9 +11,10 @@
 //! ```text
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride)
 //! [1] cluster_offsets (u64[N+1], prefix sum)
-//! [2] RNG over the centroids (see `Graph::serialize` for the layout;
-//!     absent for degenerate centroid counts — routing then falls back to a
-//!     linear scan of the centroids)
+//! [2] HNSW over the centroids (see `CentroidHnsw::serialize` for the
+//!     layout: a layer count, the base-layer `Graph` adjacency, then each
+//!     upper layer's id map and adjacency; absent for degenerate centroid
+//!     counts — routing then falls back to a linear scan of the centroids)
 //! [3] centroid bounds, REQUIRED: a segment-level BoundKind byte, then
 //!     N · stride(kind) f32s in cluster order — for Ball, one f32 per
 //!     cluster: max ||x - c|| over the cluster's NATIVE members' stored
@@ -44,8 +45,9 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use super::graph::{
     Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
+    ResumableSearchIterator, Workspace,
 };
+use super::hnsw::CentroidHnsw;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::{BoundKind, BoundStore, FileSliceArena, VectorArena};
@@ -54,7 +56,8 @@ use crate::vector::{BoundKind, BoundStore, FileSliceArena, VectorArena};
 /// contiguous row ranges of the `.vec` rows — a query should probe.
 ///
 /// Pinned state is small and touched by every query: the cluster offsets and
-/// the RNG adjacency (edges only, `num_centroids × max_edges × 4` bytes). The
+/// the HNSW adjacency (per-layer edges and id maps only, dominated by the
+/// base layer's `num_centroids × max_edges × 4` bytes). The
 /// centroid vectors stay behind a [`FileSliceArena`] and are fetched one node
 /// at a time as routing visits them. Everything row-scale (the rows and
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
@@ -69,9 +72,9 @@ pub struct IvfIndex {
     cluster_offsets: OwnedBytes,
     dim: usize,
     metric: Metric,
-    /// The persisted RNG over the centroids (slot `[2]`). `None` for
+    /// The persisted HNSW over the centroids (slot `[2]`). `None` for
     /// degenerate centroid counts, where routing falls back to a linear scan.
-    graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
+    graph: Option<CentroidHnsw<FileSliceArena<f32>>>,
     /// Slot `[3]`, pinned: the segment-level bound kind.
     bound_kind: BoundKind,
     /// Slot `[3]`, pinned: the per-cluster bound payload,
@@ -202,10 +205,10 @@ impl IvfIndex {
                 let vectors = match options.dtype() {
                     VectorDType::F32 => FileSliceArena::<f32>::new(centroids_slice.clone()),
                 };
-                // Adjacency length is validated against the arena's node
-                // count inside `Graph::open`.
+                // Per-layer adjacency lengths are validated against the
+                // arena's node count inside `CentroidHnsw::open`.
                 let adjacency = slice.read_bytes()?;
-                Some(RelativeNeighborhoodGraph::open(
+                Some(CentroidHnsw::open(
                     &adjacency,
                     vectors,
                     options.dim(),
@@ -337,14 +340,14 @@ impl IvfIndex {
     /// yielding [`Candidate`]s best routing score first (graph node `c` *is*
     /// cluster `c`, so `Candidate::node` is the cluster id).
     ///
-    /// With a persisted RNG this is a resumable beam search
-    /// ([`RelativeNeighborhoodGraph::search_iter`]): the first batch is one
-    /// converged round at the configured
-    /// [`ef`](NeighborhoodGraphConfig::ef), and pulling past it resumes the
-    /// search, so routing cost is paid only as far as probing actually
-    /// reaches. Without one every centroid is scored exactly, up front. Both
-    /// paths score through the same [`FileSliceArena`], so their rankings
-    /// agree.
+    /// With a persisted HNSW this descends the hierarchy for entry points,
+    /// then runs the base layer's resumable beam search
+    /// ([`CentroidHnsw::search_iter`]): the first batch is one converged
+    /// round at the configured [`ef`](NeighborhoodGraphConfig::ef), and
+    /// pulling past it resumes the search, so routing cost is paid only as
+    /// far as probing actually reaches. Without one every centroid is scored
+    /// exactly, up front. Both paths score through the same
+    /// [`FileSliceArena`], so their rankings agree.
     ///
     /// `ws` holds the routing search's scratch and is borrowed for the
     /// ranking's lifetime; [`ClusterRanking::metrics`] reports the cost
@@ -355,16 +358,9 @@ impl IvfIndex {
         query: &'a [f32],
     ) -> ClusterRanking<'a> {
         match &self.graph {
-            Some(graph) => {
-                // TODO: Replace with proper seed generation
-                let seeds: Vec<NodeId> = {
-                    (0..graph.len())
-                        .step_by((graph.len() / 8).max(1))
-                        .take(8)
-                        .map(|node| node as NodeId)
-                        .collect()
-                };
-                ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
+            Some(hnsw) => {
+                let (iter, descent) = hnsw.search_iter(ws, query);
+                ClusterRanking::Graph { iter, descent }
             }
             None => {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
@@ -387,9 +383,13 @@ impl IvfIndex {
 /// Lazily ranked clusters for one query, yielded best routing score first;
 /// returned by [`IvfIndex::rank_clusters`], which documents the two paths.
 pub(crate) enum ClusterRanking<'a> {
-    /// Beam-searched routing over the persisted centroid RNG; pulling past a
+    /// Beam-searched routing over the base layer of the persisted centroid
+    /// HNSW, entered via the descent whose cost is `descent`; pulling past a
     /// converged batch resumes the search.
-    Graph(ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>),
+    Graph {
+        iter: ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>,
+        descent: NeighborhoodGraphSearchMetrics,
+    },
     /// Exact fallback for graph-less segments: every centroid scored and
     /// sorted up front.
     Exact {
@@ -404,8 +404,8 @@ impl ClusterRanking<'_> {
     /// take the snapshot after the last pull.
     pub(crate) fn metrics(&self) -> IvfSearchMetrics {
         match self {
-            ClusterRanking::Graph(iter) => IvfSearchMetrics {
-                visited_count: iter.metrics().visited_count,
+            ClusterRanking::Graph { iter, descent } => IvfSearchMetrics {
+                visited_count: descent.visited_count + iter.metrics().visited_count,
                 graph: Some(iter.metrics()),
             },
             ClusterRanking::Exact { num_centroids, .. } => IvfSearchMetrics {
@@ -421,7 +421,7 @@ impl Iterator for ClusterRanking<'_> {
 
     fn next(&mut self) -> Option<Candidate> {
         match self {
-            ClusterRanking::Graph(iter) => iter.next(),
+            ClusterRanking::Graph { iter, .. } => iter.next(),
             ClusterRanking::Exact { ranked, .. } => ranked.next(),
         }
     }

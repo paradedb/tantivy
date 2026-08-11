@@ -6,6 +6,7 @@
 //! which defaults to 10k docs.
 
 pub(crate) mod graph;
+mod hnsw;
 mod index;
 mod params;
 mod partition;
@@ -20,6 +21,7 @@ pub use graph::{
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
     Workspace,
 };
+pub use hnsw::CentroidHnsw;
 pub use index::{IvfIndex, IvfSearchMetrics};
 pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;

@@ -45,9 +45,9 @@ pub use distance::{
 pub use flat::FlatVecWriter;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
-    Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch,
-    IvfVectors, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
+    Candidate, CentroidHnsw, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
+    IvfMatrixView, IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors,
+    IvfVectorBatch, IvfVectors, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
     Workspace,
 };
@@ -248,6 +248,15 @@ impl<T> FileSliceArena<T> {
     pub fn new(slice: crate::directory::FileSlice) -> Self {
         FileSliceArena {
             slice,
+            _elem: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> Clone for FileSliceArena<T> {
+    fn clone(&self) -> Self {
+        FileSliceArena {
+            slice: self.slice.clone(),
             _elem: std::marker::PhantomData,
         }
     }

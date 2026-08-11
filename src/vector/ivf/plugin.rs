@@ -21,8 +21,8 @@ use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, No
 use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header};
 use crate::vector::{
-    residual_norm, BoundKind, BoundsBuilder, BoundsScope, NeighborhoodGraphConfig, NodeId,
-    RelativeNeighborhoodGraph, Workspace, VEC_EXT,
+    residual_norm, BoundKind, BoundsBuilder, BoundsScope, CentroidHnsw, NeighborhoodGraphConfig,
+    Workspace, VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -50,9 +50,9 @@ struct AssignedVector {
 enum ReplicaSelector<'a> {
     /// Exact k-NN scan over the trained centroids (small centroid sets).
     Exact,
-    /// Approximate k-NN via a [`RelativeNeighborhoodGraph`] borrowing the
-    /// flat centroid arena (large centroid sets).
-    Graph(RelativeNeighborhoodGraph<&'a [f32]>),
+    /// Approximate k-NN via a [`CentroidHnsw`] borrowing the flat centroid
+    /// arena (large centroid sets).
+    Graph(CentroidHnsw<&'a [f32]>),
 }
 
 /// Centroid ids of the `knn` nearest centroids to `query`, nearest first —
@@ -106,16 +106,16 @@ fn build_executor(name: &'static str) -> crate::Result<Executor> {
     }
 }
 
-/// Builds the replica-selection [`RelativeNeighborhoodGraph`] over the
-/// trained `centroids` (flat, `dim`-strided) with search beam `ef`. Borrows
-/// the flat centroid arena; after the assign loop the same graph is
+/// Builds the replica-selection [`CentroidHnsw`] over the trained
+/// `centroids` (flat, `dim`-strided) with search beam `ef`. Borrows the
+/// flat centroid arena; after the assign loop the same hierarchy is
 /// persisted as the `.centroids` slot [2] routing graph.
 fn build_centroid_graph<'a>(
     metric: Metric,
     centroids: &'a [f32],
     dim: usize,
     ef: usize,
-) -> crate::Result<RelativeNeighborhoodGraph<&'a [f32]>> {
+) -> crate::Result<CentroidHnsw<&'a [f32]>> {
     // Replica cells must predict the query-time router
     // (`rank_clusters`), which ranks centroids by the field metric —
     // so the graph selects with that metric directly. For Dot,
@@ -130,9 +130,13 @@ fn build_centroid_graph<'a>(
         ef,
         ..Default::default()
     };
-    let mut rng = RelativeNeighborhoodGraph::new(centroids, dim, metric, config);
-    rng.build(&build_executor("replica-rng-")?);
-    Ok(rng)
+    Ok(CentroidHnsw::build(
+        centroids,
+        dim,
+        metric,
+        config,
+        &build_executor("hnsw-build-")?,
+    )?)
 }
 
 /// Per-field IVF build timings (one phase per field), emitted at end of build
@@ -479,19 +483,12 @@ pub(crate) fn merge_ivf(
                                             v,
                                             replicas,
                                         ),
-                                        ReplicaSelector::Graph(graph) => {
-                                            let seeds: Vec<NodeId> = (0..graph.len())
-                                                .step_by((graph.len() / 8).max(1))
-                                                .take(8)
-                                                .map(|node| node as NodeId)
-                                                .collect();
-                                            graph
-                                                .search(&mut replica_ws, v, &seeds, replicas)
-                                                .0
-                                                .into_iter()
-                                                .map(|candidate| candidate.node as usize)
-                                                .collect()
-                                        }
+                                        ReplicaSelector::Graph(hnsw) => hnsw
+                                            .search(&mut replica_ws, v, replicas)
+                                            .0
+                                            .into_iter()
+                                            .map(|candidate| candidate.node as usize)
+                                            .collect(),
                                     };
                                     timings.replica_knn += knn_start.elapsed();
                                     let mut added = 0usize;
@@ -743,38 +740,37 @@ pub(crate) fn merge_ivf(
                     bounds_w.flush()?;
                 }
 
-                // `.centroids` slot [2]: the RNG over the centroids, so a query
-                // can route to its nearest clusters without scanning all of
-                // them. Skipped for degenerate centroid counts — the reader
-                // treats the absent slot as "route by linear scan", which a
-                // 0-or-1-centroid segment doesn't need a graph for.
+                // `.centroids` slot [2]: the HNSW over the centroids, so a
+                // query can route to its nearest clusters without scanning
+                // all of them. Skipped for degenerate centroid counts — the
+                // reader treats the absent slot as "route by linear scan",
+                // which a 0-or-1-centroid segment doesn't need a graph for.
                 //
-                // A graph replica selector is the same graph over the same
-                // arena with the same metric, so it is serialized directly
-                // instead of rebuilding. Its config differs only in `ef`,
-                // which affects the query beam width, not the built edges
-                // (build/refine search with a beam of
-                // `max(ef, num_candidates)`, and `ef <= num_candidates` for
-                // any realistic `replicas`) — the persisted graph is
-                // unchanged either way.
+                // A graph replica selector is the same hierarchy over the
+                // same arena with the same metric, so it is serialized
+                // directly instead of rebuilding. Its config differs only in
+                // `ef`, which affects the query beam width, not the built
+                // edges or the seeded level assignment (build/refine search
+                // with a beam of `max(ef, num_candidates)`, and
+                // `ef <= num_candidates` for any realistic `replicas`) — the
+                // persisted hierarchy is unchanged either way.
                 if num_centroids > 1 {
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
                     let graph_w = centroids_write.for_field_with_idx(field, centroid_slot::GRAPH);
                     match replica_selector.as_ref() {
-                        Some(ReplicaSelector::Graph(graph)) => graph.serialize(graph_w)?,
+                        Some(ReplicaSelector::Graph(hnsw)) => hnsw.serialize(graph_w)?,
                         // `replicas == 1` or the exact-selector regime: no
                         // graph exists yet, build one just for routing.
                         _ => {
-                            let mut rng = RelativeNeighborhoodGraph::new(
+                            let hnsw = build_centroid_graph(
+                                opts.metric(),
                                 centroid_matrix.values.as_slice(),
                                 opts.dim(),
-                                opts.metric(),
-                                NeighborhoodGraphConfig::default(),
-                            );
-                            rng.build(&build_executor("rng-build-")?);
-                            rng.serialize(graph_w)?;
+                                NeighborhoodGraphConfig::default().ef,
+                            )?;
+                            hnsw.serialize(graph_w)?;
                         }
                     }
                     graph_w.flush()?;

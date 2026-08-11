@@ -495,9 +495,13 @@ fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
             .map(|word| u32::from_le_bytes(word.try_into().expect("u32 word")))
             .collect();
         assert_eq!(words.len() * 4, graph_bytes.len(), "whole number of u32s");
-        let max_edges = words[0] as usize;
+        // An upper layer needs both centroids sampled up (a 1-node layer is
+        // dropped), which the fixed level seed doesn't do: the hierarchy is
+        // just the base layer.
+        assert_eq!(words[0], 1, "layer count");
+        let max_edges = words[1] as usize;
         assert_eq!(max_edges, NeighborhoodGraphConfig::default().max_edges);
-        let adjacency = &words[1..];
+        let adjacency = &words[2..];
         assert_eq!(adjacency.len(), centroids.len() * max_edges);
         // Two distinct centroids prune to each other's single neighbor; the
         // rest of each run is EMPTY padding.
