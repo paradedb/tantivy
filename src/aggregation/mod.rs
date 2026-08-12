@@ -142,6 +142,7 @@ pub mod metric;
 
 mod segment_agg_result;
 use std::fmt::Display;
+use std::sync::Arc;
 
 #[cfg(test)]
 mod agg_tests;
@@ -175,23 +176,53 @@ use crate::tokenizer::TokenizerManager;
 /// For that we'll need a buffer. One Vec per bucket aggregation is needed.
 pub type BucketId = u32;
 
+/// A per-segment predicate deciding whether a doc may contribute to aggregation
+/// results. Must be pure and idempotent: collectors may invoke it zero or more
+/// times per doc and skip it entirely whenever the outcome cannot change their
+/// result (e.g. cardinality skips docs whose value is already confirmed).
+pub type DocVisibilityFilter = Box<dyn Fn(crate::DocId) -> bool>;
+
+/// Builds the [`DocVisibilityFilter`] for a segment. Returning `None` means all
+/// docs of that segment are visible.
+///
+/// The filter is assumed to be expensive and is only supported for requests
+/// consisting exclusively of cardinality aggregations over str fast fields,
+/// where the exact term-ord set allows checking only docs whose value is not
+/// yet confirmed. Any other request fails with `InvalidArgument` when a
+/// factory is set.
+pub type DocVisibilityFilterFactory =
+    Arc<dyn Fn(&crate::SegmentReader) -> Option<DocVisibilityFilter> + Send + Sync>;
+
 /// Context parameters for aggregation execution
 ///
 /// This struct holds shared resources needed during aggregation execution:
 /// - `limits`: Memory and bucket limits for the aggregation
 /// - `tokenizers`: TokenizerManager for parsing query strings in filter aggregations
+/// - `doc_visibility_factory`: optional per-segment doc filter, see [`DocVisibilityFilterFactory`]
 #[derive(Clone, Default)]
 pub struct AggContextParams {
     /// Aggregation limits (memory and bucket count)
     pub limits: AggregationLimitsGuard,
     /// Tokenizer manager for query string parsing
     pub tokenizers: TokenizerManager,
+    /// Optional per-segment doc visibility filter factory.
+    pub doc_visibility_factory: Option<DocVisibilityFilterFactory>,
 }
 
 impl AggContextParams {
     /// Create new aggregation context parameters
     pub fn new(limits: AggregationLimitsGuard, tokenizers: TokenizerManager) -> Self {
-        Self { limits, tokenizers }
+        Self {
+            limits,
+            tokenizers,
+            doc_visibility_factory: None,
+        }
+    }
+
+    /// Attach a per-segment doc visibility filter factory.
+    pub fn with_doc_visibility_factory(mut self, factory: DocVisibilityFilterFactory) -> Self {
+        self.doc_visibility_factory = Some(factory);
+        self
     }
 }
 

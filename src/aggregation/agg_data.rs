@@ -29,7 +29,7 @@ use crate::aggregation::metric::{
 use crate::aggregation::segment_agg_result::{
     GenericSegmentAggregationResultsCollector, SegmentAggregationCollector,
 };
-use crate::aggregation::{f64_to_fastfield_u64, AggContextParams, Key};
+use crate::aggregation::{f64_to_fastfield_u64, AggContextParams, DocVisibilityFilter, Key};
 use crate::{SegmentOrdinal, SegmentReader};
 
 #[derive(Default)]
@@ -40,6 +40,9 @@ pub struct AggregationsSegmentCtx {
     pub per_request: PerRequestAggSegCtx,
     pub context: AggContextParams,
     pub column_block_accessor: ColumnBlockAccessor<u64>,
+    /// Per-segment doc visibility filter, built from
+    /// `context.doc_visibility_factory`. See [`crate::aggregation::DocVisibilityFilter`].
+    pub doc_visibility: Option<DocVisibilityFilter>,
 }
 
 impl AggregationsSegmentCtx {
@@ -423,17 +426,56 @@ pub(crate) fn build_aggregations_data_from_req(
     segment_ordinal: SegmentOrdinal,
     context: AggContextParams,
 ) -> crate::Result<AggregationsSegmentCtx> {
+    let doc_visibility = context
+        .doc_visibility_factory
+        .as_ref()
+        .and_then(|factory| factory(reader));
     let mut data = AggregationsSegmentCtx {
         per_request: Default::default(),
         context,
         column_block_accessor: ColumnBlockAccessor::default(),
+        doc_visibility,
     };
 
     for (name, agg) in aggs.iter() {
         let nodes = build_nodes(name, agg, reader, segment_ordinal, &mut data, true)?;
         data.per_request.agg_tree.extend(nodes);
     }
+    if data.doc_visibility.is_some() {
+        validate_doc_visibility_request(&data)?;
+    }
     Ok(data)
+}
+
+/// The doc visibility filter is only implemented for cardinality over str
+/// columns (the lazy witness check needs the exact term-ord set). Reject
+/// anything else rather than silently returning unfiltered counts.
+///
+/// Non-str columns are tolerated when empty: a str field absent from a
+/// segment resolves to an empty fallback column, which contributes nothing.
+fn validate_doc_visibility_request(data: &AggregationsSegmentCtx) -> crate::Result<()> {
+    let unsupported_node = data
+        .per_request
+        .agg_tree
+        .iter()
+        .any(|node| !matches!(node.kind, AggKind::Cardinality) || !node.children.is_empty());
+    if unsupported_node {
+        return Err(crate::TantivyError::InvalidArgument(
+            "doc_visibility_factory is only supported for requests containing exclusively \
+             cardinality aggregations without sub-aggregations"
+                .to_string(),
+        ));
+    }
+    for req_data in &data.per_request.cardinality_req_data {
+        if req_data.column_type != ColumnType::Str && req_data.accessor.values.num_vals() > 0 {
+            return Err(crate::TantivyError::InvalidArgument(format!(
+                "doc_visibility_factory is only supported for cardinality aggregations over str \
+                 fast fields, field `{}` resolved to column type {:?}",
+                req_data.req.field, req_data.column_type
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn build_nodes(

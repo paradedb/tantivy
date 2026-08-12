@@ -255,6 +255,16 @@ impl PagedBitset {
         }
     }
 
+    #[inline]
+    fn contains(&self, term_ord: u64) -> bool {
+        let page_idx = (term_ord >> BITSET_PAGE_SHIFT) as usize;
+        let Some(Some(page)) = self.pages.get(page_idx) else {
+            return false;
+        };
+        let intra = term_ord & BITSET_PAGE_MASK;
+        page.words[(intra >> 6) as usize].contains((intra & 63) as u32)
+    }
+
     /// Number of set bits. O(1).
     #[inline]
     fn len(&self) -> u64 {
@@ -310,6 +320,7 @@ pub(crate) trait TermOrdAccumulator: Sized {
     /// on promotion).
     fn new(max_term_ord_inclusive: u64) -> Self;
     fn insert(&mut self, term_ord: u64);
+    fn contains(&self, term_ord: u64) -> bool;
     /// Bulk insert. Implementations may override to hoist any inner
     /// dispatch outside the loop. Default loops `insert`.
     #[inline]
@@ -336,6 +347,10 @@ impl TermOrdAccumulator for BitSet {
     #[inline]
     fn insert(&mut self, term_ord: u64) {
         BitSet::insert(self, term_ord as u32);
+    }
+    #[inline]
+    fn contains(&self, term_ord: u64) -> bool {
+        BitSet::contains(self, term_ord as u32)
     }
     #[inline]
     fn len(&self) -> usize {
@@ -393,6 +408,14 @@ impl TermOrdAccumulator for TermOrdSet {
         }
     }
 
+    #[inline]
+    fn contains(&self, term_ord: u64) -> bool {
+        match &self.inner {
+            TermOrdSetInner::Sparse(set) => set.contains(&term_ord),
+            TermOrdSetInner::Dense(bitset) => bitset.contains(term_ord),
+        }
+    }
+
     /// Hoist the Sparse/Dense match outside the per-ord loop so that a
     /// block of inserts dispatches once.
     fn extend_from_iter<I: IntoIterator<Item = u64>>(&mut self, ords: I) {
@@ -440,6 +463,34 @@ impl TermOrdAccumulator for TermOrdSet {
             TermOrdSetInner::Sparse(set) => itertools::Either::Left(set.iter().copied()),
             TermOrdSetInner::Dense(bitset) => itertools::Either::Right(bitset.iter_sorted()),
         }
+    }
+}
+
+/// Caches the filter verdict for the last doc seen. Multi-valued columns and
+/// re-checked unconfirmed ords hit the same doc consecutively, so one cached
+/// entry removes the repeated filter calls.
+struct MemoizedDocVisibility<'a> {
+    filter: &'a dyn Fn(crate::DocId) -> bool,
+    last_doc: crate::DocId,
+    last_visible: bool,
+}
+
+impl<'a> MemoizedDocVisibility<'a> {
+    fn new(filter: &'a dyn Fn(crate::DocId) -> bool) -> Self {
+        Self {
+            filter,
+            last_doc: crate::DocId::MAX,
+            last_visible: false,
+        }
+    }
+
+    #[inline]
+    fn is_visible(&mut self, doc: crate::DocId) -> bool {
+        if doc != self.last_doc {
+            self.last_doc = doc;
+            self.last_visible = (self.filter)(doc);
+        }
+        self.last_visible
     }
 }
 
@@ -701,6 +752,7 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
             ));
         };
         let col_block_accessor = &agg_data.column_block_accessor;
+        let doc_visibility = agg_data.doc_visibility.as_deref();
         match bucket {
             SegmentCardinalityCollectorBucket::Str(entries) => {
                 // Promotion check runs on the pre-block state: the first call
@@ -710,9 +762,34 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                 // for adaptive variants and inlines to a tight loop for the
                 // BitSet path.
                 entries.maybe_compact();
-                entries.extend_from_iter(col_block_accessor.iter_vals());
+                if let Some(filter) = doc_visibility {
+                    // Lazy visibility: a value counts iff some visible doc
+                    // carries it. Confirmed ords skip the check entirely;
+                    // unconfirmed ords re-check on each occurrence until a
+                    // visible witness is found.
+                    let mut visibility = MemoizedDocVisibility::new(filter);
+                    for (doc, term_ord) in col_block_accessor.iter_docid_vals(docs, &self.accessor)
+                    {
+                        if entries.contains(term_ord) {
+                            continue;
+                        }
+                        if visibility.is_visible(doc) {
+                            entries.insert(term_ord);
+                        }
+                    }
+                } else {
+                    entries.extend_from_iter(col_block_accessor.iter_vals());
+                }
             }
             SegmentCardinalityCollectorBucket::Numeric(cardinality) => {
+                // Guarded by `validate_doc_visibility_request` at request
+                // build time; without the term-ord set there is no lazy check
+                // and silently ignoring the filter would overshoot.
+                if doc_visibility.is_some() {
+                    return Err(crate::TantivyError::InternalError(
+                        "doc visibility filter reached a non-str cardinality collector".to_string(),
+                    ));
+                }
                 if self.column_type == ColumnType::IpAddr {
                     let compact_space_accessor = self
                         .accessor
@@ -1001,6 +1078,11 @@ mod tests {
             bitset.insert(ord);
         }
         assert_eq!(bitset.len(), ords.len() as u64);
+        for &ord in &ords {
+            assert!(bitset.contains(ord));
+        }
+        assert!(!bitset.contains(2));
+        assert!(!bitset.contains(5000));
         let collected: Vec<u64> = bitset.iter_sorted().collect();
         let mut expected: Vec<u64> = ords.to_vec();
         expected.sort_unstable();
@@ -1023,6 +1105,8 @@ mod tests {
         set.insert(7);
         set.maybe_compact();
         assert_eq!(set.len(), 2);
+        assert!(set.contains(7));
+        assert!(!set.contains(8));
 
         // Third insert promotes on next maybe_compact.
         set.insert(20);
@@ -1035,6 +1119,8 @@ mod tests {
         set.insert(15);
         set.insert(15); // dup
         assert_eq!(set.len(), 4);
+        assert!(set.contains(15));
+        assert!(!set.contains(16));
 
         let mut collected: Vec<u64> = set.iter_ords().collect();
         collected.sort_unstable();
@@ -1383,6 +1469,196 @@ mod tests {
             let res = exec_request(agg_req, &index).unwrap();
             assert_eq!(res["cardinality"]["value"], 2.0);
         }
+    }
+
+    fn exec_with_visibility_filter(
+        agg_req: Aggregations,
+        index: &Index,
+        factory: crate::aggregation::DocVisibilityFilterFactory,
+    ) -> crate::Result<serde_json::Value> {
+        use crate::aggregation::{AggContextParams, AggregationCollector};
+        use crate::query::AllQuery;
+        let collector = AggregationCollector::from_aggs(
+            agg_req,
+            AggContextParams::default().with_doc_visibility_factory(factory),
+        );
+        let searcher = index.reader()?.searcher();
+        let res = searcher.search(&AllQuery, &collector)?;
+        Ok(serde_json::to_value(res)?)
+    }
+
+    fn counting_dead_docs_factory(
+        dead_docs: Vec<crate::DocId>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> crate::aggregation::DocVisibilityFilterFactory {
+        use std::sync::atomic::Ordering;
+        std::sync::Arc::new(move |_reader| {
+            let dead_docs = dead_docs.clone();
+            let calls = calls.clone();
+            Some(Box::new(move |doc| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                !dead_docs.contains(&doc)
+            }))
+        })
+    }
+
+    fn str_cardinality_req() -> Aggregations {
+        serde_json::from_value(json!({
+            "cardinality": {
+                "cardinality": { "field": "name" }
+            },
+        }))
+        .unwrap()
+    }
+
+    fn single_segment_str_index(terms_per_doc: &[Option<&str>]) -> Index {
+        let mut schema_builder = Schema::builder();
+        let name_field = schema_builder.add_text_field("name", STRING | FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests().unwrap();
+        for term in terms_per_doc {
+            match term {
+                Some(term) => writer.add_document(doc!(name_field => *term)).unwrap(),
+                None => writer.add_document(doc!()).unwrap(),
+            };
+        }
+        writer.commit().unwrap();
+        index
+    }
+
+    /// Str path with a visibility filter: values on dead docs don't count,
+    /// a value whose first doc is dead is still counted via a later visible
+    /// doc, and confirmed values skip the filter entirely.
+    #[test]
+    fn cardinality_str_visibility_filter_is_lazy_and_exact() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        // doc:   0        1    2    3    4
+        // value: a        a    b    b    z
+        // alive: dead     ok   ok   ok   dead
+        let index =
+            single_segment_str_index(&[Some("a"), Some("a"), Some("b"), Some("b"), Some("z")]);
+        let calls = Arc::new(AtomicU32::new(0));
+        let factory = counting_dead_docs_factory(vec![0, 4], calls.clone());
+
+        let res = exec_with_visibility_filter(str_cardinality_req(), &index, factory).unwrap();
+        // "a" (witness doc 1), "b" (doc 2). "z" only exists on a dead doc.
+        assert_eq!(res["cardinality"]["value"], 2.0);
+        // Checked: doc 0 (dead), doc 1 (confirms a), doc 2 (confirms b),
+        // doc 4 (dead). Doc 3 skipped: b already confirmed.
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+    }
+
+    /// Same semantics on the TermOrdSet accumulator (dictionary larger than
+    /// BITSET_MAX_TERM_ORD), crossing the sparse -> dense promotion.
+    #[test]
+    fn cardinality_str_visibility_filter_term_ord_set() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let terms: Vec<String> = (0..300).map(|i| format!("term_{i:03}")).collect();
+        let terms_per_doc: Vec<Option<&str>> = terms.iter().map(|t| Some(t.as_str())).collect();
+        let index = single_segment_str_index(&terms_per_doc);
+        let dead_docs: Vec<crate::DocId> = (0..300).filter(|doc| doc % 2 == 1).collect();
+        let factory = counting_dead_docs_factory(dead_docs, Arc::new(AtomicU32::new(0)));
+
+        let res = exec_with_visibility_filter(str_cardinality_req(), &index, factory).unwrap();
+        assert_eq!(res["cardinality"]["value"], 150.0);
+    }
+
+    /// The missing sentinel obeys the filter: a dead doc without a value must
+    /// not produce the missing key.
+    #[test]
+    fn cardinality_str_visibility_filter_missing() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let index = single_segment_str_index(&[Some("x"), None]);
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "cardinality": {
+                "cardinality": { "field": "name", "missing": "MISSING" }
+            },
+        }))
+        .unwrap();
+
+        let factory = counting_dead_docs_factory(vec![1], Arc::new(AtomicU32::new(0)));
+        let res = exec_with_visibility_filter(agg_req.clone(), &index, factory).unwrap();
+        assert_eq!(res["cardinality"]["value"], 1.0);
+
+        let factory = counting_dead_docs_factory(vec![], Arc::new(AtomicU32::new(0)));
+        let res = exec_with_visibility_filter(agg_req, &index, factory).unwrap();
+        assert_eq!(res["cardinality"]["value"], 2.0);
+    }
+
+    /// A visibility filter on a numeric cardinality is rejected at request
+    /// build time: without the term-ord set the filter cannot be honored.
+    #[test]
+    fn cardinality_numeric_visibility_filter_rejected() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let mut schema_builder = Schema::builder();
+        let id_field = schema_builder.add_u64_field("id", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests().unwrap();
+        writer.add_document(doc!(id_field => 1u64)).unwrap();
+        writer.commit().unwrap();
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "cardinality": {
+                "cardinality": { "field": "id" }
+            },
+        }))
+        .unwrap();
+
+        let factory = counting_dead_docs_factory(vec![], Arc::new(AtomicU32::new(0)));
+        let err = exec_with_visibility_filter(agg_req, &index, factory).unwrap_err();
+        assert!(matches!(err, crate::TantivyError::InvalidArgument(_)));
+    }
+
+    /// Any non-cardinality aggregation in the request is rejected when a
+    /// visibility factory is set.
+    #[test]
+    fn visibility_filter_rejects_non_cardinality_aggs() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let index = single_segment_str_index(&[Some("a")]);
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "cardinality": {
+                "cardinality": { "field": "name" }
+            },
+            "terms": {
+                "terms": { "field": "name" }
+            },
+        }))
+        .unwrap();
+
+        let factory = counting_dead_docs_factory(vec![], Arc::new(AtomicU32::new(0)));
+        let err = exec_with_visibility_filter(agg_req, &index, factory).unwrap_err();
+        assert!(matches!(err, crate::TantivyError::InvalidArgument(_)));
+    }
+
+    /// A str field absent from the segment resolves to an empty non-str
+    /// fallback column; the validation tolerates it since it contributes
+    /// nothing.
+    #[test]
+    fn visibility_filter_allows_empty_fallback_column() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let mut schema_builder = Schema::builder();
+        let _name_field = schema_builder.add_text_field("name", STRING | FAST);
+        let id_field = schema_builder.add_u64_field("id", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests().unwrap();
+        writer.add_document(doc!(id_field => 1u64)).unwrap();
+        writer.commit().unwrap();
+
+        let factory = counting_dead_docs_factory(vec![], Arc::new(AtomicU32::new(0)));
+        let res = exec_with_visibility_filter(str_cardinality_req(), &index, factory).unwrap();
+        assert_eq!(res["cardinality"]["value"], 0.0);
     }
 
     #[test]
