@@ -782,13 +782,8 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                 }
             }
             SegmentCardinalityCollectorBucket::Numeric(cardinality) => {
-                // Without the term-ord set there is no lazy visibility check
-                // and silently ignoring the filter would overshoot. Empty
-                // columns are tolerated: a str field absent from a segment
-                // resolves to an empty non-str fallback column, which
-                // contributes nothing.
                 assert!(
-                    doc_visibility.is_none() || self.accessor.values.num_vals() == 0,
+                    doc_visibility.is_none(),
                     "doc visibility filter is only supported for cardinality aggregations over \
                      str fast fields, got column type {:?}",
                     self.column_type
