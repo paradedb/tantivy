@@ -1474,7 +1474,7 @@ mod tests {
     /// still counted via a later visible witness, and results merge across
     /// segments.
     #[test]
-    fn cardinality_visibility_filter_e2e() {
+    fn string_cardinality_with_visibility_filter() {
         use std::sync::Arc;
 
         use crate::aggregation::{AggContextParams, AggregationCollector};
