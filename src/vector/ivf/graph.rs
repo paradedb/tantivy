@@ -561,71 +561,129 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         self.metrics
     }
 
-    /// Runs one beam round to convergence and drains it into `self.batch`.
-    fn run_round(&mut self) {
+    /// Similarity of the best unscored-frontier candidate, if any.
+    #[inline]
+    pub(crate) fn frontier_best(&self) -> Option<Similarity> {
+        self.workspace.frontier.peek().map(|c| c.sim)
+    }
+
+    /// Score `nodes` against the query and push any not-yet-visited ones onto
+    /// the frontier. Returns how many were newly inserted.
+    pub(crate) fn inject(&mut self, nodes: &[NodeId]) -> usize {
+        let n = self.rng.graph.len();
+        let arena = self.rng.graph.arena();
+        let dim = self.rng.graph.dim();
+        let metric = self.rng.metric;
+        let ws = &mut *self.workspace;
+        let mut inserted = 0;
+        for &node_id in nodes {
+            if node_id as usize >= n || ws.visited.contains(node_id) {
+                continue;
+            }
+            ws.visited.insert(node_id);
+            self.metrics.visited_count += 1;
+            let sim = arena.similarity(metric, dim, node_id, self.query);
+            ws.frontier.push(Candidate {
+                sim,
+                node: node_id,
+            });
+            inserted += 1;
+        }
+        inserted
+    }
+
+    /// True when the current converged batch has been fully yielded.
+    #[inline]
+    pub(crate) fn batch_is_empty(&self) -> bool {
+        self.batch.is_empty()
+    }
+
+    /// Pop the next candidate from the current batch (most similar first).
+    pub(crate) fn pop_batch(&mut self) -> Option<Candidate> {
+        let candidate = self.batch.pop()?;
+        self.metrics.result_count += 1;
+        Some(candidate)
+    }
+
+    /// Pop the frontier's best candidate, commit it to the beam, and expand
+    /// its neighbors. Returns `false` when the frontier is empty or the beam
+    /// has converged (best remaining frontier cannot beat the beam minimum).
+    pub(crate) fn expand_one(&mut self) -> bool {
         let graph = &self.rng.graph;
         let arena = graph.arena();
         let dim = graph.dim();
         let metric = self.rng.metric;
         let ws = &mut *self.workspace;
 
-        self.metrics.termination_reason = SearchTerminationReason::GraphExhausted;
-
-        while let Some(&candidate) = ws.frontier.peek() {
-            // Stop once the best unexpanded candidate can't beat the worst
-            // kept result and the result set is already full. Whole-candidate
-            // comparisons (not raw sims) make the order strict: two distinct
-            // nodes are never equal, so a node tied with the beam minimum
-            // can't keep displacing it and cycle forever. Peek, don't pop:
-            // the candidate stays for the next round to commit.
-            if ws.results.len() >= self.ef
-                && ws.results.peek().is_some_and(|worst| candidate < worst.0)
-            {
-                self.metrics.termination_reason = SearchTerminationReason::SearchConverged;
-                break;
-            }
-
-            ws.frontier.pop();
-            if ws.results.len() < self.ef {
-                ws.results.push(Reverse(candidate));
-            } else if let Some(mut worst) = ws.results.peek_mut() {
-                let evicted = std::mem::replace(&mut *worst, Reverse(candidate)).0;
-                drop(worst);
-                if RESUMABLE {
-                    ws.frontier.push(evicted);
-                }
-                self.metrics.evictions += 1;
-            }
-
-            // Expand. An eviction re-admitted through the frontier scans its
-            // adjacency a second time, but every neighbor it could contribute
-            // was already visited by its first expansion, so the rescan is a
-            // no-op beyond the visited checks (still counted as scanned
-            // edges, since the work is done).
-            let neighbors = graph.neighbors(candidate.node);
-            self.metrics.expanded_count += 1;
-            self.metrics.edges_scanned += neighbors.len();
-
-            for &neighbor in neighbors {
-                if ws.visited.contains(neighbor) {
-                    continue;
-                }
-                ws.visited.insert(neighbor);
-                self.metrics.visited_count += 1;
-
-                let sim = arena.similarity(metric, dim, neighbor, self.query);
-                ws.frontier.push(Candidate {
-                    sim,
-                    node: neighbor,
-                });
-            }
+        let Some(&candidate) = ws.frontier.peek() else {
+            self.metrics.termination_reason = SearchTerminationReason::GraphExhausted;
+            return false;
+        };
+        // Stop once the best unexpanded candidate can't beat the worst kept
+        // result and the result set is already full. Whole-candidate
+        // comparisons (not raw sims) make the order strict: two distinct
+        // nodes are never equal, so a node tied with the beam minimum can't
+        // keep displacing it and cycle forever. Peek, don't pop: the
+        // candidate stays for the next round to commit.
+        if ws.results.len() >= self.ef
+            && ws.results.peek().is_some_and(|worst| candidate < worst.0)
+        {
+            self.metrics.termination_reason = SearchTerminationReason::SearchConverged;
+            return false;
         }
 
-        self.batch.extend(ws.results.drain().map(|Reverse(c)| c));
+        ws.frontier.pop();
+        if ws.results.len() < self.ef {
+            ws.results.push(Reverse(candidate));
+        } else if let Some(mut worst) = ws.results.peek_mut() {
+            let evicted = std::mem::replace(&mut *worst, Reverse(candidate)).0;
+            drop(worst);
+            if RESUMABLE {
+                ws.frontier.push(evicted);
+            }
+            self.metrics.evictions += 1;
+        }
+
+        // Expand. An eviction re-admitted through the frontier scans its
+        // adjacency a second time, but every neighbor it could contribute
+        // was already visited by its first expansion, so the rescan is a
+        // no-op beyond the visited checks (still counted as scanned edges,
+        // since the work is done).
+        let neighbors = graph.neighbors(candidate.node);
+        self.metrics.expanded_count += 1;
+        self.metrics.edges_scanned += neighbors.len();
+
+        for &neighbor in neighbors {
+            if ws.visited.contains(neighbor) {
+                continue;
+            }
+            ws.visited.insert(neighbor);
+            self.metrics.visited_count += 1;
+
+            let sim = arena.similarity(metric, dim, neighbor, self.query);
+            ws.frontier.push(Candidate {
+                sim,
+                node: neighbor,
+            });
+        }
+        true
+    }
+
+    /// Drain the beam into `self.batch`, ordered for [`pop_batch`].
+    pub(crate) fn commit_round(&mut self) {
+        self.batch
+            .extend(self.workspace.results.drain().map(|Reverse(c)| c));
         // Ascending similarity with descending-id ties, so popping from the
         // back yields descending similarity with ascending-id ties.
         self.batch
             .sort_unstable_by(|a, b| a.sim.cmp(&b.sim).then_with(|| b.node.cmp(&a.node)));
+    }
+
+    /// Runs one beam round to convergence and drains it into `self.batch`.
+    fn run_round(&mut self) {
+        self.metrics.termination_reason = SearchTerminationReason::GraphExhausted;
+        while self.expand_one() {}
+        self.commit_round();
     }
 }
 
@@ -638,9 +696,7 @@ impl<S: VectorArena, const RESUMABLE: bool> Iterator for SearchIterator<'_, '_, 
             // no-op; the batch stays empty and the stream ends below.
             self.run_round();
         }
-        let candidate = self.batch.pop()?;
-        self.metrics.result_count += 1;
-        Some(candidate)
+        self.pop_batch()
     }
 }
 
@@ -1323,6 +1379,34 @@ mod rng_tests {
         let (batch, _) = rng.search(&mut ws, &[4.2], &[0], 3);
         let iterated: Vec<Candidate> = rng.search_iter(&mut ws, &[4.2], &[0]).take(3).collect();
         assert_eq!(batch, iterated);
+    }
+
+    #[test]
+    fn inject_scores_unvisited_nodes_onto_the_frontier() {
+        let rng = line_index(8);
+        let mut ws = Workspace::new();
+        let mut iter = rng.search_iter(&mut ws, &[4.2], &[0]);
+        let before = iter.frontier_best().expect("seeded frontier");
+        // Node 4 is near the query and not yet visited (search hasn't expanded).
+        assert_eq!(iter.inject(&[4]), 1);
+        let after = iter.frontier_best().expect("frontier after inject");
+        assert!(after >= before);
+        // Re-injecting a visited node is a no-op.
+        assert_eq!(iter.inject(&[0, 4]), 0);
+    }
+
+    #[test]
+    fn expand_one_and_commit_round_match_run_round() {
+        let rng = line_index(8);
+        let mut ws = Workspace::new();
+        let via_next: Vec<Candidate> = rng.search_iter(&mut ws, &[4.2], &[0]).take(3).collect();
+
+        let mut ws = Workspace::new();
+        let mut iter = rng.search_iter(&mut ws, &[4.2], &[0]);
+        while iter.expand_one() {}
+        iter.commit_round();
+        let via_hooks: Vec<Candidate> = std::iter::from_fn(|| iter.pop_batch()).take(3).collect();
+        assert_eq!(via_next, via_hooks);
     }
 
     #[test]

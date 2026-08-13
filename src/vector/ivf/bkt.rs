@@ -14,7 +14,7 @@ use super::graph::Candidate;
 use super::NodeId as GraphNodeId;
 use crate::directory::FileSlice;
 use crate::schema::Metric;
-use crate::vector::{FileSliceArena, VectorArena};
+use crate::vector::{FileSliceArena, Similarity, VectorArena};
 
 /// Default per-round member budget for [`BKTree::search_iter`].
 pub(crate) const DEFAULT_MAX_LEAVES: usize = 50;
@@ -168,6 +168,24 @@ impl<'g, S: VectorArena> BKTreeSearchIterator<'g, S> {
             frontier,
             results: VecDeque::new(),
         }
+    }
+
+    /// Similarity of the best unexpanded tree node, if any.
+    #[inline]
+    pub(crate) fn frontier_best(&self) -> Option<Similarity> {
+        self.frontier.peek().map(|c| c.sim)
+    }
+
+    /// Run one best-first round if `results` is empty, then drain and return
+    /// the accumulated graph member ids.
+    pub(crate) fn take_round(&mut self) -> Vec<GraphNodeId> {
+        if self.results.is_empty() {
+            if self.frontier.is_empty() {
+                return Vec::new();
+            }
+            self.run_round();
+        }
+        self.results.drain(..).collect()
     }
 
     fn run_round(&mut self) {
@@ -666,5 +684,20 @@ mod tests {
         let first_round: Vec<_> = tree.search_iter_n(&[1.0, 0.0], 1).take(2).collect();
         assert_eq!(first_round.len(), 2);
         assert!(first_round.iter().all(|&n| n == 10 || n == 11));
+    }
+
+    #[test]
+    fn take_round_drains_members_and_preserves_frontier() {
+        let tree = sample_tree();
+        let mut iter = tree.search_iter_n(&[1.0, 0.0], 1);
+        assert!(iter.frontier_best().is_some());
+        let first = iter.take_round();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|&n| n == 10 || n == 11));
+        // A second round should still be available from the remaining frontier.
+        assert!(iter.frontier_best().is_some());
+        let second = iter.take_round();
+        assert_eq!(second.len(), 2);
+        assert!(second.iter().all(|&n| n == 20 || n == 21));
     }
 }

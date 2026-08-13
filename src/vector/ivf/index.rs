@@ -38,7 +38,7 @@ use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
-use super::bkt::{BKTree, DEFAULT_MAX_LEAVES};
+use super::bkt::{BKTree, BKTreeSearchIterator, DEFAULT_MAX_LEAVES};
 use super::graph::{
     Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
@@ -347,8 +347,10 @@ impl IvfIndex {
     ///
     /// With a persisted RNG this is a resumable beam search
     /// ([`RelativeNeighborhoodGraph::search_iter`]), seeded from the BKT when
-    /// present (else strided node ids). Without an RNG every centroid is
-    /// scored exactly, up front.
+    /// present (else strided node ids). When a BKT is present, each beam round
+    /// may pull additional BKT members whenever the tree frontier outranks the
+    /// graph frontier. Without an RNG every centroid is scored exactly, up
+    /// front.
     ///
     /// `ws` holds the routing search's scratch and is borrowed for the
     /// ranking's lifetime; [`ClusterRanking::metrics`] reports the cost
@@ -360,8 +362,11 @@ impl IvfIndex {
     ) -> ClusterRanking<'a> {
         match &self.graph {
             Some(graph) => {
-                let seeds = self.routing_seeds(graph.len(), query);
-                ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
+                let (seeds, bkt) = self.routing_seeds(graph.len(), query);
+                ClusterRanking::Graph {
+                    iter: graph.search_iter(ws, query, &seeds),
+                    bkt,
+                }
             }
             None => {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
@@ -380,20 +385,26 @@ impl IvfIndex {
         }
     }
 
-    /// Graph entry points for routing: BKT members nearest `query`, or a
-    /// strided sample of node ids when no BKT is present.
-    fn routing_seeds(&self, graph_len: usize, query: &[f32]) -> Vec<NodeId> {
+    /// Graph entry points for routing, plus a live BKT iterator when further
+    /// seed rounds may be needed mid-search.
+    fn routing_seeds<'a>(
+        &'a self,
+        graph_len: usize,
+        query: &'a [f32],
+    ) -> (Vec<NodeId>, Option<BKTreeSearchIterator<'a, FileSliceArena<f32>>>) {
         if let Some(bkt) = &self.bkt {
-            let seeds: Vec<NodeId> = bkt.search_iter(query).take(DEFAULT_MAX_LEAVES).collect();
+            let mut iter = bkt.search_iter(query);
+            let seeds: Vec<NodeId> = (&mut iter).take(DEFAULT_MAX_LEAVES).collect();
             if !seeds.is_empty() {
-                return seeds;
+                return (seeds, Some(iter));
             }
         }
-        (0..graph_len)
+        let seeds = (0..graph_len)
             .step_by((graph_len / 8).max(1))
             .take(8)
             .map(|node| node as NodeId)
-            .collect()
+            .collect();
+        (seeds, None)
     }
 }
 
@@ -401,8 +412,13 @@ impl IvfIndex {
 /// returned by [`IvfIndex::rank_clusters`], which documents the two paths.
 pub(crate) enum ClusterRanking<'a> {
     /// Beam-searched routing over the persisted centroid RNG; pulling past a
-    /// converged batch resumes the search.
-    Graph(ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>),
+    /// converged batch resumes the search. When `bkt` is set, each round may
+    /// inject additional seeds whenever the tree frontier outranks the graph
+    /// frontier.
+    Graph {
+        iter: ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>,
+        bkt: Option<BKTreeSearchIterator<'a, FileSliceArena<f32>>>,
+    },
     /// Exact fallback for graph-less segments: every centroid scored and
     /// sorted up front.
     Exact {
@@ -417,7 +433,7 @@ impl ClusterRanking<'_> {
     /// take the snapshot after the last pull.
     pub(crate) fn metrics(&self) -> IvfSearchMetrics {
         match self {
-            ClusterRanking::Graph(iter) => IvfSearchMetrics {
+            ClusterRanking::Graph { iter, .. } => IvfSearchMetrics {
                 visited_count: iter.metrics().visited_count,
                 graph: Some(iter.metrics()),
             },
@@ -427,6 +443,29 @@ impl ClusterRanking<'_> {
             },
         }
     }
+
+    /// One beam round, optionally refilling from the BKT whenever its frontier
+    /// outranks the RNG frontier before an expansion.
+    fn run_seeded_round(
+        iter: &mut ResumableSearchIterator<'_, '_, FileSliceArena<f32>>,
+        mut bkt: Option<&mut BKTreeSearchIterator<'_, FileSliceArena<f32>>>,
+    ) {
+        while {
+            if let Some(bkt) = bkt.as_mut() {
+                let should_refill = match (iter.frontier_best(), bkt.frontier_best()) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(rng_best), Some(bkt_best)) => bkt_best > rng_best,
+                };
+                if should_refill {
+                    let seeds = bkt.take_round();
+                    iter.inject(&seeds);
+                }
+            }
+            iter.expand_one()
+        } {}
+        iter.commit_round();
+    }
 }
 
 impl Iterator for ClusterRanking<'_> {
@@ -434,7 +473,12 @@ impl Iterator for ClusterRanking<'_> {
 
     fn next(&mut self) -> Option<Candidate> {
         match self {
-            ClusterRanking::Graph(iter) => iter.next(),
+            ClusterRanking::Graph { iter, bkt } => {
+                if iter.batch_is_empty() {
+                    Self::run_seeded_round(iter, bkt.as_mut());
+                }
+                iter.pop_batch()
+            }
             ClusterRanking::Exact { ranked, .. } => ranked.next(),
         }
     }
