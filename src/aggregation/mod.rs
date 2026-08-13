@@ -180,6 +180,7 @@ pub type BucketId = u32;
 /// results. Must be pure and idempotent: collectors may invoke it zero or more
 /// times per doc and skip it entirely whenever the outcome cannot change their
 /// result (e.g. cardinality skips docs whose value is already confirmed).
+/// The filter runs on the collecting thread.
 pub type DocVisibilityFilter = Box<dyn Fn(crate::DocId) -> bool>;
 
 /// Builds the [`DocVisibilityFilter`] for a segment. Returning `None` means all
