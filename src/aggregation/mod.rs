@@ -185,11 +185,11 @@ pub type DocVisibilityFilter = Box<dyn Fn(crate::DocId) -> bool>;
 /// Builds the [`DocVisibilityFilter`] for a segment. Returning `None` means all
 /// docs of that segment are visible.
 ///
-/// The filter is assumed to be expensive and is only supported for requests
-/// consisting exclusively of cardinality aggregations over str fast fields,
-/// where the exact term-ord set allows checking only docs whose value is not
-/// yet confirmed. Any other request fails with `InvalidArgument` when a
-/// factory is set.
+/// The filter is assumed to be expensive and is only honored by cardinality
+/// aggregations over str fast fields, where the exact term-ord set allows
+/// checking only docs whose value is not yet confirmed. A cardinality
+/// aggregation over a non-str fast field panics when a filter is set; other
+/// aggregation kinds ignore the filter.
 pub type DocVisibilityFilterFactory =
     Arc<dyn Fn(&crate::SegmentReader) -> Option<DocVisibilityFilter> + Send + Sync>;
 

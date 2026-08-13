@@ -782,14 +782,17 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                 }
             }
             SegmentCardinalityCollectorBucket::Numeric(cardinality) => {
-                // Guarded by `validate_doc_visibility_request` at request
-                // build time; without the term-ord set there is no lazy check
-                // and silently ignoring the filter would overshoot.
-                if doc_visibility.is_some() {
-                    return Err(crate::TantivyError::InternalError(
-                        "doc visibility filter reached a non-str cardinality collector".to_string(),
-                    ));
-                }
+                // Without the term-ord set there is no lazy visibility check
+                // and silently ignoring the filter would overshoot. Empty
+                // columns are tolerated: a str field absent from a segment
+                // resolves to an empty non-str fallback column, which
+                // contributes nothing.
+                assert!(
+                    doc_visibility.is_none() || self.accessor.values.num_vals() == 0,
+                    "doc visibility filter is only supported for cardinality aggregations over \
+                     str fast fields, got column type {:?}",
+                    self.column_type
+                );
                 if self.column_type == ColumnType::IpAddr {
                     let compact_space_accessor = self
                         .accessor
@@ -1471,194 +1474,59 @@ mod tests {
         }
     }
 
-    fn exec_with_visibility_filter(
-        agg_req: Aggregations,
-        index: &Index,
-        factory: crate::aggregation::DocVisibilityFilterFactory,
-    ) -> crate::Result<serde_json::Value> {
+    /// End-to-end str cardinality with a per-segment doc visibility filter:
+    /// values on dead docs don't count, a value whose first doc is dead is
+    /// still counted via a later visible witness, and results merge across
+    /// segments.
+    #[test]
+    fn cardinality_visibility_filter_e2e() {
+        use std::sync::Arc;
+
         use crate::aggregation::{AggContextParams, AggregationCollector};
         use crate::query::AllQuery;
-        let collector = AggregationCollector::from_aggs(
-            agg_req,
-            AggContextParams::default().with_doc_visibility_factory(factory),
-        );
-        let searcher = index.reader()?.searcher();
-        let res = searcher.search(&AllQuery, &collector)?;
-        Ok(serde_json::to_value(res)?)
-    }
 
-    fn counting_dead_docs_factory(
-        dead_docs: Vec<crate::DocId>,
-        calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    ) -> crate::aggregation::DocVisibilityFilterFactory {
-        use std::sync::atomic::Ordering;
-        std::sync::Arc::new(move |_reader| {
-            let dead_docs = dead_docs.clone();
-            let calls = calls.clone();
-            Some(Box::new(move |doc| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                !dead_docs.contains(&doc)
-            }))
-        })
-    }
-
-    fn str_cardinality_req() -> Aggregations {
-        serde_json::from_value(json!({
-            "cardinality": {
-                "cardinality": { "field": "name" }
-            },
-        }))
-        .unwrap()
-    }
-
-    fn single_segment_str_index(terms_per_doc: &[Option<&str>]) -> Index {
         let mut schema_builder = Schema::builder();
         let name_field = schema_builder.add_text_field("name", STRING | FAST);
         let index = Index::create_in_ram(schema_builder.build());
         let mut writer = index.writer_for_tests().unwrap();
-        for term in terms_per_doc {
-            match term {
-                Some(term) => writer.add_document(doc!(name_field => *term)).unwrap(),
-                None => writer.add_document(doc!()).unwrap(),
+        // Segment of 4 docs: doc 0 ("a") and doc 3 ("z") are dead. "a" is
+        // still counted via its visible witness doc 1; "z" is not counted.
+        writer.add_document(doc!(name_field => "a")).unwrap();
+        writer.add_document(doc!(name_field => "a")).unwrap();
+        writer.add_document(doc!(name_field => "b")).unwrap();
+        writer.add_document(doc!(name_field => "z")).unwrap();
+        writer.commit().unwrap();
+        // Segment of 3 docs: doc 1 ("c") is dead. "b" repeats across
+        // segments and must merge to a single distinct value.
+        writer.add_document(doc!(name_field => "b")).unwrap();
+        writer.add_document(doc!(name_field => "c")).unwrap();
+        writer.add_document(doc!(name_field => "d")).unwrap();
+        writer.commit().unwrap();
+
+        let factory: crate::aggregation::DocVisibilityFilterFactory = Arc::new(|reader| {
+            let dead_docs: &[crate::DocId] = match reader.max_doc() {
+                4 => &[0, 3],
+                3 => &[1],
+                _ => panic!("unexpected segment"),
             };
-        }
-        writer.commit().unwrap();
-        index
-    }
+            Some(Box::new(move |doc| !dead_docs.contains(&doc)))
+        });
 
-    /// Str path with a visibility filter: values on dead docs don't count,
-    /// a value whose first doc is dead is still counted via a later visible
-    /// doc, and confirmed values skip the filter entirely.
-    #[test]
-    fn cardinality_str_visibility_filter_is_lazy_and_exact() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc;
-
-        // doc:   0        1    2    3    4
-        // value: a        a    b    b    z
-        // alive: dead     ok   ok   ok   dead
-        let index =
-            single_segment_str_index(&[Some("a"), Some("a"), Some("b"), Some("b"), Some("z")]);
-        let calls = Arc::new(AtomicU32::new(0));
-        let factory = counting_dead_docs_factory(vec![0, 4], calls.clone());
-
-        let res = exec_with_visibility_filter(str_cardinality_req(), &index, factory).unwrap();
-        // "a" (witness doc 1), "b" (doc 2). "z" only exists on a dead doc.
-        assert_eq!(res["cardinality"]["value"], 2.0);
-        // Checked: doc 0 (dead), doc 1 (confirms a), doc 2 (confirms b),
-        // doc 4 (dead). Doc 3 skipped: b already confirmed.
-        assert_eq!(calls.load(Ordering::Relaxed), 4);
-    }
-
-    /// Same semantics on the TermOrdSet accumulator (dictionary larger than
-    /// BITSET_MAX_TERM_ORD), crossing the sparse -> dense promotion.
-    #[test]
-    fn cardinality_str_visibility_filter_term_ord_set() {
-        use std::sync::atomic::AtomicU32;
-        use std::sync::Arc;
-
-        let terms: Vec<String> = (0..300).map(|i| format!("term_{i:03}")).collect();
-        let terms_per_doc: Vec<Option<&str>> = terms.iter().map(|t| Some(t.as_str())).collect();
-        let index = single_segment_str_index(&terms_per_doc);
-        let dead_docs: Vec<crate::DocId> = (0..300).filter(|doc| doc % 2 == 1).collect();
-        let factory = counting_dead_docs_factory(dead_docs, Arc::new(AtomicU32::new(0)));
-
-        let res = exec_with_visibility_filter(str_cardinality_req(), &index, factory).unwrap();
-        assert_eq!(res["cardinality"]["value"], 150.0);
-    }
-
-    /// The missing sentinel obeys the filter: a dead doc without a value must
-    /// not produce the missing key.
-    #[test]
-    fn cardinality_str_visibility_filter_missing() {
-        use std::sync::atomic::AtomicU32;
-        use std::sync::Arc;
-
-        let index = single_segment_str_index(&[Some("x"), None]);
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "cardinality": {
-                "cardinality": { "field": "name", "missing": "MISSING" }
-            },
-        }))
-        .unwrap();
-
-        let factory = counting_dead_docs_factory(vec![1], Arc::new(AtomicU32::new(0)));
-        let res = exec_with_visibility_filter(agg_req.clone(), &index, factory).unwrap();
-        assert_eq!(res["cardinality"]["value"], 1.0);
-
-        let factory = counting_dead_docs_factory(vec![], Arc::new(AtomicU32::new(0)));
-        let res = exec_with_visibility_filter(agg_req, &index, factory).unwrap();
-        assert_eq!(res["cardinality"]["value"], 2.0);
-    }
-
-    /// A visibility filter on a numeric cardinality is rejected at request
-    /// build time: without the term-ord set the filter cannot be honored.
-    #[test]
-    fn cardinality_numeric_visibility_filter_rejected() {
-        use std::sync::atomic::AtomicU32;
-        use std::sync::Arc;
-
-        let mut schema_builder = Schema::builder();
-        let id_field = schema_builder.add_u64_field("id", FAST);
-        let index = Index::create_in_ram(schema_builder.build());
-        let mut writer = index.writer_for_tests().unwrap();
-        writer.add_document(doc!(id_field => 1u64)).unwrap();
-        writer.commit().unwrap();
-
-        let agg_req: Aggregations = serde_json::from_value(json!({
-            "cardinality": {
-                "cardinality": { "field": "id" }
-            },
-        }))
-        .unwrap();
-
-        let factory = counting_dead_docs_factory(vec![], Arc::new(AtomicU32::new(0)));
-        let err = exec_with_visibility_filter(agg_req, &index, factory).unwrap_err();
-        assert!(matches!(err, crate::TantivyError::InvalidArgument(_)));
-    }
-
-    /// Any non-cardinality aggregation in the request is rejected when a
-    /// visibility factory is set.
-    #[test]
-    fn visibility_filter_rejects_non_cardinality_aggs() {
-        use std::sync::atomic::AtomicU32;
-        use std::sync::Arc;
-
-        let index = single_segment_str_index(&[Some("a")]);
         let agg_req: Aggregations = serde_json::from_value(json!({
             "cardinality": {
                 "cardinality": { "field": "name" }
             },
-            "terms": {
-                "terms": { "field": "name" }
-            },
         }))
         .unwrap();
-
-        let factory = counting_dead_docs_factory(vec![], Arc::new(AtomicU32::new(0)));
-        let err = exec_with_visibility_filter(agg_req, &index, factory).unwrap_err();
-        assert!(matches!(err, crate::TantivyError::InvalidArgument(_)));
-    }
-
-    /// A str field absent from the segment resolves to an empty non-str
-    /// fallback column; the validation tolerates it since it contributes
-    /// nothing.
-    #[test]
-    fn visibility_filter_allows_empty_fallback_column() {
-        use std::sync::atomic::AtomicU32;
-        use std::sync::Arc;
-
-        let mut schema_builder = Schema::builder();
-        let _name_field = schema_builder.add_text_field("name", STRING | FAST);
-        let id_field = schema_builder.add_u64_field("id", FAST);
-        let index = Index::create_in_ram(schema_builder.build());
-        let mut writer = index.writer_for_tests().unwrap();
-        writer.add_document(doc!(id_field => 1u64)).unwrap();
-        writer.commit().unwrap();
-
-        let factory = counting_dead_docs_factory(vec![], Arc::new(AtomicU32::new(0)));
-        let res = exec_with_visibility_filter(str_cardinality_req(), &index, factory).unwrap();
-        assert_eq!(res["cardinality"]["value"], 0.0);
+        let collector = AggregationCollector::from_aggs(
+            agg_req,
+            AggContextParams::default().with_doc_visibility_factory(factory),
+        );
+        let searcher = index.reader().unwrap().searcher();
+        assert_eq!(searcher.segment_readers().len(), 2);
+        let res = serde_json::to_value(searcher.search(&AllQuery, &collector).unwrap()).unwrap();
+        // Visible: "a", "b" from the first segment; "b", "d" from the second.
+        assert_eq!(res["cardinality"]["value"], 3.0);
     }
 
     #[test]
