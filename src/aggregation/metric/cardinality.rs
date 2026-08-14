@@ -782,7 +782,7 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                 }
             }
             SegmentCardinalityCollectorBucket::Numeric(cardinality) => {
-                // Unreachable: `validate_doc_visibility_request` rejects
+                // Unreachable: `build_aggregations_data_from_req` rejects
                 // non-str cardinality at request build time.
                 if doc_visibility.is_some() {
                     return Err(crate::TantivyError::InternalError(
