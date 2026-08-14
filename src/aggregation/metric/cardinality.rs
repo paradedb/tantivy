@@ -782,12 +782,13 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                 }
             }
             SegmentCardinalityCollectorBucket::Numeric(cardinality) => {
-                assert!(
-                    doc_visibility.is_none(),
-                    "doc visibility filter is only supported for cardinality aggregations over \
-                     str fast fields, got column type {:?}",
-                    self.column_type
-                );
+                // Unreachable: `validate_doc_visibility_request` rejects
+                // non-str cardinality at request build time.
+                if doc_visibility.is_some() {
+                    return Err(crate::TantivyError::InternalError(
+                        "doc visibility filter reached a non-str cardinality collector".to_string(),
+                    ));
+                }
                 if self.column_type == ColumnType::IpAddr {
                     let compact_space_accessor = self
                         .accessor
@@ -1471,10 +1472,14 @@ mod tests {
 
     /// End-to-end str cardinality with a per-segment doc visibility filter:
     /// values on dead docs don't count, a value whose first doc is dead is
-    /// still counted via a later visible witness, and results merge across
-    /// segments.
+    /// still counted via a later visible witness, the missing sentinel obeys
+    /// the filter, results merge across segments, and confirmed values skip
+    /// the filter entirely (asserted via the exact call count). The 300-term
+    /// segment exceeds BITSET_MAX_TERM_ORD, exercising the TermOrdSet
+    /// accumulator across its sparse -> dense promotion.
     #[test]
     fn string_cardinality_with_visibility_filter() {
+        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
 
         use crate::aggregation::{AggContextParams, AggregationCollector};
@@ -1484,32 +1489,48 @@ mod tests {
         let name_field = schema_builder.add_text_field("name", STRING | FAST);
         let index = Index::create_in_ram(schema_builder.build());
         let mut writer = index.writer_for_tests().unwrap();
-        // Segment of 4 docs: doc 0 ("a") and doc 3 ("z") are dead. "a" is
-        // still counted via its visible witness doc 1; "z" is not counted.
+        // Segment of 6 docs, dead: {0, 4, 5}. "a" is still counted via its
+        // visible witness doc 1; "z" only lives on a dead doc; doc 5 has no
+        // value, and its dead missing sentinel must not count either.
         writer.add_document(doc!(name_field => "a")).unwrap();
         writer.add_document(doc!(name_field => "a")).unwrap();
         writer.add_document(doc!(name_field => "b")).unwrap();
+        writer.add_document(doc!(name_field => "b")).unwrap();
         writer.add_document(doc!(name_field => "z")).unwrap();
+        writer.add_document(doc!()).unwrap();
         writer.commit().unwrap();
-        // Segment of 3 docs: doc 1 ("c") is dead. "b" repeats across
-        // segments and must merge to a single distinct value.
+        // Segment of 3 docs, dead: {1}. "b" repeats across segments and must
+        // merge to a single distinct value.
         writer.add_document(doc!(name_field => "b")).unwrap();
         writer.add_document(doc!(name_field => "c")).unwrap();
         writer.add_document(doc!(name_field => "d")).unwrap();
         writer.commit().unwrap();
+        // Segment of 300 distinct terms, odd docs dead: 150 remain.
+        for i in 0..300 {
+            let term = format!("term_{i:03}");
+            writer.add_document(doc!(name_field => term)).unwrap();
+        }
+        writer.commit().unwrap();
 
-        let factory: crate::aggregation::DocVisibilityFilterFactory = Arc::new(|reader| {
-            let dead_docs: &[crate::DocId] = match reader.max_doc() {
-                4 => &[0, 3],
-                3 => &[1],
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_in_filter = calls.clone();
+        let factory: crate::aggregation::DocVisibilityFilterFactory = Arc::new(move |reader| {
+            let dead: fn(crate::DocId) -> bool = match reader.max_doc() {
+                6 => |doc| [0, 4, 5].contains(&doc),
+                3 => |doc| doc == 1,
+                300 => |doc| doc % 2 == 1,
                 _ => panic!("unexpected segment"),
             };
-            Some(Box::new(move |doc| !dead_docs.contains(&doc)))
+            let calls = calls_in_filter.clone();
+            Some(Box::new(move |doc| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                !dead(doc)
+            }))
         });
 
         let agg_req: Aggregations = serde_json::from_value(json!({
             "cardinality": {
-                "cardinality": { "field": "name" }
+                "cardinality": { "field": "name", "missing": "MISSING" }
             },
         }))
         .unwrap();
@@ -1518,10 +1539,15 @@ mod tests {
             AggContextParams::default().with_doc_visibility_factory(factory),
         );
         let searcher = index.reader().unwrap().searcher();
-        assert_eq!(searcher.segment_readers().len(), 2);
+        assert_eq!(searcher.segment_readers().len(), 3);
         let res = serde_json::to_value(searcher.search(&AllQuery, &collector).unwrap()).unwrap();
-        // Visible: "a", "b" from the first segment; "b", "d" from the second.
-        assert_eq!(res["cardinality"]["value"], 3.0);
+        // "a", "b", "d" plus 150 alive distinct terms; no "MISSING": the only
+        // doc without a value is dead.
+        assert_eq!(res["cardinality"]["value"], 153.0);
+        // First segment checks docs 0, 1, 2, 4, 5 and skips doc 3 ("b"
+        // already confirmed by doc 2): 5 calls. Second segment checks all
+        // 3 docs. Third segment checks all 300 (every term distinct).
+        assert_eq!(calls.load(Ordering::Relaxed), 308);
     }
 
     #[test]

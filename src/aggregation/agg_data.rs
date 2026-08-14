@@ -441,7 +441,38 @@ pub(crate) fn build_aggregations_data_from_req(
         let nodes = build_nodes(name, agg, reader, segment_ordinal, &mut data, true)?;
         data.per_request.agg_tree.extend(nodes);
     }
+    if data.doc_visibility.is_some() {
+        validate_doc_visibility_request(&data)?;
+    }
     Ok(data)
+}
+
+/// The doc visibility filter is only implemented for cardinality over str
+/// columns (the lazy witness check needs the exact term-ord set). Reject
+/// anything else rather than silently returning unfiltered counts.
+fn validate_doc_visibility_request(data: &AggregationsSegmentCtx) -> crate::Result<()> {
+    let unsupported_node = data
+        .per_request
+        .agg_tree
+        .iter()
+        .any(|node| !matches!(node.kind, AggKind::Cardinality) || !node.children.is_empty());
+    if unsupported_node {
+        return Err(crate::TantivyError::InvalidArgument(
+            "doc_visibility_factory is only supported for requests containing exclusively \
+             cardinality aggregations without sub-aggregations"
+                .to_string(),
+        ));
+    }
+    for req_data in &data.per_request.cardinality_req_data {
+        if req_data.column_type != ColumnType::Str {
+            return Err(crate::TantivyError::InvalidArgument(format!(
+                "doc_visibility_factory is only supported for cardinality aggregations over str \
+                 fast fields, field `{}` resolved to column type {:?}",
+                req_data.req.field, req_data.column_type
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn build_nodes(
