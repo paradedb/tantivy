@@ -446,6 +446,7 @@ mod ivf_e2e_tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
+                max_edges: None,
             }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
@@ -599,6 +600,7 @@ mod ivf_e2e_tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
+                max_edges: None,
             }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
@@ -772,6 +774,7 @@ mod ivf_e2e_tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: centroids.clone(),
+                max_edges: None,
             }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;

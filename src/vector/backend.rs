@@ -897,8 +897,8 @@ mod tests {
     use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
         IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-        NeighborhoodGraphSearchMetrics, SearchTerminationReason, VectorClusterStats, VectorDType,
-        VectorInfo, VectorOptions, VectorStorageFormat,
+        NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, SearchTerminationReason,
+        VectorClusterStats, VectorDType, VectorInfo, VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -985,6 +985,7 @@ mod tests {
                 training_samples_per_centroid: self.training_samples_per_centroid(),
                 assign_batch_size: self.assign_batch_size(),
                 replicas: self.replicas,
+                max_edges: NeighborhoodGraphConfig::default().max_edges,
             })
         }
         fn train(

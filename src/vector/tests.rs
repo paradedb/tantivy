@@ -10,7 +10,7 @@ use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, S
 use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-    Metric, VectorDType, VectorOptions,
+    Metric, NeighborhoodGraphConfig, VectorDType, VectorOptions,
 };
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
@@ -35,6 +35,7 @@ pub(crate) struct TestVectorIndexBuilder {
     metric: Metric,
     selectivities: Vec<f32>,
     vector_storage_format: VectorStorageFormat,
+    max_edges: Option<usize>,
 }
 
 impl TestVectorIndexBuilder {
@@ -59,6 +60,11 @@ impl TestVectorIndexBuilder {
     pub(crate) fn centroids(mut self, centroids: &[[f32; grid2d::DIM]]) -> Self {
         assert!(!centroids.is_empty(), "need at least one centroid");
         self.centroids = centroids.to_vec();
+        self
+    }
+
+    pub(crate) fn max_edges(mut self, max_edges: usize) -> Self {
+        self.max_edges = Some(max_edges);
         self
     }
 
@@ -107,6 +113,7 @@ impl TestVectorIndexBuilder {
         if self.vector_storage_format == VectorStorageFormat::Ivf {
             builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: self.centroids.clone(),
+                max_edges: self.max_edges,
             }));
         }
         builder.create_in_ram()
@@ -121,6 +128,7 @@ impl TestVectorIndex {
             metric: Metric::L2,
             selectivities: Vec::new(),
             vector_storage_format: VectorStorageFormat::Flat,
+            max_edges: None,
         }
     }
 
@@ -173,6 +181,7 @@ impl TestVectorIndex {
 
 pub(crate) struct Grid2DClusterer {
     pub(crate) centroids: Vec<[f32; grid2d::DIM]>,
+    pub(crate) max_edges: Option<usize>,
 }
 
 impl IvfClusterer for Grid2DClusterer {
@@ -192,6 +201,9 @@ impl IvfClusterer for Grid2DClusterer {
             // The grid fixture asserts exact cluster membership; keep
             // replication off so the 3×3 grid assignment stays primary-only.
             replicas: 1,
+            max_edges: self
+                .max_edges
+                .unwrap_or(NeighborhoodGraphConfig::default().max_edges),
         })
     }
 
@@ -505,6 +517,54 @@ fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
         assert!(adjacency[1..max_edges].iter().all(|&id| id == EMPTY));
         assert_eq!(adjacency[max_edges], 0);
         assert!(adjacency[max_edges + 1..].iter().all(|&id| id == EMPTY));
+    }
+    Ok(())
+}
+
+#[test]
+fn ivf_merge_honors_clusterer_max_edges() -> crate::Result<()> {
+    use crate::directory::CompositeFile;
+    use crate::index::SegmentComponent;
+    use crate::vector::ivf::graph::EMPTY;
+    use crate::vector::ivf::CENTROIDS_EXT;
+
+    let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
+    let custom_max_edges = 4usize;
+    assert_ne!(
+        custom_max_edges,
+        NeighborhoodGraphConfig::default().max_edges
+    );
+    let index = TestVectorIndex::builder(VectorDType::F32)
+        .vector_storage_format(VectorStorageFormat::Ivf)
+        .centroids(&centroids)
+        .max_edges(custom_max_edges)
+        .build()?;
+    let searcher = index.index.reader()?.searcher();
+    assert!(!searcher.segment_readers().is_empty());
+
+    for segment_reader in searcher.segment_readers() {
+        let centroids_file =
+            segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
+        let (_version, body) = super::header::read_header(&centroids_file)?;
+        let composite = CompositeFile::open(&body)?;
+        let graph_bytes = composite
+            .open_read_with_idx(index.embedding_field(), 2)
+            .expect("IVF merge should write the centroid graph slot")
+            .read_bytes()?;
+
+        let words: Vec<u32> = graph_bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("u32 word")))
+            .collect();
+        assert_eq!(words[0] as usize, custom_max_edges);
+        let adjacency = &words[1..];
+        assert_eq!(adjacency.len(), centroids.len() * custom_max_edges);
+        assert_eq!(adjacency[0], 1);
+        assert!(adjacency[1..custom_max_edges].iter().all(|&id| id == EMPTY));
+        assert_eq!(adjacency[custom_max_edges], 0);
+        assert!(adjacency[custom_max_edges + 1..]
+            .iter()
+            .all(|&id| id == EMPTY));
     }
     Ok(())
 }
@@ -854,7 +914,8 @@ mod bounds_storage_tests {
     use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
     use crate::vector::{
         residual_norm, BoundKind, IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings,
-        IvfTrainingVectors, IvfVectors, Metric, VectorDType, VectorOptions, VectorStorageFormat,
+        IvfTrainingVectors, IvfVectors, Metric, NeighborhoodGraphConfig, VectorDType,
+        VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -958,6 +1019,7 @@ mod bounds_storage_tests {
                 training_samples_per_centroid: self.training_samples_per_centroid(),
                 assign_batch_size: self.assign_batch_size(),
                 replicas: 1,
+                max_edges: NeighborhoodGraphConfig::default().max_edges,
             })
         }
         fn train(

@@ -115,6 +115,7 @@ fn build_centroid_graph<'a>(
     centroids: &'a [f32],
     dim: usize,
     ef: usize,
+    max_edges: usize,
 ) -> crate::Result<RelativeNeighborhoodGraph<&'a [f32]>> {
     // Replica cells must predict the query-time router
     // (`rank_clusters`), which ranks centroids by the field metric —
@@ -128,6 +129,7 @@ fn build_centroid_graph<'a>(
     // `exact_nearest_centroids`.
     let config = NeighborhoodGraphConfig {
         ef,
+        max_edges,
         ..Default::default()
     };
     let mut rng = RelativeNeighborhoodGraph::new(centroids, dim, metric, config);
@@ -217,6 +219,11 @@ pub(crate) fn merge_ivf(
     }
 
     let settings = clusterer.merge_settings(num_target_docs as usize)?;
+    if settings.max_edges == 0 {
+        return Err(TantivyError::InvalidArgument(
+            "IvfMergeSettings max_edges must be non-zero".to_string(),
+        ));
+    }
     let directory = ctx.target_segment.index().directory();
     let vec_path = ctx
         .target_segment
@@ -383,6 +390,7 @@ pub(crate) fn merge_ivf(
                         centroid_matrix.values.as_slice(),
                         dim,
                         ef_search,
+                        settings.max_edges,
                     )?;
                     timings.selector_build = build_start.elapsed();
                     Some(ReplicaSelector::Graph(graph))
@@ -771,7 +779,10 @@ pub(crate) fn merge_ivf(
                                 centroid_matrix.values.as_slice(),
                                 opts.dim(),
                                 opts.metric(),
-                                NeighborhoodGraphConfig::default(),
+                                NeighborhoodGraphConfig {
+                                    max_edges: settings.max_edges,
+                                    ..Default::default()
+                                },
                             );
                             rng.build(&build_executor("rng-build-")?);
                             rng.serialize(graph_w)?;

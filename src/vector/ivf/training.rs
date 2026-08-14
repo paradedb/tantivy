@@ -1,5 +1,5 @@
 use crate::schema::VectorOptions;
-use crate::vector::VectorElement;
+use crate::vector::{NeighborhoodGraphConfig, VectorElement};
 use crate::{DocId, TantivyError};
 
 pub trait IvfClusterer: Send + Sync + 'static {
@@ -54,6 +54,7 @@ pub trait IvfClusterer: Send + Sync + 'static {
             assign_batch_size,
             // Replication off by default (primary-only layout).
             replicas: 1,
+            max_edges: NeighborhoodGraphConfig::default().max_edges,
         })
     }
 }
@@ -70,6 +71,11 @@ pub struct IvfMergeSettings {
     /// default) disables replication entirely — no selector is built and the
     /// output is the primary-only layout.
     pub replicas: usize,
+    /// Maximum out-degree of the persisted centroid routing graph
+    /// (`NeighborhoodGraphConfig::max_edges`). Baked into each segment's
+    /// serialized graph at build time; already-written segments keep the
+    /// degree they were built with. Must be non-zero.
+    pub max_edges: usize,
 }
 
 #[derive(Clone, Debug)]
