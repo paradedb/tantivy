@@ -445,11 +445,10 @@ pub(crate) fn build_aggregations_data_from_req(
     // columns (the lazy witness check needs the exact term-ord set). Reject
     // anything else rather than silently returning unfiltered counts.
     if data.doc_visibility.is_some() {
-        let unsupported_node = data
-            .per_request
-            .agg_tree
-            .iter()
-            .any(|node| !matches!(node.kind, AggKind::Cardinality) || !node.children.is_empty());
+        let unsupported_node =
+            data.per_request.agg_tree.iter().any(|node| {
+                !matches!(node.kind, AggKind::Cardinality) || !node.children.is_empty()
+            });
         if unsupported_node {
             return Err(crate::TantivyError::InvalidArgument(
                 "doc_visibility_factory is only supported for requests containing exclusively \
