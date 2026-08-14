@@ -25,6 +25,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::io::{self, Write};
 use std::ops::Deref;
+use std::sync::atomic::{self, AtomicUsize};
 
 use common::{BinarySerializable, BitSet};
 
@@ -473,6 +474,27 @@ impl Default for NeighborhoodGraphConfig {
     }
 }
 
+/// Query-time override for [`NeighborhoodGraphConfig::ef`], stored as 0 when
+/// unset. Read once per graph open (see `IvfIndex::open`), not per search, so
+/// it applies to graphs opened after the call; build-time searches are
+/// unaffected.
+static GRAPH_EF_SEARCH: AtomicUsize = AtomicUsize::new(0);
+
+/// Overrides the query-time routing beam width ([`NeighborhoodGraphConfig::ef`])
+/// for subsequently opened centroid graphs. 0 clears the override, restoring
+/// the configured default.
+pub fn set_graph_ef_search(ef: usize) {
+    GRAPH_EF_SEARCH.store(ef, atomic::Ordering::Relaxed);
+}
+
+/// The current [`set_graph_ef_search`] override, if any.
+pub(crate) fn graph_ef_search() -> Option<usize> {
+    match GRAPH_EF_SEARCH.load(atomic::Ordering::Relaxed) {
+        0 => None,
+        ef => Some(ef),
+    }
+}
+
 /// A beam search over a [`RelativeNeighborhoodGraph`] that yields
 /// [`Candidate`]s on demand.
 ///
@@ -766,7 +788,9 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     /// afterward. Every node reads the same pre-pass snapshot — a
     /// *synchronous* refinement, the shape that parallelizes.
     pub fn refine(&mut self, executor: &Executor)
-    where S: Sync {
+    where
+        S: Sync,
+    {
         let len = self.graph.len();
         if len == 0 {
             return;
@@ -1313,6 +1337,14 @@ mod rng_tests {
         let (a, _) = rng.search(&mut ws, &[4.2], &[0], 3);
         let (b, _) = rng.search(&mut ws, &[4.2], &[0], 3);
         assert_eq!(a, b); // epoch reset means repeated queries match exactly
+    }
+
+    #[test]
+    fn graph_ef_search_override_roundtrip() {
+        set_graph_ef_search(32);
+        assert_eq!(graph_ef_search(), Some(32));
+        set_graph_ef_search(0);
+        assert_eq!(graph_ef_search(), None);
     }
 
     #[test]

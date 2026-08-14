@@ -16,9 +16,9 @@ mod training;
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
 pub use graph::{
-    Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    Workspace,
+    set_graph_ef_search, Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics,
+    NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator,
+    SearchTerminationReason, Workspace,
 };
 pub use index::{IvfIndex, IvfSearchMetrics};
 pub use params::{AdaptiveProbeParams, WorkModel};

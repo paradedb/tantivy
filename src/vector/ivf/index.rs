@@ -43,7 +43,7 @@ use std::ops::Range;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use super::graph::{
-    Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
+    graph_ef_search, Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
 };
 use crate::directory::FileSlice;
@@ -205,12 +205,16 @@ impl IvfIndex {
                 // Adjacency length is validated against the arena's node
                 // count inside `Graph::open`.
                 let adjacency = slice.read_bytes()?;
+                let mut config = NeighborhoodGraphConfig::default();
+                if let Some(ef) = graph_ef_search() {
+                    config.ef = ef;
+                }
                 Some(RelativeNeighborhoodGraph::open(
                     &adjacency,
                     vectors,
                     options.dim(),
                     options.metric(),
-                    NeighborhoodGraphConfig::default(),
+                    config,
                 )?)
             }
             None => None,
