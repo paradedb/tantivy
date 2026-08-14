@@ -14,10 +14,16 @@ use super::graph::Candidate;
 use super::NodeId as GraphNodeId;
 use crate::directory::FileSlice;
 use crate::schema::Metric;
-use crate::vector::{FileSliceArena, VectorArena};
+use crate::vector::{FileSliceArena, Similarity, VectorArena};
 
-/// Default per-round member budget for [`BKTree::search_iter`].
+/// Default per-round member budget for [`BKTree::search_iter`], and the
+/// initial seed count when routing through a BKT. Matches SPTAG's
+/// `NumberOfInitialDynamicPivots`.
 pub(crate) const DEFAULT_MAX_LEAVES: usize = 50;
+
+/// Seeds injected when the BKT frontier outranks the RNG mid-search.
+/// Matches SPTAG's `NumberOfOtherDynamicPivots`.
+pub(crate) const DEFAULT_REFILL_SEEDS: usize = 4;
 
 const NODE_INTERNAL: u8 = 0;
 const NODE_LEAF: u8 = 1;
@@ -168,6 +174,12 @@ impl<'g, S: VectorArena> BKTreeSearchIterator<'g, S> {
             frontier,
             results: VecDeque::new(),
         }
+    }
+
+    /// Similarity of the best unexpanded tree node, if any.
+    #[inline]
+    pub(crate) fn frontier_best(&self) -> Option<Similarity> {
+        self.frontier.peek().map(|c| c.sim)
     }
 
     fn run_round(&mut self) {
@@ -666,5 +678,20 @@ mod tests {
         let first_round: Vec<_> = tree.search_iter_n(&[1.0, 0.0], 1).take(2).collect();
         assert_eq!(first_round.len(), 2);
         assert!(first_round.iter().all(|&n| n == 10 || n == 11));
+    }
+
+    #[test]
+    fn search_iter_take_preserves_frontier_across_batches() {
+        let tree = sample_tree();
+        let mut iter = tree.search_iter_n(&[1.0, 0.0], 1);
+        assert!(iter.frontier_best().is_some());
+        let first: Vec<_> = (&mut iter).take(2).collect();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|&n| n == 10 || n == 11));
+        // A second batch should still be available from the remaining frontier.
+        assert!(iter.frontier_best().is_some());
+        let second: Vec<_> = (&mut iter).take(2).collect();
+        assert_eq!(second.len(), 2);
+        assert!(second.iter().all(|&n| n == 20 || n == 21));
     }
 }
