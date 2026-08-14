@@ -255,6 +255,16 @@ impl PagedBitset {
         }
     }
 
+    #[inline]
+    fn contains(&self, term_ord: u64) -> bool {
+        let page_idx = (term_ord >> BITSET_PAGE_SHIFT) as usize;
+        let Some(Some(page)) = self.pages.get(page_idx) else {
+            return false;
+        };
+        let intra = term_ord & BITSET_PAGE_MASK;
+        page.words[(intra >> 6) as usize].contains((intra & 63) as u32)
+    }
+
     /// Number of set bits. O(1).
     #[inline]
     fn len(&self) -> u64 {
@@ -310,6 +320,7 @@ pub(crate) trait TermOrdAccumulator: Sized {
     /// on promotion).
     fn new(max_term_ord_inclusive: u64) -> Self;
     fn insert(&mut self, term_ord: u64);
+    fn contains(&self, term_ord: u64) -> bool;
     /// Bulk insert. Implementations may override to hoist any inner
     /// dispatch outside the loop. Default loops `insert`.
     #[inline]
@@ -336,6 +347,10 @@ impl TermOrdAccumulator for BitSet {
     #[inline]
     fn insert(&mut self, term_ord: u64) {
         BitSet::insert(self, term_ord as u32);
+    }
+    #[inline]
+    fn contains(&self, term_ord: u64) -> bool {
+        BitSet::contains(self, term_ord as u32)
     }
     #[inline]
     fn len(&self) -> usize {
@@ -393,6 +408,14 @@ impl TermOrdAccumulator for TermOrdSet {
         }
     }
 
+    #[inline]
+    fn contains(&self, term_ord: u64) -> bool {
+        match &self.inner {
+            TermOrdSetInner::Sparse(set) => set.contains(&term_ord),
+            TermOrdSetInner::Dense(bitset) => bitset.contains(term_ord),
+        }
+    }
+
     /// Hoist the Sparse/Dense match outside the per-ord loop so that a
     /// block of inserts dispatches once.
     fn extend_from_iter<I: IntoIterator<Item = u64>>(&mut self, ords: I) {
@@ -440,6 +463,34 @@ impl TermOrdAccumulator for TermOrdSet {
             TermOrdSetInner::Sparse(set) => itertools::Either::Left(set.iter().copied()),
             TermOrdSetInner::Dense(bitset) => itertools::Either::Right(bitset.iter_sorted()),
         }
+    }
+}
+
+/// Caches the filter verdict for the last doc seen. Multi-valued columns and
+/// re-checked unconfirmed ords hit the same doc consecutively, so one cached
+/// entry removes the repeated filter calls.
+struct MemoizedDocVisibility<'a> {
+    filter: &'a dyn Fn(crate::DocId) -> bool,
+    last_doc: crate::DocId,
+    last_visible: bool,
+}
+
+impl<'a> MemoizedDocVisibility<'a> {
+    fn new(filter: &'a dyn Fn(crate::DocId) -> bool) -> Self {
+        Self {
+            filter,
+            last_doc: crate::DocId::MAX,
+            last_visible: false,
+        }
+    }
+
+    #[inline]
+    fn is_visible(&mut self, doc: crate::DocId) -> bool {
+        if doc != self.last_doc {
+            self.last_doc = doc;
+            self.last_visible = (self.filter)(doc);
+        }
+        self.last_visible
     }
 }
 
@@ -701,6 +752,7 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
             ));
         };
         let col_block_accessor = &agg_data.column_block_accessor;
+        let doc_visibility = agg_data.doc_visibility.as_deref();
         match bucket {
             SegmentCardinalityCollectorBucket::Str(entries) => {
                 // Promotion check runs on the pre-block state: the first call
@@ -710,9 +762,33 @@ impl<S: TermOrdAccumulator + 'static> SegmentAggregationCollector
                 // for adaptive variants and inlines to a tight loop for the
                 // BitSet path.
                 entries.maybe_compact();
-                entries.extend_from_iter(col_block_accessor.iter_vals());
+                if let Some(filter) = doc_visibility {
+                    // Lazy visibility: a value counts iff some visible doc
+                    // carries it. Confirmed ords skip the check entirely;
+                    // unconfirmed ords re-check on each occurrence until a
+                    // visible witness is found.
+                    let mut visibility = MemoizedDocVisibility::new(filter);
+                    for (doc, term_ord) in col_block_accessor.iter_docid_vals(docs, &self.accessor)
+                    {
+                        if entries.contains(term_ord) {
+                            continue;
+                        }
+                        if visibility.is_visible(doc) {
+                            entries.insert(term_ord);
+                        }
+                    }
+                } else {
+                    entries.extend_from_iter(col_block_accessor.iter_vals());
+                }
             }
             SegmentCardinalityCollectorBucket::Numeric(cardinality) => {
+                // Unreachable: `build_aggregations_data_from_req` rejects
+                // non-str cardinality at request build time.
+                if doc_visibility.is_some() {
+                    return Err(crate::TantivyError::InternalError(
+                        "doc visibility filter reached a non-str cardinality collector".to_string(),
+                    ));
+                }
                 if self.column_type == ColumnType::IpAddr {
                     let compact_space_accessor = self
                         .accessor
@@ -1001,6 +1077,11 @@ mod tests {
             bitset.insert(ord);
         }
         assert_eq!(bitset.len(), ords.len() as u64);
+        for &ord in &ords {
+            assert!(bitset.contains(ord));
+        }
+        assert!(!bitset.contains(2));
+        assert!(!bitset.contains(5000));
         let collected: Vec<u64> = bitset.iter_sorted().collect();
         let mut expected: Vec<u64> = ords.to_vec();
         expected.sort_unstable();
@@ -1023,6 +1104,8 @@ mod tests {
         set.insert(7);
         set.maybe_compact();
         assert_eq!(set.len(), 2);
+        assert!(set.contains(7));
+        assert!(!set.contains(8));
 
         // Third insert promotes on next maybe_compact.
         set.insert(20);
@@ -1035,6 +1118,8 @@ mod tests {
         set.insert(15);
         set.insert(15); // dup
         assert_eq!(set.len(), 4);
+        assert!(set.contains(15));
+        assert!(!set.contains(16));
 
         let mut collected: Vec<u64> = set.iter_ords().collect();
         collected.sort_unstable();
@@ -1383,6 +1468,86 @@ mod tests {
             let res = exec_request(agg_req, &index).unwrap();
             assert_eq!(res["cardinality"]["value"], 2.0);
         }
+    }
+
+    /// End-to-end str cardinality with a per-segment doc visibility filter:
+    /// values on dead docs don't count, a value whose first doc is dead is
+    /// still counted via a later visible witness, the missing sentinel obeys
+    /// the filter, results merge across segments, and confirmed values skip
+    /// the filter entirely (asserted via the exact call count). The 300-term
+    /// segment exceeds BITSET_MAX_TERM_ORD, exercising the TermOrdSet
+    /// accumulator across its sparse -> dense promotion.
+    #[test]
+    fn string_cardinality_with_visibility_filter() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        use crate::aggregation::{AggContextParams, AggregationCollector};
+        use crate::query::AllQuery;
+
+        let mut schema_builder = Schema::builder();
+        let name_field = schema_builder.add_text_field("name", STRING | FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests().unwrap();
+        // Segment of 6 docs, dead: {0, 4, 5}. "a" is still counted via its
+        // visible witness doc 1; "z" only lives on a dead doc; doc 5 has no
+        // value, and its dead missing sentinel must not count either.
+        writer.add_document(doc!(name_field => "a")).unwrap();
+        writer.add_document(doc!(name_field => "a")).unwrap();
+        writer.add_document(doc!(name_field => "b")).unwrap();
+        writer.add_document(doc!(name_field => "b")).unwrap();
+        writer.add_document(doc!(name_field => "z")).unwrap();
+        writer.add_document(doc!()).unwrap();
+        writer.commit().unwrap();
+        // Segment of 3 docs, dead: {1}. "b" repeats across segments and must
+        // merge to a single distinct value.
+        writer.add_document(doc!(name_field => "b")).unwrap();
+        writer.add_document(doc!(name_field => "c")).unwrap();
+        writer.add_document(doc!(name_field => "d")).unwrap();
+        writer.commit().unwrap();
+        // Segment of 300 distinct terms, odd docs dead: 150 remain.
+        for i in 0..300 {
+            let term = format!("term_{i:03}");
+            writer.add_document(doc!(name_field => term)).unwrap();
+        }
+        writer.commit().unwrap();
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_in_filter = calls.clone();
+        let factory: crate::aggregation::DocVisibilityFilterFactory = Arc::new(move |reader| {
+            let dead: fn(crate::DocId) -> bool = match reader.max_doc() {
+                6 => |doc| [0, 4, 5].contains(&doc),
+                3 => |doc| doc == 1,
+                300 => |doc| doc % 2 == 1,
+                _ => panic!("unexpected segment"),
+            };
+            let calls = calls_in_filter.clone();
+            Some(Box::new(move |doc| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                !dead(doc)
+            }))
+        });
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "cardinality": {
+                "cardinality": { "field": "name", "missing": "MISSING" }
+            },
+        }))
+        .unwrap();
+        let collector = AggregationCollector::from_aggs(
+            agg_req,
+            AggContextParams::default().with_doc_visibility_factory(factory),
+        );
+        let searcher = index.reader().unwrap().searcher();
+        assert_eq!(searcher.segment_readers().len(), 3);
+        let res = serde_json::to_value(searcher.search(&AllQuery, &collector).unwrap()).unwrap();
+        // "a", "b", "d" plus 150 alive distinct terms; no "MISSING": the only
+        // doc without a value is dead.
+        assert_eq!(res["cardinality"]["value"], 153.0);
+        // First segment checks docs 0, 1, 2, 4, 5 and skips doc 3 ("b"
+        // already confirmed by doc 2): 5 calls. Second segment checks all
+        // 3 docs. Third segment checks all 300 (every term distinct).
+        assert_eq!(calls.load(Ordering::Relaxed), 308);
     }
 
     #[test]
