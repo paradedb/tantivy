@@ -176,18 +176,13 @@ pub(crate) struct Grid2DClusterer {
 }
 
 impl IvfClusterer for Grid2DClusterer {
-    fn centroid_ratio(&self) -> f32 {
-        0.1
+    fn training_sample_ratio(&self) -> f32 {
+        1.0
     }
 
-    fn training_samples_per_centroid(&self) -> usize {
-        2
-    }
-
-    fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
+    fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
         Ok(IvfMergeSettings {
-            num_centroids: self.centroids.len().min(total_target_docs),
-            training_samples_per_centroid: self.training_samples_per_centroid(),
+            training_sample_ratio: self.training_sample_ratio(),
             assign_batch_size: self.assign_batch_size(),
             // The grid fixture asserts exact cluster membership; keep
             // replication off so the 3×3 grid assignment stays primary-only.
@@ -199,14 +194,13 @@ impl IvfClusterer for Grid2DClusterer {
         &self,
         options: &VectorOptions,
         _vectors: IvfTrainingVectors,
-        num_centroids: usize,
     ) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), grid2d::DIM);
+        let num_centroids = self.centroids.len();
         Ok(IvfCentroids::F32(IvfMatrix {
             values: self
                 .centroids
                 .iter()
-                .take(num_centroids)
                 .flat_map(|centroid| centroid.iter().copied())
                 .collect(),
             rows: num_centroids,
@@ -946,16 +940,12 @@ mod bounds_storage_tests {
     }
 
     impl IvfClusterer for TestClusterer {
-        fn centroid_ratio(&self) -> f32 {
+        fn training_sample_ratio(&self) -> f32 {
             1.0
         }
-        fn training_samples_per_centroid(&self) -> usize {
-            2
-        }
-        fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
+        fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
             Ok(IvfMergeSettings {
-                num_centroids: self.num_centroids.min(total_target_docs),
-                training_samples_per_centroid: self.training_samples_per_centroid(),
+                training_sample_ratio: self.training_sample_ratio(),
                 assign_batch_size: self.assign_batch_size(),
                 replicas: 1,
             })
@@ -964,9 +954,9 @@ mod bounds_storage_tests {
             &self,
             options: &VectorOptions,
             vectors: IvfTrainingVectors,
-            num_centroids: usize,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), 2);
+            let num_centroids = self.num_centroids;
             let values = match &self.fixed_centroids {
                 Some(centroids) => centroids
                     .iter()
