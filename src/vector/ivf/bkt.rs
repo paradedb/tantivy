@@ -16,8 +16,14 @@ use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::{FileSliceArena, Similarity, VectorArena};
 
-/// Default per-round member budget for [`BKTree::search_iter`].
+/// Default per-round member budget for [`BKTree::search_iter`], and the
+/// initial seed count when routing through a BKT. Matches SPTAG's
+/// `NumberOfInitialDynamicPivots`.
 pub(crate) const DEFAULT_MAX_LEAVES: usize = 50;
+
+/// Seeds injected when the BKT frontier outranks the RNG mid-search.
+/// Matches SPTAG's `NumberOfOtherDynamicPivots`.
+pub(crate) const DEFAULT_REFILL_SEEDS: usize = 4;
 
 const NODE_INTERNAL: u8 = 0;
 const NODE_LEAF: u8 = 1;
@@ -174,18 +180,6 @@ impl<'g, S: VectorArena> BKTreeSearchIterator<'g, S> {
     #[inline]
     pub(crate) fn frontier_best(&self) -> Option<Similarity> {
         self.frontier.peek().map(|c| c.sim)
-    }
-
-    /// Run one best-first round if `results` is empty, then drain and return
-    /// the accumulated graph member ids.
-    pub(crate) fn take_round(&mut self) -> Vec<GraphNodeId> {
-        if self.results.is_empty() {
-            if self.frontier.is_empty() {
-                return Vec::new();
-            }
-            self.run_round();
-        }
-        self.results.drain(..).collect()
     }
 
     fn run_round(&mut self) {
@@ -687,16 +681,16 @@ mod tests {
     }
 
     #[test]
-    fn take_round_drains_members_and_preserves_frontier() {
+    fn search_iter_take_preserves_frontier_across_batches() {
         let tree = sample_tree();
         let mut iter = tree.search_iter_n(&[1.0, 0.0], 1);
         assert!(iter.frontier_best().is_some());
-        let first = iter.take_round();
+        let first: Vec<_> = (&mut iter).take(2).collect();
         assert_eq!(first.len(), 2);
         assert!(first.iter().all(|&n| n == 10 || n == 11));
-        // A second round should still be available from the remaining frontier.
+        // A second batch should still be available from the remaining frontier.
         assert!(iter.frontier_best().is_some());
-        let second = iter.take_round();
+        let second: Vec<_> = (&mut iter).take(2).collect();
         assert_eq!(second.len(), 2);
         assert!(second.iter().all(|&n| n == 20 || n == 21));
     }

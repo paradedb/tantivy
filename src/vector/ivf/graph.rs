@@ -395,6 +395,8 @@ pub struct NeighborhoodGraphSearchMetrics {
     /// Nodes visited — and therefore scored — by the query; the search's
     /// navigation cost.
     pub visited_count: usize,
+    /// Nodes injected
+    pub injected_count: usize,
     /// Frontier candidates that survived the convergence check and had their
     /// adjacency scanned: the number of hops the search took. On a resumed
     /// [`SearchIterator`], evictions re-admitted through the frontier rescan
@@ -420,6 +422,7 @@ impl Default for NeighborhoodGraphSearchMetrics {
     fn default() -> Self {
         Self {
             visited_count: 0,
+            injected_count: 0,
             expanded_count: 0,
             edges_scanned: 0,
             evictions: 0,
@@ -581,12 +584,10 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
                 continue;
             }
             ws.visited.insert(node_id);
+            self.metrics.injected_count += 1;
             self.metrics.visited_count += 1;
             let sim = arena.similarity(metric, dim, node_id, self.query);
-            ws.frontier.push(Candidate {
-                sim,
-                node: node_id,
-            });
+            ws.frontier.push(Candidate { sim, node: node_id });
             inserted += 1;
         }
         inserted
@@ -625,8 +626,7 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         // nodes are never equal, so a node tied with the beam minimum can't
         // keep displacing it and cycle forever. Peek, don't pop: the
         // candidate stays for the next round to commit.
-        if ws.results.len() >= self.ef
-            && ws.results.peek().is_some_and(|worst| candidate < worst.0)
+        if ws.results.len() >= self.ef && ws.results.peek().is_some_and(|worst| candidate < worst.0)
         {
             self.metrics.termination_reason = SearchTerminationReason::SearchConverged;
             return false;

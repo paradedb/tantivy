@@ -2579,6 +2579,7 @@ mod tests {
                 visited_count: 7,
                 graph: Some(NeighborhoodGraphSearchMetrics {
                     visited_count: 7,
+                    injected_count: 0,
                     expanded_count: 4,
                     edges_scanned: 12,
                     evictions: 1,
@@ -2608,6 +2609,7 @@ mod tests {
                     "visited_count": 7,
                     "graph": {
                         "visited_count": 7,
+                        "injected_count": 0,
                         "expanded_count": 4,
                         "edges_scanned": 12,
                         "evictions": 1,

@@ -38,7 +38,7 @@ use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
-use super::bkt::{BKTree, BKTreeSearchIterator, DEFAULT_MAX_LEAVES};
+use super::bkt::{BKTree, BKTreeSearchIterator, DEFAULT_MAX_LEAVES, DEFAULT_REFILL_SEEDS};
 use super::graph::{
     Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
@@ -458,7 +458,7 @@ impl ClusterRanking<'_> {
                     (Some(rng_best), Some(bkt_best)) => bkt_best > rng_best,
                 };
                 if should_refill {
-                    let seeds = bkt.take_round();
+                    let seeds: Vec<NodeId> = bkt.take(DEFAULT_REFILL_SEEDS).collect();
                     iter.inject(&seeds);
                 }
             }
