@@ -38,6 +38,7 @@ use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
+use super::bkt::{BKTree, DEFAULT_MAX_LEAVES};
 use super::graph::{
     Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
@@ -49,11 +50,11 @@ use crate::vector::{BoundKind, BoundStore, FileSliceArena, VectorArena};
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
 ///
-/// Pinned state is small and touched by every query: the cluster offsets and
-/// the RNG adjacency (edges only, `num_centroids × max_edges × 4` bytes). The
-/// centroid vectors stay behind a [`FileSliceArena`] and are fetched one node
-/// at a time as routing visits them. Everything row-scale (the rows and
-/// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
+/// Pinned state is small and touched by every query: the cluster offsets,
+/// RNG adjacency, and BKT topology. Centroid / BKT center vectors stay behind
+/// [`FileSliceArena`]s and are fetched one row at a time. Everything
+/// row-scale (the rows and id-map) lives on
+/// [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
     num_centroids: usize,
     /// Distinct documents with a vector in this field. Rows including
@@ -73,6 +74,9 @@ pub struct IvfIndex {
     /// Slot `[3]`, pinned: the per-cluster bound payload,
     /// `num_centroids * bound_kind.stride(dim)` f32s in cluster order.
     bounds: Vec<f32>,
+    /// Balanced k-means tree over the centroids (slot `[4]`), used to seed
+    /// RNG routing. `None` falls back to strided seeds.
+    bkt: Option<BKTree<FileSliceArena<f32>>>,
 }
 
 impl IvfIndex {
@@ -142,8 +146,9 @@ impl IvfIndex {
     }
 
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
-    /// the bounds, and the graph adjacency are materialized; the centroid
-    /// rows stay behind a [`FileSlice`] for lazy per-node reads.
+    /// the bounds, the graph adjacency, and the BKT topology are
+    /// materialized; centroid and BKT center rows stay behind
+    /// [`FileSlice`]s for lazy per-row reads.
     /// `bounds_slice` is required: the caller has already refused any file
     /// old enough to lack it (the V2 check in `VectorIndexReader::open`).
     pub(crate) fn open(
@@ -152,6 +157,7 @@ impl IvfIndex {
         offsets_slice: FileSlice,
         graph_slice: Option<FileSlice>,
         bounds_slice: FileSlice,
+        bkt_slice: Option<FileSlice>,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
         if centroids_slice.len() < count_words {
@@ -253,6 +259,11 @@ impl IvfIndex {
             (kind, values)
         };
 
+        let bkt = match bkt_slice {
+            Some(slice) => Some(BKTree::open(slice, options.dim(), options.metric())?),
+            None => None,
+        };
+
         let index = IvfIndex {
             num_centroids,
             num_docs,
@@ -263,6 +274,7 @@ impl IvfIndex {
             graph,
             bound_kind,
             bounds,
+            bkt,
         };
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt file.
@@ -334,13 +346,9 @@ impl IvfIndex {
     /// cluster `c`, so `Candidate::node` is the cluster id).
     ///
     /// With a persisted RNG this is a resumable beam search
-    /// ([`RelativeNeighborhoodGraph::search_iter`]): the first batch is one
-    /// converged round at the configured
-    /// [`ef`](NeighborhoodGraphConfig::ef), and pulling past it resumes the
-    /// search, so routing cost is paid only as far as probing actually
-    /// reaches. Without one every centroid is scored exactly, up front. Both
-    /// paths score through the same [`FileSliceArena`], so their rankings
-    /// agree.
+    /// ([`RelativeNeighborhoodGraph::search_iter`]), seeded from the BKT when
+    /// present (else strided node ids). Without an RNG every centroid is
+    /// scored exactly, up front.
     ///
     /// `ws` holds the routing search's scratch and is borrowed for the
     /// ranking's lifetime; [`ClusterRanking::metrics`] reports the cost
@@ -352,14 +360,7 @@ impl IvfIndex {
     ) -> ClusterRanking<'a> {
         match &self.graph {
             Some(graph) => {
-                // TODO: Replace with proper seed generation
-                let seeds: Vec<NodeId> = {
-                    (0..graph.len())
-                        .step_by((graph.len() / 8).max(1))
-                        .take(8)
-                        .map(|node| node as NodeId)
-                        .collect()
-                };
+                let seeds = self.routing_seeds(graph.len(), query);
                 ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
             }
             None => {
@@ -377,6 +378,22 @@ impl IvfIndex {
                 }
             }
         }
+    }
+
+    /// Graph entry points for routing: BKT members nearest `query`, or a
+    /// strided sample of node ids when no BKT is present.
+    fn routing_seeds(&self, graph_len: usize, query: &[f32]) -> Vec<NodeId> {
+        if let Some(bkt) = &self.bkt {
+            let seeds: Vec<NodeId> = bkt.search_iter(query).take(DEFAULT_MAX_LEAVES).collect();
+            if !seeds.is_empty() {
+                return seeds;
+            }
+        }
+        (0..graph_len)
+            .step_by((graph_len / 8).max(1))
+            .take(8)
+            .map(|node| node as NodeId)
+            .collect()
     }
 }
 
