@@ -10,7 +10,7 @@ use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, S
 use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-    Metric, VectorDType, VectorOptions,
+    Metric, NeighborhoodGraphConfig, RelativeNeighborhoodGraph, VectorDType, VectorOptions,
 };
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
@@ -223,6 +223,23 @@ impl IvfClusterer for Grid2DClusterer {
             .chunks_exact(vectors.matrix.dims)
             .map(|vector| grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32)
             .collect())
+    }
+
+    fn build_rng(
+        &self,
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<Option<RelativeNeighborhoodGraph<Vec<f32>>>> {
+        let IvfCentroids::F32(centroids) = centroids;
+        if centroids.rows <= 1 {
+            return Ok(None);
+        }
+        Ok(Some(RelativeNeighborhoodGraph::build_from_centroids(
+            centroids.values.clone(),
+            centroids.dims,
+            options.metric(),
+            NeighborhoodGraphConfig::default(),
+        )?))
     }
 }
 

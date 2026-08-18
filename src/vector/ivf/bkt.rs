@@ -182,6 +182,19 @@ impl<'g, S: VectorArena> BKTreeSearchIterator<'g, S> {
         self.frontier.peek().map(|c| c.sim)
     }
 
+    /// Next member as a [`Candidate`], scored against IVF `centroids`
+    /// (rows indexed by graph / cluster id).
+    pub(crate) fn next_candidate<C: VectorArena<Elem = S::Elem>>(
+        &mut self,
+        centroids: &C,
+    ) -> Option<Candidate> {
+        let node = self.next()?;
+        Some(Candidate {
+            sim: centroids.similarity(self.tree.metric, self.tree.dim, node, self.query),
+            node,
+        })
+    }
+
     fn run_round(&mut self) {
         debug_assert!(self.results.is_empty());
 
