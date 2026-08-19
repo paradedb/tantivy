@@ -101,6 +101,7 @@ impl AdaptiveProbeParams {
     /// the open share; the loop's pricing is built from all three. A
     /// non-positive `max_probe_fraction` is a configuration error, not
     /// "no probing".
+    #[allow(dead_code)] // Consumed by the cross-segment search path (TODO).
     pub(crate) fn resolved_work_budget(
         &self,
         clusters_in_segment: usize,

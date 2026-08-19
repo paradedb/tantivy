@@ -1,28 +1,28 @@
-//! Distance kernels, the vector element trait, and the per-segment storage plugin.
+//! Distance kernels, the vector element trait, and the vector storage plugin.
 //!
 //! The schema-level field configuration ([`VectorOptions`](crate::schema::VectorOptions),
 //! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema module and is
 //! re-exported here; the element trait [`VectorElement`], the vector storage abstraction
 //! [`VectorArena`], and the distance kernels live here.
-//! The on-disk formats live in submodules: [`flat`] for the dense full-precision layout and
-//! [`ivf`] for the partitioned/clustered accelerator. Both are owned by a single
-//! [`VectorPlugin`] which picks between them per merge based on
-//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
-//! Top-N vector queries dispatch over them via [`VectorBackend`].
+//! Centroids are an index-level artifact ([`centroid_set`]) installed at index creation;
+//! every segment stores the one clustered layout ([`ivf`]), assigned against that set by
+//! [`VecWriter`] (per-commit) or the merge path, both owned by [`VectorPlugin`].
 
 use std::io;
 
 mod backend;
 mod bounds;
+pub(crate) mod centroid_set;
 mod collector;
 mod distance;
 mod header;
+mod id_map;
 mod index_reader;
 mod plugin;
 mod prepared;
 mod tie_break;
+mod writer;
 
-pub mod flat;
 pub mod ivf;
 
 #[cfg(test)]
@@ -42,16 +42,16 @@ pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilar
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
-pub use flat::FlatVecWriter;
-pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
+pub use centroid_set::{CentroidIndex, ROUTER_KIND_RNG};
+pub(crate) use centroid_set::write_centroid_set;
+pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo};
 pub use ivf::{
-    Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch,
-    IvfVectors, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    Workspace,
+    Candidate, Graph, IvfCentroids, IvfIndex, IvfMatrix, IvfSearchMetrics,
+    NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph,
+    ResumableSearchIterator, SearchIterator, SearchTerminationReason, Workspace,
 };
 pub use plugin::VectorPlugin;
+pub use writer::VecWriter;
 pub use prepared::PreparedQuery;
 pub use tie_break::NoTieBreak;
 

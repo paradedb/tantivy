@@ -1,19 +1,18 @@
-//! IVF (inverted-file) vector storage format.
+//! IVF (inverted-file) vector storage.
 //!
-//! The unified [`VectorPlugin`](crate::vector::VectorPlugin) routes to
-//! this module when the merge target meets
-//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold),
-//! which defaults to 10k docs.
+//! From format V3 on this is the ONLY per-segment layout: every write path
+//! assigns vectors against the index-level centroid set (see
+//! [`crate::vector::centroid_set`]) and stores cluster-sorted rows. The
+//! per-segment remainder — offsets, bounds, IVF meta — is read back through
+//! [`IvfIndex`].
 
+pub(crate) mod assign;
 pub(crate) mod graph;
 mod index;
 mod params;
 mod partition;
 mod plugin;
-mod training;
-
-/// The IVF cluster-routing file. Written per field, only for IVF segments.
-pub(crate) const CENTROIDS_EXT: &str = "centroids";
+mod types;
 
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
@@ -22,9 +21,6 @@ pub use graph::{
 };
 pub use index::{IvfIndex, IvfSearchMetrics};
 pub use params::{AdaptiveProbeParams, WorkModel};
-pub(crate) use plugin::merge_ivf;
-pub(crate) use training::{decode_row, encode_vector};
-pub use training::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfTrainingBatch,
-    IvfTrainingVectors, IvfVectorBatch, IvfVectors,
-};
+pub(crate) use plugin::{merge_ivf, write_ivf_field, IvfFieldWriteParams};
+pub(crate) use types::{decode_row, encode_vector};
+pub use types::{IvfCentroids, IvfMatrix};

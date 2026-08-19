@@ -318,6 +318,10 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         index_settings: target_settings.clone(), /* index_settings of all segments should be the
                                                   * same */
         persisted_custom_extensions: persisted_custom_extensions.clone(),
+        // The offline merge path does not carry index-level centroid sets;
+        // an output schema with vector fields fails the merge instead
+        // (merge_ivf errors on the missing set).
+        centroid_sets: Vec::new(),
         segments: vec![segment_meta],
         schema: target_schema.clone(),
         opstamp: 0u64,
@@ -332,6 +336,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     let previous_meta = IndexMeta {
         index_settings: target_settings,
         persisted_custom_extensions,
+        centroid_sets: Vec::new(),
         segments: segment_metas,
         schema: target_schema,
         opstamp: 0u64,
@@ -529,10 +534,14 @@ impl SegmentUpdater {
             // Segment 1 from disk 1, Segment 1 from disk 2, etc.
             committed_segment_metas
                 .sort_by_key(|segment_meta| std::cmp::Reverse(segment_meta.max_doc()));
+            let previous_meta = self.load_meta();
             let index_meta = IndexMeta {
                 index_settings: index.settings().clone(),
                 // The required plugin set is fixed at index creation; carry it forward.
-                persisted_custom_extensions: self.load_meta().persisted_custom_extensions.clone(),
+                persisted_custom_extensions: previous_meta.persisted_custom_extensions.clone(),
+                // The centroid sets are written at index creation (and by
+                // future re-publishes); this rebuild must not drop them.
+                centroid_sets: previous_meta.centroid_sets.clone(),
                 segments: committed_segment_metas,
                 schema: index.schema(),
                 opstamp,
@@ -562,10 +571,17 @@ impl SegmentUpdater {
         // All tracked segments (including in-flight ones), so GC keeps files for segments
         // not yet in the committed meta. Custom extensions come from the persisted record
         // (not the live registry), so GC is correct even before a plugin is re-registered.
+        let meta = self.load_meta();
         let mut files = list_segment_files(
             &self.index.list_all_segment_metas(),
-            &self.load_meta().persisted_custom_extensions,
+            &meta.persisted_custom_extensions,
         );
+        // The index-level centroid set files are living for as long as the
+        // meta lists them — without this, the very next commit-triggered GC
+        // would delete them.
+        for centroid_set in &meta.centroid_sets {
+            files.insert(PathBuf::from(&centroid_set.filename));
+        }
         files.insert(META_FILEPATH.to_path_buf());
         files
     }

@@ -1,18 +1,24 @@
+//! Per-commit vector writer: buffers raw vector bytes per doc and, at
+//! segment finalize, assigns every buffered row against the index-level
+//! centroid set and writes the segment's `.vec` in the one (IVF) layout —
+//! there is no flat tier; fresh per-commit segments cluster like merged
+//! ones, they are just small.
+
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::io::Write;
 
-use super::id_map::IdMap;
+use super::centroid_set::CentroidSetReader;
+use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use super::header::write_header;
+use super::ivf::{write_ivf_field, IvfFieldWriteParams};
+use super::VEC_EXT;
 use crate::directory::CompositeWrite;
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use crate::vector::header::write_header;
-use crate::vector::VEC_EXT;
-use crate::{DocId, TantivyError};
+use crate::{DocId, Executor, TantivyError};
 
 /// Per-field in-memory state: the doc ids that have a value (ascending),
 /// plus a dense byte array — analogous to fast-fields' `Optional`
@@ -50,14 +56,14 @@ impl FieldBuffer {
     }
 }
 
-pub struct FlatVecWriter {
+pub struct VecWriter {
     fields: BTreeMap<Field, FieldBuffer>,
-    /// Set by [`SegmentWriter::finalize`] before [`serialize`]. Used to
-    /// size the presence bitmap.
+    /// Set by [`SegmentWriter::finalize`] before [`serialize`]. Used for
+    /// the ascending-doc-order invariant checks.
     num_docs: DocId,
 }
 
-impl FlatVecWriter {
+impl VecWriter {
     pub fn for_schema(schema: &Schema) -> Self {
         let mut fields = BTreeMap::new();
         for (field, entry) in schema.fields() {
@@ -79,7 +85,7 @@ impl FlatVecWriter {
     }
 }
 
-impl PluginWriter for FlatVecWriter {
+impl PluginWriter for VecWriter {
     fn add_document(
         &mut self,
         doc_id: DocId,
@@ -136,9 +142,36 @@ impl PluginWriter for FlatVecWriter {
         if self.fields.is_empty() {
             return Ok(());
         }
+        if self.fields.values().all(|buf| buf.present_doc_ids.is_empty()) {
+            // No rows anywhere: no `.vec` at all — the reader treats a
+            // missing file as "no vector data".
+            return Ok(());
+        }
+
+        let index = segment.index();
+        let meta = index.load_metas()?;
+        let newest_set = meta
+            .centroid_sets
+            .iter()
+            .max_by_key(|set| set.version)
+            .ok_or_else(|| {
+                TantivyError::InvalidArgument(
+                    "index has vector fields but no centroid set; the centroid set must be \
+                     provided at index creation via IndexBuilder::centroid_index"
+                        .to_string(),
+                )
+            })?;
+        let set_reader =
+            CentroidSetReader::open(index.directory(), std::path::Path::new(&newest_set.filename))?;
+
         let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
         write_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
+        // Per-commit segments are small; assignment cost is dominated by
+        // the merge path, which parallelizes. No thread pool here.
+        let executor = Executor::single_thread();
+        let cancel = || false;
+        let schema = segment.schema();
 
         for (field, buf) in &self.fields {
             // Compute (present, row_bytes) in target doc-id order. For
@@ -159,18 +192,40 @@ impl PluginWriter for FlatVecWriter {
             } else {
                 (buf.present_doc_ids.clone(), buf.row_bytes.clone())
             };
+            if present.is_empty() {
+                continue;
+            }
 
-            // Slice (field, 0): row→doc_id map. Picks Identity if every
-            // doc is present (typical for dense embeddings, just one
-            // tag byte) or Bitmap otherwise.
-            let id_map_w = composite.for_field_with_idx(*field, 0);
-            IdMap::serialize(&present, self.num_docs, id_map_w)?;
-            id_map_w.flush()?;
-
-            // Slice (field, 1): dense LE byte rows, one per present doc.
-            let rows_w = composite.for_field_with_idx(*field, 1);
-            rows_w.write_all(&row_bytes)?;
-            rows_w.flush()?;
+            let field_centroids = set_reader.field_centroids(*field, &buf.opts)?;
+            let params = IvfFieldWriteParams {
+                field: *field,
+                opts: &buf.opts,
+                set: &field_centroids,
+                set_version: set_reader.version(),
+                replicas: index.settings().vector_replicas,
+                bounds_scope: index.settings().vector_bounds_scope,
+                executor: &executor,
+                cancel: &cancel,
+                field_name: schema.get_field_entry(*field).name(),
+            };
+            write_ivf_field(
+                &mut composite,
+                &params,
+                &mut |sink| {
+                    for (row_idx, &doc_id) in present.iter().enumerate() {
+                        sink(
+                            doc_id,
+                            row_idx as u64,
+                            &row_bytes[row_idx * stride..(row_idx + 1) * stride],
+                        )?;
+                    }
+                    Ok(())
+                },
+                &mut |handle, sink| {
+                    let row_idx = handle as usize;
+                    sink(&row_bytes[row_idx * stride..(row_idx + 1) * stride])
+                },
+            )?;
         }
         composite.close()?;
         Ok(())

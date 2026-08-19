@@ -2,15 +2,14 @@
 
 use std::sync::Arc;
 
-use crate::collector::{Count, TopDocs};
-use crate::index::IndexSettings;
+use crate::collector::Count;
+use crate::index::CentroidSetMeta;
 use crate::indexer::NoMergePolicy;
-use crate::query::{AllQuery, TermQuery};
+use crate::query::TermQuery;
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-    Metric, VectorDType, VectorOptions,
+    CentroidIndex, IvfCentroids, IvfMatrix, Metric, VectorDType, VectorOptions,
 };
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
@@ -18,12 +17,7 @@ const EMBEDDING_FIELD_NAME: &str = "embedding";
 const LABEL_FIELD_NAME: &str = "label";
 const NUM_DOCS: usize = 100;
 const DOCS_PER_SEGMENT: usize = 10;
-
-// Which on-disk layout the fixture should produce, reusing the public
-// descriptor enum. Selected via the index settings (clustering threshold +
-// clusterer); the resulting segment is self-describing through its `.vec`
-// `IdMap`, so this is purely a build knob here.
-pub(crate) use crate::vector::VectorStorageFormat;
+const FIXTURE_SET_VERSION: u64 = 1;
 
 pub(crate) struct TestVectorIndex {
     pub(crate) index: Index,
@@ -34,18 +28,9 @@ pub(crate) struct TestVectorIndexBuilder {
     dtype: VectorDType,
     metric: Metric,
     selectivities: Vec<f32>,
-    vector_storage_format: VectorStorageFormat,
 }
 
 impl TestVectorIndexBuilder {
-    pub(crate) fn vector_storage_format(
-        mut self,
-        vector_storage_format: VectorStorageFormat,
-    ) -> Self {
-        self.vector_storage_format = vector_storage_format;
-        self
-    }
-
     pub(crate) fn selectivities(mut self, selectivities: &[f32]) -> Self {
         self.selectivities = selectivities.to_vec();
         self
@@ -69,7 +54,13 @@ impl TestVectorIndexBuilder {
             schema_builder.add_vector_field(EMBEDDING_FIELD_NAME, vector_options.clone());
         let label_field = schema_builder.add_text_field(LABEL_FIELD_NAME, STRING | STORED);
         let schema = schema_builder.build();
-        let index = self.create_index(schema)?;
+        let index = Index::builder()
+            .schema(schema)
+            .centroid_index(Arc::new(Grid2DCentroidIndex {
+                centroids: self.centroids.clone(),
+                version: FIXTURE_SET_VERSION,
+            }))
+            .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         let doc_labels = labels::values(NUM_DOCS, &self.selectivities);
@@ -86,30 +77,16 @@ impl TestVectorIndexBuilder {
             }
         }
 
-        if self.vector_storage_format == VectorStorageFormat::Ivf {
-            let mut segment_ids = index.searchable_segment_ids()?;
-            segment_ids.sort();
-            for pair in segment_ids.chunks_exact(2) {
-                writer.merge(pair).wait()?;
-            }
+        // Merge pairwise so the index holds both merged and per-commit
+        // segments — every one clustered against the same set.
+        let mut segment_ids = index.searchable_segment_ids()?;
+        segment_ids.sort();
+        for pair in segment_ids.chunks_exact(2) {
+            writer.merge(pair).wait()?;
         }
         writer.wait_merging_threads()?;
 
         Ok(TestVectorIndex { index })
-    }
-
-    fn create_index(&self, schema: Schema) -> crate::Result<Index> {
-        let mut settings = IndexSettings::default();
-        if self.vector_storage_format == VectorStorageFormat::Ivf {
-            settings.vector_clustering_threshold = 1;
-        }
-        let mut builder = Index::builder().schema(schema).settings(settings);
-        if self.vector_storage_format == VectorStorageFormat::Ivf {
-            builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer {
-                centroids: self.centroids.clone(),
-            }));
-        }
-        builder.create_in_ram()
     }
 }
 
@@ -120,7 +97,6 @@ impl TestVectorIndex {
             dtype,
             metric: Metric::L2,
             selectivities: Vec::new(),
-            vector_storage_format: VectorStorageFormat::Flat,
         }
     }
 
@@ -171,65 +147,46 @@ impl TestVectorIndex {
     }
 }
 
-pub(crate) struct Grid2DClusterer {
+/// Fixed-centroid [`CentroidIndex`]: the consumer "trained" these
+/// centroids elsewhere; tantivy only assigns against them.
+pub(crate) struct Grid2DCentroidIndex {
     pub(crate) centroids: Vec<[f32; grid2d::DIM]>,
+    pub(crate) version: u64,
 }
 
-impl IvfClusterer for Grid2DClusterer {
-    fn centroid_ratio(&self) -> f32 {
-        0.1
+impl CentroidIndex for Grid2DCentroidIndex {
+    fn version(&self) -> u64 {
+        self.version
     }
 
-    fn training_samples_per_centroid(&self) -> usize {
-        2
-    }
-
-    fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-        Ok(IvfMergeSettings {
-            num_centroids: self.centroids.len().min(total_target_docs),
-            training_samples_per_centroid: self.training_samples_per_centroid(),
-            assign_batch_size: self.assign_batch_size(),
-            // The grid fixture asserts exact cluster membership; keep
-            // replication off so the 3×3 grid assignment stays primary-only.
-            replicas: 1,
-        })
-    }
-
-    fn train(
-        &self,
-        options: &VectorOptions,
-        _vectors: IvfTrainingVectors,
-        num_centroids: usize,
-    ) -> crate::Result<IvfCentroids> {
+    fn centroids(&self, _field: Field, options: &VectorOptions) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), grid2d::DIM);
         Ok(IvfCentroids::F32(IvfMatrix {
             values: self
                 .centroids
                 .iter()
-                .take(num_centroids)
                 .flat_map(|centroid| centroid.iter().copied())
                 .collect(),
-            rows: num_centroids,
+            rows: self.centroids.len(),
             dims: grid2d::DIM,
         }))
     }
+}
 
-    fn assign(
-        &self,
-        options: &VectorOptions,
-        vectors: IvfVectors<'_>,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<Vec<u32>> {
-        assert_eq!(options.dim(), grid2d::DIM);
-        let IvfVectors::F32(vectors) = vectors;
-        let IvfCentroids::F32(centroids) = centroids;
-        Ok(vectors
-            .matrix
-            .values
-            .chunks_exact(vectors.matrix.dims)
-            .map(|vector| grid2d::nearest_centroid(vector, centroids.values.as_slice()) as u32)
-            .collect())
-    }
+/// Resolve and open the index's newest centroid set file.
+pub(crate) fn open_newest_set(
+    index: &Index,
+) -> crate::Result<crate::vector::centroid_set::CentroidSetReader> {
+    let meta = index.load_metas()?;
+    let newest: &CentroidSetMeta = meta
+        .centroid_sets
+        .iter()
+        .max_by_key(|set| set.version)
+        .expect("index has a centroid set");
+    crate::vector::centroid_set::CentroidSetReader::open(
+        index.directory(),
+        std::path::Path::new(&newest.filename),
+    )
 }
 
 #[test]
@@ -266,108 +223,57 @@ fn fixture_builds_expected_schema_docs_and_labels() -> crate::Result<()> {
     Ok(())
 }
 
+/// Every segment — merged or straight from a commit — is clustered
+/// against the index-level set and stamps its version.
 #[test]
-fn fixture_uses_selected_storage_format() -> crate::Result<()> {
-    for vector_storage_format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
-        let index = TestVectorIndex::builder(VectorDType::F32)
-            .vector_storage_format(vector_storage_format)
-            .build()?;
-        let searcher = index.index.reader()?.searcher();
-        let vec_reader = searcher.segment_readers()[0].vector_index(index.embedding_field())?;
-        let is_ivf = vec_reader.index().is_some();
-        assert_eq!(
-            is_ivf,
-            vector_storage_format == VectorStorageFormat::Ivf,
-            "storage format mismatch: index present = {is_ivf}, expected {vector_storage_format:?}"
-        );
+fn every_segment_is_clustered_against_the_set() -> crate::Result<()> {
+    let index = TestVectorIndex::builder(VectorDType::F32).build()?;
+    let searcher = index.index.reader()?.searcher();
+    assert!(!searcher.segment_readers().is_empty());
+    for segment_reader in searcher.segment_readers() {
+        let vec_reader = segment_reader.vector_index(index.embedding_field())?;
+        let ivf = vec_reader.index().expect("every segment is IVF");
+        assert_eq!(ivf.num_clusters(), grid2d::centroids().len());
+        assert_eq!(ivf.centroid_set_version(), FIXTURE_SET_VERSION);
     }
-
     Ok(())
 }
 
-/// Both vector segment files must stamp the current format-generation header
-/// ahead of their composite body, so future layout changes can be gated.
+/// The `.vec` file stamps the current format-generation header ahead of
+/// its composite body, and no per-segment `.centroids` sidecar exists.
 #[test]
 fn vector_files_stamp_format_version_header() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
     use crate::vector::header::{read_header, VectorFileVersion};
-    use crate::vector::ivf::CENTROIDS_EXT;
     use crate::vector::VEC_EXT;
 
-    for format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
-        let index = TestVectorIndex::builder(VectorDType::F32)
-            .vector_storage_format(format)
-            .build()?;
-        let searcher = index.index.reader()?.searcher();
-        assert!(!searcher.segment_readers().is_empty());
+    let index = TestVectorIndex::builder(VectorDType::F32).build()?;
+    let searcher = index.index.reader()?.searcher();
+    assert!(!searcher.segment_readers().is_empty());
 
-        for segment_reader in searcher.segment_readers() {
-            let vec_file =
-                segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
-            let (version, body) = read_header(&vec_file)?;
-            assert_eq!(version, VectorFileVersion::V2);
-            // Body must be a valid composite — proves the stamp sits in front
-            // of the framing, not inside a slot.
-            CompositeFile::open(&body)?;
+    for segment_reader in searcher.segment_readers() {
+        let vec_file = segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
+        let (version, body) = read_header(&vec_file)?;
+        assert_eq!(version, VectorFileVersion::V3);
+        // Body must be a valid composite — proves the stamp sits in front
+        // of the framing, not inside a slot.
+        CompositeFile::open(&body)?;
 
-            match format {
-                VectorStorageFormat::Flat => {
-                    assert!(
-                        segment_reader
-                            .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
-                            .is_err(),
-                        "flat segments must not write `.centroids`"
-                    );
-                }
-                VectorStorageFormat::Ivf => {
-                    let centroids_file = segment_reader
-                        .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
-                    let (version, body) = read_header(&centroids_file)?;
-                    assert_eq!(version, VectorFileVersion::V2);
-                    CompositeFile::open(&body)?;
-                }
-            }
-        }
+        assert!(
+            segment_reader
+                .open_read(SegmentComponent::Custom("centroids".to_string()))
+                .is_err(),
+            "the per-segment `.centroids` sidecar must not exist"
+        );
     }
     Ok(())
 }
 
 #[test]
 fn fixture_vectors_round_trip_from_readers() -> crate::Result<()> {
-    let mut expected = grid2d::vectors(NUM_DOCS);
-    expected.sort_by(|left, right| {
-        left[0]
-            .partial_cmp(&right[0])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                left[1]
-                    .partial_cmp(&right[1])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-
-    for vector_storage_format in [VectorStorageFormat::Flat, VectorStorageFormat::Ivf] {
-        let index = TestVectorIndex::builder(VectorDType::F32)
-            .vector_storage_format(vector_storage_format)
-            .build()?;
-        let searcher = index.index.reader()?.searcher();
-        let mut got = Vec::new();
-        for segment_reader in searcher.segment_readers() {
-            let vec_reader = segment_reader.vector_index(index.embedding_field())?;
-            for doc in 0..segment_reader.max_doc() {
-                if let Some(bytes) = vec_reader.vector_bytes(doc)? {
-                    let vector: [f32; grid2d::DIM] = bytes
-                        .chunks_exact(VectorDType::F32.size_bytes())
-                        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
-                        .collect::<Vec<_>>()
-                        .try_into()
-                        .expect("2D vector");
-                    got.push(vector);
-                }
-            }
-        }
-        got.sort_by(|left: &[f32; grid2d::DIM], right| {
+    let sort_2d = |values: &mut Vec<[f32; grid2d::DIM]>| {
+        values.sort_by(|left, right| {
             left[0]
                 .partial_cmp(&right[0])
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -377,36 +283,58 @@ fn fixture_vectors_round_trip_from_readers() -> crate::Result<()> {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
         });
-        assert_eq!(got, expected);
-    }
+    };
+    let mut expected = grid2d::vectors(NUM_DOCS);
+    sort_2d(&mut expected);
 
+    let index = TestVectorIndex::builder(VectorDType::F32).build()?;
+    let searcher = index.index.reader()?.searcher();
+    let mut got = Vec::new();
+    for segment_reader in searcher.segment_readers() {
+        let vec_reader = segment_reader.vector_index(index.embedding_field())?;
+        for doc in 0..segment_reader.max_doc() {
+            if let Some(bytes) = vec_reader.vector_bytes(doc)? {
+                let vector: [f32; grid2d::DIM] = bytes
+                    .chunks_exact(VectorDType::F32.size_bytes())
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .expect("2D vector");
+                got.push(vector);
+            }
+        }
+    }
+    sort_2d(&mut got);
+    assert_eq!(got, expected);
     Ok(())
 }
 
+/// The set file stores the consumer's centroids verbatim (L2: no
+/// normalization), and every doc lands in its nearest cell.
 #[test]
-fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
+fn set_centroids_round_trip_and_drive_assignment() -> crate::Result<()> {
     let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
     let index = TestVectorIndex::builder(VectorDType::F32)
-        .vector_storage_format(VectorStorageFormat::Ivf)
         .centroids(&centroids)
         .build()?;
     let centroid_values: Vec<f32> = centroids
         .iter()
         .flat_map(|vector| vector.iter().copied())
         .collect();
+
+    let set = open_newest_set(&index.index)?;
+    assert_eq!(set.version(), FIXTURE_SET_VERSION);
+    let field_centroids = set.field_centroids(index.embedding_field(), &index.vector_options())?;
+    assert_eq!(field_centroids.num_centroids(), centroids.len());
+    assert_eq!(
+        field_centroids.values_f32(&index.vector_options())?,
+        centroid_values
+    );
+
     let searcher = index.index.reader()?.searcher();
     let mut assigned_docs = 0;
-
     for segment_reader in searcher.segment_readers() {
         let vec_reader = segment_reader.vector_index(index.embedding_field())?;
-        let ivf = vec_reader.index().expect("expected IVF storage");
-        assert_eq!(
-            ivf.centroid_bytes()?
-                .chunks_exact(VectorDType::F32.size_bytes())
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 bytes")))
-                .collect::<Vec<_>>(),
-            centroid_values
-        );
         for cluster_ord in 0..centroids.len() {
             let doc_ids = vec_reader
                 .cluster_doc_ids(cluster_ord)
@@ -431,81 +359,43 @@ fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
     Ok(())
 }
 
-/// Regression for `FlatBackend::top_n` under truncation. A bare
-/// `TopNComputer::new` defaults to `ReverseComparator`, which keeps
-/// the K *smallest* sort_keys — for our "higher = closer" similarity
-/// convention that returned the K *farthest* docs once a segment had
-/// more than K matches. Latent before the fix because every previous
-/// flat test had ≤ K docs per segment, so the truncate_top_n path
-/// never fired. The backend now wires `NaturalComparator` explicitly;
-/// this test would fail under the old code.
-///
-/// The shared fixture commits every `DOCS_PER_SEGMENT = 10` docs, so
-/// each segment has 10 > K = 3 docs — the truncation path is on.
+/// The set file's router slot: tag byte 0 (tantivy RNG) followed by the
+/// serialized centroid graph.
 #[test]
-fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Result<()> {
-    let index = TestVectorIndex::builder(VectorDType::F32)
-        .vector_storage_format(VectorStorageFormat::Flat)
-        .build()?;
-    let query = grid2d::centroids()[0];
-    let top_k = 3;
-    let expected = index.ground_truth(query, top_k)?;
-    let hits = index
-        .index
-        .reader()?
-        .searcher()
-        .search(
-            &AllQuery,
-            &TopDocs::with_limit(top_k)
-                .order_by_similarity(index.embedding_field(), query.to_vec()),
-        )?
-        .results;
-    assert_eq!(hits, expected);
-    Ok(())
-}
-
-#[test]
-fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
-    use crate::directory::CompositeFile;
-    use crate::index::SegmentComponent;
+fn centroid_set_writes_tagged_router_slot() -> crate::Result<()> {
     use crate::vector::ivf::graph::EMPTY;
-    use crate::vector::ivf::CENTROIDS_EXT;
-    use crate::vector::NeighborhoodGraphConfig;
+    use crate::vector::{NeighborhoodGraphConfig, ROUTER_KIND_RNG};
 
     let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
     let index = TestVectorIndex::builder(VectorDType::F32)
-        .vector_storage_format(VectorStorageFormat::Ivf)
         .centroids(&centroids)
         .build()?;
-    let searcher = index.index.reader()?.searcher();
-    assert!(!searcher.segment_readers().is_empty());
+    let set = open_newest_set(&index.index)?;
+    let router_bytes = set
+        .router_slice(index.embedding_field())
+        .expect("the set must write a router slot for C > 1")
+        .read_bytes()?;
+    assert_eq!(router_bytes[0], ROUTER_KIND_RNG);
 
-    for segment_reader in searcher.segment_readers() {
-        let centroids_file =
-            segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
-        let (_version, body) = super::header::read_header(&centroids_file)?;
-        let composite = CompositeFile::open(&body)?;
-        let graph_bytes = composite
-            .open_read_with_idx(index.embedding_field(), 2)
-            .expect("IVF merge should write the centroid graph slot")
-            .read_bytes()?;
-
-        let words: Vec<u32> = graph_bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("u32 word")))
-            .collect();
-        assert_eq!(words.len() * 4, graph_bytes.len(), "whole number of u32s");
-        let max_edges = words[0] as usize;
-        assert_eq!(max_edges, NeighborhoodGraphConfig::default().max_edges);
-        let adjacency = &words[1..];
-        assert_eq!(adjacency.len(), centroids.len() * max_edges);
-        // Two distinct centroids prune to each other's single neighbor; the
-        // rest of each run is EMPTY padding.
-        assert_eq!(adjacency[0], 1);
-        assert!(adjacency[1..max_edges].iter().all(|&id| id == EMPTY));
-        assert_eq!(adjacency[max_edges], 0);
-        assert!(adjacency[max_edges + 1..].iter().all(|&id| id == EMPTY));
-    }
+    let words: Vec<u32> = router_bytes[1..]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("u32 word")))
+        .collect();
+    assert_eq!(
+        words.len() * 4 + 1,
+        router_bytes.len(),
+        "tag byte + whole number of u32s"
+    );
+    let max_edges = words[0] as usize;
+    assert_eq!(max_edges, NeighborhoodGraphConfig::default().max_edges);
+    let adjacency = &words[1..];
+    assert_eq!(adjacency.len(), centroids.len() * max_edges);
+    // Two distinct centroids prune to each other's single neighbor; the
+    // rest of each run is EMPTY padding.
+    assert_eq!(adjacency[0], 1);
+    assert!(adjacency[1..max_edges].iter().all(|&id| id == EMPTY));
+    assert_eq!(adjacency[max_edges], 0);
+    assert!(adjacency[max_edges + 1..].iter().all(|&id| id == EMPTY));
     Ok(())
 }
 
@@ -531,6 +421,25 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
     Ok(())
 }
 
+/// A single-centroid provider, for tests that only need a valid set.
+pub(crate) struct SingleCellCentroidIndex {
+    pub(crate) dim: usize,
+    pub(crate) version: u64,
+}
+
+impl CentroidIndex for SingleCellCentroidIndex {
+    fn version(&self) -> u64 {
+        self.version
+    }
+    fn centroids(&self, _field: Field, options: &VectorOptions) -> crate::Result<IvfCentroids> {
+        Ok(IvfCentroids::F32(IvfMatrix {
+            values: vec![0.0; options.dim()],
+            rows: 1,
+            dims: options.dim(),
+        }))
+    }
+}
+
 /// Non-finite elements are rejected at ingest on normalizing fields
 /// (Cosine+F32) and accepted on non-normalizing ones (L2) — validation
 /// rides the normalize path only. `IndexWriter::add_document` enqueues
@@ -543,7 +452,10 @@ fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let l2_field = schema_builder.add_vector_field("l2", VectorOptions::new(2, Metric::L2));
         let schema = schema_builder.build();
-        let index = Index::builder().schema(schema).create_in_ram()?;
+        let index = Index::builder()
+            .schema(schema)
+            .centroid_index(Arc::new(SingleCellCentroidIndex { dim: 2, version: 1 }))
+            .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         let mut doc = TantivyDocument::new();
         doc.add_vector(l2_field, &[bad, 1.0]);
@@ -555,7 +467,10 @@ fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
         let cos_field =
             schema_builder.add_vector_field("cos", VectorOptions::new(2, Metric::Cosine));
         let schema = schema_builder.build();
-        let index = Index::builder().schema(schema).create_in_ram()?;
+        let index = Index::builder()
+            .schema(schema)
+            .centroid_index(Arc::new(SingleCellCentroidIndex { dim: 2, version: 1 }))
+            .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         let mut doc = TantivyDocument::new();
         doc.add_vector(cos_field, &[bad, 1.0]);
@@ -572,14 +487,17 @@ fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
 }
 
 /// A zero vector is honest data: ingest accepts it (`ZeroSkipped`), and
-/// at query time it scores exactly 0.0 — behind any non-zero doc.
+/// it is stored — as zeros — alongside the normalized rows.
 #[test]
 fn ingest_accepts_zero_vector() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
     let embedding_field =
         schema_builder.add_vector_field("embedding", VectorOptions::new(2, Metric::Cosine));
     let schema = schema_builder.build();
-    let index = Index::builder().schema(schema).create_in_ram()?;
+    let index = Index::builder()
+        .schema(schema)
+        .centroid_index(Arc::new(SingleCellCentroidIndex { dim: 2, version: 1 }))
+        .create_in_ram()?;
     let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
     let mut zero_doc = TantivyDocument::new();
     zero_doc.add_vector(embedding_field, &[0.0_f32, 0.0]);
@@ -590,19 +508,18 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     writer.commit()?;
 
     let searcher = index.reader()?.searcher();
-    let collector = TopDocs::with_limit(2).order_by_similarity(embedding_field, vec![1.0_f32, 0.0]);
-    let hits = searcher.search(&AllQuery, &collector)?.results;
-    assert_eq!(hits.len(), 2, "zero vector must be ingested and returned");
-    assert!(hits[0].0 > 0.0, "non-zero doc must rank first: {hits:?}");
-    assert_eq!(hits[1].0, 0.0, "zero vector scores 0.0: {hits:?}");
+    let vec_reader = searcher.segment_readers()[0].vector_index(embedding_field)?;
+    assert_eq!(vec_reader.num_vectors(), 2);
+    let zero = vec_reader.vector_bytes(0)?.expect("zero doc stored");
+    assert!(zero.iter().all(|&b| b == 0), "zero vector stays zero");
+    let unit = vec_reader.vector_bytes(1)?.expect("unit doc stored");
+    assert!(unit.iter().any(|&b| b != 0));
     Ok(())
 }
 
 /// "Scan everything" probe params: the full-capacity ceiling, so the
-/// budget never binds before the stream is exhausted. Used by
-/// oracle-equality tests, where every cluster the bounds gate cannot
-/// PROVE useless must be probed - provable skips never change the
-/// top-K, so oracle equality still holds under them.
+/// budget never binds before the stream is exhausted. Kept for the
+/// cross-segment search path (TODO).
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
         max_probe_fraction: 1.0,
@@ -836,48 +753,188 @@ mod grid2d {
 }
 
 // ======================================================================
+// Index creation, meta, and GC around the centroid set file
+// ======================================================================
+
+mod centroid_set_lifecycle_tests {
+    use std::sync::Arc;
+
+    use super::{open_newest_set, Grid2DCentroidIndex, SingleCellCentroidIndex};
+    use crate::directory::{Directory, RamDirectory};
+    use crate::indexer::NoMergePolicy;
+    use crate::schema::{Schema, STORED, STRING};
+    use crate::vector::centroid_set::centroid_set_filename;
+    use crate::vector::{Metric, VectorOptions};
+    use crate::{Index, IndexWriter, TantivyDocument};
+
+    fn vector_schema() -> Schema {
+        let mut sb = Schema::builder();
+        sb.add_vector_field("embedding", VectorOptions::new(2, Metric::L2));
+        sb.add_text_field("label", STRING | STORED);
+        sb.build()
+    }
+
+    /// Creation validates both directions of "schema has vector fields ⟺
+    /// a centroid index is provided".
+    #[test]
+    fn creation_requires_centroid_set_iff_vector_fields() {
+        let err = Index::builder()
+            .schema(vector_schema())
+            .create_in_ram()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no centroid index"),
+            "unexpected: {err}"
+        );
+
+        let mut sb = Schema::builder();
+        sb.add_text_field("label", STRING);
+        let err = Index::builder()
+            .schema(sb.build())
+            .centroid_index(Arc::new(SingleCellCentroidIndex { dim: 2, version: 1 }))
+            .create_in_ram()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no vector fields"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// The set file is written at creation, listed in the meta, carried
+    /// forward through commits, and survives commit-triggered GC.
+    #[test]
+    fn centroid_set_file_survives_commits_and_gc() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let index = Index::builder()
+            .schema(vector_schema())
+            .centroid_index(Arc::new(Grid2DCentroidIndex {
+                centroids: vec![[0.0, 0.0], [10.0, 10.0]],
+                version: 7,
+            }))
+            .create(directory.clone())?;
+        let embed_field = index.schema().get_field("embedding").unwrap();
+        let set_path = centroid_set_filename(7);
+        assert!(directory.exists(&set_path)?, "set file written at creation");
+        assert_eq!(
+            index.load_metas()?.centroid_sets,
+            vec![crate::index::CentroidSetMeta {
+                version: 7,
+                filename: set_path.to_string_lossy().into_owned(),
+            }]
+        );
+
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for v in [[0.1_f32, 0.0], [9.9, 10.1], [0.2, 0.1], [10.2, 9.8]] {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(embed_field, &v);
+            writer.add_document(doc)?;
+            writer.commit()?;
+        }
+        // Commits run GC; an explicit pass on top for good measure.
+        writer.garbage_collect_files().wait()?;
+        assert!(
+            directory.exists(&set_path)?,
+            "GC must keep the centroid set file alive"
+        );
+        // Meta still lists the set after save_metas rebuilds the meta.
+        assert_eq!(index.load_metas()?.centroid_sets.len(), 1);
+        // And the file still opens.
+        assert_eq!(open_newest_set(&index)?.version(), 7);
+
+        // Merges keep working against the set.
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let ivf = searcher.segment_readers()[0]
+            .vector_index(embed_field)?
+            .index()
+            .expect("merged segment is IVF")
+            .centroid_set_version();
+        assert_eq!(ivf, 7);
+        Ok(())
+    }
+
+    /// `open_or_create` on an existing index accepts a provider whose
+    /// version is already installed and refuses a new one (re-publishing
+    /// is unsupported).
+    #[test]
+    fn open_or_create_checks_set_version() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let provider = |version| {
+            Arc::new(Grid2DCentroidIndex {
+                centroids: vec![[0.0, 0.0], [10.0, 10.0]],
+                version,
+            })
+        };
+        let _ = Index::builder()
+            .schema(vector_schema())
+            .centroid_index(provider(3))
+            .create(directory.clone())?;
+
+        // Same version: fine.
+        Index::builder()
+            .schema(vector_schema())
+            .centroid_index(provider(3))
+            .open_or_create(directory.clone())?;
+
+        // New version: refused until re-publishing exists.
+        let err = Index::builder()
+            .schema(vector_schema())
+            .centroid_index(provider(4))
+            .open_or_create(directory)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("re-publishing"),
+            "unexpected: {err}"
+        );
+        Ok(())
+    }
+}
+
+// ======================================================================
 // P1: bounds storage
 // ======================================================================
 
-/// C1 fixture tests: the `.centroids` bounds slot end to end — write
-/// fold, roundtrip, merge recomputation, and the pre-V2 refusal. The
-/// pure builder/kind cases live in `vector::bounds::bounds_storage_tests`.
+/// Fixture tests: the `.vec` bounds slot end to end — write fold,
+/// roundtrip, merge recomputation, and the pre-V3 refusal. The pure
+/// builder/kind cases live in `vector::bounds::bounds_storage_tests`.
 mod bounds_storage_tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    use super::{TestVectorIndex, EMBEDDING_FIELD_NAME};
+    use super::{open_newest_set, Grid2DCentroidIndex, TestVectorIndex, EMBEDDING_FIELD_NAME};
     use crate::directory::{Directory, RamDirectory, TerminatingWrite};
-    use crate::index::{IndexSettings, SegmentComponent};
+    use crate::index::SegmentComponent;
     use crate::indexer::NoMergePolicy;
     use crate::schema::{Schema, STORED, STRING};
-    use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
-    use crate::vector::{
-        residual_norm, BoundKind, IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings,
-        IvfTrainingVectors, IvfVectors, Metric, VectorDType, VectorOptions, VectorStorageFormat,
-    };
+    use crate::vector::centroid_set::FieldCentroids;
+    use crate::vector::ivf::IvfIndex;
+    use crate::vector::{residual_norm, BoundKind, Metric, VectorDType, VectorOptions, VEC_EXT};
     use crate::{Index, IndexWriter, TantivyDocument};
 
     /// Recompute one segment's expected fold from its stored artifacts:
     /// per cluster, max [`residual_norm`] over the cluster's rows against
-    /// the stored centroid. Valid for `replicas == 1` builds, where every
-    /// posting row is native.
+    /// the SET's stored centroid. Valid for `replicas == 1` builds, where
+    /// every posting row is native.
     fn fresh_fold(
         vec_reader: &crate::vector::VectorIndexReader,
         ivf: &IvfIndex,
-        dim: usize,
+        set: &FieldCentroids,
         metric: Metric,
     ) -> crate::Result<Vec<f32>> {
-        let centroid_bytes = ivf.centroid_bytes()?;
-        let stride = dim * std::mem::size_of::<f32>();
         let mut expected = vec![0.0f32; ivf.num_clusters()];
         for cluster in 0..ivf.num_clusters() {
-            let centroid: Vec<f32> = centroid_bytes[cluster * stride..(cluster + 1) * stride]
+            let centroid: Vec<f32> = set
+                .centroid_bytes(cluster)
                 .chunks_exact(4)
                 .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
                 .collect();
             // The writer's degenerate-centroid rule: non-finite, or
-            // zero-norm under cosine renormalization, saturates.
+            // non-unit under cosine (a zero-norm row normalization left
+            // as-is), saturates.
             let zero_norm = centroid.iter().all(|&value| value == 0.0);
             if centroid.iter().any(|value| !value.is_finite())
                 || (metric == Metric::Cosine && zero_norm)
@@ -899,15 +956,17 @@ mod bounds_storage_tests {
     }
 
     /// Build, write, reopen: the stored bounds are bit-equal to a fresh
-    /// fold over the stored rows and centroids — for every metric.
+    /// fold over the stored rows and the set's centroids — for every
+    /// metric.
     #[test]
     fn roundtrip_per_metric() -> crate::Result<()> {
         for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
             let fixture = TestVectorIndex::builder(VectorDType::F32)
                 .metric(metric)
-                .vector_storage_format(VectorStorageFormat::Ivf)
                 .build()?;
             let field = fixture.embedding_field();
+            let set = open_newest_set(&fixture.index)?;
+            let set_field = set.field_centroids(field, &fixture.vector_options())?;
             let searcher = fixture.index.reader()?.searcher();
             let mut ivf_segments = 0usize;
             for segment_reader in searcher.segment_readers() {
@@ -918,8 +977,7 @@ mod bounds_storage_tests {
                 ivf_segments += 1;
                 let bounds = ivf.bounds();
                 assert_eq!(bounds.kind(), BoundKind::Ball);
-                let expected =
-                    fresh_fold(&vec_reader, ivf, fixture.vector_options().dim(), metric)?;
+                let expected = fresh_fold(&vec_reader, ivf, &set_field, metric)?;
                 assert_eq!(bounds.values().len(), expected.len());
                 for (cluster, (&stored, &fold)) in
                     bounds.values().iter().zip(expected.iter()).enumerate()
@@ -936,91 +994,12 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// A clusterer with deterministic centroids for crafted-geometry
-    /// builds: fixed rows when supplied, else the first
-    /// `num_centroids` training samples — data-dependent, so a merge of
-    /// merged segments re-trains onto different centroids.
-    struct TestClusterer {
-        fixed_centroids: Option<Vec<[f32; 2]>>,
-        num_centroids: usize,
-    }
-
-    impl IvfClusterer for TestClusterer {
-        fn centroid_ratio(&self) -> f32 {
-            1.0
-        }
-        fn training_samples_per_centroid(&self) -> usize {
-            2
-        }
-        fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-            Ok(IvfMergeSettings {
-                num_centroids: self.num_centroids.min(total_target_docs),
-                training_samples_per_centroid: self.training_samples_per_centroid(),
-                assign_batch_size: self.assign_batch_size(),
-                replicas: 1,
-            })
-        }
-        fn train(
-            &self,
-            options: &VectorOptions,
-            vectors: IvfTrainingVectors,
-            num_centroids: usize,
-        ) -> crate::Result<IvfCentroids> {
-            assert_eq!(options.dim(), 2);
-            let values = match &self.fixed_centroids {
-                Some(centroids) => centroids
-                    .iter()
-                    .take(num_centroids)
-                    .flat_map(|centroid| centroid.iter().copied())
-                    .collect(),
-                None => {
-                    let IvfTrainingVectors::F32(batch) = vectors;
-                    batch.matrix.values[..num_centroids * 2].to_vec()
-                }
-            };
-            Ok(IvfCentroids::F32(IvfMatrix {
-                values,
-                rows: num_centroids,
-                dims: 2,
-            }))
-        }
-        fn assign(
-            &self,
-            options: &VectorOptions,
-            vectors: IvfVectors<'_>,
-            centroids: &IvfCentroids,
-        ) -> crate::Result<Vec<u32>> {
-            assert_eq!(options.dim(), 2);
-            let IvfVectors::F32(vectors) = vectors;
-            let IvfCentroids::F32(centroids) = centroids;
-            Ok(vectors
-                .matrix
-                .values
-                .chunks_exact(2)
-                .map(|vector| {
-                    let mut best = 0u32;
-                    let mut best_d2 = f32::INFINITY;
-                    for (i, centroid) in centroids.values.chunks_exact(2).enumerate() {
-                        let dx = vector[0] - centroid[0];
-                        let dy = vector[1] - centroid[1];
-                        let d2 = dx * dx + dy * dy;
-                        if d2 < best_d2 {
-                            best = i as u32;
-                            best_d2 = d2;
-                        }
-                    }
-                    best
-                })
-                .collect())
-        }
-    }
-
-    /// A 2-dim IVF index over `commits` (one flat segment per inner
-    /// slice), merged per `merge_plan` (segment ordinals into the
-    /// searchable set at each step). Returns the index and the field.
+    /// A 2-dim IVF index over `commits` (one segment per inner slice),
+    /// assigned against the given fixed centroids. Returns the index and
+    /// the field.
     fn build_ivf_with_plan(
         metric: Metric,
-        clusterer: TestClusterer,
+        centroids: Vec<[f32; 2]>,
         commits: &[&[[f32; 2]]],
         directory: Option<RamDirectory>,
     ) -> crate::Result<(Index, crate::schema::Field)> {
@@ -1031,16 +1010,14 @@ mod bounds_storage_tests {
         );
         schema_builder.add_text_field("label", STRING | STORED);
         let schema = schema_builder.build();
-        let settings = IndexSettings {
-            vector_clustering_threshold: 1,
-            ..IndexSettings::default()
-        };
         let builder = Index::builder()
             .schema(schema)
-            .settings(settings)
-            .ivf_clusterer(Arc::new(clusterer));
+            .centroid_index(Arc::new(Grid2DCentroidIndex {
+                centroids,
+                version: 1,
+            }));
         let index = match directory {
-            Some(directory) => builder.open_or_create(directory)?,
+            Some(directory) => builder.create(directory)?,
             None => builder.create_in_ram()?,
         };
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -1056,8 +1033,7 @@ mod bounds_storage_tests {
         Ok((index, embed_field))
     }
 
-    /// Merge every searchable segment pair-wise per `pairs`, then all
-    /// remaining segments into one.
+    /// Merge every searchable segment into one.
     fn merge_all(index: &Index) -> crate::Result<()> {
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1067,20 +1043,20 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// Merge-level saturation: a huge-but-finite L2 member whose residual
-    /// overflows `f32` saturates its cluster through `add_native`; a
-    /// zero-norm cosine centroid saturates through the explicit
-    /// degenerate-centroid mark. Finite clusters stay finite.
+    /// Saturation: a huge-but-finite L2 member whose residual overflows
+    /// `f32` saturates its cluster through `add_native`; a zero-norm
+    /// cosine centroid saturates through the degenerate-centroid mark
+    /// (recomputed from the SET's stored bytes). Finite clusters stay
+    /// finite.
     #[test]
     fn saturated_sentinel() -> crate::Result<()> {
         // L2: the doc at (3e38, 3e38) is finite (passes ingest) but its
         // residual against centroid (0, 0) is sqrt(2)*3e38 > f32::MAX.
+        // Its d2 against BOTH centroids overflows to +inf, and the
+        // selector's id tie-break assigns it to cluster 0.
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
-            TestClusterer {
-                fixed_centroids: Some(vec![[0.0, 0.0], [50.0, 50.0]]),
-                num_centroids: 2,
-            },
+            vec![[0.0, 0.0], [50.0, 50.0]],
             &[&[[3.0e38, 3.0e38]], &[[50.0, 50.0], [50.5, 50.0]]],
             None,
         )?;
@@ -1090,10 +1066,6 @@ mod bounds_storage_tests {
         let vec_reader = segment_reader.vector_index(field)?;
         let ivf = vec_reader.index().expect("IVF segment");
         let bounds = ivf.bounds();
-        // Cluster ids are trained-centroid indices: the big doc's d2
-        // overflows to +inf against both centroids, and the assign rule's
-        // strict `<` keeps the first — cluster 0, whatever the merge's
-        // doc order. The (50, *) docs sit in cluster 1.
         assert_eq!(
             bounds.ball_r(0),
             f32::INFINITY,
@@ -1105,15 +1077,13 @@ mod bounds_storage_tests {
             bounds.ball_r(1)
         );
 
-        // Cosine: an all-zero cluster renormalizes its centroid to
-        // zero-norm → the degenerate-centroid saturation path.
+        // Cosine: a zero-norm centroid survives set-file normalization
+        // as-is and must saturate its (empty) cluster via the
+        // degenerate-centroid mark, whatever its membership.
         let (index, field) = build_ivf_with_plan(
             Metric::Cosine,
-            TestClusterer {
-                fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
-                num_centroids: 2,
-            },
-            &[&[[0.0, 0.0], [0.0, 0.0]], &[[10.0, 10.0], [10.0, 10.5]]],
+            vec![[0.0, 0.0], [10.0, 10.0]],
+            &[&[[10.0, 10.0]], &[[10.0, 10.5]]],
             None,
         )?;
         merge_all(&index)?;
@@ -1129,19 +1099,14 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// A merge of merged segments re-runs the fold against the NEW
-    /// centroids over the re-assignment output: the stored bounds equal a
-    /// fresh fold, and exceed every input segment's bounds — no
-    /// combination of input radii could produce them.
+    /// A merge of already-merged segments re-runs the fold over the
+    /// re-assignment output against the same set: the stored bounds equal
+    /// a fresh fold at every stage.
     #[test]
     fn merge_recomputes_bounds() -> crate::Result<()> {
-        let clusterer = || TestClusterer {
-            fixed_centroids: None, // train on the first sample → data-dependent
-            num_centroids: 1,
-        };
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
-            clusterer(),
+            vec![[0.0, 0.0], [10.0, 10.0]],
             &[
                 &[[0.0, 0.0], [0.1, 0.1]],
                 &[[0.05, 0.0], [0.0, 0.05]],
@@ -1150,7 +1115,7 @@ mod bounds_storage_tests {
             ],
             None,
         )?;
-        // Stage 1: two IVF segments, each trained on its own half.
+        // Stage 1: merge pairwise.
         {
             let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
             writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1161,88 +1126,66 @@ mod bounds_storage_tests {
             }
             writer.wait_merging_threads()?;
         }
-        let searcher = index.reader()?.searcher();
-        assert_eq!(searcher.segment_readers().len(), 2);
-        let mut max_input_bound = 0.0f32;
-        for segment_reader in searcher.segment_readers() {
-            let vec_reader = segment_reader.vector_index(field)?;
-            let ivf = vec_reader.index().expect("stage-1 segments are IVF");
-            for &value in ivf.bounds().values() {
-                assert!(value.is_finite());
-                max_input_bound = max_input_bound.max(value);
-            }
-        }
-        // Tight per-half clusters: every input bound is small.
-        assert!(
-            max_input_bound < 1.0,
-            "stage-1 bounds should be tight: {max_input_bound}"
-        );
-
-        // Stage 2: merge the merged segments. Training now sees the
-        // union and re-anchors the single centroid near (0, 0), so the
-        // far half's residuals stretch the fold far past any input value.
+        // Stage 2: merge the merged segments.
         merge_all(&index)?;
+
+        let set = open_newest_set(&index)?;
+        let opts = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
+        let set_field = set.field_centroids(field, &opts)?;
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.segment_readers().len(), 1);
         let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
         let ivf = vec_reader.index().expect("merged segment is IVF");
         let stored: Vec<f32> = ivf.bounds().values().to_vec();
-        let expected = fresh_fold(&vec_reader, ivf, 2, Metric::L2)?;
+        let expected = fresh_fold(&vec_reader, ivf, &set_field, Metric::L2)?;
         for (cluster, (&got, &fold)) in stored.iter().zip(expected.iter()).enumerate() {
             assert_eq!(
                 got.to_bits(),
                 fold.to_bits(),
                 "cluster {cluster}: stored {got} != fresh fold {fold}"
             );
+            assert!(fold.is_finite() && fold > 0.0, "cluster {cluster} non-trivial");
         }
-        let max_merged = stored.iter().cloned().fold(0.0f32, f32::max);
-        assert!(
-            max_merged > max_input_bound * 10.0,
-            "merged fold ({max_merged}) must exceed any fold of input bounds ({max_input_bound})"
-        );
         Ok(())
     }
 
-    /// A pre-V2 `.centroids` file is refused at open with the REINDEX
-    /// remedy, verbatim.
+    /// A pre-V3 `.vec` file is refused at open with the REINDEX remedy,
+    /// verbatim.
     #[test]
     fn old_index_read_errors() -> crate::Result<()> {
         let directory = RamDirectory::create();
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
-            TestClusterer {
-                fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
-                num_centroids: 2,
-            },
+            vec![[0.0, 0.0], [10.0, 10.0]],
             &[&[[0.0, 0.0], [0.1, 0.0]], &[[10.0, 10.0], [10.1, 10.0]]],
             Some(directory.clone()),
         )?;
         merge_all(&index)?;
 
-        // Restamp the merged segment's `.centroids` header to V1, body
+        // Restamp the merged segment's `.vec` header to V2, body
         // unchanged — the version gate must refuse before parsing slots.
         let segment = index
             .searchable_segments()?
             .into_iter()
             .next()
             .expect("one merged segment");
-        let path = segment.relative_path(SegmentComponent::Custom(CENTROIDS_EXT.to_string()));
+        let path = segment.relative_path(SegmentComponent::Custom(VEC_EXT.to_string()));
         let bytes = directory.open_read(&path)?.read_bytes()?;
         assert!(bytes.len() > 4);
-        let mut restamped = 1u32.to_le_bytes().to_vec();
+        let mut restamped = 2u32.to_le_bytes().to_vec();
         restamped.extend_from_slice(&bytes[4..]);
-        directory.delete(&path).expect("delete .centroids");
-        let mut writer = directory.open_write(&path).expect("rewrite .centroids");
+        directory.delete(&path).expect("delete .vec");
+        let mut writer = directory.open_write(&path).expect("rewrite .vec");
         writer.write_all(&restamped)?;
         writer.terminate()?;
 
         let searcher = index.reader()?.searcher();
         let message = match searcher.segment_readers()[0].vector_index(field) {
-            Ok(_) => panic!("pre-V2 .centroids must be refused"),
+            Ok(_) => panic!("pre-V3 .vec must be refused"),
             Err(err) => err.to_string(),
         };
         assert!(
-            message.contains("predates the V2 centroid-bounds format")
+            message.contains("predates the V3 index-level centroid format")
                 && message.contains("\"embedding\""),
             "unexpected error text: {message}"
         );

@@ -17,7 +17,8 @@ use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_L
 use crate::error::{DataCorruption, TantivyError};
 use crate::fastfield::FastFieldsPlugin;
 use crate::index::{
-    IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta, SegmentMetaInventory,
+    CentroidSetMeta, IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta,
+    SegmentMetaInventory,
 };
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
@@ -30,7 +31,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{IvfClusterer, VectorPlugin};
+use crate::vector::{write_centroid_set, CentroidIndex, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -126,6 +127,7 @@ fn save_new_metas(
     schema: Schema,
     index_settings: IndexSettings,
     plugins: &[Arc<dyn SegmentPlugin>],
+    centroid_sets: Vec<CentroidSetMeta>,
     directory: &dyn Directory,
 ) -> crate::Result<()> {
     let persisted_custom_extensions: Vec<String> = plugins
@@ -136,6 +138,7 @@ fn save_new_metas(
     let empty_metas = IndexMeta {
         index_settings,
         persisted_custom_extensions,
+        centroid_sets,
         segments: Vec::new(),
         schema,
         opstamp: 0u64,
@@ -179,7 +182,7 @@ pub struct IndexBuilder {
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
-    ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
+    centroid_index: Option<Arc<dyn CentroidIndex>>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -195,7 +198,7 @@ impl IndexBuilder {
             tokenizer_manager: TokenizerManager::default(),
             fast_field_tokenizer_manager: TokenizerManager::default(),
             custom_plugins: Vec::new(),
-            ivf_clusterer: None,
+            centroid_index: None,
         }
     }
 
@@ -231,10 +234,12 @@ impl IndexBuilder {
         self
     }
 
-    /// Configure the clusterer used when vector merges cross the IVF threshold.
+    /// Install the index-level centroid set the index's vector fields
+    /// assign against. Required when the schema has vector fields; the set
+    /// is written at creation, next to the schema and settings.
     #[must_use]
-    pub fn ivf_clusterer(mut self, clusterer: Arc<dyn IvfClusterer>) -> Self {
-        self.ivf_clusterer = Some(clusterer);
+    pub fn centroid_index(mut self, centroid_index: Arc<dyn CentroidIndex>) -> Self {
+        self.centroid_index = Some(centroid_index);
         self
     }
 
@@ -313,8 +318,22 @@ impl IndexBuilder {
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
             index.custom_plugins.extend(self.custom_plugins);
-            if let Some(clusterer) = self.ivf_clusterer {
-                index.set_ivf_clusterer(clusterer);
+            if let Some(centroid_index) = self.centroid_index {
+                // The set was installed when the index was created; a
+                // provider carrying a different version would be a
+                // re-publish, which is not supported yet.
+                let version = centroid_index.version();
+                let known = index
+                    .load_metas()?
+                    .centroid_sets
+                    .iter()
+                    .any(|set| set.version == version);
+                if !known {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "index already exists without centroid set version {version}; \
+                         re-publishing a centroid set is not supported"
+                    )));
+                }
             }
             Ok(index)
         } else {
@@ -326,6 +345,23 @@ impl IndexBuilder {
 
     fn validate(&self) -> crate::Result<()> {
         if let Some(schema) = self.schema.as_ref() {
+            let has_vector_fields = schema
+                .fields()
+                .any(|(_, entry)| matches!(entry.field_type(), FieldType::Vector(_)));
+            if has_vector_fields && self.centroid_index.is_none() {
+                return Err(TantivyError::InvalidArgument(
+                    "schema has vector fields but no centroid index; provide one via \
+                     IndexBuilder::centroid_index — the centroid set is created with the index, \
+                     like the schema"
+                        .to_string(),
+                ));
+            }
+            if !has_vector_fields && self.centroid_index.is_some() {
+                return Err(TantivyError::InvalidArgument(
+                    "a centroid index was provided but the schema has no vector fields"
+                        .to_string(),
+                ));
+            }
             if self.index_settings.manual_doc_id_mapping
                 && self.index_settings.sort_by_field.is_some()
             {
@@ -380,10 +416,24 @@ impl IndexBuilder {
         self.validate()?;
         let dir = dir.into();
         let directory = ManagedDirectory::wrap(dir)?;
+        // The centroid set file is written BEFORE the first meta.json
+        // references it — the meta write is the commit point.
+        let centroid_sets = match &self.centroid_index {
+            Some(centroid_index) => {
+                let schema = self.get_expect_schema()?;
+                let path = write_centroid_set(&directory, &schema, centroid_index.as_ref())?;
+                vec![CentroidSetMeta {
+                    version: centroid_index.version(),
+                    filename: path.to_string_lossy().into_owned(),
+                }]
+            }
+            None => Vec::new(),
+        };
         save_new_metas(
             self.get_expect_schema()?,
             self.index_settings.clone(),
             &self.custom_plugins,
+            centroid_sets,
             &directory,
         )?;
         let mut metas = IndexMeta::with_schema(self.get_expect_schema()?);
@@ -392,9 +442,6 @@ impl IndexBuilder {
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
         index.custom_plugins.extend(self.custom_plugins);
-        if let Some(clusterer) = self.ivf_clusterer {
-            index.set_ivf_clusterer(clusterer);
-        }
         Ok(index)
     }
 }
@@ -410,7 +457,6 @@ pub struct Index {
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
-    ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
 }
 
 impl Index {
@@ -531,7 +577,6 @@ impl Index {
             executor: Executor::single_thread(),
             inventory,
             custom_plugins: Vec::new(),
-            ivf_clusterer: None,
         }
     }
 
@@ -876,15 +921,6 @@ impl Index {
     /// Accessor to the index settings
     pub fn settings_mut(&mut self) -> &mut IndexSettings {
         &mut self.settings
-    }
-
-    /// Configure the clusterer used when vector merges cross the IVF threshold.
-    pub fn set_ivf_clusterer(&mut self, clusterer: Arc<dyn IvfClusterer>) {
-        self.ivf_clusterer = Some(clusterer);
-    }
-
-    pub(crate) fn ivf_clusterer(&self) -> Option<&dyn IvfClusterer> {
-        self.ivf_clusterer.as_deref()
     }
 
     /// Accessor to the index schema

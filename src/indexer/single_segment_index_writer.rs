@@ -85,15 +85,17 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             .flat_map(|plugin| plugin.extensions().iter().copied())
             .map(str::to_string)
             .collect();
+        let previous_meta = index.load_metas()?;
         let index_meta = IndexMeta {
             index_settings: index.settings().clone(),
             persisted_custom_extensions,
+            // Written at index creation; this rebuild must not drop it.
+            centroid_sets: previous_meta.centroid_sets.clone(),
             segments: vec![segment_meta.clone()],
             schema: index.schema(),
             opstamp: 0,
             payload: None,
         };
-        let previous_meta = index.load_metas()?;
         save_metas(&index_meta, &previous_meta, index.directory())?;
         index.directory().sync_directory()?;
 
@@ -103,6 +105,9 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
                 std::slice::from_ref(segment_meta),
                 &index_meta.persisted_custom_extensions,
             );
+            for centroid_set in &index_meta.centroid_sets {
+                living_files.insert(std::path::PathBuf::from(&centroid_set.filename));
+            }
             living_files.insert(crate::core::META_FILEPATH.to_path_buf());
             index.directory_mut().garbage_collect(|| living_files)?;
         }

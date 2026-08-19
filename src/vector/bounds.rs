@@ -292,6 +292,7 @@ pub fn to_bound_space(metric: Metric, heap_key: f32) -> f32 {
 /// Maintains the [`QueryBound`] beside the probe loop: converts heap
 /// peeks into bound space on kth improvement only, and records the probe
 /// index at which the bound first armed.
+#[allow(dead_code)] // Consumed by the cross-segment search path (TODO).
 pub(crate) struct QueryBoundTracker {
     bound: QueryBound,
     /// The raw kth heap key behind the current `t` — the improvement
@@ -300,6 +301,7 @@ pub(crate) struct QueryBoundTracker {
     armed_at_probe: Option<u32>,
 }
 
+#[allow(dead_code)] // Consumed by the cross-segment search path (TODO).
 impl QueryBoundTracker {
     /// Starts unarmed.
     ///

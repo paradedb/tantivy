@@ -311,16 +311,13 @@ pub struct IndexSettings {
     #[serde(default = "default_codec_types")]
     #[serde(skip_serializing_if = "is_default_codec_types")]
     pub codec_types: Vec<columnar::CodecType>,
-    /// Doc-count boundary for choosing the vector-storage format on merge.
-    ///
-    /// A merge whose target segment has strictly fewer than this many
-    /// docs writes `.flatvec`; at or above this many docs writes
-    /// `.ivfvec` (clustered). Exactly one format is written per merge —
-    /// `FlatVecPlugin` and `IvfVecPlugin` short-circuit symmetrically
-    /// off this threshold.
-    #[serde(default = "default_vector_clustering_threshold")]
-    #[serde(skip_serializing_if = "is_default_vector_clustering_threshold")]
-    pub vector_clustering_threshold: usize,
+    /// Total number of cells a vector is written into (SPANN `ReplicaCount`):
+    /// the primary plus up to `vector_replicas - 1` additional cells taken
+    /// from the next-nearest centroids of the index-level set. `1` (the
+    /// default) disables replication — the primary-only layout.
+    #[serde(default = "default_vector_replicas")]
+    #[serde(skip_serializing_if = "is_default_vector_replicas")]
+    pub vector_replicas: usize,
     /// Which rows a cluster's stored centroid bound covers — captured
     /// from the index's build-time configuration (the `bounds_scope`
     /// reloption upstream) so segments written later still fold the
@@ -348,12 +345,12 @@ fn is_default_codec_types(types: &[columnar::CodecType]) -> bool {
     types == columnar::DEFAULT_CODEC_TYPES
 }
 
-fn default_vector_clustering_threshold() -> usize {
-    10_000
+fn default_vector_replicas() -> usize {
+    1
 }
 
-fn is_default_vector_clustering_threshold(threshold: &usize) -> bool {
-    *threshold == default_vector_clustering_threshold()
+fn is_default_vector_replicas(replicas: &usize) -> bool {
+    *replicas == default_vector_replicas()
 }
 
 impl Default for IndexSettings {
@@ -365,7 +362,7 @@ impl Default for IndexSettings {
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
             codec_types: default_codec_types(),
-            vector_clustering_threshold: default_vector_clustering_threshold(),
+            vector_replicas: default_vector_replicas(),
             vector_bounds_scope: BoundsScope::default(),
         }
     }
@@ -375,12 +372,6 @@ impl IndexSettings {
     /// Returns the codec types to use for u64-based column serialization.
     pub fn columnar_codec_types(&self) -> &[columnar::CodecType] {
         &self.codec_types
-    }
-
-    /// Returns the doc-count boundary at which merges switch from flat
-    /// to IVF storage. See [`IndexSettings::vector_clustering_threshold`].
-    pub fn vector_clustering_threshold(&self) -> usize {
-        self.vector_clustering_threshold
     }
 }
 
@@ -416,6 +407,18 @@ impl Order {
     }
 }
 
+/// One published index-level centroid set: its consumer MVCC version and
+/// the managed file (`centroids.<version>`) holding it. Recorded in
+/// `meta.json` so readers can resolve the set a segment assigned against
+/// and garbage collection keeps the file alive.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CentroidSetMeta {
+    /// The consumer-provided version stamp.
+    pub version: u64,
+    /// The managed file name, `centroids.<version>`.
+    pub filename: String,
+}
+
 /// Meta information about the `Index`.
 ///
 /// This object is serialized on disk in the `meta.json` file.
@@ -438,6 +441,12 @@ pub struct IndexMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub persisted_custom_extensions: Vec<String>,
+    /// The index-level centroid sets, ascending by version. Written at
+    /// index creation (and by future re-publishes); segments stamp the
+    /// version they assigned against into their `.vec` IVF meta.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub centroid_sets: Vec<CentroidSetMeta>,
     /// List of `SegmentMeta` information associated with each finalized segment of the index.
     pub segments: Vec<SegmentMeta>,
     /// Index `Schema`
@@ -460,6 +469,8 @@ struct UntrackedIndexMeta {
     pub index_settings: IndexSettings,
     #[serde(default)]
     pub persisted_custom_extensions: Vec<String>,
+    #[serde(default)]
+    pub centroid_sets: Vec<CentroidSetMeta>,
     pub schema: Schema,
     pub opstamp: Opstamp,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -471,6 +482,7 @@ impl UntrackedIndexMeta {
         IndexMeta {
             index_settings: self.index_settings,
             persisted_custom_extensions: self.persisted_custom_extensions,
+            centroid_sets: self.centroid_sets,
             segments: self
                 .segments
                 .into_iter()
@@ -493,6 +505,7 @@ impl IndexMeta {
         IndexMeta {
             index_settings: IndexSettings::default(),
             persisted_custom_extensions: Vec::new(),
+            centroid_sets: Vec::new(),
             segments: vec![],
             schema,
             opstamp: 0u64,
@@ -541,6 +554,7 @@ mod tests {
             schema_builder.build()
         };
         let index_metas = IndexMeta {
+            centroid_sets: Vec::new(),
             index_settings: IndexSettings {
                 docstore_compression: Compressor::None,
                 sort_by_field: Some(IndexSortByField {
@@ -658,7 +672,7 @@ mod tests {
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
-                vector_clustering_threshold: 10_000,
+                vector_replicas: 1,
                 vector_bounds_scope: BoundsScope::Native,
             }
         );
