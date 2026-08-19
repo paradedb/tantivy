@@ -1,9 +1,9 @@
 //! Per-query precomputation hoisted out of the per-doc scoring loop.
 //!
-//! Built once per [`VectorBackend::for_segment`] and held by the backend.
-//! Hides the metric match and any metric-specific precomputed scalars
-//! (currently only `1/||q||` for cosine) behind
-//! [`PreparedQuery::score_doc_bytes`].
+//! Built once per query by the cross-segment search driver
+//! ([`search`](super::search)). Hides the metric match and any
+//! metric-specific precomputed scalars (currently only `1/||q||` for
+//! cosine) behind [`PreparedQuery::score_doc_bytes`].
 //!
 //! Stored vectors — including IVF centroids — are unit-normalized at
 //! write time for `Cosine + F32` (see
@@ -11,7 +11,6 @@
 //! so a single scoring entry point covers both per-doc and centroid
 //! scans.
 //!
-//! [`VectorBackend::for_segment`]: super::backend::VectorBackend::for_segment
 
 use std::sync::Arc;
 

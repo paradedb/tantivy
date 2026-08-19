@@ -20,6 +20,7 @@ mod id_map;
 mod index_reader;
 mod plugin;
 mod prepared;
+mod search;
 mod tie_break;
 mod writer;
 
@@ -31,29 +32,28 @@ pub(crate) mod tests;
 pub(crate) const VEC_EXT: &str = "vec";
 
 pub use backend::{
-    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, VectorBackend,
-    DEFAULT_FIXED_PROBE_COST_ROWS,
+    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 pub use bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
     BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
+pub(crate) use centroid_set::{write_centroid_set, SetSearchIndex};
+pub use centroid_set::{CentroidIndex, ROUTER_KIND_RNG};
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
-pub use centroid_set::{CentroidIndex, ROUTER_KIND_RNG};
-pub(crate) use centroid_set::write_centroid_set;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo};
 pub use ivf::{
-    Candidate, Graph, IvfCentroids, IvfIndex, IvfMatrix, IvfSearchMetrics,
-    NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph,
-    ResumableSearchIterator, SearchIterator, SearchTerminationReason, Workspace,
+    Candidate, Graph, IvfCentroids, IvfIndex, IvfMatrix, IvfSearchMetrics, NeighborhoodGraphConfig,
+    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
+    SearchIterator, SearchTerminationReason, Workspace,
 };
 pub use plugin::VectorPlugin;
-pub use writer::VecWriter;
 pub use prepared::PreparedQuery;
 pub use tie_break::NoTieBreak;
+pub use writer::VecWriter;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
 // resolves for callers and tests that work entirely within the vector module.

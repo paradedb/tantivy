@@ -31,7 +31,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{write_centroid_set, CentroidIndex, VectorPlugin};
+use crate::vector::{write_centroid_set, CentroidIndex, SetSearchIndex, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -358,8 +358,7 @@ impl IndexBuilder {
             }
             if !has_vector_fields && self.centroid_index.is_some() {
                 return Err(TantivyError::InvalidArgument(
-                    "a centroid index was provided but the schema has no vector fields"
-                        .to_string(),
+                    "a centroid index was provided but the schema has no vector fields".to_string(),
                 ));
             }
             if self.index_settings.manual_doc_id_mapping
@@ -457,6 +456,11 @@ pub struct Index {
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
+    /// Search-time centroid sets by version, opened once and shared across
+    /// clones — the router adjacency is far too heavy to parse per query.
+    /// Set files are immutable and version-named, so entries never
+    /// invalidate.
+    centroid_set_cache: Arc<std::sync::RwLock<std::collections::HashMap<u64, Arc<SetSearchIndex>>>>,
 }
 
 impl Index {
@@ -577,6 +581,7 @@ impl Index {
             executor: Executor::single_thread(),
             inventory,
             custom_plugins: Vec::new(),
+            centroid_set_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -952,6 +957,46 @@ impl Index {
     pub fn new_segment_with_id(&self, segment_id: SegmentId) -> Segment {
         let segment_meta = self.inventory.new_segment_meta(segment_id, 0);
         self.segment(segment_meta)
+    }
+
+    /// The search-time view of the centroid set stamped `version`, opened
+    /// on first use and cached for the life of this `Index` (and all its
+    /// clones).
+    pub(crate) fn centroid_set_search_index(
+        &self,
+        version: u64,
+    ) -> crate::Result<Arc<SetSearchIndex>> {
+        if let Some(set) = self
+            .centroid_set_cache
+            .read()
+            .expect("centroid set cache poisoned")
+            .get(&version)
+        {
+            return Ok(Arc::clone(set));
+        }
+        let metas = self.load_metas()?;
+        let entry = metas
+            .centroid_sets
+            .iter()
+            .find(|set| set.version == version)
+            .ok_or_else(|| {
+                TantivyError::InvalidArgument(format!(
+                    "segments reference centroid set version {version}, which the meta does not \
+                     list"
+                ))
+            })?;
+        let set = Arc::new(SetSearchIndex::open(
+            &self.directory,
+            Path::new(&entry.filename),
+            &self.schema,
+        )?);
+        Ok(Arc::clone(
+            self.centroid_set_cache
+                .write()
+                .expect("centroid set cache poisoned")
+                .entry(version)
+                .or_insert(set),
+        ))
     }
 
     /// Return a reference to the index directory.

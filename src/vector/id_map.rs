@@ -73,7 +73,11 @@ impl IdMap {
     #[inline]
     pub fn doc_id_at(&self, row: usize) -> DocId {
         let start = row * size_of::<DocId>();
-        DocId::from_le_bytes(self.0[start..start + size_of::<DocId>()].try_into().unwrap())
+        DocId::from_le_bytes(
+            self.0[start..start + size_of::<DocId>()]
+                .try_into()
+                .unwrap(),
+        )
     }
 }
 

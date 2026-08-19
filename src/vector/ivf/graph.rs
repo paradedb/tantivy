@@ -766,7 +766,9 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     /// afterward. Every node reads the same pre-pass snapshot — a
     /// *synchronous* refinement, the shape that parallelizes.
     pub fn refine(&mut self, executor: &Executor)
-    where S: Sync {
+    where
+        S: Sync,
+    {
         let len = self.graph.len();
         if len == 0 {
             return;

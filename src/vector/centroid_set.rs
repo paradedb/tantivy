@@ -30,10 +30,12 @@ use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use super::header::{centroid_set_slot, read_header, write_header, VectorFileVersion};
 use super::ivf::assign::build_executor;
 use super::ivf::{
-    decode_row, encode_vector, IvfCentroids, NeighborhoodGraphConfig, RelativeNeighborhoodGraph,
+    decode_row, encode_vector, Candidate, IvfCentroids, IvfSearchMetrics, NeighborhoodGraphConfig,
+    NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
 };
+use super::{FileSliceArena, VectorArena};
 use crate::directory::{CompositeFile, CompositeWrite, Directory, FileSlice};
-use crate::schema::{Field, FieldType, Schema, VectorDType, VectorOptions};
+use crate::schema::{Field, FieldType, Metric, Schema, VectorDType, VectorOptions};
 use crate::TantivyError;
 
 /// Router-kind tag for tantivy's own RNG payload (the
@@ -297,10 +299,48 @@ impl CentroidSetReader {
 
     /// The raw router slot of `field`, if the set carries one (absent for
     /// degenerate `C <= 1` sets). First byte is the router-kind tag.
-    #[allow(dead_code)] // Consumed by the cross-segment search path (TODO).
     pub(crate) fn router_slice(&self, field: Field) -> Option<FileSlice> {
         self.composite
             .open_read_with_idx(field, centroid_set_slot::ROUTER)
+    }
+
+    /// The centroid count and the rows as a lazy [`FileSlice`] (past the
+    /// count word) — the search path's view, which never materializes the
+    /// rows whole.
+    pub(crate) fn field_rows(
+        &self,
+        field: Field,
+        options: &VectorOptions,
+    ) -> crate::Result<(usize, FileSlice)> {
+        let Some(slice) = self
+            .composite
+            .open_read_with_idx(field, centroid_set_slot::CENTROIDS)
+        else {
+            return Err(TantivyError::InternalError(format!(
+                "centroid set v{} has no centroids for field {field:?}; the set does not match \
+                 the schema",
+                self.version
+            )));
+        };
+        let count_len = std::mem::size_of::<u32>();
+        if slice.len() < count_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "centroid set slot is smaller than its count word",
+            )
+            .into());
+        }
+        let count_bytes = slice.slice_to(count_len).read_bytes()?;
+        let num_centroids = u32::deserialize(&mut count_bytes.as_slice())? as usize;
+        let rows = slice.slice_from(count_len);
+        if rows.len() != num_centroids * options.bytes_per_vector() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "centroid set byte length mismatch",
+            )
+            .into());
+        }
+        Ok((num_centroids, rows))
     }
 }
 
@@ -331,6 +371,208 @@ impl FieldCentroids {
                 .chunks_exact(std::mem::size_of::<f32>())
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .collect()),
+        }
+    }
+}
+
+/// The search-time view of one centroid set: per vector field, the lazy
+/// centroid rows plus the parsed router. Opened once per set version and
+/// cached on [`Index`](crate::Index) — the router adjacency alone is
+/// `C × max_edges × 4` bytes, far too heavy to parse per query.
+pub(crate) struct SetSearchIndex {
+    version: u64,
+    fields: std::collections::HashMap<Field, FieldRouter>,
+}
+
+impl SetSearchIndex {
+    /// Open the set file and parse every vector field's router.
+    pub(crate) fn open(
+        directory: &dyn Directory,
+        filename: &std::path::Path,
+        schema: &Schema,
+    ) -> crate::Result<Self> {
+        let reader = CentroidSetReader::open(directory, filename)?;
+        let mut fields = std::collections::HashMap::new();
+        for (field, entry) in schema.fields() {
+            let opts = match entry.field_type() {
+                FieldType::Vector(opts) => opts,
+                _ => continue,
+            };
+            let (num_centroids, rows_slice) = reader.field_rows(field, opts)?;
+            let graph = match reader.router_slice(field) {
+                Some(slice) if slice.len() >= 1 => {
+                    let tag = slice.slice_to(1).read_bytes()?[0];
+                    if tag == ROUTER_KIND_RNG {
+                        let adjacency = slice.slice_from(1).read_bytes()?;
+                        let arena = match opts.dtype() {
+                            VectorDType::F32 => FileSliceArena::<f32>::new(rows_slice.clone()),
+                        };
+                        Some(RelativeNeighborhoodGraph::open(
+                            &adjacency,
+                            arena,
+                            opts.dim(),
+                            opts.metric(),
+                            NeighborhoodGraphConfig::default(),
+                        )?)
+                    } else if tag >= 128 {
+                        // A consumer-defined router tantivy cannot read:
+                        // route by exact scan, which is always correct.
+                        log::warn!(
+                            "field '{}' carries a consumer router (tag {tag}) in centroid set \
+                             v{}; routing falls back to an exact centroid scan",
+                            entry.name(),
+                            reader.version(),
+                        );
+                        None
+                    } else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unknown reserved router-kind tag {tag}"),
+                        )
+                        .into());
+                    }
+                }
+                // Degenerate sets (C <= 1) own no router slot; a linear
+                // scan needs no structure. An empty slot is corrupt but
+                // routes fine the same way.
+                _ => None,
+            };
+            fields.insert(
+                field,
+                FieldRouter {
+                    num_centroids,
+                    dim: opts.dim(),
+                    metric: opts.metric(),
+                    rows_slice,
+                    graph,
+                },
+            );
+        }
+        Ok(SetSearchIndex {
+            version: reader.version(),
+            fields,
+        })
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub(crate) fn field_router(&self, field: Field) -> Option<&FieldRouter> {
+        self.fields.get(&field)
+    }
+}
+
+/// One field's routing state within a [`SetSearchIndex`]: says which
+/// clusters a query should probe, index-wide — every segment shares these
+/// cluster ids.
+pub(crate) struct FieldRouter {
+    num_centroids: usize,
+    dim: usize,
+    metric: Metric,
+    /// The set's centroid rows, fetched per node through the lazy arena.
+    rows_slice: FileSlice,
+    /// The persisted RNG over the centroids. `None` for degenerate
+    /// centroid counts or consumer routers, where routing falls back to a
+    /// linear scan.
+    graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
+}
+
+impl FieldRouter {
+    pub(crate) fn num_centroids(&self) -> usize {
+        self.num_centroids
+    }
+
+    /// Clusters to probe for `query`, ranked lazily — a [`ClusterRanking`]
+    /// yielding [`Candidate`]s best routing score first (graph node `c` *is*
+    /// cluster `c`, so `Candidate::node` is the cluster id).
+    ///
+    /// With a persisted RNG this is a resumable beam search
+    /// ([`RelativeNeighborhoodGraph::search_iter`]): the first batch is one
+    /// converged round at the configured `ef`, and pulling past it resumes
+    /// the search, so routing cost is paid only as far as probing actually
+    /// reaches. Without one every centroid is scored exactly, up front. Both
+    /// paths score through the same [`FileSliceArena`], so their rankings
+    /// agree.
+    ///
+    /// `ws` holds the routing search's scratch and is borrowed for the
+    /// ranking's lifetime; [`ClusterRanking::metrics`] reports the cost
+    /// incurred so far (surfaced as `ProbeStats::routing`).
+    pub(crate) fn rank_clusters<'a>(
+        &'a self,
+        ws: &'a mut Workspace,
+        query: &'a [f32],
+    ) -> ClusterRanking<'a> {
+        match &self.graph {
+            Some(graph) => {
+                // TODO: Replace with proper seed generation
+                let seeds: Vec<NodeId> = {
+                    (0..graph.len())
+                        .step_by((graph.len() / 8).max(1))
+                        .take(8)
+                        .map(|node| node as NodeId)
+                        .collect()
+                };
+                ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
+            }
+            None => {
+                let arena = FileSliceArena::<f32>::new(self.rows_slice.clone());
+                let mut ranked: Vec<Candidate> = (0..self.num_centroids)
+                    .map(|cluster| Candidate {
+                        sim: arena.similarity(self.metric, self.dim, cluster as NodeId, query),
+                        node: cluster as NodeId,
+                    })
+                    .collect();
+                ranked.sort_unstable_by(|a, b| b.cmp(a));
+                ClusterRanking::Exact {
+                    ranked: ranked.into_iter(),
+                    num_centroids: self.num_centroids,
+                }
+            }
+        }
+    }
+}
+
+/// Lazily ranked clusters for one query, yielded best routing score first;
+/// returned by [`FieldRouter::rank_clusters`], which documents the two
+/// paths.
+pub(crate) enum ClusterRanking<'a> {
+    /// Beam-searched routing over the persisted centroid RNG; pulling past a
+    /// converged batch resumes the search.
+    Graph(ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>),
+    /// Exact fallback for router-less sets: every centroid scored and
+    /// sorted up front.
+    Exact {
+        ranked: std::vec::IntoIter<Candidate>,
+        num_centroids: usize,
+    },
+}
+
+impl ClusterRanking<'_> {
+    /// The routing cost incurred so far: fixed for the exact path, growing
+    /// with each pull that resumes the beam search on the graph path — so
+    /// take the snapshot after the last pull.
+    pub(crate) fn metrics(&self) -> IvfSearchMetrics {
+        match self {
+            ClusterRanking::Graph(iter) => IvfSearchMetrics {
+                visited_count: iter.metrics().visited_count,
+                graph: Some(iter.metrics()),
+            },
+            ClusterRanking::Exact { num_centroids, .. } => IvfSearchMetrics {
+                visited_count: *num_centroids,
+                graph: None,
+            },
+        }
+    }
+}
+
+impl Iterator for ClusterRanking<'_> {
+    type Item = Candidate;
+
+    fn next(&mut self) -> Option<Candidate> {
+        match self {
+            ClusterRanking::Graph(iter) => iter.next(),
+            ClusterRanking::Exact { ranked, .. } => ranked.next(),
         }
     }
 }

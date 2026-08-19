@@ -102,7 +102,6 @@ mod top_collector;
 pub use self::top_collector::ComparableDoc;
 
 mod top_score_collector;
-pub(crate) use self::top_score_collector::compare_for_top_k;
 pub use self::top_score_collector::{TopDocs, TopNComputer};
 
 mod sort_key_top_collector;
@@ -172,6 +171,21 @@ pub trait Collector: Sync + Send {
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
+
+    /// Searcher-level collection hook, checked BEFORE the per-segment
+    /// pass: a collector that must see the whole index in one pass (e.g.
+    /// vector search, whose probe loop spans segments) returns
+    /// `Some(fruit)` here and the per-segment machinery
+    /// ([`Self::collect_segment`] / [`Self::merge_fruits`]) never runs.
+    /// The default `None` keeps every ordinary collector on the
+    /// per-segment path.
+    fn collect_global(
+        &self,
+        _weight: &dyn Weight,
+        _searcher: &crate::Searcher,
+    ) -> crate::Result<Option<Self::Fruit>> {
+        Ok(None)
+    }
 
     /// Created a segment collector and
     fn collect_segment(

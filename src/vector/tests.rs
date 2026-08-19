@@ -8,9 +8,7 @@ use crate::indexer::NoMergePolicy;
 use crate::query::TermQuery;
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::ivf::AdaptiveProbeParams;
-use crate::vector::{
-    CentroidIndex, IvfCentroids, IvfMatrix, Metric, VectorDType, VectorOptions,
-};
+use crate::vector::{CentroidIndex, IvfCentroids, IvfMatrix, Metric, VectorDType, VectorOptions};
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
 const EMBEDDING_FIELD_NAME: &str = "embedding";
@@ -1010,12 +1008,13 @@ mod bounds_storage_tests {
         );
         schema_builder.add_text_field("label", STRING | STORED);
         let schema = schema_builder.build();
-        let builder = Index::builder()
-            .schema(schema)
-            .centroid_index(Arc::new(Grid2DCentroidIndex {
-                centroids,
-                version: 1,
-            }));
+        let builder =
+            Index::builder()
+                .schema(schema)
+                .centroid_index(Arc::new(Grid2DCentroidIndex {
+                    centroids,
+                    version: 1,
+                }));
         let index = match directory {
             Some(directory) => builder.create(directory)?,
             None => builder.create_in_ram()?,
@@ -1144,7 +1143,10 @@ mod bounds_storage_tests {
                 fold.to_bits(),
                 "cluster {cluster}: stored {got} != fresh fold {fold}"
             );
-            assert!(fold.is_finite() && fold > 0.0, "cluster {cluster} non-trivial");
+            assert!(
+                fold.is_finite() && fold > 0.0,
+                "cluster {cluster} non-trivial"
+            );
         }
         Ok(())
     }

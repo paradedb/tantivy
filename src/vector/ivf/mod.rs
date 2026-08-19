@@ -20,7 +20,7 @@ pub use graph::{
     Workspace,
 };
 pub use index::{IvfIndex, IvfSearchMetrics};
-pub use params::{AdaptiveProbeParams, WorkModel};
+pub use params::AdaptiveProbeParams;
 pub(crate) use plugin::{merge_ivf, write_ivf_field, IvfFieldWriteParams};
 pub(crate) use types::{decode_row, encode_vector};
 pub use types::{IvfCentroids, IvfMatrix};

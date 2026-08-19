@@ -57,6 +57,13 @@ pub struct IvfIndex {
     /// Slot `[3]`, pinned: the per-cluster bound payload,
     /// `num_centroids * bound_kind.stride(dim)` f32s in cluster order.
     bounds: Vec<f32>,
+    /// Derived at open (one pass over the offsets): bit `c` set ⟺ cluster
+    /// `c` has rows in THIS segment. The probe loop's presence check
+    /// touches one bit instead of two random u64s of the offsets array.
+    non_empty: Vec<u64>,
+    /// Count of set bits in [`Self::non_empty`] — this segment's share of
+    /// the index's open-charge capacity.
+    num_non_empty: usize,
 }
 
 impl IvfIndex {
@@ -190,14 +197,22 @@ impl IvfIndex {
             (kind, values)
         };
 
-        let index = IvfIndex {
+        let mut index = IvfIndex {
             num_centroids,
             num_docs,
             centroid_set_version,
             cluster_offsets,
             bound_kind,
             bounds,
+            non_empty: vec![0u64; num_centroids.div_ceil(64)],
+            num_non_empty: 0,
         };
+        for cluster in 0..num_centroids {
+            if index.cluster_offset(cluster + 1) > index.cluster_offset(cluster) {
+                index.non_empty[cluster / 64] |= 1u64 << (cluster % 64);
+                index.num_non_empty += 1;
+            }
+        }
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt file.
         if index.num_docs > index.num_rows() {
@@ -242,6 +257,28 @@ impl IvfIndex {
     pub fn cluster_range(&self, cluster: usize) -> Range<usize> {
         debug_assert!(cluster < self.num_centroids, "cluster out of bounds");
         self.cluster_offset(cluster) as usize..self.cluster_offset(cluster + 1) as usize
+    }
+
+    /// Presence: `true` iff `cluster` has rows in this segment. One bit of
+    /// pinned state; the probe loop's cheapest gate.
+    #[inline]
+    pub fn has_cluster(&self, cluster: usize) -> bool {
+        debug_assert!(cluster < self.num_centroids, "cluster out of bounds");
+        (self.non_empty[cluster / 64] >> (cluster % 64)) & 1 == 1
+    }
+
+    /// The non-empty row range of `cluster`, or `None` when the cluster has
+    /// no rows here — the driver-facing form, so the offsets encoding can
+    /// change underneath (a sparse layout is the flagged follow-up).
+    #[inline]
+    pub fn non_empty_cluster_range(&self, cluster: usize) -> Option<Range<usize>> {
+        self.has_cluster(cluster)
+            .then(|| self.cluster_range(cluster))
+    }
+
+    /// Number of clusters with at least one row in this segment.
+    pub fn num_non_empty_clusters(&self) -> usize {
+        self.num_non_empty
     }
 
     /// The stored centroid bounds of this segment's clusters.

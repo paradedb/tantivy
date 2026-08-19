@@ -142,7 +142,11 @@ impl PluginWriter for VecWriter {
         if self.fields.is_empty() {
             return Ok(());
         }
-        if self.fields.values().all(|buf| buf.present_doc_ids.is_empty()) {
+        if self
+            .fields
+            .values()
+            .all(|buf| buf.present_doc_ids.is_empty())
+        {
             // No rows anywhere: no `.vec` at all — the reader treats a
             // missing file as "no vector data".
             return Ok(());
@@ -161,8 +165,10 @@ impl PluginWriter for VecWriter {
                         .to_string(),
                 )
             })?;
-        let set_reader =
-            CentroidSetReader::open(index.directory(), std::path::Path::new(&newest_set.filename))?;
+        let set_reader = CentroidSetReader::open(
+            index.directory(),
+            std::path::Path::new(&newest_set.filename),
+        )?;
 
         let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
         write_header(&mut write)?;

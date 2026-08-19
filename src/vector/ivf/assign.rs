@@ -107,9 +107,7 @@ pub(crate) fn build_centroid_graph<'a>(
 /// can return fewer than `knn` neighbours, silently under-assigning) —
 /// and an approximate graph selector for large ones.
 pub(crate) enum CentroidSelector<'a> {
-    Exact {
-        centroids: &'a [f32],
-    },
+    Exact { centroids: &'a [f32] },
     Graph(RelativeNeighborhoodGraph<&'a [f32]>),
 }
 
@@ -194,7 +192,11 @@ pub(crate) fn assign_cells(
     }
     let chunk_starts = (0..num_rows).step_by(ASSIGN_CHUNK_ROWS);
     let per_chunk = executor.map(
-        |start| Ok(assign_chunk(start..(start + ASSIGN_CHUNK_ROWS).min(num_rows))),
+        |start| {
+            Ok(assign_chunk(
+                start..(start + ASSIGN_CHUNK_ROWS).min(num_rows),
+            ))
+        },
         chunk_starts,
     )?;
     Ok(per_chunk.into_iter().flatten().collect())

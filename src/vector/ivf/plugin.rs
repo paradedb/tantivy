@@ -21,8 +21,8 @@ use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::vector::centroid_set::{CentroidSetReader, FieldCentroids};
 use crate::vector::distance::{maybe_normalize_bytes, norm_squared_bytes_wide, NormalizeOutcome};
-use crate::vector::id_map::IdMap;
 use crate::vector::header::{vec_slot, write_header};
+use crate::vector::id_map::IdMap;
 use crate::vector::{residual_norm, BoundKind, BoundsBuilder, BoundsScope, VEC_EXT};
 use crate::{DocId, Executor, TantivyError};
 
@@ -204,8 +204,8 @@ pub(crate) fn write_ivf_field(
         let bytes = params.set.centroid_bytes(cluster);
         let norm_sq = norm_squared_bytes_wide::<f32>(bytes);
         let non_finite = !norm_sq.is_finite();
-        let non_unit = opts.needs_normalization()
-            && (norm_sq.sqrt() - 1.0).abs() > UNIT_NORM_TOLERANCE;
+        let non_unit =
+            opts.needs_normalization() && (norm_sq.sqrt() - 1.0).abs() > UNIT_NORM_TOLERANCE;
         if non_finite || non_unit {
             bounds_builder.saturate(cluster);
         }
