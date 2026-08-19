@@ -855,6 +855,68 @@ mod centroid_set_lifecycle_tests {
         Ok(())
     }
 
+    /// A sibling index sharing the source's set gets a byte-identical
+    /// file — same version — and its segments assign against the same
+    /// centroids, so a future merge across both passes the version guard.
+    #[test]
+    fn shared_centroid_set_copies_verbatim() -> crate::Result<()> {
+        let source_dir = RamDirectory::create();
+        let source = Index::builder()
+            .schema(vector_schema())
+            .centroid_index(Arc::new(Grid2DCentroidIndex {
+                centroids: vec![[0.0, 0.0], [10.0, 10.0]],
+                version: 9,
+            }))
+            .create(source_dir.clone())?;
+
+        let sibling = Index::builder()
+            .schema(vector_schema())
+            .shared_centroid_set(&source)
+            .create_in_ram()?;
+        assert_eq!(open_newest_set(&sibling)?.version(), 9);
+        let set_path = centroid_set_filename(9);
+        let source_bytes = source.directory().open_read(&set_path)?.read_bytes()?;
+        let sibling_bytes = sibling.directory().open_read(&set_path)?.read_bytes()?;
+        assert_eq!(
+            source_bytes.as_slice(),
+            sibling_bytes.as_slice(),
+            "the shared set must be a verbatim copy"
+        );
+
+        let embed_field = sibling.schema().get_field("embedding").unwrap();
+        let mut writer: IndexWriter = sibling.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for v in [[0.1_f32, 0.0], [9.9, 10.1]] {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(embed_field, &v);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        let searcher = sibling.reader()?.searcher();
+        let ivf = searcher.segment_readers()[0]
+            .vector_index(embed_field)?
+            .index()
+            .expect("IVF segment")
+            .centroid_set_version();
+        assert_eq!(ivf, 9, "sibling segments stamp the source's version");
+
+        // Both centroid sources at once is rejected.
+        let err = Index::builder()
+            .schema(vector_schema())
+            .centroid_index(Arc::new(Grid2DCentroidIndex {
+                centroids: vec![[0.0, 0.0]],
+                version: 1,
+            }))
+            .shared_centroid_set(&source)
+            .create_in_ram()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "unexpected: {err}"
+        );
+        Ok(())
+    }
+
     /// `open_or_create` on an existing index accepts a provider whose
     /// version is already installed and refuses a new one (re-publishing
     /// is unsupported).

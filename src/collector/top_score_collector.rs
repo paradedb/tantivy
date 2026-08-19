@@ -353,11 +353,7 @@ impl TopDocs {
     /// are candidates. For brute-force scan over every doc, pair this with
     /// [`AllQuery`](crate::query::AllQuery); pair with a filter query to
     /// restrict candidates.
-    pub fn order_by_similarity<T>(
-        self,
-        field: Field,
-        query: Vec<T>,
-    ) -> TopDocsByVectorSimilarity<T>
+    pub fn order_by_similarity<T>(self, field: Field, query: Vec<T>) -> TopDocsByVectorSimilarity<T>
     where
         T: VectorElement,
     {
@@ -603,7 +599,8 @@ impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D
 }
 
 impl<Score: std::fmt::Debug, D, C> std::fmt::Debug for TopNComputer<Score, D, C>
-where C: Comparator<Score>
+where
+    C: Comparator<Score>,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("TopNComputer")

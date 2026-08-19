@@ -68,7 +68,8 @@ pub trait CancelSentinel: Send + Sync + 'static {
 }
 
 impl<F: Fn() -> bool + Send + Sync + 'static> CancelSentinel for F
-where F: Clone
+where
+    F: Clone,
 {
     fn box_clone(&self) -> Box<dyn CancelSentinel> {
         Box::new(self.clone())

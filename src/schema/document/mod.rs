@@ -188,11 +188,13 @@ use super::*;
 pub trait Document: Send + Sync + 'static {
     /// The value of the field.
     type Value<'a>: Value<'a> + Clone
-    where Self: 'a;
+    where
+        Self: 'a;
 
     /// The iterator over all of the fields and values within the doc.
     type FieldsValuesIter<'a>: Iterator<Item = (Field, Self::Value<'a>)>
-    where Self: 'a;
+    where
+        Self: 'a;
 
     /// Get an iterator iterating over all fields and values in a document.
     fn iter_fields_and_values(&self) -> Self::FieldsValuesIter<'_>;
@@ -204,7 +206,9 @@ pub trait Document: Send + Sync + 'static {
     /// `TantivyDocument`; `TantivyDocument` overrides it to return itself, so indexing the
     /// default document type costs nothing extra.
     fn into_tantivy_document(self) -> TantivyDocument
-    where Self: Sized {
+    where
+        Self: Sized,
+    {
         let mut doc = TantivyDocument::new();
         for (field, value) in self.iter_fields_and_values() {
             doc.add_field_value(field, value);

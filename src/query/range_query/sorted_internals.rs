@@ -208,7 +208,9 @@ pub(crate) fn gallop_search_sorted(
 /// forward-cursor pattern when the answer is close to `lo`, because the
 /// early probes share a cache line with `slice[lo]`.
 pub(crate) fn gallop_partition_point<T, F>(slice: &[T], lo: usize, mut pred: F) -> usize
-where F: FnMut(&T) -> bool {
+where
+    F: FnMut(&T) -> bool,
+{
     let hi = slice.len();
     if lo >= hi {
         return hi;
