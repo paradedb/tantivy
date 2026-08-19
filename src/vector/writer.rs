@@ -165,6 +165,7 @@ impl PluginWriter for VecWriter {
                         .to_string(),
                 )
             })?;
+        let set_search = index.centroid_set_search_index(newest_set.version)?;
         let set_reader = CentroidSetReader::open(
             index.directory(),
             std::path::Path::new(&newest_set.filename),
@@ -204,6 +205,9 @@ impl PluginWriter for VecWriter {
 
             let field_centroids = set_reader.field_centroids(*field, &buf.opts)?;
             let params = IvfFieldWriteParams {
+                router: set_search
+                    .field_router(*field)
+                    .and_then(|router| router.graph()),
                 field: *field,
                 opts: &buf.opts,
                 set: &field_centroids,

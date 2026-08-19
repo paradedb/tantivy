@@ -896,7 +896,10 @@ mod tests {
         assert_eq!(stats.routing.visited_count, DEFAULT_NUM_CENTROIDS);
         assert_eq!(stats.termination, ProbeTermination::Exhausted);
         assert_eq!(stats.segments_searched as usize, FIXTURE_NUM_SEGMENTS);
-        assert_eq!(stats.filters_built as usize, FIXTURE_NUM_SEGMENTS);
+        // AllQuery matches every doc: the fast path builds NO filter
+        // bitsets and prunes nothing on filters.
+        assert_eq!(stats.filters_built, 0);
+        assert_eq!(stats.pruned_filter, 0);
         // k > total docs: the bound never arms, nothing is skipped.
         assert_eq!(stats.bounds_skips, 0);
         assert_eq!(stats.bound_armed_at_probe, None);
@@ -1004,6 +1007,8 @@ mod tests {
     /// segments. Probing the query's cluster arms the global bound; the
     /// far segment's only cluster is then provably useless — skipped for
     /// the open share, WITHOUT ever materializing that segment's filter.
+    /// The filter is a TermQuery every doc matches (an `AllQuery` would
+    /// take the no-bitset fast path and build nothing anywhere).
     #[test]
     fn bounds_skip_spares_far_segment_and_its_filter() -> crate::Result<()> {
         let near: Vec<(String, [f32; 2])> = (0..8)
@@ -1014,18 +1019,29 @@ mod tests {
             .collect();
         let near_ref: Vec<(&str, [f32; 2])> = near.iter().map(|(l, v)| (l.as_str(), *v)).collect();
         let far_ref: Vec<(&str, [f32; 2])> = far.iter().map(|(l, v)| (l.as_str(), *v)).collect();
-        let (index, embed_field, _label) = build_ivf(
+        let (index, embed_field, label_field) = build_ivf(
             Metric::L2,
             &[[0.0, 0.0], [100.0, 100.0]],
             &[&near_ref, &far_ref],
             1,
             false,
         )?;
-
+        // Filter on the near half only; the far segment's filter must
+        // STILL never build (bounds-skipped before the filter gate).
+        let near_filter = crate::query::BooleanQuery::union(
+            (0..8)
+                .map(|i| {
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(label_field, &format!("near{i}")),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>
+                })
+                .collect::<Vec<_>>(),
+        );
         let (hits, stats) = run_global(
             &index,
             embed_field,
-            &AllQuery,
+            &near_filter,
             vec![0.0, 0.0],
             1,
             exhaustive_params(2),
@@ -1039,6 +1055,53 @@ mod tests {
         assert_eq!(stats.bounds_skips, 1);
         assert_eq!(stats.filters_built, 1, "far segment must stay filter-less");
         assert_eq!(stats.candidates_scored, near.len());
+        Ok(())
+    }
+
+    /// The `AllQuery` fast path: an unfiltered search never materializes a
+    /// filter bitset, and returns exactly what the (bitset-building)
+    /// equivalent filter returns.
+    #[test]
+    fn all_query_never_builds_filters() -> crate::Result<()> {
+        let index = TestVectorIndex::builder(VectorDType::F32)
+            .metric(Metric::L2)
+            .selectivities(&[1.0])
+            .build()?;
+        let query = [0.5_f32, 0.5];
+        // k >= every doc: the bound never arms, so no segment is
+        // bounds-skipped and the term-filter run below must build ALL
+        // bitsets — keeping the counts on both sides exact.
+        let k = FIXTURE_NUM_DOCS;
+        let (all_hits, all_stats) = run_global(
+            &index.index,
+            index.embedding_field(),
+            &AllQuery,
+            query.to_vec(),
+            k,
+            exhaustive_params(DEFAULT_NUM_CENTROIDS),
+        )?;
+        assert_eq!(all_stats.filters_built, 0, "AllQuery must build no bitsets");
+        assert_eq!(all_stats.pruned_filter, 0);
+
+        // "selectivity_1" labels every doc: same match set, but through a
+        // real TermQuery, so every touched segment builds its bitset.
+        let term_filter = TermQuery::new(
+            Term::from_field_text(index.label_field(), "selectivity_1"),
+            IndexRecordOption::Basic,
+        );
+        let (term_hits, term_stats) = run_global(
+            &index.index,
+            index.embedding_field(),
+            &term_filter,
+            query.to_vec(),
+            k,
+            exhaustive_params(DEFAULT_NUM_CENTROIDS),
+        )?;
+        assert_eq!(
+            term_stats.filters_built as usize, FIXTURE_NUM_SEGMENTS,
+            "the term filter takes the bitset path"
+        );
+        assert_eq!(all_hits, term_hits, "fast path must not change results");
         Ok(())
     }
 

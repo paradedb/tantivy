@@ -13,6 +13,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::assign::{assign_cells, build_executor, CentroidSelector};
+use super::graph::RelativeNeighborhoodGraph;
 use super::{decode_row, IvfIndex};
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
@@ -60,6 +61,11 @@ pub(crate) struct IvfFieldWriteParams<'a> {
     pub(crate) field: Field,
     pub(crate) opts: &'a VectorOptions,
     pub(crate) set: &'a FieldCentroids,
+    /// The set's persisted routing graph (from the cached
+    /// [`SetSearchIndex`](crate::vector::centroid_set::SetSearchIndex)),
+    /// reused as the assignment selector for large sets.
+    pub(crate) router:
+        Option<&'a RelativeNeighborhoodGraph<crate::vector::centroid_set::UnitNormRowsArena>>,
     pub(crate) set_version: u64,
     /// Cells per vector (primary + replicas); clamped to the centroid count.
     pub(crate) replicas: usize,
@@ -98,8 +104,7 @@ pub(crate) fn write_ivf_field(
     let cells_per_vector = params.replicas.max(1).min(num_centroids.max(1));
 
     let selector_start = Instant::now();
-    let centroid_values = params.set.values_f32(opts)?;
-    let selector = CentroidSelector::build(opts.metric(), &centroid_values, dim, cells_per_vector)?;
+    let selector = CentroidSelector::for_set(params.set, params.router, opts, cells_per_vector)?;
     timings.selector_build = selector_start.elapsed();
 
     // Pass A: assign every present row, batched. Replica entries are
@@ -354,6 +359,9 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     let directory = index.directory();
     let set_reader =
         CentroidSetReader::open(directory, std::path::Path::new(&newest_set.filename))?;
+    // The cached search-time view: its pinned router doubles as the
+    // assignment selector, so this merge builds no selector structure.
+    let set_search = index.centroid_set_search_index(set_reader.version())?;
 
     let vec_path = ctx
         .target_segment
@@ -401,6 +409,9 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
             field,
             opts,
             set: &field_centroids,
+            router: set_search
+                .field_router(field)
+                .and_then(|router| router.graph()),
             set_version: set_reader.version(),
             replicas: ctx.settings.vector_replicas,
             bounds_scope: ctx.settings.vector_bounds_scope,

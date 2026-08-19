@@ -8,8 +8,9 @@
 
 use std::cmp::Ordering;
 
-use super::graph::{NeighborhoodGraphConfig, NodeId, RelativeNeighborhoodGraph, Workspace};
-use crate::schema::Metric;
+use super::graph::{NodeId, RelativeNeighborhoodGraph, Workspace};
+use crate::schema::{Metric, VectorOptions};
+use crate::vector::centroid_set::{FieldCentroids, UnitNormRowsArena};
 use crate::vector::distance::{cosine, dot, l2_squared};
 use crate::Executor;
 
@@ -52,8 +53,9 @@ fn exact_nearest_centroids(
                 // `1 - cosine` orders identically to descending cosine.
                 Metric::Cosine => 1.0 - cosine(query, centroid),
                 // Negated raw dot: the query-time router ranks by dot, and
-                // dot ordering is ||q||-invariant (see
-                // [`build_centroid_graph`]).
+                // dot ordering is ||q||-invariant — a v-directed query
+                // ranks cells by dot(v, c), so raw dot IS the
+                // query-consistent criterion.
                 Metric::Dot => -dot(query, centroid),
                 // Squared L2 orders identically to L2.
                 Metric::L2 => l2_squared(query, centroid),
@@ -74,60 +76,49 @@ fn exact_nearest_centroids(
     scored.into_iter().map(|(_, id)| id).collect()
 }
 
-/// Builds a cell-selection [`RelativeNeighborhoodGraph`] over `centroids`
-/// (flat, `dim`-strided) with search beam `ef`, borrowing the flat arena.
-pub(crate) fn build_centroid_graph<'a>(
-    metric: Metric,
-    centroids: &'a [f32],
-    dim: usize,
-    ef: usize,
-) -> crate::Result<RelativeNeighborhoodGraph<&'a [f32]>> {
-    // Assigned cells must predict the query-time router, which ranks
-    // centroids by the field metric — so the graph selects with that
-    // metric directly. For Dot, centroid ranking by dot(q, c) is
-    // invariant to ||q||: a v-directed query ranks cells by dot(v, c),
-    // so raw dot IS the query-consistent criterion, and its magnitude
-    // bias mirrors the router's. The pathological case — one dominant
-    // long centroid attracting many cells — is a cluster-balance
-    // concern, not a selection concern. Must stay consistent with
-    // `exact_nearest_centroids`.
-    let config = NeighborhoodGraphConfig {
-        ef,
-        ..Default::default()
-    };
-    let mut rng = RelativeNeighborhoodGraph::new(centroids, dim, metric, config);
-    rng.build(&build_executor("assign-rng-")?);
-    Ok(rng)
-}
-
 /// How a vector's cells are picked from the set's centroids. Exact k-NN
 /// scan for small centroid sets — anything the search's own `ef` visit
 /// budget would cover wholesale anyway, where the brute scan is at most
 /// as expensive and exact (an approximate graph over a handful of points
 /// can return fewer than `knn` neighbours, silently under-assigning) —
-/// and an approximate graph selector for large ones.
+/// and, for large ones, the set's PERSISTED router: the same pinned
+/// graph queries route through, cached on `Index`, so a segment build
+/// never constructs a selector structure of its own.
 pub(crate) enum CentroidSelector<'a> {
-    Exact { centroids: &'a [f32] },
-    Graph(RelativeNeighborhoodGraph<&'a [f32]>),
+    Exact { centroids: Vec<f32> },
+    Router(&'a RelativeNeighborhoodGraph<UnitNormRowsArena>),
 }
 
 impl<'a> CentroidSelector<'a> {
-    /// Selector over the set's flat `dim`-strided centroid rows, sized for
-    /// `cells_per_vector`-deep selection.
-    pub(crate) fn build(
-        metric: Metric,
-        centroids: &'a [f32],
-        dim: usize,
+    /// Selector over `set`'s rows, sized for `cells_per_vector`-deep
+    /// selection. `router` is the set's persisted routing graph (absent
+    /// for degenerate sets and consumer-defined routers); without it a
+    /// large set falls back to the exact scan — correct, just O(C) per
+    /// vector.
+    pub(crate) fn for_set(
+        set: &FieldCentroids,
+        router: Option<&'a RelativeNeighborhoodGraph<UnitNormRowsArena>>,
+        options: &VectorOptions,
         cells_per_vector: usize,
     ) -> crate::Result<Self> {
-        let num_centroids = centroids.len() / dim.max(1);
         let ef_search = (cells_per_vector * 4).max(64);
-        if num_centroids <= ef_search {
-            Ok(CentroidSelector::Exact { centroids })
-        } else {
-            Ok(CentroidSelector::Graph(build_centroid_graph(
-                metric, centroids, dim, ef_search,
-            )?))
+        if set.num_centroids() <= ef_search {
+            return Ok(CentroidSelector::Exact {
+                centroids: set.values_f32(options)?,
+            });
+        }
+        match router {
+            Some(graph) => Ok(CentroidSelector::Router(graph)),
+            None => {
+                log::warn!(
+                    "assigning against {} centroids with no readable router; falling back to an \
+                     exact per-vector scan",
+                    set.num_centroids(),
+                );
+                Ok(CentroidSelector::Exact {
+                    centroids: set.values_f32(options)?,
+                })
+            }
         }
     }
 
@@ -145,7 +136,11 @@ impl<'a> CentroidSelector<'a> {
             CentroidSelector::Exact { centroids } => {
                 exact_nearest_centroids(metric, centroids, dim, v, knn)
             }
-            CentroidSelector::Graph(graph) => {
+            CentroidSelector::Router(graph) => {
+                // The router's Cosine arm is a raw dot over unit-norm rows
+                // (`UnitNormRowsArena`); assignment inputs are stored rows,
+                // normalized at ingest, so the contract holds.
+                // TODO: Replace with proper seed generation
                 let seeds: Vec<NodeId> = (0..graph.len())
                     .step_by((graph.len() / 8).max(1))
                     .take(8)
@@ -227,8 +222,9 @@ mod tests {
     /// parallel chunking preserves row order.
     #[test]
     fn assign_cells_is_nearest_first_and_order_preserving() -> crate::Result<()> {
-        let centroids: Vec<f32> = vec![0.0, 0.0, 10.0, 0.0, 0.0, 10.0];
-        let selector = CentroidSelector::build(Metric::L2, &centroids, 2, 2)?;
+        let selector = CentroidSelector::Exact {
+            centroids: vec![0.0, 0.0, 10.0, 0.0, 0.0, 10.0],
+        };
         let values: Vec<f32> = vec![
             1.0, 0.0, // nearest 0, then 1
             9.0, 1.0, // nearest 1, then 0

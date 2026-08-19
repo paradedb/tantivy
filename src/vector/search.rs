@@ -60,8 +60,13 @@ struct SegmentSearch<'a, TChild> {
     tie: TChild,
     alive: Option<&'a AliveBitSet>,
     filter: FilterState,
-    /// Replica dedup; doc ids are segment-local, so dedup is too.
+    /// Replica dedup; doc ids are segment-local, so dedup is too. Never
+    /// allocated when [`Self::needs_dedup`] is false.
     seen: Option<BitSet>,
+    /// `true` iff the segment holds replica rows (`num_rows > num_docs`):
+    /// with primary-only storage every doc appears in exactly one probed
+    /// range, so there is nothing to dedup.
+    needs_dedup: bool,
     /// Set when the filter materializes empty: no row of this segment can
     /// ever qualify, all its future ranges skip for free.
     dead: bool,
@@ -69,6 +74,11 @@ struct SegmentSearch<'a, TChild> {
 
 /// The lazily materialized filter bitset of one segment.
 enum FilterState {
+    /// The weight matches every doc ([`Weight::matches_all_docs`]): no
+    /// bitset is ever built, rows gate on alive/seen alone. The common
+    /// unfiltered-query fast path — the drain this skips costs ~25% of an
+    /// unfiltered cohere-1m query.
+    All,
     NotBuilt,
     Built(BitSet),
 }
@@ -109,6 +119,7 @@ where
 
     // The participating segments: the searcher's snapshot, minus segments
     // with no vector data for the field.
+    let matches_all_docs = weight.matches_all_docs();
     let mut segments: Vec<SegmentSearch<'_, S::Child>> = Vec::new();
     let mut set_version: Option<u64> = None;
     for (ord, reader) in searcher.segment_readers().iter().enumerate() {
@@ -116,6 +127,7 @@ where
         let Some(ivf) = vec.index() else {
             continue;
         };
+        let needs_dedup = ivf.num_rows() > ivf.num_docs();
         // Multi-version snapshots are unsupported, like multi-version
         // merges: a shared routing order requires shared cluster ids.
         match set_version {
@@ -134,8 +146,13 @@ where
             reader,
             tie: tie_break.segment_sort_key_computer(reader)?,
             alive: reader.alive_bitset(),
-            filter: FilterState::NotBuilt,
+            filter: if matches_all_docs {
+                FilterState::All
+            } else {
+                FilterState::NotBuilt
+            },
             seen: None,
+            needs_dedup,
             dead: false,
             vec,
         });
@@ -174,8 +191,21 @@ where
         resolve_budget(adaptive, num_centroids, &segments)?;
 
     // ONE routing pass. Routing operates in `f32` (centroid rows are `f32`
-    // today), so the query is widened losslessly per element.
-    let query_f32: Vec<f32> = prepared.query().iter().map(|e| e.to_f32()).collect();
+    // today), so the query is widened losslessly per element. Under Cosine
+    // the router scores unit-norm rows with a raw dot kernel (see
+    // `UnitNormRowsArena`), so the QUERY is normalized here, once —
+    // dot(q̂, ĉ) is then exactly cosine(q, c), which the bounds margins
+    // consume. A degenerate (zero/non-finite norm) query stays raw and
+    // scores like it does everywhere else.
+    let mut query_f32: Vec<f32> = prepared.query().iter().map(|e| e.to_f32()).collect();
+    if metric == Metric::Cosine {
+        let norm = norm_squared_wide(&query_f32).sqrt();
+        if norm.is_finite() && norm > 0.0 {
+            for value in &mut query_f32 {
+                *value = (f64::from(*value) / norm) as f32;
+            }
+        }
+    }
     let mut routing_ws = Workspace::new();
     let mut ranked = router.rank_clusters(&mut routing_ws, &query_f32);
 
@@ -252,7 +282,8 @@ where
             }
 
             // Gate 3: the segment's filter, materialized at most once per
-            // query — only for segments that reach a real probe.
+            // query — only for segments that reach a real probe, and never
+            // for an all-docs weight.
             if matches!(segment.filter, FilterState::NotBuilt) {
                 let filter = build_filter_bitset(weight, segment.reader)?;
                 stats.filters_built += 1;
@@ -262,12 +293,20 @@ where
                 }
                 segment.filter = FilterState::Built(filter);
             }
-            let FilterState::Built(filter) = &segment.filter else {
-                unreachable!("filter materialized above")
+            let filter: Option<&BitSet> = match &segment.filter {
+                FilterState::All => None,
+                FilterState::Built(filter) => Some(filter),
+                FilterState::NotBuilt => unreachable!("filter materialized above"),
             };
-            let seen = segment
-                .seen
-                .get_or_insert_with(|| BitSet::with_max_value(segment.reader.max_doc()));
+            let seen: Option<&mut BitSet> = if segment.needs_dedup {
+                Some(
+                    segment
+                        .seen
+                        .get_or_insert_with(|| BitSet::with_max_value(segment.reader.max_doc())),
+                )
+            } else {
+                None
+            };
 
             // Event-wise charging, part 1: the open.
             work_spent += pricing_open;
@@ -391,17 +430,18 @@ fn resolve_budget<TChild>(
 /// Run one cluster's rows in one segment through the `seen → filter →
 /// alive` gate — off the pinned id-map alone, with no posting bytes
 /// fetched — collecting into `survivors` (cleared first) the rows to
-/// score. Returns `(visited, pruned_filter, pruned_dead, pruned_seen,
-/// scored_rows)`; the partition identity
-/// `visited == filter + dead + seen + scored` holds, and only the `scored`
-/// term ever charges budget.
+/// score. `filter: None` = the weight matches all docs; `seen: None` =
+/// primary-only storage, nothing to dedup. Returns `(visited,
+/// pruned_filter, pruned_dead, pruned_seen, scored_rows)`; the partition
+/// identity `visited == filter + dead + seen + scored` holds, and only
+/// the `scored` term ever charges budget.
 #[inline(never)]
 fn collect_cluster_survivors(
     vec: &VectorIndexReader,
     rows: std::ops::Range<usize>,
-    filter: &BitSet,
+    filter: Option<&BitSet>,
     alive: Option<&AliveBitSet>,
-    seen: &mut BitSet,
+    mut seen: Option<&mut BitSet>,
     survivors: &mut Vec<Survivor>,
 ) -> (usize, usize, usize, usize, usize) {
     survivors.clear();
@@ -417,14 +457,18 @@ fn collect_cluster_survivors(
         // verdicts say, so a replica's second copy is never re-checked
         // (it counts as `pruned_seen`, not the original verdict's
         // bucket).
-        if seen.contains(doc) {
-            pruned_seen += 1;
-            continue;
+        if let Some(seen) = seen.as_deref_mut() {
+            if seen.contains(doc) {
+                pruned_seen += 1;
+                continue;
+            }
+            seen.insert(doc);
         }
-        seen.insert(doc);
-        if !filter.contains(doc) {
-            pruned_filter += 1;
-            continue;
+        if let Some(filter) = filter {
+            if !filter.contains(doc) {
+                pruned_filter += 1;
+                continue;
+            }
         }
         if let Some(bs) = alive {
             if !bs.is_alive(doc) {

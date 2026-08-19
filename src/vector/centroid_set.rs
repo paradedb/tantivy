@@ -375,6 +375,39 @@ impl FieldCentroids {
     }
 }
 
+/// A [`VectorArena`] over the set's stored rows, which are UNIT-NORM under
+/// Cosine by construction (normalized at set creation): Cosine similarity
+/// collapses to a raw dot product — no per-row norm recomputation, which
+/// profiled at roughly half of routing cost — PROVIDED the query side is
+/// unit-norm too. Callers uphold the query half: the search driver
+/// normalizes the routing query once per query, and assignment vectors are
+/// stored rows, normalized at ingest. L2/Dot delegate untouched.
+pub(crate) struct UnitNormRowsArena(FileSliceArena<f32>);
+
+impl VectorArena for UnitNormRowsArena {
+    type Elem = f32;
+
+    #[inline]
+    fn num_vectors(&self, dim: usize) -> usize {
+        self.0.num_vectors(dim)
+    }
+
+    #[inline]
+    fn similarity(
+        &self,
+        metric: Metric,
+        dim: usize,
+        node: NodeId,
+        query: &[f32],
+    ) -> crate::vector::Similarity {
+        match metric {
+            // dot(q̂, ĉ) == cosine(q, c) for unit-norm q̂ and ĉ.
+            Metric::Cosine => self.0.similarity(Metric::Dot, dim, node, query),
+            Metric::L2 | Metric::Dot => self.0.similarity(metric, dim, node, query),
+        }
+    }
+}
+
 /// The search-time view of one centroid set: per vector field, the lazy
 /// centroid rows plus the parsed router. Opened once per set version and
 /// cached on [`Index`](crate::Index) — the router adjacency alone is
@@ -405,7 +438,9 @@ impl SetSearchIndex {
                     if tag == ROUTER_KIND_RNG {
                         let adjacency = slice.slice_from(1).read_bytes()?;
                         let arena = match opts.dtype() {
-                            VectorDType::F32 => FileSliceArena::<f32>::new(rows_slice.clone()),
+                            VectorDType::F32 => {
+                                UnitNormRowsArena(FileSliceArena::<f32>::new(rows_slice.clone()))
+                            }
                         };
                         Some(RelativeNeighborhoodGraph::open(
                             &adjacency,
@@ -475,7 +510,7 @@ pub(crate) struct FieldRouter {
     /// The persisted RNG over the centroids. `None` for degenerate
     /// centroid counts or consumer routers, where routing falls back to a
     /// linear scan.
-    graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
+    graph: Option<RelativeNeighborhoodGraph<UnitNormRowsArena>>,
 }
 
 impl FieldRouter {
@@ -483,9 +518,20 @@ impl FieldRouter {
         self.num_centroids
     }
 
+    /// The persisted routing graph, shared with the assignment selector so
+    /// segment builds never construct one of their own. `None` for
+    /// degenerate sets and consumer-defined routers.
+    pub(crate) fn graph(&self) -> Option<&RelativeNeighborhoodGraph<UnitNormRowsArena>> {
+        self.graph.as_ref()
+    }
+
     /// Clusters to probe for `query`, ranked lazily — a [`ClusterRanking`]
     /// yielding [`Candidate`]s best routing score first (graph node `c` *is*
     /// cluster `c`, so `Candidate::node` is the cluster id).
+    ///
+    /// Under Cosine, `query` MUST be unit-norm: both paths score through
+    /// [`UnitNormRowsArena`], whose Cosine arm is a raw dot over the
+    /// unit-norm stored rows.
     ///
     /// With a persisted RNG this is a resumable beam search
     /// ([`RelativeNeighborhoodGraph::search_iter`]): the first batch is one
@@ -516,7 +562,7 @@ impl FieldRouter {
                 ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
             }
             None => {
-                let arena = FileSliceArena::<f32>::new(self.rows_slice.clone());
+                let arena = UnitNormRowsArena(FileSliceArena::<f32>::new(self.rows_slice.clone()));
                 let mut ranked: Vec<Candidate> = (0..self.num_centroids)
                     .map(|cluster| Candidate {
                         sim: arena.similarity(self.metric, self.dim, cluster as NodeId, query),
@@ -539,7 +585,7 @@ impl FieldRouter {
 pub(crate) enum ClusterRanking<'a> {
     /// Beam-searched routing over the persisted centroid RNG; pulling past a
     /// converged batch resumes the search.
-    Graph(ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>),
+    Graph(ResumableSearchIterator<'a, 'a, UnitNormRowsArena>),
     /// Exact fallback for router-less sets: every centroid scored and
     /// sorted up front.
     Exact {
