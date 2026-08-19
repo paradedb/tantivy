@@ -1,8 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
-#[cfg(feature = "mmap")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::available_parallelism;
 
