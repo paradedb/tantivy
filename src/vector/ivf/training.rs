@@ -1,4 +1,4 @@
-use super::BKTree;
+use super::{BKTree, RelativeNeighborhoodGraph};
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
@@ -20,15 +20,31 @@ pub trait IvfClusterer: Send + Sync + 'static {
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
 
-    /// Optional BKT over `centroids` for RNG seeding.
+    /// Optional BKT over `centroids` for primary cluster ranking.
     ///
     /// Default `None` omits `.centroids` slot `[4]`. When present, leaf
-    /// `members` are IVF / RNG [`NodeId`](super::NodeId)s.
+    /// `members` are IVF / RNG [`NodeId`](super::NodeId)s. Without a BKT the
+    /// reader ranks by an exact scan of the centroids, even if
+    /// [`build_rng`](Self::build_rng) returned a graph.
     fn build_bkt(
         &self,
         options: &VectorOptions,
         centroids: &IvfCentroids,
     ) -> crate::Result<Option<BKTree<Vec<f32>>>> {
+        let _ = (options, centroids);
+        Ok(None)
+    }
+
+    /// Optional RNG over `centroids` for refining BKT ranking.
+    ///
+    /// Default `None` omits `.centroids` slot `[2]`. A graph without a BKT is
+    /// ignored at query time. Implementors that want the built-in RNG can
+    /// return [`RelativeNeighborhoodGraph::build_from_centroids`].
+    fn build_rng(
+        &self,
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<Option<RelativeNeighborhoodGraph<Vec<f32>>>> {
         let _ = (options, centroids);
         Ok(None)
     }

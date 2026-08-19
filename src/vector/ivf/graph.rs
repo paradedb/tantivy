@@ -808,6 +808,53 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
     }
 }
 
+impl RelativeNeighborhoodGraph<Vec<f32>> {
+    /// Builds an owned RNG over a flat `dim`-strided centroid arena.
+    ///
+    /// Clusterers that opt into graph routing typically call this from
+    /// [`IvfClusterer::build_rng`](super::IvfClusterer::build_rng).
+    pub fn build_from_centroids(
+        vectors: Vec<f32>,
+        dim: usize,
+        metric: Metric,
+        config: NeighborhoodGraphConfig,
+    ) -> crate::Result<Self> {
+        let mut borrowed = RelativeNeighborhoodGraph::new(vectors.as_slice(), dim, metric, config);
+        borrowed.build(&rng_build_executor("rng-build-")?);
+        let metric = borrowed.metric;
+        let config = borrowed.config;
+        let Graph {
+            max_edges,
+            dim,
+            neighbors,
+            sims,
+            vectors: _,
+        } = borrowed.graph;
+        Ok(RelativeNeighborhoodGraph {
+            graph: Graph {
+                max_edges,
+                dim,
+                vectors,
+                neighbors,
+                sims,
+            },
+            metric,
+            config,
+        })
+    }
+}
+
+fn rng_build_executor(name: &'static str) -> crate::Result<Executor> {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if num_threads > 1 {
+        Executor::multi_thread(num_threads, name)
+    } else {
+        Ok(Executor::single_thread())
+    }
+}
+
 /// Refinement requires typed storage: a node's stored vector doubles as its
 /// search query, and edge selection scores stored vectors against each other.
 /// A graph over raw file bytes is search-only.

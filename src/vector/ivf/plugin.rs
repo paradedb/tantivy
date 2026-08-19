@@ -38,20 +38,22 @@ struct AssignedVector {
 
 /// How a vector's `replicas - 1` non-primary cells are picked from the
 /// trained centroids. Constructed once per field when `replicas > 1` and
-/// queried during the assign loop. A `Graph` selector is not transient:
-/// the same instance is serialized as the `.centroids` slot [2] routing
-/// graph afterwards.
+/// queried during the assign loop.
 ///
 /// The graph index is a recall structure for *large* centroid sets. When
 /// the whole set fits within the search's own `ef` visit budget the brute
 /// scan is at most as expensive — and exact: an approximate graph over a
 /// handful of points can return fewer than `knn` neighbours, silently
-/// under-replicating small indexes.
+/// under-replicating small indexes. A [`Self::Routing`] selector reuses the
+/// clusterer's persisted RNG; [`Self::Graph`] is a transient build used
+/// only for replica k-NN and is not written to slot `[2]`.
 enum ReplicaSelector<'a> {
     /// Exact k-NN scan over the trained centroids (small centroid sets).
     Exact,
-    /// Approximate k-NN via a [`RelativeNeighborhoodGraph`] borrowing the
-    /// flat centroid arena (large centroid sets).
+    /// Clusterer's routing RNG, also used for replica k-NN.
+    Routing,
+    /// Transient graph built only for replica k-NN (large centroid sets
+    /// when the clusterer did not return a routing RNG).
     Graph(RelativeNeighborhoodGraph<&'a [f32]>),
 }
 
@@ -93,6 +95,26 @@ fn exact_nearest_centroids(
     scored.into_iter().map(|(_, id)| id).collect()
 }
 
+fn replica_graph_knn<S: crate::vector::VectorArena<Elem = f32>>(
+    graph: &RelativeNeighborhoodGraph<S>,
+    ws: &mut Workspace,
+    query: &[f32],
+    knn: usize,
+) -> Vec<usize> {
+    let n = graph.len();
+    let seeds: Vec<NodeId> = (0..n)
+        .step_by((n / 8).max(1))
+        .take(8)
+        .map(|node| node as NodeId)
+        .collect();
+    graph
+        .search(ws, query, &seeds, knn)
+        .0
+        .into_iter()
+        .map(|candidate| candidate.node as usize)
+        .collect()
+}
+
 /// A multi-threaded [`Executor`] when the host has the parallelism, the
 /// single-threaded one otherwise.
 fn build_executor(name: &'static str) -> crate::Result<Executor> {
@@ -106,10 +128,9 @@ fn build_executor(name: &'static str) -> crate::Result<Executor> {
     }
 }
 
-/// Builds the replica-selection [`RelativeNeighborhoodGraph`] over the
-/// trained `centroids` (flat, `dim`-strided) with search beam `ef`. Borrows
-/// the flat centroid arena; after the assign loop the same graph is
-/// persisted as the `.centroids` slot [2] routing graph.
+/// Builds a transient replica-selection [`RelativeNeighborhoodGraph`] over
+/// the trained `centroids` (flat, `dim`-strided) with search beam `ef`.
+/// Used only when the clusterer did not return a routing RNG.
 fn build_centroid_graph<'a>(
     metric: Metric,
     centroids: &'a [f32],
@@ -355,11 +376,16 @@ pub(crate) fn merge_ivf(
                         "IvfClusterer produced zero centroids".to_string(),
                     ));
                 }
-                // Optional BKT for RNG seed generation. Default clusterers
-                // return `None` and slot `[4]` is omitted; producers that
-                // implement `build_bkt` supply an owned tree whose leaf
-                // members are IVF centroid ids.
+                // Optional BKT / RNG for cluster ranking. Default clusterers
+                // return `None` for both; the reader then ranks by an exact
+                // scan of the centroids. Slot `[4]` / slot `[2]` are written
+                // only when the corresponding builder returns `Some`.
                 let bkt = clusterer.build_bkt(opts, &centroids)?;
+                let routing_graph = if centroid_matrix.rows > 1 {
+                    clusterer.build_rng(opts, &centroids)?
+                } else {
+                    None
+                };
 
                 // Leaf count is emergent from the clusterer; the rest of the
                 // merge uses whatever train returned.
@@ -387,6 +413,8 @@ pub(crate) fn merge_ivf(
                     None
                 } else if num_centroids <= ef_search {
                     Some(ReplicaSelector::Exact)
+                } else if routing_graph.is_some() {
+                    Some(ReplicaSelector::Routing)
                 } else {
                     let build_start = Instant::now();
                     let graph = build_centroid_graph(
@@ -490,18 +518,14 @@ pub(crate) fn merge_ivf(
                                             v,
                                             replicas,
                                         ),
+                                        ReplicaSelector::Routing => replica_graph_knn(
+                                            routing_graph.as_ref().expect("routing graph"),
+                                            &mut replica_ws,
+                                            v,
+                                            replicas,
+                                        ),
                                         ReplicaSelector::Graph(graph) => {
-                                            let seeds: Vec<NodeId> = (0..graph.len())
-                                                .step_by((graph.len() / 8).max(1))
-                                                .take(8)
-                                                .map(|node| node as NodeId)
-                                                .collect();
-                                            graph
-                                                .search(&mut replica_ws, v, &seeds, replicas)
-                                                .0
-                                                .into_iter()
-                                                .map(|candidate| candidate.node as usize)
-                                                .collect()
+                                            replica_graph_knn(graph, &mut replica_ws, v, replicas)
                                         }
                                     };
                                     timings.replica_knn += knn_start.elapsed();
@@ -754,45 +778,23 @@ pub(crate) fn merge_ivf(
                     bounds_w.flush()?;
                 }
 
-                // `.centroids` slot [2]: the RNG over the centroids, so a query
-                // can route to its nearest clusters without scanning all of
-                // them. Skipped for degenerate centroid counts — the reader
-                // treats the absent slot as "route by linear scan", which a
-                // 0-or-1-centroid segment doesn't need a graph for.
-                //
-                // A graph replica selector is the same graph over the same
-                // arena with the same metric, so it is serialized directly
-                // instead of rebuilding. Its config differs only in `ef`,
-                // which affects the query beam width, not the built edges
-                // (build/refine search with a beam of
-                // `max(ef, num_candidates)`, and `ef <= num_candidates` for
-                // any realistic `replicas`) — the persisted graph is
-                // unchanged either way.
-                if num_centroids > 1 {
+                // `.centroids` slot [2]: optional RNG over the centroids.
+                // Written only when the clusterer returned one. When a BKT
+                // is also present, a beam search over this graph refines
+                // BKT ranking; a graph without a BKT is ignored at query
+                // time.
+                if let Some(rng) = routing_graph.as_ref() {
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
                     let graph_w = centroids_write.for_field_with_idx(field, centroid_slot::GRAPH);
-                    match replica_selector.as_ref() {
-                        Some(ReplicaSelector::Graph(graph)) => graph.serialize(graph_w)?,
-                        // `replicas == 1` or the exact-selector regime: no
-                        // graph exists yet, build one just for routing.
-                        _ => {
-                            let mut rng = RelativeNeighborhoodGraph::new(
-                                centroid_matrix.values.as_slice(),
-                                opts.dim(),
-                                opts.metric(),
-                                NeighborhoodGraphConfig::default(),
-                            );
-                            rng.build(&build_executor("rng-build-")?);
-                            rng.serialize(graph_w)?;
-                        }
-                    }
+                    rng.serialize(graph_w)?;
                     graph_w.flush()?;
                 }
 
-                // `.centroids` slot [4]: optional BKT for seed generation.
-                // Omitted when the clusterer returns `None` (default).
+                // `.centroids` slot [4]: optional BKT for primary routing.
+                // Omitted when the clusterer returns `None` (default) — the
+                // reader then ranks by an exact scan of the centroids.
                 if let Some(tree) = bkt.as_ref() {
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);

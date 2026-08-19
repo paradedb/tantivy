@@ -2129,11 +2129,11 @@ mod tests {
     }
 
     /// When the probe ceiling is below the cluster count, cluster ranking
-    /// routes via the persisted RNG instead of scanning every centroid. With
-    /// 16 well-separated clusters and only 8 beam seeds, the router must
-    /// still navigate to the true nearest cluster: the routed top-K equals
-    /// the brute-force oracle, and the recorded navigation cost is the
-    /// beam-visited count, not a full scan of the ranked list.
+    /// still has to put the true nearest cluster first. Default clusterers
+    /// omit a BKT, so ranking is an exact scan of the centroids (a graph
+    /// alone is not used). With 16 well-separated clusters the routed top-K
+    /// equals the brute-force oracle; navigation cost is the full centroid
+    /// count because every centroid is scored up front.
     #[test]
     fn ivf_routed_ranking_matches_oracle_on_separated_clusters() -> crate::Result<()> {
         // 4×4 grid of well-separated centroids (spacing 10), 4 docs each,

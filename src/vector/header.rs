@@ -43,13 +43,15 @@ pub(crate) mod centroid_slot {
     /// Per-cluster posting offsets.
     pub(crate) const OFFSETS: usize = 1;
     /// The routing graph. OPTIONAL: the write side skips it for
-    /// degenerate centroid counts, and its absence is normal.
+    /// degenerate centroid counts. When present with a BKT, a beam search
+    /// refines BKT ranking; ignored without a BKT.
     pub(crate) const GRAPH: usize = 2;
     /// Per-cluster centroid bounds. MANDATORY from V2 on: a V2 file
     /// without this slot is corrupt, not old.
     pub(crate) const BOUNDS: usize = 3;
-    /// Balanced k-means tree over the IVF centroids (seed generation).
-    /// OPTIONAL: absence means routing falls back to strided / exact seeds.
+    /// Balanced k-means tree over the IVF centroids (primary routing).
+    /// OPTIONAL: absence means routing falls back to an exact scan of the
+    /// centroids. The graph slot, when present, refines this ranking.
     pub(crate) const BKT: usize = 4;
 }
 
