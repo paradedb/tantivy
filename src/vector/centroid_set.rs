@@ -451,6 +451,9 @@ impl VectorArena for UnitNormRowsArena {
 /// cached on [`Index`](crate::Index) — the router adjacency alone is
 /// `C × max_edges × 4` bytes, far too heavy to parse per query.
 pub(crate) struct SetSearchIndex {
+    /// The set version this view was opened for — the cache key, kept for
+    /// assertions and diagnostics.
+    #[allow(dead_code)]
     version: u64,
     fields: std::collections::HashMap<Field, FieldRouter>,
 }
