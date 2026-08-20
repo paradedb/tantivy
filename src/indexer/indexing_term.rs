@@ -14,8 +14,7 @@ use crate::schema::Field;
 /// global term dictionary during indexing.
 #[derive(Clone)]
 pub(crate) struct IndexingTerm<B = Vec<u8>>(B)
-where
-    B: AsRef<[u8]>;
+where B: AsRef<[u8]>;
 
 /// The number of bytes used as metadata by `Term`.
 const TERM_METADATA_LENGTH: usize = 4;
@@ -120,8 +119,7 @@ impl IndexingTerm {
 }
 
 impl<B> IndexingTerm<B>
-where
-    B: AsRef<[u8]>,
+where B: AsRef<[u8]>
 {
     /// Wraps serialized term bytes.
     ///

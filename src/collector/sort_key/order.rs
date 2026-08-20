@@ -116,8 +116,7 @@ impl Comparator<OwnedValue> for NaturalComparator {
 pub struct ReverseComparator;
 
 impl<T> Comparator<T> for ReverseComparator
-where
-    NaturalComparator: Comparator<T>,
+where NaturalComparator: Comparator<T>
 {
     #[inline(always)]
     fn compare(&self, lhs: &T, rhs: &T) -> Ordering {
@@ -138,8 +137,7 @@ where
 pub struct ReverseNoneIsLowerComparator;
 
 impl<T> Comparator<Option<T>> for ReverseNoneIsLowerComparator
-where
-    ReverseComparator: Comparator<T>,
+where ReverseComparator: Comparator<T>
 {
     #[inline(always)]
     fn compare(&self, lhs_opt: &Option<T>, rhs_opt: &Option<T>) -> Ordering {
@@ -210,8 +208,7 @@ impl Comparator<OwnedValue> for ReverseNoneIsLowerComparator {
 pub struct NaturalNoneIsHigherComparator;
 
 impl<T> Comparator<Option<T>> for NaturalNoneIsHigherComparator
-where
-    NaturalComparator: Comparator<T>,
+where NaturalComparator: Comparator<T>
 {
     #[inline(always)]
     fn compare(&self, lhs_opt: &Option<T>, rhs_opt: &Option<T>) -> Ordering {

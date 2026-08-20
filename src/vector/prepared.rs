@@ -10,7 +10,6 @@
 //! [`maybe_normalize_bytes`](super::distance::maybe_normalize_bytes)),
 //! so a single scoring entry point covers both per-doc and centroid
 //! scans.
-//!
 
 use std::sync::Arc;
 

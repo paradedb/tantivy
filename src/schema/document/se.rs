@@ -16,8 +16,7 @@ pub struct BinaryDocumentSerializer<'se, W> {
 }
 
 impl<'se, W> BinaryDocumentSerializer<'se, W>
-where
-    W: Write,
+where W: Write
 {
     /// Creates a new serializer with a provided writer.
     pub(crate) fn new(writer: &'se mut W, schema: &'se Schema) -> Self {
@@ -28,9 +27,7 @@ where
     /// to the writer.
     #[inline]
     pub(crate) fn serialize_doc<D>(&mut self, doc: &D) -> io::Result<()>
-    where
-        D: Document,
-    {
+    where D: Document {
         let stored_field_values = || {
             doc.iter_fields_and_values()
                 .filter(|(field, _)| self.schema.get_field_entry(*field).is_stored())
@@ -74,8 +71,7 @@ pub struct BinaryValueSerializer<'se, W> {
 }
 
 impl<'se, W> BinaryValueSerializer<'se, W>
-where
-    W: Write,
+where W: Write
 {
     /// Creates a new serializer with a provided writer.
     pub(crate) fn new(writer: &'se mut W) -> Self {
@@ -93,7 +89,10 @@ where
 
     /// Attempts to serialize a given value and write the output
     /// to the writer.
-    pub(crate) fn serialize_value<'a, V>(&mut self, value: ReferenceValue<'a, V>) -> io::Result<()>
+    pub(crate) fn serialize_value<'a, V>(
+        &mut self,
+        value: ReferenceValue<'a, V>,
+    ) -> io::Result<()>
     where
         V: Value<'a>,
     {
@@ -187,8 +186,7 @@ pub struct BinaryArraySerializer<'se, W> {
 }
 
 impl<'se, W> BinaryArraySerializer<'se, W>
-where
-    W: Write,
+where W: Write
 {
     /// Creates a new array serializer and writes the length of the array to the writer.
     pub(crate) fn begin(length: usize, writer: &'se mut W) -> io::Result<Self> {
@@ -203,7 +201,10 @@ where
 
     /// Attempts to serialize a given value and write the output
     /// to the writer.
-    pub(crate) fn serialize_value<'a, V>(&mut self, value: ReferenceValue<'a, V>) -> io::Result<()>
+    pub(crate) fn serialize_value<'a, V>(
+        &mut self,
+        value: ReferenceValue<'a, V>,
+    ) -> io::Result<()>
     where
         V: Value<'a>,
     {
@@ -235,8 +236,7 @@ pub struct BinaryObjectSerializer<'se, W> {
 }
 
 impl<'se, W> BinaryObjectSerializer<'se, W>
-where
-    W: Write,
+where W: Write
 {
     /// Creates a new object serializer and writes the length of the object to the writer.
     pub(crate) fn begin(length: usize, writer: &'se mut W) -> io::Result<Self> {

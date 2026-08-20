@@ -8,8 +8,7 @@ use crate::schema::Schema;
 use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, SegmentReader};
 
 pub(crate) struct TopBySortKeyCollector<TSortKeyComputer>
-where
-    TSortKeyComputer: SortKeyComputer,
+where TSortKeyComputer: SortKeyComputer
 {
     sort_key_computer: TSortKeyComputer,
     doc_range: Range<usize>,
@@ -19,8 +18,7 @@ where
 }
 
 impl<TSortKeyComputer> TopBySortKeyCollector<TSortKeyComputer>
-where
-    TSortKeyComputer: SortKeyComputer,
+where TSortKeyComputer: SortKeyComputer
 {
     pub fn new(sort_key_computer: TSortKeyComputer, doc_range: Range<usize>) -> Self {
         let shared_threshold = sort_key_computer.shared_threshold();
@@ -33,8 +31,7 @@ where
 }
 
 impl<TSortKeyComputer> Collector for TopBySortKeyCollector<TSortKeyComputer>
-where
-    TSortKeyComputer: SortKeyComputer + Send + Sync + 'static,
+where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
 {
     type Fruit = Vec<(TSortKeyComputer::SortKey, DocAddress)>;
 

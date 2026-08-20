@@ -108,9 +108,7 @@ pub struct CustomOrder {
 
 impl Serialize for CustomOrder {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    where S: Serializer {
         let map: HashMap<String, Order> =
             std::iter::once((self.target.to_string(), self.order)).collect();
         map.serialize(serializer)
@@ -119,9 +117,7 @@ impl Serialize for CustomOrder {
 
 impl<'de> Deserialize<'de> for CustomOrder {
     fn deserialize<D>(deserializer: D) -> Result<CustomOrder, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let value = serde_json::Value::deserialize(deserializer)?;
         let return_err = |message, val: serde_json::Value| {
             de::Error::custom(format!(

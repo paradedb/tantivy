@@ -2433,9 +2433,7 @@ mod tests {
                 assert!(is_sorted(&ids_in_segment));
 
                 fn is_sorted<T>(data: &[T]) -> bool
-                where
-                    T: Ord,
-                {
+                where T: Ord {
                     data.windows(2).all(|w| w[0] <= w[1])
                 }
             }

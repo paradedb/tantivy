@@ -9,9 +9,10 @@
 //! consumer ran it before index creation; here vectors are only assigned,
 //! with tantivy's own selector over the set's stored rows.
 
-use common::BitSet;
 use std::io::Write;
 use std::time::{Duration, Instant};
+
+use common::BitSet;
 
 use super::assign::{assign_cells, CentroidSelector};
 use super::graph::RelativeNeighborhoodGraph;
@@ -139,8 +140,8 @@ pub(crate) fn write_ivf_field(
             for (cells, (doc_id, handle)) in cells.into_iter().zip(batch_rows.drain(..)) {
                 let Some((&primary, replica_cells)) = cells.split_first() else {
                     return Err(TantivyError::InternalError(format!(
-                        "assignment returned no cell for doc {doc_id} in field \
-                         '{}' ({num_centroids} centroids)",
+                        "assignment returned no cell for doc {doc_id} in field '{}' \
+                         ({num_centroids} centroids)",
                         params.field_name,
                     )));
                 };

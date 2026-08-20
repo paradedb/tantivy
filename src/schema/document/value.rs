@@ -358,8 +358,7 @@ impl<'a> ReferenceValueLeaf<'a> {
 /// A enum representing a value for tantivy to index.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReferenceValue<'a, V>
-where
-    V: Value<'a> + ?Sized,
+where V: Value<'a> + ?Sized
 {
     /// A null value.
     Leaf(ReferenceValueLeaf<'a>),
@@ -370,8 +369,7 @@ where
 }
 
 impl<'a, V> ReferenceValue<'a, V>
-where
-    V: Value<'a>,
+where V: Value<'a>
 {
     #[inline]
     /// Returns if the value is `null` or not.

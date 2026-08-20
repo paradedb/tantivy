@@ -253,8 +253,7 @@ trait MultiTermsPacking: Clone + Debug + 'static {
 
     /// Pushes one field's aligned values into every active key buffer.
     fn push_full_values<I>(&self, keys: &mut [Self::PackingType], field_idx: usize, values: I)
-    where
-        I: IntoIterator<Item = u64>;
+    where I: IntoIterator<Item = u64>;
 
     fn unpack(
         &self,
@@ -285,9 +284,7 @@ impl MultiTermsPacking for U64ArrayKeyPacking {
     }
 
     fn push_full_values<I>(&self, keys: &mut [Self::PackingType], field_idx: usize, values: I)
-    where
-        I: IntoIterator<Item = u64>,
-    {
+    where I: IntoIterator<Item = u64> {
         for (key, value) in keys.iter_mut().zip(values) {
             debug_assert!(key.len() <= field_idx);
             key.push(value);
@@ -329,9 +326,7 @@ impl MultiTermsPacking for PackedU64KeyPacking {
 
     #[inline]
     fn push_full_values<I>(&self, keys: &mut [Self::PackingType], field_idx: usize, values: I)
-    where
-        I: IntoIterator<Item = u64>,
-    {
+    where I: IntoIterator<Item = u64> {
         let pack = self.packs[field_idx];
         for (key, value) in keys.iter_mut().zip(values) {
             let offset = value - pack.min_value;

@@ -84,9 +84,7 @@ pub(super) mod fast_field_text_options_serde {
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<FastFieldTextOptions>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let wire_format = WireFormat::deserialize(deserializer)?;
         match wire_format {
             WireFormat::IsEnabled(false) => Ok(None),

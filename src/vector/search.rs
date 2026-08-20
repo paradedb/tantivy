@@ -11,10 +11,10 @@
 //! Per `(cluster, segment)` pair the gates run cheapest first:
 //!
 //! 1. presence — one pinned bit; an absent cluster costs nothing
-//! 2. bounds — the margin against the GLOBAL query bound; a provable skip
-//!    charges the open share without touching rows or filter
-//! 3. filter — the segment's filter bitset, materialized lazily HERE, at
-//!    most once per segment per query; an empty filter kills the segment
+//! 2. bounds — the margin against the GLOBAL query bound; a provable skip charges the open share
+//!    without touching rows or filter
+//! 3. filter — the segment's filter bitset, materialized lazily HERE, at most once per segment per
+//!    query; an empty filter kills the segment
 //! 4. row gate — `seen → filter → alive` off the pinned id-map
 //! 5. fetch + score survivors into the one heap
 //!
