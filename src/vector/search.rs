@@ -235,6 +235,10 @@ where
         }
         let cluster = cluster as usize;
         let mut touched = false;
+        // Per-CLUSTER, not per (cluster, segment): a ranked cluster whose
+        // rows live in many segments is still one probed cluster.
+        let mut cluster_opened = false;
+        let mut cluster_scored = false;
 
         for segment in &mut segments {
             if segment.dead {
@@ -331,11 +335,12 @@ where
             // pre-pass — exactly the rows fetched and scored below.
             work_spent += pricing_row * scored_rows as f64;
 
+            stats.segment_opens += 1;
+            cluster_opened = true;
             if survivors.is_empty() {
-                stats.postings_skipped += 1;
                 continue;
             }
-            stats.postings_row += 1;
+            cluster_scored = true;
             stats.candidates_scored += survivors.len();
 
             // Gate 5: fetch + score — one stride-sized read per survivor
@@ -359,6 +364,11 @@ where
             }
         }
 
+        if cluster_scored {
+            stats.postings_row += 1;
+        } else if cluster_opened {
+            stats.postings_skipped += 1;
+        }
         if touched {
             touched_clusters += 1;
             // Fold the exact kth into the bound at the cluster boundary.

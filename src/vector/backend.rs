@@ -40,16 +40,20 @@ pub struct ProbeStats {
     pub pruned_dead: usize,
     /// Touched docs rejected by the replica `seen` dedup.
     pub pruned_seen: usize,
-    /// Probed clusters whose surviving rows' posting bytes were fetched —
-    /// one stride-sized ranged read per surviving row. Counts clusters,
-    /// not rows.
+    /// Probed CLUSTERS that yielded at least one survivor to score,
+    /// counted once however many segments the cluster's rows span.
     pub postings_row: usize,
-    /// Probed clusters that fetched no posting bytes at all: the
-    /// `filter → alive → seen` pre-pass left zero survivors (fully
-    /// filtered / dead / already-seen, or the cluster is empty). The two
-    /// `postings_*` counters partition the probed clusters:
+    /// Probed CLUSTERS that yielded no survivors in ANY segment: the
+    /// `filter → alive → seen` pre-pass rejected every row (fully
+    /// filtered / dead / already-seen). The two `postings_*` counters
+    /// partition the probed clusters:
     /// [`clusters_probed`](Self::clusters_probed) `== postings_row + postings_skipped`.
     pub postings_skipped: usize,
+    /// Per-(cluster, segment) opens — the same clusters counted once per
+    /// segment their rows live in. Scales with segment count where
+    /// [`clusters_probed`](Self::clusters_probed) does not, so the ratio
+    /// is the fragmentation the probe loop is paying for.
+    pub segment_opens: usize,
     /// Routing cost of ranking the clusters to probe — ONE routing pass
     /// per query over the index-level set. See [`IvfSearchMetrics`].
     pub routing: IvfSearchMetrics,
@@ -80,7 +84,9 @@ pub struct ProbeStats {
 }
 
 impl ProbeStats {
-    /// Clusters the probe loop visited.
+    /// Distinct clusters the probe loop opened — segment-count
+    /// invariant. [`segment_opens`](Self::segment_opens) is the
+    /// per-(cluster, segment) count.
     ///
     /// Returns (`usize`): `postings_row + postings_skipped` — every probed
     /// cluster either fetched survivors or fetched nothing.
