@@ -126,7 +126,7 @@ fn save_new_metas(
     schema: Schema,
     index_settings: IndexSettings,
     plugins: &[Arc<dyn SegmentPlugin>],
-    centroid_sets: Vec<CentroidSetMeta>,
+    centroid_set: Option<CentroidSetMeta>,
     directory: &dyn Directory,
 ) -> crate::Result<()> {
     let persisted_custom_extensions: Vec<String> = plugins
@@ -137,7 +137,7 @@ fn save_new_metas(
     let empty_metas = IndexMeta {
         index_settings,
         persisted_custom_extensions,
-        centroid_sets,
+        centroid_set,
         segments: Vec::new(),
         schema,
         opstamp: 0u64,
@@ -339,9 +339,8 @@ impl IndexBuilder {
                 let version = centroid_index.version();
                 let known = index
                     .load_metas()?
-                    .centroid_sets
-                    .iter()
-                    .any(|set| set.version == version);
+                    .centroid_set
+                    .is_some_and(|set| set.version == version);
                 if !known {
                     return Err(TantivyError::InvalidArgument(format!(
                         "index already exists without centroid set version {version}; \
@@ -439,31 +438,31 @@ impl IndexBuilder {
         let directory = ManagedDirectory::wrap(dir)?;
         // The centroid set file is written BEFORE the first meta.json
         // references it — the meta write is the commit point.
-        let centroid_sets = match (&self.centroid_index, &self.shared_centroid_set) {
+        let centroid_set = match (&self.centroid_index, &self.shared_centroid_set) {
             (Some(centroid_index), None) => {
                 let schema = self.get_expect_schema()?;
                 let path = write_centroid_set(&directory, &schema, centroid_index.as_ref())?;
-                vec![CentroidSetMeta {
+                Some(CentroidSetMeta {
                     version: centroid_index.version(),
                     filename: path.to_string_lossy().into_owned(),
-                }]
+                })
             }
             (None, Some(source)) => {
                 let schema = self.get_expect_schema()?;
                 let (version, path) = copy_centroid_set(source, &directory, &schema)?;
-                vec![CentroidSetMeta {
+                Some(CentroidSetMeta {
                     version,
                     filename: path.to_string_lossy().into_owned(),
-                }]
+                })
             }
-            (None, None) => Vec::new(),
+            (None, None) => None,
             (Some(_), Some(_)) => unreachable!("validate() rejects both sources"),
         };
         save_new_metas(
             self.get_expect_schema()?,
             self.index_settings.clone(),
             &self.custom_plugins,
-            centroid_sets,
+            centroid_set,
             &directory,
         )?;
         let mut metas = IndexMeta::with_schema(self.get_expect_schema()?);
@@ -1007,9 +1006,8 @@ impl Index {
         }
         let metas = self.load_metas()?;
         let entry = metas
-            .centroid_sets
-            .iter()
-            .find(|set| set.version == version)
+            .centroid_set
+            .filter(|set| set.version == version)
             .ok_or_else(|| {
                 TantivyError::InvalidArgument(format!(
                     "segments reference centroid set version {version}, which the meta does not \

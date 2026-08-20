@@ -236,18 +236,12 @@ pub(crate) fn copy_centroid_set(
     schema: &Schema,
 ) -> crate::Result<(u64, PathBuf)> {
     let metas = source.load_metas()?;
-    let newest = metas
-        .centroid_sets
-        .iter()
-        .max_by_key(|set| set.version)
-        .ok_or_else(|| {
-            TantivyError::InvalidArgument(
-                "the source index has no centroid set to share".to_string(),
-            )
-        })?;
-    let source_path = std::path::Path::new(&newest.filename);
+    let source_set = metas.centroid_set.as_ref().ok_or_else(|| {
+        TantivyError::InvalidArgument("the source index has no centroid set to share".to_string())
+    })?;
+    let source_path = std::path::Path::new(&source_set.filename);
     let bytes = source.directory().open_read(source_path)?.read_bytes()?;
-    let path = centroid_set_filename(newest.version);
+    let path = centroid_set_filename(source_set.version);
     let mut write = directory.open_write(&path)?;
     write.write_all(&bytes)?;
     common::TerminatingWrite::terminate(write)?;
@@ -260,7 +254,7 @@ pub(crate) fn copy_centroid_set(
             reader.field_rows(field, opts)?;
         }
     }
-    Ok((newest.version, path))
+    Ok((source_set.version, path))
 }
 
 /// Reader over one `centroids.<version>` file.
@@ -271,7 +265,7 @@ pub(crate) struct CentroidSetReader {
 
 impl CentroidSetReader {
     /// Open the set file named `filename` (from the meta's
-    /// `centroid_sets` record) in `directory`.
+    /// `centroid_set` record) in `directory`.
     pub(crate) fn open(
         directory: &dyn Directory,
         filename: &std::path::Path,

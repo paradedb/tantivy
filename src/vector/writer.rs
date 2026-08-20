@@ -154,21 +154,17 @@ impl PluginWriter for VecWriter {
 
         let index = segment.index();
         let meta = index.load_metas()?;
-        let newest_set = meta
-            .centroid_sets
-            .iter()
-            .max_by_key(|set| set.version)
-            .ok_or_else(|| {
-                TantivyError::InvalidArgument(
-                    "index has vector fields but no centroid set; the centroid set must be \
-                     provided at index creation via IndexBuilder::centroid_index"
-                        .to_string(),
-                )
-            })?;
-        let set_search = index.centroid_set_search_index(newest_set.version)?;
+        let centroid_set = meta.centroid_set.as_ref().ok_or_else(|| {
+            TantivyError::InvalidArgument(
+                "index has vector fields but no centroid set; the centroid set must be provided \
+                 at index creation via IndexBuilder::centroid_index"
+                    .to_string(),
+            )
+        })?;
+        let set_search = index.centroid_set_search_index(centroid_set.version)?;
         let set_reader = CentroidSetReader::open(
             index.directory(),
-            std::path::Path::new(&newest_set.filename),
+            std::path::Path::new(&centroid_set.filename),
         )?;
 
         let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;

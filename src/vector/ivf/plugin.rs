@@ -508,20 +508,16 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
 
     let index = ctx.target_segment.index();
     let meta = index.load_metas()?;
-    let newest_set = meta
-        .centroid_sets
-        .iter()
-        .max_by_key(|set| set.version)
-        .ok_or_else(|| {
-            TantivyError::InvalidArgument(
-                "index has vector fields but no centroid set; the centroid set must be provided \
-                 at index creation via IndexBuilder::centroid_index"
-                    .to_string(),
-            )
-        })?;
+    let centroid_set = meta.centroid_set.as_ref().ok_or_else(|| {
+        TantivyError::InvalidArgument(
+            "index has vector fields but no centroid set; the centroid set must be provided at \
+             index creation via IndexBuilder::centroid_index"
+                .to_string(),
+        )
+    })?;
     let directory = index.directory();
     let set_reader =
-        CentroidSetReader::open(directory, std::path::Path::new(&newest_set.filename))?;
+        CentroidSetReader::open(directory, std::path::Path::new(&centroid_set.filename))?;
 
     let vec_path = ctx
         .target_segment

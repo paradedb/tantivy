@@ -172,18 +172,17 @@ impl CentroidIndex for Grid2DCentroidIndex {
 }
 
 /// Resolve and open the index's newest centroid set file.
-pub(crate) fn open_newest_set(
+pub(crate) fn open_centroid_set(
     index: &Index,
 ) -> crate::Result<crate::vector::centroid_set::CentroidSetReader> {
     let meta = index.load_metas()?;
-    let newest: &CentroidSetMeta = meta
-        .centroid_sets
-        .iter()
-        .max_by_key(|set| set.version)
+    let set: &CentroidSetMeta = meta
+        .centroid_set
+        .as_ref()
         .expect("index has a centroid set");
     crate::vector::centroid_set::CentroidSetReader::open(
         index.directory(),
-        std::path::Path::new(&newest.filename),
+        std::path::Path::new(&set.filename),
     )
 }
 
@@ -320,7 +319,7 @@ fn set_centroids_round_trip_and_drive_assignment() -> crate::Result<()> {
         .flat_map(|vector| vector.iter().copied())
         .collect();
 
-    let set = open_newest_set(&index.index)?;
+    let set = open_centroid_set(&index.index)?;
     assert_eq!(set.version(), FIXTURE_SET_VERSION);
     let field_centroids = set.field_centroids(index.embedding_field(), &index.vector_options())?;
     assert_eq!(field_centroids.num_centroids(), centroids.len());
@@ -368,7 +367,7 @@ fn centroid_set_writes_tagged_router_slot() -> crate::Result<()> {
     let index = TestVectorIndex::builder(VectorDType::F32)
         .centroids(&centroids)
         .build()?;
-    let set = open_newest_set(&index.index)?;
+    let set = open_centroid_set(&index.index)?;
     let router_bytes = set
         .router_slice(index.embedding_field())
         .expect("the set must write a router slot for C > 1")
@@ -757,7 +756,7 @@ mod grid2d {
 mod centroid_set_lifecycle_tests {
     use std::sync::Arc;
 
-    use super::{open_newest_set, Grid2DCentroidIndex, SingleCellCentroidIndex};
+    use super::{open_centroid_set, Grid2DCentroidIndex, SingleCellCentroidIndex};
     use crate::directory::{Directory, RamDirectory};
     use crate::indexer::NoMergePolicy;
     use crate::schema::{Schema, STORED, STRING};
@@ -814,11 +813,11 @@ mod centroid_set_lifecycle_tests {
         let set_path = centroid_set_filename(7);
         assert!(directory.exists(&set_path)?, "set file written at creation");
         assert_eq!(
-            index.load_metas()?.centroid_sets,
-            vec![crate::index::CentroidSetMeta {
+            index.load_metas()?.centroid_set,
+            Some(crate::index::CentroidSetMeta {
                 version: 7,
                 filename: set_path.to_string_lossy().into_owned(),
-            }]
+            })
         );
 
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -836,9 +835,9 @@ mod centroid_set_lifecycle_tests {
             "GC must keep the centroid set file alive"
         );
         // Meta still lists the set after save_metas rebuilds the meta.
-        assert_eq!(index.load_metas()?.centroid_sets.len(), 1);
+        assert!(index.load_metas()?.centroid_set.is_some());
         // And the file still opens.
-        assert_eq!(open_newest_set(&index)?.version(), 7);
+        assert_eq!(open_centroid_set(&index)?.version(), 7);
 
         // Merges keep working against the set.
         let segment_ids = index.searchable_segment_ids()?;
@@ -873,7 +872,7 @@ mod centroid_set_lifecycle_tests {
             .schema(vector_schema())
             .shared_centroid_set(&source)
             .create_in_ram()?;
-        assert_eq!(open_newest_set(&sibling)?.version(), 9);
+        assert_eq!(open_centroid_set(&sibling)?.version(), 9);
         let set_path = centroid_set_filename(9);
         let source_bytes = source.directory().open_read(&set_path)?.read_bytes()?;
         let sibling_bytes = sibling.directory().open_read(&set_path)?.read_bytes()?;
@@ -965,7 +964,7 @@ mod bounds_storage_tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    use super::{open_newest_set, Grid2DCentroidIndex, TestVectorIndex, EMBEDDING_FIELD_NAME};
+    use super::{open_centroid_set, Grid2DCentroidIndex, TestVectorIndex, EMBEDDING_FIELD_NAME};
     use crate::directory::{Directory, RamDirectory, TerminatingWrite};
     use crate::index::SegmentComponent;
     use crate::indexer::NoMergePolicy;
@@ -1025,7 +1024,7 @@ mod bounds_storage_tests {
                 .metric(metric)
                 .build()?;
             let field = fixture.embedding_field();
-            let set = open_newest_set(&fixture.index)?;
+            let set = open_centroid_set(&fixture.index)?;
             let set_field = set.field_centroids(field, &fixture.vector_options())?;
             let searcher = fixture.index.reader()?.searcher();
             let mut ivf_segments = 0usize;
@@ -1190,7 +1189,7 @@ mod bounds_storage_tests {
         // Stage 2: merge the merged segments.
         merge_all(&index)?;
 
-        let set = open_newest_set(&index)?;
+        let set = open_centroid_set(&index)?;
         let opts = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
         let set_field = set.field_centroids(field, &opts)?;
         let searcher = index.reader()?.searcher();

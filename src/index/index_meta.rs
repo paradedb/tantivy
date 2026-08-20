@@ -441,12 +441,12 @@ pub struct IndexMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub persisted_custom_extensions: Vec<String>,
-    /// The index-level centroid sets, ascending by version. Written at
-    /// index creation (and by future re-publishes); segments stamp the
+    /// The index-level centroid set, written at index creation.
+    /// `None` for an index with no vector fields. Segments stamp the
     /// version they assigned against into their `.vec` IVF meta.
     #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub centroid_sets: Vec<CentroidSetMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub centroid_set: Option<CentroidSetMeta>,
     /// List of `SegmentMeta` information associated with each finalized segment of the index.
     pub segments: Vec<SegmentMeta>,
     /// Index `Schema`
@@ -470,7 +470,7 @@ struct UntrackedIndexMeta {
     #[serde(default)]
     pub persisted_custom_extensions: Vec<String>,
     #[serde(default)]
-    pub centroid_sets: Vec<CentroidSetMeta>,
+    pub centroid_set: Option<CentroidSetMeta>,
     pub schema: Schema,
     pub opstamp: Opstamp,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -482,7 +482,7 @@ impl UntrackedIndexMeta {
         IndexMeta {
             index_settings: self.index_settings,
             persisted_custom_extensions: self.persisted_custom_extensions,
-            centroid_sets: self.centroid_sets,
+            centroid_set: self.centroid_set,
             segments: self
                 .segments
                 .into_iter()
@@ -505,7 +505,7 @@ impl IndexMeta {
         IndexMeta {
             index_settings: IndexSettings::default(),
             persisted_custom_extensions: Vec::new(),
-            centroid_sets: Vec::new(),
+            centroid_set: None,
             segments: vec![],
             schema,
             opstamp: 0u64,
@@ -554,7 +554,7 @@ mod tests {
             schema_builder.build()
         };
         let index_metas = IndexMeta {
-            centroid_sets: Vec::new(),
+            centroid_set: None,
             index_settings: IndexSettings {
                 docstore_compression: Compressor::None,
                 sort_by_field: Some(IndexSortByField {
