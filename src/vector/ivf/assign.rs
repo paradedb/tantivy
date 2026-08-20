@@ -5,6 +5,11 @@
 //! `replicas - 1` next-nearest cells from ONE k-NN call per vector. The
 //! selector mirrors the query-time router's ranking per metric, so cells
 //! predict where a query would look.
+//!
+//! Everything here runs on the CALLING thread. Assignment reads centroid
+//! rows through the index's `Directory`, and an embedder like pg_search
+//! runs inside a Postgres backend, where FFI from a spawned thread aborts
+//! the transaction — so no path in the vector write pipeline spawns.
 
 use std::cmp::Ordering;
 
@@ -18,19 +23,6 @@ use crate::Executor;
 /// threads. Small enough to load-balance, large enough to amortize the
 /// per-item `Workspace` allocation.
 const ASSIGN_CHUNK_ROWS: usize = 256;
-
-/// A multi-threaded [`Executor`] when the host has the parallelism, the
-/// single-threaded one otherwise.
-pub(crate) fn build_executor(name: &'static str) -> crate::Result<Executor> {
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    if num_threads > 1 {
-        Executor::multi_thread(num_threads, name)
-    } else {
-        Ok(Executor::single_thread())
-    }
-}
 
 /// Centroid ids of the `knn` nearest centroids to `query`, nearest first —
 /// the exact counterpart of [`RelativeNeighborhoodGraph::nearest`], same

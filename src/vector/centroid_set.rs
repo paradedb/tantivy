@@ -28,7 +28,6 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use super::header::{centroid_set_slot, read_header, write_header, VectorFileVersion};
-use super::ivf::assign::build_executor;
 use super::ivf::{
     decode_row, encode_vector, Candidate, IvfCentroids, IvfSearchMetrics, NeighborhoodGraphConfig,
     NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
@@ -36,7 +35,7 @@ use super::ivf::{
 use super::{FileSliceArena, VectorArena};
 use crate::directory::{CompositeFile, CompositeWrite, Directory, FileSlice};
 use crate::schema::{Field, FieldType, Metric, Schema, VectorDType, VectorOptions};
-use crate::TantivyError;
+use crate::{Executor, TantivyError};
 
 /// Router-kind tag for tantivy's own RNG payload (the
 /// [`CentroidIndex::serialize_router`] default). Consumer-defined router
@@ -81,7 +80,13 @@ pub trait CentroidIndex: Send + Sync + 'static {
             options.metric(),
             NeighborhoodGraphConfig::default(),
         );
-        graph.build(&build_executor("router-rng-")?);
+        // SINGLE-THREADED on purpose. This runs inside the embedder's
+        // index-creation call (for pg_search, a Postgres backend), and a
+        // Postgres backend forbids FFI from any thread but its own — a
+        // spawned worker that touches the `Directory` aborts the build.
+        // An embedder that can tolerate threads here overrides this
+        // method.
+        graph.build(&Executor::single_thread());
         graph.serialize(out)?;
         Ok(())
     }
