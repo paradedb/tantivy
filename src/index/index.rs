@@ -182,7 +182,7 @@ pub struct IndexBuilder {
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     centroid_index: Option<Arc<dyn CentroidIndex>>,
-    shared_centroid_set: Option<Index>,
+    centroid_set_source: Option<Index>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -199,7 +199,7 @@ impl IndexBuilder {
             fast_field_tokenizer_manager: TokenizerManager::default(),
             custom_plugins: Vec::new(),
             centroid_index: None,
-            shared_centroid_set: None,
+            centroid_set_source: None,
         }
     }
 
@@ -244,16 +244,25 @@ impl IndexBuilder {
         self
     }
 
-    /// Share `source`'s newest centroid set instead of providing one: at
-    /// creation the set file is copied VERBATIM — same version, same rows,
-    /// same router — so this index's segments assign against byte-identical
-    /// centroids and stamp the same version as `source`'s. For sibling
-    /// indexes over the same schema (e.g. an in-memory index staging a
-    /// mutable segment for `source`). Mutually exclusive with
+    /// Take the centroid set from `source` instead of training one.
+    ///
+    /// `source` is kept as a handle — not the set itself — because
+    /// [`create`](Self::create) needs two things from it and both can
+    /// fail, so neither can be resolved in a builder method that returns
+    /// `Self`: the source's meta (for the set's version and file name)
+    /// and its directory (to read the bytes). At creation the file is
+    /// copied VERBATIM — same version, same rows, same router — so this
+    /// index's segments assign against byte-identical centroids and stamp
+    /// the same version as `source`'s.
+    ///
+    /// For sibling indexes over the same schema, e.g. an in-memory index
+    /// staging a mutable segment destined for `source`: sharing the
+    /// version is what lets that segment move across without tripping the
+    /// single-version guard on merge and search. Mutually exclusive with
     /// [`Self::centroid_index`].
     #[must_use]
     pub fn shared_centroid_set(mut self, source: &Index) -> Self {
-        self.shared_centroid_set = Some(source.clone());
+        self.centroid_set_source = Some(source.clone());
         self
     }
 
@@ -362,7 +371,7 @@ impl IndexBuilder {
                 .fields()
                 .any(|(_, entry)| matches!(entry.field_type(), FieldType::Vector(_)));
             let centroid_sources = usize::from(self.centroid_index.is_some())
-                + usize::from(self.shared_centroid_set.is_some());
+                + usize::from(self.centroid_set_source.is_some());
             if has_vector_fields && centroid_sources == 0 {
                 return Err(TantivyError::InvalidArgument(
                     "schema has vector fields but no centroid index; provide one via \
@@ -438,7 +447,7 @@ impl IndexBuilder {
         let directory = ManagedDirectory::wrap(dir)?;
         // The centroid set file is written BEFORE the first meta.json
         // references it — the meta write is the commit point.
-        let centroid_set = match (&self.centroid_index, &self.shared_centroid_set) {
+        let centroid_set = match (&self.centroid_index, &self.centroid_set_source) {
             (Some(centroid_index), None) => {
                 let schema = self.get_expect_schema()?;
                 let path = write_centroid_set(&directory, &schema, centroid_index.as_ref())?;
