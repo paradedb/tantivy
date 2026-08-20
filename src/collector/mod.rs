@@ -172,13 +172,9 @@ pub trait Collector: Sync + Send {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
 
-    /// Searcher-level collection hook, checked BEFORE the per-segment
-    /// pass: a collector that must see the whole index in one pass (e.g.
-    /// vector search, whose probe loop spans segments) returns
-    /// `Some(fruit)` here and the per-segment machinery
-    /// ([`Self::collect_segment`] / [`Self::merge_fruits`]) never runs.
-    /// The default `None` keeps every ordinary collector on the
-    /// per-segment path.
+    /// If implemented, this is called instead of [`Self::collect_segment`] and
+    /// [`Self::merge_fruits`] when the collector needs to see all segments in one pass.
+    /// For example, vector search probes clusters across segments against one shared heap.
     fn collect_global(
         &self,
         _weight: &dyn Weight,

@@ -226,9 +226,6 @@ impl Searcher {
     ) -> crate::Result<C::Fruit> {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
-        // Collectors that need the whole index in one pass (vector search
-        // probes clusters across segments against one shared heap) collect
-        // here; everything else takes the per-segment path below.
         if let Some(fruit) = collector.collect_global(weight.as_ref(), self)? {
             return Ok(fruit);
         }
