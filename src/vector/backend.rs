@@ -1287,6 +1287,82 @@ mod tests {
         Ok(())
     }
 
+    /// Merging carries the source postings over instead of re-assigning:
+    /// every doc lands in exactly the cells it already occupied. Compared
+    /// by LABEL, since the merge permutes doc ids.
+    #[test]
+    fn merge_preserves_source_memberships() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let n = docs.len();
+        let chunk = n / 4;
+        let commits: Vec<&[(&str, [f32; 2])]> = docs.chunks(chunk).collect();
+
+        // Cells per label, across however many segments the index holds.
+        let cells_by_label =
+            |index: &Index,
+             field: crate::schema::Field,
+             label_field: crate::schema::Field|
+             -> crate::Result<std::collections::BTreeMap<String, Vec<usize>>> {
+                let searcher = index.reader()?.searcher();
+                let mut out: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+                for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
+                    let vec_reader = segment_reader.vector_index(field)?;
+                    let ivf = vec_reader.index().expect("IVF segment");
+                    for cluster in 0..ivf.num_clusters() {
+                        for doc in vec_reader.cluster_doc_ids(cluster).expect("in-bounds") {
+                            let label = stored_label_at(
+                                index,
+                                label_field,
+                                DocAddress::new(segment_ord as u32, doc),
+                            )?;
+                            out.entry(label).or_default().push(cluster);
+                        }
+                    }
+                }
+                for cells in out.values_mut() {
+                    cells.sort_unstable();
+                }
+                Ok(out)
+            };
+
+        let (sharded, sharded_field, sharded_label) =
+            build_ivf(Metric::L2, &centroids, &commits, 3, false)?;
+        let before = cells_by_label(&sharded, sharded_field, sharded_label)?;
+        assert_eq!(before.len(), n, "every doc must have cells before merging");
+
+        let (merged, merged_field, merged_label) =
+            build_ivf(Metric::L2, &centroids, &commits, 3, true)?;
+        let after = cells_by_label(&merged, merged_field, merged_label)?;
+        assert_eq!(
+            before, after,
+            "merging must carry postings over, not re-assign"
+        );
+
+        // The merged bounds are the element-wise max of the sources' —
+        // exactly a fresh fold when nothing was deleted.
+        let searcher = sharded.reader()?.searcher();
+        let mut source_max = vec![0.0f32; centroids.len()];
+        for segment_reader in searcher.segment_readers() {
+            let vec_reader = segment_reader.vector_index(sharded_field)?;
+            let bounds = vec_reader.index().expect("IVF segment").bounds();
+            for (cluster, slot) in source_max.iter_mut().enumerate() {
+                *slot = slot.max(bounds.ball_r(cluster));
+            }
+        }
+        let merged_searcher = merged.reader()?.searcher();
+        let merged_reader = merged_searcher.segment_readers()[0].vector_index(merged_field)?;
+        let merged_bounds = merged_reader.index().expect("IVF segment").bounds();
+        for (cluster, &expected) in source_max.iter().enumerate() {
+            assert_eq!(
+                merged_bounds.ball_r(cluster).to_bits(),
+                expected.to_bits(),
+                "cluster {cluster}: merged bound must be the max of the sources'"
+            );
+        }
+        Ok(())
+    }
+
     /// A replicated IVF segment can be a merge SOURCE: merge it with a
     /// fresh commit segment and every doc — old and new — fills its cells
     /// against the same set, stamped with the same version.

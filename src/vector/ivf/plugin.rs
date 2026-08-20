@@ -9,10 +9,11 @@
 //! consumer ran it before index creation; here vectors are only assigned,
 //! with tantivy's own selector over the set's stored rows.
 
+use common::BitSet;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use super::assign::{assign_cells, build_executor, CentroidSelector};
+use super::assign::{assign_cells, CentroidSelector};
 use super::graph::RelativeNeighborhoodGraph;
 use super::{decode_row, IvfIndex};
 use crate::directory::{CompositeWrite, Directory};
@@ -323,6 +324,167 @@ pub(crate) fn write_ivf_field(
     Ok(num_present_docs)
 }
 
+/// Sentinel for "this source doc is not in the target" (deleted).
+const DOC_DROPPED: DocId = DocId::MAX;
+
+/// Merge one field's postings WITHOUT re-assigning: concatenate each
+/// cluster's rows across the sources, remapping doc ids.
+///
+/// Sound because the merge already refused mixed centroid-set versions:
+/// the sources assigned against the very set this target uses, and
+/// assignment is deterministic, so re-running it would reproduce these
+/// exact cells. Replica entries ride along in the postings, so the
+/// per-vector k-NN never runs.
+///
+/// `old_to_new[segment_ord][doc_id]` is the target doc id, or
+/// [`DOC_DROPPED`] for a doc the merge is dropping.
+///
+/// Returns the distinct doc count written.
+#[allow(clippy::too_many_arguments)]
+fn merge_ivf_field_from_postings(
+    vec_write: &mut CompositeWrite,
+    field: Field,
+    num_centroids: usize,
+    set_version: u64,
+    field_readers: &[std::sync::Arc<crate::vector::VectorIndexReader>],
+    old_to_new: &[Vec<DocId>],
+    num_target_docs: u32,
+    cancel: &dyn CancelSentinel,
+) -> crate::Result<usize> {
+    let field_build_start = Instant::now();
+    // One entry per surviving posting row: (target doc, source segment,
+    // source row), grouped by cluster and ascending by target doc within
+    // each cluster — the layout the reader's binary search relies on.
+    let mut memberships: Vec<(DocId, u32, u32)> = Vec::new();
+    let mut cluster_offsets: Vec<u64> = Vec::with_capacity(num_centroids + 1);
+    cluster_offsets.push(0);
+    // Distinct target docs, counted across every cell a doc lives in.
+    let mut seen_docs = BitSet::with_max_value(num_target_docs);
+    let mut per_cluster: Vec<(DocId, u32, u32)> = Vec::new();
+
+    let gather_start = Instant::now();
+    for cluster in 0..num_centroids {
+        if cluster % 4096 == 0 && cancel.wants_cancel() {
+            return Err(TantivyError::Cancelled);
+        }
+        per_cluster.clear();
+        for (segment_ord, reader) in field_readers.iter().enumerate() {
+            let Some(ivf) = reader.index() else {
+                continue;
+            };
+            let Some(rows) = ivf.non_empty_cluster_range(cluster) else {
+                continue;
+            };
+            for row in rows {
+                let doc = reader.doc_id_at(row);
+                let target_doc = old_to_new[segment_ord][doc as usize];
+                if target_doc == DOC_DROPPED {
+                    continue;
+                }
+                per_cluster.push((target_doc, segment_ord as u32, row as u32));
+            }
+        }
+        // Each source's run is already ascending in ITS doc ids, but the
+        // target ordering interleaves segments (and a doc-id mapping need
+        // not be monotonic), so sort rather than assume.
+        per_cluster.sort_unstable_by_key(|entry| entry.0);
+        for entry in &per_cluster {
+            seen_docs.insert(entry.0);
+        }
+        memberships.extend_from_slice(&per_cluster);
+        cluster_offsets.push(memberships.len() as u64);
+    }
+    let gather = gather_start.elapsed();
+    let num_present_docs = seen_docs.len();
+    if num_present_docs == 0 {
+        // No surviving vectors: the field owns no slots, matching the
+        // assignment path's empty-field behavior.
+        return Ok(0);
+    }
+
+    let posting_start = Instant::now();
+    {
+        let id_map_w = vec_write.for_field_with_idx(field, vec_slot::ID_MAP);
+        let row_doc_ids: Vec<DocId> = memberships.iter().map(|entry| entry.0).collect();
+        IdMap::serialize_explicit(&row_doc_ids, id_map_w)?;
+        id_map_w.flush()?;
+    }
+    {
+        const CANCEL_POLL_ROWS: usize = 4096;
+        let rows_w = vec_write.for_field_with_idx(field, vec_slot::ROWS);
+        for (row_idx, (_, segment_ord, row)) in memberships.iter().enumerate() {
+            if row_idx % CANCEL_POLL_ROWS == 0 && cancel.wants_cancel() {
+                return Err(TantivyError::Cancelled);
+            }
+            // Copied verbatim: source rows were normalized on the way in,
+            // and the centroids they were measured against are the same
+            // ones this segment points at.
+            let bytes = field_readers[*segment_ord as usize].vector_bytes_for_row(*row as usize)?;
+            rows_w.write_all(&bytes)?;
+        }
+        rows_w.flush()?;
+    }
+    let posting_write = posting_start.elapsed();
+
+    {
+        let offsets_w = vec_write.for_field_with_idx(field, vec_slot::OFFSETS);
+        IvfIndex::serialize_offsets(&cluster_offsets, offsets_w)?;
+        offsets_w.flush()?;
+    }
+    {
+        // Bounds combine as an element-wise MAX. This is sound only
+        // because the centroids are shared and immutable: every source
+        // radius was measured against the same anchor this segment will
+        // be probed against. (It was unsound under per-segment training,
+        // where each radius pointed at a centroid that no longer
+        // existed.) Deletes can leave a radius wider than the surviving
+        // rows warrant — conservative, so it costs pruning, never
+        // correctness.
+        let mut kind = BoundKind::Ball;
+        let mut combined = vec![0.0f32; num_centroids];
+        for reader in field_readers {
+            let Some(ivf) = reader.index() else {
+                continue;
+            };
+            let bounds = ivf.bounds();
+            if bounds.kind() != kind {
+                return Err(TantivyError::InternalError(format!(
+                    "source segments disagree on bound kind ({:?} vs {kind:?})",
+                    bounds.kind()
+                )));
+            }
+            kind = bounds.kind();
+            for (cluster, slot) in combined.iter_mut().enumerate() {
+                let r = bounds.ball_r(cluster);
+                if r > *slot || !r.is_finite() {
+                    *slot = r;
+                }
+            }
+        }
+        let bounds_w = vec_write.for_field_with_idx(field, vec_slot::BOUNDS);
+        IvfIndex::serialize_bounds(kind, &combined, bounds_w)?;
+        bounds_w.flush()?;
+    }
+    {
+        let meta_w = vec_write.for_field_with_idx(field, vec_slot::IVF_META);
+        IvfIndex::serialize_ivf_meta(num_present_docs, num_centroids, set_version, meta_w)?;
+        meta_w.flush()?;
+    }
+
+    log::info!(
+        target: "paradedb::ivf_build",
+        "ivf_merge timings_ms gather={} posting_write={} total={} centroids={} rows={} \
+         vectors={} reassigned=false",
+        gather.as_millis(),
+        posting_write.as_millis(),
+        field_build_start.elapsed().as_millis(),
+        num_centroids,
+        memberships.len(),
+        num_present_docs,
+    );
+    Ok(num_present_docs)
+}
+
 /// Merge source vectors into the target segment's `.vec`, reassigning
 /// every row against the index's newest centroid set.
 pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
@@ -359,9 +521,6 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     let directory = index.directory();
     let set_reader =
         CentroidSetReader::open(directory, std::path::Path::new(&newest_set.filename))?;
-    // The cached search-time view: its pinned router doubles as the
-    // assignment selector, so this merge builds no selector structure.
-    let set_search = index.centroid_set_search_index(set_reader.version())?;
 
     let vec_path = ctx
         .target_segment
@@ -370,7 +529,23 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     write_header(&mut vec_file)?;
     let mut vec_write = CompositeWrite::wrap(vec_file);
 
-    let executor = build_executor("ivf-assign-")?;
+    // Source doc -> target doc, built once for every field. `DOC_DROPPED`
+    // marks a doc the merge is dropping (deleted, or otherwise absent
+    // from the mapping).
+    let mut old_to_new: Vec<Vec<DocId>> = ctx
+        .readers
+        .iter()
+        .map(|reader| vec![DOC_DROPPED; reader.max_doc() as usize])
+        .collect();
+    {
+        let mut target_doc_id: DocId = 0;
+        for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
+            old_to_new[old_doc_addr.segment_ord as usize][old_doc_addr.doc_id as usize] =
+                target_doc_id;
+            target_doc_id += 1;
+        }
+        debug_assert_eq!(target_doc_id, num_target_docs);
+    }
 
     for (field, entry) in ctx.schema.fields() {
         let opts = match entry.field_type() {
@@ -405,54 +580,32 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
             continue;
         }
         let field_centroids = set_reader.field_centroids(field, opts)?;
-        let params = IvfFieldWriteParams {
-            field,
-            opts,
-            set: &field_centroids,
-            router: set_search
-                .field_router(field)
-                .and_then(|router| router.graph()),
-            set_version: set_reader.version(),
-            replicas: ctx.settings.vector_replicas,
-            bounds_scope: ctx.settings.vector_bounds_scope,
-            executor: &executor,
-            cancel: ctx.cancel,
-            field_name: entry.name(),
-        };
-        let pack = |segment_ord: usize, doc_id: DocId| -> u64 {
-            ((segment_ord as u64) << 32) | doc_id as u64
-        };
-        write_ivf_field(
-            &mut vec_write,
-            &params,
-            &mut |sink| {
-                let mut target_doc_id: DocId = 0;
-                for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                    let reader = &field_readers[old_doc_addr.segment_ord as usize];
-                    if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
-                        sink(
-                            target_doc_id,
-                            pack(old_doc_addr.segment_ord as usize, old_doc_addr.doc_id),
-                            &bytes,
-                        )?;
-                    }
-                    target_doc_id += 1;
+        let num_centroids = field_centroids.num_centroids();
+        for reader in &field_readers {
+            if let Some(ivf) = reader.index() {
+                if ivf.num_clusters() != num_centroids {
+                    return Err(TantivyError::InternalError(format!(
+                        "source segment holds {} clusters but centroid set v{} holds \
+                         {num_centroids}",
+                        ivf.num_clusters(),
+                        set_reader.version(),
+                    )));
                 }
-                debug_assert_eq!(target_doc_id, num_target_docs);
-                Ok(())
-            },
-            &mut |handle, sink| {
-                let segment_ord = (handle >> 32) as usize;
-                let doc_id = handle as u32;
-                let bytes = field_readers[segment_ord]
-                    .vector_bytes(doc_id)?
-                    .ok_or_else(|| {
-                        TantivyError::InternalError(format!(
-                            "missing source vector for doc {doc_id} in segment {segment_ord}"
-                        ))
-                    })?;
-                sink(&bytes)
-            },
+            }
+        }
+        // Every source assigned against THIS set (the version guard above),
+        // and assignment is deterministic, so the merged postings are
+        // exactly what re-assignment would produce — carry them over
+        // instead of re-running a k-NN per vector.
+        merge_ivf_field_from_postings(
+            &mut vec_write,
+            field,
+            num_centroids,
+            set_reader.version(),
+            &field_readers,
+            &old_to_new,
+            num_target_docs,
+            ctx.cancel,
         )?;
     }
 
