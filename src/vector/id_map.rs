@@ -2,7 +2,7 @@
 //!
 //! Stored as slot `[0]` of the `.vec` composite file, parallel to the dense
 //! row blob in slot `[1]`. The variant is the layout discriminator: the flat
-//! layout (indexes without a centroid set — mutable/staging segments) writes
+//! layout (indexes without a centroid index — mutable/staging segments) writes
 //! `Identity` (dense) or `Bitmap` (sparse); the clustered layout writes
 //! `Explicit`. Reading the variant tag is all it takes to learn the layout —
 //! there is no separate format byte.

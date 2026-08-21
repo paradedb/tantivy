@@ -1,8 +1,8 @@
 //! IVF (inverted-file) vector storage.
 //!
 //! From format V3 on this is the ONLY per-segment layout: every write path
-//! assigns vectors against the index-level centroid set (see
-//! [`crate::vector::centroid_set`]) and stores cluster-sorted rows. The
+//! assigns vectors against the index-level centroid index (see
+//! [`crate::vector::centroid_index`]) and stores cluster-sorted rows. The
 //! per-segment remainder — offsets, bounds, IVF meta — is read back through
 //! [`IvfIndex`].
 

@@ -13,10 +13,10 @@
 //! * clustered — an `Explicit` (cluster-sorted) id-map, the dense rows in slot `[1]`, and slots
 //!   `[2..=4]` the per-segment IVF remainder parsed into [`IvfIndex`] — offsets, bounds, and the
 //!   centroid-set version the segment assigned against. The centroid rows themselves live in the
-//!   index-level `centroids.<version>` file (see [`centroid_set`](super::centroid_set)); this
+//!   index-level `centroids.<version>` file (see [`centroid_index`](super::centroid_index)); this
 //!   reader never touches them.
 //! * flat — an `Identity`/`Bitmap` (doc-ordered) id-map and the rows, nothing else. Written by
-//!   indexes without a centroid set (the mutable/staging tier) and searched exhaustively;
+//!   indexes without a centroid index (the mutable/staging tier) and searched exhaustively;
 //!   [`Self::index`] is `None`.
 //!
 //! A field with no vectors owns no slots at all; any other partial slot

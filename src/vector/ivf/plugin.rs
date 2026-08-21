@@ -1,10 +1,10 @@
-//! The IVF field build: assign rows against the index-level centroid set
+//! The IVF field build: assign rows against the index-level centroid index
 //! and serialize one field's `.vec` slots.
 //!
 //! Both clustered write paths funnel here: the per-commit serialize
 //! ([`VecWriter`](crate::vector::VecWriter)) over its in-memory buffers,
 //! and the merge ([`merge_ivf`]) streaming rows out of its source
-//! segments. (Indexes without a centroid set write the flat layout
+//! segments. (Indexes without a centroid index write the flat layout
 //! instead — see [`flat`](crate::vector::flat).) Neither trains anything —
 //! training happened wherever the consumer ran it before index creation;
 //! here vectors are only assigned, with tantivy's own selector over the
@@ -23,7 +23,7 @@ use crate::index::SegmentComponent;
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, VectorOptions};
-use crate::vector::centroid_set::{CentroidSetReader, FieldCentroids};
+use crate::vector::centroid_index::{CentroidIndexReader, FieldCentroids};
 use crate::vector::distance::{maybe_normalize_bytes, norm_squared_bytes_wide, NormalizeOutcome};
 use crate::vector::flat::merge_flat;
 use crate::vector::header::{vec_slot, write_header};
@@ -66,10 +66,10 @@ pub(crate) struct IvfFieldWriteParams<'a> {
     pub(crate) opts: &'a VectorOptions,
     pub(crate) set: &'a FieldCentroids,
     /// The set's persisted routing graph (from the cached
-    /// [`SetSearchIndex`](crate::vector::centroid_set::SetSearchIndex)),
+    /// [`CentroidIndexView`](crate::vector::centroid_index::CentroidIndexView)),
     /// reused as the assignment selector for large sets.
     pub(crate) router:
-        Option<&'a RelativeNeighborhoodGraph<crate::vector::centroid_set::UnitNormRowsArena>>,
+        Option<&'a RelativeNeighborhoodGraph<crate::vector::centroid_index::UnitNormRowsArena>>,
     /// Cells per vector (primary + replicas); clamped to the centroid count.
     pub(crate) replicas: usize,
     pub(crate) bounds_scope: BoundsScope,
@@ -196,7 +196,7 @@ pub(crate) fn write_ivf_field(
         cluster_offsets.push(next_offset);
     }
 
-    // The bounds fold measures residuals against the SET's stored centroid
+    // The bounds fold measures residuals against the centroid index's stored centroid
     // bytes. A degenerate stored centroid — non-finite, or non-unit under
     // Cosine (a zero-norm row normalization left as-is) — anchors no
     // residual geometry: SATURATE, so the cluster always probes.
@@ -621,7 +621,7 @@ fn merge_ivf_field(
 }
 
 /// Merge source vectors into the target segment's `.vec`, reassigning
-/// every row against the index's newest centroid set.
+/// every row against the index's newest centroid index.
 pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     if ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);
@@ -642,15 +642,15 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
 
     let index = ctx.target_segment.index();
     let meta = index.load_metas()?;
-    // No centroid set = the flat (mutable/staging) tier: every source is
+    // No centroid index = the flat (mutable/staging) tier: every source is
     // flat and the target stays flat.
-    let Some(centroid_set) = meta.centroid_set.as_ref() else {
+    let Some(centroid_index) = meta.centroid_index.as_ref() else {
         return merge_flat(ctx);
     };
-    let set_search = index.centroid_set_search_index()?;
+    let set_search = index.centroid_index_view()?;
     let directory = index.directory();
     let set_reader =
-        CentroidSetReader::open(directory, std::path::Path::new(&centroid_set.filename))?;
+        CentroidIndexReader::open(directory, std::path::Path::new(&centroid_index.filename))?;
 
     let vec_path = ctx
         .target_segment
@@ -704,7 +704,7 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
             if let Some(ivf) = reader.index() {
                 if ivf.num_clusters() != num_centroids {
                     return Err(TantivyError::InternalError(format!(
-                        "source segment holds {} clusters but the centroid set holds \
+                        "source segment holds {} clusters but the centroid index holds \
                          {num_centroids}",
                         ivf.num_clusters(),
                     )));

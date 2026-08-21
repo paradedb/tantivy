@@ -1,7 +1,7 @@
 //! The flat (doc-ordered) `.vec` layout: slots `[0]`/`[1]` only, no
 //! clustering.
 //!
-//! Written by indexes WITHOUT a centroid set — the mutable/staging tier,
+//! Written by indexes WITHOUT a centroid index — the mutable/staging tier,
 //! where segments are bounded and searched exhaustively (exact, so fresh
 //! data is always found regardless of how well it fits any vocabulary).
 //! Indexes with a set never write it; a flat segment entering such an
@@ -40,7 +40,7 @@ pub(crate) fn write_flat_field(
     Ok(())
 }
 
-/// Merge for an index WITHOUT a centroid set: every source is flat, and
+/// Merge for an index WITHOUT a centroid index: every source is flat, and
 /// the target stays flat — raw rows copied in target doc order.
 pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     if ctx.cancel.wants_cancel() {
@@ -67,7 +67,7 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
         for reader in &field_readers {
             if reader.index().is_some() {
                 return Err(TantivyError::InternalError(
-                    "clustered vector segment in an index without a centroid set".to_string(),
+                    "clustered vector segment in an index without a centroid index".to_string(),
                 ));
             }
         }

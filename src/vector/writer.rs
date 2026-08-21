@@ -1,13 +1,13 @@
 //! Per-commit vector writer: buffers raw vector bytes per doc and, at
 //! segment finalize, writes the segment's `.vec` in the layout the index
-//! dictates — clustered (assigned against the index-level centroid set)
+//! dictates — clustered (assigned against the index-level centroid index)
 //! when the index has one, flat (doc-ordered, searched exhaustively) when
 //! it does not. The mutable/staging tier is exactly the no-set case.
 
 use std::any::Any;
 use std::collections::BTreeMap;
 
-use super::centroid_set::CentroidSetReader;
+use super::centroid_index::CentroidIndexReader;
 use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use super::flat::write_flat_field;
 use super::header::write_header;
@@ -155,12 +155,12 @@ impl PluginWriter for VecWriter {
 
         let index = segment.index();
         let meta = index.load_metas()?;
-        let set = match meta.centroid_set.as_ref() {
-            Some(centroid_set) => {
-                let set_search = index.centroid_set_search_index()?;
-                let set_reader = CentroidSetReader::open(
+        let set = match meta.centroid_index.as_ref() {
+            Some(centroid_index) => {
+                let set_search = index.centroid_index_view()?;
+                let set_reader = CentroidIndexReader::open(
                     index.directory(),
-                    std::path::Path::new(&centroid_set.filename),
+                    std::path::Path::new(&centroid_index.filename),
                 )?;
                 Some((set_search, set_reader))
             }

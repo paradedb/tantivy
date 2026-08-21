@@ -15,7 +15,7 @@ use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_L
 use crate::error::{DataCorruption, TantivyError};
 use crate::fastfield::FastFieldsPlugin;
 use crate::index::{
-    CentroidSetMeta, IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta,
+    CentroidIndexMeta, IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta,
     SegmentMetaInventory,
 };
 use crate::indexer::index_writer::{
@@ -29,7 +29,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{write_centroid_set, CentroidProducer, SetSearchIndex, VectorPlugin};
+use crate::vector::{write_centroid_index, CentroidIndexView, CentroidProducer, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -125,7 +125,7 @@ fn save_new_metas(
     schema: Schema,
     index_settings: IndexSettings,
     plugins: &[Arc<dyn SegmentPlugin>],
-    centroid_set: Option<CentroidSetMeta>,
+    centroid_index: Option<CentroidIndexMeta>,
     directory: &dyn Directory,
 ) -> crate::Result<()> {
     let persisted_custom_extensions: Vec<String> = plugins
@@ -136,7 +136,7 @@ fn save_new_metas(
     let empty_metas = IndexMeta {
         index_settings,
         persisted_custom_extensions,
-        centroid_set,
+        centroid_index,
         segments: Vec::new(),
         schema,
         opstamp: 0u64,
@@ -232,7 +232,7 @@ impl IndexBuilder {
         self
     }
 
-    /// Install the index-level centroid set the index's vector fields
+    /// Install the index-level centroid index the index's vector fields
     /// assign against; the set is written at creation, next to the schema
     /// and settings. Without one, vector fields are stored flat
     /// (doc-ordered) and searched exhaustively — the mutable/staging tier.
@@ -318,13 +318,13 @@ impl IndexBuilder {
         if index.schema() == self.get_expect_schema()? {
             index.custom_plugins.extend(self.custom_plugins);
             if self.centroid_producer.is_some() {
-                // The set was installed when the index was created and is
+                // The centroid index was installed at creation and is
                 // assumed to be the producer's; installing one into an
                 // existing set-less index would be a re-publish, which is
                 // not supported.
-                if index.load_metas()?.centroid_set.is_none() {
+                if index.load_metas()?.centroid_index.is_none() {
                     return Err(TantivyError::InvalidArgument(
-                        "index already exists without a centroid set; installing one after \
+                        "index already exists without a centroid index; installing one after \
                          creation is not supported"
                             .to_string(),
                     ));
@@ -403,13 +403,13 @@ impl IndexBuilder {
         self.validate()?;
         let dir = dir.into();
         let directory = ManagedDirectory::wrap(dir)?;
-        // The centroid set file is written BEFORE the first meta.json
+        // The centroid index file is written BEFORE the first meta.json
         // references it — the meta write is the commit point.
-        let centroid_set = match &self.centroid_producer {
+        let centroid_index = match &self.centroid_producer {
             Some(centroid_producer) => {
                 let schema = self.get_expect_schema()?;
-                let path = write_centroid_set(&directory, &schema, centroid_producer.as_ref())?;
-                Some(CentroidSetMeta {
+                let path = write_centroid_index(&directory, &schema, centroid_producer.as_ref())?;
+                Some(CentroidIndexMeta {
                     filename: path.to_string_lossy().into_owned(),
                 })
             }
@@ -419,7 +419,7 @@ impl IndexBuilder {
             self.get_expect_schema()?,
             self.index_settings.clone(),
             &self.custom_plugins,
-            centroid_set,
+            centroid_index,
             &directory,
         )?;
         let mut metas = IndexMeta::with_schema(self.get_expect_schema()?);
@@ -443,11 +443,11 @@ pub struct Index {
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
-    /// Search-time centroid sets by version, opened once and shared across
+    /// Search-time centroid indexs by version, opened once and shared across
     /// clones — the router adjacency is far too heavy to parse per query.
     /// Set files are immutable and version-named, so entries never
     /// invalidate.
-    centroid_set_cache: Arc<std::sync::RwLock<Option<Arc<SetSearchIndex>>>>,
+    centroid_index_cache: Arc<std::sync::RwLock<Option<Arc<CentroidIndexView>>>>,
 }
 
 impl Index {
@@ -568,7 +568,7 @@ impl Index {
             executor: Executor::single_thread(),
             inventory,
             custom_plugins: Vec::new(),
-            centroid_set_cache: Arc::new(std::sync::RwLock::new(None)),
+            centroid_index_cache: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -946,33 +946,33 @@ impl Index {
         self.segment(segment_meta)
     }
 
-    /// The search-time view of the centroid set stamped `version`, opened
+    /// The search-time view of the centroid index stamped `version`, opened
     /// on first use and cached for the life of this `Index` (and all its
     /// clones).
-    pub(crate) fn centroid_set_search_index(&self) -> crate::Result<Arc<SetSearchIndex>> {
+    pub(crate) fn centroid_index_view(&self) -> crate::Result<Arc<CentroidIndexView>> {
         if let Some(set) = self
-            .centroid_set_cache
+            .centroid_index_cache
             .read()
-            .expect("centroid set cache poisoned")
+            .expect("centroid index cache poisoned")
             .as_ref()
         {
             return Ok(Arc::clone(set));
         }
         let metas = self.load_metas()?;
-        let entry = metas.centroid_set.ok_or_else(|| {
+        let entry = metas.centroid_index.ok_or_else(|| {
             TantivyError::InvalidArgument(
-                "clustered segments exist but the meta lists no centroid set".to_string(),
+                "clustered segments exist but the meta lists no centroid index".to_string(),
             )
         })?;
-        let set = Arc::new(SetSearchIndex::open(
+        let set = Arc::new(CentroidIndexView::open(
             &self.directory,
             Path::new(&entry.filename),
             &self.schema,
         )?);
         Ok(Arc::clone(
-            self.centroid_set_cache
+            self.centroid_index_cache
                 .write()
-                .expect("centroid set cache poisoned")
+                .expect("centroid index cache poisoned")
                 .get_or_insert(set),
         ))
     }

@@ -1,4 +1,4 @@
-//! The index-level centroid set: the consumer-provided [`CentroidProducer`]
+//! The index-level centroid index: the consumer-provided [`CentroidProducer`]
 //! trait and the immutable `centroids` file it is serialized into.
 //!
 //! Centroids are an index-level artifact, installed at index creation like
@@ -12,7 +12,7 @@
 //!
 //! On-disk layout: the 4-byte vector format header, then a
 //! [`CompositeFile`] with per-field slots (see
-//! `header::centroid_set_slot`):
+//! `header::centroid_index_slot`):
 //!
 //! ```text
 //! [0] num_centroids (u32) + centroid rows (C · stride, normalized here
@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use super::header::{centroid_set_slot, read_header, write_header, VectorFileVersion};
+use super::header::{centroid_index_slot, read_header, write_header, VectorFileVersion};
 use super::ivf::{
     decode_row, encode_vector, Candidate, IvfCentroids, IvfSearchMetrics, NeighborhoodGraphConfig,
     NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
@@ -88,8 +88,8 @@ pub trait CentroidProducer: Send + Sync + 'static {
     }
 }
 
-/// The managed file name of the index's one centroid set.
-pub(crate) fn centroid_set_filename() -> PathBuf {
+/// The managed file name of the index's one centroid index.
+pub(crate) fn centroid_index_filename() -> PathBuf {
     PathBuf::from("centroids")
 }
 
@@ -97,12 +97,12 @@ pub(crate) fn centroid_set_filename() -> PathBuf {
 /// normalize them, and write the `centroids` file. Called at
 /// index creation, BEFORE the first `meta.json` references the file.
 /// Returns the written file name.
-pub(crate) fn write_centroid_set(
+pub(crate) fn write_centroid_index(
     directory: &dyn Directory,
     schema: &Schema,
     provider: &dyn CentroidProducer,
 ) -> crate::Result<PathBuf> {
-    let path = centroid_set_filename();
+    let path = centroid_index_filename();
     let mut write = directory.open_write(&path)?;
     write_header(&mut write)?;
     let mut composite = CompositeWrite::wrap(write);
@@ -168,7 +168,7 @@ pub(crate) fn write_centroid_set(
         }
 
         {
-            let centroids_w = composite.for_field_with_idx(field, centroid_set_slot::CENTROIDS);
+            let centroids_w = composite.for_field_with_idx(field, centroid_index_slot::CENTROIDS);
             (matrix.rows as u32).serialize(centroids_w)?;
             centroids_w.write_all(&centroid_bytes)?;
             centroids_w.flush()?;
@@ -182,7 +182,7 @@ pub(crate) fn write_centroid_set(
                 rows: matrix.rows,
                 dims: matrix.dims,
             });
-            let router_w = composite.for_field_with_idx(field, centroid_set_slot::ROUTER);
+            let router_w = composite.for_field_with_idx(field, centroid_index_slot::ROUTER);
             let mut sink = RouterSlotWriter {
                 out: router_w,
                 written: 0,
@@ -222,13 +222,13 @@ impl<W: Write> Write for RouterSlotWriter<W> {
 }
 
 /// Reader over one `centroids` file.
-pub(crate) struct CentroidSetReader {
+pub(crate) struct CentroidIndexReader {
     composite: CompositeFile,
 }
 
-impl CentroidSetReader {
+impl CentroidIndexReader {
     /// Open the set file named `filename` (from the meta's
-    /// `centroid_set` record) in `directory`.
+    /// `centroid_index` record) in `directory`.
     pub(crate) fn open(
         directory: &dyn Directory,
         filename: &std::path::Path,
@@ -238,12 +238,12 @@ impl CentroidSetReader {
         if version_stamp < VectorFileVersion::V3 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("file {} is not a centroid set file", filename.display()),
+                format!("file {} is not a centroid index file", filename.display()),
             )
             .into());
         }
         let composite = CompositeFile::open(&body)?;
-        Ok(CentroidSetReader { composite })
+        Ok(CentroidIndexReader { composite })
     }
 
     /// The stored centroids of `field`. Every vector field is validated to
@@ -256,10 +256,10 @@ impl CentroidSetReader {
     ) -> crate::Result<FieldCentroids> {
         let Some(slice) = self
             .composite
-            .open_read_with_idx(field, centroid_set_slot::CENTROIDS)
+            .open_read_with_idx(field, centroid_index_slot::CENTROIDS)
         else {
             return Err(TantivyError::InternalError(format!(
-                "centroid set has no centroids for field {field:?}; the set does not match the \
+                "centroid index has no centroids for field {field:?}; the set does not match the \
                  schema"
             )));
         };
@@ -267,7 +267,7 @@ impl CentroidSetReader {
         if slice.len() < count_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "centroid set slot is smaller than its count word",
+                "centroid index slot is smaller than its count word",
             )
             .into());
         }
@@ -278,7 +278,7 @@ impl CentroidSetReader {
         if rows.len() != num_centroids * stride {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "centroid set byte length mismatch",
+                "centroid index byte length mismatch",
             )
             .into());
         }
@@ -293,7 +293,7 @@ impl CentroidSetReader {
     /// degenerate `C <= 1` sets). First byte is the router-kind tag.
     pub(crate) fn router_slice(&self, field: Field) -> Option<FileSlice> {
         self.composite
-            .open_read_with_idx(field, centroid_set_slot::ROUTER)
+            .open_read_with_idx(field, centroid_index_slot::ROUTER)
     }
 
     /// The centroid count and the rows as a lazy [`FileSlice`] (past the
@@ -306,10 +306,10 @@ impl CentroidSetReader {
     ) -> crate::Result<(usize, FileSlice)> {
         let Some(slice) = self
             .composite
-            .open_read_with_idx(field, centroid_set_slot::CENTROIDS)
+            .open_read_with_idx(field, centroid_index_slot::CENTROIDS)
         else {
             return Err(TantivyError::InternalError(format!(
-                "centroid set has no centroids for field {field:?}; the set does not match the \
+                "centroid index has no centroids for field {field:?}; the set does not match the \
                  schema"
             )));
         };
@@ -317,7 +317,7 @@ impl CentroidSetReader {
         if slice.len() < count_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "centroid set slot is smaller than its count word",
+                "centroid index slot is smaller than its count word",
             )
             .into());
         }
@@ -327,7 +327,7 @@ impl CentroidSetReader {
         if rows.len() != num_centroids * options.bytes_per_vector() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "centroid set byte length mismatch",
+                "centroid index byte length mismatch",
             )
             .into());
         }
@@ -366,7 +366,7 @@ impl FieldCentroids {
     }
 }
 
-/// A [`VectorArena`] over the set's stored rows, which are UNIT-NORM under
+/// A [`VectorArena`] over the centroid index's stored rows, UNIT-NORM under
 /// Cosine by construction (normalized at set creation): Cosine similarity
 /// collapses to a raw dot product — no per-row norm recomputation, which
 /// profiled at roughly half of routing cost — PROVIDED the query side is
@@ -399,22 +399,22 @@ impl VectorArena for UnitNormRowsArena {
     }
 }
 
-/// The search-time view of the centroid set: per vector field, the lazy
+/// The search-time view of the centroid index: per vector field, the lazy
 /// centroid rows plus the parsed router. Opened once and cached on
 /// [`Index`](crate::Index) — the router adjacency alone is
 /// `C × max_edges × 4` bytes, far too heavy to parse per query.
-pub(crate) struct SetSearchIndex {
+pub(crate) struct CentroidIndexView {
     fields: std::collections::HashMap<Field, FieldRouter>,
 }
 
-impl SetSearchIndex {
+impl CentroidIndexView {
     /// Open the set file and parse every vector field's router.
     pub(crate) fn open(
         directory: &dyn Directory,
         filename: &std::path::Path,
         schema: &Schema,
     ) -> crate::Result<Self> {
-        let reader = CentroidSetReader::open(directory, filename)?;
+        let reader = CentroidIndexReader::open(directory, filename)?;
         let mut fields = std::collections::HashMap::new();
         for (field, entry) in schema.fields() {
             let opts = match entry.field_type() {
@@ -472,7 +472,7 @@ impl SetSearchIndex {
                 },
             );
         }
-        Ok(SetSearchIndex { fields })
+        Ok(CentroidIndexView { fields })
     }
 
     pub(crate) fn field_router(&self, field: Field) -> Option<&FieldRouter> {
@@ -480,14 +480,14 @@ impl SetSearchIndex {
     }
 }
 
-/// One field's routing state within a [`SetSearchIndex`]: says which
+/// One field's routing state within a [`CentroidIndexView`]: says which
 /// clusters a query should probe, index-wide — every segment shares these
 /// cluster ids.
 pub(crate) struct FieldRouter {
     num_centroids: usize,
     dim: usize,
     metric: Metric,
-    /// The set's centroid rows, fetched per node through the lazy arena.
+    /// The centroid rows, fetched per node through the lazy arena.
     rows_slice: FileSlice,
     /// The persisted RNG over the centroids. `None` for degenerate
     /// centroid counts or consumer routers, where routing falls back to a

@@ -4,7 +4,7 @@
 //! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema module and is
 //! re-exported here; the element trait [`VectorElement`], the vector storage abstraction
 //! [`VectorArena`], and the distance kernels live here.
-//! Centroids are an index-level artifact ([`centroid_set`]) installed at index creation;
+//! Centroids are an index-level artifact ([`centroid_index`]) installed at index creation;
 //! every segment stores the one clustered layout ([`ivf`]), assigned against that set by
 //! [`VecWriter`] (per-commit) or the merge path, both owned by [`VectorPlugin`].
 
@@ -12,7 +12,7 @@ use std::io;
 
 mod backend;
 mod bounds;
-pub(crate) mod centroid_set;
+pub(crate) mod centroid_index;
 mod collector;
 mod distance;
 mod flat;
@@ -39,8 +39,8 @@ pub use bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
     BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
-pub(crate) use centroid_set::{write_centroid_set, SetSearchIndex};
-pub use centroid_set::{CentroidProducer, ROUTER_KIND_RNG};
+pub(crate) use centroid_index::{write_centroid_index, CentroidIndexView};
+pub use centroid_index::{CentroidProducer, ROUTER_KIND_RNG};
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,

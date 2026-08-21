@@ -2,7 +2,7 @@
 //!
 //! From format V3 on, the centroid rows and the routing structure live in
 //! the index-level `centroids.<version>` set file (see
-//! `vector::centroid_set`); a segment keeps only what is genuinely
+//! `vector::centroid_index`); a segment keeps only what is genuinely
 //! per-segment — which rows landed in which cluster, and the residual
 //! geometry of those rows. This module owns the wire format of those
 //! `.vec` slots end to end: the serializers the write paths call and the
@@ -15,7 +15,7 @@
 //! [3] centroid bounds, REQUIRED: a segment-level BoundKind byte, then
 //!     C · stride(kind) f32s in cluster order — for Ball, one f32 per
 //!     cluster: max ||x - c|| over the cluster's NATIVE members' stored
-//!     rows against the SET's stored centroid (replica spill is excluded
+//!     rows against the centroid index's stored centroid (replica spill is excluded
 //!     per the stored `bounds_scope = native`)
 //! [4] IVF meta: num_docs (u32) + num_centroids (u32)
 //! ```

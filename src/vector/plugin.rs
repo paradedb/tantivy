@@ -2,7 +2,7 @@
 //!
 //! [`VectorPlugin`] owns per-segment vector storage end-to-end:
 //! - During indexing, accumulates raw vector bytes per doc; at segment finalize the buffered rows
-//!   are assigned against the index-level centroid set and written as a clustered `.vec`.
+//!   are assigned against the index-level centroid index and written as a clustered `.vec`.
 //! - During merge, source rows are streamed out and reassigned against the same set.
 //! - During reads, [`VectorIndexReader`](super::VectorIndexReader) opens the field's `.vec` slots
 //!   via [`SegmentReader::vector_index`](crate::SegmentReader::vector_index).

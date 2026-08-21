@@ -1,7 +1,7 @@
 //! Centroid assignment: vector → nearest cells of the index-level set.
 //!
 //! Both write paths (per-commit serialize and merge) assign every vector
-//! against the same frozen centroid set, taking the primary cell and the
+//! against the same frozen centroid index, taking the primary cell and the
 //! `replicas - 1` next-nearest cells from ONE k-NN call per vector. The
 //! selector mirrors the query-time router's ranking per metric, so cells
 //! predict where a query would look.
@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 
 use super::graph::{NodeId, RelativeNeighborhoodGraph, Workspace};
 use crate::schema::{Metric, VectorOptions};
-use crate::vector::centroid_set::{FieldCentroids, UnitNormRowsArena};
+use crate::vector::centroid_index::{FieldCentroids, UnitNormRowsArena};
 use crate::vector::distance::{cosine, dot, l2_squared};
 use crate::Executor;
 
@@ -69,7 +69,7 @@ fn exact_nearest_centroids(
 }
 
 /// How a vector's cells are picked from the set's centroids. Exact k-NN
-/// scan for small centroid sets — anything the search's own `ef` visit
+/// scan for small centroid indexs — anything the search's own `ef` visit
 /// budget would cover wholesale anyway, where the brute scan is at most
 /// as expensive and exact (an approximate graph over a handful of points
 /// can return fewer than `knn` neighbours, silently under-assigning) —

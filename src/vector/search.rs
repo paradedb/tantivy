@@ -224,17 +224,17 @@ where
 
     // The routed tier, over the clustered segments.
     if !segments.is_empty() {
-        let set = searcher.index().centroid_set_search_index()?;
+        let set = searcher.index().centroid_index_view()?;
         let router = set.field_router(field).ok_or_else(|| {
             TantivyError::InternalError(format!(
-                "the centroid set has no router for field {field:?}"
+                "the centroid index has no router for field {field:?}"
             ))
         })?;
         let num_centroids = router.num_centroids();
         for segment in &segments {
             if segment.ivf().num_clusters() != num_centroids {
                 return Err(TantivyError::InternalError(format!(
-                    "segment {} holds {} clusters but the centroid set holds {num_centroids}",
+                    "segment {} holds {} clusters but the centroid index holds {num_centroids}",
                     segment.ord,
                     segment.ivf().num_clusters(),
                 )));

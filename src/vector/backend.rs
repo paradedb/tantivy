@@ -1132,7 +1132,7 @@ mod tests {
         Ok(())
     }
 
-    /// A single-centroid set writes no router slot; routing takes the
+    /// A single-centroid index writes no router slot; routing takes the
     /// exact linear fallback and still returns the exact top-K.
     #[test]
     fn single_centroid_routes_without_router_slot() -> crate::Result<()> {
@@ -1620,7 +1620,7 @@ mod tests {
     }
     // ---- The flat (mutable/staging) tier ----
 
-    /// [`build_ivf`] without a centroid set: every segment stores flat.
+    /// [`build_ivf`] without a centroid index: every segment stores flat.
     fn build_flat(
         metric: Metric,
         commits: &[&[(&str, [f32; 2])]],

@@ -54,7 +54,7 @@ pub(crate) mod vec_slot {
 /// `centroids.<version>` composite slot indices (the index-level set file).
 /// The body is prefixed by the set's `u64` version, after the format header
 /// and before the composite.
-pub(crate) mod centroid_set_slot {
+pub(crate) mod centroid_index_slot {
     /// `num_centroids: u32` + the centroid rows (normalized at creation).
     pub(crate) const CENTROIDS: usize = 0;
     /// The routing structure over the centroids. OPTIONAL: absent for

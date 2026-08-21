@@ -90,7 +90,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             index_settings: index.settings().clone(),
             persisted_custom_extensions,
             // Written at index creation; this rebuild must not drop it.
-            centroid_set: previous_meta.centroid_set.clone(),
+            centroid_index: previous_meta.centroid_index.clone(),
             segments: vec![segment_meta.clone()],
             schema: index.schema(),
             opstamp: 0,
@@ -105,8 +105,8 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
                 std::slice::from_ref(segment_meta),
                 &index_meta.persisted_custom_extensions,
             );
-            if let Some(centroid_set) = &index_meta.centroid_set {
-                living_files.insert(std::path::PathBuf::from(&centroid_set.filename));
+            if let Some(centroid_index) = &index_meta.centroid_index {
+                living_files.insert(std::path::PathBuf::from(&centroid_index.filename));
             }
             living_files.insert(crate::core::META_FILEPATH.to_path_buf());
             index.directory_mut().garbage_collect(|| living_files)?;

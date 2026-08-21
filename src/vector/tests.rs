@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::collector::Count;
-use crate::index::CentroidSetMeta;
+use crate::index::CentroidIndexMeta;
 use crate::indexer::NoMergePolicy;
 use crate::query::TermQuery;
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
@@ -166,16 +166,16 @@ impl CentroidProducer for Grid2DCentroidProducer {
     }
 }
 
-/// Resolve and open the index's newest centroid set file.
-pub(crate) fn open_centroid_set(
+/// Resolve and open the index's newest centroid index file.
+pub(crate) fn open_centroid_index(
     index: &Index,
-) -> crate::Result<crate::vector::centroid_set::CentroidSetReader> {
+) -> crate::Result<crate::vector::centroid_index::CentroidIndexReader> {
     let meta = index.load_metas()?;
-    let set: &CentroidSetMeta = meta
-        .centroid_set
+    let set: &CentroidIndexMeta = meta
+        .centroid_index
         .as_ref()
-        .expect("index has a centroid set");
-    crate::vector::centroid_set::CentroidSetReader::open(
+        .expect("index has a centroid index");
+    crate::vector::centroid_index::CentroidIndexReader::open(
         index.directory(),
         std::path::Path::new(&set.filename),
     )
@@ -313,7 +313,7 @@ fn set_centroids_round_trip_and_drive_assignment() -> crate::Result<()> {
         .flat_map(|vector| vector.iter().copied())
         .collect();
 
-    let set = open_centroid_set(&index.index)?;
+    let set = open_centroid_index(&index.index)?;
     let field_centroids = set.field_centroids(index.embedding_field(), &index.vector_options())?;
     assert_eq!(field_centroids.num_centroids(), centroids.len());
     assert_eq!(
@@ -352,7 +352,7 @@ fn set_centroids_round_trip_and_drive_assignment() -> crate::Result<()> {
 /// The set file's router slot: tag byte 0 (tantivy RNG) followed by the
 /// serialized centroid graph.
 #[test]
-fn centroid_set_writes_tagged_router_slot() -> crate::Result<()> {
+fn centroid_index_writes_tagged_router_slot() -> crate::Result<()> {
     use crate::vector::ivf::graph::EMPTY;
     use crate::vector::{NeighborhoodGraphConfig, ROUTER_KIND_RNG};
 
@@ -360,7 +360,7 @@ fn centroid_set_writes_tagged_router_slot() -> crate::Result<()> {
     let index = TestVectorIndex::builder(VectorDType::F32)
         .centroids(&centroids)
         .build()?;
-    let set = open_centroid_set(&index.index)?;
+    let set = open_centroid_index(&index.index)?;
     let router_bytes = set
         .router_slice(index.embedding_field())
         .expect("the set must write a router slot for C > 1")
@@ -739,17 +739,17 @@ mod grid2d {
 }
 
 // ======================================================================
-// Index creation, meta, and GC around the centroid set file
+// Index creation, meta, and GC around the centroid index file
 // ======================================================================
 
-mod centroid_set_lifecycle_tests {
+mod centroid_index_lifecycle_tests {
     use std::sync::Arc;
 
-    use super::{open_centroid_set, Grid2DCentroidProducer, SingleCellCentroidProducer};
+    use super::{open_centroid_index, Grid2DCentroidProducer, SingleCellCentroidProducer};
     use crate::directory::{Directory, RamDirectory};
     use crate::indexer::NoMergePolicy;
     use crate::schema::{Schema, STORED, STRING};
-    use crate::vector::centroid_set::centroid_set_filename;
+    use crate::vector::centroid_index::centroid_index_filename;
     use crate::vector::{Metric, VectorOptions};
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -781,13 +781,13 @@ mod centroid_set_lifecycle_tests {
             .schema(vector_schema())
             .create_in_ram()
             .expect("a no-set index stores vectors flat");
-        assert!(index.load_metas().unwrap().centroid_set.is_none());
+        assert!(index.load_metas().unwrap().centroid_index.is_none());
     }
 
     /// The set file is written at creation, listed in the meta, carried
     /// forward through commits, and survives commit-triggered GC.
     #[test]
-    fn centroid_set_file_survives_commits_and_gc() -> crate::Result<()> {
+    fn centroid_index_file_survives_commits_and_gc() -> crate::Result<()> {
         let directory = RamDirectory::create();
         let index = Index::builder()
             .schema(vector_schema())
@@ -796,11 +796,11 @@ mod centroid_set_lifecycle_tests {
             }))
             .create(directory.clone())?;
         let embed_field = index.schema().get_field("embedding").unwrap();
-        let set_path = centroid_set_filename();
+        let set_path = centroid_index_filename();
         assert!(directory.exists(&set_path)?, "set file written at creation");
         assert_eq!(
-            index.load_metas()?.centroid_set,
-            Some(crate::index::CentroidSetMeta {
+            index.load_metas()?.centroid_index,
+            Some(crate::index::CentroidIndexMeta {
                 filename: set_path.to_string_lossy().into_owned(),
             })
         );
@@ -817,12 +817,12 @@ mod centroid_set_lifecycle_tests {
         writer.garbage_collect_files().wait()?;
         assert!(
             directory.exists(&set_path)?,
-            "GC must keep the centroid set file alive"
+            "GC must keep the centroid index file alive"
         );
         // Meta still lists the set after save_metas rebuilds the meta.
-        assert!(index.load_metas()?.centroid_set.is_some());
+        assert!(index.load_metas()?.centroid_index.is_some());
         // And the file still opens.
-        open_centroid_set(&index)?;
+        open_centroid_index(&index)?;
 
         // Merges keep working against the set.
         let segment_ids = index.searchable_segment_ids()?;
@@ -837,12 +837,12 @@ mod centroid_set_lifecycle_tests {
         Ok(())
     }
 
-    /// An index created without a centroid set writes the flat layout:
+    /// An index created without a centroid index writes the flat layout:
     /// no set file, no IVF remainder, doc-ordered rows.
     #[test]
     fn index_without_set_writes_flat() -> crate::Result<()> {
         let index = Index::builder().schema(vector_schema()).create_in_ram()?;
-        assert!(index.load_metas()?.centroid_set.is_none());
+        assert!(index.load_metas()?.centroid_index.is_none());
 
         let embed_field = index.schema().get_field("embedding").unwrap();
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -916,19 +916,21 @@ mod bounds_storage_tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    use super::{open_centroid_set, Grid2DCentroidProducer, TestVectorIndex, EMBEDDING_FIELD_NAME};
+    use super::{
+        open_centroid_index, Grid2DCentroidProducer, TestVectorIndex, EMBEDDING_FIELD_NAME,
+    };
     use crate::directory::{Directory, RamDirectory, TerminatingWrite};
     use crate::index::SegmentComponent;
     use crate::indexer::NoMergePolicy;
     use crate::schema::{Schema, STORED, STRING};
-    use crate::vector::centroid_set::FieldCentroids;
+    use crate::vector::centroid_index::FieldCentroids;
     use crate::vector::ivf::IvfIndex;
     use crate::vector::{residual_norm, BoundKind, Metric, VectorDType, VectorOptions, VEC_EXT};
     use crate::{Index, IndexWriter, TantivyDocument};
 
     /// Recompute one segment's expected fold from its stored artifacts:
     /// per cluster, max [`residual_norm`] over the cluster's rows against
-    /// the SET's stored centroid. Valid for `replicas == 1` builds, where
+    /// the centroid index's stored centroid. Valid for `replicas == 1` builds, where
     /// every posting row is native.
     fn fresh_fold(
         vec_reader: &crate::vector::VectorIndexReader,
@@ -976,7 +978,7 @@ mod bounds_storage_tests {
                 .metric(metric)
                 .build()?;
             let field = fixture.embedding_field();
-            let set = open_centroid_set(&fixture.index)?;
+            let set = open_centroid_index(&fixture.index)?;
             let set_field = set.field_centroids(field, &fixture.vector_options())?;
             let searcher = fixture.index.reader()?.searcher();
             let mut ivf_segments = 0usize;
@@ -1054,7 +1056,7 @@ mod bounds_storage_tests {
     /// Saturation: a huge-but-finite L2 member whose residual overflows
     /// `f32` saturates its cluster through `add_native`; a zero-norm
     /// cosine centroid saturates through the degenerate-centroid mark
-    /// (recomputed from the SET's stored bytes). Finite clusters stay
+    /// (recomputed from the centroid index's stored bytes). Finite clusters stay
     /// finite.
     #[test]
     fn saturated_sentinel() -> crate::Result<()> {
@@ -1137,7 +1139,7 @@ mod bounds_storage_tests {
         // Stage 2: merge the merged segments.
         merge_all(&index)?;
 
-        let set = open_centroid_set(&index)?;
+        let set = open_centroid_index(&index)?;
         let opts = VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32);
         let set_field = set.field_centroids(field, &opts)?;
         let searcher = index.reader()?.searcher();
