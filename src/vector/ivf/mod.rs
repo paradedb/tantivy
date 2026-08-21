@@ -7,16 +7,16 @@
 //! flat layout instead, written inline by
 //! [`VecWriter`](crate::vector::VecWriter).)
 
-pub(crate) mod assign;
+pub(crate) mod assignments;
 pub(crate) mod bounds;
 pub(crate) mod centroid_index;
 pub(crate) mod graph;
 mod params;
 mod partition;
 mod plugin;
-mod segment_clusters;
 mod types;
 
+pub use assignments::{IvfSearchMetrics, SegmentClusters};
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
@@ -24,6 +24,5 @@ pub use graph::{
 };
 pub use params::AdaptiveProbeParams;
 pub(crate) use plugin::{merge_ivf, write_ivf_field, IvfFieldWriteParams};
-pub use segment_clusters::{IvfSearchMetrics, SegmentClusters};
 pub(crate) use types::{decode_row, encode_vector};
 pub use types::{IvfCentroids, IvfMatrix};

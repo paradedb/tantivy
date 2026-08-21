@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use common::BitSet;
 
-use super::assign::{assign_cells, CentroidSelector};
+use super::assignments::{assign_cells, CentroidSelector};
 use super::graph::RelativeNeighborhoodGraph;
 use super::{decode_row, SegmentClusters};
 use crate::directory::{CompositeWrite, Directory};
