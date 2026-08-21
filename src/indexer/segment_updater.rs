@@ -318,9 +318,9 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         index_settings: target_settings.clone(), /* index_settings of all segments should be the
                                                   * same */
         persisted_custom_extensions: persisted_custom_extensions.clone(),
-        // The offline merge path does not carry index-level centroid indexs;
-        // an output schema with vector fields fails the merge instead
-        // (merge_ivf errors on the missing set).
+        // The offline merge path does not carry an index-level centroid
+        // index; vector merges route to merge_flat, which refuses
+        // clustered sources.
         centroid_index: None,
         segments: vec![segment_meta],
         schema: target_schema.clone(),
@@ -539,8 +539,8 @@ impl SegmentUpdater {
                 index_settings: index.settings().clone(),
                 // The required plugin set is fixed at index creation; carry it forward.
                 persisted_custom_extensions: previous_meta.persisted_custom_extensions.clone(),
-                // The centroid indexs are written at index creation (and by
-                // future re-publishes); this rebuild must not drop them.
+                // The centroid index is written at index creation; this
+                // rebuild must not drop it.
                 centroid_index: previous_meta.centroid_index.clone(),
                 segments: committed_segment_metas,
                 schema: index.schema(),

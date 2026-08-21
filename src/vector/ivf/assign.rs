@@ -68,8 +68,8 @@ fn exact_nearest_centroids(
     scored.into_iter().map(|(_, id)| id).collect()
 }
 
-/// How a vector's cells are picked from the set's centroids. Exact k-NN
-/// scan for small centroid indexs — anything the search's own `ef` visit
+/// How a vector's cells are picked from the stored centroids. Exact
+/// k-NN scan for a small centroid index — anything the search's own `ef` visit
 /// budget would cover wholesale anyway, where the brute scan is at most
 /// as expensive and exact (an approximate graph over a handful of points
 /// can return fewer than `knn` neighbours, silently under-assigning) —

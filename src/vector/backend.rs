@@ -1159,8 +1159,8 @@ mod tests {
     // ==========================================================
 
     /// A single commit — no merge — already stores the clustered V3
-    /// layout against the index-level set: correct centroid count, the
-    /// set's version stamp, and every doc in its primary cluster.
+    /// layout against the index-level centroid index: correct centroid
+    /// count, every doc in its primary cluster.
     #[test]
     fn commit_segment_is_clustered_against_the_set() -> crate::Result<()> {
         let (centroids, labels) = replication_fixture();
@@ -1368,7 +1368,7 @@ mod tests {
 
     /// A replicated IVF segment can be a merge SOURCE: merge it with a
     /// fresh commit segment and every doc — old and new — fills its cells
-    /// against the same set, stamped with the same version.
+    /// against the same centroids.
     #[test]
     fn remerge_replicated_segment() -> crate::Result<()> {
         let (centroids, labels) = replication_fixture();

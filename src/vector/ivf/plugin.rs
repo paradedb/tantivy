@@ -335,11 +335,11 @@ const DOC_DROPPED: DocId = DocId::MAX;
 /// segments moved into this index) have no cells yet, so ONLY their rows
 /// are assigned here.
 ///
-/// The postings carry-over is sound because the merge already refused
-/// mixed centroid-set versions: the sources assigned against the very set
-/// this target uses, and assignment is deterministic, so re-running it
-/// would reproduce these exact cells. Replica entries ride along in the
-/// postings, so the per-vector k-NN never runs for them.
+/// The postings carry-over is sound because the index has exactly one
+/// immutable centroid index: the sources assigned against the very
+/// centroids this target uses, and assignment is deterministic, so
+/// re-running it would reproduce these exact cells. Replica entries ride
+/// along in the postings, so the per-vector k-NN never runs for them.
 ///
 /// `old_to_new[segment_ord][doc_id]` is the target doc id, or
 /// [`DOC_DROPPED`] for a doc the merge is dropping.

@@ -46,8 +46,7 @@ pub(crate) mod vec_slot {
     /// Per-cluster centroid bounds: a segment-level kind byte, then the
     /// per-cluster payload folded over this segment's NATIVE rows.
     pub(crate) const BOUNDS: usize = 3;
-    /// Per-segment IVF metadata: distinct doc count, centroid count, and
-    /// the centroid-set version this segment assigned against.
+    /// Per-segment IVF metadata: distinct doc count and centroid count.
     pub(crate) const IVF_META: usize = 4;
 }
 

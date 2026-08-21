@@ -36,8 +36,8 @@ use crate::schema::VectorOptions;
 use crate::vector::{BoundKind, BoundStore};
 
 /// The per-segment IVF remainder for one field: which contiguous row
-/// ranges of the `.vec` rows form each cluster, the per-cluster bounds,
-/// and the centroid-set version the segment assigned against.
+/// ranges of the `.vec` rows form each cluster, plus the per-cluster
+/// bounds.
 ///
 /// Everything here is small and pinned; the row-scale payload (rows,
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader),
@@ -47,7 +47,6 @@ pub struct IvfIndex {
     /// Distinct documents with a vector in this field. Rows including
     /// replicas are [`Self::num_rows`].
     num_docs: usize,
-    /// The centroid-set version this segment's assignments index into.
     /// Slot `[2]`: the `u64[C+1]` prefix sum, pinned.
     cluster_offsets: OwnedBytes,
     /// Slot `[3]`, pinned: the segment-level bound kind.

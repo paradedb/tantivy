@@ -440,10 +440,6 @@ pub struct Index {
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
-    /// Search-time centroid indexs by version, opened once and shared across
-    /// clones — the router adjacency is far too heavy to parse per query.
-    /// Set files are immutable and version-named, so entries never
-    /// invalidate.
     centroid_index_cache: Arc<std::sync::RwLock<Option<Arc<CentroidIndexView>>>>,
 }
 
@@ -943,9 +939,9 @@ impl Index {
         self.segment(segment_meta)
     }
 
-    /// The search-time view of the centroid index stamped `version`, opened
-    /// on first use and cached for the life of this `Index` (and all its
-    /// clones).
+    /// The search-time view of the centroid index, opened on first use
+    /// and cached for the life of this `Index` (and all its clones) — the
+    /// file is immutable, so the cache never invalidates.
     pub(crate) fn centroid_index_view(&self) -> crate::Result<Arc<CentroidIndexView>> {
         if let Some(set) = self
             .centroid_index_cache
