@@ -6,11 +6,12 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::io::Write;
 
 use super::centroid_index::CentroidIndexReader;
 use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use super::flat::write_flat_field;
-use super::header::write_header;
+use super::header::{vec_slot, write_header};
+use super::id_map::IdMap;
 use super::ivf::{write_ivf_field, IvfFieldWriteParams};
 use super::VEC_EXT;
 use crate::directory::CompositeWrite;
@@ -198,7 +199,16 @@ impl PluginWriter for VecWriter {
             }
 
             let Some((set_search, set_reader)) = &set else {
-                write_flat_field(&mut composite, *field, &present, &row_bytes, self.num_docs)?;
+                // Flat layout (no centroid index — the mutable/staging
+                // tier): the `Identity`/`Bitmap` id-map and the
+                // doc-ordered rows, nothing else. Searched exhaustively;
+                // clustered at its first merge into a real index.
+                let id_map_w = composite.for_field_with_idx(*field, vec_slot::ID_MAP);
+                IdMap::serialize(&present, self.num_docs, id_map_w)?;
+                id_map_w.flush()?;
+                let rows_w = composite.for_field_with_idx(*field, vec_slot::ROWS);
+                rows_w.write_all(&row_bytes)?;
+                rows_w.flush()?;
                 continue;
             };
 

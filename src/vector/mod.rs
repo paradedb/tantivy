@@ -15,7 +15,6 @@ mod bounds;
 pub(crate) mod centroid_index;
 mod collector;
 mod distance;
-mod flat;
 mod header;
 mod id_map;
 mod index_reader;
