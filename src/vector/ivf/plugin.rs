@@ -649,8 +649,7 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     };
     let set_search = index.centroid_index_view()?;
     let directory = index.directory();
-    let set_reader =
-        CentroidIndexReader::open(directory, std::path::Path::new(&centroid_index.filename))?;
+    let set_reader = CentroidIndexReader::open(directory, std::path::Path::new(centroid_index))?;
 
     let vec_path = ctx
         .target_segment

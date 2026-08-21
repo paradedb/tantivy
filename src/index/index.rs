@@ -15,8 +15,7 @@ use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_L
 use crate::error::{DataCorruption, TantivyError};
 use crate::fastfield::FastFieldsPlugin;
 use crate::index::{
-    CentroidIndexMeta, IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta,
-    SegmentMetaInventory,
+    IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta, SegmentMetaInventory,
 };
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
@@ -125,7 +124,7 @@ fn save_new_metas(
     schema: Schema,
     index_settings: IndexSettings,
     plugins: &[Arc<dyn SegmentPlugin>],
-    centroid_index: Option<CentroidIndexMeta>,
+    centroid_index: Option<String>,
     directory: &dyn Directory,
 ) -> crate::Result<()> {
     let persisted_custom_extensions: Vec<String> = plugins
@@ -409,9 +408,7 @@ impl IndexBuilder {
             Some(centroid_producer) => {
                 let schema = self.get_expect_schema()?;
                 let path = write_centroid_index(&directory, &schema, centroid_producer.as_ref())?;
-                Some(CentroidIndexMeta {
-                    filename: path.to_string_lossy().into_owned(),
-                })
+                Some(path.to_string_lossy().into_owned())
             }
             None => None,
         };
@@ -966,7 +963,7 @@ impl Index {
         })?;
         let set = Arc::new(CentroidIndexView::open(
             &self.directory,
-            Path::new(&entry.filename),
+            Path::new(&entry),
             &self.schema,
         )?);
         Ok(Arc::clone(

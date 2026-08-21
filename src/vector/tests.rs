@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use crate::collector::Count;
-use crate::index::CentroidIndexMeta;
 use crate::indexer::NoMergePolicy;
 use crate::query::TermQuery;
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
@@ -171,13 +170,13 @@ pub(crate) fn open_centroid_index(
     index: &Index,
 ) -> crate::Result<crate::vector::centroid_index::CentroidIndexReader> {
     let meta = index.load_metas()?;
-    let set: &CentroidIndexMeta = meta
+    let filename = meta
         .centroid_index
         .as_ref()
         .expect("index has a centroid index");
     crate::vector::centroid_index::CentroidIndexReader::open(
         index.directory(),
-        std::path::Path::new(&set.filename),
+        std::path::Path::new(filename),
     )
 }
 
@@ -800,9 +799,7 @@ mod centroid_index_lifecycle_tests {
         assert!(directory.exists(&set_path)?, "set file written at creation");
         assert_eq!(
             index.load_metas()?.centroid_index,
-            Some(crate::index::CentroidIndexMeta {
-                filename: set_path.to_string_lossy().into_owned(),
-            })
+            Some(set_path.to_string_lossy().into_owned())
         );
 
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;

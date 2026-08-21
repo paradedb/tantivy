@@ -407,15 +407,6 @@ impl Order {
     }
 }
 
-/// The index-level centroid index's managed file (`centroids`). Recorded in
-/// `meta.json` so its presence decides the vector layout (clustered vs
-/// flat) and garbage collection keeps the file alive.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CentroidIndexMeta {
-    /// The managed file name.
-    pub filename: String,
-}
-
 /// Meta information about the `Index`.
 ///
 /// This object is serialized on disk in the `meta.json` file.
@@ -438,12 +429,13 @@ pub struct IndexMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub persisted_custom_extensions: Vec<String>,
-    /// The index-level centroid index, written at index creation.
-    /// `None` for an index with no vector fields. Segments stamp the
-    /// version they assigned against into their `.vec` IVF meta.
+    /// Managed file name of the index-level centroid index, written at
+    /// index creation. Its presence decides the vector layout (clustered
+    /// vs flat) and garbage collection keeps the file alive. `None` for
+    /// an index whose vector fields (if any) store flat.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub centroid_index: Option<CentroidIndexMeta>,
+    pub centroid_index: Option<String>,
     /// List of `SegmentMeta` information associated with each finalized segment of the index.
     pub segments: Vec<SegmentMeta>,
     /// Index `Schema`
@@ -467,7 +459,7 @@ struct UntrackedIndexMeta {
     #[serde(default)]
     pub persisted_custom_extensions: Vec<String>,
     #[serde(default)]
-    pub centroid_index: Option<CentroidIndexMeta>,
+    pub centroid_index: Option<String>,
     pub schema: Schema,
     pub opstamp: Opstamp,
     #[serde(skip_serializing_if = "Option::is_none")]

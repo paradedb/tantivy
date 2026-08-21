@@ -580,7 +580,7 @@ impl SegmentUpdater {
         // meta lists them — without this, the very next commit-triggered GC
         // would delete them.
         if let Some(centroid_index) = &meta.centroid_index {
-            files.insert(PathBuf::from(&centroid_index.filename));
+            files.insert(PathBuf::from(centroid_index));
         }
         files.insert(META_FILEPATH.to_path_buf());
         files

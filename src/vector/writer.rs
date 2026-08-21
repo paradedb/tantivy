@@ -160,7 +160,7 @@ impl PluginWriter for VecWriter {
                 let set_search = index.centroid_index_view()?;
                 let set_reader = CentroidIndexReader::open(
                     index.directory(),
-                    std::path::Path::new(&centroid_index.filename),
+                    std::path::Path::new(centroid_index),
                 )?;
                 Some((set_search, set_reader))
             }

@@ -106,7 +106,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
                 &index_meta.persisted_custom_extensions,
             );
             if let Some(centroid_index) = &index_meta.centroid_index {
-                living_files.insert(std::path::PathBuf::from(&centroid_index.filename));
+                living_files.insert(std::path::PathBuf::from(centroid_index));
             }
             living_files.insert(crate::core::META_FILEPATH.to_path_buf());
             index.directory_mut().garbage_collect(|| living_files)?;
