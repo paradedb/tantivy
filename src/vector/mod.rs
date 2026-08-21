@@ -39,7 +39,7 @@ pub use bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
     BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
-pub(crate) use centroid_index::{write_centroid_index, CachedCentroidIndex};
+pub(crate) use centroid_index::CachedCentroidIndex;
 pub use centroid_index::{CentroidProducer, ROUTER_KIND_RNG};
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{

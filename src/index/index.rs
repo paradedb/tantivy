@@ -28,7 +28,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{write_centroid_index, CachedCentroidIndex, CentroidProducer, VectorPlugin};
+use crate::vector::{CachedCentroidIndex, CentroidProducer, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -405,7 +405,7 @@ impl IndexBuilder {
         let centroid_index = match &self.centroid_producer {
             Some(centroid_producer) => {
                 let schema = self.get_expect_schema()?;
-                let path = write_centroid_index(&directory, &schema, centroid_producer.as_ref())?;
+                let path = centroid_producer.serialize(&directory, &schema)?;
                 Some(path.to_string_lossy().into_owned())
             }
             None => None,

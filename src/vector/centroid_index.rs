@@ -86,120 +86,117 @@ pub trait CentroidProducer: Send + Sync + 'static {
         graph.serialize(out)?;
         Ok(())
     }
+
+    /// Pull every vector field's centroids, validate and normalize them,
+    /// and write the `centroids` file — the canonical serialization the
+    /// readers expect. Called at index creation, BEFORE the first
+    /// `meta.json` references the file. Returns the written file name.
+    fn serialize(&self, directory: &dyn Directory, schema: &Schema) -> crate::Result<PathBuf> {
+        let path = centroid_index_filename();
+        let mut write = directory.open_write(&path)?;
+        write_header(&mut write)?;
+        let mut composite = CompositeWrite::wrap(write);
+
+        for (field, entry) in schema.fields() {
+            let opts = match entry.field_type() {
+                FieldType::Vector(opts) => opts,
+                _ => continue,
+            };
+            let centroids = self.centroids(field, opts)?;
+            let IvfCentroids::F32(matrix) = &centroids;
+            if matrix.dims != opts.dim() {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "CentroidProducer produced centroids with {} dimensions for field '{}', \
+                     expected {}",
+                    matrix.dims,
+                    entry.name(),
+                    opts.dim()
+                )));
+            }
+            if matrix.values.len() != matrix.rows * matrix.dims {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "CentroidProducer produced {} centroid values for {} rows x {} dimensions in \
+                     field '{}'",
+                    matrix.values.len(),
+                    matrix.rows,
+                    matrix.dims,
+                    entry.name()
+                )));
+            }
+            if matrix.rows == 0 {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "CentroidProducer produced no centroids for field '{}'",
+                    entry.name()
+                )));
+            }
+            u32::try_from(matrix.rows).map_err(|_| {
+                TantivyError::InvalidArgument(format!(
+                    "CentroidProducer produced more than u32::MAX centroids for field '{}'",
+                    entry.name()
+                ))
+            })?;
+
+            // Normalize INTO the stored bytes for Cosine, so the segment
+            // bounds folds and the future search path all score the exact
+            // bytes written here. Non-finite centroids are a hard creation
+            // error — this is consumer input at its validation boundary. A
+            // zero-norm row under Cosine stays as-is; assignment tolerates it
+            // and the segment bounds fold saturates its cluster.
+            let mut normalized_values: Vec<f32> = Vec::with_capacity(matrix.values.len());
+            let mut centroid_bytes = Vec::with_capacity(matrix.rows * opts.bytes_per_vector());
+            for (centroid_ord, centroid) in matrix.values.chunks_exact(opts.dim()).enumerate() {
+                let mut bytes = encode_vector(centroid, opts.dim())?;
+                if maybe_normalize_bytes(opts, &mut bytes) == NormalizeOutcome::NonFinite {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "CentroidProducer produced a non-finite centroid (ord {centroid_ord}) for \
+                         field '{}'",
+                        entry.name()
+                    )));
+                }
+                normalized_values.extend_from_slice(&decode_row::<f32>(&bytes, opts.dim())?);
+                centroid_bytes.extend_from_slice(&bytes);
+            }
+
+            {
+                let centroids_w =
+                    composite.for_field_with_idx(field, centroid_index_slot::CENTROIDS);
+                (matrix.rows as u32).serialize(centroids_w)?;
+                centroids_w.write_all(&centroid_bytes)?;
+                centroids_w.flush()?;
+            }
+
+            // The router slot: skipped for degenerate centroid counts, where
+            // routing is a linear scan a structure cannot beat.
+            if matrix.rows > 1 {
+                let normalized = IvfCentroids::F32(super::ivf::IvfMatrix {
+                    values: normalized_values,
+                    rows: matrix.rows,
+                    dims: matrix.dims,
+                });
+                let router_w = composite.for_field_with_idx(field, centroid_index_slot::ROUTER);
+                let mut sink = RouterSlotWriter {
+                    out: router_w,
+                    written: 0,
+                };
+                self.serialize_router(field, opts, &normalized, &mut sink)?;
+                if sink.written == 0 {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "CentroidProducer::serialize_router wrote no router payload for field \
+                         '{}'; the payload must start with a router-kind tag byte",
+                        entry.name()
+                    )));
+                }
+                sink.out.flush()?;
+            }
+        }
+        composite.close()?;
+        Ok(path)
+    }
 }
 
 /// The managed file name of the index's one centroid index.
 pub(crate) fn centroid_index_filename() -> PathBuf {
     PathBuf::from("centroids")
-}
-
-/// Pull every vector field's centroids from `provider`, validate and
-/// normalize them, and write the `centroids` file. Called at
-/// index creation, BEFORE the first `meta.json` references the file.
-/// Returns the written file name.
-pub(crate) fn write_centroid_index(
-    directory: &dyn Directory,
-    schema: &Schema,
-    provider: &dyn CentroidProducer,
-) -> crate::Result<PathBuf> {
-    let path = centroid_index_filename();
-    let mut write = directory.open_write(&path)?;
-    write_header(&mut write)?;
-    let mut composite = CompositeWrite::wrap(write);
-
-    for (field, entry) in schema.fields() {
-        let opts = match entry.field_type() {
-            FieldType::Vector(opts) => opts,
-            _ => continue,
-        };
-        let centroids = provider.centroids(field, opts)?;
-        let IvfCentroids::F32(matrix) = &centroids;
-        if matrix.dims != opts.dim() {
-            return Err(TantivyError::InvalidArgument(format!(
-                "CentroidProducer produced centroids with {} dimensions for field '{}', expected \
-                 {}",
-                matrix.dims,
-                entry.name(),
-                opts.dim()
-            )));
-        }
-        if matrix.values.len() != matrix.rows * matrix.dims {
-            return Err(TantivyError::InvalidArgument(format!(
-                "CentroidProducer produced {} centroid values for {} rows x {} dimensions in \
-                 field '{}'",
-                matrix.values.len(),
-                matrix.rows,
-                matrix.dims,
-                entry.name()
-            )));
-        }
-        if matrix.rows == 0 {
-            return Err(TantivyError::InvalidArgument(format!(
-                "CentroidProducer produced no centroids for field '{}'",
-                entry.name()
-            )));
-        }
-        u32::try_from(matrix.rows).map_err(|_| {
-            TantivyError::InvalidArgument(format!(
-                "CentroidProducer produced more than u32::MAX centroids for field '{}'",
-                entry.name()
-            ))
-        })?;
-
-        // Normalize INTO the stored bytes for Cosine, so the segment
-        // bounds folds and the future search path all score the exact
-        // bytes written here. Non-finite centroids are a hard creation
-        // error — this is consumer input at its validation boundary. A
-        // zero-norm row under Cosine stays as-is; assignment tolerates it
-        // and the segment bounds fold saturates its cluster.
-        let mut normalized_values: Vec<f32> = Vec::with_capacity(matrix.values.len());
-        let mut centroid_bytes = Vec::with_capacity(matrix.rows * opts.bytes_per_vector());
-        for (centroid_ord, centroid) in matrix.values.chunks_exact(opts.dim()).enumerate() {
-            let mut bytes = encode_vector(centroid, opts.dim())?;
-            if maybe_normalize_bytes(opts, &mut bytes) == NormalizeOutcome::NonFinite {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "CentroidProducer produced a non-finite centroid (ord {centroid_ord}) for \
-                     field '{}'",
-                    entry.name()
-                )));
-            }
-            normalized_values.extend_from_slice(&decode_row::<f32>(&bytes, opts.dim())?);
-            centroid_bytes.extend_from_slice(&bytes);
-        }
-
-        {
-            let centroids_w = composite.for_field_with_idx(field, centroid_index_slot::CENTROIDS);
-            (matrix.rows as u32).serialize(centroids_w)?;
-            centroids_w.write_all(&centroid_bytes)?;
-            centroids_w.flush()?;
-        }
-
-        // The router slot: skipped for degenerate centroid counts, where
-        // routing is a linear scan a structure cannot beat.
-        if matrix.rows > 1 {
-            let normalized = IvfCentroids::F32(super::ivf::IvfMatrix {
-                values: normalized_values,
-                rows: matrix.rows,
-                dims: matrix.dims,
-            });
-            let router_w = composite.for_field_with_idx(field, centroid_index_slot::ROUTER);
-            let mut sink = RouterSlotWriter {
-                out: router_w,
-                written: 0,
-            };
-            provider.serialize_router(field, opts, &normalized, &mut sink)?;
-            if sink.written == 0 {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "CentroidProducer::serialize_router wrote no router payload for field '{}'; \
-                     the payload must start with a router-kind tag byte",
-                    entry.name()
-                )));
-            }
-            sink.out.flush()?;
-        }
-    }
-    composite.close()?;
-    Ok(path)
 }
 
 /// `Write` adapter counting the router payload so an empty (tag-less)
