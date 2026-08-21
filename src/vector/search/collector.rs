@@ -30,7 +30,8 @@ use super::tie_break::NoTieBreak;
 use super::{global_top_n_by, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
-    Collector, SegmentCollector, SegmentSortKeyComputer, SortKeyComputer, TopNComputer,
+    Collector, CollectorMode, SegmentCollector, SegmentSortKeyComputer, SortKeyComputer,
+    TopNComputer,
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
@@ -352,8 +353,11 @@ where
         false
     }
 
-    fn multi_segment_selection(&self, searcher: &Searcher) -> crate::Result<Vec<SegmentOrdinal>> {
-        let mut selection = Vec::new();
+    fn collection_mode(&self, searcher: &Searcher) -> crate::Result<CollectorMode> {
+        // Clustered segments are coupled — shared cluster ids, one
+        // routing pass, one heap; flat segments are not and collect
+        // per-segment.
+        let mut clustered = Vec::new();
         for (ord, reader) in searcher.segment_readers().iter().enumerate() {
             let ord = ord as SegmentOrdinal;
             if let Some(allowed) = &self.segments {
@@ -362,10 +366,14 @@ where
                 }
             }
             if reader.vector_index(self.field)?.clusters().is_some() {
-                selection.push(ord);
+                clustered.push(ord);
             }
         }
-        Ok(selection)
+        if clustered.is_empty() {
+            Ok(CollectorMode::SingleSegment)
+        } else {
+            Ok(CollectorMode::MultiSegment(clustered))
+        }
     }
 
     /// Per-segment collection, i.e. the flat tier. Skipped without

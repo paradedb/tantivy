@@ -126,6 +126,21 @@ pub trait Fruit: Send + downcast_rs::Downcast {}
 
 impl<T> Fruit for T where T: Send + downcast_rs::Downcast {}
 
+/// How a collector wants a search executed — see
+/// [`Collector::collection_mode`].
+#[derive(Debug, Clone, Default)]
+pub enum CollectorMode {
+    /// The standard path: every segment is collected independently
+    /// through [`Collector::collect_segment`].
+    #[default]
+    SingleSegment,
+    /// The listed segments are COUPLED and collected in one
+    /// [`Collector::collect_multi_segment`] pass; every other segment
+    /// still collects through the standard per-segment path. All fruits
+    /// meet in [`Collector::merge_fruits`].
+    MultiSegment(Vec<SegmentOrdinal>),
+}
+
 /// Collectors are in charge of collecting and retaining relevant
 /// information from the document found and scored by the query.
 ///
@@ -173,25 +188,20 @@ pub trait Collector: Sync + Send {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
 
-    /// The segments that need one COUPLED pass
-    /// ([`Self::collect_multi_segment`]); every other segment goes
-    /// through the standard per-segment path, and all fruits meet in
-    /// [`Self::merge_fruits`]. Vector search selects the clustered
-    /// segments here — they share one routing pass and one heap — while
-    /// flat segments collect per-segment like any other collector.
-    ///
-    /// Empty (the default) collects every segment per-segment.
-    fn multi_segment_selection(
-        &self,
-        _searcher: &crate::Searcher,
-    ) -> crate::Result<Vec<SegmentOrdinal>> {
-        Ok(Vec::new())
+    /// How this collector wants the search executed. The default,
+    /// [`CollectorMode::SingleSegment`], is the standard per-segment
+    /// path. A collector with cross-segment coupling returns
+    /// [`CollectorMode::MultiSegment`] naming the coupled segments —
+    /// vector search lists the clustered segments (they share one
+    /// routing pass and one heap) while its flat segments collect
+    /// per-segment like any other collector.
+    fn collection_mode(&self, _searcher: &crate::Searcher) -> crate::Result<CollectorMode> {
+        Ok(CollectorMode::SingleSegment)
     }
 
-    /// The coupled pass over the [`Self::multi_segment_selection`]
-    /// segments. Returns a segment-fruit merged by [`Self::merge_fruits`]
-    /// alongside the per-segment ones. Only called when the selection is
-    /// non-empty.
+    /// The coupled pass over a [`CollectorMode::MultiSegment`] list.
+    /// Returns a segment-fruit merged by [`Self::merge_fruits`]
+    /// alongside the per-segment ones.
     fn collect_multi_segment(
         &self,
         _weight: &dyn Weight,
@@ -199,7 +209,8 @@ pub trait Collector: Sync + Send {
         _segments: &[SegmentOrdinal],
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
         Err(crate::TantivyError::InternalError(
-            "collector selected multi-segment ordinals without implementing collect_multi_segment"
+            "collector returned CollectorMode::MultiSegment without implementing \
+             collect_multi_segment"
                 .to_string(),
         ))
     }

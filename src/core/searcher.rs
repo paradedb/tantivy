@@ -227,11 +227,12 @@ impl Searcher {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
         let segment_readers = self.segment_readers();
-        let multi_segment = collector.multi_segment_selection(self)?;
-        if !multi_segment.is_empty() {
-            // The coupled pass over the selection; every other segment
-            // takes the standard per-segment path; all fruits meet in
-            // merge_fruits.
+        if let crate::collector::CollectorMode::MultiSegment(multi_segment) =
+            collector.collection_mode(self)?
+        {
+            // The coupled pass over the listed segments; every other
+            // segment takes the standard per-segment path; all fruits
+            // meet in merge_fruits.
             let mut fruits = Vec::with_capacity(segment_readers.len() + 1);
             fruits.push(collector.collect_multi_segment(weight.as_ref(), self, &multi_segment)?);
             let mut per_segment = executor.map(
