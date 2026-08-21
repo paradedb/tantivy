@@ -17,8 +17,7 @@
 //!     cluster: max ||x - c|| over the cluster's NATIVE members' stored
 //!     rows against the SET's stored centroid (replica spill is excluded
 //!     per the stored `bounds_scope = native`)
-//! [4] IVF meta: num_docs (u32) + num_centroids (u32) +
-//!     centroid_set_version (u64) — the set this segment assigned against
+//! [4] IVF meta: num_docs (u32) + num_centroids (u32)
 //! ```
 //!
 //! One dense `centroid_id = 0..C` indexes the set file's rows and these
@@ -49,7 +48,6 @@ pub struct IvfIndex {
     /// replicas are [`Self::num_rows`].
     num_docs: usize,
     /// The centroid-set version this segment's assignments index into.
-    centroid_set_version: u64,
     /// Slot `[2]`: the `u64[C+1]` prefix sum, pinned.
     cluster_offsets: OwnedBytes,
     /// Slot `[3]`, pinned: the segment-level bound kind.
@@ -108,7 +106,6 @@ impl IvfIndex {
     pub(crate) fn serialize_ivf_meta<W: Write + ?Sized>(
         num_docs: usize,
         num_centroids: usize,
-        centroid_set_version: u64,
         out: &mut W,
     ) -> io::Result<()> {
         u32::try_from(num_docs)
@@ -116,8 +113,7 @@ impl IvfIndex {
             .serialize(out)?;
         u32::try_from(num_centroids)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "centroid count exceeds u32"))?
-            .serialize(out)?;
-        centroid_set_version.serialize(out)
+            .serialize(out)
     }
 
     /// Parse a field's per-segment IVF slots. Everything is materialized and
@@ -128,7 +124,7 @@ impl IvfIndex {
         bounds_slice: FileSlice,
         meta_slice: FileSlice,
     ) -> crate::Result<Self> {
-        let meta_len = 2 * mem::size_of::<u32>() + mem::size_of::<u64>();
+        let meta_len = 2 * mem::size_of::<u32>();
         if meta_slice.len() != meta_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -140,7 +136,6 @@ impl IvfIndex {
         let mut reader = meta.as_slice();
         let num_docs = u32::deserialize(&mut reader)? as usize;
         let num_centroids = u32::deserialize(&mut reader)? as usize;
-        let centroid_set_version = u64::deserialize(&mut reader)?;
 
         let cluster_offsets = offsets_slice.read_bytes()?;
         let expected_offsets = (num_centroids + 1)
@@ -200,7 +195,6 @@ impl IvfIndex {
         let mut index = IvfIndex {
             num_centroids,
             num_docs,
-            centroid_set_version,
             cluster_offsets,
             bound_kind,
             bounds,
@@ -233,11 +227,6 @@ impl IvfIndex {
     /// [`Self::num_rows`].
     pub(crate) fn num_docs(&self) -> usize {
         self.num_docs
-    }
-
-    /// The centroid-set version this segment assigned against.
-    pub fn centroid_set_version(&self) -> u64 {
-        self.centroid_set_version
     }
 
     /// Total posting rows across all clusters — memberships, counting a

@@ -369,13 +369,9 @@ mod tests {
     /// centroids elsewhere; tantivy only assigns against them.
     pub(crate) struct InlineCentroidProducer {
         pub(crate) centroids: Vec<[f32; 2]>,
-        pub(crate) version: u64,
     }
 
     impl CentroidProducer for InlineCentroidProducer {
-        fn version(&self) -> u64 {
-            self.version
-        }
         fn centroids(
             &self,
             _field: crate::schema::Field,
@@ -414,7 +410,6 @@ mod tests {
             .settings(settings)
             .centroid_producer(Arc::new(InlineCentroidProducer {
                 centroids: centroids.to_vec(),
-                version: 1,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -1182,7 +1177,6 @@ mod tests {
             .schema(sb.build())
             .centroid_producer(Arc::new(InlineCentroidProducer {
                 centroids: centroids.clone(),
-                version: 42,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -1212,7 +1206,6 @@ mod tests {
             VectorInfo {
                 num_vectors: n,
                 num_centroids: centroids.len(),
-                centroid_set_version: 42,
                 cluster_stats: crate::vector::VectorClusterStats {
                     min_cluster_size: REPLICATION_N_PER,
                     max_cluster_size: REPLICATION_N_PER,
@@ -1410,7 +1403,6 @@ mod tests {
         assert_eq!(vec_reader.num_vectors(), total);
         let info = vec_reader.info().expect("vector info");
         assert_eq!(info.num_vectors, total, "num_vectors counts distinct docs");
-        assert_eq!(info.centroid_set_version, 1);
         let sizes = vec_reader.cluster_sizes().expect("ivf cluster sizes");
         let memberships: usize = sizes.iter().map(|&s| s as usize).sum();
         assert_eq!(
@@ -1442,7 +1434,6 @@ mod tests {
             .schema(sb.build())
             .centroid_producer(Arc::new(InlineCentroidProducer {
                 centroids: centroids.clone(),
-                version: 1,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -1516,7 +1507,6 @@ mod tests {
             .schema(sb.build())
             .centroid_producer(Arc::new(InlineCentroidProducer {
                 centroids: centroids.clone(),
-                version: 1,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;

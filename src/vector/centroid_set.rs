@@ -1,16 +1,17 @@
 //! The index-level centroid set: the consumer-provided [`CentroidProducer`]
-//! trait and the immutable `centroids.<version>` file it is serialized into.
+//! trait and the immutable `centroids` file it is serialized into.
 //!
 //! Centroids are an index-level artifact, installed at index creation like
 //! the schema and settings: the consumer trains them externally (over the
 //! whole corpus, not a per-segment shard) and hands them over through
 //! [`CentroidProducer`]. The file is written once, before the first
-//! `meta.json` references it, and never mutates — segments record which
-//! set version they assigned against, so a future re-publish (background
-//! reclustering, SPFresh-style maintenance) is an additive operation.
+//! `meta.json` references it, and never mutates — one set per index, for
+//! the index's whole life. A future re-publish (background reclustering,
+//! SPFresh-style maintenance) will need its own versioning design; none
+//! exists today.
 //!
-//! On-disk layout: the 4-byte vector format header, the set's `u64`
-//! version, then a [`CompositeFile`] with per-field slots (see
+//! On-disk layout: the 4-byte vector format header, then a
+//! [`CompositeFile`] with per-field slots (see
 //! `header::centroid_set_slot`):
 //!
 //! ```text
@@ -46,14 +47,9 @@ pub const ROUTER_KIND_RNG: u8 = 0;
 ///
 /// Implementors own centroid *training* entirely — tantivy never trains.
 /// Segments assign against the serialized set with tantivy's internal
-/// selector, so the only knobs here are the data itself: the rows, the
-/// MVCC version, and (optionally) a custom routing structure.
+/// selector, so the only knobs here are the data itself: the rows and
+/// (optionally) a custom routing structure.
 pub trait CentroidProducer: Send + Sync + 'static {
-    /// The set's version stamp. Recorded in `meta.json`, in the file name,
-    /// and in every segment that assigns against this set — the hook for
-    /// consumer-side MVCC once re-publishing exists.
-    fn version(&self) -> u64;
-
     /// The centroids for `field`. Required for every vector field in the
     /// schema; erroring here fails index creation.
     fn centroids(&self, field: Field, options: &VectorOptions) -> crate::Result<IvfCentroids>;
@@ -92,13 +88,13 @@ pub trait CentroidProducer: Send + Sync + 'static {
     }
 }
 
-/// The managed file name of the version-`version` centroid set.
-pub(crate) fn centroid_set_filename(version: u64) -> PathBuf {
-    PathBuf::from(format!("centroids.{version}"))
+/// The managed file name of the index's one centroid set.
+pub(crate) fn centroid_set_filename() -> PathBuf {
+    PathBuf::from("centroids")
 }
 
 /// Pull every vector field's centroids from `provider`, validate and
-/// normalize them, and write the `centroids.<version>` file. Called at
+/// normalize them, and write the `centroids` file. Called at
 /// index creation, BEFORE the first `meta.json` references the file.
 /// Returns the written file name.
 pub(crate) fn write_centroid_set(
@@ -106,10 +102,9 @@ pub(crate) fn write_centroid_set(
     schema: &Schema,
     provider: &dyn CentroidProducer,
 ) -> crate::Result<PathBuf> {
-    let path = centroid_set_filename(provider.version());
+    let path = centroid_set_filename();
     let mut write = directory.open_write(&path)?;
     write_header(&mut write)?;
-    provider.version().serialize(&mut write)?;
     let mut composite = CompositeWrite::wrap(write);
 
     for (field, entry) in schema.fields() {
@@ -226,9 +221,8 @@ impl<W: Write> Write for RouterSlotWriter<W> {
     }
 }
 
-/// Reader over one `centroids.<version>` file.
+/// Reader over one `centroids` file.
 pub(crate) struct CentroidSetReader {
-    version: u64,
     composite: CompositeFile,
 }
 
@@ -248,15 +242,8 @@ impl CentroidSetReader {
             )
             .into());
         }
-        let set_version_len = std::mem::size_of::<u64>();
-        let version_bytes = body.slice_to(set_version_len).read_bytes()?;
-        let version = u64::deserialize(&mut version_bytes.as_slice())?;
-        let composite = CompositeFile::open(&body.slice_from(set_version_len))?;
-        Ok(CentroidSetReader { version, composite })
-    }
-
-    pub(crate) fn version(&self) -> u64 {
-        self.version
+        let composite = CompositeFile::open(&body)?;
+        Ok(CentroidSetReader { composite })
     }
 
     /// The stored centroids of `field`. Every vector field is validated to
@@ -272,9 +259,8 @@ impl CentroidSetReader {
             .open_read_with_idx(field, centroid_set_slot::CENTROIDS)
         else {
             return Err(TantivyError::InternalError(format!(
-                "centroid set v{} has no centroids for field {field:?}; the set does not match \
-                 the schema",
-                self.version
+                "centroid set has no centroids for field {field:?}; the set does not match the \
+                 schema"
             )));
         };
         let count_len = std::mem::size_of::<u32>();
@@ -323,9 +309,8 @@ impl CentroidSetReader {
             .open_read_with_idx(field, centroid_set_slot::CENTROIDS)
         else {
             return Err(TantivyError::InternalError(format!(
-                "centroid set v{} has no centroids for field {field:?}; the set does not match \
-                 the schema",
-                self.version
+                "centroid set has no centroids for field {field:?}; the set does not match the \
+                 schema"
             )));
         };
         let count_len = std::mem::size_of::<u32>();
@@ -414,15 +399,11 @@ impl VectorArena for UnitNormRowsArena {
     }
 }
 
-/// The search-time view of one centroid set: per vector field, the lazy
-/// centroid rows plus the parsed router. Opened once per set version and
-/// cached on [`Index`](crate::Index) — the router adjacency alone is
+/// The search-time view of the centroid set: per vector field, the lazy
+/// centroid rows plus the parsed router. Opened once and cached on
+/// [`Index`](crate::Index) — the router adjacency alone is
 /// `C × max_edges × 4` bytes, far too heavy to parse per query.
 pub(crate) struct SetSearchIndex {
-    /// The set version this view was opened for — the cache key, kept for
-    /// assertions and diagnostics.
-    #[allow(dead_code)]
-    version: u64,
     fields: std::collections::HashMap<Field, FieldRouter>,
 }
 
@@ -462,10 +443,9 @@ impl SetSearchIndex {
                         // A consumer-defined router tantivy cannot read:
                         // route by exact scan, which is always correct.
                         log::warn!(
-                            "field '{}' carries a consumer router (tag {tag}) in centroid set \
-                             v{}; routing falls back to an exact centroid scan",
+                            "field '{}' carries a consumer router (tag {tag}) in the centroid \
+                             set; routing falls back to an exact centroid scan",
                             entry.name(),
-                            reader.version(),
                         );
                         None
                     } else {
@@ -492,14 +472,7 @@ impl SetSearchIndex {
                 },
             );
         }
-        Ok(SetSearchIndex {
-            version: reader.version(),
-            fields,
-        })
-    }
-
-    pub(crate) fn version(&self) -> u64 {
-        self.version
+        Ok(SetSearchIndex { fields })
     }
 
     pub(crate) fn field_router(&self, field: Field) -> Option<&FieldRouter> {

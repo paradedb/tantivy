@@ -317,20 +317,17 @@ impl IndexBuilder {
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
             index.custom_plugins.extend(self.custom_plugins);
-            if let Some(centroid_producer) = self.centroid_producer {
-                // The set was installed when the index was created; a
-                // provider carrying a different version would be a
-                // re-publish, which is not supported yet.
-                let version = centroid_producer.version();
-                let known = index
-                    .load_metas()?
-                    .centroid_set
-                    .is_some_and(|set| set.version == version);
-                if !known {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "index already exists without centroid set version {version}; \
-                         re-publishing a centroid set is not supported"
-                    )));
+            if self.centroid_producer.is_some() {
+                // The set was installed when the index was created and is
+                // assumed to be the producer's; installing one into an
+                // existing set-less index would be a re-publish, which is
+                // not supported.
+                if index.load_metas()?.centroid_set.is_none() {
+                    return Err(TantivyError::InvalidArgument(
+                        "index already exists without a centroid set; installing one after \
+                         creation is not supported"
+                            .to_string(),
+                    ));
                 }
             }
             Ok(index)
@@ -413,7 +410,6 @@ impl IndexBuilder {
                 let schema = self.get_expect_schema()?;
                 let path = write_centroid_set(&directory, &schema, centroid_producer.as_ref())?;
                 Some(CentroidSetMeta {
-                    version: centroid_producer.version(),
                     filename: path.to_string_lossy().into_owned(),
                 })
             }
@@ -451,7 +447,7 @@ pub struct Index {
     /// clones — the router adjacency is far too heavy to parse per query.
     /// Set files are immutable and version-named, so entries never
     /// invalidate.
-    centroid_set_cache: Arc<std::sync::RwLock<std::collections::HashMap<u64, Arc<SetSearchIndex>>>>,
+    centroid_set_cache: Arc<std::sync::RwLock<Option<Arc<SetSearchIndex>>>>,
 }
 
 impl Index {
@@ -572,7 +568,7 @@ impl Index {
             executor: Executor::single_thread(),
             inventory,
             custom_plugins: Vec::new(),
-            centroid_set_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            centroid_set_cache: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -953,28 +949,21 @@ impl Index {
     /// The search-time view of the centroid set stamped `version`, opened
     /// on first use and cached for the life of this `Index` (and all its
     /// clones).
-    pub(crate) fn centroid_set_search_index(
-        &self,
-        version: u64,
-    ) -> crate::Result<Arc<SetSearchIndex>> {
+    pub(crate) fn centroid_set_search_index(&self) -> crate::Result<Arc<SetSearchIndex>> {
         if let Some(set) = self
             .centroid_set_cache
             .read()
             .expect("centroid set cache poisoned")
-            .get(&version)
+            .as_ref()
         {
             return Ok(Arc::clone(set));
         }
         let metas = self.load_metas()?;
-        let entry = metas
-            .centroid_set
-            .filter(|set| set.version == version)
-            .ok_or_else(|| {
-                TantivyError::InvalidArgument(format!(
-                    "segments reference centroid set version {version}, which the meta does not \
-                     list"
-                ))
-            })?;
+        let entry = metas.centroid_set.ok_or_else(|| {
+            TantivyError::InvalidArgument(
+                "clustered segments exist but the meta lists no centroid set".to_string(),
+            )
+        })?;
         let set = Arc::new(SetSearchIndex::open(
             &self.directory,
             Path::new(&entry.filename),
@@ -984,8 +973,7 @@ impl Index {
             self.centroid_set_cache
                 .write()
                 .expect("centroid set cache poisoned")
-                .entry(version)
-                .or_insert(set),
+                .get_or_insert(set),
         ))
     }
 

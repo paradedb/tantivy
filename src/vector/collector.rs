@@ -352,7 +352,6 @@ mod e2e_tests {
             .schema(schema_builder.build())
             .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
-                version: 1,
             }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
@@ -495,7 +494,6 @@ mod e2e_tests {
             .schema(schema_builder.build())
             .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
-                version: 1,
             }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
@@ -562,7 +560,6 @@ mod e2e_tests {
             .schema(schema_builder.build())
             .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 0.0]],
-                version: 1,
             }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;

@@ -157,7 +157,7 @@ impl PluginWriter for VecWriter {
         let meta = index.load_metas()?;
         let set = match meta.centroid_set.as_ref() {
             Some(centroid_set) => {
-                let set_search = index.centroid_set_search_index(centroid_set.version)?;
+                let set_search = index.centroid_set_search_index()?;
                 let set_reader = CentroidSetReader::open(
                     index.directory(),
                     std::path::Path::new(&centroid_set.filename),
@@ -212,7 +212,6 @@ impl PluginWriter for VecWriter {
                 field: *field,
                 opts: &buf.opts,
                 set: &field_centroids,
-                set_version: set_reader.version(),
                 replicas: index.settings().vector_replicas,
                 bounds_scope: index.settings().vector_bounds_scope,
                 executor: &executor,

@@ -17,7 +17,6 @@ const EMBEDDING_FIELD_NAME: &str = "embedding";
 const LABEL_FIELD_NAME: &str = "label";
 const NUM_DOCS: usize = 100;
 const DOCS_PER_SEGMENT: usize = 10;
-const FIXTURE_SET_VERSION: u64 = 1;
 
 pub(crate) struct TestVectorIndex {
     pub(crate) index: Index,
@@ -58,7 +57,6 @@ impl TestVectorIndexBuilder {
             .schema(schema)
             .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: self.centroids.clone(),
-                version: FIXTURE_SET_VERSION,
             }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
@@ -151,14 +149,9 @@ impl TestVectorIndex {
 /// centroids elsewhere; tantivy only assigns against them.
 pub(crate) struct Grid2DCentroidProducer {
     pub(crate) centroids: Vec<[f32; grid2d::DIM]>,
-    pub(crate) version: u64,
 }
 
 impl CentroidProducer for Grid2DCentroidProducer {
-    fn version(&self) -> u64 {
-        self.version
-    }
-
     fn centroids(&self, _field: Field, options: &VectorOptions) -> crate::Result<IvfCentroids> {
         assert_eq!(options.dim(), grid2d::DIM);
         Ok(IvfCentroids::F32(IvfMatrix {
@@ -223,7 +216,7 @@ fn fixture_builds_expected_schema_docs_and_labels() -> crate::Result<()> {
 }
 
 /// Every segment — merged or straight from a commit — is clustered
-/// against the index-level set and stamps its version.
+/// against the index-level set.
 #[test]
 fn every_segment_is_clustered_against_the_set() -> crate::Result<()> {
     let index = TestVectorIndex::builder(VectorDType::F32).build()?;
@@ -233,7 +226,6 @@ fn every_segment_is_clustered_against_the_set() -> crate::Result<()> {
         let vec_reader = segment_reader.vector_index(index.embedding_field())?;
         let ivf = vec_reader.index().expect("every segment is IVF");
         assert_eq!(ivf.num_clusters(), grid2d::centroids().len());
-        assert_eq!(ivf.centroid_set_version(), FIXTURE_SET_VERSION);
     }
     Ok(())
 }
@@ -322,7 +314,6 @@ fn set_centroids_round_trip_and_drive_assignment() -> crate::Result<()> {
         .collect();
 
     let set = open_centroid_set(&index.index)?;
-    assert_eq!(set.version(), FIXTURE_SET_VERSION);
     let field_centroids = set.field_centroids(index.embedding_field(), &index.vector_options())?;
     assert_eq!(field_centroids.num_centroids(), centroids.len());
     assert_eq!(
@@ -423,13 +414,9 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
 /// A single-centroid provider, for tests that only need a valid set.
 pub(crate) struct SingleCellCentroidProducer {
     pub(crate) dim: usize,
-    pub(crate) version: u64,
 }
 
 impl CentroidProducer for SingleCellCentroidProducer {
-    fn version(&self) -> u64 {
-        self.version
-    }
     fn centroids(&self, _field: Field, options: &VectorOptions) -> crate::Result<IvfCentroids> {
         Ok(IvfCentroids::F32(IvfMatrix {
             values: vec![0.0; options.dim()],
@@ -453,7 +440,7 @@ fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
         let schema = schema_builder.build();
         let index = Index::builder()
             .schema(schema)
-            .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2, version: 1 }))
+            .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2 }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         let mut doc = TantivyDocument::new();
@@ -468,7 +455,7 @@ fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
         let schema = schema_builder.build();
         let index = Index::builder()
             .schema(schema)
-            .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2, version: 1 }))
+            .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2 }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         let mut doc = TantivyDocument::new();
@@ -495,7 +482,7 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     let schema = schema_builder.build();
     let index = Index::builder()
         .schema(schema)
-        .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2, version: 1 }))
+        .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2 }))
         .create_in_ram()?;
     let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
     let mut zero_doc = TantivyDocument::new();
@@ -782,7 +769,7 @@ mod centroid_set_lifecycle_tests {
         sb.add_text_field("label", STRING);
         let err = Index::builder()
             .schema(sb.build())
-            .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2, version: 1 }))
+            .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2 }))
             .create_in_ram()
             .unwrap_err();
         assert!(
@@ -806,16 +793,14 @@ mod centroid_set_lifecycle_tests {
             .schema(vector_schema())
             .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
-                version: 7,
             }))
             .create(directory.clone())?;
         let embed_field = index.schema().get_field("embedding").unwrap();
-        let set_path = centroid_set_filename(7);
+        let set_path = centroid_set_filename();
         assert!(directory.exists(&set_path)?, "set file written at creation");
         assert_eq!(
             index.load_metas()?.centroid_set,
             Some(crate::index::CentroidSetMeta {
-                version: 7,
                 filename: set_path.to_string_lossy().into_owned(),
             })
         );
@@ -837,7 +822,7 @@ mod centroid_set_lifecycle_tests {
         // Meta still lists the set after save_metas rebuilds the meta.
         assert!(index.load_metas()?.centroid_set.is_some());
         // And the file still opens.
-        assert_eq!(open_centroid_set(&index)?.version(), 7);
+        open_centroid_set(&index)?;
 
         // Merges keep working against the set.
         let segment_ids = index.searchable_segment_ids()?;
@@ -845,12 +830,10 @@ mod centroid_set_lifecycle_tests {
         writer.wait_merging_threads()?;
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.segment_readers().len(), 1);
-        let ivf = searcher.segment_readers()[0]
+        searcher.segment_readers()[0]
             .vector_index(embed_field)?
             .index()
-            .expect("merged segment is IVF")
-            .centroid_set_version();
-        assert_eq!(ivf, 7);
+            .expect("merged segment is IVF");
         Ok(())
     }
 
@@ -880,41 +863,42 @@ mod centroid_set_lifecycle_tests {
         }
         let info = vec.info().expect("flat segments still report info");
         assert_eq!(info.num_centroids, 0);
-        assert_eq!(info.centroid_set_version, 0);
         Ok(())
     }
 
-    /// `open_or_create` on an existing index accepts a provider whose
-    /// version is already installed and refuses a new one (re-publishing
-    /// is unsupported).
+    /// `open_or_create` on an existing index accepts a producer when a
+    /// set is already installed (assumed identical) and refuses to
+    /// install one into an existing set-less index.
     #[test]
-    fn open_or_create_checks_set_version() -> crate::Result<()> {
-        let directory = RamDirectory::create();
-        let provider = |version| {
+    fn open_or_create_checks_set_presence() -> crate::Result<()> {
+        let provider = || {
             Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
-                version,
             })
         };
+
+        let directory = RamDirectory::create();
         let _ = Index::builder()
             .schema(vector_schema())
-            .centroid_producer(provider(3))
+            .centroid_producer(provider())
             .create(directory.clone())?;
-
-        // Same version: fine.
         Index::builder()
             .schema(vector_schema())
-            .centroid_producer(provider(3))
-            .open_or_create(directory.clone())?;
+            .centroid_producer(provider())
+            .open_or_create(directory)?;
 
-        // New version: refused until re-publishing exists.
+        // A flat index cannot gain a set after the fact.
+        let directory = RamDirectory::create();
+        let _ = Index::builder()
+            .schema(vector_schema())
+            .create(directory.clone())?;
         let err = Index::builder()
             .schema(vector_schema())
-            .centroid_producer(provider(4))
+            .centroid_producer(provider())
             .open_or_create(directory)
             .unwrap_err();
         assert!(
-            err.to_string().contains("re-publishing"),
+            err.to_string().contains("installing one after creation"),
             "unexpected: {err}"
         );
         Ok(())
@@ -1037,13 +1021,9 @@ mod bounds_storage_tests {
         );
         schema_builder.add_text_field("label", STRING | STORED);
         let schema = schema_builder.build();
-        let builder =
-            Index::builder()
-                .schema(schema)
-                .centroid_producer(Arc::new(Grid2DCentroidProducer {
-                    centroids,
-                    version: 1,
-                }));
+        let builder = Index::builder()
+            .schema(schema)
+            .centroid_producer(Arc::new(Grid2DCentroidProducer { centroids }));
         let index = match directory {
             Some(directory) => builder.create(directory)?,
             None => builder.create_in_ram()?,

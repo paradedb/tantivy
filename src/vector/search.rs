@@ -138,7 +138,6 @@ where
     let matches_all_docs = weight.matches_all_docs();
     let mut segments: Vec<SegmentSearch<'_, S::Child>> = Vec::new();
     let mut flats: Vec<FlatSegment<'_, S::Child>> = Vec::new();
-    let mut set_version: Option<u64> = None;
     for (ord, reader) in searcher.segment_readers().iter().enumerate() {
         let vec = reader.vector_index(field)?;
         let Some(ivf) = vec.index() else {
@@ -153,19 +152,6 @@ where
             continue;
         };
         let needs_dedup = ivf.num_rows() > ivf.num_docs();
-        // Multi-version snapshots are unsupported, like multi-version
-        // merges: a shared routing order requires shared cluster ids.
-        match set_version {
-            None => set_version = Some(ivf.centroid_set_version()),
-            Some(version) if version != ivf.centroid_set_version() => {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "segments assigned against different centroid set versions ({} vs {version}); \
-                     multi-version search is not supported",
-                    ivf.centroid_set_version(),
-                )));
-            }
-            Some(_) => {}
-        }
         segments.push(SegmentSearch {
             ord: ord as SegmentOrdinal,
             reader,
@@ -236,21 +222,19 @@ where
         }
     }
 
-    // The routed tier. `set_version` is `Some` iff any clustered segment
-    // participates.
-    if let Some(set_version) = set_version {
-        let set = searcher.index().centroid_set_search_index(set_version)?;
+    // The routed tier, over the clustered segments.
+    if !segments.is_empty() {
+        let set = searcher.index().centroid_set_search_index()?;
         let router = set.field_router(field).ok_or_else(|| {
             TantivyError::InternalError(format!(
-                "centroid set v{set_version} has no router for field {field:?}"
+                "the centroid set has no router for field {field:?}"
             ))
         })?;
         let num_centroids = router.num_centroids();
         for segment in &segments {
             if segment.ivf().num_clusters() != num_centroids {
                 return Err(TantivyError::InternalError(format!(
-                    "segment {} holds {} clusters but centroid set v{set_version} holds \
-                     {num_centroids}",
+                    "segment {} holds {} clusters but the centroid set holds {num_centroids}",
                     segment.ord,
                     segment.ivf().num_clusters(),
                 )));

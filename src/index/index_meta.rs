@@ -407,15 +407,12 @@ impl Order {
     }
 }
 
-/// One published index-level centroid set: its consumer MVCC version and
-/// the managed file (`centroids.<version>`) holding it. Recorded in
-/// `meta.json` so readers can resolve the set a segment assigned against
-/// and garbage collection keeps the file alive.
+/// The index-level centroid set's managed file (`centroids`). Recorded in
+/// `meta.json` so its presence decides the vector layout (clustered vs
+/// flat) and garbage collection keeps the file alive.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CentroidSetMeta {
-    /// The consumer-provided version stamp.
-    pub version: u64,
-    /// The managed file name, `centroids.<version>`.
+    /// The managed file name.
     pub filename: String,
 }
 

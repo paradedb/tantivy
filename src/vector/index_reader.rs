@@ -41,10 +41,9 @@ pub struct VectorInfo {
     /// numbers (`cluster_stats`, [`VectorIndexReader::cluster_sizes`]) count
     /// posting rows, so with replication their sum exceeds `num_vectors`.
     pub num_vectors: usize,
+    /// `0` for a flat (unclustered) segment, which assigned against
+    /// nothing and is searched exhaustively.
     pub num_centroids: usize,
-    /// The index-level centroid set version this segment assigned against;
-    /// `0` for a flat (unclustered) segment, which assigned against nothing.
-    pub centroid_set_version: u64,
     pub cluster_stats: VectorClusterStats,
 }
 
@@ -226,7 +225,6 @@ impl VectorIndexReader {
             return Some(VectorInfo {
                 num_vectors: self.num_vectors,
                 num_centroids: 0,
-                centroid_set_version: 0,
                 cluster_stats: VectorClusterStats {
                     min_cluster_size: 0,
                     max_cluster_size: 0,
@@ -259,7 +257,6 @@ impl VectorIndexReader {
         Some(VectorInfo {
             num_vectors: self.num_vectors,
             num_centroids,
-            centroid_set_version: index.centroid_set_version(),
             cluster_stats: VectorClusterStats {
                 min_cluster_size,
                 max_cluster_size,

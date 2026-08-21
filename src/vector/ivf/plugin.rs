@@ -70,7 +70,6 @@ pub(crate) struct IvfFieldWriteParams<'a> {
     /// reused as the assignment selector for large sets.
     pub(crate) router:
         Option<&'a RelativeNeighborhoodGraph<crate::vector::centroid_set::UnitNormRowsArena>>,
-    pub(crate) set_version: u64,
     /// Cells per vector (primary + replicas); clamped to the centroid count.
     pub(crate) replicas: usize,
     pub(crate) bounds_scope: BoundsScope,
@@ -308,7 +307,7 @@ pub(crate) fn write_ivf_field(
     }
     {
         let meta_w = vec_write.for_field_with_idx(params.field, vec_slot::IVF_META);
-        IvfIndex::serialize_ivf_meta(num_present_docs, num_centroids, params.set_version, meta_w)?;
+        IvfIndex::serialize_ivf_meta(num_present_docs, num_centroids, meta_w)?;
         meta_w.flush()?;
     }
 
@@ -355,7 +354,6 @@ fn merge_ivf_field(
 ) -> crate::Result<usize> {
     let field = params.field;
     let num_centroids = params.set.num_centroids();
-    let set_version = params.set_version;
     let cancel = params.cancel;
     let field_build_start = Instant::now();
 
@@ -602,7 +600,7 @@ fn merge_ivf_field(
     }
     {
         let meta_w = vec_write.for_field_with_idx(field, vec_slot::IVF_META);
-        IvfIndex::serialize_ivf_meta(num_present_docs, num_centroids, set_version, meta_w)?;
+        IvfIndex::serialize_ivf_meta(num_present_docs, num_centroids, meta_w)?;
         meta_w.flush()?;
     }
 
@@ -649,7 +647,7 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     let Some(centroid_set) = meta.centroid_set.as_ref() else {
         return merge_flat(ctx);
     };
-    let set_search = index.centroid_set_search_index(centroid_set.version)?;
+    let set_search = index.centroid_set_search_index()?;
     let directory = index.directory();
     let set_reader =
         CentroidSetReader::open(directory, std::path::Path::new(&centroid_set.filename))?;
@@ -693,20 +691,6 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
             .iter()
             .map(|reader| reader.vector_index(field))
             .collect::<crate::Result<Vec<_>>>()?;
-        // Multi-version merges are unsupported: every source segment must
-        // have assigned against the set this merge assigns against.
-        for reader in &field_readers {
-            if let Some(source_ivf) = reader.index() {
-                if source_ivf.centroid_set_version() != set_reader.version() {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "segments assigned against different centroid set versions ({} vs {}); \
-                         multi-version merge is not supported",
-                        source_ivf.centroid_set_version(),
-                        set_reader.version(),
-                    )));
-                }
-            }
-        }
         let vector_count = field_readers
             .iter()
             .map(|reader| reader.num_vectors())
@@ -720,19 +704,19 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
             if let Some(ivf) = reader.index() {
                 if ivf.num_clusters() != num_centroids {
                     return Err(TantivyError::InternalError(format!(
-                        "source segment holds {} clusters but centroid set v{} holds \
+                        "source segment holds {} clusters but the centroid set holds \
                          {num_centroids}",
                         ivf.num_clusters(),
-                        set_reader.version(),
                     )));
                 }
             }
         }
-        // Every clustered source assigned against THIS set (the version
-        // guard above), and assignment is deterministic, so the merged
-        // postings are exactly what re-assignment would produce — carry
-        // them over instead of re-running a k-NN per vector. Flat sources
-        // are the exception: their rows are assigned inside.
+        // Every clustered source assigned against THIS set (there is
+        // exactly one, immutable for the index's life), and assignment is
+        // deterministic, so the merged postings are exactly what
+        // re-assignment would produce — carry them over instead of
+        // re-running a k-NN per vector. Flat sources are the exception:
+        // their rows are assigned inside.
         let params = IvfFieldWriteParams {
             router: set_search
                 .field_router(field)
@@ -740,7 +724,6 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
             field,
             opts,
             set: &field_centroids,
-            set_version: set_reader.version(),
             replicas: index.settings().vector_replicas,
             bounds_scope: index.settings().vector_bounds_scope,
             executor: &executor,
