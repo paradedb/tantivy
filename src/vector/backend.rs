@@ -75,7 +75,11 @@ pub struct ProbeStats {
     /// opens at `x` per non-empty (cluster, segment) pair, scored rows
     /// at `(1 - x)/n_avg`.
     pub work_charged: f32,
-    /// Vector-bearing segments this query considered.
+    /// Rows fetched and scored by the exact tier — flat (unclustered)
+    /// segments scanned exhaustively. Mandatory work, outside the probe
+    /// budget; disjoint from every clustered counter above.
+    pub exact_rows_read: usize,
+    /// Vector-bearing segments this query considered — clustered and flat.
     pub segments_searched: u32,
     /// Segments whose filter bitset was actually materialized — lazy
     /// filters mean a segment whose every touched (cluster, segment)
@@ -1622,6 +1626,309 @@ mod tests {
         assert!(line.contains("replicas=8"));
         assert!(line.contains("assign="));
         eprintln!("IVF_BUILD_SAMPLE {line}");
+        Ok(())
+    }
+    // ---- The flat (mutable/staging) tier ----
+
+    /// [`build_ivf`] without a centroid set: every segment stores flat.
+    fn build_flat(
+        metric: Metric,
+        commits: &[&[(&str, [f32; 2])]],
+        merge: bool,
+    ) -> crate::Result<(Index, crate::schema::Field, crate::schema::Field)> {
+        let mut sb = Schema::builder();
+        let embed_field = sb.add_vector_field(
+            "embedding",
+            VectorOptions::new(2, metric).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let index = Index::builder().schema(sb.build()).create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for chunk in commits {
+            for (label, v) in *chunk {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(label_field, label);
+                doc.add_vector(embed_field, v.as_slice());
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+        if merge {
+            let segment_ids = index.searchable_segment_ids()?;
+            writer.merge(&segment_ids).wait()?;
+        }
+        writer.wait_merging_threads()?;
+        Ok((index, embed_field, label_field))
+    }
+
+    /// Copy `source`'s segments (files + meta entries) into `dest` — same
+    /// schema required. The tantivy-level stand-in for how a consumer
+    /// moves a staged mutable segment into its real index.
+    fn graft_segments(source: &Index, dest: &Index) -> crate::Result<()> {
+        use std::io::Write as _;
+
+        use crate::directory::{Directory, TerminatingWrite};
+        use crate::index::SegmentComponent;
+        let components = [
+            SegmentComponent::Postings,
+            SegmentComponent::Positions,
+            SegmentComponent::Terms,
+            SegmentComponent::Store,
+            SegmentComponent::FastFields,
+            SegmentComponent::FieldNorms,
+            SegmentComponent::Custom(crate::vector::VEC_EXT.to_string()),
+        ];
+        let mut writer: IndexWriter = dest.writer_with_num_threads(1, 15_000_000)?;
+        for meta in source.searchable_segment_metas()? {
+            for component in &components {
+                let path = meta.relative_path(component.clone());
+                if !source.directory().exists(&path)? {
+                    continue;
+                }
+                let bytes = source.directory().open_read(&path)?.read_bytes()?;
+                let mut write = dest.directory().open_write(&path)?;
+                write.write_all(&bytes)?;
+                write.terminate()?;
+            }
+            writer.add_segment(dest.new_segment_meta(meta.id(), meta.max_doc()))?;
+        }
+        writer.commit()?;
+        writer.wait_merging_threads()?;
+        Ok(())
+    }
+
+    /// A no-set index scans exhaustively: results equal ground truth for
+    /// any budget, all work lands in `exact_rows_read`, and the routed
+    /// tier never runs.
+    #[test]
+    fn flat_index_searches_exactly() -> crate::Result<()> {
+        let docs: Vec<(String, [f32; 2])> = (0..30)
+            .map(|i| (format!("d{i}"), [i as f32, (i * 7 % 13) as f32]))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+        let (index, embed_field, label_field) =
+            build_flat(Metric::L2, &[&docs[..10], &docs[10..]], false)?;
+
+        let query = vec![4.2f32, 3.1];
+        // A tiny budget must change nothing — the exact tier ignores it.
+        let params = AdaptiveProbeParams {
+            max_probe_fraction: 1e-6,
+            min_probe_clusters: 1,
+        };
+        let (hits, stats) = run_global(&index, embed_field, &AllQuery, query.clone(), 5, params)?;
+        let truth = ground_truth::top_k(&index, embed_field, Metric::L2, &query, 5)?;
+        assert_eq!(hits, truth);
+        assert_eq!(stats.exact_rows_read, 30);
+        assert_eq!(stats.segments_searched, 2);
+        assert_eq!(stats.clusters_probed(), 0, "no routed tier without a set");
+        assert_eq!(stats.filters_built, 0, "AllQuery builds no bitset");
+
+        // Filtered: only matching docs qualify, filter bitsets built per
+        // flat segment.
+        let filter = TermQuery::new(
+            Term::from_field_text(label_field, "d7"),
+            IndexRecordOption::Basic,
+        );
+        let (hits, stats) =
+            run_global(&index, embed_field, &filter, query, 5, exhaustive_params(1))?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(stored_label_at(&index, label_field, hits[0].1)?, "d7");
+        assert_eq!(stats.exact_rows_read, 1, "filtered rows are never fetched");
+        assert_eq!(
+            stats.filters_built, 2,
+            "the exact tier evaluates every flat segment's filter"
+        );
+        Ok(())
+    }
+
+    /// Merging inside a no-set index keeps the flat layout and the exact
+    /// results.
+    #[test]
+    fn flat_merge_stays_flat() -> crate::Result<()> {
+        let docs: Vec<(String, [f32; 2])> = (0..20)
+            .map(|i| (format!("d{i}"), [i as f32, (i * 3 % 7) as f32]))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+        let (index, embed_field, _) = build_flat(
+            Metric::Cosine,
+            &[&docs[..7], &docs[7..14], &docs[14..]],
+            true,
+        )?;
+
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let vec = searcher.segment_readers()[0].vector_index(embed_field)?;
+        assert!(vec.index().is_none(), "the merged segment stays flat");
+        assert_eq!(vec.num_vectors(), 20);
+
+        let query = vec![0.6f32, 0.8];
+        let (hits, stats) = run_global(
+            &index,
+            embed_field,
+            &AllQuery,
+            query.clone(),
+            4,
+            exhaustive_params(1),
+        )?;
+        let truth = ground_truth::top_k(&index, embed_field, Metric::Cosine, &query, 4)?;
+        assert_eq!(hits, truth);
+        assert_eq!(stats.exact_rows_read, 20);
+        Ok(())
+    }
+
+    /// The grid the mixed-tier tests share: 4 well-separated centroids,
+    /// clustered docs on the first three, flat (staged) docs near the
+    /// fourth AND near the first — fresh data both inside and outside the
+    /// clustered vocabulary's reach.
+    const MIXED_CENTROIDS: [[f32; 2]; 4] = [[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [100.0, 100.0]];
+
+    fn mixed_fixture() -> crate::Result<(Index, crate::schema::Field, crate::schema::Field)> {
+        let clustered: Vec<(String, [f32; 2])> = (0..30)
+            .map(|i| {
+                let c = MIXED_CENTROIDS[i % 3];
+                (
+                    format!("c{i}"),
+                    [c[0] + (i / 3) as f32 * 0.5, c[1] + (i / 3) as f32 * 0.25],
+                )
+            })
+            .collect();
+        let clustered: Vec<(&str, [f32; 2])> =
+            clustered.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+        let (index, embed_field, label_field) = build_ivf(
+            Metric::L2,
+            &MIXED_CENTROIDS,
+            &[&clustered[..15], &clustered[15..]],
+            1,
+            false,
+        )?;
+
+        let staged: Vec<(String, [f32; 2])> = (0..8)
+            .map(|i| {
+                let c = MIXED_CENTROIDS[if i % 2 == 0 { 3 } else { 0 }];
+                (format!("f{i}"), [c[0] + i as f32 * 0.3, c[1] + 1.0])
+            })
+            .collect();
+        let staged: Vec<(&str, [f32; 2])> = staged.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+        let (flat_index, _, _) = build_flat(Metric::L2, &[&staged], false)?;
+        graft_segments(&flat_index, &index)?;
+        Ok((index, embed_field, label_field))
+    }
+
+    /// Clustered and flat segments search into ONE heap: results equal
+    /// ground truth over the union, the flat rows all pass through the
+    /// exact tier, and the routed tier still probes.
+    #[test]
+    fn mixed_flat_and_clustered_search() -> crate::Result<()> {
+        let (index, embed_field, label_field) = mixed_fixture()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 3);
+
+        // Query near centroid 3: the best hits are staged docs, which only
+        // the exact tier can find (no clustered segment has rows there).
+        let query = vec![100.0f32, 101.0];
+        let (hits, stats) = run_global(
+            &index,
+            embed_field,
+            &AllQuery,
+            query.clone(),
+            6,
+            exhaustive_params(4),
+        )?;
+        let truth = ground_truth::top_k(&index, embed_field, Metric::L2, &query, 6)?;
+        assert_eq!(hits, truth);
+        assert_eq!(stats.exact_rows_read, 8, "every staged row is read");
+        assert_eq!(stats.segments_searched, 3);
+        assert!(stats.clusters_probed() > 0, "the routed tier still runs");
+        let top_label = stored_label_at(&index, label_field, hits[0].1)?;
+        assert!(
+            top_label.starts_with('f'),
+            "freshest data wins: {top_label}"
+        );
+
+        // Query near centroid 0, where clustered and staged docs compete
+        // in one heap.
+        let query = vec![0.5f32, 0.5];
+        let (hits, _) = run_global(
+            &index,
+            embed_field,
+            &AllQuery,
+            query.clone(),
+            10,
+            exhaustive_params(4),
+        )?;
+        let truth = ground_truth::top_k(&index, embed_field, Metric::L2, &query, 10)?;
+        assert_eq!(hits, truth);
+        Ok(())
+    }
+
+    /// Merging a mix of clustered and flat sources produces one clustered
+    /// segment: carried-over postings for the clustered rows, fresh
+    /// assignment for the flat rows — each doc in its nearest cluster.
+    #[test]
+    fn mixed_merge_assigns_only_flat_rows() -> crate::Result<()> {
+        let (index, embed_field, label_field) = mixed_fixture()?;
+        let labeled = |hits: &[(Score, DocAddress)]| -> crate::Result<Vec<(u32, String)>> {
+            hits.iter()
+                .map(|(score, addr)| {
+                    Ok((
+                        score.to_bits(),
+                        stored_label_at(&index, label_field, *addr)?,
+                    ))
+                })
+                .collect()
+        };
+        let query = vec![50.0f32, 50.0];
+        let (before, _) = run_global(
+            &index,
+            embed_field,
+            &AllQuery,
+            query.clone(),
+            12,
+            exhaustive_params(4),
+        )?;
+        // Labels resolve against the CURRENT snapshot — before the merge
+        // rewrites every address.
+        let before_labeled = labeled(&before)?;
+
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec = segment_reader.vector_index(embed_field)?;
+        let ivf = vec.index().expect("the merged segment is clustered");
+        assert_eq!(vec.num_vectors(), 38);
+
+        // Every doc — carried or assigned — sits in its nearest cluster.
+        for cluster in 0..ivf.num_clusters() {
+            for doc in vec.cluster_doc_ids(cluster).unwrap() {
+                let row = vec.vector_bytes(doc)?.unwrap();
+                let point = decode_2d(&row);
+                assert_eq!(
+                    nearest_centroid(point, &MIXED_CENTROIDS),
+                    cluster,
+                    "doc {} landed in cluster {cluster}",
+                    stored_label_at(&index, label_field, DocAddress::new(0, doc))?,
+                );
+            }
+        }
+
+        // Search results survive the merge bit-for-bit (modulo addresses):
+        // compare (score, label) sequences.
+        let (after, stats) = run_global(
+            &index,
+            embed_field,
+            &AllQuery,
+            query,
+            12,
+            exhaustive_params(4),
+        )?;
+        assert_eq!(before_labeled, labeled(&after)?);
+        assert_eq!(stats.exact_rows_read, 0, "no flat segments remain");
         Ok(())
     }
 }

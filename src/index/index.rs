@@ -29,7 +29,6 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::centroid_set::copy_centroid_set;
 use crate::vector::{write_centroid_set, CentroidIndex, SetSearchIndex, VectorPlugin};
 use crate::SegmentReader;
 
@@ -182,7 +181,6 @@ pub struct IndexBuilder {
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     centroid_index: Option<Arc<dyn CentroidIndex>>,
-    centroid_set_source: Option<Index>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -199,7 +197,6 @@ impl IndexBuilder {
             fast_field_tokenizer_manager: TokenizerManager::default(),
             custom_plugins: Vec::new(),
             centroid_index: None,
-            centroid_set_source: None,
         }
     }
 
@@ -236,33 +233,12 @@ impl IndexBuilder {
     }
 
     /// Install the index-level centroid set the index's vector fields
-    /// assign against. Required when the schema has vector fields; the set
-    /// is written at creation, next to the schema and settings.
+    /// assign against; the set is written at creation, next to the schema
+    /// and settings. Without one, vector fields are stored flat
+    /// (doc-ordered) and searched exhaustively — the mutable/staging tier.
     #[must_use]
     pub fn centroid_index(mut self, centroid_index: Arc<dyn CentroidIndex>) -> Self {
         self.centroid_index = Some(centroid_index);
-        self
-    }
-
-    /// Take the centroid set from `source` instead of training one.
-    ///
-    /// `source` is kept as a handle — not the set itself — because
-    /// [`create`](Self::create) needs two things from it and both can
-    /// fail, so neither can be resolved in a builder method that returns
-    /// `Self`: the source's meta (for the set's version and file name)
-    /// and its directory (to read the bytes). At creation the file is
-    /// copied VERBATIM — same version, same rows, same router — so this
-    /// index's segments assign against byte-identical centroids and stamp
-    /// the same version as `source`'s.
-    ///
-    /// For sibling indexes over the same schema, e.g. an in-memory index
-    /// staging a mutable segment destined for `source`: sharing the
-    /// version is what lets that segment move across without tripping the
-    /// single-version guard on merge and search. Mutually exclusive with
-    /// [`Self::centroid_index`].
-    #[must_use]
-    pub fn shared_centroid_set(mut self, source: &Index) -> Self {
-        self.centroid_set_source = Some(source.clone());
         self
     }
 
@@ -370,25 +346,9 @@ impl IndexBuilder {
             let has_vector_fields = schema
                 .fields()
                 .any(|(_, entry)| matches!(entry.field_type(), FieldType::Vector(_)));
-            let centroid_sources = usize::from(self.centroid_index.is_some())
-                + usize::from(self.centroid_set_source.is_some());
-            if has_vector_fields && centroid_sources == 0 {
-                return Err(TantivyError::InvalidArgument(
-                    "schema has vector fields but no centroid index; provide one via \
-                     IndexBuilder::centroid_index (or share an existing index's set via \
-                     IndexBuilder::shared_centroid_set) — the centroid set is created with the \
-                     index, like the schema"
-                        .to_string(),
-                ));
-            }
-            if !has_vector_fields && centroid_sources > 0 {
+            if !has_vector_fields && self.centroid_index.is_some() {
                 return Err(TantivyError::InvalidArgument(
                     "a centroid index was provided but the schema has no vector fields".to_string(),
-                ));
-            }
-            if centroid_sources > 1 {
-                return Err(TantivyError::InvalidArgument(
-                    "centroid_index and shared_centroid_set are mutually exclusive".to_string(),
                 ));
             }
             if self.index_settings.manual_doc_id_mapping
@@ -447,8 +407,8 @@ impl IndexBuilder {
         let directory = ManagedDirectory::wrap(dir)?;
         // The centroid set file is written BEFORE the first meta.json
         // references it — the meta write is the commit point.
-        let centroid_set = match (&self.centroid_index, &self.centroid_set_source) {
-            (Some(centroid_index), None) => {
+        let centroid_set = match &self.centroid_index {
+            Some(centroid_index) => {
                 let schema = self.get_expect_schema()?;
                 let path = write_centroid_set(&directory, &schema, centroid_index.as_ref())?;
                 Some(CentroidSetMeta {
@@ -456,16 +416,7 @@ impl IndexBuilder {
                     filename: path.to_string_lossy().into_owned(),
                 })
             }
-            (None, Some(source)) => {
-                let schema = self.get_expect_schema()?;
-                let (version, path) = copy_centroid_set(source, &directory, &schema)?;
-                Some(CentroidSetMeta {
-                    version,
-                    filename: path.to_string_lossy().into_owned(),
-                })
-            }
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!("validate() rejects both sources"),
+            None => None,
         };
         save_new_metas(
             self.get_expect_schema()?,

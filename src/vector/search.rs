@@ -22,6 +22,12 @@
 //! bounds-skipped segments once the bound arms, and future spatially
 //! partitioned segments where most pairs are absent; on randomly sharded
 //! big segments every filter materializes at the first probed cluster.
+//!
+//! Flat (unclustered) segments — the mutable/staging tier — are searched
+//! exhaustively before the routed loop: every row passing filter ∧ alive
+//! is scored into the same heap. Exact, bounded by the segment's size,
+//! and outside the probe budget; scanning them first also seeds the heap,
+//! so the kth threshold arms earlier for the routed clusters.
 
 use std::sync::Arc;
 
@@ -91,6 +97,15 @@ impl<TChild> SegmentSearch<'_, TChild> {
     }
 }
 
+/// One flat (unclustered) segment, searched exhaustively. No `seen`
+/// bitset: flat storage has no replicas.
+struct FlatSegment<'a, TChild> {
+    ord: SegmentOrdinal,
+    reader: &'a SegmentReader,
+    vec: Arc<VectorIndexReader>,
+    tie: TChild,
+}
+
 /// One gate survivor from the pre-pass over a cluster's rows: `row`
 /// indexes into the segment-wide dense rows slot.
 #[derive(Clone, Copy)]
@@ -118,13 +133,23 @@ where
     let mut stats = ProbeStats::default();
 
     // The participating segments: the searcher's snapshot, minus segments
-    // with no vector data for the field.
+    // with no vector data for the field. Clustered segments feed the
+    // routed loop; flat ones (the mutable tier) feed the exact scan.
     let matches_all_docs = weight.matches_all_docs();
     let mut segments: Vec<SegmentSearch<'_, S::Child>> = Vec::new();
+    let mut flats: Vec<FlatSegment<'_, S::Child>> = Vec::new();
     let mut set_version: Option<u64> = None;
     for (ord, reader) in searcher.segment_readers().iter().enumerate() {
         let vec = reader.vector_index(field)?;
         let Some(ivf) = vec.index() else {
+            if vec.num_vectors() > 0 {
+                flats.push(FlatSegment {
+                    ord: ord as SegmentOrdinal,
+                    reader,
+                    tie: tie_break.segment_sort_key_computer(reader)?,
+                    vec,
+                });
+            }
             continue;
         };
         let needs_dedup = ivf.num_rows() > ivf.num_docs();
@@ -157,238 +182,280 @@ where
             vec,
         });
     }
-    let Some(set_version) = set_version else {
+    if top_n == 0 || (segments.is_empty() && flats.is_empty()) {
         return Ok((Vec::new(), stats));
+    }
+    stats.segments_searched = (segments.len() + flats.len()) as u32;
+
+    let options = match segments.first() {
+        Some(segment) => segment.vec.options().clone(),
+        None => flats[0].vec.options().clone(),
     };
-    if top_n == 0 {
-        return Ok((Vec::new(), stats));
-    }
-    stats.segments_searched = segments.len() as u32;
-
-    let set = searcher.index().centroid_set_search_index(set_version)?;
-    let router = set.field_router(field).ok_or_else(|| {
-        TantivyError::InternalError(format!(
-            "centroid set v{set_version} has no router for field {field:?}"
-        ))
-    })?;
-    let num_centroids = router.num_centroids();
-    for segment in &segments {
-        if segment.ivf().num_clusters() != num_centroids {
-            return Err(TantivyError::InternalError(format!(
-                "segment {} holds {} clusters but centroid set v{set_version} holds \
-                 {num_centroids}",
-                segment.ord,
-                segment.ivf().num_clusters(),
-            )));
-        }
-    }
-
-    let options = segments[0].vec.options().clone();
     let metric = options.metric();
     let prepared = PreparedQuery::<T>::new(metric, Arc::clone(query));
-
-    let (work_budget, pricing_open, pricing_row) =
-        resolve_budget(adaptive, num_centroids, &segments)?;
-
-    // ONE routing pass. Routing operates in `f32` (centroid rows are `f32`
-    // today), so the query is widened losslessly per element. Under Cosine
-    // the router scores unit-norm rows with a raw dot kernel (see
-    // `UnitNormRowsArena`), so the QUERY is normalized here, once —
-    // dot(q̂, ĉ) is then exactly cosine(q, c), which the bounds margins
-    // consume. A degenerate (zero/non-finite norm) query stays raw and
-    // scores like it does everywhere else.
-    let mut query_f32: Vec<f32> = prepared.query().iter().map(|e| e.to_f32()).collect();
-    if metric == Metric::Cosine {
-        let norm = norm_squared_wide(&query_f32).sqrt();
-        if norm.is_finite() && norm > 0.0 {
-            for value in &mut query_f32 {
-                *value = (f64::from(*value) / norm) as f32;
-            }
-        }
-    }
-    let mut routing_ws = Workspace::new();
-    let mut ranked = router.rank_clusters(&mut routing_ws, &query_f32);
 
     let mut topn: GlobalHeap<S, S::Comparator> =
         TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_break.comparator()));
 
-    // The global query bound, maintained at cluster boundaries; `||q||`
-    // once, for the dot margin's Cauchy-Schwarz term.
-    let mut bound_tracker = QueryBoundTracker::new();
-    let q_norm = norm_squared_wide(prepared.query()).sqrt() as f32;
-
-    let mut work_spent = WorkUnits::ZERO;
-    let mut termination = ProbeTermination::Exhausted;
-    // Ranked clusters that did any work in any segment — the arming index's
-    // denominator and the boundary at which the kth folds into the bound.
-    let mut touched_clusters = 0u32;
-    // The probed cluster's gate survivors; allocated once, reused.
-    let mut survivors: Vec<Survivor> = Vec::new();
-
-    for Candidate { sim, node: cluster } in &mut ranked {
-        // Boundary rule: open iff remaining > 0. The tripping pull proves
-        // another ranked cluster existed, keeping `Ceiling` distinct from
-        // `Exhausted`.
-        if work_spent >= work_budget {
-            termination = ProbeTermination::Ceiling;
-            break;
-        }
-        let cluster = cluster as usize;
-        let mut touched = false;
-        // Per-CLUSTER, not per (cluster, segment): a ranked cluster whose
-        // rows live in many segments is still one probed cluster.
-        let mut cluster_opened = false;
-        let mut cluster_scored = false;
-
-        for segment in &mut segments {
-            if segment.dead {
+    // The exact tier.
+    for flat in &mut flats {
+        let filter: Option<BitSet> = if matches_all_docs {
+            None
+        } else {
+            let filter = build_filter_bitset(weight, flat.reader)?;
+            stats.filters_built += 1;
+            if filter.len() == 0 {
                 continue;
             }
-            // Gate 1: presence — absent clusters cost nothing, not even
-            // the margin computation (an empty cluster's 0.0 bound would
-            // masquerade as a bounds skip).
-            let Some(rows) = segment.ivf().non_empty_cluster_range(cluster) else {
-                continue;
-            };
-            touched = true;
-
-            // Gate 2: the bounds verdict, against the GLOBAL bound — the
-            // shared-kth win. Consumed only through `Armed` (the heap
-            // holds k results); Filling probes, and SATURATED probes
-            // arithmetically (+inf margin).
-            let qb = bound_tracker.bound();
-            let verdict = bounds_verdict(qb, || {
-                let QueryBound::Armed { t } = qb else {
-                    // `bounds_verdict` never calls the margin while
-                    // Filling; +inf keeps even that impossibility
-                    // fail-open.
-                    return f32::INFINITY;
-                };
-                // The separation IS the routing key the ranked stream
-                // already computed: `to_bound_space` maps the similarity
-                // key into the metric's distance space for L2/cosine,
-                // and dot consumes the raw `q . c` key directly.
-                let r = segment.ivf().bounds().ball_r(cluster);
-                match metric {
-                    Metric::L2 | Metric::Cosine => {
-                        margin_ball_ball(t, r, to_bound_space(metric, sim.score()))
-                    }
-                    Metric::Dot => margin_ball_halfspace(sim.score(), q_norm, r, t),
-                }
-            });
-            if let Verdict::Skip = verdict {
-                // A skip charges the open share: skips are search work,
-                // and free skips break the work identity. No row work is
-                // spent, no filter is materialized.
-                work_spent += pricing_open;
-                stats.bounds_skips += 1;
-                continue;
-            }
-
-            // Gate 3: the segment's filter, materialized at most once per
-            // query — only for segments that reach a real probe, and never
-            // for an all-docs weight.
-            if matches!(segment.filter, FilterState::NotBuilt) {
-                let filter = build_filter_bitset(weight, segment.reader)?;
-                stats.filters_built += 1;
-                if filter.len() == 0 {
-                    segment.dead = true;
+            Some(filter)
+        };
+        let alive = flat.reader.alive_bitset();
+        for row in 0..flat.vec.num_vectors() {
+            let doc = flat.vec.doc_id_at(row);
+            if let Some(filter) = &filter {
+                if !filter.contains(doc) {
                     continue;
                 }
-                segment.filter = FilterState::Built(filter);
             }
-            let filter: Option<&BitSet> = match &segment.filter {
-                FilterState::All => None,
-                FilterState::Built(filter) => Some(filter),
-                FilterState::NotBuilt => unreachable!("filter materialized above"),
-            };
-            let seen: Option<&mut BitSet> = if segment.needs_dedup {
-                Some(
-                    segment
-                        .seen
-                        .get_or_insert_with(|| BitSet::with_max_value(segment.reader.max_doc())),
-                )
-            } else {
-                None
-            };
-
-            // Event-wise charging, part 1: the open.
-            work_spent += pricing_open;
-
-            // Gate 4 pre-pass: `seen → filter → alive` off the pinned
-            // id-map, no posting bytes fetched.
-            let (visited, pruned_filter, pruned_dead, pruned_seen, scored_rows) =
-                collect_cluster_survivors(
-                    &segment.vec,
-                    rows,
-                    filter,
-                    segment.alive,
-                    seen,
-                    &mut survivors,
-                );
-            stats.vectors_visited += visited;
-            stats.pruned_filter += pruned_filter;
-            stats.pruned_dead += pruned_dead;
-            stats.pruned_seen += pruned_seen;
-
-            // Event-wise charging, part 2: the rows that survive the
-            // pre-pass — exactly the rows fetched and scored below.
-            work_spent += pricing_row * scored_rows as f64;
-
-            stats.segment_opens += 1;
-            cluster_opened = true;
-            if survivors.is_empty() {
-                continue;
-            }
-            cluster_scored = true;
-            stats.candidates_scored += survivors.len();
-
-            // Gate 5: fetch + score — one stride-sized read per survivor
-            // (the unit the pg-backed `Directory` serves zero-copy).
-            for &Survivor { row, doc } in &survivors {
-                let vbytes = segment.vec.vector_bytes_for_row(row)?;
-                let score = prepared.score_doc_bytes(&vbytes);
-                // The skip is exact: `(s, t) < (ts, tt)` requires either
-                // `s < ts`, or a tie the composite comparator resolves —
-                // so a candidate rejected on similarity alone could never
-                // have survived, and its tie-break conversion (a possible
-                // dictionary lookup) is pure waste.
-                if let Some(((threshold_score, _), _)) = &topn.threshold {
-                    if score < *threshold_score {
-                        continue;
-                    }
+            if let Some(bs) = alive {
+                if !bs.is_alive(doc) {
+                    continue;
                 }
-                let segment_key = segment.tie.segment_sort_key(doc, score);
-                let global_key = segment.tie.convert_segment_sort_key(segment_key);
-                topn.push_unordered((score, global_key), DocAddress::new(segment.ord, doc));
             }
-        }
-
-        if cluster_scored {
-            stats.postings_row += 1;
-        } else if cluster_opened {
-            stats.postings_skipped += 1;
-        }
-        if touched {
-            touched_clusters += 1;
-            // Fold the exact kth into the bound at the cluster boundary.
-            // `kth_best` is O(buffer) and force-truncates — results and
-            // every counter above are unaffected (truncation only drops
-            // already-lost entries and tightens the push threshold).
-            let peek = HeapPeek::from_kth(topn.kth_best().map(|(score, _tie)| score));
-            bound_tracker.observe(metric, peek, touched_clusters - 1);
+            let vbytes = flat.vec.vector_bytes_for_row(row)?;
+            let score = prepared.score_doc_bytes(&vbytes);
+            stats.exact_rows_read += 1;
+            if let Some(((threshold_score, _), _)) = &topn.threshold {
+                if score < *threshold_score {
+                    continue;
+                }
+            }
+            let segment_key = flat.tie.segment_sort_key(doc, score);
+            let global_key = flat.tie.convert_segment_sort_key(segment_key);
+            topn.push_unordered((score, global_key), DocAddress::new(flat.ord, doc));
         }
     }
-    // The armed index exists exactly when the bound armed.
-    debug_assert!(
-        bound_tracker.armed_at_probe().is_some()
-            == matches!(bound_tracker.bound(), QueryBound::Armed { .. })
-    );
 
-    stats.routing = ranked.metrics();
-    stats.bound_armed_at_probe = bound_tracker.armed_at_probe();
-    stats.termination = termination;
-    stats.work_charged = work_spent.to_f32();
+    // The routed tier. `set_version` is `Some` iff any clustered segment
+    // participates.
+    if let Some(set_version) = set_version {
+        let set = searcher.index().centroid_set_search_index(set_version)?;
+        let router = set.field_router(field).ok_or_else(|| {
+            TantivyError::InternalError(format!(
+                "centroid set v{set_version} has no router for field {field:?}"
+            ))
+        })?;
+        let num_centroids = router.num_centroids();
+        for segment in &segments {
+            if segment.ivf().num_clusters() != num_centroids {
+                return Err(TantivyError::InternalError(format!(
+                    "segment {} holds {} clusters but centroid set v{set_version} holds \
+                     {num_centroids}",
+                    segment.ord,
+                    segment.ivf().num_clusters(),
+                )));
+            }
+        }
+
+        let (work_budget, pricing_open, pricing_row) =
+            resolve_budget(adaptive, num_centroids, &segments)?;
+
+        // ONE routing pass. Routing operates in `f32` (centroid rows are `f32`
+        // today), so the query is widened losslessly per element. Under Cosine
+        // the router scores unit-norm rows with a raw dot kernel (see
+        // `UnitNormRowsArena`), so the QUERY is normalized here, once —
+        // dot(q̂, ĉ) is then exactly cosine(q, c), which the bounds margins
+        // consume. A degenerate (zero/non-finite norm) query stays raw and
+        // scores like it does everywhere else.
+        let mut query_f32: Vec<f32> = prepared.query().iter().map(|e| e.to_f32()).collect();
+        if metric == Metric::Cosine {
+            let norm = norm_squared_wide(&query_f32).sqrt();
+            if norm.is_finite() && norm > 0.0 {
+                for value in &mut query_f32 {
+                    *value = (f64::from(*value) / norm) as f32;
+                }
+            }
+        }
+        let mut routing_ws = Workspace::new();
+        let mut ranked = router.rank_clusters(&mut routing_ws, &query_f32);
+
+        // The global query bound, maintained at cluster boundaries; `||q||`
+        // once, for the dot margin's Cauchy-Schwarz term.
+        let mut bound_tracker = QueryBoundTracker::new();
+        let q_norm = norm_squared_wide(prepared.query()).sqrt() as f32;
+
+        let mut work_spent = WorkUnits::ZERO;
+        let mut termination = ProbeTermination::Exhausted;
+        // Ranked clusters that did any work in any segment — the arming index's
+        // denominator and the boundary at which the kth folds into the bound.
+        let mut touched_clusters = 0u32;
+        // The probed cluster's gate survivors; allocated once, reused.
+        let mut survivors: Vec<Survivor> = Vec::new();
+
+        for Candidate { sim, node: cluster } in &mut ranked {
+            // Boundary rule: open iff remaining > 0. The tripping pull proves
+            // another ranked cluster existed, keeping `Ceiling` distinct from
+            // `Exhausted`.
+            if work_spent >= work_budget {
+                termination = ProbeTermination::Ceiling;
+                break;
+            }
+            let cluster = cluster as usize;
+            let mut touched = false;
+            // Per-CLUSTER, not per (cluster, segment): a ranked cluster whose
+            // rows live in many segments is still one probed cluster.
+            let mut cluster_opened = false;
+            let mut cluster_scored = false;
+
+            for segment in &mut segments {
+                if segment.dead {
+                    continue;
+                }
+                // Gate 1: presence — absent clusters cost nothing, not even
+                // the margin computation (an empty cluster's 0.0 bound would
+                // masquerade as a bounds skip).
+                let Some(rows) = segment.ivf().non_empty_cluster_range(cluster) else {
+                    continue;
+                };
+                touched = true;
+
+                // Gate 2: the bounds verdict, against the GLOBAL bound — the
+                // shared-kth win. Consumed only through `Armed` (the heap
+                // holds k results); Filling probes, and SATURATED probes
+                // arithmetically (+inf margin).
+                let qb = bound_tracker.bound();
+                let verdict = bounds_verdict(qb, || {
+                    let QueryBound::Armed { t } = qb else {
+                        // `bounds_verdict` never calls the margin while
+                        // Filling; +inf keeps even that impossibility
+                        // fail-open.
+                        return f32::INFINITY;
+                    };
+                    // The separation IS the routing key the ranked stream
+                    // already computed: `to_bound_space` maps the similarity
+                    // key into the metric's distance space for L2/cosine,
+                    // and dot consumes the raw `q . c` key directly.
+                    let r = segment.ivf().bounds().ball_r(cluster);
+                    match metric {
+                        Metric::L2 | Metric::Cosine => {
+                            margin_ball_ball(t, r, to_bound_space(metric, sim.score()))
+                        }
+                        Metric::Dot => margin_ball_halfspace(sim.score(), q_norm, r, t),
+                    }
+                });
+                if let Verdict::Skip = verdict {
+                    // A skip charges the open share: skips are search work,
+                    // and free skips break the work identity. No row work is
+                    // spent, no filter is materialized.
+                    work_spent += pricing_open;
+                    stats.bounds_skips += 1;
+                    continue;
+                }
+
+                // Gate 3: the segment's filter, materialized at most once per
+                // query — only for segments that reach a real probe, and never
+                // for an all-docs weight.
+                if matches!(segment.filter, FilterState::NotBuilt) {
+                    let filter = build_filter_bitset(weight, segment.reader)?;
+                    stats.filters_built += 1;
+                    if filter.len() == 0 {
+                        segment.dead = true;
+                        continue;
+                    }
+                    segment.filter = FilterState::Built(filter);
+                }
+                let filter: Option<&BitSet> = match &segment.filter {
+                    FilterState::All => None,
+                    FilterState::Built(filter) => Some(filter),
+                    FilterState::NotBuilt => unreachable!("filter materialized above"),
+                };
+                let seen: Option<&mut BitSet> =
+                    if segment.needs_dedup {
+                        Some(segment.seen.get_or_insert_with(|| {
+                            BitSet::with_max_value(segment.reader.max_doc())
+                        }))
+                    } else {
+                        None
+                    };
+
+                // Event-wise charging, part 1: the open.
+                work_spent += pricing_open;
+
+                // Gate 4 pre-pass: `seen → filter → alive` off the pinned
+                // id-map, no posting bytes fetched.
+                let (visited, pruned_filter, pruned_dead, pruned_seen, scored_rows) =
+                    collect_cluster_survivors(
+                        &segment.vec,
+                        rows,
+                        filter,
+                        segment.alive,
+                        seen,
+                        &mut survivors,
+                    );
+                stats.vectors_visited += visited;
+                stats.pruned_filter += pruned_filter;
+                stats.pruned_dead += pruned_dead;
+                stats.pruned_seen += pruned_seen;
+
+                // Event-wise charging, part 2: the rows that survive the
+                // pre-pass — exactly the rows fetched and scored below.
+                work_spent += pricing_row * scored_rows as f64;
+
+                stats.segment_opens += 1;
+                cluster_opened = true;
+                if survivors.is_empty() {
+                    continue;
+                }
+                cluster_scored = true;
+                stats.candidates_scored += survivors.len();
+
+                // Gate 5: fetch + score — one stride-sized read per survivor
+                // (the unit the pg-backed `Directory` serves zero-copy).
+                for &Survivor { row, doc } in &survivors {
+                    let vbytes = segment.vec.vector_bytes_for_row(row)?;
+                    let score = prepared.score_doc_bytes(&vbytes);
+                    // The skip is exact: `(s, t) < (ts, tt)` requires either
+                    // `s < ts`, or a tie the composite comparator resolves —
+                    // so a candidate rejected on similarity alone could never
+                    // have survived, and its tie-break conversion (a possible
+                    // dictionary lookup) is pure waste.
+                    if let Some(((threshold_score, _), _)) = &topn.threshold {
+                        if score < *threshold_score {
+                            continue;
+                        }
+                    }
+                    let segment_key = segment.tie.segment_sort_key(doc, score);
+                    let global_key = segment.tie.convert_segment_sort_key(segment_key);
+                    topn.push_unordered((score, global_key), DocAddress::new(segment.ord, doc));
+                }
+            }
+
+            if cluster_scored {
+                stats.postings_row += 1;
+            } else if cluster_opened {
+                stats.postings_skipped += 1;
+            }
+            if touched {
+                touched_clusters += 1;
+                // Fold the exact kth into the bound at the cluster boundary.
+                // `kth_best` is O(buffer) and force-truncates — results and
+                // every counter above are unaffected (truncation only drops
+                // already-lost entries and tightens the push threshold).
+                let peek = HeapPeek::from_kth(topn.kth_best().map(|(score, _tie)| score));
+                bound_tracker.observe(metric, peek, touched_clusters - 1);
+            }
+        }
+        // The armed index exists exactly when the bound armed.
+        debug_assert!(
+            bound_tracker.armed_at_probe().is_some()
+                == matches!(bound_tracker.bound(), QueryBound::Armed { .. })
+        );
+
+        stats.routing = ranked.metrics();
+        stats.bound_armed_at_probe = bound_tracker.armed_at_probe();
+        stats.termination = termination;
+        stats.work_charged = work_spent.to_f32();
+    }
 
     let hits = topn
         .into_sorted_vec()

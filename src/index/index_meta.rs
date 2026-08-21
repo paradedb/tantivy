@@ -604,6 +604,7 @@ mod tests {
                 ..IndexSettings::default()
             },
             persisted_custom_extensions: Vec::new(),
+            centroid_set: None,
             segments: Vec::new(),
             schema,
             opstamp: 0u64,

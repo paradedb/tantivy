@@ -771,19 +771,11 @@ mod centroid_set_lifecycle_tests {
         sb.build()
     }
 
-    /// Creation validates both directions of "schema has vector fields ⟺
-    /// a centroid index is provided".
+    /// A centroid index without vector fields is refused; the converse —
+    /// vector fields without a set — is the flat (mutable/staging) tier
+    /// and creates fine.
     #[test]
-    fn creation_requires_centroid_set_iff_vector_fields() {
-        let err = Index::builder()
-            .schema(vector_schema())
-            .create_in_ram()
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("no centroid index"),
-            "unexpected: {err}"
-        );
-
+    fn centroid_index_requires_vector_fields() {
         let mut sb = Schema::builder();
         sb.add_text_field("label", STRING);
         let err = Index::builder()
@@ -795,6 +787,12 @@ mod centroid_set_lifecycle_tests {
             err.to_string().contains("no vector fields"),
             "unexpected: {err}"
         );
+
+        let index = Index::builder()
+            .schema(vector_schema())
+            .create_in_ram()
+            .expect("a no-set index stores vectors flat");
+        assert!(index.load_metas().unwrap().centroid_set.is_none());
     }
 
     /// The set file is written at creation, listed in the meta, carried
@@ -854,36 +852,15 @@ mod centroid_set_lifecycle_tests {
         Ok(())
     }
 
-    /// A sibling index sharing the source's set gets a byte-identical
-    /// file — same version — and its segments assign against the same
-    /// centroids, so a future merge across both passes the version guard.
+    /// An index created without a centroid set writes the flat layout:
+    /// no set file, no IVF remainder, doc-ordered rows.
     #[test]
-    fn shared_centroid_set_copies_verbatim() -> crate::Result<()> {
-        let source_dir = RamDirectory::create();
-        let source = Index::builder()
-            .schema(vector_schema())
-            .centroid_index(Arc::new(Grid2DCentroidIndex {
-                centroids: vec![[0.0, 0.0], [10.0, 10.0]],
-                version: 9,
-            }))
-            .create(source_dir.clone())?;
+    fn index_without_set_writes_flat() -> crate::Result<()> {
+        let index = Index::builder().schema(vector_schema()).create_in_ram()?;
+        assert!(index.load_metas()?.centroid_set.is_none());
 
-        let sibling = Index::builder()
-            .schema(vector_schema())
-            .shared_centroid_set(&source)
-            .create_in_ram()?;
-        assert_eq!(open_centroid_set(&sibling)?.version(), 9);
-        let set_path = centroid_set_filename(9);
-        let source_bytes = source.directory().open_read(&set_path)?.read_bytes()?;
-        let sibling_bytes = sibling.directory().open_read(&set_path)?.read_bytes()?;
-        assert_eq!(
-            source_bytes.as_slice(),
-            sibling_bytes.as_slice(),
-            "the shared set must be a verbatim copy"
-        );
-
-        let embed_field = sibling.schema().get_field("embedding").unwrap();
-        let mut writer: IndexWriter = sibling.writer_with_num_threads(1, 15_000_000)?;
+        let embed_field = index.schema().get_field("embedding").unwrap();
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         for v in [[0.1_f32, 0.0], [9.9, 10.1]] {
             let mut doc = TantivyDocument::new();
@@ -891,28 +868,17 @@ mod centroid_set_lifecycle_tests {
             writer.add_document(doc)?;
         }
         writer.commit()?;
-        let searcher = sibling.reader()?.searcher();
-        let ivf = searcher.segment_readers()[0]
-            .vector_index(embed_field)?
-            .index()
-            .expect("IVF segment")
-            .centroid_set_version();
-        assert_eq!(ivf, 9, "sibling segments stamp the source's version");
 
-        // Both centroid sources at once is rejected.
-        let err = Index::builder()
-            .schema(vector_schema())
-            .centroid_index(Arc::new(Grid2DCentroidIndex {
-                centroids: vec![[0.0, 0.0]],
-                version: 1,
-            }))
-            .shared_centroid_set(&source)
-            .create_in_ram()
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("mutually exclusive"),
-            "unexpected: {err}"
-        );
+        let searcher = index.reader()?.searcher();
+        let vec = searcher.segment_readers()[0].vector_index(embed_field)?;
+        assert!(vec.index().is_none(), "flat segments carry no IvfIndex");
+        assert_eq!(vec.num_vectors(), 2);
+        for (row, doc) in [(0usize, 0u32), (1, 1)] {
+            assert_eq!(vec.doc_id_at(row), doc, "flat rows are doc-ordered");
+        }
+        let info = vec.info().expect("flat segments still report info");
+        assert_eq!(info.num_centroids, 0);
+        assert_eq!(info.centroid_set_version, 0);
         Ok(())
     }
 

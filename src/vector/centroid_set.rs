@@ -225,38 +225,6 @@ impl<W: Write> Write for RouterSlotWriter<W> {
     }
 }
 
-/// Copy the source index's newest centroid set file VERBATIM into
-/// `directory` — same version, same normalized rows, same router payload —
-/// so a sibling index (e.g. an in-memory index staging a mutable segment)
-/// assigns against byte-identical centroids and stamps the same version.
-/// Returns the copied set's meta entry inputs `(version, filename)`.
-pub(crate) fn copy_centroid_set(
-    source: &crate::Index,
-    directory: &dyn Directory,
-    schema: &Schema,
-) -> crate::Result<(u64, PathBuf)> {
-    let metas = source.load_metas()?;
-    let source_set = metas.centroid_set.as_ref().ok_or_else(|| {
-        TantivyError::InvalidArgument("the source index has no centroid set to share".to_string())
-    })?;
-    let source_path = std::path::Path::new(&source_set.filename);
-    let bytes = source.directory().open_read(source_path)?.read_bytes()?;
-    let path = centroid_set_filename(source_set.version);
-    let mut write = directory.open_write(&path)?;
-    write.write_all(&bytes)?;
-    common::TerminatingWrite::terminate(write)?;
-    // The copy is verbatim, but the DESTINATION schema decides what must be
-    // in it: every vector field needs a slot (field ids must line up, which
-    // sharing between same-schema siblings guarantees).
-    let reader = CentroidSetReader::open(directory, &path)?;
-    for (field, entry) in schema.fields() {
-        if let FieldType::Vector(opts) = entry.field_type() {
-            reader.field_rows(field, opts)?;
-        }
-    }
-    Ok((source_set.version, path))
-}
-
 /// Reader over one `centroids.<version>` file.
 pub(crate) struct CentroidSetReader {
     version: u64,

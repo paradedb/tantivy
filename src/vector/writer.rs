@@ -1,14 +1,15 @@
 //! Per-commit vector writer: buffers raw vector bytes per doc and, at
-//! segment finalize, assigns every buffered row against the index-level
-//! centroid set and writes the segment's `.vec` in the one (IVF) layout —
-//! there is no flat tier; fresh per-commit segments cluster like merged
-//! ones, they are just small.
+//! segment finalize, writes the segment's `.vec` in the layout the index
+//! dictates — clustered (assigned against the index-level centroid set)
+//! when the index has one, flat (doc-ordered, searched exhaustively) when
+//! it does not. The mutable/staging tier is exactly the no-set case.
 
 use std::any::Any;
 use std::collections::BTreeMap;
 
 use super::centroid_set::CentroidSetReader;
 use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use super::flat::write_flat_field;
 use super::header::write_header;
 use super::ivf::{write_ivf_field, IvfFieldWriteParams};
 use super::VEC_EXT;
@@ -154,18 +155,17 @@ impl PluginWriter for VecWriter {
 
         let index = segment.index();
         let meta = index.load_metas()?;
-        let centroid_set = meta.centroid_set.as_ref().ok_or_else(|| {
-            TantivyError::InvalidArgument(
-                "index has vector fields but no centroid set; the centroid set must be provided \
-                 at index creation via IndexBuilder::centroid_index"
-                    .to_string(),
-            )
-        })?;
-        let set_search = index.centroid_set_search_index(centroid_set.version)?;
-        let set_reader = CentroidSetReader::open(
-            index.directory(),
-            std::path::Path::new(&centroid_set.filename),
-        )?;
+        let set = match meta.centroid_set.as_ref() {
+            Some(centroid_set) => {
+                let set_search = index.centroid_set_search_index(centroid_set.version)?;
+                let set_reader = CentroidSetReader::open(
+                    index.directory(),
+                    std::path::Path::new(&centroid_set.filename),
+                )?;
+                Some((set_search, set_reader))
+            }
+            None => None,
+        };
 
         let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
         write_header(&mut write)?;
@@ -198,6 +198,11 @@ impl PluginWriter for VecWriter {
             if present.is_empty() {
                 continue;
             }
+
+            let Some((set_search, set_reader)) = &set else {
+                write_flat_field(&mut composite, *field, &present, &row_bytes, self.num_docs)?;
+                continue;
+            };
 
             let field_centroids = set_reader.field_centroids(*field, &buf.opts)?;
             let params = IvfFieldWriteParams {
