@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::{fmt, io};
 
-use crate::collector::Collector;
+use crate::collector::{Collector, CollectorMode};
 use crate::core::Executor;
 use crate::index::{SegmentId, SegmentReader};
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
@@ -227,9 +227,7 @@ impl Searcher {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
         let segment_readers = self.segment_readers();
-        if let crate::collector::CollectorMode::MultiSegment(multi_segment) =
-            collector.collection_mode(self)?
-        {
+        if let CollectorMode::MultiSegment(multi_segment) = collector.collection_mode(self)? {
             // The coupled pass over the listed segments; every other
             // segment takes the standard per-segment path; all fruits
             // meet in merge_fruits.
