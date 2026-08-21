@@ -1,28 +1,30 @@
-//! Distance kernels, the vector element trait, and the per-segment storage plugin.
+//! Vector storage and search.
+//!
+//! The module root holds what every side shares: the element trait
+//! [`VectorElement`], the arenas, the [`distance`] kernels, the on-disk
+//! framing ([`header`], [`id_map`]), the per-segment read surface
+//! ([`VectorIndexReader`]), and the write entry ([`VecWriter`] /
+//! [`VectorPlugin`], which pick the layout: clustered when the index has
+//! a centroid index, flat when it does not). The clustered design lives
+//! in [`ivf`] — the index-level centroid index (vocabulary + router) and
+//! each segment's [`SegmentClusters`] (cluster → row-range postings),
+//! plus assignment, bounds, and the field write/merge. The whole query
+//! path — the cross-segment driver, collector, prepared query,
+//! tie-break, and the work-unit model — lives in `search`.
 //!
 //! The schema-level field configuration ([`VectorOptions`](crate::schema::VectorOptions),
-//! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema module and is
-//! re-exported here; the element trait [`VectorElement`], the vector storage abstraction
-//! [`VectorArena`], and the distance kernels live here.
-//! The on-disk formats live in submodules: [`flat`] for the dense full-precision layout and
-//! [`ivf`] for the partitioned/clustered accelerator. Both are owned by a single
-//! [`VectorPlugin`] which picks between them per merge based on
-//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
-//! Top-N vector queries dispatch over them via [`VectorBackend`].
+//! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema
+//! module and is re-exported here.
 
 use std::io;
 
-mod backend;
-mod bounds;
-mod collector;
 mod distance;
 mod header;
-mod index_reader;
-mod plugin;
-mod prepared;
-mod tie_break;
+mod id_map;
+mod reader;
+mod search;
+mod writer;
 
-pub mod flat;
 pub mod ivf;
 
 #[cfg(test)]
@@ -30,31 +32,29 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
-pub use backend::{
-    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, VectorBackend,
-    DEFAULT_FIXED_PROBE_COST_ROWS,
-};
-pub use bounds::{
-    bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
-    BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
-};
-pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
-pub use flat::FlatVecWriter;
-pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
-pub use ivf::{
-    Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch,
-    IvfVectors, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    Workspace,
+pub use ivf::bounds::{
+    bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
+    BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
-pub use plugin::VectorPlugin;
-pub use prepared::PreparedQuery;
-pub use tie_break::NoTieBreak;
+pub(crate) use ivf::centroid_index::CachedCentroidIndex;
+pub use ivf::centroid_index::{CentroidProducer, ROUTER_KIND_RNG};
+pub use ivf::{
+    Candidate, Graph, IvfCentroids, IvfMatrix, IvfSearchMetrics, NeighborhoodGraphConfig,
+    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
+    SearchIterator, SearchTerminationReason, SegmentClusters, Workspace,
+};
+pub use reader::{VectorClusterStats, VectorIndexReader, VectorInfo};
+pub use search::collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
+pub use search::prepared::PreparedQuery;
+pub use search::stats::{ProbeStats, ProbeTermination};
+pub use search::tie_break::NoTieBreak;
+pub use search::work::{set_fixed_probe_cost_rows, DEFAULT_FIXED_PROBE_COST_ROWS};
+pub use writer::{VecWriter, VectorPlugin};
 
+pub use crate::core::CENTROIDS_FILEPATH;
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
 // resolves for callers and tests that work entirely within the vector module.
 pub use crate::schema::{Metric, VectorDType, VectorOptions};

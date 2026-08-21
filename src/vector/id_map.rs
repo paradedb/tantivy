@@ -1,14 +1,15 @@
 //! Per-segment row→doc_id map for vector fields.
 //!
 //! Stored as slot `[0]` of the `.vec` composite file, parallel to the dense
-//! row blob in slot `[1]`. The variant is the storage-mode discriminator: the
-//! flat backend writes `Identity` (dense) or `Bitmap` (sparse); the future IVF
-//! backend writes `Explicit`. Reading the variant tag is all it takes to learn
-//! the mode — there is no separate format byte or metadata file.
+//! row blob in slot `[1]`. The variant is the layout discriminator: the flat
+//! layout (indexes without a centroid index — mutable/staging segments) writes
+//! `Identity` (dense) or `Bitmap` (sparse); the clustered layout writes
+//! `Explicit`. Reading the variant tag is all it takes to learn the layout —
+//! there is no separate format byte.
 //!
 //! For the flat variants the map also addresses the dense row array via rank
-//! (`rank(doc_id) -> row_id`) and distinguishes "missing vector" from "zero
-//! vector" at query time.
+//! (`rank_if_exists(doc_id) -> row_id`) and distinguishes "missing vector"
+//! from "zero vector" at query time.
 //!
 //! Mirrors the `Full | Optional` cardinality split in `tantivy-columnar`. For
 //! dense columns (every doc present — the typical case for embeddings) the
@@ -27,11 +28,9 @@
 //!   tag = 2  (Explicit): body = row→doc_id permutation, one u32 LE per row
 //! ```
 //!
-//! `Identity`/`Bitmap` are written by the flat backend (`row_id == doc_id` or a
-//! presence bitmap). `Explicit` is written by the IVF backend, where rows are
-//! cluster-sorted and bear no positional relationship to `doc_id`; the variant
-//! tag is therefore the flat-vs-IVF discriminator (`Explicit` ⟺ IVF ⟺ a
-//! sibling `.centroids` file is present).
+//! `Explicit` rows are cluster-sorted and bear no positional relationship to
+//! `doc_id`; the variant tag is therefore the flat-vs-clustered discriminator
+//! (`Explicit` ⟺ the field owns the IVF remainder slots `[2..=4]`).
 
 use std::io::{self, Write};
 use std::mem::size_of;
@@ -54,23 +53,23 @@ fn explicit_doc_id_at(bytes: &[u8], row: usize) -> DocId {
     DocId::from_le_bytes(bytes[start..start + size_of::<DocId>()].try_into().unwrap())
 }
 
-/// Per-field row→doc_id map. Dispatches on cardinality at open time so the hot
-/// path can skip the bitmap entirely when every doc has a value.
+/// Per-field row→doc_id map. Dispatches on cardinality at open time so the
+/// hot path can skip the bitmap entirely when every doc has a value.
 pub enum IdMap {
     /// Every doc has a value. `row_id == doc_id`; no bitmap stored.
     Identity { num_docs: u32 },
-    /// Some docs may be absent. Rank/contains go through columnar's
+    /// Some docs may be absent. Rank/select go through columnar's
     /// `OptionalIndex` (roaring-style block bitmap).
     Bitmap(OptionalIndex),
-    /// IVF: maps each row to its doc_id. Held as the raw little-endian body
-    /// (one u32 per row) so it can be decoded a row at a time.
+    /// Clustered: maps each row to its doc_id. Held as the raw
+    /// little-endian body (one u32 per row) so it can be decoded a row at
+    /// a time.
     Explicit(OwnedBytes),
 }
 
 impl IdMap {
-    /// Serialize the appropriate variant given a sorted list of present
-    /// `doc_id`s. Chooses `Identity` if every doc is present, `Bitmap`
-    /// otherwise.
+    /// Serialize the appropriate flat variant given a sorted list of present
+    /// `doc_id`s: `Identity` if every doc is present, `Bitmap` otherwise.
     ///
     /// The Identity variant writes only the variant tag — `num_docs` is
     /// supplied at open time (typically from `segment_reader.max_doc()`).
@@ -128,6 +127,12 @@ impl IdMap {
         }
     }
 
+    /// `true` for the flat (doc-ordered) variants, `false` for the
+    /// clustered permutation.
+    pub fn is_flat(&self) -> bool {
+        !matches!(self, IdMap::Explicit(_))
+    }
+
     /// Number of docs that have a value (= number of stored rows).
     pub fn num_rows(&self) -> u32 {
         match self {
@@ -137,30 +142,26 @@ impl IdMap {
         }
     }
 
-    /// `true` if `doc_id` has a value. The `Explicit` arm is a linear scan —
-    /// the reference semantics the format tests exercise; the read path
-    /// ([`VectorIndexReader`](crate::vector::VectorIndexReader)) uses
-    /// cluster-local binary search instead.
-    #[cfg(test)]
+    /// The doc id stored at `row`. For the flat variants rows ascend by
+    /// doc id (`Identity` is the identity, `Bitmap` a select); for
+    /// `Explicit` the permutation is decoded on demand from the pinned
+    /// bytes. Caller guarantees `row < num_rows`.
     #[inline]
-    pub fn contains(&self, doc_id: DocId) -> bool {
+    pub fn doc_id_at(&self, row: usize) -> DocId {
         match self {
-            IdMap::Identity { num_docs } => doc_id < *num_docs,
-            IdMap::Bitmap(idx) => Set::contains(idx, doc_id),
-            IdMap::Explicit(bytes) => {
-                let num_rows = bytes.len() / size_of::<DocId>();
-                (0..num_rows).any(|row| explicit_doc_id_at(bytes, row) == doc_id)
-            }
+            IdMap::Identity { .. } => row as DocId,
+            IdMap::Bitmap(idx) => idx.select(row as u32),
+            IdMap::Explicit(bytes) => explicit_doc_id_at(bytes, row),
         }
     }
 
     /// Returns the dense row id for `doc_id` if it has a value, else `None`.
     /// For `Identity`, this is the identity map — no bitmap consulted. For
-    /// `Explicit` this is a linear scan; the IVF read path uses cluster-local
-    /// binary search instead (see
+    /// `Explicit` this is a linear scan; the clustered read path uses
+    /// cluster-local binary search instead (see
     /// [`VectorIndexReader`](crate::vector::VectorIndexReader)).
     /// Callers must pass a `doc_id` within the segment (`doc_id < max_doc`);
-    /// this is asserted in debug builds.
+    /// this is asserted in debug builds for `Identity`.
     #[inline]
     pub fn rank_if_exists(&self, doc_id: DocId) -> Option<u32> {
         match self {
@@ -194,8 +195,6 @@ mod tests {
         let n = 100u32;
         let present: Vec<DocId> = (0..n).collect();
 
-        // Wire-level: the serialized output is exactly 1 byte (just the
-        // variant tag); no body — num_docs comes from the caller.
         let mut buf = Vec::new();
         IdMap::serialize(&present, n, &mut buf).unwrap();
         assert_eq!(buf.len(), 1, "Identity variant should write only the tag");
@@ -203,15 +202,12 @@ mod tests {
 
         let p = IdMap::open(FileSlice::from(buf), n).unwrap();
         assert!(matches!(p, IdMap::Identity { num_docs } if num_docs == n));
+        assert!(p.is_flat());
         assert_eq!(p.num_rows(), n);
         for d in 0..n {
-            assert!(p.contains(d));
+            assert_eq!(p.doc_id_at(d as usize), d);
             assert_eq!(p.rank_if_exists(d), Some(d));
         }
-        // Out-of-range queries are the caller's responsibility:
-        // `contains` returns false, but `rank_if_exists` requires
-        // `doc_id < num_docs` (asserted in debug builds).
-        assert!(!p.contains(n));
     }
 
     #[test]
@@ -220,7 +216,6 @@ mod tests {
         assert!(matches!(p, IdMap::Bitmap(_)));
         assert_eq!(p.num_rows(), 0);
         for d in 0..100 {
-            assert!(!p.contains(d));
             assert_eq!(p.rank_if_exists(d), None);
         }
     }
@@ -230,13 +225,13 @@ mod tests {
         let present: Vec<DocId> = vec![3, 7, 11, 12, 50, 99];
         let p = round_trip(&present, 100);
         assert!(matches!(p, IdMap::Bitmap(_)));
+        assert!(p.is_flat());
         assert_eq!(p.num_rows(), 6);
         for (row, &doc) in present.iter().enumerate() {
-            assert!(p.contains(doc));
+            assert_eq!(p.doc_id_at(row), doc);
             assert_eq!(p.rank_if_exists(doc), Some(row as u32));
         }
         for d in [0u32, 1, 2, 4, 5, 6, 8, 9, 10, 13, 49, 51, 98] {
-            assert!(!p.contains(d));
             assert_eq!(p.rank_if_exists(d), None);
         }
     }
@@ -250,21 +245,14 @@ mod tests {
         assert!(matches!(p, IdMap::Bitmap(_)));
         assert_eq!(p.num_rows() as usize, present.len());
         for (row, &doc) in present.iter().enumerate() {
+            assert_eq!(p.doc_id_at(row), doc);
             assert_eq!(p.rank_if_exists(doc), Some(row as u32));
         }
         for d in 0..n {
             if d % 3 != 0 {
-                assert!(!p.contains(d));
+                assert_eq!(p.rank_if_exists(d), None);
             }
         }
-    }
-
-    #[test]
-    fn test_doc_id_beyond_num_docs() {
-        let p = round_trip(&[1, 5], 10);
-        assert!(!p.contains(10));
-        assert!(!p.contains(100));
-        assert_eq!(p.rank_if_exists(10), None);
     }
 
     #[test]
@@ -278,12 +266,27 @@ mod tests {
 
         let p = IdMap::open(FileSlice::from(buf), 5).unwrap();
         assert!(matches!(p, IdMap::Explicit(_)));
+        assert!(!p.is_flat());
         assert_eq!(p.num_rows(), 4);
         for (row, &doc) in row_doc_ids.iter().enumerate() {
-            assert!(p.contains(doc));
+            assert_eq!(p.doc_id_at(row), doc);
             assert_eq!(p.rank_if_exists(doc), Some(row as u32));
         }
-        assert!(!p.contains(2));
         assert_eq!(p.rank_if_exists(2), None);
+    }
+
+    #[test]
+    fn test_ragged_explicit_body_rejected() {
+        let mut buf = Vec::new();
+        IdMap::serialize_explicit(&[1, 2], &mut buf).unwrap();
+        buf.push(0xFF);
+        let err = IdMap::open(FileSlice::from(buf), 5).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_unknown_tag_rejected() {
+        let err = IdMap::open(FileSlice::from(vec![3u8]), 5).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

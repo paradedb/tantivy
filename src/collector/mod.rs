@@ -100,9 +100,9 @@ pub use self::multi_collector::{FruitHandle, MultiCollector, MultiFruit};
 
 mod top_collector;
 pub use self::top_collector::ComparableDoc;
+// re-exported with the Collector trait below
 
 mod top_score_collector;
-pub(crate) use self::top_score_collector::compare_for_top_k;
 pub use self::top_score_collector::{TopDocs, TopNComputer};
 
 mod sort_key_top_collector;
@@ -126,19 +126,6 @@ pub trait Fruit: Send + downcast_rs::Downcast {}
 
 impl<T> Fruit for T where T: Send + downcast_rs::Downcast {}
 
-/// Collectors are in charge of collecting and retaining relevant
-/// information from the document found and scored by the query.
-///
-/// For instance,
-///
-/// - keeping track of the top 10 best documents
-/// - computing a breakdown over a fast field
-/// - computing the number of documents matching the query
-///
-/// Our search index is in fact a collection of segments, so
-/// a `Collector` trait is actually more of a factory to instance
-/// `SegmentCollector`s for each segments.
-///
 /// The collection logic itself is in the `SegmentCollector`.
 ///
 /// Segments are not guaranteed to be visited in any specific order.
