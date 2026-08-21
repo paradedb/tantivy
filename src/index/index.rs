@@ -402,8 +402,6 @@ impl IndexBuilder {
         self.validate()?;
         let dir = dir.into();
         let directory = ManagedDirectory::wrap(dir)?;
-        // The centroid index file is written BEFORE the first meta.json
-        // references it — the meta write is the commit point.
         let centroid_index = match &self.centroid_producer {
             Some(centroid_producer) => {
                 let schema = self.get_expect_schema()?;
