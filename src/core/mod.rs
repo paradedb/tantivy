@@ -21,5 +21,10 @@ pub static META_FILEPATH: Lazy<&'static Path> = Lazy::new(|| Path::new("meta.jso
 /// are currently in the directory
 pub static MANAGED_FILEPATH: Lazy<&'static Path> = Lazy::new(|| Path::new(".managed.json"));
 
+/// The index-level centroid index the clustered vector layout assigns
+/// against, written at index creation by
+/// [`CentroidProducer::serialize`](crate::vector::CentroidProducer::serialize).
+pub static CENTROIDS_FILEPATH: Lazy<&'static Path> = Lazy::new(|| Path::new("centroids"));
+
 #[cfg(test)]
 mod tests;

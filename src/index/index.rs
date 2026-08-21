@@ -7,7 +7,7 @@ use std::thread::available_parallelism;
 use super::segment::Segment;
 use super::segment_reader::merge_field_meta_data;
 use super::{FieldMetadata, IndexSettings};
-use crate::core::{Executor, META_FILEPATH};
+use crate::core::{Executor, CENTROIDS_FILEPATH, META_FILEPATH};
 use crate::directory::error::OpenReadError;
 #[cfg(feature = "mmap")]
 use crate::directory::MmapDirectory;
@@ -409,9 +409,8 @@ impl IndexBuilder {
                 // (for pg_search, a Postgres backend, which forbids FFI from
                 // any thread but its own). Callers invoking serialize
                 // directly may pass a pool.
-                let path =
-                    centroid_producer.serialize(&directory, &schema, &Executor::single_thread())?;
-                Some(path.to_string_lossy().into_owned())
+                centroid_producer.serialize(&directory, &schema, &Executor::single_thread())?;
+                Some(CENTROIDS_FILEPATH.to_string_lossy().into_owned())
             }
             None => None,
         };

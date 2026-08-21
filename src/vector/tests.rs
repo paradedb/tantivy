@@ -745,10 +745,10 @@ mod centroid_index_lifecycle_tests {
     use std::sync::Arc;
 
     use super::{open_centroid_index, Grid2DCentroidProducer, SingleCellCentroidProducer};
+    use crate::core::CENTROIDS_FILEPATH;
     use crate::directory::{Directory, RamDirectory};
     use crate::indexer::NoMergePolicy;
     use crate::schema::{Schema, STORED, STRING};
-    use crate::vector::centroid_index::centroid_index_filename;
     use crate::vector::{Metric, VectorOptions};
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -795,7 +795,7 @@ mod centroid_index_lifecycle_tests {
             }))
             .create(directory.clone())?;
         let embed_field = index.schema().get_field("embedding").unwrap();
-        let set_path = centroid_index_filename();
+        let set_path = *CENTROIDS_FILEPATH;
         assert!(directory.exists(&set_path)?, "set file written at creation");
         assert_eq!(
             index.load_metas()?.centroid_index,

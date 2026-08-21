@@ -23,7 +23,6 @@
 //! ```
 
 use std::io::Write;
-use std::path::PathBuf;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
@@ -34,6 +33,7 @@ use super::ivf::{
     NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
 };
 use super::{FileSliceArena, VectorArena};
+use crate::core::CENTROIDS_FILEPATH;
 use crate::directory::{CompositeFile, CompositeWrite, Directory, FileSlice};
 use crate::schema::{Field, FieldType, Metric, Schema, VectorDType, VectorOptions};
 use crate::{Executor, TantivyError};
@@ -85,17 +85,16 @@ pub trait CentroidProducer: Send + Sync + 'static {
     }
 
     /// Pull every vector field's centroids, validate and normalize them,
-    /// and write the `centroids` file — the canonical serialization the
-    /// readers expect. Called at index creation, BEFORE the first
-    /// `meta.json` references the file. Returns the written file name.
+    /// and write the [`CENTROIDS_FILEPATH`] file — the canonical
+    /// serialization the readers expect. Called at index creation, BEFORE
+    /// the first `meta.json` references the file.
     fn serialize(
         &self,
         directory: &dyn Directory,
         schema: &Schema,
         executor: &Executor,
-    ) -> crate::Result<PathBuf> {
-        let path = centroid_index_filename();
-        let mut write = directory.open_write(&path)?;
+    ) -> crate::Result<()> {
+        let mut write = directory.open_write(&CENTROIDS_FILEPATH)?;
         write_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
 
@@ -192,13 +191,8 @@ pub trait CentroidProducer: Send + Sync + 'static {
             }
         }
         composite.close()?;
-        Ok(path)
+        Ok(())
     }
-}
-
-/// The managed file name of the index's one centroid index.
-pub(crate) fn centroid_index_filename() -> PathBuf {
-    PathBuf::from("centroids")
 }
 
 /// `Write` adapter counting the router payload so an empty (tag-less)
