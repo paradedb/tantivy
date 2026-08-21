@@ -29,19 +29,24 @@
 //! and outside the probe budget; scanning them first also seeds the heap,
 //! so the kth threshold arms earlier for the routed clusters.
 
+pub(crate) mod backend;
+pub(crate) mod collector;
+pub(crate) mod prepared;
+pub(crate) mod tie_break;
+
 use std::sync::Arc;
 
 use common::BitSet;
 
-use super::backend::{open_share, ProbeStats, ProbeTermination, WorkUnits};
-use super::bounds::{
+use self::backend::{open_share, ProbeStats, ProbeTermination, WorkUnits};
+use self::prepared::PreparedQuery;
+use super::distance::norm_squared_wide;
+use super::index_reader::VectorIndexReader;
+use super::ivf::bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, to_bound_space, HeapPeek, QueryBound,
     QueryBoundTracker, Verdict,
 };
-use super::distance::norm_squared_wide;
-use super::index_reader::VectorIndexReader;
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, Workspace};
-use super::prepared::PreparedQuery;
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};

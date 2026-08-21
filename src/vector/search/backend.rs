@@ -7,7 +7,7 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
-use super::ivf::IvfSearchMetrics;
+use crate::vector::ivf::IvfSearchMetrics;
 
 /// How the probe loop stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
@@ -934,7 +934,7 @@ mod tests {
             total_docs += ivf.num_docs();
         }
         let n_avg = total_docs as f64 / centroids.len() as f64;
-        let x = crate::vector::backend::open_share(n_avg);
+        let x = crate::vector::search::backend::open_share(n_avg);
         let capacity = total_nonempty as f64 * x + (1.0 - x) * total_docs as f64 / n_avg;
 
         let (_, stats) = run_global(

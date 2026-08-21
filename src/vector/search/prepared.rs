@@ -13,9 +13,9 @@
 
 use std::sync::Arc;
 
-use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
 use super::VectorElement;
 use crate::schema::Metric;
+use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
 
 pub struct PreparedQuery<T: VectorElement> {
     query: Arc<Vec<T>>,

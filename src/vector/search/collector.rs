@@ -20,14 +20,13 @@
 use std::sync::Arc;
 
 use super::backend::ProbeStats;
-use super::ivf::AdaptiveProbeParams;
-use super::search::global_top_n_by;
 use super::tie_break::NoTieBreak;
-use super::VectorElement;
+use super::{global_top_n_by, VectorElement};
 use crate::collector::{Collector, SegmentCollector, SortKeyComputer};
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
+use crate::vector::ivf::AdaptiveProbeParams;
 use crate::{DocAddress, DocId, Score, Searcher, SegmentOrdinal, TantivyError};
 
 /// Top-N by vector similarity. Returns documents in descending

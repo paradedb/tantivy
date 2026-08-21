@@ -266,3 +266,27 @@ impl PluginWriter for VecWriter {
         self
     }
 }
+
+/// The segment plugin owning vector storage end-to-end: [`VecWriter`]
+/// during indexing, [`merge_ivf`](super::ivf) during merges, and
+/// [`VectorIndexReader`](super::VectorIndexReader) behind
+/// [`SegmentReader::vector_index`](crate::SegmentReader::vector_index)
+/// during reads.
+pub struct VectorPlugin;
+
+impl crate::plugin::SegmentPlugin for VectorPlugin {
+    fn extensions(&self) -> &[&str] {
+        &[VEC_EXT]
+    }
+
+    fn create_writer(
+        &self,
+        ctx: &crate::plugin::PluginWriterContext,
+    ) -> crate::Result<Box<dyn PluginWriter>> {
+        Ok(Box::new(VecWriter::for_schema(&ctx.segment.schema())))
+    }
+
+    fn merge(&self, ctx: crate::plugin::PluginMergeContext) -> crate::Result<()> {
+        super::ivf::merge_ivf(&ctx)
+    }
+}
