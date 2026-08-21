@@ -1,15 +1,20 @@
 //! Top-N vector-similarity collector.
 //!
-//! Unlike the other `TopDocs::order_by_*` paths, collection here is not
-//! per-segment at all: centroids are index-level and every segment shares
-//! their cluster ids, so the search ranks the set's centroids once and
-//! gathers each ranked cluster across ALL segments into one heap (see
-//! [`search`](super::search)). That inverts the [`Collector`] trait's
-//! per-segment pull model, so this collector implements
-//! [`Collector::collect_global`] — the searcher-level hook — and must be
-//! the TOP-LEVEL collector of its search: wrapped inside `MultiCollector`
-//! or another combinator, the per-segment path would run instead, and
-//! [`Collector::collect_segment`] fails loudly.
+//! Collection is split by tier, matching what is actually coupled:
+//! clustered segments share cluster ids with the index-level centroid
+//! index, so they are collected in ONE multi-segment pass — one routing
+//! pass, one shared-kth heap (see the [`search`](super) driver) — through
+//! [`Collector::collect_multi_segment`]. Flat segments have no
+//! cross-segment state at all and ride the ordinary per-segment path:
+//! [`VectorSegmentCollector`] scores each filter match through the O(1)
+//! flat doc→row rank, so a selective filter visits only its matches and
+//! never materializes a bitset. Every fruit meets in
+//! [`Collector::merge_fruits`].
+//!
+//! The collector must still be the TOP-LEVEL collector of its search:
+//! wrapped inside `MultiCollector` or another per-segment combinator, the
+//! multi-segment plan never runs and [`Collector::for_segment`] fails
+//! loudly on the first clustered segment.
 //!
 //! A secondary key *is* an ordinary `SortKeyComputer` — see
 //! [`TopDocsByVectorSimilarity::with_tie_break`]. The global heap sorts on
@@ -19,14 +24,20 @@
 
 use std::sync::Arc;
 
-use super::stats::{ProbeStats, ProbeTermination};
+use super::prepared::PreparedQuery;
+use super::stats::ProbeStats;
 use super::tie_break::NoTieBreak;
 use super::{global_top_n_by, VectorElement};
-use crate::collector::{Collector, SegmentCollector, SortKeyComputer};
+use crate::collector::sort_key::NaturalComparator;
+use crate::collector::{
+    Collector, MultiSegmentPlan, SegmentCollector, SegmentSortKeyComputer, SortKeyComputer,
+    TopNComputer,
+};
 use crate::index::SegmentReader;
 use crate::query::Weight;
 use crate::schema::{Field, FieldType, Schema};
 use crate::vector::ivf::AdaptiveProbeParams;
+use crate::vector::VectorIndexReader;
 use crate::{DocAddress, DocId, Score, Searcher, SegmentOrdinal, TantivyError};
 
 /// Top-N by vector similarity. Returns documents in descending
@@ -162,35 +173,12 @@ impl VectorSimilarityFruit {
         let mut first = true;
         for fruit in fruits {
             merged.results.extend(fruit.results);
-            let stats = fruit.stats;
             if first {
-                merged.stats = stats;
+                merged.stats = fruit.stats;
                 first = false;
-                continue;
+            } else {
+                merged.stats.absorb(fruit.stats);
             }
-            let acc = &mut merged.stats;
-            acc.candidates_scored += stats.candidates_scored;
-            acc.vectors_visited += stats.vectors_visited;
-            acc.pruned_filter += stats.pruned_filter;
-            acc.pruned_dead += stats.pruned_dead;
-            acc.pruned_seen += stats.pruned_seen;
-            acc.postings_row += stats.postings_row;
-            acc.postings_skipped += stats.postings_skipped;
-            acc.segment_opens += stats.segment_opens;
-            acc.routing.visited_count += stats.routing.visited_count;
-            acc.bounds_skips += stats.bounds_skips;
-            acc.bound_armed_at_probe = match (acc.bound_armed_at_probe, stats.bound_armed_at_probe)
-            {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-            if stats.termination == ProbeTermination::Ceiling {
-                acc.termination = super::ProbeTermination::Ceiling;
-            }
-            acc.work_charged += stats.work_charged;
-            acc.segments_searched += stats.segments_searched;
-            acc.filters_built += stats.filters_built;
-            acc.exact_rows_read += stats.exact_rows_read;
         }
         merged
             .results
@@ -202,10 +190,82 @@ impl VectorSimilarityFruit {
     }
 }
 
-/// Trait-bound placeholder: collection is global, so no per-segment fruit
-/// is ever produced — the type exists only to satisfy the
-/// `Child: SegmentCollector` bound.
-pub struct SegmentVectorFruit;
+/// One collection pass's keyed hits plus its probe stats: produced by the
+/// multi-segment pass (clustered segments, one shared heap) and by each
+/// flat segment's [`VectorSegmentCollector`]; merged in
+/// [`Collector::merge_fruits`]. Keys are the GLOBAL `(similarity,
+/// tie_break)` composite so fruits merge without re-reading anything.
+pub struct SegmentVectorFruit<K> {
+    pub hits: Vec<((Score, K), DocAddress)>,
+    pub stats: ProbeStats,
+}
+
+/// Per-segment exact collection for one FLAT segment: the filter drives
+/// `collect`, each match resolves doc→row through the flat id-map's O(1)
+/// rank, and the row is fetched and scored into a local heap. A selective
+/// filter therefore visits only its matches — no filter bitset, no full
+/// row scan.
+pub struct VectorSegmentCollector<T: VectorElement, S: SortKeyComputer> {
+    ord: SegmentOrdinal,
+    /// `limit + offset`; `0` collects nothing.
+    limit: usize,
+    vec: Arc<VectorIndexReader>,
+    prepared: PreparedQuery<T>,
+    tie: S::Child,
+    topn: TopNComputer<(Score, S::SortKey), DocAddress, (NaturalComparator, S::Comparator)>,
+    exact_rows: usize,
+}
+
+impl<T, S> SegmentCollector for VectorSegmentCollector<T, S>
+where
+    T: VectorElement,
+    S: SortKeyComputer + Send + Sync + 'static,
+{
+    type Fruit = SegmentVectorFruit<S::SortKey>;
+
+    fn collect(&mut self, doc: DocId, _score: Score) {
+        if self.limit == 0 {
+            return;
+        }
+        let Some(row) = self.vec.row_id(doc) else {
+            // The doc matches the filter but has no vector: IVF-style
+            // semantics, vectorless docs are never returned.
+            return;
+        };
+        let bytes = self
+            .vec
+            .vector_bytes_for_row(row)
+            .expect("failed to read a validated vector row");
+        let score = self.prepared.score_doc_bytes(&bytes);
+        self.exact_rows += 1;
+        // Same competitive skip as the driver: a candidate losing on
+        // similarity alone never pays the tie-key conversion.
+        if let Some(((threshold_score, _), _)) = &self.topn.threshold {
+            if score < *threshold_score {
+                return;
+            }
+        }
+        let segment_key = self.tie.segment_sort_key(doc, score);
+        let global_key = self.tie.convert_segment_sort_key(segment_key);
+        self.topn
+            .push_unordered((score, global_key), DocAddress::new(self.ord, doc));
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        let hits = self
+            .topn
+            .into_sorted_vec()
+            .into_iter()
+            .map(|cd| (cd.sort_key, cd.doc))
+            .collect();
+        let stats = ProbeStats {
+            exact_rows_read: self.exact_rows,
+            segments_searched: 1,
+            ..ProbeStats::default()
+        };
+        SegmentVectorFruit { hits, stats }
+    }
+}
 
 impl<T, S> Collector for TopDocsByVectorSimilarity<T, S>
 where
@@ -213,7 +273,7 @@ where
     S: SortKeyComputer + Send + Sync + 'static,
 {
     type Fruit = VectorSimilarityFruit;
-    type Child = NoOpSegmentCollector;
+    type Child = VectorSegmentCollector<T, S>;
 
     fn check_schema(&self, schema: &Schema) -> crate::Result<()> {
         let entry = schema.get_field_entry(self.field);
@@ -257,12 +317,34 @@ where
 
     fn for_segment(
         &self,
-        _segment_local_id: SegmentOrdinal,
-        _reader: &SegmentReader,
+        segment_local_id: SegmentOrdinal,
+        reader: &SegmentReader,
     ) -> crate::Result<Self::Child> {
-        // Never called at runtime — collection is global. The child type
-        // exists only to satisfy the trait bound.
-        Ok(NoOpSegmentCollector)
+        let vec = reader.vector_index(self.field)?;
+        if vec.clusters().is_some() {
+            // The plan routes clustered segments through the
+            // multi-segment pass; reaching here means a per-segment
+            // combinator is driving this collector.
+            return Err(TantivyError::InvalidArgument(
+                "clustered vector segments collect through the multi-segment pass; \
+                 TopDocsByVectorSimilarity must be the top-level collector of its search (it \
+                 cannot run inside MultiCollector or another per-segment combinator)"
+                    .to_string(),
+            ));
+        }
+        let metric = vec.options().metric();
+        Ok(VectorSegmentCollector {
+            ord: segment_local_id,
+            limit: self.segment_top_n(),
+            prepared: PreparedQuery::new(metric, Arc::clone(&self.query)),
+            tie: self.tie_break.segment_sort_key_computer(reader)?,
+            topn: TopNComputer::new_with_comparator(
+                self.segment_top_n().max(1),
+                (NaturalComparator, self.tie_break.comparator()),
+            ),
+            exact_rows: 0,
+            vec,
+        })
     }
 
     fn requires_scoring(&self) -> bool {
@@ -271,11 +353,31 @@ where
         false
     }
 
-    fn collect_global(
+    fn multi_segment_plan(&self, searcher: &Searcher) -> crate::Result<Option<MultiSegmentPlan>> {
+        let mut plan = MultiSegmentPlan::default();
+        for (ord, reader) in searcher.segment_readers().iter().enumerate() {
+            let ord = ord as SegmentOrdinal;
+            if let Some(allowed) = &self.segments {
+                if !allowed.contains(&ord) {
+                    continue;
+                }
+            }
+            let vec = reader.vector_index(self.field)?;
+            if vec.clusters().is_some() {
+                plan.multi_segment.push(ord);
+            } else if vec.num_vectors() > 0 {
+                plan.per_segment.push(ord);
+            }
+        }
+        Ok(Some(plan))
+    }
+
+    fn collect_multi_segment(
         &self,
         weight: &dyn Weight,
         searcher: &Searcher,
-    ) -> crate::Result<Option<Self::Fruit>> {
+        segments: &[SegmentOrdinal],
+    ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
         let (hits, stats) = global_top_n_by(
             searcher,
             weight,
@@ -284,49 +386,46 @@ where
             self.segment_top_n(),
             &self.adaptive,
             &self.tie_break,
-            self.segments.as_deref(),
+            Some(segments),
         )?;
-        let results = hits
-            .into_iter()
-            .skip(self.offset)
-            .take(self.limit)
-            .map(|((score, _tie), address)| (score, address))
-            .collect();
-        Ok(Some(VectorSimilarityFruit { results, stats }))
+        Ok(SegmentVectorFruit { hits, stats })
     }
 
-    fn collect_segment(
+    fn merge_fruits(
         &self,
-        _weight: &dyn Weight,
-        _segment_ord: SegmentOrdinal,
-        _reader: &SegmentReader,
-    ) -> crate::Result<SegmentVectorFruit> {
-        Err(TantivyError::InvalidArgument(
-            "TopDocsByVectorSimilarity collects across segments in one pass and must be the \
-             top-level collector of its search; it cannot run inside MultiCollector or another \
-             per-segment combinator"
-                .to_string(),
-        ))
-    }
-
-    fn merge_fruits(&self, _segment_fruits: Vec<SegmentVectorFruit>) -> crate::Result<Self::Fruit> {
-        Err(TantivyError::InvalidArgument(
-            "TopDocsByVectorSimilarity produces no per-segment fruits to merge; it must be the \
-             top-level collector of its search"
-                .to_string(),
-        ))
-    }
-}
-
-/// Trait-bound shim: the collector overrides [`Collector::collect_global`]
-/// so the per-doc path never fires, but the `Child: SegmentCollector`
-/// bound on `Collector` still has to be satisfied.
-pub struct NoOpSegmentCollector;
-
-impl SegmentCollector for NoOpSegmentCollector {
-    type Fruit = SegmentVectorFruit;
-    fn collect(&mut self, _doc: DocId, _score: Score) {}
-    fn harvest(self) -> Self::Fruit {
-        SegmentVectorFruit
+        fruits: Vec<SegmentVectorFruit<S::SortKey>>,
+    ) -> crate::Result<Self::Fruit> {
+        let mut stats = ProbeStats::default();
+        let mut first = true;
+        let mut topn: TopNComputer<
+            (Score, S::SortKey),
+            DocAddress,
+            (NaturalComparator, S::Comparator),
+        > = TopNComputer::new_with_comparator(
+            self.segment_top_n().max(1),
+            (NaturalComparator, self.tie_break.comparator()),
+        );
+        for fruit in fruits {
+            if first {
+                stats = fruit.stats;
+                first = false;
+            } else {
+                stats.absorb(fruit.stats);
+            }
+            for (key, doc) in fruit.hits {
+                topn.push(key, doc);
+            }
+        }
+        let results = if self.limit == 0 {
+            Vec::new()
+        } else {
+            topn.into_sorted_vec()
+                .into_iter()
+                .skip(self.offset)
+                .take(self.limit)
+                .map(|cd| (cd.sort_key.0, cd.doc))
+                .collect()
+        };
+        Ok(VectorSimilarityFruit { results, stats })
     }
 }

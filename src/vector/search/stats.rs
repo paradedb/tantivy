@@ -81,6 +81,35 @@ pub struct ProbeStats {
 }
 
 impl ProbeStats {
+    /// Fold another pass's stats into this one: counters add,
+    /// `bound_armed_at_probe` keeps the earliest arming, and
+    /// `termination` reports `Ceiling` if either side hit its ceiling.
+    /// Used when merging per-segment / per-tier / per-worker fruits of
+    /// one query.
+    pub fn absorb(&mut self, other: ProbeStats) {
+        self.candidates_scored += other.candidates_scored;
+        self.vectors_visited += other.vectors_visited;
+        self.pruned_filter += other.pruned_filter;
+        self.pruned_dead += other.pruned_dead;
+        self.pruned_seen += other.pruned_seen;
+        self.postings_row += other.postings_row;
+        self.postings_skipped += other.postings_skipped;
+        self.segment_opens += other.segment_opens;
+        self.routing.visited_count += other.routing.visited_count;
+        self.bounds_skips += other.bounds_skips;
+        self.bound_armed_at_probe = match (self.bound_armed_at_probe, other.bound_armed_at_probe) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if other.termination == ProbeTermination::Ceiling {
+            self.termination = ProbeTermination::Ceiling;
+        }
+        self.work_charged += other.work_charged;
+        self.exact_rows_read += other.exact_rows_read;
+        self.segments_searched += other.segments_searched;
+        self.filters_built += other.filters_built;
+    }
+
     /// Distinct clusters the probe loop opened — segment-count
     /// invariant. [`segment_opens`](Self::segment_opens) is the
     /// per-(cluster, segment) count.

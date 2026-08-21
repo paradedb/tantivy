@@ -82,6 +82,22 @@ fn run_global(
     ))
 }
 
+/// The full collector path — multi-segment plan over clustered segments
+/// plus the per-segment flat tier — returning the merged fruit.
+fn run_search(
+    index: &Index,
+    field: crate::schema::Field,
+    filter: &dyn Query,
+    query: Vec<f32>,
+    k: usize,
+    params: AdaptiveProbeParams,
+) -> crate::Result<crate::vector::VectorSimilarityFruit> {
+    let collector = crate::collector::TopDocs::with_limit(k)
+        .order_by_similarity(field, query)
+        .with_adaptive_params(params);
+    index.reader()?.searcher().search(filter, &collector)
+}
+
 /// Every doc address matching `filter`, across all segments.
 fn collect_filter_doc_set(
     index: &Index,
@@ -1448,32 +1464,41 @@ fn flat_index_searches_exactly() -> crate::Result<()> {
         build_flat(Metric::L2, &[&docs[..10], &docs[10..]], false)?;
 
     let query = vec![4.2f32, 3.1];
-    // A tiny budget must change nothing — the exact tier ignores it.
+    // A tiny budget must change nothing — the flat tier has none.
     let params = AdaptiveProbeParams {
         max_probe_fraction: 1e-6,
         min_probe_clusters: 1,
     };
-    let (hits, stats) = run_global(&index, embed_field, &AllQuery, query.clone(), 5, params)?;
+    let fruit = run_search(&index, embed_field, &AllQuery, query.clone(), 5, params)?;
     let truth = ground_truth::top_k(&index, embed_field, Metric::L2, &query, 5)?;
-    assert_eq!(hits, truth);
-    assert_eq!(stats.exact_rows_read, 30);
-    assert_eq!(stats.segments_searched, 2);
-    assert_eq!(stats.clusters_probed(), 0, "no routed tier without a set");
-    assert_eq!(stats.filters_built, 0, "AllQuery builds no bitset");
+    assert_eq!(fruit.results, truth);
+    assert_eq!(fruit.stats.exact_rows_read, 30);
+    assert_eq!(fruit.stats.segments_searched, 2);
+    assert_eq!(
+        fruit.stats.clusters_probed(),
+        0,
+        "no routed tier without a set"
+    );
 
-    // Filtered: only matching docs qualify, filter bitsets built per
-    // flat segment.
+    // Filtered: the filter DRIVES the per-segment scan, so only its
+    // matches are ever visited — no bitset, no full row walk.
     let filter = TermQuery::new(
         Term::from_field_text(label_field, "d7"),
         IndexRecordOption::Basic,
     );
-    let (hits, stats) = run_global(&index, embed_field, &filter, query, 5, exhaustive_params(1))?;
-    assert_eq!(hits.len(), 1);
-    assert_eq!(stored_label_at(&index, label_field, hits[0].1)?, "d7");
-    assert_eq!(stats.exact_rows_read, 1, "filtered rows are never fetched");
+    let fruit = run_search(&index, embed_field, &filter, query, 5, exhaustive_params(1))?;
+    assert_eq!(fruit.results.len(), 1);
     assert_eq!(
-        stats.filters_built, 2,
-        "the exact tier evaluates every flat segment's filter"
+        stored_label_at(&index, label_field, fruit.results[0].1)?,
+        "d7"
+    );
+    assert_eq!(
+        fruit.stats.exact_rows_read, 1,
+        "only the filter's match is scored"
+    );
+    assert_eq!(
+        fruit.stats.filters_built, 0,
+        "flat segments build no filter bitset"
     );
     Ok(())
 }
@@ -1509,7 +1534,7 @@ fn flat_only_merge_errors() -> crate::Result<()> {
     let searcher = index.reader()?.searcher();
     assert_eq!(searcher.segment_readers().len(), 3);
     let query = vec![0.6f32, 0.8];
-    let (hits, stats) = run_global(
+    let fruit = run_search(
         &index,
         embed_field,
         &AllQuery,
@@ -1518,8 +1543,8 @@ fn flat_only_merge_errors() -> crate::Result<()> {
         exhaustive_params(1),
     )?;
     let truth = ground_truth::top_k(&index, embed_field, Metric::Cosine, &query, 4)?;
-    assert_eq!(hits, truth);
-    assert_eq!(stats.exact_rows_read, 20);
+    assert_eq!(fruit.results, truth);
+    assert_eq!(fruit.stats.exact_rows_read, 20);
     Ok(())
 }
 
@@ -1571,9 +1596,9 @@ fn mixed_flat_and_clustered_search() -> crate::Result<()> {
     assert_eq!(searcher.segment_readers().len(), 3);
 
     // Query near centroid 3: the best hits are staged docs, which only
-    // the exact tier can find (no clustered segment has rows there).
+    // the flat tier can find (no clustered segment has rows there).
     let query = vec![100.0f32, 101.0];
-    let (hits, stats) = run_global(
+    let fruit = run_search(
         &index,
         embed_field,
         &AllQuery,
@@ -1582,20 +1607,23 @@ fn mixed_flat_and_clustered_search() -> crate::Result<()> {
         exhaustive_params(4),
     )?;
     let truth = ground_truth::top_k(&index, embed_field, Metric::L2, &query, 6)?;
-    assert_eq!(hits, truth);
-    assert_eq!(stats.exact_rows_read, 8, "every staged row is read");
-    assert_eq!(stats.segments_searched, 3);
-    assert!(stats.clusters_probed() > 0, "the routed tier still runs");
-    let top_label = stored_label_at(&index, label_field, hits[0].1)?;
+    assert_eq!(fruit.results, truth);
+    assert_eq!(fruit.stats.exact_rows_read, 8, "every staged row is read");
+    assert_eq!(fruit.stats.segments_searched, 3);
+    assert!(
+        fruit.stats.clusters_probed() > 0,
+        "the routed tier still runs"
+    );
+    let top_label = stored_label_at(&index, label_field, fruit.results[0].1)?;
     assert!(
         top_label.starts_with('f'),
         "freshest data wins: {top_label}"
     );
 
-    // Query near centroid 0, where clustered and staged docs compete
-    // in one heap.
+    // Query near centroid 0, where clustered and staged docs compete for
+    // the same top-k.
     let query = vec![0.5f32, 0.5];
-    let (hits, _) = run_global(
+    let fruit = run_search(
         &index,
         embed_field,
         &AllQuery,
@@ -1604,7 +1632,7 @@ fn mixed_flat_and_clustered_search() -> crate::Result<()> {
         exhaustive_params(4),
     )?;
     let truth = ground_truth::top_k(&index, embed_field, Metric::L2, &query, 10)?;
-    assert_eq!(hits, truth);
+    assert_eq!(fruit.results, truth);
     Ok(())
 }
 
@@ -1625,14 +1653,15 @@ fn mixed_merge_assigns_only_flat_rows() -> crate::Result<()> {
             .collect()
     };
     let query = vec![50.0f32, 50.0];
-    let (before, _) = run_global(
+    let before = run_search(
         &index,
         embed_field,
         &AllQuery,
         query.clone(),
         12,
         exhaustive_params(4),
-    )?;
+    )?
+    .results;
     // Labels resolve against the CURRENT snapshot — before the merge
     // rewrites every address.
     let before_labeled = labeled(&before)?;
@@ -1665,7 +1694,7 @@ fn mixed_merge_assigns_only_flat_rows() -> crate::Result<()> {
 
     // Search results survive the merge bit-for-bit (modulo addresses):
     // compare (score, label) sequences.
-    let (after, stats) = run_global(
+    let after = run_search(
         &index,
         embed_field,
         &AllQuery,
@@ -1673,8 +1702,8 @@ fn mixed_merge_assigns_only_flat_rows() -> crate::Result<()> {
         12,
         exhaustive_params(4),
     )?;
-    assert_eq!(before_labeled, labeled(&after)?);
-    assert_eq!(stats.exact_rows_read, 0, "no flat segments remain");
+    assert_eq!(before_labeled, labeled(&after.results)?);
+    assert_eq!(after.stats.exact_rows_read, 0, "no flat segments remain");
     Ok(())
 }
 

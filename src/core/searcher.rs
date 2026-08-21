@@ -226,10 +226,32 @@ impl Searcher {
     ) -> crate::Result<C::Fruit> {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
-        if let Some(fruit) = collector.collect_global(weight.as_ref(), self)? {
-            return Ok(fruit);
-        }
         let segment_readers = self.segment_readers();
+        if let Some(plan) = collector.multi_segment_plan(self)? {
+            // The coupled pass first, then the plan's per-segment ordinals
+            // through the ordinary (executor-parallel) path; every fruit
+            // meets in merge_fruits. Segments in neither list are skipped.
+            let mut fruits = Vec::with_capacity(plan.per_segment.len() + 1);
+            if !plan.multi_segment.is_empty() {
+                fruits.push(collector.collect_multi_segment(
+                    weight.as_ref(),
+                    self,
+                    &plan.multi_segment,
+                )?);
+            }
+            let mut per_segment = executor.map(
+                |segment_ord| {
+                    collector.collect_segment(
+                        weight.as_ref(),
+                        segment_ord,
+                        &segment_readers[segment_ord as usize],
+                    )
+                },
+                plan.per_segment.iter().copied(),
+            )?;
+            fruits.append(&mut per_segment);
+            return collector.merge_fruits(fruits);
+        }
         let fruits = executor.map(
             |(segment_ord, segment_reader)| {
                 collector.collect_segment(weight.as_ref(), segment_ord as u32, segment_reader)
