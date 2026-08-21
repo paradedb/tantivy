@@ -1,18 +1,26 @@
+//! Per-commit vector writer: buffers raw vector bytes per doc and, at
+//! segment finalize, writes the segment's `.vec` in the layout the index
+//! dictates — clustered (assigned against the index-level centroid index)
+//! when the index has one, flat (doc-ordered, searched exhaustively) when
+//! it does not. The mutable/staging tier is exactly the no-set case.
+
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use super::header::{vec_slot, write_header};
 use super::id_map::IdMap;
+use super::ivf::centroid_index::CentroidIndexReader;
+use super::ivf::{write_ivf_field, IvfFieldWriteParams};
+use super::VEC_EXT;
 use crate::directory::CompositeWrite;
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use crate::vector::header::write_header;
-use crate::vector::VEC_EXT;
-use crate::{DocId, TantivyError};
+use crate::{DocId, Executor, TantivyError};
 
 /// Per-field in-memory state: the doc ids that have a value (ascending),
 /// plus a dense byte array — analogous to fast-fields' `Optional`
@@ -50,14 +58,14 @@ impl FieldBuffer {
     }
 }
 
-pub struct FlatVecWriter {
+pub struct VecWriter {
     fields: BTreeMap<Field, FieldBuffer>,
-    /// Set by [`SegmentWriter::finalize`] before [`serialize`]. Used to
-    /// size the presence bitmap.
+    /// Set by [`SegmentWriter::finalize`] before [`serialize`]. Used for
+    /// the ascending-doc-order invariant checks.
     num_docs: DocId,
 }
 
-impl FlatVecWriter {
+impl VecWriter {
     pub fn for_schema(schema: &Schema) -> Self {
         let mut fields = BTreeMap::new();
         for (field, entry) in schema.fields() {
@@ -79,7 +87,7 @@ impl FlatVecWriter {
     }
 }
 
-impl PluginWriter for FlatVecWriter {
+impl PluginWriter for VecWriter {
     fn add_document(
         &mut self,
         doc_id: DocId,
@@ -136,9 +144,36 @@ impl PluginWriter for FlatVecWriter {
         if self.fields.is_empty() {
             return Ok(());
         }
+        if self
+            .fields
+            .values()
+            .all(|buf| buf.present_doc_ids.is_empty())
+        {
+            // No rows anywhere: no `.vec` at all — the reader treats a
+            // missing file as "no vector data".
+            return Ok(());
+        }
+
+        let index = segment.index();
+        let meta = index.load_metas()?;
+        let set = match meta.centroid_index.as_ref() {
+            Some(centroid_index) => {
+                let set_search = index.cached_centroid_index()?;
+                let set_reader = CentroidIndexReader::open(
+                    index.directory(),
+                    std::path::Path::new(centroid_index),
+                )?;
+                Some((set_search, set_reader))
+            }
+            None => None,
+        };
+
         let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
         write_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
+        let executor = Executor::single_thread();
+        let cancel = || false;
+        let schema = segment.schema();
 
         for (field, buf) in &self.fields {
             // Compute (present, row_bytes) in target doc-id order. For
@@ -159,18 +194,56 @@ impl PluginWriter for FlatVecWriter {
             } else {
                 (buf.present_doc_ids.clone(), buf.row_bytes.clone())
             };
+            if present.is_empty() {
+                continue;
+            }
 
-            // Slice (field, 0): row→doc_id map. Picks Identity if every
-            // doc is present (typical for dense embeddings, just one
-            // tag byte) or Bitmap otherwise.
-            let id_map_w = composite.for_field_with_idx(*field, 0);
-            IdMap::serialize(&present, self.num_docs, id_map_w)?;
-            id_map_w.flush()?;
+            let Some((set_search, set_reader)) = &set else {
+                // Flat layout (no centroid index — the mutable/staging
+                // tier): the `Identity`/`Bitmap` id-map and the
+                // doc-ordered rows, nothing else. Searched exhaustively;
+                // clustered at its first merge into a real index.
+                let id_map_w = composite.for_field_with_idx(*field, vec_slot::ID_MAP);
+                IdMap::serialize(&present, self.num_docs, id_map_w)?;
+                id_map_w.flush()?;
+                let rows_w = composite.for_field_with_idx(*field, vec_slot::ROWS);
+                rows_w.write_all(&row_bytes)?;
+                rows_w.flush()?;
+                continue;
+            };
 
-            // Slice (field, 1): dense LE byte rows, one per present doc.
-            let rows_w = composite.for_field_with_idx(*field, 1);
-            rows_w.write_all(&row_bytes)?;
-            rows_w.flush()?;
+            let field_centroids = set_reader.field_centroids(*field, &buf.opts)?;
+            let params = IvfFieldWriteParams {
+                router: set_search
+                    .field_router(*field)
+                    .and_then(|router| router.graph()),
+                field: *field,
+                opts: &buf.opts,
+                set: &field_centroids,
+                replicas: index.settings().vector_replicas,
+                bounds_scope: index.settings().vector_bounds_scope,
+                executor: &executor,
+                cancel: &cancel,
+                field_name: schema.get_field_entry(*field).name(),
+            };
+            write_ivf_field(
+                &mut composite,
+                &params,
+                &mut |sink| {
+                    for (row_idx, &doc_id) in present.iter().enumerate() {
+                        sink(
+                            doc_id,
+                            row_idx as u64,
+                            &row_bytes[row_idx * stride..(row_idx + 1) * stride],
+                        )?;
+                    }
+                    Ok(())
+                },
+                &mut |handle, sink| {
+                    let row_idx = handle as usize;
+                    sink(&row_bytes[row_idx * stride..(row_idx + 1) * stride])
+                },
+            )?;
         }
         composite.close()?;
         Ok(())
@@ -191,5 +264,29 @@ impl PluginWriter for FlatVecWriter {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+/// The segment plugin owning vector storage end-to-end: [`VecWriter`]
+/// during indexing, [`merge_ivf`](super::ivf) during merges, and
+/// [`VectorIndexReader`](super::VectorIndexReader) behind
+/// [`SegmentReader::vector_index`](crate::SegmentReader::vector_index)
+/// during reads.
+pub struct VectorPlugin;
+
+impl crate::plugin::SegmentPlugin for VectorPlugin {
+    fn extensions(&self) -> &[&str] {
+        &[VEC_EXT]
+    }
+
+    fn create_writer(
+        &self,
+        ctx: &crate::plugin::PluginWriterContext,
+    ) -> crate::Result<Box<dyn PluginWriter>> {
+        Ok(Box::new(VecWriter::for_schema(&ctx.segment.schema())))
+    }
+
+    fn merge(&self, ctx: crate::plugin::PluginMergeContext) -> crate::Result<()> {
+        super::ivf::merge_ivf(&ctx)
     }
 }

@@ -102,7 +102,6 @@ mod top_collector;
 pub use self::top_collector::ComparableDoc;
 
 mod top_score_collector;
-pub(crate) use self::top_score_collector::compare_for_top_k;
 pub use self::top_score_collector::{TopDocs, TopNComputer};
 
 mod sort_key_top_collector;
@@ -172,6 +171,17 @@ pub trait Collector: Sync + Send {
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
+
+    /// If implemented, this is called instead of [`Self::collect_segment`] and
+    /// [`Self::merge_fruits`] when the collector needs to see all segments in one pass.
+    /// For example, vector search probes clusters across segments against one shared heap.
+    fn collect_global(
+        &self,
+        _weight: &dyn Weight,
+        _searcher: &crate::Searcher,
+    ) -> crate::Result<Option<Self::Fruit>> {
+        Ok(None)
+    }
 
     /// Created a segment collector and
     fn collect_segment(

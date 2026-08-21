@@ -226,6 +226,9 @@ impl Searcher {
     ) -> crate::Result<C::Fruit> {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
+        if let Some(fruit) = collector.collect_global(weight.as_ref(), self)? {
+            return Ok(fruit);
+        }
         let segment_readers = self.segment_readers();
         let fruits = executor.map(
             |(segment_ord, segment_reader)| {
