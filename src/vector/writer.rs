@@ -170,8 +170,6 @@ impl PluginWriter for VecWriter {
         let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
         write_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
-        // Per-commit segments are small; assignment cost is dominated by
-        // the merge path, which parallelizes. No thread pool here.
         let executor = Executor::single_thread();
         let cancel = || false;
         let schema = segment.schema();
