@@ -1739,12 +1739,26 @@ fn tier_split_merges_to_the_serial_run() -> crate::Result<()> {
         }
     };
     let full = searcher.search(&AllQuery, &collector(None))?;
-    let clustered_run = searcher.search(&AllQuery, &collector(Some(clustered)))?;
-    let flat_run = searcher.search(&AllQuery, &collector(Some(flat)))?;
+    let clustered_run = searcher.search(&AllQuery, &collector(Some(clustered.clone())))?;
+    let flat_run = searcher.search(&AllQuery, &collector(Some(flat.clone())))?;
 
     assert_eq!(clustered_run.stats.exact_rows_read, 0);
     assert_eq!(flat_run.stats.exact_rows_read, full.stats.exact_rows_read);
     assert_eq!(flat_run.stats.clusters_probed(), 0);
+
+    // A worker that already knows its claim's tier sets the mode
+    // explicitly and skips tier detection — same results.
+    let explicit_clustered = searcher.search(
+        &AllQuery,
+        &collector(Some(clustered.clone()))
+            .with_collection_mode(crate::collector::CollectorMode::MultiSegment(clustered)),
+    )?;
+    let explicit_flat = searcher.search(
+        &AllQuery,
+        &collector(Some(flat)).with_collection_mode(crate::collector::CollectorMode::SingleSegment),
+    )?;
+    assert_eq!(explicit_clustered.results, clustered_run.results);
+    assert_eq!(explicit_flat.results, flat_run.results);
 
     let merged = VectorSimilarityFruit::merge(vec![clustered_run, flat_run], k);
     assert_eq!(merged.results, full.results);

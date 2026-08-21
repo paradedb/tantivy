@@ -59,6 +59,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     adaptive: AdaptiveProbeParams,
     tie_break: S,
     segments: Option<Vec<SegmentOrdinal>>,
+    collection_mode: Option<CollectorMode>,
 }
 
 impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
@@ -71,6 +72,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             adaptive: AdaptiveProbeParams::default(),
             tie_break: NoTieBreak,
             segments: None,
+            collection_mode: None,
         }
     }
 }
@@ -101,6 +103,19 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// spend its budget slightly differently.
     pub fn for_segments(mut self, segments: Vec<SegmentOrdinal>) -> Self {
         self.segments = Some(segments);
+        self
+    }
+
+    /// Set the [`CollectorMode`] instead of deriving it from the
+    /// snapshot. A caller that already knows its segments' tiers — e.g. a
+    /// parallel worker that claimed either the clustered chunk or a flat
+    /// segment — skips the per-segment tier detection this way:
+    /// `MultiSegment(ords)` for the clustered chunk, `SingleSegment` for
+    /// flat claims. Usually paired with
+    /// [`for_segments`](Self::for_segments) naming the same claim, so
+    /// unclaimed segments are not collected.
+    pub fn with_collection_mode(mut self, mode: CollectorMode) -> Self {
+        self.collection_mode = Some(mode);
         self
     }
 
@@ -135,6 +150,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             adaptive: self.adaptive,
             tie_break,
             segments: self.segments,
+            collection_mode: self.collection_mode,
         }
     }
 
@@ -354,9 +370,12 @@ where
     }
 
     fn collection_mode(&self, searcher: &Searcher) -> crate::Result<CollectorMode> {
-        // Clustered segments are coupled — shared cluster ids, one
-        // routing pass, one heap; flat segments are not and collect
-        // per-segment.
+        if let Some(mode) = &self.collection_mode {
+            return Ok(mode.clone());
+        }
+        // Not caller-set: derive it. Clustered segments are coupled —
+        // shared cluster ids, one routing pass, one heap; flat segments
+        // are not and collect per-segment.
         let mut clustered = Vec::new();
         for (ord, reader) in searcher.segment_readers().iter().enumerate() {
             let ord = ord as SegmentOrdinal;
