@@ -227,27 +227,22 @@ impl Searcher {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
         let segment_readers = self.segment_readers();
-        if let Some(plan) = collector.multi_segment_plan(self)? {
-            // The coupled pass first, then the plan's per-segment ordinals
-            // through the ordinary (executor-parallel) path; every fruit
-            // meets in merge_fruits. Segments in neither list are skipped.
-            let mut fruits = Vec::with_capacity(plan.per_segment.len() + 1);
-            if !plan.multi_segment.is_empty() {
-                fruits.push(collector.collect_multi_segment(
-                    weight.as_ref(),
-                    self,
-                    &plan.multi_segment,
-                )?);
-            }
+        let multi_segment = collector.multi_segment_selection(self)?;
+        if !multi_segment.is_empty() {
+            // The coupled pass over the selection; every other segment
+            // takes the standard per-segment path; all fruits meet in
+            // merge_fruits.
+            let mut fruits = Vec::with_capacity(segment_readers.len() + 1);
+            fruits.push(collector.collect_multi_segment(weight.as_ref(), self, &multi_segment)?);
             let mut per_segment = executor.map(
-                |segment_ord| {
-                    collector.collect_segment(
-                        weight.as_ref(),
-                        segment_ord,
-                        &segment_readers[segment_ord as usize],
-                    )
+                |(segment_ord, segment_reader)| {
+                    collector.collect_segment(weight.as_ref(), segment_ord, segment_reader)
                 },
-                plan.per_segment.iter().copied(),
+                segment_readers
+                    .iter()
+                    .enumerate()
+                    .map(|(ord, reader)| (ord as u32, reader))
+                    .filter(|(ord, _)| !multi_segment.contains(ord)),
             )?;
             fruits.append(&mut per_segment);
             return collector.merge_fruits(fruits);

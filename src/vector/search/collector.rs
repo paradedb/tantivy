@@ -30,8 +30,7 @@ use super::tie_break::NoTieBreak;
 use super::{global_top_n_by, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
-    Collector, MultiSegmentPlan, SegmentCollector, SegmentSortKeyComputer, SortKeyComputer,
-    TopNComputer,
+    Collector, SegmentCollector, SegmentSortKeyComputer, SortKeyComputer, TopNComputer,
 };
 use crate::index::SegmentReader;
 use crate::query::Weight;
@@ -353,8 +352,8 @@ where
         false
     }
 
-    fn multi_segment_plan(&self, searcher: &Searcher) -> crate::Result<Option<MultiSegmentPlan>> {
-        let mut plan = MultiSegmentPlan::default();
+    fn multi_segment_selection(&self, searcher: &Searcher) -> crate::Result<Vec<SegmentOrdinal>> {
+        let mut selection = Vec::new();
         for (ord, reader) in searcher.segment_readers().iter().enumerate() {
             let ord = ord as SegmentOrdinal;
             if let Some(allowed) = &self.segments {
@@ -362,14 +361,41 @@ where
                     continue;
                 }
             }
-            let vec = reader.vector_index(self.field)?;
-            if vec.clusters().is_some() {
-                plan.multi_segment.push(ord);
-            } else if vec.num_vectors() > 0 {
-                plan.per_segment.push(ord);
+            if reader.vector_index(self.field)?.clusters().is_some() {
+                selection.push(ord);
             }
         }
-        Ok(Some(plan))
+        Ok(selection)
+    }
+
+    /// Per-segment collection, i.e. the flat tier. Skipped without
+    /// driving the filter when the segment is outside a
+    /// [`for_segments`](TopDocsByVectorSimilarity::for_segments)
+    /// restriction or has no vector rows.
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        segment_ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
+        let restricted_out = self
+            .segments
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&segment_ord));
+        if restricted_out || reader.vector_index(self.field)?.num_vectors() == 0 {
+            return Ok(SegmentVectorFruit {
+                hits: Vec::new(),
+                stats: ProbeStats::default(),
+            });
+        }
+        let mut segment_collector = self.for_segment(segment_ord, reader)?;
+        crate::collector::default_collect_segment_impl(
+            &mut segment_collector,
+            weight,
+            reader,
+            self.requires_scoring(),
+        )?;
+        Ok(segment_collector.harvest())
     }
 
     fn collect_multi_segment(

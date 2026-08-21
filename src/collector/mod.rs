@@ -139,19 +139,6 @@ impl<T> Fruit for T where T: Send + downcast_rs::Downcast {}
 /// a `Collector` trait is actually more of a factory to instance
 /// `SegmentCollector`s for each segments.
 ///
-/// How a collector splits a search across segments — see
-/// [`Collector::multi_segment_plan`]. Ordinals in neither list are not
-/// visited (a consumer restricting a search to a segment subset lists
-/// only that subset).
-#[derive(Debug, Clone, Default)]
-pub struct MultiSegmentPlan {
-    /// Segments the coupled [`Collector::collect_multi_segment`] pass
-    /// consumes in one call.
-    pub multi_segment: Vec<SegmentOrdinal>,
-    /// Segments collected through the ordinary per-segment path.
-    pub per_segment: Vec<SegmentOrdinal>,
-}
-
 /// The collection logic itself is in the `SegmentCollector`.
 ///
 /// Segments are not guaranteed to be visited in any specific order.
@@ -186,28 +173,25 @@ pub trait Collector: Sync + Send {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
 
-    /// If implemented, splits collection into one COUPLED multi-segment
-    /// pass plus the ordinary per-segment path. The plan names the
-    /// ordinals each side consumes; segments in neither list are not
-    /// visited at all. Vector search uses this: clustered segments share
-    /// one routing pass and one heap ([`Self::collect_multi_segment`]),
-    /// while flat segments ride the per-segment path like any other
-    /// collector. All fruits — the multi-segment pass's and the
-    /// per-segment ones — meet in [`Self::merge_fruits`].
+    /// The segments that need one COUPLED pass
+    /// ([`Self::collect_multi_segment`]); every other segment goes
+    /// through the standard per-segment path, and all fruits meet in
+    /// [`Self::merge_fruits`]. Vector search selects the clustered
+    /// segments here — they share one routing pass and one heap — while
+    /// flat segments collect per-segment like any other collector.
     ///
-    /// `None` (the default) collects every segment per-segment.
-    fn multi_segment_plan(
+    /// Empty (the default) collects every segment per-segment.
+    fn multi_segment_selection(
         &self,
         _searcher: &crate::Searcher,
-    ) -> crate::Result<Option<MultiSegmentPlan>> {
-        Ok(None)
+    ) -> crate::Result<Vec<SegmentOrdinal>> {
+        Ok(Vec::new())
     }
 
-    /// The coupled pass over `segments` (the plan's `multi_segment` list).
-    /// Returns a segment-fruit merged by [`Self::merge_fruits`] alongside
-    /// the per-segment ones. Only called when
-    /// [`Self::multi_segment_plan`] returned a plan with a non-empty
-    /// `multi_segment` list.
+    /// The coupled pass over the [`Self::multi_segment_selection`]
+    /// segments. Returns a segment-fruit merged by [`Self::merge_fruits`]
+    /// alongside the per-segment ones. Only called when the selection is
+    /// non-empty.
     fn collect_multi_segment(
         &self,
         _weight: &dyn Weight,
@@ -215,7 +199,7 @@ pub trait Collector: Sync + Send {
         _segments: &[SegmentOrdinal],
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
         Err(crate::TantivyError::InternalError(
-            "collector returned a multi-segment plan without implementing collect_multi_segment"
+            "collector selected multi-segment ordinals without implementing collect_multi_segment"
                 .to_string(),
         ))
     }
