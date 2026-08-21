@@ -54,18 +54,21 @@ pub trait CentroidProducer: Send + Sync + 'static {
     /// schema; erroring here fails index creation.
     fn centroids(&self, field: Field, options: &VectorOptions) -> crate::Result<IvfCentroids>;
 
-    /// Serialize the routing structure over the centroids into the router
-    /// slot. `centroids` are the normalized rows exactly as stored in the
-    /// set file. The payload's first byte must be a router-kind tag; the
-    /// default writes [`ROUTER_KIND_RNG`] followed by a serialized
-    /// [`RelativeNeighborhoodGraph`](super::RelativeNeighborhoodGraph).
-    /// Never called for degenerate sets (`C <= 1`), which route by linear
-    /// scan and own no router slot.
+    /// Serialize the routing structure over `field`'s centroids into the
+    /// router slot. `centroids` are the normalized rows exactly as stored
+    /// in the file; `_field` is unused by the default but lets an
+    /// override pick the right per-field structure. The payload's first
+    /// byte must be a router-kind tag; the default writes
+    /// [`ROUTER_KIND_RNG`] followed by a serialized
+    /// [`RelativeNeighborhoodGraph`](super::RelativeNeighborhoodGraph),
+    /// built on `executor`. Never called for degenerate sets (`C <= 1`),
+    /// which route by linear scan and own no router slot.
     fn serialize_router(
         &self,
         _field: Field,
         options: &VectorOptions,
         centroids: &IvfCentroids,
+        executor: &Executor,
         out: &mut dyn Write,
     ) -> crate::Result<()> {
         let IvfCentroids::F32(matrix) = centroids;
@@ -76,13 +79,7 @@ pub trait CentroidProducer: Send + Sync + 'static {
             options.metric(),
             NeighborhoodGraphConfig::default(),
         );
-        // SINGLE-THREADED on purpose. This runs inside the embedder's
-        // index-creation call (for pg_search, a Postgres backend), and a
-        // Postgres backend forbids FFI from any thread but its own — a
-        // spawned worker that touches the `Directory` aborts the build.
-        // An embedder that can tolerate threads here overrides this
-        // method.
-        graph.build(&Executor::single_thread());
+        graph.build(executor);
         graph.serialize(out)?;
         Ok(())
     }
@@ -91,7 +88,12 @@ pub trait CentroidProducer: Send + Sync + 'static {
     /// and write the `centroids` file — the canonical serialization the
     /// readers expect. Called at index creation, BEFORE the first
     /// `meta.json` references the file. Returns the written file name.
-    fn serialize(&self, directory: &dyn Directory, schema: &Schema) -> crate::Result<PathBuf> {
+    fn serialize(
+        &self,
+        directory: &dyn Directory,
+        schema: &Schema,
+        executor: &Executor,
+    ) -> crate::Result<PathBuf> {
         let path = centroid_index_filename();
         let mut write = directory.open_write(&path)?;
         write_header(&mut write)?;
@@ -178,7 +180,7 @@ pub trait CentroidProducer: Send + Sync + 'static {
                     out: router_w,
                     written: 0,
                 };
-                self.serialize_router(field, opts, &normalized, &mut sink)?;
+                self.serialize_router(field, opts, &normalized, executor, &mut sink)?;
                 if sink.written == 0 {
                     return Err(TantivyError::InvalidArgument(format!(
                         "CentroidProducer::serialize_router wrote no router payload for field \
