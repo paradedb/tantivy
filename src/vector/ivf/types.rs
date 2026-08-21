@@ -1,4 +1,4 @@
-//! Matrix types crossing the [`CentroidIndex`](crate::vector::CentroidIndex)
+//! Matrix types crossing the [`CentroidProducer`](crate::vector::CentroidProducer)
 //! boundary, plus the row byte codecs shared by the write paths.
 
 use crate::vector::VectorElement;

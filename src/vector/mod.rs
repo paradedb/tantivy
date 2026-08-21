@@ -40,7 +40,7 @@ pub use bounds::{
     BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
 pub(crate) use centroid_set::{write_centroid_set, SetSearchIndex};
-pub use centroid_set::{CentroidIndex, ROUTER_KIND_RNG};
+pub use centroid_set::{CentroidProducer, ROUTER_KIND_RNG};
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,

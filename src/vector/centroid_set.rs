@@ -1,10 +1,10 @@
-//! The index-level centroid set: the consumer-provided [`CentroidIndex`]
+//! The index-level centroid set: the consumer-provided [`CentroidProducer`]
 //! trait and the immutable `centroids.<version>` file it is serialized into.
 //!
 //! Centroids are an index-level artifact, installed at index creation like
 //! the schema and settings: the consumer trains them externally (over the
 //! whole corpus, not a per-segment shard) and hands them over through
-//! [`CentroidIndex`]. The file is written once, before the first
+//! [`CentroidProducer`]. The file is written once, before the first
 //! `meta.json` references it, and never mutates — segments record which
 //! set version they assigned against, so a future re-publish (background
 //! reclustering, SPFresh-style maintenance) is an additive operation.
@@ -38,17 +38,17 @@ use crate::schema::{Field, FieldType, Metric, Schema, VectorDType, VectorOptions
 use crate::{Executor, TantivyError};
 
 /// Router-kind tag for tantivy's own RNG payload (the
-/// [`CentroidIndex::serialize_router`] default). Consumer-defined router
+/// [`CentroidProducer::serialize_router`] default). Consumer-defined router
 /// structures must tag themselves `>= 128`.
 pub const ROUTER_KIND_RNG: u8 = 0;
 
-/// The consumer-provided centroid index, pulled once at index creation.
+/// The consumer-provided centroid producer, pulled once at index creation.
 ///
 /// Implementors own centroid *training* entirely — tantivy never trains.
 /// Segments assign against the serialized set with tantivy's internal
 /// selector, so the only knobs here are the data itself: the rows, the
 /// MVCC version, and (optionally) a custom routing structure.
-pub trait CentroidIndex: Send + Sync + 'static {
+pub trait CentroidProducer: Send + Sync + 'static {
     /// The set's version stamp. Recorded in `meta.json`, in the file name,
     /// and in every segment that assigns against this set — the hook for
     /// consumer-side MVCC once re-publishing exists.
@@ -104,7 +104,7 @@ pub(crate) fn centroid_set_filename(version: u64) -> PathBuf {
 pub(crate) fn write_centroid_set(
     directory: &dyn Directory,
     schema: &Schema,
-    provider: &dyn CentroidIndex,
+    provider: &dyn CentroidProducer,
 ) -> crate::Result<PathBuf> {
     let path = centroid_set_filename(provider.version());
     let mut write = directory.open_write(&path)?;
@@ -121,7 +121,8 @@ pub(crate) fn write_centroid_set(
         let IvfCentroids::F32(matrix) = &centroids;
         if matrix.dims != opts.dim() {
             return Err(TantivyError::InvalidArgument(format!(
-                "CentroidIndex produced centroids with {} dimensions for field '{}', expected {}",
+                "CentroidProducer produced centroids with {} dimensions for field '{}', expected \
+                 {}",
                 matrix.dims,
                 entry.name(),
                 opts.dim()
@@ -129,8 +130,8 @@ pub(crate) fn write_centroid_set(
         }
         if matrix.values.len() != matrix.rows * matrix.dims {
             return Err(TantivyError::InvalidArgument(format!(
-                "CentroidIndex produced {} centroid values for {} rows x {} dimensions in field \
-                 '{}'",
+                "CentroidProducer produced {} centroid values for {} rows x {} dimensions in \
+                 field '{}'",
                 matrix.values.len(),
                 matrix.rows,
                 matrix.dims,
@@ -139,13 +140,13 @@ pub(crate) fn write_centroid_set(
         }
         if matrix.rows == 0 {
             return Err(TantivyError::InvalidArgument(format!(
-                "CentroidIndex produced no centroids for field '{}'",
+                "CentroidProducer produced no centroids for field '{}'",
                 entry.name()
             )));
         }
         u32::try_from(matrix.rows).map_err(|_| {
             TantivyError::InvalidArgument(format!(
-                "CentroidIndex produced more than u32::MAX centroids for field '{}'",
+                "CentroidProducer produced more than u32::MAX centroids for field '{}'",
                 entry.name()
             ))
         })?;
@@ -162,8 +163,8 @@ pub(crate) fn write_centroid_set(
             let mut bytes = encode_vector(centroid, opts.dim())?;
             if maybe_normalize_bytes(opts, &mut bytes) == NormalizeOutcome::NonFinite {
                 return Err(TantivyError::InvalidArgument(format!(
-                    "CentroidIndex produced a non-finite centroid (ord {centroid_ord}) for field \
-                     '{}'",
+                    "CentroidProducer produced a non-finite centroid (ord {centroid_ord}) for \
+                     field '{}'",
                     entry.name()
                 )));
             }
@@ -194,8 +195,8 @@ pub(crate) fn write_centroid_set(
             provider.serialize_router(field, opts, &normalized, &mut sink)?;
             if sink.written == 0 {
                 return Err(TantivyError::InvalidArgument(format!(
-                    "CentroidIndex::serialize_router wrote no router payload for field '{}'; the \
-                     payload must start with a router-kind tag byte",
+                    "CentroidProducer::serialize_router wrote no router payload for field '{}'; \
+                     the payload must start with a router-kind tag byte",
                     entry.name()
                 )));
             }

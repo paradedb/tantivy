@@ -8,7 +8,9 @@ use crate::indexer::NoMergePolicy;
 use crate::query::TermQuery;
 use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, STRING};
 use crate::vector::ivf::AdaptiveProbeParams;
-use crate::vector::{CentroidIndex, IvfCentroids, IvfMatrix, Metric, VectorDType, VectorOptions};
+use crate::vector::{
+    CentroidProducer, IvfCentroids, IvfMatrix, Metric, VectorDType, VectorOptions,
+};
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
 const EMBEDDING_FIELD_NAME: &str = "embedding";
@@ -54,7 +56,7 @@ impl TestVectorIndexBuilder {
         let schema = schema_builder.build();
         let index = Index::builder()
             .schema(schema)
-            .centroid_index(Arc::new(Grid2DCentroidIndex {
+            .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: self.centroids.clone(),
                 version: FIXTURE_SET_VERSION,
             }))
@@ -145,14 +147,14 @@ impl TestVectorIndex {
     }
 }
 
-/// Fixed-centroid [`CentroidIndex`]: the consumer "trained" these
+/// Fixed-centroid [`CentroidProducer`]: the consumer "trained" these
 /// centroids elsewhere; tantivy only assigns against them.
-pub(crate) struct Grid2DCentroidIndex {
+pub(crate) struct Grid2DCentroidProducer {
     pub(crate) centroids: Vec<[f32; grid2d::DIM]>,
     pub(crate) version: u64,
 }
 
-impl CentroidIndex for Grid2DCentroidIndex {
+impl CentroidProducer for Grid2DCentroidProducer {
     fn version(&self) -> u64 {
         self.version
     }
@@ -419,12 +421,12 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
 }
 
 /// A single-centroid provider, for tests that only need a valid set.
-pub(crate) struct SingleCellCentroidIndex {
+pub(crate) struct SingleCellCentroidProducer {
     pub(crate) dim: usize,
     pub(crate) version: u64,
 }
 
-impl CentroidIndex for SingleCellCentroidIndex {
+impl CentroidProducer for SingleCellCentroidProducer {
     fn version(&self) -> u64 {
         self.version
     }
@@ -451,7 +453,7 @@ fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
         let schema = schema_builder.build();
         let index = Index::builder()
             .schema(schema)
-            .centroid_index(Arc::new(SingleCellCentroidIndex { dim: 2, version: 1 }))
+            .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2, version: 1 }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         let mut doc = TantivyDocument::new();
@@ -466,7 +468,7 @@ fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
         let schema = schema_builder.build();
         let index = Index::builder()
             .schema(schema)
-            .centroid_index(Arc::new(SingleCellCentroidIndex { dim: 2, version: 1 }))
+            .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2, version: 1 }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         let mut doc = TantivyDocument::new();
@@ -493,7 +495,7 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     let schema = schema_builder.build();
     let index = Index::builder()
         .schema(schema)
-        .centroid_index(Arc::new(SingleCellCentroidIndex { dim: 2, version: 1 }))
+        .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2, version: 1 }))
         .create_in_ram()?;
     let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
     let mut zero_doc = TantivyDocument::new();
@@ -756,7 +758,7 @@ mod grid2d {
 mod centroid_set_lifecycle_tests {
     use std::sync::Arc;
 
-    use super::{open_centroid_set, Grid2DCentroidIndex, SingleCellCentroidIndex};
+    use super::{open_centroid_set, Grid2DCentroidProducer, SingleCellCentroidProducer};
     use crate::directory::{Directory, RamDirectory};
     use crate::indexer::NoMergePolicy;
     use crate::schema::{Schema, STORED, STRING};
@@ -771,7 +773,7 @@ mod centroid_set_lifecycle_tests {
         sb.build()
     }
 
-    /// A centroid index without vector fields is refused; the converse —
+    /// A centroid producer without vector fields is refused; the converse —
     /// vector fields without a set — is the flat (mutable/staging) tier
     /// and creates fine.
     #[test]
@@ -780,7 +782,7 @@ mod centroid_set_lifecycle_tests {
         sb.add_text_field("label", STRING);
         let err = Index::builder()
             .schema(sb.build())
-            .centroid_index(Arc::new(SingleCellCentroidIndex { dim: 2, version: 1 }))
+            .centroid_producer(Arc::new(SingleCellCentroidProducer { dim: 2, version: 1 }))
             .create_in_ram()
             .unwrap_err();
         assert!(
@@ -802,7 +804,7 @@ mod centroid_set_lifecycle_tests {
         let directory = RamDirectory::create();
         let index = Index::builder()
             .schema(vector_schema())
-            .centroid_index(Arc::new(Grid2DCentroidIndex {
+            .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
                 version: 7,
             }))
@@ -889,26 +891,26 @@ mod centroid_set_lifecycle_tests {
     fn open_or_create_checks_set_version() -> crate::Result<()> {
         let directory = RamDirectory::create();
         let provider = |version| {
-            Arc::new(Grid2DCentroidIndex {
+            Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
                 version,
             })
         };
         let _ = Index::builder()
             .schema(vector_schema())
-            .centroid_index(provider(3))
+            .centroid_producer(provider(3))
             .create(directory.clone())?;
 
         // Same version: fine.
         Index::builder()
             .schema(vector_schema())
-            .centroid_index(provider(3))
+            .centroid_producer(provider(3))
             .open_or_create(directory.clone())?;
 
         // New version: refused until re-publishing exists.
         let err = Index::builder()
             .schema(vector_schema())
-            .centroid_index(provider(4))
+            .centroid_producer(provider(4))
             .open_or_create(directory)
             .unwrap_err();
         assert!(
@@ -930,7 +932,7 @@ mod bounds_storage_tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    use super::{open_centroid_set, Grid2DCentroidIndex, TestVectorIndex, EMBEDDING_FIELD_NAME};
+    use super::{open_centroid_set, Grid2DCentroidProducer, TestVectorIndex, EMBEDDING_FIELD_NAME};
     use crate::directory::{Directory, RamDirectory, TerminatingWrite};
     use crate::index::SegmentComponent;
     use crate::indexer::NoMergePolicy;
@@ -1038,7 +1040,7 @@ mod bounds_storage_tests {
         let builder =
             Index::builder()
                 .schema(schema)
-                .centroid_index(Arc::new(Grid2DCentroidIndex {
+                .centroid_producer(Arc::new(Grid2DCentroidProducer {
                     centroids,
                     version: 1,
                 }));

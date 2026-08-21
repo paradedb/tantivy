@@ -29,7 +29,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{write_centroid_set, CentroidIndex, SetSearchIndex, VectorPlugin};
+use crate::vector::{write_centroid_set, CentroidProducer, SetSearchIndex, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -180,7 +180,7 @@ pub struct IndexBuilder {
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
-    centroid_index: Option<Arc<dyn CentroidIndex>>,
+    centroid_producer: Option<Arc<dyn CentroidProducer>>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -196,7 +196,7 @@ impl IndexBuilder {
             tokenizer_manager: TokenizerManager::default(),
             fast_field_tokenizer_manager: TokenizerManager::default(),
             custom_plugins: Vec::new(),
-            centroid_index: None,
+            centroid_producer: None,
         }
     }
 
@@ -237,8 +237,8 @@ impl IndexBuilder {
     /// and settings. Without one, vector fields are stored flat
     /// (doc-ordered) and searched exhaustively — the mutable/staging tier.
     #[must_use]
-    pub fn centroid_index(mut self, centroid_index: Arc<dyn CentroidIndex>) -> Self {
-        self.centroid_index = Some(centroid_index);
+    pub fn centroid_producer(mut self, centroid_producer: Arc<dyn CentroidProducer>) -> Self {
+        self.centroid_producer = Some(centroid_producer);
         self
     }
 
@@ -317,11 +317,11 @@ impl IndexBuilder {
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
             index.custom_plugins.extend(self.custom_plugins);
-            if let Some(centroid_index) = self.centroid_index {
+            if let Some(centroid_producer) = self.centroid_producer {
                 // The set was installed when the index was created; a
                 // provider carrying a different version would be a
                 // re-publish, which is not supported yet.
-                let version = centroid_index.version();
+                let version = centroid_producer.version();
                 let known = index
                     .load_metas()?
                     .centroid_set
@@ -346,9 +346,10 @@ impl IndexBuilder {
             let has_vector_fields = schema
                 .fields()
                 .any(|(_, entry)| matches!(entry.field_type(), FieldType::Vector(_)));
-            if !has_vector_fields && self.centroid_index.is_some() {
+            if !has_vector_fields && self.centroid_producer.is_some() {
                 return Err(TantivyError::InvalidArgument(
-                    "a centroid index was provided but the schema has no vector fields".to_string(),
+                    "a centroid producer was provided but the schema has no vector fields"
+                        .to_string(),
                 ));
             }
             if self.index_settings.manual_doc_id_mapping
@@ -407,12 +408,12 @@ impl IndexBuilder {
         let directory = ManagedDirectory::wrap(dir)?;
         // The centroid set file is written BEFORE the first meta.json
         // references it — the meta write is the commit point.
-        let centroid_set = match &self.centroid_index {
-            Some(centroid_index) => {
+        let centroid_set = match &self.centroid_producer {
+            Some(centroid_producer) => {
                 let schema = self.get_expect_schema()?;
-                let path = write_centroid_set(&directory, &schema, centroid_index.as_ref())?;
+                let path = write_centroid_set(&directory, &schema, centroid_producer.as_ref())?;
                 Some(CentroidSetMeta {
-                    version: centroid_index.version(),
+                    version: centroid_producer.version(),
                     filename: path.to_string_lossy().into_owned(),
                 })
             }

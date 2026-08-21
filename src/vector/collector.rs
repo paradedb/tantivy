@@ -269,7 +269,7 @@ mod e2e_tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
     use crate::schema::{Field, Schema, FAST};
-    use crate::vector::tests::{exhaustive_params, Grid2DCentroidIndex, TestVectorIndex};
+    use crate::vector::tests::{exhaustive_params, Grid2DCentroidProducer, TestVectorIndex};
     use crate::vector::{Metric, VectorDType, VectorOptions};
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
@@ -350,7 +350,7 @@ mod e2e_tests {
         let id_field = schema_builder.add_u64_field("id", FAST);
         let index = Index::builder()
             .schema(schema_builder.build())
-            .centroid_index(Arc::new(Grid2DCentroidIndex {
+            .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
                 version: 1,
             }))
@@ -493,7 +493,7 @@ mod e2e_tests {
         let embedding_field = schema_builder.add_vector_field("embedding", vector_options);
         let index = Index::builder()
             .schema(schema_builder.build())
-            .centroid_index(Arc::new(Grid2DCentroidIndex {
+            .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
                 version: 1,
             }))
@@ -560,7 +560,7 @@ mod e2e_tests {
         let city_field = schema_builder.add_text_field("city", crate::schema::STRING | FAST);
         let index = Index::builder()
             .schema(schema_builder.build())
-            .centroid_index(Arc::new(Grid2DCentroidIndex {
+            .centroid_producer(Arc::new(Grid2DCentroidProducer {
                 centroids: vec![[0.0, 0.0]],
                 version: 1,
             }))

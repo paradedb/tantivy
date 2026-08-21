@@ -264,7 +264,7 @@ mod tests {
     use crate::vector::ivf::AdaptiveProbeParams;
     use crate::vector::tests::{exhaustive_params, ground_truth, TestVectorIndex};
     use crate::vector::{
-        CentroidIndex, IvfCentroids, IvfMatrix, Metric, NoTieBreak, VectorDType, VectorInfo,
+        CentroidProducer, IvfCentroids, IvfMatrix, Metric, NoTieBreak, VectorDType, VectorInfo,
         VectorOptions,
     };
     use crate::{DocAddress, Index, IndexWriter, Score, TantivyDocument};
@@ -365,14 +365,14 @@ mod tests {
 
     // ---- Inline fixtures ----
 
-    /// Fixed-centroid [`CentroidIndex`]: the consumer "trained" these
+    /// Fixed-centroid [`CentroidProducer`]: the consumer "trained" these
     /// centroids elsewhere; tantivy only assigns against them.
-    pub(crate) struct InlineCentroidIndex {
+    pub(crate) struct InlineCentroidProducer {
         pub(crate) centroids: Vec<[f32; 2]>,
         pub(crate) version: u64,
     }
 
-    impl CentroidIndex for InlineCentroidIndex {
+    impl CentroidProducer for InlineCentroidProducer {
         fn version(&self) -> u64 {
             self.version
         }
@@ -412,7 +412,7 @@ mod tests {
         let index = Index::builder()
             .schema(sb.build())
             .settings(settings)
-            .centroid_index(Arc::new(InlineCentroidIndex {
+            .centroid_producer(Arc::new(InlineCentroidProducer {
                 centroids: centroids.to_vec(),
                 version: 1,
             }))
@@ -1180,7 +1180,7 @@ mod tests {
         let label_field = sb.add_text_field("label", STRING | STORED);
         let index = Index::builder()
             .schema(sb.build())
-            .centroid_index(Arc::new(InlineCentroidIndex {
+            .centroid_producer(Arc::new(InlineCentroidProducer {
                 centroids: centroids.clone(),
                 version: 42,
             }))
@@ -1440,7 +1440,7 @@ mod tests {
         let label_field = sb.add_text_field("label", STRING | STORED);
         let index = Index::builder()
             .schema(sb.build())
-            .centroid_index(Arc::new(InlineCentroidIndex {
+            .centroid_producer(Arc::new(InlineCentroidProducer {
                 centroids: centroids.clone(),
                 version: 1,
             }))
@@ -1514,7 +1514,7 @@ mod tests {
         let label_field = sb.add_text_field("label", STRING | STORED);
         let index = Index::builder()
             .schema(sb.build())
-            .centroid_index(Arc::new(InlineCentroidIndex {
+            .centroid_producer(Arc::new(InlineCentroidProducer {
                 centroids: centroids.clone(),
                 version: 1,
             }))
