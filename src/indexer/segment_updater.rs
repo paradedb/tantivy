@@ -319,8 +319,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
                                                   * same */
         persisted_custom_extensions: persisted_custom_extensions.clone(),
         // The offline merge path does not carry an index-level centroid
-        // index; vector merges route to merge_flat, which refuses
-        // clustered sources.
+        // index; vector merges error on the missing one.
         centroid_index: None,
         segments: vec![segment_meta],
         schema: target_schema.clone(),

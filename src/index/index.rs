@@ -405,10 +405,6 @@ impl IndexBuilder {
         let centroid_index = match &self.centroid_producer {
             Some(centroid_producer) => {
                 let schema = self.get_expect_schema()?;
-                // Single-threaded: create() runs inside the embedder's call
-                // (for pg_search, a Postgres backend, which forbids FFI from
-                // any thread but its own). Callers invoking serialize
-                // directly may pass a pool.
                 centroid_producer.serialize(&directory, &schema, &Executor::single_thread())?;
                 Some(CENTROIDS_FILEPATH.to_string_lossy().into_owned())
             }

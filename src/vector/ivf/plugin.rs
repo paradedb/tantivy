@@ -25,7 +25,6 @@ use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::vector::centroid_index::{CentroidIndexReader, FieldCentroids};
 use crate::vector::distance::{maybe_normalize_bytes, norm_squared_bytes_wide, NormalizeOutcome};
-use crate::vector::flat::merge_flat;
 use crate::vector::header::{vec_slot, write_header};
 use crate::vector::id_map::IdMap;
 use crate::vector::{residual_norm, BoundKind, BoundsBuilder, BoundsScope, VEC_EXT};
@@ -642,10 +641,15 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
 
     let index = ctx.target_segment.index();
     let meta = index.load_metas()?;
-    // No centroid index = the flat (mutable/staging) tier: every source is
-    // flat and the target stays flat.
+    // Flat segments exist to be clustered at their first merge; a merge
+    // whose TARGET has nothing to cluster against is a misuse, not a
+    // tier. (The flat/staging tier is bounded and never merges.)
     let Some(centroid_index) = meta.centroid_index.as_ref() else {
-        return merge_flat(ctx);
+        return Err(TantivyError::InvalidArgument(
+            "cannot merge vector segments in an index without a centroid index; flat segments \
+             only merge into a clustered index"
+                .to_string(),
+        ));
     };
     let set_search = index.cached_centroid_index()?;
     let directory = index.directory();

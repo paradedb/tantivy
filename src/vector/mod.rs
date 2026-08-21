@@ -41,7 +41,6 @@ pub use bounds::{
 };
 pub(crate) use centroid_index::CachedCentroidIndex;
 pub use centroid_index::{CentroidProducer, ROUTER_KIND_RNG};
-pub use crate::core::CENTROIDS_FILEPATH;
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
@@ -57,6 +56,7 @@ pub use prepared::PreparedQuery;
 pub use tie_break::NoTieBreak;
 pub use writer::VecWriter;
 
+pub use crate::core::CENTROIDS_FILEPATH;
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
 // resolves for callers and tests that work entirely within the vector module.
 pub use crate::schema::{Metric, VectorDType, VectorOptions};

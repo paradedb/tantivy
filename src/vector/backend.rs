@@ -1732,10 +1732,11 @@ mod tests {
         Ok(())
     }
 
-    /// Merging inside a no-set index keeps the flat layout and the exact
-    /// results.
+    /// Merging inside a no-centroid-index index is refused: flat segments
+    /// only ever merge INTO a clustered index (where their rows are
+    /// assigned); the staging tier itself never merges.
     #[test]
-    fn flat_merge_stays_flat() -> crate::Result<()> {
+    fn flat_only_merge_errors() -> crate::Result<()> {
         let docs: Vec<(String, [f32; 2])> = (0..20)
             .map(|i| (format!("d{i}"), [i as f32, (i * 3 % 7) as f32]))
             .collect();
@@ -1743,15 +1744,24 @@ mod tests {
         let (index, embed_field, _) = build_flat(
             Metric::Cosine,
             &[&docs[..7], &docs[7..14], &docs[14..]],
-            true,
+            false,
         )?;
 
-        let searcher = index.reader()?.searcher();
-        assert_eq!(searcher.segment_readers().len(), 1);
-        let vec = searcher.segment_readers()[0].vector_index(embed_field)?;
-        assert!(vec.index().is_none(), "the merged segment stays flat");
-        assert_eq!(vec.num_vectors(), 20);
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        let segment_ids = index.searchable_segment_ids()?;
+        // Foreground merge: the background path panics its merge thread on
+        // any error under cfg(test).
+        let err = writer.merge_foreground(&segment_ids, false).unwrap_err();
+        assert!(
+            err.to_string().contains("without a centroid index"),
+            "unexpected: {err}"
+        );
+        drop(writer);
 
+        // The failed merge changes nothing: still three flat segments,
+        // still exact results.
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 3);
         let query = vec![0.6f32, 0.8];
         let (hits, stats) = run_global(
             &index,
