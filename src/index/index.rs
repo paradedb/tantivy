@@ -28,7 +28,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{write_centroid_index, CentroidIndexView, CentroidProducer, VectorPlugin};
+use crate::vector::{write_centroid_index, CachedCentroidIndex, CentroidProducer, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -438,7 +438,7 @@ pub struct Index {
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
-    centroid_index_cache: Arc<std::sync::RwLock<Option<Arc<CentroidIndexView>>>>,
+    centroid_index_cache: Arc<std::sync::RwLock<Option<Arc<CachedCentroidIndex>>>>,
 }
 
 impl Index {
@@ -940,7 +940,7 @@ impl Index {
     /// The search-time view of the centroid index, opened on first use
     /// and cached for the life of this `Index` (and all its clones) — the
     /// file is immutable, so the cache never invalidates.
-    pub(crate) fn centroid_index_view(&self) -> crate::Result<Arc<CentroidIndexView>> {
+    pub(crate) fn cached_centroid_index(&self) -> crate::Result<Arc<CachedCentroidIndex>> {
         if let Some(set) = self
             .centroid_index_cache
             .read()
@@ -955,7 +955,7 @@ impl Index {
                 "clustered segments exist but the meta lists no centroid index".to_string(),
             )
         })?;
-        let set = Arc::new(CentroidIndexView::open(
+        let set = Arc::new(CachedCentroidIndex::open(
             &self.directory,
             Path::new(&entry),
             &self.schema,

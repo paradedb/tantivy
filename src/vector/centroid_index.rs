@@ -403,11 +403,11 @@ impl VectorArena for UnitNormRowsArena {
 /// centroid rows plus the parsed router. Opened once and cached on
 /// [`Index`](crate::Index) — the router adjacency alone is
 /// `C × max_edges × 4` bytes, far too heavy to parse per query.
-pub(crate) struct CentroidIndexView {
+pub(crate) struct CachedCentroidIndex {
     fields: std::collections::HashMap<Field, FieldRouter>,
 }
 
-impl CentroidIndexView {
+impl CachedCentroidIndex {
     /// Open the set file and parse every vector field's router.
     pub(crate) fn open(
         directory: &dyn Directory,
@@ -472,7 +472,7 @@ impl CentroidIndexView {
                 },
             );
         }
-        Ok(CentroidIndexView { fields })
+        Ok(CachedCentroidIndex { fields })
     }
 
     pub(crate) fn field_router(&self, field: Field) -> Option<&FieldRouter> {
@@ -480,7 +480,7 @@ impl CentroidIndexView {
     }
 }
 
-/// One field's routing state within a [`CentroidIndexView`]: says which
+/// One field's routing state within a [`CachedCentroidIndex`]: says which
 /// clusters a query should probe, index-wide — every segment shares these
 /// cluster ids.
 pub(crate) struct FieldRouter {

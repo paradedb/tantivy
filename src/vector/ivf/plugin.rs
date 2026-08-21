@@ -66,7 +66,7 @@ pub(crate) struct IvfFieldWriteParams<'a> {
     pub(crate) opts: &'a VectorOptions,
     pub(crate) set: &'a FieldCentroids,
     /// The set's persisted routing graph (from the cached
-    /// [`CentroidIndexView`](crate::vector::centroid_index::CentroidIndexView)),
+    /// [`CachedCentroidIndex`](crate::vector::centroid_index::CachedCentroidIndex)),
     /// reused as the assignment selector for large sets.
     pub(crate) router:
         Option<&'a RelativeNeighborhoodGraph<crate::vector::centroid_index::UnitNormRowsArena>>,
@@ -647,7 +647,7 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     let Some(centroid_index) = meta.centroid_index.as_ref() else {
         return merge_flat(ctx);
     };
-    let set_search = index.centroid_index_view()?;
+    let set_search = index.cached_centroid_index()?;
     let directory = index.directory();
     let set_reader = CentroidIndexReader::open(directory, std::path::Path::new(centroid_index))?;
 

@@ -224,7 +224,7 @@ where
 
     // The routed tier, over the clustered segments.
     if !segments.is_empty() {
-        let set = searcher.index().centroid_index_view()?;
+        let set = searcher.index().cached_centroid_index()?;
         let router = set.field_router(field).ok_or_else(|| {
             TantivyError::InternalError(format!(
                 "the centroid index has no router for field {field:?}"
