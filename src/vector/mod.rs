@@ -3,14 +3,14 @@
 //! The module root holds what every side shares: the element trait
 //! [`VectorElement`], the arenas, the [`distance`] kernels, the on-disk
 //! framing ([`header`], [`id_map`]), the per-segment read surface
-//! ([`VectorIndexReader`]), the index-level [`centroid_index`] artifact,
-//! and the write entry ([`VecWriter`] / [`VectorPlugin`], which pick the
-//! layout: clustered when the index has a centroid index, flat when it
-//! does not). The clustered layout's internals — assignment, the router
-//! graph, per-cluster bounds, the field write and merge — live in
-//! [`ivf`]; the whole query path — the cross-segment driver, collector,
-//! prepared query, tie-break, and the work-unit model — lives in
-//! `search`.
+//! ([`VectorIndexReader`]), and the write entry ([`VecWriter`] /
+//! [`VectorPlugin`], which pick the layout: clustered when the index has
+//! a centroid index, flat when it does not). The clustered design lives
+//! in [`ivf`] — the index-level centroid index (vocabulary + router) and
+//! each segment's [`SegmentClusters`] (cluster → row-range postings),
+//! plus assignment, bounds, and the field write/merge. The whole query
+//! path — the cross-segment driver, collector, prepared query,
+//! tie-break, and the work-unit model — lives in `search`.
 //!
 //! The schema-level field configuration ([`VectorOptions`](crate::schema::VectorOptions),
 //! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema
@@ -18,7 +18,6 @@
 
 use std::io;
 
-pub(crate) mod centroid_index;
 mod distance;
 mod header;
 mod id_map;
@@ -33,8 +32,6 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
-pub(crate) use centroid_index::CachedCentroidIndex;
-pub use centroid_index::{CentroidProducer, ROUTER_KIND_RNG};
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
@@ -43,10 +40,12 @@ pub use ivf::bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
     BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
+pub(crate) use ivf::centroid_index::CachedCentroidIndex;
+pub use ivf::centroid_index::{CentroidProducer, ROUTER_KIND_RNG};
 pub use ivf::{
-    Candidate, Graph, IvfCentroids, IvfIndex, IvfMatrix, IvfSearchMetrics, NeighborhoodGraphConfig,
+    Candidate, Graph, IvfCentroids, IvfMatrix, IvfSearchMetrics, NeighborhoodGraphConfig,
     NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
-    SearchIterator, SearchTerminationReason, Workspace,
+    SearchIterator, SearchTerminationReason, SegmentClusters, Workspace,
 };
 pub use search::backend::{
     set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS,

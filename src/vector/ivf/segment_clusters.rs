@@ -1,4 +1,4 @@
-//! The per-segment IVF remainder and its reader, [`IvfIndex`].
+//! The per-segment IVF remainder and its reader, [`SegmentClusters`].
 //!
 //! From format V3 on, the centroid rows and the routing structure live in
 //! the index-level `centroids.<version>` set file (see
@@ -6,7 +6,7 @@
 //! per-segment — which rows landed in which cluster, and the residual
 //! geometry of those rows. This module owns the wire format of those
 //! `.vec` slots end to end: the serializers the write paths call and the
-//! [`IvfIndex::open`] that parses them back sit side by side.
+//! [`SegmentClusters::open`] that parses them back sit side by side.
 //!
 //! The `.vec` composite slots (see `vector::header::vec_slot`):
 //!
@@ -42,7 +42,7 @@ use crate::vector::{BoundKind, BoundStore};
 /// Everything here is small and pinned; the row-scale payload (rows,
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader),
 /// and the centroid rows live in the index-level set file.
-pub struct IvfIndex {
+pub struct SegmentClusters {
     num_centroids: usize,
     /// Distinct documents with a vector in this field. Rows including
     /// replicas are [`Self::num_rows`].
@@ -63,7 +63,7 @@ pub struct IvfIndex {
     num_non_empty: usize,
 }
 
-impl IvfIndex {
+impl SegmentClusters {
     /// Write slot `[2]` of the `.vec` composite for a field.
     pub(crate) fn serialize_offsets<W: Write + ?Sized>(
         cluster_offsets: &[u64],
@@ -191,7 +191,7 @@ impl IvfIndex {
             (kind, values)
         };
 
-        let mut index = IvfIndex {
+        let mut index = SegmentClusters {
             num_centroids,
             num_docs,
             cluster_offsets,

@@ -17,16 +17,16 @@ use common::BitSet;
 
 use super::assign::{assign_cells, CentroidSelector};
 use super::graph::RelativeNeighborhoodGraph;
-use super::{decode_row, IvfIndex};
+use super::{decode_row, SegmentClusters};
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, VectorOptions};
-use crate::vector::centroid_index::{CentroidIndexReader, FieldCentroids};
 use crate::vector::distance::{maybe_normalize_bytes, norm_squared_bytes_wide, NormalizeOutcome};
 use crate::vector::header::{vec_slot, write_header};
 use crate::vector::id_map::IdMap;
+use crate::vector::ivf::centroid_index::{CentroidIndexReader, FieldCentroids};
 use crate::vector::{residual_norm, BoundKind, BoundsBuilder, BoundsScope, VEC_EXT};
 use crate::{DocId, Executor, TantivyError};
 
@@ -65,10 +65,11 @@ pub(crate) struct IvfFieldWriteParams<'a> {
     pub(crate) opts: &'a VectorOptions,
     pub(crate) set: &'a FieldCentroids,
     /// The set's persisted routing graph (from the cached
-    /// [`CachedCentroidIndex`](crate::vector::centroid_index::CachedCentroidIndex)),
+    /// [`CachedCentroidIndex`](crate::vector::ivf::centroid_index::CachedCentroidIndex)),
     /// reused as the assignment selector for large sets.
-    pub(crate) router:
-        Option<&'a RelativeNeighborhoodGraph<crate::vector::centroid_index::UnitNormRowsArena>>,
+    pub(crate) router: Option<
+        &'a RelativeNeighborhoodGraph<crate::vector::ivf::centroid_index::UnitNormRowsArena>,
+    >,
     /// Cells per vector (primary + replicas); clamped to the centroid count.
     pub(crate) replicas: usize,
     pub(crate) bounds_scope: BoundsScope,
@@ -296,17 +297,17 @@ pub(crate) fn write_ivf_field(
 
     {
         let offsets_w = vec_write.for_field_with_idx(params.field, vec_slot::OFFSETS);
-        IvfIndex::serialize_offsets(&cluster_offsets, offsets_w)?;
+        SegmentClusters::serialize_offsets(&cluster_offsets, offsets_w)?;
         offsets_w.flush()?;
     }
     {
         let bounds_w = vec_write.for_field_with_idx(params.field, vec_slot::BOUNDS);
-        IvfIndex::serialize_bounds(BoundKind::Ball, &bounds_builder.finish(), bounds_w)?;
+        SegmentClusters::serialize_bounds(BoundKind::Ball, &bounds_builder.finish(), bounds_w)?;
         bounds_w.flush()?;
     }
     {
         let meta_w = vec_write.for_field_with_idx(params.field, vec_slot::IVF_META);
-        IvfIndex::serialize_ivf_meta(num_present_docs, num_centroids, meta_w)?;
+        SegmentClusters::serialize_ivf_meta(num_present_docs, num_centroids, meta_w)?;
         meta_w.flush()?;
     }
 
@@ -366,7 +367,7 @@ fn merge_ivf_field(
         let flat_sources: Vec<usize> = field_readers
             .iter()
             .enumerate()
-            .filter(|(_, reader)| reader.index().is_none() && reader.num_vectors() > 0)
+            .filter(|(_, reader)| reader.clusters().is_none() && reader.num_vectors() > 0)
             .map(|(ord, _)| ord)
             .collect();
         if !flat_sources.is_empty() {
@@ -487,7 +488,7 @@ fn merge_ivf_field(
         }
         per_cluster.clear();
         for (segment_ord, reader) in field_readers.iter().enumerate() {
-            let Some(ivf) = reader.index() else {
+            let Some(ivf) = reader.clusters() else {
                 continue;
             };
             let Some(rows) = ivf.non_empty_cluster_range(cluster) else {
@@ -553,7 +554,7 @@ fn merge_ivf_field(
 
     {
         let offsets_w = vec_write.for_field_with_idx(field, vec_slot::OFFSETS);
-        IvfIndex::serialize_offsets(&cluster_offsets, offsets_w)?;
+        SegmentClusters::serialize_offsets(&cluster_offsets, offsets_w)?;
         offsets_w.flush()?;
     }
     {
@@ -568,7 +569,7 @@ fn merge_ivf_field(
         let mut kind = BoundKind::Ball;
         let mut combined = vec![0.0f32; num_centroids];
         for reader in field_readers {
-            let Some(ivf) = reader.index() else {
+            let Some(ivf) = reader.clusters() else {
                 continue;
             };
             let bounds = ivf.bounds();
@@ -594,12 +595,12 @@ fn merge_ivf_field(
             }
         }
         let bounds_w = vec_write.for_field_with_idx(field, vec_slot::BOUNDS);
-        IvfIndex::serialize_bounds(kind, &combined, bounds_w)?;
+        SegmentClusters::serialize_bounds(kind, &combined, bounds_w)?;
         bounds_w.flush()?;
     }
     {
         let meta_w = vec_write.for_field_with_idx(field, vec_slot::IVF_META);
-        IvfIndex::serialize_ivf_meta(num_present_docs, num_centroids, meta_w)?;
+        SegmentClusters::serialize_ivf_meta(num_present_docs, num_centroids, meta_w)?;
         meta_w.flush()?;
     }
 
@@ -704,7 +705,7 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
         let field_centroids = set_reader.field_centroids(field, opts)?;
         let num_centroids = field_centroids.num_centroids();
         for reader in &field_readers {
-            if let Some(ivf) = reader.index() {
+            if let Some(ivf) = reader.clusters() {
                 if ivf.num_clusters() != num_centroids {
                     return Err(TantivyError::InternalError(format!(
                         "source segment holds {} clusters but the centroid index holds \

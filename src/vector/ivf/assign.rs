@@ -15,8 +15,8 @@ use std::cmp::Ordering;
 
 use super::graph::{NodeId, RelativeNeighborhoodGraph, Workspace};
 use crate::schema::{Metric, VectorOptions};
-use crate::vector::centroid_index::{FieldCentroids, UnitNormRowsArena};
 use crate::vector::distance::{cosine, dot, l2_squared};
+use crate::vector::ivf::centroid_index::{FieldCentroids, UnitNormRowsArena};
 use crate::Executor;
 
 /// Rows assigned per [`Executor`] work item when a batch is split across

@@ -168,13 +168,13 @@ impl CentroidProducer for Grid2DCentroidProducer {
 /// Resolve and open the index's newest centroid index file.
 pub(crate) fn open_centroid_index(
     index: &Index,
-) -> crate::Result<crate::vector::centroid_index::CentroidIndexReader> {
+) -> crate::Result<crate::vector::ivf::centroid_index::CentroidIndexReader> {
     let meta = index.load_metas()?;
     let filename = meta
         .centroid_index
         .as_ref()
         .expect("index has a centroid index");
-    crate::vector::centroid_index::CentroidIndexReader::open(
+    crate::vector::ivf::centroid_index::CentroidIndexReader::open(
         index.directory(),
         std::path::Path::new(filename),
     )
@@ -223,7 +223,7 @@ fn every_segment_is_clustered_against_the_set() -> crate::Result<()> {
     assert!(!searcher.segment_readers().is_empty());
     for segment_reader in searcher.segment_readers() {
         let vec_reader = segment_reader.vector_index(index.embedding_field())?;
-        let ivf = vec_reader.index().expect("every segment is IVF");
+        let ivf = vec_reader.clusters().expect("every segment is IVF");
         assert_eq!(ivf.num_clusters(), grid2d::centroids().len());
     }
     Ok(())
@@ -829,7 +829,7 @@ mod centroid_index_lifecycle_tests {
         assert_eq!(searcher.segment_readers().len(), 1);
         searcher.segment_readers()[0]
             .vector_index(embed_field)?
-            .index()
+            .clusters()
             .expect("merged segment is IVF");
         Ok(())
     }
@@ -853,7 +853,10 @@ mod centroid_index_lifecycle_tests {
 
         let searcher = index.reader()?.searcher();
         let vec = searcher.segment_readers()[0].vector_index(embed_field)?;
-        assert!(vec.index().is_none(), "flat segments carry no IvfIndex");
+        assert!(
+            vec.clusters().is_none(),
+            "flat segments carry no SegmentClusters"
+        );
         assert_eq!(vec.num_vectors(), 2);
         for (row, doc) in [(0usize, 0u32), (1, 1)] {
             assert_eq!(vec.doc_id_at(row), doc, "flat rows are doc-ordered");
@@ -920,8 +923,8 @@ mod bounds_storage_tests {
     use crate::index::SegmentComponent;
     use crate::indexer::NoMergePolicy;
     use crate::schema::{Schema, STORED, STRING};
-    use crate::vector::centroid_index::FieldCentroids;
-    use crate::vector::ivf::IvfIndex;
+    use crate::vector::ivf::centroid_index::FieldCentroids;
+    use crate::vector::ivf::SegmentClusters;
     use crate::vector::{residual_norm, BoundKind, Metric, VectorDType, VectorOptions, VEC_EXT};
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -931,7 +934,7 @@ mod bounds_storage_tests {
     /// every posting row is native.
     fn fresh_fold(
         vec_reader: &crate::vector::VectorIndexReader,
-        ivf: &IvfIndex,
+        ivf: &SegmentClusters,
         set: &FieldCentroids,
         metric: Metric,
     ) -> crate::Result<Vec<f32>> {
@@ -981,7 +984,7 @@ mod bounds_storage_tests {
             let mut ivf_segments = 0usize;
             for segment_reader in searcher.segment_readers() {
                 let vec_reader = segment_reader.vector_index(field)?;
-                let Some(ivf) = vec_reader.index() else {
+                let Some(ivf) = vec_reader.clusters() else {
                     continue;
                 };
                 ivf_segments += 1;
@@ -1071,7 +1074,7 @@ mod bounds_storage_tests {
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
         let vec_reader = segment_reader.vector_index(field)?;
-        let ivf = vec_reader.index().expect("IVF segment");
+        let ivf = vec_reader.clusters().expect("IVF segment");
         let bounds = ivf.bounds();
         assert_eq!(
             bounds.ball_r(0),
@@ -1096,7 +1099,7 @@ mod bounds_storage_tests {
         merge_all(&index)?;
         let searcher = index.reader()?.searcher();
         let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
-        let ivf = vec_reader.index().expect("IVF segment");
+        let ivf = vec_reader.clusters().expect("IVF segment");
         assert_eq!(
             ivf.bounds().ball_r(0),
             f32::INFINITY,
@@ -1142,7 +1145,7 @@ mod bounds_storage_tests {
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.segment_readers().len(), 1);
         let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
-        let ivf = vec_reader.index().expect("merged segment is IVF");
+        let ivf = vec_reader.clusters().expect("merged segment is IVF");
         let stored: Vec<f32> = ivf.bounds().values().to_vec();
         let expected = fresh_fold(&vec_reader, ivf, &set_field, Metric::L2)?;
         for (cluster, (&got, &fold)) in stored.iter().zip(expected.iter()).enumerate() {

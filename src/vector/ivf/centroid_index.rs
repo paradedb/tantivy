@@ -26,16 +26,16 @@ use std::io::Write;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
-use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use super::header::{centroid_index_slot, read_header, write_header, VectorFileVersion};
-use super::ivf::{
+use super::{
     decode_row, encode_vector, Candidate, IvfCentroids, IvfSearchMetrics, NeighborhoodGraphConfig,
     NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
 };
-use super::{FileSliceArena, VectorArena};
 use crate::core::CENTROIDS_FILEPATH;
 use crate::directory::{CompositeFile, CompositeWrite, Directory, FileSlice};
 use crate::schema::{Field, FieldType, Metric, Schema, VectorDType, VectorOptions};
+use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::header::{centroid_index_slot, read_header, write_header, VectorFileVersion};
+use crate::vector::{FileSliceArena, VectorArena};
 use crate::{Executor, TantivyError};
 
 /// Router-kind tag for tantivy's own RNG payload (the
@@ -169,7 +169,7 @@ pub trait CentroidProducer: Send + Sync + 'static {
             // The router slot: skipped for degenerate centroid counts, where
             // routing is a linear scan a structure cannot beat.
             if matrix.rows > 1 {
-                let normalized = IvfCentroids::F32(super::ivf::IvfMatrix {
+                let normalized = IvfCentroids::F32(super::IvfMatrix {
                     values: normalized_values,
                     rows: matrix.rows,
                     dims: matrix.dims,

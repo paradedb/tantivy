@@ -46,7 +46,7 @@ use super::ivf::bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, to_bound_space, HeapPeek, QueryBound,
     QueryBoundTracker, Verdict,
 };
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, Workspace};
+use super::ivf::{AdaptiveProbeParams, Candidate, SegmentClusters, Workspace};
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
@@ -95,10 +95,10 @@ enum FilterState {
 }
 
 impl<TChild> SegmentSearch<'_, TChild> {
-    fn ivf(&self) -> &IvfIndex {
+    fn ivf(&self) -> &SegmentClusters {
         self.vec
-            .index()
-            .expect("vector-bearing segments carry an IvfIndex")
+            .clusters()
+            .expect("clustered segments carry SegmentClusters")
     }
 }
 
@@ -145,7 +145,7 @@ where
     let mut flats: Vec<FlatSegment<'_, S::Child>> = Vec::new();
     for (ord, reader) in searcher.segment_readers().iter().enumerate() {
         let vec = reader.vector_index(field)?;
-        let Some(ivf) = vec.index() else {
+        let Some(ivf) = vec.clusters() else {
             if vec.num_vectors() > 0 {
                 flats.push(FlatSegment {
                     ord: ord as SegmentOrdinal,

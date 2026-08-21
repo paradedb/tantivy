@@ -8,10 +8,10 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use super::centroid_index::CentroidIndexReader;
 use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use super::header::{vec_slot, write_header};
 use super::id_map::IdMap;
+use super::ivf::centroid_index::CentroidIndexReader;
 use super::ivf::{write_ivf_field, IvfFieldWriteParams};
 use super::VEC_EXT;
 use crate::directory::CompositeWrite;

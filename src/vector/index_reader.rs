@@ -11,8 +11,8 @@
 //! by the [`IdMap`] variant tag in slot `[0]`:
 //!
 //! * clustered — an `Explicit` (cluster-sorted) id-map, the dense rows in slot `[1]`, and slots
-//!   `[2..=4]` the per-segment IVF remainder parsed into [`IvfIndex`] — offsets, bounds, and doc
-//!   counts. The centroid rows themselves live in the index-level `centroids` file (see
+//!   `[2..=4]` the per-segment IVF remainder parsed into [`SegmentClusters`] — offsets, bounds, and
+//!   doc counts. The centroid rows themselves live in the index-level `centroids` file (see
 //!   [`centroid_index`](super::centroid_index)); this reader never touches them.
 //! * flat — an `Identity`/`Bitmap` (doc-ordered) id-map and the rows, nothing else. Written by
 //!   indexes without a centroid index (the mutable/staging tier) and searched exhaustively;
@@ -26,7 +26,7 @@ use common::{HasLen, OwnedBytes};
 
 use super::header::{read_header, vec_slot, VectorFileVersion};
 use super::id_map::IdMap;
-use super::ivf::IvfIndex;
+use super::ivf::SegmentClusters;
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
@@ -60,7 +60,7 @@ pub struct VectorClusterStats {
 pub struct VectorIndexReader {
     options: VectorOptions,
     /// Distinct docs with a vector (the persisted IVF doc count; the row
-    /// total replication inflates is [`IvfIndex::num_rows`]).
+    /// total replication inflates is [`SegmentClusters::num_rows`]).
     num_vectors: usize,
     /// `false` for the placeholder built by [`Self::empty`] — the segment has
     /// no vector data for this field at all.
@@ -70,7 +70,7 @@ pub struct VectorIndexReader {
     /// `.vec` slot `[1]`: the dense vector rows. Never materialized whole;
     /// queries fetch per-cluster (or per-doc) ranges.
     rows_slice: FileSlice,
-    index: Option<IvfIndex>,
+    index: Option<SegmentClusters>,
 }
 
 impl VectorIndexReader {
@@ -137,7 +137,7 @@ impl VectorIndexReader {
             )));
         }
         let index = match ivf_slices {
-            Some((offsets_slice, bounds_slice, meta_slice)) => Some(IvfIndex::open(
+            Some((offsets_slice, bounds_slice, meta_slice)) => Some(SegmentClusters::open(
                 &options,
                 offsets_slice,
                 bounds_slice,
@@ -209,7 +209,7 @@ impl VectorIndexReader {
 
     /// The per-segment IVF remainder; `None` for a flat (unclustered)
     /// segment and for the [`empty`](Self::empty) placeholder.
-    pub fn index(&self) -> Option<&IvfIndex> {
+    pub fn clusters(&self) -> Option<&SegmentClusters> {
         self.index.as_ref()
     }
 

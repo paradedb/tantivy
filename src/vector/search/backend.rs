@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(searcher.segment_readers().len(), 1, "one segment expected");
         let segment_reader = &searcher.segment_readers()[0];
         let vec_reader = segment_reader.vector_index(embed_field)?;
-        let ivf = vec_reader.index().expect("expected IVF storage");
+        let ivf = vec_reader.clusters().expect("expected IVF storage");
         assert_eq!(ivf.num_clusters(), centroids.len());
         let max_doc = segment_reader.max_doc() as usize;
         assert_eq!(max_doc, expected_docs, "unexpected doc count");
@@ -929,7 +929,7 @@ mod tests {
         let mut total_docs = 0usize;
         for segment_reader in searcher.segment_readers() {
             let ivf_reader = segment_reader.vector_index(field)?;
-            let ivf = ivf_reader.index().expect("IVF segment");
+            let ivf = ivf_reader.clusters().expect("IVF segment");
             total_nonempty += ivf.num_non_empty_clusters();
             total_docs += ivf.num_docs();
         }
@@ -1311,7 +1311,7 @@ mod tests {
                 let mut out: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
                 for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
                     let vec_reader = segment_reader.vector_index(field)?;
-                    let ivf = vec_reader.index().expect("IVF segment");
+                    let ivf = vec_reader.clusters().expect("IVF segment");
                     for cluster in 0..ivf.num_clusters() {
                         for doc in vec_reader.cluster_doc_ids(cluster).expect("in-bounds") {
                             let label = stored_label_at(
@@ -1348,14 +1348,14 @@ mod tests {
         let mut source_max = vec![0.0f32; centroids.len()];
         for segment_reader in searcher.segment_readers() {
             let vec_reader = segment_reader.vector_index(sharded_field)?;
-            let bounds = vec_reader.index().expect("IVF segment").bounds();
+            let bounds = vec_reader.clusters().expect("IVF segment").bounds();
             for (cluster, slot) in source_max.iter_mut().enumerate() {
                 *slot = slot.max(bounds.ball_r(cluster));
             }
         }
         let merged_searcher = merged.reader()?.searcher();
         let merged_reader = merged_searcher.segment_readers()[0].vector_index(merged_field)?;
-        let merged_bounds = merged_reader.index().expect("IVF segment").bounds();
+        let merged_bounds = merged_reader.clusters().expect("IVF segment").bounds();
         for (cluster, &expected) in source_max.iter().enumerate() {
             assert_eq!(
                 merged_bounds.ball_r(cluster).to_bits(),
@@ -1472,7 +1472,7 @@ mod tests {
         );
         // Every alive doc holds exactly one (replicas=1) membership, and
         // the memberships cover the merged doc space exactly.
-        let ivf = vec_reader.index().expect("expected IVF storage");
+        let ivf = vec_reader.clusters().expect("expected IVF storage");
         assert_eq!(ivf.num_rows(), alive);
         let mut all_docs: Vec<u32> = (0..ivf.num_clusters())
             .flat_map(|c| vec_reader.cluster_doc_ids(c).expect("in-bounds"))
@@ -1547,7 +1547,7 @@ mod tests {
         assert_eq!(vec_reader.num_vectors(), 0);
         assert!(vec_reader.is_empty());
         assert!(vec_reader.info().is_none(), "no slots ⇒ no info");
-        assert!(vec_reader.index().is_none());
+        assert!(vec_reader.clusters().is_none());
 
         // The live field is untouched: every alive doc is counted.
         let kept_count = n / 2;
@@ -1900,7 +1900,7 @@ mod tests {
         assert_eq!(searcher.segment_readers().len(), 1);
         let segment_reader = &searcher.segment_readers()[0];
         let vec = segment_reader.vector_index(embed_field)?;
-        let ivf = vec.index().expect("the merged segment is clustered");
+        let ivf = vec.clusters().expect("the merged segment is clustered");
         assert_eq!(vec.num_vectors(), 38);
 
         // Every doc — carried or assigned — sits in its nearest cluster.
