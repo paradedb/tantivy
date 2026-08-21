@@ -41,6 +41,7 @@ pub use bounds::{
 };
 pub(crate) use centroid_index::CachedCentroidIndex;
 pub use centroid_index::{CentroidProducer, ROUTER_KIND_RNG};
+pub use crate::core::CENTROIDS_FILEPATH;
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
