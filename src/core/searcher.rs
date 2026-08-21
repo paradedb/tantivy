@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::{fmt, io};
 
-use crate::collector::{Collector, CollectorMode};
+use crate::collector::Collector;
 use crate::core::Executor;
 use crate::index::{SegmentId, SegmentReader};
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
@@ -227,25 +227,6 @@ impl Searcher {
         let weight = query.weight(enabled_scoring)?;
         collector.check_schema(self.schema())?;
         let segment_readers = self.segment_readers();
-        if let CollectorMode::MultiSegment(multi_segment) = collector.collection_mode(self)? {
-            // The coupled pass over the listed segments; every other
-            // segment takes the standard per-segment path; all fruits
-            // meet in merge_fruits.
-            let mut fruits = Vec::with_capacity(segment_readers.len() + 1);
-            fruits.push(collector.collect_multi_segment(weight.as_ref(), self, &multi_segment)?);
-            let mut per_segment = executor.map(
-                |(segment_ord, segment_reader)| {
-                    collector.collect_segment(weight.as_ref(), segment_ord, segment_reader)
-                },
-                segment_readers
-                    .iter()
-                    .enumerate()
-                    .map(|(ord, reader)| (ord as u32, reader))
-                    .filter(|(ord, _)| !multi_segment.contains(ord)),
-            )?;
-            fruits.append(&mut per_segment);
-            return collector.merge_fruits(fruits);
-        }
         let fruits = executor.map(
             |(segment_ord, segment_reader)| {
                 collector.collect_segment(weight.as_ref(), segment_ord as u32, segment_reader)

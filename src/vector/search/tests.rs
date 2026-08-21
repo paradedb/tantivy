@@ -45,10 +45,8 @@ fn search(
     let collector = TopDocs::with_limit(k)
         .order_by_similarity(field, query)
         .with_adaptive_params(params);
-    Ok(index
-        .reader()?
-        .searcher()
-        .search(filter, &collector)?
+    Ok(collector
+        .search(&index.reader()?.searcher(), filter)?
         .results)
 }
 
@@ -95,7 +93,7 @@ fn run_search(
     let collector = crate::collector::TopDocs::with_limit(k)
         .order_by_similarity(field, query)
         .with_adaptive_params(params);
-    index.reader()?.searcher().search(filter, &collector)
+    collector.search(&index.reader()?.searcher(), filter)
 }
 
 /// Every doc address matching `filter`, across all segments.
@@ -1707,13 +1705,13 @@ fn mixed_merge_assigns_only_flat_rows() -> crate::Result<()> {
     Ok(())
 }
 
-/// The two-worker split: clustered ordinals in one run, flat ordinals in
-/// the other, fruits merged — identical to the single full run at an
-/// exhaustive budget, with the stats combining additively.
+/// The two-worker split: one collect_ivf over the clustered segments,
+/// one collect_flat per flat segment, fruits merged — identical to the
+/// serial convenience at an exhaustive budget, with the stats combining
+/// additively.
 #[test]
 fn tier_split_merges_to_the_serial_run() -> crate::Result<()> {
     use crate::collector::TopDocs;
-    use crate::vector::VectorSimilarityFruit;
 
     let (index, embed_field, _) = mixed_fixture()?;
     let searcher = index.reader()?.searcher();
@@ -1729,38 +1727,30 @@ fn tier_split_merges_to_the_serial_run() -> crate::Result<()> {
     assert!(!clustered.is_empty() && !flat.is_empty());
 
     let k = 10;
-    let collector = |ords: Option<Vec<crate::SegmentOrdinal>>| {
-        let base = TopDocs::with_limit(k)
-            .order_by_similarity(embed_field, vec![0.5f32, 0.5])
-            .with_adaptive_params(exhaustive_params(4));
-        match ords {
-            Some(ords) => base.for_segments(ords),
-            None => base,
-        }
-    };
-    let full = searcher.search(&AllQuery, &collector(None))?;
-    let clustered_run = searcher.search(&AllQuery, &collector(Some(clustered.clone())))?;
-    let flat_run = searcher.search(&AllQuery, &collector(Some(flat.clone())))?;
+    let collector = TopDocs::with_limit(k)
+        .order_by_similarity(embed_field, vec![0.5f32, 0.5])
+        .with_adaptive_params(exhaustive_params(4));
+    let full = collector.search(&searcher, &AllQuery)?;
 
-    assert_eq!(clustered_run.stats.exact_rows_read, 0);
-    assert_eq!(flat_run.stats.exact_rows_read, full.stats.exact_rows_read);
-    assert_eq!(flat_run.stats.clusters_probed(), 0);
+    let ivf_fruit = collector.collect_ivf(&searcher, &AllQuery, &clustered)?;
+    assert_eq!(ivf_fruit.stats.exact_rows_read, 0);
+    let mut fruits = vec![ivf_fruit];
+    let mut flat_rows = 0;
+    for &ord in &flat {
+        let fruit = collector.collect_flat(&searcher, &AllQuery, ord)?;
+        assert_eq!(fruit.stats.clusters_probed(), 0);
+        flat_rows += fruit.stats.exact_rows_read;
+        fruits.push(fruit);
+    }
+    assert_eq!(flat_rows, full.stats.exact_rows_read);
 
-    // A worker that already knows its claim's tier sets the mode
-    // explicitly and skips tier detection — same results.
-    let explicit_clustered = searcher.search(
-        &AllQuery,
-        &collector(Some(clustered.clone()))
-            .with_collection_mode(crate::collector::CollectorMode::MultiSegment(clustered)),
-    )?;
-    let explicit_flat = searcher.search(
-        &AllQuery,
-        &collector(Some(flat)).with_collection_mode(crate::collector::CollectorMode::SingleSegment),
-    )?;
-    assert_eq!(explicit_clustered.results, clustered_run.results);
-    assert_eq!(explicit_flat.results, flat_run.results);
+    // Tier mixups are refused, not silently mis-collected.
+    assert!(collector.collect_ivf(&searcher, &AllQuery, &flat).is_err());
+    assert!(collector
+        .collect_flat(&searcher, &AllQuery, clustered[0])
+        .is_err());
 
-    let merged = VectorSimilarityFruit::merge(vec![clustered_run, flat_run], k);
+    let merged = collector.merge(fruits);
     assert_eq!(merged.results, full.results);
     assert_eq!(merged.stats.exact_rows_read, full.stats.exact_rows_read);
     assert_eq!(merged.stats.segments_searched, full.stats.segments_searched);
@@ -1768,9 +1758,9 @@ fn tier_split_merges_to_the_serial_run() -> crate::Result<()> {
 }
 
 mod e2e {
-    //! End-to-end coverage of the production path: `searcher.search →
-    //! Collector::collect_global → search::global_top_n_by`, asserted
-    //! against `index.ground_truth(...)`.
+    //! End-to-end coverage of the production path — the collector's
+    //! `search` convenience over collect_ivf / collect_flat / merge —
+    //! asserted against `index.ground_truth(...)`.
 
     use std::sync::Arc;
 
@@ -1799,7 +1789,7 @@ mod e2e {
                 let collector = TopDocs::with_limit(k)
                     .order_by_similarity(index.embedding_field(), query.to_vec())
                     .with_adaptive_params(params.clone());
-                let actual = searcher.search(&AllQuery, &collector)?;
+                let actual = collector.search(&searcher, &AllQuery)?;
                 assert_eq!(actual.results, expected, "query={query:?} k={k}");
             }
         }
@@ -1819,7 +1809,7 @@ mod e2e {
         let collector = TopDocs::with_limit(4)
             .order_by_similarity(index.embedding_field(), vec![0.5_f32, 0.5])
             .with_adaptive_params(exhaustive_params(9));
-        let fruit = searcher.search(&AllQuery, &collector)?;
+        let fruit = collector.search(&searcher, &AllQuery)?;
 
         let s = &fruit.stats;
         assert_eq!(
@@ -1849,7 +1839,7 @@ mod e2e {
             .and_offset(offset)
             .order_by_similarity(index.embedding_field(), query.to_vec())
             .with_adaptive_params(exhaustive_params(9));
-        let actual = searcher.search(&AllQuery, &collector)?;
+        let actual = collector.search(&searcher, &AllQuery)?;
         assert_eq!(actual.results, expected);
         Ok(())
     }
@@ -1948,13 +1938,11 @@ mod e2e {
             for k in [1usize, 3, 7, 12] {
                 // Ordering: exhaustive probing so the ranking is exact and
                 // only the composite ordering is tested.
-                let fruit = searcher.search(
-                    &AllQuery,
-                    &TopDocs::with_limit(k)
-                        .order_by_similarity(embedding_field, query.to_vec())
-                        .with_adaptive_params(exhaustive_params(2))
-                        .with_tie_break(tie_break()),
-                )?;
+                let fruit = TopDocs::with_limit(k)
+                    .order_by_similarity(embedding_field, query.to_vec())
+                    .with_adaptive_params(exhaustive_params(2))
+                    .with_tie_break(tie_break())
+                    .search(&searcher, &AllQuery)?;
                 let actual: Vec<DocAddress> =
                     fruit.results.iter().map(|(_, address)| *address).collect();
                 let want: Vec<DocAddress> = expected.iter().take(k).map(|entry| entry.2).collect();
@@ -1964,8 +1952,10 @@ mod e2e {
                 // gate/ceiling logic actually runs.
                 let collector =
                     || TopDocs::with_limit(k).order_by_similarity(embedding_field, query.to_vec());
-                let untied = searcher.search(&AllQuery, &collector())?;
-                let tied = searcher.search(&AllQuery, &collector().with_tie_break(tie_break()))?;
+                let untied = collector().search(&searcher, &AllQuery)?;
+                let tied = collector()
+                    .with_tie_break(tie_break())
+                    .search(&searcher, &AllQuery)?;
                 assert!(
                     untied.stats.candidates_scored > 0,
                     "no probe activity to compare for query={query:?} k={k}"
@@ -2038,12 +2028,10 @@ mod e2e {
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.segment_readers().len(), 1);
 
-        let fruit = searcher.search(
-            &AllQuery,
-            &TopDocs::with_limit(1)
-                .order_by_similarity(embedding_field, query.to_vec())
-                .with_adaptive_params(exhaustive_params(2)),
-        )?;
+        let fruit = TopDocs::with_limit(1)
+            .order_by_similarity(embedding_field, query.to_vec())
+            .with_adaptive_params(exhaustive_params(2))
+            .search(&searcher, &AllQuery)?;
         // All four docs tie at distance 1, so the lowest DocAddress wins.
         let scores: Vec<Score> = fruit.results.iter().map(|(score, _)| *score).collect();
         assert_eq!(scores, vec![-1.0], "expected the shared distance");
@@ -2146,12 +2134,10 @@ mod e2e {
             (2, vec!["a", "b"]),
             (1, vec!["a"]),
         ] {
-            let fruit = searcher.search(
-                &AllQuery,
-                &TopDocs::with_limit(k)
-                    .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
-                    .with_tie_break((SortByString::for_field("city"), Order::Asc)),
-            )?;
+            let fruit = TopDocs::with_limit(k)
+                .order_by_similarity(embedding_field, vec![0.0_f32, 0.0])
+                .with_tie_break((SortByString::for_field("city"), Order::Asc))
+                .search(&searcher, &AllQuery)?;
             assert_eq!(cities(&fruit), want, "k={k}");
         }
         Ok(())
@@ -2168,7 +2154,7 @@ mod e2e {
 
         let wrong_dim =
             TopDocs::with_limit(2).order_by_similarity(index.embedding_field(), vec![0.0_f32; 3]);
-        let err = searcher.search(&AllQuery, &wrong_dim).unwrap_err();
+        let err = wrong_dim.search(&searcher, &AllQuery).unwrap_err();
         assert!(
             matches!(err, TantivyError::SchemaError(ref msg) if msg.contains("does not match")),
             "unexpected error: {err:?}"
@@ -2176,10 +2162,21 @@ mod e2e {
 
         let not_a_vector =
             TopDocs::with_limit(2).order_by_similarity(index.label_field(), vec![0.0_f32, 0.0]);
-        let err = searcher.search(&AllQuery, &not_a_vector).unwrap_err();
+        let err = not_a_vector.search(&searcher, &AllQuery).unwrap_err();
         assert!(
             matches!(err, TantivyError::SchemaError(ref msg) if msg.contains("not a vector field")),
             "unexpected error: {err:?}"
+        );
+
+        // Driving the collector through Searcher::search is a misuse with
+        // its own message.
+        let valid =
+            TopDocs::with_limit(2).order_by_similarity(index.embedding_field(), vec![0.0_f32, 0.0]);
+        let err = searcher.search(&AllQuery, &valid).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not run through Searcher::search"),
+            "unexpected error: {err}"
         );
         Ok(())
     }
