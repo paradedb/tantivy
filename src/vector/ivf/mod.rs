@@ -8,6 +8,7 @@
 pub(crate) mod bkt;
 pub(crate) mod graph;
 mod index;
+mod ivf;
 mod params;
 mod partition;
 mod plugin;
@@ -23,6 +24,10 @@ pub use graph::{
     Workspace,
 };
 pub use index::{IvfIndex, IvfSearchMetrics, RoutingIndex};
+pub use ivf::{
+    ClusterId, FlatStore, IvfConfig, IvfIndex as MultiLevelIvf, IvfLevelClusterer,
+    StackedIvfIndex, SuperKMeansLevelClusterer,
+};
 pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, encode_vector};
