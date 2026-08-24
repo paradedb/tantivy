@@ -1,4 +1,4 @@
-//! Ordering quality of the routing index candidates (SPANN).
+//! Ordering quality of the routing index candidates (SPANN + Quake).
 //!
 //! The 200k Cohere vectors play the role of posting-list centroids in the
 //! broader vector store: given a query, the routing index must order them so
@@ -8,6 +8,9 @@
 //! - BKT: balanced k-means tree, greedy best-first descent (iterator)
 //! - BKT+RNG: BKT seeds a beam search over a relative neighborhood graph
 //!   built on the vectors (iterator)
+//! - stacked IVF: L0 (~n/10 lists) over the vectors, L1 (~L0/100 lists) over
+//!   the L0 centroids; `search` probes `n_probe` L0 lists seeded by L1 and
+//!   returns a globally ordered bag (Vec)
 //!
 //! Per query we compute the exact top-k over the 200k, then report how deep
 //! in each structure's output the true top-k sits (`*_depth`: position of
@@ -15,7 +18,7 @@
 //! done to get there (`*_visited`).
 //!
 //! Usage:
-//!   cargo bench --bench ivf_index_recall -- [n] [queries]
+//!   cargo bench --bench ivf_index_recall -- [n] [queries] [nprobe_fraction]
 
 use std::collections::HashSet;
 use std::env;
@@ -31,7 +34,9 @@ use superkmeans::{
 };
 use tantivy::schema::{Metric, VectorOptions};
 use tantivy::vector::ivf::{
-    BKTree, BKTreeNode, IvfIndex, NeighborhoodGraphConfig, RelativeNeighborhoodGraph, Workspace,
+    BKTree, BKTreeNode, Candidate, ClusterId, IvfConfig, IvfIndex, IvfLevelClusterer,
+    NeighborhoodGraphConfig, RelativeNeighborhoodGraph, StackedIvfIndex,
+    SuperKMeansLevelClusterer, Workspace,
 };
 use tantivy::vector::Similarity;
 
@@ -42,6 +47,10 @@ const DEFAULT_QUERIES: usize = 200;
 /// BKT leaf width: the tree over the 200k has ~n/32 leaves, each holding its
 /// assigned vectors as members.
 const MAX_LEAF_SIZE: usize = 32;
+/// Stacked IVF L0 target list size: `nlist_L0 ≈ n / 10` (200k → ~20000).
+const L0_TARGET_LIST_SIZE: usize = 10;
+/// Stacked IVF L1 target: `nlist_L1 ≈ nlist_L0 / bf` (20000 → ~200).
+const BRANCHING_FACTOR: usize = 100;
 /// Ground-truth neighborhood sizes on the 200k-vector set.
 const EVAL_K: &[usize] = &[10, 100, 200, 400];
 
@@ -182,7 +191,8 @@ fn exact_knn(data: &[f32], dim: usize, query: &[f32], k: usize, metric: Metric) 
 struct Cover {
     /// Position (1-based) of the last true top-k member in the output order.
     depth: usize,
-    /// Work done when that position was reached: routing nodes scored.
+    /// Work done when that position was reached: routing nodes scored for
+    /// the iterators, bag size for the stacked IVF.
     visited: usize,
 }
 
@@ -236,6 +246,49 @@ fn cover_ranking(
     out
 }
 
+/// Cover depths in the stacked IVF's globally ordered bag; `visited` counts
+/// every distance computation: `routing` (centroid scoring above L0) plus
+/// the bag (every member of a probed list was scored). The second element
+/// per k is recall@k of the bag — the fraction of the true top-k it holds,
+/// meaningful even when strict coverage fails.
+fn cover_bag(
+    bag: &[Candidate<ClusterId>],
+    routing: usize,
+    truth: &[u32],
+    ks: &[usize],
+) -> Vec<(Option<Cover>, f64)> {
+    let sets = truth_sets(truth, ks);
+    let mut seen = vec![0usize; ks.len()];
+    let mut out = vec![None; ks.len()];
+    for (pos, candidate) in bag.iter().enumerate() {
+        let id = u32::from(candidate.node);
+        let mut done = true;
+        for (j, set) in sets.iter().enumerate() {
+            if out[j].is_none() {
+                if set.contains(&id) {
+                    seen[j] += 1;
+                    if seen[j] == set.len() {
+                        out[j] = Some(Cover {
+                            depth: pos + 1,
+                            visited: routing + bag.len(),
+                        });
+                        continue;
+                    }
+                }
+                done = false;
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    out.into_iter()
+        .zip(&sets)
+        .zip(seen)
+        .map(|((cover, set), found)| (cover, found as f64 / set.len().max(1) as f64))
+        .collect()
+}
+
 fn mean(values: &[f64]) -> f64 {
     if values.is_empty() {
         return f64::NAN;
@@ -259,6 +312,10 @@ fn main() {
         .get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_QUERIES);
+    let nprobe_fraction: f32 = positional
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| IvfConfig::default().nprobe_fraction);
 
     let all = load_cohere(n + n_queries);
     let d = COHERE_D;
@@ -319,34 +376,77 @@ fn main() {
     let bkt_only = IvfIndex::from_centroids(&options, base, Some(&bkt), None).unwrap();
     let bkt_rng = IvfIndex::from_centroids(&options, base, Some(&bkt), Some(&rng)).unwrap();
 
-    println!("task: position of the true top-k in each structure's output order");
+    // Stacked IVF: its own L0 over the 200k, L1 over the L0 centroids.
+    let stack_start = Instant::now();
+    let clusterer = SuperKMeansLevelClusterer { iters_per_split: 5 };
+    let l0_target = (n / L0_TARGET_LIST_SIZE).max(1);
+    let (l0_centroids, l0_assign) = clusterer.cluster(base, n, d, l0_target);
+    let stacked = StackedIvfIndex::from_l0(
+        base.to_vec(),
+        l0_centroids,
+        l0_assign,
+        &clusterer,
+        BRANCHING_FACTOR,
+        IvfConfig { nprobe_fraction },
+    );
+    let n_probe = stacked.n_probe();
+    let l1_nlist = stacked.parent.as_ref().map(|p| p.nlist()).unwrap_or(0);
+    let l1_n_probe = stacked.parent.as_ref().map(|p| p.n_probe()).unwrap_or(0);
+    println!(
+        "stacked IVF: L0 nlist={} nprobe={n_probe} L1 nlist={l1_nlist} nprobe={l1_n_probe} bf={BRANCHING_FACTOR} in {:.2}s",
+        stacked.nlist(),
+        stack_start.elapsed().as_secs_f64()
+    );
 
     println!(
-        "\n{:<6} {:<12} {:<12} {:<12} {:<14} {:<14} {:<10} {:<10}",
+        "task: position of the true top-k in each structure's output order \
+         (BKT/RNG: rank_clusters iterator; stacked: search bag, n_probe={n_probe} lists)"
+    );
+
+    println!(
+        "\n{:<6} {:<12} {:<12} {:<12} {:<12} {:<14} {:<14} {:<14} {:<10} {:<10} {:<10} {:<12}",
         "k",
         "exact_depth",
         "bkt_depth",
         "rng_depth",
+        "stack_depth",
         "bkt_visited",
         "rng_visited",
+        "stack_visited",
         "bkt_ok",
-        "rng_ok"
+        "rng_ok",
+        "stack_ok",
+        "stack_recall"
     );
 
     let ks: Vec<usize> = EVAL_K.iter().copied().filter(|&k| k <= n).collect();
     let mut exact_depths = vec![Vec::new(); ks.len()];
     let mut bkt_depths = vec![Vec::new(); ks.len()];
     let mut rng_depths = vec![Vec::new(); ks.len()];
+    let mut stack_depths = vec![Vec::new(); ks.len()];
     let mut bkt_visited = vec![Vec::new(); ks.len()];
     let mut rng_visited = vec![Vec::new(); ks.len()];
+    let mut stack_visited = vec![Vec::new(); ks.len()];
     let mut bkt_ok = vec![0usize; ks.len()];
     let mut rng_ok = vec![0usize; ks.len()];
+    let mut stack_ok = vec![0usize; ks.len()];
+    let mut stack_recall = vec![Vec::new(); ks.len()];
 
     for q in 0..n_queries {
         let query = &queries[q * d..(q + 1) * d];
         let exact_c = cover_ranking(&exact, query, &truth[q], &ks, n);
         let bkt_c = cover_ranking(&bkt_only, query, &truth[q], &ks, n);
         let rng_c = cover_ranking(&bkt_rng, query, &truth[q], &ks, n);
+        // APS stub: recall=1.0 so only n_probe stops the probe loop.
+        let bag = stacked.search(query, gt_k, 1.0, Metric::L2);
+        // Every distance computation above L0: the root scores all its own
+        // centroids, then the L0 centroids in its probed lists — replay its
+        // search to count the latter (the seed bag it hands L0).
+        let stack_routing = match stacked.parent.as_ref() {
+            Some(parent) => parent.nlist() + parent.search(query, n_probe, 1.0, Metric::L2).len(),
+            None => stacked.nlist(),
+        };
+        let stack_c = cover_bag(&bag, stack_routing, &truth[q], &ks);
         for i in 0..ks.len() {
             if let Some(c) = &exact_c[i] {
                 exact_depths[i].push(c.depth as f64);
@@ -361,20 +461,31 @@ fn main() {
                 rng_depths[i].push(c.depth as f64);
                 rng_visited[i].push(c.visited as f64);
             }
+            let (cover, recall) = &stack_c[i];
+            stack_recall[i].push(*recall);
+            if let Some(c) = cover {
+                stack_ok[i] += 1;
+                stack_depths[i].push(c.depth as f64);
+                stack_visited[i].push(c.visited as f64);
+            }
         }
     }
 
     let nq = n_queries as f64;
     for (i, &k) in ks.iter().enumerate() {
         println!(
-            "{k:<6} {:<12.1} {:<12.1} {:<12.1} {:<14.1} {:<14.1} {:<10.2} {:<10.2}",
+            "{k:<6} {:<12.1} {:<12.1} {:<12.1} {:<12.1} {:<14.1} {:<14.1} {:<14.1} {:<10.2} {:<10.2} {:<10.2} {:<12.3}",
             mean(&exact_depths[i]),
             mean(&bkt_depths[i]),
             mean(&rng_depths[i]),
+            mean(&stack_depths[i]),
             mean(&bkt_visited[i]),
             mean(&rng_visited[i]),
+            mean(&stack_visited[i]),
             bkt_ok[i] as f64 / nq,
             rng_ok[i] as f64 / nq,
+            stack_ok[i] as f64 / nq,
+            mean(&stack_recall[i]),
         );
     }
 }
