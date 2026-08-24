@@ -45,11 +45,13 @@ pub use distance::{
 pub use flat::FlatVecWriter;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
-    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, ClusterRanking, Graph,
-    IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView, IvfMergeSettings,
-    IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors,
-    NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph,
-    ResumableSearchIterator, SearchIterator, SearchTerminationReason, Workspace,
+    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, ClusterId, ClusterRanking,
+    FlatStore, Graph, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex, IvfLevelClusterer,
+    IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch,
+    IvfTrainingVectors, IvfVectorBatch, IvfVectors, MultiLevelIvf, NeighborhoodGraphConfig,
+    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
+    SearchIterator, SearchTerminationReason, StackedIvfIndex, SuperKMeansLevelClusterer,
+    Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
@@ -207,6 +209,19 @@ pub trait VectorArena {
         index: u32,
         query: &[Self::Elem],
     ) -> Similarity;
+}
+
+pub trait VectorStore {
+    type Id;
+    type Elem: VectorElement;
+
+    fn dim(&self) -> usize;
+
+    /// The number of vectors held, at `dim` elements each.
+    fn num_vectors(&self, dim: usize) -> usize;
+
+    /// [`Similarity`] of `query` to the vector at dense row `index`.
+    fn similarity(&self, id: Self::Id, query: &[Self::Elem], metric: Metric) -> Similarity;
 }
 
 /// Any `[T]`-shaped storage (`&[T]`, `Vec<T>`, …), scored with the typed kernels.

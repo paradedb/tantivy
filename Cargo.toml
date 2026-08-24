@@ -97,6 +97,7 @@ fnv = "1.0.7"
 parking_lot = "0.12.4"
 typetag = "0.2.21"
 unwrap-infallible = "1.0.0"
+superkmeans = { git = "https://github.com/paradedb/superkmeans-rs.git", package = "superkmeans-rs", rev = "c06dc2b6e9bd15fb5c4a0627178bebbe1fb37a64" }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -117,7 +118,6 @@ time = { version = "0.3.47", features = ["serde-well-known", "macros"] }
 postcard = { version = "1.0.4", features = [
   "use-std",
 ], default-features = false }
-superkmeans = { git = "https://github.com/paradedb/superkmeans-rs.git", package = "superkmeans-rs", rev = "c06dc2b6e9bd15fb5c4a0627178bebbe1fb37a64" }
 
 [target.'cfg(not(windows))'.dev-dependencies]
 criterion = { version = "0.8", default-features = false }
