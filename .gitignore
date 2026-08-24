@@ -13,6 +13,9 @@ agg_bench
 .idea
 trace.dat
 cargo-timing*
+
+# benchmark vector dumps (see benches/ivf_index_recall.rs)
+/data
 control
 variable
 

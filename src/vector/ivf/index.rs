@@ -39,6 +39,7 @@ use std::ops::Range;
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
 use super::bkt::{BKTree, BKTreeSearchIterator, DEFAULT_MAX_LEAVES, DEFAULT_REFILL_SEEDS};
+use super::encode_vector;
 use super::graph::{
     Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
@@ -143,6 +144,67 @@ impl IvfIndex {
             value.serialize(out)?;
         }
         Ok(())
+    }
+
+    /// In-memory routing index over a centroid matrix, for ranking quality
+    /// tests and benches.
+    ///
+    /// `centroids` is row-major `n × dim`. Posting offsets and bounds are
+    /// dummies — [`rank_clusters`](Self::rank_clusters) never reads them.
+    /// Pass `bkt` / `graph` to select the routing mode: neither is exact
+    /// scan; `bkt` alone is BKT ranking; both is BKT seeded with RNG refill.
+    pub fn from_centroids(
+        options: &VectorOptions,
+        centroids: &[f32],
+        bkt: Option<&BKTree<Vec<f32>>>,
+        graph: Option<&RelativeNeighborhoodGraph<Vec<f32>>>,
+    ) -> crate::Result<Self> {
+        let dim = options.dim();
+        if dim == 0 || centroids.len() % dim != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "centroid matrix is not a multiple of dim",
+            )
+            .into());
+        }
+        let n = centroids.len() / dim;
+        let mut centroid_bytes = Vec::with_capacity(n * options.bytes_per_vector());
+        for row in centroids.chunks_exact(dim) {
+            centroid_bytes.extend(encode_vector(row, dim)?);
+        }
+        let mut centroid_slot = Vec::new();
+        Self::serialize_centroids(n, n, &centroid_bytes, options, &mut centroid_slot)?;
+        let offsets: Vec<u64> = (0..=n as u64).collect();
+        let mut offset_slot = Vec::new();
+        Self::serialize_offsets(&offsets, &mut offset_slot)?;
+        let mut bounds_slot = Vec::new();
+        Self::serialize_bounds(BoundKind::Ball, &vec![0.0; n], &mut bounds_slot)?;
+
+        let graph_slice = match graph {
+            Some(graph) => {
+                let mut buf = Vec::new();
+                graph.serialize(&mut buf)?;
+                Some(FileSlice::from(buf))
+            }
+            None => None,
+        };
+        let bkt_slice = match bkt {
+            Some(tree) => {
+                let mut buf = Vec::new();
+                tree.serialize(&mut buf)?;
+                Some(FileSlice::from(buf))
+            }
+            None => None,
+        };
+
+        Self::open(
+            options,
+            FileSlice::from(centroid_slot),
+            FileSlice::from(offset_slot),
+            graph_slice,
+            FileSlice::from(bounds_slot),
+            bkt_slice,
+        )
     }
 
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
@@ -341,21 +403,22 @@ impl IvfIndex {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
-    /// Clusters to probe for `query`, ranked lazily — a [`ClusterRanking`]
-    /// yielding [`Candidate`]s best routing score first (graph node `c` *is*
+    /// Nearest-centroid search for `query`, ranked lazily — a [`ClusterRanking`]
+    /// yielding [`Candidate`]s best similarity first (graph node `c` *is*
     /// cluster `c`, so `Candidate::node` is the cluster id).
     ///
-    /// With a BKT this is a [`BKTree::search_iter`] over the centroids. When a
-    /// persisted RNG is also present, ranking is a resumable beam search
-    /// ([`RelativeNeighborhoodGraph::search_iter`]) seeded from the BKT; each
-    /// beam round may pull additional BKT members whenever the tree frontier
-    /// outranks the graph frontier. Without a BKT every centroid is scored
-    /// exactly, up front — a graph alone is not used for routing.
+    /// With a BKT this is approximate k-NN over the centroids via
+    /// [`BKTree::search_iter`]. When a persisted RNG is also present, ranking
+    /// is a resumable beam search ([`RelativeNeighborhoodGraph::search_iter`])
+    /// seeded from the BKT; each beam round may pull additional BKT members
+    /// whenever the tree frontier outranks the graph frontier. Without a BKT
+    /// every centroid is scored exactly, up front — a graph alone is not used
+    /// for routing. That exact ranking is the ground truth for BKT / BKT+RNG.
     ///
     /// `ws` holds the routing search's scratch and is borrowed for the
     /// ranking's lifetime; [`ClusterRanking::metrics`] reports the cost
     /// incurred so far (surfaced as `ProbeStats::routing`).
-    pub(crate) fn rank_clusters<'a>(
+    pub fn rank_clusters<'a>(
         &'a self,
         ws: &'a mut Workspace,
         query: &'a [f32],
@@ -410,7 +473,7 @@ impl IvfIndex {
 
 /// Lazily ranked clusters for one query, yielded best routing score first;
 /// returned by [`IvfIndex::rank_clusters`], which documents the two paths.
-pub(crate) enum ClusterRanking<'a> {
+pub enum ClusterRanking<'a> {
     /// BKT-ranked routing. When `graph` is set, a beam search over the
     /// persisted centroid RNG is seeded (and refilled) from the BKT. When
     /// `graph` is `None`, clusters are yielded from the BKT iterator, each
@@ -435,7 +498,7 @@ impl ClusterRanking<'_> {
     /// The routing cost incurred so far: fixed for the exact path, growing
     /// with each pull that resumes the beam search on the graph path — so
     /// take the snapshot after the last pull.
-    pub(crate) fn metrics(&self) -> IvfSearchMetrics {
+    pub fn metrics(&self) -> IvfSearchMetrics {
         match self {
             ClusterRanking::Graph {
                 graph: Some(iter), ..
