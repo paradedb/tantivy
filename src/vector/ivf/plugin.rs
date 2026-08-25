@@ -355,11 +355,10 @@ pub(crate) fn merge_ivf(
                         "IvfClusterer produced zero centroids".to_string(),
                     ));
                 }
-                // Optional BKT for RNG seed generation. Default clusterers
-                // return `None` and slot `[4]` is omitted; producers that
-                // implement `build_bkt` supply an owned tree whose leaf
-                // members are IVF centroid ids.
-                let bkt = clusterer.build_bkt(opts, &centroids)?;
+                // Optional router override (slot [2]). Default clusterers
+                // return `None` and the merge builds a routing RNG (or
+                // reuses the replica-selector graph when present).
+                let clusterer_router = clusterer.build_router(opts, &centroids)?;
 
                 // Leaf count is emergent from the clusterer; the rest of the
                 // merge uses whatever train returned.
@@ -754,52 +753,42 @@ pub(crate) fn merge_ivf(
                     bounds_w.flush()?;
                 }
 
-                // `.centroids` slot [2]: the RNG over the centroids, so a query
-                // can route to its nearest clusters without scanning all of
-                // them. Skipped for degenerate centroid counts — the reader
+                // `.centroids` slot [2]: the router over the centroids, so a
+                // query can route to its nearest clusters without scanning all
+                // of them. Skipped for degenerate centroid counts — the reader
                 // treats the absent slot as "route by linear scan", which a
                 // 0-or-1-centroid segment doesn't need a graph for.
                 //
-                // A graph replica selector is the same graph over the same
-                // arena with the same metric, so it is serialized directly
-                // instead of rebuilding. Its config differs only in `ef`,
-                // which affects the query beam width, not the built edges
-                // (build/refine search with a beam of
-                // `max(ef, num_candidates)`, and `ef <= num_candidates` for
-                // any realistic `replicas`) — the persisted graph is
-                // unchanged either way.
+                // A clusterer override wins when present. Otherwise a graph
+                // replica selector is the same graph over the same arena with
+                // the same metric, so it is serialized directly instead of
+                // rebuilding.
                 if num_centroids > 1 {
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
-                    let graph_w = centroids_write.for_field_with_idx(field, centroid_slot::GRAPH);
-                    match replica_selector.as_ref() {
-                        Some(ReplicaSelector::Graph(graph)) => graph.serialize(graph_w)?,
-                        // `replicas == 1` or the exact-selector regime: no
-                        // graph exists yet, build one just for routing.
-                        _ => {
-                            let mut rng = RelativeNeighborhoodGraph::new(
-                                centroid_matrix.values.as_slice(),
-                                opts.dim(),
-                                opts.metric(),
-                                NeighborhoodGraphConfig::default(),
-                            );
-                            rng.build(&build_executor("rng-build-")?);
-                            rng.serialize(graph_w)?;
+                    let router_w =
+                        centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
+                    if let Some(router) = clusterer_router {
+                        router.serialize(router_w)?;
+                    } else {
+                        match replica_selector.as_ref() {
+                            Some(ReplicaSelector::Graph(graph)) => graph.serialize(router_w)?,
+                            // `replicas == 1` or the exact-selector regime: no
+                            // graph exists yet, build one just for routing.
+                            _ => {
+                                let mut rng = RelativeNeighborhoodGraph::new(
+                                    centroid_matrix.values.as_slice(),
+                                    opts.dim(),
+                                    opts.metric(),
+                                    NeighborhoodGraphConfig::default(),
+                                );
+                                rng.build(&build_executor("rng-build-")?);
+                                rng.serialize(router_w)?;
+                            }
                         }
                     }
-                    graph_w.flush()?;
-                }
-
-                // `.centroids` slot [4]: optional BKT for seed generation.
-                // Omitted when the clusterer returns `None` (default).
-                if let Some(tree) = bkt.as_ref() {
-                    if ctx.cancel.wants_cancel() {
-                        return Err(TantivyError::Cancelled);
-                    }
-                    let bkt_w = centroids_write.for_field_with_idx(field, centroid_slot::BKT);
-                    tree.serialize(bkt_w)?;
-                    bkt_w.flush()?;
+                    router_w.flush()?;
                 }
 
                 log::info!(

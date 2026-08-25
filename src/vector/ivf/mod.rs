@@ -22,7 +22,7 @@ pub use graph::{
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
     Workspace,
 };
-pub use index::{IvfIndex, IvfSearchMetrics};
+pub use index::{IvfIndex, IvfSearchMetrics, RoutingIndex};
 pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, encode_vector};

@@ -1,4 +1,4 @@
-use super::BKTree;
+use super::RelativeNeighborhoodGraph;
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
@@ -20,15 +20,16 @@ pub trait IvfClusterer: Send + Sync + 'static {
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
 
-    /// Optional BKT over `centroids` for RNG seeding.
+    /// Optional router over `centroids` for slot `[2]`.
     ///
-    /// Default `None` omits `.centroids` slot `[4]`. When present, leaf
-    /// `members` are IVF / RNG [`NodeId`](super::NodeId)s.
-    fn build_bkt(
+    /// Default `None` lets the merge build a routing RNG (or reuse the
+    /// replica-selector graph). When `Some`, the returned graph is serialized
+    /// to `.centroids` slot `[2]` as the field's router.
+    fn build_router(
         &self,
         options: &VectorOptions,
         centroids: &IvfCentroids,
-    ) -> crate::Result<Option<BKTree<Vec<f32>>>> {
+    ) -> crate::Result<Option<RelativeNeighborhoodGraph<Vec<f32>>>> {
         let _ = (options, centroids);
         Ok(None)
     }
