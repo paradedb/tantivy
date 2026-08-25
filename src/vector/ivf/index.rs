@@ -28,7 +28,10 @@
 //! that way. Slot `[3]` does not, which is why it costs a generation:
 //! absence would have to mean "no bounds", and a silently absent bound is
 //! indistinguishable from a zero one. New segments stamp `V3` with a tagged
-//! router in slot `[2]`; V2 files keep the bare graph layout there.
+//! router in slot `[2]`; V2 files keep the bare graph layout there. A V1 file
+//! (shipped, and legitimately bounds-less) still opens: its clusters get
+//! SATURATED bounds (`f32::INFINITY` — always probe), so old segments stay
+//! correct-but-unpruned until their next merge rewrites them.
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;
@@ -303,15 +306,18 @@ impl IvfIndex {
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
     /// the bounds, and the router topology are materialized; the centroid
     /// rows stay behind a [`FileSlice`] for lazy per-node reads.
-    /// `bounds_slice` is required: the caller has already refused any file
-    /// old enough to lack it (the V2 check in `VectorIndexReader::open`).
+    /// `bounds_slice` is `None` only for a V1 file, which predates the slot —
+    /// the caller (`VectorIndexReader::open`) has already rejected a V2+ file
+    /// without it as corrupt. `None` synthesizes SATURATED bounds
+    /// (`f32::INFINITY` per cluster): every cluster probes, no skip is ever
+    /// certified against data the file doesn't have.
     pub(crate) fn open(
         version: VectorFileVersion,
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         router_slice: Option<FileSlice>,
-        bounds_slice: FileSlice,
+        bounds_slice: Option<FileSlice>,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
         if centroids_slice.len() < count_words {
@@ -364,7 +370,9 @@ impl IvfIndex {
         };
 
         // P1: bounds slot — one kind byte, then the stride-derived payload.
-        let (bound_kind, bounds) = {
+        // A V1 file has no slot: saturate every cluster instead (always
+        // probe), rather than inventing a bound the writer never folded.
+        let (bound_kind, bounds) = if let Some(bounds_slice) = bounds_slice {
             let bytes = bounds_slice.read_bytes()?;
             let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
                 return Err(io::Error::new(
@@ -402,6 +410,8 @@ impl IvfIndex {
                 .into());
             }
             (kind, values)
+        } else {
+            (BoundKind::Ball, vec![f32::INFINITY; num_centroids])
         };
 
         let index = IvfIndex {

@@ -24,11 +24,14 @@ pub(crate) const HEADER_LEN: usize = 4;
 pub(crate) enum VectorFileVersion {
     V1 = 1,
     /// `.centroids` carries per-cluster centroid bounds (slot `[3]`) as a
-    /// REQUIRED slot. A V1 `.centroids` is rejected at open with a REINDEX
-    /// message: the bounds gate certifies skips against the slot, and a
-    /// silently absent bound is indistinguishable from a zero one. `.vec`
-    /// is unaffected by the change and V1 `.vec` files stay readable —
-    /// flat segments have no clusters and no bounds.
+    /// REQUIRED slot: the bounds gate certifies skips against it, and a
+    /// silently absent bound is indistinguishable from a zero one — so a V2
+    /// file missing the slot is corrupt. A V1 `.centroids` (which shipped,
+    /// and legitimately predates the slot) still opens: its clusters get
+    /// SATURATED bounds (`f32::INFINITY`, always probe), correct but
+    /// unpruned until the next merge rewrites the segment. `.vec` is
+    /// unaffected by the change and V1 `.vec` files stay readable — flat
+    /// segments have no clusters and no bounds.
     V2 = 2,
     /// `.centroids` slot `[2]` carries a tagged router: a kind byte followed
     /// by the variant payload (see [`RoutingIndex`](crate::vector::ivf::RoutingIndex)).

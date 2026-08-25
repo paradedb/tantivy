@@ -846,9 +846,13 @@ mod bounds_storage_tests {
     use std::io::Write;
     use std::sync::Arc;
 
+    use common::HasLen;
+
     use super::{TestVectorIndex, EMBEDDING_FIELD_NAME};
-    use crate::directory::{Directory, RamDirectory, TerminatingWrite};
+    use crate::collector::TopDocs;
+    use crate::directory::{CompositeFile, CompositeWrite, Directory, RamDirectory};
     use crate::index::{IndexSettings, SegmentComponent};
+    use crate::query::AllQuery;
     use crate::indexer::NoMergePolicy;
     use crate::schema::{Schema, STORED, STRING};
     use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
@@ -1199,11 +1203,8 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// A pre-V2 `.centroids` file is refused at open with the REINDEX
-    /// remedy, verbatim.
-    #[test]
-    fn old_index_read_errors() -> crate::Result<()> {
-        let directory = RamDirectory::create();
+    /// The two-cluster fixture the version-policy tests below share.
+    fn version_policy_fixture() -> crate::Result<(Index, crate::schema::Field)> {
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
             TestClusterer {
@@ -1211,35 +1212,127 @@ mod bounds_storage_tests {
                 num_centroids: 2,
             },
             &[&[[0.0, 0.0], [0.1, 0.0]], &[[10.0, 10.0], [10.1, 10.0]]],
-            Some(directory.clone()),
+            None,
         )?;
         merge_all(&index)?;
+        Ok((index, field))
+    }
 
-        // Restamp the merged segment's `.centroids` header to V1, body
-        // unchanged — the version gate must refuse before parsing slots.
+    /// Rewrite the merged segment's `.centroids` as a file stamped
+    /// `version` carrying only `slots`, each copied verbatim from the
+    /// original composite — a facsimile of what an older writer produced.
+    /// Reads and writes go through the index's managed directory so the
+    /// file-level footer is stripped and re-appended correctly.
+    fn rewrite_centroids_with_slots(
+        index: &Index,
+        field: crate::schema::Field,
+        version: u32,
+        slots: &[usize],
+    ) -> crate::Result<()> {
         let segment = index
             .searchable_segments()?
             .into_iter()
             .next()
             .expect("one merged segment");
         let path = segment.relative_path(SegmentComponent::Custom(CENTROIDS_EXT.to_string()));
-        let bytes = directory.open_read(&path)?.read_bytes()?;
-        assert!(bytes.len() > 4);
-        let mut restamped = 1u32.to_le_bytes().to_vec();
-        restamped.extend_from_slice(&bytes[4..]);
+        let directory = index.directory();
+        let file = directory.open_read(&path)?;
+        assert!(file.len() > 4);
+        let composite = CompositeFile::open(&file.slice_from(4))?;
+        let slot_payloads: Vec<(usize, Vec<u8>)> = slots
+            .iter()
+            .map(|&slot| {
+                let slice = composite
+                    .open_read_with_idx(field, slot)
+                    .unwrap_or_else(|| panic!("slot {slot} missing from the original file"));
+                Ok((slot, slice.read_bytes()?.to_vec()))
+            })
+            .collect::<crate::Result<_>>()?;
+
         directory.delete(&path).expect("delete .centroids");
         let mut writer = directory.open_write(&path).expect("rewrite .centroids");
-        writer.write_all(&restamped)?;
-        writer.terminate()?;
+        writer.write_all(&version.to_le_bytes())?;
+        let mut composite_write = CompositeWrite::wrap(writer);
+        for (slot, payload) in slot_payloads {
+            let slot_w = composite_write.for_field_with_idx(field, slot);
+            slot_w.write_all(&payload)?;
+            slot_w.flush()?;
+        }
+        composite_write.close()?;
+        Ok(())
+    }
+
+    /// A V1 `.centroids` (no bounds slot — the shape 0.25 wrote) opens
+    /// with SATURATED bounds: every cluster probes, search stays correct.
+    #[test]
+    fn v1_centroids_without_bounds_opens_saturated() -> crate::Result<()> {
+        let (index, field) = version_policy_fixture()?;
+        rewrite_centroids_with_slots(&index, field, 1, &[0, 1])?;
+
+        let searcher = index.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
+        let ivf = vec_reader.index().expect("V1 file must open as IVF");
+        assert_eq!(ivf.num_clusters(), 2);
+        assert_eq!(ivf.bounds().kind(), BoundKind::Ball);
+        assert!(
+            ivf.bounds().values().iter().all(|bound| bound.is_infinite()),
+            "V1 bounds must synthesize as SATURATED: {:?}",
+            ivf.bounds().values()
+        );
+
+        // Saturated bounds never certify a skip, so the probe loop scores
+        // everything it routes to — the true nearest doc must win.
+        let query = vec![10.0f32, 10.0];
+        let hits = searcher
+            .search(
+                &AllQuery,
+                &TopDocs::with_limit(1).order_by_similarity(field, query.clone()),
+            )?
+            .results;
+        assert_eq!(hits.len(), 1);
+        let top_bytes = vec_reader
+            .vector_bytes(hits[0].1.doc_id)?
+            .expect("top hit has a vector");
+        let top_vector: Vec<f32> = top_bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(top_vector, query, "top hit must be the exact-match doc");
+        Ok(())
+    }
+
+    /// Bounds are read whenever the slot exists, whatever the stamp: a
+    /// V1-restamped file that still carries slot [3] keeps its real bounds.
+    #[test]
+    fn v1_centroids_with_bounds_reads_them() -> crate::Result<()> {
+        let (index, field) = version_policy_fixture()?;
+        rewrite_centroids_with_slots(&index, field, 1, &[0, 1, 3])?;
+
+        let searcher = index.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
+        let ivf = vec_reader.index().expect("V1 file must open as IVF");
+        assert!(
+            ivf.bounds().values().iter().all(|bound| bound.is_finite()),
+            "present bounds must be read, not synthesized: {:?}",
+            ivf.bounds().values()
+        );
+        Ok(())
+    }
+
+    /// A V2 `.centroids` without slot [3] is corrupt, not old: V2 writers
+    /// always fold bounds, so absence means the file is damaged.
+    #[test]
+    fn v2_centroids_missing_bounds_is_corrupt() -> crate::Result<()> {
+        let (index, field) = version_policy_fixture()?;
+        rewrite_centroids_with_slots(&index, field, 2, &[0, 1])?;
 
         let searcher = index.reader()?.searcher();
         let message = match searcher.segment_readers()[0].vector_index(field) {
-            Ok(_) => panic!("pre-V2 .centroids must be refused"),
+            Ok(_) => panic!("a V2 .centroids without bounds must be refused"),
             Err(err) => err.to_string(),
         };
         assert!(
-            message.contains("predates the V2 centroid-bounds format")
-                && message.contains("\"embedding\""),
+            message.contains("no bounds slot") && message.contains("\"embedding\""),
             "unexpected error text: {message}"
         );
         Ok(())
