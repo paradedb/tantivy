@@ -1,7 +1,16 @@
-use super::RelativeNeighborhoodGraph;
+use super::{RelativeNeighborhoodGraph, StackedIvfIndex};
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
+
+/// What a clusterer may supply at merge time for `.centroids` slot `[2]`.
+pub enum BuiltRouter {
+    Graph(RelativeNeighborhoodGraph<Vec<f32>>),
+    Stacked {
+        index: StackedIvfIndex,
+        perm: Vec<u32>,
+    },
+}
 
 pub trait IvfClusterer: Send + Sync + 'static {
     /// Fraction of vectors sampled for training, in `(0, 1]`.
@@ -22,14 +31,15 @@ pub trait IvfClusterer: Send + Sync + 'static {
 
     /// Optional router over `centroids` for slot `[2]`.
     ///
-    /// Default `None` lets the merge build a routing RNG (or reuse the
-    /// replica-selector graph). When `Some`, the returned graph is serialized
-    /// to `.centroids` slot `[2]` as the field's router.
+    /// Default `None` lets the merge build a routing RNG. When `Some`, the
+    /// returned router is serialized to `.centroids` slot `[2]`. For
+    /// [`BuiltRouter::Stacked`], the merge applies `perm` to the trained
+    /// centroid matrix before assign so posting lists address the stored rows.
     fn build_router(
         &self,
         options: &VectorOptions,
         centroids: &IvfCentroids,
-    ) -> crate::Result<Option<RelativeNeighborhoodGraph<Vec<f32>>>> {
+    ) -> crate::Result<Option<BuiltRouter>> {
         let _ = (options, centroids);
         Ok(None)
     }

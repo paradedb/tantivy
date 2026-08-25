@@ -854,8 +854,9 @@ mod bounds_storage_tests {
     use crate::schema::{Schema, STORED, STRING};
     use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
     use crate::vector::{
-        residual_norm, BoundKind, IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings,
-        IvfTrainingVectors, IvfVectors, Metric, VectorDType, VectorOptions, VectorStorageFormat,
+        residual_norm, BoundKind, BuiltRouter, IvfCentroids, IvfClusterer, IvfConfig, IvfMatrix,
+        IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric, StackedIvfIndex,
+        SuperKMeansLevelClusterer, VectorDType, VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -943,6 +944,8 @@ mod bounds_storage_tests {
     struct TestClusterer {
         fixed_centroids: Option<Vec<[f32; 2]>>,
         num_centroids: usize,
+        /// Build a stacked router over the trained centroids (slot `[2]`).
+        stacked: bool,
     }
 
     impl IvfClusterer for TestClusterer {
@@ -1007,6 +1010,26 @@ mod bounds_storage_tests {
                     best
                 })
                 .collect())
+        }
+        fn build_router(
+            &self,
+            options: &VectorOptions,
+            centroids: &IvfCentroids,
+        ) -> crate::Result<Option<BuiltRouter>> {
+            if !self.stacked {
+                return Ok(None);
+            }
+            let IvfCentroids::F32(matrix) = centroids;
+            let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+            let (index, perm) = StackedIvfIndex::build(
+                &matrix.values,
+                matrix.rows,
+                options.dim(),
+                &clusterer,
+                2,
+                IvfConfig::default(),
+            );
+            Ok(Some(BuiltRouter::Stacked { index, perm }))
         }
     }
 
@@ -1075,6 +1098,7 @@ mod bounds_storage_tests {
             TestClusterer {
                 fixed_centroids: Some(vec![[0.0, 0.0], [50.0, 50.0]]),
                 num_centroids: 2,
+                stacked: false,
             },
             &[&[[3.0e38, 3.0e38]], &[[50.0, 50.0], [50.5, 50.0]]],
             None,
@@ -1107,6 +1131,7 @@ mod bounds_storage_tests {
             TestClusterer {
                 fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
                 num_centroids: 2,
+                stacked: false,
             },
             &[&[[0.0, 0.0], [0.0, 0.0]], &[[10.0, 10.0], [10.0, 10.5]]],
             None,
@@ -1133,6 +1158,7 @@ mod bounds_storage_tests {
         let clusterer = || TestClusterer {
             fixed_centroids: None, // train on the first sample → data-dependent
             num_centroids: 1,
+            stacked: false,
         };
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
@@ -1205,6 +1231,7 @@ mod bounds_storage_tests {
             TestClusterer {
                 fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
                 num_centroids: 2,
+                stacked: false,
             },
             &[&[[0.0, 0.0], [0.1, 0.0]], &[[10.0, 10.0], [10.1, 10.0]]],
             None,
@@ -1330,6 +1357,102 @@ mod bounds_storage_tests {
             message.contains("no bounds slot") && message.contains("\"embedding\""),
             "unexpected error text: {message}"
         );
+        Ok(())
+    }
+
+    /// A clusterer that builds a stacked router: the merge stamps V3,
+    /// writes the router into slot [2], and cascades the canonical
+    /// centroid permutation into slot [0] / the assignments / the bounds —
+    /// proven by parsing the router against the stored rows and by search
+    /// staying exact.
+    #[test]
+    fn ivf_merge_writes_stacked_slot_at_v3() -> crate::Result<()> {
+        use crate::vector::header::{read_header, VectorFileVersion};
+
+        // 8 fixed centroids on a line; two tight docs per centroid split
+        // across two commits.
+        let centroids: Vec<[f32; 2]> = (0..8).map(|i| [i as f32 * 10.0, 0.0]).collect();
+        let docs: Vec<[f32; 2]> = centroids
+            .iter()
+            .flat_map(|c| [[c[0] + 0.1, 0.0], [c[0] + 0.2, 0.0]])
+            .collect();
+        let (first, second) = docs.split_at(docs.len() / 2);
+        let (index, field) = build_ivf_with_plan(
+            Metric::L2,
+            TestClusterer {
+                fixed_centroids: Some(centroids.clone()),
+                num_centroids: centroids.len(),
+                stacked: true,
+            },
+            &[first, second],
+            None,
+        )?;
+        merge_all(&index)?;
+
+        let searcher = index.reader()?.searcher();
+        let segment_reader = &searcher.segment_readers()[0];
+        let centroids_file =
+            segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
+        let (version, body) = read_header(&centroids_file)?;
+        assert_eq!(version, VectorFileVersion::V3, "stacked files stamp V3");
+        let composite = CompositeFile::open(&body)?;
+        let stacked_bytes = composite
+            .open_read_with_idx(field, 2)
+            .expect("stacked router slot must be written")
+            .read_bytes()?;
+
+        // The router parses against the STORED (permuted) centroid rows —
+        // its level-0 offsets must cover exactly those rows.
+        let vec_reader = segment_reader.vector_index(field)?;
+        let ivf = vec_reader.index().expect("IVF segment");
+        let stored_rows: Vec<f32> = ivf
+            .centroid_bytes()?
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(stacked_bytes[0], 1, "V3 stacked router kind byte");
+        let stacked = StackedIvfIndex::deserialize_owned(
+            &stacked_bytes[1..],
+            stored_rows.clone(),
+            2,
+            IvfConfig::default(),
+        )
+        .expect("slot [2] must parse as a stacked router");
+        assert_eq!(stacked.members.len(), centroids.len());
+        assert_eq!(
+            *stacked.offsets.last().unwrap() as usize,
+            centroids.len(),
+            "level-0 offsets must cover the stored centroid rows"
+        );
+
+        // The stored rows are a permutation of the trained centroids.
+        let mut stored_sorted: Vec<[f32; 2]> = stored_rows
+            .chunks_exact(2)
+            .map(|row| [row[0], row[1]])
+            .collect();
+        stored_sorted.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert_eq!(stored_sorted, centroids, "rows permuted, none lost");
+
+        // End-to-end search stays exact — the permutation cascaded
+        // coherently into the assignments and posting rows.
+        for c in &centroids {
+            let query = vec![c[0] + 0.12, 0.0];
+            let hits = searcher
+                .search(
+                    &AllQuery,
+                    &TopDocs::with_limit(1).order_by_similarity(field, query),
+                )?
+                .results;
+            assert_eq!(hits.len(), 1);
+            let bytes = vec_reader
+                .vector_bytes(hits[0].1.doc_id)?
+                .expect("top hit has a vector");
+            let top: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            assert_eq!(top, vec![c[0] + 0.1, 0.0], "nearest doc must win");
+        }
         Ok(())
     }
 }

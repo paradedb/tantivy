@@ -45,12 +45,13 @@ pub use distance::{
 pub use flat::FlatVecWriter;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
-    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, ClusterId, FlatStore, Graph,
-    IvfCentroids, IvfClusterer, IvfConfig, IvfIndex, IvfLevelClusterer, IvfMatrix, IvfMatrixView,
-    IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch,
-    IvfVectors, MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    StackedIvfIndex, SuperKMeansLevelClusterer, Workspace,
+    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, BuiltRouter, Candidate, ClusterId,
+    FlatStore, Graph, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex, IvfLevelClusterer,
+    IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch,
+    IvfTrainingVectors, IvfVectorBatch, IvfVectors, MultiLevelIvf, NeighborhoodGraphConfig,
+    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
+    RoutingIndex, SearchIterator, SearchTerminationReason, StackedIvfIndex,
+    SuperKMeansLevelClusterer, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;

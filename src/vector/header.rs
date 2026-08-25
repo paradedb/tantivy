@@ -7,7 +7,7 @@
 //! For `.vec`, the version is orthogonal to the
 //! [`IdMap`](super::flat::id_map) variant, which selects the storage *mode*
 //! (flat vs IVF) within a generation. For `.centroids`, it versions the IVF
-//! routing composite (centroids, cluster offsets, optional graph, required
+//! routing composite (centroids, cluster offsets, optional router, required
 //! bounds).
 
 use std::io::{self, Read, Write};
@@ -54,7 +54,9 @@ pub(crate) mod centroid_slot {
     pub(crate) const ROUTER: usize = 2;
     /// Alias kept for call sites that still name the graph router.
     pub(crate) const GRAPH: usize = ROUTER;
-    /// Per-cluster centroid bounds. MANDATORY from V2 on: a V2 file
+    /// Alias for stacked router writes (same slot index, kind byte disambiguates).
+    pub(crate) const STACKED: usize = ROUTER;
+    /// Per-cluster centroid bounds. MANDATORY from V2 on: a V2+ file
     /// without this slot is corrupt, not old.
     pub(crate) const BOUNDS: usize = 3;
 }

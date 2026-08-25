@@ -9,16 +9,18 @@
 //! `Explicit`). The composite has four slots per field:
 //!
 //! ```text
-//! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride)
+//! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride),
+//!     rows in the router's canonical cluster-sorted order when a stacked
+//!     router was built
 //! [1] cluster_offsets (u64[N+1], prefix sum)
-//! [2] the router (see [`RoutingIndex`]); at V2 a bare RNG graph
-//!     (`Graph::serialize`); absent for degenerate centroid counts —
-//!     routing then falls back to a linear scan of the centroids)
-//! [3] centroid bounds, REQUIRED: a segment-level BoundKind byte, then
-//!     N · stride(kind) f32s in cluster order — for Ball, one f32 per
-//!     cluster: max ||x - c|| over the cluster's members' stored rows
-//!     against the stored centroid (the merge documents the metric-uniform
-//!     fold)
+//! [2] the router (see [`RoutingIndex`]); at V2 a bare RNG graph; at V3 a
+//!     tagged `[u8 kind][payload]` envelope. Absent for degenerate centroid
+//!     counts — routing then falls back to a linear scan of the centroids.
+//! [3] centroid bounds, REQUIRED from V2 on: a segment-level BoundKind byte,
+//!     then N · stride(kind) f32s in cluster order — for Ball, one f32 per
+//!     cluster: max ||x - c|| over the cluster's members' stored rows against
+//!     the stored centroid (the merge documents the metric-uniform fold).
+//!     V1 files predate the slot and open with synthesized SATURATED bounds.
 //! ```
 //!
 //! Slot presence is the compatibility mechanism WITHIN a generation: the
@@ -41,6 +43,7 @@ use super::graph::{
     Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
 };
+use super::StackedIvfIndex;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::header::VectorFileVersion;
@@ -185,6 +188,24 @@ impl RoutingIndex {
             VectorFileVersion::V3 => {
                 (RoutingIndexKind::Graph as u8).serialize(out)?;
                 graph.serialize(out)
+            }
+        }
+    }
+
+    /// Serializes an in-memory stacked router to slot `[2]` for `version`.
+    pub(crate) fn serialize_stacked<W: Write + ?Sized>(
+        version: VectorFileVersion,
+        stacked: &StackedIvfIndex,
+        out: &mut W,
+    ) -> io::Result<()> {
+        match version {
+            VectorFileVersion::V1 | VectorFileVersion::V2 => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stacked router requires V3 `.centroids`",
+            )),
+            VectorFileVersion::V3 => {
+                (RoutingIndexKind::Stacked as u8).serialize(out)?;
+                stacked.serialize(out)
             }
         }
     }
@@ -360,12 +381,34 @@ impl IvfIndex {
         }
 
         let router = match router_slice {
-            Some(slice) => Some(RoutingIndex::open(
-                version,
-                slice,
-                centroids_slice.clone(),
-                options,
-            )?),
+            Some(slice) => {
+                // Stacked routers are persisted at merge time from this
+                // commit onward; loading them into [`RoutingIndex`] lands in
+                // the next stack commit. Until then, treat the slot as absent
+                // so segments stay searchable via exact centroid ranking.
+                if version == VectorFileVersion::V3 {
+                    let kind_byte = slice.slice_to(1).read_bytes()?;
+                    if kind_byte.as_slice().first()
+                        == Some(&(RoutingIndexKind::Stacked as u8))
+                    {
+                        None
+                    } else {
+                        Some(RoutingIndex::open(
+                            version,
+                            slice,
+                            centroids_slice.clone(),
+                            options,
+                        )?)
+                    }
+                } else {
+                    Some(RoutingIndex::open(
+                        version,
+                        slice,
+                        centroids_slice.clone(),
+                        options,
+                    )?)
+                }
+            }
             None => None,
         };
 

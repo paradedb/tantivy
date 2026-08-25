@@ -9,8 +9,9 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::{
-    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, RoutingIndex, CENTROIDS_EXT,
+    decode_row, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
+    IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, RoutingIndex,
+    CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
@@ -262,13 +263,47 @@ pub(crate) fn merge_ivf(
                         "IvfClusterer produced zero centroids".to_string(),
                     ));
                 }
-                // Optional router override (slot [2]). Default clusterers
-                // return `None` and the merge builds a routing RNG.
-                let clusterer_router = clusterer.build_router(opts, &centroids)?;
-
-                // Leaf count is emergent from the clusterer; the rest of the
-                // merge uses whatever train returned.
                 let num_centroids = centroid_matrix.rows;
+
+                // Optional router (slot [2]). Default clusterers return `None`
+                // and the merge builds a routing RNG. When present, a stacked
+                // build's canonical cluster-sort permutation is applied to the
+                // trained centroid matrix before assign.
+                let built_router = clusterer.build_router(opts, &centroids)?;
+                let centroids = match &built_router {
+                    Some(BuiltRouter::Stacked { perm, .. }) => {
+                        let IvfCentroids::F32(matrix) = &centroids;
+                        if perm.len() != num_centroids {
+                            return Err(TantivyError::InvalidArgument(format!(
+                                "build_router returned a permutation over {} centroids, \
+                                 expected {num_centroids}",
+                                perm.len()
+                            )));
+                        }
+                        let dims = matrix.dims;
+                        let mut values = vec![0.0f32; matrix.values.len()];
+                        let mut seen = vec![false; num_centroids];
+                        for (old, &new) in perm.iter().enumerate() {
+                            let new = new as usize;
+                            if new >= num_centroids || seen[new] {
+                                return Err(TantivyError::InvalidArgument(
+                                    "build_router permutation is not a bijection".to_string(),
+                                ));
+                            }
+                            seen[new] = true;
+                            values[new * dims..(new + 1) * dims]
+                                .copy_from_slice(&matrix.values[old * dims..(old + 1) * dims]);
+                        }
+                        IvfCentroids::F32(IvfMatrix {
+                            values,
+                            rows: matrix.rows,
+                            dims,
+                        })
+                    }
+                    _ => centroids,
+                };
+                let IvfCentroids::F32(centroid_matrix) = &centroids;
+
                 // Float working copy of the trained centroids — the
                 // `.centroids` encode below reads per-row slices. Encoding +
                 // Cosine normalization happen at the `.centroids` write
@@ -557,27 +592,31 @@ pub(crate) fn merge_ivf(
                     bounds_w.flush()?;
                 }
 
-                // `.centroids` slot [2]: the router over the centroids, so a
-                // query can route to its nearest clusters without scanning all
-                // of them. Skipped for degenerate centroid counts — the reader
-                // treats the absent slot as "route by linear scan", which a
-                // 0-or-1-centroid segment doesn't need a graph for.
+                // `.centroids` slot [2]: the tagged router. Skipped when no
+                // clusterer router was built and `num_centroids <= 1`.
                 if num_centroids > 1 {
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
-                    let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
-                    if let Some(router) = clusterer_router {
-                        RoutingIndex::serialize_graph(CURRENT, &router, router_w)?;
-                    } else {
-                        let mut rng = RelativeNeighborhoodGraph::new(
-                            centroid_matrix.values.as_slice(),
-                            opts.dim(),
-                            opts.metric(),
-                            NeighborhoodGraphConfig::default(),
-                        );
-                        rng.build(&build_executor("rng-build-")?);
-                        RoutingIndex::serialize_graph(CURRENT, &rng, router_w)?;
+                    let router_w =
+                        centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
+                    match built_router.as_ref() {
+                        Some(BuiltRouter::Stacked { index, .. }) => {
+                            RoutingIndex::serialize_stacked(CURRENT, index, router_w)?;
+                        }
+                        Some(BuiltRouter::Graph(graph)) => {
+                            RoutingIndex::serialize_graph(CURRENT, graph, router_w)?;
+                        }
+                        None => {
+                            let mut rng = RelativeNeighborhoodGraph::new(
+                                centroid_matrix.values.as_slice(),
+                                opts.dim(),
+                                opts.metric(),
+                                NeighborhoodGraphConfig::default(),
+                            );
+                            rng.build(&build_executor("rng-build-")?);
+                            RoutingIndex::serialize_graph(CURRENT, &rng, router_w)?;
+                        }
                     }
                     router_w.flush()?;
                 }
