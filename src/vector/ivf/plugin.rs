@@ -767,8 +767,7 @@ pub(crate) fn merge_ivf(
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
-                    let router_w =
-                        centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
+                    let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
                     if let Some(router) = clusterer_router {
                         router.serialize(router_w)?;
                     } else {
