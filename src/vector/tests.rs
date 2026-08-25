@@ -300,7 +300,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
             let vec_file =
                 segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
             let (version, body) = read_header(&vec_file)?;
-            assert_eq!(version, VectorFileVersion::V2);
+            assert_eq!(version, VectorFileVersion::V3);
             // Body must be a valid composite — proves the stamp sits in front
             // of the framing, not inside a slot.
             CompositeFile::open(&body)?;
@@ -318,7 +318,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
                     let centroids_file = segment_reader
                         .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
                     let (version, body) = read_header(&centroids_file)?;
-                    assert_eq!(version, VectorFileVersion::V2);
+                    assert_eq!(version, VectorFileVersion::V3);
                     CompositeFile::open(&body)?;
                 }
             }
@@ -483,12 +483,18 @@ fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
             .open_read_with_idx(index.embedding_field(), 2)
             .expect("IVF merge should write the centroid graph slot")
             .read_bytes()?;
+        assert_eq!(graph_bytes[0], 0, "V3 router kind byte (Graph)");
+        let graph_payload = &graph_bytes[1..];
 
-        let words: Vec<u32> = graph_bytes
+        let words: Vec<u32> = graph_payload
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("u32 word")))
             .collect();
-        assert_eq!(words.len() * 4, graph_bytes.len(), "whole number of u32s");
+        assert_eq!(
+            words.len() * 4,
+            graph_payload.len(),
+            "whole number of u32s"
+        );
         let max_edges = words[0] as usize;
         assert_eq!(max_edges, NeighborhoodGraphConfig::default().max_edges);
         let adjacency = &words[1..];

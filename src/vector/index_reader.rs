@@ -115,12 +115,12 @@ impl VectorIndexReader {
         let centroid_slots =
             match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
                 Ok(file) => {
-                    let (version, body) = read_header(&file)?;
+                    let (centroids_version, body) = read_header(&file)?;
                     // P1: the bounds gate certifies skips against slot [3],
                     // and there is no bounds-less execution path to fall
                     // back to — a pre-V2 `.centroids` is refused with the
                     // one remedy there is.
-                    if version < VectorFileVersion::V2 {
+                    if centroids_version < VectorFileVersion::V2 {
                         return Err(TantivyError::InvalidArgument(format!(
                             "Vector index file predates the V2 centroid-bounds format; the \
                              segment must be rebuilt with the current index version: <{:?}>",
@@ -133,14 +133,15 @@ impl VectorIndexReader {
                         composite.open_read_with_idx(field, centroid_slot::OFFSETS),
                         composite.open_read_with_idx(field, centroid_slot::BOUNDS),
                     ) {
-                        // Slot [2] (the routing graph) stays optional: the
-                        // write side skips it for degenerate centroid
-                        // counts. Slot [3] (bounds) does not — a V2 file
-                        // without it is corrupt, not old.
+                        // Slot [2] (the router) stays optional: the write
+                        // side skips it for degenerate centroid counts. Slot
+                        // [3] (bounds) does not — a V2+ file without it is
+                        // corrupt, not old.
                         (Some(centroids), Some(offsets), Some(bounds)) => Some((
+                            centroids_version,
                             centroids,
                             offsets,
-                            composite.open_read_with_idx(field, centroid_slot::GRAPH),
+                            composite.open_read_with_idx(field, centroid_slot::ROUTER),
                             bounds,
                         )),
                         (Some(_), Some(_), None) => {
@@ -160,9 +161,16 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((centroids, offsets, graph, bounds))) => {
-                Some(IvfIndex::open(&options, centroids, offsets, graph, bounds)?)
-            }
+            (IdMap::Explicit(_), Some((version, centroids, offsets, router, bounds))) => Some(
+                IvfIndex::open(
+                    version,
+                    &options,
+                    centroids,
+                    offsets,
+                    router,
+                    bounds,
+                )?,
+            ),
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
                     "vector field {:?} has cluster-sorted rows but no `.centroids` data",

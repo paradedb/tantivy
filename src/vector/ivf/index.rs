@@ -27,9 +27,8 @@
 //! optional slot and an older segment simply lacks it. Slot `[2]` works
 //! that way. Slot `[3]` does not, which is why it costs a generation:
 //! absence would have to mean "no bounds", and a silently absent bound is
-//! indistinguishable from a zero one. So `.centroids` stamps `V2`, a
-//! pre-V2 file is refused at open with a REINDEX message, and a V2 file
-//! missing the slot is corrupt rather than old.
+//! indistinguishable from a zero one. New segments stamp `V3` with a tagged
+//! router in slot `[2]`; V2 files keep the bare graph layout there.
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;
@@ -42,22 +41,62 @@ use super::graph::{
 };
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
+use crate::vector::header::VectorFileVersion;
 use crate::vector::{BoundKind, BoundStore, FileSliceArena, VectorArena};
+
+/// Discriminant for a tagged router in `.centroids` slot `[2]` at V3+.
+#[repr(u8)]
+enum RoutingIndexKind {
+    Graph = 0,
+    /// Multi-level stacked IVF; parsed by later stack commits.
+    Stacked = 1,
+}
+
+impl RoutingIndexKind {
+    fn from_code(code: u8) -> io::Result<Self> {
+        match code {
+            0 => Ok(RoutingIndexKind::Graph),
+            1 => Ok(RoutingIndexKind::Stacked),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown router kind: {other}"),
+            )),
+        }
+    }
+}
 
 /// The persisted router for one field (`.centroids` slot `[2]`).
 ///
 /// At [`VectorFileVersion::V2`](crate::vector::header::VectorFileVersion::V2)
 /// the `Graph` payload is a bare adjacency blob (see [`Graph::serialize`](super::graph::Graph::serialize)).
-/// A tagged envelope (`kind` byte + payload) arrives at V3 on the stacked-IVF
-/// stack.
+/// At V3+ the slot is `[u8 kind][variant payload…]`; the file version selects
+/// the parser — the kind byte is never inferred on V2 payloads.
 pub enum RoutingIndex {
     /// RNG over the centroids.
     Graph(RelativeNeighborhoodGraph<FileSliceArena<f32>>),
 }
 
 impl RoutingIndex {
+    /// Opens a router from slot `[2]` for the given file generation.
+    pub(crate) fn open(
+        version: VectorFileVersion,
+        slice: FileSlice,
+        centroids_slice: FileSlice,
+        options: &VectorOptions,
+    ) -> crate::Result<Self> {
+        match version {
+            VectorFileVersion::V1 => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V1 `.centroids` files have no router slot",
+            )
+            .into()),
+            VectorFileVersion::V2 => Self::open_v2(slice, centroids_slice, options),
+            VectorFileVersion::V3 => Self::open_v3(slice, centroids_slice, options),
+        }
+    }
+
     /// Opens a V2 bare-graph router from slot `[2]`.
-    pub(crate) fn open_v2(
+    fn open_v2(
         slice: FileSlice,
         centroids_slice: FileSlice,
         options: &VectorOptions,
@@ -75,10 +114,93 @@ impl RoutingIndex {
         )?))
     }
 
+    /// Opens a V3 tagged router from slot `[2]`.
+    fn open_v3(
+        slice: FileSlice,
+        centroids_slice: FileSlice,
+        options: &VectorOptions,
+    ) -> crate::Result<Self> {
+        let bytes = slice.read_bytes()?;
+        let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V3 router slot is missing its kind byte",
+            )
+            .into());
+        };
+        match RoutingIndexKind::from_code(kind_code)? {
+            RoutingIndexKind::Graph => {
+                let vectors = match options.dtype() {
+                    VectorDType::F32 => FileSliceArena::<f32>::new(centroids_slice),
+                };
+                Ok(RoutingIndex::Graph(RelativeNeighborhoodGraph::open(
+                    payload,
+                    vectors,
+                    options.dim(),
+                    options.metric(),
+                    NeighborhoodGraphConfig::default(),
+                )?))
+            }
+            RoutingIndexKind::Stacked => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stacked router parsing is not implemented yet",
+            )
+            .into()),
+        }
+    }
+
+    /// Writes a router to slot `[2]` for the given file generation.
+    pub(crate) fn serialize<W: Write + ?Sized>(
+        version: VectorFileVersion,
+        router: &Self,
+        out: &mut W,
+    ) -> io::Result<()> {
+        match version {
+            VectorFileVersion::V1 => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V1 `.centroids` files have no router slot",
+            )),
+            VectorFileVersion::V2 => router.serialize_v2(out),
+            VectorFileVersion::V3 => router.serialize_v3(out),
+        }
+    }
+
+    /// Serializes an in-memory graph router to slot `[2]` for `version`.
+    pub(crate) fn serialize_graph<S, W: Write + ?Sized>(
+        version: VectorFileVersion,
+        graph: &RelativeNeighborhoodGraph<S>,
+        out: &mut W,
+    ) -> io::Result<()>
+    where
+        S: VectorArena,
+    {
+        match version {
+            VectorFileVersion::V1 => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V1 `.centroids` files have no router slot",
+            )),
+            VectorFileVersion::V2 => graph.serialize(out),
+            VectorFileVersion::V3 => {
+                (RoutingIndexKind::Graph as u8).serialize(out)?;
+                graph.serialize(out)
+            }
+        }
+    }
+
     /// Writes a V2 bare-graph router to slot `[2]`.
-    pub(crate) fn serialize_v2<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+    fn serialize_v2<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         match self {
             RoutingIndex::Graph(graph) => graph.serialize(out),
+        }
+    }
+
+    /// Writes a V3 tagged router to slot `[2]`.
+    fn serialize_v3<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+        match self {
+            RoutingIndex::Graph(graph) => {
+                (RoutingIndexKind::Graph as u8).serialize(out)?;
+                graph.serialize(out)
+            }
         }
     }
 }
@@ -184,6 +306,7 @@ impl IvfIndex {
     /// `bounds_slice` is required: the caller has already refused any file
     /// old enough to lack it (the V2 check in `VectorIndexReader::open`).
     pub(crate) fn open(
+        version: VectorFileVersion,
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
@@ -231,7 +354,8 @@ impl IvfIndex {
         }
 
         let router = match router_slice {
-            Some(slice) => Some(RoutingIndex::open_v2(
+            Some(slice) => Some(RoutingIndex::open(
+                version,
                 slice,
                 centroids_slice.clone(),
                 options,

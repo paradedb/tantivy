@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
+    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, RoutingIndex, CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
@@ -19,7 +19,7 @@ use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
-use crate::vector::header::{centroid_slot, vec_slot, write_header};
+use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT};
 use crate::vector::{
     residual_norm, BoundKind, BoundsBuilder, BoundsScope, NeighborhoodGraphConfig, NodeId,
     RelativeNeighborhoodGraph, Workspace, VEC_EXT,
@@ -769,10 +769,12 @@ pub(crate) fn merge_ivf(
                     }
                     let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
                     if let Some(router) = clusterer_router {
-                        router.serialize(router_w)?;
+                        RoutingIndex::serialize_graph(CURRENT, &router, router_w)?;
                     } else {
                         match replica_selector.as_ref() {
-                            Some(ReplicaSelector::Graph(graph)) => graph.serialize(router_w)?,
+                            Some(ReplicaSelector::Graph(graph)) => {
+                                RoutingIndex::serialize_graph(CURRENT, graph, router_w)?;
+                            }
                             // `replicas == 1` or the exact-selector regime: no
                             // graph exists yet, build one just for routing.
                             _ => {
@@ -783,7 +785,7 @@ pub(crate) fn merge_ivf(
                                     NeighborhoodGraphConfig::default(),
                                 );
                                 rng.build(&build_executor("rng-build-")?);
-                                rng.serialize(router_w)?;
+                                RoutingIndex::serialize_graph(CURRENT, &rng, router_w)?;
                             }
                         }
                     }
