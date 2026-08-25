@@ -49,9 +49,9 @@ pub use ivf::{
     FlatStore, Graph, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex, IvfLevelClusterer,
     IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch,
     IvfTrainingVectors, IvfVectorBatch, IvfVectors, MultiLevelIvf, NeighborhoodGraphConfig,
-    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
-    RoutingIndex, SearchIterator, SearchTerminationReason, StackedIvfIndex,
-    SuperKMeansLevelClusterer, Workspace,
+    NeighborhoodGraphSearchMetrics, NodeId, PersistedStackedIvf, RelativeNeighborhoodGraph,
+    ResumableSearchIterator, RoutingIndex, SearchIterator, SearchTerminationReason, SliceStore,
+    StackedIvfIndex, SuperKMeansLevelClusterer, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;

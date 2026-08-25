@@ -26,7 +26,8 @@ pub use graph::{
 pub use index::{IvfIndex, IvfSearchMetrics, RoutingIndex};
 pub use ivf::{
     AddLevelError, ClusterId, FlatStore, IvfConfig, IvfIndex as MultiLevelIvf,
-    IvfLevelClusterer, StackedIvfIndex, SuperKMeansLevelClusterer,
+    IvfLevelClusterer, PersistedStackedIvf, SliceStore, StackedIvfIndex,
+    SuperKMeansLevelClusterer,
 };
 pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;

@@ -43,7 +43,7 @@ use super::graph::{
     Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
 };
-use super::StackedIvfIndex;
+use super::ivf::{IvfConfig as StackedIvfConfig, PersistedStackedIvf, StackedIvfIndex};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::header::VectorFileVersion;
@@ -79,6 +79,8 @@ impl RoutingIndexKind {
 pub enum RoutingIndex {
     /// RNG over the centroids.
     Graph(RelativeNeighborhoodGraph<FileSliceArena<f32>>),
+    /// Multi-level stacked IVF over the centroids.
+    Stacked(PersistedStackedIvf),
 }
 
 impl RoutingIndex {
@@ -146,11 +148,12 @@ impl RoutingIndex {
                     NeighborhoodGraphConfig::default(),
                 )?))
             }
-            RoutingIndexKind::Stacked => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stacked router parsing is not implemented yet",
-            )
-            .into()),
+            RoutingIndexKind::Stacked => Ok(RoutingIndex::Stacked(PersistedStackedIvf::open(
+                slice.slice_from(1),
+                centroids_slice,
+                options.dim(),
+                StackedIvfConfig::default(),
+            )?)),
         }
     }
 
@@ -214,6 +217,10 @@ impl RoutingIndex {
     fn serialize_v2<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         match self {
             RoutingIndex::Graph(graph) => graph.serialize(out),
+            RoutingIndex::Stacked(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stacked router requires V3 `.centroids`",
+            )),
         }
     }
 
@@ -224,9 +231,14 @@ impl RoutingIndex {
                 (RoutingIndexKind::Graph as u8).serialize(out)?;
                 graph.serialize(out)
             }
+            RoutingIndex::Stacked(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slice-backed stacked router cannot be re-serialized",
+            )),
         }
     }
 }
+
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -381,34 +393,12 @@ impl IvfIndex {
         }
 
         let router = match router_slice {
-            Some(slice) => {
-                // Stacked routers are persisted at merge time from this
-                // commit onward; loading them into [`RoutingIndex`] lands in
-                // the next stack commit. Until then, treat the slot as absent
-                // so segments stay searchable via exact centroid ranking.
-                if version == VectorFileVersion::V3 {
-                    let kind_byte = slice.slice_to(1).read_bytes()?;
-                    if kind_byte.as_slice().first()
-                        == Some(&(RoutingIndexKind::Stacked as u8))
-                    {
-                        None
-                    } else {
-                        Some(RoutingIndex::open(
-                            version,
-                            slice,
-                            centroids_slice.clone(),
-                            options,
-                        )?)
-                    }
-                } else {
-                    Some(RoutingIndex::open(
-                        version,
-                        slice,
-                        centroids_slice.clone(),
-                        options,
-                    )?)
-                }
-            }
+            Some(slice) => Some(RoutingIndex::open(
+                version,
+                slice,
+                centroids_slice.clone(),
+                options,
+            )?),
             None => None,
         };
 
@@ -482,6 +472,16 @@ impl IvfIndex {
 
     pub fn num_clusters(&self) -> usize {
         self.num_centroids
+    }
+
+    /// The persisted stacked router (V3 slot `[2]`), when the segment was
+    /// written with one. Parsed and validated at open; not yet consulted by
+    /// [`rank_clusters`](Self::rank_clusters).
+    pub fn stacked(&self) -> Option<&PersistedStackedIvf> {
+        match self.router.as_ref()? {
+            RoutingIndex::Stacked(stacked) => Some(stacked),
+            RoutingIndex::Graph(_) => None,
+        }
     }
 
     /// Distinct docs with a vector; legacy V2 replication could inflate the
@@ -566,7 +566,7 @@ impl IvfIndex {
                 };
                 ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
             }
-            None => {
+            None | Some(RoutingIndex::Stacked(_)) => {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
                 let mut ranked: Vec<Candidate> = (0..self.num_centroids)
                     .map(|cluster| Candidate {

@@ -856,7 +856,7 @@ mod bounds_storage_tests {
     use crate::vector::{
         residual_norm, BoundKind, BuiltRouter, IvfCentroids, IvfClusterer, IvfConfig, IvfMatrix,
         IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric, StackedIvfIndex,
-        SuperKMeansLevelClusterer, VectorDType, VectorOptions, VectorStorageFormat,
+        SuperKMeansLevelClusterer, VectorDType, VectorOptions, VectorStorageFormat, VectorStore,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -1401,10 +1401,18 @@ mod bounds_storage_tests {
             .expect("stacked router slot must be written")
             .read_bytes()?;
 
-        // The router parses against the STORED (permuted) centroid rows —
-        // its level-0 offsets must cover exactly those rows.
+        // The reader parses the router at open and exposes it.
         let vec_reader = segment_reader.vector_index(field)?;
         let ivf = vec_reader.index().expect("IVF segment");
+        let persisted = ivf
+            .stacked()
+            .expect("reader must parse the V3 stacked router");
+        assert_eq!(persisted.members.num_vectors(2), centroids.len());
+        assert_eq!(
+            *persisted.offsets.last().unwrap() as usize,
+            centroids.len(),
+            "persisted level-0 offsets must cover the stored centroid rows"
+        );
         let stored_rows: Vec<f32> = ivf
             .centroid_bytes()?
             .chunks_exact(4)
@@ -1424,6 +1432,19 @@ mod bounds_storage_tests {
             centroids.len(),
             "level-0 offsets must cover the stored centroid rows"
         );
+
+        // The reader's lazy router and the owned parse agree, query by
+        // query — the FileSlice path scores the same rows.
+        for c in &centroids {
+            let query = [c[0] + 0.3, 0.2];
+            let owned = stacked.search(&query, 2, 1.0, Metric::L2);
+            let lazy = persisted.search(&query, 2, 1.0, Metric::L2);
+            assert_eq!(owned.len(), lazy.len());
+            for (o, l) in owned.iter().zip(&lazy) {
+                assert_eq!(u32::from(o.node), u32::from(l.node));
+                assert_eq!(o.sim, l.sim);
+            }
+        }
 
         // The stored rows are a permutation of the trained centroids.
         let mut stored_sorted: Vec<[f32; 2]> = stored_rows

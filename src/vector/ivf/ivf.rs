@@ -37,12 +37,15 @@ use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::mem;
 
-use common::BinarySerializable;
+use common::{BinarySerializable, HasLen};
 use itertools::Itertools;
 use superkmeans::{HierarchicalSuperKMeans, HierarchicalSuperKMeansConfig, SuperKMeansConfig};
 
+use crate::directory::FileSlice;
 use crate::schema::Metric;
-use crate::vector::{Candidate, Similarity, VectorElement, VectorStore};
+use crate::vector::{
+    Candidate, FileSliceArena, Similarity, VectorArena, VectorElement, VectorStore,
+};
 
 /// Dense row into a level's centroid / member [`FlatStore`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -277,6 +280,47 @@ pub struct IvfIndex<C: VectorStore, M: VectorStore> {
 
 /// In-memory Quake-shaped stacked IVF (owned stores).
 pub type StackedIvfIndex = IvfIndex<FlatStore<ClusterId>, FlatStore<ClusterId>>;
+
+/// The persisted form: every vector row stays behind a [`FileSliceArena`]
+/// and is fetched lazily, per row; only the per-level offsets are pinned.
+pub type PersistedStackedIvf = IvfIndex<SliceStore, SliceStore>;
+
+/// [`FileSlice`]-backed vector store: `dim`-strided `f32` rows fetched with
+/// one ranged read each through a [`FileSliceArena`].
+pub struct SliceStore {
+    arena: FileSliceArena<f32>,
+    dim: usize,
+}
+
+impl SliceStore {
+    /// Wraps `rows` (row-major `n × dim` little-endian `f32`s).
+    pub fn new(rows: FileSlice, dim: usize) -> Self {
+        SliceStore {
+            arena: FileSliceArena::new(rows),
+            dim,
+        }
+    }
+}
+
+impl VectorStore for SliceStore {
+    type Id = ClusterId;
+    type Elem = f32;
+
+    #[inline]
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    #[inline]
+    fn num_vectors(&self, dim: usize) -> usize {
+        self.arena.num_vectors(dim)
+    }
+
+    #[inline]
+    fn similarity(&self, id: Self::Id, query: &[Self::Elem], metric: Metric) -> Similarity {
+        self.arena.similarity(metric, self.dim, id.0, query)
+    }
+}
 
 /// Stable counting sort of `assignments` into list order. Returns
 /// `(perm, offsets)` where `perm[old_index] = new_row` and `offsets` is the
@@ -578,35 +622,8 @@ impl IvfIndex<FlatStore<ClusterId>, FlatStore<ClusterId>> {
                 "stacked IVF centroids_byte_offset out of range",
             ));
         }
-        let mut topology = &bytes[mem::size_of::<u64>()..centroids_byte_offset];
-        let num_levels = u32::deserialize(&mut topology)? as usize;
-        if num_levels == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stacked IVF has zero levels",
-            ));
-        }
-        let mut level_topology = Vec::with_capacity(num_levels);
-        for _ in 0..num_levels {
-            let nlist = u32::deserialize(&mut topology)? as usize;
-            let mut offsets = Vec::with_capacity(nlist + 1);
-            for _ in 0..nlist + 1 {
-                offsets.push(u64::deserialize(&mut topology)?);
-            }
-            if offsets.windows(2).any(|pair| pair[0] > pair[1]) || offsets[0] != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "stacked IVF offsets are not a prefix sum",
-                ));
-            }
-            level_topology.push((nlist, offsets));
-        }
-        if !topology.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stacked IVF topology has trailing bytes before centroids",
-            ));
-        }
+        let level_topology =
+            parse_level_topology(&bytes[mem::size_of::<u64>()..centroids_byte_offset])?;
 
         let mut centroid_cursor = &bytes[centroids_byte_offset..];
         let expected_values: usize = level_topology.iter().map(|(nlist, _)| nlist * dim).sum();
@@ -616,7 +633,7 @@ impl IvfIndex<FlatStore<ClusterId>, FlatStore<ClusterId>> {
                 "stacked IVF centroid blob length mismatch",
             ));
         }
-        let mut level_centroids = Vec::with_capacity(num_levels);
+        let mut level_centroids = Vec::with_capacity(level_topology.len());
         for (nlist, _) in &level_topology {
             let mut values = Vec::with_capacity(nlist * dim);
             for _ in 0..nlist * dim {
@@ -628,7 +645,7 @@ impl IvfIndex<FlatStore<ClusterId>, FlatStore<ClusterId>> {
         // Assemble top-down so each level can own its parent; validate each
         // level's offsets end at the member count of the level below.
         let mut index: Option<Box<StackedIvfIndex>> = None;
-        for level in (0..num_levels).rev() {
+        for level in (0..level_topology.len()).rev() {
             let (nlist, offsets) = &level_topology[level];
             let level_members = if level == 0 {
                 members.clone()
@@ -654,6 +671,141 @@ impl IvfIndex<FlatStore<ClusterId>, FlatStore<ClusterId>> {
                 offsets: offsets.clone(),
                 centroids: FlatStore::new(level_centroids[level].clone(), dim),
                 members: FlatStore::new(level_members, dim),
+            }));
+        }
+        Ok(*index.expect("at least one level"))
+    }
+}
+
+/// Parses `num_levels` then per level `(nlist, offsets u64[nlist + 1])`
+/// from the topology bytes between `centroids_byte_offset` and the blobs,
+/// validating prefix-sum shape and exact consumption.
+fn parse_level_topology(mut topology: &[u8]) -> io::Result<Vec<(usize, Vec<u64>)>> {
+    let num_levels = u32::deserialize(&mut topology)? as usize;
+    if num_levels == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stacked IVF has zero levels",
+        ));
+    }
+    let mut level_topology = Vec::with_capacity(num_levels);
+    for _ in 0..num_levels {
+        let nlist = u32::deserialize(&mut topology)? as usize;
+        let mut offsets = Vec::with_capacity(nlist + 1);
+        for _ in 0..nlist + 1 {
+            offsets.push(u64::deserialize(&mut topology)?);
+        }
+        if offsets.windows(2).any(|pair| pair[0] > pair[1]) || offsets[0] != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stacked IVF offsets are not a prefix sum",
+            ));
+        }
+        level_topology.push((nlist, offsets));
+    }
+    if !topology.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stacked IVF topology has trailing bytes before centroids",
+        ));
+    }
+    Ok(level_topology)
+}
+
+impl PersistedStackedIvf {
+    /// Opens a payload written by [`StackedIvfIndex::serialize`]
+    /// (`.centroids` slot `[2]`). Pins only the per-level offsets; centroid
+    /// rows and the level-0 members (`member_rows` — the slot `[0]` rows
+    /// past the count words, already in the writer's canonical order) stay
+    /// behind [`FileSliceArena`]s and are fetched per row at search time.
+    /// `config` is caller-supplied runtime configuration, never read from
+    /// the file; parent levels get [`PARENT_NPROBE_FRACTION`].
+    pub fn open(
+        slot: FileSlice,
+        member_rows: FileSlice,
+        dim: usize,
+        config: IvfConfig,
+    ) -> io::Result<Self> {
+        if dim == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dim must be positive",
+            ));
+        }
+        let header_len = mem::size_of::<u64>();
+        if slot.len() < header_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stacked IVF payload shorter than centroids_byte_offset",
+            ));
+        }
+        let header = slot.slice_to(header_len).read_bytes()?;
+        let centroids_byte_offset = u64::deserialize(&mut header.as_slice())? as usize;
+        if centroids_byte_offset > slot.len() || centroids_byte_offset < header_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stacked IVF centroids_byte_offset out of range",
+            ));
+        }
+        let topology_bytes = slot.slice(header_len..centroids_byte_offset).read_bytes()?;
+        let level_topology = parse_level_topology(&topology_bytes)?;
+
+        let row_bytes = dim * mem::size_of::<f32>();
+        if member_rows.len() % row_bytes != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stacked IVF member rows are not a multiple of the row stride",
+            ));
+        }
+        let num_members = member_rows.len() / row_bytes;
+        let expected: usize = level_topology
+            .iter()
+            .map(|(nlist, _)| nlist * row_bytes)
+            .sum();
+        if slot.len() - centroids_byte_offset != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stacked IVF centroid blob length mismatch",
+            ));
+        }
+
+        // Per-level centroid sub-slices, bottom-up in payload order.
+        let mut centroid_slices = Vec::with_capacity(level_topology.len());
+        let mut start = centroids_byte_offset;
+        for (nlist, _) in &level_topology {
+            let end = start + nlist * row_bytes;
+            centroid_slices.push(slot.slice(start..end));
+            start = end;
+        }
+
+        // Assemble top-down so each level can own its parent; validate each
+        // level's offsets end at the member count of the level below.
+        let mut index: Option<Box<PersistedStackedIvf>> = None;
+        for level in (0..level_topology.len()).rev() {
+            let (_, offsets) = &level_topology[level];
+            let (level_members, level_member_count) = if level == 0 {
+                (member_rows.clone(), num_members)
+            } else {
+                (centroid_slices[level - 1].clone(), level_topology[level - 1].0)
+            };
+            if *offsets.last().expect("nlist + 1 offsets") as usize != level_member_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("level {level} offsets do not cover its members"),
+                ));
+            }
+            index = Some(Box::new(IvfIndex {
+                config: if level == 0 {
+                    config.clone()
+                } else {
+                    IvfConfig {
+                        nprobe_fraction: PARENT_NPROBE_FRACTION,
+                    }
+                },
+                parent: index,
+                offsets: offsets.clone(),
+                centroids: SliceStore::new(centroid_slices[level].clone(), dim),
+                members: SliceStore::new(level_members, dim),
             }));
         }
         Ok(*index.expect("at least one level"))
@@ -894,5 +1046,90 @@ mod tests {
             index.add_level(&clusterer, 16, IvfConfig::default()),
             Err(AddLevelError::NoParent)
         );
+    }
+
+    /// The FileSlice-lazy open scores identically to the owned index:
+    /// same topology, same search output, every row fetched through the
+    /// arena instead of a materialized copy.
+    #[test]
+    fn slice_backed_open_matches_owned_search() {
+        let dim = 2;
+        let n = 32;
+        let data = line_data(n);
+        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let (index, _perm) =
+            StackedIvfIndex::build(&data, n, dim, &clusterer, 2, IvfConfig::default());
+
+        let mut slot = Vec::new();
+        index.serialize(&mut slot).unwrap();
+        let member_bytes: Vec<u8> = index
+            .members
+            .as_slice()
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let opened = PersistedStackedIvf::open(
+            FileSlice::from(slot),
+            FileSlice::from(member_bytes),
+            dim,
+            index.config.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(opened.depth(), index.depth());
+        assert_eq!(opened.offsets, index.offsets);
+        assert_eq!(opened.nlist(), index.nlist());
+        assert_eq!(
+            opened.parent.as_ref().unwrap().offsets,
+            index.parent.as_ref().unwrap().offsets
+        );
+
+        for query in [[0.0f32, 0.0], [7.5, 0.0], [15.2, 0.0], [31.0, 0.0]] {
+            let expected = index.search(&query, 4, 1.0, Metric::L2);
+            let got = opened.search(&query, 4, 1.0, Metric::L2);
+            assert_eq!(got.len(), expected.len());
+            for (g, e) in got.iter().zip(&expected) {
+                assert_eq!(u32::from(g.node), u32::from(e.node));
+                assert_eq!(g.sim, e.sim);
+            }
+        }
+    }
+
+    /// A truncated payload is refused, not misparsed.
+    #[test]
+    fn slice_backed_open_rejects_truncation() {
+        let dim = 2;
+        let n = 32;
+        let data = line_data(n);
+        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let (index, _perm) =
+            StackedIvfIndex::build(&data, n, dim, &clusterer, 2, IvfConfig::default());
+        let mut slot = Vec::new();
+        index.serialize(&mut slot).unwrap();
+        let member_bytes: Vec<u8> = index
+            .members
+            .as_slice()
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+
+        let truncated = slot[..slot.len() - 4].to_vec();
+        assert!(PersistedStackedIvf::open(
+            FileSlice::from(truncated),
+            FileSlice::from(member_bytes.clone()),
+            dim,
+            IvfConfig::default(),
+        )
+        .is_err());
+
+        // Wrong member count: offsets no longer cover the members.
+        let short_members = member_bytes[..member_bytes.len() - dim * 4].to_vec();
+        assert!(PersistedStackedIvf::open(
+            FileSlice::from(slot),
+            FileSlice::from(short_members),
+            dim,
+            IvfConfig::default(),
+        )
+        .is_err());
     }
 }
