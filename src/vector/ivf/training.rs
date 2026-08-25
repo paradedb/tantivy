@@ -55,8 +55,6 @@ pub trait IvfClusterer: Send + Sync + 'static {
         Ok(IvfMergeSettings {
             training_sample_ratio,
             assign_batch_size,
-            // Replication off by default (primary-only layout).
-            replicas: 1,
         })
     }
 }
@@ -66,13 +64,6 @@ pub struct IvfMergeSettings {
     /// Fraction of vectors sampled for training, in `(0, 1]`.
     pub training_sample_ratio: f32,
     pub assign_batch_size: usize,
-    /// Total number of cells a vector is written into (SPANN `ReplicaCount`):
-    /// the primary plus up to `replicas - 1` additional cells taken from the
-    /// nearest centroids — selected exactly for small centroid sets, via a
-    /// transient build-time neighborhood graph for large ones. `1` (the
-    /// default) disables replication entirely — no selector is built and the
-    /// output is the primary-only layout.
-    pub replicas: usize,
 }
 
 #[derive(Clone, Debug)]

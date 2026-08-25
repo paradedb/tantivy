@@ -16,10 +16,9 @@
 //!     routing then falls back to a linear scan of the centroids)
 //! [3] centroid bounds, REQUIRED: a segment-level BoundKind byte, then
 //!     N · stride(kind) f32s in cluster order — for Ball, one f32 per
-//!     cluster: max ||x - c|| over the cluster's NATIVE members' stored
-//!     rows against the stored centroid (the merge documents the
-//!     metric-uniform fold; replica spill is excluded per the stored
-//!     `bounds_scope = native`)
+//!     cluster: max ||x - c|| over the cluster's members' stored rows
+//!     against the stored centroid (the merge documents the metric-uniform
+//!     fold)
 //! ```
 //!
 //! Slot presence is the compatibility mechanism WITHIN a generation: the
@@ -218,8 +217,9 @@ impl RoutingIndex {
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
     num_centroids: usize,
-    /// Distinct documents with a vector in this field. Rows including
-    /// replicas are [`Self::num_rows`].
+    /// Distinct documents with a vector in this field. Equal to
+    /// [`Self::num_rows`] for files this writer produces; legacy V2 files
+    /// could inflate the row total via replication.
     num_docs: usize,
     /// The centroid rows (slot `[0]` past the two count words).
     centroids_slice: FileSlice,
@@ -240,7 +240,7 @@ pub struct IvfIndex {
 impl IvfIndex {
     /// Write slot `[0]` of the `.centroids` composite for a field. `num_docs`
     /// is the number of distinct docs assigned — NOT the posting-row total,
-    /// which replication can multiply.
+    /// which legacy V2 replication could multiply.
     pub(crate) fn serialize_centroids<W: Write + ?Sized>(
         num_centroids: usize,
         num_docs: usize,
@@ -441,14 +441,14 @@ impl IvfIndex {
         self.num_centroids
     }
 
-    /// Distinct docs with a vector; replication inflates the row total,
-    /// [`Self::num_rows`].
+    /// Distinct docs with a vector; legacy V2 replication could inflate the
+    /// row total, [`Self::num_rows`].
     pub(crate) fn num_docs(&self) -> usize {
         self.num_docs
     }
 
     /// Total posting rows across all clusters — memberships, counting a
-    /// replicated doc once per cell it lives in.
+    /// (legacy V2) replicated doc once per cell it lives in.
     pub fn num_rows(&self) -> usize {
         self.cluster_offset(self.num_centroids) as usize
     }

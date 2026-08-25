@@ -46,7 +46,8 @@ pub struct VectorInfo {
     pub format: VectorStorageFormat,
     /// Distinct documents with a vector in this field. The per-cluster
     /// numbers (`cluster_stats`, [`VectorIndexReader::cluster_sizes`]) count
-    /// posting rows, so with replication their sum exceeds `num_vectors`.
+    /// posting rows, so with legacy V2 replication their sum could exceed
+    /// `num_vectors`.
     pub num_vectors: usize,
     pub num_centroids: Option<usize>,
     pub cluster_stats: Option<VectorClusterStats>,
@@ -66,7 +67,8 @@ pub struct VectorClusterStats {
 pub struct VectorIndexReader {
     options: VectorOptions,
     /// Distinct docs with a vector (the IdMap row count for flat storage; the
-    /// persisted doc count for IVF, whose row total replication inflates).
+    /// persisted doc count for IVF, whose row total legacy V2 replication
+    /// could inflate).
     num_vectors: usize,
     /// `false` for the placeholder built by [`Self::empty`] — the segment has
     /// no vector data for this field at all.

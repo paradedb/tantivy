@@ -184,9 +184,6 @@ impl IvfClusterer for Grid2DClusterer {
         Ok(IvfMergeSettings {
             training_sample_ratio: self.training_sample_ratio(),
             assign_batch_size: self.assign_batch_size(),
-            // The grid fixture asserts exact cluster membership; keep
-            // replication off so the 3×3 grid assignment stays primary-only.
-            replicas: 1,
         })
     }
 
@@ -864,8 +861,7 @@ mod bounds_storage_tests {
 
     /// Recompute one segment's expected fold from its stored artifacts:
     /// per cluster, max [`residual_norm`] over the cluster's rows against
-    /// the stored centroid. Valid for `replicas == 1` builds, where every
-    /// posting row is native.
+    /// the stored centroid.
     fn fresh_fold(
         vec_reader: &crate::vector::VectorIndexReader,
         ivf: &IvfIndex,
@@ -957,7 +953,6 @@ mod bounds_storage_tests {
             Ok(IvfMergeSettings {
                 training_sample_ratio: self.training_sample_ratio(),
                 assign_batch_size: self.assign_batch_size(),
-                replicas: 1,
             })
         }
         fn train(
