@@ -3,11 +3,19 @@
 //! L0 members are the base vectors (~200k). L0 lists are the ~11k IVF
 //! clusters. L1 is IVF over those L0 centroids (~100 lists).
 //!
+//! Build follows Quake's split:
+//! - [`IvfIndex::build`] clusters `members` at this level and, when
+//!   `nlist > branching_factor`, attaches one parent built over this
+//!   level's centroids (initial stack is two levels deep).
+//! - [`IvfIndex::add_level`] walks to the topmost parent and builds one
+//!   more level over its centroids (Quake's deferred deepening).
+//!
 //! Search starts at L0: parent returns ranked seeds; L0 probes those lists
 //! and keeps a globally ordered member heap.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::fmt;
 use std::marker::PhantomData;
 
 use itertools::Itertools;
@@ -67,6 +75,67 @@ impl Default for IvfConfig {
         }
     }
 }
+
+/// Parameters for [`IvfIndex::build`] and [`IvfIndex::add_level`].
+#[derive(Clone, Debug)]
+pub struct IvfBuildParams {
+    /// Target fan-out: `nlist ≈ n / branching_factor` at each level.
+    pub branching_factor: usize,
+    /// Probe budget at the level being built (typically L0).
+    pub config: IvfConfig,
+    /// Probe budget for parent levels created by `build` / `add_level`.
+    pub parent_config: IvfConfig,
+}
+
+impl Default for IvfBuildParams {
+    fn default() -> Self {
+        Self {
+            branching_factor: 16,
+            config: IvfConfig::default(),
+            parent_config: IvfConfig {
+                nprobe_fraction: PARENT_NPROBE_FRACTION,
+            },
+        }
+    }
+}
+
+impl IvfBuildParams {
+    pub fn new(branching_factor: usize, config: IvfConfig) -> Self {
+        Self {
+            branching_factor,
+            config,
+            ..Default::default()
+        }
+    }
+
+    fn nlist_for(&self, n: usize) -> usize {
+        assert!(self.branching_factor >= 2);
+        (n / self.branching_factor).max(1).min(n)
+    }
+
+    fn should_attach_parent(&self, nlist: usize) -> bool {
+        let parent_nlist = self.nlist_for(nlist);
+        nlist > self.branching_factor && parent_nlist < nlist
+    }
+}
+
+/// [`IvfIndex::add_level`] requires an existing parent (call after [`IvfIndex::build`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddLevelError {
+    NoParent,
+}
+
+impl fmt::Display for AddLevelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AddLevelError::NoParent => {
+                f.write_str("no parent index — build this level before calling add_level")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AddLevelError {}
 
 /// One inverted list: member ids belonging to this cluster.
 #[derive(Clone, Debug, Default)]
@@ -189,8 +258,104 @@ pub struct IvfIndex<C: VectorStore, M: VectorStore> {
 pub type StackedIvfIndex = IvfIndex<FlatStore<ClusterId>, FlatStore<ClusterId>>;
 
 impl IvfIndex<FlatStore<ClusterId>, FlatStore<ClusterId>> {
-    /// Cluster `data` into `n / branching_factor` L0 lists and attach an L1
-    /// parent over the L0 centroids (stop at two levels).
+    fn empty(config: IvfConfig, dim: usize) -> Self {
+        Self {
+            config,
+            parent: None,
+            clusters: Vec::new(),
+            centroids: FlatStore::new(Vec::new(), dim),
+            members: FlatStore::new(Vec::new(), dim),
+        }
+    }
+
+    /// Build this level from `members`, then attach one parent when warranted
+    /// (Quake initial [`build`]).
+    pub fn build_with_parent<Cl: IvfLevelClusterer<Elem = f32>>(
+        &mut self,
+        members: Vec<f32>,
+        dim: usize,
+        clusterer: &Cl,
+        params: &IvfBuildParams,
+    ) {
+        self.build_level(members, dim, clusterer, params);
+        self.attach_parent_if_needed(clusterer, params);
+    }
+
+    /// Cluster `members` into inverted lists at this level only.
+    pub fn build_level<Cl: IvfLevelClusterer<Elem = f32>>(
+        &mut self,
+        members: Vec<f32>,
+        dim: usize,
+        clusterer: &Cl,
+        params: &IvfBuildParams,
+    ) {
+        assert!(dim > 0, "dim must be positive");
+        assert!(
+            params.branching_factor >= 2,
+            "branching_factor must be >= 2, got {}",
+            params.branching_factor
+        );
+        assert_eq!(members.len() % dim, 0, "members length must be n × dim");
+        let n = members.len() / dim;
+        assert!(n > 0, "members must be non-empty");
+
+        let nlist = params.nlist_for(n);
+        let (centroids, assignments) = clusterer.cluster(&members, n, dim, nlist);
+        self.populate_from_clustering(members, centroids, assignments, params.config.clone());
+    }
+
+    /// Extend the stack by one level at the top (Quake [`add_level`]): walk
+    /// to the topmost parent without a parent, then [`build`] one level over
+    /// its centroids.
+    pub fn add_level<Cl: IvfLevelClusterer<Elem = f32>>(
+        &mut self,
+        clusterer: &Cl,
+        params: &IvfBuildParams,
+    ) -> Result<(), AddLevelError> {
+        let parent = self.parent.as_mut().ok_or(AddLevelError::NoParent)?;
+        if parent.parent.is_some() {
+            return parent.add_level(clusterer, params);
+        }
+        let dim = parent.centroids.dim();
+        let centroids = parent.centroids.as_slice().to_vec();
+        parent.build_with_parent(centroids, dim, clusterer, params);
+        Ok(())
+    }
+
+    /// Build L0 from raw vectors, then attach one parent when warranted.
+    pub fn build_l0<Cl: IvfLevelClusterer<Elem = f32>>(
+        data: &[f32],
+        n: usize,
+        dim: usize,
+        clusterer: &Cl,
+        params: &IvfBuildParams,
+    ) -> Self {
+        assert!(n > 0 && dim > 0, "n and dim must be positive");
+        assert_eq!(data.len(), n * dim);
+        let mut index = Self::empty(params.config.clone(), dim);
+        index.build_with_parent(data.to_vec(), dim, clusterer, params);
+        index
+    }
+
+    /// Convenience wrapper around [`Self::build_l0`].
+    pub fn build_from_data<Cl: IvfLevelClusterer<Elem = f32>>(
+        data: &[f32],
+        n: usize,
+        dim: usize,
+        clusterer: &Cl,
+        branching_factor: usize,
+        config: IvfConfig,
+    ) -> Self {
+        Self::build_l0(
+            data,
+            n,
+            dim,
+            clusterer,
+            &IvfBuildParams::new(branching_factor, config),
+        )
+    }
+
+    /// Backward-compatible alias for [`Self::build_from_data`].
     pub fn build<Cl: IvfLevelClusterer<Elem = f32>>(
         data: &[f32],
         n: usize,
@@ -199,26 +364,12 @@ impl IvfIndex<FlatStore<ClusterId>, FlatStore<ClusterId>> {
         branching_factor: usize,
         config: IvfConfig,
     ) -> Self {
-        assert!(n > 0 && dim > 0, "n and dim must be positive");
-        assert!(
-            branching_factor >= 2,
-            "branching_factor must be >= 2, got {branching_factor}"
-        );
-        assert_eq!(data.len(), n * dim);
-        let nlist = (n / branching_factor).max(1).min(n);
-        let (centroids, assignments) = clusterer.cluster(data, n, dim, nlist);
-        Self::from_l0(
-            data.to_vec(),
-            centroids,
-            assignments,
-            clusterer,
-            branching_factor,
-            config,
-        )
+        Self::build_from_data(data, n, dim, clusterer, branching_factor, config)
     }
 
-    /// L0 from existing centroids + assignments (e.g. SuperKMeans on the
-    /// 200k). L1 is trained on those centroids with `nlist ≈ n_l0 / bf`.
+    /// L0 from existing centroids + assignments (e.g. merge-time
+    /// [`IvfClusterer::train`](super::training::IvfClusterer::train)). Attaches
+    /// one parent over the centroids when `nlist > branching_factor`.
     pub fn from_l0<Cl: IvfLevelClusterer<Elem = f32>>(
         members: Vec<f32>,
         centroids: Vec<f32>,
@@ -227,52 +378,59 @@ impl IvfIndex<FlatStore<ClusterId>, FlatStore<ClusterId>> {
         branching_factor: usize,
         config: IvfConfig,
     ) -> Self {
+        let params = IvfBuildParams::new(branching_factor, config);
         assert!(
-            branching_factor >= 2,
-            "branching_factor must be >= 2, got {branching_factor}"
+            params.branching_factor >= 2,
+            "branching_factor must be >= 2, got {}",
+            params.branching_factor
         );
         assert!(!centroids.is_empty(), "L0 must have centroids");
         let dim = {
-            // `members` and `centroids` share dim; infer from assignment count.
             let n = assignments.len();
             assert!(n > 0, "assignments must be non-empty");
             assert_eq!(members.len() % n, 0, "members length must be n × dim");
             members.len() / n
         };
         assert_eq!(centroids.len() % dim, 0);
-        let nlist = centroids.len() / dim;
         assert_eq!(assignments.len(), members.len() / dim);
 
-        let clusters = clusters_from_assignments(&assignments, nlist);
-        let parent = if nlist > branching_factor {
-            let parent_nlist = (nlist / branching_factor).max(1);
-            if parent_nlist < nlist {
-                let (p_centroids, p_assign) =
-                    clusterer.cluster(&centroids, nlist, dim, parent_nlist);
-                let p_nlist = p_centroids.len() / dim;
-                Some(Box::new(IvfIndex {
-                    config: IvfConfig {
-                        nprobe_fraction: PARENT_NPROBE_FRACTION,
-                    },
-                    parent: None,
-                    clusters: clusters_from_assignments(&p_assign, p_nlist),
-                    centroids: FlatStore::new(p_centroids, dim),
-                    members: FlatStore::new(centroids.clone(), dim),
-                }))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let mut index = Self::empty(params.config.clone(), dim);
+        index.populate_from_clustering(members, centroids, assignments, params.config.clone());
+        index.attach_parent_if_needed(clusterer, &params);
+        index
+    }
 
-        IvfIndex {
-            config,
-            parent,
-            clusters,
-            centroids: FlatStore::new(centroids, dim),
-            members: FlatStore::new(members, dim),
+    fn populate_from_clustering(
+        &mut self,
+        members: Vec<f32>,
+        centroids: Vec<f32>,
+        assignments: Vec<u32>,
+        config: IvfConfig,
+    ) {
+        let dim = self.centroids.dim();
+        assert_eq!(centroids.len() % dim, 0);
+        let nlist = centroids.len() / dim;
+        assert_eq!(assignments.len(), members.len() / dim);
+        self.config = config;
+        self.clusters = clusters_from_assignments(&assignments, nlist);
+        self.centroids = FlatStore::new(centroids, dim);
+        self.members = FlatStore::new(members, dim);
+    }
+
+    fn attach_parent_if_needed<Cl: IvfLevelClusterer<Elem = f32>>(
+        &mut self,
+        clusterer: &Cl,
+        params: &IvfBuildParams,
+    ) {
+        let nlist = self.nlist();
+        if !params.should_attach_parent(nlist) {
+            return;
         }
+        let dim = self.centroids.dim();
+        let centroids = self.centroids.as_slice().to_vec();
+        let mut parent = Self::empty(params.parent_config.clone(), dim);
+        parent.build_level(centroids, dim, clusterer, params);
+        self.parent = Some(Box::new(parent));
     }
 }
 
@@ -387,7 +545,7 @@ mod tests {
             data.push(0.0);
         }
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let index = StackedIvfIndex::build(&data, n, dim, &clusterer, 2, IvfConfig::default());
+        let index = StackedIvfIndex::build(&data, n, dim, &clusterer, 4, IvfConfig::default());
         assert!(index.nlist() > 1);
         assert_eq!(index.members.len(), n);
         let parent = index.parent.as_ref().expect("L1 parent");
@@ -401,6 +559,46 @@ mod tests {
         assert!(
             hits.len() < n,
             "nprobe search should not score every L0 member"
+        );
+    }
+
+    #[test]
+    fn add_level_extends_stack_at_the_top() {
+        let dim = 2;
+        let n = 64;
+        let mut data = Vec::with_capacity(n * dim);
+        for i in 0..n {
+            data.push(i as f32);
+            data.push(0.0);
+        }
+        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let params = IvfBuildParams::new(2, IvfConfig::default());
+        let mut index = StackedIvfIndex::build_l0(&data, n, dim, &clusterer, &params);
+        assert_eq!(index.depth(), 2);
+
+        index.add_level(&clusterer, &params).expect("L1 exists");
+        assert_eq!(index.depth(), 3);
+        let l1 = index.parent.as_ref().expect("L1");
+        let l2 = l1.parent.as_ref().expect("L2");
+        assert!(l2.parent.is_none());
+        assert_eq!(l2.members.len(), l1.nlist());
+    }
+
+    #[test]
+    fn add_level_errors_without_parent() {
+        let dim = 2;
+        let mut index = IvfIndex {
+            config: IvfConfig::default(),
+            parent: None,
+            clusters: Vec::new(),
+            centroids: FlatStore::new(Vec::new(), dim),
+            members: FlatStore::new(Vec::new(), dim),
+        };
+        let clusterer = SuperKMeansLevelClusterer::default();
+        let params = IvfBuildParams::default();
+        assert_eq!(
+            index.add_level(&clusterer, &params),
+            Err(AddLevelError::NoParent)
         );
     }
 }
