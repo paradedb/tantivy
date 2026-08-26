@@ -25,7 +25,7 @@ pub use graph::{
 };
 pub use index::{IvfIndex, IvfSearchMetrics, RoutingIndex};
 pub use ivf::{
-    AddLevelError, ClusterId, FlatStore, IvfBuildParams, IvfConfig, IvfIndex as MultiLevelIvf,
+    AddLevelError, ClusterId, FlatStore, IvfConfig, IvfIndex as MultiLevelIvf,
     IvfLevelClusterer, StackedIvfIndex, SuperKMeansLevelClusterer,
 };
 pub use params::{AdaptiveProbeParams, WorkModel};
