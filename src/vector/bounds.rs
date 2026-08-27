@@ -79,21 +79,6 @@ impl BoundKind {
     }
 }
 
-/// Which rows a cluster's stored bound covers. Captured into the stored
-/// [`IndexSettings`](crate::index::IndexSettings) at build.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub enum BoundsScope {
-    /// The fold runs over a cluster's NATIVE (primary-assignment) members
-    /// only; replica spill is excluded. Sound because a qualifying row's
-    /// HOME cluster always fails the skip test — the replica-closure
-    /// argument at the gate's property test.
-    #[default]
-    #[serde(rename = "native")]
-    Native,
-    // Posting — fold over every posting row incl. replicas — is a named
-    // non-goal; the variant lands with its write path.
-}
-
 /// Read view over the bounds payload of one segment's `.centroids` field
 /// slot.
 pub struct BoundStore<'a> {
@@ -503,15 +488,6 @@ mod bounds_storage_tests {
             residual_norm::<f32>(&row(&[f32::INFINITY, 0.0]), &[0.0, 0.0]),
             f32::INFINITY
         );
-    }
-
-    #[test]
-    fn bounds_scope_serde_is_the_reloption_token() {
-        // The reloption's only legal value round-trips as "native".
-        let json = serde_json::to_string(&BoundsScope::Native).unwrap();
-        assert_eq!(json, "\"native\"");
-        let back: BoundsScope = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, BoundsScope::Native);
     }
 }
 

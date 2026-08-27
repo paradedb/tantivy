@@ -5,24 +5,24 @@
 //! This module exposes the merge body so the parent plugin can call it
 //! after the threshold check.
 
-use std::cmp::Ordering;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::{
-    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
+    decode_row, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
+    IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, RoutingIndex,
+    CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
-use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
-use crate::vector::distance::{cosine, dot, l2_squared, maybe_normalize_bytes, NormalizeOutcome};
+use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
+use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
-use crate::vector::header::{centroid_slot, vec_slot, write_header};
+use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT};
 use crate::vector::{
-    residual_norm, BoundKind, BoundsBuilder, BoundsScope, NeighborhoodGraphConfig, NodeId,
-    RelativeNeighborhoodGraph, Workspace, VEC_EXT,
+    residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig, RelativeNeighborhoodGraph,
+    VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -31,66 +31,6 @@ struct AssignedVector {
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_doc_id: DocId,
-    /// `true` for the primary assignment, `false` for a replica entry.
-    /// The bounds fold covers native rows only (`bounds_scope = native`).
-    native: bool,
-}
-
-/// How a vector's `replicas - 1` non-primary cells are picked from the
-/// trained centroids. Constructed once per field when `replicas > 1` and
-/// queried during the assign loop. A `Graph` selector is not transient:
-/// the same instance is serialized as the `.centroids` slot [2] routing
-/// graph afterwards.
-///
-/// The graph index is a recall structure for *large* centroid sets. When
-/// the whole set fits within the search's own `ef` visit budget the brute
-/// scan is at most as expensive — and exact: an approximate graph over a
-/// handful of points can return fewer than `knn` neighbours, silently
-/// under-replicating small indexes.
-enum ReplicaSelector<'a> {
-    /// Exact k-NN scan over the trained centroids (small centroid sets).
-    Exact,
-    /// Approximate k-NN via a [`RelativeNeighborhoodGraph`] borrowing the
-    /// flat centroid arena (large centroid sets).
-    Graph(RelativeNeighborhoodGraph<&'a [f32]>),
-}
-
-/// Centroid ids of the `knn` nearest centroids to `query`, nearest first —
-/// the exact counterpart of [`RelativeNeighborhoodGraph::nearest`], same
-/// distance family per metric. Ties break on centroid id so selection is
-/// deterministic.
-fn exact_nearest_centroids(
-    metric: Metric,
-    centroid_rows: &[Vec<f32>],
-    query: &[f32],
-    knn: usize,
-) -> Vec<usize> {
-    let mut scored: Vec<(f32, usize)> = centroid_rows
-        .iter()
-        .enumerate()
-        .map(|(id, centroid)| {
-            // Each arm is the negated `Metric::similarity` ordering the
-            // graph selector ranks by.
-            let d = match metric {
-                // `1 - cosine` orders identically to descending cosine.
-                Metric::Cosine => 1.0 - cosine(query, centroid.as_slice()),
-                // Negated raw dot: the query-time router ranks by dot, and
-                // dot ordering is ||q||-invariant (see
-                // [`build_centroid_graph`]).
-                Metric::Dot => -dot(query, centroid.as_slice()),
-                // Squared L2 orders identically to L2.
-                Metric::L2 => l2_squared(query, centroid.as_slice()),
-            };
-            (d, id)
-        })
-        .collect();
-    scored.sort_unstable_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(Ordering::Equal)
-            .then(a.1.cmp(&b.1))
-    });
-    scored.truncate(knn);
-    scored.into_iter().map(|(_, id)| id).collect()
 }
 
 /// A multi-threaded [`Executor`] when the host has the parallelism, the
@@ -106,43 +46,12 @@ fn build_executor(name: &'static str) -> crate::Result<Executor> {
     }
 }
 
-/// Builds the replica-selection [`RelativeNeighborhoodGraph`] over the
-/// trained `centroids` (flat, `dim`-strided) with search beam `ef`. Borrows
-/// the flat centroid arena; after the assign loop the same graph is
-/// persisted as the `.centroids` slot [2] routing graph.
-fn build_centroid_graph<'a>(
-    metric: Metric,
-    centroids: &'a [f32],
-    dim: usize,
-    ef: usize,
-) -> crate::Result<RelativeNeighborhoodGraph<&'a [f32]>> {
-    // Replica cells must predict the query-time router
-    // (`rank_clusters`), which ranks centroids by the field metric —
-    // so the graph selects with that metric directly. For Dot,
-    // centroid ranking by dot(q, c) is invariant to ||q||: a
-    // v-directed query ranks cells by dot(v, c), so raw dot IS the
-    // query-consistent criterion, and its magnitude bias mirrors the
-    // router's. The pathological case — one dominant long centroid
-    // attracting many replicas — is a cluster-balance concern, not a
-    // selection concern. Must stay consistent with
-    // `exact_nearest_centroids`.
-    let config = NeighborhoodGraphConfig {
-        ef,
-        ..Default::default()
-    };
-    let mut rng = RelativeNeighborhoodGraph::new(centroids, dim, metric, config);
-    rng.build(&build_executor("replica-rng-")?);
-    Ok(rng)
-}
-
 /// Per-field IVF build timings (one phase per field), emitted at end of build
 /// as a parseable `log::info!` line on target `paradedb::ivf_build`.
 #[derive(Default)]
 struct IvfBuildTimings {
     train: Duration,
-    selector_build: Duration,
     assign: Duration,
-    replica_knn: Duration,
     posting_write: Duration,
 }
 
@@ -268,7 +177,6 @@ pub(crate) fn merge_ivf(
             VectorDType::F32 => {
                 let field_build_start = Instant::now();
                 let mut timings = IvfBuildTimings::default();
-                let replicas = settings.replicas.max(1);
                 let mut training_values = Vec::with_capacity(training_sample_size * opts.dim());
                 let mut training_doc_ids = Vec::with_capacity(training_sample_size);
                 let mut target_doc_id: DocId = 0;
@@ -355,55 +263,56 @@ pub(crate) fn merge_ivf(
                         "IvfClusterer produced zero centroids".to_string(),
                     ));
                 }
-                // Optional router override (slot [2]). Default clusterers
-                // return `None` and the merge builds a routing RNG (or
-                // reuses the replica-selector graph when present).
-                let clusterer_router = clusterer.build_router(opts, &centroids)?;
-
-                // Leaf count is emergent from the clusterer; the rest of the
-                // merge uses whatever train returned.
                 let num_centroids = centroid_matrix.rows;
-                // Float working copy of the trained centroids — the exact
-                // replica scan and the `.centroids` encode below read
-                // per-row slices. Encoding + Cosine normalization happen at
-                // the `.centroids` write below.
+
+                // Optional router (slot [2]). Default clusterers return `None`
+                // and the merge builds a routing RNG. When present, a stacked
+                // build's canonical cluster-sort permutation is applied to the
+                // trained centroid matrix before assign.
+                let built_router = clusterer.build_router(opts, &centroids)?;
+                let centroids = match &built_router {
+                    Some(BuiltRouter::Stacked { perm, .. }) => {
+                        let IvfCentroids::F32(matrix) = &centroids;
+                        if perm.len() != num_centroids {
+                            return Err(TantivyError::InvalidArgument(format!(
+                                "build_router returned a permutation over {} centroids, \
+                                 expected {num_centroids}",
+                                perm.len()
+                            )));
+                        }
+                        let dims = matrix.dims;
+                        let mut values = vec![0.0f32; matrix.values.len()];
+                        let mut seen = vec![false; num_centroids];
+                        for (old, &new) in perm.iter().enumerate() {
+                            let new = new as usize;
+                            if new >= num_centroids || seen[new] {
+                                return Err(TantivyError::InvalidArgument(
+                                    "build_router permutation is not a bijection".to_string(),
+                                ));
+                            }
+                            seen[new] = true;
+                            values[new * dims..(new + 1) * dims]
+                                .copy_from_slice(&matrix.values[old * dims..(old + 1) * dims]);
+                        }
+                        IvfCentroids::F32(IvfMatrix {
+                            values,
+                            rows: matrix.rows,
+                            dims,
+                        })
+                    }
+                    _ => centroids,
+                };
+                let IvfCentroids::F32(centroid_matrix) = &centroids;
+
+                // Float working copy of the trained centroids — the
+                // `.centroids` encode below reads per-row slices. Encoding +
+                // Cosine normalization happen at the `.centroids` write
+                // below.
                 let centroid_rows: Vec<Vec<f32>> = centroid_matrix
                     .values
                     .chunks_exact(opts.dim())
                     .map(|centroid| centroid.to_vec())
                     .collect();
-
-                // Fixed-k replication: pick a selector ONCE before the assign
-                // loop, and only when `replicas > 1`. At `replicas == 1`
-                // nothing is built or allocated — the layout stays
-                // primary-only. Small centroid sets — anything the search's
-                // own `ef` budget would visit wholesale anyway — use the
-                // exact scan; only larger sets pay for a transient
-                // neighborhood graph.
-                let dim = opts.dim();
-                let ef_search = (replicas * 4).max(64);
-                let replica_selector = if replicas <= 1 {
-                    None
-                } else if num_centroids <= ef_search {
-                    Some(ReplicaSelector::Exact)
-                } else {
-                    let build_start = Instant::now();
-                    let graph = build_centroid_graph(
-                        opts.metric(),
-                        centroid_matrix.values.as_slice(),
-                        dim,
-                        ef_search,
-                    )?;
-                    timings.selector_build = build_start.elapsed();
-                    Some(ReplicaSelector::Graph(graph))
-                };
-                // One per-query scratch reused across every graph replica
-                // lookup in this field's assign loop — never per vector.
-                let mut replica_ws = Workspace::new();
-                // Replica cells accumulated during assign; appended as extra
-                // entries AFTER the primary pass so primary membership is
-                // untouched. Empty at `replicas == 1`.
-                let mut replica_entries: Vec<AssignedVector> = Vec::new();
 
                 let mut assigned_vectors = Vec::with_capacity(vector_count);
                 let mut target_doc_id: DocId = 0;
@@ -452,13 +361,8 @@ pub(crate) fn merge_ivf(
                                     batch_len
                                 )));
                             }
-                            for (
-                                i,
-                                (cluster, (target_doc_id, source_segment_ord, source_doc_id)),
-                            ) in clusters
-                                .into_iter()
-                                .zip(batch_sources.drain(..))
-                                .enumerate()
+                            for (cluster, (target_doc_id, source_segment_ord, source_doc_id)) in
+                                clusters.into_iter().zip(batch_sources.drain(..))
                             {
                                 let cluster = cluster as usize;
                                 if cluster >= num_centroids {
@@ -472,56 +376,7 @@ pub(crate) fn merge_ivf(
                                     target_doc_id,
                                     source_segment_ord,
                                     source_doc_id,
-                                    native: true,
                                 });
-                                // Fixed-k replication: take the `replicas - 1`
-                                // nearest NON-primary centroids from the
-                                // selector. The top-k includes the primary;
-                                // drop it (build-time dedup) so a vector is
-                                // never written into its primary list twice.
-                                if let Some(selector) = replica_selector.as_ref() {
-                                    let v = &batch_values[i * dim..(i + 1) * dim];
-                                    let knn_start = Instant::now();
-                                    let nearest = match selector {
-                                        ReplicaSelector::Exact => exact_nearest_centroids(
-                                            opts.metric(),
-                                            &centroid_rows,
-                                            v,
-                                            replicas,
-                                        ),
-                                        ReplicaSelector::Graph(graph) => {
-                                            let seeds: Vec<NodeId> = (0..graph.len())
-                                                .step_by((graph.len() / 8).max(1))
-                                                .take(8)
-                                                .map(|node| node as NodeId)
-                                                .collect();
-                                            graph
-                                                .search(&mut replica_ws, v, &seeds, replicas)
-                                                .0
-                                                .into_iter()
-                                                .map(|candidate| candidate.node as usize)
-                                                .collect()
-                                        }
-                                    };
-                                    timings.replica_knn += knn_start.elapsed();
-                                    let mut added = 0usize;
-                                    for cell in nearest {
-                                        if added >= replicas - 1 {
-                                            break;
-                                        }
-                                        if cell == cluster {
-                                            continue;
-                                        }
-                                        replica_entries.push(AssignedVector {
-                                            cluster: cell,
-                                            target_doc_id,
-                                            source_segment_ord,
-                                            source_doc_id,
-                                            native: false,
-                                        });
-                                        added += 1;
-                                    }
-                                }
                             }
                             batch_values.clear();
                             batch_doc_ids.clear();
@@ -554,21 +409,10 @@ pub(crate) fn merge_ivf(
                 // have found the same vectors (deletes make both fall short
                 // of `vector_count` together, so compare them to each other).
                 debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
-                // The `.centroids` doc count: distinct docs assigned, captured
-                // before the replica append turns `assigned_vectors` into
-                // posting rows (one entry per cell a doc lives in).
+                // The `.centroids` doc count: one posting row per distinct
+                // doc (legacy V2 files could inflate rows via replication;
+                // this writer never does).
                 let num_present_docs = assigned_vectors.len();
-
-                // Fixed-k replication: append the accumulated replica cells as
-                // extra entries — the write path below already tolerates more
-                // than one entry per vector. Cells index the trained centroids,
-                // whose count is fixed here; guard anyway so a bad cell id can
-                // never index out of bounds.
-                for entry in replica_entries.drain(..) {
-                    if entry.cluster < num_centroids {
-                        assigned_vectors.push(entry);
-                    }
-                }
 
                 let mut cluster_counts = vec![0usize; num_centroids];
                 for assigned_vector in &assigned_vectors {
@@ -600,10 +444,6 @@ pub(crate) fn merge_ivf(
                 // would be unsound (their centroids no longer exist), which
                 // is why no bound-combining API exists.
                 let mut bounds_builder = BoundsBuilder::new(num_centroids);
-                // The scope captured in the stored settings at build.
-                // `native` — fold primary assignments only — is the only
-                // variant; a future scope must decide its fold here.
-                let BoundsScope::Native = ctx.settings.vector_bounds_scope;
                 for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
                     let mut bytes = encode_vector(centroid, opts.dim())?;
                     // Centroids are means of ingest-validated rows, so
@@ -700,24 +540,23 @@ pub(crate) fn merge_ivf(
                             &bytes
                         };
                         rows_w.write_all(written_bytes)?;
-                        // P1: the bounds fold — NATIVE rows only, the exact
-                        // bytes written above against the stored centroid.
-                        // A non-finite row residual saturates its cluster
+                        // P1: the bounds fold — every written row (all rows
+                        // are native without replication), the exact bytes
+                        // written above against the stored centroid. A
+                        // non-finite row residual saturates its cluster
                         // inside `add_native`.
-                        if assigned_vector.native {
-                            if assigned_vector.cluster != current_cluster {
-                                current_cluster = assigned_vector.cluster;
-                                current_centroid = decode_row::<f32>(
-                                    &centroid_bytes[current_cluster * centroid_stride..]
-                                        [..centroid_stride],
-                                    opts.dim(),
-                                )?;
-                            }
-                            bounds_builder.add_native(
-                                assigned_vector.cluster,
-                                residual(written_bytes, &current_centroid),
-                            );
+                        if assigned_vector.cluster != current_cluster {
+                            current_cluster = assigned_vector.cluster;
+                            current_centroid = decode_row::<f32>(
+                                &centroid_bytes[current_cluster * centroid_stride..]
+                                    [..centroid_stride],
+                                opts.dim(),
+                            )?;
                         }
+                        bounds_builder.add_native(
+                            assigned_vector.cluster,
+                            residual(written_bytes, &current_centroid),
+                        );
                     }
                     rows_w.flush()?;
                 }
@@ -753,38 +592,29 @@ pub(crate) fn merge_ivf(
                     bounds_w.flush()?;
                 }
 
-                // `.centroids` slot [2]: the router over the centroids, so a
-                // query can route to its nearest clusters without scanning all
-                // of them. Skipped for degenerate centroid counts — the reader
-                // treats the absent slot as "route by linear scan", which a
-                // 0-or-1-centroid segment doesn't need a graph for.
-                //
-                // A clusterer override wins when present. Otherwise a graph
-                // replica selector is the same graph over the same arena with
-                // the same metric, so it is serialized directly instead of
-                // rebuilding.
+                // `.centroids` slot [2]: the tagged router. Skipped when no
+                // clusterer router was built and `num_centroids <= 1`.
                 if num_centroids > 1 {
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
                     let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
-                    if let Some(router) = clusterer_router {
-                        router.serialize(router_w)?;
-                    } else {
-                        match replica_selector.as_ref() {
-                            Some(ReplicaSelector::Graph(graph)) => graph.serialize(router_w)?,
-                            // `replicas == 1` or the exact-selector regime: no
-                            // graph exists yet, build one just for routing.
-                            _ => {
-                                let mut rng = RelativeNeighborhoodGraph::new(
-                                    centroid_matrix.values.as_slice(),
-                                    opts.dim(),
-                                    opts.metric(),
-                                    NeighborhoodGraphConfig::default(),
-                                );
-                                rng.build(&build_executor("rng-build-")?);
-                                rng.serialize(router_w)?;
-                            }
+                    match built_router.as_ref() {
+                        Some(BuiltRouter::Stacked { index, .. }) => {
+                            RoutingIndex::serialize_stacked(CURRENT, index, router_w)?;
+                        }
+                        Some(BuiltRouter::Graph(graph)) => {
+                            RoutingIndex::serialize_graph(CURRENT, graph, router_w)?;
+                        }
+                        None => {
+                            let mut rng = RelativeNeighborhoodGraph::new(
+                                centroid_matrix.values.as_slice(),
+                                opts.dim(),
+                                opts.metric(),
+                                NeighborhoodGraphConfig::default(),
+                            );
+                            rng.build(&build_executor("rng-build-")?);
+                            RoutingIndex::serialize_graph(CURRENT, &rng, router_w)?;
                         }
                     }
                     router_w.flush()?;
@@ -792,15 +622,12 @@ pub(crate) fn merge_ivf(
 
                 log::info!(
                     target: "paradedb::ivf_build",
-                    "ivf_build timings_ms train={} selector_build={} assign={} replica_knn={} \
-                     posting_write={} total={} replicas={} centroids={} vectors={}",
+                    "ivf_build timings_ms train={} assign={} posting_write={} total={} \
+                     centroids={} vectors={}",
                     timings.train.as_millis(),
-                    timings.selector_build.as_millis(),
                     timings.assign.as_millis(),
-                    timings.replica_knn.as_millis(),
                     timings.posting_write.as_millis(),
                     field_build_start.elapsed().as_millis(),
-                    replicas,
                     num_centroids,
                     vector_count,
                 );
@@ -811,26 +638,4 @@ pub(crate) fn merge_ivf(
     vec_write.close()?;
     centroids_write.close()?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Pins the Dot selection semantics: replica cells follow RAW dot —
-    /// the query-time router's ranking — not angular order. Centroid
-    /// norms are deliberately unequal so the two orderings disagree.
-    #[test]
-    fn dot_selector_uses_raw_dot_not_angular() {
-        let centroid_rows: Vec<Vec<f32>> = vec![
-            vec![10.0, 0.0], // long, off-direction: dot 10, cosine 0.45
-            vec![0.0, 1.0],  // short, near-direction: dot 2, cosine 0.89
-            vec![7.0, 7.0],  // long, near-direction: dot 21, cosine 0.95
-        ];
-        let query = [1.0_f32, 2.0];
-        let picked = exact_nearest_centroids(Metric::Dot, &centroid_rows, &query, 3);
-        // Raw-dot order: [7,7] (21), then [10,0] (10), then [0,1] (2).
-        // Angular order would put [0,1] ahead of [10,0].
-        assert_eq!(picked, vec![2, 0, 1], "must rank by raw dot");
-    }
 }

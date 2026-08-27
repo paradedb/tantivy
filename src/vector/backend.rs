@@ -969,19 +969,11 @@ mod tests {
 
     struct InlineClusterer {
         centroids: Vec<[f32; 2]>,
-        replicas: usize,
     }
 
     impl IvfClusterer for InlineClusterer {
         fn training_sample_ratio(&self) -> f32 {
             1.0
-        }
-        fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-            Ok(IvfMergeSettings {
-                training_sample_ratio: self.training_sample_ratio(),
-                assign_batch_size: self.assign_batch_size(),
-                replicas: self.replicas,
-            })
         }
         fn train(
             &self,
@@ -1039,7 +1031,6 @@ mod tests {
         metric: Metric,
         centroids: &[[f32; 2]],
         docs: &[(&str, [f32; 2])],
-        replicas: usize,
     ) -> crate::Result<(Index, Field, Field)> {
         assert!(docs.len() >= 2, "need ≥ 2 docs for ≥ 2 source segments");
         let mut sb = Schema::builder();
@@ -1059,7 +1050,6 @@ mod tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.to_vec(),
-                replicas,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -1143,256 +1133,6 @@ mod tests {
             .collect()
     }
 
-    /// Fixed-k replication is additive and, at small centroid counts, EXACT:
-    /// the fixture's 6 centroids sit far below the exact-selection threshold
-    /// (the search's `ef` budget), so replica cells come from a brute k-NN
-    /// scan, not the approximate graph selector — every vector is written into exactly
-    /// `min(replicas, num_centroids)` distinct cells: its primary (once) plus
-    /// the `replicas - 1` next-nearest centroids. Total posting entries are
-    /// exactly `replicas × N`. `replicas == 1` is the identity: every doc in
-    /// exactly its primary cluster, no replica selector constructed at all
-    /// (`replica_selector` stays `None`) — byte-identical to no replication.
-    /// Query results never repeat a doc id (the `seen` dedup).
-    ///
-    /// Every assertion here is deterministic — no envelopes, no retries.
-    #[test]
-    fn ivf_fixed_k_replication_is_additive() -> crate::Result<()> {
-        let (centroids, labels) = replication_fixture();
-        let docs = replication_docs(&centroids, &labels);
-        let n = docs.len();
-        let replicas = 3usize;
-        assert!(
-            centroids.len() >= replicas,
-            "fixture needs >= replicas centroids for full fill"
-        );
-
-        // A replicated build read back through Ming's cluster iteration:
-        // each doc's cluster memberships plus its primary (recomputed from
-        // the stored vector).
-        struct ReplicatedBuild {
-            index: Index,
-            embed_field: Field,
-            memberships: Vec<Vec<usize>>,
-            primaries: Vec<usize>,
-        }
-        let build_and_read = |replicas: usize| -> crate::Result<ReplicatedBuild> {
-            let (index, embed_field, _label) =
-                build_inline_ivf(Metric::L2, &centroids, &docs, replicas)?;
-            let searcher = index.reader()?.searcher();
-            assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
-            let segment_reader = &searcher.segment_readers()[0];
-            let vec_reader = segment_reader.vector_index(embed_field)?;
-            let ivf = vec_reader.index().expect("expected IVF segment");
-            assert_eq!(ivf.num_clusters(), centroids.len());
-            let max_doc = segment_reader.max_doc() as usize;
-            assert_eq!(max_doc, n, "every fixture doc must survive the merge");
-            let mut memberships: Vec<Vec<usize>> = vec![Vec::new(); max_doc];
-            for cluster in 0..ivf.num_clusters() {
-                for doc in vec_reader
-                    .cluster_doc_ids(cluster)
-                    .expect("in-bounds cluster")
-                {
-                    memberships[doc as usize].push(cluster);
-                }
-            }
-            let primaries: Vec<usize> = (0..max_doc)
-                .map(|doc| {
-                    let bytes = vec_reader
-                        .vector_bytes(doc as u32)
-                        .expect("readable vector bytes")
-                        .expect("stored vector bytes");
-                    nearest_centroid(decode_2d(&bytes), &centroids)
-                })
-                .collect();
-            Ok(ReplicatedBuild {
-                index,
-                embed_field,
-                memberships,
-                primaries,
-            })
-        };
-
-        // replicas = 3: exact fill. Per doc — ceiling and fill
-        // (exactly min(replicas, num_centroids) = 3 cells), dedup (cells
-        // distinct, primary present exactly once). Corpus-wide — total
-        // memberships exactly replicas × N.
-        let built3 = build_and_read(replicas)?;
-        let mut total = 0usize;
-        for (doc, cells) in built3.memberships.iter().enumerate() {
-            assert_eq!(
-                cells.len(),
-                replicas,
-                "doc {doc}: expected exactly {replicas} cells, got {cells:?}"
-            );
-            let mut distinct = cells.clone();
-            distinct.sort_unstable();
-            distinct.dedup();
-            assert_eq!(
-                distinct.len(),
-                replicas,
-                "doc {doc}: duplicate cells in {cells:?}"
-            );
-            assert_eq!(
-                cells
-                    .iter()
-                    .filter(|&&c| c == built3.primaries[doc])
-                    .count(),
-                1,
-                "doc {doc}: primary {} must appear exactly once in {cells:?}",
-                built3.primaries[doc]
-            );
-            total += cells.len();
-        }
-        assert_eq!(
-            total,
-            replicas * n,
-            "total memberships must be replicas × N"
-        );
-
-        // Query-time dedup: a doc sits in several probed clusters, but a
-        // search must return each doc id exactly once — and with exhaustive
-        // params over an all-alive corpus, all N of them.
-        let hits = search(
-            &built3.index,
-            built3.embed_field,
-            &AllQuery,
-            vec![10.0, 10.0],
-            n,
-            exhaustive_params(centroids.len()),
-        )?;
-        assert_eq!(hits.len(), n, "exhaustive top-N must return every doc");
-        let mut ids: Vec<_> = hits.iter().map(|(_, addr)| addr.doc_id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), n, "search returned duplicate doc ids");
-
-        // replicas = 1: identity. Every doc lives in exactly one cluster —
-        // its primary — which is the byte-level content of the primary-only
-        // layout (the id-map and rows are fully determined by these
-        // memberships plus the merge's (cluster, doc) sort).
-        let built1 = build_and_read(1)?;
-        for (doc, cells) in built1.memberships.iter().enumerate() {
-            assert_eq!(
-                cells.as_slice(),
-                &[built1.primaries[doc]],
-                "replicas=1: doc {doc} must live only in its primary cluster"
-            );
-        }
-        Ok(())
-    }
-
-    /// Replica dedup is counted, exactly: exact small-set selection puts
-    /// every doc in exactly `replicas` cells, so exhaustive probing visits
-    /// `replicas × N` entries, re-encounters each doc exactly `replicas - 1`
-    /// times (`pruned_seen`), scores each exactly once, and the counter
-    /// invariant holds with zero filter/dead prunes.
-    #[test]
-    fn ivf_probe_stats_counts_replica_dedup() -> crate::Result<()> {
-        let (centroids, labels) = replication_fixture();
-        let docs = replication_docs(&centroids, &labels);
-        let n = docs.len();
-        let replicas = 4usize;
-        let (index, embed_field, _label) =
-            build_inline_ivf(Metric::L2, &centroids, &docs, replicas)?;
-
-        let (_, stats) = run_top_n(
-            &index,
-            embed_field,
-            vec![10.0, 10.0],
-            n,
-            exhaustive_params(centroids.len()),
-        )?;
-        // Every doc sits in exactly `replicas` probed cells; the
-        // `replicas - 1` re-encounters are deduped.
-        assert_eq!(
-            stats.vectors_visited,
-            replicas * n,
-            "exhaustive probe must touch every posting entry: {stats:?}"
-        );
-        assert_eq!(
-            stats.pruned_seen,
-            (replicas - 1) * n,
-            "replica dedup must fire exactly replicas-1 times per doc: {stats:?}"
-        );
-        // Still scored exactly once each; nothing filtered or dead here.
-        assert_eq!(stats.candidates_scored, n);
-        assert_eq!(
-            stats.vectors_visited,
-            stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
-            "visited must equal filter+dead+seen+scored ({stats:?})"
-        );
-        Ok(())
-    }
-
-    /// Re-merging a replicated IVF segment must account in DISTINCT docs, not
-    /// posting entries. Regression test for the reader's doc count returning
-    /// memberships (rows incl. replicas): with `replicas = 3` the IVF source
-    /// used to report 3 × 36 = 108 "vectors" into the next merge's
-    /// `vector_count`, tripping the `present_vector_ord == vector_count`
-    /// debug_asserts (and, in release, inflating the centroid count and the
-    /// training sample interval).
-    #[test]
-    fn remerge_replicated_segment() -> crate::Result<()> {
-        let (centroids, labels) = replication_fixture();
-        let docs = replication_docs(&centroids, &labels);
-        let n = docs.len();
-        let replicas = 3usize;
-        let (index, embed_field, label_field) =
-            build_inline_ivf(Metric::L2, &centroids, &docs, replicas)?;
-
-        // Two more docs in a fresh (flat) segment, then merge everything —
-        // the replicated IVF segment is now a merge SOURCE.
-        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
-        writer.set_merge_policy(Box::new(NoMergePolicy));
-        for (label, v) in [("extra0", [5.0_f32, 5.0]), ("extra1", [15.0, 5.0])] {
-            let mut doc = TantivyDocument::new();
-            doc.add_text(label_field, label);
-            doc.add_vector(embed_field, v.as_slice());
-            writer.add_document(doc)?;
-        }
-        writer.commit()?;
-        let segment_ids = index.searchable_segment_ids()?;
-        assert_eq!(segment_ids.len(), 2, "IVF segment + fresh flat segment");
-        writer.merge(&segment_ids).wait()?;
-        writer.wait_merging_threads()?;
-
-        let total = n + 2;
-        let searcher = index.reader()?.searcher();
-        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
-        let segment_reader = &searcher.segment_readers()[0];
-
-        // num_vectors reports distinct docs; per-cluster sizes keep
-        // membership semantics (each doc exact-fills `replicas` cells here).
-        let vec_reader = segment_reader.vector_index(embed_field)?;
-        assert_eq!(vec_reader.num_vectors(), total);
-        let info = vec_reader.info().expect("vector info");
-        assert_eq!(info.format, VectorStorageFormat::Ivf);
-        assert_eq!(info.num_vectors, total, "num_vectors counts distinct docs");
-        let sizes = vec_reader.cluster_sizes().expect("ivf cluster sizes");
-        let memberships: usize = sizes.iter().map(|&s| s as usize).sum();
-        assert_eq!(
-            memberships,
-            replicas * total,
-            "per-cluster sizes keep membership semantics"
-        );
-
-        // Exhaustive search returns every distinct doc exactly once.
-        let hits = search(
-            &index,
-            embed_field,
-            &AllQuery,
-            vec![10.0, 10.0],
-            total,
-            exhaustive_params(centroids.len()),
-        )?;
-        assert_eq!(hits.len(), total, "exhaustive top-N must return every doc");
-        let mut ids: Vec<_> = hits.iter().map(|(_, addr)| addr.doc_id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), total, "search returned duplicate doc ids");
-        Ok(())
-    }
-
     /// Merging flat segments with deletes past the clustering threshold: rows
     /// written for since-deleted docs still count toward the sources'
     /// `count()` (tombstones don't rewrite `.vec`), so the alive-doc merge
@@ -1423,7 +1163,6 @@ mod tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.clone(),
-                replicas: 1,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -1518,7 +1257,6 @@ mod tests {
             .settings(settings)
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.clone(),
-                replicas: 1,
             }))
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -1616,10 +1354,10 @@ mod tests {
     }
     static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
 
-    /// The merge emits one parseable `ivf_build timings_ms ...` line per field,
-    /// with `replica_knn` non-trivial at `replicas > 1`. Builds a larger index
-    /// so the phase timings are measurable, captures the line, and prints it
-    /// (run with `--nocapture`) so we can see where build time goes.
+    /// The merge emits one parseable `ivf_build timings_ms ...` line per
+    /// field. Builds a larger index so the phase timings are measurable,
+    /// captures the line, and prints it (run with `--nocapture`) so we can
+    /// see where build time goes.
     #[test]
     fn ivf_build_emits_timings_log() -> crate::Result<()> {
         let _ = log::set_logger(&CAPTURE_LOGGER);
@@ -1645,14 +1383,14 @@ mod tests {
             .collect();
 
         let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
-        let _ = build_inline_ivf(Metric::L2, &centroids, &docs, 8)?;
+        let _ = build_inline_ivf(Metric::L2, &centroids, &docs)?;
         let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
         let line = lines
             .iter()
             .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
             .expect("expected an ivf_build timings line for the 200-centroid build");
-        assert!(line.contains("replicas=8"));
-        assert!(line.contains("replica_knn="));
+        assert!(line.contains("train="));
+        assert!(line.contains("posting_write="));
         eprintln!("IVF_BUILD_SAMPLE {line}");
         Ok(())
     }
@@ -1763,7 +1501,7 @@ mod tests {
             ("trap_b", [5.0, 5.01]),
             ("anchor_b", [10.0, 10.0]),
         ];
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
         let query = [1.0_f32, 1.0];
 
         // Setup assertions.
@@ -2070,7 +1808,7 @@ mod tests {
                 (labels[i].as_str(), [c[0] + off, c[1] + off])
             })
             .collect();
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
 
         // Cap 1 → ceiling at the first probe; an unsatisfiable survivor
         // floor keeps the gate from firing first.
@@ -2103,7 +1841,7 @@ mod tests {
         let docs: Vec<(&str, [f32; 2])> = (0..5)
             .map(|i| (labels[i].as_str(), [i as f32 * 0.01, 0.0]))
             .collect();
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
 
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
@@ -2154,7 +1892,7 @@ mod tests {
                 (labels[i].as_str(), [c[0] + off, c[1] + off])
             })
             .collect();
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
 
         // The merged segment must carry the routing graph, and cap 2 (< 16
         // clusters) must engage it.
@@ -2223,9 +1961,9 @@ mod tests {
             // Per-cluster sizes count posting rows (memberships)...
             let ivf = vec_reader.index().expect("expected IVF segment");
             assert_eq!(sum as usize, ivf.num_rows(), "sizes sum to rows");
-            // ...and the shared fixture runs replicas=1 with no deletes, so
-            // the row total coincides with the distinct-doc `num_vectors`.
-            assert_eq!(sum as usize, info.num_vectors, "replicas=1: rows == docs");
+            // ...and the shared fixture has no deletes, so the row total
+            // coincides with the distinct-doc `num_vectors`.
+            assert_eq!(sum as usize, info.num_vectors, "rows == docs");
             assert_eq!(min, stats.min_cluster_size, "min");
             assert_eq!(max, stats.max_cluster_size, "max");
             assert_eq!(empty, stats.empty_clusters, "empty");
@@ -2305,7 +2043,7 @@ mod tests {
             }
         }
         let docs: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
         let (_, stats) = run_top_n(
             &index,
             embed_field,
@@ -2318,45 +2056,6 @@ mod tests {
         assert!(
             (stats.work_charged - c).abs() <= 1e-6 * c,
             "an exhaustive scan must charge exactly C units: {stats:?}"
-        );
-        Ok(())
-    }
-
-    /// Replicas charge nothing on re-encounter: at replicas = 2 a full
-    /// scan still charges exactly C units - every doc costs one
-    /// row-deduction, whichever copy arrives first - and every second copy
-    /// lands in `pruned_seen`.
-    #[test]
-    fn replicas_charge_once() -> crate::Result<()> {
-        let centroids = vec![[0.0_f32, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]];
-        let mut docs: Vec<(String, [f32; 2])> = Vec::new();
-        for (c, count) in [(0usize, 4usize), (1, 2), (2, 2), (3, 2)] {
-            for i in 0..count {
-                docs.push((
-                    format!("d{c}_{i}"),
-                    [centroids[c][0] + i as f32 * 0.01, 0.0],
-                ));
-            }
-        }
-        let docs: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
-        let n_docs = docs.len();
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 2)?;
-        let (_, stats) = run_top_n(
-            &index,
-            embed_field,
-            vec![0.0, 0.0],
-            11,
-            budget_only_params(),
-        )?;
-        let c = centroids.len() as f32;
-        assert_eq!(stats.termination, ProbeTermination::Exhausted);
-        assert!(
-            (stats.work_charged - c).abs() <= 1e-6 * c,
-            "replica copies must not re-charge: {stats:?}"
-        );
-        assert_eq!(
-            stats.pruned_seen, n_docs,
-            "each doc's second copy prunes as seen: {stats:?}"
         );
         Ok(())
     }
@@ -2400,7 +2099,7 @@ mod tests {
             max_probe_fraction: 0.8,
             ..budget_only_params()
         };
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
         let (_, stats) = run_top_n(&index, embed_field, vec![0.0, 0.0], 41, params)?;
         assert_eq!(stats.termination, ProbeTermination::Ceiling, "{stats:?}");
         assert_eq!(
@@ -2444,7 +2143,7 @@ mod tests {
             }
         }
         let docs: Vec<(&str, [f32; 2])> = docs.iter().map(|(l, v)| (l.as_str(), *v)).collect();
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
 
         let n_avg = 22.0 / 2.0;
         let fixed = fixed_probe_cost_rows();
@@ -2750,10 +2449,10 @@ mod tests {
         backend.top_n(weight, segment_reader, k)
     }
 
-    /// Filter-aware fetches across selectivities: on the replicated
-    /// multi-cluster fixture, hand-built filters admitting {0, 1, 50,
-    /// 100}% of docs return every admitted doc exactly once, with both
-    /// partition identities intact. 0% admits nothing — the empty-filter
+    /// Filter-aware fetches across selectivities: on the multi-cluster
+    /// fixture, hand-built filters admitting {0, 1, 50, 100}% of docs
+    /// return every admitted doc exactly once, with both partition
+    /// identities intact. 0% admits nothing — the empty-filter
     /// short-circuit returns before the probe loop, so zero clusters
     /// probe and zero fetches happen (postings_skipped == clusters
     /// probed == 0).
@@ -2762,7 +2461,7 @@ mod tests {
         let (centroids, labels) = replication_fixture();
         let docs = replication_docs(&centroids, &labels);
         let n = docs.len();
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 3)?;
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
         let params = exhaustive_params(centroids.len());
 
         for pct in [0usize, 1, 50, 100] {
@@ -2800,9 +2499,8 @@ mod tests {
                     );
                 }
                 1 => {
-                    // One admitted doc → exactly one cluster fetches (the
-                    // first-probed of its replica cells); every other
-                    // probed cluster skips.
+                    // One admitted doc → exactly one cluster fetches (its
+                    // primary); every other probed cluster skips.
                     assert_eq!(stats.postings_row, 1, "{stats:?}");
                     assert_eq!(
                         stats.postings_skipped,
@@ -2818,49 +2516,6 @@ mod tests {
         Ok(())
     }
 
-    /// Replica dedup is decided in the pre-pass: a doc whose copies land
-    /// in several probed clusters is fetched and scored exactly once, and
-    /// its later cells (holding no other survivor) skip their fetches
-    /// entirely.
-    #[test]
-    fn filter_aware_fetch_preserves_replica_dedup() -> crate::Result<()> {
-        let (centroids, labels) = replication_fixture();
-        let docs = replication_docs(&centroids, &labels);
-        let n = docs.len();
-        let replicas = 3usize;
-        let (index, embed_field, _label) =
-            build_inline_ivf(Metric::L2, &centroids, &docs, replicas)?;
-        let params = exhaustive_params(centroids.len());
-
-        // Admit exactly one doc; exact small-N replica selection puts its
-        // copies in exactly `replicas` distinct cells, all probed under
-        // exhaustive params.
-        let weight = FixedDocsWeight {
-            max_doc: n as DocId,
-            docs: vec![0],
-        };
-        let (hits, stats) =
-            run_top_n_with_weight(&index, embed_field, vec![10.0, 10.0], n, params, &weight)?;
-
-        assert_eq!(hits.len(), 1, "the admitted doc must return exactly once");
-        assert_eq!(stats.candidates_scored, 1, "scored on first encounter only");
-        // First-touch marking (the work-unit charge basis): EVERY doc
-        // marks `seen` on its first structural encounter, filter verdict
-        // irrelevant - so all replica re-encounters land in `pruned_seen`
-        // (visited * (replicas - 1)/replicas), not just the admitted
-        // doc's.
-        assert_eq!(
-            stats.pruned_seen,
-            stats.vectors_visited * (replicas - 1) / replicas,
-            "every later cell prunes as seen: {stats:?}"
-        );
-        // Only the first-probed cell fetches anything.
-        assert_eq!(stats.postings_row, 1, "{stats:?}");
-        assert_eq!(stats.postings_skipped, stats.clusters_probed() - 1);
-        assert_stats_identities(&stats);
-        Ok(())
-    }
-
     /// Deletes are decided in the pre-pass: a cluster whose rows are all
     /// dead yields zero survivors and fetches nothing.
     #[test]
@@ -2868,10 +2523,9 @@ mod tests {
         let (centroids, labels) = replication_fixture();
         let docs = replication_docs(&centroids, &labels);
         let n = docs.len();
-        // replicas = 1, so cluster 0's rows are exactly its 6 primary
-        // docs — deleting those leaves a fully-dead cluster with no
-        // replica rows from elsewhere.
-        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        // Cluster 0's rows are exactly its 6 primary docs — deleting
+        // those leaves a fully-dead cluster.
+        let (index, embed_field, label_field) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
         {
             let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
             writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -2924,7 +2578,7 @@ mod tests {
     #[test]
     fn empty_cluster_probed_but_fetch_skipped() -> crate::Result<()> {
         // No doc is nearest to the third centroid, so its cluster is
-        // empty (replicas = 1 keeps replica fill away from it too). The
+        // empty. The
         // empty centroid sits ON the query so its zero-radius bound can
         // never prove it useless - the bounds gate must not be what
         // skips it; the empty-fetch path is what's under test.
@@ -2936,7 +2590,7 @@ mod tests {
                 (labels[i].as_str(), [c[0] + (i / 2) as f32 * 0.01, c[1]])
             })
             .collect();
-        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs, 1)?;
+        let (index, embed_field, _label) = build_inline_ivf(Metric::L2, &centroids, &docs)?;
 
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
@@ -3182,7 +2836,6 @@ mod tests {
             metric: Metric,
             centroids: &[[f32; 2]],
             docs: &[[f32; 2]],
-            replicas: usize,
         ) -> crate::Result<(Index, Field)> {
             let mut sb = Schema::builder();
             let embed_field = sb.add_vector_field(
@@ -3200,7 +2853,6 @@ mod tests {
                 .settings(settings)
                 .ivf_clusterer(Arc::new(InlineClusterer {
                     centroids: centroids.to_vec(),
-                    replicas,
                 }))
                 .create_in_ram()?;
             let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -3241,9 +2893,9 @@ mod tests {
             }
         }
 
-        /// PROPERTY TEST — the replica-closure theorem. Random data x
-        /// {L2, cosine, dot} x replication ON; brute-force top-k vs gated
-        /// top-k under a full budget. Asserts:
+        /// PROPERTY TEST — the home-cluster closure theorem. Random data x
+        /// {L2, cosine, dot}; brute-force top-k vs gated top-k under a
+        /// full budget. Asserts:
         ///
         /// (a) the result sets are identical — a wrong skip would lose a
         ///     true member;
@@ -3251,10 +2903,8 @@ mod tests {
         ///     FINAL (tightest) bound: `margin(t_final) >= 0`. The
         ///     running bound is never tighter than the final one (the kth
         ///     only improves), so this proves the home cluster probed at
-        ///     every point of the scan. Native-scope bounds are safe iff
-        ///     a qualifying row's HOME cluster always fails the skip test
-        ///     — this assertion IS the theorem; replica copies may sit in
-        ///     skipped clusters, the home closure is what scores them.
+        ///     every point of the scan — the bound fold covers every row,
+        ///     so a qualifying row's cluster always fails the skip test.
         #[test]
         fn closure_no_true_member_skipped() -> crate::Result<()> {
             let k = 5;
@@ -3263,7 +2913,7 @@ mod tests {
                     let mut rng = Lcg(seed ^ (metric as u64) << 32);
                     let centroids: Vec<[f32; 2]> = (0..5).map(|_| rng.point()).collect();
                     let docs: Vec<[f32; 2]> = (0..40).map(|_| rng.point()).collect();
-                    let (index, field) = single_segment_fixture(metric, &centroids, &docs, 2)?;
+                    let (index, field) = single_segment_fixture(metric, &centroids, &docs)?;
                     let query: Vec<f32> = rng.point().to_vec();
 
                     let brute = ground_truth_top_k(&index, field, metric, &query, k)?;
@@ -3341,7 +2991,7 @@ mod tests {
             // d2 home B (r 1, disjoint by 5 - strictly nearest B, no
             // assignment tie with C).
             let docs = [[0.0f32, 2.0], [2.0, 0.0], [7.0, 0.0]];
-            let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs, 1)?;
+            let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs)?;
             let query = vec![0.0f32, 0.0];
 
             let brute = ground_truth_top_k(&index, field, Metric::L2, &query, 1)?;
@@ -3377,7 +3027,7 @@ mod tests {
             let centroids = [[2.0f32, 0.0], [4.0, 4.0]];
             // d0 = (3, 0) home c0, score 3; d1 = (3, 4) home c1, score 3.
             let docs = [[3.0f32, 0.0], [3.0, 4.0]];
-            let (index, field) = single_segment_fixture(Metric::Dot, &centroids, &docs, 1)?;
+            let (index, field) = single_segment_fixture(Metric::Dot, &centroids, &docs)?;
             let query = vec![1.0f32, 0.0];
 
             let brute = ground_truth_top_k(&index, field, Metric::Dot, &query, 1)?;
@@ -3417,7 +3067,7 @@ mod tests {
                     [c[0] + off, c[1] + off]
                 })
                 .collect();
-            let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs, 1)?;
+            let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs)?;
             let (_, stats) = run_top_n(&index, field, vec![0.2, 0.3], 5, exhaustive_params(6))?;
 
             assert_eq!(stats.termination, ProbeTermination::Exhausted);
@@ -3456,7 +3106,7 @@ mod tests {
                     [c[0] + off, c[1] + off]
                 })
                 .collect();
-            let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs, 1)?;
+            let (index, field) = single_segment_fixture(Metric::L2, &centroids, &docs)?;
             // k = 100 > 9 docs: the heap can never hold k results.
             let (hits, stats) =
                 run_top_n(&index, field, vec![0.2, 0.3], 100, exhaustive_params(3))?;
@@ -3571,7 +3221,7 @@ mod tests {
                     [c[0] + off, c[1] + off]
                 })
                 .collect();
-            single_segment_fixture(metric, &centroids, &docs, 1)
+            single_segment_fixture(metric, &centroids, &docs)
         }
 
         /// `bounds_skips` counts exactly the clusters the gate passed

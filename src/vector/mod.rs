@@ -36,7 +36,7 @@ pub use backend::{
 };
 pub use bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
-    BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
+    BoundKind, BoundStore, BoundsBuilder, HeapPeek, QueryBound, Verdict,
 };
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use distance::{
@@ -45,11 +45,13 @@ pub use distance::{
 pub use flat::FlatVecWriter;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
-    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, Graph, IvfCentroids,
-    IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfSearchMetrics,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, NeighborhoodGraphConfig,
-    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
-    SearchIterator, SearchTerminationReason, Workspace,
+    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, BuiltRouter, Candidate, ClusterId,
+    FlatStore, Graph, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex, IvfIndexBuilder,
+    IvfLevelClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfSearchMetrics,
+    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, MultiLevelIvf,
+    NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId, PersistedStackedIvf,
+    RelativeNeighborhoodGraph, ResumableSearchIterator, RoutingIndex, SearchIterator,
+    SearchTerminationReason, SliceStore, StackedIvfIndex, SuperKMeansLevelClusterer, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
