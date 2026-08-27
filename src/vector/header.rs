@@ -32,19 +32,19 @@ pub(crate) enum VectorFileVersion {
     V2 = 2,
 }
 
-/// `.centroids` composite slot indices. Slot `[2]` is OPTIONAL and slot
-/// `[3]` is MANDATORY from [`VectorFileVersion::V2`] on; crossing them
-/// turns a missing-because-degenerate graph into a corrupt-file error, or
-/// a missing bound into a silently absent one. They live beside the
-/// version because that is what decides which of them must be present.
+/// `.centroids` composite slot indices. Slot `[2]` is OPTIONAL (absence =
+/// exact-scan routing) and slot `[3]` is MANDATORY from
+/// [`VectorFileVersion::V2`] on.
 pub(crate) mod centroid_slot {
     /// The centroid rows themselves.
     pub(crate) const CENTROIDS: usize = 0;
     /// Per-cluster posting offsets.
     pub(crate) const OFFSETS: usize = 1;
-    /// The routing graph. OPTIONAL: the write side skips it for
+    /// The router (RNG graph at V2). OPTIONAL: the write side skips it for
     /// degenerate centroid counts, and its absence is normal.
-    pub(crate) const GRAPH: usize = 2;
+    pub(crate) const ROUTER: usize = 2;
+    /// Alias kept for call sites that still name the graph router.
+    pub(crate) const GRAPH: usize = ROUTER;
     /// Per-cluster centroid bounds. MANDATORY from V2 on: a V2 file
     /// without this slot is corrupt, not old.
     pub(crate) const BOUNDS: usize = 3;

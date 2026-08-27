@@ -1,17 +1,16 @@
+use super::RelativeNeighborhoodGraph;
 use crate::schema::VectorOptions;
 use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
 
 pub trait IvfClusterer: Send + Sync + 'static {
-    fn centroid_ratio(&self) -> f32;
-
-    fn training_samples_per_centroid(&self) -> usize;
+    /// Fraction of vectors sampled for training, in `(0, 1]`.
+    fn training_sample_ratio(&self) -> f32;
 
     fn train(
         &self,
         options: &VectorOptions,
         vectors: IvfTrainingVectors,
-        num_centroids: usize,
     ) -> crate::Result<IvfCentroids>;
 
     fn assign(
@@ -21,36 +20,40 @@ pub trait IvfClusterer: Send + Sync + 'static {
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
 
+    /// Optional router over `centroids` for slot `[2]`.
+    ///
+    /// Default `None` lets the merge build a routing RNG (or reuse the
+    /// replica-selector graph). When `Some`, the returned graph is serialized
+    /// to `.centroids` slot `[2]` as the field's router.
+    fn build_router(
+        &self,
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<Option<RelativeNeighborhoodGraph<Vec<f32>>>> {
+        let _ = (options, centroids);
+        Ok(None)
+    }
+
     fn assign_batch_size(&self) -> usize {
         2048
     }
 
-    fn merge_settings(&self, total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
-        let centroid_ratio = self.centroid_ratio();
-        let training_samples_per_centroid = self.training_samples_per_centroid();
+    fn merge_settings(&self, _total_target_docs: usize) -> crate::Result<IvfMergeSettings> {
+        let training_sample_ratio = self.training_sample_ratio();
         let assign_batch_size = self.assign_batch_size();
 
         assert!(
-            centroid_ratio > 0.0 && centroid_ratio <= 1.0,
-            "IvfClusterer centroid_ratio must be greater than 0 and less than or equal to 1, got \
-             {centroid_ratio}"
-        );
-        assert!(
-            training_samples_per_centroid > 1,
-            "IvfClusterer training_samples_per_centroid must be greater than 1, got \
-             {training_samples_per_centroid}"
+            training_sample_ratio > 0.0 && training_sample_ratio <= 1.0,
+            "IvfClusterer training_sample_ratio must be greater than 0 and less than or equal to \
+             1, got {training_sample_ratio}"
         );
         assert!(
             assign_batch_size > 0,
             "IvfClusterer assign_batch_size must be greater than 0, got {assign_batch_size}"
         );
 
-        let num_centroids =
-            ((total_target_docs as f64) * f64::from(centroid_ratio)).ceil() as usize;
-        let num_centroids = num_centroids.clamp(1, total_target_docs);
         Ok(IvfMergeSettings {
-            num_centroids,
-            training_samples_per_centroid,
+            training_sample_ratio,
             assign_batch_size,
             // Replication off by default (primary-only layout).
             replicas: 1,
@@ -60,8 +63,8 @@ pub trait IvfClusterer: Send + Sync + 'static {
 
 #[derive(Clone, Copy, Debug)]
 pub struct IvfMergeSettings {
-    pub num_centroids: usize,
-    pub training_samples_per_centroid: usize,
+    /// Fraction of vectors sampled for training, in `(0, 1]`.
+    pub training_sample_ratio: f32,
     pub assign_batch_size: usize,
     /// Total number of cells a vector is written into (SPANN `ReplicaCount`):
     /// the primary plus up to `replicas - 1` additional cells taken from the

@@ -45,11 +45,11 @@ pub use distance::{
 pub use flat::FlatVecWriter;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
-    Candidate, Graph, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
-    IvfMergeSettings, IvfSearchMetrics, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch,
-    IvfVectors, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    Workspace,
+    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, Graph, IvfCentroids,
+    IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfSearchMetrics,
+    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, NeighborhoodGraphConfig,
+    NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
+    SearchIterator, SearchTerminationReason, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
@@ -186,8 +186,7 @@ impl VectorElement for f32 {
     }
 }
 
-/// A flat, `dim`-strided arena of vectors a [`Graph`] is built over or
-/// searched against.
+/// A flat, `dim`-strided arena of vectors addressed by dense row index.
 ///
 /// The arena owns its representation — typed slices via the blanket impl,
 /// raw little-endian file bytes for reloaded storage — and scores a typed
@@ -200,12 +199,12 @@ pub trait VectorArena {
     /// The number of vectors held, at `dim` elements each.
     fn num_vectors(&self, dim: usize) -> usize;
 
-    /// [`Similarity`] of `query` to vector `node`.
+    /// [`Similarity`] of `query` to the vector at dense row `index`.
     fn similarity(
         &self,
         metric: Metric,
         dim: usize,
-        node: NodeId,
+        index: u32,
         query: &[Self::Elem],
     ) -> Similarity;
 }
@@ -221,17 +220,17 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
     }
 
     #[inline]
-    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> Similarity {
-        metric.similarity(query, &self[node as usize * dim..][..dim])
+    fn similarity(&self, metric: Metric, dim: usize, index: u32, query: &[T]) -> Similarity {
+        metric.similarity(query, &self[index as usize * dim..][..dim])
     }
 }
 
 /// A [`VectorArena`] over raw little-endian `T` rows behind a
 /// [`FileSlice`](crate::directory::FileSlice): each [`similarity`] call
-/// fetches only that node's row with one stride-sized ranged read, scored
-/// with the byte kernels ([`Metric::similarity_bytes`]). The arena is never
+/// fetches only that row with one stride-sized ranged read, scored with the
+/// byte kernels ([`Metric::similarity_bytes`]). The arena is never
 /// materialized whole — under `MmapDirectory` a read is a zero-copy view,
-/// and under a copying `Directory` only the visited nodes' bytes are fetched.
+/// and under a copying `Directory` only the visited rows' bytes are fetched.
 ///
 /// This is the search-time counterpart of the typed blanket impl: a
 /// [`Graph`] reloaded from disk wraps its file-resident vectors in one of
@@ -266,17 +265,15 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
 
     /// # Panics
     ///
-    /// The trait has no error channel, so a failed read panics. Row bounds
-    /// are guaranteed by the graph (node ids come from the adjacency, which
-    /// is length-validated against this arena at open); an I/O failure here
-    /// means the underlying `Directory` could not produce bytes it already
-    /// promised via the slice.
+    /// The trait has no error channel, so a failed read panics. Callers must
+    /// pass in-range row indices; an I/O failure here means the underlying
+    /// `Directory` could not produce bytes it already promised via the slice.
     #[inline]
-    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> Similarity {
+    fn similarity(&self, metric: Metric, dim: usize, index: u32, query: &[T]) -> Similarity {
         let stride = dim * T::SIZE_BYTES;
         let bytes = self
             .slice
-            .slice(node as usize * stride..(node as usize + 1) * stride)
+            .slice(index as usize * stride..(index as usize + 1) * stride)
             .read_bytes()
             .expect("failed to read vector arena row");
         metric.similarity_bytes(query, &bytes)

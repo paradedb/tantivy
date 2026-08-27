@@ -11,9 +11,9 @@
 //! ```text
 //! [0] num_centroids (u32) + num_docs (u32) + centroid_bytes (N · stride)
 //! [1] cluster_offsets (u64[N+1], prefix sum)
-//! [2] RNG over the centroids (see `Graph::serialize` for the layout;
-//!     absent for degenerate centroid counts — routing then falls back to a
-//!     linear scan of the centroids)
+//! [2] the router (see [`RoutingIndex`]); at V2 a bare RNG graph
+//!     (`Graph::serialize`); absent for degenerate centroid counts —
+//!     routing then falls back to a linear scan of the centroids)
 //! [3] centroid bounds, REQUIRED: a segment-level BoundKind byte, then
 //!     N · stride(kind) f32s in cluster order — for Ball, one f32 per
 //!     cluster: max ||x - c|| over the cluster's NATIVE members' stored
@@ -30,12 +30,6 @@
 //! indistinguishable from a zero one. So `.centroids` stamps `V2`, a
 //! pre-V2 file is refused at open with a REINDEX message, and a V2 file
 //! missing the slot is corrupt rather than old.
-//!
-//! One dense `centroid_id = 0..N` indexes all four: `cluster_offsets[c]` is
-//! the first row of cluster `c` in the parallel `.vec` rows/`IdMap`, and graph
-//! node `c` is centroid `c` (its vector is row `c` of slot `[0]`, which is why
-//! the graph slot stores no vectors of its own).
-
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;
@@ -49,6 +43,45 @@ use super::graph::{
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::{BoundKind, BoundStore, FileSliceArena, VectorArena};
+
+/// The persisted router for one field (`.centroids` slot `[2]`).
+///
+/// At [`VectorFileVersion::V2`](crate::vector::header::VectorFileVersion::V2)
+/// the `Graph` payload is a bare adjacency blob (see [`Graph::serialize`](super::graph::Graph::serialize)).
+/// A tagged envelope (`kind` byte + payload) arrives at V3 on the stacked-IVF
+/// stack.
+pub enum RoutingIndex {
+    /// RNG over the centroids.
+    Graph(RelativeNeighborhoodGraph<FileSliceArena<f32>>),
+}
+
+impl RoutingIndex {
+    /// Opens a V2 bare-graph router from slot `[2]`.
+    pub(crate) fn open_v2(
+        slice: FileSlice,
+        centroids_slice: FileSlice,
+        options: &VectorOptions,
+    ) -> crate::Result<Self> {
+        let vectors = match options.dtype() {
+            VectorDType::F32 => FileSliceArena::<f32>::new(centroids_slice),
+        };
+        let adjacency = slice.read_bytes()?;
+        Ok(RoutingIndex::Graph(RelativeNeighborhoodGraph::open(
+            &adjacency,
+            vectors,
+            options.dim(),
+            options.metric(),
+            NeighborhoodGraphConfig::default(),
+        )?))
+    }
+
+    /// Writes a V2 bare-graph router to slot `[2]`.
+    pub(crate) fn serialize_v2<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+        match self {
+            RoutingIndex::Graph(graph) => graph.serialize(out),
+        }
+    }
+}
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -69,9 +102,9 @@ pub struct IvfIndex {
     cluster_offsets: OwnedBytes,
     dim: usize,
     metric: Metric,
-    /// The persisted RNG over the centroids (slot `[2]`). `None` for
-    /// degenerate centroid counts, where routing falls back to a linear scan.
-    graph: Option<RelativeNeighborhoodGraph<FileSliceArena<f32>>>,
+    /// The persisted router (slot `[2]`). `None` for degenerate centroid
+    /// counts, where routing falls back to a linear scan.
+    router: Option<RoutingIndex>,
     /// Slot `[3]`, pinned: the segment-level bound kind.
     bound_kind: BoundKind,
     /// Slot `[3]`, pinned: the per-cluster bound payload,
@@ -146,7 +179,7 @@ impl IvfIndex {
     }
 
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
-    /// the bounds, and the graph adjacency are materialized; the centroid
+    /// the bounds, and the router topology are materialized; the centroid
     /// rows stay behind a [`FileSlice`] for lazy per-node reads.
     /// `bounds_slice` is required: the caller has already refused any file
     /// old enough to lack it (the V2 check in `VectorIndexReader::open`).
@@ -154,7 +187,7 @@ impl IvfIndex {
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
-        graph_slice: Option<FileSlice>,
+        router_slice: Option<FileSlice>,
         bounds_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -197,22 +230,12 @@ impl IvfIndex {
             .into());
         }
 
-        let graph = match graph_slice {
-            Some(slice) => {
-                let vectors = match options.dtype() {
-                    VectorDType::F32 => FileSliceArena::<f32>::new(centroids_slice.clone()),
-                };
-                // Adjacency length is validated against the arena's node
-                // count inside `Graph::open`.
-                let adjacency = slice.read_bytes()?;
-                Some(RelativeNeighborhoodGraph::open(
-                    &adjacency,
-                    vectors,
-                    options.dim(),
-                    options.metric(),
-                    NeighborhoodGraphConfig::default(),
-                )?)
-            }
+        let router = match router_slice {
+            Some(slice) => Some(RoutingIndex::open_v2(
+                slice,
+                centroids_slice.clone(),
+                options,
+            )?),
             None => None,
         };
 
@@ -264,7 +287,7 @@ impl IvfIndex {
             cluster_offsets,
             dim: options.dim(),
             metric: options.metric(),
-            graph,
+            router,
             bound_kind,
             bounds,
         };
@@ -354,8 +377,8 @@ impl IvfIndex {
         ws: &'a mut Workspace,
         query: &'a [f32],
     ) -> ClusterRanking<'a> {
-        match &self.graph {
-            Some(graph) => {
+        match &self.router {
+            Some(RoutingIndex::Graph(graph)) => {
                 // TODO: Replace with proper seed generation
                 let seeds: Vec<NodeId> = {
                     (0..graph.len())
@@ -370,7 +393,7 @@ impl IvfIndex {
                 let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
                 let mut ranked: Vec<Candidate> = (0..self.num_centroids)
                     .map(|cluster| Candidate {
-                        sim: arena.similarity(self.metric, self.dim, cluster as NodeId, query),
+                        sim: arena.similarity(self.metric, self.dim, cluster as u32, query),
                         node: cluster as NodeId,
                     })
                     .collect();

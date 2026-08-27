@@ -250,9 +250,11 @@ pub(crate) fn merge_ivf(
             write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
             continue;
         }
-        let num_centroids = settings.num_centroids.min(vector_count);
-        let training_sample_size =
-            vector_count.min(num_centroids.saturating_mul(settings.training_samples_per_centroid));
+        let training_sample_size = {
+            let ratio = f64::from(settings.training_sample_ratio).clamp(f64::MIN_POSITIVE, 1.0);
+            let target = ((vector_count as f64) * ratio).ceil() as usize;
+            target.clamp(1, vector_count)
+        };
         let training_sample_interval = (vector_count / training_sample_size).max(1);
 
         let residual: fn(&[u8], &[f32]) -> f32 = match opts.dtype() {
@@ -324,7 +326,8 @@ pub(crate) fn merge_ivf(
                     },
                 });
                 let train_start = Instant::now();
-                let centroids = clusterer.train(opts, training_vectors, num_centroids)?;
+                let centroids = clusterer.train(opts, training_vectors)?;
+
                 timings.train = train_start.elapsed();
 
                 if ctx.cancel.wants_cancel() {
@@ -347,12 +350,19 @@ pub(crate) fn merge_ivf(
                         centroid_matrix.dims
                     )));
                 }
-                if centroid_matrix.rows != num_centroids {
-                    return Err(TantivyError::InvalidArgument(format!(
-                        "IvfClusterer produced {} centroids, but {num_centroids} were requested",
-                        centroid_matrix.rows
-                    )));
+                if centroid_matrix.rows == 0 {
+                    return Err(TantivyError::InvalidArgument(
+                        "IvfClusterer produced zero centroids".to_string(),
+                    ));
                 }
+                // Optional router override (slot [2]). Default clusterers
+                // return `None` and the merge builds a routing RNG (or
+                // reuses the replica-selector graph when present).
+                let clusterer_router = clusterer.build_router(opts, &centroids)?;
+
+                // Leaf count is emergent from the clusterer; the rest of the
+                // merge uses whatever train returned.
+                let num_centroids = centroid_matrix.rows;
                 // Float working copy of the trained centroids — the exact
                 // replica scan and the `.centroids` encode below read
                 // per-row slices. Encoding + Cosine normalization happen at
@@ -743,41 +753,41 @@ pub(crate) fn merge_ivf(
                     bounds_w.flush()?;
                 }
 
-                // `.centroids` slot [2]: the RNG over the centroids, so a query
-                // can route to its nearest clusters without scanning all of
-                // them. Skipped for degenerate centroid counts — the reader
+                // `.centroids` slot [2]: the router over the centroids, so a
+                // query can route to its nearest clusters without scanning all
+                // of them. Skipped for degenerate centroid counts — the reader
                 // treats the absent slot as "route by linear scan", which a
                 // 0-or-1-centroid segment doesn't need a graph for.
                 //
-                // A graph replica selector is the same graph over the same
-                // arena with the same metric, so it is serialized directly
-                // instead of rebuilding. Its config differs only in `ef`,
-                // which affects the query beam width, not the built edges
-                // (build/refine search with a beam of
-                // `max(ef, num_candidates)`, and `ef <= num_candidates` for
-                // any realistic `replicas`) — the persisted graph is
-                // unchanged either way.
+                // A clusterer override wins when present. Otherwise a graph
+                // replica selector is the same graph over the same arena with
+                // the same metric, so it is serialized directly instead of
+                // rebuilding.
                 if num_centroids > 1 {
                     if ctx.cancel.wants_cancel() {
                         return Err(TantivyError::Cancelled);
                     }
-                    let graph_w = centroids_write.for_field_with_idx(field, centroid_slot::GRAPH);
-                    match replica_selector.as_ref() {
-                        Some(ReplicaSelector::Graph(graph)) => graph.serialize(graph_w)?,
-                        // `replicas == 1` or the exact-selector regime: no
-                        // graph exists yet, build one just for routing.
-                        _ => {
-                            let mut rng = RelativeNeighborhoodGraph::new(
-                                centroid_matrix.values.as_slice(),
-                                opts.dim(),
-                                opts.metric(),
-                                NeighborhoodGraphConfig::default(),
-                            );
-                            rng.build(&build_executor("rng-build-")?);
-                            rng.serialize(graph_w)?;
+                    let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
+                    if let Some(router) = clusterer_router {
+                        router.serialize(router_w)?;
+                    } else {
+                        match replica_selector.as_ref() {
+                            Some(ReplicaSelector::Graph(graph)) => graph.serialize(router_w)?,
+                            // `replicas == 1` or the exact-selector regime: no
+                            // graph exists yet, build one just for routing.
+                            _ => {
+                                let mut rng = RelativeNeighborhoodGraph::new(
+                                    centroid_matrix.values.as_slice(),
+                                    opts.dim(),
+                                    opts.metric(),
+                                    NeighborhoodGraphConfig::default(),
+                                );
+                                rng.build(&build_executor("rng-build-")?);
+                                rng.serialize(router_w)?;
+                            }
                         }
                     }
-                    graph_w.flush()?;
+                    router_w.flush()?;
                 }
 
                 log::info!(
