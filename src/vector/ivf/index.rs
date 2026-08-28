@@ -127,21 +127,22 @@ impl RoutingIndex {
         centroids_slice: FileSlice,
         options: &VectorOptions,
     ) -> crate::Result<Self> {
-        let bytes = slice.read_bytes()?;
-        let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
+        if slice.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "V3 router slot is missing its kind byte",
             )
             .into());
-        };
-        match RoutingIndexKind::from_code(kind_code)? {
+        }
+        let kind_byte = slice.read_byte(0)?;
+        let router_slice = slice.slice_from(1);
+        match RoutingIndexKind::from_code(kind_byte)? {
             RoutingIndexKind::Graph => {
                 let vectors = match options.dtype() {
                     VectorDType::F32 => FileSliceArena::<f32>::new(centroids_slice),
                 };
                 Ok(RoutingIndex::Graph(RelativeNeighborhoodGraph::open(
-                    payload,
+                    router_slice.read_bytes()?.as_slice(),
                     vectors,
                     options.dim(),
                     options.metric(),
@@ -149,7 +150,7 @@ impl RoutingIndex {
                 )?))
             }
             RoutingIndexKind::Stacked => Ok(RoutingIndex::Stacked(PersistedStackedIvf::open(
-                slice.slice_from(1),
+                router_slice,
                 centroids_slice,
                 options.dim(),
                 StackedIvfConfig::default(),
