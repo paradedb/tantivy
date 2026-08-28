@@ -73,9 +73,10 @@ impl RoutingIndexKind {
 /// The persisted router for one field (`.centroids` slot `[2]`).
 ///
 /// At [`VectorFileVersion::V2`](crate::vector::header::VectorFileVersion::V2)
-/// the `Graph` payload is a bare adjacency blob (see [`Graph::serialize`](super::graph::Graph::serialize)).
-/// At V3+ the slot is `[u8 kind][variant payload…]`; the file version selects
-/// the parser — the kind byte is never inferred on V2 payloads.
+/// the `Graph` payload is a bare adjacency blob (see
+/// [`Graph::serialize`](super::graph::Graph::serialize)). At V3+ the slot is `[u8 kind][variant
+/// payload…]`; the file version selects the parser — the kind byte is never inferred on V2
+/// payloads.
 pub enum RoutingIndex {
     /// RNG over the centroids.
     Graph(RelativeNeighborhoodGraph<FileSliceArena<f32>>),

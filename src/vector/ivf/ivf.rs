@@ -16,10 +16,9 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::fmt;
 use std::io::{self, Write};
-use std::mem;
 use std::ops::Deref;
+use std::{fmt, mem};
 
 use common::{BinarySerializable, HasLen};
 use itertools::Itertools;

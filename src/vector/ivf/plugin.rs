@@ -275,8 +275,8 @@ pub(crate) fn merge_ivf(
                         let IvfCentroids::F32(matrix) = &centroids;
                         if perm.len() != num_centroids {
                             return Err(TantivyError::InvalidArgument(format!(
-                                "build_router returned a permutation over {} centroids, \
-                                 expected {num_centroids}",
+                                "build_router returned a permutation over {} centroids, expected \
+                                 {num_centroids}",
                                 perm.len()
                             )));
                         }

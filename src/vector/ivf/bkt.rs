@@ -230,8 +230,7 @@ impl<S: VectorArena> Iterator for BKTreeSearchIterator<'_, S> {
 }
 
 impl<S> BKTree<S>
-where
-    S: VectorArena<Elem = f32> + Deref<Target = [f32]>,
+where S: VectorArena<Elem = f32> + Deref<Target = [f32]>
 {
     /// Serialize the tree for `.centroids` slot `[4]`.
     ///
