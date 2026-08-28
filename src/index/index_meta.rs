@@ -10,7 +10,6 @@ use super::SegmentComponent;
 use crate::index::SegmentId;
 use crate::schema::Schema;
 use crate::store::Compressor;
-use crate::vector::BoundsScope;
 use crate::{Inventory, Opstamp, TrackedObject};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,18 +320,6 @@ pub struct IndexSettings {
     #[serde(default = "default_vector_clustering_threshold")]
     #[serde(skip_serializing_if = "is_default_vector_clustering_threshold")]
     pub vector_clustering_threshold: usize,
-    /// Which rows a cluster's stored centroid bound covers — captured
-    /// from the index's build-time configuration (the `bounds_scope`
-    /// reloption upstream) so segments written later still fold the
-    /// scope the index was created with. `native` is the only variant
-    /// today.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_default_bounds_scope")]
-    pub vector_bounds_scope: BoundsScope,
-}
-
-fn is_default_bounds_scope(scope: &BoundsScope) -> bool {
-    *scope == BoundsScope::default()
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -366,7 +353,6 @@ impl Default for IndexSettings {
             docstore_compress_dedicated_thread: true,
             codec_types: default_codec_types(),
             vector_clustering_threshold: default_vector_clustering_threshold(),
-            vector_bounds_scope: BoundsScope::default(),
         }
     }
 }
@@ -529,8 +515,6 @@ mod tests {
     use crate::store::Compressor;
     #[cfg(feature = "zstd-compression")]
     use crate::store::ZstdCompressor;
-    #[cfg(feature = "lz4-compression")]
-    use crate::vector::BoundsScope;
     use crate::{IndexSettings, IndexSortByField, Order};
 
     #[test]
@@ -659,7 +643,6 @@ mod tests {
                 docstore_blocksize: 16_384,
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
                 vector_clustering_threshold: 10_000,
-                vector_bounds_scope: BoundsScope::Native,
             }
         );
         {
