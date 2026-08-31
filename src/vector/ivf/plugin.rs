@@ -9,8 +9,8 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::{
-    decode_row, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
-    IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
+    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
+    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
@@ -89,19 +89,27 @@ fn write_empty_field_slots(
 fn build_router(
     router_factory: &dyn RouterFactory,
     opts: &VectorOptions,
-    centroids: &IvfCentroids,
-) -> crate::Result<BuiltRouter> {
-    let built_router = router_factory.build(opts, centroids)?;
-    let router_version = built_router.router().vector_file_version();
+    centroids: &mut IvfCentroids,
+) -> crate::Result<Box<dyn crate::vector::Router>> {
+    let IvfCentroids::F32(matrix) = &*centroids;
+    let shape = (matrix.rows, matrix.dims, matrix.values.len());
+    let router = router_factory.build(opts, centroids)?;
+    let IvfCentroids::F32(matrix) = &*centroids;
+    if (matrix.rows, matrix.dims, matrix.values.len()) != shape {
+        return Err(TantivyError::InvalidArgument(
+            "Router changed the centroid matrix shape while building".to_string(),
+        ));
+    }
+    let router_version = router.vector_file_version();
     if router_version != CURRENT {
         return Err(TantivyError::InvalidArgument(format!(
             "router {} requires vector file version {:?}, but this merge writes {:?}",
-            built_router.router().id(),
+            router.id(),
             router_version,
             CURRENT
         )));
     }
-    Ok(built_router)
+    Ok(router)
 }
 
 pub(crate) fn merge_ivf(
@@ -170,18 +178,18 @@ pub(crate) fn merge_ivf(
             .map(|reader| reader.num_vectors())
             .sum::<usize>();
         if vector_count == 0 {
-            let centroids = IvfCentroids::F32(IvfMatrix {
+            let mut centroids = IvfCentroids::F32(IvfMatrix {
                 values: Vec::new(),
                 rows: 0,
                 dims: opts.dim(),
             });
-            let built_router = build_router(router_factory, opts, &centroids)?;
+            let router = build_router(router_factory, opts, &mut centroids)?;
             write_empty_field_slots(
                 &mut vec_write,
                 &mut centroids_write,
                 field,
                 opts,
-                built_router.router(),
+                router.as_ref(),
             )?;
             continue;
         }
@@ -246,18 +254,18 @@ pub(crate) fn merge_ivf(
                     // leave its slots missing from composites the other
                     // fields still write, and the reader errors on
                     // missing slots.
-                    let centroids = IvfCentroids::F32(IvfMatrix {
+                    let mut centroids = IvfCentroids::F32(IvfMatrix {
                         values: Vec::new(),
                         rows: 0,
                         dims: opts.dim(),
                     });
-                    let built_router = build_router(router_factory, opts, &centroids)?;
+                    let router = build_router(router_factory, opts, &mut centroids)?;
                     write_empty_field_slots(
                         &mut vec_write,
                         &mut centroids_write,
                         field,
                         opts,
-                        built_router.router(),
+                        router.as_ref(),
                     )?;
                     continue;
                 }
@@ -272,7 +280,7 @@ pub(crate) fn merge_ivf(
                     },
                 });
                 let train_start = Instant::now();
-                let centroids = clusterer.train(opts, training_vectors)?;
+                let mut centroids = clusterer.train(opts, training_vectors)?;
 
                 timings.train = train_start.elapsed();
 
@@ -303,39 +311,7 @@ pub(crate) fn merge_ivf(
                 }
                 let num_centroids = centroid_matrix.rows;
 
-                let built_router = build_router(router_factory, opts, &centroids)?;
-                let centroids = match built_router.centroid_permutation() {
-                    Some(perm) => {
-                        let IvfCentroids::F32(matrix) = &centroids;
-                        if perm.len() != num_centroids {
-                            return Err(TantivyError::InvalidArgument(format!(
-                                "build_router returned a permutation over {} centroids, expected \
-                                 {num_centroids}",
-                                perm.len()
-                            )));
-                        }
-                        let dims = matrix.dims;
-                        let mut values = vec![0.0f32; matrix.values.len()];
-                        let mut seen = vec![false; num_centroids];
-                        for (old, &new) in perm.iter().enumerate() {
-                            let new = new as usize;
-                            if new >= num_centroids || seen[new] {
-                                return Err(TantivyError::InvalidArgument(
-                                    "build_router permutation is not a bijection".to_string(),
-                                ));
-                            }
-                            seen[new] = true;
-                            values[new * dims..(new + 1) * dims]
-                                .copy_from_slice(&matrix.values[old * dims..(old + 1) * dims]);
-                        }
-                        IvfCentroids::F32(IvfMatrix {
-                            values,
-                            rows: matrix.rows,
-                            dims,
-                        })
-                    }
-                    None => centroids,
-                };
+                let router = build_router(router_factory, opts, &mut centroids)?;
                 let IvfCentroids::F32(centroid_matrix) = &centroids;
 
                 // Float working copy of the trained centroids — the
@@ -630,7 +606,7 @@ pub(crate) fn merge_ivf(
                     return Err(TantivyError::Cancelled);
                 }
                 let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
-                built_router.router().serialize(router_w)?;
+                router.serialize(router_w)?;
                 router_w.flush()?;
 
                 log::info!(

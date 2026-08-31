@@ -10,7 +10,7 @@ use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::graph::{Candidate, Workspace};
-use crate::vector::{BuiltRouter, FileSliceArena, IvfCentroids, VectorArena, VectorOptions};
+use crate::vector::{FileSliceArena, IvfCentroids, VectorArena, VectorOptions};
 
 const EXACT_ROUTER_ID: &str = "tantivy.exact";
 const EXACT_ROUTER_VERSION: u32 = 1;
@@ -57,9 +57,9 @@ where
 {
     fn build_router(
         options: &VectorOptions,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<BuiltRouter> {
-        Ok(BuiltRouter::new(ExactRouter::<Vec<f32>>::from_centroids(
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Box<dyn Router>> {
+        Ok(Box::new(ExactRouter::<Vec<f32>>::from_centroids(
             options, centroids,
         )))
     }

@@ -10,7 +10,7 @@ use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::graph::{
     NeighborhoodGraphConfig, RelativeNeighborhoodGraph, SearchIterator, Workspace,
 };
-use crate::vector::{BuiltRouter, FileSliceArena, IvfCentroids, VectorArena};
+use crate::vector::{FileSliceArena, IvfCentroids, VectorArena};
 use crate::Executor;
 
 const GRAPH_ROUTER_VERSION: u32 = 1;
@@ -29,8 +29,8 @@ fn build_executor() -> crate::Result<Executor> {
 
 fn build_rng_router(
     options: &VectorOptions,
-    centroids: &IvfCentroids,
-) -> crate::Result<BuiltRouter> {
+    centroids: &mut IvfCentroids,
+) -> crate::Result<Box<dyn Router>> {
     let IvfCentroids::F32(matrix) = centroids;
     let config = NeighborhoodGraphConfig::default();
     let mut graph = RelativeNeighborhoodGraph::new(
@@ -50,7 +50,7 @@ fn build_rng_router(
         options.metric(),
         config,
     )?;
-    Ok(BuiltRouter::new(graph))
+    Ok(Box::new(graph))
 }
 
 impl<S> Router for RelativeNeighborhoodGraph<S>
@@ -59,8 +59,8 @@ where
 {
     fn build_router(
         options: &VectorOptions,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<BuiltRouter> {
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Box<dyn Router>> {
         build_rng_router(options, centroids)
     }
 

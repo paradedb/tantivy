@@ -9,16 +9,50 @@ use crate::schema::VectorOptions;
 use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::graph::{Candidate, Workspace};
 use crate::vector::ivf::{
-    BuiltRouter, InMemoryStackedIvf, IvfCentroids, IvfConfig as StackedIvfConfig, IvfIndexBuilder,
+    InMemoryStackedIvf, IvfCentroids, IvfConfig as StackedIvfConfig, IvfIndexBuilder,
     LazyStackedIvf, MultiLevelIvf, SuperKMeansLevelClusterer,
 };
 use crate::vector::VectorArena;
+use crate::TantivyError;
 
 const STACKED_ROUTER_VERSION: u32 = 1;
 const STACKED_ROUTER_ID: &str = "tantivy.stacked-ivf";
 
-fn build_stacked_router(options: &VectorOptions, centroids: &IvfCentroids) -> BuiltRouter {
+fn apply_centroid_permutation(
+    centroids: &mut IvfCentroids,
+    permutation: &[u32],
+) -> crate::Result<()> {
     let IvfCentroids::F32(matrix) = centroids;
+    if permutation.len() != matrix.rows {
+        return Err(TantivyError::InvalidArgument(format!(
+            "stacked router returned a permutation over {} centroids, expected {}",
+            permutation.len(),
+            matrix.rows
+        )));
+    }
+
+    let mut values = vec![0.0f32; matrix.values.len()];
+    let mut seen = vec![false; matrix.rows];
+    for (old, &new) in permutation.iter().enumerate() {
+        let new = new as usize;
+        if new >= matrix.rows || seen[new] {
+            return Err(TantivyError::InvalidArgument(
+                "stacked router centroid permutation is not a bijection".to_string(),
+            ));
+        }
+        seen[new] = true;
+        values[new * matrix.dims..(new + 1) * matrix.dims]
+            .copy_from_slice(&matrix.values[old * matrix.dims..(old + 1) * matrix.dims]);
+    }
+    matrix.values = values;
+    Ok(())
+}
+
+fn build_stacked_router(
+    options: &VectorOptions,
+    centroids: &mut IvfCentroids,
+) -> crate::Result<Box<dyn Router>> {
+    let IvfCentroids::F32(matrix) = &*centroids;
     let clusterer = SuperKMeansLevelClusterer::default();
     let (index, permutation) = IvfIndexBuilder::new(
         matrix.values.clone(),
@@ -28,7 +62,8 @@ fn build_stacked_router(options: &VectorOptions, centroids: &IvfCentroids) -> Bu
         StackedIvfConfig::default(),
     )
     .build();
-    BuiltRouter::new(index).with_centroid_permutation(permutation)
+    apply_centroid_permutation(centroids, &permutation)?;
+    Ok(Box::new(index))
 }
 
 fn deserialize_stacked_router(
@@ -69,9 +104,9 @@ where
 impl Router for InMemoryStackedIvf {
     fn build_router(
         options: &VectorOptions,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<BuiltRouter> {
-        Ok(build_stacked_router(options, centroids))
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Box<dyn Router>> {
+        build_stacked_router(options, centroids)
     }
 
     fn id(&self) -> &'static str {
@@ -111,9 +146,9 @@ impl Router for InMemoryStackedIvf {
 impl Router for LazyStackedIvf {
     fn build_router(
         options: &VectorOptions,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<BuiltRouter> {
-        Ok(build_stacked_router(options, centroids))
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Box<dyn Router>> {
+        build_stacked_router(options, centroids)
     }
 
     fn id(&self) -> &'static str {

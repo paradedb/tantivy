@@ -33,6 +33,6 @@ pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, encode_vector};
 pub use training::{
-    BuiltRouter, IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfTrainingBatch,
+    IvfTrainingVectors, IvfVectorBatch, IvfVectors,
 };

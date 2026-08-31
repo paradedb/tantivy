@@ -1,33 +1,6 @@
 use crate::schema::VectorOptions;
-use crate::vector::{Router, VectorElement};
+use crate::vector::VectorElement;
 use crate::{DocId, TantivyError};
-
-pub struct BuiltRouter {
-    router: Box<dyn Router>,
-    centroid_permutation: Option<Vec<u32>>,
-}
-
-impl BuiltRouter {
-    pub fn new(router: impl Router + 'static) -> Self {
-        Self {
-            router: Box::new(router),
-            centroid_permutation: None,
-        }
-    }
-
-    pub fn with_centroid_permutation(mut self, permutation: Vec<u32>) -> Self {
-        self.centroid_permutation = Some(permutation);
-        self
-    }
-
-    pub fn router(&self) -> &dyn Router {
-        self.router.as_ref()
-    }
-
-    pub fn centroid_permutation(&self) -> Option<&[u32]> {
-        self.centroid_permutation.as_deref()
-    }
-}
 
 pub trait IvfClusterer: Send + Sync + 'static {
     /// Fraction of vectors sampled for training, in `(0, 1]`.

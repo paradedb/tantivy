@@ -5,7 +5,7 @@ use std::sync::Arc;
 use common::{BinarySerializable, HasLen};
 
 use super::ivf::graph::{Candidate, NeighborhoodGraphSearchMetrics, Workspace};
-use super::ivf::{BuiltRouter, IvfCentroids};
+use super::ivf::IvfCentroids;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
@@ -68,10 +68,11 @@ impl RouterSearchContext {
 /// delegating the payload to `deserialize`.
 pub trait Router: Send + Sync {
     /// Builds a router over the supplied centroids, which may be empty.
+    /// Implementations may reorder rows in place but must preserve the matrix shape.
     fn build_router(
         options: &VectorOptions,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<BuiltRouter>
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Box<dyn Router>>
     where
         Self: Sized;
 
@@ -119,8 +120,8 @@ pub trait RouterFactory: Send + Sync {
     fn build(
         &self,
         options: &VectorOptions,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<BuiltRouter>;
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Box<dyn Router>>;
 
     fn open(
         &self,
@@ -142,8 +143,8 @@ impl<R: Router + 'static> RouterFactory for RouterFactoryFor<R> {
     fn build(
         &self,
         options: &VectorOptions,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<BuiltRouter> {
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Box<dyn Router>> {
         R::build_router(options, centroids)
     }
 
@@ -300,9 +301,9 @@ mod tests {
     impl Router for TestRouter {
         fn build_router(
             _options: &VectorOptions,
-            _centroids: &IvfCentroids,
-        ) -> crate::Result<BuiltRouter> {
-            Ok(BuiltRouter::new(TestRouter { cluster: 0 }))
+            _centroids: &mut IvfCentroids,
+        ) -> crate::Result<Box<dyn Router>> {
+            Ok(Box::new(TestRouter { cluster: 0 }))
         }
 
         fn id(&self) -> &'static str {
@@ -364,8 +365,8 @@ mod tests {
         fn build(
             &self,
             options: &VectorOptions,
-            centroids: &IvfCentroids,
-        ) -> crate::Result<BuiltRouter> {
+            centroids: &mut IvfCentroids,
+        ) -> crate::Result<Box<dyn Router>> {
             TestRouter::build_router(options, centroids)
         }
 
