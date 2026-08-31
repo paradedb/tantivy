@@ -252,6 +252,10 @@ impl Weight for InvertedIndexRangeWeight {
         }
         Ok(Explanation::new("RangeQuery", 1.0))
     }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        Ok(1.0 * boost)
+    }
 }
 
 #[cfg(test)]

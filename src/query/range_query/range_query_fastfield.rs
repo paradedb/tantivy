@@ -279,6 +279,10 @@ impl Weight for FastFieldRangeWeight {
 
         Ok(explanation)
     }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        Ok(1.0 * boost)
+    }
 }
 
 /// On numerical fields the column type may not match the user provided one.

@@ -115,6 +115,10 @@ where
             ))
         }
     }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        Ok(1.0 * boost)
+    }
 }
 
 fn automaton_score<A>(automaton: &A, state: A::State) -> f32

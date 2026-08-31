@@ -90,6 +90,10 @@ impl Weight for ConstWeight {
     fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
         self.weight.count(reader)
     }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        Ok(self.score * boost)
+    }
 }
 
 /// Wraps a `DocSet` and simply returns a constant `Scorer`.

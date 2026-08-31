@@ -43,6 +43,14 @@ impl Weight for EmptyWeight {
     fn explain(&self, _reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
         Err(does_not_match(doc))
     }
+
+    fn max_score(&self, _reader: &SegmentReader, _boost: Score) -> crate::Result<Score> {
+        Ok(0.0)
+    }
+
+    fn index_max_score(&self, _boost: Score) -> crate::Result<Score> {
+        Ok(0.0)
+    }
 }
 
 /// `EmptyScorer` is a dummy `Scorer` in which no document matches.

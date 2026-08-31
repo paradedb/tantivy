@@ -26,6 +26,16 @@ impl Scorer for Box<dyn Scorer> {
 
 pub trait PruningScorer: Scorer {
     fn set_threshold(&mut self, score: Score);
+
+    // TODO(Proposal B): Support dynamic remaining max score bounds on PruningScorer:
+    // fn max_score(&self) -> Score { Score::MAX }
+    //
+    // While `Weight::max_score` / `Weight::index_max_score` (Proposal A) provides static
+    // upper bounds at query initialization and per-segment opening, exposing the dynamic
+    // maximum possible score of remaining un-evaluated documents on `PruningScorer`
+    // allows bidirectional threshold tightening during Top-K join execution. As one scan
+    // passes its highest-scoring blocks, its remaining max score drops, allowing the
+    // partner scan's pruning threshold to dynamically rise and skip more blocks via BMW.
 }
 
 impl_downcast!(PruningScorer);

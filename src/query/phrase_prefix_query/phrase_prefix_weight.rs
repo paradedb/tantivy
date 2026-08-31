@@ -140,6 +140,14 @@ impl Weight for PhrasePrefixWeight {
         }
         Ok(explanation)
     }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
+            Ok(similarity_weight.max_score() * boost)
+        } else {
+            Ok(1.0 * boost)
+        }
+    }
 }
 
 #[cfg(test)]

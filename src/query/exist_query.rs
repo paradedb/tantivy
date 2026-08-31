@@ -172,6 +172,10 @@ impl Weight for ExistsWeight {
         }
         Ok(Explanation::new("ExistsQuery", 1.0))
     }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        Ok(1.0 * boost)
+    }
 }
 
 pub(crate) struct ExistsDocSet {

@@ -24,6 +24,11 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
 
     /// Returns the aggregate score.
     fn score(&self) -> Score;
+
+    /// Combines an array of upper bounds into an overall upper bound for this combiner.
+    fn combine_max_scores(&self, max_scores: &[Score]) -> Score {
+        max_scores.iter().copied().sum()
+    }
 }
 
 /// Just ignores scores. The `DoNothingCombiner` does not
@@ -40,6 +45,10 @@ impl ScoreCombiner for DoNothingCombiner {
 
     #[inline]
     fn score(&self) -> Score {
+        1.0
+    }
+
+    fn combine_max_scores(&self, _max_scores: &[Score]) -> Score {
         1.0
     }
 }
@@ -102,5 +111,18 @@ impl ScoreCombiner for DisjunctionMaxCombiner {
     #[inline]
     fn score(&self) -> Score {
         self.max + (self.sum - self.max) * self.tie_breaker
+    }
+
+    fn combine_max_scores(&self, max_scores: &[Score]) -> Score {
+        if max_scores.is_empty() {
+            return 0.0;
+        }
+        let mut max = 0.0;
+        let mut sum = 0.0;
+        for &s in max_scores {
+            max = Score::max(s, max);
+            sum += s;
+        }
+        max + (sum - max) * self.tie_breaker
     }
 }

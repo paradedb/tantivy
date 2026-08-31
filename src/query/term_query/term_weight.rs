@@ -163,6 +163,23 @@ impl Weight for TermWeight {
 
         Ok(())
     }
+
+    fn max_score(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Score> {
+        let field = self.term.field();
+        let inverted_index = reader.inverted_index(field)?;
+        if inverted_index.get_term_info(&self.term)?.is_none() {
+            return Ok(0.0);
+        }
+        self.index_max_score(boost)
+    }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        if self.scoring_enabled {
+            Ok(self.similarity_weight.max_score() * boost)
+        } else {
+            Ok(1.0 * boost)
+        }
+    }
 }
 
 impl TermWeight {

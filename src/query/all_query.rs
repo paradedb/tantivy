@@ -36,6 +36,10 @@ impl Weight for AllWeight {
         }
         Ok(Explanation::new("AllQuery", 1.0))
     }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        Ok(1.0 * boost)
+    }
 }
 
 /// Scorer associated with the `AllQuery` query.

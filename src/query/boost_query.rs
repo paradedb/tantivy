@@ -100,6 +100,14 @@ impl Weight for BoostWeight {
     fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
         self.weight.count(reader)
     }
+
+    fn max_score(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Score> {
+        self.weight.max_score(reader, boost * self.boost)
+    }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        self.weight.index_max_score(boost * self.boost)
+    }
 }
 
 pub(crate) struct BoostScorer<S: Scorer> {

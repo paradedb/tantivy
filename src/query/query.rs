@@ -7,7 +7,7 @@ use super::Weight;
 use crate::core::searcher::Searcher;
 use crate::query::Explanation;
 use crate::schema::{Field, Schema};
-use crate::{DocAddress, SegmentReader, Term};
+use crate::{DocAddress, Score, SegmentReader, Term};
 
 /// Argument used in `Query::weight(..)`
 #[derive(Copy, Clone)]
@@ -151,6 +151,23 @@ pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
         Ok(result)
     }
 
+    /// Returns an upper bound on the maximum score across all segments in the index.
+    fn index_max_score(&self, searcher: &Searcher) -> crate::Result<Score> {
+        let weight = self.weight(EnableScoring::enabled_from_searcher(searcher))?;
+        weight.index_max_score(1.0)
+    }
+
+    /// Returns an upper bound on the maximum score any document in the given segment
+    /// can achieve for this query.
+    fn max_score(
+        &self,
+        searcher: &Searcher,
+        segment_reader: &SegmentReader,
+    ) -> crate::Result<Score> {
+        let weight = self.weight(EnableScoring::enabled_from_searcher(searcher))?;
+        weight.max_score(segment_reader, 1.0)
+    }
+
     /// Extract all of the terms associated with the query and pass them to the
     /// given closure.
     ///
@@ -189,6 +206,18 @@ impl Query for Box<dyn Query> {
 
     fn count(&self, searcher: &Searcher) -> crate::Result<usize> {
         self.as_ref().count(searcher)
+    }
+
+    fn index_max_score(&self, searcher: &Searcher) -> crate::Result<Score> {
+        self.as_ref().index_max_score(searcher)
+    }
+
+    fn max_score(
+        &self,
+        searcher: &Searcher,
+        segment_reader: &SegmentReader,
+    ) -> crate::Result<Score> {
+        self.as_ref().max_score(searcher, segment_reader)
     }
 
     fn query_terms(

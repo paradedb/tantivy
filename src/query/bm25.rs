@@ -205,8 +205,12 @@ impl Bm25Weight {
         self.weight * self.tf_factor(fieldnorm_id, term_freq)
     }
 
+    /// Returns an upper bound on the maximum possible BM25 score.
+    ///
+    /// Since `tf / (tf + norm) <= 1.0`, the theoretical upper bound is `self.weight`
+    /// which equals `idf * (1.0 + k1)`.
     pub fn max_score(&self) -> Score {
-        self.score(255u8, 2_013_265_944)
+        self.weight
     }
 
     #[inline]

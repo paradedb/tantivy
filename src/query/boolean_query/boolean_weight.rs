@@ -672,6 +672,46 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         }
         Ok(())
     }
+
+    fn max_score(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Score> {
+        if self.weights.is_empty() {
+            return Ok(0.0);
+        }
+        if !self.scoring_enabled {
+            return Ok(1.0 * boost);
+        }
+        let mut sub_max_scores = Vec::new();
+        for (occur, subweight) in &self.weights {
+            if is_include_occur(*occur) {
+                sub_max_scores.push(subweight.max_score(reader, boost)?);
+            }
+        }
+        if sub_max_scores.is_empty() {
+            return Ok(0.0);
+        }
+        let combiner = (self.score_combiner_fn)();
+        Ok(combiner.combine_max_scores(&sub_max_scores))
+    }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        if self.weights.is_empty() {
+            return Ok(0.0);
+        }
+        if !self.scoring_enabled {
+            return Ok(1.0 * boost);
+        }
+        let mut sub_max_scores = Vec::new();
+        for (occur, subweight) in &self.weights {
+            if is_include_occur(*occur) {
+                sub_max_scores.push(subweight.index_max_score(boost)?);
+            }
+        }
+        if sub_max_scores.is_empty() {
+            return Ok(0.0);
+        }
+        let combiner = (self.score_combiner_fn)();
+        Ok(combiner.combine_max_scores(&sub_max_scores))
+    }
 }
 
 fn is_include_occur(occur: Occur) -> bool {

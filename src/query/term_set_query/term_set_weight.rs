@@ -371,6 +371,14 @@ impl Weight for TermSetWeight {
         }
         Ok(Explanation::new("TermSetScorer", scorer.score()))
     }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        if self.terms_bytes.is_empty() {
+            Ok(0.0)
+        } else {
+            Ok(1.0 * boost)
+        }
+    }
 }
 
 impl TermSetWeight {

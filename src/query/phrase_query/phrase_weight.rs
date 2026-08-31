@@ -117,6 +117,27 @@ impl Weight for PhraseWeight {
         }
         Ok(explanation)
     }
+
+    fn max_score(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Score> {
+        for &(_, ref term) in &self.phrase_terms {
+            if reader
+                .inverted_index(term.field())?
+                .get_term_info(term)?
+                .is_none()
+            {
+                return Ok(0.0);
+            }
+        }
+        self.index_max_score(boost)
+    }
+
+    fn index_max_score(&self, boost: Score) -> crate::Result<Score> {
+        if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
+            Ok(similarity_weight.max_score() * boost)
+        } else {
+            Ok(1.0 * boost)
+        }
+    }
 }
 
 #[cfg(test)]
