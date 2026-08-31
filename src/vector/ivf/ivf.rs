@@ -4,15 +4,15 @@
 //! centroids, L2 over L1's, and so on. Each list is a contiguous row
 //! range in [`IvfIndex::offsets`].
 //!
-//! [`StackedIvfIndex::build`] creates one level. [`StackedIvfIndex::add_level`]
+//! [`InMemoryStackedIvf::build`] creates one level. [`InMemoryStackedIvf::add_level`]
 //! hangs a parent on this level and reorders this level's centroids and
 //! offset ranges so parent member `i` is list `i`. Member rows stay put;
 //! a later parent only shuffles this level's metadata. [`IvfIndexBuilder`]
 //! walks up, calling `add_level` until the top has at most
 //! `branching_factor` lists.
 //!
-//! Search works on any [`VectorArena`]. Build and serialize require
-//! owned [`FlatStore`]s. [`PersistedStackedIvf::open`] is search-only.
+//! Search works on any [`VectorArena`]. Build and payload serialization require
+//! owned [`InMemoryStore`]s. [`LazyStackedIvf::open`] is search-only.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -105,7 +105,7 @@ impl IvfConfig {
     }
 }
 
-/// No centroids at the level [`StackedIvfIndex::add_level`] would extend.
+/// No centroids at the level [`InMemoryStackedIvf::add_level`] would extend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddLevelError {
     Empty,
@@ -125,17 +125,17 @@ impl std::error::Error for AddLevelError {}
 
 /// Owned row-major `f32` matrix.
 #[derive(Clone, Debug)]
-pub struct FlatStore {
+pub struct InMemoryStore {
     data: Vec<f32>,
     dim: usize,
 }
 
-impl FlatStore {
+impl InMemoryStore {
     /// Row-major `n × dim` matrix. Panics if `data.len()` is not a multiple of `dim`.
     pub fn new(data: Vec<f32>, dim: usize) -> Self {
         assert!(dim > 0, "dim must be positive");
         assert_eq!(data.len() % dim, 0, "data length must be a multiple of dim");
-        FlatStore { data, dim }
+        InMemoryStore { data, dim }
     }
 
     pub fn as_slice(&self) -> &[f32] {
@@ -155,7 +155,7 @@ impl FlatStore {
     }
 }
 
-impl Deref for FlatStore {
+impl Deref for InMemoryStore {
     type Target = [f32];
 
     fn deref(&self) -> &[f32] {
@@ -213,7 +213,7 @@ impl IvfLevelClusterer for SuperKMeansLevelClusterer {
 ///
 /// List `j` is `vectors` rows `offsets[j].0..offsets[j].1`. Search is
 /// available for any [`VectorArena`]; [`build`](IvfIndex::build) and
-/// [`add_level`](IvfIndex::add_level) require [`FlatStore`].
+/// [`add_level`](IvfIndex::add_level) require [`InMemoryStore`].
 pub struct IvfIndex<C, M> {
     pub config: IvfConfig,
     pub parent: Option<Box<IvfIndex<C, C>>>,
@@ -225,21 +225,21 @@ pub struct IvfIndex<C, M> {
 }
 
 /// Owned stacked IVF (`build` / `add_level` / `serialize`).
-pub type StackedIvfIndex = IvfIndex<FlatStore, FlatStore>;
+pub type InMemoryStackedIvf = IvfIndex<InMemoryStore, InMemoryStore>;
 
 /// File-backed stacked IVF (`open` / search only).
-pub type PersistedStackedIvf = IvfIndex<SliceStore, SliceStore>;
+pub type LazyStackedIvf = IvfIndex<LazyStore, LazyStore>;
 
 /// File-backed row-major `f32` matrix.
-pub struct SliceStore {
+pub struct LazyStore {
     arena: FileSliceArena<f32>,
     dim: usize,
 }
 
-impl SliceStore {
+impl LazyStore {
     /// Wraps `rows` (row-major `n × dim` little-endian `f32`s).
     pub fn new(rows: FileSlice, dim: usize) -> Self {
-        SliceStore {
+        LazyStore {
             arena: FileSliceArena::new(rows),
             dim,
         }
@@ -254,7 +254,7 @@ impl SliceStore {
     }
 }
 
-impl VectorArena for SliceStore {
+impl VectorArena for LazyStore {
     type Elem = f32;
 
     #[inline]
@@ -272,6 +272,95 @@ impl VectorArena for SliceStore {
     ) -> Similarity {
         self.arena.similarity(metric, dim, index, query)
     }
+}
+
+trait SerializableStore {
+    fn len(&self) -> usize;
+    fn serialize_rows<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()>;
+}
+
+impl SerializableStore for InMemoryStore {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn serialize_rows<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+        for &value in self.as_slice() {
+            value.serialize(out)?;
+        }
+        Ok(())
+    }
+}
+
+impl SerializableStore for LazyStore {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn serialize_rows<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+        for chunk in self.arena.slice.stream_file_chunks() {
+            out.write_all(&chunk?)?;
+        }
+        Ok(())
+    }
+}
+
+fn serialize_stacked_index<C, M, W>(index: &IvfIndex<C, M>, out: &mut W) -> io::Result<()>
+where
+    C: SerializableStore,
+    W: Write + ?Sized,
+{
+    let mut num_levels = 1usize;
+    let mut parent = index.parent.as_deref();
+    while let Some(level) = parent {
+        num_levels += 1;
+        parent = level.parent.as_deref();
+    }
+
+    let mut topology = Vec::new();
+    u32::try_from(num_levels)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "level count exceeds u32"))?
+        .serialize(&mut topology)?;
+
+    fn serialize_level<C, M>(index: &IvfIndex<C, M>, out: &mut Vec<u8>) -> io::Result<()>
+    where C: SerializableStore {
+        let nlist = index.centroids.len();
+        if index.offsets.len() != nlist {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "level has {} offset ranges for {nlist} lists",
+                    index.offsets.len()
+                ),
+            ));
+        }
+        u32::try_from(nlist)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nlist exceeds u32"))?
+            .serialize(out)?;
+        for &(start, end) in &index.offsets {
+            start.serialize(out)?;
+            end.serialize(out)?;
+        }
+        Ok(())
+    }
+
+    serialize_level(index, &mut topology)?;
+    let mut parent = index.parent.as_deref();
+    while let Some(level) = parent {
+        serialize_level(level, &mut topology)?;
+        parent = level.parent.as_deref();
+    }
+
+    let centroids_byte_offset = (mem::size_of::<u64>() + topology.len()) as u64;
+    centroids_byte_offset.serialize(out)?;
+    out.write_all(&topology)?;
+    index.centroids.serialize_rows(out)?;
+    let mut parent = index.parent.as_deref();
+    while let Some(level) = parent {
+        level.centroids.serialize_rows(out)?;
+        parent = level.parent.as_deref();
+    }
+    Ok(())
 }
 
 /// Counting sort into list order. `perm[old] = new_row`.
@@ -310,8 +399,8 @@ fn permute_rows(data: &[f32], dim: usize, perm: &[u32]) -> Vec<f32> {
 /// Builds a stacked IVF, hanging parents until the top has at most
 /// [`IvfConfig::branching_factor`] lists.
 ///
-/// [`StackedIvfIndex::build`] is one level. The builder walks up, calling
-/// [`StackedIvfIndex::add_level`] on each current top. Only L0's member
+/// [`InMemoryStackedIvf::build`] is one level. The builder walks up, calling
+/// [`InMemoryStackedIvf::add_level`] on each current top. Only L0's member
 /// permutation is returned — later levels shuffle metadata, not L0 rows.
 pub struct IvfIndexBuilder<'a, Cl> {
     data: Vec<f32>,
@@ -332,14 +421,14 @@ impl<'a, Cl: IvfLevelClusterer<Elem = f32>> IvfIndexBuilder<'a, Cl> {
         }
     }
 
-    /// Clusters L0, then walks up calling [`StackedIvfIndex::add_level`]
+    /// Clusters L0, then walks up calling [`InMemoryStackedIvf::add_level`]
     /// while the current top's `nlist` is greater than `branching_factor`.
     ///
     /// Returns the stacked index and L0's member permutation
     /// (`perm[old] = new`).
-    pub fn build(self) -> (StackedIvfIndex, Vec<u32>) {
+    pub fn build(self) -> (InMemoryStackedIvf, Vec<u32>) {
         let (mut index, perm) =
-            StackedIvfIndex::build(self.data, self.n, self.dim, self.clusterer, self.config);
+            InMemoryStackedIvf::build(self.data, self.n, self.dim, self.clusterer, self.config);
         let parent_cfg = index.config.for_parent();
         let branching_factor = index.config.branching_factor;
         let mut cur = &mut index;
@@ -352,14 +441,14 @@ impl<'a, Cl: IvfLevelClusterer<Elem = f32>> IvfIndexBuilder<'a, Cl> {
     }
 }
 
-impl IvfIndex<FlatStore, FlatStore> {
+impl IvfIndex<InMemoryStore, InMemoryStore> {
     fn empty(config: IvfConfig, dim: usize) -> Self {
         Self {
             config,
             parent: None,
             offsets: Vec::new(),
-            centroids: FlatStore::new(Vec::new(), dim),
-            vectors: FlatStore::new(Vec::new(), dim),
+            centroids: InMemoryStore::new(Vec::new(), dim),
+            vectors: InMemoryStore::new(Vec::new(), dim),
         }
     }
 
@@ -376,8 +465,8 @@ impl IvfIndex<FlatStore, FlatStore> {
         let (member_perm, offsets) = cluster_sort(&assignments, nlist);
         let members = permute_rows(&members, dim, &member_perm);
         self.offsets = offsets;
-        self.centroids = FlatStore::new(centroids, dim);
-        self.vectors = FlatStore::new(members, dim);
+        self.centroids = InMemoryStore::new(centroids, dim);
+        self.vectors = InMemoryStore::new(members, dim);
         member_perm
     }
 
@@ -395,7 +484,7 @@ impl IvfIndex<FlatStore, FlatStore> {
             centroids[new * dim..(new + 1) * dim].copy_from_slice(&src[old * dim..(old + 1) * dim]);
             offsets[new] = self.offsets[old];
         }
-        self.centroids = FlatStore::new(centroids, dim);
+        self.centroids = InMemoryStore::new(centroids, dim);
         self.offsets = offsets;
     }
 
@@ -448,48 +537,14 @@ impl IvfIndex<FlatStore, FlatStore> {
 
     /// Writes offsets and centroid rows for every level (L0, L1, …).
     /// L0 member vectors and [`IvfConfig`] are not written.
-    pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
-        let mut levels: Vec<&StackedIvfIndex> = vec![self];
-        while let Some(parent) = levels.last().and_then(|level| level.parent.as_deref()) {
-            levels.push(parent);
-        }
-
-        let mut topology = Vec::new();
-        u32::try_from(levels.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "level count exceeds u32"))?
-            .serialize(&mut topology)?;
-        for level in &levels {
-            let nlist = level.centroids.len();
-            if level.offsets.len() != nlist {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "level has {} offset ranges for {nlist} lists",
-                        level.offsets.len()
-                    ),
-                ));
-            }
-            u32::try_from(nlist)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nlist exceeds u32"))?
-                .serialize(&mut topology)?;
-            for &(start, end) in &level.offsets {
-                start.serialize(&mut topology)?;
-                end.serialize(&mut topology)?;
-            }
-        }
-
-        let centroids_byte_offset = (mem::size_of::<u64>() + topology.len()) as u64;
-        centroids_byte_offset.serialize(out)?;
-        out.write_all(&topology)?;
-        for level in &levels {
-            for &value in level.centroids.as_slice() {
-                value.serialize(out)?;
-            }
-        }
-        Ok(())
+    pub(crate) fn serialize_router_payload<W: Write + ?Sized>(
+        &self,
+        out: &mut W,
+    ) -> io::Result<()> {
+        serialize_stacked_index(self, out)
     }
 
-    /// Rebuilds an owned index from [`serialize`].
+    /// Rebuilds an owned index from [`serialize_router_payload`](Self::serialize_router_payload).
     ///
     /// `members` are the L0 rows in serialized order. `config` applies to
     /// L0; parents use [`PARENT_NPROBE_FRACTION`].
@@ -539,7 +594,7 @@ impl IvfIndex<FlatStore, FlatStore> {
             level_centroids.push(values);
         }
 
-        let mut index: Option<Box<StackedIvfIndex>> = None;
+        let mut index: Option<Box<InMemoryStackedIvf>> = None;
         for level in (0..level_topology.len()).rev() {
             let (nlist, offsets) = &level_topology[level];
             let level_members = if level == 0 {
@@ -562,8 +617,8 @@ impl IvfIndex<FlatStore, FlatStore> {
                 },
                 parent: index,
                 offsets: offsets.clone(),
-                centroids: FlatStore::new(level_centroids[level].clone(), dim),
-                vectors: FlatStore::new(level_members, dim),
+                centroids: InMemoryStore::new(level_centroids[level].clone(), dim),
+                vectors: InMemoryStore::new(level_members, dim),
             }));
         }
         Ok(*index.expect("at least one level"))
@@ -617,7 +672,7 @@ fn ranges_cover_members(ranges: &[(u64, u64)], n: usize) -> bool {
     packed.windows(2).all(|pair| pair[0].1 == pair[1].0)
 }
 
-impl PersistedStackedIvf {
+impl LazyStackedIvf {
     /// Opens a serialized index for search.
     ///
     /// `member_rows` are the L0 vectors in serialized order. `config` is
@@ -679,7 +734,7 @@ impl PersistedStackedIvf {
             start = end;
         }
 
-        let mut index: Option<Box<PersistedStackedIvf>> = None;
+        let mut index: Option<Box<LazyStackedIvf>> = None;
         for level in (0..level_topology.len()).rev() {
             let (_, offsets) = &level_topology[level];
             let (level_members, level_member_count) = if level == 0 {
@@ -704,11 +759,18 @@ impl PersistedStackedIvf {
                 },
                 parent: index,
                 offsets: offsets.clone(),
-                centroids: SliceStore::new(centroid_slices[level].clone(), dim),
-                vectors: SliceStore::new(level_members, dim),
+                centroids: LazyStore::new(centroid_slices[level].clone(), dim),
+                vectors: LazyStore::new(level_members, dim),
             }));
         }
         Ok(*index.expect("at least one level"))
+    }
+
+    pub(crate) fn serialize_router_payload<W: Write + ?Sized>(
+        &self,
+        out: &mut W,
+    ) -> io::Result<()> {
+        serialize_stacked_index(self, out)
     }
 }
 
@@ -818,8 +880,8 @@ mod tests {
         dim: usize,
         clusterer: &SuperKMeansLevelClusterer,
         branching_factor: usize,
-    ) -> (StackedIvfIndex, Vec<u32>) {
-        let (mut index, perm) = StackedIvfIndex::build(
+    ) -> (InMemoryStackedIvf, Vec<u32>) {
+        let (mut index, perm) = InMemoryStackedIvf::build(
             data.to_vec(),
             n,
             dim,
@@ -840,7 +902,7 @@ mod tests {
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
         let (index, member_perm) =
-            StackedIvfIndex::build(data, n, dim, &clusterer, IvfConfig::new(4));
+            InMemoryStackedIvf::build(data, n, dim, &clusterer, IvfConfig::new(4));
         assert!(index.nlist() > 1);
         assert_eq!(index.vectors.len(), n);
         assert_eq!(member_perm.len(), n);
@@ -897,8 +959,8 @@ mod tests {
         let (index, _perm) = build_with_parent(&data, n, dim, &clusterer, 2);
 
         let mut bytes = Vec::new();
-        index.serialize(&mut bytes).unwrap();
-        let decoded = StackedIvfIndex::deserialize_owned(
+        index.serialize_router_payload(&mut bytes).unwrap();
+        let decoded = InMemoryStackedIvf::deserialize_owned(
             &bytes,
             index.vectors.as_slice().to_vec(),
             dim,
@@ -940,7 +1002,7 @@ mod tests {
         let n = 64;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (mut index, _) = StackedIvfIndex::build(data, n, dim, &clusterer, IvfConfig::new(2));
+        let (mut index, _) = InMemoryStackedIvf::build(data, n, dim, &clusterer, IvfConfig::new(2));
         assert_eq!(index.depth(), 1);
 
         let parent_cfg = index.config.for_parent();
@@ -964,7 +1026,7 @@ mod tests {
         let n = 64;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (mut index, _) = StackedIvfIndex::build(data, n, dim, &clusterer, IvfConfig::new(2));
+        let (mut index, _) = InMemoryStackedIvf::build(data, n, dim, &clusterer, IvfConfig::new(2));
         let parent_cfg = index.config.for_parent();
         index.add_level(&clusterer, parent_cfg.clone()).expect("L1");
         let members = index.vectors.as_slice().to_vec();
@@ -1002,7 +1064,7 @@ mod tests {
     #[test]
     fn test_add_level_errors_when_empty() {
         let dim = 2;
-        let mut index = StackedIvfIndex::empty(IvfConfig::default(), dim);
+        let mut index = InMemoryStackedIvf::empty(IvfConfig::default(), dim);
         let clusterer = SuperKMeansLevelClusterer::default();
         assert_eq!(
             index.add_level(&clusterer, IvfConfig::default()),
@@ -1019,14 +1081,14 @@ mod tests {
         let (index, _perm) = build_with_parent(&data, n, dim, &clusterer, 2);
 
         let mut slot = Vec::new();
-        index.serialize(&mut slot).unwrap();
+        index.serialize_router_payload(&mut slot).unwrap();
         let member_bytes: Vec<u8> = index
             .vectors
             .as_slice()
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        let opened = PersistedStackedIvf::open(
+        let opened = LazyStackedIvf::open(
             FileSlice::from(slot),
             FileSlice::from(member_bytes),
             dim,
@@ -1059,9 +1121,9 @@ mod tests {
         let n = 32;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (index, _perm) = StackedIvfIndex::build(data, n, dim, &clusterer, IvfConfig::new(2));
+        let (index, _perm) = InMemoryStackedIvf::build(data, n, dim, &clusterer, IvfConfig::new(2));
         let mut slot = Vec::new();
-        index.serialize(&mut slot).unwrap();
+        index.serialize_router_payload(&mut slot).unwrap();
         let member_bytes: Vec<u8> = index
             .vectors
             .as_slice()
@@ -1070,7 +1132,7 @@ mod tests {
             .collect();
 
         let truncated = slot[..slot.len() - 4].to_vec();
-        assert!(PersistedStackedIvf::open(
+        assert!(LazyStackedIvf::open(
             FileSlice::from(truncated),
             FileSlice::from(member_bytes.clone()),
             dim,
@@ -1080,7 +1142,7 @@ mod tests {
 
         // Wrong member count: offsets no longer cover the members.
         let short_members = member_bytes[..member_bytes.len() - dim * 4].to_vec();
-        assert!(PersistedStackedIvf::open(
+        assert!(LazyStackedIvf::open(
             FileSlice::from(slot),
             FileSlice::from(short_members),
             dim,

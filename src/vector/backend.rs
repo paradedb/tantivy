@@ -23,10 +23,10 @@ use super::bounds::{
 };
 use super::distance::norm_squared_wide;
 use super::index_reader::VectorIndexReader;
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
+use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, Workspace};
 use super::prepared::PreparedQuery;
 use super::tie_break::NoTieBreak;
-use super::VectorElement;
+use super::{IvfSearchMetrics, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::fastfield::AliveBitSet;

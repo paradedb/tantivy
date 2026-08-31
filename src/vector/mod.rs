@@ -24,6 +24,7 @@ mod tie_break;
 
 pub mod flat;
 pub mod ivf;
+pub mod router;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -43,18 +44,22 @@ pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
 pub use flat::FlatVecWriter;
+pub use header::VectorFileVersion;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
-    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, BuiltRouter, Candidate, ClusterId,
-    FlatStore, Graph, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex, IvfIndexBuilder,
-    IvfLevelClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfSearchMetrics,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, MultiLevelIvf,
-    NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId, PersistedStackedIvf,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, RoutingIndex, SearchIterator,
-    SearchTerminationReason, SliceStore, StackedIvfIndex, SuperKMeansLevelClusterer, Workspace,
+    BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, BuiltRouter, Candidate, ClusterId, Graph,
+    InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex,
+    IvfIndexBuilder, IvfLevelClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
+    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, LazyStackedIvf, LazyStore,
+    MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
+    RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
+    SuperKMeansLevelClusterer, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
+pub use router::{
+    IvfSearchMetrics, Router, RouterOpenContext, RouterOpenFn, RouterRanking, RouterSearchContext,
+};
 pub use tie_break::NoTieBreak;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`

@@ -21,7 +21,7 @@ pub(crate) const HEADER_LEN: usize = 4;
 
 /// On-disk format version of a vector segment file (`.vec` or `.centroids`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum VectorFileVersion {
+pub enum VectorFileVersion {
     V1 = 1,
     /// `.centroids` carries per-cluster centroid bounds (slot `[3]`) as a
     /// REQUIRED slot: the bounds gate certifies skips against it, and a
@@ -33,10 +33,8 @@ pub(crate) enum VectorFileVersion {
     /// unaffected by the change and V1 `.vec` files stay readable — flat
     /// segments have no clusters and no bounds.
     V2 = 2,
-    /// `.centroids` slot `[2]` carries a tagged router: a kind byte followed
-    /// by the variant payload (see [`RoutingIndex`](crate::vector::ivf::RoutingIndex)).
-    /// V2 files keep the bare graph layout in that slot; the file version
-    /// selects the parser — the kind byte is never sniffed on V2 payloads.
+    /// `.centroids` slot `[2]` carries a self-describing router envelope.
+    /// V2 files keep the bare graph layout in that slot.
     V3 = 3,
 }
 
@@ -50,12 +48,8 @@ pub(crate) mod centroid_slot {
     pub(crate) const OFFSETS: usize = 1;
     /// The router. OPTIONAL: the write side skips it for degenerate centroid
     /// counts, and its absence is normal. At V2 the payload is a bare RNG
-    /// graph; at V3+ it is a tagged [`RoutingIndex`](crate::vector::ivf::RoutingIndex).
+    /// graph; at V3+ it is a self-describing router envelope.
     pub(crate) const ROUTER: usize = 2;
-    /// Alias kept for call sites that still name the graph router.
-    pub(crate) const GRAPH: usize = ROUTER;
-    /// Alias for stacked router writes (same slot index, kind byte disambiguates).
-    pub(crate) const STACKED: usize = ROUTER;
     /// Per-cluster centroid bounds. MANDATORY from V2 on: a V2+ file
     /// without this slot is corrupt, not old.
     pub(crate) const BOUNDS: usize = 3;

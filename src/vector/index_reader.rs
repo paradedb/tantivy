@@ -138,13 +138,8 @@ impl VectorIndexReader {
                                 entry.name()
                             )));
                         }
-                        Some((
-                            centroids_version,
-                            centroids,
-                            offsets,
-                            composite.open_read_with_idx(field, centroid_slot::ROUTER),
-                            bounds,
-                        ))
+                        let router = composite.open_read_with_idx(field, centroid_slot::ROUTER);
+                        Some((centroids_version, centroids, offsets, router, bounds))
                     }
                     _ => None,
                 }
@@ -157,9 +152,17 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((version, centroids, offsets, router, bounds))) => Some(
-                IvfIndex::open(version, &options, centroids, offsets, router, bounds)?,
-            ),
+            (IdMap::Explicit(_), Some((version, centroids, offsets, router, bounds))) => {
+                Some(IvfIndex::open(
+                    version,
+                    &options,
+                    centroids,
+                    offsets,
+                    router,
+                    segment_reader.ivf_router_opener(),
+                    bounds,
+                )?)
+            }
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
                     "vector field {:?} has cluster-sorted rows but no `.centroids` data",

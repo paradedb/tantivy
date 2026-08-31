@@ -13,9 +13,8 @@
 //!     rows in the router's canonical cluster-sorted order when a stacked
 //!     router was built
 //! [1] cluster_offsets (u64[N+1], prefix sum)
-//! [2] the router (see [`RoutingIndex`]); at V2 a bare RNG graph; at V3 a
-//!     tagged `[u8 kind][payload]` envelope. Absent for degenerate centroid
-//!     counts — routing then falls back to a linear scan of the centroids.
+//! [2] a self-describing router envelope. V2 files carry a bare RNG graph.
+//!     Absent for degenerate centroid counts, which use exact routing.
 //! [3] centroid bounds, REQUIRED from V2 on: a segment-level BoundKind byte,
 //!     then N · stride(kind) f32s in cluster order — for Ball, one f32 per
 //!     cluster: max ||x - c|| over the cluster's members' stored rows against
@@ -28,7 +27,7 @@
 //! optional slot and an older segment simply lacks it. Slot `[2]` works
 //! that way. Slot `[3]` does not, which is why it costs a generation:
 //! absence would have to mean "no bounds", and a silently absent bound is
-//! indistinguishable from a zero one. New segments stamp `V3` with a tagged
+//! indistinguishable from a zero one. New segments write a self-describing
 //! router in slot `[2]`; V2 files keep the bare graph layout there. A V1 file
 //! (shipped, and legitimately bounds-less) still opens: its clusters get
 //! SATURATED bounds (`f32::INFINITY` — always probe), so old segments stay
@@ -39,207 +38,14 @@ use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
-use super::graph::{
-    Candidate, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
-    RelativeNeighborhoodGraph, ResumableSearchIterator, Workspace,
-};
-use super::ivf::{IvfConfig as StackedIvfConfig, PersistedStackedIvf, StackedIvfIndex};
+use super::graph::Workspace;
 use crate::directory::FileSlice;
-use crate::schema::{Metric, VectorDType, VectorOptions};
+use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
-use crate::vector::{BoundKind, BoundStore, FileSliceArena, VectorArena};
-
-/// Discriminant for a tagged router in `.centroids` slot `[2]` at V3+.
-#[repr(u8)]
-enum RoutingIndexKind {
-    Graph = 0,
-    /// Multi-level stacked IVF; parsed by later stack commits.
-    Stacked = 1,
-}
-
-impl RoutingIndexKind {
-    fn from_code(code: u8) -> io::Result<Self> {
-        match code {
-            0 => Ok(RoutingIndexKind::Graph),
-            1 => Ok(RoutingIndexKind::Stacked),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown router kind: {other}"),
-            )),
-        }
-    }
-}
-
-/// The persisted router for one field (`.centroids` slot `[2]`).
-///
-/// At [`VectorFileVersion::V2`](crate::vector::header::VectorFileVersion::V2)
-/// the `Graph` payload is a bare adjacency blob (see
-/// [`Graph::serialize`](super::graph::Graph::serialize)). At V3+ the slot is `[u8 kind][variant
-/// payload…]`; the file version selects the parser — the kind byte is never inferred on V2
-/// payloads.
-pub enum RoutingIndex {
-    /// RNG over the centroids.
-    Graph(RelativeNeighborhoodGraph<FileSliceArena<f32>>),
-    /// Multi-level stacked IVF over the centroids.
-    Stacked(PersistedStackedIvf),
-}
-
-impl RoutingIndex {
-    /// Opens a router from slot `[2]` for the given file generation.
-    pub(crate) fn open(
-        version: VectorFileVersion,
-        slice: FileSlice,
-        centroids_slice: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Self> {
-        match version {
-            VectorFileVersion::V1 => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "V1 `.centroids` files have no router slot",
-            )
-            .into()),
-            VectorFileVersion::V2 => Self::open_v2(slice, centroids_slice, options),
-            VectorFileVersion::V3 => Self::open_v3(slice, centroids_slice, options),
-        }
-    }
-
-    /// Opens a V2 bare-graph router from slot `[2]`.
-    fn open_v2(
-        slice: FileSlice,
-        centroids_slice: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Self> {
-        let vectors = match options.dtype() {
-            VectorDType::F32 => FileSliceArena::<f32>::new(centroids_slice),
-        };
-        let adjacency = slice.read_bytes()?;
-        Ok(RoutingIndex::Graph(RelativeNeighborhoodGraph::open(
-            &adjacency,
-            vectors,
-            options.dim(),
-            options.metric(),
-            NeighborhoodGraphConfig::default(),
-        )?))
-    }
-
-    /// Opens a V3 tagged router from slot `[2]`.
-    fn open_v3(
-        slice: FileSlice,
-        centroids_slice: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Self> {
-        if slice.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "V3 router slot is missing its kind byte",
-            )
-            .into());
-        }
-        let kind_byte = slice.read_byte(0)?;
-        let router_slice = slice.slice_from(1);
-        match RoutingIndexKind::from_code(kind_byte)? {
-            RoutingIndexKind::Graph => {
-                let vectors = match options.dtype() {
-                    VectorDType::F32 => FileSliceArena::<f32>::new(centroids_slice),
-                };
-                Ok(RoutingIndex::Graph(RelativeNeighborhoodGraph::open(
-                    router_slice.read_bytes()?.as_slice(),
-                    vectors,
-                    options.dim(),
-                    options.metric(),
-                    NeighborhoodGraphConfig::default(),
-                )?))
-            }
-            RoutingIndexKind::Stacked => Ok(RoutingIndex::Stacked(PersistedStackedIvf::open(
-                router_slice,
-                centroids_slice,
-                options.dim(),
-                StackedIvfConfig::default(),
-            )?)),
-        }
-    }
-
-    /// Writes a router to slot `[2]` for the given file generation.
-    pub(crate) fn serialize<W: Write + ?Sized>(
-        version: VectorFileVersion,
-        router: &Self,
-        out: &mut W,
-    ) -> io::Result<()> {
-        match version {
-            VectorFileVersion::V1 => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "V1 `.centroids` files have no router slot",
-            )),
-            VectorFileVersion::V2 => router.serialize_v2(out),
-            VectorFileVersion::V3 => router.serialize_v3(out),
-        }
-    }
-
-    /// Serializes an in-memory graph router to slot `[2]` for `version`.
-    pub(crate) fn serialize_graph<S, W: Write + ?Sized>(
-        version: VectorFileVersion,
-        graph: &RelativeNeighborhoodGraph<S>,
-        out: &mut W,
-    ) -> io::Result<()>
-    where
-        S: VectorArena,
-    {
-        match version {
-            VectorFileVersion::V1 => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "V1 `.centroids` files have no router slot",
-            )),
-            VectorFileVersion::V2 => graph.serialize(out),
-            VectorFileVersion::V3 => {
-                (RoutingIndexKind::Graph as u8).serialize(out)?;
-                graph.serialize(out)
-            }
-        }
-    }
-
-    /// Serializes an in-memory stacked router to slot `[2]` for `version`.
-    pub(crate) fn serialize_stacked<W: Write + ?Sized>(
-        version: VectorFileVersion,
-        stacked: &StackedIvfIndex,
-        out: &mut W,
-    ) -> io::Result<()> {
-        match version {
-            VectorFileVersion::V1 | VectorFileVersion::V2 => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stacked router requires V3 `.centroids`",
-            )),
-            VectorFileVersion::V3 => {
-                (RoutingIndexKind::Stacked as u8).serialize(out)?;
-                stacked.serialize(out)
-            }
-        }
-    }
-
-    /// Writes a V2 bare-graph router to slot `[2]`.
-    fn serialize_v2<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
-        match self {
-            RoutingIndex::Graph(graph) => graph.serialize(out),
-            RoutingIndex::Stacked(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stacked router requires V3 `.centroids`",
-            )),
-        }
-    }
-
-    /// Writes a V3 tagged router to slot `[2]`.
-    fn serialize_v3<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
-        match self {
-            RoutingIndex::Graph(graph) => {
-                (RoutingIndexKind::Graph as u8).serialize(out)?;
-                graph.serialize(out)
-            }
-            RoutingIndex::Stacked(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "slice-backed stacked router cannot be re-serialized",
-            )),
-        }
-    }
-}
+use crate::vector::router::{
+    ExactRouter, Router, RouterOpenContext, RouterOpenFn, RouterRanking, RouterSearchContext,
+};
+use crate::vector::{BoundKind, BoundStore};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -259,11 +65,8 @@ pub struct IvfIndex {
     centroids_slice: FileSlice,
     /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
     cluster_offsets: OwnedBytes,
-    dim: usize,
     metric: Metric,
-    /// The persisted router (slot `[2]`). `None` for degenerate centroid
-    /// counts, where routing falls back to a linear scan.
-    router: Option<RoutingIndex>,
+    router: Box<dyn Router>,
     /// Slot `[3]`, pinned: the segment-level bound kind.
     bound_kind: BoundKind,
     /// Slot `[3]`, pinned: the per-cluster bound payload,
@@ -345,12 +148,15 @@ impl IvfIndex {
     /// without it as corrupt. `None` synthesizes SATURATED bounds
     /// (`f32::INFINITY` per cluster): every cluster probes, no skip is ever
     /// certified against data the file doesn't have.
+    /// `router_opener` is selected by the caller and validates that the
+    /// persisted router and `version` are compatible with its implementation.
     pub(crate) fn open(
         version: VectorFileVersion,
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         router_slice: Option<FileSlice>,
+        router_opener: RouterOpenFn,
         bounds_slice: Option<FileSlice>,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -393,14 +199,10 @@ impl IvfIndex {
             .into());
         }
 
+        let router_context = RouterOpenContext::new(centroids_slice.clone(), options.clone());
         let router = match router_slice {
-            Some(slice) => Some(RoutingIndex::open(
-                version,
-                slice,
-                centroids_slice.clone(),
-                options,
-            )?),
-            None => None,
+            Some(slice) => router_opener(version, slice, &router_context)?,
+            None => Box::new(ExactRouter::new(&router_context)),
         };
 
         // P1: bounds slot — one kind byte, then the stride-derived payload.
@@ -453,7 +255,6 @@ impl IvfIndex {
             num_docs,
             centroids_slice,
             cluster_offsets,
-            dim: options.dim(),
             metric: options.metric(),
             router,
             bound_kind,
@@ -475,14 +276,8 @@ impl IvfIndex {
         self.num_centroids
     }
 
-    /// The persisted stacked router (V3 slot `[2]`), when the segment was
-    /// written with one. Parsed at open; [`rank_clusters`](Self::rank_clusters)
-    /// searches it to rank which clusters to probe.
-    pub fn stacked(&self) -> Option<&PersistedStackedIvf> {
-        match self.router.as_ref()? {
-            RoutingIndex::Stacked(stacked) => Some(stacked),
-            RoutingIndex::Graph(_) => None,
-        }
+    pub fn router(&self) -> &dyn Router {
+        self.router.as_ref()
     }
 
     /// Distinct docs with a vector; legacy V2 replication could inflate the
@@ -534,136 +329,15 @@ impl IvfIndex {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
-    /// Clusters to probe for `query`, ranked lazily — a [`ClusterRanking`]
-    /// yielding [`Candidate`]s best routing score first (graph node `c` *is*
-    /// cluster `c`, so `Candidate::node` is the cluster id).
-    ///
-    /// With a persisted RNG this is a resumable beam search
-    /// ([`RelativeNeighborhoodGraph::search_iter`]): the first batch is one
-    /// converged round at the configured
-    /// [`ef`](NeighborhoodGraphConfig::ef), and pulling past it resumes the
-    /// search, so routing cost is paid only as far as probing actually
-    /// reaches. With a stacked IVF the opened router ranks L0 members
-    /// (centroid rows after the merge perm). Without a router every
-    /// centroid is scored exactly, up front.
-    ///
-    /// `ws` holds the routing search's scratch and is borrowed for the
-    /// ranking's lifetime; [`ClusterRanking::metrics`] reports the cost
-    /// incurred so far (surfaced as `ProbeStats::routing`).
     pub(crate) fn rank_clusters<'a>(
         &'a self,
-        ws: &'a mut Workspace,
+        workspace: &'a mut Workspace,
         query: &'a [f32],
-    ) -> ClusterRanking<'a> {
-        match &self.router {
-            Some(RoutingIndex::Graph(graph)) => {
-                // TODO: Replace with proper seed generation
-                let seeds: Vec<NodeId> = {
-                    (0..graph.len())
-                        .step_by((graph.len() / 8).max(1))
-                        .take(8)
-                        .map(|node| node as NodeId)
-                        .collect()
-                };
-                ClusterRanking::Graph(graph.search_iter(ws, query, &seeds))
-            }
-            Some(RoutingIndex::Stacked(stacked)) => {
-                let hits = stacked.search(query, self.num_centroids, 1.0, self.metric);
-                let ranked: Vec<Candidate> = hits
-                    .into_iter()
-                    .map(|c| Candidate {
-                        sim: c.sim,
-                        node: c.node.0,
-                    })
-                    .collect();
-                ClusterRanking::Stacked {
-                    visited_count: ranked.len(),
-                    ranked: ranked.into_iter(),
-                }
-            }
-            None => {
-                let arena = FileSliceArena::<f32>::new(self.centroids_slice.clone());
-                let mut ranked: Vec<Candidate> = (0..self.num_centroids)
-                    .map(|cluster| Candidate {
-                        sim: arena.similarity(self.metric, self.dim, cluster as u32, query),
-                        node: cluster as NodeId,
-                    })
-                    .collect();
-                ranked.sort_unstable_by(|a, b| b.cmp(a));
-                ClusterRanking::Exact {
-                    ranked: ranked.into_iter(),
-                    num_centroids: self.num_centroids,
-                }
-            }
-        }
+    ) -> Box<dyn RouterRanking + 'a> {
+        self.router.rank(
+            workspace,
+            query,
+            RouterSearchContext::new(self.num_centroids, self.metric),
+        )
     }
-}
-
-/// Lazily ranked clusters for one query, yielded best routing score first;
-/// returned by [`IvfIndex::rank_clusters`], which documents the three paths.
-pub(crate) enum ClusterRanking<'a> {
-    /// Beam-searched routing over the persisted centroid RNG; pulling past a
-    /// converged batch resumes the search.
-    Graph(ResumableSearchIterator<'a, 'a, FileSliceArena<f32>>),
-    /// Stacked IVF ranking: L0 members of the lists the router probed,
-    /// already sorted best-first.
-    Stacked {
-        ranked: std::vec::IntoIter<Candidate>,
-        visited_count: usize,
-    },
-    /// Exact fallback for router-less segments: every centroid scored and
-    /// sorted up front.
-    Exact {
-        ranked: std::vec::IntoIter<Candidate>,
-        num_centroids: usize,
-    },
-}
-
-impl ClusterRanking<'_> {
-    /// The routing cost incurred so far: fixed for the exact and stacked
-    /// paths, growing with each pull that resumes the beam search on the
-    /// graph path — so take the snapshot after the last pull.
-    pub(crate) fn metrics(&self) -> IvfSearchMetrics {
-        match self {
-            ClusterRanking::Graph(iter) => IvfSearchMetrics {
-                visited_count: iter.metrics().visited_count,
-                graph: Some(iter.metrics()),
-            },
-            ClusterRanking::Stacked { visited_count, .. } => IvfSearchMetrics {
-                visited_count: *visited_count,
-                graph: None,
-            },
-            ClusterRanking::Exact { num_centroids, .. } => IvfSearchMetrics {
-                visited_count: *num_centroids,
-                graph: None,
-            },
-        }
-    }
-}
-
-impl Iterator for ClusterRanking<'_> {
-    type Item = Candidate;
-
-    fn next(&mut self) -> Option<Candidate> {
-        match self {
-            ClusterRanking::Graph(iter) => iter.next(),
-            ClusterRanking::Stacked { ranked, .. } => ranked.next(),
-            ClusterRanking::Exact { ranked, .. } => ranked.next(),
-        }
-    }
-}
-
-/// Routing cost of one [`IvfIndex::rank_clusters`] ranking (a
-/// [`ClusterRanking::metrics`] snapshot): how many centroids were scored to
-/// pick the probe order, and — when routing went through the centroid RNG —
-/// the beam search's full [`NeighborhoodGraphSearchMetrics`].
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
-pub struct IvfSearchMetrics {
-    /// Centroids scored to route the query (the navigation cost):
-    /// `num_centroids` on the exact path, the stacked L0 hit count, or the
-    /// beam-visited count when routed via the RNG.
-    pub visited_count: usize,
-    /// The centroid-graph beam search's counters; `None` when routing went
-    /// through stacked IVF or a linear scan of the centroids.
-    pub graph: Option<NeighborhoodGraphSearchMetrics>,
 }

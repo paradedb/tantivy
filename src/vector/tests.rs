@@ -456,12 +456,10 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
 }
 
 #[test]
-fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
+fn ivf_merge_writes_stacked_router_by_default() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
-    use crate::vector::ivf::graph::EMPTY;
     use crate::vector::ivf::CENTROIDS_EXT;
-    use crate::vector::NeighborhoodGraphConfig;
 
     let centroids = vec![[0.0, 0.0], [6.0, 6.0]];
     let index = TestVectorIndex::builder(VectorDType::F32)
@@ -476,28 +474,18 @@ fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
             segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
         let (_version, body) = super::header::read_header(&centroids_file)?;
         let composite = CompositeFile::open(&body)?;
-        let graph_bytes = composite
+        let router_bytes = composite
             .open_read_with_idx(index.embedding_field(), 2)
-            .expect("IVF merge should write the centroid graph slot")
+            .expect("IVF merge should write the router slot")
             .read_bytes()?;
-        assert_eq!(graph_bytes[0], 0, "V3 router kind byte (Graph)");
-        let graph_payload = &graph_bytes[1..];
-
-        let words: Vec<u32> = graph_payload
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("u32 word")))
-            .collect();
-        assert_eq!(words.len() * 4, graph_payload.len(), "whole number of u32s");
-        let max_edges = words[0] as usize;
-        assert_eq!(max_edges, NeighborhoodGraphConfig::default().max_edges);
-        let adjacency = &words[1..];
-        assert_eq!(adjacency.len(), centroids.len() * max_edges);
-        // Two distinct centroids prune to each other's single neighbor; the
-        // rest of each run is EMPTY padding.
-        assert_eq!(adjacency[0], 1);
-        assert!(adjacency[1..max_edges].iter().all(|&id| id == EMPTY));
-        assert_eq!(adjacency[max_edges], 0);
-        assert!(adjacency[max_edges + 1..].iter().all(|&id| id == EMPTY));
+        assert_eq!(&router_bytes[..8], b"TVROUTER");
+        let id_len = u16::from_le_bytes(router_bytes[8..10].try_into().unwrap()) as usize;
+        assert_eq!(
+            u32::from_le_bytes(router_bytes[10..14].try_into().unwrap()),
+            1
+        );
+        assert_eq!(&router_bytes[14..14 + id_len], b"tantivy.stacked-ivf");
+        assert!(router_bytes.len() > 14 + id_len);
     }
     Ok(())
 }
@@ -850,10 +838,10 @@ mod bounds_storage_tests {
     use crate::schema::{Schema, STORED, STRING};
     use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
     use crate::vector::{
-        residual_norm, BoundKind, BuiltRouter, IvfCentroids, IvfClusterer, IvfConfig,
-        IvfIndexBuilder, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric,
-        StackedIvfIndex, SuperKMeansLevelClusterer, VectorDType, VectorOptions,
-        VectorStorageFormat,
+        residual_norm, BoundKind, BuiltRouter, InMemoryStackedIvf, IvfCentroids, IvfClusterer,
+        IvfConfig, IvfIndexBuilder, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
+        LazyStackedIvf, Metric, SuperKMeansLevelClusterer, VectorDType, VectorOptions,
+        VectorStorageFormat, Workspace,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -1026,7 +1014,9 @@ mod bounds_storage_tests {
                 IvfConfig::new(2),
             )
             .build();
-            Ok(Some(BuiltRouter::Stacked { index, perm }))
+            Ok(Some(
+                BuiltRouter::new(index).with_centroid_permutation(perm),
+            ))
         }
     }
 
@@ -1050,10 +1040,16 @@ mod bounds_storage_tests {
             vector_clustering_threshold: 1,
             ..IndexSettings::default()
         };
+        let uses_stacked_router = clusterer.stacked;
         let builder = Index::builder()
             .schema(schema)
             .settings(settings)
             .ivf_clusterer(Arc::new(clusterer));
+        let builder = if uses_stacked_router {
+            builder.ivf_router::<LazyStackedIvf>()
+        } else {
+            builder
+        };
         let index = match directory {
             Some(directory) => builder.open_or_create(directory)?,
             None => builder.create_in_ram()?,
@@ -1401,35 +1397,30 @@ mod bounds_storage_tests {
             .expect("stacked router slot must be written")
             .read_bytes()?;
 
-        // The reader parses the router at open and exposes it.
+        // The reader invokes the caller-selected router at open.
         let vec_reader = segment_reader.vector_index(field)?;
         let ivf = vec_reader.index().expect("IVF segment");
-        let persisted = ivf
-            .stacked()
-            .expect("reader must parse the V3 stacked router");
-        assert!(
-            persisted.depth() >= 2,
-            "builder must hang a parent over 8 centroids at branching_factor 2"
-        );
-        assert_eq!(persisted.vectors.len(), centroids.len());
-        assert_eq!(
-            persisted
-                .offsets
-                .iter()
-                .map(|&(_, end)| end)
-                .max()
-                .unwrap_or(0) as usize,
-            centroids.len(),
-            "persisted level-0 offsets must cover the stored centroid rows"
-        );
+        assert_eq!(ivf.router().id(), "tantivy.stacked-ivf");
+        assert_eq!(ivf.router().vector_file_version(), VectorFileVersion::V3);
+        assert_eq!(ivf.router().format_version(), 1);
+        let mut reserialized = Vec::new();
+        ivf.router().serialize(&mut reserialized)?;
+        assert_eq!(reserialized, stacked_bytes.as_slice());
         let stored_rows: Vec<f32> = ivf
             .centroid_bytes()?
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        assert_eq!(stacked_bytes[0], 1, "V3 stacked router kind byte");
-        let stacked = StackedIvfIndex::deserialize_owned(
-            &stacked_bytes[1..],
+        assert_eq!(&stacked_bytes[..8], b"TVROUTER");
+        let id_len = u16::from_le_bytes(stacked_bytes[8..10].try_into().unwrap()) as usize;
+        assert_eq!(
+            u32::from_le_bytes(stacked_bytes[10..14].try_into().unwrap()),
+            1
+        );
+        assert_eq!(&stacked_bytes[14..14 + id_len], b"tantivy.stacked-ivf");
+        let payload_offset = 14 + id_len;
+        let stacked = InMemoryStackedIvf::deserialize_owned(
+            &stacked_bytes[payload_offset..],
             stored_rows.clone(),
             2,
             IvfConfig::default(),
@@ -1452,10 +1443,11 @@ mod bounds_storage_tests {
         for c in &centroids {
             let query = [c[0] + 0.3, 0.2];
             let owned = stacked.search(&query, 2, 1.0, Metric::L2);
-            let lazy = persisted.search(&query, 2, 1.0, Metric::L2);
+            let mut workspace = Workspace::new();
+            let lazy: Vec<_> = ivf.rank_clusters(&mut workspace, &query).take(2).collect();
             assert_eq!(owned.len(), lazy.len());
             for (o, l) in owned.iter().zip(&lazy) {
-                assert_eq!(u32::from(o.node), u32::from(l.node));
+                assert_eq!(u32::from(o.node), l.node);
                 assert_eq!(o.sim, l.sim);
             }
         }

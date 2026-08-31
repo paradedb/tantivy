@@ -1,15 +1,32 @@
-use super::{RelativeNeighborhoodGraph, StackedIvfIndex};
 use crate::schema::VectorOptions;
-use crate::vector::VectorElement;
+use crate::vector::{Router, VectorElement};
 use crate::{DocId, TantivyError};
 
-/// What a clusterer may supply at merge time for `.centroids` slot `[2]`.
-pub enum BuiltRouter {
-    Graph(RelativeNeighborhoodGraph<Vec<f32>>),
-    Stacked {
-        index: StackedIvfIndex,
-        perm: Vec<u32>,
-    },
+pub struct BuiltRouter {
+    router: Box<dyn Router>,
+    centroid_permutation: Option<Vec<u32>>,
+}
+
+impl BuiltRouter {
+    pub fn new(router: impl Router + 'static) -> Self {
+        Self {
+            router: Box::new(router),
+            centroid_permutation: None,
+        }
+    }
+
+    pub fn with_centroid_permutation(mut self, permutation: Vec<u32>) -> Self {
+        self.centroid_permutation = Some(permutation);
+        self
+    }
+
+    pub fn router(&self) -> &dyn Router {
+        self.router.as_ref()
+    }
+
+    pub fn centroid_permutation(&self) -> Option<&[u32]> {
+        self.centroid_permutation.as_deref()
+    }
 }
 
 pub trait IvfClusterer: Send + Sync + 'static {
@@ -31,10 +48,10 @@ pub trait IvfClusterer: Send + Sync + 'static {
 
     /// Optional router over `centroids` for slot `[2]`.
     ///
-    /// Default `None` lets the merge build a routing RNG. When `Some`, the
-    /// returned router is serialized to `.centroids` slot `[2]`. For
-    /// [`BuiltRouter::Stacked`], the merge applies `perm` to the trained
-    /// centroid matrix before assign so posting lists address the stored rows.
+    /// Default `None` lets the merge build a stacked router. When `Some`, the
+    /// returned router is serialized to `.centroids` slot `[2]`. Its optional
+    /// centroid permutation is applied before assignment so posting lists
+    /// address the stored rows.
     fn build_router(
         &self,
         options: &VectorOptions,
