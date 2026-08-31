@@ -74,7 +74,7 @@ pub struct IvfConfig {
 impl Default for IvfConfig {
     fn default() -> Self {
         Self {
-            nprobe_fraction: 0.02,
+            nprobe_fraction: 0.1,
             branching_factor: 16,
         }
     }
@@ -756,7 +756,6 @@ where
         let mut result: BinaryHeap<Reverse<Candidate<ClusterId>>> = BinaryHeap::with_capacity(k);
 
         let n_probe = self.n_probe();
-
         if let Some(parent) = &self.parent {
             frontier.extend(parent.search(query, n_probe, recall, metric));
         } else {
@@ -770,7 +769,6 @@ where
         }
 
         let cumulative_recall = 0.0;
-        let mut probe_count = 0;
         while let Some(candidate) = frontier.pop() {
             let cluster = usize::from(candidate.node);
             let (start, end) = self.offsets[cluster];
@@ -784,8 +782,7 @@ where
                 }));
             }
 
-            probe_count += 1;
-            if cumulative_recall >= recall || probe_count >= n_probe {
+            if cumulative_recall >= recall {
                 break;
             }
         }
@@ -795,6 +792,7 @@ where
             .map(|Reverse(c)| c)
             .sorted()
             .rev()
+            .take(k)
             .collect()
     }
 }
