@@ -1,4 +1,6 @@
 use std::io::{self, Write};
+use std::marker::PhantomData;
+use std::sync::Arc;
 
 use common::{BinarySerializable, HasLen};
 
@@ -59,9 +61,6 @@ impl RouterSearchContext {
     }
 }
 
-pub type RouterOpenFn =
-    fn(VectorFileVersion, FileSlice, &RouterOpenContext) -> crate::Result<Box<dyn Router>>;
-
 /// Routes IVF queries and owns its persisted format.
 ///
 /// `serialize` wraps the router payload in an envelope containing its ID and
@@ -106,6 +105,38 @@ pub trait Router: Send + Sync {
         write_router_header(self.id(), self.format_version(), out)?;
         self.serialize_payload(out)
     }
+}
+
+pub trait RouterFactory: Send + Sync {
+    fn open(
+        &self,
+        file_version: VectorFileVersion,
+        slot: FileSlice,
+        context: &RouterOpenContext,
+    ) -> crate::Result<Box<dyn Router>>;
+}
+
+struct RouterFactoryFor<R>(PhantomData<fn() -> R>);
+
+impl<R> RouterFactoryFor<R> {
+    fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<R: Router + 'static> RouterFactory for RouterFactoryFor<R> {
+    fn open(
+        &self,
+        file_version: VectorFileVersion,
+        slot: FileSlice,
+        context: &RouterOpenContext,
+    ) -> crate::Result<Box<dyn Router>> {
+        R::open_router(file_version, slot, context)
+    }
+}
+
+pub(crate) fn router_factory_for<R: Router + 'static>() -> Arc<dyn RouterFactory> {
+    Arc::new(RouterFactoryFor::<R>::new())
 }
 
 pub trait RouterRanking: Iterator<Item = Candidate> {
@@ -235,6 +266,8 @@ impl RouterRanking for EagerRouterRanking {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::vector::Similarity;
 
@@ -294,6 +327,22 @@ mod tests {
         }
     }
 
+    struct CountingRouterFactory {
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl RouterFactory for CountingRouterFactory {
+        fn open(
+            &self,
+            file_version: VectorFileVersion,
+            slot: FileSlice,
+            context: &RouterOpenContext,
+        ) -> crate::Result<Box<dyn Router>> {
+            self.opens.fetch_add(1, Ordering::Relaxed);
+            TestRouter::open_router(file_version, slot, context)
+        }
+    }
+
     fn test_context() -> RouterOpenContext {
         RouterOpenContext::new(FileSlice::empty(), VectorOptions::new(1, Metric::L2))
     }
@@ -305,7 +354,11 @@ mod tests {
         router.serialize(&mut bytes)?;
 
         let slot = FileSlice::from(bytes);
-        let opened = TestRouter::open_router(VectorFileVersion::V3, slot, &test_context())?;
+        let opened = router_factory_for::<TestRouter>().open(
+            VectorFileVersion::V3,
+            slot,
+            &test_context(),
+        )?;
         assert_eq!(opened.id(), "test.router");
         assert_eq!(opened.vector_file_version(), VectorFileVersion::V3);
         assert_eq!(opened.format_version(), 7);
@@ -318,6 +371,27 @@ mod tests {
         );
         assert_eq!(ranked.next().map(|candidate| candidate.node), Some(42));
         assert_eq!(ranked.metrics().visited_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_factory_opens_the_selected_router() -> crate::Result<()> {
+        let router = TestRouter { cluster: 42 };
+        let mut bytes = Vec::new();
+        router.serialize(&mut bytes)?;
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let factory: Arc<dyn RouterFactory> = Arc::new(CountingRouterFactory {
+            opens: opens.clone(),
+        });
+        let opened = factory.open(
+            VectorFileVersion::V3,
+            FileSlice::from(bytes),
+            &test_context(),
+        )?;
+
+        assert_eq!(opened.id(), "test.router");
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
         Ok(())
     }
 
@@ -337,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn router_opener_rejects_incompatible_vector_file_version() {
+    fn selected_router_rejects_incompatible_vector_file_version() {
         let router = TestRouter { cluster: 42 };
         let mut bytes = Vec::new();
         router.serialize(&mut bytes).unwrap();

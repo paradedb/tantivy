@@ -43,7 +43,7 @@ use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
 use crate::vector::router::{
-    ExactRouter, Router, RouterOpenContext, RouterOpenFn, RouterRanking, RouterSearchContext,
+    ExactRouter, Router, RouterFactory, RouterOpenContext, RouterRanking, RouterSearchContext,
 };
 use crate::vector::{BoundKind, BoundStore};
 
@@ -148,7 +148,7 @@ impl IvfIndex {
     /// without it as corrupt. `None` synthesizes SATURATED bounds
     /// (`f32::INFINITY` per cluster): every cluster probes, no skip is ever
     /// certified against data the file doesn't have.
-    /// `router_opener` is selected by the caller and validates that the
+    /// `router_factory` is selected by the caller and validates that the
     /// persisted router and `version` are compatible with its implementation.
     pub(crate) fn open(
         version: VectorFileVersion,
@@ -156,7 +156,7 @@ impl IvfIndex {
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         router_slice: Option<FileSlice>,
-        router_opener: RouterOpenFn,
+        router_factory: &dyn RouterFactory,
         bounds_slice: Option<FileSlice>,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -201,7 +201,7 @@ impl IvfIndex {
 
         let router_context = RouterOpenContext::new(centroids_slice.clone(), options.clone());
         let router = match router_slice {
-            Some(slice) => router_opener(version, slice, &router_context)?,
+            Some(slice) => router_factory.open(version, slice, &router_context)?,
             None => Box::new(ExactRouter::new(&router_context)),
         };
 

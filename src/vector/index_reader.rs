@@ -159,7 +159,7 @@ impl VectorIndexReader {
                     centroids,
                     offsets,
                     router,
-                    segment_reader.ivf_router_opener(),
+                    segment_reader.ivf_router_factory(),
                     bounds,
                 )?)
             }

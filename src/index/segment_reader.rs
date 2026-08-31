@@ -20,7 +20,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::{RouterOpenFn, VectorIndexReader};
+use crate::vector::{RouterFactory, VectorIndexReader};
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -85,8 +85,8 @@ impl SegmentReader {
         self.index.settings().sort_by_field.as_ref()
     }
 
-    pub(crate) fn ivf_router_opener(&self) -> RouterOpenFn {
-        self.index.ivf_router_opener()
+    pub(crate) fn ivf_router_factory(&self) -> &dyn RouterFactory {
+        self.index.ivf_router_factory()
     }
 
     /// Return the number of documents that have been
