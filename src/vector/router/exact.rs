@@ -39,18 +39,6 @@ impl ExactRouter<FileSliceArena<f32>> {
     }
 }
 
-impl ExactRouter<Vec<f32>> {
-    fn from_centroids(options: &VectorOptions, centroids: &IvfCentroids) -> Self {
-        let IvfCentroids::F32(matrix) = centroids;
-        Self {
-            centroids: matrix.values.clone(),
-            num_centroids: matrix.rows,
-            dim: options.dim(),
-            metric: options.metric(),
-        }
-    }
-}
-
 impl<S> Router for ExactRouter<S>
 where
     S: VectorArena<Elem = f32> + Send + Sync + 'static,
@@ -59,9 +47,13 @@ where
         options: &VectorOptions,
         centroids: &mut IvfCentroids,
     ) -> crate::Result<Box<dyn Router>> {
-        Ok(Box::new(ExactRouter::<Vec<f32>>::from_centroids(
-            options, centroids,
-        )))
+        let IvfCentroids::F32(matrix) = centroids;
+        Ok(Box::new(ExactRouter::<Vec<f32>> {
+            centroids: matrix.values.clone(),
+            num_centroids: matrix.rows,
+            dim: options.dim(),
+            metric: options.metric(),
+        }))
     }
 
     fn id(&self) -> &'static str {

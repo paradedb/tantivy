@@ -133,12 +133,6 @@ pub trait RouterFactory: Send + Sync {
 
 struct RouterFactoryFor<R>(PhantomData<fn() -> R>);
 
-impl<R> RouterFactoryFor<R> {
-    fn new() -> Self {
-        Self(PhantomData)
-    }
-}
-
 impl<R: Router + 'static> RouterFactory for RouterFactoryFor<R> {
     fn build(
         &self,
@@ -159,7 +153,7 @@ impl<R: Router + 'static> RouterFactory for RouterFactoryFor<R> {
 }
 
 pub(crate) fn router_factory_for<R: Router + 'static>() -> Arc<dyn RouterFactory> {
-    Arc::new(RouterFactoryFor::<R>::new())
+    Arc::new(RouterFactoryFor::<R>(PhantomData))
 }
 
 pub trait RouterRanking: Iterator<Item = Candidate> {
@@ -186,7 +180,33 @@ fn open_enveloped_router<R: Router>(
     slot: FileSlice,
     context: &RouterOpenContext,
 ) -> crate::Result<Box<dyn Router>> {
-    let (id, format_version, payload_offset) = read_router_header(&slot)?;
+    if slot.len() < ROUTER_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "router slot is shorter than its header",
+        )
+        .into());
+    }
+    let header = slot.slice_to(ROUTER_HEADER_LEN).read_bytes()?;
+    if &header[..ROUTER_MAGIC.len()] != ROUTER_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid router magic").into());
+    }
+    let mut cursor = &header[ROUTER_MAGIC.len()..];
+    let id_len = u16::deserialize(&mut cursor)? as usize;
+    let format_version = u32::deserialize(&mut cursor)?;
+    let payload_offset = ROUTER_HEADER_LEN
+        .checked_add(id_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "router header overflow"))?;
+    if payload_offset > slot.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "router slot is shorter than its declared ID",
+        )
+        .into());
+    }
+    let id_bytes = slot.slice(ROUTER_HEADER_LEN..payload_offset).read_bytes()?;
+    let id = std::str::from_utf8(&id_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "router ID is not UTF-8"))?;
     let router = R::deserialize(format_version, slot.slice_from(payload_offset), context)?;
     if router.id() != id {
         return Err(io::Error::new(
@@ -211,38 +231,6 @@ fn open_enveloped_router<R: Router>(
         .into());
     }
     Ok(router)
-}
-
-fn read_router_header(slot: &FileSlice) -> crate::Result<(String, u32, usize)> {
-    if slot.len() < ROUTER_HEADER_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "router slot is shorter than its header",
-        )
-        .into());
-    }
-    let header = slot.slice_to(ROUTER_HEADER_LEN).read_bytes()?;
-    if &header[..ROUTER_MAGIC.len()] != ROUTER_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid router magic").into());
-    }
-    let mut cursor = &header[ROUTER_MAGIC.len()..];
-    let id_len = u16::deserialize(&mut cursor)? as usize;
-    let version = u32::deserialize(&mut cursor)?;
-    let payload_offset = ROUTER_HEADER_LEN
-        .checked_add(id_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "router header overflow"))?;
-    if payload_offset > slot.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "router slot is shorter than its declared ID",
-        )
-        .into());
-    }
-    let id_bytes = slot.slice(ROUTER_HEADER_LEN..payload_offset).read_bytes()?;
-    let id = std::str::from_utf8(&id_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "router ID is not UTF-8"))?
-        .to_owned();
-    Ok((id, version, payload_offset))
 }
 
 fn require_version(id: &str, actual: u32, expected: u32) -> crate::Result<()> {

@@ -18,36 +18,6 @@ use crate::TantivyError;
 const STACKED_ROUTER_VERSION: u32 = 1;
 const STACKED_ROUTER_ID: &str = "tantivy.stacked-ivf";
 
-fn apply_centroid_permutation(
-    centroids: &mut IvfCentroids,
-    permutation: &[u32],
-) -> crate::Result<()> {
-    let IvfCentroids::F32(matrix) = centroids;
-    if permutation.len() != matrix.rows {
-        return Err(TantivyError::InvalidArgument(format!(
-            "stacked router returned a permutation over {} centroids, expected {}",
-            permutation.len(),
-            matrix.rows
-        )));
-    }
-
-    let mut values = vec![0.0f32; matrix.values.len()];
-    let mut seen = vec![false; matrix.rows];
-    for (old, &new) in permutation.iter().enumerate() {
-        let new = new as usize;
-        if new >= matrix.rows || seen[new] {
-            return Err(TantivyError::InvalidArgument(
-                "stacked router centroid permutation is not a bijection".to_string(),
-            ));
-        }
-        seen[new] = true;
-        values[new * matrix.dims..(new + 1) * matrix.dims]
-            .copy_from_slice(&matrix.values[old * matrix.dims..(old + 1) * matrix.dims]);
-    }
-    matrix.values = values;
-    Ok(())
-}
-
 fn build_stacked_router(
     options: &VectorOptions,
     centroids: &mut IvfCentroids,
@@ -62,7 +32,28 @@ fn build_stacked_router(
         StackedIvfConfig::default(),
     )
     .build();
-    apply_centroid_permutation(centroids, &permutation)?;
+    let IvfCentroids::F32(matrix) = centroids;
+    if permutation.len() != matrix.rows {
+        return Err(TantivyError::InvalidArgument(format!(
+            "stacked router returned a permutation over {} centroids, expected {}",
+            permutation.len(),
+            matrix.rows
+        )));
+    }
+    let mut values = vec![0.0f32; matrix.values.len()];
+    let mut seen = vec![false; matrix.rows];
+    for (old, &new) in permutation.iter().enumerate() {
+        let new = new as usize;
+        if new >= matrix.rows || seen[new] {
+            return Err(TantivyError::InvalidArgument(
+                "stacked router centroid permutation is not a bijection".to_string(),
+            ));
+        }
+        seen[new] = true;
+        values[new * matrix.dims..(new + 1) * matrix.dims]
+            .copy_from_slice(&matrix.values[old * matrix.dims..(old + 1) * matrix.dims]);
+    }
+    matrix.values = values;
     Ok(Box::new(index))
 }
 
