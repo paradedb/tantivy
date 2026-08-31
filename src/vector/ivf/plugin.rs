@@ -19,8 +19,7 @@ use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT};
-use crate::vector::router::build_default_stacked_router;
-use crate::vector::{residual_norm, BoundKind, BoundsBuilder, VEC_EXT};
+use crate::vector::{residual_norm, BoundKind, BoundsBuilder, RouterFactory, VEC_EXT};
 use crate::{DocId, TantivyError};
 
 struct AssignedVector {
@@ -50,6 +49,7 @@ fn write_empty_field_slots(
     centroids_write: &mut CompositeWrite,
     field: Field,
     opts: &VectorOptions,
+    router: &dyn crate::vector::Router,
 ) -> crate::Result<()> {
     // `.vec`: empty Explicit id-map + empty rows.
     {
@@ -78,12 +78,36 @@ fn write_empty_field_slots(
         IvfIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
         bounds_w.flush()?;
     }
+    {
+        let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
+        router.serialize(router_w)?;
+        router_w.flush()?;
+    }
     Ok(())
+}
+
+fn build_router(
+    router_factory: &dyn RouterFactory,
+    opts: &VectorOptions,
+    centroids: &IvfCentroids,
+) -> crate::Result<BuiltRouter> {
+    let built_router = router_factory.build(opts, centroids)?;
+    let router_version = built_router.router().vector_file_version();
+    if router_version != CURRENT {
+        return Err(TantivyError::InvalidArgument(format!(
+            "router {} requires vector file version {:?}, but this merge writes {:?}",
+            built_router.router().id(),
+            router_version,
+            CURRENT
+        )));
+    }
+    Ok(built_router)
 }
 
 pub(crate) fn merge_ivf(
     ctx: &PluginMergeContext,
     clusterer: Option<&dyn IvfClusterer>,
+    router_factory: Option<&dyn RouterFactory>,
 ) -> crate::Result<()> {
     if ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);
@@ -100,6 +124,12 @@ pub(crate) fn merge_ivf(
     let clusterer = clusterer.ok_or_else(|| {
         TantivyError::InvalidArgument(
             "vector_clustering_threshold selected IVF merge, but no IvfClusterer is configured"
+                .to_string(),
+        )
+    })?;
+    let router_factory = router_factory.ok_or_else(|| {
+        TantivyError::InvalidArgument(
+            "vector_clustering_threshold selected IVF merge, but no Router is configured"
                 .to_string(),
         )
     })?;
@@ -140,7 +170,19 @@ pub(crate) fn merge_ivf(
             .map(|reader| reader.num_vectors())
             .sum::<usize>();
         if vector_count == 0 {
-            write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
+            let centroids = IvfCentroids::F32(IvfMatrix {
+                values: Vec::new(),
+                rows: 0,
+                dims: opts.dim(),
+            });
+            let built_router = build_router(router_factory, opts, &centroids)?;
+            write_empty_field_slots(
+                &mut vec_write,
+                &mut centroids_write,
+                field,
+                opts,
+                built_router.router(),
+            )?;
             continue;
         }
         let training_sample_size = {
@@ -204,7 +246,19 @@ pub(crate) fn merge_ivf(
                     // leave its slots missing from composites the other
                     // fields still write, and the reader errors on
                     // missing slots.
-                    write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
+                    let centroids = IvfCentroids::F32(IvfMatrix {
+                        values: Vec::new(),
+                        rows: 0,
+                        dims: opts.dim(),
+                    });
+                    let built_router = build_router(router_factory, opts, &centroids)?;
+                    write_empty_field_slots(
+                        &mut vec_write,
+                        &mut centroids_write,
+                        field,
+                        opts,
+                        built_router.router(),
+                    )?;
                     continue;
                 }
 
@@ -249,30 +303,8 @@ pub(crate) fn merge_ivf(
                 }
                 let num_centroids = centroid_matrix.rows;
 
-                // `None` selects the default stacked router.
-                let built_router = match clusterer.build_router(opts, &centroids)? {
-                    Some(router) => Some(router),
-                    None if num_centroids > 1 => {
-                        Some(build_default_stacked_router(opts, &centroids))
-                    }
-                    None => None,
-                };
-                if let Some(built) = &built_router {
-                    let router_version = built.router().vector_file_version();
-                    if router_version != CURRENT {
-                        return Err(TantivyError::InvalidArgument(format!(
-                            "router {} requires vector file version {:?}, but this merge writes \
-                             {:?}",
-                            built.router().id(),
-                            router_version,
-                            CURRENT
-                        )));
-                    }
-                }
-                let centroids = match built_router
-                    .as_ref()
-                    .and_then(BuiltRouter::centroid_permutation)
-                {
+                let built_router = build_router(router_factory, opts, &centroids)?;
+                let centroids = match built_router.centroid_permutation() {
                     Some(perm) => {
                         let IvfCentroids::F32(matrix) = &centroids;
                         if perm.len() != num_centroids {
@@ -594,19 +626,12 @@ pub(crate) fn merge_ivf(
                     bounds_w.flush()?;
                 }
 
-                // `.centroids` slot [2]. Skipped for degenerate centroid counts.
-                if num_centroids > 1 {
-                    if ctx.cancel.wants_cancel() {
-                        return Err(TantivyError::Cancelled);
-                    }
-                    let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
-                    built_router
-                        .as_ref()
-                        .expect("non-degenerate IVF must have a router")
-                        .router()
-                        .serialize(router_w)?;
-                    router_w.flush()?;
+                if ctx.cancel.wants_cancel() {
+                    return Err(TantivyError::Cancelled);
                 }
+                let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
+                built_router.router().serialize(router_w)?;
+                router_w.flush()?;
 
                 log::info!(
                     target: "paradedb::ivf_build",

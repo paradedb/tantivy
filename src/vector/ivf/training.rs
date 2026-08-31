@@ -46,21 +46,6 @@ pub trait IvfClusterer: Send + Sync + 'static {
         centroids: &IvfCentroids,
     ) -> crate::Result<Vec<u32>>;
 
-    /// Optional router over `centroids` for slot `[2]`.
-    ///
-    /// Default `None` lets the merge build a stacked router. When `Some`, the
-    /// returned router is serialized to `.centroids` slot `[2]`. Its optional
-    /// centroid permutation is applied before assignment so posting lists
-    /// address the stored rows.
-    fn build_router(
-        &self,
-        options: &VectorOptions,
-        centroids: &IvfCentroids,
-    ) -> crate::Result<Option<BuiltRouter>> {
-        let _ = (options, centroids);
-        Ok(None)
-    }
-
     fn assign_batch_size(&self) -> usize {
         2048
     }

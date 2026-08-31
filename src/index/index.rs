@@ -31,7 +31,7 @@ use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::vector::router::router_factory_for;
-use crate::vector::{IvfClusterer, LazyStackedIvf, Router, RouterFactory, VectorPlugin};
+use crate::vector::{IvfClusterer, Router, RouterFactory, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -181,7 +181,7 @@ pub struct IndexBuilder {
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
-    ivf_router_factory: Arc<dyn RouterFactory>,
+    ivf_router_factory: Option<Arc<dyn RouterFactory>>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -198,7 +198,7 @@ impl IndexBuilder {
             fast_field_tokenizer_manager: TokenizerManager::default(),
             custom_plugins: Vec::new(),
             ivf_clusterer: None,
-            ivf_router_factory: router_factory_for::<LazyStackedIvf>(),
+            ivf_router_factory: None,
         }
     }
 
@@ -241,17 +241,17 @@ impl IndexBuilder {
         self
     }
 
-    /// Select the router implementation used to open persisted IVF routers.
+    /// Select the router implementation used to build and open IVF routers.
     #[must_use]
     pub fn ivf_router<R: Router + 'static>(mut self) -> Self {
-        self.ivf_router_factory = router_factory_for::<R>();
+        self.ivf_router_factory = Some(router_factory_for::<R>());
         self
     }
 
-    /// Configure a factory that can select among multiple router implementations.
+    /// Configure the factory used to build and open IVF routers.
     #[must_use]
     pub fn ivf_router_factory(mut self, factory: Arc<dyn RouterFactory>) -> Self {
-        self.ivf_router_factory = factory;
+        self.ivf_router_factory = Some(factory);
         self
     }
 
@@ -322,6 +322,7 @@ impl IndexBuilder {
 
     /// Opens or creates a new index in the provided directory
     pub fn open_or_create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+        self.validate()?;
         let dir: Box<dyn Directory> = dir.into();
         if !Index::exists(&*dir)? {
             return self.create(dir);
@@ -343,6 +344,11 @@ impl IndexBuilder {
     }
 
     fn validate(&self) -> crate::Result<()> {
+        if self.ivf_clusterer.is_some() && self.ivf_router_factory.is_none() {
+            return Err(TantivyError::InvalidArgument(
+                "an IvfClusterer requires an explicitly configured Router".to_string(),
+            ));
+        }
         if let Some(schema) = self.schema.as_ref() {
             if self.index_settings.manual_doc_id_mapping
                 && self.index_settings.sort_by_field.is_some()
@@ -430,7 +436,7 @@ pub struct Index {
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
-    ivf_router_factory: Arc<dyn RouterFactory>,
+    ivf_router_factory: Option<Arc<dyn RouterFactory>>,
 }
 
 impl Index {
@@ -552,7 +558,7 @@ impl Index {
             inventory,
             custom_plugins: Vec::new(),
             ivf_clusterer: None,
-            ivf_router_factory: router_factory_for::<LazyStackedIvf>(),
+            ivf_router_factory: None,
         }
     }
 
@@ -904,18 +910,18 @@ impl Index {
         self.ivf_clusterer = Some(clusterer);
     }
 
-    /// Select the router implementation used to open persisted IVF routers.
+    /// Select the router implementation used to build and open IVF routers.
     pub fn set_ivf_router<R: Router + 'static>(&mut self) {
-        self.ivf_router_factory = router_factory_for::<R>();
+        self.ivf_router_factory = Some(router_factory_for::<R>());
     }
 
-    /// Configure a factory that can select among multiple router implementations.
+    /// Configure the factory used to build and open IVF routers.
     pub fn set_ivf_router_factory(&mut self, factory: Arc<dyn RouterFactory>) {
-        self.ivf_router_factory = factory;
+        self.ivf_router_factory = Some(factory);
     }
 
-    pub(crate) fn ivf_router_factory(&self) -> &dyn RouterFactory {
-        self.ivf_router_factory.as_ref()
+    pub(crate) fn ivf_router_factory(&self) -> Option<&dyn RouterFactory> {
+        self.ivf_router_factory.as_deref()
     }
 
     pub(crate) fn ivf_clusterer(&self) -> Option<&dyn IvfClusterer> {

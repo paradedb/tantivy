@@ -5,19 +5,65 @@ use super::{
     RouterRanking, RouterSearchContext,
 };
 use crate::directory::FileSlice;
-use crate::schema::VectorDType;
+use crate::schema::{VectorDType, VectorOptions};
 use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::graph::{
     NeighborhoodGraphConfig, RelativeNeighborhoodGraph, SearchIterator, Workspace,
 };
-use crate::vector::{FileSliceArena, VectorArena};
+use crate::vector::{BuiltRouter, FileSliceArena, IvfCentroids, VectorArena};
+use crate::Executor;
 
 const GRAPH_ROUTER_VERSION: u32 = 1;
 const GRAPH_ROUTER_ID: &str = "tantivy.relative-neighborhood-graph";
 
+fn build_executor() -> crate::Result<Executor> {
+    let num_threads = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    if num_threads > 1 {
+        Executor::multi_thread(num_threads, "rng-build-")
+    } else {
+        Ok(Executor::single_thread())
+    }
+}
+
+fn build_rng_router(
+    options: &VectorOptions,
+    centroids: &IvfCentroids,
+) -> crate::Result<BuiltRouter> {
+    let IvfCentroids::F32(matrix) = centroids;
+    let config = NeighborhoodGraphConfig::default();
+    let mut graph = RelativeNeighborhoodGraph::new(
+        matrix.values.as_slice(),
+        options.dim(),
+        options.metric(),
+        config.clone(),
+    );
+    graph.build(&build_executor()?);
+
+    let mut adjacency = Vec::new();
+    graph.serialize_adjacency(&mut adjacency)?;
+    let graph = RelativeNeighborhoodGraph::open(
+        &adjacency,
+        matrix.values.clone(),
+        options.dim(),
+        options.metric(),
+        config,
+    )?;
+    Ok(BuiltRouter::new(graph))
+}
+
 impl<S> Router for RelativeNeighborhoodGraph<S>
-where S: VectorArena<Elem = f32> + Send + Sync
+where
+    S: VectorArena<Elem = f32> + Send + Sync,
 {
+    fn build_router(
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<BuiltRouter> {
+        build_rng_router(options, centroids)
+    }
+
     fn id(&self) -> &'static str {
         GRAPH_ROUTER_ID
     }

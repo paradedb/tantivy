@@ -85,7 +85,7 @@ impl SegmentReader {
         self.index.settings().sort_by_field.as_ref()
     }
 
-    pub(crate) fn ivf_router_factory(&self) -> &dyn RouterFactory {
+    pub(crate) fn ivf_router_factory(&self) -> Option<&dyn RouterFactory> {
         self.index.ivf_router_factory()
     }
 

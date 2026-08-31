@@ -38,17 +38,17 @@ pub enum VectorFileVersion {
     V3 = 3,
 }
 
-/// `.centroids` composite slot indices. Slot `[2]` is OPTIONAL (absence =
-/// exact-scan routing) and slot `[3]` is MANDATORY from
-/// [`VectorFileVersion::V2`] on.
+/// `.centroids` composite slot indices. Slot `[2]` is required for current
+/// writes; older files may omit it and use exact-scan routing. Slot `[3]` is
+/// MANDATORY from [`VectorFileVersion::V2`] on.
 pub(crate) mod centroid_slot {
     /// The centroid rows themselves.
     pub(crate) const CENTROIDS: usize = 0;
     /// Per-cluster posting offsets.
     pub(crate) const OFFSETS: usize = 1;
-    /// The router. OPTIONAL: the write side skips it for degenerate centroid
-    /// counts, and its absence is normal. At V2 the payload is a bare RNG
-    /// graph; at V3+ it is a self-describing router envelope.
+    /// The router. At V2 the payload is a bare RNG graph; at V3+ it is a
+    /// self-describing router envelope. Older degenerate IVF segments may
+    /// omit it and use exact routing when read.
     pub(crate) const ROUTER: usize = 2;
     /// Per-cluster centroid bounds. MANDATORY from V2 on: a V2+ file
     /// without this slot is corrupt, not old.

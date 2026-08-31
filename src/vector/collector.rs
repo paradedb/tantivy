@@ -325,7 +325,7 @@ mod ivf_e2e_tests {
     use crate::query::AllQuery;
     use crate::schema::{Field, Schema, FAST, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
-    use crate::vector::{Metric, VectorDType, VectorOptions, VectorStorageFormat};
+    use crate::vector::{LazyStackedIvf, Metric, VectorDType, VectorOptions, VectorStorageFormat};
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
     /// IVF + exhaustive probing matches the global oracle. The shared
@@ -447,6 +447,7 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
             }))
+            .ivf_router::<LazyStackedIvf>()
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -600,6 +601,7 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
             }))
+            .ivf_router::<LazyStackedIvf>()
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -773,6 +775,7 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: centroids.clone(),
             }))
+            .ivf_router::<LazyStackedIvf>()
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));

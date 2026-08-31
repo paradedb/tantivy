@@ -17,10 +17,7 @@ use crate::vector::VectorArena;
 const STACKED_ROUTER_VERSION: u32 = 1;
 const STACKED_ROUTER_ID: &str = "tantivy.stacked-ivf";
 
-pub(crate) fn build_default_stacked_router(
-    options: &VectorOptions,
-    centroids: &IvfCentroids,
-) -> BuiltRouter {
+fn build_stacked_router(options: &VectorOptions, centroids: &IvfCentroids) -> BuiltRouter {
     let IvfCentroids::F32(matrix) = centroids;
     let clusterer = SuperKMeansLevelClusterer::default();
     let (index, permutation) = IvfIndexBuilder::new(
@@ -70,6 +67,13 @@ where
 }
 
 impl Router for InMemoryStackedIvf {
+    fn build_router(
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<BuiltRouter> {
+        Ok(build_stacked_router(options, centroids))
+    }
+
     fn id(&self) -> &'static str {
         STACKED_ROUTER_ID
     }
@@ -105,6 +109,13 @@ impl Router for InMemoryStackedIvf {
 }
 
 impl Router for LazyStackedIvf {
+    fn build_router(
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<BuiltRouter> {
+        Ok(build_stacked_router(options, centroids))
+    }
+
     fn id(&self) -> &'static str {
         STACKED_ROUTER_ID
     }

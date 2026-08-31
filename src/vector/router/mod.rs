@@ -5,6 +5,7 @@ use std::sync::Arc;
 use common::{BinarySerializable, HasLen};
 
 use super::ivf::graph::{Candidate, NeighborhoodGraphSearchMetrics, Workspace};
+use super::ivf::{BuiltRouter, IvfCentroids};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
@@ -13,8 +14,7 @@ mod exact;
 mod rng;
 mod stacked;
 
-pub(crate) use exact::ExactRouter;
-pub(crate) use stacked::build_default_stacked_router;
+pub(crate) use exact::LazyExactRouter;
 
 const ROUTER_MAGIC: &[u8; 8] = b"TVROUTER";
 const ROUTER_HEADER_LEN: usize = ROUTER_MAGIC.len() + size_of::<u16>() + size_of::<u32>();
@@ -61,12 +61,20 @@ impl RouterSearchContext {
     }
 }
 
-/// Routes IVF queries and owns its persisted format.
+/// Builds and routes an IVF index and owns its persisted format.
 ///
 /// `serialize` wraps the router payload in an envelope containing its ID and
 /// format version. `open_router` removes and validates that envelope before
 /// delegating the payload to `deserialize`.
 pub trait Router: Send + Sync {
+    /// Builds a router over the supplied centroids, which may be empty.
+    fn build_router(
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<BuiltRouter>
+    where
+        Self: Sized;
+
     fn id(&self) -> &'static str;
 
     fn vector_file_version(&self) -> VectorFileVersion;
@@ -108,6 +116,12 @@ pub trait Router: Send + Sync {
 }
 
 pub trait RouterFactory: Send + Sync {
+    fn build(
+        &self,
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<BuiltRouter>;
+
     fn open(
         &self,
         file_version: VectorFileVersion,
@@ -125,6 +139,14 @@ impl<R> RouterFactoryFor<R> {
 }
 
 impl<R: Router + 'static> RouterFactory for RouterFactoryFor<R> {
+    fn build(
+        &self,
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<BuiltRouter> {
+        R::build_router(options, centroids)
+    }
+
     fn open(
         &self,
         file_version: VectorFileVersion,
@@ -276,6 +298,13 @@ mod tests {
     }
 
     impl Router for TestRouter {
+        fn build_router(
+            _options: &VectorOptions,
+            _centroids: &IvfCentroids,
+        ) -> crate::Result<BuiltRouter> {
+            Ok(BuiltRouter::new(TestRouter { cluster: 0 }))
+        }
+
         fn id(&self) -> &'static str {
             "test.router"
         }
@@ -332,6 +361,14 @@ mod tests {
     }
 
     impl RouterFactory for CountingRouterFactory {
+        fn build(
+            &self,
+            options: &VectorOptions,
+            centroids: &IvfCentroids,
+        ) -> crate::Result<BuiltRouter> {
+            TestRouter::build_router(options, centroids)
+        }
+
         fn open(
             &self,
             file_version: VectorFileVersion,

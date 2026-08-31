@@ -10,7 +10,7 @@ use crate::schema::{Field, FieldType, IndexRecordOption, Schema, Term, STORED, S
 use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::{
     IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-    Metric, VectorDType, VectorOptions,
+    LazyStackedIvf, Metric, VectorDType, VectorOptions,
 };
 use crate::{DocAddress, Index, Score, TantivyDocument};
 
@@ -108,6 +108,7 @@ impl TestVectorIndexBuilder {
             builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: self.centroids.clone(),
             }));
+            builder = builder.ivf_router::<LazyStackedIvf>();
         }
         builder.create_in_ram()
     }
@@ -456,7 +457,27 @@ fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Resu
 }
 
 #[test]
-fn ivf_merge_writes_stacked_router_by_default() -> crate::Result<()> {
+fn ivf_clusterer_requires_an_explicit_router() {
+    let mut schema_builder = Schema::builder();
+    schema_builder.add_vector_field(
+        EMBEDDING_FIELD_NAME,
+        VectorOptions::new(grid2d::DIM, Metric::L2),
+    );
+    let error = Index::builder()
+        .schema(schema_builder.build())
+        .ivf_clusterer(Arc::new(Grid2DClusterer {
+            centroids: grid2d::centroids(),
+        }))
+        .create_in_ram()
+        .err()
+        .expect("an IVF clusterer without a router must be rejected");
+    assert!(error
+        .to_string()
+        .contains("requires an explicitly configured Router"));
+}
+
+#[test]
+fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
     use crate::vector::ivf::CENTROIDS_EXT;
@@ -838,10 +859,9 @@ mod bounds_storage_tests {
     use crate::schema::{Schema, STORED, STRING};
     use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
     use crate::vector::{
-        residual_norm, BoundKind, BuiltRouter, InMemoryStackedIvf, IvfCentroids, IvfClusterer,
-        IvfConfig, IvfIndexBuilder, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-        LazyStackedIvf, Metric, SuperKMeansLevelClusterer, VectorDType, VectorOptions,
-        VectorStorageFormat, Workspace,
+        residual_norm, BoundKind, InMemoryStackedIvf, IvfCentroids, IvfClusterer, IvfConfig,
+        IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors, LazyStackedIvf, Metric,
+        VectorDType, VectorOptions, VectorStorageFormat, Workspace,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -929,8 +949,6 @@ mod bounds_storage_tests {
     struct TestClusterer {
         fixed_centroids: Option<Vec<[f32; 2]>>,
         num_centroids: usize,
-        /// Build a stacked router over the trained centroids (slot `[2]`).
-        stacked: bool,
     }
 
     impl IvfClusterer for TestClusterer {
@@ -996,28 +1014,6 @@ mod bounds_storage_tests {
                 })
                 .collect())
         }
-        fn build_router(
-            &self,
-            options: &VectorOptions,
-            centroids: &IvfCentroids,
-        ) -> crate::Result<Option<BuiltRouter>> {
-            if !self.stacked {
-                return Ok(None);
-            }
-            let IvfCentroids::F32(matrix) = centroids;
-            let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-            let (index, perm) = IvfIndexBuilder::new(
-                matrix.values.clone(),
-                matrix.rows,
-                options.dim(),
-                &clusterer,
-                IvfConfig::new(2),
-            )
-            .build();
-            Ok(Some(
-                BuiltRouter::new(index).with_centroid_permutation(perm),
-            ))
-        }
     }
 
     /// A 2-dim IVF index over `commits` (one flat segment per inner
@@ -1040,16 +1036,11 @@ mod bounds_storage_tests {
             vector_clustering_threshold: 1,
             ..IndexSettings::default()
         };
-        let uses_stacked_router = clusterer.stacked;
         let builder = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(clusterer));
-        let builder = if uses_stacked_router {
-            builder.ivf_router::<LazyStackedIvf>()
-        } else {
-            builder
-        };
+            .ivf_clusterer(Arc::new(clusterer))
+            .ivf_router::<LazyStackedIvf>();
         let index = match directory {
             Some(directory) => builder.open_or_create(directory)?,
             None => builder.create_in_ram()?,
@@ -1091,7 +1082,6 @@ mod bounds_storage_tests {
             TestClusterer {
                 fixed_centroids: Some(vec![[0.0, 0.0], [50.0, 50.0]]),
                 num_centroids: 2,
-                stacked: false,
             },
             &[&[[3.0e38, 3.0e38]], &[[50.0, 50.0], [50.5, 50.0]]],
             None,
@@ -1124,7 +1114,6 @@ mod bounds_storage_tests {
             TestClusterer {
                 fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
                 num_centroids: 2,
-                stacked: false,
             },
             &[&[[0.0, 0.0], [0.0, 0.0]], &[[10.0, 10.0], [10.0, 10.5]]],
             None,
@@ -1151,7 +1140,6 @@ mod bounds_storage_tests {
         let clusterer = || TestClusterer {
             fixed_centroids: None, // train on the first sample → data-dependent
             num_centroids: 1,
-            stacked: false,
         };
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
@@ -1224,13 +1212,43 @@ mod bounds_storage_tests {
             TestClusterer {
                 fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
                 num_centroids: 2,
-                stacked: false,
             },
             &[&[[0.0, 0.0], [0.1, 0.0]], &[[10.0, 10.0], [10.1, 10.0]]],
             None,
         )?;
         merge_all(&index)?;
         Ok((index, field))
+    }
+
+    #[test]
+    fn opening_ivf_requires_an_explicit_router() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let (index, field) = build_ivf_with_plan(
+            Metric::L2,
+            TestClusterer {
+                fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
+                num_centroids: 2,
+            },
+            &[&[[0.0, 0.0], [0.1, 0.0]], &[[10.0, 10.0], [10.1, 10.0]]],
+            Some(directory.clone()),
+        )?;
+        merge_all(&index)?;
+        drop(index);
+
+        let mut reopened = Index::open(directory)?;
+        let searcher = reopened.reader()?.searcher();
+        let error = searcher.segment_readers()[0]
+            .vector_index(field)
+            .err()
+            .expect("opening IVF without a router must fail");
+        assert!(error
+            .to_string()
+            .contains("requires an explicitly configured Router"));
+
+        reopened.set_ivf_router::<LazyStackedIvf>();
+        let searcher = reopened.reader()?.searcher();
+        searcher.segment_readers()[0].vector_index(field)?;
+        Ok(())
     }
 
     /// Rewrite the merged segment's `.centroids` as a file stamped
@@ -1378,7 +1396,6 @@ mod bounds_storage_tests {
             TestClusterer {
                 fixed_centroids: Some(centroids.clone()),
                 num_centroids: centroids.len(),
-                stacked: true,
             },
             &[first, second],
             None,
@@ -1442,7 +1459,11 @@ mod bounds_storage_tests {
         // query — the FileSlice path scores the same rows.
         for c in &centroids {
             let query = [c[0] + 0.3, 0.2];
-            let owned = stacked.search(&query, 2, 1.0, Metric::L2);
+            let owned: Vec<_> = stacked
+                .search(&query, 2, 1.0, Metric::L2)
+                .into_iter()
+                .take(2)
+                .collect();
             let mut workspace = Workspace::new();
             let lazy: Vec<_> = ivf.rank_clusters(&mut workspace, &query).take(2).collect();
             assert_eq!(owned.len(), lazy.len());

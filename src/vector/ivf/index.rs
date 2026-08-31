@@ -14,7 +14,7 @@
 //!     router was built
 //! [1] cluster_offsets (u64[N+1], prefix sum)
 //! [2] a self-describing router envelope. V2 files carry a bare RNG graph.
-//!     Absent for degenerate centroid counts, which use exact routing.
+//!     Older degenerate IVF segments may omit it and use exact routing.
 //! [3] centroid bounds, REQUIRED from V2 on: a segment-level BoundKind byte,
 //!     then N · stride(kind) f32s in cluster order — for Ball, one f32 per
 //!     cluster: max ||x - c|| over the cluster's members' stored rows against
@@ -43,9 +43,10 @@ use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
 use crate::vector::router::{
-    ExactRouter, Router, RouterFactory, RouterOpenContext, RouterRanking, RouterSearchContext,
+    LazyExactRouter, Router, RouterFactory, RouterOpenContext, RouterRanking, RouterSearchContext,
 };
 use crate::vector::{BoundKind, BoundStore};
+use crate::TantivyError;
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -156,7 +157,7 @@ impl IvfIndex {
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         router_slice: Option<FileSlice>,
-        router_factory: &dyn RouterFactory,
+        router_factory: Option<&dyn RouterFactory>,
         bounds_slice: Option<FileSlice>,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -200,9 +201,14 @@ impl IvfIndex {
         }
 
         let router_context = RouterOpenContext::new(centroids_slice.clone(), options.clone());
+        let router_factory = router_factory.ok_or_else(|| {
+            TantivyError::InvalidArgument(
+                "IVF index requires an explicitly configured Router".to_string(),
+            )
+        })?;
         let router = match router_slice {
             Some(slice) => router_factory.open(version, slice, &router_context)?,
-            None => Box::new(ExactRouter::new(&router_context)),
+            None => Box::new(LazyExactRouter::new(&router_context)),
         };
 
         // P1: bounds slot — one kind byte, then the stride-derived payload.

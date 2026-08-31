@@ -526,8 +526,11 @@ impl IvfIndex<InMemoryStore, InMemoryStore> {
         clusterer: &Cl,
         config: IvfConfig,
     ) -> (Self, Vec<u32>) {
-        assert!(n > 0 && dim > 0, "n and dim must be positive");
+        assert!(dim > 0, "dim must be positive");
         assert_eq!(data.len(), n * dim);
+        if n == 0 {
+            return (Self::empty(config, dim), Vec::new());
+        }
         let nlist = config.nlist_for(n);
         let (centroids, assignments) = clusterer.cluster(&data, n, dim, nlist);
         let mut index = Self::empty(config, dim);

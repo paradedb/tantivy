@@ -896,9 +896,9 @@ mod tests {
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors,
-        NeighborhoodGraphSearchMetrics, SearchTerminationReason, VectorClusterStats, VectorDType,
-        VectorInfo, VectorOptions, VectorStorageFormat,
+        IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors,
+        LazyStackedIvf, NeighborhoodGraphSearchMetrics, SearchTerminationReason,
+        VectorClusterStats, VectorDType, VectorInfo, VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -1051,6 +1051,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.to_vec(),
             }))
+            .ivf_router::<LazyStackedIvf>()
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1164,6 +1165,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.clone(),
             }))
+            .ivf_router::<LazyStackedIvf>()
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1258,6 +1260,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.clone(),
             }))
+            .ivf_router::<LazyStackedIvf>()
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -2854,6 +2857,7 @@ mod tests {
                 .ivf_clusterer(Arc::new(InlineClusterer {
                     centroids: centroids.to_vec(),
                 }))
+                .ivf_router::<LazyStackedIvf>()
                 .create_in_ram()?;
             let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
             writer.set_merge_policy(Box::new(NoMergePolicy));

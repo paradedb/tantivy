@@ -10,19 +10,21 @@ use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::graph::{Candidate, Workspace};
-use crate::vector::{FileSliceArena, VectorArena};
+use crate::vector::{BuiltRouter, FileSliceArena, IvfCentroids, VectorArena, VectorOptions};
 
 const EXACT_ROUTER_ID: &str = "tantivy.exact";
 const EXACT_ROUTER_VERSION: u32 = 1;
 
-pub(crate) struct ExactRouter {
-    centroids: FileSliceArena<f32>,
+pub(crate) struct ExactRouter<S> {
+    centroids: S,
     num_centroids: usize,
     dim: usize,
     metric: Metric,
 }
 
-impl ExactRouter {
+pub(crate) type LazyExactRouter = ExactRouter<FileSliceArena<f32>>;
+
+impl ExactRouter<FileSliceArena<f32>> {
     pub(crate) fn new(context: &RouterOpenContext) -> Self {
         Self {
             centroids: FileSliceArena::new(context.centroids().clone()),
@@ -37,7 +39,31 @@ impl ExactRouter {
     }
 }
 
-impl Router for ExactRouter {
+impl ExactRouter<Vec<f32>> {
+    fn from_centroids(options: &VectorOptions, centroids: &IvfCentroids) -> Self {
+        let IvfCentroids::F32(matrix) = centroids;
+        Self {
+            centroids: matrix.values.clone(),
+            num_centroids: matrix.rows,
+            dim: options.dim(),
+            metric: options.metric(),
+        }
+    }
+}
+
+impl<S> Router for ExactRouter<S>
+where
+    S: VectorArena<Elem = f32> + Send + Sync + 'static,
+{
+    fn build_router(
+        options: &VectorOptions,
+        centroids: &IvfCentroids,
+    ) -> crate::Result<BuiltRouter> {
+        Ok(BuiltRouter::new(ExactRouter::<Vec<f32>>::from_centroids(
+            options, centroids,
+        )))
+    }
+
     fn id(&self) -> &'static str {
         EXACT_ROUTER_ID
     }
@@ -63,7 +89,7 @@ impl Router for ExactRouter {
             )
             .into());
         }
-        Ok(Box::new(ExactRouter::new(context)))
+        Ok(Box::new(LazyExactRouter::new(context)))
     }
 
     fn rank<'a>(

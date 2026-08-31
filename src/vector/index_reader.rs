@@ -125,12 +125,10 @@ impl VectorIndexReader {
                     composite.open_read_with_idx(field, centroid_slot::OFFSETS),
                     composite.open_read_with_idx(field, centroid_slot::BOUNDS),
                 ) {
-                    // Slot [2] (the router) stays optional: the write
-                    // side skips it for degenerate centroid counts. Slot
-                    // [3] (bounds) is read whenever present; when absent,
-                    // a V1 file simply predates it — `IvfIndex::open`
-                    // synthesizes SATURATED bounds — while a V2+ file
-                    // without it is corrupt, not old.
+                    // Slot [2] (the router) stays optional for older
+                    // degenerate IVF segments. Slot [3] (bounds) is read
+                    // whenever present; when absent, a V1 file simply predates
+                    // it, while a V2+ file without it is corrupt.
                     (Some(centroids), Some(offsets), bounds) => {
                         if bounds.is_none() && centroids_version >= VectorFileVersion::V2 {
                             return Err(TantivyError::InternalError(format!(
