@@ -17,8 +17,7 @@ const GRAPH_ROUTER_VERSION: u32 = 1;
 const GRAPH_ROUTER_ID: &str = "tantivy.relative-neighborhood-graph";
 
 impl<S> Router for RelativeNeighborhoodGraph<S>
-where
-    S: VectorArena<Elem = f32> + Send + Sync,
+where S: VectorArena<Elem = f32> + Send + Sync
 {
     fn build_router(
         options: &VectorOptions,

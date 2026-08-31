@@ -40,8 +40,7 @@ impl ExactRouter<FileSliceArena<f32>> {
 }
 
 impl<S> Router for ExactRouter<S>
-where
-    S: VectorArena<Elem = f32> + Send + Sync + 'static,
+where S: VectorArena<Elem = f32> + Send + Sync + 'static
 {
     fn build_router(
         options: &VectorOptions,
