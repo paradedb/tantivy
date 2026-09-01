@@ -98,12 +98,14 @@ pub trait Router: ErasedRouterDescriptor + Send + Sync + 'static {
     where
         Self: Sized;
 
+    /// Rank centroids and update `metrics` as the returned iterator advances.
     fn rank<'a>(
         &'a self,
         workspace: &'a mut Workspace,
         query: &'a [f32],
         metric: Metric,
-    ) -> Box<dyn RouterRanking + 'a>;
+        metrics: &'a mut IvfSearchMetrics,
+    ) -> Box<dyn Iterator<Item = Candidate> + 'a>;
 
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()>;
 
@@ -222,10 +224,6 @@ impl RouterBinding {
     }
 }
 
-pub trait RouterRanking: Iterator<Item = Candidate> {
-    fn metrics(&self) -> IvfSearchMetrics;
-}
-
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct IvfSearchMetrics {
     pub visited_count: usize,
@@ -243,37 +241,6 @@ fn write_router_header(id: &str, out: &mut dyn Write) -> io::Result<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "router ID exceeds u16"))?;
     id_len.serialize(out)?;
     out.write_all(id.as_bytes())
-}
-
-struct EagerRouterRanking {
-    ranked: std::vec::IntoIter<Candidate>,
-    visited_count: usize,
-}
-
-impl EagerRouterRanking {
-    fn new(ranked: Vec<Candidate>, visited_count: usize) -> Self {
-        Self {
-            ranked: ranked.into_iter(),
-            visited_count,
-        }
-    }
-}
-
-impl Iterator for EagerRouterRanking {
-    type Item = Candidate;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.ranked.next()
-    }
-}
-
-impl RouterRanking for EagerRouterRanking {
-    fn metrics(&self) -> IvfSearchMetrics {
-        IvfSearchMetrics {
-            visited_count: self.visited_count,
-            graph: None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -325,14 +292,19 @@ mod tests {
             _workspace: &'a mut Workspace,
             _query: &'a [f32],
             _metric: Metric,
-        ) -> Box<dyn RouterRanking + 'a> {
-            Box::new(EagerRouterRanking::new(
+            metrics: &'a mut IvfSearchMetrics,
+        ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
+            *metrics = IvfSearchMetrics {
+                visited_count: 1,
+                graph: None,
+            };
+            Box::new(
                 vec![Candidate {
                     sim: Similarity::new(1.0),
                     node: self.cluster,
-                }],
-                1,
-            ))
+                }]
+                .into_iter(),
+            )
         }
 
         fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()> {
@@ -354,8 +326,11 @@ mod tests {
             &options,
         )?;
         let mut workspace = Workspace::new();
-        let mut ranking = opened.rank(&mut workspace, &[0.0], Metric::L2);
+        let mut metrics = IvfSearchMetrics::default();
+        let mut ranking = opened.rank(&mut workspace, &[0.0], Metric::L2, &mut metrics);
         assert_eq!(ranking.next().unwrap().node, 42);
+        drop(ranking);
+        assert_eq!(metrics.visited_count, 1);
         Ok(())
     }
 

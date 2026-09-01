@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use super::{EagerRouterRanking, Router, RouterDescriptor, RouterRanking};
+use super::{IvfSearchMetrics, Router, RouterDescriptor};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
@@ -70,7 +70,8 @@ fn rank_stacked<'a, C, M>(
     index: &MultiLevelIvf<C, M>,
     query: &[f32],
     metric: Metric,
-) -> Box<dyn RouterRanking + 'a>
+    metrics: &mut IvfSearchMetrics,
+) -> Box<dyn Iterator<Item = Candidate> + 'a>
 where
     C: VectorArena<Elem = f32>,
     M: VectorArena<Elem = f32>,
@@ -83,8 +84,11 @@ where
             node: candidate.node.0,
         })
         .collect::<Vec<_>>();
-    let visited_count = ranked.len();
-    Box::new(EagerRouterRanking::new(ranked, visited_count))
+    *metrics = IvfSearchMetrics {
+        visited_count: ranked.len(),
+        graph: None,
+    };
+    Box::new(ranked.into_iter())
 }
 
 impl Router for InMemoryStackedIvf {
@@ -112,8 +116,9 @@ impl Router for InMemoryStackedIvf {
         _workspace: &'a mut Workspace,
         query: &'a [f32],
         metric: Metric,
-    ) -> Box<dyn RouterRanking + 'a> {
-        rank_stacked(self, query, metric)
+        metrics: &'a mut IvfSearchMetrics,
+    ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
+        rank_stacked(self, query, metric, metrics)
     }
 
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()> {
@@ -146,8 +151,9 @@ impl Router for LazyStackedIvf {
         _workspace: &'a mut Workspace,
         query: &'a [f32],
         metric: Metric,
-    ) -> Box<dyn RouterRanking + 'a> {
-        rank_stacked(self, query, metric)
+        metrics: &'a mut IvfSearchMetrics,
+    ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
+        rank_stacked(self, query, metric, metrics)
     }
 
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()> {

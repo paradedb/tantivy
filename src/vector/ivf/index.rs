@@ -33,8 +33,8 @@ use super::graph::Workspace;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
-use crate::vector::router::{Router, RouterBinding, RouterRanking};
-use crate::vector::{BoundKind, BoundStore};
+use crate::vector::router::{IvfSearchMetrics, Router, RouterBinding};
+use crate::vector::{BoundKind, BoundStore, Candidate};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -298,7 +298,8 @@ impl IvfIndex {
         &'a self,
         workspace: &'a mut Workspace,
         query: &'a [f32],
-    ) -> Box<dyn RouterRanking + 'a> {
-        self.router.rank(workspace, query, self.metric)
+        metrics: &'a mut IvfSearchMetrics,
+    ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
+        self.router.rank(workspace, query, self.metric, metrics)
     }
 }

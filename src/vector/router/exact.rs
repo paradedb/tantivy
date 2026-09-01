@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use common::HasLen;
 
-use super::{EagerRouterRanking, Router, RouterDescriptor, RouterRanking};
+use super::{IvfSearchMetrics, Router, RouterDescriptor};
 use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::header::VectorFileVersion;
@@ -69,7 +69,8 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
         _workspace: &'a mut Workspace,
         query: &'a [f32],
         _metric: Metric,
-    ) -> Box<dyn RouterRanking + 'a> {
+        metrics: &'a mut IvfSearchMetrics,
+    ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
         let mut ranked = (0..self.num_centroids)
             .map(|cluster| Candidate {
                 sim: self
@@ -79,7 +80,11 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
             })
             .collect::<Vec<_>>();
         ranked.sort_unstable_by(|a, b| b.cmp(a));
-        Box::new(EagerRouterRanking::new(ranked, self.num_centroids))
+        *metrics = IvfSearchMetrics {
+            visited_count: self.num_centroids,
+            graph: None,
+        };
+        Box::new(ranked.into_iter())
     }
 
     fn serialize_payload(&self, _out: &mut dyn Write) -> io::Result<()> {

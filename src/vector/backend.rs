@@ -557,7 +557,8 @@ impl<T: VectorElement> VectorBackend<T> {
         // query is widened losslessly per element.
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
         let mut routing_ws = Workspace::new();
-        let mut ranked = index.rank_clusters(&mut routing_ws, &query_f32);
+        let mut routing_metrics = IvfSearchMetrics::default();
+        let mut ranked = index.rank_clusters(&mut routing_ws, &query_f32, &mut routing_metrics);
 
         let topn = self.scan_clusters(
             index,
@@ -574,7 +575,8 @@ impl<T: VectorElement> VectorBackend<T> {
         )?;
 
         // The routing cost is only known once the scan stops pulling.
-        stats.routing = ranked.metrics();
+        drop(ranked);
+        stats.routing = routing_metrics;
 
         let segment_ord = self.segment_ord;
         Ok(topn
