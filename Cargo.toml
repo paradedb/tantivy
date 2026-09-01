@@ -251,3 +251,7 @@ harness = false
 [[bench]]
 name = "graph"
 harness = false
+
+[[bench]]
+name = "ivf_recall"
+harness = false
