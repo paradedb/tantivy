@@ -2,10 +2,7 @@ use std::io::{self, Write};
 
 use common::HasLen;
 
-use super::{
-    EagerRouterRanking, Router, RouterDescriptor, RouterOpenContext, RouterRanking,
-    RouterSearchContext,
-};
+use super::{EagerRouterRanking, Router, RouterDescriptor, RouterRanking};
 use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::header::VectorFileVersion;
@@ -45,7 +42,8 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
 
     fn deserialize(
         payload: FileSlice,
-        context: &RouterOpenContext,
+        centroids: FileSlice,
+        options: &VectorOptions,
     ) -> crate::Result<Box<dyn Router>> {
         if payload.len() != 0 {
             return Err(io::Error::new(
@@ -54,15 +52,15 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
             )
             .into());
         }
+        let num_centroids = centroids
+            .len()
+            .checked_div(options.bytes_per_vector())
+            .unwrap_or(0);
         Ok(Box::new(LazyExactRouter {
-            centroids: FileSliceArena::new(context.centroids().clone()),
-            num_centroids: context
-                .centroids()
-                .len()
-                .checked_div(context.options().bytes_per_vector())
-                .unwrap_or(0),
-            dim: context.options().dim(),
-            metric: context.options().metric(),
+            centroids: FileSliceArena::new(centroids),
+            num_centroids,
+            dim: options.dim(),
+            metric: options.metric(),
         }))
     }
 
@@ -70,7 +68,7 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
         &'a self,
         _workspace: &'a mut Workspace,
         query: &'a [f32],
-        _context: RouterSearchContext,
+        _metric: Metric,
     ) -> Box<dyn RouterRanking + 'a> {
         let mut ranked = (0..self.num_centroids)
             .map(|cluster| Candidate {

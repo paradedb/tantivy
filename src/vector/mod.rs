@@ -57,10 +57,7 @@ pub use ivf::{
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
-pub use router::{
-    IvfSearchMetrics, LazyExactRouter, Router, RouterDescriptor, RouterOpenContext, RouterRanking,
-    RouterSearchContext,
-};
+pub use router::{IvfSearchMetrics, LazyExactRouter, Router, RouterDescriptor, RouterRanking};
 pub use tie_break::NoTieBreak;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`

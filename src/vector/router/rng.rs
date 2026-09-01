@@ -1,11 +1,8 @@
 use std::io::{self, Write};
 
-use super::{
-    IvfSearchMetrics, Router, RouterDescriptor, RouterOpenContext, RouterRanking,
-    RouterSearchContext,
-};
+use super::{IvfSearchMetrics, Router, RouterDescriptor, RouterRanking};
 use crate::directory::FileSlice;
-use crate::schema::{VectorDType, VectorOptions};
+use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::header::VectorFileVersion;
 use crate::vector::ivf::graph::{
     NeighborhoodGraphConfig, RelativeNeighborhoodGraph, SearchIterator, Workspace,
@@ -57,17 +54,18 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
 
     fn deserialize(
         payload: FileSlice,
-        context: &RouterOpenContext,
+        centroids: FileSlice,
+        options: &VectorOptions,
     ) -> crate::Result<Box<dyn Router>> {
-        let vectors = match context.options().dtype() {
-            VectorDType::F32 => FileSliceArena::<f32>::new(context.centroids().clone()),
+        let vectors = match options.dtype() {
+            VectorDType::F32 => FileSliceArena::<f32>::new(centroids),
         };
         let adjacency = payload.read_bytes()?;
         Ok(Box::new(RelativeNeighborhoodGraph::open(
             &adjacency,
             vectors,
-            context.options().dim(),
-            context.options().metric(),
+            options.dim(),
+            options.metric(),
             NeighborhoodGraphConfig::default(),
         )?))
     }
@@ -76,7 +74,7 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
         &'a self,
         workspace: &'a mut Workspace,
         query: &'a [f32],
-        _context: RouterSearchContext,
+        _metric: Metric,
     ) -> Box<dyn RouterRanking + 'a> {
         let seeds = (0..self.len())
             .step_by((self.len() / 8).max(1))

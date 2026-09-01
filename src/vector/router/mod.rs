@@ -61,48 +61,6 @@ pub(crate) trait ErasedRouterDescriptor {
     fn erased_descriptor(&self) -> RouterDescriptor;
 }
 
-pub struct RouterOpenContext {
-    centroids: FileSlice,
-    options: VectorOptions,
-}
-
-impl RouterOpenContext {
-    pub(crate) fn new(centroids: FileSlice, options: VectorOptions) -> Self {
-        Self { centroids, options }
-    }
-
-    pub fn centroids(&self) -> &FileSlice {
-        &self.centroids
-    }
-
-    pub fn options(&self) -> &VectorOptions {
-        &self.options
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct RouterSearchContext {
-    num_centroids: usize,
-    metric: Metric,
-}
-
-impl RouterSearchContext {
-    pub(crate) fn new(num_centroids: usize, metric: Metric) -> Self {
-        Self {
-            num_centroids,
-            metric,
-        }
-    }
-
-    pub fn num_centroids(self) -> usize {
-        self.num_centroids
-    }
-
-    pub fn metric(self) -> Metric {
-        self.metric
-    }
-}
-
 /// Builds and routes an IVF index and owns its persisted format.
 ///
 /// `serialize` prefixes the router payload with its ID. The configured router
@@ -136,7 +94,8 @@ pub trait Router: ErasedRouterDescriptor + Send + Sync + 'static {
 
     fn deserialize(
         payload: FileSlice,
-        context: &RouterOpenContext,
+        centroids: FileSlice,
+        options: &VectorOptions,
     ) -> crate::Result<Box<dyn Router>>
     where
         Self: Sized;
@@ -145,7 +104,7 @@ pub trait Router: ErasedRouterDescriptor + Send + Sync + 'static {
         &'a self,
         workspace: &'a mut Workspace,
         query: &'a [f32],
-        context: RouterSearchContext,
+        metric: Metric,
     ) -> Box<dyn RouterRanking + 'a>;
 
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()>;
@@ -175,14 +134,16 @@ pub(crate) trait RouterFactory: Send + Sync + 'static {
     fn deserialize(
         &self,
         payload: FileSlice,
-        context: &RouterOpenContext,
+        centroids: FileSlice,
+        options: &VectorOptions,
     ) -> crate::Result<Box<dyn Router>>;
 
     fn open(
         &self,
         file_version: VectorFileVersion,
         slot: FileSlice,
-        context: &RouterOpenContext,
+        centroids: FileSlice,
+        options: &VectorOptions,
     ) -> crate::Result<Box<dyn Router>> {
         let descriptor = self.descriptor();
         if descriptor.vector_file_version() != file_version {
@@ -230,7 +191,7 @@ pub(crate) trait RouterFactory: Send + Sync + 'static {
             )
             .into());
         }
-        let router = self.deserialize(slot.slice_from(payload_offset), context)?;
+        let router = self.deserialize(slot.slice_from(payload_offset), centroids, options)?;
         if router.descriptor() != descriptor {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -264,9 +225,10 @@ impl<R: Router + 'static> RouterFactory for RouterFactoryFor<R> {
     fn deserialize(
         &self,
         payload: FileSlice,
-        context: &RouterOpenContext,
+        centroids: FileSlice,
+        options: &VectorOptions,
     ) -> crate::Result<Box<dyn Router>> {
-        R::deserialize(payload, context)
+        R::deserialize(payload, centroids, options)
     }
 }
 
@@ -358,7 +320,8 @@ mod tests {
 
         fn deserialize(
             payload: FileSlice,
-            _context: &RouterOpenContext,
+            _centroids: FileSlice,
+            _options: &VectorOptions,
         ) -> crate::Result<Box<dyn Router>> {
             let bytes = payload.read_bytes()?;
             let mut cursor = bytes.as_slice();
@@ -377,7 +340,7 @@ mod tests {
             &'a self,
             _workspace: &'a mut Workspace,
             _query: &'a [f32],
-            _context: RouterSearchContext,
+            _metric: Metric,
         ) -> Box<dyn RouterRanking + 'a> {
             Box::new(EagerRouterRanking::new(
                 vec![Candidate {
@@ -413,15 +376,12 @@ mod tests {
         fn deserialize(
             &self,
             payload: FileSlice,
-            context: &RouterOpenContext,
+            centroids: FileSlice,
+            options: &VectorOptions,
         ) -> crate::Result<Box<dyn Router>> {
             self.opens.fetch_add(1, Ordering::Relaxed);
-            TestRouter::<0>::deserialize(payload, context)
+            TestRouter::<0>::deserialize(payload, centroids, options)
         }
-    }
-
-    fn test_context() -> RouterOpenContext {
-        RouterOpenContext::new(FileSlice::empty(), VectorOptions::new(1, Metric::L2))
     }
 
     #[test]
@@ -430,17 +390,15 @@ mod tests {
         let mut bytes = Vec::new();
         router.serialize(&mut bytes)?;
         let factory = router_factory_for::<TestRouter<0>>();
+        let options = VectorOptions::new(1, Metric::L2);
         let opened = factory.open(
             VectorFileVersion::V3,
             FileSlice::from(bytes),
-            &test_context(),
+            FileSlice::empty(),
+            &options,
         )?;
         let mut workspace = Workspace::new();
-        let mut ranking = opened.rank(
-            &mut workspace,
-            &[0.0],
-            RouterSearchContext::new(1, Metric::L2),
-        );
+        let mut ranking = opened.rank(&mut workspace, &[0.0], Metric::L2);
         assert_eq!(ranking.next().unwrap().node, 42);
         Ok(())
     }
@@ -455,10 +413,12 @@ mod tests {
         let factory: Arc<dyn RouterFactory> = Arc::new(CountingRouterFactory {
             opens: opens.clone(),
         });
+        let options = VectorOptions::new(1, Metric::L2);
         let opened = factory.open(
             VectorFileVersion::V3,
             FileSlice::from(bytes),
-            &test_context(),
+            FileSlice::empty(),
+            &options,
         )?;
 
         assert_eq!(opened.id(), "test.primary");
@@ -471,11 +431,13 @@ mod tests {
         let router = TestRouter::<1> { cluster: 42 };
         let mut bytes = Vec::new();
         router.serialize(&mut bytes).unwrap();
+        let options = VectorOptions::new(1, Metric::L2);
         let error = router_factory_for::<TestRouter<0>>()
             .open(
                 VectorFileVersion::V3,
                 FileSlice::from(bytes),
-                &test_context(),
+                FileSlice::empty(),
+                &options,
             )
             .err()
             .expect("a different persisted router must fail");
@@ -486,8 +448,14 @@ mod tests {
 
     #[test]
     fn pre_v3_router_format_is_rejected() {
+        let options = VectorOptions::new(1, Metric::L2);
         let error = router_factory_for::<TestRouter<0>>()
-            .open(VectorFileVersion::V2, FileSlice::empty(), &test_context())
+            .open(
+                VectorFileVersion::V2,
+                FileSlice::empty(),
+                FileSlice::empty(),
+                &options,
+            )
             .err()
             .expect("pre-V3 router formats must fail");
         assert!(error
