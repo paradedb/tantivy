@@ -707,6 +707,7 @@ impl VectorIndexReader {
                     u32::from_le_bytes(calibration_version.as_slice().try_into().unwrap());
                 let calibration_len = match calibration_version {
                     1 => 12,
+                    2 => 8 + config.layers.len() * 8,
                     QUANTIZED_CALIBRATION_VERSION => {
                         quantized_calibration_metadata_len(config.layers.len())
                     }
@@ -726,8 +727,9 @@ impl VectorIndexReader {
                 .read_bytes()?;
                 let calibration =
                     VectorQuantizationCalibration::decode(&calibration, config.layers.len())?;
+                let biases = calibration.depths.iter().map(|depth| depth.bias).collect();
                 let cals = calibration.depths.iter().map(|depth| depth.cal).collect();
-                let index_ctx = QuantizedIndexCtx::resolve(config.clone(), cals);
+                let index_ctx = QuantizedIndexCtx::resolve(config.clone(), biases, cals);
                 Some(QuantizedFieldReader {
                     config,
                     layers,

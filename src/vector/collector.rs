@@ -18,11 +18,12 @@
 //! never the ordering rule.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::backend::{ProbeStats, VectorBackend};
 use super::ivf::AdaptiveProbeParams;
 use super::tie_break::NoTieBreak;
-use super::VectorElement;
+use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
     compare_for_top_k, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
@@ -140,8 +141,7 @@ pub struct VectorSimilarityFruit {
     pub results: Vec<(Score, DocAddress)>,
     /// One [`ProbeStats`] per collected segment, in segment-ordinal order
     /// after [`Collector::merge_fruits`]. The counter fields are summable
-    /// across segments; `termination` and `bound_armed_at_probe` only
-    /// carry per-segment meaning.
+    /// across segments; `termination` only carries per-segment meaning.
     pub stats: Vec<ProbeStats>,
 }
 
@@ -227,7 +227,10 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
-        let backend = VectorBackend::for_segment(
+        let collect_start = Instant::now();
+        let init_start = Instant::now();
+        let init_stage = enter_vector_stage(Stage::ScanInit);
+        let mut backend = VectorBackend::for_segment(
             reader,
             segment_ord,
             self.field,
@@ -236,7 +239,11 @@ where
             self.max_scan_levels,
         )?;
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
-        let (hits, stats) = backend.top_n_by(
+        drop(init_stage);
+        backend.add_scan_init_ns(
+            (init_start.elapsed().as_nanos() as u64).saturating_sub(backend.query_prep_ns()),
+        );
+        let (hits, mut stats) = backend.top_n_by(
             weight,
             reader,
             self.segment_top_n(),
@@ -255,6 +262,10 @@ where
                 )
             })
             .collect();
+        let residual_ns =
+            (collect_start.elapsed().as_nanos() as u64).saturating_sub(stats.stage_elapsed_ns());
+        let assembly_ns = stats.result_assembly_ns.unwrap_or_default();
+        stats.result_assembly_ns = Some(assembly_ns.saturating_add(residual_ns));
         Ok(SegmentVectorFruit { results, stats })
     }
 
@@ -262,6 +273,8 @@ where
         &self,
         segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
     ) -> crate::Result<Self::Fruit> {
+        let assembly_start = Instant::now();
+        let _assembly_stage = enter_vector_stage(Stage::ResultAssembly);
         // Per-segment fruits are each already top-(limit+offset) under this
         // same composite order, so the global window is a plain sort of their
         // union. Stats concatenate untouched — one entry per segment, kept
@@ -288,6 +301,11 @@ where
             .take(self.limit)
             .map(|cd| (cd.sort_key.0, cd.doc))
             .collect();
+        if let Some(first) = stats.first_mut() {
+            let merge_ns = assembly_start.elapsed().as_nanos() as u64;
+            let segment_ns = first.result_assembly_ns.unwrap_or_default();
+            first.result_assembly_ns = Some(segment_ns.saturating_add(merge_ns));
+        }
         Ok(VectorSimilarityFruit { results, stats })
     }
 }
@@ -574,13 +592,7 @@ mod ivf_e2e_tests {
                     "no probe activity to compare for query={query:?} k={k}"
                 );
                 for stats in untied.stats.iter_mut().chain(&mut tied.stats) {
-                    stats.query_prep_ns = 0;
-                    stats.routing_ns = 0;
-                    stats.plane1_ns = 0;
-                    stats.boundary_ns = 0;
-                    stats.plane2_ns = 0;
-                    stats.rerank_fetch_ns = 0;
-                    stats.rerank_score_ns = 0;
+                    stats.clear_stage_timings();
                 }
                 assert_eq!(
                     format!("{:?}", untied.stats),

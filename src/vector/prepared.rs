@@ -47,12 +47,14 @@ pub(crate) struct QuantizedIndexCtx {
     pub(crate) config: VectorQuantizationConfig,
     pub(crate) specs: Vec<LayerSpec>,
     pub(crate) grids: Vec<Grid>,
+    biases: Vec<f32>,
     cals: Vec<f32>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct QuantizedIndexCacheKey {
     config_json: String,
+    bias_bits: Vec<u32>,
     cal_bits: Vec<u32>,
 }
 
@@ -61,9 +63,12 @@ static QUANTIZED_INDEX_CACHE: OnceLock<
 > = OnceLock::new();
 
 impl QuantizedIndexCtx {
-    #[cfg(test)]
     pub(crate) fn calibrations(&self) -> &[f32] {
         &self.cals
+    }
+
+    pub(crate) fn biases(&self) -> &[f32] {
+        &self.biases
     }
 
     pub(crate) fn new(config: VectorQuantizationConfig) -> Self {
@@ -76,7 +81,18 @@ impl QuantizedIndexCtx {
     }
 
     pub(crate) fn new_with_cals(config: VectorQuantizationConfig, cals: Vec<f32>) -> Self {
+        let biases = vec![0.0; config.layers.len()];
+        Self::new_with_biases_and_cals(config, biases, cals)
+    }
+
+    pub(crate) fn new_with_biases_and_cals(
+        config: VectorQuantizationConfig,
+        biases: Vec<f32>,
+        cals: Vec<f32>,
+    ) -> Self {
+        assert_eq!(biases.len(), config.layers.len());
         assert_eq!(cals.len(), config.layers.len());
+        assert!(biases.iter().all(|bias| bias.is_finite()));
         assert!(cals.iter().all(|cal| cal.is_finite() && *cal >= 0.0));
         let specs: Vec<LayerSpec> = config
             .layers
@@ -114,6 +130,7 @@ impl QuantizedIndexCtx {
             config,
             specs,
             grids,
+            biases,
             cals,
         }
     }
@@ -122,10 +139,15 @@ impl QuantizedIndexCtx {
     /// reuse it across SegmentReader lifetimes in the same backend process.
     /// SegmentReader's field cache provides the first level; this weak cache
     /// closes the pg_search query boundary, which reopens segment readers.
-    pub(crate) fn resolve(config: VectorQuantizationConfig, cals: Vec<f32>) -> Arc<Self> {
+    pub(crate) fn resolve(
+        config: VectorQuantizationConfig,
+        biases: Vec<f32>,
+        cals: Vec<f32>,
+    ) -> Arc<Self> {
         let key = QuantizedIndexCacheKey {
             config_json: serde_json::to_string(&config)
                 .expect("vector quantization config must serialize"),
+            bias_bits: biases.iter().map(|bias| bias.to_bits()).collect(),
             cal_bits: cals.iter().map(|cal| cal.to_bits()).collect(),
         };
         let cache = QUANTIZED_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -133,7 +155,7 @@ impl QuantizedIndexCtx {
         if let Some(resolved) = cache.get(&key) {
             return Arc::clone(resolved);
         }
-        let resolved = Arc::new(Self::new_with_cals(config, cals));
+        let resolved = Arc::new(Self::new_with_biases_and_cals(config, biases, cals));
         cache.insert(key, Arc::clone(&resolved));
         resolved
     }
@@ -197,9 +219,40 @@ impl QuantizedQueryCtx {
     }
 
     #[inline(always)]
+    pub(crate) fn score_layer_batch_unscaled_indexed(
+        &self,
+        layer: usize,
+        codes: &[u8],
+        code_stride: usize,
+        row_offsets: &[usize],
+        out: &mut [f32],
+    ) {
+        self.prepared.score_layer_batch_unscaled_indexed(
+            layer,
+            codes,
+            code_stride,
+            row_offsets,
+            self.index.specs[layer],
+            out,
+        );
+    }
+
+    #[inline(always)]
     pub(crate) fn layer_sigma_factor(&self, layer: usize, query_norm: f32) -> f32 {
         self.index.grids[layer].rho_model as f32
             * self.index.cals[layer]
+            * query_norm
+            * if self.index.config.metric == Metric::L2 {
+                2.0
+            } else {
+                1.0
+            }
+    }
+
+    #[inline(always)]
+    pub(crate) fn layer_bias_factor(&self, layer: usize, query_norm: f32) -> f32 {
+        self.index.grids[layer].rho_model as f32
+            * self.index.biases[layer]
             * query_norm
             * if self.index.config.metric == Metric::L2 {
                 2.0
@@ -242,6 +295,7 @@ impl QuantizedQueryCtx {
             } else {
                 1.0
             };
+        let bias_factor = self.index.grids[layer].rho_model as f32 * self.index.biases[layer];
         match constants {
             Some(constants) => {
                 for ((((score, sigma), &query_norm), scale), constant) in out
@@ -254,7 +308,7 @@ impl QuantizedQueryCtx {
                     let scale = u16::from_le_bytes(scale.try_into().unwrap());
                     let constant = f32::from_le_bytes(constant.try_into().unwrap());
                     let scale = f16_to_f32(scale);
-                    *score = scale * *score - constant;
+                    *score = scale * (*score + bias_factor * query_norm) - constant;
                     *sigma = scale * sigma_factor * query_norm;
                 }
             }
@@ -267,7 +321,7 @@ impl QuantizedQueryCtx {
                 {
                     let scale = u16::from_le_bytes(scale.try_into().unwrap());
                     let scale = f16_to_f32(scale);
-                    *score *= scale;
+                    *score = scale * (*score + bias_factor * query_norm);
                     *sigma = scale * sigma_factor * query_norm;
                 }
             }
@@ -308,6 +362,8 @@ impl QuantizedQueryCtx {
             } else {
                 1.0
             };
+        let bias_factor =
+            self.index.grids[layer].rho_model as f32 * self.index.biases[layer] * query_norm;
         match constants {
             Some(constants) => {
                 for (((score, sigma), scale), constant) in out
@@ -318,7 +374,7 @@ impl QuantizedQueryCtx {
                 {
                     let scale = f16_to_f32(u16::from_le_bytes(scale.try_into().unwrap()));
                     let constant = f32::from_le_bytes(constant.try_into().unwrap());
-                    *score = scale * *score - constant;
+                    *score = scale * (*score + bias_factor) - constant;
                     *sigma = scale * sigma_factor;
                 }
             }
@@ -329,7 +385,7 @@ impl QuantizedQueryCtx {
                     .zip(scales.chunks_exact(2))
                 {
                     let scale = f16_to_f32(u16::from_le_bytes(scale.try_into().unwrap()));
-                    *score *= scale;
+                    *score = scale * (*score + bias_factor);
                     *sigma = scale * sigma_factor;
                 }
             }
@@ -458,8 +514,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let first = QuantizedIndexCtx::resolve(config.clone(), vec![2.27, 2.31]);
-        let reopened = QuantizedIndexCtx::resolve(config, vec![2.27, 2.31]);
+        let first = QuantizedIndexCtx::resolve(config.clone(), vec![0.0, 0.0], vec![2.27, 2.31]);
+        let reopened = QuantizedIndexCtx::resolve(config, vec![0.0, 0.0], vec![2.27, 2.31]);
         assert!(Arc::ptr_eq(&first, &reopened));
     }
 
@@ -519,7 +575,11 @@ mod tests {
         )
         .unwrap();
         let query = super::QuantizedQueryCtx::new(
-            Arc::new(QuantizedIndexCtx::new_with_cals(config, vec![3.5, 2.25])),
+            Arc::new(QuantizedIndexCtx::new_with_biases_and_cals(
+                config,
+                vec![-1.5, 0.25],
+                vec![3.5, 2.25],
+            )),
             vec![0.1; 100],
         );
         assert_eq!(
@@ -529,6 +589,14 @@ mod tests {
         assert_eq!(
             query.layer_sigma_factor(1, 1.0).to_bits(),
             (query.index.grids[1].rho_model as f32 * 2.25).to_bits()
+        );
+        assert_eq!(
+            query.layer_bias_factor(0, 1.0).to_bits(),
+            (query.index.grids[0].rho_model as f32 * -1.5).to_bits()
+        );
+        assert_eq!(
+            query.layer_bias_factor(1, 1.0).to_bits(),
+            (query.index.grids[1].rho_model as f32 * 0.25).to_bits()
         );
     }
 }

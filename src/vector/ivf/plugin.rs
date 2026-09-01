@@ -79,6 +79,7 @@ const QUANTIZATION_CALIBRATION_SAMPLE_ROWS: usize = 1_024;
 // observed floor until an index build has a larger field-local measurement.
 const REAL_QUERY_CALIBRATION: VectorQuantizationDepthCalibration =
     VectorQuantizationDepthCalibration {
+        bias: 0.0,
         cal: 2.265_918_2,
         sample_count: 1_000,
     };
@@ -89,25 +90,40 @@ struct QuantizationCalibrator {
     stored_query: Vec<CalibrationMeasurement>,
     gaussian_query: Vec<CalibrationMeasurement>,
     heldout_query: Vec<CalibrationMeasurement>,
+    heldout_query_by_source: Vec<Vec<CalibrationMeasurement>>,
 }
 
 #[derive(Clone, Default)]
 struct CalibrationMeasurement {
     sample_count: usize,
-    empirical_variance_sum: f64,
+    empirical_squared_sum: f64,
+    empirical_model_cross_sum: f64,
     model_variance_sum: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BiasStability {
+    query_count: usize,
+    mean: f64,
+    stddev: f64,
+    min: f64,
+    max: f64,
 }
 
 struct QuantizationCalibrationReport {
     stored_query: Vec<VectorQuantizationDepthCalibration>,
     gaussian_query: Vec<VectorQuantizationDepthCalibration>,
     heldout_query: Vec<VectorQuantizationDepthCalibration>,
+    heldout_bias_stability: Vec<BiasStability>,
 }
 
 fn persisted_depth_calibration(
     heldout: VectorQuantizationDepthCalibration,
 ) -> VectorQuantizationDepthCalibration {
-    if heldout.sample_count == 0 || heldout.cal >= REAL_QUERY_CALIBRATION.cal {
+    let heldout_envelope = f64::from(heldout.bias).hypot(f64::from(heldout.cal));
+    let real_query_envelope =
+        f64::from(REAL_QUERY_CALIBRATION.bias).hypot(f64::from(REAL_QUERY_CALIBRATION.cal));
+    if heldout.sample_count == 0 || heldout_envelope >= real_query_envelope {
         heldout
     } else {
         REAL_QUERY_CALIBRATION
@@ -128,19 +144,29 @@ impl CalibrationMeasurement {
             .zip(query)
             .map(|(&value, &query)| f64::from(value) * f64::from(query))
             .sum::<f64>();
-        self.empirical_variance_sum += dot_error.powi(2);
-        self.model_variance_sum +=
-            (f64::from(f16_to_f32(scale)) * final_rho * f64::from(query_norm)).powi(2);
+        let model_sigma = f64::from(f16_to_f32(scale)) * final_rho * f64::from(query_norm);
+        self.empirical_squared_sum += dot_error.powi(2);
+        self.empirical_model_cross_sum += dot_error * model_sigma;
+        self.model_variance_sum += model_sigma.powi(2);
         self.sample_count += 1;
     }
 
     fn finish(self) -> VectorQuantizationDepthCalibration {
-        let cal = if self.sample_count == 0 || self.model_variance_sum == 0.0 {
-            DEFAULT_CAL
-        } else {
-            (self.empirical_variance_sum / self.model_variance_sum).sqrt()
-        };
+        if self.sample_count == 0 || self.model_variance_sum == 0.0 {
+            return VectorQuantizationDepthCalibration {
+                bias: 0.0,
+                cal: DEFAULT_CAL as f32,
+                sample_count: self.sample_count as u32,
+            };
+        }
+        let bias = self.empirical_model_cross_sum / self.model_variance_sum;
+        let centered_squared_sum = (self.empirical_squared_sum
+            - 2.0 * bias * self.empirical_model_cross_sum
+            + bias.powi(2) * self.model_variance_sum)
+            .max(0.0);
+        let cal = (centered_squared_sum / self.model_variance_sum).sqrt();
         VectorQuantizationDepthCalibration {
+            bias: bias as f32,
             cal: cal as f32,
             sample_count: self.sample_count as u32,
         }
@@ -148,7 +174,7 @@ impl CalibrationMeasurement {
 }
 
 impl QuantizationCalibrator {
-    fn new(num_rows: usize, layer_count: usize) -> Self {
+    fn new(num_rows: usize, layer_count: usize, heldout_query_count: usize) -> Self {
         Self {
             interval: num_rows
                 .div_ceil(QUANTIZATION_CALIBRATION_SAMPLE_ROWS)
@@ -157,6 +183,13 @@ impl QuantizationCalibrator {
             stored_query: vec![CalibrationMeasurement::default(); layer_count],
             gaussian_query: vec![CalibrationMeasurement::default(); layer_count],
             heldout_query: vec![CalibrationMeasurement::default(); layer_count],
+            heldout_query_by_source: vec![
+                vec![
+                    CalibrationMeasurement::default();
+                    heldout_query_count
+                ];
+                layer_count
+            ],
         }
     }
 
@@ -172,7 +205,7 @@ impl QuantizationCalibrator {
         rho: f64,
         stored_query: (&[f32], f32),
         gaussian_query: (&[f32], f32),
-        heldout_query: Option<(&[f32], f32)>,
+        heldout_query: Option<(usize, &[f32], f32)>,
     ) {
         debug_assert_eq!(errors.len(), scales.len() * stored_query.0.len());
         for (local_row, (error, &scale)) in errors
@@ -193,8 +226,10 @@ impl QuantizationCalibrator {
                 gaussian_query.0,
                 gaussian_query.1,
             );
-            if let Some((query, query_norm)) = heldout_query {
+            if let Some((query_index, query, query_norm)) = heldout_query {
                 self.heldout_query[layer].observe(error, scale, rho, query, query_norm);
+                self.heldout_query_by_source[layer][query_index]
+                    .observe(error, scale, rho, query, query_norm);
             }
         }
     }
@@ -208,6 +243,31 @@ impl QuantizationCalibrator {
     }
 
     fn finish(self) -> QuantizationCalibrationReport {
+        let heldout_bias_stability = self
+            .heldout_query_by_source
+            .into_iter()
+            .map(|queries| {
+                let biases = queries
+                    .into_iter()
+                    .filter(|query| query.sample_count > 0 && query.model_variance_sum > 0.0)
+                    .map(|query| query.finish().bias as f64)
+                    .collect::<Vec<_>>();
+                if biases.is_empty() {
+                    return BiasStability::default();
+                }
+                let mean = biases.iter().sum::<f64>() / biases.len() as f64;
+                let stddev = (biases.iter().map(|bias| (bias - mean).powi(2)).sum::<f64>()
+                    / biases.len() as f64)
+                    .sqrt();
+                BiasStability {
+                    query_count: biases.len(),
+                    mean,
+                    stddev,
+                    min: biases.iter().copied().fold(f64::INFINITY, f64::min),
+                    max: biases.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                }
+            })
+            .collect();
         QuantizationCalibrationReport {
             stored_query: self
                 .stored_query
@@ -224,6 +284,7 @@ impl QuantizationCalibrator {
                 .into_iter()
                 .map(CalibrationMeasurement::finish)
                 .collect(),
+            heldout_bias_stability,
         }
     }
 }
@@ -395,6 +456,7 @@ fn write_empty_field_slots(
             &VectorQuantizationCalibration {
                 depths: vec![
                     VectorQuantizationDepthCalibration {
+                        bias: 0.0,
                         cal: DEFAULT_CAL as f32,
                         sample_count: 0,
                     };
@@ -936,8 +998,6 @@ pub(crate) fn merge_ivf(
                     let needs_norm = opts.needs_normalization();
                     let mut normalized = Vec::with_capacity(opts.bytes_per_vector());
                     let mut batch_values = Vec::with_capacity(tile_rows * opts.dim());
-                    let mut calibrator = QuantizationCalibrator::new(num_rows, specs.len());
-
                     let load_calibration_query =
                         |assigned_vector: &AssignedVector| -> crate::Result<Vec<f32>> {
                             let reader = &field_readers[assigned_vector.source_segment_ord];
@@ -969,6 +1029,11 @@ pub(crate) fn merge_ivf(
                         heldout_calibration_queries
                             .push((assigned.cluster, load_calibration_query(assigned)?));
                     }
+                    let mut calibrator = QuantizationCalibrator::new(
+                        num_rows,
+                        specs.len(),
+                        heldout_calibration_queries.len(),
+                    );
 
                     for (cluster, offsets) in cluster_offsets.windows(2).enumerate() {
                         let start = offsets[0] as usize;
@@ -1003,11 +1068,14 @@ pub(crate) fn merge_ivf(
                                         let (query_cluster, query) =
                                             &heldout_calibration_queries[query_idx];
                                         (*query_cluster != cluster).then(|| {
-                                            prepare_calibration_query(
-                                                query,
-                                                opts.metric(),
-                                                &centroid,
-                                                &specs,
+                                            (
+                                                query_idx,
+                                                prepare_calibration_query(
+                                                    query,
+                                                    opts.metric(),
+                                                    &centroid,
+                                                    &specs,
+                                                ),
                                             )
                                         })
                                     })
@@ -1079,9 +1147,11 @@ pub(crate) fn merge_ivf(
                                             gaussian_calibration_query.0.layer(layer),
                                             gaussian_calibration_query.1,
                                         ),
-                                        heldout_calibration_query
-                                            .as_ref()
-                                            .map(|query| (query.0.layer(layer), query.1)),
+                                        heldout_calibration_query.as_ref().map(
+                                            |(query_index, query)| {
+                                                (*query_index, query.0.layer(layer), query.1)
+                                            },
+                                        ),
                                     );
                                 },
                             );
@@ -1094,9 +1164,10 @@ pub(crate) fn merge_ivf(
                         }
                     }
                     let calibration_report = calibrator.finish();
-                    // Persist the measured real-query envelope. The held-out
-                    // protocol remains a field-local diagnostic and replaces
-                    // the floor if it observes a larger error ratio.
+                    // Persist a centered field-local model when its total
+                    // bias+spread envelope is larger than the production-query
+                    // floor. The floor remains conservative when the build
+                    // sample cannot characterize the production query center.
                     let calibration = VectorQuantizationCalibration {
                         depths: calibration_report
                             .heldout_query
@@ -1112,30 +1183,44 @@ pub(crate) fn merge_ivf(
                         residual_norms.as_deref(),
                         &calibration,
                     )?;
-                    for (layer, (((stored, gaussian), heldout), persisted)) in calibration_report
-                        .stored_query
-                        .iter()
-                        .zip(&calibration_report.gaussian_query)
-                        .zip(&calibration_report.heldout_query)
-                        .zip(&calibration.depths)
-                        .enumerate()
+                    for (layer, ((((stored, gaussian), heldout), stability), persisted)) in
+                        calibration_report
+                            .stored_query
+                            .iter()
+                            .zip(&calibration_report.gaussian_query)
+                            .zip(&calibration_report.heldout_query)
+                            .zip(&calibration_report.heldout_bias_stability)
+                            .zip(&calibration.depths)
+                            .enumerate()
                     {
                         log::info!(
                             target: "paradedb::ivf_build",
-                            "quantization_calibration field={} depth={} cal={} samples={} \
-                             stored_query_cal={} stored_query_samples={} gaussian_query_cal={} \
-                             gaussian_query_samples={} heldout_query_cal={} \
-                             heldout_query_samples={}",
+                            "quantization_calibration field={} depth={} bias={} cal={} samples={} \
+                             stored_query_bias={} stored_query_cal={} stored_query_samples={} \
+                             gaussian_query_bias={} gaussian_query_cal={} \
+                             gaussian_query_samples={} heldout_query_bias={} \
+                             heldout_query_cal={} heldout_query_samples={} \
+                             heldout_bias_queries={} heldout_bias_mean={} \
+                             heldout_bias_stddev={} heldout_bias_min={} heldout_bias_max={}",
                             entry.name(),
                             layer + 1,
+                            persisted.bias,
                             persisted.cal,
                             persisted.sample_count,
+                            stored.bias,
                             stored.cal,
                             stored.sample_count,
+                            gaussian.bias,
                             gaussian.cal,
                             gaussian.sample_count,
+                            heldout.bias,
                             heldout.cal,
                             heldout.sample_count,
+                            stability.query_count,
+                            stability.mean,
+                            stability.stddev,
+                            stability.min,
+                            stability.max,
                         );
                     }
                     timings.quantize = quantize_start.elapsed();
@@ -1245,7 +1330,7 @@ mod tests {
             quant_model::f16::f32_to_f16(0.25),
         ];
         let rho = 0.1;
-        let mut calibrator = QuantizationCalibrator::new(2, 1);
+        let mut calibrator = QuantizationCalibrator::new(2, 1, 1);
         calibrator.observe_layer(
             0,
             0,
@@ -1254,34 +1339,75 @@ mod tests {
             rho,
             (&query, 1.0),
             (&query, 1.0),
-            Some((&query, 1.0)),
+            Some((0, &query, 1.0)),
         );
         let measured = calibrator.finish();
 
-        let empirical = ((2.2_f64.powi(2) + 5.0_f64.powi(2))
-            / ((0.5_f64 * rho).powi(2) + (0.25_f64 * rho).powi(2)))
-        .sqrt();
-        assert!((f64::from(measured.stored_query[0].cal) - empirical).abs() < 1e-4);
+        let model_variance = (0.5_f64 * rho).powi(2) + (0.25_f64 * rho).powi(2);
+        let cross = 2.2 * 0.5 * rho + 5.0 * 0.25 * rho;
+        let bias = cross / model_variance;
+        let centered = (2.2_f64.powi(2) + 5.0_f64.powi(2) - 2.0 * bias * cross
+            + bias.powi(2) * model_variance)
+            / model_variance;
+        assert!((f64::from(measured.stored_query[0].bias) - bias).abs() < 1e-4);
+        assert!((f64::from(measured.stored_query[0].cal) - centered.sqrt()).abs() < 1e-4);
         assert_eq!(measured.stored_query[0].sample_count, 2);
         assert_eq!(measured.gaussian_query, measured.stored_query);
         assert_eq!(measured.heldout_query, measured.stored_query);
     }
 
     #[test]
+    fn per_query_bias_stability_tracks_independent_query_centers() {
+        let query_x = [1.0_f32, 0.0];
+        let query_y = [0.0_f32, 1.0];
+        let scale = quant_model::f16::f32_to_f16(1.0);
+        let mut calibrator = QuantizationCalibrator::new(4, 1, 2);
+        calibrator.observe_layer(
+            0,
+            0,
+            &[1.0, 0.0, 2.0, 0.0],
+            &[scale, scale],
+            0.1,
+            (&query_x, 1.0),
+            (&query_x, 1.0),
+            Some((0, &query_x, 1.0)),
+        );
+        calibrator.advance(2);
+        calibrator.observe_layer(
+            0,
+            2,
+            &[0.0, 1.0, 0.0, 2.0],
+            &[scale, scale],
+            0.1,
+            (&query_y, 1.0),
+            (&query_y, 1.0),
+            Some((1, &query_y, 1.0)),
+        );
+        let stability = calibrator.finish().heldout_bias_stability[0];
+        assert_eq!(stability.query_count, 2);
+        assert!((stability.mean - 15.0).abs() < 1e-5);
+        assert!(stability.stddev < 1e-6);
+        assert!((stability.min - stability.max).abs() < 1e-6);
+    }
+
+    #[test]
     fn persisted_calibration_uses_the_real_query_envelope() {
         let below = VectorQuantizationDepthCalibration {
+            bias: 0.0,
             cal: 1.08,
             sample_count: 1_024,
         };
         assert_eq!(persisted_depth_calibration(below), REAL_QUERY_CALIBRATION);
 
         let above = VectorQuantizationDepthCalibration {
-            cal: 2.5,
+            bias: -2.0,
+            cal: 1.5,
             sample_count: 777,
         };
         assert_eq!(persisted_depth_calibration(above), above);
 
         let empty = VectorQuantizationDepthCalibration {
+            bias: 0.0,
             cal: 1.0,
             sample_count: 0,
         };
@@ -1642,20 +1768,17 @@ mod tests {
         let quantized_fruit = searcher.search(&AllQuery, &collector)?;
         assert_eq!(quantized_fruit.stats.len(), 1);
         let stats = &quantized_fruit.stats[0];
-        assert!(stats.quantized_plane1_scored > 0, "{stats:?}");
-        assert!(
-            stats.quantized_plane1_survivors <= stats.quantized_plane1_scored,
-            "{stats:?}"
-        );
+        let layer0 = stats.layers.get(0).expect("layer 0 must execute");
+        let layer1 = stats.layers.get(1).expect("layer 1 must execute");
+        assert!(layer0.scored() > 0, "{stats:?}");
+        assert!(layer0.survivors() <= layer0.scored(), "{stats:?}");
         assert_eq!(
-            stats.quantized_refinements_scored, stats.quantized_plane1_survivors,
+            layer1.scored(),
+            layer0.survivors(),
             "the two-layer fixture refines every first-boundary survivor: {stats:?}"
         );
-        assert!(
-            stats.quantized_final_survivors <= stats.quantized_plane1_survivors,
-            "{stats:?}"
-        );
-        assert!(stats.rerank_rows <= stats.quantized_final_survivors, "{stats:?}");
+        assert!(layer1.survivors() <= layer0.survivors(), "{stats:?}");
+        assert!(stats.rerank_rows <= layer1.survivors(), "{stats:?}");
         assert_eq!(stats.exact_rows_read, stats.rerank_rows, "{stats:?}");
         let hits = quantized_fruit.results;
         let exact_hits = searcher

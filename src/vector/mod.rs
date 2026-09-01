@@ -71,39 +71,42 @@ pub use tie_break::NoTieBreak;
 // resolves for callers and tests that work entirely within the vector module.
 pub use crate::schema::{Metric, VectorDType, VectorOptions};
 
-/// Logical vector-read stage, exposed so storage backends can attribute I/O
-/// without knowing the V3 composite slot layout.
+/// Logical vector-search stage, exposed so storage backends can attribute I/O
+/// without knowing the V3 composite slot layout. Quantized layers and their
+/// following boundaries use zero-based indices.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum VectorIoPhase {
+pub enum Stage {
     #[default]
     Other,
+    ScanInit,
     QueryPrep,
     Routing,
-    Plane1,
-    Boundary,
-    Plane2,
+    LayerScan(u8),
+    Boundary(u8),
+    ExactScan,
+    ResultAssembly,
     RerankFetch,
     RerankScore,
 }
 
 thread_local! {
-    static VECTOR_IO_PHASE: Cell<VectorIoPhase> = const { Cell::new(VectorIoPhase::Other) };
+    static VECTOR_STAGE: Cell<Stage> = const { Cell::new(Stage::Other) };
 }
 
 /// The logical stage responsible for a vector component read on this thread.
-pub fn current_vector_io_phase() -> VectorIoPhase {
-    VECTOR_IO_PHASE.get()
+pub fn current_vector_stage() -> Stage {
+    VECTOR_STAGE.get()
 }
 
-pub(crate) struct VectorIoPhaseGuard(VectorIoPhase);
+pub(crate) struct VectorStageGuard(Stage);
 
-pub(crate) fn enter_vector_io_phase(phase: VectorIoPhase) -> VectorIoPhaseGuard {
-    VectorIoPhaseGuard(VECTOR_IO_PHASE.replace(phase))
+pub(crate) fn enter_vector_stage(stage: Stage) -> VectorStageGuard {
+    VectorStageGuard(VECTOR_STAGE.replace(stage))
 }
 
-impl Drop for VectorIoPhaseGuard {
+impl Drop for VectorStageGuard {
     fn drop(&mut self) {
-        VECTOR_IO_PHASE.set(self.0);
+        VECTOR_STAGE.set(self.0);
     }
 }
 

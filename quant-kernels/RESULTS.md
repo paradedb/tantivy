@@ -1264,3 +1264,207 @@ nearest-rank selections over EXPLAIN execution time.
 | boundary | 0.902 | 6.59% |
 | all other measured stages | 0.111 | 0.81% |
 | uninstrumented remainder | 0.120 | 0.88% |
+
+## Phase B — layer-indexed instrumentation attribution (2026-08-25, M5/ARM)
+
+Warm cache; Cohere 1M; `knn_top10_unfiltered`; 100 EXPLAIN samples per sweep
+point. Tantivy `e3528a8f4040d2d2c89d586babe7cf6dc2f3a525`; pg_search
+`af463c8e5`. Cell format is mean ms / mean-wall share / buffer hits.
+
+| config | schedule | persisted CAL | mean posting | run |
+|---|---|---|---:|---|
+| qoff | off | · | 100.000 | `20260825_151438_search.json` |
+| q14 | [1,4] | [3.451091, 2.265918] | 100.000 | `20260825_151508_search.json` |
+| q1 | [1] | [3.505208] | 100.000 | `20260825_151534_search.json` |
+
+### r90 attribution
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| routing | 0.348 / 12.9% / 635 | 0.347 / 12.0% / 635 | 0.350 / 12.3% / 635 |
+| query prep | 0.000 / 0.0% / 0 | 0.130 / 4.5% / 0 | 0.028 / 1.0% / 0 |
+| exact scan | 1.410 / 52.2% / 2601 | 0.000 / 0.0% / 0 | 0.000 / 0.0% / 0 |
+| result assembly | 0.000 / 0.0% / 0 | 0.000 / 0.0% / 0 | 0.000 / 0.0% / 0 |
+| layer-0 scan | 0.000 / 0.0% / 0 | 0.281 / 9.7% / 149 | 0.282 / 9.9% / 149 |
+| boundary-0 | 0.000 / 0.0% / 0 | 0.050 / 1.7% / 0 | 0.051 / 1.8% / 0 |
+| layer-1 scan | 0.000 / 0.0% / 0 | 0.971 / 33.6% / 357 | 0.000 / 0.0% / 0 |
+| boundary-1 | 0.000 / 0.0% / 0 | 0.006 / 0.2% / 0 | 0.000 / 0.0% / 0 |
+| rerank fetch | 0.000 / 0.0% / 0 | 0.029 / 1.0% / 49 | 0.971 / 34.0% / 2300 |
+| rerank score | 0.000 / 0.0% / 0 | 0.004 / 0.2% / 0 | 0.228 / 8.0% / 0 |
+| unattributed gap | 0.944 / 34.9% / 715 | 1.072 / 37.1% / 718 | 0.943 / 33.0% / 718 |
+| TOTAL | 2.703 / 100.0% / 3950 | 2.891 / 100.0% / 1907 | 2.853 / 100.0% / 3802 |
+
+| r90 footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| probe / recall | 0.005 / 0.8970 | 0.005 / 0.8970 | 0.005 / 0.8970 |
+| wall p50 / p99 ms | 2.688 / 3.640 | 2.925 / 3.460 | 2.935 / 3.461 |
+| layer funnel | · | L0 5093.4→3849.7; L1 3849.7→35.9 | L0 5093.4→3897.2 |
+| R / rerank bytes | 0.0 / 0 | 35.9 / 147210 | 3897.2 / 15962931 |
+| layer bytes | · | L0 651954; L1 1971067 | L0 651954 |
+| unit ns/row | · | L0 55.3; L1 252.3 | L0 55.4 |
+
+### r95 attribution
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| routing | 0.585 / 13.3% / 1058 | 0.710 / 14.8% / 1288 | 0.575 / 13.2% / 1058 |
+| query prep | 0.000 / 0.0% / 0 | 0.130 / 2.7% / 0 | 0.029 / 0.7% / 0 |
+| exact scan | 3.035 / 69.0% / 5612 | 0.000 / 0.0% / 0 | 0.000 / 0.0% / 0 |
+| result assembly | 0.000 / 0.0% / 0 | 0.000 / 0.0% / 0 | 0.000 / 0.0% / 0 |
+| layer-0 scan | 0.000 / 0.0% / 0 | 0.779 / 16.2% / 442 | 0.599 / 13.7% / 336 |
+| boundary-0 | 0.000 / 0.0% / 0 | 0.123 / 2.6% / 0 | 0.101 / 2.3% / 0 |
+| layer-1 scan | 0.000 / 0.0% / 0 | 2.045 / 42.7% / 854 | 0.000 / 0.0% / 0 |
+| boundary-1 | 0.000 / 0.0% / 0 | 0.012 / 0.2% / 0 | 0.000 / 0.0% / 0 |
+| rerank fetch | 0.000 / 0.0% / 0 | 0.032 / 0.7% / 52 | 1.735 / 39.8% / 4235 |
+| rerank score | 0.000 / 0.0% / 0 | 0.005 / 0.1% / 0 | 0.401 / 9.2% / 0 |
+| unattributed gap | 0.780 / 17.7% / 715 | 0.957 / 20.0% / 718 | 0.923 / 21.2% / 718 |
+| TOTAL | 4.401 / 100.0% / 7385 | 4.793 / 100.0% / 3355 | 4.363 / 100.0% / 6347 |
+
+| r95 footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| probe / recall | 0.0109 / 0.9480 | 0.0141 / 0.9580 | 0.0109 / 0.9480 |
+| wall p50 / p99 ms | 4.398 / 4.821 | 5.024 / 6.536 | 4.639 / 5.707 |
+| layer funnel | · | L0 14188.3→7638.8; L1 7638.8→37.9 | L0 10983.9→6682.9 |
+| R / rerank bytes | 0.0 / 0 | 37.9 / 155034 | 6682.9 / 27373117 |
+| layer bytes | · | L0 1816105; L1 3911055 | L0 1405942 |
+| unit ns/row | · | L0 54.9; L1 267.7 | L0 54.6 |
+
+### r99 attribution
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| routing | 2.970 / 9.8% / 5068 | 2.822 / 18.6% / 5068 | 2.846 / 16.6% / 5068 |
+| query prep | 0.000 / 0.0% / 0 | 0.139 / 0.9% / 0 | 0.032 / 0.2% / 0 |
+| exact scan | 27.522 / 90.4% / 51227 | 0.000 / 0.0% / 0 | 0.000 / 0.0% / 0 |
+| result assembly | 0.001 / 0.0% / 0 | 0.000 / 0.0% / 0 | 0.000 / 0.0% / 0 |
+| layer-0 scan | 0.000 / 0.0% / 0 | 5.601 / 36.9% / 3432 | 5.597 / 32.7% / 3432 |
+| boundary-0 | 0.000 / 0.0% / 0 | 0.458 / 3.0% / 0 | 0.481 / 2.8% / 0 |
+| layer-1 scan | 0.000 / 0.0% / 0 | 5.298 / 34.9% / 2987 | 0.000 / 0.0% / 0 |
+| boundary-1 | 0.000 / 0.0% / 0 | 0.027 / 0.2% / 0 | 0.000 / 0.0% / 0 |
+| rerank fetch | 0.000 / 0.0% / 0 | 0.036 / 0.2% / 56 | 5.964 / 34.9% / 14087 |
+| rerank score | 0.000 / 0.0% / 0 | 0.005 / 0.0% / 0 | 1.171 / 6.8% / 0 |
+| unattributed gap | -0.058 / -0.2% / 715 | 0.779 / 5.1% / 718 | 1.007 / 5.9% / 718 |
+| TOTAL | 30.435 / 100.0% / 57010 | 15.165 / 100.0% / 12262 | 17.097 / 100.0% / 23305 |
+
+| r99 footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| probe / recall | 0.1 / 0.9930 | 0.1 / 0.9930 | 0.1 / 0.9930 |
+| wall p50 / p99 ms | 30.165 / 33.419 | 13.770 / 29.253 | 14.827 / 35.064 |
+| layer funnel | · | L0 100107.7→16591.5; L1 16591.5→40.7 | L0 100107.7→17397.2 |
+| R / rerank bytes | 0.0 / 0 | 40.7 / 166543 | 17397.2 / 71258972 |
+| layer bytes | · | L0 12813783; L1 8494853 | L0 12813783 |
+| unit ns/row | · | L0 56.0; L1 319.3 | L0 55.9 |
+
+| attribution gap gate | value |
+|---|---:|
+| limit | 1.000 ms |
+| largest | 1.072 ms (q14 r90) |
+| next largest | 1.007 ms (q1 r99) |
+
+## 2026-08-25 — exact-scan baseline boundary (M5/ARM, warm cache)
+
+| metric | before | after |
+|---|---:|---:|
+| exact scan | 374 ns/row | 275 ns/row |
+
+Baseline shift: `374 → 275 ns/row`, attributed to the shared storage-layer
+improvements (pin cache and block geometry). Every comparison that crosses
+this boundary must use the re-measured qoff baseline.
+
+## 2026-08-25 — scan-init attribution rerun (M5/ARM, warm cache)
+
+Tantivy `8031926d56c53a21608decca4f4b0b4a9f9ea402`; existing indexes,
+search-only.
+
+| config | run JSON |
+|---|---|
+| qoff | `runs/cohere-1m-qoff/20260825_153550_search.json` |
+| q14 | `runs/cohere-1m-q14/20260825_153618_search.json` |
+| q1 | `runs/cohere-1m-q1/20260825_153646_search.json` |
+
+### Warm single-query scan-init page attribution
+
+q14, probe `0.0141`, query `1`, segment `6f28403b`, one segment.
+
+| component | buffer hits | buffer reads |
+|---|---:|---:|
+| `.vec` | 499 | 0 |
+| `.centroids` | 179 | 0 |
+| total | 678 | 0 |
+| scan init | 0.923042 ms | · |
+
+`.vec`: explicit row→doc IdMap (`1,000,000 × 4 B`) plus vector composite
+metadata/header pages. `.centroids`: cluster offsets, graph adjacency, bounds,
+and centroid composite metadata/header pages. No scan-row payload is included.
+
+### Recall-paired scan-init ledger
+
+Cells are `scan_init ms / hits / stage-sum ms / mean-wall ms / gap ms`.
+
+| target / pairing | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| r90, matched `0.8970` | 1.340 / 675 / 3.225 / 3.275 / +0.050 | 0.905 / 678 / 2.726 / 2.858 / +0.132 | 0.860 / 678 / 2.909 / 3.103 / +0.194 |
+| r95, nearest-above (`0.9480 / 0.9580 / 0.9480`) | 1.380 / 675 / 5.553 / 4.921 / −0.632 | 0.937 / 678 / 4.815 / 4.778 / −0.037 | 0.873 / 678 / 4.582 / 4.690 / +0.108 |
+| r95, nearest-below (`0.9480 / 0.8970 / 0.9480`) | 1.380 / 675 / 5.553 / 4.921 / −0.632 | 0.905 / 678 / 2.726 / 2.858 / +0.132 | 0.873 / 678 / 4.582 / 4.690 / +0.108 |
+| r99, matched `0.9930` | 1.415 / 675 / 38.459 / 39.628 / +1.169 | 0.987 / 678 / 15.464 / 15.340 / −0.124 | 1.003 / 678 / 19.664 / 19.367 / −0.297 |
+
+| gap gate | value |
+|---|---:|
+| limit | 0.100 ms |
+| largest positive residual | 1.169 ms (qoff r99, matched) |
+| non-attributed buffer hits | 40/query |
+| status | STOP-AND-FLAG |
+
+### Reader-open cache finding
+
+| item | finding |
+|---|---|
+| current scope | `VectorIndexReader` is cached per `SegmentReader`, but `SearchIndexReader::open_index_components` constructs a new index reader/searcher and segment-reader set for each SQL execution |
+| reusable key | index relation + visible segment generation + vector field + MVCC snapshot/style |
+| invalidation | relcache/index rebuild; committed segment-set generation change from merge/drop; schema/index-settings or vector-format change; snapshot visibility change |
+| measured upper-bound saving | 0.860–1.415 ms/query and 675–678 warm buffer pins for the one-segment 1M profiles |
+| implementation | deferred pg_search-wide reader/searcher cache; no cache change in this branch |
+
+## 2026-08-25 — scan-init executor-entry correction (M5/ARM, warm cache)
+
+Append-only correction to the preceding scan-init entry: the initial rerun
+started at Tantivy segment collection and omitted direct pg_search executor
+metadata pins. This rerun starts at `SearchIndexReader::open_with_context`,
+preserves that window through first-segment collection, and records direct
+non-component pins as `executor`.
+
+| config | final run JSON |
+|---|---|
+| qoff | `runs/cohere-1m-qoff/20260825_155017_search.json` |
+| q14 | `runs/cohere-1m-q14/20260825_155043_search.json` |
+| q1 | `runs/cohere-1m-q1/20260825_155110_search.json` |
+
+### Warm single-query page attribution, corrected boundary
+
+q14, probe `0.0141`, query `1`, segment `6f28403b`, one segment.
+
+| component | buffer hits | buffer reads |
+|---|---:|---:|
+| `.vec` | 499 | 0 |
+| `.centroids` | 179 | 0 |
+| executor / MetaPage / index-searcher open | 13 | 0 |
+| total | 691 | 0 |
+| scan init | 1.043208 ms | · |
+
+### Final recall-paired gap ledger
+
+Cells are `scan_init ms / hits / stage-sum ms / mean-wall ms / gap ms`.
+
+| target / pairing | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| r90, matched `0.8970` | 1.415 / 688 / 3.482 / 3.478 / −0.004 | 0.896 / 691 / 2.761 / 2.897 / +0.136 | 0.860 / 691 / 2.891 / 3.059 / +0.168 |
+| r95, nearest-above (`0.9480 / 0.9580 / 0.9480`) | 1.317 / 688 / 5.289 / 5.288 / −0.001 | 0.912 / 691 / 4.845 / 4.819 / −0.026 | 0.891 / 691 / 4.633 / 4.709 / +0.076 |
+| r95, nearest-below (`0.9480 / 0.8970 / 0.9480`) | 1.317 / 688 / 5.289 / 5.288 / −0.001 | 0.896 / 691 / 2.761 / 2.897 / +0.136 | 0.891 / 691 / 4.633 / 4.709 / +0.076 |
+| r99, matched `0.9930` | 1.380 / 688 / 35.352 / 35.592 / +0.240 | 0.980 / 691 / 15.962 / 15.596 / −0.366 | 0.941 / 691 / 18.135 / 17.842 / −0.293 |
+
+| final gap gate | value |
+|---|---:|
+| limit | 0.100 ms |
+| largest positive residual | 0.240 ms (qoff r99, matched) |
+| non-attributed buffer hits | 27/query |
+| status | STOP-AND-FLAG |

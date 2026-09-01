@@ -4,6 +4,15 @@ Status: frozen for Phase B v1 on 2026-08-24.
 
 Changelog:
 
+- On 2026-08-25, before shipment, amendment 9 centers the measured error
+  distribution at every active prefix depth. Slot-15 metadata payload version
+  3 stores `(bias, CAL, sample_count)` per depth. `bias` is the signed
+  normalized error center: readers add `bias * scale * rho * ||q||` to the dot
+  estimate (twice that correction in L2 score space), while `CAL` is the
+  centered residual spread used by the κ band. Version-1 and version-2
+  payloads decode with zero bias until their segments are re-merged. The build
+  sampler also reports the per-pseudo-query bias distribution so a global
+  center is auditable rather than assumed.
 - On 2026-08-25, before shipment, amendment 8 replaced scalar slot-15 CAL
   with one entry per active prefix depth. The merge observes every prefix in
   the existing sampled encode pass, and the reader applies entry `l` after

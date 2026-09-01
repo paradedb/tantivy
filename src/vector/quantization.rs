@@ -28,11 +28,13 @@ pub const QUANTIZED_CONSTANT_STRIDE: usize = 4;
 /// One binary32 residual squared norm per posting-membership row when needed.
 pub const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
 /// Version of the per-segment, per-field measured calibration payload.
-pub const QUANTIZED_CALIBRATION_VERSION: u32 = 2;
+pub const QUANTIZED_CALIBRATION_VERSION: u32 = 3;
 const LEGACY_QUANTIZED_CALIBRATION_VERSION: u32 = 1;
+const LEGACY_PER_DEPTH_CALIBRATION_VERSION: u32 = 2;
 const LEGACY_QUANTIZED_CALIBRATION_METADATA_LEN: usize = 12;
 const QUANTIZED_CALIBRATION_HEADER_LEN: usize = 8;
-const QUANTIZED_CALIBRATION_DEPTH_LEN: usize = 8;
+const LEGACY_QUANTIZED_CALIBRATION_DEPTH_LEN: usize = 8;
+const QUANTIZED_CALIBRATION_DEPTH_LEN: usize = 12;
 
 pub(crate) fn quantized_calibration_metadata_len(layer_count: usize) -> usize {
     QUANTIZED_CALIBRATION_HEADER_LEN + layer_count * QUANTIZED_CALIBRATION_DEPTH_LEN
@@ -41,6 +43,9 @@ pub(crate) fn quantized_calibration_metadata_len(layer_count: usize) -> usize {
 /// Build-measured uncertainty calibration for one scorer prefix.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct VectorQuantizationDepthCalibration {
+    /// Signed normalized error center. The reader adds
+    /// `bias * scale * rho * ||q||` to the estimate.
+    pub(crate) bias: f32,
     pub(crate) cal: f32,
     pub(crate) sample_count: u32,
 }
@@ -57,6 +62,7 @@ impl VectorQuantizationCalibration {
         bytes.extend_from_slice(&QUANTIZED_CALIBRATION_VERSION.to_le_bytes());
         bytes.extend_from_slice(&(self.depths.len() as u32).to_le_bytes());
         for depth in &self.depths {
+            bytes.extend_from_slice(&depth.bias.to_le_bytes());
             bytes.extend_from_slice(&depth.cal.to_le_bytes());
             bytes.extend_from_slice(&depth.sample_count.to_le_bytes());
         }
@@ -84,6 +90,7 @@ impl VectorQuantizationCalibration {
                 ));
             }
             let depth = VectorQuantizationDepthCalibration {
+                bias: 0.0,
                 cal: f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
                 sample_count: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
             };
@@ -91,6 +98,41 @@ impl VectorQuantizationCalibration {
             return Ok(Self {
                 depths: vec![depth; layer_count],
             });
+        }
+        if version == LEGACY_PER_DEPTH_CALIBRATION_VERSION {
+            let expected_len = QUANTIZED_CALIBRATION_HEADER_LEN
+                + layer_count * LEGACY_QUANTIZED_CALIBRATION_DEPTH_LEN;
+            if bytes.len() != expected_len {
+                return Err(TantivyError::DataCorruption(
+                    crate::error::DataCorruption::comment_only(format!(
+                        "legacy per-depth quantization calibration metadata has {} bytes; \
+                         expected {expected_len}",
+                        bytes.len()
+                    )),
+                ));
+            }
+            let stored_layer_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            if stored_layer_count != layer_count {
+                return Err(TantivyError::DataCorruption(
+                    crate::error::DataCorruption::comment_only(format!(
+                        "quantization calibration has {stored_layer_count} depths; expected \
+                         {layer_count}"
+                    )),
+                ));
+            }
+            let mut depths = Vec::with_capacity(layer_count);
+            for encoded in bytes[QUANTIZED_CALIBRATION_HEADER_LEN..]
+                .chunks_exact(LEGACY_QUANTIZED_CALIBRATION_DEPTH_LEN)
+            {
+                let depth = VectorQuantizationDepthCalibration {
+                    bias: 0.0,
+                    cal: f32::from_le_bytes(encoded[..4].try_into().unwrap()),
+                    sample_count: u32::from_le_bytes(encoded[4..8].try_into().unwrap()),
+                };
+                validate_calibration_depth(depth)?;
+                depths.push(depth);
+            }
+            return Ok(Self { depths });
         }
         if version != QUANTIZED_CALIBRATION_VERSION {
             return Err(TantivyError::DataCorruption(
@@ -123,8 +165,9 @@ impl VectorQuantizationCalibration {
             bytes[QUANTIZED_CALIBRATION_HEADER_LEN..].chunks_exact(QUANTIZED_CALIBRATION_DEPTH_LEN)
         {
             let depth = VectorQuantizationDepthCalibration {
-                cal: f32::from_le_bytes(encoded[..4].try_into().unwrap()),
-                sample_count: u32::from_le_bytes(encoded[4..8].try_into().unwrap()),
+                bias: f32::from_le_bytes(encoded[..4].try_into().unwrap()),
+                cal: f32::from_le_bytes(encoded[4..8].try_into().unwrap()),
+                sample_count: u32::from_le_bytes(encoded[8..12].try_into().unwrap()),
             };
             validate_calibration_depth(depth)?;
             depths.push(depth);
@@ -134,6 +177,14 @@ impl VectorQuantizationCalibration {
 }
 
 fn validate_calibration_depth(depth: VectorQuantizationDepthCalibration) -> crate::Result<()> {
+    if !depth.bias.is_finite() {
+        return Err(TantivyError::DataCorruption(
+            crate::error::DataCorruption::comment_only(format!(
+                "quantization calibration bias must be finite, got {}",
+                depth.bias
+            )),
+        ));
+    }
     if !depth.cal.is_finite() || depth.cal < 0.0 {
         return Err(TantivyError::DataCorruption(
             crate::error::DataCorruption::comment_only(format!(
@@ -562,10 +613,12 @@ mod tests {
         let metadata = VectorQuantizationCalibration {
             depths: vec![
                 VectorQuantizationDepthCalibration {
+                    bias: -0.5,
                     cal: 2.25,
                     sample_count: 1_024,
                 },
                 VectorQuantizationDepthCalibration {
+                    bias: 0.25,
                     cal: 1.75,
                     sample_count: 1_000,
                 },
@@ -589,12 +642,26 @@ mod tests {
             decoded.depths,
             vec![
                 VectorQuantizationDepthCalibration {
+                    bias: 0.0,
                     cal: 3.25,
                     sample_count: 777,
                 };
                 2
             ]
         );
+
+        let mut legacy_per_depth = vec![0_u8; 8 + 2 * 8];
+        legacy_per_depth[..4].copy_from_slice(&LEGACY_PER_DEPTH_CALIBRATION_VERSION.to_le_bytes());
+        legacy_per_depth[4..8].copy_from_slice(&2_u32.to_le_bytes());
+        legacy_per_depth[8..12].copy_from_slice(&3.0_f32.to_le_bytes());
+        legacy_per_depth[12..16].copy_from_slice(&500_u32.to_le_bytes());
+        legacy_per_depth[16..20].copy_from_slice(&2.0_f32.to_le_bytes());
+        legacy_per_depth[20..24].copy_from_slice(&600_u32.to_le_bytes());
+        let decoded = VectorQuantizationCalibration::decode(&legacy_per_depth, 2).unwrap();
+        assert_eq!(decoded.depths[0].bias, 0.0);
+        assert_eq!(decoded.depths[0].cal, 3.0);
+        assert_eq!(decoded.depths[1].bias, 0.0);
+        assert_eq!(decoded.depths[1].cal, 2.0);
     }
 
     #[test]
