@@ -51,6 +51,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     limit: usize,
     offset: usize,
     adaptive: AdaptiveProbeParams,
+    max_scan_levels: usize,
     tie_break: S,
 }
 
@@ -62,6 +63,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             limit,
             offset: 0,
             adaptive: AdaptiveProbeParams::default(),
+            max_scan_levels: usize::MAX,
             tie_break: NoTieBreak,
         }
     }
@@ -80,6 +82,12 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// segments).
     pub fn with_adaptive_params(mut self, params: AdaptiveProbeParams) -> Self {
         self.adaptive = params;
+        self
+    }
+
+    /// Limit the quantized residual prefix. Zero selects the exact scan.
+    pub fn with_max_scan_levels(mut self, max_scan_levels: usize) -> Self {
+        self.max_scan_levels = max_scan_levels;
         self
     }
 
@@ -113,6 +121,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             limit: self.limit,
             offset: self.offset,
             adaptive: self.adaptive,
+            max_scan_levels: self.max_scan_levels,
             tie_break,
         }
     }
@@ -224,6 +233,7 @@ where
             self.field,
             Arc::clone(&self.query),
             self.adaptive.clone(),
+            self.max_scan_levels,
         )?;
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         let (hits, stats) = backend.top_n_by(
@@ -556,12 +566,17 @@ mod ivf_e2e_tests {
                 // gate/ceiling logic actually runs.
                 let collector =
                     || TopDocs::with_limit(k).order_by_similarity(embedding_field, query.to_vec());
-                let untied = searcher.search(&AllQuery, &collector())?;
-                let tied = searcher.search(&AllQuery, &collector().with_tie_break(tie_break()))?;
+                let mut untied = searcher.search(&AllQuery, &collector())?;
+                let mut tied =
+                    searcher.search(&AllQuery, &collector().with_tie_break(tie_break()))?;
                 assert!(
                     untied.stats.iter().any(|s| s.candidates_scored > 0),
                     "no probe activity to compare for query={query:?} k={k}"
                 );
+                for stats in untied.stats.iter_mut().chain(&mut tied.stats) {
+                    stats.query_prep_ns = 0;
+                    stats.boundary_ns = 0;
+                }
                 assert_eq!(
                     format!("{:?}", untied.stats),
                     format!("{:?}", tied.stats),

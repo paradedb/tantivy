@@ -8,6 +8,9 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use cascade::{encode_batch_in_place, prepare_centroid, LayerSpec};
+use quant_model::Grid;
+
 use super::{
     decode_row, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
     IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, RoutingIndex,
@@ -16,13 +19,14 @@ use super::{
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
 use crate::plugin::PluginMergeContext;
-use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
-use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
+use crate::vector::distance::{l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
-use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT};
+use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT, HEADER_LEN};
 use crate::vector::{
-    residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig, RelativeNeighborhoodGraph,
-    VEC_EXT,
+    quantized_code_stride, residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig,
+    RelativeNeighborhoodGraph, VectorQuantizationConfig, VectorQuantizer,
+    QUANTIZED_CODE_ALIGNMENT, VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -53,6 +57,93 @@ struct IvfBuildTimings {
     train: Duration,
     assign: Duration,
     posting_write: Duration,
+    quantize: Duration,
+}
+
+struct QuantizedLayerSlots {
+    codes: Vec<u8>,
+    scales: Vec<u16>,
+    constants: Vec<f32>,
+}
+
+fn quantization_runtime(
+    config: &VectorQuantizationConfig,
+    opts: &VectorOptions,
+) -> crate::Result<(Vec<LayerSpec>, Vec<Grid>)> {
+    config.validate(opts)?;
+    let specs = config
+        .layers
+        .iter()
+        .map(|layer| LayerSpec {
+            bits: layer.bits,
+            seed: layer.seed,
+            rotate: true,
+        })
+        .collect();
+    let grids = config
+        .layers
+        .iter()
+        .map(|layer| match layer.quantizer {
+            // The sign encoder does not consume grid points. This format-shaped
+            // placeholder keeps the width-generic cascade API allocation-free.
+            VectorQuantizer::RaBitQ => Grid {
+                bits: 1,
+                points: vec![-1.0, 1.0],
+                rho_model: 0.0,
+            },
+            VectorQuantizer::TurboQuant => {
+                let grid = config
+                    .grids
+                    .iter()
+                    .find(|grid| grid.bits == layer.bits)
+                    .expect("validated TurboQuant grid must be present");
+                Grid {
+                    bits: grid.bits,
+                    points: grid.points.clone(),
+                    rho_model: 0.0,
+                }
+            }
+        })
+        .collect();
+    Ok((specs, grids))
+}
+
+fn write_quantized_slots(
+    vec_write: &mut CompositeWrite,
+    field: Field,
+    layers: &[QuantizedLayerSlots],
+    residual_norms: Option<&[f32]>,
+) -> crate::Result<()> {
+    for (layer, encoded) in layers.iter().enumerate() {
+        vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
+        {
+            let writer = vec_write.for_field_with_idx(field, vec_slot::quantized_codes(layer));
+            writer.write_all(&encoded.codes)?;
+            writer.flush()?;
+        }
+        {
+            let writer = vec_write.for_field_with_idx(field, vec_slot::quantized_scales(layer));
+            for &scale in &encoded.scales {
+                writer.write_all(&scale.to_le_bytes())?;
+            }
+            writer.flush()?;
+        }
+        {
+            let writer = vec_write.for_field_with_idx(field, vec_slot::quantized_constants(layer));
+            for &constant in &encoded.constants {
+                writer.write_all(&constant.to_le_bytes())?;
+            }
+            writer.flush()?;
+        }
+    }
+    if let Some(residual_norms) = residual_norms {
+        let writer = vec_write.for_field_with_idx(field, vec_slot::QUANTIZED_RESIDUAL_NORMS);
+        for &residual_norm in residual_norms {
+            writer.write_all(&residual_norm.to_le_bytes())?;
+        }
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 /// Write `field`'s slots in both composites as an empty IVF field: empty
@@ -66,6 +157,7 @@ fn write_empty_field_slots(
     centroids_write: &mut CompositeWrite,
     field: Field,
     opts: &VectorOptions,
+    quantization: Option<&VectorQuantizationConfig>,
 ) -> crate::Result<()> {
     // `.vec`: empty Explicit id-map + empty rows.
     {
@@ -76,6 +168,19 @@ fn write_empty_field_slots(
     {
         let rows_w = vec_write.for_field_with_idx(field, vec_slot::ROWS);
         rows_w.flush()?;
+    }
+    if let Some(config) = quantization {
+        let layers: Vec<QuantizedLayerSlots> = config
+            .layers
+            .iter()
+            .map(|_| QuantizedLayerSlots {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                constants: Vec::new(),
+            })
+            .collect();
+        let residual_norms = config.needs_residual_norm().then_some([].as_slice());
+        write_quantized_slots(vec_write, field, &layers, residual_norms)?;
     }
     // `.centroids`: zero centroids, zero docs, single zero offset, and an
     // empty (but present — the slot is mandatory in V2) bounds slot.
@@ -145,6 +250,14 @@ pub(crate) fn merge_ivf(
             FieldType::Vector(opts) => opts,
             _ => continue,
         };
+        let quantization = ctx
+            .settings
+            .vector_quantization
+            .iter()
+            .find(|config| config.field == entry.name());
+        if let Some(config) = quantization {
+            config.validate(opts)?;
+        }
         // Per-segment readers for this field (cached on the SegmentReaders).
         let field_readers: Vec<_> = ctx
             .readers
@@ -156,7 +269,13 @@ pub(crate) fn merge_ivf(
             .map(|reader| reader.num_vectors())
             .sum::<usize>();
         if vector_count == 0 {
-            write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
+            write_empty_field_slots(
+                &mut vec_write,
+                &mut centroids_write,
+                field,
+                opts,
+                quantization,
+            )?;
             continue;
         }
         let training_sample_size = {
@@ -220,7 +339,13 @@ pub(crate) fn merge_ivf(
                     // leave its slots missing from composites the other
                     // fields still write, and the reader errors on
                     // missing slots.
-                    write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
+                    write_empty_field_slots(
+                        &mut vec_write,
+                        &mut centroids_write,
+                        field,
+                        opts,
+                        quantization,
+                    )?;
                     continue;
                 }
 
@@ -409,9 +534,7 @@ pub(crate) fn merge_ivf(
                 // have found the same vectors (deletes make both fall short
                 // of `vector_count` together, so compare them to each other).
                 debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
-                // The `.centroids` doc count: one posting row per distinct
-                // doc (legacy V2 files could inflate rows via replication;
-                // this writer never does).
+                // The `.centroids` doc count: one posting row per document.
                 let num_present_docs = assigned_vectors.len();
 
                 let mut cluster_counts = vec![0usize; num_centroids];
@@ -540,9 +663,8 @@ pub(crate) fn merge_ivf(
                             &bytes
                         };
                         rows_w.write_all(written_bytes)?;
-                        // P1: the bounds fold — every written row (all rows
-                        // are native without replication), the exact bytes
-                        // written above against the stored centroid. A
+                        // P1: the bounds fold — every written row, using the exact
+                        // bytes written above against the stored centroid. A
                         // non-finite row residual saturates its cluster
                         // inside `add_native`.
                         if assigned_vector.cluster != current_cluster {
@@ -561,6 +683,116 @@ pub(crate) fn merge_ivf(
                     rows_w.flush()?;
                 }
                 timings.posting_write = posting_start.elapsed();
+
+                if let Some(config) = quantization {
+                    let quantize_start = Instant::now();
+                    let (specs, grids) = quantization_runtime(config, opts)?;
+                    let num_rows = assigned_vectors.len();
+                    let mut encoded_layers: Vec<QuantizedLayerSlots> = config
+                        .layers
+                        .iter()
+                        .map(|layer| QuantizedLayerSlots {
+                            codes: Vec::with_capacity(
+                                num_rows * quantized_code_stride(opts.dim(), layer.bits),
+                            ),
+                            scales: Vec::with_capacity(num_rows),
+                            constants: Vec::with_capacity(num_rows),
+                        })
+                        .collect();
+                    let mut residual_norms = config
+                        .needs_residual_norm()
+                        .then(|| Vec::with_capacity(num_rows));
+
+                    // Two row-major f32 tile buffers live in the cascade
+                    // encoder. Rotation adds one d-sized transient buffer.
+                    const MAX_QUANTIZATION_SCRATCH_BYTES: usize = 1 << 20;
+                    let row_bytes = opts.dim() * std::mem::size_of::<f32>();
+                    let tile_rows = MAX_QUANTIZATION_SCRATCH_BYTES
+                        .saturating_sub(row_bytes)
+                        .checked_div(2 * row_bytes)
+                        .unwrap_or(0)
+                        .max(1);
+                    let needs_norm = opts.needs_normalization();
+                    let mut normalized = Vec::with_capacity(opts.bytes_per_vector());
+                    let mut batch_values = Vec::with_capacity(tile_rows * opts.dim());
+
+                    for (cluster, offsets) in cluster_offsets.windows(2).enumerate() {
+                        let start = offsets[0] as usize;
+                        let end = offsets[1] as usize;
+                        if start == end {
+                            continue;
+                        }
+                        let centroid = decode_row::<f32>(
+                            &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
+                            opts.dim(),
+                        )?;
+                        let prepared = prepare_centroid(&centroid, &specs);
+                        for tile in assigned_vectors[start..end].chunks(tile_rows) {
+                            if ctx.cancel.wants_cancel() {
+                                return Err(TantivyError::Cancelled);
+                            }
+                            batch_values.clear();
+                            for assigned_vector in tile {
+                                let reader = &field_readers[assigned_vector.source_segment_ord];
+                                let bytes = reader
+                                    .vector_bytes(assigned_vector.source_doc_id)?
+                                    .ok_or_else(|| {
+                                        TantivyError::InternalError(format!(
+                                            "missing source vector for doc {:?}",
+                                            assigned_vector.source_doc_id
+                                        ))
+                                    })?;
+                                let encoded_bytes: &[u8] = if needs_norm {
+                                    normalized.clear();
+                                    normalized.extend_from_slice(&bytes);
+                                    if maybe_normalize_bytes(opts, &mut normalized)
+                                        == NormalizeOutcome::NonFinite
+                                    {
+                                        log::warn!(
+                                            "non-finite vector in field '{}' (doc {}) encoded \
+                                             un-normalized during merge",
+                                            entry.name(),
+                                            assigned_vector.target_doc_id,
+                                        );
+                                    }
+                                    &normalized
+                                } else {
+                                    &bytes
+                                };
+                                batch_values.extend_from_slice(&decode_row::<f32>(
+                                    encoded_bytes,
+                                    opts.dim(),
+                                )?);
+                            }
+                            if let Some(residual_norms) = residual_norms.as_mut() {
+                                residual_norms.extend(
+                                    batch_values
+                                        .chunks_exact(opts.dim())
+                                        .map(|row| l2_squared(row, &centroid)),
+                                );
+                            }
+                            let batch = encode_batch_in_place(
+                                &mut batch_values,
+                                tile.len(),
+                                &prepared,
+                                &specs,
+                                &grids,
+                            );
+                            for (target, layer) in encoded_layers.iter_mut().zip(batch.layers) {
+                                target.codes.extend_from_slice(&layer.codes);
+                                target.scales.extend_from_slice(&layer.scales);
+                                target.constants.extend_from_slice(&layer.constants);
+                            }
+                        }
+                    }
+                    write_quantized_slots(
+                        &mut vec_write,
+                        field,
+                        &encoded_layers,
+                        residual_norms.as_deref(),
+                    )?;
+                    timings.quantize = quantize_start.elapsed();
+                }
 
                 {
                     let centroids_w =
@@ -622,11 +854,12 @@ pub(crate) fn merge_ivf(
 
                 log::info!(
                     target: "paradedb::ivf_build",
-                    "ivf_build timings_ms train={} assign={} posting_write={} total={} \
+                    "ivf_build timings_ms train={} assign={} posting_write={} quantize={} total={} \
                      centroids={} vectors={}",
                     timings.train.as_millis(),
                     timings.assign.as_millis(),
                     timings.posting_write.as_millis(),
+                    timings.quantize.as_millis(),
                     field_build_start.elapsed().as_millis(),
                     num_centroids,
                     vector_count,
@@ -638,4 +871,524 @@ pub(crate) fn merge_ivf(
     vec_write.close()?;
     centroids_write.close()?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::index::IndexSettings;
+    use crate::indexer::NoMergePolicy;
+    use crate::query::AllQuery;
+    use crate::schema::Schema;
+    use crate::vector::ivf::AdaptiveProbeParams;
+    use crate::vector::prepared::{QuantizedIndexCtx, QuantizedQueryCtx};
+    use crate::vector::{
+        TopDocsByVectorSimilarity, VectorNormPolicy, VectorQuantizationGrid,
+        VectorQuantizationLayer, GRID_FORMAT_VERSION, VECTOR_QUANTIZATION_FORMAT_VERSION,
+    };
+    use crate::{Index, TantivyDocument};
+
+    const QUANT_FIXTURE_DIM: usize = 64;
+
+    struct QuantFixtureClusterer {
+        dim: usize,
+    }
+
+    impl IvfClusterer for QuantFixtureClusterer {
+        fn training_sample_ratio(&self) -> f32 {
+            0.5
+        }
+
+        fn train(
+            &self,
+            options: &VectorOptions,
+            _vectors: IvfTrainingVectors,
+        ) -> crate::Result<IvfCentroids> {
+            assert_eq!(options.dim(), self.dim);
+            let values = [0.0_f32, 1.0]
+                .into_iter()
+                .flat_map(|center| std::iter::repeat_n(center, self.dim))
+                .collect();
+            Ok(IvfCentroids::F32(IvfMatrix {
+                values,
+                rows: 2,
+                dims: self.dim,
+            }))
+        }
+
+        fn assign(
+            &self,
+            _options: &VectorOptions,
+            vectors: IvfVectors<'_>,
+            _centroids: &IvfCentroids,
+        ) -> crate::Result<Vec<u32>> {
+            let IvfVectors::F32(vectors) = vectors;
+            Ok(vectors
+                .matrix
+                .values
+                .chunks_exact(self.dim)
+                .map(|row| u32::from(row[0] >= 0.5))
+                .collect())
+        }
+    }
+
+    fn quant_fixture_config(dim: usize) -> VectorQuantizationConfig {
+        let grid = quant_model::build_grid(dim, 4);
+        VectorQuantizationConfig {
+            field: "embedding".to_string(),
+            format_version: VECTOR_QUANTIZATION_FORMAT_VERSION,
+            dim,
+            metric: Metric::L2,
+            norm_policy: VectorNormPolicy::None,
+            layers: vec![
+                VectorQuantizationLayer {
+                    bits: 1,
+                    quantizer: VectorQuantizer::RaBitQ,
+                    seed: 0x1111,
+                },
+                VectorQuantizationLayer {
+                    bits: 4,
+                    quantizer: VectorQuantizer::TurboQuant,
+                    seed: 0x2222,
+                },
+            ],
+            grids: vec![VectorQuantizationGrid {
+                bits: 4,
+                version: GRID_FORMAT_VERSION,
+                points: grid.points,
+            }],
+        }
+    }
+
+    fn build_quantized_fixture(dim: usize, quantized: bool) -> crate::Result<Index> {
+        let mut schema_builder = Schema::builder();
+        let field =
+            schema_builder.add_vector_field("embedding", VectorOptions::new(dim, Metric::L2));
+        let schema = schema_builder.build();
+        let mut settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..Default::default()
+        };
+        if quantized {
+            settings.vector_quantization = vec![quant_fixture_config(dim)];
+        }
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .ivf_clusterer(Arc::new(QuantFixtureClusterer { dim }))
+            .create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for doc in 0..8 {
+            let center = if doc < 4 { 0.0 } else { 1.0 };
+            let vector: Vec<f32> = (0..dim)
+                .map(|coordinate| center + ((doc * dim + coordinate) as f32 * 0.017).sin() * 0.1)
+                .collect();
+            let mut document = TantivyDocument::new();
+            document.add_vector(field, &vector);
+            writer.add_document(document)?;
+            if doc == 3 || doc == 7 {
+                writer.commit()?;
+            }
+        }
+        let mut segments = index.searchable_segment_ids()?;
+        segments.sort();
+        writer.merge(&segments).wait()?;
+        writer.wait_merging_threads()?;
+        Ok(index)
+    }
+
+    fn build_flat_quantized_fixture(dim: usize) -> crate::Result<Index> {
+        let mut schema_builder = Schema::builder();
+        let field =
+            schema_builder.add_vector_field("embedding", VectorOptions::new(dim, Metric::L2));
+        let schema = schema_builder.build();
+        let settings = IndexSettings {
+            vector_clustering_threshold: usize::MAX,
+            vector_quantization: vec![quant_fixture_config(dim)],
+            ..Default::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()?;
+        let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for doc in 0..8 {
+            let center = if doc < 4 { 0.0 } else { 1.0 };
+            let vector: Vec<f32> = (0..dim)
+                .map(|coordinate| center + ((doc * dim + coordinate) as f32 * 0.017).sin() * 0.1)
+                .collect();
+            let mut document = TantivyDocument::new();
+            document.add_vector(field, &vector);
+            writer.add_document(document)?;
+        }
+        writer.commit()?;
+        Ok(index)
+    }
+
+    fn fixture_expected(query: &[f32], dim: usize, top_n: usize) -> Vec<(u32, u32)> {
+        let mut expected: Vec<(f32, u32)> = (0..8)
+            .map(|doc| {
+                let center = if doc < 4 { 0.0 } else { 1.0 };
+                let vector: Vec<f32> = (0..dim)
+                    .map(|coordinate| {
+                        center + ((doc * dim + coordinate) as f32 * 0.017).sin() * 0.1
+                    })
+                    .collect();
+                (-l2_squared(query, &vector), doc as u32)
+            })
+            .collect();
+        expected.sort_unstable_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        expected[..top_n]
+            .iter()
+            .map(|&(score, doc)| (score.to_bits(), doc))
+            .collect()
+    }
+
+    fn fixture_hits(
+        index: &Index,
+        query: Vec<f32>,
+        level_zero: bool,
+    ) -> crate::Result<Vec<(u32, u32)>> {
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let field = index.schema().get_field("embedding")?;
+        let mut collector = TopDocsByVectorSimilarity::new(field, query, 3).with_adaptive_params(
+            AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 2,
+                ..Default::default()
+            },
+        );
+        if level_zero {
+            collector = collector.with_max_scan_levels(0);
+        }
+        Ok(searcher
+            .search(&AllQuery, &collector)?
+            .results
+            .iter()
+            .map(|&(score, address)| (score.to_bits(), address.doc_id))
+            .collect())
+    }
+
+    fn quantized_vec_file(index: &Index) -> crate::Result<Vec<u8>> {
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        Ok(searcher.segment_readers()[0]
+            .open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?
+            .read_bytes()?
+            .to_vec())
+    }
+
+    fn assert_relative_1e5(actual: f32, expected: f32, context: &str) {
+        let tolerance = 1e-5 * expected.abs().max(f32::MIN_POSITIVE);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{context}: actual={actual} expected={expected} tolerance={tolerance}"
+        );
+    }
+
+    fn assert_quantized_bridge_exactness(dim: usize) -> crate::Result<()> {
+        let index = build_quantized_fixture(dim, true)?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = segment.vector_index(field)?;
+        let ivf = vector_reader.index().expect("merged fixture must be IVF");
+        let quantized = vector_reader
+            .quantization()
+            .expect("configured IVF fixture must carry quantized slots");
+        let (specs, grids) = quantization_runtime(quantized.config(), vector_reader.options())?;
+        let query: Vec<f32> = (0..dim)
+            .map(|coordinate| ((coordinate as f32 + 0.5) * 0.031).cos())
+            .collect();
+        let harness = cascade::prepare_split_query(&query, &specs, &grids, 4);
+        let scan = QuantizedQueryCtx::new(
+            Arc::new(QuantizedIndexCtx::new(quantized.config().clone())),
+            query,
+        );
+
+        for row in 0..ivf.num_rows() {
+            let mut scan_sum = 0.0;
+            let mut harness_sum = 0.0;
+            for (layer, stored) in quantized.layers().iter().enumerate() {
+                let codes = stored.code_bytes(row)?;
+                let scale = stored.scale(row)?;
+                let constant = stored.constant(row)?;
+                let scan_estimate = scan.score_layer(layer, &codes, scale, constant);
+                let harness_estimate =
+                    harness.score_layer(layer, &codes, scale, constant, specs[layer]);
+                assert_relative_1e5(
+                    scan_estimate,
+                    harness_estimate,
+                    &format!("d={dim} row={row} layer={layer}"),
+                );
+                scan_sum += scan_estimate;
+                harness_sum += harness_estimate;
+            }
+            assert_relative_1e5(scan_sum, harness_sum, &format!("d={dim} row={row} summed"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gate_a_bridge_exactness_d768_and_d100() -> crate::Result<()> {
+        assert_quantized_bridge_exactness(768)?;
+        assert_quantized_bridge_exactness(100)
+    }
+
+    #[test]
+    fn gate_c_exact_path_equivalence() -> crate::Result<()> {
+        const DIM: usize = 64;
+        let query = vec![0.05_f32; DIM];
+        let expected = fixture_expected(&query, DIM, 3);
+
+        let opted_out = build_quantized_fixture(DIM, false)?;
+        assert_eq!(fixture_hits(&opted_out, query.clone(), false)?, expected);
+
+        let no_slot = build_flat_quantized_fixture(DIM)?;
+        let reader = no_slot.reader()?;
+        let searcher = reader.searcher();
+        let field = no_slot.schema().get_field("embedding")?;
+        let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
+        assert!(vector_reader.index().is_none());
+        assert!(vector_reader.quantization().is_none());
+        assert_eq!(fixture_hits(&no_slot, query.clone(), false)?, expected);
+
+        let quantized = build_quantized_fixture(DIM, true)?;
+        assert_eq!(fixture_hits(&quantized, query, true)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_quantization_matches_kernel_harness_and_is_reproducible() -> crate::Result<()> {
+        let index = build_quantized_fixture(QUANT_FIXTURE_DIM, true)?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let segment = &searcher.segment_readers()[0];
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = segment.vector_index(field)?;
+        let ivf = vector_reader.index().expect("merged fixture must be IVF");
+        assert_eq!(ivf.num_rows(), 8);
+        let quantized = vector_reader
+            .quantization()
+            .expect("configured IVF fixture must carry quantized slots");
+        let (specs, grids) = quantization_runtime(quantized.config(), vector_reader.options())?;
+        let centroid_bytes = ivf.centroid_bytes()?;
+        let centroid_stride = QUANT_FIXTURE_DIM * std::mem::size_of::<f32>();
+
+        for cluster in 0..ivf.num_clusters() {
+            let centroid = decode_row::<f32>(
+                &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
+                QUANT_FIXTURE_DIM,
+            )?;
+            let prepared = prepare_centroid(&centroid, &specs);
+            for row in ivf.cluster_range(cluster) {
+                let vector = decode_row::<f32>(
+                    &vector_reader.vector_bytes_for_row(row)?,
+                    QUANT_FIXTURE_DIM,
+                )?;
+                let residual: Vec<f32> = vector
+                    .iter()
+                    .zip(&centroid)
+                    .map(|(&value, &center)| value - center)
+                    .collect();
+                let expected = cascade::encode_layers(&residual, Some(&prepared), &specs, &grids);
+                assert_eq!(
+                    quantized
+                        .residual_norm(row)?
+                        .expect("L2 fixture requires residual norm")
+                        .to_bits(),
+                    l2_squared(&vector, &centroid).to_bits()
+                );
+                for (layer, stored) in quantized.layers().iter().enumerate() {
+                    let stored_codes = stored.code_bytes(row)?;
+                    assert_eq!(
+                        stored_codes.len(),
+                        QUANT_FIXTURE_DIM * usize::from(specs[layer].bits) / 8,
+                        "divisible-d V3 fixture must retain its original row stride"
+                    );
+                    assert_eq!(stored_codes.as_slice(), expected.codes[layer]);
+                    assert_eq!(stored.scale(row)?, expected.scales[layer]);
+                    assert_eq!(
+                        stored.constant(row)?.to_bits(),
+                        expected.constants[layer].to_bits()
+                    );
+                }
+            }
+        }
+
+        let query = vec![0.05_f32; QUANT_FIXTURE_DIM];
+        let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 3)
+            .with_adaptive_params(AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 2,
+                ..Default::default()
+            });
+        let quantized_fruit = searcher.search(&AllQuery, &collector)?;
+        assert_eq!(quantized_fruit.stats.len(), 1);
+        let stats = &quantized_fruit.stats[0];
+        assert!(stats.quantized_plane1_scored > 0, "{stats:?}");
+        assert!(
+            stats.quantized_plane1_survivors <= stats.quantized_plane1_scored,
+            "{stats:?}"
+        );
+        assert_eq!(
+            stats.quantized_refinements_scored, stats.quantized_plane1_survivors,
+            "the two-layer fixture refines every first-boundary survivor: {stats:?}"
+        );
+        assert!(
+            stats.quantized_final_survivors <= stats.quantized_plane1_survivors,
+            "{stats:?}"
+        );
+        assert!(stats.rerank_rows <= stats.quantized_final_survivors, "{stats:?}");
+        assert_eq!(stats.exact_rows_read, stats.rerank_rows, "{stats:?}");
+        let hits = quantized_fruit.results;
+        let exact_hits = searcher
+            .search(
+                &AllQuery,
+                &TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_max_scan_levels(0),
+            )?
+            .results;
+        let mut expected: Vec<(f32, u32)> = (0..8)
+            .map(|doc| {
+                let center = if doc < 4 { 0.0 } else { 1.0 };
+                let vector: Vec<f32> = (0..QUANT_FIXTURE_DIM)
+                    .map(|coordinate| {
+                        center + ((doc * QUANT_FIXTURE_DIM + coordinate) as f32 * 0.017).sin() * 0.1
+                    })
+                    .collect();
+                (-l2_squared(&query, &vector), doc as u32)
+            })
+            .collect();
+        expected.sort_unstable_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        assert_eq!(
+            hits.iter()
+                .map(|&(score, address)| (score.to_bits(), address.doc_id))
+                .collect::<Vec<_>>(),
+            expected[..3]
+                .iter()
+                .map(|&(score, doc)| (score.to_bits(), doc))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(hits, exact_hits, "level zero must preserve the exact scan");
+
+        let first = quantized_vec_file(&index)?;
+        let second = quantized_vec_file(&build_quantized_fixture(QUANT_FIXTURE_DIM, true)?)?;
+        assert_eq!(
+            first, second,
+            "fixed assignment and seeds must be byte-identical"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
+        const DIM: usize = 100;
+        let index = build_quantized_fixture(DIM, true)?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = segment.vector_index(field)?;
+        let ivf = vector_reader.index().expect("merged fixture must be IVF");
+        let quantized = vector_reader
+            .quantization()
+            .expect("configured IVF fixture must carry quantized slots");
+        let (specs, grids) = quantization_runtime(quantized.config(), vector_reader.options())?;
+        let centroid_bytes = ivf.centroid_bytes()?;
+        let centroid_stride = DIM * std::mem::size_of::<f32>();
+
+        for cluster in 0..ivf.num_clusters() {
+            let centroid = decode_row::<f32>(
+                &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
+                DIM,
+            )?;
+            let prepared = prepare_centroid(&centroid, &specs);
+            for row in ivf.cluster_range(cluster) {
+                let vector = decode_row::<f32>(&vector_reader.vector_bytes_for_row(row)?, DIM)?;
+                let residual: Vec<f32> = vector
+                    .iter()
+                    .zip(&centroid)
+                    .map(|(&value, &center)| value - center)
+                    .collect();
+                let expected = cascade::encode_layers(&residual, Some(&prepared), &specs, &grids);
+                for (layer, stored) in quantized.layers().iter().enumerate() {
+                    assert_eq!(stored.code_bytes(row)?.as_slice(), expected.codes[layer]);
+                    assert_eq!(stored.scale(row)?, expected.scales[layer]);
+                    assert_eq!(
+                        stored.constant(row)?.to_bits(),
+                        expected.constants[layer].to_bits()
+                    );
+                }
+            }
+        }
+
+        let query = vec![0.05_f32; DIM];
+        let quantized_hits = searcher
+            .search(
+                &AllQuery,
+                &TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_adaptive_params(
+                    AdaptiveProbeParams {
+                        max_probe_fraction: 1.0,
+                        min_probe_clusters: 2,
+                        ..Default::default()
+                    },
+                ),
+            )?
+            .results;
+        let exact_hits = searcher
+            .search(
+                &AllQuery,
+                &TopDocsByVectorSimilarity::new(field, query, 3).with_max_scan_levels(0),
+            )?
+            .results;
+        assert_eq!(quantized_hits, exact_hits);
+        Ok(())
+    }
+
+    #[test]
+    fn quantized_fixture_growth_matches_768_1_plus_4_ledger() -> crate::Result<()> {
+        const DIM: usize = 768;
+        const ROWS: usize = 8;
+        let config = quant_fixture_config(DIM);
+        assert_eq!(config.bytes_per_row(), 496);
+
+        let plain = quantized_vec_file(&build_quantized_fixture(DIM, false)?)?;
+        let quantized = quantized_vec_file(&build_quantized_fixture(DIM, true)?)?;
+        let physical_growth = quantized.len() - plain.len();
+        let logical_growth = ROWS * config.bytes_per_row();
+        println!(
+            "VECTOR_QUANTIZATION_SIZE dim={DIM} rows={ROWS} plain_bytes={} quantized_bytes={} \
+             physical_growth={physical_growth} logical_growth={logical_growth}",
+            plain.len(),
+            quantized.len(),
+        );
+        assert!(physical_growth >= logical_growth);
+        assert!(physical_growth <= logical_growth + 512);
+        assert!(
+            (logical_growth as f64 / (ROWS * DIM * 4) as f64 - 0.161_458_333_333).abs() < 1e-12
+        );
+        Ok(())
+    }
 }

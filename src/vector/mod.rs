@@ -10,6 +10,7 @@
 //! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
 //! Top-N vector queries dispatch over them via [`VectorBackend`].
 
+use std::cell::Cell;
 use std::io;
 
 mod backend;
@@ -59,14 +60,44 @@ pub use prepared::PreparedQuery;
 pub use quantization::{
     quantized_code_stride, VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationGrid,
     VectorQuantizationLayer, VectorQuantizer, GRID_FORMAT_VERSION, MAX_QUANTIZATION_LAYERS,
-    QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_SCALE_STRIDE,
-    VECTOR_QUANTIZATION_FORMAT_VERSION,
+    QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE,
+    QUANTIZED_SCALE_STRIDE, VECTOR_QUANTIZATION_FORMAT_VERSION,
 };
 pub use tie_break::NoTieBreak;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
 // resolves for callers and tests that work entirely within the vector module.
 pub use crate::schema::{Metric, VectorDType, VectorOptions};
+
+/// Logical vector-read stage, exposed so storage backends can attribute I/O
+/// without knowing the V3 composite slot layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VectorIoPhase {
+    #[default]
+    Other,
+    Rerank,
+}
+
+thread_local! {
+    static VECTOR_IO_PHASE: Cell<VectorIoPhase> = const { Cell::new(VectorIoPhase::Other) };
+}
+
+/// The logical stage responsible for a vector component read on this thread.
+pub fn current_vector_io_phase() -> VectorIoPhase {
+    VECTOR_IO_PHASE.get()
+}
+
+pub(crate) struct VectorIoPhaseGuard(VectorIoPhase);
+
+pub(crate) fn enter_vector_io_phase(phase: VectorIoPhase) -> VectorIoPhaseGuard {
+    VectorIoPhaseGuard(VECTOR_IO_PHASE.replace(phase))
+}
+
+impl Drop for VectorIoPhaseGuard {
+    fn drop(&mut self) {
+        VECTOR_IO_PHASE.set(self.0);
+    }
+}
 
 /// Wide accumulator used by the reduction kernels (norms). Element
 /// types choose their accumulator via [`VectorElement::Acc`]; this

@@ -3,13 +3,32 @@
 use quant_model::f16::{f16_to_f32, f32_to_f16};
 
 pub fn packed_len(d: usize, bits: u8) -> usize {
-    assert!(d > 0 && d.is_multiple_of(64));
+    assert!(d > 0);
     assert!(matches!(bits, 2..=4));
-    (d * bits as usize).div_ceil(8)
+    d.checked_mul(bits as usize)
+        .expect("packed grid length overflow")
+        .div_ceil(64)
+        * 8
+}
+
+fn tail_is_zero(packed: &[u8], d: usize, bits: u8) -> bool {
+    if d == 0 || !matches!(bits, 2..=4) || packed.len() != packed_len(d, bits) {
+        return false;
+    }
+    let used_bits = d * bits as usize;
+    let full_bytes = used_bits / 8;
+    let tail_bits = used_bits % 8;
+    if tail_bits == 0 {
+        packed[full_bytes..].iter().all(|&byte| byte == 0)
+    } else {
+        let used_mask = (1_u8 << tail_bits) - 1;
+        packed[full_bytes] & !used_mask == 0
+            && packed[full_bytes + 1..].iter().all(|&byte| byte == 0)
+    }
 }
 
 pub fn pack(codes: &[u8], bits: u8, out: &mut [u8]) {
-    assert!(!codes.is_empty() && codes.len().is_multiple_of(64));
+    assert!(!codes.is_empty());
     assert_eq!(out.len(), packed_len(codes.len(), bits));
     out.fill(0);
     let mask = (1_u8 << bits) - 1;
@@ -24,6 +43,7 @@ pub fn pack(codes: &[u8], bits: u8, out: &mut [u8]) {
                 out[byte + 1] |= code >> (8 - shift);
             }
         }
+        debug_assert!(tail_is_zero(out, codes.len(), bits));
         return;
     }
     let per_byte = 8 / bits as usize;
@@ -31,11 +51,13 @@ pub fn pack(codes: &[u8], bits: u8, out: &mut [u8]) {
         assert!(code <= mask);
         out[i / per_byte] |= code << (bits as usize * (i % per_byte));
     }
+    debug_assert!(tail_is_zero(out, codes.len(), bits));
 }
 
 pub fn unpack(packed: &[u8], d: usize, bits: u8) -> Vec<u8> {
-    assert!(d > 0 && d.is_multiple_of(64));
+    assert!(d > 0);
     assert_eq!(packed.len(), packed_len(d, bits));
+    debug_assert!(tail_is_zero(packed, d, bits));
     let mask = (1_u8 << bits) - 1;
     if bits == 3 {
         return (0..d).map(|i| code_at_3(packed, i)).collect();
@@ -48,7 +70,7 @@ pub fn unpack(packed: &[u8], d: usize, bits: u8) -> Vec<u8> {
 
 /// Encode a vector and return its RMS scale after f16 rounding.
 pub fn encode(y: &[f32], grid: &[f32], bits: u8, out: &mut [u8]) -> u16 {
-    assert!(!y.is_empty() && y.len().is_multiple_of(64));
+    assert!(!y.is_empty());
     validate_grid(grid, bits);
     assert_eq!(out.len(), packed_len(y.len(), bits));
     let norm_squared = y.iter().map(|&value| value * value).sum::<f32>();
@@ -71,7 +93,7 @@ pub fn encode(y: &[f32], grid: &[f32], bits: u8, out: &mut [u8]) -> u16 {
 }
 
 pub fn decode(codes: &[u8], grid: &[f32], d: usize, bits: u8, scale: u16) -> Vec<f32> {
-    assert!(d > 0 && d.is_multiple_of(64));
+    assert!(d > 0);
     validate_grid(grid, bits);
     let scale = f16_to_f32(scale);
     unpack(codes, d, bits)
@@ -81,7 +103,7 @@ pub fn decode(codes: &[u8], grid: &[f32], d: usize, bits: u8, scale: u16) -> Vec
 }
 
 pub fn build_lut(u: &[f32], grid: &[f32], bits: u8) -> Vec<f32> {
-    assert!(!u.is_empty() && u.len().is_multiple_of(64));
+    assert!(!u.is_empty());
     validate_grid(grid, bits);
     let mut lut = Vec::with_capacity(u.len() * grid.len());
     for &value in u {
@@ -91,8 +113,9 @@ pub fn build_lut(u: &[f32], grid: &[f32], bits: u8) -> Vec<f32> {
 }
 
 pub fn score(codes: &[u8], lut: &[f32], d: usize, bits: u8) -> f32 {
-    assert!(d > 0 && d.is_multiple_of(64));
+    assert!(d > 0);
     assert_eq!(codes.len(), packed_len(d, bits));
+    debug_assert!(tail_is_zero(codes, d, bits));
     let levels = 1usize << bits;
     assert_eq!(lut.len(), d * levels);
     let mask = (1_u8 << bits) - 1;
@@ -160,6 +183,30 @@ mod tests {
         let mut packed3 = vec![0; packed_len(128, 3)];
         pack(&codes3, 3, &mut packed3);
         assert_eq!(unpack(&packed3, 128, 3), codes3);
+    }
+
+    #[test]
+    fn odd_dimension_round_trips_score_and_zero_tail() {
+        for d in [65, 100, 300, 769] {
+            for bits in 2..=4 {
+                let codes: Vec<u8> = (0..d).map(|i| (i % (1usize << bits)) as u8).collect();
+                let mut packed = vec![0xff; packed_len(d, bits)];
+                pack(&codes, bits, &mut packed);
+                assert!(tail_is_zero(&packed, d, bits), "d={d}, b={bits}");
+                assert_eq!(unpack(&packed, d, bits), codes, "d={d}, b={bits}");
+
+                let grid = build_grid(d, bits);
+                let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.043).cos()).collect();
+                let lut = build_lut(&query, &grid.points, bits);
+                let actual = score(&packed, &lut, d, bits);
+                let direct: f32 = query
+                    .iter()
+                    .zip(&codes)
+                    .map(|(&q, &code)| q * grid.points[code as usize])
+                    .sum();
+                assert!((actual - direct).abs() < 1e-5, "d={d}, b={bits}");
+            }
+        }
     }
 
     #[test]

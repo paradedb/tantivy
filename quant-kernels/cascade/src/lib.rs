@@ -6,7 +6,10 @@ use grid_plane::{
 };
 use quant_model::f16::f16_to_f32;
 use quant_model::Grid;
-use sign_plane::{encode as encode_sign, estimate_fp as estimate_sign_fp, unpack as unpack_sign};
+use sign_plane::{
+    encode as encode_sign, estimate_asym as estimate_sign_asym, estimate_fp as estimate_sign_fp,
+    prepare_query, unpack as unpack_sign, QueryPlanes,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayerSpec {
@@ -22,11 +25,30 @@ pub struct Encoded {
     pub constants: Vec<f32>,
 }
 
+/// One layer's row-parallel encoded output for a cluster batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncodedLayerBatch {
+    /// Packed row codes, concatenated at the layer's fixed code stride.
+    pub codes: Vec<u8>,
+    /// One binary16 scale per row.
+    pub scales: Vec<u16>,
+    /// One binary32 split-form constant per row.
+    pub constants: Vec<f32>,
+}
+
+/// SoA output from the cluster-scoped batch encoder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncodedBatch {
+    pub rows: usize,
+    pub layers: Vec<EncodedLayerBatch>,
+}
+
 /// Cluster-scoped centroid state shared by every residual encoded in the cluster.
 #[derive(Clone, Debug)]
 pub struct PreparedCentroid {
     d: usize,
     specs: Vec<LayerSpec>,
+    original: Vec<f32>,
     layers: Vec<Vec<f32>>,
     rotations: Vec<Option<Rotation>>,
 }
@@ -34,6 +56,73 @@ pub struct PreparedCentroid {
 #[derive(Clone, Debug)]
 pub struct PreparedFpQuery {
     layers: Vec<Vec<f32>>,
+}
+
+enum PreparedSplitLayer {
+    Sign(QueryPlanes),
+    Grid(Vec<f32>),
+}
+
+/// Segment-query state with all rotations, sign bitplanes, and grid LUTs hoisted.
+pub struct PreparedSplitQuery {
+    d: usize,
+    layers: Vec<PreparedSplitLayer>,
+}
+
+pub fn prepare_split_query(
+    query: &[f32],
+    specs: &[LayerSpec],
+    grids: &[Grid],
+    sign_query_bits: u8,
+) -> PreparedSplitQuery {
+    validate(query.len(), specs, grids);
+    assert!((1..=8).contains(&sign_query_bits));
+    let mut current = query.to_vec();
+    let mut layers = Vec::with_capacity(specs.len());
+    for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
+        if layer == 0 || spec.rotate {
+            Rotation::new(query.len(), spec.seed).apply(&mut current);
+        }
+        if spec.bits == 1 {
+            layers.push(PreparedSplitLayer::Sign(prepare_query(
+                &current,
+                sign_query_bits,
+            )));
+        } else {
+            layers.push(PreparedSplitLayer::Grid(build_lut(
+                &current,
+                &grid.points,
+                spec.bits,
+            )));
+        }
+    }
+    PreparedSplitQuery {
+        d: query.len(),
+        layers,
+    }
+}
+
+impl PreparedSplitQuery {
+    /// Score one stored layer as `kernel * scale - split_constant`.
+    pub fn score_layer(
+        &self,
+        layer: usize,
+        codes: &[u8],
+        scale: u16,
+        constant: f32,
+        spec: LayerSpec,
+    ) -> f32 {
+        match &self.layers[layer] {
+            PreparedSplitLayer::Sign(query) => {
+                assert_eq!(spec.bits, 1);
+                estimate_sign_asym(&bytes_to_words(codes), scale, query) - constant
+            }
+            PreparedSplitLayer::Grid(lut) => {
+                assert!(spec.bits > 1);
+                estimate_grid(codes, scale, lut, self.d, spec.bits) - constant
+            }
+        }
+    }
 }
 
 pub fn prepare_centroid(centroid: &[f32], specs: &[LayerSpec]) -> PreparedCentroid {
@@ -54,9 +143,120 @@ pub fn prepare_centroid(centroid: &[f32], specs: &[LayerSpec]) -> PreparedCentro
     PreparedCentroid {
         d: centroid.len(),
         specs: specs.to_vec(),
+        original: centroid.to_vec(),
         layers,
         rotations,
     }
+}
+
+/// Encode a row-major cluster tile using at most two `rows * d` f32 buffers.
+///
+/// `vectors` is consumed as scratch: the function first subtracts the prepared
+/// centroid, then carries the residual through the rotated layer chain. The
+/// output is layer-separated SoA in the same row order as the input.
+pub fn encode_batch_in_place(
+    vectors: &mut [f32],
+    rows: usize,
+    centroid: &PreparedCentroid,
+    specs: &[LayerSpec],
+    grids: &[Grid],
+) -> EncodedBatch {
+    validate(centroid.d, specs, grids);
+    assert_eq!(centroid.specs, specs);
+    assert_eq!(vectors.len(), rows * centroid.d);
+
+    let d = centroid.d;
+    for row in vectors.chunks_exact_mut(d) {
+        for (value, &center) in row.iter_mut().zip(&centroid.original) {
+            *value -= center;
+        }
+    }
+
+    let mut reconstruction = vec![0.0_f32; vectors.len()];
+    let mut layers = Vec::with_capacity(specs.len());
+    for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
+        if layer == 0 || spec.rotate {
+            let rotation = centroid.rotations[layer]
+                .as_ref()
+                .expect("rotating layer must have a prepared rotation");
+            for row in vectors.chunks_exact_mut(d) {
+                rotation.apply(row);
+            }
+        }
+
+        reconstruction.fill(0.0);
+        let code_stride = if spec.bits == 1 {
+            d.div_ceil(64) * 8
+        } else {
+            grid_plane::packed_len(d, spec.bits)
+        };
+        let mut codes = Vec::with_capacity(rows * code_stride);
+        let mut scales = Vec::with_capacity(rows);
+
+        for (residual, reconstructed) in vectors
+            .chunks_exact(d)
+            .zip(reconstruction.chunks_exact_mut(d))
+        {
+            if spec.bits == 1 {
+                let mut words = vec![0_u64; d.div_ceil(64)];
+                let scale = encode_sign(residual, &mut words);
+                let reconstruction_scale = f16_to_f32(scale);
+                for (i, value) in reconstructed.iter_mut().enumerate() {
+                    let sign = if words[i / 64] & (1_u64 << (i % 64)) != 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    *value = reconstruction_scale * sign;
+                }
+                for word in words {
+                    codes.extend_from_slice(&word.to_le_bytes());
+                }
+                scales.push(scale);
+            } else {
+                let code_start = codes.len();
+                codes.resize(code_start + code_stride, 0);
+                let scale =
+                    encode_grid(residual, &grid.points, spec.bits, &mut codes[code_start..]);
+                reconstructed.copy_from_slice(&decode_grid(
+                    &codes[code_start..],
+                    &grid.points,
+                    d,
+                    spec.bits,
+                    scale,
+                ));
+                scales.push(scale);
+            }
+        }
+
+        let constants = reconstruction
+            .chunks_exact(d)
+            .map(|row| {
+                centroid.layers[layer]
+                    .iter()
+                    .zip(row)
+                    .map(|(&center, &value)| center * value)
+                    .sum()
+            })
+            .collect();
+
+        for (residual, reconstructed) in vectors
+            .chunks_exact_mut(d)
+            .zip(reconstruction.chunks_exact(d))
+        {
+            for (value, &encoded) in residual.iter_mut().zip(reconstructed) {
+                *value -= encoded;
+            }
+        }
+
+        layers.push(EncodedLayerBatch {
+            codes,
+            scales,
+            constants,
+        });
+    }
+
+    EncodedBatch { rows, layers }
 }
 
 pub fn encode_layers(
@@ -84,7 +284,7 @@ pub fn encode_layers(
             }
         }
         if spec.bits == 1 {
-            let mut words = vec![0_u64; r.len() / 64];
+            let mut words = vec![0_u64; r.len().div_ceil(64)];
             let scale = encode_sign(&residual, &mut words);
             let reconstruction_scale = f16_to_f32(scale);
             let signs = unpack_sign(&words, r.len());
@@ -123,7 +323,7 @@ pub fn encode_layers(
 }
 
 pub fn prepare_fp_query(query: &[f32], specs: &[LayerSpec]) -> PreparedFpQuery {
-    assert!(!query.is_empty() && query.len().is_multiple_of(64));
+    assert!(!query.is_empty());
     assert!((1..=4).contains(&specs.len()));
     assert!(specs[0].rotate, "layer 0 must rotate");
     let mut current = query.to_vec();
@@ -172,7 +372,7 @@ fn estimate_prepared_fp_layers(
     grids: &[Grid],
     d: usize,
 ) -> Vec<f32> {
-    assert!(d > 0 && d.is_multiple_of(64));
+    assert!(d > 0);
     assert_eq!(encoded.codes.len(), specs.len());
     assert_eq!(encoded.scales.len(), specs.len());
     assert_eq!(query.layers.len(), specs.len());
@@ -205,7 +405,7 @@ pub fn reconstruct_first_space(
     grids: &[Grid],
     d: usize,
 ) -> Vec<f32> {
-    assert!(d > 0 && d.is_multiple_of(64));
+    assert!(d > 0);
     assert_eq!(encoded.codes.len(), specs.len());
     assert_eq!(encoded.scales.len(), specs.len());
     assert_eq!(grids.len(), specs.len());
@@ -278,7 +478,7 @@ fn validate(d: usize, specs: &[LayerSpec], grids: &[Grid]) {
 }
 
 fn validate_specs(d: usize, specs: &[LayerSpec]) {
-    assert!(d > 0 && d.is_multiple_of(64));
+    assert!(d > 0);
     assert!((1..=4).contains(&specs.len()));
     assert!(specs[0].rotate, "layer 0 must rotate");
 }
@@ -352,6 +552,68 @@ mod tests {
     }
 
     #[test]
+    fn cluster_batch_matches_row_encoder_byte_for_byte() {
+        let d = 128;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let centroid: Vec<f32> = (0..d).map(|i| (i as f32 * 0.013).sin() * 0.1).collect();
+        let vectors: Vec<Vec<f32>> = (0..7)
+            .map(|row| {
+                centroid
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &center)| center + ((i + row) as f32 * 0.031).cos() * 0.2)
+                    .collect()
+            })
+            .collect();
+        let prepared = prepare_centroid(&centroid, &specs);
+        let expected: Vec<Encoded> = vectors
+            .iter()
+            .map(|vector| {
+                let residual: Vec<f32> = vector
+                    .iter()
+                    .zip(&centroid)
+                    .map(|(&value, &center)| value - center)
+                    .collect();
+                encode_layers(&residual, Some(&prepared), &specs, &grids)
+            })
+            .collect();
+        let mut row_major: Vec<f32> = vectors.into_iter().flatten().collect();
+        let actual =
+            encode_batch_in_place(&mut row_major, expected.len(), &prepared, &specs, &grids);
+
+        assert_eq!(actual.rows, expected.len());
+        for (layer, batch) in actual.layers.iter().enumerate() {
+            let expected_codes: Vec<u8> = expected
+                .iter()
+                .flat_map(|encoded| encoded.codes[layer].iter().copied())
+                .collect();
+            let expected_scales: Vec<u16> = expected
+                .iter()
+                .map(|encoded| encoded.scales[layer])
+                .collect();
+            let expected_constants: Vec<f32> = expected
+                .iter()
+                .map(|encoded| encoded.constants[layer])
+                .collect();
+            assert_eq!(batch.codes, expected_codes);
+            assert_eq!(batch.scales, expected_scales);
+            assert_eq!(batch.constants, expected_constants);
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "layer 0 must rotate")]
     fn layer_zero_rejects_rotation_ablation() {
         let specs = [LayerSpec {
@@ -412,6 +674,76 @@ mod tests {
             (empirical / modeled - 1.0).abs() <= 0.05,
             "empirical={empirical}, model={modeled}"
         );
+    }
+
+    #[test]
+    fn odd_dimension_layered_rho_goldens() {
+        for (d, rho_golden) in [
+            (64, 0.057_061_499),
+            (65, 0.056_939_250),
+            (100, 0.057_902_796),
+            (300, 0.058_633_208),
+            (769, 0.058_493_834),
+        ] {
+            let specs = [
+                LayerSpec {
+                    bits: 1,
+                    seed: 11,
+                    rotate: true,
+                },
+                LayerSpec {
+                    bits: 4,
+                    seed: 22,
+                    rotate: true,
+                },
+            ];
+            let grids = [build_grid(d, 1), build_grid(d, 4)];
+            let model_rho = grids[0].rho_model * grids[1].rho_model;
+            let mut rng = ChaCha8Rng::seed_from_u64(0x004f_4444_4449_4d00 ^ d as u64);
+            let queries: Vec<Vec<f32>> = (0..32).map(|_| random_unit(&mut rng, d)).collect();
+            let prepared: Vec<PreparedFpQuery> = queries
+                .iter()
+                .map(|query| prepare_fp_query(query, &specs))
+                .collect();
+            let mut error_energy = 0.0_f64;
+            let mut signal_energy = 0.0_f64;
+            let mut estimates = Vec::with_capacity(32_000);
+            let mut truths = Vec::with_capacity(32_000);
+            for _ in 0..1_000 {
+                let vector = random_unit(&mut rng, d);
+                let encoded = encode_layers(&vector, None, &specs, &grids);
+                let mut first_space = vector.clone();
+                Rotation::new(d, specs[0].seed).apply(&mut first_space);
+                let reconstructed = reconstruct_first_space(&encoded, &specs, &grids, d);
+                for (&actual, estimated) in first_space.iter().zip(reconstructed) {
+                    error_energy += f64::from(actual - estimated).powi(2);
+                    signal_energy += f64::from(actual).powi(2);
+                }
+                for (query, prepared) in queries.iter().zip(&prepared) {
+                    estimates.push(estimate_prepared_fp(&encoded, prepared, &specs, &grids, d));
+                    truths.push(dot(query, &vector));
+                }
+            }
+            let measured_rho = (error_energy / signal_energy).sqrt();
+            let sigma_ratio =
+                empirical_sigma(&estimates, &truths) / sigma_from_rho(model_rho, d, DEFAULT_CAL);
+            println!(
+                "d={d} measured_rho={measured_rho:.9} model_rho={model_rho:.9} \
+                 sigma_ratio={sigma_ratio:.9}"
+            );
+            assert!(
+                (measured_rho / model_rho - 1.0).abs() <= 0.08,
+                "d={d}: measured rho {measured_rho}, model rho {model_rho}"
+            );
+            assert!(
+                (measured_rho - rho_golden).abs() <= 0.004,
+                "d={d}: measured rho {measured_rho}, golden {rho_golden}"
+            );
+            assert!(
+                (sigma_ratio - 1.0).abs() <= 0.05,
+                "d={d}: sigma ratio {sigma_ratio}"
+            );
+        }
     }
 
     #[test]

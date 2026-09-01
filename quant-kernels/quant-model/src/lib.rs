@@ -20,7 +20,7 @@ pub const DEFAULT_CAL: f64 = 1.0;
 
 /// Build an exact-density Lloyd-Max grid for a dimension-normalized sphere marginal.
 pub fn build_grid(d: usize, bits: u8) -> Grid {
-    assert!(d >= 64 && d.is_multiple_of(64));
+    assert!(d >= 64);
     assert!((1..=8).contains(&bits));
 
     let count = 1usize << bits;
@@ -114,7 +114,7 @@ fn erfc(x: f64) -> f64 {
 }
 
 pub fn sigma_from_rho(rho: f64, d: usize, cal: f64) -> f64 {
-    assert!(rho >= 0.0 && d > 0 && d.is_multiple_of(64) && cal >= 0.0);
+    assert!(rho >= 0.0 && d > 0 && cal >= 0.0);
     cal * rho / (d as f64).sqrt()
 }
 
@@ -132,7 +132,7 @@ pub fn empirical_sigma(estimates: &[f32], truths: &[f32]) -> f64 {
 
 /// Empirically compare dot-product error to the isotropic product model.
 pub fn measure_cal(d: usize, bits: u8, n: usize) -> f64 {
-    assert!(d.is_multiple_of(64));
+    assert!(d > 0);
     assert!(n > 0);
     let grid = build_grid(d, bits);
     let mut rng = ChaCha8Rng::seed_from_u64(0x4341_4c00_0000_0000 ^ d as u64 ^ bits as u64);

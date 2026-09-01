@@ -8,22 +8,38 @@ pub struct QueryPlanes {
     pub lo: f32,
     pub delta: f32,
     pub sum_codes: u64,
+    d: usize,
+}
+
+fn packed_words(d: usize) -> usize {
+    assert!(d > 0);
+    d.div_ceil(64)
+}
+
+fn tail_is_zero(words: &[u64], d: usize) -> bool {
+    if d == 0 || words.len() != packed_words(d) {
+        return false;
+    }
+    let tail = d % 64;
+    tail == 0 || words.last().is_some_and(|word| word >> tail == 0)
 }
 
 pub fn pack(y: &[f32], out: &mut [u64]) {
-    assert!(!y.is_empty() && y.len().is_multiple_of(64));
-    assert_eq!(out.len(), y.len() / 64);
+    assert!(!y.is_empty());
+    assert_eq!(out.len(), packed_words(y.len()));
     out.fill(0);
     for (i, &value) in y.iter().enumerate() {
         if value > 0.0 {
             out[i / 64] |= 1_u64 << (i % 64);
         }
     }
+    debug_assert!(tail_is_zero(out, y.len()));
 }
 
 pub fn unpack(bits: &[u64], d: usize) -> Vec<f32> {
-    assert!(d > 0 && d.is_multiple_of(64));
-    assert_eq!(bits.len(), d / 64);
+    assert!(d > 0);
+    assert_eq!(bits.len(), packed_words(d));
+    debug_assert!(tail_is_zero(bits, d));
     (0..d)
         .map(|i| {
             if bits[i / 64] & (1_u64 << (i % 64)) != 0 {
@@ -37,8 +53,8 @@ pub fn unpack(bits: &[u64], d: usize) -> Vec<f32> {
 
 /// Encode signs and return the mean-absolute-value scale after f16 rounding.
 pub fn encode(y: &[f32], out_bits: &mut [u64]) -> u16 {
-    assert!(!y.is_empty() && y.len().is_multiple_of(64));
-    assert_eq!(out_bits.len(), y.len() / 64);
+    assert!(!y.is_empty());
+    assert_eq!(out_bits.len(), packed_words(y.len()));
     pack(y, out_bits);
     if y.iter().all(|&value| value == 0.0) {
         return 0;
@@ -55,7 +71,7 @@ pub fn score_sym(x: &[u64], q: &[u64]) -> u32 {
 }
 
 pub fn prepare_query(u: &[f32], bq: u8) -> QueryPlanes {
-    assert!(!u.is_empty() && u.len().is_multiple_of(64));
+    assert!(!u.is_empty());
     assert!((1..=8).contains(&bq));
     debug_assert!(u.iter().all(|value| value.is_finite()));
 
@@ -67,7 +83,7 @@ pub fn prepare_query(u: &[f32], bq: u8) -> QueryPlanes {
     } else {
         (hi - lo) / f32::from(levels)
     };
-    let mut planes = vec![vec![0_u64; u.len() / 64]; bq as usize];
+    let mut planes = vec![vec![0_u64; packed_words(u.len())]; bq as usize];
     let mut sum_codes = 0_u64;
 
     if delta != 0.0 {
@@ -82,11 +98,13 @@ pub fn prepare_query(u: &[f32], bq: u8) -> QueryPlanes {
         }
     }
 
+    debug_assert!(planes.iter().all(|plane| tail_is_zero(plane, u.len())));
     QueryPlanes {
         planes,
         lo,
         delta,
         sum_codes,
+        d: u.len(),
     }
 }
 
@@ -95,6 +113,8 @@ pub fn score_asym(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
     assert!(!x.is_empty());
     assert!(!q.planes.is_empty());
     assert!(q.planes.iter().all(|plane| plane.len() == x.len()));
+    debug_assert!(tail_is_zero(x, q.d));
+    debug_assert!(q.planes.iter().all(|plane| tail_is_zero(plane, q.d)));
     let positives = x.iter().map(|word| word.count_ones()).sum();
     let weighted_sum = q
         .planes
@@ -114,15 +134,16 @@ pub fn score_asym(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
 
 pub fn estimate_asym(x: &[u64], scale: u16, q: &QueryPlanes) -> f32 {
     let (positives, weighted_sum) = score_asym(x, q);
-    let d = (x.len() * 64) as i64;
+    let d = q.d as i64;
     let sign_sum = i64::from(positives) * 2 - d;
     let code_sum = i128::from(weighted_sum) * 2 - i128::from(q.sum_codes);
     f16_to_f32(scale) * (q.lo * sign_sum as f32 + q.delta * code_sum as f32)
 }
 
 pub fn estimate_fp(x: &[u64], scale: u16, query: &[f32]) -> f32 {
-    assert!(!query.is_empty() && query.len().is_multiple_of(64));
-    assert_eq!(x.len(), query.len() / 64);
+    assert!(!query.is_empty());
+    assert_eq!(x.len(), packed_words(query.len()));
+    debug_assert!(tail_is_zero(x, query.len()));
     let signed_dot: f32 = query
         .iter()
         .enumerate()
@@ -155,6 +176,59 @@ mod tests {
     }
 
     #[test]
+    fn odd_dimension_round_trip_and_zero_tail() {
+        for d in [65, 100, 300, 769] {
+            let values: Vec<f32> = (0..d)
+                .map(|i| if i % 3 == 0 { 1.0 } else { -1.0 })
+                .collect();
+            let mut packed = vec![u64::MAX; packed_words(d)];
+            pack(&values, &mut packed);
+            assert!(tail_is_zero(&packed, d), "d={d}: {packed:x?}");
+            assert_eq!(unpack(&packed, d), values);
+
+            let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.13).sin()).collect();
+            let prepared = prepare_query(&query, 4);
+            assert!(
+                prepared.planes.iter().all(|plane| tail_is_zero(plane, d)),
+                "d={d}"
+            );
+            let scale = f32_to_f16(0.25);
+            let direct = estimate_fp(&packed, scale, &query);
+            let asymmetric = estimate_asym(&packed, scale, &prepared);
+            let quantized_query: Vec<f32> = (0..d)
+                .map(|i| {
+                    let code: u16 = prepared
+                        .planes
+                        .iter()
+                        .enumerate()
+                        .map(|(bit, plane)| (((plane[i / 64] >> (i % 64)) & 1) as u16) << bit)
+                        .sum();
+                    prepared.lo + prepared.delta * f32::from(code)
+                })
+                .collect();
+            let quantized_direct = estimate_fp(&packed, scale, &quantized_query);
+            assert!((asymmetric - quantized_direct).abs() < 2e-4, "d={d}");
+            assert!(direct.is_finite());
+
+            let mut query_signs = vec![0_u64; packed_words(d)];
+            let query_scale = encode(&query, &mut query_signs);
+            let decoded_dot = dot(
+                &unpack(&packed, d)
+                    .into_iter()
+                    .map(|sign| sign * f16_to_f32(scale))
+                    .collect::<Vec<_>>(),
+                &unpack(&query_signs, d)
+                    .into_iter()
+                    .map(|sign| sign * f16_to_f32(query_scale))
+                    .collect::<Vec<_>>(),
+            );
+            let sign_sum = d as i64 - 2 * i64::from(score_sym(&packed, &query_signs));
+            let popcount = f16_to_f32(scale) * f16_to_f32(query_scale) * sign_sum as f32;
+            assert!((decoded_dot - popcount).abs() < 1e-5, "d={d}");
+        }
+    }
+
+    #[test]
     fn symmetric_hamming_score() {
         assert_eq!(score_sym(&[0, u64::MAX], &[u64::MAX, u64::MAX]), 64);
     }
@@ -166,8 +240,8 @@ mod tests {
         for _ in 0..100 {
             let data = random_unit(&mut rng, d);
             let query = random_unit(&mut rng, d);
-            let mut data_bits = vec![0_u64; d / 64];
-            let mut query_bits = vec![0_u64; d / 64];
+            let mut data_bits = vec![0_u64; packed_words(d)];
+            let mut query_bits = vec![0_u64; packed_words(d)];
             let data_scale = f16_to_f32(encode(&data, &mut data_bits));
             let query_scale = f16_to_f32(encode(&query, &mut query_bits));
             let decoded_data: Vec<f32> = unpack(&data_bits, d)
@@ -251,7 +325,7 @@ mod tests {
         let mut energy = 0.0_f64;
         for _ in 0..1_000 {
             let vector = random_unit(&mut rng, d);
-            let mut bits = vec![0_u64; d / 64];
+            let mut bits = vec![0_u64; packed_words(d)];
             let scale = f16_to_f32(encode(&vector, &mut bits));
             let reference_scale = f16_to_f32(f32_to_f16(
                 vector.iter().map(|value| value.abs()).sum::<f32>() / d as f32,
@@ -287,7 +361,7 @@ mod tests {
         let mut q1_error = 0.0_f64;
         for _ in 0..1_000 {
             let vector = random_unit(&mut rng, d);
-            let mut bits = vec![0_u64; d / 64];
+            let mut bits = vec![0_u64; packed_words(d)];
             let scale = encode(&vector, &mut bits);
             for ((query, q4), q1) in queries.iter().zip(&q4).zip(&q1) {
                 let truth = dot(query, &vector);

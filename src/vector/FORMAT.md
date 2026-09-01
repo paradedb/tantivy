@@ -2,9 +2,20 @@
 
 Status: frozen for Phase B v1 on 2026-08-24.
 
+Changelog:
+
+- V3 amendment 3: quantized fields require `d >= 64`, matching the validated
+  error-model envelope and the packed-word width; unquantized fields remain unrestricted.
+
+- On 2026-08-24, before shipment, amendment 1 added the metric-gated
+  residual-squared-norm slot 14 required for L2 split-form distance assembly.
+- On 2026-08-24, before shipment, amendment 2 lifted the dimension divisibility
+  restriction and defined word-rounded, zero-tail code rows for general `d`.
+
 This document describes the byte contract introduced by
-`VectorFileVersion::V3`. Kernel packing and seed expansion remain governed by
-the quant-kernels golden tests.
+`VectorFileVersion::V3`. Seed expansion remains governed by the quant-kernels
+golden tests. Codes use I7 coordinate packing (coordinate 0 in the least
+significant bits), serialized as little-endian `u64` words.
 
 ## Container and compatibility
 
@@ -32,6 +43,7 @@ independently to every vector field.
 | `2 + 3*l` | Packed codes for zero-based layer `l` |
 | `3 + 3*l` | Little-endian binary16 scale for layer `l` |
 | `4 + 3*l` | Little-endian binary32 split-form constant for layer `l` |
+| 14 | Little-endian binary32 `‖x-c‖²`, present iff metric assembly requires a per-row norm (L2 in v1) |
 
 With the v1 maximum of four layers, quantized slots occupy 2 through 13. Each
 layer owns three separate SoA byte ranges; layers never interleave.
@@ -43,12 +55,24 @@ same replication factor as the existing fp32 rows.
 
 For dimension `d` and layer width `b`, logical lengths for `n` posting rows are:
 
-- codes: `n * d * b / 8` bytes;
+- codes: `n * ceil(d * b / 64) * 8` bytes;
 - scales: `n * 2` bytes;
 - constants: `n * 4` bytes.
 
-`d` is non-zero and divisible by 64; `b` is in 1 through 4. At `d=768`, the
-`[1,4]` schedule is `96 + 384 + 2*2 + 2*4 = 492` bytes per posting row.
+`d >= 64` for quantized fields; unquantized fields are unrestricted. `b` is in
+1 through 4. Coordinates are packed densely, and
+every bit after the true `d * b` payload in a row's final little-endian `u64`
+word is zero. Writers force this zero tail for both stored codes and prepared
+query bitplanes; readers may validate it. Whole-word XOR/AND plus popcount is
+therefore exact without masking, while formulas use the true `d`. Dimensions
+divisible by 64 retain byte-identical V3 rows. At `d=768`, the
+`[1,4]` schedule is `96 + 384 + 2*2 + 2*4 = 492` bytes per posting row for
+Dot/Cosine, and 496 bytes with the L2 residual norm.
+
+The norm is computed from the stored row and its posting centroid before any
+rotation. Readers must not derive it from quantization scales or reconstructed
+layers. L2 assembles `dist² = ‖q-c‖² - 2·est + ‖r‖²`, where `est` is the
+split-form estimate of `⟨q-c,r⟩`; the score buffer stores `-dist²`.
 
 ## Code alignment
 
@@ -75,8 +99,8 @@ vector fields with different dimensions and metrics. Each entry persists:
   fp32 points.
 
 Configuration is validated by `IndexBuilder` before any index metadata is
-written: field exists and is vector/f32; dimension matches and is divisible by
-64; layer count is 1 through 4; widths are 1 through 4; RaBitQ is one bit;
+written: field exists and is vector/f32; dimension is at least 64 and matches;
+layer count is 1 through 4; widths are 1 through 4; RaBitQ is one bit;
 TurboQuant grids are present exactly once per used width with `2^b` finite,
 strictly increasing points; metric and normalization agree with the schema.
 

@@ -14,6 +14,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::time::Instant;
 
 use common::BitSet;
 
@@ -24,11 +25,12 @@ use super::bounds::{
 use super::distance::norm_squared_wide;
 use super::index_reader::VectorIndexReader;
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
-use super::prepared::PreparedQuery;
+use super::prepared::{PreparedQuery, QuantizedQueryCtx};
 use super::tie_break::NoTieBreak;
-use super::VectorElement;
+use super::{enter_vector_io_phase, VectorElement, VectorIoPhase};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
+use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
 use crate::query::Weight;
 use crate::schema::{Field, Metric};
@@ -52,6 +54,9 @@ type TieBreakHeap<K, CTail> = TopNComputer<
 pub struct VectorBackend<T: VectorElement> {
     reader: Arc<VectorIndexReader>,
     query: Arc<PreparedQuery<T>>,
+    quantized_query: Option<Arc<QuantizedQueryCtx>>,
+    max_scan_levels: usize,
+    query_prep_ns: u64,
     adaptive: AdaptiveProbeParams,
     segment_ord: SegmentOrdinal,
 }
@@ -66,12 +71,21 @@ impl<T: VectorElement> VectorBackend<T> {
         field: Field,
         query: Arc<Vec<T>>,
         adaptive: AdaptiveProbeParams,
+        max_scan_levels: usize,
     ) -> crate::Result<Self> {
         let reader = segment_reader.vector_index(field)?;
+        let prep_start = Instant::now();
+        let query_f32: Vec<f32> = query.iter().map(|value| value.to_f32()).collect();
+        let quantized_query = reader
+            .quantization()
+            .map(|quantized| Arc::new(QuantizedQueryCtx::new(quantized.index_ctx(), query_f32)));
         let query = Arc::new(PreparedQuery::<T>::new(reader.options().metric(), query));
         Ok(Self {
             reader,
             query,
+            quantized_query,
+            max_scan_levels,
+            query_prep_ns: prep_start.elapsed().as_nanos() as u64,
             adaptive,
             segment_ord,
         })
@@ -127,25 +141,54 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        let mut stats = ProbeStats::default();
-        let hits = match self.reader.index() {
-            Some(index) => self.approximate_top_n(
-                index,
+        let mut stats = ProbeStats {
+            query_prep_ns: self.query_prep_ns,
+            ..Default::default()
+        };
+        let hits = if self.max_scan_levels == 0 {
+            self.exact_top_n(
                 weight,
                 segment_reader,
                 top_n,
                 tie_break,
                 tie_comparator,
                 &mut stats,
-            )?,
-            None => self.exact_top_n(
-                weight,
-                segment_reader,
-                top_n,
-                tie_break,
-                tie_comparator,
-                &mut stats,
-            )?,
+            )?
+        } else {
+            match self.reader.index() {
+                Some(index) => {
+                    if let Some(quantized_query) = &self.quantized_query {
+                        self.quantized_top_n(
+                            index,
+                            quantized_query,
+                            weight,
+                            segment_reader,
+                            top_n,
+                            tie_break,
+                            tie_comparator,
+                            &mut stats,
+                        )?
+                    } else {
+                        self.approximate_top_n(
+                            index,
+                            weight,
+                            segment_reader,
+                            top_n,
+                            tie_break,
+                            tie_comparator,
+                            &mut stats,
+                        )?
+                    }
+                }
+                None => self.exact_top_n(
+                    weight,
+                    segment_reader,
+                    top_n,
+                    tie_break,
+                    tie_comparator,
+                    &mut stats,
+                )?,
+            }
         };
         Ok((hits, stats))
     }
@@ -267,10 +310,23 @@ pub enum ProbeTermination {
 /// only `exact_rows_read`; every other field is IVF-probe-only.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
-    /// Docs that passed filter + alive + seen and were scored against the
-    /// query. This stays the "scored" bucket and equals the final survivor
-    /// `candidates`.
+    /// Docs or posting memberships scored by the active scan path. On the
+    /// quantized path this is the plane-1 membership count before κ bands.
     pub candidates_scored: usize,
+    /// Posting memberships scored by quantized plane 1.
+    pub quantized_plane1_scored: usize,
+    /// Posting memberships retained by the first κ boundary.
+    pub quantized_plane1_survivors: usize,
+    /// Layer-refinement scores evaluated after plane 1.
+    pub quantized_refinements_scored: usize,
+    /// Memberships surviving the final compressed boundary.
+    pub quantized_final_survivors: usize,
+    /// Distinct documents fetched for exact rerank.
+    pub rerank_rows: usize,
+    /// Segment-query rotation, bitplane, and LUT preparation time.
+    pub query_prep_ns: u64,
+    /// Total κ-boundary selection and filtering time.
+    pub boundary_ns: u64,
     /// Every doc-id the inner loop touched, before any gate — the denominator
     /// for the prune breakdown.
     pub vectors_visited: usize,
@@ -298,7 +354,22 @@ pub struct ProbeStats {
     /// routing went through the RNG. Ranking is lazy, so this covers only as
     /// much routing as the probe loop actually pulled. See
     /// [`IvfSearchMetrics`].
+    #[serde(skip)]
     pub routing: IvfSearchMetrics,
+    /// Centroids scored while producing routing order.
+    pub routing_visited_count: usize,
+    /// Segments routed through the centroid graph (0 or 1 per segment query).
+    pub routing_graph_count: usize,
+    /// Graph nodes visited and scored.
+    pub routing_graph_visited_count: usize,
+    /// Graph frontier candidates expanded.
+    pub routing_graph_expanded_count: usize,
+    /// Graph adjacency entries scanned.
+    pub routing_graph_edges_scanned: usize,
+    /// Graph result-set evictions.
+    pub routing_graph_evictions: usize,
+    /// Graph candidates returned before probing stopped.
+    pub routing_graph_result_count: usize,
     /// Clusters the bounds gate passed over with a Skip verdict, without
     /// opening them: their margins proved they could not improve the
     /// armed result. Each charged the open share. Disjoint from the
@@ -310,7 +381,12 @@ pub struct ProbeStats {
     /// heap never held k results), serialized as JSON null - the
     /// harness's armed-share column depends on the null contract.
     /// Per-segment; does not sum.
+    #[serde(skip)]
     pub bound_armed_at_probe: Option<u32>,
+    /// Number of segment scans in which the query bound armed.
+    pub bound_armed_count: u32,
+    /// Sum of the zero-based probe index where the bound armed.
+    pub bound_armed_probe_sum: u64,
     /// How the probe loop terminated. Per-segment; does not sum.
     pub termination: ProbeTermination,
     /// Work units this segment's probe loop charged against its resolved
@@ -322,6 +398,27 @@ pub struct ProbeStats {
 }
 
 impl ProbeStats {
+    fn record_routing(&mut self, routing: IvfSearchMetrics) {
+        self.routing = routing;
+        self.routing_visited_count += routing.visited_count;
+        if let Some(graph) = routing.graph {
+            self.routing_graph_count += 1;
+            self.routing_graph_visited_count += graph.visited_count;
+            self.routing_graph_expanded_count += graph.expanded_count;
+            self.routing_graph_edges_scanned += graph.edges_scanned;
+            self.routing_graph_evictions += graph.evictions;
+            self.routing_graph_result_count += graph.result_count;
+        }
+    }
+
+    fn record_bound_armed(&mut self, at_probe: Option<u32>) {
+        self.bound_armed_at_probe = at_probe;
+        if let Some(probe) = at_probe {
+            self.bound_armed_count += 1;
+            self.bound_armed_probe_sum += u64::from(probe);
+        }
+    }
+
     /// Clusters the probe loop visited.
     ///
     /// Returns (`usize`): `postings_row + postings_skipped` — every probed
@@ -497,7 +594,311 @@ struct Survivor {
     doc: DocId,
 }
 
+struct QuantizedCandidate {
+    row: usize,
+    doc: DocId,
+    score: f32,
+    sigma: f32,
+    query_residual_norm: f32,
+    residual_norm_sq: f32,
+}
+
+struct QuantizedScanCtx {
+    candidates: Vec<QuantizedCandidate>,
+    best_by_doc: Vec<Option<usize>>,
+    work_spent: WorkUnits,
+}
+
+impl QuantizedScanCtx {
+    fn new(max_doc: DocId) -> Self {
+        Self {
+            candidates: Vec::new(),
+            best_by_doc: vec![None; max_doc as usize],
+            work_spent: WorkUnits::ZERO,
+        }
+    }
+
+    fn push(&mut self, candidate: QuantizedCandidate) {
+        let index = self.candidates.len();
+        let best = &mut self.best_by_doc[candidate.doc as usize];
+        if best.is_none_or(|previous| {
+            let previous = &self.candidates[previous];
+            candidate.score > previous.score
+                || (candidate.score == previous.score && candidate.row < previous.row)
+        }) {
+            *best = Some(index);
+        }
+        self.candidates.push(candidate);
+    }
+
+    fn rebuild_best_by_doc(&mut self) {
+        self.best_by_doc.fill(None);
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            let best = &mut self.best_by_doc[candidate.doc as usize];
+            if best.is_none_or(|previous| {
+                let previous = &self.candidates[previous];
+                candidate.score > previous.score
+                    || (candidate.score == previous.score && candidate.row < previous.row)
+            }) {
+                *best = Some(index);
+            }
+        }
+    }
+
+    /// The distinct-document k-th estimate widened pessimistically by its σ.
+    fn pessimistic_kth(&self, top_n: usize, kappa: f32) -> Option<f32> {
+        let best: Vec<usize> = self.best_by_doc.iter().flatten().copied().collect();
+        if top_n == 0 || best.len() < top_n {
+            return None;
+        }
+        let scores: Vec<f32> = best
+            .iter()
+            .map(|&index| self.candidates[index].score)
+            .collect();
+        let (kth_index, kth_score) = cascade::kth(&scores, top_n);
+        let candidate = &self.candidates[best[kth_index]];
+        Some(kth_score - kappa * candidate.sigma)
+    }
+
+    fn band(&mut self, top_n: usize, kappa: f32) {
+        if let Some(pessimistic_kth) = self.pessimistic_kth(top_n, kappa) {
+            self.candidates
+                .retain(|candidate| candidate.score + kappa * candidate.sigma >= pessimistic_kth);
+        }
+        self.candidates
+            .sort_unstable_by_key(|candidate| candidate.row);
+        self.rebuild_best_by_doc();
+    }
+}
+
 impl<T: VectorElement> VectorBackend<T> {
+    #[allow(clippy::too_many_arguments)]
+    fn quantized_top_n<K, CTail>(
+        &self,
+        index: &IvfIndex,
+        query: &QuantizedQueryCtx,
+        weight: &dyn Weight,
+        segment_reader: &SegmentReader,
+        top_n: usize,
+        tie_break: &mut K,
+        tie_comparator: CTail,
+        stats: &mut ProbeStats,
+    ) -> crate::Result<TieBreakHits<K>>
+    where
+        K: SegmentSortKeyComputer,
+        CTail: Comparator<K::SegmentSortKey>,
+    {
+        if top_n == 0 || segment_reader.max_doc() == 0 || index.num_clusters() == 0 {
+            return Ok(Vec::new());
+        }
+        let max_doc = segment_reader.max_doc();
+        let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
+        if filter.len() == 0 {
+            return Ok(Vec::new());
+        }
+        let alive = segment_reader.alive_bitset();
+        let quantized = self
+            .reader
+            .quantization()
+            .expect("quantized query requires quantized slots");
+        let centroid_bytes = index.centroid_bytes()?;
+        let centroid_stride = self.reader.options().bytes_per_vector();
+
+        let (work_budget, n_avg, x) = self
+            .adaptive
+            .resolved_work_budget(index.num_clusters(), index.num_docs())?;
+        let pricing = UnitPricing {
+            budget: WorkUnits::new(work_budget),
+            open: WorkUnits::new(x),
+            row: WorkUnits::new((1.0 - x) / n_avg),
+        };
+        let mut routing_ws = Workspace::new();
+        let mut ranked = index.rank_clusters(&mut routing_ws, query.query());
+        let mut scan = QuantizedScanCtx::new(max_doc);
+        let mut visited = 0usize;
+        let mut pruned_filter = 0usize;
+        let mut pruned_dead = 0usize;
+        let mut postings_row = 0usize;
+        let mut postings_skipped = 0usize;
+        let bounds = index.bounds();
+        let metric = query.index.config.metric;
+        let q_norm = norm_squared_wide(query.query()).sqrt() as f32;
+        let mut bounds_skips = 0u32;
+        let mut bound_armed_at_probe = None;
+
+        for Candidate { sim, node } in &mut ranked {
+            if scan.work_spent >= pricing.budget {
+                stats.termination = ProbeTermination::Ceiling;
+                break;
+            }
+            let cluster = node as usize;
+            let query_bound =
+                scan.pessimistic_kth(top_n, 2.0)
+                    .map_or(QueryBound::Filling, |score| QueryBound::Armed {
+                        t: to_bound_space(metric, score),
+                    });
+            if bound_armed_at_probe.is_none() && matches!(query_bound, QueryBound::Armed { .. }) {
+                bound_armed_at_probe =
+                    Some((postings_row + postings_skipped).saturating_sub(1) as u32);
+            }
+            let verdict = bounds_verdict(query_bound, || {
+                let QueryBound::Armed { t } = query_bound else {
+                    return f32::INFINITY;
+                };
+                let r = bounds.ball_r(cluster);
+                match metric {
+                    Metric::L2 | Metric::Cosine => {
+                        margin_ball_ball(t, r, to_bound_space(metric, sim.score()))
+                    }
+                    Metric::Dot => margin_ball_halfspace(sim.score(), q_norm, r, t),
+                }
+            });
+            if verdict == Verdict::Skip {
+                scan.work_spent += pricing.open;
+                bounds_skips += 1;
+                continue;
+            }
+            scan.work_spent += pricing.open;
+            let centroid = super::ivf::decode_row::<f32>(
+                &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
+                self.reader.dim(),
+            )?;
+            let query_residual_norm = query.query_residual_norm(sim.score(), centroid.as_slice());
+            let mut cluster_scored = 0usize;
+            for row in index.cluster_range(cluster) {
+                visited += 1;
+                let doc = self.reader.doc_id_at(row);
+                if !filter.contains(doc) {
+                    pruned_filter += 1;
+                    continue;
+                }
+                if alive.is_some_and(|alive| !alive.is_alive(doc)) {
+                    pruned_dead += 1;
+                    continue;
+                }
+                let layer = &quantized.layers()[0];
+                let estimate = query.score_layer(
+                    0,
+                    &layer.code_bytes(row)?,
+                    layer.scale(row)?,
+                    layer.constant(row)?,
+                );
+                let stored_residual_norm_sq = quantized.residual_norm(row)?;
+                let residual_norm_sq = stored_residual_norm_sq.unwrap_or(f32::INFINITY);
+                let score = match metric {
+                    Metric::L2 => {
+                        let residual_norm_sq = stored_residual_norm_sq.ok_or_else(|| {
+                            TantivyError::DataCorruption(DataCorruption::comment_only(
+                                "quantized L2 field is missing residual-norm slot 14",
+                            ))
+                        })?;
+                        sim.score() + 2.0 * estimate - residual_norm_sq
+                    }
+                    Metric::Dot | Metric::Cosine => sim.score() + estimate,
+                };
+                scan.push(QuantizedCandidate {
+                    row,
+                    doc,
+                    score,
+                    sigma: query.score_sigma(0, query_residual_norm, residual_norm_sq),
+                    query_residual_norm,
+                    residual_norm_sq,
+                });
+                cluster_scored += 1;
+            }
+            scan.work_spent += pricing.row * cluster_scored as f64;
+            if cluster_scored == 0 {
+                postings_skipped += 1;
+            } else {
+                postings_row += 1;
+            }
+        }
+        stats.record_routing(ranked.metrics());
+        stats.vectors_visited += visited;
+        stats.pruned_filter += pruned_filter;
+        stats.pruned_dead += pruned_dead;
+        stats.postings_row += postings_row;
+        stats.postings_skipped += postings_skipped;
+        stats.candidates_scored += scan.candidates.len();
+        stats.quantized_plane1_scored += scan.candidates.len();
+        stats.bounds_skips += bounds_skips;
+        stats.record_bound_armed(bound_armed_at_probe);
+        stats.work_charged += scan.work_spent.to_f32();
+
+        let boundary_start = Instant::now();
+        scan.band(top_n, 2.0);
+        stats.boundary_ns += boundary_start.elapsed().as_nanos() as u64;
+        stats.quantized_plane1_survivors += scan.candidates.len();
+        let scan_levels = self.max_scan_levels.min(query.index.specs.len()).max(1);
+        for layer_idx in 1..scan_levels {
+            let layer = &quantized.layers()[layer_idx];
+            stats.quantized_refinements_scored += scan.candidates.len();
+            for candidate in &mut scan.candidates {
+                let refinement = query.score_layer(
+                    layer_idx,
+                    &layer.code_bytes(candidate.row)?,
+                    layer.scale(candidate.row)?,
+                    layer.constant(candidate.row)?,
+                );
+                candidate.score += if query.index.config.metric == Metric::L2 {
+                    2.0 * refinement
+                } else {
+                    refinement
+                };
+                candidate.sigma = query.score_sigma(
+                    layer_idx,
+                    candidate.query_residual_norm,
+                    candidate.residual_norm_sq,
+                );
+            }
+            let final_sign = query.index.specs[layer_idx].bits == 1;
+            let boundary_start = Instant::now();
+            scan.band(top_n, if final_sign { 2.0 } else { 4.0 });
+            stats.boundary_ns += boundary_start.elapsed().as_nanos() as u64;
+        }
+        stats.quantized_final_survivors += scan.candidates.len();
+
+        // Replicated memberships survive independently through the bands;
+        // keep the best estimate per doc before the one exact fetch.
+        let mut best_by_doc: Vec<Option<(f32, usize)>> = vec![None; max_doc as usize];
+        for candidate in scan.candidates {
+            let slot = &mut best_by_doc[candidate.doc as usize];
+            if slot.is_none_or(|(score, _)| candidate.score > score) {
+                *slot = Some((candidate.score, candidate.row));
+            }
+        }
+        let mut rerank: Vec<(usize, DocId)> = best_by_doc
+            .into_iter()
+            .enumerate()
+            .filter_map(|(doc, entry)| entry.map(|(_, row)| (row, doc as DocId)))
+            .collect();
+        rerank.sort_unstable_by_key(|&(row, _)| row);
+        stats.rerank_rows += rerank.len();
+
+        let mut topn =
+            TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
+        let _rerank_io_phase = enter_vector_io_phase(VectorIoPhase::Rerank);
+        for (row, doc) in rerank {
+            let bytes = self.reader.vector_bytes_for_row(row)?;
+            let score = self.query.score_doc_bytes(&bytes);
+            if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                topn.push_unordered(key, doc);
+            }
+            stats.exact_rows_read += 1;
+        }
+        let segment_ord = self.segment_ord;
+        Ok(topn
+            .into_sorted_vec()
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.sort_key,
+                    DocAddress::new(segment_ord, candidate.doc),
+                )
+            })
+            .collect())
+    }
+
     /// Top-N by IVF probe. Fills `stats` with this segment's probe-loop
     /// counters.
     #[allow(clippy::too_many_arguments)]
@@ -574,7 +975,7 @@ impl<T: VectorElement> VectorBackend<T> {
         )?;
 
         // The routing cost is only known once the scan stops pulling.
-        stats.routing = ranked.metrics();
+        stats.record_routing(ranked.metrics());
 
         let segment_ord = self.segment_ord;
         Ok(topn
@@ -779,7 +1180,7 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.postings_skipped += postings_skipped;
         stats.candidates_scored += candidates;
         stats.bounds_skips += bounds_skips;
-        stats.bound_armed_at_probe = bound_tracker.armed_at_probe();
+        stats.record_bound_armed(bound_tracker.armed_at_probe());
         stats.termination = termination;
         stats.work_charged += work_spent.to_f32();
 
@@ -951,6 +1352,7 @@ mod tests {
             embed_field,
             Arc::new(query),
             params,
+            usize::MAX,
         )?;
         assert!(
             segment_reader.vector_index(embed_field)?.index().is_some(),
@@ -2265,8 +2667,15 @@ mod tests {
     /// through `serde_json` with the field names callers rely on.
     #[test]
     fn probe_stats_serializes_to_json() {
-        let stats = ProbeStats {
+        let mut stats = ProbeStats {
             candidates_scored: 10,
+            quantized_plane1_scored: 10,
+            quantized_plane1_survivors: 8,
+            quantized_refinements_scored: 8,
+            quantized_final_survivors: 5,
+            rerank_rows: 4,
+            query_prep_ns: 125,
+            boundary_ns: 75,
             vectors_visited: 20,
             pruned_filter: 4,
             pruned_dead: 3,
@@ -2274,28 +2683,36 @@ mod tests {
             postings_row: 1,
             postings_skipped: 1,
             exact_rows_read: 0,
-            routing: IvfSearchMetrics {
-                visited_count: 7,
-                graph: Some(NeighborhoodGraphSearchMetrics {
-                    visited_count: 7,
-                    expanded_count: 4,
-                    edges_scanned: 12,
-                    evictions: 1,
-                    result_count: 3,
-                    termination_reason: SearchTerminationReason::SearchConverged,
-                }),
-            },
             bounds_skips: 2,
-            bound_armed_at_probe: Some(1),
             termination: ProbeTermination::Ceiling,
             work_charged: 1.75,
+            ..Default::default()
         };
+        stats.record_routing(IvfSearchMetrics {
+            visited_count: 7,
+            graph: Some(NeighborhoodGraphSearchMetrics {
+                visited_count: 7,
+                expanded_count: 4,
+                edges_scanned: 12,
+                evictions: 1,
+                result_count: 3,
+                termination_reason: SearchTerminationReason::SearchConverged,
+            }),
+        });
+        stats.record_bound_armed(Some(1));
 
         let value = serde_json::to_value(&stats).expect("ProbeStats should serialize to JSON");
         assert_eq!(
             value,
             serde_json::json!({
                 "candidates_scored": 10,
+                "quantized_plane1_scored": 10,
+                "quantized_plane1_survivors": 8,
+                "quantized_refinements_scored": 8,
+                "quantized_final_survivors": 5,
+                "rerank_rows": 4,
+                "query_prep_ns": 125,
+                "boundary_ns": 75,
                 "vectors_visited": 20,
                 "pruned_filter": 4,
                 "pruned_dead": 3,
@@ -2303,31 +2720,164 @@ mod tests {
                 "postings_row": 1,
                 "postings_skipped": 1,
                 "exact_rows_read": 0,
-                "routing": {
-                    "visited_count": 7,
-                    "graph": {
-                        "visited_count": 7,
-                        "expanded_count": 4,
-                        "edges_scanned": 12,
-                        "evictions": 1,
-                        "result_count": 3,
-                        "termination_reason": "SearchConverged"
-                    }
-                },
+                "routing_visited_count": 7,
+                "routing_graph_count": 1,
+                "routing_graph_visited_count": 7,
+                "routing_graph_expanded_count": 4,
+                "routing_graph_edges_scanned": 12,
+                "routing_graph_evictions": 1,
+                "routing_graph_result_count": 3,
                 "bounds_skips": 2,
-                "bound_armed_at_probe": 1,
+                "bound_armed_count": 1,
+                "bound_armed_probe_sum": 1,
                 "termination": "Ceiling",
                 "work_charged": 1.75
             })
         );
         assert_eq!(stats.clusters_probed(), 2);
 
-        // Exact routing leaves `graph` unset — still must serialize as null.
-        let mut exact_routing = stats;
-        exact_routing.routing.graph = None;
+        // Exact routing serializes only additive flat counters; nested routing
+        // state is intentionally outside pdbench's numeric reach.
+        let mut exact_routing = ProbeStats::default();
+        exact_routing.record_routing(IvfSearchMetrics {
+            visited_count: 7,
+            graph: None,
+        });
         let exact_value =
             serde_json::to_value(&exact_routing).expect("ProbeStats should serialize to JSON");
-        assert_eq!(exact_value["routing"]["graph"], serde_json::Value::Null);
+        assert_eq!(exact_value["routing_visited_count"], 7);
+        assert_eq!(exact_value["routing_graph_count"], 0);
+        assert!(exact_value.get("routing").is_none());
+    }
+
+    #[test]
+    fn quantized_boundary_counts_replicas_once() {
+        let mut scan = QuantizedScanCtx::new(2);
+        for (row, doc, score) in [(0, 0, 100.0), (1, 0, 90.0), (2, 1, 0.0)] {
+            scan.push(QuantizedCandidate {
+                row,
+                doc,
+                score,
+                sigma: 0.0,
+                query_residual_norm: 1.0,
+                residual_norm_sq: 1.0,
+            });
+        }
+        assert_eq!(scan.pessimistic_kth(2, 2.0), Some(0.0));
+        scan.band(2, 2.0);
+        assert!(
+            scan.candidates.iter().any(|candidate| candidate.doc == 1),
+            "a replica of doc 0 must not displace the second distinct document"
+        );
+    }
+
+    #[test]
+    fn gate_b_recall_parity_survivor_sets() {
+        const CANDIDATES: usize = 40;
+        const TOP_N: usize = 10;
+        const KAPPA_1: f32 = 2.0;
+        const KAPPA_2: f32 = 4.0;
+
+        let plane1_scores: Vec<f32> = (0..CANDIDATES)
+            .map(|row| 2.0 - row as f32 * 0.09 + (row as f32 * 0.7).sin() * 0.08)
+            .collect();
+        let plane1_sigmas: Vec<f32> = (0..CANDIDATES)
+            .map(|row| 0.03 + (row % 5) as f32 * 0.01)
+            .collect();
+        let refinements: Vec<f32> = (0..CANDIDATES)
+            .map(|row| (row as f32 * 0.41).cos() * 0.06)
+            .collect();
+        let plane2_sigmas: Vec<f32> = (0..CANDIDATES)
+            .map(|row| 0.012 + (row % 3) as f32 * 0.004)
+            .collect();
+
+        let (first_kth_index, first_kth) = cascade::kth(&plane1_scores, TOP_N);
+        let harness_first = cascade::band_filter(
+            &plane1_scores,
+            &plane1_sigmas,
+            KAPPA_1,
+            first_kth - KAPPA_1 * plane1_sigmas[first_kth_index],
+        );
+
+        let mut scan = QuantizedScanCtx::new(CANDIDATES as DocId);
+        for row in 0..CANDIDATES {
+            scan.push(QuantizedCandidate {
+                row,
+                doc: row as DocId,
+                score: plane1_scores[row],
+                sigma: plane1_sigmas[row],
+                query_residual_norm: 1.0,
+                residual_norm_sq: 1.0,
+            });
+        }
+        scan.band(TOP_N, KAPPA_1);
+        let scan_first: Vec<u32> = scan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.row as u32)
+            .collect();
+        assert_eq!(scan_first, harness_first, "plane-1 survivor set");
+
+        let second_scores: Vec<f32> = harness_first
+            .iter()
+            .map(|&row| plane1_scores[row as usize] + refinements[row as usize])
+            .collect();
+        let second_sigmas: Vec<f32> = harness_first
+            .iter()
+            .map(|&row| plane2_sigmas[row as usize])
+            .collect();
+        let (second_kth_index, second_kth) = cascade::kth(&second_scores, TOP_N);
+        let harness_second_local = cascade::band_filter(
+            &second_scores,
+            &second_sigmas,
+            KAPPA_2,
+            second_kth - KAPPA_2 * second_sigmas[second_kth_index],
+        );
+        let harness_second: Vec<u32> = harness_second_local
+            .iter()
+            .map(|&local| harness_first[local as usize])
+            .collect();
+
+        for candidate in &mut scan.candidates {
+            candidate.score += refinements[candidate.row];
+            candidate.sigma = plane2_sigmas[candidate.row];
+        }
+        scan.band(TOP_N, KAPPA_2);
+        let scan_second: Vec<u32> = scan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.row as u32)
+            .collect();
+        assert_eq!(scan_second, harness_second, "plane-2 survivor set");
+
+        let mut exact_order: Vec<usize> = (0..CANDIDATES).collect();
+        exact_order.sort_unstable_by(|&left, &right| {
+            (plane1_scores[right] + refinements[right])
+                .total_cmp(&(plane1_scores[left] + refinements[left]))
+                .then_with(|| left.cmp(&right))
+        });
+        let recalled = exact_order[..TOP_N]
+            .iter()
+            .filter(|&&row| scan_second.contains(&(row as u32)))
+            .count();
+        assert_eq!(recalled, TOP_N, "candidate recall must match the harness");
+    }
+
+    #[test]
+    fn quantized_boundary_fails_open_without_a_residual_norm() {
+        let mut scan = QuantizedScanCtx::new(2);
+        for (row, score) in [(0, 100.0), (1, -100.0)] {
+            scan.push(QuantizedCandidate {
+                row,
+                doc: row as DocId,
+                score,
+                sigma: f32::INFINITY,
+                query_residual_norm: 1.0,
+                residual_norm_sq: f32::INFINITY,
+            });
+        }
+        scan.band(1, 4.0);
+        assert_eq!(scan.candidates.len(), 2);
     }
 
     // ============================================================
@@ -2380,6 +2930,7 @@ mod tests {
             embed_field,
             Arc::new(query),
             params,
+            usize::MAX,
         )?;
         assert!(
             segment_reader.vector_index(embed_field)?.index().is_some(),
@@ -2441,6 +2992,7 @@ mod tests {
             embed_field,
             Arc::new(query),
             AdaptiveProbeParams::default(),
+            usize::MAX,
         )?;
         assert!(
             segment_reader.vector_index(embed_field)?.index().is_none(),
@@ -3240,9 +3792,8 @@ mod tests {
             Ok(())
         }
 
-        /// Unarmed (k > N): zero skips, and the armed index serializes
-        /// as JSON null, not 0 - the harness's armed-share column
-        /// depends on the null contract.
+        /// Unarmed (k > N): the additive armed counters remain zero and the
+        /// non-additive probe index stays outside serialized numeric fields.
         #[test]
         fn armed_null_when_unarmed() -> crate::Result<()> {
             let (index, field) = separated_fixture(Metric::L2)?;
@@ -3250,11 +3801,9 @@ mod tests {
             assert_eq!(stats.bound_armed_at_probe, None);
             assert_eq!(stats.bounds_skips, 0);
             let value = serde_json::to_value(&stats).expect("ProbeStats serializes");
-            assert_eq!(
-                value["bound_armed_at_probe"],
-                serde_json::Value::Null,
-                "unarmed must serialize as null, not 0"
-            );
+            assert_eq!(value["bound_armed_count"], 0);
+            assert_eq!(value["bound_armed_probe_sum"], 0);
+            assert!(value.get("bound_armed_at_probe").is_none());
             Ok(())
         }
 

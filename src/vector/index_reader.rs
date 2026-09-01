@@ -20,15 +20,22 @@
 //! sidecar. [`VectorIndexReader::open`] validates the two signals agree.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use common::{HasLen, OwnedBytes};
 
 use super::flat::IdMap;
 use super::header::{centroid_slot, read_header, vec_slot, VectorFileVersion};
 use super::ivf::{IvfIndex, CENTROIDS_EXT};
+use super::prepared::QuantizedIndexCtx;
+use super::quantization::{
+    quantized_code_stride, quantized_code_tail_is_zero, VectorQuantizationConfig,
+    QUANTIZED_CONSTANT_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_STRIDE,
+};
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
+use crate::error::DataCorruption;
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
@@ -61,6 +68,109 @@ pub struct VectorClusterStats {
     pub empty_clusters: usize,
 }
 
+/// Deferred fixed-stride slices for one residual plane.
+pub(crate) struct QuantizedLayerReader {
+    codes: FileSlice,
+    scales: FileSlice,
+    constants: FileSlice,
+    code_stride: usize,
+    dim: usize,
+    bits: u8,
+}
+
+impl QuantizedLayerReader {
+    pub(crate) fn code_bytes(&self, row: usize) -> crate::Result<OwnedBytes> {
+        let bytes = self
+            .codes
+            .slice(row * self.code_stride..(row + 1) * self.code_stride)
+            .read_bytes()
+            .map_err(TantivyError::from)?;
+        if !quantized_code_tail_is_zero(bytes.as_slice(), self.dim, self.bits) {
+            return Err(DataCorruption::comment_only(format!(
+                "quantized row {row} has non-zero padding bits for d={} b={}",
+                self.dim, self.bits
+            ))
+            .into());
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn scale(&self, row: usize) -> crate::Result<u16> {
+        let bytes = self
+            .scales
+            .slice(row * QUANTIZED_SCALE_STRIDE..(row + 1) * QUANTIZED_SCALE_STRIDE)
+            .read_bytes()?;
+        Ok(u16::from_le_bytes(bytes.as_slice().try_into().unwrap()))
+    }
+
+    pub(crate) fn constant(&self, row: usize) -> crate::Result<f32> {
+        let bytes = self
+            .constants
+            .slice(row * QUANTIZED_CONSTANT_STRIDE..(row + 1) * QUANTIZED_CONSTANT_STRIDE)
+            .read_bytes()?;
+        Ok(f32::from_le_bytes(bytes.as_slice().try_into().unwrap()))
+    }
+}
+
+/// Field-keyed V3 quantized payloads resolved from immutable index metadata.
+pub(crate) struct QuantizedFieldReader {
+    config: VectorQuantizationConfig,
+    layers: Vec<QuantizedLayerReader>,
+    residual_norms: Option<FileSlice>,
+    index_ctx: Arc<QuantizedIndexCtx>,
+}
+
+impl QuantizedFieldReader {
+    pub(crate) fn config(&self) -> &VectorQuantizationConfig {
+        &self.config
+    }
+
+    pub(crate) fn layers(&self) -> &[QuantizedLayerReader] {
+        &self.layers
+    }
+
+    pub(crate) fn residual_norm(&self, row: usize) -> crate::Result<Option<f32>> {
+        let Some(residual_norms) = &self.residual_norms else {
+            return Ok(None);
+        };
+        let bytes = residual_norms
+            .slice(row * QUANTIZED_RESIDUAL_NORM_STRIDE..(row + 1) * QUANTIZED_RESIDUAL_NORM_STRIDE)
+            .read_bytes()?;
+        Ok(Some(f32::from_le_bytes(
+            bytes.as_slice().try_into().unwrap(),
+        )))
+    }
+
+    pub(crate) fn index_ctx(&self) -> Arc<QuantizedIndexCtx> {
+        Arc::clone(&self.index_ctx)
+    }
+}
+
+fn logical_slice(
+    slice: FileSlice,
+    logical_len: usize,
+    description: &str,
+) -> crate::Result<FileSlice> {
+    let physical_len = slice.len();
+    if physical_len < logical_len || physical_len - logical_len >= 64 {
+        return Err(DataCorruption::comment_only(format!(
+            "{description} physical length {physical_len} does not contain logical length \
+             {logical_len} plus at most 63 alignment bytes"
+        ))
+        .into());
+    }
+    if physical_len != logical_len {
+        let trailer = slice.slice(logical_len..physical_len).read_bytes()?;
+        if trailer.iter().any(|&byte| byte != 0) {
+            return Err(DataCorruption::comment_only(format!(
+                "{description} has a non-zero alignment trailer"
+            ))
+            .into());
+        }
+    }
+    Ok(slice.slice_to(logical_len))
+}
+
 /// Per-(segment, field) vector reader: the row store plus, for IVF segments,
 /// the routing index. See the module docs for the layout and the
 /// pinned-vs-deferred split.
@@ -79,6 +189,7 @@ pub struct VectorIndexReader {
     /// queries fetch per-cluster (or per-doc) ranges.
     rows_slice: FileSlice,
     index: Option<IvfIndex>,
+    quantization: Option<QuantizedFieldReader>,
 }
 
 impl VectorIndexReader {
@@ -104,7 +215,7 @@ impl VectorIndexReader {
             Err(OpenReadError::FileDoesNotExist(_)) => return Ok(Self::empty(options)),
             Err(err) => return Err(err.into()),
         };
-        let (_version, body) = read_header(&vec_file)?;
+        let (version, body) = read_header(&vec_file)?;
         let vec_composite = CompositeFile::open(&body)?;
         let (Some(id_map_slice), Some(rows_slice)) = (
             vec_composite.open_read_with_idx(field, vec_slot::ID_MAP),
@@ -113,6 +224,12 @@ impl VectorIndexReader {
             return Ok(Self::empty(options));
         };
         let id_map = IdMap::open(id_map_slice, segment_reader.max_doc())?;
+        let quantization_config = segment_reader
+            .index_settings()
+            .vector_quantization
+            .iter()
+            .find(|config| config.field == entry.name())
+            .cloned();
 
         let centroid_slots = match segment_reader
             .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
@@ -183,14 +300,131 @@ impl VectorIndexReader {
                 ));
             }
         }
-        if rows_slice.len() != num_rows * options.bytes_per_vector() {
-            return Err(TantivyError::InternalError(format!(
-                "vector rows length {} does not match {} rows of {} bytes",
-                rows_slice.len(),
-                num_rows,
-                options.bytes_per_vector()
-            )));
-        }
+        let rows_slice = logical_slice(
+            rows_slice,
+            num_rows * options.bytes_per_vector(),
+            &format!("vector field {:?} rows", entry.name()),
+        )?;
+
+        let first_quantized_slot = vec_composite
+            .open_read_with_idx(field, vec_slot::quantized_codes(0))
+            .is_some()
+            || vec_composite
+                .open_read_with_idx(field, vec_slot::QUANTIZED_RESIDUAL_NORMS)
+                .is_some();
+        let quantization = match (&index, quantization_config) {
+            (Some(_), Some(config)) => {
+                if version < VectorFileVersion::V3 {
+                    return Err(DataCorruption::comment_only(format!(
+                        "vector field {:?} enables quantization but its IVF rows predate V3",
+                        entry.name()
+                    ))
+                    .into());
+                }
+                let mut layers = Vec::with_capacity(config.layers.len());
+                for (layer, spec) in config.layers.iter().enumerate() {
+                    let code_stride = quantized_code_stride(options.dim(), spec.bits);
+                    let (Some(codes), Some(scales), Some(constants)) = (
+                        vec_composite.open_read_with_idx(field, vec_slot::quantized_codes(layer)),
+                        vec_composite.open_read_with_idx(field, vec_slot::quantized_scales(layer)),
+                        vec_composite
+                            .open_read_with_idx(field, vec_slot::quantized_constants(layer)),
+                    ) else {
+                        return Err(DataCorruption::comment_only(format!(
+                            "vector field {:?} has an incomplete configured quantization layer \
+                             {layer}",
+                            entry.name()
+                        ))
+                        .into());
+                    };
+                    layers.push(QuantizedLayerReader {
+                        codes: logical_slice(
+                            codes,
+                            num_rows * code_stride,
+                            &format!("vector field {:?} layer {layer} codes", entry.name()),
+                        )?,
+                        scales: logical_slice(
+                            scales,
+                            num_rows * QUANTIZED_SCALE_STRIDE,
+                            &format!("vector field {:?} layer {layer} scales", entry.name()),
+                        )?,
+                        constants: logical_slice(
+                            constants,
+                            num_rows * QUANTIZED_CONSTANT_STRIDE,
+                            &format!("vector field {:?} layer {layer} constants", entry.name()),
+                        )?,
+                        code_stride,
+                        dim: options.dim(),
+                        bits: spec.bits,
+                    });
+                }
+                for layer in config.layers.len()..4 {
+                    if vec_composite
+                        .open_read_with_idx(field, vec_slot::quantized_codes(layer))
+                        .is_some()
+                        || vec_composite
+                            .open_read_with_idx(field, vec_slot::quantized_scales(layer))
+                            .is_some()
+                        || vec_composite
+                            .open_read_with_idx(field, vec_slot::quantized_constants(layer))
+                            .is_some()
+                    {
+                        return Err(DataCorruption::comment_only(format!(
+                            "vector field {:?} carries quantization layers beyond its configured \
+                             prefix",
+                            entry.name()
+                        ))
+                        .into());
+                    }
+                }
+                let residual_norm_slot =
+                    vec_composite.open_read_with_idx(field, vec_slot::QUANTIZED_RESIDUAL_NORMS);
+                let residual_norms = match (config.needs_residual_norm(), residual_norm_slot) {
+                    (true, Some(slice)) => Some(logical_slice(
+                        slice,
+                        num_rows * QUANTIZED_RESIDUAL_NORM_STRIDE,
+                        &format!("vector field {:?} residual squared norms", entry.name()),
+                    )?),
+                    (true, None) => {
+                        return Err(DataCorruption::comment_only(format!(
+                            "L2 vector field {:?} is missing residual squared norm slot 14",
+                            entry.name()
+                        ))
+                        .into());
+                    }
+                    (false, Some(_)) => {
+                        return Err(DataCorruption::comment_only(format!(
+                            "vector field {:?} carries residual norms for a metric that omits them",
+                            entry.name()
+                        ))
+                        .into());
+                    }
+                    (false, None) => None,
+                };
+                let index_ctx = Arc::new(QuantizedIndexCtx::new(config.clone()));
+                Some(QuantizedFieldReader {
+                    config,
+                    layers,
+                    residual_norms,
+                    index_ctx,
+                })
+            }
+            (Some(_), None) if first_quantized_slot => {
+                return Err(DataCorruption::comment_only(format!(
+                    "vector field {:?} carries quantized slots without index metadata",
+                    entry.name()
+                ))
+                .into());
+            }
+            (None, _) if first_quantized_slot => {
+                return Err(DataCorruption::comment_only(format!(
+                    "flat vector field {:?} unexpectedly carries quantized slots",
+                    entry.name()
+                ))
+                .into());
+            }
+            _ => None,
+        };
 
         let num_vectors = match &index {
             Some(index) => index.num_docs(),
@@ -203,6 +437,7 @@ impl VectorIndexReader {
             rows_slice,
             id_map,
             index,
+            quantization,
         })
     }
 
@@ -216,6 +451,7 @@ impl VectorIndexReader {
             rows_slice: FileSlice::empty(),
             id_map: IdMap::Identity { num_docs: 0 },
             index: None,
+            quantization: None,
         }
     }
 
@@ -240,6 +476,10 @@ impl VectorIndexReader {
     /// `None` means search must scan the rows exactly.
     pub fn index(&self) -> Option<&IvfIndex> {
         self.index.as_ref()
+    }
+
+    pub(crate) fn quantization(&self) -> Option<&QuantizedFieldReader> {
+        self.quantization.as_ref()
     }
 
     /// Storage info for tooling; `None` if the segment has no vector data for
@@ -389,5 +629,135 @@ impl VectorIndexReader {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::directory::CompositeWrite;
+    use crate::vector::header::write_header;
+
+    #[test]
+    fn quantized_layer_reader_rejects_non_zero_tail() -> crate::Result<()> {
+        let mut codes = vec![0_u8; quantized_code_stride(65, 1)];
+        codes[8] = 1;
+        let valid = QuantizedLayerReader {
+            codes: FileSlice::from(codes.clone()),
+            scales: FileSlice::empty(),
+            constants: FileSlice::empty(),
+            code_stride: codes.len(),
+            dim: 65,
+            bits: 1,
+        };
+        assert_eq!(valid.code_bytes(0)?.as_slice(), codes);
+
+        codes[8] |= 2;
+        let corrupt = QuantizedLayerReader {
+            codes: FileSlice::from(codes.clone()),
+            scales: FileSlice::empty(),
+            constants: FileSlice::empty(),
+            code_stride: codes.len(),
+            dim: 65,
+            bits: 1,
+        };
+        assert!(corrupt.code_bytes(0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn v3_maximal_trailers_are_trimmed_from_logical_arrays() -> crate::Result<()> {
+        let field = Field::from_field_id(0);
+        let mut bytes = Vec::new();
+        write_header(&mut bytes)?;
+        {
+            let mut writer = CompositeWrite::wrap(&mut bytes);
+            let rows = writer.for_field_with_idx(field, vec_slot::ROWS);
+            rows.write_all(&[1, 2, 3, 4])?;
+            rows.write_all(&[0; 63])?;
+            writer
+                .for_field_with_idx(Field::from_field_id(1), 0)
+                .write_all(&[9])?;
+
+            let scales = writer.for_field_with_idx(field, vec_slot::quantized_scales(0));
+            scales.write_all(&17_u16.to_le_bytes())?;
+            scales.write_all(&[0; 63])?;
+            writer
+                .for_field_with_idx(Field::from_field_id(2), 0)
+                .write_all(&[9])?;
+
+            let constants = writer.for_field_with_idx(field, vec_slot::quantized_constants(0));
+            constants.write_all(&1.25_f32.to_le_bytes())?;
+            constants.write_all(&[0; 63])?;
+            writer
+                .for_field_with_idx(Field::from_field_id(3), 0)
+                .write_all(&[9])?;
+
+            let norms = writer.for_field_with_idx(field, vec_slot::QUANTIZED_RESIDUAL_NORMS);
+            norms.write_all(&2.5_f32.to_le_bytes())?;
+            norms.write_all(&[0; 63])?;
+            writer
+                .for_field_with_idx(Field::from_field_id(4), 0)
+                .write_all(&[9])?;
+            writer.close()?;
+        }
+
+        let (version, body) = read_header(&FileSlice::from(bytes))?;
+        assert_eq!(version, VectorFileVersion::V3);
+        let composite = CompositeFile::open(&body)?;
+
+        let rows = logical_slice(
+            composite.open_read_with_idx(field, vec_slot::ROWS).unwrap(),
+            4,
+            "rows fixture",
+        )?
+        .read_bytes()?;
+        let scales = logical_slice(
+            composite
+                .open_read_with_idx(field, vec_slot::quantized_scales(0))
+                .unwrap(),
+            2,
+            "scales fixture",
+        )?
+        .read_bytes()?;
+        let constants = logical_slice(
+            composite
+                .open_read_with_idx(field, vec_slot::quantized_constants(0))
+                .unwrap(),
+            4,
+            "constants fixture",
+        )?
+        .read_bytes()?;
+        let norms = logical_slice(
+            composite
+                .open_read_with_idx(field, vec_slot::QUANTIZED_RESIDUAL_NORMS)
+                .unwrap(),
+            4,
+            "residual norms fixture",
+        )?
+        .read_bytes()?;
+
+        assert_eq!(rows.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(
+            u16::from_le_bytes(scales.as_slice().try_into().unwrap()),
+            17
+        );
+        assert_eq!(
+            f32::from_le_bytes(constants.as_slice().try_into().unwrap()),
+            1.25
+        );
+        assert_eq!(
+            f32::from_le_bytes(norms.as_slice().try_into().unwrap()),
+            2.5
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nonzero_alignment_trailer_is_corruption() {
+        let slice = FileSlice::from(vec![1, 2, 3, 4, 0, 7]);
+        assert!(logical_slice(slice, 4, "bad fixture").is_err());
     }
 }

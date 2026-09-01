@@ -265,3 +265,58 @@ Pareto rows:
 | [1,1] | 3 | 5557.410 | 8759837 | 17072364 | 25832200 | 4809.291 | 2 |
 | [1,2] | 2 | 169.465 | 7572564 | 520596 | 8093160 | 9364.534 | 3 |
 | [1,2] | 3 | 555.845 | 12719674 | 1707556 | 14427229 | 22694.525 | 3 |
+
+## Phase B writer measurements — 2026-08-24
+
+Apple M5 Max MacBook Pro (18 cores, 128 GB), macOS 26.5.1, arm64. Writer-context Criterion measurement uses one 100-vector cluster at d=768; the prepared centroid is built once per iteration and the two-layer cluster batch is encoded through the merge writer's batch API.
+
+| schedule | d | vectors/cluster | time/cluster (95% CI) | µs/vector (95% CI) |
+|---|---:|---:|---:|---:|
+| [1,4] | 768 | 100 | 1.3724–1.3773 ms | 13.724–13.773 |
+
+The sizing fixture is an eight-row, one-membership-per-document IVF merge at d=768.
+
+| schedule | plain `.vec` bytes | quantized `.vec` bytes | measured growth bytes | measured growth | logical code/scales/constants bytes per row |
+|---|---:|---:|---:|---:|---:|
+| [1,4] | 24630 | 28649 | 4019 | 16.317% | 492 |
+
+### V3 L2 residual-norm amendment — 2026-08-24
+
+Same eight-row d=768 fixture and machine, after adding the metric-gated LE f32 `‖x-c‖²` slot 14.
+
+| schedule | metric | plain `.vec` bytes | quantized `.vec` bytes | measured growth bytes | measured growth | logical bytes per row |
+|---|---|---:|---:|---:|---:|---:|
+| [1,4] | L2 | 24630 | 28687 | 4057 | 16.472% | 496 |
+
+### V3 general-d amendment — 2026-08-24
+
+Apple M5 Max MacBook Pro (18 cores, 128 GB), macOS 26.5.1, arm64. Fixed-seed
+`[1,4]` reconstruction and dot-error run with 1,000 vectors and 32 queries per
+dimension.
+
+| d | ρ measured | ρ exact-d product model | empirical/model σ ratio |
+|---:|---:|---:|---:|
+| 65 | 0.056939250 | 0.057230917 | 0.993307326 |
+| 100 | 0.057902796 | 0.057763437 | 0.997292819 |
+| 300 | 0.058633208 | 0.058427719 | 0.999116343 |
+| 769 | 0.058493834 | 0.058632777 | 0.995650111 |
+
+## 2026-08-24 — quantized-dimension floor boundary
+
+Apple M5 Max MacBook Pro, macOS, arm64. V3 amendment 3 makes `d >= 64` the
+validated quantization floor; the existing exact-density solver is unchanged.
+
+| d | ρ measured [1,4] | ρ product-model | σ ratio |
+|---:|---:|---:|---:|
+| 64 | 0.057061499 | 0.057207434 | 0.999372304 |
+
+## Phase B integration gates — 2026-08-24
+
+Apple M5 Max MacBook Pro (18 cores, 128 GB), macOS 26.5.1, arm64. Named gate
+tests are pinned by Tantivy commit `f2460aa3`.
+
+| gate | result | fixture | test |
+|---|---|---|---|
+| GATE-A · bridge exactness | green | d=768 and odd d=100; every stored row, per layer and summed, relative 1e-5 | `vector::ivf::plugin::tests::gate_a_bridge_exactness_d768_and_d100` |
+| GATE-B · recall parity | green | 40 harness candidates, k=10, (κ1, κ2)=(2.0, 4.0); plane-1 and plane-2 survivor sets equal, candidate recall 1.0 | `vector::backend::tests::gate_b_recall_parity_survivor_sets` |
+| GATE-C · exact-path equivalence | green | opted-out IVF field, quantization-configured flat/no-slot segment, and quantized IVF with `max_scan_levels=0`; score bits and ordering equal exact oracle | `vector::ivf::plugin::tests::gate_c_exact_path_equivalence` |

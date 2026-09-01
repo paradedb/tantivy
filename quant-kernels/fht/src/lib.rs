@@ -29,7 +29,7 @@ pub struct Rotation {
 
 impl Rotation {
     pub fn new(d: usize, seed: u64) -> Self {
-        assert!(d > 0 && d.is_multiple_of(64));
+        assert!(d > 0);
         assert!(u32::try_from(d).is_ok());
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut rounds = Vec::with_capacity(ROUNDS);
@@ -59,7 +59,6 @@ impl Rotation {
 
     pub fn apply(&self, x: &mut [f32]) {
         assert_eq!(x.len(), self.d);
-        assert!(x.len().is_multiple_of(64));
         #[cfg(debug_assertions)]
         APPLY_COUNT.with(|count| count.set(count.get() + 1));
         let mut scratch = vec![0.0; self.d];
@@ -75,7 +74,6 @@ impl Rotation {
 
     pub fn apply_inverse(&self, x: &mut [f32]) {
         assert_eq!(x.len(), self.d);
-        assert!(x.len().is_multiple_of(64));
         let mut scratch = vec![0.0; self.d];
         for round in self.rounds.iter().rev() {
             block_hadamard(x, &self.blocks);
@@ -179,6 +177,10 @@ mod tests {
         assert_eq!(blocks(1536), [1024, 512]);
         assert_eq!(blocks(128), [128]);
         assert_eq!(blocks(1024), [1024]);
+        assert_eq!(blocks(65), [64, 1]);
+        assert_eq!(blocks(100), [64, 32, 4]);
+        assert_eq!(blocks(300), [256, 32, 8, 4]);
+        assert_eq!(blocks(769), [512, 256, 1]);
     }
 
     #[test]
@@ -227,7 +229,7 @@ mod tests {
 
     #[test]
     fn preserves_norm_dot_and_round_trips() {
-        for d in [128, 768, 1536] {
+        for d in [65, 100, 128, 300, 768, 769, 1536] {
             let rotation = Rotation::new(d, 99);
             let original_x = input(d, 0.2);
             let original_y = input(d, 1.1);
@@ -273,5 +275,55 @@ mod tests {
             );
         }
         assert!(x.iter().copied().map(f32::abs).fold(0.0, f32::max) < 0.2);
+    }
+
+    #[test]
+    fn odd_dimension_determinism_snapshot_and_mixing() {
+        let mut first = vec![0.0; 100];
+        first[0] = 1.0;
+        Rotation::new(100, 42).apply(&mut first);
+        let expected = [
+            -0.241_009_7_f32,
+            0.139_677_18,
+            0.124_607_4,
+            0.120_030_954,
+            0.105_746_36,
+            -0.105_746_36,
+            0.091_461_78,
+            -0.016_017_599,
+        ];
+        for (&actual, &expected) in first.iter().take(8).zip(&expected) {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "snapshot actual={:?}",
+                &first[..8]
+            );
+        }
+        let mut second = vec![0.0; 100];
+        second[0] = 1.0;
+        Rotation::new(100, 42).apply(&mut second);
+        assert_eq!(first, second);
+        assert!(
+            first.iter().filter(|&&value| value != 0.0).count() >= 90,
+            "insufficient mixing: {first:?}"
+        );
+        assert!(
+            first.iter().copied().map(f32::abs).fold(0.0, f32::max) < 0.4,
+            "insufficient mixing: {first:?}"
+        );
+    }
+
+    #[test]
+    fn odd_dimensions_mix_impulses() {
+        for d in [65, 100, 300, 769] {
+            let mut values = vec![0.0; d];
+            values[d - 1] = 1.0;
+            Rotation::new(d, 0x4d49_5849_4e47).apply(&mut values);
+            let support = values.iter().filter(|&&value| value != 0.0).count();
+            let max = values.iter().copied().map(f32::abs).fold(0.0, f32::max);
+            assert!(support >= d * 3 / 4, "d={d}: support={support}");
+            assert!(max < 0.5, "d={d}: max={max}");
+        }
     }
 }
