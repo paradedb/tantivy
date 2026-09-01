@@ -296,3 +296,7 @@ harness = false
 name = "vector_quantization_scan"
 harness = false
 required-features = ["unstable"]
+
+[[bench]]
+name = "ivf_recall"
+harness = false
