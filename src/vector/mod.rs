@@ -58,8 +58,8 @@ pub use ivf::{
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
 pub use router::{
-    IvfSearchMetrics, LazyExactRouter, Router, RouterDescriptor, RouterMetadata, RouterOpenContext,
-    RouterRanking, RouterSearchContext, RouterType,
+    IvfSearchMetrics, LazyExactRouter, Router, RouterDescriptor, RouterOpenContext, RouterRanking,
+    RouterSearchContext,
 };
 pub use tie_break::NoTieBreak;
 

@@ -4,7 +4,7 @@ use common::HasLen;
 
 use super::{
     EagerRouterRanking, Router, RouterDescriptor, RouterOpenContext, RouterRanking,
-    RouterSearchContext, RouterType,
+    RouterSearchContext,
 };
 use crate::directory::FileSlice;
 use crate::schema::Metric;
@@ -23,17 +23,13 @@ pub struct ExactRouter<S> {
 
 pub type LazyExactRouter = ExactRouter<FileSliceArena<f32>>;
 
-impl<S> RouterType for ExactRouter<S>
+impl<S> Router for ExactRouter<S>
 where S: VectorArena<Elem = f32> + Send + Sync + 'static
 {
     fn router_descriptor() -> RouterDescriptor {
         RouterDescriptor::new(EXACT_ROUTER_ID, VectorFileVersion::V3)
     }
-}
 
-impl<S> Router for ExactRouter<S>
-where S: VectorArena<Elem = f32> + Send + Sync + 'static
-{
     fn build_router(
         options: &VectorOptions,
         centroids: &mut IvfCentroids,

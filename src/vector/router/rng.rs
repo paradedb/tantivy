@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use super::{
     IvfSearchMetrics, Router, RouterDescriptor, RouterOpenContext, RouterRanking,
-    RouterSearchContext, RouterType,
+    RouterSearchContext,
 };
 use crate::directory::FileSlice;
 use crate::schema::{VectorDType, VectorOptions};
@@ -15,17 +15,13 @@ use crate::Executor;
 
 const GRAPH_ROUTER_ID: &str = "tantivy.relative-neighborhood-graph";
 
-impl<S> RouterType for RelativeNeighborhoodGraph<S>
+impl<S> Router for RelativeNeighborhoodGraph<S>
 where S: VectorArena<Elem = f32> + Send + Sync + 'static
 {
     fn router_descriptor() -> RouterDescriptor {
         RouterDescriptor::new(GRAPH_ROUTER_ID, VectorFileVersion::V3)
     }
-}
 
-impl<S> Router for RelativeNeighborhoodGraph<S>
-where S: VectorArena<Elem = f32> + Send + Sync + 'static
-{
     fn build_router(
         options: &VectorOptions,
         centroids: &mut IvfCentroids,

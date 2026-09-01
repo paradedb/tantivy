@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use super::{
     EagerRouterRanking, Router, RouterDescriptor, RouterOpenContext, RouterRanking,
-    RouterSearchContext, RouterType,
+    RouterSearchContext,
 };
 use crate::directory::FileSlice;
 use crate::schema::VectorOptions;
@@ -16,19 +16,6 @@ use crate::vector::VectorArena;
 use crate::TantivyError;
 
 const STACKED_ROUTER_ID: &str = "tantivy.stacked-ivf";
-
-macro_rules! impl_stacked_router_type {
-    ($router:ty) => {
-        impl RouterType for $router {
-            fn router_descriptor() -> RouterDescriptor {
-                RouterDescriptor::new(STACKED_ROUTER_ID, VectorFileVersion::V3)
-            }
-        }
-    };
-}
-
-impl_stacked_router_type!(InMemoryStackedIvf);
-impl_stacked_router_type!(LazyStackedIvf);
 
 fn build_stacked_router(
     options: &VectorOptions,
@@ -103,6 +90,10 @@ where
 }
 
 impl Router for InMemoryStackedIvf {
+    fn router_descriptor() -> RouterDescriptor {
+        RouterDescriptor::new(STACKED_ROUTER_ID, VectorFileVersion::V3)
+    }
+
     fn build_router(
         options: &VectorOptions,
         centroids: &mut IvfCentroids,
@@ -132,6 +123,10 @@ impl Router for InMemoryStackedIvf {
 }
 
 impl Router for LazyStackedIvf {
+    fn router_descriptor() -> RouterDescriptor {
+        RouterDescriptor::new(STACKED_ROUTER_ID, VectorFileVersion::V3)
+    }
+
     fn build_router(
         options: &VectorOptions,
         centroids: &mut IvfCentroids,

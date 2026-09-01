@@ -57,29 +57,8 @@ impl RouterDescriptor {
     }
 }
 
-/// Type-level router metadata used by factories before a router is built.
-pub trait RouterType: Send + Sync + 'static {
-    fn router_descriptor() -> RouterDescriptor
-    where Self: Sized;
-}
-
-/// Object-safe access to a router's type-level metadata.
-pub trait RouterMetadata {
-    fn descriptor(&self) -> RouterDescriptor;
-
-    fn id(&self) -> &'static str {
-        self.descriptor().id()
-    }
-
-    fn vector_file_version(&self) -> VectorFileVersion {
-        self.descriptor().vector_file_version()
-    }
-}
-
-impl<R: RouterType> RouterMetadata for R {
-    fn descriptor(&self) -> RouterDescriptor {
-        R::router_descriptor()
-    }
+pub(crate) trait ErasedRouterDescriptor {
+    fn erased_descriptor(&self) -> RouterDescriptor;
 }
 
 pub struct RouterOpenContext {
@@ -128,7 +107,24 @@ impl RouterSearchContext {
 ///
 /// `serialize` prefixes the router payload with its ID. The configured router
 /// checks that ID before opening the payload.
-pub trait Router: RouterType + RouterMetadata {
+#[allow(private_bounds)]
+pub trait Router: ErasedRouterDescriptor + Send + Sync + 'static {
+    /// Return this router's persisted identity and compatible vector file version.
+    fn router_descriptor() -> RouterDescriptor
+    where Self: Sized;
+
+    fn descriptor(&self) -> RouterDescriptor {
+        ErasedRouterDescriptor::erased_descriptor(self)
+    }
+
+    fn id(&self) -> &'static str {
+        self.descriptor().id()
+    }
+
+    fn vector_file_version(&self) -> VectorFileVersion {
+        self.descriptor().vector_file_version()
+    }
+
     /// Builds a router over the supplied centroids, which may be empty.
     /// Implementations may reorder rows in place but must preserve the matrix shape.
     fn build_router(
@@ -155,9 +151,15 @@ pub trait Router: RouterType + RouterMetadata {
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()>;
 
     fn serialize(&self, out: &mut dyn Write) -> io::Result<()> {
-        let descriptor = RouterMetadata::descriptor(self);
+        let descriptor = self.descriptor();
         write_router_header(descriptor.id(), out)?;
         self.serialize_payload(out)
+    }
+}
+
+impl<R: Router> ErasedRouterDescriptor for R {
+    fn erased_descriptor(&self) -> RouterDescriptor {
+        R::router_descriptor()
     }
 }
 
@@ -337,7 +339,7 @@ mod tests {
         cluster: u32,
     }
 
-    impl<const KIND: u8> RouterType for TestRouter<KIND> {
+    impl<const KIND: u8> Router for TestRouter<KIND> {
         fn router_descriptor() -> RouterDescriptor {
             let id = match KIND {
                 0 => "test.primary",
@@ -346,9 +348,7 @@ mod tests {
             };
             RouterDescriptor::new(id, VectorFileVersion::V3)
         }
-    }
 
-    impl<const KIND: u8> Router for TestRouter<KIND> {
         fn build_router(
             _options: &VectorOptions,
             _centroids: &mut IvfCentroids,
