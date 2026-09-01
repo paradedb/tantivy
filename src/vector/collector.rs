@@ -1,12 +1,13 @@
 //! Top-N vector-similarity collection.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::backend::{ProbeStats, VectorBackend};
 use super::ivf::AdaptiveProbeParams;
 use super::prepared::QuantizedQueryCache;
 use super::tie_break::NoTieBreak;
-use super::VectorElement;
+use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::{
     compare_for_top_k, Collector, ComparableDoc, SegmentCollector, SegmentSortKeyComputer,
@@ -170,7 +171,10 @@ where
         segment_ord: SegmentOrdinal,
         reader: &SegmentReader,
     ) -> crate::Result<SegmentVectorFruit<S::SortKey>> {
-        let backend = VectorBackend::for_segment(
+        let collect_start = Instant::now();
+        let init_start = Instant::now();
+        let init_stage = enter_vector_stage(Stage::ScanInit);
+        let mut backend = VectorBackend::for_segment(
             reader,
             segment_ord,
             self.field,
@@ -180,7 +184,11 @@ where
             self.max_scan_levels,
         )?;
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
-        let (hits, stats) = backend.top_n_by(
+        drop(init_stage);
+        backend.add_scan_init_ns(
+            (init_start.elapsed().as_nanos() as u64).saturating_sub(backend.query_prep_ns()),
+        );
+        let (hits, mut stats) = backend.top_n_by(
             weight,
             reader,
             self.segment_top_n(),
@@ -196,6 +204,10 @@ where
                 )
             })
             .collect();
+        let residual_ns =
+            (collect_start.elapsed().as_nanos() as u64).saturating_sub(stats.stage_elapsed_ns());
+        let assembly_ns = stats.result_assembly_ns.unwrap_or_default();
+        stats.result_assembly_ns = Some(assembly_ns.saturating_add(residual_ns));
         Ok(SegmentVectorFruit { results, stats })
     }
 
@@ -203,6 +215,8 @@ where
         &self,
         segment_fruits: Vec<SegmentVectorFruit<S::SortKey>>,
     ) -> crate::Result<Self::Fruit> {
+        let assembly_start = Instant::now();
+        let _assembly_stage = enter_vector_stage(Stage::ResultAssembly);
         let comparator = (NaturalComparator, self.tie_break.comparator());
         let mut stats = Vec::with_capacity(segment_fruits.len());
         let mut all: Vec<ComparableDoc<(Score, S::SortKey), DocAddress>> = Vec::new();
@@ -222,6 +236,11 @@ where
             .take(self.limit)
             .map(|cd| (cd.sort_key.0, cd.doc))
             .collect();
+        if let Some(first) = stats.first_mut() {
+            let merge_ns = assembly_start.elapsed().as_nanos() as u64;
+            let segment_ns = first.result_assembly_ns.unwrap_or_default();
+            first.result_assembly_ns = Some(segment_ns.saturating_add(merge_ns));
+        }
         Ok(VectorSimilarityFruit { results, stats })
     }
 }
@@ -462,12 +481,16 @@ mod ivf_e2e_tests {
 
                 let collector =
                     || TopDocs::with_limit(k).order_by_similarity(embedding_field, query.to_vec());
-                let untied = searcher.search(&AllQuery, &collector())?;
-                let tied = searcher.search(&AllQuery, &collector().with_tie_break(tie_break()))?;
+                let mut untied = searcher.search(&AllQuery, &collector())?;
+                let mut tied =
+                    searcher.search(&AllQuery, &collector().with_tie_break(tie_break()))?;
                 assert!(
                     untied.stats.iter().any(|s| s.candidates_scored > 0),
                     "no probe activity to compare for query={query:?} k={k}"
                 );
+                for stats in untied.stats.iter_mut().chain(&mut tied.stats) {
+                    stats.clear_stage_timings();
+                }
                 assert_eq!(
                     format!("{:?}", untied.stats),
                     format!("{:?}", tied.stats),
