@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use common::HasLen;
 
-use super::{IvfSearchMetrics, Router, RouterDescriptor};
+use super::{Router, RouterDescriptor};
 use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::header::VectorFileVersion;
@@ -66,10 +66,9 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
 
     fn rank<'a>(
         &'a self,
-        _workspace: &'a mut Workspace,
+        workspace: &'a mut Workspace,
         query: &'a [f32],
         _metric: Metric,
-        metrics: &'a mut IvfSearchMetrics,
     ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
         let mut ranked = (0..self.num_centroids)
             .map(|cluster| Candidate {
@@ -80,10 +79,7 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
             })
             .collect::<Vec<_>>();
         ranked.sort_unstable_by(|a, b| b.cmp(a));
-        *metrics = IvfSearchMetrics {
-            visited_count: self.num_centroids,
-            graph: None,
-        };
+        workspace.set_routing_visited_count(self.num_centroids);
         Box::new(ranked.into_iter())
     }
 

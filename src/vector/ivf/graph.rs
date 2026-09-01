@@ -543,6 +543,7 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
             let sim = arena.similarity(rng.metric, dim, node_id, query);
             workspace.frontier.push(Candidate { sim, node: node_id });
         }
+        workspace.set_routing_visited_count(metrics.visited_count);
 
         SearchIterator {
             rng,
@@ -620,6 +621,7 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
                 });
             }
         }
+        ws.set_routing_visited_count(self.metrics.visited_count);
 
         self.batch.extend(ws.results.drain().map(|Reverse(c)| c));
         // Ascending similarity with descending-id ties, so popping from the
@@ -957,6 +959,7 @@ pub struct Workspace {
     /// Min-heap by similarity (via `Reverse`): the current beam — the best
     /// `width` committed results, with the least-similar on top for eviction.
     pub(crate) results: BinaryHeap<Reverse<Candidate>>,
+    routing_visited_count: usize,
 }
 
 impl Default for Workspace {
@@ -965,6 +968,7 @@ impl Default for Workspace {
             visited: BitSet::with_max_value(0),
             frontier: BinaryHeap::new(),
             results: BinaryHeap::new(),
+            routing_visited_count: 0,
         }
     }
 }
@@ -973,6 +977,16 @@ impl Workspace {
     /// Creates an empty workspace. It grows to fit on first use.
     pub fn new() -> Self {
         Workspace::default()
+    }
+
+    /// Number of centroids visited by the current routing query.
+    pub fn routing_visited_count(&self) -> usize {
+        self.routing_visited_count
+    }
+
+    /// Record the number of centroids visited by the current routing query.
+    pub fn set_routing_visited_count(&mut self, visited_count: usize) {
+        self.routing_visited_count = visited_count;
     }
 
     /// Prepares the workspace for a query over `n` nodes: zeroes the visited
@@ -985,6 +999,7 @@ impl Workspace {
         }
         self.frontier.clear();
         self.results.clear();
+        self.routing_visited_count = 0;
     }
 }
 

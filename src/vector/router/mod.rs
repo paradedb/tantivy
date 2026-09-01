@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use common::{BinarySerializable, HasLen};
 
-use super::ivf::graph::{Candidate, NeighborhoodGraphSearchMetrics, Workspace};
+use super::ivf::graph::{Candidate, Workspace};
 use super::ivf::IvfCentroids;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
@@ -98,14 +98,20 @@ pub trait Router: ErasedRouterDescriptor + Send + Sync + 'static {
     where
         Self: Sized;
 
-    /// Rank centroids and update `metrics` as the returned iterator advances.
+    /// Rank centroids, updating the query-local metrics in `workspace`.
     fn rank<'a>(
         &'a self,
         workspace: &'a mut Workspace,
         query: &'a [f32],
         metric: Metric,
-        metrics: &'a mut IvfSearchMetrics,
     ) -> Box<dyn Iterator<Item = Candidate> + 'a>;
+
+    /// Return metrics for the query most recently ranked in `workspace`.
+    fn metrics(&self, workspace: &Workspace) -> RouterMetrics {
+        RouterMetrics {
+            visited_count: workspace.routing_visited_count(),
+        }
+    }
 
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()>;
 
@@ -227,10 +233,10 @@ impl RouterBinding {
     }
 }
 
+/// Router-neutral metrics for one query.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
-pub struct IvfSearchMetrics {
+pub struct RouterMetrics {
     pub visited_count: usize,
-    pub graph: Option<NeighborhoodGraphSearchMetrics>,
 }
 
 fn write_router_header(id: &str, out: &mut dyn Write) -> io::Result<()> {
@@ -292,15 +298,11 @@ mod tests {
 
         fn rank<'a>(
             &'a self,
-            _workspace: &'a mut Workspace,
+            workspace: &'a mut Workspace,
             _query: &'a [f32],
             _metric: Metric,
-            metrics: &'a mut IvfSearchMetrics,
         ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
-            *metrics = IvfSearchMetrics {
-                visited_count: 1,
-                graph: None,
-            };
+            workspace.set_routing_visited_count(1);
             Box::new(
                 vec![Candidate {
                     sim: Similarity::new(1.0),
@@ -329,11 +331,10 @@ mod tests {
             &options,
         )?;
         let mut workspace = Workspace::new();
-        let mut metrics = IvfSearchMetrics::default();
-        let mut ranking = opened.rank(&mut workspace, &[0.0], Metric::L2, &mut metrics);
+        let mut ranking = opened.rank(&mut workspace, &[0.0], Metric::L2);
         assert_eq!(ranking.next().unwrap().node, 42);
         drop(ranking);
-        assert_eq!(metrics.visited_count, 1);
+        assert_eq!(opened.metrics(&workspace).visited_count, 1);
         Ok(())
     }
 

@@ -852,9 +852,8 @@ mod bounds_storage_tests {
     use crate::vector::ivf::{IvfIndex, CENTROIDS_EXT};
     use crate::vector::{
         residual_norm, BoundKind, InMemoryStackedIvf, IvfCentroids, IvfClusterer, IvfConfig,
-        IvfMatrix, IvfMergeSettings, IvfSearchMetrics, IvfTrainingVectors, IvfVectors,
-        LazyStackedIvf, Metric, RelativeNeighborhoodGraph, VectorDType, VectorOptions,
-        VectorStorageFormat, Workspace,
+        IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors, LazyStackedIvf, Metric,
+        RelativeNeighborhoodGraph, VectorDType, VectorOptions, VectorStorageFormat, Workspace,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -1340,11 +1339,7 @@ mod bounds_storage_tests {
                 .take(2)
                 .collect();
             let mut workspace = Workspace::new();
-            let mut metrics = IvfSearchMetrics::default();
-            let lazy: Vec<_> = ivf
-                .rank_clusters(&mut workspace, &query, &mut metrics)
-                .take(2)
-                .collect();
+            let lazy: Vec<_> = ivf.rank_clusters(&mut workspace, &query).take(2).collect();
             assert_eq!(owned.len(), lazy.len());
             for (o, l) in owned.iter().zip(&lazy) {
                 assert_eq!(u32::from(o.node), l.node);
