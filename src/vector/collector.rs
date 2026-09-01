@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use super::backend::{ProbeStats, VectorBackend};
 use super::ivf::AdaptiveProbeParams;
+use super::prepared::QuantizedQueryCache;
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::NaturalComparator;
@@ -53,6 +54,7 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     adaptive: AdaptiveProbeParams,
     max_scan_levels: usize,
+    quantized_queries: QuantizedQueryCache,
     tie_break: S,
 }
 
@@ -65,6 +67,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             offset: 0,
             adaptive: AdaptiveProbeParams::default(),
             max_scan_levels: usize::MAX,
+            quantized_queries: QuantizedQueryCache::default(),
             tie_break: NoTieBreak,
         }
     }
@@ -86,7 +89,9 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
         self
     }
 
-    /// Limit the quantized residual prefix. Zero selects the exact scan.
+    /// Limit the quantized residual prefix. Zero disables quantized scoring;
+    /// IVF routing and its probe budget still apply, while flat segments
+    /// continue to use their exhaustive exact scan.
     pub fn with_max_scan_levels(mut self, max_scan_levels: usize) -> Self {
         self.max_scan_levels = max_scan_levels;
         self
@@ -123,12 +128,18 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             offset: self.offset,
             adaptive: self.adaptive,
             max_scan_levels: self.max_scan_levels,
+            quantized_queries: self.quantized_queries,
             tie_break,
         }
     }
 
     fn segment_top_n(&self) -> usize {
         self.limit.saturating_add(self.offset)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_quantized_query_count(&self) -> usize {
+        self.quantized_queries.len()
     }
 }
 
@@ -235,6 +246,7 @@ where
             segment_ord,
             self.field,
             Arc::clone(&self.query),
+            &self.quantized_queries,
             self.adaptive.clone(),
             self.max_scan_levels,
         )?;

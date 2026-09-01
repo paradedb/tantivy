@@ -21,33 +21,27 @@
 
 use std::cmp::Ordering;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-#[cfg(test)]
-use cascade::{encode_batch_in_place, prepare_centroid, prepare_fp_query};
 use common::{HasLen, OwnedBytes};
-#[cfg(test)]
 use quant_model::f16::f16_to_f32;
 
 use super::flat::IdMap;
 use super::header::{centroid_slot, read_header, vec_slot, VectorFileVersion};
-#[cfg(test)]
-use super::ivf::decode_row;
-use super::ivf::{IvfIndex, CENTROIDS_EXT};
-use super::prepared::QuantizedIndexCtx;
+use super::ivf::{decode_row, IvfIndex, CENTROIDS_EXT};
+use super::prepared::{QuantizedIndexCtx, QuantizedQueryCtx};
 use super::quantization::{
-    quantized_calibration_metadata_len, quantized_code_stride, quantized_code_tail_is_zero,
-    VectorQuantizationCalibration, VectorQuantizationConfig, QUANTIZED_CALIBRATION_VERSION,
-    QUANTIZED_CONSTANT_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_STRIDE,
+    quantized_code_stride, quantized_code_tail_is_zero, VectorQuantizationCalibrationSource,
+    VectorQuantizationConfig, VectorQuantizationDepthCalibration, QUANTIZED_CONSTANT_STRIDE,
+    QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_STRIDE,
 };
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
+use crate::fastfield::AliveBitSet;
 use crate::index::SegmentComponent;
-#[cfg(test)]
-use crate::schema::Metric;
-use crate::schema::{Field, FieldType, VectorOptions};
+use crate::schema::{Field, FieldType, Metric, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
 
 /// Which on-disk layout a segment's vector data uses, surfaced through
@@ -78,21 +72,144 @@ pub struct VectorClusterStats {
     pub empty_clusters: usize,
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq)]
-pub struct QuantizationCalibrationAudit {
-    pub depth: usize,
-    pub sample_count: usize,
-    pub cal: f64,
-    pub signed_mean: f64,
-    pub signed_stddev: f64,
-    pub signed_skewness: f64,
-    pub signed_excess_kurtosis: f64,
-    pub abs_p50: f64,
-    pub abs_p90: f64,
-    pub abs_p95: f64,
-    pub abs_p99: f64,
-    pub abs_max: f64,
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VectorCalibrationMoments {
+    pub sample_count: u64,
+    pub normalized_error_sum: f64,
+    pub normalized_error_squared_sum: f64,
+}
+
+impl VectorCalibrationMoments {
+    fn observe(&mut self, value: f64) {
+        self.sample_count += 1;
+        self.normalized_error_sum += value;
+        self.normalized_error_squared_sum += value * value;
+    }
+
+    pub fn bias(&self) -> Option<f64> {
+        (self.sample_count != 0).then(|| self.normalized_error_sum / self.sample_count as f64)
+    }
+
+    pub fn spread(&self) -> Option<f64> {
+        self.bias().map(|bias| {
+            (self.normalized_error_squared_sum / self.sample_count as f64 - bias * bias)
+                .max(0.0)
+                .sqrt()
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VectorCalibrationMeasurements {
+    aggregate: Vec<VectorCalibrationMoments>,
+    per_query: Vec<Vec<VectorCalibrationMoments>>,
+}
+
+#[inline]
+fn calibration_query_norm(query: &QuantizedQueryCtx, metric: Metric, centroid_bytes: &[u8]) -> f32 {
+    let routing_score = metric
+        .similarity_bytes::<f32>(query.query(), centroid_bytes)
+        .score();
+    query.score_query_norm(routing_score)
+}
+
+#[inline]
+fn observe_calibration_prefix(
+    measurements: &mut VectorCalibrationMeasurements,
+    query_idx: usize,
+    depth: usize,
+    exact_dot: f32,
+    prefix_estimate: &mut f32,
+    layer_estimate: f32,
+    model_sigma: f32,
+) {
+    // Production accumulates residual-plane estimates in f32. Keep the
+    // calibration prefix bit-for-bit in that arithmetic domain and widen
+    // only the final normalized error for the f64 moment accumulators.
+    *prefix_estimate += layer_estimate;
+    if model_sigma > 0.0 && model_sigma.is_finite() {
+        let error = (exact_dot - *prefix_estimate) / model_sigma;
+        if error.is_finite() {
+            let error = f64::from(error);
+            measurements.aggregate[depth].observe(error);
+            measurements.per_query[query_idx][depth].observe(error);
+        }
+    }
+}
+
+impl VectorCalibrationMeasurements {
+    pub fn aggregate(&self) -> &[VectorCalibrationMoments] {
+        &self.aggregate
+    }
+
+    pub fn per_query(&self) -> &[Vec<VectorCalibrationMoments>] {
+        &self.per_query
+    }
+
+    pub fn merge(&mut self, other: &Self) -> crate::Result<()> {
+        if self.aggregate.is_empty() {
+            *self = other.clone();
+            return Ok(());
+        }
+        if self.aggregate.len() != other.aggregate.len()
+            || self.per_query.len() != other.per_query.len()
+        {
+            return Err(TantivyError::InvalidArgument(
+                "cannot merge quantization calibration measurements with different shapes"
+                    .to_string(),
+            ));
+        }
+        for (left, right) in self.aggregate.iter_mut().zip(&other.aggregate) {
+            left.sample_count += right.sample_count;
+            left.normalized_error_sum += right.normalized_error_sum;
+            left.normalized_error_squared_sum += right.normalized_error_squared_sum;
+        }
+        for (left_query, right_query) in self.per_query.iter_mut().zip(&other.per_query) {
+            for (left, right) in left_query.iter_mut().zip(right_query) {
+                left.sample_count += right.sample_count;
+                left.normalized_error_sum += right.normalized_error_sum;
+                left.normalized_error_squared_sum += right.normalized_error_squared_sum;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(
+        &self,
+        source: VectorQuantizationCalibrationSource,
+    ) -> crate::Result<Vec<VectorQuantizationDepthCalibration>> {
+        self.aggregate
+            .iter()
+            .enumerate()
+            .map(|(depth, moments)| {
+                let Some(bias) = moments.bias() else {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "quantization calibration depth {depth} has no measurements"
+                    )));
+                };
+                let spread = moments.spread().unwrap();
+                if !bias.is_finite()
+                    || !spread.is_finite()
+                    || bias.abs() > f32::MAX as f64
+                    || spread > f32::MAX as f64
+                {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "quantization calibration depth {depth} produced non-finite f32 statistics"
+                    )));
+                }
+                Ok(VectorQuantizationDepthCalibration {
+                    bias: bias as f32,
+                    spread: spread as f32,
+                    sample_count: u32::try_from(moments.sample_count).map_err(|_| {
+                        TantivyError::InvalidArgument(format!(
+                            "quantization calibration depth {depth} sample count exceeds u32"
+                        ))
+                    })?,
+                    source,
+                })
+            })
+            .collect()
+    }
 }
 
 /// Deferred fixed-stride slices for one residual plane.
@@ -112,45 +229,6 @@ pub(crate) struct QuantizedLayerBatch {
     constants: OwnedBytes,
     rows: Range<usize>,
     code_stride: usize,
-    dim: usize,
-    bits: u8,
-}
-
-/// Reusable dense SoA stream gathered from ascending survivor row ids. The
-/// gatherer pins each touched code block once; the cascade kernel then sees
-/// one fixed-stride batch rather than one call per survivor.
-pub(crate) struct QuantizedLayerDenseBatch {
-    codes: Vec<u8>,
-    scales: Vec<u8>,
-    constants: Vec<u8>,
-    code_stride: usize,
-}
-
-impl QuantizedLayerDenseBatch {
-    pub(crate) fn new() -> Self {
-        Self {
-            codes: Vec::new(),
-            scales: Vec::new(),
-            constants: Vec::new(),
-            code_stride: 0,
-        }
-    }
-
-    pub(crate) fn codes(&self) -> &[u8] {
-        &self.codes
-    }
-
-    pub(crate) fn scales(&self) -> &[u8] {
-        &self.scales
-    }
-
-    pub(crate) fn constants(&self) -> &[u8] {
-        &self.constants
-    }
-
-    pub(crate) fn code_stride(&self) -> usize {
-        self.code_stride
-    }
 }
 
 impl QuantizedLayerBatch {
@@ -167,15 +245,7 @@ impl QuantizedLayerBatch {
     pub(crate) fn code_bytes(&self, row: usize) -> crate::Result<&[u8]> {
         let local = self.local_row(row)?;
         let start = local * self.code_stride;
-        let bytes = &self.codes[start..start + self.code_stride];
-        if !quantized_code_tail_is_zero(bytes, self.dim, self.bits) {
-            return Err(DataCorruption::comment_only(format!(
-                "quantized row {row} has non-zero padding bits for d={} b={}",
-                self.dim, self.bits
-            ))
-            .into());
-        }
-        Ok(bytes)
+        Ok(&self.codes[start..start + self.code_stride])
     }
 
     pub(crate) fn scale(&self, row: usize) -> crate::Result<u16> {
@@ -215,7 +285,86 @@ impl QuantizedLayerBatch {
     }
 }
 
+fn storage_block_span(slot: &FileSlice, byte_range: Range<usize>) -> Option<(usize, usize)> {
+    debug_assert!(byte_range.start < byte_range.end);
+    let first = slot.storage_block_ord(byte_range.start)?;
+    let last = slot.storage_block_ord(byte_range.end - 1)?;
+    Some((first, last))
+}
+
+fn append_storage_block_span(
+    slot: &FileSlice,
+    byte_range: Range<usize>,
+    spans: &mut Vec<(usize, usize)>,
+) -> bool {
+    let Some(span) = storage_block_span(slot, byte_range) else {
+        return false;
+    };
+    spans.push(span);
+    true
+}
+
+fn merged_storage_block_count(spans: &mut [(usize, usize)]) -> usize {
+    spans.sort_unstable_by_key(|&(start, end)| (start, end));
+    let mut count = 0usize;
+    let mut current: Option<(usize, usize)> = None;
+    for &(start, end) in spans.iter() {
+        current = match current {
+            None => Some((start, end)),
+            Some((current_start, current_end)) if start <= current_end.saturating_add(1) => {
+                Some((current_start, current_end.max(end)))
+            }
+            Some((current_start, current_end)) => {
+                count += current_end - current_start + 1;
+                Some((start, end))
+            }
+        };
+    }
+    if let Some((start, end)) = current {
+        count += end - start + 1;
+    }
+    count
+}
+
 impl QuantizedLayerReader {
+    pub(crate) fn code_stride(&self) -> usize {
+        self.code_stride
+    }
+
+    pub(crate) fn read_codes(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
+        let codes = self
+            .codes
+            .slice(rows.start * self.code_stride..rows.end * self.code_stride)
+            .read_bytes()?;
+        // The zero-tail invariant is checked once per pinned range, never in
+        // an indexed survivor loop.
+        for (local, code) in codes.chunks_exact(self.code_stride).enumerate() {
+            if !quantized_code_tail_is_zero(code, self.dim, self.bits) {
+                let row = rows.start + local;
+                return Err(DataCorruption::comment_only(format!(
+                    "quantized row {row} has non-zero padding bits for d={} b={}",
+                    self.dim, self.bits
+                ))
+                .into());
+            }
+        }
+        Ok(codes)
+    }
+
+    pub(crate) fn read_scales(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
+        Ok(self
+            .scales
+            .slice(rows.start * QUANTIZED_SCALE_STRIDE..rows.end * QUANTIZED_SCALE_STRIDE)
+            .read_bytes()?)
+    }
+
+    pub(crate) fn read_constants(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
+        Ok(self
+            .constants
+            .slice(rows.start * QUANTIZED_CONSTANT_STRIDE..rows.end * QUANTIZED_CONSTANT_STRIDE)
+            .read_bytes()?)
+    }
+
     pub(crate) fn read_batch(
         &self,
         rows: Range<usize>,
@@ -226,18 +375,10 @@ impl QuantizedLayerReader {
                 "invalid quantized row range {rows:?}"
             )));
         }
-        let codes = self
-            .codes
-            .slice(rows.start * self.code_stride..rows.end * self.code_stride)
-            .read_bytes()?;
-        let scales = self
-            .scales
-            .slice(rows.start * QUANTIZED_SCALE_STRIDE..rows.end * QUANTIZED_SCALE_STRIDE)
-            .read_bytes()?;
+        let codes = self.read_codes(rows.clone())?;
+        let scales = self.read_scales(rows.clone())?;
         let constants = if read_constants {
-            self.constants
-                .slice(rows.start * QUANTIZED_CONSTANT_STRIDE..rows.end * QUANTIZED_CONSTANT_STRIDE)
-                .read_bytes()?
+            self.read_constants(rows.clone())?
         } else {
             OwnedBytes::empty()
         };
@@ -247,79 +388,128 @@ impl QuantizedLayerReader {
             constants,
             rows,
             code_stride: self.code_stride,
-            dim: self.dim,
-            bits: self.bits,
         })
     }
 
-    pub(crate) fn gather_rows(
-        &self,
+    fn plan_slot_reads(
+        slot: &FileSlice,
+        stride: usize,
+        available_rows: Range<usize>,
         rows: &[usize],
-        read_constants: bool,
-        dense: &mut QuantizedLayerDenseBatch,
-    ) -> crate::Result<()> {
+        read_ranges: &mut Vec<Range<usize>>,
+        block_scratch: &mut Vec<(usize, usize)>,
+    ) {
+        debug_assert!(!rows.is_empty());
         debug_assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
-        dense.codes.clear();
-        dense.scales.clear();
-        dense.constants.clear();
-        dense.code_stride = self.code_stride;
-        dense.codes.reserve(rows.len() * self.code_stride);
-        dense.scales.reserve(rows.len() * QUANTIZED_SCALE_STRIDE);
-        if read_constants {
-            dense
-                .constants
-                .reserve(rows.len() * QUANTIZED_CONSTANT_STRIDE);
+        debug_assert!(rows.iter().all(|row| available_rows.contains(row)));
+        read_ranges.clear();
+
+        block_scratch.clear();
+        for &row in rows {
+            if !append_storage_block_span(slot, row * stride..(row + 1) * stride, block_scratch) {
+                // In-memory and ordinary-file handles expose no page
+                // geometry. Pin the available borrowed slice once; never
+                // fabricate a block size.
+                read_ranges.push(available_rows);
+                return;
+            }
+        }
+        let touched_blocks = merged_storage_block_count(block_scratch);
+
+        block_scratch.clear();
+        debug_assert!(append_storage_block_span(
+            slot,
+            available_rows.start * stride..available_rows.end * stride,
+            block_scratch,
+        ));
+        let covered_blocks = merged_storage_block_count(block_scratch);
+        debug_assert!(touched_blocks <= covered_blocks);
+        if touched_blocks == covered_blocks {
+            read_ranges.push(available_rows);
+            return;
         }
 
-        const FALLBACK_READ_BLOCK_BYTES: usize = 8 * 1024;
-        let mut first = 0;
-        while first < rows.len() {
-            let code_offset = rows[first] * self.code_stride;
-            let code_block = self
-                .codes
-                .storage_block_ord(code_offset)
-                .unwrap_or(code_offset / FALLBACK_READ_BLOCK_BYTES);
-            let mut end = first + 1;
-            while end < rows.len() {
-                let next_offset = rows[end] * self.code_stride;
-                let next_block = self
-                    .codes
-                    .storage_block_ord(next_offset)
-                    .unwrap_or(next_offset / FALLBACK_READ_BLOCK_BYTES);
-                if next_block != code_block {
-                    break;
-                }
-                end += 1;
+        // Sparse path: merge only overlapping physical-block intervals.
+        // Adjacent blocks stay as separate reads so page-backed handles never
+        // materialize a multi-page OwnedBytes merely for call coalescing.
+        let mut first_row = rows[0];
+        let mut previous_row = rows[0];
+        let (_, mut group_end_block) =
+            storage_block_span(slot, rows[0] * stride..(rows[0] + 1) * stride)
+                .expect("storage geometry was resolved above");
+        for &row in &rows[1..] {
+            let (start_block, end_block) =
+                storage_block_span(slot, row * stride..(row + 1) * stride)
+                    .expect("storage geometry was resolved above");
+            if start_block <= group_end_block {
+                group_end_block = group_end_block.max(end_block);
+            } else {
+                read_ranges.push(first_row..previous_row + 1);
+                first_row = row;
+                group_end_block = end_block;
             }
-            let pinned = self.read_batch(rows[first]..rows[end - 1] + 1, read_constants)?;
-            for &row in &rows[first..end] {
-                let local = row - pinned.rows.start;
-                let code_start = local * self.code_stride;
-                let code = &pinned.codes[code_start..code_start + self.code_stride];
-                if !quantized_code_tail_is_zero(code, self.dim, self.bits) {
-                    return Err(DataCorruption::comment_only(format!(
-                        "quantized row {row} has non-zero padding bits for d={} b={}",
-                        self.dim, self.bits
-                    ))
-                    .into());
-                }
-                dense.codes.extend_from_slice(code);
-
-                let scale_start = local * QUANTIZED_SCALE_STRIDE;
-                dense.scales.extend_from_slice(
-                    &pinned.scales[scale_start..scale_start + QUANTIZED_SCALE_STRIDE],
-                );
-                if read_constants {
-                    let constant_start = local * QUANTIZED_CONSTANT_STRIDE;
-                    dense.constants.extend_from_slice(
-                        &pinned.constants
-                            [constant_start..constant_start + QUANTIZED_CONSTANT_STRIDE],
-                    );
-                }
-            }
-            first = end;
+            previous_row = row;
         }
-        Ok(())
+        read_ranges.push(first_row..previous_row + 1);
+
+        debug_assert!(read_ranges.windows(2).all(|pair| {
+            let (_, left_end) =
+                storage_block_span(slot, pair[0].start * stride..pair[0].end * stride).unwrap();
+            let (right_start, _) =
+                storage_block_span(slot, pair[1].start * stride..pair[1].end * stride).unwrap();
+            left_end < right_start
+        }));
+    }
+
+    pub(crate) fn plan_code_reads(
+        &self,
+        available_rows: Range<usize>,
+        rows: &[usize],
+        read_ranges: &mut Vec<Range<usize>>,
+        block_scratch: &mut Vec<(usize, usize)>,
+    ) {
+        Self::plan_slot_reads(
+            &self.codes,
+            self.code_stride,
+            available_rows,
+            rows,
+            read_ranges,
+            block_scratch,
+        );
+    }
+
+    pub(crate) fn plan_scale_reads(
+        &self,
+        available_rows: Range<usize>,
+        rows: &[usize],
+        read_ranges: &mut Vec<Range<usize>>,
+        block_scratch: &mut Vec<(usize, usize)>,
+    ) {
+        Self::plan_slot_reads(
+            &self.scales,
+            QUANTIZED_SCALE_STRIDE,
+            available_rows,
+            rows,
+            read_ranges,
+            block_scratch,
+        );
+    }
+
+    pub(crate) fn plan_constant_reads(
+        &self,
+        available_rows: Range<usize>,
+        rows: &[usize],
+        read_ranges: &mut Vec<Range<usize>>,
+        block_scratch: &mut Vec<(usize, usize)>,
+    ) {
+        Self::plan_slot_reads(
+            &self.constants,
+            QUANTIZED_CONSTANT_STRIDE,
+            available_rows,
+            rows,
+            read_ranges,
+            block_scratch,
+        );
     }
 
     pub(crate) fn code_bytes(&self, row: usize) -> crate::Result<OwnedBytes> {
@@ -358,9 +548,11 @@ impl QuantizedLayerReader {
 /// Field-keyed V3 quantized payloads resolved from immutable index metadata.
 pub(crate) struct QuantizedFieldReader {
     config: VectorQuantizationConfig,
+    // Positive-depth scans resolve this once for the segment/field. Level 0
+    // never touches it, so unquantized IVF does not construct scorer state.
+    index_ctx: OnceLock<Option<Arc<QuantizedIndexCtx>>>,
     layers: Vec<QuantizedLayerReader>,
     residual_norms: Option<FileSlice>,
-    index_ctx: Arc<QuantizedIndexCtx>,
 }
 
 pub(crate) struct QuantizedResidualNormBatch {
@@ -369,19 +561,15 @@ pub(crate) struct QuantizedResidualNormBatch {
 }
 
 impl QuantizedResidualNormBatch {
-    pub(crate) fn get(&self, row: usize) -> crate::Result<f32> {
-        if !self.rows.contains(&row) {
-            return Err(TantivyError::InternalError(format!(
-                "residual-norm row {row} is outside pinned range {:?}",
-                self.rows
-            )));
-        }
-        let start = (row - self.rows.start) * QUANTIZED_RESIDUAL_NORM_STRIDE;
-        Ok(f32::from_le_bytes(
-            self.bytes[start..start + QUANTIZED_RESIDUAL_NORM_STRIDE]
-                .try_into()
-                .unwrap(),
-        ))
+    /// The complete fixed-stride LE-f32 range for one cluster pin. Callers
+    /// decode this once as a contiguous pass rather than doing checked
+    /// per-row lookups in the scoring loop.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        debug_assert_eq!(
+            self.bytes.len(),
+            self.rows.len() * QUANTIZED_RESIDUAL_NORM_STRIDE
+        );
+        &self.bytes
     }
 }
 
@@ -422,8 +610,16 @@ impl QuantizedFieldReader {
         Ok(Some(QuantizedResidualNormBatch { bytes, rows }))
     }
 
-    pub(crate) fn index_ctx(&self) -> Arc<QuantizedIndexCtx> {
-        Arc::clone(&self.index_ctx)
+    pub(crate) fn index_ctx(&self) -> Option<Arc<QuantizedIndexCtx>> {
+        self.index_ctx
+            .get_or_init(|| QuantizedIndexCtx::resolve_from_config(self.config.clone()))
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_ctx_is_initialized(&self) -> bool {
+        self.index_ctx.get().is_some()
     }
 }
 
@@ -592,9 +788,6 @@ impl VectorIndexReader {
             .is_some()
             || vec_composite
                 .open_read_with_idx(field, vec_slot::QUANTIZED_RESIDUAL_NORMS)
-                .is_some()
-            || vec_composite
-                .open_read_with_idx(field, vec_slot::QUANTIZED_CALIBRATION)
                 .is_some();
         let quantization = match (&index, quantization_config) {
             (Some(_), Some(config)) => {
@@ -685,56 +878,13 @@ impl VectorIndexReader {
                     }
                     (false, None) => None,
                 };
-                let calibration = vec_composite
-                    .open_read_with_idx(field, vec_slot::QUANTIZED_CALIBRATION)
-                    .ok_or_else(|| {
-                        DataCorruption::comment_only(format!(
-                            "quantized vector field {:?} is missing calibration metadata slot 15",
-                            entry.name()
-                        ))
-                    })?;
-                if calibration.len() < std::mem::size_of::<u32>() {
-                    return Err(DataCorruption::comment_only(format!(
-                        "vector field {:?} quantization calibration has {} bytes; expected a \
-                         version word",
-                        entry.name(),
-                        calibration.len()
-                    ))
-                    .into());
-                }
-                let calibration_version = calibration.slice_to(4).read_bytes()?;
-                let calibration_version =
-                    u32::from_le_bytes(calibration_version.as_slice().try_into().unwrap());
-                let calibration_len = match calibration_version {
-                    1 => 12,
-                    2 => 8 + config.layers.len() * 8,
-                    QUANTIZED_CALIBRATION_VERSION => {
-                        quantized_calibration_metadata_len(config.layers.len())
-                    }
-                    version => {
-                        return Err(DataCorruption::comment_only(format!(
-                            "quantization calibration metadata version {version} is unsupported; \
-                             expected {QUANTIZED_CALIBRATION_VERSION}"
-                        ))
-                        .into());
-                    }
-                };
-                let calibration = logical_slice(
-                    calibration,
-                    calibration_len,
-                    &format!("vector field {:?} quantization calibration", entry.name()),
-                )?
-                .read_bytes()?;
-                let calibration =
-                    VectorQuantizationCalibration::decode(&calibration, config.layers.len())?;
-                let biases = calibration.depths.iter().map(|depth| depth.bias).collect();
-                let cals = calibration.depths.iter().map(|depth| depth.cal).collect();
-                let index_ctx = QuantizedIndexCtx::resolve(config.clone(), biases, cals);
+                // Slot 15 was retired before V3 shipped. Calibration lives in
+                // index settings; any physical slot 15 bytes are ignored.
                 Some(QuantizedFieldReader {
                     config,
+                    index_ctx: OnceLock::new(),
                     layers,
                     residual_norms,
-                    index_ctx,
                 })
             }
             (Some(_), None) if first_quantized_slot => {
@@ -807,7 +957,9 @@ impl VectorIndexReader {
     }
 
     pub(crate) fn quantization(&self) -> Option<&QuantizedFieldReader> {
-        self.quantization.as_ref()
+        self.quantization
+            .as_ref()
+            .filter(|quantization| quantization.config.calibration().is_some())
     }
 
     /// Storage info for tooling; `None` if the segment has no vector data for
@@ -858,184 +1010,122 @@ impl VectorIndexReader {
         })
     }
 
-    #[cfg(test)]
-    /// Exact calibration value decoded from quantization metadata slot 15.
-    pub fn quantization_calibrations(&self) -> Option<&[f32]> {
-        self.quantization
-            .as_ref()
-            .map(|quantization| quantization.index_ctx.calibrations())
-    }
-
-    #[cfg(test)]
-    /// Replays the merge-time held-out calibration protocol against the
-    /// already-persisted exact rows, using only the requested scorer prefix.
-    /// This is an audit path: it never mutates slots or participates in search.
-    pub fn quantization_calibration_audit(
+    /// Measure per-prefix normalized estimator errors for caller-supplied
+    /// queries using the same quantized query preparation and split-form
+    /// kernels as production scanning. Raw moments make results mergeable
+    /// across segment readers before settings are updated. Callers must pass
+    /// the owning [`SegmentReader::alive_bitset`] so deleted documents never
+    /// enter the target-row sample.
+    pub fn calibrate_external_queries(
         &self,
-        depth: usize,
-    ) -> crate::Result<Option<QuantizationCalibrationAudit>> {
-        const SAMPLE_ROWS: usize = 1_024;
-        const PSEUDO_QUERIES: usize = 64;
-
+        queries: &[Vec<f32>],
+        sample_rows: usize,
+        alive: Option<&AliveBitSet>,
+    ) -> crate::Result<Option<VectorCalibrationMeasurements>> {
         let (Some(index), Some(quantization)) = (&self.index, &self.quantization) else {
             return Ok(None);
         };
-        if depth == 0 || depth > quantization.index_ctx.specs.len() {
-            return Err(TantivyError::InvalidArgument(format!(
-                "quantization calibration audit depth {depth} is outside 1..={}",
-                quantization.index_ctx.specs.len()
-            )));
-        }
-        let specs = &quantization.index_ctx.specs[..depth];
-        let rho = quantization.index_ctx.grids[depth - 1].rho_model;
-        let num_rows = index.num_rows();
-        if num_rows == 0 {
-            return Ok(Some(QuantizationCalibrationAudit {
-                depth,
-                sample_count: 0,
-                cal: 1.0,
-                signed_mean: 0.0,
-                signed_stddev: 0.0,
-                signed_skewness: 0.0,
-                signed_excess_kurtosis: 0.0,
-                abs_p50: 0.0,
-                abs_p90: 0.0,
-                abs_p95: 0.0,
-                abs_p99: 0.0,
-                abs_max: 0.0,
-            }));
-        }
-
-        let pseudo_query_count = num_rows.min(PSEUDO_QUERIES);
-        let mut pseudo_queries = Vec::with_capacity(pseudo_query_count);
-        for sample in 0..pseudo_query_count {
-            let row = sample * num_rows / pseudo_query_count;
-            let cluster = (0..index.num_clusters())
-                .find(|&cluster| index.cluster_range(cluster).contains(&row))
-                .expect("persisted row must belong to one IVF cluster");
-            pseudo_queries.push((
-                cluster,
-                decode_row::<f32>(&self.vector_bytes_for_row(row)?, self.options.dim())?,
+        if sample_rows == 0 {
+            return Err(TantivyError::InvalidArgument(
+                "quantization calibration sample_rows must be greater than zero".to_string(),
             ));
         }
+        for query in queries {
+            if query.len() != self.options.dim() {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "quantization calibration query has dimension {}; expected {}",
+                    query.len(),
+                    self.options.dim()
+                )));
+            }
+        }
 
+        let layer_count = quantization.config.layers.len();
+        let mut measurements = VectorCalibrationMeasurements {
+            aggregate: vec![VectorCalibrationMoments::default(); layer_count],
+            per_query: vec![vec![VectorCalibrationMoments::default(); layer_count]; queries.len()],
+        };
+        if index.num_rows() == 0 || queries.is_empty() {
+            return Ok(Some(measurements));
+        }
+
+        let measurement_ctx =
+            QuantizedIndexCtx::for_calibration_measurement(quantization.config.clone());
+        let prepared_queries: Vec<QuantizedQueryCtx> = queries
+            .iter()
+            .cloned()
+            .map(|query| QuantizedQueryCtx::new(Arc::clone(&measurement_ctx), query))
+            .collect();
+        let live_row_count = self.live_posting_row_count(alive);
+        let target_rows = sample_rows.min(live_row_count);
+        if target_rows == 0 {
+            return Ok(Some(measurements));
+        }
         let centroid_stride = self.options.bytes_per_vector();
         let centroid_bytes = index.centroid_bytes()?;
-        let interval = num_rows.div_ceil(SAMPLE_ROWS).max(1);
-        let mut empirical_variance_sum = 0.0;
-        let mut model_variance_sum = 0.0;
-        let mut normalized_errors = Vec::with_capacity(SAMPLE_ROWS.min(num_rows));
+        let mut sampled = 0usize;
+        let mut live_rows_seen = 0usize;
+        let mut next_sample_ordinal = 0usize;
 
         for cluster in 0..index.num_clusters() {
             let rows = index.cluster_range(cluster);
-            if rows.is_empty() {
-                continue;
-            }
-            let centroid = decode_row::<f32>(
-                &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
-                self.options.dim(),
-            )?;
-            let prepared_centroid = prepare_centroid(&centroid, specs);
-            let (_, source_query) = (0..pseudo_queries.len())
-                .map(|offset| (cluster + offset) % pseudo_queries.len())
-                .find_map(|query_idx| {
-                    let (query_cluster, query) = &pseudo_queries[query_idx];
-                    (*query_cluster != cluster).then_some((*query_cluster, query))
-                })
-                .expect("held-out calibration requires a query from another cluster");
-            let mut score_query = source_query.clone();
-            if self.options.metric() == Metric::L2 {
-                for (value, &center) in score_query.iter_mut().zip(&centroid) {
-                    *value -= center;
-                }
-            }
-            let query_norm = score_query
-                .iter()
-                .map(|value| value * value)
-                .sum::<f32>()
-                .sqrt();
-            let prepared_query = prepare_fp_query(&score_query, specs);
-            let final_query = prepared_query.final_layer();
-
+            let centroid_row = &centroid_bytes[cluster * centroid_stride..][..centroid_stride];
+            let centroid = decode_row::<f32>(centroid_row, self.options.dim())?;
             for row in rows {
-                if !row.is_multiple_of(interval) || normalized_errors.len() >= SAMPLE_ROWS {
+                if alive.is_some_and(|alive| !alive.is_alive(self.doc_id_at(row))) {
                     continue;
                 }
-                let mut values =
+                let live_ordinal = live_rows_seen;
+                live_rows_seen += 1;
+                if sampled >= target_rows || live_ordinal != next_sample_ordinal {
+                    continue;
+                }
+                sampled += 1;
+                next_sample_ordinal = sampled * live_row_count / target_rows;
+                let values =
                     decode_row::<f32>(&self.vector_bytes_for_row(row)?, self.options.dim())?;
-                let encoded = encode_batch_in_place(
-                    &mut values,
-                    1,
-                    &prepared_centroid,
-                    specs,
-                    &quantization.index_ctx.grids[..depth],
-                );
-                let scale = encoded.layers[depth - 1].scales[0];
-                let dot_error = values
-                    .iter()
-                    .zip(final_query)
-                    .map(|(&error, &query)| f64::from(error) * f64::from(query))
-                    .sum::<f64>();
-                let model_sigma = f64::from(f16_to_f32(scale)) * rho * f64::from(query_norm);
-                empirical_variance_sum += dot_error.powi(2);
-                model_variance_sum += model_sigma.powi(2);
-                if model_sigma > 0.0 {
-                    normalized_errors.push(dot_error / model_sigma);
+                for (query_idx, query) in prepared_queries.iter().enumerate() {
+                    let mut exact_dot = 0.0f32;
+                    for ((&value, &center), &query_value) in
+                        values.iter().zip(&centroid).zip(query.query())
+                    {
+                        let residual = value - center;
+                        let score_query = if self.options.metric() == Metric::L2 {
+                            query_value - center
+                        } else {
+                            query_value
+                        };
+                        exact_dot += residual * score_query;
+                    }
+                    let query_norm =
+                        calibration_query_norm(query, self.options.metric(), centroid_row);
+                    let mut prefix_estimate = 0.0f32;
+                    for (depth, layer) in quantization.layers.iter().enumerate() {
+                        let scale = layer.scale(row)?;
+                        let constant = if self.options.metric() == Metric::L2 {
+                            layer.constant(row)?
+                        } else {
+                            0.0
+                        };
+                        let layer_estimate =
+                            query.score_layer(depth, &layer.code_bytes(row)?, scale, constant);
+                        let model_sigma = f16_to_f32(scale)
+                            * measurement_ctx.grids[depth].rho_model as f32
+                            * query_norm;
+                        observe_calibration_prefix(
+                            &mut measurements,
+                            query_idx,
+                            depth,
+                            exact_dot,
+                            &mut prefix_estimate,
+                            layer_estimate,
+                            model_sigma,
+                        );
+                    }
                 }
             }
         }
-
-        let cal = if model_variance_sum == 0.0 {
-            1.0
-        } else {
-            (empirical_variance_sum / model_variance_sum).sqrt()
-        };
-        let sample_count = normalized_errors.len();
-        let signed_mean = normalized_errors.iter().sum::<f64>() / sample_count as f64;
-        let centered: Vec<f64> = normalized_errors
-            .iter()
-            .map(|value| value - signed_mean)
-            .collect();
-        let variance =
-            centered.iter().map(|value| value.powi(2)).sum::<f64>() / sample_count as f64;
-        let signed_stddev = variance.sqrt();
-        let signed_skewness = if signed_stddev == 0.0 {
-            0.0
-        } else {
-            centered.iter().map(|value| value.powi(3)).sum::<f64>()
-                / sample_count as f64
-                / signed_stddev.powi(3)
-        };
-        let signed_excess_kurtosis = if signed_stddev == 0.0 {
-            0.0
-        } else {
-            centered.iter().map(|value| value.powi(4)).sum::<f64>()
-                / sample_count as f64
-                / signed_stddev.powi(4)
-                - 3.0
-        };
-        let mut absolute_errors: Vec<f64> =
-            normalized_errors.iter().map(|value| value.abs()).collect();
-        absolute_errors.sort_by(f64::total_cmp);
-        let percentile = |fraction: f64| {
-            let index = ((absolute_errors.len() - 1) as f64 * fraction).round() as usize;
-            absolute_errors[index]
-        };
-
-        Ok(Some(QuantizationCalibrationAudit {
-            depth,
-            sample_count,
-            cal,
-            signed_mean,
-            signed_stddev,
-            signed_skewness,
-            signed_excess_kurtosis,
-            abs_p50: percentile(0.50),
-            abs_p90: percentile(0.90),
-            abs_p95: percentile(0.95),
-            abs_p99: percentile(0.99),
-            abs_max: *absolute_errors.last().unwrap(),
-        }))
+        Ok(Some(measurements))
     }
 
     /// Per-cluster posting-list sizes in cluster order — the distribution
@@ -1045,6 +1135,17 @@ impl VectorIndexReader {
         self.index
             .as_ref()
             .map(|index| index.cluster_sizes().map(|size| size as u32).collect())
+    }
+
+    /// Number of live IVF posting memberships. Replicated documents count
+    /// once per membership; deleted documents contribute no memberships.
+    pub fn live_posting_row_count(&self, alive: Option<&AliveBitSet>) -> usize {
+        let Some(index) = &self.index else {
+            return 0;
+        };
+        (0..index.num_rows())
+            .filter(|&row| alive.is_none_or(|alive| alive.is_alive(self.doc_id_at(row))))
+            .count()
     }
 
     /// `true` if `doc_id` has a stored vector.
@@ -1175,6 +1276,105 @@ mod tests {
     }
 
     #[test]
+    fn calibration_query_norm_matches_production_f32_chain() {
+        const DIM: usize = 64;
+        let source_query: Vec<f32> = (0..DIM)
+            .map(|coordinate| 10_000.0 + coordinate as f32 * 0.375)
+            .collect();
+        let centroid: Vec<f32> = (0..DIM)
+            .map(|coordinate| 9_997.0 - coordinate as f32 * 0.1875)
+            .collect();
+        let centroid_bytes = centroid
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut differs_from_the_retired_f64_chain = false;
+
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let config = VectorQuantizationConfig::materialize(
+                "embedding".to_string(),
+                &VectorOptions::new(DIM, metric),
+                vec![super::super::quantization::VectorQuantizationLayer {
+                    bits: 1,
+                    quantizer: super::super::quantization::VectorQuantizer::RaBitQ,
+                    seed: 7,
+                }],
+            )
+            .unwrap();
+            let query = QuantizedQueryCtx::new(
+                QuantizedIndexCtx::for_calibration_measurement(config),
+                source_query.clone(),
+            );
+            let routing_score = metric
+                .similarity_bytes::<f32>(query.query(), &centroid_bytes)
+                .score();
+            let expected = query.score_query_norm(routing_score);
+            let actual = calibration_query_norm(&query, metric, &centroid_bytes);
+            assert_eq!(actual.to_bits(), expected.to_bits(), "metric={metric:?}");
+
+            let retired_norm = query
+                .query()
+                .iter()
+                .zip(&centroid)
+                .map(|(&query, &centroid)| {
+                    let value = if metric == Metric::L2 {
+                        query - centroid
+                    } else {
+                        query
+                    };
+                    f64::from(value) * f64::from(value)
+                })
+                .sum::<f64>()
+                .sqrt();
+            differs_from_the_retired_f64_chain |=
+                f64::from(actual).to_bits() != retired_norm.to_bits();
+        }
+        assert!(differs_from_the_retired_f64_chain);
+    }
+
+    #[test]
+    fn depth_two_calibration_oracle_tracks_signed_prefix_errors() {
+        // Two deterministic samples with unit model sigma:
+        // depth 1 errors = [10 - 9, 10 - 7] = [1, 3]
+        // depth 2 errors = [10 - (9 + 5), 10 - (7 + 5)] = [-4, -2].
+        // The aggregate oracle is therefore (+2, 1) then (-3, 1) for
+        // (bias, spread). This catches both sign loss and treating layer 2
+        // as a standalone estimate instead of an f32 prefix refinement.
+        let mut measurements = VectorCalibrationMeasurements {
+            aggregate: vec![VectorCalibrationMoments::default(); 2],
+            per_query: vec![vec![VectorCalibrationMoments::default(); 2]; 2],
+        };
+        for (query_idx, layer_estimates) in [[9.0_f32, 5.0], [7.0, 5.0]].into_iter().enumerate() {
+            let mut prefix_estimate = 0.0_f32;
+            for (depth, layer_estimate) in layer_estimates.into_iter().enumerate() {
+                observe_calibration_prefix(
+                    &mut measurements,
+                    query_idx,
+                    depth,
+                    10.0,
+                    &mut prefix_estimate,
+                    layer_estimate,
+                    1.0,
+                );
+            }
+        }
+
+        let calibration = measurements
+            .finish(VectorQuantizationCalibrationSource::RealQuery)
+            .unwrap();
+        assert_eq!(calibration[0].bias.to_bits(), 2.0_f32.to_bits());
+        assert_eq!(calibration[0].spread.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(calibration[1].bias.to_bits(), (-3.0_f32).to_bits());
+        assert_eq!(calibration[1].spread.to_bits(), 1.0_f32.to_bits());
+        assert!(calibration[0].bias.is_sign_positive());
+        assert!(calibration[1].bias.is_sign_negative());
+        assert_eq!(measurements.per_query()[0][0].bias(), Some(1.0));
+        assert_eq!(measurements.per_query()[0][1].bias(), Some(-4.0));
+        assert_eq!(measurements.per_query()[1][0].bias(), Some(3.0));
+        assert_eq!(measurements.per_query()[1][1].bias(), Some(-2.0));
+    }
+
+    #[test]
     fn quantized_layer_reader_rejects_non_zero_tail() -> crate::Result<()> {
         let mut codes = vec![0_u8; quantized_code_stride(65, 1)];
         codes[8] = 1;
@@ -1199,6 +1399,31 @@ mod tests {
         };
         assert!(corrupt.code_bytes(0).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn indexed_range_validates_unselected_gap_row_tail() {
+        let stride = quantized_code_stride(65, 1);
+        let mut codes = vec![0_u8; stride * 3];
+        codes[8] = 1;
+        codes[stride + 8] = 0b10;
+        codes[stride * 2 + 8] = 1;
+        let reader = QuantizedLayerReader {
+            codes: FileSlice::from(codes),
+            scales: FileSlice::from(vec![0_u8; 3 * QUANTIZED_SCALE_STRIDE]),
+            constants: FileSlice::empty(),
+            code_stride: stride,
+            dim: 65,
+            bits: 1,
+        };
+        let mut ranges = Vec::new();
+        let mut blocks = Vec::new();
+        reader.plan_code_reads(0..3, &[0, 2], &mut ranges, &mut blocks);
+        assert_eq!(ranges, [0..3]);
+        assert!(
+            reader.read_codes(ranges.pop().unwrap()).is_err(),
+            "the unselected corrupt row inside the pinned range must be checked"
+        );
     }
 
     #[test]
@@ -1242,32 +1467,82 @@ mod tests {
             dim: 65,
             bits: 1,
         };
-        assert!(corrupt.read_batch(0..2, true)?.code_bytes(1).is_err());
+        assert!(corrupt.read_batch(0..2, true).is_err());
         Ok(())
     }
 
     #[test]
-    fn sparse_gather_groups_by_absolute_storage_block() -> crate::Result<()> {
+    fn indexed_read_plan_is_density_adaptive_across_soa_slots() -> crate::Result<()> {
         let reads = Arc::new(Mutex::new(Vec::new()));
-        let codes = FileSlice::new(Arc::new(BlockTrackedBytes {
-            bytes: vec![0_u8; 64],
+        let storage = Arc::new(BlockTrackedBytes {
+            bytes: vec![0_u8; 160],
             reads: Arc::clone(&reads),
             block_len: 16,
-        }))
-        .slice(15..31);
+        });
+        let codes = FileSlice::new(storage.clone()).slice(15..79);
+        let scales = FileSlice::new(storage.clone()).slice(80..96);
+        let constants = FileSlice::new(storage).slice(96..128);
         let reader = QuantizedLayerReader {
             codes,
-            scales: FileSlice::from(vec![0_u8; 4]),
+            scales,
+            constants,
+            code_stride: 8,
+            dim: 64,
+            bits: 1,
+        };
+        let mut ranges = Vec::new();
+        let mut blocks = Vec::new();
+
+        reader.plan_code_reads(0..8, &[1, 3], &mut ranges, &mut blocks);
+        assert_eq!(ranges, [1..2, 3..4], "adjacent pages stay separate");
+        reader.plan_code_reads(0..8, &[0, 7], &mut ranges, &mut blocks);
+        assert_eq!(ranges, [0..1, 7..8]);
+        for range in ranges.drain(..) {
+            reader.read_codes(range)?;
+        }
+        reader.plan_scale_reads(0..8, &[0, 7], &mut ranges, &mut blocks);
+        assert_eq!(ranges, [0..8]);
+        reader.read_scales(ranges.pop().unwrap())?;
+        reader.plan_constant_reads(0..8, &[0, 7], &mut ranges, &mut blocks);
+        assert_eq!(ranges, [0..8]);
+        reader.read_constants(ranges.pop().unwrap())?;
+        let reads = reads.lock().unwrap();
+        assert_eq!(&*reads, &[15..23, 71..79, 80..96, 96..128]);
+        let mut pinned_blocks = reads
+            .iter()
+            .flat_map(|range| range.start / 16..=(range.end - 1) / 16)
+            .collect::<Vec<_>>();
+        let pin_count = pinned_blocks.len();
+        pinned_blocks.sort_unstable();
+        pinned_blocks.dedup();
+        assert_eq!(
+            pinned_blocks.len(),
+            pin_count,
+            "each physical block must be pinned once per indexed batch"
+        );
+        drop(reads);
+
+        reader.plan_code_reads(0..8, &(0..8).collect::<Vec<_>>(), &mut ranges, &mut blocks);
+        assert_eq!(ranges, [0..8]);
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_read_plan_without_storage_geometry_pins_available_range() {
+        let reader = QuantizedLayerReader {
+            codes: FileSlice::from(vec![0_u8; 8 * 8]),
+            scales: FileSlice::from(vec![0_u8; 8 * 2]),
             constants: FileSlice::empty(),
             code_stride: 8,
             dim: 64,
             bits: 1,
         };
-        let mut dense = QuantizedLayerDenseBatch::new();
-        reader.gather_rows(&[0, 1], false, &mut dense)?;
-        assert_eq!(&*reads.lock().unwrap(), &[15..23, 23..31]);
-        assert_eq!(dense.codes(), &[0_u8; 16]);
-        Ok(())
+        let mut ranges = Vec::new();
+        let mut blocks = Vec::new();
+        reader.plan_code_reads(0..8, &[0, 7], &mut ranges, &mut blocks);
+        assert_eq!(ranges, [0..8]);
+        reader.plan_scale_reads(0..8, &[0, 7], &mut ranges, &mut blocks);
+        assert_eq!(ranges, [0..8]);
     }
 
     #[test]

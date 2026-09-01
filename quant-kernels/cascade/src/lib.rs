@@ -1,9 +1,12 @@
 //! Residual quantization cascade and plane-boundary operations.
 
+use std::borrow::Cow;
+
 use fht::Rotation;
 use grid_plane::{
     build_lut, build_packed_lut_4, decode as decode_grid, encode as encode_grid,
     estimate as estimate_grid, score_batch as score_grid_batch,
+    score_batch_indexed as score_grid_batch_indexed,
     score_batch_packed_4 as score_grid_batch_packed_4,
     score_batch_packed_4_indexed as score_grid_batch_packed_4_indexed,
 };
@@ -11,8 +14,9 @@ use quant_model::f16::f16_to_f32;
 use quant_model::Grid;
 use sign_plane::{
     encode as encode_sign, estimate_asym as estimate_sign_asym,
-    estimate_asym_batch_unscaled as estimate_sign_batch, estimate_fp as estimate_sign_fp,
-    prepare_query, unpack as unpack_sign, QueryPlanes,
+    estimate_asym_batch_unscaled as estimate_sign_batch,
+    estimate_asym_batch_unscaled_indexed as estimate_sign_batch_indexed,
+    estimate_fp as estimate_sign_fp, prepare_query, unpack as unpack_sign, QueryPlanes,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +66,62 @@ pub struct PreparedFpQuery {
     layers: Vec<Vec<f32>>,
 }
 
+/// Immutable, reusable rotation state for preparing queries against one
+/// quantization schedule.
+///
+/// Construct this once with the persisted layer seeds, then reuse it for
+/// every query. Preparing a prefix applies only the rotations in that prefix.
+#[derive(Clone, Debug)]
+pub struct QueryRotationPlan {
+    d: usize,
+    specs: Vec<LayerSpec>,
+    rotations: Vec<Option<Rotation>>,
+}
+
+impl QueryRotationPlan {
+    /// Expand every rotating layer's seed into its format-stable rotation.
+    pub fn new(d: usize, specs: &[LayerSpec]) -> Self {
+        validate_specs(d, specs);
+        let rotations = specs
+            .iter()
+            .enumerate()
+            .map(|(layer, spec)| (layer == 0 || spec.rotate).then(|| Rotation::new(d, spec.seed)))
+            .collect();
+        Self {
+            d,
+            specs: specs.to_vec(),
+            rotations,
+        }
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.d
+    }
+
+    pub fn specs(&self) -> &[LayerSpec] {
+        &self.specs
+    }
+
+    fn active_specs(&self, active_layers: usize) -> &[LayerSpec] {
+        assert!((1..=self.specs.len()).contains(&active_layers));
+        &self.specs[..active_layers]
+    }
+
+    fn prepare_layers(&self, query: &[f32], active_layers: usize) -> Vec<Vec<f32>> {
+        assert_eq!(query.len(), self.d);
+        self.active_specs(active_layers);
+        let mut current = query.to_vec();
+        let mut layers = Vec::with_capacity(active_layers);
+        for layer in 0..active_layers {
+            if let Some(rotation) = &self.rotations[layer] {
+                rotation.apply(&mut current);
+            }
+            layers.push(current.clone());
+        }
+        layers
+    }
+}
+
 impl PreparedFpQuery {
     /// Query in the coordinate space of one encoded layer.
     pub fn layer(&self, layer: usize) -> &[f32] {
@@ -96,14 +156,30 @@ pub fn prepare_split_query(
     grids: &[Grid],
     sign_query_bits: u8,
 ) -> PreparedSplitQuery {
+    // Preserve the original harness API contract: only the explicit
+    // `_with_plan` entry accepts a grid slice as an active prefix.
     validate(query.len(), specs, grids);
+    let plan = QueryRotationPlan::new(query.len(), specs);
+    prepare_split_query_with_plan(query, &plan, grids, sign_query_bits)
+}
+
+/// Prepare a query using pre-expanded rotations from `plan`.
+///
+/// `grids` selects the active schedule prefix: passing `&all_grids[..depth]`
+/// prepares exactly `depth` layers.
+pub fn prepare_split_query_with_plan(
+    query: &[f32],
+    plan: &QueryRotationPlan,
+    grids: &[Grid],
+    sign_query_bits: u8,
+) -> PreparedSplitQuery {
+    let specs = plan.active_specs(grids.len());
+    validate(query.len(), specs, grids);
+    assert_eq!(query.len(), plan.dimension());
     assert!((1..=8).contains(&sign_query_bits));
-    let mut current = query.to_vec();
+    let rotated_layers = plan.prepare_layers(query, specs.len());
     let mut layers = Vec::with_capacity(specs.len());
-    for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
-        if layer == 0 || spec.rotate {
-            Rotation::new(query.len(), spec.seed).apply(&mut current);
-        }
+    for ((spec, grid), current) in specs.iter().zip(grids).zip(rotated_layers) {
         if spec.bits == 1 {
             layers.push(PreparedSplitLayer::Sign(prepare_query(
                 &current,
@@ -111,8 +187,7 @@ pub fn prepare_split_query(
             )));
         } else {
             let lut = build_lut(&current, &grid.points, spec.bits);
-            let packed_lut_4 = (spec.bits == 4 && query.len().is_multiple_of(2))
-                .then(|| build_packed_lut_4(&lut, query.len()));
+            let packed_lut_4 = (spec.bits == 4).then(|| build_packed_lut_4(&lut, query.len()));
             layers.push(PreparedSplitLayer::Grid { lut, packed_lut_4 });
         }
     }
@@ -135,13 +210,8 @@ impl PreparedSplitQuery {
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
-                #[cfg(target_endian = "little")]
-                let estimate = estimate_sign_asym(aligned_le_words(codes), scale, query);
-                #[cfg(not(target_endian = "little"))]
-                let estimate = {
-                    let words = decode_le_words(codes);
-                    estimate_sign_asym(&words, scale, query)
-                };
+                let words = aligned_le_words(codes);
+                let estimate = estimate_sign_asym(words.as_ref(), scale, query);
                 estimate - constant
             }
             PreparedSplitLayer::Grid { lut, .. } => {
@@ -168,23 +238,13 @@ impl PreparedSplitQuery {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
                 assert_eq!(code_stride % std::mem::size_of::<u64>(), 0);
-                #[cfg(target_endian = "little")]
+                let words = aligned_le_words(codes);
                 estimate_sign_batch(
-                    aligned_le_words(codes),
+                    words.as_ref(),
                     code_stride / std::mem::size_of::<u64>(),
                     query,
                     out,
                 );
-                #[cfg(not(target_endian = "little"))]
-                {
-                    let words = decode_le_words(codes);
-                    estimate_sign_batch(
-                        &words,
-                        code_stride / std::mem::size_of::<u64>(),
-                        query,
-                        out,
-                    );
-                }
             }
             PreparedSplitLayer::Grid { lut, packed_lut_4 } => {
                 assert!(spec.bits > 1);
@@ -199,7 +259,9 @@ impl PreparedSplitQuery {
 
     /// Score selected rows from one borrowed contiguous posting range. This
     /// is the sparse survivor-stream equivalent of the fixed-stride batch
-    /// entry and deliberately has no scalar per-row fallback for b=4.
+    /// entry. Every supported layer width remains borrowed in place; b=4
+    /// uses the packed LUT fast path while sign and b=2/b=3 use their indexed
+    /// kernels directly.
     #[inline(always)]
     pub fn score_layer_batch_unscaled_indexed(
         &self,
@@ -212,6 +274,18 @@ impl PreparedSplitQuery {
     ) {
         assert_eq!(row_offsets.len(), out.len());
         match &self.layers[layer] {
+            PreparedSplitLayer::Sign(query) => {
+                assert_eq!(spec.bits, 1);
+                assert_eq!(code_stride % std::mem::size_of::<u64>(), 0);
+                let words = aligned_le_words(codes);
+                estimate_sign_batch_indexed(
+                    words.as_ref(),
+                    code_stride / std::mem::size_of::<u64>(),
+                    row_offsets,
+                    query,
+                    out,
+                );
+            }
             PreparedSplitLayer::Grid {
                 packed_lut_4: Some(packed_lut_4),
                 ..
@@ -226,7 +300,21 @@ impl PreparedSplitQuery {
                     out,
                 );
             }
-            _ => panic!("indexed survivor batch is only resolved for an even-d b=4 grid layer"),
+            PreparedSplitLayer::Grid {
+                lut,
+                packed_lut_4: None,
+            } => {
+                assert!(matches!(spec.bits, 2 | 3));
+                score_grid_batch_indexed(
+                    codes,
+                    code_stride,
+                    row_offsets,
+                    lut,
+                    self.d,
+                    spec.bits,
+                    out,
+                );
+            }
         }
     }
 }
@@ -456,18 +544,20 @@ pub fn encode_layers(
 }
 
 pub fn prepare_fp_query(query: &[f32], specs: &[LayerSpec]) -> PreparedFpQuery {
-    assert!(!query.is_empty());
-    assert!((1..=4).contains(&specs.len()));
-    assert!(specs[0].rotate, "layer 0 must rotate");
-    let mut current = query.to_vec();
-    let mut layers = Vec::with_capacity(specs.len());
-    for (layer, spec) in specs.iter().enumerate() {
-        if layer == 0 || spec.rotate {
-            Rotation::new(query.len(), spec.seed).apply(&mut current);
-        }
-        layers.push(current.clone());
+    let plan = QueryRotationPlan::new(query.len(), specs);
+    prepare_fp_query_with_plan(query, &plan, specs.len())
+}
+
+/// Prepare full-precision query coordinates for one active schedule prefix
+/// using pre-expanded rotations from `plan`.
+pub fn prepare_fp_query_with_plan(
+    query: &[f32],
+    plan: &QueryRotationPlan,
+    active_layers: usize,
+) -> PreparedFpQuery {
+    PreparedFpQuery {
+        layers: plan.prepare_layers(query, active_layers),
     }
-    PreparedFpQuery { layers }
 }
 
 pub fn estimate_prepared_fp(
@@ -516,17 +606,9 @@ fn estimate_prepared_fp_layers(
         .enumerate()
         .map(|(layer, (spec, grid))| {
             if spec.bits == 1 {
-                #[cfg(target_endian = "little")]
-                let estimate = estimate_sign_fp(
-                    aligned_le_words(&encoded.codes[layer]),
-                    encoded.scales[layer],
-                    &query.layers[layer],
-                );
-                #[cfg(not(target_endian = "little"))]
-                let estimate = {
-                    let words = decode_le_words(&encoded.codes[layer]);
-                    estimate_sign_fp(&words, encoded.scales[layer], &query.layers[layer])
-                };
+                let words = aligned_le_words(&encoded.codes[layer]);
+                let estimate =
+                    estimate_sign_fp(words.as_ref(), encoded.scales[layer], &query.layers[layer]);
                 estimate
             } else {
                 let lut = build_lut(&query.layers[layer], &grid.points, spec.bits);
@@ -557,13 +639,8 @@ pub fn reconstruct_first_space(
         let spec = specs[layer];
         let mut reconstruction = if spec.bits == 1 {
             let scale = f16_to_f32(encoded.scales[layer]);
-            #[cfg(target_endian = "little")]
-            let signs = unpack_sign(aligned_le_words(&encoded.codes[layer]), d);
-            #[cfg(not(target_endian = "little"))]
-            let signs = {
-                let words = decode_le_words(&encoded.codes[layer]);
-                unpack_sign(&words, d)
-            };
+            let words = aligned_le_words(&encoded.codes[layer]);
+            let signs = unpack_sign(words.as_ref(), d);
             signs.into_iter().map(|sign| scale * sign).collect()
         } else {
             decode_grid(
@@ -633,36 +710,38 @@ fn words_to_bytes(words: &[u64]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-#[cfg(target_endian = "little")]
 #[inline]
-fn aligned_le_words(bytes: &[u8]) -> &[u64] {
+fn aligned_le_words(bytes: &[u8]) -> Cow<'_, [u64]> {
     assert_eq!(bytes.len() % std::mem::size_of::<u64>(), 0);
-    debug_assert_eq!(
-        bytes.as_ptr().align_offset(std::mem::align_of::<u64>()),
-        0,
-        "V3 code rows must be u64-aligned"
-    );
-    // SAFETY: V3 code sections begin at a 64-byte-aligned absolute offset and
-    // every code-row stride is a whole number of little-endian u64 words.
-    // `u64` has no invalid bit patterns, and the returned view cannot outlive
-    // the source bytes. This path is compiled only where native u64 loads have
-    // the format's little-endian interpretation.
-    unsafe {
-        std::slice::from_raw_parts(
-            bytes.as_ptr().cast::<u64>(),
-            bytes.len() / std::mem::size_of::<u64>(),
-        )
+
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: every bit pattern is a valid `u64`. `align_to` returns only
+        // views within `bytes`, and borrowing is allowed only when the entire
+        // input is represented by exactly the expected number of words.
+        let (prefix, words, suffix) = unsafe { bytes.align_to::<u64>() };
+        if prefix.is_empty()
+            && suffix.is_empty()
+            && words.len() == bytes.len() / std::mem::size_of::<u64>()
+        {
+            return Cow::Borrowed(words);
+        }
     }
+
+    Cow::Owned(decode_le_words(bytes))
 }
 
-#[cfg(not(target_endian = "little"))]
 fn decode_le_words(bytes: &[u8]) -> Vec<u64> {
     assert_eq!(bytes.len() % 8, 0);
-    bytes
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|chunk| u64::from_le_bytes(*chunk))
+    let chunks = bytes.chunks_exact(8);
+    assert!(chunks.remainder().is_empty());
+    chunks
+        .map(|chunk| {
+            let bytes: [u8; 8] = chunk
+                .try_into()
+                .expect("chunk size is fixed at eight bytes");
+            u64::from_le_bytes(bytes)
+        })
         .collect()
 }
 
@@ -673,6 +752,206 @@ mod tests {
     use rand_core::{RngCore, SeedableRng};
 
     use super::*;
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn aligned_le_words_borrows_aligned_input() {
+        let expected = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+        // SAFETY: every `u64` byte is a valid `u8`, and `u8` has alignment one.
+        let (prefix, bytes, suffix) = unsafe { expected.as_slice().align_to::<u8>() };
+        assert!(prefix.is_empty() && suffix.is_empty());
+
+        let words = aligned_le_words(bytes);
+        assert_eq!(words.as_ref(), expected);
+        assert!(matches!(words, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn aligned_le_words_decodes_deliberately_unaligned_input() {
+        let expected = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+        let encoded = words_to_bytes(&expected);
+        let mut storage = vec![0_u8; encoded.len() + 8];
+        let offset = (0..8)
+            .find(|offset| (storage.as_ptr() as usize + offset) % std::mem::align_of::<u64>() != 0)
+            .expect("at least seven of eight consecutive byte offsets are unaligned");
+        storage[offset..offset + encoded.len()].copy_from_slice(&encoded);
+
+        let words = aligned_le_words(&storage[offset..offset + encoded.len()]);
+        assert_eq!(words.as_ref(), expected);
+        assert!(matches!(words, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn reusable_rotation_plan_matches_legacy_query_preparation() {
+        let d = 100;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.019).cos()).collect();
+        let plan = QueryRotationPlan::new(d, &specs);
+
+        let mut legacy_current = query.clone();
+        let mut legacy_layers = Vec::new();
+        for (layer, spec) in specs.iter().enumerate() {
+            if layer == 0 || spec.rotate {
+                Rotation::new(d, spec.seed).apply(&mut legacy_current);
+            }
+            legacy_layers.push(legacy_current.clone());
+        }
+        let planned_fp = prepare_fp_query_with_plan(&query, &plan, specs.len());
+        assert_eq!(planned_fp.layers, legacy_layers);
+        assert_eq!(prepare_fp_query(&query, &specs).layers, planned_fp.layers);
+
+        let encoded = encode_layers(&query, None, &specs, &grids);
+        let legacy_split = prepare_split_query(&query, &specs, &grids, 4);
+        let planned_split = prepare_split_query_with_plan(&query, &plan, &grids, 4);
+        for layer in 0..specs.len() {
+            assert_eq!(
+                legacy_split.score_layer(
+                    layer,
+                    &encoded.codes[layer],
+                    encoded.scales[layer],
+                    0.0,
+                    specs[layer],
+                ),
+                planned_split.score_layer(
+                    layer,
+                    &encoded.codes[layer],
+                    encoded.scales[layer],
+                    0.0,
+                    specs[layer],
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_plan_prepares_only_active_prefix() {
+        let d = 100;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 2,
+                seed: 22,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 33,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 2), build_grid(d, 4)];
+        let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.023).sin()).collect();
+        let plan = QueryRotationPlan::new(d, &specs);
+
+        #[cfg(debug_assertions)]
+        fht::debug_reset_apply_count();
+        let fp = prepare_fp_query_with_plan(&query, &plan, 1);
+        let split = prepare_split_query_with_plan(&query, &plan, &grids[..1], 4);
+
+        assert_eq!(fp.layers.len(), 1);
+        assert_eq!(split.layers.len(), 1);
+        #[cfg(debug_assertions)]
+        assert_eq!(fht::debug_apply_count(), 2);
+        let mut expected = query;
+        Rotation::new(d, specs[0].seed).apply(&mut expected);
+        assert_eq!(fp.layers[0], expected);
+    }
+
+    #[test]
+    fn rotation_plan_preserves_skipped_layers_and_prefix_split_scores() {
+        let d = 100;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 2,
+                seed: 22,
+                rotate: false,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 33,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 2), build_grid(d, 4)];
+        let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.029).cos()).collect();
+        let plan = QueryRotationPlan::new(d, &specs);
+
+        let mut layer_0 = query.clone();
+        Rotation::new(d, specs[0].seed).apply(&mut layer_0);
+        let layer_1 = layer_0.clone();
+        let mut layer_2 = layer_1.clone();
+        Rotation::new(d, specs[2].seed).apply(&mut layer_2);
+
+        let prefix_fp = prepare_fp_query_with_plan(&query, &plan, 2);
+        assert_eq!(prefix_fp.layers, [layer_0.clone(), layer_1.clone()]);
+        assert_eq!(prefix_fp.layers[0], prefix_fp.layers[1]);
+
+        let full_fp = prepare_fp_query_with_plan(&query, &plan, specs.len());
+        assert_eq!(full_fp.layers, [layer_0, layer_1, layer_2]);
+
+        let encoded = encode_layers(&query, None, &specs, &grids);
+        let prefix_split = prepare_split_query_with_plan(&query, &plan, &grids[..2], 4);
+        let full_split = prepare_split_query_with_plan(&query, &plan, &grids, 4);
+        for layer in 0..2 {
+            assert_eq!(
+                prefix_split.score_layer(
+                    layer,
+                    &encoded.codes[layer],
+                    encoded.scales[layer],
+                    0.0,
+                    specs[layer],
+                ),
+                full_split.score_layer(
+                    layer,
+                    &encoded.codes[layer],
+                    encoded.scales[layer],
+                    0.0,
+                    specs[layer],
+                ),
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn legacy_split_query_rejects_an_implicit_grid_prefix() {
+        let d = 64;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        prepare_split_query(&vec![0.25; d], &specs, &grids[..1], 4);
+    }
 
     #[test]
     fn layered_space_bookkeeping_is_exact() {
@@ -879,6 +1158,78 @@ mod tests {
                     specs[layer],
                 );
                 assert_relative_eq(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_batch_scoring_matches_dense_for_all_widths_and_dimensions() {
+        const ROWS: usize = 11;
+        let row_offsets = [10, 2, 7, 2, 0, 9, 4, 6, 1, 8];
+
+        for d in [64, 65] {
+            let query: Vec<f32> = (0..d).map(|i| ((i as f32 + 0.25) * 0.019).cos()).collect();
+            for bits in 1..=4 {
+                let spec = LayerSpec {
+                    bits,
+                    seed: 0x00b2_1d00 + u64::from(bits),
+                    rotate: true,
+                };
+                let grid = build_grid(d, bits);
+                let prepared = prepare_split_query(&query, &[spec], &[grid.clone()], 4);
+                if bits == 4 {
+                    assert!(matches!(
+                        &prepared.layers[0],
+                        PreparedSplitLayer::Grid {
+                            packed_lut_4: Some(_),
+                            ..
+                        }
+                    ));
+                }
+
+                let code_stride = if bits == 1 {
+                    d.div_ceil(64) * std::mem::size_of::<u64>()
+                } else {
+                    grid_plane::packed_len(d, bits)
+                };
+                let mut codes = Vec::with_capacity(ROWS * code_stride);
+                for row in 0..ROWS {
+                    let values: Vec<f32> = (0..d)
+                        .map(|i| {
+                            let phase = (i * 13 + row * 29 + bits as usize * 7) as f32;
+                            (phase * 0.017).sin() + (phase * 0.031).cos() * 0.25
+                        })
+                        .collect();
+                    if bits == 1 {
+                        let mut words = vec![0_u64; d.div_ceil(64)];
+                        encode_sign(&values, &mut words);
+                        codes.extend_from_slice(&words_to_bytes(&words));
+                    } else {
+                        let start = codes.len();
+                        codes.resize(start + code_stride, 0);
+                        encode_grid(
+                            &values,
+                            &grid.points,
+                            bits,
+                            &mut codes[start..start + code_stride],
+                        );
+                    }
+                }
+
+                let mut dense = vec![0.0; ROWS];
+                prepared.score_layer_batch_unscaled(0, &codes, code_stride, spec, &mut dense);
+                let mut indexed = vec![0.0; row_offsets.len()];
+                prepared.score_layer_batch_unscaled_indexed(
+                    0,
+                    &codes,
+                    code_stride,
+                    &row_offsets,
+                    spec,
+                    &mut indexed,
+                );
+                for (&row, &actual) in row_offsets.iter().zip(&indexed) {
+                    assert_relative_eq(actual, dense[row]);
+                }
             }
         }
     }

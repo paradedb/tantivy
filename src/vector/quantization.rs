@@ -27,174 +27,53 @@ pub const QUANTIZED_SCALE_STRIDE: usize = 2;
 pub const QUANTIZED_CONSTANT_STRIDE: usize = 4;
 /// One binary32 residual squared norm per posting-membership row when needed.
 pub const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
-/// Version of the per-segment, per-field measured calibration payload.
-pub const QUANTIZED_CALIBRATION_VERSION: u32 = 3;
-const LEGACY_QUANTIZED_CALIBRATION_VERSION: u32 = 1;
-const LEGACY_PER_DEPTH_CALIBRATION_VERSION: u32 = 2;
-const LEGACY_QUANTIZED_CALIBRATION_METADATA_LEN: usize = 12;
-const QUANTIZED_CALIBRATION_HEADER_LEN: usize = 8;
-const LEGACY_QUANTIZED_CALIBRATION_DEPTH_LEN: usize = 8;
-const QUANTIZED_CALIBRATION_DEPTH_LEN: usize = 12;
-
-pub(crate) fn quantized_calibration_metadata_len(layer_count: usize) -> usize {
-    QUANTIZED_CALIBRATION_HEADER_LEN + layer_count * QUANTIZED_CALIBRATION_DEPTH_LEN
+/// Origin of one settings-backed calibration measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum VectorQuantizationCalibrationSource {
+    HeldOut = 0,
+    RealQuery = 1,
 }
 
-/// Build-measured uncertainty calibration for one scorer prefix.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct VectorQuantizationDepthCalibration {
-    /// Signed normalized error center. The reader adds
-    /// `bias * scale * rho * ||q||` to the estimate.
-    pub(crate) bias: f32,
-    pub(crate) cal: f32,
-    pub(crate) sample_count: u32,
-}
-
-/// One calibration entry for every active prefix depth in a quantized field.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct VectorQuantizationCalibration {
-    pub(crate) depths: Vec<VectorQuantizationDepthCalibration>,
-}
-
-impl VectorQuantizationCalibration {
-    pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(quantized_calibration_metadata_len(self.depths.len()));
-        bytes.extend_from_slice(&QUANTIZED_CALIBRATION_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&(self.depths.len() as u32).to_le_bytes());
-        for depth in &self.depths {
-            bytes.extend_from_slice(&depth.bias.to_le_bytes());
-            bytes.extend_from_slice(&depth.cal.to_le_bytes());
-            bytes.extend_from_slice(&depth.sample_count.to_le_bytes());
-        }
-        bytes
-    }
-
-    pub(crate) fn decode(bytes: &[u8], layer_count: usize) -> crate::Result<Self> {
-        if bytes.len() < std::mem::size_of::<u32>() {
-            return Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(format!(
-                    "quantization calibration metadata has {} bytes; expected a version word",
-                    bytes.len()
-                )),
-            ));
-        }
-        let version = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        if version == LEGACY_QUANTIZED_CALIBRATION_VERSION {
-            if bytes.len() != LEGACY_QUANTIZED_CALIBRATION_METADATA_LEN {
-                return Err(TantivyError::DataCorruption(
-                    crate::error::DataCorruption::comment_only(format!(
-                        "legacy quantization calibration metadata has {} bytes; expected {}",
-                        bytes.len(),
-                        LEGACY_QUANTIZED_CALIBRATION_METADATA_LEN
-                    )),
-                ));
-            }
-            let depth = VectorQuantizationDepthCalibration {
-                bias: 0.0,
-                cal: f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-                sample_count: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            };
-            validate_calibration_depth(depth)?;
-            return Ok(Self {
-                depths: vec![depth; layer_count],
-            });
-        }
-        if version == LEGACY_PER_DEPTH_CALIBRATION_VERSION {
-            let expected_len = QUANTIZED_CALIBRATION_HEADER_LEN
-                + layer_count * LEGACY_QUANTIZED_CALIBRATION_DEPTH_LEN;
-            if bytes.len() != expected_len {
-                return Err(TantivyError::DataCorruption(
-                    crate::error::DataCorruption::comment_only(format!(
-                        "legacy per-depth quantization calibration metadata has {} bytes; \
-                         expected {expected_len}",
-                        bytes.len()
-                    )),
-                ));
-            }
-            let stored_layer_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-            if stored_layer_count != layer_count {
-                return Err(TantivyError::DataCorruption(
-                    crate::error::DataCorruption::comment_only(format!(
-                        "quantization calibration has {stored_layer_count} depths; expected \
-                         {layer_count}"
-                    )),
-                ));
-            }
-            let mut depths = Vec::with_capacity(layer_count);
-            for encoded in bytes[QUANTIZED_CALIBRATION_HEADER_LEN..]
-                .chunks_exact(LEGACY_QUANTIZED_CALIBRATION_DEPTH_LEN)
-            {
-                let depth = VectorQuantizationDepthCalibration {
-                    bias: 0.0,
-                    cal: f32::from_le_bytes(encoded[..4].try_into().unwrap()),
-                    sample_count: u32::from_le_bytes(encoded[4..8].try_into().unwrap()),
-                };
-                validate_calibration_depth(depth)?;
-                depths.push(depth);
-            }
-            return Ok(Self { depths });
-        }
-        if version != QUANTIZED_CALIBRATION_VERSION {
-            return Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(format!(
-                    "quantization calibration metadata version {version} is unsupported; expected \
-                     {QUANTIZED_CALIBRATION_VERSION}"
-                )),
-            ));
-        }
-        let expected_len = quantized_calibration_metadata_len(layer_count);
-        if bytes.len() != expected_len {
-            return Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(format!(
-                    "quantization calibration metadata has {} bytes; expected {expected_len}",
-                    bytes.len()
-                )),
-            ));
-        }
-        let stored_layer_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        if stored_layer_count != layer_count {
-            return Err(TantivyError::DataCorruption(
-                crate::error::DataCorruption::comment_only(format!(
-                    "quantization calibration has {stored_layer_count} depths; expected \
-                     {layer_count}"
-                )),
-            ));
-        }
-        let mut depths = Vec::with_capacity(layer_count);
-        for encoded in
-            bytes[QUANTIZED_CALIBRATION_HEADER_LEN..].chunks_exact(QUANTIZED_CALIBRATION_DEPTH_LEN)
-        {
-            let depth = VectorQuantizationDepthCalibration {
-                bias: f32::from_le_bytes(encoded[..4].try_into().unwrap()),
-                cal: f32::from_le_bytes(encoded[4..8].try_into().unwrap()),
-                sample_count: u32::from_le_bytes(encoded[8..12].try_into().unwrap()),
-            };
-            validate_calibration_depth(depth)?;
-            depths.push(depth);
-        }
-        Ok(Self { depths })
+impl Serialize for VectorQuantizationCalibrationSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        serializer.serialize_u8(*self as u8)
     }
 }
 
-fn validate_calibration_depth(depth: VectorQuantizationDepthCalibration) -> crate::Result<()> {
-    if !depth.bias.is_finite() {
-        return Err(TantivyError::DataCorruption(
-            crate::error::DataCorruption::comment_only(format!(
-                "quantization calibration bias must be finite, got {}",
-                depth.bias
-            )),
-        ));
+impl<'de> Deserialize<'de> for VectorQuantizationCalibrationSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        match u8::deserialize(deserializer)? {
+            0 => Ok(Self::HeldOut),
+            1 => Ok(Self::RealQuery),
+            value => Err(serde::de::Error::custom(format!(
+                "quantization calibration source {value} is unsupported; expected 0 or 1"
+            ))),
+        }
     }
-    if !depth.cal.is_finite() || depth.cal < 0.0 {
-        return Err(TantivyError::DataCorruption(
-            crate::error::DataCorruption::comment_only(format!(
-                "quantization calibration must be finite and non-negative, got {}",
-                depth.cal
-            )),
-        ));
-    }
-    Ok(())
 }
+
+/// Bias center and uncertainty spread for one active scorer prefix.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct VectorQuantizationDepthCalibration {
+    pub bias: f32,
+    pub spread: f32,
+    pub sample_count: u32,
+    pub source: VectorQuantizationCalibrationSource,
+}
+
+impl PartialEq for VectorQuantizationDepthCalibration {
+    fn eq(&self, other: &Self) -> bool {
+        self.bias.to_bits() == other.bias.to_bits()
+            && self.spread.to_bits() == other.spread.to_bits()
+            && self.sample_count == other.sample_count
+            && self.source == other.source
+    }
+}
+
+impl Eq for VectorQuantizationDepthCalibration {}
 
 /// The stored-code construction and corresponding scoring kernel.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -284,6 +163,8 @@ pub struct VectorQuantizationConfig {
     pub norm_policy: VectorNormPolicy,
     pub layers: Vec<VectorQuantizationLayer>,
     pub grids: Vec<VectorQuantizationGrid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    calibration: Option<Vec<VectorQuantizationDepthCalibration>>,
 }
 
 impl VectorQuantizationConfig {
@@ -348,6 +229,7 @@ impl VectorQuantizationConfig {
             norm_policy: VectorNormPolicy::for_options(options),
             layers,
             grids,
+            calibration: None,
         };
         config.validate(options)?;
         Ok(config)
@@ -491,6 +373,63 @@ impl VectorQuantizationConfig {
                  {required_point_grids:?} and stay within model widths {model_widths:?}"
             )));
         }
+        if let Some(calibration) = &self.calibration {
+            validate_calibration(calibration, self.layers.len()).map_err(invalid)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the settings-backed calibration, or `None` when quantized
+    /// scoring must remain unavailable.
+    pub fn calibration(&self) -> Option<&[VectorQuantizationDepthCalibration]> {
+        self.calibration.as_deref()
+    }
+
+    /// Install held-out calibration unless real-query calibration already
+    /// owns the field. Real-query values can only be replaced by the explicit
+    /// real-query update path.
+    pub fn install_held_out_calibration(
+        &mut self,
+        calibration: Vec<VectorQuantizationDepthCalibration>,
+    ) -> crate::Result<()> {
+        self.install_calibration(calibration, VectorQuantizationCalibrationSource::HeldOut)
+    }
+
+    /// Install caller-query calibration. This is the sole update path allowed
+    /// to replace an existing real-query calibration.
+    pub fn install_real_query_calibration(
+        &mut self,
+        calibration: Vec<VectorQuantizationDepthCalibration>,
+    ) -> crate::Result<()> {
+        self.install_calibration(calibration, VectorQuantizationCalibrationSource::RealQuery)
+    }
+
+    fn install_calibration(
+        &mut self,
+        calibration: Vec<VectorQuantizationDepthCalibration>,
+        source: VectorQuantizationCalibrationSource,
+    ) -> crate::Result<()> {
+        validate_calibration(&calibration, self.layers.len())
+            .map_err(TantivyError::InvalidArgument)?;
+        if calibration.iter().any(|depth| depth.source != source) {
+            return Err(TantivyError::InvalidArgument(format!(
+                "all quantization calibration entries must have source {source:?}"
+            )));
+        }
+        if source != VectorQuantizationCalibrationSource::RealQuery
+            && self.calibration.as_ref().is_some_and(|depths| {
+                depths
+                    .iter()
+                    .any(|depth| depth.source == VectorQuantizationCalibrationSource::RealQuery)
+            })
+        {
+            return Err(TantivyError::InvalidArgument(
+                "real-query quantization calibration can only be replaced by the real-query \
+                 update path"
+                    .to_string(),
+            ));
+        }
+        self.calibration = Some(calibration);
         Ok(())
     }
 
@@ -512,6 +451,43 @@ impl VectorQuantizationConfig {
     pub fn needs_residual_norm(&self) -> bool {
         self.metric == Metric::L2
     }
+}
+
+fn validate_calibration(
+    calibration: &[VectorQuantizationDepthCalibration],
+    layer_count: usize,
+) -> Result<(), String> {
+    if calibration.len() != layer_count {
+        return Err(format!(
+            "calibration has {} depths; expected {layer_count}",
+            calibration.len()
+        ));
+    }
+    for (depth, value) in calibration.iter().enumerate() {
+        if !value.bias.is_finite() {
+            return Err(format!(
+                "calibration depth {depth} bias must be finite, got {}",
+                value.bias
+            ));
+        }
+        if !value.spread.is_finite() || value.spread < 0.0 {
+            return Err(format!(
+                "calibration depth {depth} spread must be finite and non-negative, got {}",
+                value.spread
+            ));
+        }
+        if value.sample_count == 0 {
+            return Err(format!(
+                "calibration depth {depth} sample_count must be greater than zero"
+            ));
+        }
+        if depth != 0 && value.source != calibration[0].source {
+            return Err(
+                "quantization calibration source must be uniform across all depths".to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Validate all field-keyed configurations against an index schema.
@@ -600,6 +576,7 @@ mod tests {
                 })
                 .collect(),
             grids: grid_bits.into_iter().map(grid).collect(),
+            calibration: None,
         }
     }
 
@@ -609,59 +586,46 @@ mod tests {
     }
 
     #[test]
-    fn calibration_metadata_round_trips_and_rejects_invalid_values() {
-        let metadata = VectorQuantizationCalibration {
-            depths: vec![
-                VectorQuantizationDepthCalibration {
-                    bias: -0.5,
-                    cal: 2.25,
-                    sample_count: 1_024,
-                },
-                VectorQuantizationDepthCalibration {
-                    bias: 0.25,
-                    cal: 1.75,
-                    sample_count: 1_000,
-                },
-            ],
-        };
-        assert_eq!(
-            VectorQuantizationCalibration::decode(&metadata.encode(), 2).unwrap(),
-            metadata
-        );
+    fn settings_calibration_round_trips_and_enforces_precedence() {
+        let mut config = config(&[1, 4]);
+        let held_out = vec![
+            VectorQuantizationDepthCalibration {
+                bias: -0.5,
+                spread: 2.25,
+                sample_count: 1_024,
+                source: VectorQuantizationCalibrationSource::HeldOut,
+            };
+            2
+        ];
+        config
+            .install_held_out_calibration(held_out.clone())
+            .unwrap();
+        let real_query = held_out
+            .iter()
+            .map(|depth| VectorQuantizationDepthCalibration {
+                source: VectorQuantizationCalibrationSource::RealQuery,
+                ..*depth
+            })
+            .collect::<Vec<_>>();
+        config
+            .install_real_query_calibration(real_query.clone())
+            .unwrap();
+        assert!(config.install_held_out_calibration(held_out).is_err());
+        let json = serde_json::to_string(&config).unwrap();
+        let decoded: VectorQuantizationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.calibration(), Some(real_query.as_slice()));
 
-        let mut invalid = metadata.encode();
-        invalid[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
-        assert!(VectorQuantizationCalibration::decode(&invalid, 2).is_err());
+        let mut zero_samples = real_query.clone();
+        zero_samples[0].sample_count = 0;
+        assert!(config.install_real_query_calibration(zero_samples).is_err());
 
-        let mut legacy = [0_u8; LEGACY_QUANTIZED_CALIBRATION_METADATA_LEN];
-        legacy[..4].copy_from_slice(&LEGACY_QUANTIZED_CALIBRATION_VERSION.to_le_bytes());
-        legacy[4..8].copy_from_slice(&3.25_f32.to_le_bytes());
-        legacy[8..12].copy_from_slice(&777_u32.to_le_bytes());
-        let decoded = VectorQuantizationCalibration::decode(&legacy, 2).unwrap();
-        assert_eq!(
-            decoded.depths,
-            vec![
-                VectorQuantizationDepthCalibration {
-                    bias: 0.0,
-                    cal: 3.25,
-                    sample_count: 777,
-                };
-                2
-            ]
-        );
-
-        let mut legacy_per_depth = vec![0_u8; 8 + 2 * 8];
-        legacy_per_depth[..4].copy_from_slice(&LEGACY_PER_DEPTH_CALIBRATION_VERSION.to_le_bytes());
-        legacy_per_depth[4..8].copy_from_slice(&2_u32.to_le_bytes());
-        legacy_per_depth[8..12].copy_from_slice(&3.0_f32.to_le_bytes());
-        legacy_per_depth[12..16].copy_from_slice(&500_u32.to_le_bytes());
-        legacy_per_depth[16..20].copy_from_slice(&2.0_f32.to_le_bytes());
-        legacy_per_depth[20..24].copy_from_slice(&600_u32.to_le_bytes());
-        let decoded = VectorQuantizationCalibration::decode(&legacy_per_depth, 2).unwrap();
-        assert_eq!(decoded.depths[0].bias, 0.0);
-        assert_eq!(decoded.depths[0].cal, 3.0);
-        assert_eq!(decoded.depths[1].bias, 0.0);
-        assert_eq!(decoded.depths[1].cal, 2.0);
+        let mut mixed = config.clone();
+        let mut mixed_depths = real_query;
+        mixed_depths[0].source = VectorQuantizationCalibrationSource::HeldOut;
+        mixed.calibration = Some(mixed_depths);
+        assert!(mixed
+            .validate(&VectorOptions::new(768, Metric::Dot))
+            .is_err());
     }
 
     #[test]

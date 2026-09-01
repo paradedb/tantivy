@@ -95,7 +95,8 @@ pub(crate) mod vec_slot {
     /// Exact little-endian f32 residual squared norms for metric policies
     /// that require them during distance assembly.
     pub(crate) const QUANTIZED_RESIDUAL_NORMS: usize = 14;
-    /// Per-segment, per-field measured uncertainty calibration metadata.
+    /// Retired pre-release slot. Readers ignore it and writers never emit it;
+    /// the number remains reserved so later slots cannot reuse the bytes.
     pub(crate) const QUANTIZED_CALIBRATION: usize = 15;
 }
 

@@ -118,7 +118,7 @@ pub fn build_lut(u: &[f32], grid: &[f32], bits: u8) -> Vec<f32> {
 pub fn build_packed_lut_4(lut: &[f32], d: usize) -> Vec<f32> {
     assert_eq!(lut.len(), d * 16);
     let pairs = d / 2;
-    let mut packed_lut = Vec::with_capacity(pairs * 256);
+    let mut packed_lut = Vec::with_capacity(packed_lut_len_4(d));
     for pair in 0..pairs {
         let low_lut = pair * 32;
         let high_lut = low_lut + 16;
@@ -129,7 +129,16 @@ pub fn build_packed_lut_4(lut: &[f32], d: usize) -> Vec<f32> {
             );
         }
     }
+    if !d.is_multiple_of(2) {
+        let tail_lut = pairs * 32;
+        packed_lut.extend_from_slice(&lut[tail_lut..tail_lut + 16]);
+    }
+    debug_assert_eq!(packed_lut.len(), packed_lut_len_4(d));
     packed_lut
+}
+
+fn packed_lut_len_4(d: usize) -> usize {
+    (d / 2) * 256 + (d % 2) * 16
 }
 
 pub fn score_batch_packed_4(
@@ -139,13 +148,9 @@ pub fn score_batch_packed_4(
     d: usize,
     out: &mut [f32],
 ) {
-    assert!(
-        d.is_multiple_of(2),
-        "packed b=4 LUT batches require an even dimension"
-    );
     assert_eq!(code_stride, packed_len(d, 4));
     assert_eq!(codes.len(), out.len() * code_stride);
-    assert_eq!(packed_lut.len(), (d / 2) * 256);
+    assert_eq!(packed_lut.len(), packed_lut_len_4(d));
     let pairs = d / 2;
     let mut row = 0;
     while row + 8 <= out.len() {
@@ -171,6 +176,17 @@ pub fn score_batch_packed_4(
                 }
             }
         }
+        if !d.is_multiple_of(2) {
+            let lut_base = pairs * 256;
+            for lane in 0..8 {
+                // SAFETY: an odd dimension leaves one valid low nibble in
+                // byte `pairs` and one trailing 16-entry LUT.
+                unsafe {
+                    let packed = *codes.get_unchecked(offsets[lane] + pairs);
+                    sums[lane] += *packed_lut.get_unchecked(lut_base + (packed & 0x0f) as usize);
+                }
+            }
+        }
         out[row..row + 8].copy_from_slice(&sums);
         row += 8;
     }
@@ -181,6 +197,13 @@ pub fn score_batch_packed_4(
             unsafe {
                 sum += *packed_lut
                     .get_unchecked(pair * 256 + *packed_row.get_unchecked(pair) as usize);
+            }
+        }
+        if !d.is_multiple_of(2) {
+            unsafe {
+                sum += *packed_lut.get_unchecked(
+                    pairs * 256 + (*packed_row.get_unchecked(pairs) & 0x0f) as usize,
+                );
             }
         }
         *score_out = sum;
@@ -198,17 +221,13 @@ pub fn score_batch_packed_4_indexed(
     d: usize,
     out: &mut [f32],
 ) {
-    assert!(
-        d.is_multiple_of(2),
-        "packed b=4 LUT batches require an even dimension"
-    );
     assert_eq!(code_stride, packed_len(d, 4));
     assert_eq!(codes.len() % code_stride, 0);
     assert_eq!(row_offsets.len(), out.len());
     assert!(row_offsets
         .iter()
         .all(|&row| row < codes.len() / code_stride));
-    assert_eq!(packed_lut.len(), (d / 2) * 256);
+    assert_eq!(packed_lut.len(), packed_lut_len_4(d));
     let pairs = d / 2;
     let mut row = 0;
     while row + 8 <= out.len() {
@@ -234,6 +253,15 @@ pub fn score_batch_packed_4_indexed(
                 }
             }
         }
+        if !d.is_multiple_of(2) {
+            let lut_base = pairs * 256;
+            for lane in 0..8 {
+                unsafe {
+                    let packed = *codes.get_unchecked(offsets[lane] + pairs);
+                    sums[lane] += *packed_lut.get_unchecked(lut_base + (packed & 0x0f) as usize);
+                }
+            }
+        }
         out[row..row + 8].copy_from_slice(&sums);
         row += 8;
     }
@@ -244,6 +272,13 @@ pub fn score_batch_packed_4_indexed(
             unsafe {
                 sum += *packed_lut
                     .get_unchecked(pair * 256 + *codes.get_unchecked(offset + pair) as usize);
+            }
+        }
+        if !d.is_multiple_of(2) {
+            unsafe {
+                sum += *packed_lut.get_unchecked(
+                    pairs * 256 + (*codes.get_unchecked(offset + pairs) & 0x0f) as usize,
+                );
             }
         }
         *score_out = sum;
@@ -302,6 +337,142 @@ pub fn score_batch(
             }
         }
         _ => unreachable!("grid widths are validated as 2..=4"),
+    }
+}
+
+/// Score selected rows from one borrowed fixed-stride posting range without
+/// gathering or copying their packed code bytes. `row_offsets` are local row
+/// indices into `codes` and may be sparse or repeated.
+pub fn score_batch_indexed(
+    codes: &[u8],
+    code_stride: usize,
+    row_offsets: &[usize],
+    lut: &[f32],
+    d: usize,
+    bits: u8,
+    out: &mut [f32],
+) {
+    assert_eq!(code_stride, packed_len(d, bits));
+    assert_eq!(codes.len() % code_stride, 0);
+    assert_eq!(row_offsets.len(), out.len());
+    assert!(row_offsets
+        .iter()
+        .all(|&row| row < codes.len() / code_stride));
+    let levels = 1usize << bits;
+    assert_eq!(lut.len(), d * levels);
+    match bits {
+        4 => score_batch_4_indexed(codes, code_stride, row_offsets, lut, d, out),
+        2 => score_batch_2_indexed(codes, code_stride, row_offsets, lut, d, out),
+        3 => {
+            for (&row_offset, score_out) in row_offsets.iter().zip(out) {
+                let base = row_offset * code_stride;
+                let packed_row = &codes[base..base + code_stride];
+                let mut sum = 0.0;
+                for i in 0..d {
+                    sum += lut[i * levels + code_at_3(packed_row, i) as usize];
+                }
+                *score_out = sum;
+            }
+        }
+        _ => unreachable!("grid widths are validated as 2..=4"),
+    }
+}
+
+#[inline(always)]
+fn score_batch_4_indexed(
+    codes: &[u8],
+    stride: usize,
+    row_offsets: &[usize],
+    lut: &[f32],
+    d: usize,
+    out: &mut [f32],
+) {
+    let pairs = d / 2;
+    let mut row = 0;
+    while row + 8 <= out.len() {
+        let offsets = [
+            row_offsets[row] * stride,
+            row_offsets[row + 1] * stride,
+            row_offsets[row + 2] * stride,
+            row_offsets[row + 3] * stride,
+            row_offsets[row + 4] * stride,
+            row_offsets[row + 5] * stride,
+            row_offsets[row + 6] * stride,
+            row_offsets[row + 7] * stride,
+        ];
+        let mut sums = [0.0_f32; 8];
+        for pair in 0..pairs {
+            let low_lut = pair * 32;
+            let high_lut = low_lut + 16;
+            for lane in 0..8 {
+                unsafe {
+                    let packed = *codes.get_unchecked(offsets[lane] + pair);
+                    sums[lane] += *lut.get_unchecked(low_lut + (packed & 0x0f) as usize);
+                    sums[lane] += *lut.get_unchecked(high_lut + (packed >> 4) as usize);
+                }
+            }
+        }
+        if !d.is_multiple_of(2) {
+            let low_lut = pairs * 32;
+            for lane in 0..8 {
+                unsafe {
+                    let packed = *codes.get_unchecked(offsets[lane] + pairs);
+                    sums[lane] += *lut.get_unchecked(low_lut + (packed & 0x0f) as usize);
+                }
+            }
+        }
+        out[row..row + 8].copy_from_slice(&sums);
+        row += 8;
+    }
+    for (local, score_out) in out[row..].iter_mut().enumerate() {
+        let offset = row_offsets[row + local] * stride;
+        let mut sum = 0.0;
+        for pair in 0..pairs {
+            unsafe {
+                let packed = *codes.get_unchecked(offset + pair);
+                let low_lut = pair * 32;
+                sum += *lut.get_unchecked(low_lut + (packed & 0x0f) as usize);
+                sum += *lut.get_unchecked(low_lut + 16 + (packed >> 4) as usize);
+            }
+        }
+        if !d.is_multiple_of(2) {
+            unsafe {
+                sum += *lut.get_unchecked(
+                    pairs * 32 + (*codes.get_unchecked(offset + pairs) & 0x0f) as usize,
+                );
+            }
+        }
+        *score_out = sum;
+    }
+}
+
+#[inline(always)]
+fn score_batch_2_indexed(
+    codes: &[u8],
+    stride: usize,
+    row_offsets: &[usize],
+    lut: &[f32],
+    d: usize,
+    out: &mut [f32],
+) {
+    for (&row_offset, score_out) in row_offsets.iter().zip(out) {
+        let base = row_offset * stride;
+        let packed_row = &codes[base..base + stride];
+        let mut sum = 0.0;
+        let full_bytes = d / 4;
+        for (byte_index, &packed) in packed_row[..full_bytes].iter().enumerate() {
+            let lut_base = byte_index * 16;
+            sum += lut[lut_base + (packed & 0x03) as usize];
+            sum += lut[lut_base + 4 + ((packed >> 2) & 0x03) as usize];
+            sum += lut[lut_base + 8 + ((packed >> 4) & 0x03) as usize];
+            sum += lut[lut_base + 12 + (packed >> 6) as usize];
+        }
+        for i in full_bytes * 4..d {
+            let packed = packed_row[i / 4];
+            let code = (packed >> (2 * (i % 4))) & 0x03;
+            sum += lut[i * 4 + code as usize];
+        }
+        *score_out = sum;
     }
 }
 
@@ -494,6 +665,92 @@ mod tests {
                     let tolerance = expected.abs().max(1.0) * 1e-5;
                     assert!((expected - actual).abs() <= tolerance, "d={d}, b={bits}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_scoring_matches_contiguous_and_scalar_for_sparse_rows() {
+        let row_offsets = [17, 0, 8, 22, 3, 11, 11, 5, 19];
+        for d in [65, 100, 128] {
+            for bits in 2..=4 {
+                let grid = build_grid(d, bits);
+                let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.043).cos()).collect();
+                let lut = build_lut(&query, &grid.points, bits);
+                let stride = packed_len(d, bits);
+                let rows = 23;
+                let mut packed = vec![0_u8; rows * stride];
+                for row in 0..rows {
+                    let codes: Vec<u8> = (0..d)
+                        .map(|i| ((i * 7 + row * 3) % (1usize << bits)) as u8)
+                        .collect();
+                    pack(&codes, bits, &mut packed[row * stride..(row + 1) * stride]);
+                }
+
+                let expected: Vec<f32> = row_offsets
+                    .iter()
+                    .map(|&row| score(&packed[row * stride..(row + 1) * stride], &lut, d, bits))
+                    .collect();
+                let mut contiguous = vec![0.0; rows];
+                score_batch(&packed, stride, &lut, d, bits, &mut contiguous);
+                let mut indexed = vec![0.0; row_offsets.len()];
+                score_batch_indexed(&packed, stride, &row_offsets, &lut, d, bits, &mut indexed);
+
+                for ((&row, expected), actual) in row_offsets.iter().zip(expected).zip(indexed) {
+                    let tolerance = expected.abs().max(1.0) * 1e-5;
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "indexed: d={d}, b={bits}, row={row}, actual={actual}, expected={expected}"
+                    );
+                    assert!(
+                        (actual - contiguous[row]).abs() <= tolerance,
+                        "contiguous: d={d}, b={bits}, row={row}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_b4_indexed_scoring_supports_odd_dimensions() {
+        let row_offsets = [18, 2, 9, 0, 14, 6, 6];
+        for d in [65, 100, 128, 769] {
+            let bits = 4;
+            let grid = build_grid(d, bits);
+            let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.031).sin()).collect();
+            let lut = build_lut(&query, &grid.points, bits);
+            let packed_lut = build_packed_lut_4(&lut, d);
+            assert_eq!(packed_lut.len(), packed_lut_len_4(d));
+            let stride = packed_len(d, bits);
+            let rows = 19;
+            let mut packed = vec![0_u8; rows * stride];
+            for row in 0..rows {
+                let codes: Vec<u8> = (0..d).map(|i| ((i * 5 + row * 7) % 16) as u8).collect();
+                pack(&codes, bits, &mut packed[row * stride..(row + 1) * stride]);
+            }
+
+            let mut contiguous = vec![0.0; rows];
+            score_batch_packed_4(&packed, stride, &packed_lut, d, &mut contiguous);
+            let mut indexed = vec![0.0; row_offsets.len()];
+            score_batch_packed_4_indexed(
+                &packed,
+                stride,
+                &row_offsets,
+                &packed_lut,
+                d,
+                &mut indexed,
+            );
+            for (&row, actual) in row_offsets.iter().zip(indexed) {
+                let expected = score(&packed[row * stride..(row + 1) * stride], &lut, d, bits);
+                let tolerance = expected.abs().max(1.0) * 1e-5;
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "indexed: d={d}, row={row}, actual={actual}, expected={expected}"
+                );
+                assert!(
+                    (actual - contiguous[row]).abs() <= tolerance,
+                    "contiguous: d={d}, row={row}"
+                );
             }
         }
     }

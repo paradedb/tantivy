@@ -202,6 +202,68 @@ pub fn estimate_asym_batch_unscaled(
     }
 }
 
+/// Score selected rows from one borrowed fixed-stride posting range without
+/// gathering or copying their packed sign words. `row_offsets` are local row
+/// indices into `rows` and may be sparse or repeated.
+#[inline(always)]
+pub fn estimate_asym_batch_unscaled_indexed(
+    rows: &[u64],
+    words_per_row: usize,
+    row_offsets: &[usize],
+    q: &QueryPlanes,
+    out: &mut [f32],
+) {
+    assert!(words_per_row > 0);
+    assert_eq!(rows.len() % words_per_row, 0);
+    assert_eq!(row_offsets.len(), out.len());
+    assert!(row_offsets
+        .iter()
+        .all(|&row| row < rows.len() / words_per_row));
+    assert!(!q.planes.is_empty());
+    assert!(q.planes.iter().all(|plane| plane.len() == words_per_row));
+
+    // Keep the production Bq=4 path fused across all query bitplanes, just as
+    // the contiguous batch entry does. Only the row base comes from the index
+    // stream; the packed posting remains borrowed in place.
+    if let [p0, p1, p2, p3] = q.planes.as_slice() {
+        for (&row_offset, score) in row_offsets.iter().zip(out) {
+            let row_base = row_offset * words_per_row;
+            let row = &rows[row_base..row_base + words_per_row];
+            let mut positives = 0_u32;
+            let mut weighted_sum = 0_u64;
+            for ((((signs, &q0), &q1), &q2), &q3) in
+                row.iter().copied().zip(p0).zip(p1).zip(p2).zip(p3)
+            {
+                positives += signs.count_ones();
+                weighted_sum += u64::from((signs & q0).count_ones());
+                weighted_sum += u64::from((signs & q1).count_ones()) << 1;
+                weighted_sum += u64::from((signs & q2).count_ones()) << 2;
+                weighted_sum += u64::from((signs & q3).count_ones()) << 3;
+            }
+            let sign_sum = i64::from(positives) * 2 - q.d as i64;
+            let code_sum = i128::from(weighted_sum) * 2 - i128::from(q.sum_codes);
+            *score = q.lo * sign_sum as f32 + q.delta * code_sum as f32;
+        }
+        return;
+    }
+
+    for (&row_offset, score) in row_offsets.iter().zip(out) {
+        let row_base = row_offset * words_per_row;
+        let row = &rows[row_base..row_base + words_per_row];
+        let mut positives = 0_u32;
+        let mut weighted_sum = 0_u64;
+        for (word_idx, &signs) in row.iter().enumerate() {
+            positives += signs.count_ones();
+            for (bit, plane) in q.planes.iter().enumerate() {
+                weighted_sum += u64::from((signs & plane[word_idx]).count_ones()) << bit;
+            }
+        }
+        let sign_sum = i64::from(positives) * 2 - q.d as i64;
+        let code_sum = i128::from(weighted_sum) * 2 - i128::from(q.sum_codes);
+        *score = q.lo * sign_sum as f32 + q.delta * code_sum as f32;
+    }
+}
+
 pub fn estimate_fp(x: &[u64], scale: u16, query: &[f32]) -> f32 {
     assert!(!query.is_empty());
     assert_eq!(x.len(), packed_words(query.len()));
@@ -324,6 +386,60 @@ mod tests {
                 "decoded={decoded_dot}, popcount={popcount_estimate}, absolute={absolute}, \
                  relative={relative}"
             );
+        }
+    }
+
+    #[test]
+    fn indexed_batch_matches_contiguous_and_scalar_for_sparse_rows() {
+        let row_offsets = [17, 0, 8, 22, 3, 11, 11, 5];
+        for d in [65, 128] {
+            let words_per_row = packed_words(d);
+            let rows = 23;
+            let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.071).cos()).collect();
+            for bq in [1, 4] {
+                let prepared = prepare_query(&query, bq);
+                let mut packed = vec![0_u64; rows * words_per_row];
+                for row in 0..rows {
+                    let values: Vec<f32> = (0..d)
+                        .map(|i| {
+                            if (i * 7 + row * 5) % 11 < 6 {
+                                1.0
+                            } else {
+                                -1.0
+                            }
+                        })
+                        .collect();
+                    pack(
+                        &values,
+                        &mut packed[row * words_per_row..(row + 1) * words_per_row],
+                    );
+                }
+
+                let expected: Vec<f32> = row_offsets
+                    .iter()
+                    .map(|&row| {
+                        estimate_asym_unscaled(
+                            &packed[row * words_per_row..(row + 1) * words_per_row],
+                            &prepared,
+                        )
+                    })
+                    .collect();
+                let mut contiguous = vec![0.0; rows];
+                estimate_asym_batch_unscaled(&packed, words_per_row, &prepared, &mut contiguous);
+                let mut indexed = vec![0.0; row_offsets.len()];
+                estimate_asym_batch_unscaled_indexed(
+                    &packed,
+                    words_per_row,
+                    &row_offsets,
+                    &prepared,
+                    &mut indexed,
+                );
+
+                for ((&row, expected), actual) in row_offsets.iter().zip(expected).zip(indexed) {
+                    assert_eq!(actual, expected, "d={d}, bq={bq}, row={row}");
+                    assert_eq!(actual, contiguous[row], "d={d}, bq={bq}, row={row}");
+                }
+            }
         }
     }
 

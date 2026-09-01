@@ -8,11 +8,8 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use cascade::{
-    encode_batch_in_place_with_residual_observer, prepare_centroid, prepare_fp_query, LayerSpec,
-};
-use quant_model::f16::f16_to_f32;
-use quant_model::{build_grid, Grid, DEFAULT_CAL};
+use cascade::{encode_batch_in_place, prepare_centroid, LayerSpec};
+use quant_model::{build_grid, Grid};
 
 use super::{
     decode_row, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
@@ -26,9 +23,6 @@ use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT, HEADER_LEN};
-use crate::vector::quantization::{
-    VectorQuantizationCalibration, VectorQuantizationDepthCalibration,
-};
 use crate::vector::{
     quantized_code_stride, residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig,
     RelativeNeighborhoodGraph, VectorQuantizationConfig, VectorQuantizer,
@@ -70,259 +64,6 @@ struct QuantizedLayerSlots {
     codes: Vec<u8>,
     scales: Vec<u16>,
     constants: Vec<f32>,
-}
-
-const QUANTIZATION_CALIBRATION_SAMPLE_ROWS: usize = 1_024;
-// Production-query calibration measured from 1,000 Cohere scan rows. The
-// held-out stored-vector protocol measures encoder error but underestimates
-// the query-distribution tail seen by the real scan workload. Persist this
-// observed floor until an index build has a larger field-local measurement.
-const REAL_QUERY_CALIBRATION: VectorQuantizationDepthCalibration =
-    VectorQuantizationDepthCalibration {
-        bias: 0.0,
-        cal: 2.265_918_2,
-        sample_count: 1_000,
-    };
-
-struct QuantizationCalibrator {
-    interval: usize,
-    rows_seen: usize,
-    stored_query: Vec<CalibrationMeasurement>,
-    gaussian_query: Vec<CalibrationMeasurement>,
-    heldout_query: Vec<CalibrationMeasurement>,
-    heldout_query_by_source: Vec<Vec<CalibrationMeasurement>>,
-}
-
-#[derive(Clone, Default)]
-struct CalibrationMeasurement {
-    sample_count: usize,
-    empirical_squared_sum: f64,
-    empirical_model_cross_sum: f64,
-    model_variance_sum: f64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct BiasStability {
-    query_count: usize,
-    mean: f64,
-    stddev: f64,
-    min: f64,
-    max: f64,
-}
-
-struct QuantizationCalibrationReport {
-    stored_query: Vec<VectorQuantizationDepthCalibration>,
-    gaussian_query: Vec<VectorQuantizationDepthCalibration>,
-    heldout_query: Vec<VectorQuantizationDepthCalibration>,
-    heldout_bias_stability: Vec<BiasStability>,
-}
-
-fn persisted_depth_calibration(
-    heldout: VectorQuantizationDepthCalibration,
-) -> VectorQuantizationDepthCalibration {
-    let heldout_envelope = f64::from(heldout.bias).hypot(f64::from(heldout.cal));
-    let real_query_envelope =
-        f64::from(REAL_QUERY_CALIBRATION.bias).hypot(f64::from(REAL_QUERY_CALIBRATION.cal));
-    if heldout.sample_count == 0 || heldout_envelope >= real_query_envelope {
-        heldout
-    } else {
-        REAL_QUERY_CALIBRATION
-    }
-}
-
-impl CalibrationMeasurement {
-    fn observe(
-        &mut self,
-        error: &[f32],
-        scale: u16,
-        final_rho: f64,
-        query: &[f32],
-        query_norm: f32,
-    ) {
-        let dot_error = error
-            .iter()
-            .zip(query)
-            .map(|(&value, &query)| f64::from(value) * f64::from(query))
-            .sum::<f64>();
-        let model_sigma = f64::from(f16_to_f32(scale)) * final_rho * f64::from(query_norm);
-        self.empirical_squared_sum += dot_error.powi(2);
-        self.empirical_model_cross_sum += dot_error * model_sigma;
-        self.model_variance_sum += model_sigma.powi(2);
-        self.sample_count += 1;
-    }
-
-    fn finish(self) -> VectorQuantizationDepthCalibration {
-        if self.sample_count == 0 || self.model_variance_sum == 0.0 {
-            return VectorQuantizationDepthCalibration {
-                bias: 0.0,
-                cal: DEFAULT_CAL as f32,
-                sample_count: self.sample_count as u32,
-            };
-        }
-        let bias = self.empirical_model_cross_sum / self.model_variance_sum;
-        let centered_squared_sum = (self.empirical_squared_sum
-            - 2.0 * bias * self.empirical_model_cross_sum
-            + bias.powi(2) * self.model_variance_sum)
-            .max(0.0);
-        let cal = (centered_squared_sum / self.model_variance_sum).sqrt();
-        VectorQuantizationDepthCalibration {
-            bias: bias as f32,
-            cal: cal as f32,
-            sample_count: self.sample_count as u32,
-        }
-    }
-}
-
-impl QuantizationCalibrator {
-    fn new(num_rows: usize, layer_count: usize, heldout_query_count: usize) -> Self {
-        Self {
-            interval: num_rows
-                .div_ceil(QUANTIZATION_CALIBRATION_SAMPLE_ROWS)
-                .max(1),
-            rows_seen: 0,
-            stored_query: vec![CalibrationMeasurement::default(); layer_count],
-            gaussian_query: vec![CalibrationMeasurement::default(); layer_count],
-            heldout_query: vec![CalibrationMeasurement::default(); layer_count],
-            heldout_query_by_source: vec![
-                vec![
-                    CalibrationMeasurement::default();
-                    heldout_query_count
-                ];
-                layer_count
-            ],
-        }
-    }
-
-    /// `errors` is one prefix's rotated reconstruction residual. `query` is a
-    /// build-sampled real vector in that exact coordinate space, so every
-    /// accumulator matches the scan's prefix-local sigma chain.
-    fn observe_layer(
-        &mut self,
-        layer: usize,
-        row_base: usize,
-        errors: &[f32],
-        scales: &[u16],
-        rho: f64,
-        stored_query: (&[f32], f32),
-        gaussian_query: (&[f32], f32),
-        heldout_query: Option<(usize, &[f32], f32)>,
-    ) {
-        debug_assert_eq!(errors.len(), scales.len() * stored_query.0.len());
-        for (local_row, (error, &scale)) in errors
-            .chunks_exact(stored_query.0.len())
-            .zip(scales)
-            .enumerate()
-        {
-            let sample = (row_base + local_row).is_multiple_of(self.interval)
-                && self.stored_query[layer].sample_count < QUANTIZATION_CALIBRATION_SAMPLE_ROWS;
-            if !sample {
-                continue;
-            }
-            self.stored_query[layer].observe(error, scale, rho, stored_query.0, stored_query.1);
-            self.gaussian_query[layer].observe(
-                error,
-                scale,
-                rho,
-                gaussian_query.0,
-                gaussian_query.1,
-            );
-            if let Some((query_index, query, query_norm)) = heldout_query {
-                self.heldout_query[layer].observe(error, scale, rho, query, query_norm);
-                self.heldout_query_by_source[layer][query_index]
-                    .observe(error, scale, rho, query, query_norm);
-            }
-        }
-    }
-
-    fn rows_seen(&self) -> usize {
-        self.rows_seen
-    }
-
-    fn advance(&mut self, rows: usize) {
-        self.rows_seen += rows;
-    }
-
-    fn finish(self) -> QuantizationCalibrationReport {
-        let heldout_bias_stability = self
-            .heldout_query_by_source
-            .into_iter()
-            .map(|queries| {
-                let biases = queries
-                    .into_iter()
-                    .filter(|query| query.sample_count > 0 && query.model_variance_sum > 0.0)
-                    .map(|query| query.finish().bias as f64)
-                    .collect::<Vec<_>>();
-                if biases.is_empty() {
-                    return BiasStability::default();
-                }
-                let mean = biases.iter().sum::<f64>() / biases.len() as f64;
-                let stddev = (biases.iter().map(|bias| (bias - mean).powi(2)).sum::<f64>()
-                    / biases.len() as f64)
-                    .sqrt();
-                BiasStability {
-                    query_count: biases.len(),
-                    mean,
-                    stddev,
-                    min: biases.iter().copied().fold(f64::INFINITY, f64::min),
-                    max: biases.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                }
-            })
-            .collect();
-        QuantizationCalibrationReport {
-            stored_query: self
-                .stored_query
-                .into_iter()
-                .map(CalibrationMeasurement::finish)
-                .collect(),
-            gaussian_query: self
-                .gaussian_query
-                .into_iter()
-                .map(CalibrationMeasurement::finish)
-                .collect(),
-            heldout_query: self
-                .heldout_query
-                .into_iter()
-                .map(CalibrationMeasurement::finish)
-                .collect(),
-            heldout_bias_stability,
-        }
-    }
-}
-
-fn deterministic_gaussian_query(dim: usize) -> Vec<f32> {
-    let mut rng = fastrand::Rng::with_seed(0x4341_4c2d_4741_5553);
-    let mut query = Vec::with_capacity(dim);
-    while query.len() < dim {
-        let u1 = rng.f64().max(f64::MIN_POSITIVE);
-        let u2 = rng.f64();
-        let radius = (-2.0 * u1.ln()).sqrt();
-        let angle = std::f64::consts::TAU * u2;
-        query.push((radius * angle.cos()) as f32);
-        if query.len() < dim {
-            query.push((radius * angle.sin()) as f32);
-        }
-    }
-    query
-}
-
-fn prepare_calibration_query(
-    query: &[f32],
-    metric: Metric,
-    centroid: &[f32],
-    specs: &[LayerSpec],
-) -> (cascade::PreparedFpQuery, f32) {
-    let mut score_query = query.to_vec();
-    if metric == Metric::L2 {
-        for (value, &center) in score_query.iter_mut().zip(centroid) {
-            *value -= center;
-        }
-    }
-    let query_norm = score_query
-        .iter()
-        .map(|value| value * value)
-        .sum::<f32>()
-        .sqrt();
-    (prepare_fp_query(&score_query, specs), query_norm)
 }
 
 fn quantization_runtime(
@@ -375,7 +116,6 @@ fn write_quantized_slots(
     field: Field,
     layers: &[QuantizedLayerSlots],
     residual_norms: Option<&[f32]>,
-    calibration: &VectorQuantizationCalibration,
 ) -> crate::Result<()> {
     for (layer, encoded) in layers.iter().enumerate() {
         vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
@@ -404,11 +144,6 @@ fn write_quantized_slots(
         for &residual_norm in residual_norms {
             writer.write_all(&residual_norm.to_le_bytes())?;
         }
-        writer.flush()?;
-    }
-    {
-        let writer = vec_write.for_field_with_idx(field, vec_slot::QUANTIZED_CALIBRATION);
-        writer.write_all(&calibration.encode())?;
         writer.flush()?;
     }
     Ok(())
@@ -448,22 +183,7 @@ fn write_empty_field_slots(
             })
             .collect();
         let residual_norms = config.needs_residual_norm().then_some([].as_slice());
-        write_quantized_slots(
-            vec_write,
-            field,
-            &layers,
-            residual_norms,
-            &VectorQuantizationCalibration {
-                depths: vec![
-                    VectorQuantizationDepthCalibration {
-                        bias: 0.0,
-                        cal: DEFAULT_CAL as f32,
-                        sample_count: 0,
-                    };
-                    config.layers.len()
-                ],
-            },
-        )?;
+        write_quantized_slots(vec_write, field, &layers, residual_norms)?;
     }
     // `.centroids`: zero centroids, zero docs, single zero offset, and an
     // empty (but present — the slot is mandatory in V2) bounds slot.
@@ -998,43 +718,6 @@ pub(crate) fn merge_ivf(
                     let needs_norm = opts.needs_normalization();
                     let mut normalized = Vec::with_capacity(opts.bytes_per_vector());
                     let mut batch_values = Vec::with_capacity(tile_rows * opts.dim());
-                    let load_calibration_query =
-                        |assigned_vector: &AssignedVector| -> crate::Result<Vec<f32>> {
-                            let reader = &field_readers[assigned_vector.source_segment_ord];
-                            let bytes = reader
-                                .vector_bytes(assigned_vector.source_doc_id)?
-                                .ok_or_else(|| {
-                                    TantivyError::InternalError(format!(
-                                        "missing source vector for doc {:?}",
-                                        assigned_vector.source_doc_id
-                                    ))
-                                })?;
-                            let mut bytes = bytes.to_vec();
-                            if needs_norm {
-                                let _ = maybe_normalize_bytes(opts, &mut bytes);
-                            }
-                            decode_row::<f32>(&bytes, opts.dim())
-                        };
-                    let stored_calibration_query = load_calibration_query(&assigned_vectors[0])?;
-                    let gaussian_calibration_query = deterministic_gaussian_query(opts.dim());
-                    const CALIBRATION_PSEUDO_QUERIES: usize = 64;
-                    let native_rows: Vec<_> = assigned_vectors
-                        .iter()
-                        .filter(|assigned| assigned.native)
-                        .collect();
-                    let pseudo_query_count = native_rows.len().min(CALIBRATION_PSEUDO_QUERIES);
-                    let mut heldout_calibration_queries = Vec::with_capacity(pseudo_query_count);
-                    for sample in 0..pseudo_query_count {
-                        let assigned = native_rows[sample * native_rows.len() / pseudo_query_count];
-                        heldout_calibration_queries
-                            .push((assigned.cluster, load_calibration_query(assigned)?));
-                    }
-                    let mut calibrator = QuantizationCalibrator::new(
-                        num_rows,
-                        specs.len(),
-                        heldout_calibration_queries.len(),
-                    );
-
                     for (cluster, offsets) in cluster_offsets.windows(2).enumerate() {
                         let start = offsets[0] as usize;
                         let end = offsets[1] as usize;
@@ -1046,41 +729,6 @@ pub(crate) fn merge_ivf(
                             opts.dim(),
                         )?;
                         let prepared = prepare_centroid(&centroid, &specs);
-                        let stored_calibration_query = prepare_calibration_query(
-                            &stored_calibration_query,
-                            opts.metric(),
-                            &centroid,
-                            &specs,
-                        );
-                        let gaussian_calibration_query = prepare_calibration_query(
-                            &gaussian_calibration_query,
-                            opts.metric(),
-                            &centroid,
-                            &specs,
-                        );
-                        let heldout_calibration_query = (!heldout_calibration_queries.is_empty())
-                            .then(|| {
-                                (0..heldout_calibration_queries.len())
-                                    .map(|offset| {
-                                        (cluster + offset) % heldout_calibration_queries.len()
-                                    })
-                                    .find_map(|query_idx| {
-                                        let (query_cluster, query) =
-                                            &heldout_calibration_queries[query_idx];
-                                        (*query_cluster != cluster).then(|| {
-                                            (
-                                                query_idx,
-                                                prepare_calibration_query(
-                                                    query,
-                                                    opts.metric(),
-                                                    &centroid,
-                                                    &specs,
-                                                ),
-                                            )
-                                        })
-                                    })
-                            })
-                            .flatten();
                         for tile in assigned_vectors[start..end].chunks(tile_rows) {
                             if ctx.cancel.wants_cancel() {
                                 return Err(TantivyError::Cancelled);
@@ -1125,37 +773,13 @@ pub(crate) fn merge_ivf(
                                         .map(|row| l2_squared(row, &centroid)),
                                 );
                             }
-                            let row_base = calibrator.rows_seen();
-                            let batch = encode_batch_in_place_with_residual_observer(
+                            let batch = encode_batch_in_place(
                                 &mut batch_values,
                                 tile.len(),
                                 &prepared,
                                 &specs,
                                 &grids,
-                                |layer, errors, scales| {
-                                    calibrator.observe_layer(
-                                        layer,
-                                        row_base,
-                                        errors,
-                                        scales,
-                                        grids[layer].rho_model,
-                                        (
-                                            stored_calibration_query.0.layer(layer),
-                                            stored_calibration_query.1,
-                                        ),
-                                        (
-                                            gaussian_calibration_query.0.layer(layer),
-                                            gaussian_calibration_query.1,
-                                        ),
-                                        heldout_calibration_query.as_ref().map(
-                                            |(query_index, query)| {
-                                                (*query_index, query.0.layer(layer), query.1)
-                                            },
-                                        ),
-                                    );
-                                },
                             );
-                            calibrator.advance(tile.len());
                             for (target, layer) in encoded_layers.iter_mut().zip(batch.layers) {
                                 target.codes.extend_from_slice(&layer.codes);
                                 target.scales.extend_from_slice(&layer.scales);
@@ -1163,66 +787,12 @@ pub(crate) fn merge_ivf(
                             }
                         }
                     }
-                    let calibration_report = calibrator.finish();
-                    // Persist a centered field-local model when its total
-                    // bias+spread envelope is larger than the production-query
-                    // floor. The floor remains conservative when the build
-                    // sample cannot characterize the production query center.
-                    let calibration = VectorQuantizationCalibration {
-                        depths: calibration_report
-                            .heldout_query
-                            .iter()
-                            .copied()
-                            .map(persisted_depth_calibration)
-                            .collect(),
-                    };
                     write_quantized_slots(
                         &mut vec_write,
                         field,
                         &encoded_layers,
                         residual_norms.as_deref(),
-                        &calibration,
                     )?;
-                    for (layer, ((((stored, gaussian), heldout), stability), persisted)) in
-                        calibration_report
-                            .stored_query
-                            .iter()
-                            .zip(&calibration_report.gaussian_query)
-                            .zip(&calibration_report.heldout_query)
-                            .zip(&calibration_report.heldout_bias_stability)
-                            .zip(&calibration.depths)
-                            .enumerate()
-                    {
-                        log::info!(
-                            target: "paradedb::ivf_build",
-                            "quantization_calibration field={} depth={} bias={} cal={} samples={} \
-                             stored_query_bias={} stored_query_cal={} stored_query_samples={} \
-                             gaussian_query_bias={} gaussian_query_cal={} \
-                             gaussian_query_samples={} heldout_query_bias={} \
-                             heldout_query_cal={} heldout_query_samples={} \
-                             heldout_bias_queries={} heldout_bias_mean={} \
-                             heldout_bias_stddev={} heldout_bias_min={} heldout_bias_max={}",
-                            entry.name(),
-                            layer + 1,
-                            persisted.bias,
-                            persisted.cal,
-                            persisted.sample_count,
-                            stored.bias,
-                            stored.cal,
-                            stored.sample_count,
-                            gaussian.bias,
-                            gaussian.cal,
-                            gaussian.sample_count,
-                            heldout.bias,
-                            heldout.cal,
-                            heldout.sample_count,
-                            stability.query_count,
-                            stability.mean,
-                            stability.stddev,
-                            stability.min,
-                            stability.max,
-                        );
-                    }
                     timings.quantize = quantize_start.elapsed();
                 }
 
@@ -1306,118 +876,32 @@ pub(crate) fn merge_ivf(
 }
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::sync::Arc;
 
+    use common::{BinarySerializable, VInt};
+
     use super::*;
+    use crate::directory::{CompositeFile, DirectoryClone, FileSlice, TerminatingWrite};
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
-    use crate::query::AllQuery;
-    use crate::schema::Schema;
+    use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
+    use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
+    use crate::vector::header::read_header;
     use crate::vector::ivf::AdaptiveProbeParams;
     use crate::vector::prepared::{QuantizedIndexCtx, QuantizedQueryCtx};
+    use crate::vector::tests::ground_truth;
     use crate::vector::{
-        TopDocsByVectorSimilarity, VectorNormPolicy, VectorQuantizationGrid,
-        VectorQuantizationLayer, GRID_FORMAT_VERSION, VECTOR_QUANTIZATION_FORMAT_VERSION,
+        TopDocsByVectorSimilarity, VectorCalibrationMeasurements,
+        VectorQuantizationCalibrationSource, VectorQuantizationLayer,
     };
     use crate::{Index, TantivyDocument};
-
-    #[test]
-    fn build_calibration_matches_the_scan_sigma_ratio() {
-        let errors = [1.0_f32, 2.0, 3.0, 4.0];
-        let query = [0.6_f32, 0.8];
-        let scales = [
-            quant_model::f16::f32_to_f16(0.5),
-            quant_model::f16::f32_to_f16(0.25),
-        ];
-        let rho = 0.1;
-        let mut calibrator = QuantizationCalibrator::new(2, 1, 1);
-        calibrator.observe_layer(
-            0,
-            0,
-            &errors,
-            &scales,
-            rho,
-            (&query, 1.0),
-            (&query, 1.0),
-            Some((0, &query, 1.0)),
-        );
-        let measured = calibrator.finish();
-
-        let model_variance = (0.5_f64 * rho).powi(2) + (0.25_f64 * rho).powi(2);
-        let cross = 2.2 * 0.5 * rho + 5.0 * 0.25 * rho;
-        let bias = cross / model_variance;
-        let centered = (2.2_f64.powi(2) + 5.0_f64.powi(2) - 2.0 * bias * cross
-            + bias.powi(2) * model_variance)
-            / model_variance;
-        assert!((f64::from(measured.stored_query[0].bias) - bias).abs() < 1e-4);
-        assert!((f64::from(measured.stored_query[0].cal) - centered.sqrt()).abs() < 1e-4);
-        assert_eq!(measured.stored_query[0].sample_count, 2);
-        assert_eq!(measured.gaussian_query, measured.stored_query);
-        assert_eq!(measured.heldout_query, measured.stored_query);
-    }
-
-    #[test]
-    fn per_query_bias_stability_tracks_independent_query_centers() {
-        let query_x = [1.0_f32, 0.0];
-        let query_y = [0.0_f32, 1.0];
-        let scale = quant_model::f16::f32_to_f16(1.0);
-        let mut calibrator = QuantizationCalibrator::new(4, 1, 2);
-        calibrator.observe_layer(
-            0,
-            0,
-            &[1.0, 0.0, 2.0, 0.0],
-            &[scale, scale],
-            0.1,
-            (&query_x, 1.0),
-            (&query_x, 1.0),
-            Some((0, &query_x, 1.0)),
-        );
-        calibrator.advance(2);
-        calibrator.observe_layer(
-            0,
-            2,
-            &[0.0, 1.0, 0.0, 2.0],
-            &[scale, scale],
-            0.1,
-            (&query_y, 1.0),
-            (&query_y, 1.0),
-            Some((1, &query_y, 1.0)),
-        );
-        let stability = calibrator.finish().heldout_bias_stability[0];
-        assert_eq!(stability.query_count, 2);
-        assert!((stability.mean - 15.0).abs() < 1e-5);
-        assert!(stability.stddev < 1e-6);
-        assert!((stability.min - stability.max).abs() < 1e-6);
-    }
-
-    #[test]
-    fn persisted_calibration_uses_the_real_query_envelope() {
-        let below = VectorQuantizationDepthCalibration {
-            bias: 0.0,
-            cal: 1.08,
-            sample_count: 1_024,
-        };
-        assert_eq!(persisted_depth_calibration(below), REAL_QUERY_CALIBRATION);
-
-        let above = VectorQuantizationDepthCalibration {
-            bias: -2.0,
-            cal: 1.5,
-            sample_count: 777,
-        };
-        assert_eq!(persisted_depth_calibration(above), above);
-
-        let empty = VectorQuantizationDepthCalibration {
-            bias: 0.0,
-            cal: 1.0,
-            sample_count: 0,
-        };
-        assert_eq!(persisted_depth_calibration(empty), empty);
-    }
 
     const QUANT_FIXTURE_DIM: usize = 64;
 
     struct QuantFixtureClusterer {
         dim: usize,
+        metric: Metric,
     }
 
     impl IvfClusterer for QuantFixtureClusterer {
@@ -1431,10 +915,19 @@ mod tests {
             _vectors: IvfTrainingVectors,
         ) -> crate::Result<IvfCentroids> {
             assert_eq!(options.dim(), self.dim);
-            let values = [0.0_f32, 1.0]
-                .into_iter()
-                .flat_map(|center| std::iter::repeat_n(center, self.dim))
-                .collect();
+            let values = match self.metric {
+                Metric::L2 => [0.0_f32, 1.0]
+                    .into_iter()
+                    .flat_map(|center| std::iter::repeat_n(center, self.dim))
+                    .collect(),
+                Metric::Cosine => {
+                    let mut values = vec![0.0; 2 * self.dim];
+                    values[0] = 1.0;
+                    values[self.dim + 1] = 1.0;
+                    values
+                }
+                Metric::Dot => unreachable!("quantized matrix fixture covers L2 and cosine"),
+            };
             Ok(IvfCentroids::F32(IvfMatrix {
                 values,
                 rows: 2,
@@ -1453,66 +946,189 @@ mod tests {
                 .matrix
                 .values
                 .chunks_exact(self.dim)
-                .map(|row| u32::from(row[0] >= 0.5))
+                .map(|row| match self.metric {
+                    Metric::L2 => u32::from(row[0] >= 0.5),
+                    Metric::Cosine => u32::from(row[1] > row[0]),
+                    Metric::Dot => unreachable!("quantized matrix fixture covers L2 and cosine"),
+                })
                 .collect())
         }
     }
 
     fn quant_fixture_config(dim: usize) -> VectorQuantizationConfig {
-        let grid = quant_model::build_grid(dim, 4);
-        VectorQuantizationConfig {
-            field: "embedding".to_string(),
-            format_version: VECTOR_QUANTIZATION_FORMAT_VERSION,
-            dim,
-            metric: Metric::L2,
-            norm_policy: VectorNormPolicy::None,
-            layers: vec![
-                VectorQuantizationLayer {
-                    bits: 1,
-                    quantizer: VectorQuantizer::RaBitQ,
-                    seed: 0x1111,
-                },
-                VectorQuantizationLayer {
-                    bits: 4,
-                    quantizer: VectorQuantizer::TurboQuant,
-                    seed: 0x2222,
-                },
-            ],
-            grids: vec![VectorQuantizationGrid {
-                bits: 4,
-                version: GRID_FORMAT_VERSION,
-                points: grid.points,
-                rho_model: Some(grid.rho_model),
-            }],
+        quant_fixture_config_for(dim, Metric::L2, &[1, 4])
+    }
+
+    fn quant_fixture_config_for(
+        dim: usize,
+        metric: Metric,
+        schedule: &[u8],
+    ) -> VectorQuantizationConfig {
+        let seeds = [0x1111, 0x2222, 0x3333, 0x4444];
+        VectorQuantizationConfig::materialize(
+            "embedding".to_string(),
+            &VectorOptions::new(dim, metric),
+            schedule
+                .iter()
+                .enumerate()
+                .map(|(layer, &bits)| VectorQuantizationLayer {
+                    bits,
+                    quantizer: if bits == 1 {
+                        VectorQuantizer::RaBitQ
+                    } else {
+                        VectorQuantizer::TurboQuant
+                    },
+                    seed: seeds[layer],
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn fixture_vector(metric: Metric, dim: usize, doc: usize) -> Vec<f32> {
+        match metric {
+            Metric::L2 => {
+                let center = if doc < 4 { 0.0 } else { 1.0 };
+                (0..dim)
+                    .map(|coordinate| {
+                        center + ((doc * dim + coordinate) as f32 * 0.017).sin() * 0.1
+                    })
+                    .collect()
+            }
+            Metric::Cosine => {
+                let cluster = usize::from(doc >= 4);
+                let mut vector: Vec<f32> = (0..dim)
+                    .map(|coordinate| ((doc * dim + coordinate) as f32 * 0.017).sin() * 0.025)
+                    .collect();
+                vector[cluster] += 1.0;
+                vector
+            }
+            Metric::Dot => unreachable!("quantized matrix fixture covers L2 and cosine"),
         }
     }
 
-    fn build_quantized_fixture(dim: usize, quantized: bool) -> crate::Result<Index> {
+    fn fixture_calibration_queries_for(metric: Metric, dim: usize) -> Vec<Vec<f32>> {
+        (0..4)
+            .map(|query| match metric {
+                Metric::L2 => {
+                    let center = if query < 2 { 0.0 } else { 1.0 };
+                    (0..dim)
+                        .map(|coordinate| {
+                            center + ((query * dim + coordinate) as f32 * 0.023).cos() * 0.1
+                        })
+                        .collect()
+                }
+                Metric::Cosine => {
+                    let cluster = usize::from(query >= 2);
+                    let mut vector: Vec<f32> = (0..dim)
+                        .map(|coordinate| ((query * dim + coordinate) as f32 * 0.023).cos() * 0.025)
+                        .collect();
+                    vector[cluster] += 1.0;
+                    vector
+                }
+                Metric::Dot => {
+                    unreachable!("quantized matrix fixture covers L2 and cosine")
+                }
+            })
+            .collect()
+    }
+
+    fn fixture_calibration_queries(dim: usize) -> Vec<Vec<f32>> {
+        fixture_calibration_queries_for(Metric::L2, dim)
+    }
+
+    fn persist_fixture_calibration_for(
+        mut index: Index,
+        dim: usize,
+        metric: Metric,
+    ) -> crate::Result<Index> {
+        let reader = index.reader()?;
+        reader.reload().map_err(|error| {
+            TantivyError::InternalError(format!("calibration fixture reload failed: {error}"))
+        })?;
+        let field = index.schema().get_field("embedding")?;
+        let queries = fixture_calibration_queries_for(metric, dim);
+        let mut measurements = VectorCalibrationMeasurements::default();
+        for segment in reader.searcher().segment_readers() {
+            if let Some(segment_measurements) = segment
+                .vector_index(field)?
+                .calibrate_external_queries(&queries, 1_000, segment.alive_bitset())
+                .map_err(|error| {
+                    TantivyError::InternalError(format!(
+                        "calibration fixture measurement failed: {error}"
+                    ))
+                })?
+            {
+                measurements.merge(&segment_measurements)?;
+            }
+        }
+        let calibration = measurements.finish(VectorQuantizationCalibrationSource::RealQuery)?;
+        let previous = index.load_metas()?;
+        let mut updated = index.load_metas()?;
+        updated.index_settings.vector_quantization[0]
+            .install_real_query_calibration(calibration)?;
+        crate::indexer::segment_updater::save_metas(&updated, &previous, index.directory())?;
+        let reopened = Index::open(index.directory().box_clone()).map_err(|error| {
+            TantivyError::InternalError(format!("calibration fixture reopen failed: {error}"))
+        })?;
+        assert_eq!(
+            reopened.settings().vector_quantization[0].calibration(),
+            updated.index_settings.vector_quantization[0].calibration()
+        );
+        *index.settings_mut() = reopened.settings().clone();
+        Ok(index)
+    }
+
+    fn build_quantized_fixture_with_calibration(
+        dim: usize,
+        quantized: bool,
+        calibrated: bool,
+    ) -> crate::Result<Index> {
+        build_quantized_fixture_case_with_calibration(
+            dim,
+            Metric::L2,
+            &[1, 4],
+            quantized,
+            calibrated,
+        )
+    }
+
+    fn build_quantized_fixture_case_with_calibration(
+        dim: usize,
+        metric: Metric,
+        schedule: &[u8],
+        quantized: bool,
+        calibrated: bool,
+    ) -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
-        let field =
-            schema_builder.add_vector_field("embedding", VectorOptions::new(dim, Metric::L2));
+        let field = schema_builder.add_vector_field("embedding", VectorOptions::new(dim, metric));
+        let label_field = schema_builder.add_text_field("label", STRING | STORED);
         let schema = schema_builder.build();
         let mut settings = IndexSettings {
             vector_clustering_threshold: 1,
             ..Default::default()
         };
         if quantized {
-            settings.vector_quantization = vec![quant_fixture_config(dim)];
+            settings.vector_quantization = vec![quant_fixture_config_for(dim, metric, schedule)];
         }
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(QuantFixtureClusterer { dim }))
+            .ivf_clusterer(Arc::new(QuantFixtureClusterer {
+                dim,
+                metric,
+            }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         for doc in 0..8 {
-            let center = if doc < 4 { 0.0 } else { 1.0 };
-            let vector: Vec<f32> = (0..dim)
-                .map(|coordinate| center + ((doc * dim + coordinate) as f32 * 0.017).sin() * 0.1)
-                .collect();
+            let vector = fixture_vector(metric, dim, doc);
             let mut document = TantivyDocument::new();
             document.add_vector(field, &vector);
+            document.add_text(label_field, format!("d{doc}"));
+            if doc % 2 == 0 {
+                document.add_text(label_field, "keep");
+            }
             writer.add_document(document)?;
             if doc == 3 || doc == 7 {
                 writer.commit()?;
@@ -1522,7 +1138,15 @@ mod tests {
         segments.sort();
         writer.merge(&segments).wait()?;
         writer.wait_merging_threads()?;
-        Ok(index)
+        if quantized && calibrated {
+            persist_fixture_calibration_for(index, dim, metric)
+        } else {
+            Ok(index)
+        }
+    }
+
+    fn build_quantized_fixture(dim: usize, quantized: bool) -> crate::Result<Index> {
+        build_quantized_fixture_with_calibration(dim, quantized, true)
     }
 
     fn build_flat_quantized_fixture(dim: usize) -> crate::Result<Index> {
@@ -1578,31 +1202,236 @@ mod tests {
             .collect()
     }
 
-    fn fixture_hits(
-        index: &Index,
-        query: Vec<f32>,
-        level_zero: bool,
-    ) -> crate::Result<Vec<(u32, u32)>> {
+    fn fixture_hits(index: &Index, query: Vec<f32>) -> crate::Result<Vec<(u32, u32)>> {
         let reader = index.reader()?;
         reader.reload()?;
         let searcher = reader.searcher();
         let field = index.schema().get_field("embedding")?;
-        let mut collector = TopDocsByVectorSimilarity::new(field, query, 3).with_adaptive_params(
+        let collector = TopDocsByVectorSimilarity::new(field, query, 3).with_adaptive_params(
             AdaptiveProbeParams {
                 max_probe_fraction: 1.0,
                 min_probe_clusters: 2,
                 ..Default::default()
             },
         );
-        if level_zero {
-            collector = collector.with_max_scan_levels(0);
-        }
         Ok(searcher
             .search(&AllQuery, &collector)?
             .results
             .iter()
             .map(|&(score, address)| (score.to_bits(), address.doc_id))
             .collect())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum QuantizedMatrixScenario {
+        None,
+        Filter,
+        Deletes,
+    }
+
+    fn fixture_search_query(metric: Metric, dim: usize) -> Vec<f32> {
+        match metric {
+            Metric::L2 => vec![0.05; dim],
+            Metric::Cosine => {
+                let mut query: Vec<f32> = (0..dim)
+                    .map(|coordinate| ((coordinate as f32 + 0.5) * 0.031).cos() * 0.01)
+                    .collect();
+                query[0] += 0.8;
+                query[1] += 0.6;
+                query
+            }
+            Metric::Dot => unreachable!("quantized matrix fixture covers L2 and cosine"),
+        }
+    }
+
+    fn fixture_filter_docs(
+        index: &Index,
+        filter: &dyn Query,
+    ) -> crate::Result<std::collections::HashSet<crate::DocAddress>> {
+        let searcher = index.reader()?.searcher();
+        let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let mut admitted = std::collections::HashSet::new();
+        for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            weight.for_each_no_score(segment, &mut |docs| {
+                admitted.extend(
+                    docs.iter()
+                        .copied()
+                        .map(|doc| crate::DocAddress::new(segment_ord as u32, doc)),
+                );
+            })?;
+        }
+        Ok(admitted)
+    }
+
+    fn fixture_exact_hits(
+        index: &Index,
+        metric: Metric,
+        query: &[f32],
+        filter: Option<&dyn Query>,
+        top_n: usize,
+    ) -> crate::Result<Vec<(crate::Score, crate::DocAddress)>> {
+        let field = index.schema().get_field("embedding")?;
+        let mut hits = ground_truth::top_k(index, field, metric, query, 8)?;
+        if let Some(filter) = filter {
+            let admitted = fixture_filter_docs(index, filter)?;
+            hits.retain(|(_, address)| admitted.contains(address));
+        }
+        hits.truncate(top_n);
+        Ok(hits)
+    }
+
+    fn assert_matrix_results(
+        context: &str,
+        actual: &[(crate::Score, crate::DocAddress)],
+        expected: &[(crate::Score, crate::DocAddress)],
+        stats: &crate::vector::backend::ProbeStats,
+    ) {
+        if actual == expected {
+            return;
+        }
+
+        let actual_docs: std::collections::HashSet<_> =
+            actual.iter().map(|(_, address)| address.doc_id).collect();
+        let missing = expected
+            .iter()
+            .map(|(_, address)| address.doc_id)
+            .find(|doc| !actual_docs.contains(doc));
+        let attribution = if let Some(doc) = missing {
+            if !stats.quantized_trace.scored_docs.contains(&doc) {
+                "routing/admission miss"
+            } else if stats
+                .quantized_trace
+                .boundary_docs
+                .iter()
+                .any(|survivors| !survivors.contains(&doc))
+            {
+                "band drop"
+            } else if !stats.quantized_trace.rerank_docs.contains(&doc) {
+                "rerank fetch bug"
+            } else {
+                "rerank scoring/order bug"
+            }
+        } else {
+            "rerank scoring/order bug"
+        };
+        panic!(
+            "{context}: {attribution}; actual={actual:?} expected={expected:?} trace={:?}",
+            stats.quantized_trace
+        );
+    }
+
+    fn assert_quantized_matrix_storage(
+        index: &Index,
+        metric: Metric,
+        schedule: &[u8],
+    ) -> crate::Result<()> {
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
+        let ivf = vector_reader.index().expect("matrix fixture must be IVF");
+        assert_eq!(ivf.num_rows(), 8);
+        let quantized = vector_reader
+            .quantization()
+            .expect("matrix fixture must carry quantized slots");
+        assert_eq!(
+            quantized
+                .config()
+                .layers
+                .iter()
+                .map(|layer| layer.bits)
+                .collect::<Vec<_>>(),
+            schedule
+        );
+        assert_eq!(
+            quantized.config().needs_residual_norm(),
+            metric == Metric::L2
+        );
+        for row in 0..ivf.num_rows() {
+            assert_eq!(
+                quantized.residual_norm(row)?.is_some(),
+                metric == Metric::L2,
+                "slot 14 presence must follow the metric at row {row}"
+            );
+        }
+        Ok(())
+    }
+
+    fn run_quantized_matrix_query(
+        index: &Index,
+        metric: Metric,
+        schedule: &[u8],
+        scenario: QuantizedMatrixScenario,
+        depth: usize,
+    ) -> crate::Result<()> {
+        const TOP_N: usize = 3;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let field = index.schema().get_field("embedding")?;
+        let label = index.schema().get_field("label")?;
+        let query = fixture_search_query(metric, index.settings().vector_quantization[0].dim);
+        let keep = TermQuery::new(
+            Term::from_field_text(label, "keep"),
+            IndexRecordOption::Basic,
+        );
+        let filter: &dyn Query = if matches!(scenario, QuantizedMatrixScenario::Filter) {
+            &keep
+        } else {
+            &AllQuery
+        };
+        let expected = fixture_exact_hits(index, metric, &query, Some(filter), TOP_N)?;
+        let collector = TopDocsByVectorSimilarity::new(field, query, TOP_N)
+            .with_adaptive_params(AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 2,
+                ..Default::default()
+            })
+            .with_max_scan_levels(depth);
+        let fruit = searcher.search(filter, &collector)?;
+        assert_eq!(fruit.stats.len(), 1);
+        let stats = &fruit.stats[0];
+        let context =
+            format!("metric={metric:?} schedule={schedule:?} scenario={scenario:?} depth={depth}");
+        assert_matrix_results(&context, &fruit.results, &expected, stats);
+
+        let layer0 = stats.layers.get(0).expect("layer 0 must execute");
+        assert!(layer0.scored() > 0, "{context}: {stats:?}");
+        assert!(
+            layer0.survivors() <= layer0.scored(),
+            "{context}: {stats:?}"
+        );
+        if depth == 1 {
+            assert!(stats.layers.get(1).is_none(), "{context}: {stats:?}");
+        } else {
+            let layer1 = stats.layers.get(1).expect("layer 1 must execute");
+            assert_eq!(
+                layer1.scored(),
+                layer0.survivors(),
+                "{context}: every boundary-0 survivor must be refined"
+            );
+            assert!(
+                layer1.survivors() <= layer1.scored(),
+                "{context}: {stats:?}"
+            );
+        }
+        assert_eq!(
+            stats.quantized_trace.boundary_docs.len(),
+            depth,
+            "{context}: one identity snapshot per executed boundary"
+        );
+        match scenario {
+            QuantizedMatrixScenario::Filter => {
+                assert!(stats.pruned_filter > 0, "{context}: {stats:?}")
+            }
+            QuantizedMatrixScenario::Deletes => {
+                assert!(stats.pruned_dead > 0, "{context}: {stats:?}")
+            }
+            QuantizedMatrixScenario::None => {}
+        }
+        Ok(())
     }
 
     fn quantized_vec_file(index: &Index) -> crate::Result<Vec<u8>> {
@@ -1614,6 +1443,57 @@ mod tests {
             .open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?
             .read_bytes()?
             .to_vec())
+    }
+
+    fn vec_composite_slot(
+        bytes: &[u8],
+        field: Field,
+        slot: usize,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        let (_, body) = read_header(&FileSlice::from(bytes.to_vec()))?;
+        Ok(CompositeFile::open(&body)?
+            .open_read_with_idx(field, slot)
+            .map(|slice| slice.read_bytes().map(|bytes| bytes.to_vec()))
+            .transpose()?)
+    }
+
+    fn inject_legacy_slot15(bytes: &[u8], field: Field, payload: &[u8]) -> crate::Result<Vec<u8>> {
+        let (header, body) = bytes.split_at(HEADER_LEN);
+        let footer_len = u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap()) as usize;
+        let footer_start = body.len() - 4 - footer_len;
+        let mut footer_reader = &body[footer_start..body.len() - 4];
+        let entry_count = VInt::deserialize(&mut footer_reader)?.0 as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut absolute_offset = 0_u64;
+        for _ in 0..entry_count {
+            absolute_offset += VInt::deserialize(&mut footer_reader)?.0;
+            let entry_field = Field::deserialize(&mut footer_reader)?;
+            let entry_slot = VInt::deserialize(&mut footer_reader)?.0;
+            entries.push((absolute_offset, entry_field, entry_slot));
+        }
+        assert!(footer_reader.is_empty());
+
+        let mut new_footer = Vec::new();
+        VInt((entry_count + 1) as u64).serialize(&mut new_footer)?;
+        let mut previous_offset = 0_u64;
+        for &(offset, entry_field, entry_slot) in &entries {
+            VInt(offset - previous_offset).serialize(&mut new_footer)?;
+            entry_field.serialize(&mut new_footer)?;
+            VInt(entry_slot).serialize(&mut new_footer)?;
+            previous_offset = offset;
+        }
+        let legacy_offset = footer_start as u64;
+        VInt(legacy_offset - previous_offset).serialize(&mut new_footer)?;
+        field.serialize(&mut new_footer)?;
+        VInt(vec_slot::QUANTIZED_CALIBRATION as u64).serialize(&mut new_footer)?;
+
+        let mut injected = Vec::with_capacity(bytes.len() + payload.len() + new_footer.len());
+        injected.extend_from_slice(header);
+        injected.extend_from_slice(&body[..footer_start]);
+        injected.extend_from_slice(payload);
+        injected.extend_from_slice(&new_footer);
+        injected.extend_from_slice(&(new_footer.len() as u32).to_le_bytes());
+        Ok(injected)
     }
 
     fn assert_relative_1e5(actual: f32, expected: f32, context: &str) {
@@ -1642,7 +1522,7 @@ mod tests {
             .collect();
         let harness = cascade::prepare_split_query(&query, &specs, &grids, 4);
         let scan = QuantizedQueryCtx::new(
-            Arc::new(QuantizedIndexCtx::new(quantized.config().clone())),
+            QuantizedIndexCtx::resolve_from_config(quantized.config().clone()).unwrap(),
             query,
         );
 
@@ -1676,25 +1556,91 @@ mod tests {
     }
 
     #[test]
-    fn gate_c_exact_path_equivalence() -> crate::Result<()> {
+    fn gate_c_level_zero_matches_unquantized_ivf() -> crate::Result<()> {
+        const DIM: usize = 64;
+        let query = vec![0.05_f32; DIM];
+        let params = AdaptiveProbeParams {
+            max_probe_fraction: 0.5,
+            min_probe_clusters: 1,
+            ..Default::default()
+        };
+        let unquantized = build_quantized_fixture(DIM, false)?;
+        let quantized = build_quantized_fixture(DIM, true)?;
+        let field = unquantized.schema().get_field("embedding")?;
+        let unquantized_fruit = unquantized.reader()?.searcher().search(
+            &AllQuery,
+            &TopDocsByVectorSimilarity::new(field, query.clone(), 3)
+                .with_adaptive_params(params.clone()),
+        )?;
+        let level_zero_collector = TopDocsByVectorSimilarity::new(field, query, 3)
+            .with_adaptive_params(params)
+            .with_max_scan_levels(0);
+        let quantized_reader = quantized.reader()?;
+        let quantized_searcher = quantized_reader.searcher();
+        let quantized_storage = quantized_searcher.segment_readers()[0].vector_index(field)?;
+        let quantized_field = quantized_storage
+            .quantization()
+            .expect("fixture must carry quantized slots");
+        assert!(!quantized_field.index_ctx_is_initialized());
+        let level_zero_fruit = quantized_searcher.search(&AllQuery, &level_zero_collector)?;
+        assert_eq!(level_zero_collector.cached_quantized_query_count(), 0);
+        assert!(!quantized_field.index_ctx_is_initialized());
+
+        assert_eq!(level_zero_fruit.results, unquantized_fruit.results);
+        assert_eq!(level_zero_fruit.stats.len(), 1);
+        assert_eq!(unquantized_fruit.stats.len(), 1);
+        let level_zero = &level_zero_fruit.stats[0];
+        let baseline = &unquantized_fruit.stats[0];
+        assert!(level_zero.layers.get(0).is_none(), "{level_zero:?}");
+        assert!(level_zero.routing_visited_count > 0, "{level_zero:?}");
+        assert!(level_zero.clusters_probed() > 0, "{level_zero:?}");
+        assert!(level_zero.candidates_scored > 0, "{level_zero:?}");
+        assert!(level_zero.exact_scan_ns.is_some(), "{level_zero:?}");
+        assert_eq!(level_zero.candidates_scored, baseline.candidates_scored);
+        assert_eq!(level_zero.exact_rows_read, baseline.exact_rows_read);
+        assert_eq!(level_zero.postings_row, baseline.postings_row);
+        assert_eq!(level_zero.postings_skipped, baseline.postings_skipped);
+        assert_eq!(
+            level_zero.routing_visited_count,
+            baseline.routing_visited_count
+        );
+        assert_eq!(
+            level_zero.work_charged.to_bits(),
+            baseline.work_charged.to_bits()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn level_zero_flat_segment_remains_exact() -> crate::Result<()> {
         const DIM: usize = 64;
         let query = vec![0.05_f32; DIM];
         let expected = fixture_expected(&query, DIM, 3);
-
-        let opted_out = build_quantized_fixture(DIM, false)?;
-        assert_eq!(fixture_hits(&opted_out, query.clone(), false)?, expected);
-
-        let no_slot = build_flat_quantized_fixture(DIM)?;
-        let reader = no_slot.reader()?;
+        let flat = build_flat_quantized_fixture(DIM)?;
+        let reader = flat.reader()?;
         let searcher = reader.searcher();
-        let field = no_slot.schema().get_field("embedding")?;
+        let field = flat.schema().get_field("embedding")?;
         let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
         assert!(vector_reader.index().is_none());
         assert!(vector_reader.quantization().is_none());
-        assert_eq!(fixture_hits(&no_slot, query.clone(), false)?, expected);
 
-        let quantized = build_quantized_fixture(DIM, true)?;
-        assert_eq!(fixture_hits(&quantized, query, true)?, expected);
+        let fruit = searcher.search(
+            &AllQuery,
+            &TopDocsByVectorSimilarity::new(field, query, 3).with_max_scan_levels(0),
+        )?;
+        assert_eq!(
+            fruit
+                .results
+                .iter()
+                .map(|&(score, address)| (score.to_bits(), address.doc_id))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let stats = &fruit.stats[0];
+        assert_eq!(stats.exact_rows_read, 8, "{stats:?}");
+        assert_eq!(stats.routing_visited_count, 0, "{stats:?}");
+        assert_eq!(stats.clusters_probed(), 0, "{stats:?}");
+        assert!(stats.layers.get(0).is_none(), "{stats:?}");
         Ok(())
     }
 
@@ -1766,6 +1712,8 @@ mod tests {
                 ..Default::default()
             });
         let quantized_fruit = searcher.search(&AllQuery, &collector)?;
+        assert_eq!(collector.cached_quantized_query_count(), 1);
+        assert!(quantized.index_ctx_is_initialized());
         assert_eq!(quantized_fruit.stats.len(), 1);
         let stats = &quantized_fruit.stats[0];
         let layer0 = stats.layers.get(0).expect("layer 0 must execute");
@@ -1781,12 +1729,6 @@ mod tests {
         assert!(stats.rerank_rows <= layer1.survivors(), "{stats:?}");
         assert_eq!(stats.exact_rows_read, stats.rerank_rows, "{stats:?}");
         let hits = quantized_fruit.results;
-        let exact_hits = searcher
-            .search(
-                &AllQuery,
-                &TopDocsByVectorSimilarity::new(field, query.clone(), 3).with_max_scan_levels(0),
-            )?
-            .results;
         let mut expected: Vec<(f32, u32)> = (0..8)
             .map(|doc| {
                 let center = if doc < 4 { 0.0 } else { 1.0 };
@@ -1813,7 +1755,6 @@ mod tests {
                 .map(|&(score, doc)| (score.to_bits(), doc))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(hits, exact_hits, "level zero must preserve the exact scan");
 
         let first = quantized_vec_file(&index)?;
         let second = quantized_vec_file(&build_quantized_fixture(QUANT_FIXTURE_DIM, true)?)?;
@@ -1825,15 +1766,115 @@ mod tests {
     }
 
     #[test]
+    fn quantized_top_n_fixture_matrix_matches_direct_exact_oracle() -> crate::Result<()> {
+        const SCHEDULES: [[u8; 2]; 2] = [[1, 4], [1, 1]];
+
+        for metric in [Metric::Cosine, Metric::L2] {
+            for schedule in &SCHEDULES {
+                // One complete metric/schedule cell carries the non-64-aligned
+                // dimension through none, filter, delete, and both active prefix depths.
+                let dim = if metric == Metric::L2 && schedule == &[1, 4] {
+                    100
+                } else {
+                    QUANT_FIXTURE_DIM
+                };
+
+                let primary = build_quantized_fixture_case_with_calibration(
+                    dim, metric, schedule, true, true,
+                )?;
+                assert_quantized_matrix_storage(&primary, metric, schedule)?;
+                for scenario in [
+                    QuantizedMatrixScenario::None,
+                    QuantizedMatrixScenario::Filter,
+                ] {
+                    for depth in 1..=2 {
+                        run_quantized_matrix_query(&primary, metric, schedule, scenario, depth)?;
+                    }
+                }
+
+                // Tombstone one deterministic row in each primary cluster.
+                let label = primary.schema().get_field("label")?;
+                let mut writer: crate::IndexWriter<TantivyDocument> =
+                    primary.writer_with_num_threads(1, 30_000_000)?;
+                writer.set_merge_policy(Box::new(NoMergePolicy));
+                for doc in [0, 4] {
+                    writer.delete_term(Term::from_field_text(label, &format!("d{doc}")));
+                }
+                writer.commit()?;
+                drop(writer);
+                for depth in 1..=2 {
+                    run_quantized_matrix_query(
+                        &primary,
+                        metric,
+                        schedule,
+                        QuantizedMatrixScenario::Deletes,
+                        depth,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn slot15_is_not_written_and_legacy_bytes_are_ignored() -> crate::Result<()> {
+        let index = build_quantized_fixture(QUANT_FIXTURE_DIM, true)?;
+        let field = index.schema().get_field("embedding")?;
+        let query = fixture_calibration_queries(QUANT_FIXTURE_DIM).remove(0);
+        let baseline = fixture_hits(&index, query.clone())?;
+
+        let original = quantized_vec_file(&index)?;
+        assert_eq!(
+            vec_composite_slot(&original, field, vec_slot::QUANTIZED_CALIBRATION)?,
+            None,
+            "the V3 writer must not emit retired slot 15"
+        );
+
+        // Shape the payload like retired metadata, but make its values
+        // deliberately nonsensical. Opening and scoring must depend only on
+        // settings-backed calibration and therefore ignore these bytes.
+        let mut legacy_payload = 3_u32.to_le_bytes().to_vec();
+        legacy_payload.extend_from_slice(&[0xA5; 28]);
+        let injected = inject_legacy_slot15(&original, field, &legacy_payload)?;
+        assert_eq!(
+            vec_composite_slot(&injected, field, vec_slot::QUANTIZED_CALIBRATION)?,
+            Some(legacy_payload)
+        );
+
+        let segment = index
+            .searchable_segments()?
+            .into_iter()
+            .next()
+            .expect("one merged fixture segment");
+        let path = segment.relative_path(SegmentComponent::Custom(VEC_EXT.to_string()));
+        index
+            .directory()
+            .delete(&path)
+            .expect("delete fixture .vec before slot-15 rewrite");
+        let mut writer = index.directory().open_write(&path)?;
+        writer.write_all(&injected)?;
+        writer.terminate()?;
+
+        assert_eq!(fixture_hits(&index, query)?, baseline);
+        Ok(())
+    }
+
+    #[test]
     fn general_dimension_quantized_bridge_at_d100() -> crate::Result<()> {
         const DIM: usize = 100;
         let index = build_quantized_fixture(DIM, true)?;
-        let reader = index.reader()?;
-        reader.reload()?;
+        let reader = index.reader().map_err(|error| {
+            TantivyError::InternalError(format!("general-d reader open failed: {error}"))
+        })?;
+        reader.reload().map_err(|error| {
+            TantivyError::InternalError(format!("general-d reader reload failed: {error}"))
+        })?;
         let searcher = reader.searcher();
         let segment = &searcher.segment_readers()[0];
         let field = index.schema().get_field("embedding")?;
-        let vector_reader = segment.vector_index(field)?;
+        let vector_reader = segment.vector_index(field).map_err(|error| {
+            TantivyError::InternalError(format!("general-d vector reader failed: {error}"))
+        })?;
         let ivf = vector_reader.index().expect("merged fixture must be IVF");
         let quantized = vector_reader
             .quantization()
@@ -1880,13 +1921,13 @@ mod tests {
                 ),
             )?
             .results;
-        let exact_hits = searcher
-            .search(
-                &AllQuery,
-                &TopDocsByVectorSimilarity::new(field, query, 3).with_max_scan_levels(0),
-            )?
-            .results;
-        assert_eq!(quantized_hits, exact_hits);
+        assert_eq!(
+            quantized_hits
+                .iter()
+                .map(|&(score, address)| (score.to_bits(), address.doc_id))
+                .collect::<Vec<_>>(),
+            fixture_expected(&query, DIM, 3)
+        );
         Ok(())
     }
 
@@ -1912,6 +1953,76 @@ mod tests {
         assert!(
             (logical_growth as f64 / (ROWS * DIM * 4) as f64 - 0.161_458_333_333).abs() < 1e-12
         );
+        Ok(())
+    }
+
+    #[test]
+    fn uncalibrated_quantized_slots_use_ivf_fp32_fallback() -> crate::Result<()> {
+        const DIM: usize = 100;
+        let index = build_quantized_fixture_with_calibration(DIM, true, false)?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
+        assert!(vector_reader.quantization().is_none());
+
+        let queries = fixture_calibration_queries(DIM);
+        let measurements = vector_reader
+            .calibrate_external_queries(&queries, 1_000, None)?
+            .expect("uncalibrated slots remain available to explicit calibration");
+        assert!(measurements
+            .aggregate()
+            .iter()
+            .all(|depth| depth.sample_count == 8 * queries.len() as u64));
+
+        let fruit = searcher.search(
+            &AllQuery,
+            &TopDocsByVectorSimilarity::new(field, queries[0].clone(), 3).with_adaptive_params(
+                AdaptiveProbeParams {
+                    max_probe_fraction: 1.0,
+                    min_probe_clusters: 2,
+                    ..Default::default()
+                },
+            ),
+        )?;
+        assert!(fruit.stats[0].layers.get(0).is_none());
+        assert!(fruit.stats[0].postings_row > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn external_calibration_samples_only_live_rows() -> crate::Result<()> {
+        const DIM: usize = 100;
+        let index = build_quantized_fixture_with_calibration(DIM, true, false)?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = segment.vector_index(field)?;
+        let alive = crate::fastfield::AliveBitSet::for_test_from_deleted_docs(&[1, 3], 8);
+        let live_posting_rows = (0..vector_reader.index().unwrap().num_rows())
+            .filter(|&row| alive.is_alive(vector_reader.doc_id_at(row)))
+            .count();
+        assert_eq!(live_posting_rows, 6);
+
+        let queries = fixture_calibration_queries(DIM);
+        let measurements = vector_reader
+            .calibrate_external_queries(&queries, usize::MAX, Some(&alive))?
+            .unwrap();
+        assert!(measurements
+            .aggregate()
+            .iter()
+            .all(|depth| { depth.sample_count == (live_posting_rows * queries.len()) as u64 }));
+
+        let bounded = vector_reader
+            .calibrate_external_queries(&queries, 5, Some(&alive))?
+            .unwrap();
+        assert!(bounded
+            .aggregate()
+            .iter()
+            .all(|depth| depth.sample_count == (5 * queries.len()) as u64));
         Ok(())
     }
 }

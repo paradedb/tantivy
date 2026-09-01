@@ -32,6 +32,9 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
+#[cfg(feature = "quantization-bench")]
+#[doc(hidden)]
+pub use backend::quantization_bench_plane1_cosine_cluster;
 pub use backend::{
     set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, VectorBackend,
     DEFAULT_FIXED_PROBE_COST_ROWS,
@@ -41,13 +44,17 @@ pub use bounds::{
     BoundKind, BoundStore, BoundsBuilder, HeapPeek, QueryBound, Verdict,
 };
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
+#[cfg(feature = "quantization-bench")]
+#[doc(hidden)]
+pub use distance::quantization_bench_dot_bytes_f32;
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
 pub use flat::FlatVecWriter;
-#[cfg(test)]
-pub use index_reader::QuantizationCalibrationAudit;
-pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
+pub use index_reader::{
+    VectorCalibrationMeasurements, VectorCalibrationMoments, VectorClusterStats, VectorIndexReader,
+    VectorInfo, VectorStorageFormat,
+};
 pub use ivf::{
     BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, BuiltRouter, Candidate, ClusterId,
     FlatStore, Graph, IvfCentroids, IvfClusterer, IvfConfig, IvfIndex, IvfIndexBuilder,
@@ -60,7 +67,8 @@ pub use ivf::{
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
 pub use quantization::{
-    quantized_code_stride, VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationGrid,
+    quantized_code_stride, VectorNormPolicy, VectorQuantizationCalibrationSource,
+    VectorQuantizationConfig, VectorQuantizationDepthCalibration, VectorQuantizationGrid,
     VectorQuantizationLayer, VectorQuantizer, GRID_FORMAT_VERSION, MAX_QUANTIZATION_LAYERS,
     QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE,
     QUANTIZED_SCALE_STRIDE, VECTOR_QUANTIZATION_FORMAT_VERSION,

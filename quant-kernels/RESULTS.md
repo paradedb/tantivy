@@ -1468,3 +1468,251 @@ Cells are `scan_init ms / hits / stage-sum ms / mean-wall ms / gap ms`.
 | largest positive residual | 0.240 ms (qoff r99, matched) |
 | non-attributed buffer hits | 27/query |
 | status | STOP-AND-FLAG |
+
+## 2026-08-25 — A1 real-query calibration v3 persistence (M5/ARM)
+
+Tantivy `6e260f3be743ee514d2642d574aa5fb8a2e40e6f`; pg_search
+`9fbafcd0e8`; caller-supplied `pdbench_queries`, 100 queries, 1,000 live
+posting-membership rows per index, production quantized-query estimator.
+
+| config | depth | bias | spread | sample count | source |
+|---|---:|---:|---:|---:|---|
+| q14 | 1 | -3.218186 | 1.808974 | 100000 | real_query |
+| q14 | 2 | -0.223322 | 2.007957 | 100000 | real_query |
+| q1 | 1 | -3.165773 | 1.780213 | 100000 | real_query |
+| q2 | 1 | -1.449059 | 1.150055 | 100000 | real_query |
+| q14-p4x | 1 | -3.473929 | 1.781963 | 100000 | real_query |
+| q14-p4x | 2 | -0.237123 | 1.986253 | 100000 | real_query |
+| q14-p16x | 1 | -3.725733 | 1.792323 | 100000 | real_query |
+| q14-p16x | 2 | -0.247079 | 1.955126 | 100000 | real_query |
+
+Per-query stability cells are `mean / stddev / min / max`, across 100 query
+fixtures.
+
+| config | depth | bias stability | spread stability |
+|---|---:|---:|---:|
+| q14 | 1 | -3.218186 / 0.213471 / -3.846690 / -2.597470 | 1.795141 / 0.065444 / 1.615055 / 1.941548 |
+| q14 | 2 | -0.223322 / 0.365691 / -1.111846 / 0.825977 | 1.970982 / 0.115720 / 1.732651 / 2.388867 |
+| q1 | 1 | -3.165773 / 0.216731 / -3.684365 / -2.559162 | 1.765657 / 0.068115 / 1.604243 / 1.912511 |
+| q2 | 1 | -1.449059 / 0.101827 / -1.714005 / -1.174778 | 1.145208 / 0.027486 / 1.081863 / 1.205024 |
+| q14-p4x | 1 | -3.473929 / 0.238189 / -3.959586 / -2.780980 | 1.765147 / 0.053985 / 1.622973 / 1.890232 |
+| q14-p4x | 2 | -0.237123 / 0.370692 / -1.310642 / 0.951889 | 1.948168 / 0.111490 / 1.731019 / 2.290443 |
+| q14-p16x | 1 | -3.725733 / 0.234417 / -4.292371 / -3.030674 | 1.776009 / 0.057106 / 1.659460 / 1.922863 |
+| q14-p16x | 2 | -0.247078 / 0.374844 / -0.845057 / 0.762636 | 1.915477 / 0.113840 / 1.686020 / 2.180211 |
+
+## 2026-08-25 — A2 GATE-C superseding level-0 contract
+
+| gate | status | code/test result |
+|---|---|---|
+| GATE-C · level 0 disables quantized scoring, IVF intact | green | calibrated quantized IVF at `max_scan_levels=0` matched unquantized IVF results and routed/probe counters at identical adaptive parameters; no layer stats emitted (`vector::ivf::plugin::tests::gate_c_level_zero_matches_unquantized_ivf`); flat level 0 remained exhaustive (`vector::ivf::plugin::tests::level_zero_flat_segment_remains_exact`); Tantivy vector suite 186/186 and kernel release suites 38/38 green |
+
+## 2026-08-25 — definitive quantization closeout (M5/ARM, warm cache)
+
+Cohere 1M, `knn_top10_unfiltered`, 100 queries, with 300 timed samples and
+100 EXPLAIN samples per sweep point. Funnel and recall are machine-independent;
+latency and micro-benchmark numbers are M5/ARM context.
+
+Measured code: Tantivy `9903c3665894c91b985a0c3e5e5dd83f436de274`;
+pg_search `78a17a1cab362ace94e0693a994162883b535610`; pdbench
+`f7846119f6ff99bf900c22f79abb527d78234ac4`.
+
+| config | schedule | persisted calibration `(bias, spread)` | mean posting | before run | definitive run |
+|---|---|---|---:|---|---|
+| qoff | off | · | 100.000 | `runs/cohere-1m-qoff/20260825_155017_search.json` | `runs/cohere-1m-qoff/20260825_203655_search.json` |
+| q14 | [1,4] | [(-3.218186, 1.808974), (-0.223322, 2.007957)] | 100.000 | `runs/cohere-1m-q14/20260825_155043_search.json` | `runs/cohere-1m-q14/20260825_203717_search.json` |
+| q1 | [1] | [(-3.165773, 1.780213)] | 100.000 | `runs/cohere-1m-q1/20260825_155110_search.json` | `runs/cohere-1m-q1/20260825_203738_search.json` |
+
+### C1 — within-EXPLAIN attribution gate
+
+Gap is `EXPLAIN execution mean − Σ(stage means)` in the same 100-sample
+EXPLAIN population. Limit is `max(0.100 ms, 0.5% of stage total)`. Direct
+CustomScan result delivery is now included in `result_assembly_ns`; the
+separate timed-wall-minus-EXPLAIN footer includes timed-sample variation and
+executor tuple delivery outside the measured vector stage population.
+
+| config | target | probe / recall | EXPLAIN ms | stage sum ms | gap ms | limit ms | timed wall − EXPLAIN ms | status |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| qoff | r90 | 0.005 / 0.8970 | 2.920 | 2.854 | 0.066 | 0.100 | -0.047 | green |
+| q14 | r90 | 0.005 / 0.8970 | 2.074 | 2.006 | 0.068 | 0.100 | +0.023 | green |
+| q1 | r90 | 0.005 / 0.8970 | 2.397 | 2.314 | 0.083 | 0.100 | -0.064 | green |
+| qoff | r95 | 0.0109 / 0.9480 | 5.043 | 4.972 | 0.071 | 0.100 | -0.374 | green |
+| q14 | r95 | 0.0109 / 0.9480 | 2.663 | 2.594 | 0.069 | 0.100 | -0.063 | green |
+| q1 | r95 | 0.0109 / 0.9480 | 3.087 | 3.006 | 0.081 | 0.100 | +0.009 | green |
+| qoff | r99 | 0.1 / 0.9930 | 34.631 | 34.549 | 0.082 | 0.173 | -0.820 | green |
+| q14 | r99 | 0.1 / 0.9930 | 9.412 | 9.338 | 0.074 | 0.100 | -0.295 | green |
+| q1 | r99 | 0.1 / 0.9930 | 11.085 | 10.990 | 0.095 | 0.100 | -0.570 | green |
+
+### C3 — recall-matched attribution tables
+
+Cells are `mean ms / percent of EXPLAIN wall / buffer hits`.
+
+#### r90 — all configs probe 0.005, recall 0.8970
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| scan init | 0.873 / 29.9% / 688 | 0.901 / 43.4% / 690 | 0.986 / 41.1% / 690 |
+| query prep | 0.000 / 0.0% / 0 | 0.102 / 4.9% / 0 | 0.025 / 1.1% / 0 |
+| routing | 0.373 / 12.8% / 635 | 0.360 / 17.4% / 635 | 0.445 / 18.6% / 635 |
+| exact scan | 1.585 / 54.3% / 2601 | · | · |
+| result assembly | 0.023 / 0.8% / 0 | 0.025 / 1.2% / 0 | 0.077 / 3.2% / 0 |
+| layer-0 scan | · | 0.211 / 10.2% / 149 | 0.241 / 10.0% / 149 |
+| boundary-0 | · | 0.036 / 1.7% / 0 | 0.039 / 1.6% / 0 |
+| layer-1 scan | · | 0.337 / 16.3% / 215 | · |
+| boundary-1 | · | 0.004 / 0.2% / 0 | · |
+| rerank fetch | · | 0.026 / 1.3% / 43 | 0.431 / 18.0% / 815 |
+| rerank score | · | 0.004 / 0.2% / 0 | 0.070 / 2.9% / 0 |
+| unattributed gap | 0.066 / 2.3% / 27 | 0.068 / 3.3% / 27 | 0.083 / 3.5% / 27 |
+| TOTAL | 2.920 / 100.0% / 3950 | 2.074 / 100.0% / 1759 | 2.397 / 100.0% / 2316 |
+
+| r90 footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| wall p50 / p99 ms | 2.771 / 4.931 | 2.054 / 2.902 | 2.318 / 3.171 |
+| layer funnel | · | L0 5093.4→859.5; L1 859.5→31.3 | L0 5093.4→844.9 |
+| R / rerank bytes | 0.0 / 0 | 31.3 / 128369 | 844.9 / 3460833 |
+| layer bytes | · | L0 651954; L1 440069 | L0 651954 |
+| unit ns/scored row | · | L0 41.4; L1 392.2 | L0 47.3 |
+| timed wall − EXPLAIN wall ms | -0.047 | +0.023 | -0.064 |
+
+#### r95 — all configs probe 0.0109, recall 0.9480
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| scan init | 0.902 / 17.9% / 688 | 0.904 / 33.9% / 690 | 0.979 / 31.7% / 690 |
+| query prep | 0.000 / 0.0% / 0 | 0.100 / 3.7% / 0 | 0.025 / 0.8% / 0 |
+| routing | 0.625 / 12.4% / 1058 | 0.588 / 22.1% / 1058 | 0.724 / 23.4% / 1058 |
+| exact scan | 3.416 / 67.7% / 5612 | · | · |
+| result assembly | 0.028 / 0.6% / 0 | 0.026 / 1.0% / 0 | 0.083 / 2.7% / 0 |
+| layer-0 scan | · | 0.447 / 16.8% / 336 | 0.499 / 16.2% / 336 |
+| boundary-0 | · | 0.062 / 2.3% / 0 | 0.066 / 2.1% / 0 |
+| layer-1 scan | · | 0.433 / 16.2% / 305 | · |
+| boundary-1 | · | 0.004 / 0.2% / 0 | · |
+| rerank fetch | · | 0.027 / 1.0% / 44 | 0.544 / 17.6% / 1012 |
+| rerank score | · | 0.004 / 0.1% / 0 | 0.086 / 2.8% / 0 |
+| unattributed gap | 0.071 / 1.4% / 27 | 0.069 / 2.6% / 27 | 0.081 / 2.6% / 27 |
+| TOTAL | 5.043 / 100.0% / 7385 | 2.663 / 100.0% / 2461 | 3.087 / 100.0% / 3123 |
+
+| r95 footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| wall p50 / p99 ms | 4.631 / 5.438 | 2.544 / 3.495 | 2.955 / 5.519 |
+| layer funnel | · | L0 10983.9→1008.1; L1 1008.1→32.2 | L0 10983.9→995.2 |
+| R / rerank bytes | 0.0 / 0 | 32.2 / 131973 | 995.2 / 4076257 |
+| layer bytes | · | L0 1405942; L1 516137 | L0 1405942 |
+| unit ns/scored row | · | L0 40.7; L1 429.0 | L0 45.5 |
+| timed wall − EXPLAIN wall ms | -0.374 | -0.063 | +0.009 |
+
+#### r99 — all configs probe 0.1, recall 0.9930
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| scan init | 0.920 / 2.7% / 688 | 0.953 / 10.1% / 690 | 1.048 / 9.5% / 690 |
+| query prep | 0.000 / 0.0% / 0 | 0.110 / 1.2% / 0 | 0.031 / 0.3% / 0 |
+| routing | 3.125 / 9.0% / 5068 | 2.927 / 31.1% / 5068 | 3.733 / 33.7% / 5068 |
+| exact scan | 30.462 / 88.0% / 51227 | · | · |
+| result assembly | 0.042 / 0.1% / 0 | 0.037 / 0.4% / 0 | 0.113 / 1.0% / 0 |
+| layer-0 scan | · | 4.227 / 44.9% / 3432 | 4.806 / 43.4% / 3432 |
+| boundary-0 | · | 0.436 / 4.6% / 0 | 0.448 / 4.0% / 0 |
+| layer-1 scan | · | 0.605 / 6.4% / 426 | · |
+| boundary-1 | · | 0.006 / 0.1% / 0 | · |
+| rerank fetch | · | 0.033 / 0.4% / 48 | 0.706 / 6.4% / 1196 |
+| rerank score | · | 0.005 / 0.1% / 0 | 0.104 / 0.9% / 0 |
+| unattributed gap | 0.082 / 0.2% / 27 | 0.074 / 0.8% / 27 | 0.095 / 0.9% / 27 |
+| TOTAL | 34.631 / 100.0% / 57010 | 9.412 / 100.0% / 9691 | 11.085 / 100.0% / 10414 |
+
+| r99 footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| wall p50 / p99 ms | 33.026 / 42.615 | 9.013 / 13.902 | 9.915 / 15.094 |
+| layer funnel | · | L0 100107.7→1142.4; L1 1142.4→34.3 | L0 100107.7→1123.8 |
+| R / rerank bytes | 0.0 / 0 | 34.3 / 140452 | 1123.8 / 4603290 |
+| layer bytes | · | L0 12813783; L1 584914 | L0 12813783 |
+| unit ns/scored row | · | L0 42.2; L1 529.4 | L0 48.0 |
+| timed wall − EXPLAIN wall ms | -0.820 | -0.295 | -0.570 |
+
+### C7 — before/after attribution boundary
+
+Cells are `before → definitive`. Funnel counts are omitted because A1
+centering intentionally changes them; the comparison keys on attribution and
+wall latency. The q14 middle row is explicitly non-comparable because the old
+run used probe 0.0141 / recall 0.9580 and the definitive matched row uses
+0.0109 / 0.9480.
+
+| config / target | probe / recall before → final | scan init ms | exact or L0 ms | L1 ms | rerank fetch+score ms | wall p50 ms | wall p99 ms |
+|---|---|---:|---:|---:|---:|---:|---:|
+| qoff r90 | 0.005 / .897 → same | 1.415→0.873 | 1.677→1.585 | · | · | 3.580→2.771 | 4.909→4.931 |
+| qoff r95 | 0.0109 / .948 → same | 1.317→0.902 | 3.372→3.416 | · | · | 5.412→4.631 | 6.273→5.438 |
+| qoff r99 | 0.1 / .993 → same | 1.380→0.920 | 30.888→30.462 | · | · | 34.678→33.026 | 42.936→42.615 |
+| q14 r90 | 0.005 / .897 → same | 0.896→0.901 | 0.285→0.211 | 1.000→0.337 | 0.034→0.030 | 2.966→2.054 | 4.215→2.902 |
+| q14 middle | 0.0141 / .958 → 0.0109 / .948 | 0.912→0.904 | 0.786→0.447 | 2.123→0.433 | 0.037→0.031 | 5.065→2.544 | 6.587→3.495 |
+| q14 r99 | 0.1 / .993 → same | 0.980→0.953 | 5.737→4.227 | 5.535→0.605 | 0.043→0.038 | 13.914→9.013 | 29.347→13.902 |
+| q1 r90 | 0.005 / .897 → same | 0.860→0.986 | 0.285→0.241 | · | 1.310→0.501 | 3.158→2.318 | 3.656→3.171 |
+| q1 r95 | 0.0109 / .948 → same | 0.891→0.979 | 0.610→0.499 | · | 2.402→0.630 | 4.996→2.955 | 6.175→5.519 |
+| q1 r99 | 0.1 / .993 → same | 0.941→1.048 | 5.741→4.806 | · | 7.919→0.810 | 15.239→9.915 | 36.618→15.094 |
+
+### C4 — integrated plane-1 production shape
+
+Criterion command: `cargo bench --features quantization-bench --bench vector_quantization_scan`.
+The case streams 100-row, d=1024 cosine postings
+through the production borrowed-code batch entry, branchless f16 scale decode,
+score/bias combine, and sigma pass.
+
+| case | d | rows/batch | ns/row | 95% CI ns/row | throughput |
+|---|---:|---:|---:|---:|---:|
+| sign-kernel reference | 1024 | 100 | 18.5 | · | · |
+| integrated production shape | 1024 | 100 | 13.483930 | 13.474050–13.494331 | 74.162 M rows/s |
+
+### C5 — assembly verdicts
+
+| loop | verdict | receipt |
+|---|---|---|
+| fissioned score/bias combine | packed ARM64 NEON confirmed | `quantization_bench_plane1_cosine_cluster`; `fmla.4s` and `fmul.4s` packed loop |
+| fissioned sigma pass | packed ARM64 NEON confirmed | same symbol; packed `fmul.4s` loop |
+| qoff fp32 dot | packed ARM64 NEON confirmed | `src/vector/distance.rs`; four `fmul.4s` followed by four `fadd.4s` in the release loop |
+| eager IdMap/open finding | team-report item | qoff open cost approximately +0.48 ms; page attribution and cache/invalidation proposal remain deferred |
+
+### A/B implementation receipts
+
+| item | status | code/test receipt |
+|---|---|---|
+| A1(a) hardcoded calibration removal | complete | production grep has no `REAL_QUERY_CALIBRATION`, Cohere floor, `sample_count == 1000` source hack, or production `prepare_fp_query` |
+| A1(b,c) per-depth `(bias, spread)` | complete | `src/vector/quantization.rs`; prefix measurement including depth 2 in `src/vector/index_reader.rs`; persisted table above |
+| A1(d) SQL calibration API | complete | `pg_search/src/api/vector.rs`: required field, validation, 256-query cap, 1K interval rows, production quantized-query estimator, returned persisted rows; external queries intentionally have no residency exclusion |
+| A1(e) center exactly once | complete | sole application in `src/vector/backend.rs`; active-prefix resolution in `src/vector/prepared.rs`; deeper prefixes replace rather than accumulate corrections |
+| A1(f) no numeric fallback | complete | missing calibration suppresses quantized context in `src/vector/index_reader.rs`; pg_search emits NOTICE and uses routed fp32 IVF |
+| A1(g) precedence/atomicity | complete | real-query precedence in `src/vector/quantization.rs`; atomic settings swap in `pg_search/src/index/directory/utils.rs` |
+| A1(h) live persistence/stability | complete | q14, q1, q2, p4x, p16x and both depth-2 rows recorded in the A1 table above |
+| A2 level 0 | complete | routed exact IVF dispatch in `src/vector/backend.rs`; GUC contract in `pg_search/src/gucs.rs`; Tantivy and SQL GATE-C tests |
+| A3 format body | complete | retired slot 15 and settings calibration contract in `src/vector/FORMAT.md`; reader ignores legacy slot 15 |
+| A4 aligned LE words | complete | hard validation plus `align_to` borrow / explicit LE-copy fallback in `quant-kernels/cascade/src/lib.rs`; aligned and unaligned tests |
+| A5 exclusion scope | complete as ruled | external calibration has no self-membership; held-out all-replica exclusion is deferred with B5 and is not claimed implemented |
+| A6 fixture matrix | complete | direct exact oracle and attribution across cosine/L2+slot14, [1,4]/[1,1], every prefix, filters, deletes, replication/dedup, and d=100 in `src/vector/ivf/plugin.rs` |
+| B1 fission | complete | SoA buffers, one branchless f16 decode, separate f32 combine/sigma loops, cluster-range residual norms, and shared refinement shape in `src/vector/backend.rs` / `src/vector/index_reader.rs`; packed assembly in C5 |
+| B2 indexed kernels | complete | indexed sign and odd-d grid kernels in `quant-kernels`; one-time tail validation, density-adaptive reads, cross-cluster cosine batches, L2-local batches in vector reader/backend tests |
+| B3 hoisting | complete | process-cached rotations/grids and query-shared bitplanes/LUT in `src/vector/prepared.rs`; level 0 bypasses quantized state |
+| B4 bookkeeping | complete | cluster-local running-min heap and once-per-cluster merge; replica HashMap rebuild only at boundary/rerank; independent/adversarial tests in `src/vector/backend.rs` |
+
+### C6 — final regression gates
+
+| gate | result |
+|---|---|
+| quant-kernels release goldens | green, 49/49 |
+| Tantivy vector suite | green, 197/197 |
+| pg_regress `vector_quantization` | green, 58.323 s |
+| pdbench C renderer tests | green, 34/34 |
+
+### Deferred dispositions
+
+| item | disposition |
+|---|---|
+| reader/searcher caching | team report only; page attribution, cache key, invalidation story, and saving are recorded above; no cache implementation in this branch |
+| format-amendment bundle | follow-up: cosine constants-slot writes and f16→f32 scale-storage question; V3 is unchanged in this batch |
+| packed LUT (`pshufb` / `tbl`) | follow-up kernel project; indexed packed-LUT scalar gather remains current |
+| kappa values | design stance, not a gap: layer 0 uses 2.0; later sign-final uses 2.0 and grid-final uses 4.0 |
+| B5 build side | explicitly deferred: slot temp-file streaming, merge-loop rotation/decode scratch reuse, persisted-rho merge use, and held-out calibration hook |
+| 10M campaign | deferred with B5 and blocked on streaming quantized slot output; not forgotten |
+
+### Branch record
+
+| repository | branch | revision |
+|---|---|---|
+| tantivy | `ruchir/quantization` | this append-only record; measured code parent `9903c3665894c91b985a0c3e5e5dd83f436de274` |
+| paradedb | `ruchir/quantization` | `78a17a1cab362ace94e0693a994162883b535610` |
+| pdbench | `ruchir/quantization` | `f7846119f6ff99bf900c22f79abb527d78234ac4` |

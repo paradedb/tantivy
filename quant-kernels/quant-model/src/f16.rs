@@ -1,25 +1,21 @@
 //! IEEE-754 binary16 conversion with round-to-nearest, ties-to-even.
 
+#[inline(always)]
 pub fn f16_to_f32(value: u16) -> f32 {
-    let sign = (u32::from(value & 0x8000)) << 16;
-    let exponent = (value >> 10) & 0x1f;
-    let fraction = u32::from(value & 0x03ff);
-    let bits = match exponent {
-        0 if fraction == 0 => sign,
-        0 => {
-            let mut mantissa = fraction;
-            let mut unbiased_exponent = -14_i32;
-            while mantissa & 0x0400 == 0 {
-                mantissa <<= 1;
-                unbiased_exponent -= 1;
-            }
-            mantissa &= 0x03ff;
-            sign | (((unbiased_exponent + 127) as u32) << 23) | (mantissa << 13)
-        }
-        0x1f => sign | 0x7f80_0000 | (fraction << 13),
-        _ => sign | ((u32::from(exponent) + 112) << 23) | (fraction << 13),
-    };
-    f32::from_bits(bits)
+    // Branch-free binary16 expansion. `renorm_shift` normalizes subnormals;
+    // `inf_nan_mask` restores the all-ones exponent; `zero_mask` clears the
+    // synthetic exponent that normalization would otherwise give ±0.
+    let word = (value as u32) << 16;
+    let sign = word & 0x8000_0000;
+    let nonsign = word & 0x7fff_ffff;
+    let renorm_shift = nonsign.leading_zeros().saturating_sub(5);
+    let inf_nan_mask = ((nonsign.wrapping_add(0x0400_0000) as i32 >> 8) as u32) & 0x7f80_0000;
+    let zero_mask = ((nonsign.wrapping_sub(1) as i32) >> 31) as u32;
+    let magnitude = (((nonsign << renorm_shift) >> 3)
+        .wrapping_add((0x70_u32.wrapping_sub(renorm_shift)) << 23)
+        | inf_nan_mask)
+        & !zero_mask;
+    f32::from_bits(sign | magnitude)
 }
 
 pub fn f32_to_f16(value: f32) -> u16 {

@@ -220,6 +220,16 @@ pub fn dot_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {
     acc
 }
 
+/// Assembly-receipt entry for the exact-scan f32 dot loop. This exists only
+/// under the non-default quantization benchmark feature; its body is the same
+/// generic kernel used by the qoff scan path.
+#[cfg(feature = "quantization-bench")]
+#[doc(hidden)]
+#[inline(never)]
+pub fn quantization_bench_dot_bytes_f32(query: &[f32], doc_bytes: &[u8]) -> f32 {
+    dot_bytes::<f32>(query, doc_bytes)
+}
+
 /// `norm_squared` over little-endian bytes encoding `T`.
 #[inline]
 pub fn norm_squared_bytes<T: VectorElement>(doc_bytes: &[u8]) -> f32 {

@@ -10,7 +10,7 @@
 //! fetched with one stride-sized read ([`VectorIndexReader::vector_bytes_for_row`])
 //! — the unit the pg-backed `Directory` can serve zero-copy.
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -25,9 +25,9 @@ use super::bounds::{
     QueryBoundTracker, Verdict,
 };
 use super::distance::norm_squared_wide;
-use super::index_reader::{QuantizedLayerDenseBatch, VectorIndexReader};
+use super::index_reader::{QuantizedLayerReader, VectorIndexReader};
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
-use super::prepared::{PreparedQuery, QuantizedQueryCtx};
+use super::prepared::{PreparedQuery, QuantizedQueryCache, QuantizedQueryCtx};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
@@ -57,7 +57,6 @@ pub struct VectorBackend<T: VectorElement> {
     reader: Arc<VectorIndexReader>,
     query: Arc<PreparedQuery<T>>,
     quantized_query: Option<Arc<QuantizedQueryCtx>>,
-    max_scan_levels: usize,
     scan_init_ns: u64,
     query_prep_ns: u64,
     adaptive: AdaptiveProbeParams,
@@ -68,27 +67,33 @@ impl<T: VectorElement> VectorBackend<T> {
     /// Opens the segment's cached vector reader for `field` and prepares the
     /// query against the field's metric. A segment with no vector data gets
     /// the empty reader and yields no hits.
-    pub fn for_segment(
+    pub(crate) fn for_segment(
         segment_reader: &SegmentReader,
         segment_ord: SegmentOrdinal,
         field: Field,
         query: Arc<Vec<T>>,
+        quantized_queries: &QuantizedQueryCache,
         adaptive: AdaptiveProbeParams,
         max_scan_levels: usize,
     ) -> crate::Result<Self> {
         let reader = segment_reader.vector_index(field)?;
         let prep_start = Instant::now();
         let _query_prep_stage = enter_vector_stage(Stage::QueryPrep);
-        let query_f32: Vec<f32> = query.iter().map(|value| value.to_f32()).collect();
-        let quantized_query = reader
-            .quantization()
-            .map(|quantized| Arc::new(QuantizedQueryCtx::new(quantized.index_ctx(), query_f32)));
+        let quantized_query = if max_scan_levels == 0 {
+            None
+        } else {
+            reader.quantization().and_then(|quantized| {
+                quantized.index_ctx().map(|index_ctx| {
+                    let active_layers = max_scan_levels.min(index_ctx.specs.len());
+                    quantized_queries.resolve(index_ctx, query.as_slice(), active_layers)
+                })
+            })
+        };
         let query = Arc::new(PreparedQuery::<T>::new(reader.options().metric(), query));
         Ok(Self {
             reader,
             query,
             quantized_query,
-            max_scan_levels,
             scan_init_ns: 0,
             query_prep_ns: prep_start.elapsed().as_nanos() as u64,
             adaptive,
@@ -108,7 +113,7 @@ impl<T: VectorElement> VectorBackend<T> {
     /// an index, exact-scan otherwise. Hits come back already tagged with
     /// `DocAddress`, so the collector doesn't need a second pass to attach
     /// the segment. The segment's [`ProbeStats`] ride along: the IVF path
-    /// fills the probe-loop counters, the flat/exact path only
+    /// fills the probe-loop counters, the flat exact path only
     /// `exact_rows_read` plus exact-stage timings.
     pub fn top_n(
         &self,
@@ -159,42 +164,19 @@ impl<T: VectorElement> VectorBackend<T> {
             query_prep_ns: self.query_prep_ns,
             ..Default::default()
         };
-        let hits = if self.max_scan_levels == 0 {
-            self.exact_top_n(
+        let hits = match self.reader.index() {
+            None => self.exact_top_n(
                 weight,
                 segment_reader,
                 top_n,
                 tie_break,
                 tie_comparator,
                 &mut stats,
-            )?
-        } else {
-            match self.reader.index() {
-                Some(index) => {
-                    if let Some(quantized_query) = &self.quantized_query {
-                        self.quantized_top_n(
-                            index,
-                            quantized_query,
-                            weight,
-                            segment_reader,
-                            top_n,
-                            tie_break,
-                            tie_comparator,
-                            &mut stats,
-                        )?
-                    } else {
-                        self.approximate_top_n(
-                            index,
-                            weight,
-                            segment_reader,
-                            top_n,
-                            tie_break,
-                            tie_comparator,
-                            &mut stats,
-                        )?
-                    }
-                }
-                None => self.exact_top_n(
+            )?,
+            Some(index) => match &self.quantized_query {
+                Some(quantized_query) => self.quantized_top_n(
+                    index,
+                    quantized_query,
                     weight,
                     segment_reader,
                     top_n,
@@ -202,12 +184,21 @@ impl<T: VectorElement> VectorBackend<T> {
                     tie_comparator,
                     &mut stats,
                 )?,
-            }
+                None => self.approximate_top_n(
+                    index,
+                    weight,
+                    segment_reader,
+                    top_n,
+                    tie_break,
+                    tie_comparator,
+                    &mut stats,
+                )?,
+            },
         };
         Ok((hits, stats))
     }
 
-    /// Flat/exact scan: drain the filter DocSet doc-by-doc, scoring each
+    /// Flat exact scan: drain the filter DocSet doc-by-doc, scoring each
     /// survivor from one stride-sized row read. Fills only the
     /// `exact_rows_read` stat.
     fn exact_top_n<K, CTail>(
@@ -347,6 +338,17 @@ pub struct LayerProbeStats {
     calibration: Option<f32>,
 }
 
+/// Candidate identities at the quantized stage boundaries, used only by the
+/// deterministic end-to-end fixture to classify a mismatch as routing,
+/// banding, or rerank. This never enters the production stats wire format.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct QuantizedStageTrace {
+    pub(crate) scored_docs: Vec<DocId>,
+    pub(crate) boundary_docs: Vec<Vec<DocId>>,
+    pub(crate) rerank_docs: Vec<DocId>,
+}
+
 /// Sparse, zero-based per-layer instrumentation. A layer is inserted only
 /// when its scorer executes, so omission remains the wire-level signal for a
 /// truncated or shorter schedule.
@@ -425,6 +427,9 @@ pub struct ProbeStats {
     /// Sparse layer-indexed timing and funnel counters, flattened on the wire.
     #[serde(flatten)]
     pub layers: LayerProbeStatsSet,
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) quantized_trace: QuantizedStageTrace,
     /// Distinct documents fetched for exact rerank.
     pub rerank_rows: usize,
     /// Segment reader, id-map, metadata/header, filter, and scan-state setup
@@ -756,150 +761,447 @@ struct Survivor {
     doc: DocId,
 }
 
+/// A boundary survivor materialized only while compacting/reordering the SoA
+/// scan buffers. The hot scan loops append primitive columns directly.
+#[derive(Clone, Copy)]
 struct QuantizedCandidate {
     row: usize,
     doc: DocId,
     score: f32,
     bias_correction: f32,
     sigma: f32,
-    score_query_norm: f32,
 }
 
-/// Apply one refinement kernel result stream directly to a cluster-local
-/// candidate slice. The kernel has one batch entry; scale decode, split-form
-/// constant application, sigma, and score accumulation share this one pass.
-#[inline(always)]
-fn apply_refinement_batch(
-    query: &QuantizedQueryCtx,
-    layer_idx: usize,
-    metric: Metric,
-    candidates: &mut [QuantizedCandidate],
-    codes: &[u8],
-    code_stride: usize,
-    scales: &[u8],
-    constants: Option<&[u8]>,
-    kernel_scores: &mut Vec<f32>,
-) {
-    let rows = candidates.len();
-    assert_eq!(scales.len(), rows * std::mem::size_of::<u16>());
-    if let Some(constants) = constants {
-        assert_eq!(constants.len(), rows * std::mem::size_of::<f32>());
-    }
-    kernel_scores.resize(rows, 0.0);
-    query.score_layer_batch_unscaled(layer_idx, codes, code_stride, &mut kernel_scores[..rows]);
-    let query_norm = candidates[0].score_query_norm;
-    debug_assert!(candidates
-        .iter()
-        .all(|candidate| candidate.score_query_norm == query_norm));
-    let sigma_factor = query.layer_sigma_factor(layer_idx, query_norm);
-    let bias_factor = query.layer_bias_factor(layer_idx, query_norm);
-    match constants {
-        Some(constants) => {
-            for (((candidate, &kernel_score), scale), constant) in candidates
-                .iter_mut()
-                .zip(&kernel_scores[..rows])
-                .zip(scales.chunks_exact(2))
-                .zip(constants.chunks_exact(4))
-            {
-                let scale = f16_to_f32(u16::from_le_bytes(scale.try_into().unwrap()));
-                let constant = f32::from_le_bytes(constant.try_into().unwrap());
-                let refinement = scale * kernel_score - constant;
-                let refinement = if metric == Metric::L2 {
-                    2.0 * refinement
-                } else {
-                    refinement
-                };
-                let bias_correction = scale * bias_factor;
-                candidate.score += refinement - candidate.bias_correction + bias_correction;
-                candidate.bias_correction = bias_correction;
-                candidate.sigma = scale * sigma_factor;
-            }
-        }
-        None => {
-            for ((candidate, &kernel_score), scale) in candidates
-                .iter_mut()
-                .zip(&kernel_scores[..rows])
-                .zip(scales.chunks_exact(2))
-            {
-                let scale = f16_to_f32(u16::from_le_bytes(scale.try_into().unwrap()));
-                let bias_correction = scale * bias_factor;
-                candidate.score +=
-                    scale * kernel_score - candidate.bias_correction + bias_correction;
-                candidate.bias_correction = bias_correction;
-                candidate.sigma = scale * sigma_factor;
-            }
-        }
-    }
+/// Dense, row-parallel scan state. Keeping the numeric columns separate lets
+/// the combine and uncertainty passes stream contiguous f32 slices without
+/// constructing one candidate object per scored row.
+struct QuantizedCandidates {
+    rows: Vec<usize>,
+    docs: Vec<DocId>,
+    scores: Vec<f32>,
+    bias_corrections: Vec<f32>,
+    sigmas: Vec<f32>,
 }
 
-/// Sparse counterpart of [`apply_refinement_batch`]. Codes, scales, and
-/// constants remain borrowed from one cluster-range pin; `row_offsets` selects
-/// survivor rows without copying them into a dense gather buffer.
-#[inline(always)]
-fn apply_refinement_indexed_batch(
-    query: &QuantizedQueryCtx,
-    layer_idx: usize,
-    metric: Metric,
-    candidates: &mut [QuantizedCandidate],
-    codes: &[u8],
-    code_stride: usize,
-    scales: &[u8],
-    constants: Option<&[u8]>,
-    row_offsets: &[usize],
-    kernel_scores: &mut Vec<f32>,
-) {
-    let rows = candidates.len();
-    assert_eq!(row_offsets.len(), rows);
-    assert_eq!(scales.len() % std::mem::size_of::<u16>(), 0);
-    if let Some(constants) = constants {
-        assert_eq!(constants.len() % std::mem::size_of::<f32>(), 0);
+impl QuantizedCandidates {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            rows: Vec::with_capacity(capacity),
+            docs: Vec::with_capacity(capacity),
+            scores: Vec::with_capacity(capacity),
+            bias_corrections: Vec::with_capacity(capacity),
+            sigmas: Vec::with_capacity(capacity),
+        }
     }
-    kernel_scores.resize(rows, 0.0);
-    query.score_layer_batch_unscaled_indexed(
-        layer_idx,
-        codes,
-        code_stride,
-        row_offsets,
-        &mut kernel_scores[..rows],
-    );
-    let query_norm = candidates[0].score_query_norm;
-    debug_assert!(candidates
-        .iter()
-        .all(|candidate| candidate.score_query_norm == query_norm));
-    let sigma_factor = query.layer_sigma_factor(layer_idx, query_norm);
-    let bias_factor = query.layer_bias_factor(layer_idx, query_norm);
-    for ((candidate, &kernel_score), &offset) in candidates
-        .iter_mut()
-        .zip(&kernel_scores[..rows])
-        .zip(row_offsets)
-    {
-        let scale_start = offset * std::mem::size_of::<u16>();
-        let scale = f16_to_f32(u16::from_le_bytes(
-            scales[scale_start..scale_start + 2].try_into().unwrap(),
-        ));
-        let refinement = if let Some(constants) = constants {
-            let constant_start = offset * std::mem::size_of::<f32>();
-            let constant = f32::from_le_bytes(
-                constants[constant_start..constant_start + 4]
-                    .try_into()
-                    .unwrap(),
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    #[inline]
+    fn push(&mut self, row: usize, doc: DocId, score: f32, bias_correction: f32, sigma: f32) {
+        self.rows.push(row);
+        self.docs.push(doc);
+        self.scores.push(score);
+        self.bias_corrections.push(bias_correction);
+        self.sigmas.push(sigma);
+    }
+
+    /// The sole production site that applies calibration centering.
+    #[inline(always)]
+    fn estimate(&self, index: usize) -> f32 {
+        self.scores[index] + self.bias_corrections[index]
+    }
+
+    fn materialize(&self, index: usize) -> QuantizedCandidate {
+        QuantizedCandidate {
+            row: self.rows[index],
+            doc: self.docs[index],
+            score: self.scores[index],
+            bias_correction: self.bias_corrections[index],
+            sigma: self.sigmas[index],
+        }
+    }
+
+    fn replace_with_boundary_survivors(&mut self, survivors: &[QuantizedCandidate]) {
+        self.rows.clear();
+        self.docs.clear();
+        self.scores.clear();
+        self.bias_corrections.clear();
+        self.sigmas.clear();
+        self.rows.reserve(survivors.len());
+        self.docs.reserve(survivors.len());
+        self.scores.reserve(survivors.len());
+        self.bias_corrections.reserve(survivors.len());
+        self.sigmas.reserve(survivors.len());
+        for survivor in survivors {
+            self.push(
+                survivor.row,
+                survivor.doc,
+                survivor.score,
+                survivor.bias_correction,
+                survivor.sigma,
             );
-            scale * kernel_score - constant
-        } else {
-            scale * kernel_score
-        };
-        let refinement = if metric == Metric::L2 {
-            2.0 * refinement
-        } else {
-            refinement
-        };
-        let bias_correction = scale * bias_factor;
-        candidate.score += refinement - candidate.bias_correction + bias_correction;
-        candidate.bias_correction = bias_correction;
-        candidate.sigma = scale * sigma_factor;
+        }
     }
 }
 
+/// Pass A: decode the complete LE-f16 scale stream into reusable f32 scratch.
+/// The loop body is branch-free; special-value handling lives in the inlined
+/// bit-manipulation implementation of `f16_to_f32`.
+#[inline(always)]
+fn decode_scales(scales: &[u8], decoded: &mut Vec<f32>) {
+    assert_eq!(scales.len() % std::mem::size_of::<u16>(), 0);
+    decoded.resize(scales.len() / std::mem::size_of::<u16>(), 0.0);
+    for (out, bytes) in decoded.iter_mut().zip(scales.chunks_exact(2)) {
+        let bits = bytes[0] as u16 | (bytes[1] as u16) << 8;
+        *out = f16_to_f32(bits);
+    }
+}
+
+/// Decode a contiguous LE-f32 slot once, before the floating-point combine.
+#[inline(always)]
+fn decode_f32s(bytes: &[u8], decoded: &mut Vec<f32>) {
+    assert_eq!(bytes.len() % std::mem::size_of::<f32>(), 0);
+    decoded.resize(bytes.len() / std::mem::size_of::<f32>(), 0.0);
+    for (out, bytes) in decoded.iter_mut().zip(bytes.chunks_exact(4)) {
+        let bits = bytes[0] as u32
+            | (bytes[1] as u32) << 8
+            | (bytes[2] as u32) << 16
+            | (bytes[3] as u32) << 24;
+        *out = f32::from_bits(bits);
+    }
+}
+
+/// Passes B and C for the cosine/dot plane-1 path. Keeping the score/bias
+/// assembly and uncertainty scaling as separate f32-only loops gives LLVM a
+/// straight-line vectorization unit for each output stream.
+#[inline(always)]
+fn combine_initial_dot_decoded(
+    kernel_scores: &mut [f32],
+    bias_scores: &mut [f32],
+    sigma_scores: &mut [f32],
+    decoded_scales: &[f32],
+    cluster_score: f32,
+    bias_factor: f32,
+    sigma_factor: f32,
+) {
+    debug_assert_eq!(kernel_scores.len(), decoded_scales.len());
+    debug_assert_eq!(bias_scores.len(), decoded_scales.len());
+    debug_assert_eq!(sigma_scores.len(), decoded_scales.len());
+
+    // Pass B: f32-only FMA assembly over contiguous arrays.
+    for ((score, bias), &scale) in kernel_scores
+        .iter_mut()
+        .zip(bias_scores.iter_mut())
+        .zip(decoded_scales)
+    {
+        *score = scale.mul_add(*score, cluster_score);
+        *bias = scale * bias_factor;
+    }
+
+    // Pass C: f32-only uncertainty scaling.
+    for (sigma, &scale) in sigma_scores.iter_mut().zip(decoded_scales) {
+        *sigma = scale * sigma_factor;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn combine_initial_decoded(
+    metric: Metric,
+    kernel_scores: &mut [f32],
+    bias_scores: &mut [f32],
+    sigma_scores: &mut [f32],
+    decoded_scales: &[f32],
+    decoded_constants: &[f32],
+    decoded_residual_norms: &[f32],
+    cluster_score: f32,
+    bias_factor: f32,
+    sigma_factor: f32,
+) {
+    debug_assert_eq!(kernel_scores.len(), decoded_scales.len());
+    debug_assert_eq!(bias_scores.len(), decoded_scales.len());
+    debug_assert_eq!(sigma_scores.len(), decoded_scales.len());
+    match metric {
+        Metric::L2 => {
+            debug_assert_eq!(decoded_constants.len(), decoded_scales.len());
+            debug_assert_eq!(decoded_residual_norms.len(), decoded_scales.len());
+            // Pass B: f32-only FMA assembly over contiguous arrays.
+            for ((((score, bias), &scale), &constant), &residual_norm_sq) in kernel_scores
+                .iter_mut()
+                .zip(bias_scores.iter_mut())
+                .zip(decoded_scales)
+                .zip(decoded_constants)
+                .zip(decoded_residual_norms)
+            {
+                *score = (2.0 * scale)
+                    .mul_add(*score, cluster_score - 2.0 * constant - residual_norm_sq);
+                *bias = scale * bias_factor;
+            }
+            // Pass C: f32-only uncertainty scaling.
+            for (sigma, &scale) in sigma_scores.iter_mut().zip(decoded_scales) {
+                *sigma = scale * sigma_factor;
+            }
+        }
+        Metric::Dot | Metric::Cosine => combine_initial_dot_decoded(
+            kernel_scores,
+            bias_scores,
+            sigma_scores,
+            decoded_scales,
+            cluster_score,
+            bias_factor,
+            sigma_factor,
+        ),
+    }
+}
+
+/// Criterion-only entry for the complete plane-1 cluster shape. The feature
+/// gate keeps this receipt out of the default public API while the function
+/// itself reuses the production kernel, scale decoder, and combine passes.
+#[cfg(feature = "quantization-bench")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub fn quantization_bench_plane1_cosine_cluster(
+    prepared: &cascade::PreparedSplitQuery,
+    spec: cascade::LayerSpec,
+    codes: &[u8],
+    code_stride: usize,
+    scales: &[u8],
+    cluster_score: f32,
+    bias_factor: f32,
+    sigma_factor: f32,
+    kernel_scores: &mut Vec<f32>,
+    decoded_scales: &mut Vec<f32>,
+    bias_scores: &mut Vec<f32>,
+    sigma_scores: &mut Vec<f32>,
+) -> f32 {
+    let rows = scales.len() / std::mem::size_of::<u16>();
+    assert_eq!(codes.len(), rows * code_stride);
+    kernel_scores.resize(rows, 0.0);
+    prepared.score_layer_batch_unscaled(0, codes, code_stride, spec, kernel_scores);
+    decode_scales(scales, decoded_scales);
+    bias_scores.resize(rows, 0.0);
+    sigma_scores.resize(rows, 0.0);
+    combine_initial_decoded(
+        Metric::Cosine,
+        kernel_scores,
+        bias_scores,
+        sigma_scores,
+        decoded_scales,
+        &[],
+        &[],
+        cluster_score,
+        bias_factor,
+        sigma_factor,
+    );
+
+    // One value from every output stream makes the writes observable without
+    // adding a reduction to the measured per-row loop shape.
+    kernel_scores[rows - 1] + bias_scores[rows - 1] + sigma_scores[rows - 1]
+}
+
+const COSINE_REFINEMENT_BATCH_ROWS: usize = 2_048;
+
+fn cosine_refinement_batches(row_count: usize) -> impl Iterator<Item = Range<usize>> {
+    (0..row_count)
+        .step_by(COSINE_REFINEMENT_BATCH_ROWS)
+        .map(move |start| start..(start + COSINE_REFINEMENT_BATCH_ROWS).min(row_count))
+}
+
+#[inline(always)]
+fn combine_refinement_decoded(
+    metric: Metric,
+    candidates: &mut QuantizedCandidates,
+    candidate_range: Range<usize>,
+    kernel_scores: &[f32],
+    decoded_scales: &[f32],
+    decoded_constants: &[f32],
+    sigma_factor: f32,
+    bias_factor: f32,
+) {
+    let rows = candidate_range.len();
+    debug_assert_eq!(kernel_scores.len(), rows);
+    debug_assert_eq!(decoded_scales.len(), rows);
+    let scores = &mut candidates.scores[candidate_range.clone()];
+    let bias_corrections = &mut candidates.bias_corrections[candidate_range.clone()];
+    match metric {
+        Metric::L2 => {
+            debug_assert_eq!(decoded_constants.len(), rows);
+            for (((score, bias_correction), &kernel_score), (&scale, &constant)) in scores
+                .iter_mut()
+                .zip(bias_corrections.iter_mut())
+                .zip(kernel_scores)
+                .zip(decoded_scales.iter().zip(decoded_constants))
+            {
+                *score = (2.0 * scale).mul_add(kernel_score, *score - 2.0 * constant);
+                *bias_correction = scale * bias_factor;
+            }
+        }
+        Metric::Dot | Metric::Cosine => {
+            for (((score, bias_correction), &kernel_score), &scale) in scores
+                .iter_mut()
+                .zip(bias_corrections.iter_mut())
+                .zip(kernel_scores)
+                .zip(decoded_scales)
+            {
+                *score = scale.mul_add(kernel_score, *score);
+                *bias_correction = scale * bias_factor;
+            }
+        }
+    }
+    for (sigma, &scale) in candidates.sigmas[candidate_range]
+        .iter_mut()
+        .zip(decoded_scales)
+    {
+        *sigma = scale * sigma_factor;
+    }
+}
+
+/// Score one storage-ordered survivor batch from independently planned SoA
+/// pins. Packed codes are never gathered: every kernel call borrows one code
+/// range and indexes rows relative to that pin. Scale/constant plans may have
+/// different block geometry and fill reusable f32 scratch independently.
+#[inline(always)]
+fn apply_refinement_planned(
+    query: &QuantizedQueryCtx,
+    layer_idx: usize,
+    metric: Metric,
+    layer: &QuantizedLayerReader,
+    candidates: &mut QuantizedCandidates,
+    candidate_range: Range<usize>,
+    available_rows: Range<usize>,
+    query_norm: f32,
+    kernel_scores: &mut Vec<f32>,
+    decoded_scales: &mut Vec<f32>,
+    decoded_constants: &mut Vec<f32>,
+    read_ranges: &mut Vec<Range<usize>>,
+    block_scratch: &mut Vec<(usize, usize)>,
+    row_offsets: &mut Vec<usize>,
+) -> crate::Result<()> {
+    let rows = candidate_range.len();
+    debug_assert!(rows > 0);
+    debug_assert!(candidates.rows[candidate_range.clone()]
+        .windows(2)
+        .all(|pair| pair[0] < pair[1]));
+    kernel_scores.resize(rows, 0.0);
+    decoded_scales.resize(rows, 0.0);
+    if metric == Metric::L2 {
+        decoded_constants.resize(rows, 0.0);
+    }
+
+    // Codes: one indexed kernel entry per independently pinnable range.
+    layer.plan_code_reads(
+        available_rows.clone(),
+        &candidates.rows[candidate_range.clone()],
+        read_ranges,
+        block_scratch,
+    );
+    let mut selected_start = 0usize;
+    for read_range in read_ranges.iter().cloned() {
+        let mut selected_end = selected_start;
+        while selected_end < rows
+            && candidates.rows[candidate_range.start + selected_end] < read_range.end
+        {
+            debug_assert!(
+                candidates.rows[candidate_range.start + selected_end] >= read_range.start
+            );
+            selected_end += 1;
+        }
+        row_offsets.clear();
+        row_offsets.extend(
+            candidates.rows
+                [candidate_range.start + selected_start..candidate_range.start + selected_end]
+                .iter()
+                .map(|&row| row - read_range.start),
+        );
+        let codes = layer.read_codes(read_range)?;
+        query.score_layer_batch_unscaled_indexed(
+            layer_idx,
+            codes.as_slice(),
+            layer.code_stride(),
+            row_offsets,
+            &mut kernel_scores[selected_start..selected_end],
+        );
+        selected_start = selected_end;
+    }
+    debug_assert_eq!(selected_start, rows);
+
+    // Pass A: decode scales according to the scale slot's own page plan.
+    layer.plan_scale_reads(
+        available_rows.clone(),
+        &candidates.rows[candidate_range.clone()],
+        read_ranges,
+        block_scratch,
+    );
+    selected_start = 0;
+    for read_range in read_ranges.iter().cloned() {
+        let scales = layer.read_scales(read_range.clone())?;
+        while selected_start < rows
+            && candidates.rows[candidate_range.start + selected_start] < read_range.end
+        {
+            let row = candidates.rows[candidate_range.start + selected_start];
+            debug_assert!(row >= read_range.start);
+            let offset = (row - read_range.start) * std::mem::size_of::<u16>();
+            let bits = scales[offset] as u16 | (scales[offset + 1] as u16) << 8;
+            decoded_scales[selected_start] = f16_to_f32(bits);
+            selected_start += 1;
+        }
+    }
+    debug_assert_eq!(selected_start, rows);
+
+    if metric == Metric::L2 {
+        layer.plan_constant_reads(
+            available_rows,
+            &candidates.rows[candidate_range.clone()],
+            read_ranges,
+            block_scratch,
+        );
+        selected_start = 0;
+        for read_range in read_ranges.iter().cloned() {
+            let constants = layer.read_constants(read_range.clone())?;
+            while selected_start < rows
+                && candidates.rows[candidate_range.start + selected_start] < read_range.end
+            {
+                let row = candidates.rows[candidate_range.start + selected_start];
+                debug_assert!(row >= read_range.start);
+                let offset = (row - read_range.start) * std::mem::size_of::<f32>();
+                let bits = constants[offset] as u32
+                    | (constants[offset + 1] as u32) << 8
+                    | (constants[offset + 2] as u32) << 16
+                    | (constants[offset + 3] as u32) << 24;
+                decoded_constants[selected_start] = f32::from_bits(bits);
+                selected_start += 1;
+            }
+        }
+        debug_assert_eq!(selected_start, rows);
+    }
+
+    // Pass B: f32-only estimate/bias assembly across the complete logical
+    // batch, including cross-cluster cosine batches.
+    let sigma_factor = query.layer_sigma_factor(layer_idx, query_norm);
+    let bias_factor = query.layer_bias_factor(layer_idx, query_norm);
+    let decoded_constants = if metric == Metric::L2 {
+        &decoded_constants[..rows]
+    } else {
+        &[]
+    };
+    combine_refinement_decoded(
+        metric,
+        candidates,
+        candidate_range,
+        &kernel_scores[..rows],
+        &decoded_scales[..rows],
+        decoded_constants,
+        sigma_factor,
+        bias_factor,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
 #[inline]
 fn quantized_layer_constant(metric: Metric, stored: f32) -> f32 {
     if metric == Metric::L2 {
@@ -910,7 +1212,10 @@ fn quantized_layer_constant(metric: Metric, stored: f32) -> f32 {
 }
 
 struct QuantizedScanCtx {
-    candidates: Vec<QuantizedCandidate>,
+    candidates: QuantizedCandidates,
+    boundary_scratch: Vec<QuantizedCandidate>,
+    /// One query-residual norm per admitted cluster, not one copy per row.
+    cluster_query_norms: Vec<f32>,
     dedup_docs: bool,
     best_by_doc: HashMap<DocId, usize>,
     best_docs: Vec<DocId>,
@@ -918,9 +1223,15 @@ struct QuantizedScanCtx {
     /// is updated once per completed cluster for the admission bound; the
     /// exact boundary still uses `kth_scratch` once after plane 1.
     bound_top: Vec<usize>,
-    /// Reused cluster-local top-k scratch. Scoring only appends to the dense
-    /// candidate buffer; no row mutates the running global top-k.
-    local_top: Vec<usize>,
+    /// Reused cluster-local top-k, with the worst retained row at the root.
+    /// Once full, a scored row performs one admission comparison rather than
+    /// rescanning the retained rows for their minimum.
+    local_top: BinaryHeap<LocalTopEntry>,
+    local_top_n: usize,
+    cluster_start: Option<usize>,
+    /// Reused O(k) merge scratch. Replica matching happens here, once per
+    /// cluster, never in the dense plane-1 append loop.
+    bound_merge: Vec<usize>,
     kth_scratch: Vec<usize>,
     work_spent: WorkUnits,
 }
@@ -930,107 +1241,120 @@ impl QuantizedScanCtx {
         let distinct_capacity = candidate_capacity.min(max_doc as usize);
         let dedup_capacity = if dedup_docs { distinct_capacity } else { 0 };
         Self {
-            candidates: Vec::with_capacity(candidate_capacity),
+            candidates: QuantizedCandidates::with_capacity(candidate_capacity),
+            boundary_scratch: Vec::with_capacity(candidate_capacity),
+            cluster_query_norms: Vec::new(),
             dedup_docs,
             best_by_doc: HashMap::with_capacity(dedup_capacity),
             best_docs: Vec::with_capacity(dedup_capacity),
             bound_top: Vec::new(),
-            local_top: Vec::new(),
+            local_top: BinaryHeap::new(),
+            local_top_n: 0,
+            cluster_start: None,
+            bound_merge: Vec::new(),
             kth_scratch: Vec::with_capacity(distinct_capacity),
             work_spent: WorkUnits::ZERO,
         }
     }
 
-    fn push(&mut self, candidate: QuantizedCandidate) {
+    fn begin_cluster(&mut self, top_n: usize) {
+        debug_assert!(self.cluster_start.is_none());
+        debug_assert!(self.local_top.is_empty());
+        self.local_top.reserve(top_n);
+        self.bound_top.reserve(top_n);
+        self.bound_merge.reserve(top_n.saturating_mul(2));
+        self.local_top_n = top_n;
+        self.cluster_start = Some(self.candidates.len());
+    }
+
+    /// Append one row to the SoA buffers and maintain only the cluster-local
+    /// running minimum. Document deduplication is deliberately absent here;
+    /// it is performed at the cluster merge and κ boundaries.
+    #[inline]
+    fn push(&mut self, row: usize, doc: DocId, score: f32, bias_correction: f32, sigma: f32) {
         let index = self.candidates.len();
-        if self.dedup_docs {
-            let previous_best = self.best_by_doc.get(&candidate.doc).copied();
-            if previous_best.is_none() {
-                self.best_docs.push(candidate.doc);
-            }
-            let replaces_best = previous_best.is_none_or(|previous| {
-                let previous = &self.candidates[previous];
-                candidate.score > previous.score
-                    || (candidate.score == previous.score && candidate.row < previous.row)
-            });
-            if replaces_best {
-                self.best_by_doc.insert(candidate.doc, index);
-            }
+        self.candidates
+            .push(row, doc, score, bias_correction, sigma);
+        if self.local_top_n == 0 {
+            return;
         }
-        self.candidates.push(candidate);
+        let entry = LocalTopEntry {
+            estimate: self.candidates.estimate(index),
+            row,
+            index,
+        };
+        if self.local_top.len() < self.local_top_n {
+            self.local_top.push(entry);
+            return;
+        }
+        let mut worst = self
+            .local_top
+            .peek_mut()
+            .expect("a full local top has a root");
+        if entry.precedes(&worst) {
+            *worst = entry;
+        }
+    }
+
+    fn set_cluster_query_norm(&mut self, cluster: usize, query_norm: f32) {
+        if self.cluster_query_norms.len() <= cluster {
+            self.cluster_query_norms.resize(cluster + 1, f32::NAN);
+        }
+        self.cluster_query_norms[cluster] = query_norm;
+    }
+
+    fn cluster_query_norm(&self, cluster: usize) -> f32 {
+        let query_norm = self.cluster_query_norms[cluster];
+        debug_assert!(query_norm.is_finite());
+        query_norm
     }
 
     /// Merge one completed cluster into the running admission top-k. The
     /// scorer writes the cluster densely first; this method derives a local-k
     /// and performs one small global merge, restoring the boundary design's
     /// separation between scoring and kth maintenance.
-    fn merge_cluster_bound(&mut self, cluster_start: usize, top_n: usize) {
+    fn finish_cluster_bound(&mut self) {
+        let cluster_start = self
+            .cluster_start
+            .take()
+            .expect("finish_cluster_bound requires begin_cluster");
+        let top_n = std::mem::take(&mut self.local_top_n);
         if top_n == 0 || cluster_start >= self.candidates.len() {
+            self.local_top.clear();
             return;
         }
-        self.local_top.clear();
-        for index in cluster_start..self.candidates.len() {
-            let doc = self.candidates[index].doc;
-            if self.dedup_docs {
-                if self.best_by_doc.get(&doc).copied() != Some(index) {
-                    continue;
-                }
-                if let Some(slot) = self
-                    .local_top
-                    .iter_mut()
-                    .find(|slot| self.candidates[**slot].doc == doc)
-                {
-                    if candidate_precedes(&self.candidates[index], &self.candidates[*slot]) {
-                        *slot = index;
-                    }
-                    continue;
-                }
-            }
-            if self.local_top.len() < top_n {
-                self.local_top.push(index);
-                continue;
-            }
-            let (worst_slot, &worst) = self
-                .local_top
-                .iter()
-                .enumerate()
-                .max_by(|(_, &a), (_, &b)| {
-                    candidate_order(&self.candidates[a], &self.candidates[b])
-                })
-                .unwrap();
-            if candidate_precedes(&self.candidates[index], &self.candidates[worst]) {
-                self.local_top[worst_slot] = index;
-            }
-        }
 
-        for local_slot in 0..self.local_top.len() {
-            let index = self.local_top[local_slot];
-            let doc = self.candidates[index].doc;
+        self.bound_merge.clear();
+        self.bound_merge.extend_from_slice(&self.bound_top);
+        while let Some(entry) = self.local_top.pop() {
+            let index = entry.index;
+            let doc = self.candidates.docs[index];
             if self.dedup_docs {
                 if let Some(slot) = self
-                    .bound_top
+                    .bound_merge
                     .iter_mut()
-                    .find(|slot| self.candidates[**slot].doc == doc)
+                    .find(|slot| self.candidates.docs[**slot] == doc)
                 {
-                    if candidate_precedes(&self.candidates[index], &self.candidates[*slot]) {
+                    if candidate_precedes(&self.candidates, index, *slot) {
                         *slot = index;
                     }
                     continue;
                 }
             }
-            self.bound_top.push(index);
+            self.bound_merge.push(index);
         }
-        self.bound_top
-            .sort_unstable_by(|&a, &b| candidate_order(&self.candidates[a], &self.candidates[b]));
-        self.bound_top.truncate(top_n);
+        self.bound_merge
+            .sort_unstable_by(|&a, &b| candidate_order(&self.candidates, a, b));
+        self.bound_merge.truncate(top_n);
+        std::mem::swap(&mut self.bound_top, &mut self.bound_merge);
     }
 
     fn running_pessimistic_kth(&self, top_n: usize, kappa: f32) -> Option<f32> {
         if top_n == 0 || self.bound_top.len() < top_n {
             return None;
         }
-        let candidate = &self.candidates[*self.bound_top.last().unwrap()];
-        Some(candidate.score - kappa * candidate.sigma)
+        let index = *self.bound_top.last().unwrap();
+        Some(self.candidates.estimate(index) - kappa * self.candidates.sigmas[index])
     }
 
     fn rebuild_best_by_doc(&mut self) {
@@ -1039,17 +1363,16 @@ impl QuantizedScanCtx {
         }
         self.best_by_doc.clear();
         self.best_docs.clear();
-        for (index, candidate) in self.candidates.iter().enumerate() {
-            let previous_best = self.best_by_doc.get(&candidate.doc).copied();
+        for index in 0..self.candidates.len() {
+            let doc = self.candidates.docs[index];
+            let previous_best = self.best_by_doc.get(&doc).copied();
             if previous_best.is_none() {
-                self.best_docs.push(candidate.doc);
+                self.best_docs.push(doc);
             }
-            if previous_best.is_none_or(|previous| {
-                let previous = &self.candidates[previous];
-                candidate.score > previous.score
-                    || (candidate.score == previous.score && candidate.row < previous.row)
-            }) {
-                self.best_by_doc.insert(candidate.doc, index);
+            if previous_best
+                .is_none_or(|previous| candidate_precedes(&self.candidates, index, previous))
+            {
+                self.best_by_doc.insert(doc, index);
             }
         }
     }
@@ -1058,10 +1381,16 @@ impl QuantizedScanCtx {
     fn pessimistic_kth(&mut self, top_n: usize, kappa: f32) -> Option<f32> {
         debug_assert!(
             self.candidates
+                .scores
                 .iter()
-                .all(|candidate| candidate.score.is_finite() && candidate.sigma.is_finite()),
+                .zip(&self.candidates.bias_corrections)
+                .zip(&self.candidates.sigmas)
+                .all(|((&score, &bias), &sigma)| (score + bias).is_finite() && sigma.is_finite()),
             "quantized boundary inputs must be finite"
         );
+        // Replica winner selection is boundary work. Plane-1 append and
+        // refinement retain every membership without per-row hashing.
+        self.rebuild_best_by_doc();
         let distinct_len = if self.dedup_docs {
             self.best_docs.len()
         } else {
@@ -1079,34 +1408,97 @@ impl QuantizedScanCtx {
         }
         let (_, selected, _) = self
             .kth_scratch
-            .select_nth_unstable_by(top_n - 1, |&a, &b| {
-                self.candidates[b]
-                    .score
-                    .total_cmp(&self.candidates[a].score)
-            });
-        let candidate = &self.candidates[*selected];
-        Some(candidate.score - kappa * candidate.sigma)
+            .select_nth_unstable_by(top_n - 1, |&a, &b| candidate_order(&self.candidates, a, b));
+        let index = *selected;
+        Some(self.candidates.estimate(index) - kappa * self.candidates.sigmas[index])
     }
 
     fn band(&mut self, top_n: usize, kappa: f32) {
-        if let Some(pessimistic_kth) = self.pessimistic_kth(top_n, kappa) {
-            self.candidates
-                .retain(|candidate| candidate.score + kappa * candidate.sigma >= pessimistic_kth);
+        let pessimistic_kth = self.pessimistic_kth(top_n, kappa);
+        self.boundary_scratch.clear();
+        for index in 0..self.candidates.len() {
+            if pessimistic_kth.is_none_or(|kth| {
+                self.candidates.estimate(index) + kappa * self.candidates.sigmas[index] >= kth
+            }) {
+                self.boundary_scratch
+                    .push(self.candidates.materialize(index));
+            }
         }
-        self.candidates
+        self.boundary_scratch
             .sort_unstable_by_key(|candidate| candidate.row);
-        self.rebuild_best_by_doc();
+        self.candidates
+            .replace_with_boundary_survivors(&self.boundary_scratch);
+        self.best_by_doc.clear();
+        self.best_docs.clear();
     }
 }
 
-#[inline]
-fn candidate_order(a: &QuantizedCandidate, b: &QuantizedCandidate) -> std::cmp::Ordering {
-    b.score.total_cmp(&a.score).then(a.row.cmp(&b.row))
+/// A heap entry ordered with the worst retained candidate first. The total
+/// key is the same estimate-descending, row-ascending key used at κ
+/// boundaries, so equal estimates select the same σ-bearing row everywhere.
+#[derive(Clone, Copy, Debug)]
+struct LocalTopEntry {
+    estimate: f32,
+    row: usize,
+    index: usize,
+}
+
+impl LocalTopEntry {
+    #[inline]
+    fn precedes(&self, other: &Self) -> bool {
+        self.estimate
+            .total_cmp(&other.estimate)
+            .reverse()
+            .then(self.row.cmp(&other.row))
+            .is_lt()
+    }
+}
+
+impl PartialEq for LocalTopEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.estimate.to_bits() == other.estimate.to_bits()
+            && self.row == other.row
+            && self.index == other.index
+    }
+}
+
+impl Eq for LocalTopEntry {}
+
+impl PartialOrd for LocalTopEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LocalTopEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .estimate
+            .total_cmp(&self.estimate)
+            .then(self.row.cmp(&other.row))
+            .then(self.index.cmp(&other.index))
+    }
+}
+
+#[cfg(test)]
+fn distinct_candidate_docs(candidates: &QuantizedCandidates) -> Vec<DocId> {
+    let mut docs = candidates.docs.clone();
+    docs.sort_unstable();
+    docs.dedup();
+    docs
 }
 
 #[inline]
-fn candidate_precedes(a: &QuantizedCandidate, b: &QuantizedCandidate) -> bool {
-    candidate_order(a, b).is_lt()
+fn candidate_order(candidates: &QuantizedCandidates, a: usize, b: usize) -> std::cmp::Ordering {
+    candidates
+        .estimate(b)
+        .total_cmp(&candidates.estimate(a))
+        .then(candidates.rows[a].cmp(&candidates.rows[b]))
+}
+
+#[inline]
+fn candidate_precedes(candidates: &QuantizedCandidates, a: usize, b: usize) -> bool {
+    candidate_order(candidates, a, b).is_lt()
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -1137,7 +1529,7 @@ impl<T: VectorElement> VectorBackend<T> {
             return Ok(Vec::new());
         }
         let filter_is_all = filter.len() == max_doc as usize;
-        let scan_levels = self.max_scan_levels.min(query.index.specs.len()).max(1);
+        let scan_levels = query.active_layers();
         let alive = segment_reader.alive_bitset();
         let quantized = self
             .reader
@@ -1174,9 +1566,14 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut armed_probe = None;
         let mut cluster_rows = Vec::new();
         let mut kernel_scores = Vec::new();
+        let mut decoded_scales = Vec::new();
+        let mut decoded_constants = Vec::new();
+        let mut decoded_residual_norms = Vec::new();
+        let mut bias_scores = Vec::new();
         let mut sigma_scores = Vec::new();
         let mut survivor_rows = Vec::new();
-        let mut survivor_batch = QuantizedLayerDenseBatch::new();
+        let mut survivor_read_ranges = Vec::new();
+        let mut survivor_block_scratch = Vec::new();
         drop(init_stage);
         stats.scan_init_ns = stats
             .scan_init_ns
@@ -1267,60 +1664,68 @@ impl<T: VectorElement> VectorBackend<T> {
             };
             let batch_rows = layer.scales().len() / std::mem::size_of::<u16>();
             kernel_scores.resize(batch_rows, 0.0);
-            sigma_scores.resize(batch_rows, 0.0);
-            query.score_layer_sigma_batch_constant(
+            query.score_layer_batch_unscaled(
                 0,
                 layer.codes(),
                 layer.code_stride(),
-                layer.scales(),
-                needs_l2_rows.then_some(layer.constants()),
-                score_query_norm,
                 &mut kernel_scores[..batch_rows],
-                &mut sigma_scores[..batch_rows],
             );
-            let cluster_candidate_start = scan.candidates.len();
-            let mut score_row = |row: usize, doc: DocId| -> crate::Result<()> {
-                let local = row - rows.start;
-                let estimate = kernel_scores[local];
-                let bias_correction = query.layer_bias_factor(0, score_query_norm)
-                    * f16_to_f32(u16::from_le_bytes(
-                        layer.scales()[local * 2..local * 2 + 2].try_into().unwrap(),
-                    ));
-                let stored_residual_norm_sq = residual_norms
-                    .as_ref()
-                    .map(|residual_norms| residual_norms.get(row))
-                    .transpose()?;
-                let score = match metric {
-                    Metric::L2 => {
-                        let residual_norm_sq = stored_residual_norm_sq.ok_or_else(|| {
-                            TantivyError::DataCorruption(DataCorruption::comment_only(
-                                "quantized L2 field is missing residual-norm slot 14",
-                            ))
-                        })?;
-                        sim.score() + 2.0 * estimate - residual_norm_sq
-                    }
-                    Metric::Dot | Metric::Cosine => sim.score() + estimate,
-                };
-                scan.push(QuantizedCandidate {
-                    row,
-                    doc,
-                    score,
-                    bias_correction,
-                    sigma: sigma_scores[local],
-                    score_query_norm,
-                });
-                Ok(())
-            };
+
+            // Pass A: isolate all byte/integer decoding from the floating
+            // combine loops and reuse the same scratch across clusters.
+            decode_scales(layer.scales(), &mut decoded_scales);
+            if needs_l2_rows {
+                decode_f32s(layer.constants(), &mut decoded_constants);
+                let residual_norms = residual_norms.as_ref().ok_or_else(|| {
+                    TantivyError::DataCorruption(DataCorruption::comment_only(
+                        "quantized L2 field is missing residual-norm slot 14",
+                    ))
+                })?;
+                decode_f32s(residual_norms.as_bytes(), &mut decoded_residual_norms);
+            }
+            bias_scores.resize(batch_rows, 0.0);
+            sigma_scores.resize(batch_rows, 0.0);
+            let bias_factor = query.layer_bias_factor(0, score_query_norm);
+            let cluster_score = sim.score();
+            let sigma_factor = query.layer_sigma_factor(0, score_query_norm);
+            combine_initial_decoded(
+                metric,
+                &mut kernel_scores,
+                &mut bias_scores,
+                &mut sigma_scores,
+                &decoded_scales,
+                &decoded_constants,
+                &decoded_residual_norms,
+                cluster_score,
+                bias_factor,
+                sigma_factor,
+            );
+            scan.set_cluster_query_norm(cluster, score_query_norm);
+            scan.begin_cluster(top_n);
             if all_rows_eligible {
                 for row in rows.clone() {
-                    score_row(row, self.reader.doc_id_at(row))?;
+                    let local = row - rows.start;
+                    scan.push(
+                        row,
+                        self.reader.doc_id_at(row),
+                        kernel_scores[local],
+                        bias_scores[local],
+                        sigma_scores[local],
+                    );
                 }
             } else {
                 for &(row, doc) in &cluster_rows {
-                    score_row(row, doc)?;
+                    let local = row - rows.start;
+                    scan.push(
+                        row,
+                        doc,
+                        kernel_scores[local],
+                        bias_scores[local],
+                        sigma_scores[local],
+                    );
                 }
             }
-            scan.merge_cluster_bound(cluster_candidate_start, top_n);
+            scan.finish_cluster_bound();
             let cluster_scored = if all_rows_eligible {
                 rows.len()
             } else {
@@ -1349,9 +1754,19 @@ impl<T: VectorElement> VectorBackend<T> {
             scan_ns.saturating_sub(routing_ns.saturating_sub(routing_before_scan)),
         );
 
+        #[cfg(test)]
+        {
+            stats.quantized_trace.scored_docs = distinct_candidate_docs(&scan.candidates);
+        }
+
         let boundary_start = Instant::now();
         let boundary_stage = enter_vector_stage(Stage::Boundary(0));
         scan.band(top_n, 2.0);
+        #[cfg(test)]
+        stats
+            .quantized_trace
+            .boundary_docs
+            .push(distinct_candidate_docs(&scan.candidates));
         drop(boundary_stage);
         stats.record_boundary(
             0,
@@ -1368,99 +1783,88 @@ impl<T: VectorElement> VectorBackend<T> {
             let layer_stage = enter_vector_stage(Stage::LayerScan(layer_idx as u8));
             let layer = &quantized.layers()[layer_idx];
             let layer_scored = scan.candidates.len();
-            let needs_l2_rows = metric == Metric::L2;
-            let mut candidate_start = 0;
-            let mut cluster = 0;
-            while candidate_start < scan.candidates.len() {
-                let first_row = scan.candidates[candidate_start].row;
-                while cluster < index.num_clusters()
-                    && index.cluster_range(cluster).end <= first_row
-                {
-                    cluster += 1;
-                }
-                if cluster == index.num_clusters() {
-                    return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
-                        format!("quantized survivor row {first_row} is outside IVF cluster ranges"),
-                    )));
-                }
-                let cluster_rows = index.cluster_range(cluster);
-                if first_row < cluster_rows.start {
-                    return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
-                        format!(
-                            "quantized survivor row {first_row} precedes cluster {cluster} range \
-                             {cluster_rows:?}"
-                        ),
-                    )));
-                }
-                let mut candidate_end = candidate_start + 1;
-                while candidate_end < scan.candidates.len()
-                    && scan.candidates[candidate_end].row < cluster_rows.end
-                {
-                    candidate_end += 1;
-                }
-                let candidates = &mut scan.candidates[candidate_start..candidate_end];
-                let contiguous = candidates
-                    .windows(2)
-                    .all(|pair| pair[1].row == pair[0].row + 1);
-                if contiguous {
-                    let rows = candidates[0].row..candidates.last().unwrap().row + 1;
-                    let pinned = layer.read_batch(rows, needs_l2_rows)?;
-                    apply_refinement_batch(
+            if metric == Metric::Cosine {
+                // Cosine has one query norm and no per-cluster refinement
+                // term. Accumulate storage-ordered survivors across cluster
+                // boundaries up to the explicitly authorized batch maximum.
+                let query_norm = query.score_query_norm(0.0);
+                for candidate_range in cosine_refinement_batches(scan.candidates.len()) {
+                    let candidate_start = candidate_range.start;
+                    let candidate_end = candidate_range.end;
+                    let first_row = scan.candidates.rows[candidate_start];
+                    let last_row = scan.candidates.rows[candidate_end - 1];
+                    apply_refinement_planned(
                         query,
                         layer_idx,
                         metric,
-                        candidates,
-                        pinned.codes(),
-                        pinned.code_stride(),
-                        pinned.scales(),
-                        needs_l2_rows.then_some(pinned.constants()),
+                        layer,
+                        &mut scan.candidates,
+                        candidate_range,
+                        first_row..last_row + 1,
+                        query_norm,
                         &mut kernel_scores,
-                    );
-                } else {
-                    survivor_rows.clear();
-                    if query.index.specs[layer_idx].bits == 4
-                        && query.index.config.dim.is_multiple_of(2)
-                    {
-                        survivor_rows.extend(
-                            candidates
-                                .iter()
-                                .map(|candidate| candidate.row - cluster_rows.start),
-                        );
-                        let pinned = layer.read_batch(cluster_rows.clone(), needs_l2_rows)?;
-                        apply_refinement_indexed_batch(
-                            query,
-                            layer_idx,
-                            metric,
-                            candidates,
-                            pinned.codes(),
-                            pinned.code_stride(),
-                            pinned.scales(),
-                            needs_l2_rows.then_some(pinned.constants()),
-                            &survivor_rows,
-                            &mut kernel_scores,
-                        );
-                    } else {
-                        survivor_rows.extend(candidates.iter().map(|candidate| candidate.row));
-                        layer.gather_rows(&survivor_rows, needs_l2_rows, &mut survivor_batch)?;
-                        apply_refinement_batch(
-                            query,
-                            layer_idx,
-                            metric,
-                            candidates,
-                            survivor_batch.codes(),
-                            survivor_batch.code_stride(),
-                            survivor_batch.scales(),
-                            needs_l2_rows.then_some(survivor_batch.constants()),
-                            &mut kernel_scores,
-                        );
-                    }
+                        &mut decoded_scales,
+                        &mut decoded_constants,
+                        &mut survivor_read_ranges,
+                        &mut survivor_block_scratch,
+                        &mut survivor_rows,
+                    )?;
                 }
-                candidate_start = candidate_end;
+            } else {
+                // L2 retains cluster-local query-residual norms. Dot keeps the
+                // same cluster-local scheduling; only cosine is authorized to
+                // cross cluster boundaries in v1.
+                let mut candidate_start = 0;
+                let mut cluster = 0;
+                while candidate_start < scan.candidates.len() {
+                    let first_row = scan.candidates.rows[candidate_start];
+                    while cluster < index.num_clusters()
+                        && index.cluster_range(cluster).end <= first_row
+                    {
+                        cluster += 1;
+                    }
+                    if cluster == index.num_clusters() {
+                        return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
+                            format!(
+                                "quantized survivor row {first_row} is outside IVF cluster ranges"
+                            ),
+                        )));
+                    }
+                    let cluster_rows = index.cluster_range(cluster);
+                    if first_row < cluster_rows.start {
+                        return Err(TantivyError::DataCorruption(DataCorruption::comment_only(
+                            format!(
+                                "quantized survivor row {first_row} precedes cluster {cluster} \
+                                 range {cluster_rows:?}"
+                            ),
+                        )));
+                    }
+                    let mut candidate_end = candidate_start + 1;
+                    while candidate_end < scan.candidates.len()
+                        && scan.candidates.rows[candidate_end] < cluster_rows.end
+                    {
+                        candidate_end += 1;
+                    }
+                    let query_norm = scan.cluster_query_norm(cluster);
+                    apply_refinement_planned(
+                        query,
+                        layer_idx,
+                        metric,
+                        layer,
+                        &mut scan.candidates,
+                        candidate_start..candidate_end,
+                        cluster_rows,
+                        query_norm,
+                        &mut kernel_scores,
+                        &mut decoded_scales,
+                        &mut decoded_constants,
+                        &mut survivor_read_ranges,
+                        &mut survivor_block_scratch,
+                        &mut survivor_rows,
+                    )?;
+                    candidate_start = candidate_end;
+                }
             }
-            // Refinement can change which replicated membership is best for
-            // a document; the next distinct-document k-th must see the new
-            // scores rather than the plane-1 winner map.
-            scan.rebuild_best_by_doc();
             drop(layer_stage);
             stats.record_layer_scan(
                 layer_idx,
@@ -1472,6 +1876,11 @@ impl<T: VectorElement> VectorBackend<T> {
             let kappa = if final_sign { 2.0 } else { 4.0 };
             let boundary_stage = enter_vector_stage(Stage::Boundary(layer_idx as u8));
             scan.band(top_n, kappa);
+            #[cfg(test)]
+            stats
+                .quantized_trace
+                .boundary_docs
+                .push(distinct_candidate_docs(&scan.candidates));
             drop(boundary_stage);
             stats.record_boundary(
                 layer_idx,
@@ -1482,6 +1891,9 @@ impl<T: VectorElement> VectorBackend<T> {
 
         let rerank_fetch_start = Instant::now();
         let rerank_fetch_stage = enter_vector_stage(Stage::RerankFetch);
+        // Refinement can change a replicated document's best membership. The
+        // final physical dedup is performed once, immediately before fetch.
+        scan.rebuild_best_by_doc();
         let rerank_capacity = if scan.dedup_docs {
             scan.best_docs.len()
         } else {
@@ -1492,17 +1904,25 @@ impl<T: VectorElement> VectorBackend<T> {
             // Replicated memberships survive independently through the
             // bands; `best_docs` names the best row per distinct document.
             for &doc in &scan.best_docs {
-                let candidate = &scan.candidates[scan.best_by_doc[&doc]];
-                rerank.push((candidate.row, doc));
+                let index = scan.best_by_doc[&doc];
+                rerank.push((scan.candidates.rows[index], doc));
             }
         } else {
             rerank.extend(
                 scan.candidates
+                    .rows
                     .iter()
-                    .map(|candidate| (candidate.row, candidate.doc)),
+                    .copied()
+                    .zip(scan.candidates.docs.iter().copied()),
             );
         }
         rerank.sort_unstable_by_key(|&(row, _)| row);
+        #[cfg(test)]
+        {
+            stats.quantized_trace.rerank_docs = rerank.iter().map(|&(_, doc)| doc).collect();
+            stats.quantized_trace.rerank_docs.sort_unstable();
+            stats.quantized_trace.rerank_docs.dedup();
+        }
         drop(rerank_fetch_stage);
         stats.rerank_fetch_ns += rerank_fetch_start.elapsed().as_nanos() as u64;
         stats.rerank_rows += rerank.len();
@@ -2031,11 +2451,13 @@ mod tests {
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
         let weight = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let quantized_queries = QuantizedQueryCache::default();
         let backend = VectorBackend::<f32>::for_segment(
             segment_reader,
             0,
             embed_field,
             Arc::new(query),
+            &quantized_queries,
             params,
             usize::MAX,
         )?;
@@ -3460,21 +3882,30 @@ mod tests {
     fn quantized_boundary_counts_replicas_once() {
         let mut scan = QuantizedScanCtx::new(2, 2, true);
         for (row, doc, score) in [(0, 0, 100.0), (1, 0, 90.0), (2, 1, 0.0)] {
-            scan.push(QuantizedCandidate {
-                row,
-                doc,
-                score,
-                bias_correction: 0.0,
-                sigma: 0.0,
-                score_query_norm: 1.0,
-            });
+            scan.push(row, doc, score, 0.0, 0.0);
         }
         assert_eq!(scan.pessimistic_kth(2, 2.0), Some(0.0));
         scan.band(2, 2.0);
         assert!(
-            scan.candidates.iter().any(|candidate| candidate.doc == 1),
+            scan.candidates.docs.contains(&1),
             "a replica of doc 0 must not displace the second distinct document"
         );
+    }
+
+    #[test]
+    fn quantized_boundary_kth_uses_the_row_tie_for_sigma() {
+        let mut scan = QuantizedScanCtx::new(3, 3, false);
+        scan.begin_cluster(2);
+        for (row, score, sigma) in [(0, 10.0, 0.0), (1, 9.0, 1.0), (2, 9.0, 100.0)] {
+            scan.push(row, row as DocId, score, 0.0, sigma);
+        }
+        scan.finish_cluster_bound();
+
+        // Equal estimates are ordered by the lower storage row. Admission
+        // and the exact boundary must therefore widen row 1's estimate, not
+        // choose row 2's much larger sigma arbitrarily.
+        assert_eq!(scan.running_pessimistic_kth(2, 2.0), Some(7.0));
+        assert_eq!(scan.pessimistic_kth(2, 2.0), Some(7.0));
     }
 
     #[test]
@@ -3482,18 +3913,17 @@ mod tests {
         const TOP_N: usize = 4;
         let mut scan = QuantizedScanCtx::new(12, 24, true);
         for cluster in 0..6 {
-            let cluster_start = scan.candidates.len();
+            scan.begin_cluster(TOP_N);
             for row in cluster * 4..cluster * 4 + 4 {
-                scan.push(QuantizedCandidate {
+                scan.push(
                     row,
-                    doc: (row % 12) as DocId,
-                    score: 3.0 - row as f32 * 0.071 + (row as f32 * 0.37).sin() * 0.2,
-                    bias_correction: 0.0,
-                    sigma: 0.01 + (row % 5) as f32 * 0.003,
-                    score_query_norm: 1.0,
-                });
+                    (row % 12) as DocId,
+                    3.0 - row as f32 * 0.071 + (row as f32 * 0.37).sin() * 0.2,
+                    0.0,
+                    0.01 + (row % 5) as f32 * 0.003,
+                );
             }
-            scan.merge_cluster_bound(cluster_start, TOP_N);
+            scan.finish_cluster_bound();
             assert_eq!(
                 scan.running_pessimistic_kth(TOP_N, 2.0),
                 scan.pessimistic_kth(TOP_N, 2.0),
@@ -3502,12 +3932,237 @@ mod tests {
         }
     }
 
+    fn independent_admission_top(
+        scan: &QuantizedScanCtx,
+        top_n: usize,
+        dedup_docs: bool,
+    ) -> Vec<usize> {
+        fn oracle_precedes(scan: &QuantizedScanCtx, left: usize, right: usize) -> bool {
+            let left_estimate =
+                scan.candidates.scores[left] + scan.candidates.bias_corrections[left];
+            let right_estimate =
+                scan.candidates.scores[right] + scan.candidates.bias_corrections[right];
+            right_estimate
+                .total_cmp(&left_estimate)
+                .then(scan.candidates.rows[left].cmp(&scan.candidates.rows[right]))
+                .is_lt()
+        }
+
+        let mut indices = if dedup_docs {
+            let mut best_by_doc = HashMap::<DocId, usize>::new();
+            for index in 0..scan.candidates.len() {
+                let doc = scan.candidates.docs[index];
+                let best = best_by_doc.entry(doc).or_insert(index);
+                if oracle_precedes(scan, index, *best) {
+                    *best = index;
+                }
+            }
+            best_by_doc.into_values().collect::<Vec<_>>()
+        } else {
+            (0..scan.candidates.len()).collect::<Vec<_>>()
+        };
+        indices.sort_unstable_by(|&left, &right| {
+            let left_estimate =
+                scan.candidates.scores[left] + scan.candidates.bias_corrections[left];
+            let right_estimate =
+                scan.candidates.scores[right] + scan.candidates.bias_corrections[right];
+            right_estimate
+                .total_cmp(&left_estimate)
+                .then(scan.candidates.rows[left].cmp(&scan.candidates.rows[right]))
+        });
+        indices.truncate(top_n);
+        indices
+    }
+
+    #[test]
+    fn cluster_running_min_matches_independent_oracle() {
+        // The clusters deliberately arrive fewer-than-k, descending, then
+        // alternating. Doc 1 later improves; doc 2 later ties with a very
+        // different sigma, for which the lower storage row must remain the
+        // selected membership.
+        let clusters: &[&[(usize, DocId, f32, f32)]] = &[
+            &[(0, 0, 1.0, 0.01), (1, 1, 2.0, 0.02)],
+            &[
+                (2, 2, 9.0, 0.03),
+                (3, 3, 8.0, 0.04),
+                (4, 4, 7.0, 0.05),
+                (5, 0, 6.0, 0.06),
+                (6, 5, 5.0, 0.07),
+            ],
+            &[
+                (7, 6, 0.0, 0.08),
+                (8, 1, 10.0, 0.09),
+                (9, 7, 1.0, 0.10),
+                (10, 2, 9.0, 8.0),
+                (11, 8, 2.0, 0.11),
+            ],
+        ];
+
+        for dedup_docs in [false, true] {
+            for top_n in [1, 3] {
+                let mut scan = QuantizedScanCtx::new(16, 16, dedup_docs);
+                for (cluster, rows) in clusters.iter().enumerate() {
+                    scan.begin_cluster(top_n);
+                    for &(row, doc, estimate, sigma) in *rows {
+                        scan.push(row, doc, estimate, 0.0, sigma);
+                    }
+                    scan.finish_cluster_bound();
+
+                    let expected = independent_admission_top(&scan, top_n, dedup_docs);
+                    let actual_rows = scan
+                        .bound_top
+                        .iter()
+                        .map(|&index| scan.candidates.rows[index])
+                        .collect::<Vec<_>>();
+                    let expected_rows = expected
+                        .iter()
+                        .map(|&index| scan.candidates.rows[index])
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual_rows, expected_rows,
+                        "cluster={cluster}, dedup_docs={dedup_docs}, top_n={top_n}"
+                    );
+
+                    let expected_kth = (expected.len() == top_n).then(|| {
+                        let index = expected[top_n - 1];
+                        scan.candidates.scores[index] + scan.candidates.bias_corrections[index]
+                            - 2.0 * scan.candidates.sigmas[index]
+                    });
+                    assert_eq!(
+                        scan.running_pessimistic_kth(top_n, 2.0),
+                        expected_kth,
+                        "cluster={cluster}, dedup_docs={dedup_docs}, top_n={top_n}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replica_dedup_is_deferred_and_winner_can_flip() {
+        let mut scan = QuantizedScanCtx::new(4, 4, true);
+        scan.begin_cluster(2);
+        for (row, doc, score, sigma) in [(10, 0, 10.0, 100.0), (11, 1, 8.0, 100.0)] {
+            scan.push(row, doc, score, 0.0, sigma);
+        }
+        scan.finish_cluster_bound();
+        scan.begin_cluster(2);
+        scan.push(12, 0, 9.0, 0.0, 200.0);
+        scan.finish_cluster_bound();
+
+        assert_eq!(
+            scan.candidates.docs.iter().filter(|&&doc| doc == 0).count(),
+            2,
+            "plane 1 must retain every replica membership"
+        );
+        assert!(
+            scan.best_by_doc.is_empty() && scan.best_docs.is_empty(),
+            "per-document hashing is deferred to a boundary"
+        );
+
+        scan.band(2, 2.0);
+        scan.rebuild_best_by_doc();
+        let winner_row = |scan: &QuantizedScanCtx, doc| {
+            let index = scan.best_by_doc[&doc];
+            scan.candidates.rows[index]
+        };
+        assert_eq!(winner_row(&scan, 0), 10);
+
+        let row10 = scan
+            .candidates
+            .rows
+            .iter()
+            .position(|&row| row == 10)
+            .unwrap();
+        let row12 = scan
+            .candidates
+            .rows
+            .iter()
+            .position(|&row| row == 12)
+            .unwrap();
+        scan.candidates.scores[row10] = 5.0;
+        scan.candidates.scores[row12] = 11.0;
+        scan.band(2, 2.0);
+        scan.rebuild_best_by_doc();
+        assert_eq!(
+            winner_row(&scan, 0),
+            12,
+            "refinement may flip the replica winner"
+        );
+
+        let row10 = scan
+            .candidates
+            .rows
+            .iter()
+            .position(|&row| row == 10)
+            .unwrap();
+        scan.candidates.scores[row10] = 11.0;
+        scan.band(2, 2.0);
+        scan.rebuild_best_by_doc();
+        assert_eq!(
+            winner_row(&scan, 0),
+            10,
+            "an equal estimate resolves to the lower storage row"
+        );
+    }
+
     #[test]
     fn quantized_split_constants_are_l2_only() {
         let stored = -0.375_f32;
         assert_eq!(quantized_layer_constant(Metric::L2, stored), stored);
         assert_eq!(quantized_layer_constant(Metric::Dot, stored), 0.0);
         assert_eq!(quantized_layer_constant(Metric::Cosine, stored), 0.0);
+    }
+
+    #[test]
+    fn cosine_refinement_batches_cross_clusters_and_cap_at_2048() {
+        let rows = (0..2_049).collect::<Vec<_>>();
+        let clusters = [0..700, 700..1_400, 1_400..2_100];
+        let batches = cosine_refinement_batches(rows.len()).collect::<Vec<_>>();
+        assert_eq!(batches, [0..2_048, 2_048..2_049]);
+        let first_rows = rows[batches[0].clone()].iter().copied();
+        for cluster in clusters {
+            assert!(
+                first_rows.clone().any(|row| cluster.contains(&row)),
+                "one logical cosine batch must cross all three clusters"
+            );
+        }
+    }
+
+    #[test]
+    fn l2_refinement_keeps_cluster_norm_factors_and_constants_local() {
+        let mut candidates = QuantizedCandidates::with_capacity(2);
+        candidates.push(0, 10, 10.0, 0.0, 0.0);
+        candidates.push(1, 11, 20.0, 0.0, 0.0);
+
+        // Cluster 0: query-residual norm has already been folded into these
+        // sigma/bias factors; its stored split constant is 5.
+        combine_refinement_decoded(
+            Metric::L2,
+            &mut candidates,
+            0..1,
+            &[2.0],
+            &[3.0],
+            &[5.0],
+            7.0,
+            11.0,
+        );
+        // Cluster 1 deliberately uses different norm-derived factors and a
+        // different stored constant. Neither may leak across the boundary.
+        combine_refinement_decoded(
+            Metric::L2,
+            &mut candidates,
+            1..2,
+            &[4.0],
+            &[2.0],
+            &[1.0],
+            13.0,
+            17.0,
+        );
+
+        assert_eq!(candidates.scores, [12.0, 34.0]);
+        assert_eq!(candidates.bias_corrections, [33.0, 34.0]);
+        assert_eq!(candidates.sigmas, [21.0, 26.0]);
     }
 
     #[test]
@@ -3540,21 +4195,16 @@ mod tests {
 
         let mut scan = QuantizedScanCtx::new(CANDIDATES as DocId, CANDIDATES, false);
         for row in 0..CANDIDATES {
-            scan.push(QuantizedCandidate {
+            scan.push(
                 row,
-                doc: row as DocId,
-                score: plane1_scores[row],
-                bias_correction: 0.0,
-                sigma: plane1_sigmas[row],
-                score_query_norm: 1.0,
-            });
+                row as DocId,
+                plane1_scores[row],
+                0.0,
+                plane1_sigmas[row],
+            );
         }
         scan.band(TOP_N, KAPPA_1);
-        let scan_first: Vec<u32> = scan
-            .candidates
-            .iter()
-            .map(|candidate| candidate.row as u32)
-            .collect();
+        let scan_first: Vec<u32> = scan.candidates.rows.iter().map(|&row| row as u32).collect();
         assert!(
             harness_first.len() < CANDIDATES,
             "GATE-B plane 1 must measurably filter"
@@ -3581,16 +4231,13 @@ mod tests {
             .map(|&local| harness_first[local as usize])
             .collect();
 
-        for candidate in &mut scan.candidates {
-            candidate.score += refinements[candidate.row];
-            candidate.sigma = plane2_sigmas[candidate.row];
+        for index in 0..scan.candidates.len() {
+            let row = scan.candidates.rows[index];
+            scan.candidates.scores[index] += refinements[row];
+            scan.candidates.sigmas[index] = plane2_sigmas[row];
         }
         scan.band(TOP_N, KAPPA_2);
-        let scan_second: Vec<u32> = scan
-            .candidates
-            .iter()
-            .map(|candidate| candidate.row as u32)
-            .collect();
+        let scan_second: Vec<u32> = scan.candidates.rows.iter().map(|&row| row as u32).collect();
         assert!(
             harness_second.len() < harness_first.len(),
             "GATE-B plane 2 must measurably filter"
@@ -3614,18 +4261,38 @@ mod tests {
     fn quantized_boundary_filters_with_finite_sigmas() {
         let mut scan = QuantizedScanCtx::new(3, 3, false);
         for (row, score) in [(0, 100.0), (1, 99.0), (2, -100.0)] {
-            scan.push(QuantizedCandidate {
-                row,
-                doc: row as DocId,
-                score,
-                bias_correction: 0.0,
-                sigma: 0.1,
-                score_query_norm: 1.0,
-            });
+            scan.push(row, row as DocId, score, 0.0, 0.1);
         }
         scan.band(1, 2.0);
         assert_eq!(scan.candidates.len(), 1);
-        assert_eq!(scan.candidates[0].row, 0);
+        assert_eq!(scan.candidates.rows[0], 0);
+    }
+
+    #[test]
+    fn quantized_bias_is_applied_once_at_estimate_access() {
+        let mut scan = QuantizedScanCtx::new(2, 2, false);
+        scan.push(0, 0, 10.0, -100.0, 0.0);
+        scan.push(1, 1, 9.0, 0.0, 0.0);
+        assert_eq!(scan.candidates.estimate(0), -90.0);
+        scan.band(1, 0.0);
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(scan.candidates.rows[0], 1);
+    }
+
+    #[test]
+    fn quantized_depth_two_bias_replaces_depth_one_correction() {
+        // Match the first sample in the independent calibration oracle:
+        // depth-1 prefix 9 with correction +1, then depth-2 prefix 14 with
+        // correction -4. The active-depth estimate remains 10; retaining
+        // depth 1 as an additional correction would incorrectly produce 11.
+        let mut candidates = QuantizedCandidates::with_capacity(1);
+        candidates.push(0, 0, 9.0, 1.0, 1.0);
+        assert_eq!(candidates.estimate(0).to_bits(), 10.0_f32.to_bits());
+
+        candidates.scores[0] += 5.0;
+        candidates.bias_corrections[0] = -4.0;
+        assert_eq!(candidates.estimate(0).to_bits(), 10.0_f32.to_bits());
+        assert_ne!(candidates.estimate(0).to_bits(), 11.0_f32.to_bits());
     }
 
     // ============================================================
@@ -3672,11 +4339,13 @@ mod tests {
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
+        let quantized_queries = QuantizedQueryCache::default();
         let backend = VectorBackend::<f32>::for_segment(
             segment_reader,
             0,
             embed_field,
             Arc::new(query),
+            &quantized_queries,
             params,
             usize::MAX,
         )?;
@@ -3734,11 +4403,13 @@ mod tests {
         k: usize,
         weight: &dyn Weight,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
+        let quantized_queries = QuantizedQueryCache::default();
         let backend = VectorBackend::<f32>::for_segment(
             segment_reader,
             0,
             embed_field,
             Arc::new(query),
+            &quantized_queries,
             AdaptiveProbeParams::default(),
             usize::MAX,
         )?;

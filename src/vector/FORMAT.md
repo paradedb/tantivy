@@ -4,40 +4,20 @@ Status: frozen for Phase B v1 on 2026-08-24.
 
 Changelog:
 
-- On 2026-08-25, before shipment, amendment 9 centers the measured error
-  distribution at every active prefix depth. Slot-15 metadata payload version
-  3 stores `(bias, CAL, sample_count)` per depth. `bias` is the signed
-  normalized error center: readers add `bias * scale * rho * ||q||` to the dot
-  estimate (twice that correction in L2 score space), while `CAL` is the
-  centered residual spread used by the κ band. Version-1 and version-2
-  payloads decode with zero bias until their segments are re-merged. The build
-  sampler also reports the per-pseudo-query bias distribution so a global
-  center is auditable rather than assumed.
-- On 2026-08-25, before shipment, amendment 8 replaced scalar slot-15 CAL
-  with one entry per active prefix depth. The merge observes every prefix in
-  the existing sampled encode pass, and the reader applies entry `l` after
-  scoring layers `0..=l`. This removes schedule-depth dependence from prefix
-  scans. Metadata payload version 2 records the layer count and `(CAL,
-  sample_count)` for each prefix; local pre-amendment version-1 segments remain
-  readable long enough to re-merge.
-- On 2026-08-25, before shipment, amendment 7 made slot 15 honor the measured
-  production-query CAL envelope. The current floor is `2.2659182`, measured
-  from 1,000 Cohere scan rows; a larger field-local held-out measurement wins.
+- On 2026-08-25, before shipment, calibration v3 superseded the pre-release
+  slot-15 calibration amendments. Slot 15 is retired and reserved: writers
+  omit it and readers ignore it. Per-field, per-prefix `(bias, spread,
+  sample_count, source)` calibration now lives only in
+  `IndexSettings.vector_quantization`. There is no built-in numeric fallback
+  or production-query floor.
 - On 2026-08-25, before shipment, amendment 6 persisted the exact-density
   model rho alongside every used width's grid, including the sign plane.
-  Segment-open scorer resolution consumes these entries directly and is
-  cached across query-driven segment reopens; query preparation never runs the
-  Lloyd-Max solver.
-- On 2026-08-25, before shipment, amendment 4 added field-scoped measured-CAL
-  metadata slot 15. Each IVF merge measures the final-layer empirical/model
-  dot-error sigma ratio from up to 1,024 encoded posting rows; readers apply
-  the stored factor to every layer's sigma chain.
-- On 2026-08-25, before shipment, amendment 5 changed the CAL query sample to
-  held-out stored vectors. A pseudo-query never measures rows from its own IVF
-  cluster, avoiding self-match bias while preserving the field's real vector
-  distribution.
+  Nonzero quantized-query scorer resolution consumes these entries directly
+  and is cached across query-driven segment reopens; query preparation never
+  runs the Lloyd-Max solver. Level 0 does not resolve quantized scorer state.
 - V3 amendment 3: quantized fields require `d >= 64`, matching the validated
-  error-model envelope and the packed-word width; unquantized fields remain unrestricted.
+  error-model envelope and the packed-word width; unquantized fields remain
+  unrestricted.
 
 - On 2026-08-24, before shipment, amendment 1 added the metric-gated
   residual-squared-norm slot 14 required for L2 split-form distance assembly.
@@ -54,11 +34,14 @@ significant bits), serialized as little-endian `u64` words.
 - Every newly written `.vec` and `.centroids` file starts with the existing
   four-byte little-endian version header, now set to `3`, followed by the
   existing `CompositeFile` body.
-- V1 and V2 `.vec` files remain readable. They have no quantized slots and use
-  the exact path. V1 `.centroids` remains rejected by the existing V2 bounds
-  requirement; V2 `.centroids` remains readable.
+- V1 and V2 `.vec` files remain readable. They have no quantized slots. Flat
+  segments use the exhaustive exact path; IVF segments retain centroid routing
+  and the probe budget, then score the routed rows exactly. V1 `.centroids`
+  remains rejected by the existing V2 bounds requirement; V2 `.centroids`
+  remains readable.
 - A V3 flat segment has no centroid context and therefore has no quantized
-  slots. Absence of all quantized slots means quantization is off/exact.
+  slots. Absence of all quantized slots means quantized scoring is off; flat
+  segments scan exhaustively and IVF segments use routed exact scoring.
 - A V3 IVF field whose per-index configuration enables quantization must carry
   the complete configured slot prefix. A partial layer or a layer count that
   differs from the index configuration is corruption, not a fallback.
@@ -76,7 +59,7 @@ independently to every vector field.
 | `3 + 3*l` | Little-endian binary16 scale for layer `l` |
 | `4 + 3*l` | Little-endian binary32 split-form constant for layer `l` |
 | 14 | Little-endian binary32 `‖x-c‖²`, present iff metric assembly requires a per-row norm (L2 in v1) |
-| 15 | Quantization calibration metadata, present for every quantized IVF field |
+| 15 | Retired pre-release calibration slot; reserved, never written, ignored if present |
 
 With the v1 maximum of four layers, quantized slots occupy 2 through 13. Each
 layer owns three separate SoA byte ranges; layers never interleave.
@@ -107,23 +90,10 @@ rotation. Readers must not derive it from quantization scales or reconstructed
 layers. L2 assembles `dist² = ‖q-c‖² - 2·est + ‖r‖²`, where `est` is the
 split-form estimate of `⟨q-c,r⟩`; the score buffer stores `-dist²`.
 
-Slot 15 is a variable-length, little-endian field payload: metadata version
-`u32` (`2`), layer count `u32`, then one `(CAL f32, sample_count u32)` pair for
-each prefix depth, for a total of `8 + 8*L` bytes. It is scoped to one field in
-one segment because its values are measured from that merge's encoded posting
-rows. The merge selects up to 64 deterministically spaced stored vectors as
-pseudo-queries and samples up to 1,024 encoded rows at a deterministic
-interval. Each row uses a pseudo-query whose primary assignment is a different
-cluster. In the same encode pass, after every layer `l`, it observes the exact
-dot product between that prefix's transformed query and remaining
-reconstruction error; the denominator is the matching
-`f16_scale[l] * rho[l] * query_norm` model sigma. Entry `l` is the larger of
-that prefix's field-local empirical/model RMS ratio and the production-query
-envelope (`2.2659182` from 1,000 measured Cohere scan rows); its sample count
-identifies the selected source. L2's factor of two multiplies both sides and
-therefore does not change the ratio. Empty fields store one CAL `1.0`, sample
-count zero entry per built layer. After scoring prefix depth `l+1`, readers
-multiply the normal f16 scale × rho × query-norm sigma chain by entry `l`.
+Slot 15 has no active payload or decoder. Its number remains reserved so a
+future format cannot reinterpret bytes written by a pre-release build. Current
+writers never open this slot. Current readers neither require nor decode it;
+if physical slot-15 bytes are present, they have no effect on open or scoring.
 
 ## Code alignment
 
@@ -147,7 +117,42 @@ vector fields with different dimensions and metrics. Each entry persists:
   policy;
 - one validity tuple per layer: width, quantizer tag, and `u64` rotation seed;
 - one exact-density model entry per used width: grid version (`1`), ordered
-  fp32 points, and normalized-RMSE `rho_model` (including the sign width).
+  fp32 points, and normalized-RMSE `rho_model` (including the sign width);
+- an optional calibration array with exactly one entry per active prefix
+  depth. Each entry is `{ bias: f32, spread: f32, sample_count: u32, source:
+  u8 }`, where source `0` is `held_out` and source `1` is `real_query`.
+
+Calibration is field-scoped and shared by every segment of the index. All
+depth entries must use one source; `bias` must be finite, `spread` finite and
+non-negative, and `sample_count` nonzero. Array entry `l` calibrates the
+cumulative estimate after scoring layers `0..=l`, not layer `l` in isolation.
+
+`paradedb.vector_calibrate` supplies production queries to the production
+quantized-query estimator, using at most the first 256 queries. It samples a
+deterministic index-wide target of 1,000 live IVF posting-membership rows;
+replicas remain separate memberships and every membership of a deleted
+document is excluded. Caller queries are external to the indexed corpus, so
+there is no query-cluster exclusion. For every row and prefix, exact dot,
+cumulative prefix estimate, and base model sigma stay in `f32`; only the
+finite normalized error
+`(exact_dot - prefix_estimate) / (f16_scale[l] * rho[l] * query_norm)` is
+widened into the aggregate moments. `bias` is its mean, `spread` its population
+standard deviation, and `sample_count` counts accepted query-row errors. The
+result is persisted with source `real_query`.
+
+At prefix `l`, the reader centers the raw estimate exactly once by adding
+`bias[l] * f16_scale[l] * rho[l] * query_norm`; the κ band uses
+`spread[l] * f16_scale[l] * rho[l] * query_norm`. L2 applies its score-space
+factor of two to both corrections. Selecting a deeper prefix replaces the
+active bias and spread with that depth's entry; it does not add calibration
+from shallower prefixes.
+
+If the calibration array is absent, quantized scorer resolution is unavailable:
+IVF search falls back to routed exact scoring and pg_search emits a notice;
+there is no silent bias or spread constant. A held-out entry may initialize or
+replace held-out calibration, but it cannot replace an existing real-query
+entry. Only the explicit real-query update path used by
+`paradedb.vector_calibrate` may replace real-query calibration.
 
 Configuration is validated by `IndexBuilder` before any index metadata is
 written: field exists and is vector/f32; dimension is at least 64 and matches;
@@ -155,9 +160,11 @@ layer count is 1 through 4; widths are 1 through 4; RaBitQ is one bit;
 TurboQuant grids are present exactly once per used width with `2^b` finite,
 strictly increasing points; newly materialized metadata also carries the sign
 entry and finite non-negative model rho for every width; metric and
-normalization agree with the schema.
+normalization agree with the schema. When calibration is present, its array
+length, field types, nonzero sample counts, and uniform source obey the rules
+above.
 
-An empty configuration is the backward-compatible default. pg_search's build
-option will materialize the configured field entries once the Phase B writer
-lands; segments only reference these persisted entries and never fork seeds or
-grids.
+An empty configuration is the backward-compatible default. pg_search
+materializes configured field entries at index creation, and IVF merges emit
+the corresponding quantized slots. Segments reference the persisted per-index
+seeds, grids, and optional calibration; they never fork them.
