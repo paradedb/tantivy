@@ -11,7 +11,7 @@ use log::Level;
 use crate::directory::directory_lock::Lock;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use crate::directory::{
-    FileHandle, FileSlice, InnerWritePtr, WatchCallback, WatchHandle, WritePtr,
+    FileHandle, FileSlice, InnerWritePtr, TempFilePtr, WatchCallback, WatchHandle, WritePtr,
 };
 use crate::index::SegmentMetaInventory;
 use crate::IndexMeta;
@@ -179,6 +179,17 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
         Ok(io::BufWriter::with_capacity(
             self.bufwriter_capacity(),
             self.open_write_inner(path)?,
+        ))
+    }
+
+    /// Opens a seekable temporary file for spill data.
+    ///
+    /// The temporary file is not part of the directory's managed WORM namespace. Directory
+    /// implementations that cannot provide temporary storage return [`io::ErrorKind::Unsupported`].
+    fn open_temp_file(&self) -> io::Result<TempFilePtr> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory does not support temporary files",
         ))
     }
 

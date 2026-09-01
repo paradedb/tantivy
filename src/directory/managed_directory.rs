@@ -12,7 +12,7 @@ use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteEr
 use crate::directory::footer::{Footer, FooterProxy, FOOTER_LEN};
 use crate::directory::{
     DirectoryLock, DirectoryPanicHandler, FileHandle, FileSlice, GarbageCollectionResult,
-    InnerWritePtr, Lock, WatchCallback, WatchHandle, MANAGED_LOCK, META_LOCK,
+    InnerWritePtr, Lock, TempFilePtr, WatchCallback, WatchHandle, MANAGED_LOCK, META_LOCK,
 };
 use crate::error::DataCorruption;
 use crate::index::SegmentMetaInventory;
@@ -320,6 +320,10 @@ impl Directory for ManagedDirectory {
                 .map_err(|_| ())
                 .expect("buffer should be empty"),
         )))
+    }
+
+    fn open_temp_file(&self) -> io::Result<TempFilePtr> {
+        self.directory.open_temp_file()
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
