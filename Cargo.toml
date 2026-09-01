@@ -131,6 +131,28 @@ opt-level = 3
 debug = false
 debug-assertions = false
 
+# Keep quant-kernel release symbols inspectable for cargo-asm. LTO is selected
+# by the CI asm/criterion job because Cargo does not support per-package LTO.
+[profile.release.package.fht]
+codegen-units = 1
+debug = true
+
+[profile.release.package.sign-plane]
+codegen-units = 1
+debug = true
+
+[profile.release.package.grid-plane]
+codegen-units = 1
+debug = true
+
+[profile.release.package.quant-model]
+codegen-units = 1
+debug = true
+
+[profile.release.package.cascade]
+codegen-units = 1
+debug = true
+
 [profile.bench]
 opt-level = 3
 debug = true
@@ -174,7 +196,19 @@ members = [
   "sstable",
   "tokenizer-api",
   "columnar",
+  "quant-kernels/fht",
+  "quant-kernels/sign-plane",
+  "quant-kernels/grid-plane",
+  "quant-kernels/quant-model",
+  "quant-kernels/cascade",
 ]
+
+[workspace.dependencies]
+# The raw ChaCha8 stream participates in the stored vector format.
+rand_chacha = "=0.3.1"
+rand_core = "=0.6.4"
+criterion = "0.5"
+half = "2.4"
 
 # Following the "fail" crate best practises, we isolate
 # tests that define specific behavior in fail check points
