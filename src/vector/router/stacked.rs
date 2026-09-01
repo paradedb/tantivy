@@ -60,7 +60,9 @@ pub(super) fn open(
 }
 
 pub(super) fn rank(index: &LazyStackedIvf, query: &[f32], metric: Metric) -> Ranking {
-    let ranked = index.search(query, index.nlist(), 1.0, metric);
+    // Members of this level are the segment's centroids; rank all of them
+    // that the probed lists contain, so `k` is the member count, not `nlist`.
+    let ranked = index.search(query, index.vectors.len(), 1.0, metric);
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),
