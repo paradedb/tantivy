@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use common::{BinarySerializable, HasLen};
 
-use super::ivf::graph::{Candidate, Workspace};
+use super::ivf::graph::Candidate;
 use super::ivf::IvfCentroids;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
@@ -98,20 +98,12 @@ pub trait Router: ErasedRouterDescriptor + Send + Sync + 'static {
     where
         Self: Sized;
 
-    /// Rank centroids, updating the query-local metrics in `workspace`.
+    /// Rank centroids for a query.
     fn rank<'a>(
         &'a self,
-        workspace: &'a mut Workspace,
         query: &'a [f32],
         metric: Metric,
     ) -> Box<dyn Iterator<Item = Candidate> + 'a>;
-
-    /// Return metrics for the query most recently ranked in `workspace`.
-    fn metrics(&self, workspace: &Workspace) -> RouterMetrics {
-        RouterMetrics {
-            visited_count: workspace.routing_visited_count(),
-        }
-    }
 
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()>;
 
@@ -233,12 +225,6 @@ impl RouterBinding {
     }
 }
 
-/// Router-neutral metrics for one query.
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
-pub struct RouterMetrics {
-    pub visited_count: usize,
-}
-
 fn write_router_header(id: &str, out: &mut dyn Write) -> io::Result<()> {
     if id.is_empty() {
         return Err(io::Error::new(
@@ -298,11 +284,9 @@ mod tests {
 
         fn rank<'a>(
             &'a self,
-            workspace: &'a mut Workspace,
             _query: &'a [f32],
             _metric: Metric,
         ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
-            workspace.set_routing_visited_count(1);
             Box::new(
                 vec![Candidate {
                     sim: Similarity::new(1.0),
@@ -330,11 +314,8 @@ mod tests {
             FileSlice::empty(),
             &options,
         )?;
-        let mut workspace = Workspace::new();
-        let mut ranking = opened.rank(&mut workspace, &[0.0], Metric::L2);
+        let mut ranking = opened.rank(&[0.0], Metric::L2);
         assert_eq!(ranking.next().unwrap().node, 42);
-        drop(ranking);
-        assert_eq!(opened.metrics(&workspace).visited_count, 1);
         Ok(())
     }
 

@@ -23,10 +23,10 @@ use super::bounds::{
 };
 use super::distance::norm_squared_wide;
 use super::index_reader::VectorIndexReader;
-use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, Workspace};
+use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
 use super::prepared::PreparedQuery;
 use super::tie_break::NoTieBreak;
-use super::{RouterMetrics, VectorElement};
+use super::VectorElement;
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, TopNComputer};
 use crate::fastfield::AliveBitSet;
@@ -293,10 +293,6 @@ pub struct ProbeStats {
     /// Flat/exact-path stride-sized row reads — one per survivor scored.
     /// Filled only by the exact (non-IVF) path.
     pub exact_rows_read: usize,
-    /// Routing cost of ranking the clusters to probe. Ranking is lazy, so
-    /// `routing.visited_count` covers only as much work as the probe loop
-    /// actually pulled.
-    pub routing: RouterMetrics,
     /// Clusters the bounds gate passed over with a Skip verdict, without
     /// opening them: their margins proved they could not improve the
     /// armed result. Each charged the open share. Disjoint from the
@@ -554,8 +550,7 @@ impl<T: VectorElement> VectorBackend<T> {
         // Routing operates in `f32` (centroid rows are `f32` today), so the
         // query is widened losslessly per element.
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
-        let mut routing_ws = Workspace::new();
-        let mut ranked = index.rank_clusters(&mut routing_ws, &query_f32);
+        let mut ranked = index.rank_clusters(&query_f32);
 
         let topn = self.scan_clusters(
             index,
@@ -570,10 +565,6 @@ impl<T: VectorElement> VectorBackend<T> {
             &query_f32,
             stats,
         )?;
-
-        // The routing cost is only known once the scan stops pulling.
-        drop(ranked);
-        stats.routing = index.router_metrics(&routing_ws);
 
         let segment_ord = self.segment_ord;
         Ok(topn
@@ -1775,8 +1766,6 @@ mod tests {
             stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
             "visited must equal filter+dead+seen+scored ({stats:?})"
         );
-        // Navigation cost == the centroids ranked for this query.
-        assert_eq!(stats.routing.visited_count, DEFAULT_NUM_CENTROIDS);
         // Exhaustive params (unclamped ceiling, unsatisfiable floor)
         // drain the ranked list.
         assert_eq!(stats.termination, ProbeTermination::Exhausted);
@@ -1822,7 +1811,6 @@ mod tests {
         assert_eq!(stats.termination, ProbeTermination::Ceiling);
         // Stopped at exactly the cap, short of the ranked list.
         assert_eq!(stats.clusters_probed(), 1);
-        assert_eq!(stats.routing.visited_count, centroids.len());
         assert_eq!(
             stats.vectors_visited,
             stats.pruned_filter + stats.pruned_dead + stats.pruned_seen + stats.candidates_scored,
@@ -1863,7 +1851,6 @@ mod tests {
         )?;
         assert_eq!(hits, expected, "linear fallback must match the oracle");
         assert_eq!(stats.clusters_probed(), 1, "one cluster, one probe");
-        assert_eq!(stats.routing.visited_count, 1);
         Ok(())
     }
 
@@ -1918,10 +1905,6 @@ mod tests {
                 stats.clusters_probed() <= 2,
                 "cap 2 must bound the probes, got {}",
                 stats.clusters_probed()
-            );
-            assert!(
-                stats.routing.visited_count <= centroids.len(),
-                "navigation cost is the beam-visited count"
             );
         }
         Ok(())
@@ -2262,8 +2245,8 @@ mod tests {
         Ok(())
     }
 
-    /// `ProbeStats` and its routing metrics round-trip through `serde_json`
-    /// with the field names callers rely on.
+    /// `ProbeStats` round-trips through `serde_json` with the field names
+    /// callers rely on.
     #[test]
     fn probe_stats_serializes_to_json() {
         let stats = ProbeStats {
@@ -2275,7 +2258,6 @@ mod tests {
             postings_row: 1,
             postings_skipped: 1,
             exact_rows_read: 0,
-            routing: RouterMetrics { visited_count: 7 },
             bounds_skips: 2,
             bound_armed_at_probe: Some(1),
             termination: ProbeTermination::Ceiling,
@@ -2294,9 +2276,6 @@ mod tests {
                 "postings_row": 1,
                 "postings_skipped": 1,
                 "exact_rows_read": 0,
-                "routing": {
-                    "visited_count": 7
-                },
                 "bounds_skips": 2,
                 "bound_armed_at_probe": 1,
                 "termination": "Ceiling",

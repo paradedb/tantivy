@@ -6,7 +6,7 @@ use super::{Router, RouterDescriptor};
 use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::header::VectorFileVersion;
-use crate::vector::ivf::graph::{Candidate, Workspace};
+use crate::vector::ivf::graph::Candidate;
 use crate::vector::{FileSliceArena, IvfCentroids, VectorArena, VectorOptions};
 
 const EXACT_ROUTER_ID: &str = "tantivy.exact";
@@ -66,7 +66,6 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
 
     fn rank<'a>(
         &'a self,
-        workspace: &'a mut Workspace,
         query: &'a [f32],
         _metric: Metric,
     ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
@@ -79,7 +78,6 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
             })
             .collect::<Vec<_>>();
         ranked.sort_unstable_by(|a, b| b.cmp(a));
-        workspace.set_routing_visited_count(self.num_centroids);
         Box::new(ranked.into_iter())
     }
 

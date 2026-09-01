@@ -4,7 +4,7 @@ use super::{Router, RouterDescriptor};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::header::VectorFileVersion;
-use crate::vector::ivf::graph::{NeighborhoodGraphConfig, RelativeNeighborhoodGraph, Workspace};
+use crate::vector::ivf::graph::{NeighborhoodGraphConfig, RelativeNeighborhoodGraph};
 use crate::vector::{Candidate, FileSliceArena, IvfCentroids, VectorArena};
 use crate::Executor;
 
@@ -70,7 +70,6 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
 
     fn rank<'a>(
         &'a self,
-        workspace: &'a mut Workspace,
         query: &'a [f32],
         _metric: Metric,
     ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
@@ -79,7 +78,7 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
             .take(8)
             .map(|node| node as u32)
             .collect::<Vec<_>>();
-        Box::new(self.search_iter(workspace, query, &seeds))
+        Box::new(self.search_iter_owned(query, &seeds))
     }
 
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()> {

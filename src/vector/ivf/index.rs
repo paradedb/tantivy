@@ -29,11 +29,10 @@ use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
 
-use super::graph::Workspace;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
-use crate::vector::router::{Router, RouterBinding, RouterMetrics};
+use crate::vector::router::{Router, RouterBinding};
 use crate::vector::{BoundKind, BoundStore, Candidate};
 
 /// The IVF routing index over one field's clusters: says which clusters —
@@ -296,13 +295,8 @@ impl IvfIndex {
 
     pub(crate) fn rank_clusters<'a>(
         &'a self,
-        workspace: &'a mut Workspace,
         query: &'a [f32],
     ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
-        self.router.rank(workspace, query, self.metric)
-    }
-
-    pub(crate) fn router_metrics(&self, workspace: &Workspace) -> RouterMetrics {
-        self.router.metrics(workspace)
+        self.router.rank(query, self.metric)
     }
 }

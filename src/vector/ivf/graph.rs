@@ -497,7 +497,7 @@ impl Default for NeighborhoodGraphConfig {
 /// already yielded.
 pub struct SearchIterator<'g, 'w, S: VectorArena, const RESUMABLE: bool> {
     rng: &'g RelativeNeighborhoodGraph<S>,
-    workspace: &'w mut Workspace,
+    workspace: SearchWorkspace<'w>,
     query: &'g [S::Elem],
     /// Beam width of each round.
     ef: usize,
@@ -518,6 +518,20 @@ pub type ResumableSearchIterator<'g, 'w, S> = SearchIterator<'g, 'w, S, true>;
 /// [`search`](RelativeNeighborhoodGraph::search) drives it.
 type OneShotSearchIterator<'g, 'w, S> = SearchIterator<'g, 'w, S, false>;
 
+enum SearchWorkspace<'w> {
+    Borrowed(&'w mut Workspace),
+    Owned(Workspace),
+}
+
+impl SearchWorkspace<'_> {
+    fn as_mut(&mut self) -> &mut Workspace {
+        match self {
+            SearchWorkspace::Borrowed(workspace) => workspace,
+            SearchWorkspace::Owned(workspace) => workspace,
+        }
+    }
+}
+
 impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RESUMABLE> {
     fn new(
         rng: &'g RelativeNeighborhoodGraph<S>,
@@ -526,24 +540,34 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         seeds: &[NodeId],
         ef: usize,
     ) -> Self {
+        Self::from_workspace(rng, SearchWorkspace::Borrowed(workspace), query, seeds, ef)
+    }
+
+    fn from_workspace(
+        rng: &'g RelativeNeighborhoodGraph<S>,
+        mut workspace: SearchWorkspace<'w>,
+        query: &'g [S::Elem],
+        seeds: &[NodeId],
+        ef: usize,
+    ) -> Self {
         debug_assert_eq!(query.len(), rng.graph.dim(), "query dimension mismatch");
         let n = rng.graph.len();
-        workspace.begin_query(n);
+        let ws = workspace.as_mut();
+        ws.begin_query(n);
 
         let arena = rng.graph.arena();
         let dim = rng.graph.dim();
         let mut metrics = NeighborhoodGraphSearchMetrics::default();
 
         for &node_id in seeds {
-            if node_id as usize >= n || workspace.visited.contains(node_id) {
+            if node_id as usize >= n || ws.visited.contains(node_id) {
                 continue;
             }
-            workspace.visited.insert(node_id);
+            ws.visited.insert(node_id);
             metrics.visited_count += 1;
             let sim = arena.similarity(rng.metric, dim, node_id, query);
-            workspace.frontier.push(Candidate { sim, node: node_id });
+            ws.frontier.push(Candidate { sim, node: node_id });
         }
-        workspace.set_routing_visited_count(metrics.visited_count);
 
         SearchIterator {
             rng,
@@ -568,7 +592,7 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         let arena = graph.arena();
         let dim = graph.dim();
         let metric = self.rng.metric;
-        let ws = &mut *self.workspace;
+        let ws = self.workspace.as_mut();
 
         self.metrics.termination_reason = SearchTerminationReason::GraphExhausted;
 
@@ -621,13 +645,28 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
                 });
             }
         }
-        ws.set_routing_visited_count(self.metrics.visited_count);
-
         self.batch.extend(ws.results.drain().map(|Reverse(c)| c));
         // Ascending similarity with descending-id ties, so popping from the
         // back yields descending similarity with ascending-id ties.
         self.batch
             .sort_unstable_by(|a, b| a.sim.cmp(&b.sim).then_with(|| b.node.cmp(&a.node)));
+    }
+}
+
+impl<'g, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'static, S, RESUMABLE> {
+    fn new_owned(
+        rng: &'g RelativeNeighborhoodGraph<S>,
+        query: &'g [S::Elem],
+        seeds: &[NodeId],
+        ef: usize,
+    ) -> Self {
+        Self::from_workspace(
+            rng,
+            SearchWorkspace::Owned(Workspace::new()),
+            query,
+            seeds,
+            ef,
+        )
     }
 }
 
@@ -713,6 +752,14 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         seeds: &[NodeId],
     ) -> ResumableSearchIterator<'g, 'w, S> {
         ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef)
+    }
+
+    pub(crate) fn search_iter_owned<'g>(
+        &'g self,
+        query: &'g [S::Elem],
+        seeds: &[NodeId],
+    ) -> ResumableSearchIterator<'g, 'static, S> {
+        ResumableSearchIterator::new_owned(self, query, seeds, self.config.ef)
     }
 
     /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
@@ -959,7 +1006,6 @@ pub struct Workspace {
     /// Min-heap by similarity (via `Reverse`): the current beam — the best
     /// `width` committed results, with the least-similar on top for eviction.
     pub(crate) results: BinaryHeap<Reverse<Candidate>>,
-    routing_visited_count: usize,
 }
 
 impl Default for Workspace {
@@ -968,7 +1014,6 @@ impl Default for Workspace {
             visited: BitSet::with_max_value(0),
             frontier: BinaryHeap::new(),
             results: BinaryHeap::new(),
-            routing_visited_count: 0,
         }
     }
 }
@@ -977,16 +1022,6 @@ impl Workspace {
     /// Creates an empty workspace. It grows to fit on first use.
     pub fn new() -> Self {
         Workspace::default()
-    }
-
-    /// Number of centroids visited by the current routing query.
-    pub fn routing_visited_count(&self) -> usize {
-        self.routing_visited_count
-    }
-
-    /// Record the number of centroids visited by the current routing query.
-    pub fn set_routing_visited_count(&mut self, visited_count: usize) {
-        self.routing_visited_count = visited_count;
     }
 
     /// Prepares the workspace for a query over `n` nodes: zeroes the visited
@@ -999,7 +1034,6 @@ impl Workspace {
         }
         self.frontier.clear();
         self.results.clear();
-        self.routing_visited_count = 0;
     }
 }
 
