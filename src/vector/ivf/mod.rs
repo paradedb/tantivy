@@ -5,6 +5,7 @@
 //! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold),
 //! which defaults to 10k docs.
 
+mod aps;
 pub(crate) mod bkt;
 pub(crate) mod graph;
 mod index;
@@ -26,12 +27,13 @@ pub use graph::{
 pub use index::{IvfIndex, IvfSearchMetrics, RoutingIndex};
 pub use ivf::{
     AddLevelError, ClusterId, FlatStore, IvfConfig, IvfIndex as MultiLevelIvf, IvfIndexBuilder,
-    IvfLevelClusterer, PersistedStackedIvf, SliceStore, StackedIvfIndex, SuperKMeansLevelClusterer,
+    IvfLevelClusterer, PersistedStackedIvf, SliceStore, StackedIvfIndex, StackedSearchStats,
+    SuperKMeansLevelClusterer,
 };
 pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;
-pub(crate) use training::{decode_row, encode_vector};
 pub use training::{
     BuiltRouter, IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
     IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors,
 };
+pub(crate) use training::{decode_row, encode_vector};

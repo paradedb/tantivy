@@ -203,38 +203,70 @@ fn main() {
             break;
         }
         index.config.nprobe_fraction = nprobe as f32 / nlist as f32;
-        let lists_scanned = index.n_probe();
 
         let t0 = Instant::now();
-        let (recall_sum, cand_sum) = (0..n_queries)
+        let (recall_sum, cand_sum, list_sum) = (0..n_queries)
             .into_par_iter()
             .map(|q| {
                 let query = &queries[q * d..(q + 1) * d];
-                let hits = index.search(query, TOP_K, 1.0, Metric::L2);
-                let found = hits
+                let stats = index.search_with_stats(query, TOP_K, 1.0, Metric::L2);
+                let found = stats
+                    .hits
                     .iter()
                     .filter(|h| truth[q].contains(&inv[usize::from(h.node)]))
                     .count();
-                let members: u64 = if let Some(parent) = &index.parent {
-                    parent
-                        .search(query, lists_scanned, 1.0, Metric::L2)
-                        .iter()
-                        .map(|c| {
-                            let (s, e) = index.offsets[usize::from(c.node)];
-                            e.saturating_sub(s)
-                        })
-                        .sum()
-                } else {
-                    n as u64
-                };
-                (found as f64 / TOP_K as f64, members as f64)
+                (
+                    found as f64 / TOP_K as f64,
+                    stats.members_scored as f64,
+                    stats.lists_scanned as f64,
+                )
             })
-            .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+            .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
         let elapsed = t0.elapsed().as_secs_f64();
 
         let mean_cand = cand_sum / n_queries as f64;
+        let mean_lists = list_sum / n_queries as f64;
         println!(
-            "{nprobe:<8} {lists_scanned:<10} {:<12.2} {:<10.4} {:>6.2}",
+            "{nprobe:<8} {mean_lists:<10.1} {:<12.2} {:<10.4} {:>6.2}",
+            100.0 * mean_cand / n as f64,
+            recall_sum / n_queries as f64,
+            1e3 * elapsed / n_queries as f64,
+        );
+    }
+
+    index.config.nprobe_fraction = 0.10;
+    println!(
+        "\n{:<8} {:<10} {:<12} {:<10} {:>6}",
+        "target",
+        "lists",
+        "%_of_base",
+        format!("recall@{TOP_K}"),
+        "ms/q"
+    );
+    for target in [0.80f32, 0.90, 0.99] {
+        let t0 = Instant::now();
+        let (recall_sum, cand_sum, list_sum) = (0..n_queries)
+            .into_par_iter()
+            .map(|q| {
+                let query = &queries[q * d..(q + 1) * d];
+                let stats = index.search_with_stats(query, TOP_K, target, Metric::L2);
+                let found = stats
+                    .hits
+                    .iter()
+                    .filter(|h| truth[q].contains(&inv[usize::from(h.node)]))
+                    .count();
+                (
+                    found as f64 / TOP_K as f64,
+                    stats.members_scored as f64,
+                    stats.lists_scanned as f64,
+                )
+            })
+            .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+        let elapsed = t0.elapsed().as_secs_f64();
+        let mean_cand = cand_sum / n_queries as f64;
+        let mean_lists = list_sum / n_queries as f64;
+        println!(
+            "{target:<8.2} {mean_lists:<10.1} {:<12.2} {:<10.4} {:>6.2}",
             100.0 * mean_cand / n as f64,
             recall_sum / n_queries as f64,
             1e3 * elapsed / n_queries as f64,

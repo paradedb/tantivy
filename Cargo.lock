@@ -1875,6 +1875,7 @@ dependencies = [
  "htmlescape",
  "itertools 0.14.0",
  "levenshtein_automata",
+ "libm",
  "log",
  "lru",
  "lz4_flex",
