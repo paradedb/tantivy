@@ -19,10 +19,6 @@ const LABEL_FIELD_NAME: &str = "label";
 const NUM_DOCS: usize = 100;
 const DOCS_PER_SEGMENT: usize = 10;
 
-// Which on-disk layout the fixture should produce, reusing the public
-// descriptor enum. Selected via the index settings (clustering threshold +
-// clusterer); the resulting segment is self-describing through its `.vec`
-// `IdMap`, so this is purely a build knob here.
 pub(crate) use crate::vector::VectorStorageFormat;
 
 pub(crate) struct TestVectorIndex {
@@ -276,8 +272,6 @@ fn fixture_uses_selected_storage_format() -> crate::Result<()> {
     Ok(())
 }
 
-/// Both vector segment files must stamp the current format-generation header
-/// ahead of their composite body, so future layout changes can be gated.
 #[test]
 fn vector_files_stamp_format_version_header() -> crate::Result<()> {
     use crate::directory::CompositeFile;
@@ -422,17 +416,6 @@ fn ivf_fixture_uses_custom_centroids_for_assignment() -> crate::Result<()> {
     Ok(())
 }
 
-/// Regression for `FlatBackend::top_n` under truncation. A bare
-/// `TopNComputer::new` defaults to `ReverseComparator`, which keeps
-/// the K *smallest* sort_keys — for our "higher = closer" similarity
-/// convention that returned the K *farthest* docs once a segment had
-/// more than K matches. Latent before the fix because every previous
-/// flat test had ≤ K docs per segment, so the truncate_top_n path
-/// never fired. The backend now wires `NaturalComparator` explicitly;
-/// this test would fail under the old code.
-///
-/// The shared fixture commits every `DOCS_PER_SEGMENT = 10` docs, so
-/// each segment has 10 > K = 3 docs — the truncation path is on.
 #[test]
 fn flat_top_n_returns_nearest_when_more_than_k_docs_per_segment() -> crate::Result<()> {
     let index = TestVectorIndex::builder(VectorDType::F32)
@@ -492,8 +475,6 @@ fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
         assert_eq!(max_edges, NeighborhoodGraphConfig::default().max_edges);
         let adjacency = &words[1..];
         assert_eq!(adjacency.len(), centroids.len() * max_edges);
-        // Two distinct centroids prune to each other's single neighbor; the
-        // rest of each run is EMPTY padding.
         assert_eq!(adjacency[0], 1);
         assert!(adjacency[1..max_edges].iter().all(|&id| id == EMPTY));
         assert_eq!(adjacency[max_edges], 0);
@@ -524,15 +505,9 @@ fn ground_truth_orders_by_metric() -> crate::Result<()> {
     Ok(())
 }
 
-/// Non-finite elements are rejected at ingest on normalizing fields
-/// (Cosine+F32) and accepted on non-normalizing ones (L2) — validation
-/// rides the normalize path only. `IndexWriter::add_document` enqueues
-/// to a worker, so the rejection may surface either from the enqueue or
-/// from the following `commit`.
 #[test]
 fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        // L2: same vector is accepted; nothing normalizes, data is stored raw.
         let mut schema_builder = Schema::builder();
         let l2_field = schema_builder.add_vector_field("l2", VectorOptions::new(2, Metric::L2));
         let schema = schema_builder.build();
@@ -543,7 +518,6 @@ fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
         writer.add_document(doc)?;
         writer.commit()?;
 
-        // Cosine: rejected.
         let mut schema_builder = Schema::builder();
         let cos_field =
             schema_builder.add_vector_field("cos", VectorOptions::new(2, Metric::Cosine));
@@ -564,8 +538,6 @@ fn ingest_rejects_non_finite_cosine_vector() -> crate::Result<()> {
     Ok(())
 }
 
-/// A zero vector is honest data: ingest accepts it (`ZeroSkipped`), and
-/// at query time it scores exactly 0.0 — behind any non-zero doc.
 #[test]
 fn ingest_accepts_zero_vector() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
@@ -591,11 +563,6 @@ fn ingest_accepts_zero_vector() -> crate::Result<()> {
     Ok(())
 }
 
-/// "Scan everything" probe params: the full-capacity ceiling, so the
-/// budget never binds before the stream is exhausted. Used by
-/// oracle-equality tests, where every cluster the bounds gate cannot
-/// PROVE useless must be probed - provable skips never change the
-/// top-K, so oracle equality still holds under them.
 pub(crate) fn exhaustive_params(_num_centroids: usize) -> AdaptiveProbeParams {
     AdaptiveProbeParams {
         max_probe_fraction: 1.0,
@@ -650,7 +617,6 @@ pub(crate) mod ground_truth {
     }
 }
 
-// Generates mock string labels with controlled selectivity for filter tests.
 mod labels {
     use std::fmt;
 
@@ -701,7 +667,6 @@ mod labels {
     }
 }
 
-// Generates deterministic mock 2D embeddings scattered around a centroid grid.
 mod grid2d {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -874,8 +839,6 @@ mod bounds_storage_tests {
                 .chunks_exact(4)
                 .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
                 .collect();
-            // The writer's degenerate-centroid rule: non-finite, or
-            // zero-norm under cosine renormalization, saturates.
             let zero_norm = centroid.iter().all(|&value| value == 0.0);
             if centroid.iter().any(|value| !value.is_finite())
                 || (metric == Metric::Cosine && zero_norm)
@@ -896,8 +859,6 @@ mod bounds_storage_tests {
         Ok(expected)
     }
 
-    /// Build, write, reopen: the stored bounds are bit-equal to a fresh
-    /// fold over the stored rows and centroids — for every metric.
     #[test]
     fn roundtrip_per_metric() -> crate::Result<()> {
         for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
@@ -934,10 +895,6 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// A clusterer with deterministic centroids for crafted-geometry
-    /// builds: fixed rows when supplied, else the first
-    /// `num_centroids` training samples — data-dependent, so a merge of
-    /// merged segments re-trains onto different centroids.
     struct TestClusterer {
         fixed_centroids: Option<Vec<[f32; 2]>>,
         num_centroids: usize,
@@ -1030,9 +987,6 @@ mod bounds_storage_tests {
         }
     }
 
-    /// A 2-dim IVF index over `commits` (one flat segment per inner
-    /// slice), merged per `merge_plan` (segment ordinals into the
-    /// searchable set at each step). Returns the index and the field.
     fn build_ivf_with_plan(
         metric: Metric,
         clusterer: TestClusterer,
@@ -1071,8 +1025,6 @@ mod bounds_storage_tests {
         Ok((index, embed_field))
     }
 
-    /// Merge every searchable segment pair-wise per `pairs`, then all
-    /// remaining segments into one.
     fn merge_all(index: &Index) -> crate::Result<()> {
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1082,14 +1034,8 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// Merge-level saturation: a huge-but-finite L2 member whose residual
-    /// overflows `f32` saturates its cluster through `add_native`; a
-    /// zero-norm cosine centroid saturates through the explicit
-    /// degenerate-centroid mark. Finite clusters stay finite.
     #[test]
     fn saturated_sentinel() -> crate::Result<()> {
-        // L2: the doc at (3e38, 3e38) is finite (passes ingest) but its
-        // residual against centroid (0, 0) is sqrt(2)*3e38 > f32::MAX.
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
             TestClusterer {
@@ -1106,10 +1052,6 @@ mod bounds_storage_tests {
         let vec_reader = segment_reader.vector_index(field)?;
         let ivf = vec_reader.index().expect("IVF segment");
         let bounds = ivf.bounds();
-        // Cluster ids are trained-centroid indices: the big doc's d2
-        // overflows to +inf against both centroids, and the assign rule's
-        // strict `<` keeps the first — cluster 0, whatever the merge's
-        // doc order. The (50, *) docs sit in cluster 1.
         assert_eq!(
             bounds.ball_r(0),
             f32::INFINITY,
@@ -1121,8 +1063,6 @@ mod bounds_storage_tests {
             bounds.ball_r(1)
         );
 
-        // Cosine: an all-zero cluster renormalizes its centroid to
-        // zero-norm → the degenerate-centroid saturation path.
         let (index, field) = build_ivf_with_plan(
             Metric::Cosine,
             TestClusterer {
@@ -1146,10 +1086,6 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// A merge of merged segments re-runs the fold against the NEW
-    /// centroids over the re-assignment output: the stored bounds equal a
-    /// fresh fold, and exceed every input segment's bounds — no
-    /// combination of input radii could produce them.
     #[test]
     fn merge_recomputes_bounds() -> crate::Result<()> {
         let clusterer = || TestClusterer {
@@ -1168,7 +1104,6 @@ mod bounds_storage_tests {
             ],
             None,
         )?;
-        // Stage 1: two IVF segments, each trained on its own half.
         {
             let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
             writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1190,15 +1125,11 @@ mod bounds_storage_tests {
                 max_input_bound = max_input_bound.max(value);
             }
         }
-        // Tight per-half clusters: every input bound is small.
         assert!(
             max_input_bound < 1.0,
             "stage-1 bounds should be tight: {max_input_bound}"
         );
 
-        // Stage 2: merge the merged segments. Training now sees the
-        // union and re-anchors the single centroid near (0, 0), so the
-        // far half's residuals stretch the fold far past any input value.
         merge_all(&index)?;
         let searcher = index.reader()?.searcher();
         assert_eq!(searcher.segment_readers().len(), 1);
@@ -1274,7 +1205,12 @@ mod bounds_storage_tests {
         let mut composite_write = CompositeWrite::wrap(writer);
         for (slot, payload) in slot_payloads {
             let slot_w = composite_write.for_field_with_idx(field, slot);
-            slot_w.write_all(&payload)?;
+            let payload = if version == 2 && slot == 2 {
+                payload.get(1..).expect("V3 router includes a kind byte")
+            } else {
+                &payload
+            };
+            slot_w.write_all(payload)?;
             slot_w.flush()?;
         }
         composite_write.close()?;
@@ -1357,6 +1293,19 @@ mod bounds_storage_tests {
             message.contains("no bounds slot") && message.contains("\"embedding\""),
             "unexpected error text: {message}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_centroids_with_graph_and_bounds_open() -> crate::Result<()> {
+        let (index, field) = version_policy_fixture()?;
+        rewrite_centroids_with_slots(&index, field, 2, &[0, 1, 2, 3])?;
+
+        let searcher = index.reader()?.searcher();
+        let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
+        let ivf = vec_reader.index().expect("V2 file must open as IVF");
+        assert_eq!(ivf.num_clusters(), 2);
+        assert!(ivf.bounds().values().iter().all(|bound| bound.is_finite()));
         Ok(())
     }
 

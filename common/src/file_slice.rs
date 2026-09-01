@@ -51,6 +51,15 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
     fn as_slice(&self) -> Option<&[u8]> {
         None
     }
+
+    /// Logical byte capacity of one independently pinnable storage block.
+    ///
+    /// Backends with page-granular caches expose their payload size so range
+    /// consumers can group sparse reads by the backend's real pin unit. The
+    /// default keeps ordinary files and in-memory handles storage-agnostic.
+    fn storage_block_len(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -278,6 +287,15 @@ impl FileSlice {
         Some(&all[self.range.clone()])
     }
 
+    /// Storage-block ordinal containing `offset`, accounting for this
+    /// slice's absolute position in the underlying file handle.
+    pub fn storage_block_ord(&self, offset: usize) -> Option<usize> {
+        assert!(offset < self.len(), "offset exceeds the fileslice length");
+        let block_len = self.data.storage_block_len()?;
+        debug_assert!(block_len > 0);
+        Some((self.range.start + offset) / block_len)
+    }
+
     /// Reads a specific slice of data.
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
@@ -413,13 +431,13 @@ impl DeferredFileSlice {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::ops::Bound;
     use std::sync::Arc;
+    use std::{fmt, io};
 
     use super::{FileHandle, FileSlice};
-    use crate::HasLen;
     use crate::file_slice::combine_ranges;
+    use crate::{HasLen, OwnedBytes};
 
     #[test]
     fn test_file_slice() -> io::Result<()> {
@@ -463,6 +481,40 @@ mod tests {
         let blop: &'static [u8] = b"abc";
         let owned_bytes: Box<dyn FileHandle> = Box::new(blop);
         assert_eq!(owned_bytes.len(), 3);
+    }
+
+    struct BlockHandle(&'static [u8]);
+
+    impl fmt::Debug for BlockHandle {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("BlockHandle")
+        }
+    }
+
+    impl HasLen for BlockHandle {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileHandle for BlockHandle {
+        fn read_bytes(&self, range: std::ops::Range<usize>) -> io::Result<OwnedBytes> {
+            Ok(OwnedBytes::new(&self.0[range]))
+        }
+
+        fn storage_block_len(&self) -> Option<usize> {
+            Some(4)
+        }
+    }
+
+    #[test]
+    fn storage_block_ord_includes_parent_slice_offset() {
+        let file = FileSlice::new(Arc::new(BlockHandle(b"abcdefghijkl")));
+        let slot = file.slice(3..11);
+        assert_eq!(slot.storage_block_ord(0), Some(0));
+        assert_eq!(slot.storage_block_ord(1), Some(1));
+        assert_eq!(slot.storage_block_ord(5), Some(2));
     }
 
     #[test]

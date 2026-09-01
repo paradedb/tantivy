@@ -1,3 +1,5 @@
+//! Flat vector storage and row mapping.
+
 mod id_map;
 mod plugin;
 mod writer;
