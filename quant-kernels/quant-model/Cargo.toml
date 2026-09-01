@@ -1,0 +1,12 @@
+[package]
+name = "quant-model"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand_chacha.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+half.workspace = true
+

@@ -1,0 +1,23 @@
+[package]
+name = "cascade"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fht = { path = "../fht" }
+grid-plane = { path = "../grid-plane" }
+quant-model = { path = "../quant-model" }
+sign-plane = { path = "../sign-plane" }
+rand_chacha.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "cascade"
+harness = false
+
+[[bench]]
+name = "baselines"
+harness = false
