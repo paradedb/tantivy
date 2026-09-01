@@ -41,8 +41,8 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
     let mut composite = CompositeWrite::wrap(write);
 
     // num_docs in the target segment = number of alive docs aggregated
-    // by the doc_id_mapping. Each call to iter_old_doc_addrs yields
-    // exactly num_new_doc_ids items.
+    // by the doc_id_mapping. Each call to iter_source_doc_addrs yields
+    // exactly `num_target_docs` items.
     let num_target_docs: u32 = ctx.readers.iter().map(|r| r.num_docs()).sum::<u32>();
 
     for (field, entry) in ctx.schema.fields() {
@@ -59,22 +59,22 @@ pub(crate) fn merge_flat(ctx: &PluginMergeContext) -> crate::Result<()> {
             .collect::<crate::Result<Vec<_>>>()?;
 
         let mut target_present: Vec<DocId> = Vec::new();
-        let mut new_doc_id: DocId = 0;
+        let mut target_doc_id: DocId = 0;
         {
             let rows_w = composite.for_field_with_idx(field, 1);
-            for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                let reader = &field_readers[old_doc_addr.segment_ord as usize];
-                if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
-                    target_present.push(new_doc_id);
+            for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
+                let reader = &field_readers[source_doc_addr.segment_ord as usize];
+                if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
+                    target_present.push(target_doc_id);
                     rows_w.write_all(&bytes)?;
                 }
-                new_doc_id += 1;
+                target_doc_id += 1;
             }
             rows_w.flush()?;
         }
 
         // Sanity: the mapping iterator should yield exactly num_target_docs items.
-        debug_assert_eq!(new_doc_id, num_target_docs);
+        debug_assert_eq!(target_doc_id, num_target_docs);
 
         // Slice (field, 0): row→doc_id map (Identity or Bitmap).
         let id_map_w = composite.for_field_with_idx(field, 0);

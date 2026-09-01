@@ -52,7 +52,7 @@ impl SegmentPlugin for FieldNormsPlugin {
                 .iter()
                 .map(|reader| reader.get_fieldnorms_reader(field))
                 .collect::<Result<_, _>>()?;
-            for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
+            for old_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
                 let reader = &fieldnorms_readers[old_doc_addr.segment_ord as usize];
                 let fieldnorm_id = reader.fieldnorm_id(old_doc_addr.doc_id);
                 fieldnorms_data.push(fieldnorm_id);

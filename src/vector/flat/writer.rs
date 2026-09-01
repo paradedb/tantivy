@@ -148,9 +148,9 @@ impl PluginWriter for FlatVecWriter {
             let (present, row_bytes): (Vec<DocId>, Vec<u8>) = if let Some(map) = doc_id_map {
                 let mut p = Vec::new();
                 let mut r = Vec::new();
-                for (new_doc_id, old_doc_id) in map.iter_old_doc_ids().enumerate() {
-                    if let Ok(row_idx) = buf.present_doc_ids.binary_search(&old_doc_id) {
-                        p.push(new_doc_id as DocId);
+                for (target_doc_id, source_doc_id) in map.iter_source_doc_ids().enumerate() {
+                    if let Ok(row_idx) = buf.present_doc_ids.binary_search(&source_doc_id) {
+                        p.push(target_doc_id as DocId);
                         let start = row_idx * stride;
                         r.extend_from_slice(&buf.row_bytes[start..start + stride]);
                     }

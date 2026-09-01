@@ -34,7 +34,9 @@ pub(crate) const VEC_EXT: &str = "vec";
 
 #[cfg(feature = "quantization-bench")]
 #[doc(hidden)]
-pub use backend::quantization_bench_plane1_cosine_cluster;
+pub use backend::{
+    quantization_bench_layer0_cosine_cluster, quantization_bench_layer0_cosine_cluster_f16_scales,
+};
 pub use backend::{
     set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, VectorBackend,
     DEFAULT_FIXED_PROBE_COST_ROWS,
@@ -53,9 +55,9 @@ pub use distance::{
 pub use flat::FlatVecWriter;
 pub use index_reader::{
     VectorAuditMoments, VectorCalibrationMeasurements, VectorCalibrationMoments,
-    VectorClusterStats, VectorGammaAuditMeasurements, VectorGammaAuditQuery,
-    VectorGammaConeAuditMeasurements, VectorGammaConeDepthMeasurements,
-    VectorGammaDepthMeasurements, VectorIndexReader, VectorInfo, VectorStorageFormat,
+    VectorClusterStats, VectorErrorAuditMeasurements, VectorErrorAuditQuery,
+    VectorErrorConeAuditMeasurements, VectorErrorConeDepthMeasurements,
+    VectorErrorDepthMeasurements, VectorIndexReader, VectorInfo, VectorStorageFormat,
 };
 pub use ivf::{
     BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, BuiltRouter, Candidate, ClusterId,
@@ -71,10 +73,10 @@ pub use prepared::PreparedQuery;
 pub use quantization::{
     quantized_code_stride, VectorNormPolicy, VectorQuantizationCalibrationSource,
     VectorQuantizationConfig, VectorQuantizationDepthCalibration, VectorQuantizationGrid,
-    VectorQuantizationLayer, VectorQuantizer, GRID_FORMAT_VERSION, MAX_QUANTIZATION_LAYERS,
-    QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_GAMMA_STRIDE,
-    QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_GAMMA_STRIDE, QUANTIZED_SCALE_STRIDE,
-    VECTOR_QUANTIZATION_FORMAT_VERSION,
+    VectorQuantizationLayer, GRID_FORMAT_VERSION, MAX_QUANTIZATION_LAYERS,
+    QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_ERROR_RATIO_STRIDE,
+    QUANTIZED_GAMMA_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_STRIDE,
+    QUANTIZED_SIDECAR_STRIDE, VECTOR_QUANTIZATION_FORMAT_VERSION,
 };
 pub use tie_break::NoTieBreak;
 
@@ -83,7 +85,7 @@ pub use tie_break::NoTieBreak;
 pub use crate::schema::{Metric, VectorDType, VectorOptions};
 
 /// Logical vector-search stage, exposed so storage backends can attribute I/O
-/// without knowing the V3 composite slot layout. Quantized layers and their
+/// without knowing the composite slot layout. Quantized layers and their
 /// following boundaries use zero-based indices.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Stage {

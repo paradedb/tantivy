@@ -21,7 +21,7 @@
 //! lives with the other slot serializers in [`ivf::index`](super::ivf).
 
 // ======================================================================
-// P1: storage
+// Storage
 // ======================================================================
 
 use std::io;
@@ -29,7 +29,7 @@ use std::io;
 use crate::schema::Metric;
 use crate::vector::VectorElement;
 
-/// Segment-level bound shape, captured in the `.centroids` V2 bounds slot
+/// Segment-level bound shape, captured in the `.centroids` bounds slot
 /// at build time — one kind for every cluster of a field's segment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -206,7 +206,7 @@ pub fn residual_norm<T: VectorElement>(row_bytes: &[u8], c: &[f32]) -> f32 {
 }
 
 // ======================================================================
-// P2: query bound
+// Query bound
 // ======================================================================
 
 /// Collector-side peek: the kth ordering key iff the heap holds k results.
@@ -337,7 +337,7 @@ impl QueryBoundTracker {
 }
 
 // ======================================================================
-// P4: collision
+// Collision
 // ======================================================================
 // Ball column: scalar-only. `separation` / `q_dot_c` is the routing key of
 // the ranked stream. Precondition (debug_assert at the call site): the
@@ -388,7 +388,7 @@ pub fn margin_ball_halfspace(q_dot_c: f32, q_norm: f32, r: f32, s_k: f32) -> f32
 // routing-key-free scalar path.
 
 // ======================================================================
-// P5: gate verdict
+// Gate verdict
 // ======================================================================
 
 /// The gate's decision for one ranked cluster.
@@ -504,7 +504,7 @@ mod bounds_peek_tests {
     /// The vector heap: f32 similarity keys, "higher is better",
     /// out-of-order pushes — the `scan_clusters` shape.
     fn heap(k: usize) -> TopNComputer<f32, u32, NaturalComparator> {
-        TopNComputer::new_with_comparator(k, NaturalComparator)
+        TopNComputer::with_comparator(k, NaturalComparator)
     }
 
     /// Little-endian row bytes for `values`, as the row store holds them.

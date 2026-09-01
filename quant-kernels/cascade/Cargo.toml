@@ -21,11 +21,3 @@ harness = false
 [[bench]]
 name = "baselines"
 harness = false
-
-[[bin]]
-name = "experiments"
-path = "src/bin/experiments.rs"
-
-[[bin]]
-name = "experiments_a2"
-path = "src/bin/experiments_a2.rs"

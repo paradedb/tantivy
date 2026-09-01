@@ -13,26 +13,33 @@ use serde::{Deserialize, Serialize};
 use crate::schema::{FieldType, Metric, Schema, VectorDType, VectorOptions};
 use crate::TantivyError;
 
-/// Quantized payloads first appear in V3 vector files.
-pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 3;
+/// Settings schema for the vector quantization format.
+pub const VECTOR_QUANTIZATION_FORMAT_VERSION: u32 = 4;
 /// Version of the persisted exact-density Lloyd-Max grid representation.
 pub const GRID_FORMAT_VERSION: u32 = 1;
-/// V1 supports at most four residual layers.
-pub const MAX_QUANTIZATION_LAYERS: usize = 4;
-/// V1 code sections begin at a 64-byte-aligned file offset.
+/// Maximum number of residual layers stored by the vector format.
+pub const MAX_QUANTIZATION_LAYERS: usize = 3;
+/// Code sections begin at a 64-byte-aligned file offset.
 pub const QUANTIZED_CODE_ALIGNMENT: usize = 64;
-/// One binary16 scale per posting-membership row and layer.
-pub const QUANTIZED_SCALE_STRIDE: usize = 2;
+/// One little-endian binary32 scale per posting-membership row and layer.
+pub const QUANTIZED_SCALE_STRIDE: usize = 4;
 /// One binary16 cumulative-prefix gamma per posting-membership row and layer.
 pub const QUANTIZED_GAMMA_STRIDE: usize = 2;
+/// One binary16 corrected-error ratio per posting-membership row and layer.
+pub const QUANTIZED_ERROR_RATIO_STRIDE: usize = 2;
 /// Combined per-layer sidecar bytes per posting-membership row.
-pub const QUANTIZED_SCALE_GAMMA_STRIDE: usize = QUANTIZED_SCALE_STRIDE + QUANTIZED_GAMMA_STRIDE;
+pub const QUANTIZED_SIDECAR_STRIDE: usize =
+    QUANTIZED_SCALE_STRIDE + QUANTIZED_GAMMA_STRIDE + QUANTIZED_ERROR_RATIO_STRIDE;
 /// One binary32 split-form constant per posting-membership row and layer.
 pub const QUANTIZED_CONSTANT_STRIDE: usize = 4;
-/// One binary32 residual squared norm per posting-membership row when needed.
+/// One binary32 residual squared norm per posting-membership row.
 pub const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
-/// Closed-form uncertainty safety multiplier declared by the V3 scoring policy.
+/// Closed-form uncertainty safety multiplier declared by the scoring policy.
 pub(crate) const GAMMA_ANALYTICAL_SAFETY: f32 = 1.15;
+/// Uniform confidence width at every quantized layer boundary.
+pub(crate) const QUANTIZED_BOUNDARY_KAPPA: f32 = 2.0;
+/// Query-side bits used by every sign-layer estimator.
+pub(crate) const SIGN_QUERY_BITS: u8 = 4;
 /// Origin of one settings-backed calibration measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -61,13 +68,14 @@ impl<'de> Deserialize<'de> for VectorQuantizationCalibrationSource {
     }
 }
 
-/// Bias center and uncertainty spread for one active scorer prefix.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// Diagnostic bias and spread for one active scorer prefix.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VectorQuantizationDepthCalibration {
     pub bias: f32,
     pub spread: f32,
     pub sample_count: u32,
     pub source: VectorQuantizationCalibrationSource,
+    pub protocol: String,
 }
 
 impl PartialEq for VectorQuantizationDepthCalibration {
@@ -76,31 +84,11 @@ impl PartialEq for VectorQuantizationDepthCalibration {
             && self.spread.to_bits() == other.spread.to_bits()
             && self.sample_count == other.sample_count
             && self.source == other.source
+            && self.protocol == other.protocol
     }
 }
 
 impl Eq for VectorQuantizationDepthCalibration {}
-
-/// The stored-code construction and corresponding scoring kernel.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum VectorQuantizer {
-    /// Single-bit RaBitQ sign snap and popcount scoring.
-    RaBitQ,
-    /// Exact-density TurboQuant grid and LUT scoring.
-    TurboQuant,
-}
-
-impl VectorQuantizer {
-    /// Default quantizer inferred from a layer's stored width.
-    pub fn inferred(bits: u8) -> Self {
-        if bits == 1 {
-            Self::RaBitQ
-        } else {
-            Self::TurboQuant
-        }
-    }
-}
 
 /// Normalization applied to fp32 rows before residual encoding and rerank.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -124,7 +112,6 @@ impl VectorNormPolicy {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct VectorQuantizationLayer {
     pub bits: u8,
-    pub quantizer: VectorQuantizer,
     pub seed: u64,
 }
 
@@ -135,10 +122,7 @@ pub struct VectorQuantizationGrid {
     pub version: u32,
     pub points: Vec<f32>,
     /// Exact-density normalized RMSE resolved when the grid is materialized.
-    /// `None` remains deserializable so pre-amendment V3 metadata can produce
-    /// a precise validation error; segment open and merge never recompute it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rho_model: Option<f64>,
+    pub rho_model: f64,
 }
 
 // Grid points are finite after validation. Bit equality also distinguishes
@@ -147,7 +131,7 @@ impl PartialEq for VectorQuantizationGrid {
     fn eq(&self, other: &Self) -> bool {
         self.bits == other.bits
             && self.version == other.version
-            && self.rho_model.map(f64::to_bits) == other.rho_model.map(f64::to_bits)
+            && self.rho_model.to_bits() == other.rho_model.to_bits()
             && self.points.len() == other.points.len()
             && self
                 .points
@@ -194,7 +178,6 @@ impl VectorQuantizationConfig {
                 layers.len()
             )));
         }
-
         let mut grid_widths = BTreeSet::new();
         for (layer, spec) in layers.iter().enumerate() {
             if !(1..=4).contains(&spec.bits) {
@@ -203,15 +186,10 @@ impl VectorQuantizationConfig {
                     spec.bits
                 )));
             }
-            if spec.quantizer == VectorQuantizer::RaBitQ && spec.bits != 1 {
-                return Err(TantivyError::InvalidArgument(format!(
-                    "quantization layer {layer} selects RaBitQ with {} bits; RaBitQ requires 1 bit",
-                    spec.bits
-                )));
-            }
-            // Persist one complete model entry for every width, including
-            // the sign plane. Sign scoring does not consume the points, but
-            // its sigma chain consumes the persisted rho.
+            // Persist one complete model entry for every width, including the
+            // sign quantizer. Construction resolves these entries instead of
+            // rerunning the solver; scoring uncertainty comes from the stored
+            // exact-error ratio rather than a model rho.
             grid_widths.insert(spec.bits);
         }
 
@@ -223,7 +201,7 @@ impl VectorQuantizationConfig {
                     bits,
                     version: GRID_FORMAT_VERSION,
                     points: grid.points,
-                    rho_model: Some(grid.rho_model),
+                    rho_model: grid.rho_model,
                 }
             })
             .collect();
@@ -252,8 +230,8 @@ impl VectorQuantizationConfig {
 
         if self.format_version != VECTOR_QUANTIZATION_FORMAT_VERSION {
             return Err(invalid(format!(
-                "format version {} is unsupported; expected {}",
-                self.format_version, VECTOR_QUANTIZATION_FORMAT_VERSION
+                "format version {} is unsupported; rebuild required",
+                self.format_version
             )));
         }
         if self.dim < 64 {
@@ -296,7 +274,6 @@ impl VectorQuantizationConfig {
                 self.layers.len()
             )));
         }
-
         let mut model_widths = BTreeSet::new();
         let mut required_point_grids = BTreeSet::new();
         for (layer, spec) in self.layers.iter().enumerate() {
@@ -306,17 +283,8 @@ impl VectorQuantizationConfig {
                     spec.bits
                 )));
             }
-            match spec.quantizer {
-                VectorQuantizer::RaBitQ if spec.bits != 1 => {
-                    return Err(invalid(format!(
-                        "layer {layer} selects RaBitQ with {} bits; RaBitQ requires 1 bit",
-                        spec.bits
-                    )));
-                }
-                VectorQuantizer::TurboQuant => {
-                    required_point_grids.insert(spec.bits);
-                }
-                VectorQuantizer::RaBitQ => {}
+            if spec.bits > 1 {
+                required_point_grids.insert(spec.bits);
             }
             model_widths.insert(spec.bits);
         }
@@ -357,26 +325,17 @@ impl VectorQuantizationConfig {
                     grid.bits
                 )));
             }
-            if grid
-                .rho_model
-                .is_some_and(|rho| !rho.is_finite() || rho < 0.0)
-            {
+            if !grid.rho_model.is_finite() || grid.rho_model < 0.0 {
                 return Err(invalid(format!(
                     "grid width {} rho_model must be finite and non-negative",
                     grid.bits
                 )));
             }
         }
-        // Pre-amendment V3 persisted point grids only for TurboQuant widths.
-        // New metadata persists every model width so sign rho never needs to
-        // be resolved again, while the legacy subset remains readable until
-        // its next merge/REINDEX.
-        if !required_point_grids.is_subset(&present_grids)
-            || !present_grids.is_subset(&model_widths)
-        {
+        if present_grids != model_widths || !required_point_grids.is_subset(&present_grids) {
             return Err(invalid(format!(
-                "grid widths {present_grids:?} must contain TurboQuant widths \
-                 {required_point_grids:?} and stay within model widths {model_widths:?}"
+                "grid widths {present_grids:?} must exactly equal model widths {model_widths:?} \
+                 and contain TurboQuant widths {required_point_grids:?}"
             )));
         }
         if let Some(calibration) = &self.calibration {
@@ -391,49 +350,20 @@ impl VectorQuantizationConfig {
         self.calibration.as_deref()
     }
 
-    /// Install held-out calibration unless real-query calibration already
-    /// owns the field. Real-query values can only be replaced by the explicit
-    /// real-query update path.
-    pub fn install_held_out_calibration(
-        &mut self,
-        calibration: Vec<VectorQuantizationDepthCalibration>,
-    ) -> crate::Result<()> {
-        self.install_calibration(calibration, VectorQuantizationCalibrationSource::HeldOut)
-    }
-
-    /// Install caller-query calibration. This is the sole update path allowed
-    /// to replace an existing real-query calibration.
+    /// Install caller-query diagnostic measurements.
     pub fn install_real_query_calibration(
         &mut self,
         calibration: Vec<VectorQuantizationDepthCalibration>,
     ) -> crate::Result<()> {
-        self.install_calibration(calibration, VectorQuantizationCalibrationSource::RealQuery)
-    }
-
-    fn install_calibration(
-        &mut self,
-        calibration: Vec<VectorQuantizationDepthCalibration>,
-        source: VectorQuantizationCalibrationSource,
-    ) -> crate::Result<()> {
         validate_calibration(&calibration, self.layers.len())
             .map_err(TantivyError::InvalidArgument)?;
-        if calibration.iter().any(|depth| depth.source != source) {
-            return Err(TantivyError::InvalidArgument(format!(
-                "all quantization calibration entries must have source {source:?}"
-            )));
-        }
-        if source != VectorQuantizationCalibrationSource::RealQuery
-            && self.calibration.as_ref().is_some_and(|depths| {
-                depths
-                    .iter()
-                    .any(|depth| depth.source == VectorQuantizationCalibrationSource::RealQuery)
-            })
+        if calibration
+            .iter()
+            .any(|depth| depth.source != VectorQuantizationCalibrationSource::RealQuery)
         {
-            return Err(TantivyError::InvalidArgument(
-                "real-query quantization calibration can only be replaced by the real-query \
-                 update path"
-                    .to_string(),
-            ));
+            return Err(TantivyError::InvalidArgument(format!(
+                "caller-query diagnostic entries must have source RealQuery"
+            )));
         }
         self.calibration = Some(calibration);
         Ok(())
@@ -446,15 +376,15 @@ impl VectorQuantizationConfig {
             .iter()
             .map(|layer| {
                 quantized_code_stride(self.dim, layer.bits)
-                    + QUANTIZED_SCALE_GAMMA_STRIDE
-                    + QUANTIZED_CONSTANT_STRIDE
+                    + QUANTIZED_SIDECAR_STRIDE
+                    + usize::from(self.needs_constants()) * QUANTIZED_CONSTANT_STRIDE
             })
             .sum();
-        layer_bytes + usize::from(self.needs_residual_norm()) * QUANTIZED_RESIDUAL_NORM_STRIDE
+        layer_bytes + QUANTIZED_RESIDUAL_NORM_STRIDE
     }
 
-    /// Whether split-form metric assembly needs the exact residual norm.
-    pub fn needs_residual_norm(&self) -> bool {
+    /// Whether split-form L2 assembly needs per-layer constants.
+    pub fn needs_constants(&self) -> bool {
         self.metric == Metric::L2
     }
 }
@@ -487,9 +417,19 @@ fn validate_calibration(
                 "calibration depth {depth} sample_count must be greater than zero"
             ));
         }
+        if value.protocol.trim().is_empty() {
+            return Err(format!(
+                "calibration depth {depth} protocol must be non-empty"
+            ));
+        }
         if depth != 0 && value.source != calibration[0].source {
             return Err(
                 "quantization calibration source must be uniform across all depths".to_string(),
+            );
+        }
+        if depth != 0 && value.protocol != calibration[0].protocol {
+            return Err(
+                "quantization calibration protocol must be uniform across all depths".to_string(),
             );
         }
     }
@@ -560,12 +500,12 @@ mod tests {
             bits,
             version: GRID_FORMAT_VERSION,
             points: (0..count).map(|point| point as f32).collect(),
-            rho_model: Some(0.25),
+            rho_model: 0.25,
         }
     }
 
     fn config(bits: &[u8]) -> VectorQuantizationConfig {
-        let grid_bits: BTreeSet<u8> = bits.iter().copied().filter(|bits| *bits > 1).collect();
+        let grid_bits: BTreeSet<u8> = bits.iter().copied().collect();
         VectorQuantizationConfig {
             field: "embedding".to_string(),
             format_version: VECTOR_QUANTIZATION_FORMAT_VERSION,
@@ -577,7 +517,6 @@ mod tests {
                 .enumerate()
                 .map(|(layer, &bits)| VectorQuantizationLayer {
                     bits,
-                    quantizer: VectorQuantizer::inferred(bits),
                     seed: 11 * (layer as u64 + 1),
                 })
                 .collect(),
@@ -587,46 +526,58 @@ mod tests {
     }
 
     #[test]
-    fn one_plus_four_is_496_bytes_per_dot_row() {
-        assert_eq!(config(&[1, 4]).bytes_per_row(), 496);
+    fn one_plus_four_is_500_bytes_per_dot_row() {
+        assert_eq!(config(&[1, 4]).bytes_per_row(), 500);
     }
 
     #[test]
     fn settings_calibration_round_trips_and_enforces_precedence() {
         let mut config = config(&[1, 4]);
-        let held_out = vec![
+        let diagnostic = vec![
             VectorQuantizationDepthCalibration {
                 bias: -0.5,
                 spread: 2.25,
                 sample_count: 1_024,
-                source: VectorQuantizationCalibrationSource::HeldOut,
+                source: VectorQuantizationCalibrationSource::RealQuery,
+                protocol: "REAL_QUERY_EXACT_E_BQ4".to_string(),
             };
             2
         ];
         config
-            .install_held_out_calibration(held_out.clone())
+            .install_real_query_calibration(diagnostic.clone())
             .unwrap();
-        let real_query = held_out
+        let replacement = diagnostic
             .iter()
             .map(|depth| VectorQuantizationDepthCalibration {
-                source: VectorQuantizationCalibrationSource::RealQuery,
-                ..*depth
+                bias: depth.bias + 0.25,
+                ..depth.clone()
             })
             .collect::<Vec<_>>();
         config
-            .install_real_query_calibration(real_query.clone())
+            .install_real_query_calibration(replacement.clone())
             .unwrap();
-        assert!(config.install_held_out_calibration(held_out).is_err());
         let json = serde_json::to_string(&config).unwrap();
         let decoded: VectorQuantizationConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.calibration(), Some(real_query.as_slice()));
+        assert_eq!(decoded.calibration(), Some(replacement.as_slice()));
 
-        let mut zero_samples = real_query.clone();
+        let mut zero_samples = replacement.clone();
         zero_samples[0].sample_count = 0;
         assert!(config.install_real_query_calibration(zero_samples).is_err());
 
+        let mut empty_protocol = replacement.clone();
+        empty_protocol[0].protocol.clear();
+        assert!(config
+            .install_real_query_calibration(empty_protocol)
+            .is_err());
+
+        let mut mixed_protocol = replacement.clone();
+        mixed_protocol[1].protocol = "HELD_OUT_EXACT_E_BQ4".to_string();
+        assert!(config
+            .install_real_query_calibration(mixed_protocol)
+            .is_err());
+
         let mut mixed = config.clone();
-        let mut mixed_depths = real_query;
+        let mut mixed_depths = replacement;
         mixed_depths[0].source = VectorQuantizationCalibrationSource::HeldOut;
         mixed.calibration = Some(mixed_depths);
         assert!(mixed
@@ -635,11 +586,10 @@ mod tests {
     }
 
     #[test]
-    fn one_plus_four_is_500_bytes_per_l2_row() {
+    fn one_plus_four_is_508_bytes_per_l2_row() {
         let mut config = config(&[1, 4]);
         config.metric = Metric::L2;
-        assert_eq!(config.bytes_per_row(), 500);
-        assert!(config.needs_residual_norm());
+        assert_eq!(config.bytes_per_row(), 508);
     }
 
     #[test]
@@ -657,6 +607,13 @@ mod tests {
         invalid.layers[1].bits = 5;
         let err = invalid.validate(&options).unwrap_err();
         assert!(err.to_string().contains("supported range is 1..=4"));
+    }
+
+    #[test]
+    fn accepts_grid_first_schedules() {
+        let options = VectorOptions::new(768, Metric::Dot);
+        config(&[4]).validate(&options).unwrap();
+        config(&[2, 4]).validate(&options).unwrap();
     }
 
     #[test]
@@ -679,7 +636,6 @@ mod tests {
             .enumerate()
             .map(|(layer, bits)| VectorQuantizationLayer {
                 bits,
-                quantizer: VectorQuantizer::inferred(bits),
                 seed: layer as u64 + 1,
             })
             .collect();
@@ -693,7 +649,7 @@ mod tests {
             assert_eq!(persisted.version, GRID_FORMAT_VERSION);
             assert_eq!(persisted.points.len(), 1usize << persisted.bits);
             assert_eq!(persisted.points, recomputed.points);
-            assert_eq!(persisted.rho_model, Some(recomputed.rho_model));
+            assert_eq!(persisted.rho_model, recomputed.rho_model);
         }
     }
 
@@ -709,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn divisible_dimensions_retain_the_original_v3_stride() {
+    fn divisible_dimensions_use_exact_byte_strides() {
         for dim in [64, 128, 768, 1536] {
             for bits in 1..=4 {
                 assert_eq!(quantized_code_stride(dim, bits), dim * bits as usize / 8);

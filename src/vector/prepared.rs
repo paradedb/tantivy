@@ -22,7 +22,7 @@ use cascade::{prepare_split_query_with_plan, LayerSpec, PreparedSplitQuery, Quer
 use quant_model::Grid;
 
 use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
-use super::quantization::VectorQuantizationConfig;
+use super::quantization::{VectorQuantizationConfig, SIGN_QUERY_BITS};
 use super::VectorElement;
 use crate::schema::Metric;
 use crate::TantivyError;
@@ -83,21 +83,14 @@ impl QuantizedIndexCtx {
                     .ok_or_else(|| {
                         TantivyError::InvalidArgument(format!(
                             "quantization field {:?} layer width {} has no persisted grid/model \
-                             entry; rebuild the pre-release index",
+                             entry; rebuild required",
                             config.field, layer.bits
                         ))
                     })?;
-                let rho_model = stored.rho_model.ok_or_else(|| {
-                    TantivyError::InvalidArgument(format!(
-                        "quantization field {:?} layer width {} has no persisted rho_model; \
-                         rebuild the pre-release index",
-                        config.field, layer.bits
-                    ))
-                })?;
                 Ok(Grid {
                     bits: layer.bits,
                     points: stored.points.clone(),
-                    rho_model,
+                    rho_model: stored.rho_model,
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -151,15 +144,6 @@ impl QuantizedIndexCtx {
     ) -> crate::Result<Arc<Self>> {
         Self::resolve(config)
     }
-
-    /// Diagnostic measurements use the same persisted scorer state as
-    /// production. Persisted calibration metadata does not participate in
-    /// query preparation or scoring.
-    pub(crate) fn for_calibration_measurement(
-        config: VectorQuantizationConfig,
-    ) -> crate::Result<Arc<Self>> {
-        Self::resolve(config)
-    }
 }
 
 /// Collector-scoped cache of prepared quantized queries. A collector may be
@@ -190,7 +174,7 @@ impl QuantizedQueryCache {
             return Arc::clone(prepared);
         }
         let query_f32 = query.iter().map(|value| value.to_f32()).collect();
-        let prepared = Arc::new(QuantizedQueryCtx::new_with_depth(
+        let prepared = Arc::new(QuantizedQueryCtx::with_depth(
             index,
             query_f32,
             active_layers,
@@ -218,10 +202,10 @@ pub(crate) struct QuantizedQueryCtx {
 impl QuantizedQueryCtx {
     pub(crate) fn new(index: Arc<QuantizedIndexCtx>, query: Vec<f32>) -> Self {
         let active_layers = index.specs.len();
-        Self::new_with_depth(index, query, active_layers)
+        Self::with_depth(index, query, active_layers)
     }
 
-    pub(crate) fn new_with_depth(
+    pub(crate) fn with_depth(
         index: Arc<QuantizedIndexCtx>,
         mut query: Vec<f32>,
         active_layers: usize,
@@ -243,7 +227,7 @@ impl QuantizedQueryCtx {
             &query,
             &index.rotation_plan,
             &index.grids[..active_layers],
-            4,
+            SIGN_QUERY_BITS,
         );
         Self {
             index,
@@ -264,9 +248,38 @@ impl QuantizedQueryCtx {
         self.prepared.query_error_squared(layer)
     }
 
-    pub(crate) fn score_layer(&self, layer: usize, codes: &[u8], scale: u16, constant: f32) -> f32 {
-        self.prepared
-            .score_layer(layer, codes, scale, constant, self.index.specs[layer])
+    pub(crate) fn score_layer(
+        &self,
+        layer: usize,
+        codes: &[u8],
+        scale: f32,
+        constant: Option<f32>,
+    ) -> crate::Result<f32> {
+        match (self.index.config.metric, constant) {
+            (Metric::L2, Some(constant)) => Ok(self.prepared.score_layer(
+                layer,
+                codes,
+                scale,
+                constant,
+                self.index.specs[layer],
+            )),
+            (Metric::L2, None) => Err(TantivyError::DataCorruption(
+                crate::error::DataCorruption::comment_only(
+                    "quantized L2 scoring requires a split constant",
+                ),
+            )),
+            (Metric::Dot | Metric::Cosine, None) => Ok(self.prepared.score_layer_without_constant(
+                layer,
+                codes,
+                scale,
+                self.index.specs[layer],
+            )),
+            (Metric::Dot | Metric::Cosine, Some(_)) => Err(TantivyError::DataCorruption(
+                crate::error::DataCorruption::comment_only(
+                    "quantized dot and cosine scoring omit split constants",
+                ),
+            )),
+        }
     }
 
     /// Enter the resolved monomorphic kernel once for a fixed-stride batch.
@@ -380,7 +393,7 @@ mod tests {
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::{
         VectorQuantizationCalibrationSource, VectorQuantizationConfig,
-        VectorQuantizationDepthCalibration, VectorQuantizationLayer, VectorQuantizer,
+        VectorQuantizationDepthCalibration, VectorQuantizationLayer,
     };
 
     #[test]
@@ -391,12 +404,10 @@ mod tests {
             vec![
                 VectorQuantizationLayer {
                     bits: 1,
-                    quantizer: VectorQuantizer::RaBitQ,
                     seed: 0xfeed_0001,
                 },
                 VectorQuantizationLayer {
                     bits: 4,
-                    quantizer: VectorQuantizer::TurboQuant,
                     seed: 0xfeed_0002,
                 },
             ],
@@ -416,12 +427,10 @@ mod tests {
             vec![
                 VectorQuantizationLayer {
                     bits: 1,
-                    quantizer: VectorQuantizer::RaBitQ,
                     seed: 0xfeed_1001,
                 },
                 VectorQuantizationLayer {
                     bits: 4,
-                    quantizer: VectorQuantizer::TurboQuant,
                     seed: 0xfeed_1002,
                 },
             ],
@@ -449,7 +458,6 @@ mod tests {
             &VectorOptions::new(100, Metric::Dot),
             vec![VectorQuantizationLayer {
                 bits: 1,
-                quantizer: VectorQuantizer::RaBitQ,
                 seed: 0xfeed_2001,
             }],
         )
@@ -475,12 +483,10 @@ mod tests {
             vec![
                 VectorQuantizationLayer {
                     bits: 1,
-                    quantizer: VectorQuantizer::RaBitQ,
                     seed: 0xfeed_3001,
                 },
                 VectorQuantizationLayer {
                     bits: 4,
-                    quantizer: VectorQuantizer::TurboQuant,
                     seed: 0xfeed_3002,
                 },
             ],
@@ -519,7 +525,6 @@ mod tests {
             &VectorOptions::new(100, Metric::Dot),
             vec![VectorQuantizationLayer {
                 bits: 1,
-                quantizer: VectorQuantizer::RaBitQ,
                 seed: 0xfeed_4001,
             }],
         )
@@ -531,13 +536,6 @@ mod tests {
             .err()
             .expect("missing grid must be rejected");
         assert!(error.to_string().contains("no persisted grid/model entry"));
-
-        let mut missing_rho = config;
-        missing_rho.grids[0].rho_model = None;
-        let error = QuantizedIndexCtx::resolve(missing_rho)
-            .err()
-            .expect("missing rho must be rejected");
-        assert!(error.to_string().contains("no persisted rho_model"));
     }
 
     #[test]
@@ -547,7 +545,6 @@ mod tests {
             &VectorOptions::new(100, Metric::Dot),
             vec![VectorQuantizationLayer {
                 bits: 1,
-                quantizer: VectorQuantizer::RaBitQ,
                 seed: 0xfeed_5001,
             }],
         )
@@ -559,6 +556,7 @@ mod tests {
                 spread: 11.25,
                 sample_count: 1_000,
                 source: VectorQuantizationCalibrationSource::RealQuery,
+                protocol: "REAL_QUERY_EXACT_E_BQ4".to_string(),
             }])
             .unwrap();
         let query_values = (0..100)
@@ -573,8 +571,14 @@ mod tests {
         codes[..8].fill(0xa5);
 
         assert_eq!(
-            uncalibrated.score_layer(0, &codes, 0x3c00, 0.125).to_bits(),
-            calibrated.score_layer(0, &codes, 0x3c00, 0.125).to_bits()
+            uncalibrated
+                .score_layer(0, &codes, 1.0, None)
+                .unwrap()
+                .to_bits(),
+            calibrated
+                .score_layer(0, &codes, 1.0, None)
+                .unwrap()
+                .to_bits()
         );
         assert_eq!(
             uncalibrated.query_error_squared(0).to_bits(),
@@ -588,16 +592,8 @@ mod tests {
             "query_error_by_kernel".to_string(),
             &VectorOptions::new(100, Metric::Dot),
             vec![
-                VectorQuantizationLayer {
-                    bits: 1,
-                    quantizer: VectorQuantizer::RaBitQ,
-                    seed: 1,
-                },
-                VectorQuantizationLayer {
-                    bits: 4,
-                    quantizer: VectorQuantizer::TurboQuant,
-                    seed: 2,
-                },
+                VectorQuantizationLayer { bits: 1, seed: 1 },
+                VectorQuantizationLayer { bits: 4, seed: 2 },
             ],
         )
         .unwrap();

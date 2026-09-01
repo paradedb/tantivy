@@ -74,6 +74,12 @@ pub fn encode(y: &[f32], grid: &[f32], bits: u8, out: &mut [u8]) -> u16 {
     encode_with_scratch(y, grid, bits, out, &mut code_scratch)
 }
 
+/// Encode a vector and return its exact RMS scale.
+pub fn encode_f32(y: &[f32], grid: &[f32], bits: u8, out: &mut [u8]) -> f32 {
+    let mut code_scratch = vec![0_u8; y.len()];
+    encode_f32_with_scratch(y, grid, bits, out, &mut code_scratch)
+}
+
 /// Encode a vector using caller-owned one-byte-per-coordinate scratch.
 ///
 /// The scratch form is byte-identical to [`encode`] and lets a cluster batch
@@ -85,6 +91,17 @@ pub fn encode_with_scratch(
     out: &mut [u8],
     code_scratch: &mut [u8],
 ) -> u16 {
+    f32_to_f16(encode_f32_with_scratch(y, grid, bits, out, code_scratch))
+}
+
+/// Encode a vector using caller-owned scratch and return its exact RMS scale.
+pub fn encode_f32_with_scratch(
+    y: &[f32],
+    grid: &[f32],
+    bits: u8,
+    out: &mut [u8],
+    code_scratch: &mut [u8],
+) -> f32 {
     assert!(!y.is_empty());
     validate_grid(grid, bits);
     assert_eq!(out.len(), packed_len(y.len(), bits));
@@ -92,7 +109,7 @@ pub fn encode_with_scratch(
     let norm_squared = y.iter().map(|&value| value * value).sum::<f32>();
     if norm_squared == 0.0 {
         out.fill(0);
-        return 0;
+        return 0.0;
     }
 
     let scale = norm_squared.sqrt() / (y.len() as f32).sqrt();
@@ -105,7 +122,7 @@ pub fn encode_with_scratch(
         *code = boundaries.partition_point(|&boundary| value / scale > boundary) as u8;
     }
     pack(code_scratch, bits, out);
-    f32_to_f16(scale)
+    scale
 }
 
 pub fn decode(codes: &[u8], grid: &[f32], d: usize, bits: u8, scale: u16) -> Vec<f32> {
@@ -332,6 +349,10 @@ pub fn score(codes: &[u8], lut: &[f32], d: usize, bits: u8) -> f32 {
 
 pub fn estimate(codes: &[u8], scale: u16, lut: &[f32], d: usize, bits: u8) -> f32 {
     f16_to_f32(scale) * score(codes, lut, d, bits)
+}
+
+pub fn estimate_f32(codes: &[u8], scale: f32, lut: &[f32], d: usize, bits: u8) -> f32 {
+    scale * score(codes, lut, d, bits)
 }
 
 /// Score a fixed-stride row batch in one kernel call, leaving scale and

@@ -1,6 +1,8 @@
 //! Numerical oracle for the exact sphere-marginal scalar quantizers.
 
+#[cfg(test)]
 use rand_chacha::ChaCha8Rng;
+#[cfg(test)]
 use rand_core::{RngCore, SeedableRng};
 
 pub mod f16;
@@ -14,9 +16,6 @@ pub struct Grid {
 }
 
 const QUADRATURE_POINTS: usize = 1 << 16;
-
-/// Settled Phase-A calibration after the N=1000 three-dimension measurement.
-pub const DEFAULT_CAL: f64 = 1.0;
 
 fn sphere_samples(d: usize) -> Vec<(f64, f64)> {
     assert!(d >= 64);
@@ -52,25 +51,6 @@ pub fn rho_model_for_points(d: usize, points: &[f32]) -> f64 {
     let samples = sphere_samples(d);
     let points: Vec<f64> = points.iter().map(|&point| f64::from(point)).collect();
     rho_from_samples(&samples, &points)
-}
-
-/// Exact-density sign grid used only to open legacy metadata that predates
-/// persisted model rho. This is one centroid moment plus one error integral,
-/// not a Lloyd-Max solve.
-pub fn exact_sign_grid(d: usize) -> Grid {
-    let samples = sphere_samples(d);
-    let (mass, moment) = samples
-        .iter()
-        .fold((0.0, 0.0), |(mass, moment), &(z, weight)| {
-            (mass + weight, moment + weight * z.abs())
-        });
-    let magnitude = moment / mass;
-    let points = vec![-magnitude, magnitude];
-    Grid {
-        bits: 1,
-        points: points.iter().map(|&point| point as f32).collect(),
-        rho_model: rho_from_samples(&samples, &points),
-    }
 }
 
 /// Build an exact-density Lloyd-Max grid for a dimension-normalized sphere marginal.
@@ -152,9 +132,10 @@ fn erfc(x: f64) -> f64 {
     }
 }
 
-pub fn sigma_from_rho(rho: f64, d: usize, cal: f64) -> f64 {
-    assert!(rho >= 0.0 && d > 0 && cal >= 0.0);
-    cal * rho / (d as f64).sqrt()
+/// Isotropic dot-product error for unit-norm operands.
+pub fn isotropic_sigma(rho: f64, d: usize) -> f64 {
+    assert!(rho >= 0.0 && d > 0);
+    rho / (d as f64).sqrt()
 }
 
 pub fn empirical_sigma(estimates: &[f32], truths: &[f32]) -> f64 {
@@ -169,33 +150,7 @@ pub fn empirical_sigma(estimates: &[f32], truths: &[f32]) -> f64 {
     mse.sqrt()
 }
 
-/// Empirically compare dot-product error to the isotropic product model.
-pub fn measure_cal(d: usize, bits: u8, n: usize) -> f64 {
-    assert!(d > 0);
-    assert!(n > 0);
-    let grid = build_grid(d, bits);
-    let mut rng = ChaCha8Rng::seed_from_u64(0x4341_4c00_0000_0000 ^ d as u64 ^ bits as u64);
-    let query = random_unit(&mut rng, d);
-    let mut estimates = Vec::with_capacity(n);
-    let mut truths = Vec::with_capacity(n);
-    for _ in 0..n {
-        let vector = random_unit(&mut rng, d);
-        let scale_bits = f16::f32_to_f16(1.0 / (d as f32).sqrt());
-        let scale = f16::f16_to_f32(scale_bits);
-        let estimate = vector
-            .iter()
-            .zip(&query)
-            .map(|(&value, &q)| {
-                let code = nearest(value / scale, &grid.points);
-                q * scale * grid.points[code]
-            })
-            .sum();
-        estimates.push(estimate);
-        truths.push(dot(&query, &vector));
-    }
-    empirical_sigma(&estimates, &truths) / sigma_from_rho(grid.rho_model, d, 1.0)
-}
-
+#[cfg(test)]
 fn nearest(value: f32, grid: &[f32]) -> usize {
     grid.windows(2)
         .map(|pair| (pair[0] + pair[1]) * 0.5)
@@ -203,6 +158,7 @@ fn nearest(value: f32, grid: &[f32]) -> usize {
         .unwrap_or(grid.len() - 1)
 }
 
+#[cfg(test)]
 fn random_unit(rng: &mut ChaCha8Rng, d: usize) -> Vec<f32> {
     let mut values = Vec::with_capacity(d);
     while values.len() < d {
@@ -224,10 +180,6 @@ fn random_unit(rng: &mut ChaCha8Rng, d: usize) -> Vec<f32> {
         *value /= norm;
     }
     values
-}
-
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(&x, &y)| x * y).sum()
 }
 
 #[cfg(test)]

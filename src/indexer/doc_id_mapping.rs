@@ -46,7 +46,7 @@ impl SegmentDocIdMapping {
     ///
     /// In the returned `DocAddress`, the `segment_ord` is the ordinal of targeted segment
     /// in the list of merged segments.
-    pub(crate) fn iter_old_doc_addrs(&self) -> impl Iterator<Item = DocAddress> + '_ {
+    pub(crate) fn iter_source_doc_addrs(&self) -> impl Iterator<Item = DocAddress> + '_ {
         self.new_doc_id_to_old_doc_addr.iter().copied()
     }
 
@@ -126,7 +126,7 @@ impl DocIdMapping {
     }
 
     /// Iiterate over old doc_ids in order of the new doc_ids
-    pub(crate) fn iter_old_doc_ids(&self) -> impl Iterator<Item = DocId> + Clone + '_ {
+    pub(crate) fn iter_source_doc_ids(&self) -> impl Iterator<Item = DocId> + Clone + '_ {
         self.new_doc_id_to_old.iter().copied()
     }
 

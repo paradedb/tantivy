@@ -1,12 +1,12 @@
-//! Residual quantization cascade and plane-boundary operations.
+//! Residual quantization cascade and layer-boundary operations.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use fht::Rotation;
 use grid_plane::{
-    build_lut, build_packed_lut_4, decode as decode_grid, encode as encode_grid,
-    encode_with_scratch as encode_grid_with_scratch, estimate as estimate_grid,
+    build_lut, build_packed_lut_4, encode_f32 as encode_grid,
+    encode_f32_with_scratch as encode_grid_with_scratch, score as score_grid,
     score_batch as score_grid_batch, score_batch_indexed as score_grid_batch_indexed,
     score_batch_packed_4 as score_grid_batch_packed_4,
     score_batch_packed_4_indexed as score_grid_batch_packed_4_indexed, unpack as unpack_grid,
@@ -14,11 +14,10 @@ use grid_plane::{
 use quant_model::f16::{f16_to_f32, f32_to_f16};
 use quant_model::Grid;
 use sign_plane::{
-    encode as encode_sign, estimate_asym as estimate_sign_asym,
-    estimate_asym_batch_unscaled as estimate_sign_batch,
+    encode_f32 as encode_sign, estimate_asym_batch_unscaled as estimate_sign_batch,
     estimate_asym_batch_unscaled_indexed as estimate_sign_batch_indexed,
-    estimate_fp as estimate_sign_fp, pack as pack_sign, prepare_query, unpack as unpack_sign,
-    QueryPlanes,
+    estimate_asym_unscaled as estimate_sign_asym, estimate_fp_unscaled as estimate_sign_fp,
+    pack as pack_sign, prepare_query, unpack as unpack_sign, QueryPlanes,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,7 +30,7 @@ pub struct LayerSpec {
 #[derive(Clone, Debug)]
 pub struct Encoded {
     pub codes: Vec<Vec<u8>>,
-    pub scales: Vec<u16>,
+    pub scales: Vec<f32>,
     pub constants: Vec<f32>,
 }
 
@@ -40,14 +39,21 @@ pub struct Encoded {
 pub struct EncodedLayerBatch {
     /// Packed row codes, concatenated at the layer's fixed code stride.
     pub codes: Vec<u8>,
-    /// One binary16 scale per row.
-    pub scales: Vec<u16>,
+    /// One exact binary32 scale per row.
+    pub scales: Vec<f32>,
     /// One binary16 cumulative-prefix gamma per row.
     ///
-    /// Gamma is exact encode-side metadata for a leading-sign schedule:
+    /// Gamma is exact encode-side metadata for an encoded prefix:
     /// `||r0||^2 / <r0, rhat_prefix>`, clamped to `[1, 4]` before the f16
     /// round trip.
     pub gammas: Vec<u16>,
+    /// One binary16 corrected-estimator error ratio per row.
+    ///
+    /// `E = ||r0 - gamma_stored * rhat_prefix||^2 / ||r0||^2`, where
+    /// `gamma_stored` is the decoded post-clamp binary16 coefficient used by
+    /// scoring. A zero original residual has the canonical value zero.
+    /// Nonzero values are converted directly to binary16 without clamping.
+    pub corrected_error_ratios: Vec<u16>,
     /// One binary32 split-form constant per row.
     pub constants: Vec<f32>,
 }
@@ -56,6 +62,11 @@ pub struct EncodedLayerBatch {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EncodedBatch {
     pub rows: usize,
+    /// One shared binary32 `R0²` value per row.
+    ///
+    /// This is both the value serialized in the radius slot and the numerator
+    /// and denominator anchor used for cumulative gamma and corrected error.
+    pub residual_norms_squared: Vec<f32>,
     pub layers: Vec<EncodedLayerBatch>,
 }
 
@@ -66,8 +77,7 @@ pub struct EncodedBatch {
 /// while retaining every scratch and output allocation.
 #[derive(Debug)]
 pub struct BatchEncodeWorkspace {
-    rotated_original: Vec<f32>,
-    norm_squares: Vec<f64>,
+    prefix_reconstructions: Vec<f32>,
     prefix_dots: Vec<f64>,
     rotation_scratch: Vec<f32>,
     sign_words: Vec<u64>,
@@ -78,14 +88,14 @@ pub struct BatchEncodeWorkspace {
 impl BatchEncodeWorkspace {
     pub fn new() -> Self {
         Self {
-            rotated_original: Vec::new(),
-            norm_squares: Vec::new(),
+            prefix_reconstructions: Vec::new(),
             prefix_dots: Vec::new(),
             rotation_scratch: Vec::new(),
             sign_words: Vec::new(),
             grid_code_scratch: Vec::new(),
             encoded: EncodedBatch {
                 rows: 0,
+                residual_norms_squared: Vec::new(),
                 layers: Vec::new(),
             },
         }
@@ -103,9 +113,9 @@ impl BatchEncodeWorkspace {
     }
 
     fn reserve(&mut self, d: usize, rows: usize, specs: &[LayerSpec]) {
-        self.rotated_original.reserve(rows * d);
-        self.norm_squares.reserve(rows);
+        self.prefix_reconstructions.reserve(rows * d);
         self.prefix_dots.reserve(rows);
+        self.encoded.residual_norms_squared.reserve(rows);
         self.rotation_scratch.resize(d, 0.0);
         self.sign_words.resize(d.div_ceil(64), 0);
         self.grid_code_scratch.resize(d, 0);
@@ -115,6 +125,7 @@ impl BatchEncodeWorkspace {
                 codes: Vec::new(),
                 scales: Vec::new(),
                 gammas: Vec::new(),
+                corrected_error_ratios: Vec::new(),
                 constants: Vec::new(),
             });
         for (spec, layer) in specs.iter().zip(&mut self.encoded.layers) {
@@ -126,6 +137,7 @@ impl BatchEncodeWorkspace {
             layer.codes.reserve(rows * code_stride);
             layer.scales.reserve(rows);
             layer.gammas.reserve(rows);
+            layer.corrected_error_ratios.reserve(rows);
             layer.constants.reserve(rows);
         }
     }
@@ -152,25 +164,36 @@ impl GammaRoundTrip {
     }
 }
 
+/// One corrected-estimator error ratio before and after binary16 storage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CorrectedErrorRatioRoundTrip {
+    pub raw: f64,
+    pub f16: u16,
+}
+
+impl CorrectedErrorRatioRoundTrip {
+    pub fn f16_value(self) -> f32 {
+        f16_to_f32(self.f16)
+    }
+}
+
 /// Audit data for one cumulative encoded prefix. Reconstructions and inner
 /// products are expressed in the original, unrotated residual coordinates.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PrefixGammaAudit {
+pub struct PrefixErrorAudit {
     pub gamma: GammaRoundTrip,
+    pub corrected_error_ratio: CorrectedErrorRatioRoundTrip,
     pub prefix_dot: f64,
-    pub s_eff_sq: f64,
-    pub layer_raw_scale: f32,
-    pub layer_scale_f16: u16,
+    pub layer_scale: f32,
     pub codes: Vec<u8>,
     pub raw_prefix_reconstruction: Vec<f32>,
 }
 
-/// Non-persisting gamma audit for every active prefix of a `[1, ...]`
-/// schedule.
+/// Non-persisting metadata audit for every active encoded prefix.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PrefixGammaAuditResult {
+pub struct PrefixErrorAuditResult {
     pub norm_sq: f64,
-    pub prefixes: Vec<PrefixGammaAudit>,
+    pub prefixes: Vec<PrefixErrorAudit>,
 }
 
 /// Cluster-scoped centroid state shared by every residual encoded in the cluster.
@@ -330,8 +353,7 @@ pub fn prepare_split_query(
     grids: &[Grid],
     sign_query_bits: u8,
 ) -> PreparedSplitQuery {
-    // Preserve the original harness API contract: only the explicit
-    // `_with_plan` entry accepts a grid slice as an active prefix.
+    // The direct entry prepares the complete supplied schedule.
     validate(query.len(), specs, grids);
     let plan = QueryRotationPlan::new(query.len(), specs);
     prepare_split_query_with_plan(query, &plan, grids, sign_query_bits)
@@ -414,20 +436,30 @@ impl PreparedSplitQuery {
         &self,
         layer: usize,
         codes: &[u8],
-        scale: u16,
+        scale: f32,
         constant: f32,
+        spec: LayerSpec,
+    ) -> f32 {
+        self.score_layer_without_constant(layer, codes, scale, spec) - constant
+    }
+
+    /// Score one stored layer for metrics whose format omits split constants.
+    pub fn score_layer_without_constant(
+        &self,
+        layer: usize,
+        codes: &[u8],
+        scale: f32,
         spec: LayerSpec,
     ) -> f32 {
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
                 let words = aligned_le_words(codes);
-                let estimate = estimate_sign_asym(words.as_ref(), scale, query);
-                estimate - constant
+                scale * estimate_sign_asym(words.as_ref(), query)
             }
             PreparedSplitLayer::Grid { lut, .. } => {
                 assert!(spec.bits > 1);
-                estimate_grid(codes, scale, lut, self.d, spec.bits) - constant
+                scale * score_grid(codes, lut, self.d, spec.bits)
             }
         }
     }
@@ -567,6 +599,7 @@ pub fn encode_batch_in_place(
         specs,
         grids,
         &mut workspace,
+        true,
         |_, _, _| {},
     );
     workspace.encoded
@@ -585,6 +618,7 @@ pub fn encode_batch_in_place_with_workspace<'workspace>(
     specs: &[LayerSpec],
     grids: &[Grid],
     workspace: &'workspace mut BatchEncodeWorkspace,
+    compute_constants: bool,
 ) -> &'workspace EncodedBatch {
     encode_batch_in_place_reusing(
         vectors,
@@ -593,6 +627,7 @@ pub fn encode_batch_in_place_with_workspace<'workspace>(
         specs,
         grids,
         workspace,
+        compute_constants,
         |_, _, _| {},
     );
     &workspace.encoded
@@ -611,7 +646,7 @@ pub fn encode_batch_in_place_with_residual_observer<F>(
     observer: F,
 ) -> EncodedBatch
 where
-    F: FnMut(usize, &[f32], &[u16]),
+    F: FnMut(usize, &[f32], &[f32]),
 {
     let mut workspace = BatchEncodeWorkspace::new();
     encode_batch_in_place_reusing(
@@ -621,11 +656,13 @@ where
         specs,
         grids,
         &mut workspace,
+        true,
         observer,
     );
     workspace.encoded
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_batch_in_place_reusing<F>(
     vectors: &mut [f32],
     rows: usize,
@@ -633,22 +670,17 @@ fn encode_batch_in_place_reusing<F>(
     specs: &[LayerSpec],
     grids: &[Grid],
     workspace: &mut BatchEncodeWorkspace,
+    compute_constants: bool,
     mut observer: F,
 ) where
-    F: FnMut(usize, &[f32], &[u16]),
+    F: FnMut(usize, &[f32], &[f32]),
 {
     validate(centroid.d, specs, grids);
     assert_eq!(centroid.specs, specs);
     assert_eq!(vectors.len(), rows * centroid.d);
-    assert_eq!(
-        specs[0].bits, 1,
-        "production prefix gamma requires a leading sign plane"
-    );
-
     let d = centroid.d;
     let BatchEncodeWorkspace {
-        rotated_original,
-        norm_squares,
+        prefix_reconstructions,
         prefix_dots,
         rotation_scratch,
         sign_words,
@@ -661,23 +693,17 @@ fn encode_batch_in_place_reusing<F>(
         }
     }
 
-    // Preserve the exact original residual and carry it through the same
-    // cumulative rotations as the encode residual. This makes the layer-local
-    // dot with each raw reconstruction equal to
-    // `<r0, inverse_rotated(layer_reconstruction)>` without an inverse FHT per
-    // row. The one extra forward transform per rotating layer supersedes the
-    // historical two-FHT data-path accounting: cumulative gamma needs both
-    // the changing residual and the unchanged original direction.
-    rotated_original.clear();
-    rotated_original.extend_from_slice(vectors);
-    norm_squares.clear();
-    norm_squares.reserve(rows);
-    for row in rotated_original.chunks_exact(d) {
-        norm_squares.push(
-            row.iter()
-                .map(|&value| f64::from(value).powi(2))
-                .sum::<f64>(),
-        );
+    // Carry the cumulative reconstruction itself through the same rotation
+    // chain as the residual. This buffer is assembled only from the codes and
+    // binary32 scales that are serialized, so gamma and E describe the
+    // reconstruction the scorer actually consumes. The encoder uses exactly
+    // two `rows * d` f32 buffers.
+    prefix_reconstructions.clear();
+    prefix_reconstructions.resize(rows * d, 0.0);
+    encoded.residual_norms_squared.clear();
+    encoded.residual_norms_squared.reserve(rows);
+    for row in vectors.chunks_exact(d) {
+        encoded.residual_norms_squared.push(squared_norm_f32(row));
     }
     prefix_dots.clear();
     prefix_dots.resize(rows, 0.0);
@@ -691,6 +717,7 @@ fn encode_batch_in_place_reusing<F>(
             codes: Vec::new(),
             scales: Vec::new(),
             gammas: Vec::new(),
+            corrected_error_ratios: Vec::new(),
             constants: Vec::new(),
         });
     for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
@@ -701,7 +728,7 @@ fn encode_batch_in_place_reusing<F>(
             for row in vectors.chunks_exact_mut(d) {
                 rotation.apply_with_scratch(row, rotation_scratch);
             }
-            for row in rotated_original.chunks_exact_mut(d) {
+            for row in prefix_reconstructions.chunks_exact_mut(d) {
                 rotation.apply_with_scratch(row, rotation_scratch);
             }
         }
@@ -715,6 +742,7 @@ fn encode_batch_in_place_reusing<F>(
             codes,
             scales,
             gammas,
+            corrected_error_ratios,
             constants,
         } = &mut encoded.layers[layer];
         codes.clear();
@@ -723,48 +751,58 @@ fn encode_batch_in_place_reusing<F>(
         scales.reserve(rows);
         gammas.clear();
         gammas.reserve(rows);
+        corrected_error_ratios.clear();
+        corrected_error_ratios.reserve(rows);
         constants.clear();
-        constants.reserve(rows);
+        if compute_constants {
+            constants.reserve(rows);
+        }
 
-        for (row_index, (residual, original)) in vectors
+        for (row_index, (residual, prefix_reconstruction)) in vectors
             .chunks_exact_mut(d)
-            .zip(rotated_original.chunks_exact(d))
+            .zip(prefix_reconstructions.chunks_exact_mut(d))
             .enumerate()
         {
             if spec.bits == 1 {
                 pack_sign(residual, sign_words);
-                let raw_scale = residual.iter().map(|value| value.abs()).sum::<f32>() / d as f32;
-                let scale = f32_to_f16(raw_scale);
-                let stored_scale = f16_to_f32(scale);
-                let mut layer_dot = 0.0_f64;
-                let mut constant = 0.0_f32;
-                for i in 0..d {
-                    let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    layer_dot += f64::from(original[i]) * f64::from(raw_scale * sign);
-                    let reconstruction = stored_scale * sign;
-                    constant += centroid.layers[layer][i] * reconstruction;
-                    residual[i] -= reconstruction;
-                }
-                prefix_dots[row_index] += layer_dot;
-                gammas.push(gamma_round_trip(norm_squares[row_index], prefix_dots[row_index]).f16);
+                let scale = residual.iter().map(|value| value.abs()).sum::<f32>() / d as f32;
+                let constant = if compute_constants {
+                    let mut constant = 0.0_f32;
+                    for i in 0..d {
+                        let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        let reconstruction = scale * sign;
+                        constant += centroid.layers[layer][i] * reconstruction;
+                        prefix_reconstruction[i] += reconstruction;
+                        residual[i] -= reconstruction;
+                    }
+                    Some(constant)
+                } else {
+                    for i in 0..d {
+                        let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                        let reconstruction = scale * sign;
+                        prefix_reconstruction[i] += reconstruction;
+                        residual[i] -= reconstruction;
+                    }
+                    None
+                };
                 for &word in sign_words.iter() {
                     codes.extend_from_slice(&word.to_le_bytes());
                 }
                 scales.push(scale);
-                constants.push(constant);
+                if let Some(constant) = constant {
+                    constants.push(constant);
+                }
             } else {
                 let code_start = codes.len();
                 codes.resize(code_start + code_stride, 0);
-                let raw_norm_squared = residual.iter().map(|&value| value * value).sum::<f32>();
-                let raw_scale = if raw_norm_squared == 0.0 {
-                    0.0
-                } else {
-                    raw_norm_squared.sqrt() / (d as f32).sqrt()
-                };
                 let scale = encode_grid_with_scratch(
                     residual,
                     &grid.points,
@@ -772,22 +810,53 @@ fn encode_batch_in_place_reusing<F>(
                     &mut codes[code_start..],
                     grid_code_scratch,
                 );
-                debug_assert_eq!(scale, f32_to_f16(raw_scale));
-                let stored_scale = f16_to_f32(scale);
-                let mut layer_dot = 0.0_f64;
-                let mut constant = 0.0_f32;
-                for i in 0..d {
-                    let point = grid.points[grid_code_scratch[i] as usize];
-                    layer_dot += f64::from(original[i]) * f64::from(raw_scale * point);
-                    let reconstruction = stored_scale * point;
-                    constant += centroid.layers[layer][i] * reconstruction;
-                    residual[i] -= reconstruction;
-                }
-                prefix_dots[row_index] += layer_dot;
-                gammas.push(gamma_round_trip(norm_squares[row_index], prefix_dots[row_index]).f16);
+                let constant = if compute_constants {
+                    let mut constant = 0.0_f32;
+                    for i in 0..d {
+                        let point = grid.points[grid_code_scratch[i] as usize];
+                        let reconstruction = scale * point;
+                        constant += centroid.layers[layer][i] * reconstruction;
+                        prefix_reconstruction[i] += reconstruction;
+                        residual[i] -= reconstruction;
+                    }
+                    Some(constant)
+                } else {
+                    for i in 0..d {
+                        let point = grid.points[grid_code_scratch[i] as usize];
+                        let reconstruction = scale * point;
+                        prefix_reconstruction[i] += reconstruction;
+                        residual[i] -= reconstruction;
+                    }
+                    None
+                };
                 scales.push(scale);
-                constants.push(constant);
+                if let Some(constant) = constant {
+                    constants.push(constant);
+                }
             }
+            let prefix_dot = residual
+                .iter()
+                .zip(prefix_reconstruction.iter())
+                .map(|(&residual, &reconstruction)| {
+                    let reconstruction = f64::from(reconstruction);
+                    (f64::from(residual) + reconstruction) * reconstruction
+                })
+                .sum::<f64>();
+            prefix_dots[row_index] = prefix_dot;
+            let radius_squared = f64::from(encoded.residual_norms_squared[row_index]);
+            let gamma = gamma_round_trip(radius_squared, prefix_dot);
+            gammas.push(gamma.f16);
+            let stored_gamma = f64::from(gamma.f16_value());
+            let corrected_error_norm_sq = residual
+                .iter()
+                .zip(prefix_reconstruction.iter())
+                .map(|(&residual, &reconstruction)| {
+                    (f64::from(residual) + (1.0 - stored_gamma) * f64::from(reconstruction)).powi(2)
+                })
+                .sum::<f64>();
+            corrected_error_ratios.push(
+                corrected_error_ratio_round_trip(radius_squared, corrected_error_norm_sq).f16,
+            );
         }
 
         observer(layer, vectors, scales);
@@ -823,11 +892,10 @@ pub fn encode_layers(
         if spec.bits == 1 {
             let mut words = vec![0_u64; r.len().div_ceil(64)];
             let scale = encode_sign(&residual, &mut words);
-            let reconstruction_scale = f16_to_f32(scale);
             let signs = unpack_sign(&words, r.len());
             let mut constant = 0.0;
             for (i, (value, sign)) in residual.iter_mut().zip(signs).enumerate() {
-                let reconstruction = reconstruction_scale * sign;
+                let reconstruction = scale * sign;
                 if let Some(context) = centroid {
                     constant += context.layers[layer][i] * reconstruction;
                 }
@@ -839,7 +907,9 @@ pub fn encode_layers(
         } else {
             let mut codes = vec![0_u8; grid_plane::packed_len(r.len(), spec.bits)];
             let scale = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
-            let reconstructed = decode_grid(&codes, &grid.points, r.len(), spec.bits, scale);
+            let reconstructed = unpack_grid(&codes, r.len(), spec.bits)
+                .into_iter()
+                .map(|code| scale * grid.points[code as usize]);
             let mut constant = 0.0;
             for (i, (value, reconstruction)) in residual.iter_mut().zip(reconstructed).enumerate() {
                 if let Some(context) = centroid {
@@ -873,92 +943,91 @@ fn gamma_round_trip(norm_sq: f64, prefix_dot: f64) -> GammaRoundTrip {
     }
 }
 
+/// Storage-shaped squared norm. Sixteen independent binary32 accumulators
+/// match Tantivy's vector-distance kernel while keeping this crate standalone.
+#[inline]
+#[allow(unknown_lints)]
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn squared_norm_f32(values: &[f32]) -> f32 {
+    const LANES: usize = 16;
+    let chunks = values.chunks_exact(LANES);
+    let tail = chunks.remainder();
+    let mut sums = [0.0_f32; LANES];
+    for chunk in chunks {
+        for lane in 0..LANES {
+            sums[lane] += chunk[lane] * chunk[lane];
+        }
+    }
+    let mut total = sums.iter().sum::<f32>();
+    for &value in tail {
+        total += value * value;
+    }
+    total
+}
+
+fn corrected_error_ratio_round_trip(
+    original_norm_sq: f64,
+    corrected_error_norm_sq: f64,
+) -> CorrectedErrorRatioRoundTrip {
+    let raw = if original_norm_sq == 0.0 {
+        debug_assert_eq!(corrected_error_norm_sq, 0.0);
+        0.0
+    } else {
+        corrected_error_norm_sq / original_norm_sq
+    };
+    CorrectedErrorRatioRoundTrip {
+        raw,
+        f16: f32_to_f16(raw as f32),
+    }
+}
+
 /// Re-encode one residual without persisting anything and expose the
 /// cumulative gamma measurements used by the external audit harness.
 ///
-/// The first layer must be the sign plane. Each layer advances its residual
-/// with the same f16 reconstruction as production encoding, while the prefix
-/// reported here uses that layer's pre-f16 raw scale. Every contribution is
-/// inverse-rotated into `r0`'s original coordinates before the cumulative
-/// inner product is measured. Grid-only schedules are intentionally outside
-/// this audit contract.
-pub fn audit_prefix_gammas(
+/// Each layer advances its residual with the exact binary32 scale used by
+/// production encoding. Every contribution is inverse-rotated into `r0`'s
+/// original coordinates for reporting. Gamma and the corrected error ratio
+/// are measured in the encoder's equivalent cumulatively rotated coordinates.
+pub fn audit_prefix_error_model(
     r0: &[f32],
     specs: &[LayerSpec],
     grids: &[Grid],
-) -> PrefixGammaAuditResult {
+) -> PrefixErrorAuditResult {
     validate(r0.len(), specs, grids);
-    assert_eq!(
-        specs[0].bits, 1,
-        "gamma audit requires a leading sign plane"
-    );
-
     let d = r0.len();
     let plan = QueryRotationPlan::new(d, specs);
-    let norm_sq = r0
-        .iter()
-        .map(|&value| f64::from(value).powi(2))
-        .sum::<f64>();
+    let norm_sq = f64::from(squared_norm_f32(r0));
     let mut residual = r0.to_vec();
+    let mut prefix_reconstruction = vec![0.0_f32; d];
     let mut raw_prefix_reconstruction = vec![0.0_f32; d];
     let mut prefixes = Vec::with_capacity(specs.len());
 
     for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
         if let Some(rotation) = &plan.rotations[layer] {
             rotation.apply(&mut residual);
+            rotation.apply(&mut prefix_reconstruction);
         }
 
-        let (codes, raw_scale, scale_f16, raw_reconstruction, stored_reconstruction) = if spec.bits
-            == 1
-        {
+        let (codes, scale, reconstruction) = if spec.bits == 1 {
             let mut words = vec![0_u64; d.div_ceil(64)];
-            let raw_scale = residual.iter().map(|value| value.abs()).sum::<f32>() / d as f32;
-            let scale_f16 = encode_sign(&residual, &mut words);
-            debug_assert_eq!(scale_f16, f32_to_f16(raw_scale));
+            let scale = encode_sign(&residual, &mut words);
             let signs = unpack_sign(&words, d);
-            let stored_scale = f16_to_f32(scale_f16);
-            let raw_reconstruction: Vec<f32> = signs.iter().map(|&sign| raw_scale * sign).collect();
-            let stored_reconstruction: Vec<f32> =
-                signs.into_iter().map(|sign| stored_scale * sign).collect();
-            (
-                words_to_bytes(&words),
-                raw_scale,
-                scale_f16,
-                raw_reconstruction,
-                stored_reconstruction,
-            )
+            let reconstruction: Vec<f32> = signs.into_iter().map(|sign| scale * sign).collect();
+            (words_to_bytes(&words), scale, reconstruction)
         } else {
-            let norm_squared = residual.iter().map(|&value| value * value).sum::<f32>();
-            let raw_scale = if norm_squared == 0.0 {
-                0.0
-            } else {
-                norm_squared.sqrt() / (d as f32).sqrt()
-            };
             let mut codes = vec![0_u8; grid_plane::packed_len(d, spec.bits)];
-            let scale_f16 = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
-            debug_assert_eq!(scale_f16, f32_to_f16(raw_scale));
+            let scale = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
             let unpacked = unpack_grid(&codes, d, spec.bits);
-            let stored_scale = f16_to_f32(scale_f16);
-            let raw_reconstruction: Vec<f32> = unpacked
-                .iter()
-                .map(|&code| raw_scale * grid.points[code as usize])
-                .collect();
-            let stored_reconstruction: Vec<f32> = unpacked
+            let reconstruction: Vec<f32> = unpacked
                 .into_iter()
-                .map(|code| stored_scale * grid.points[code as usize])
+                .map(|code| scale * grid.points[code as usize])
                 .collect();
-            (
-                codes,
-                raw_scale,
-                scale_f16,
-                raw_reconstruction,
-                stored_reconstruction,
-            )
+            (codes, scale, reconstruction)
         };
 
-        let mut original_space_contribution = raw_reconstruction;
-        for prior_layer in (0..=layer).rev() {
-            if let Some(rotation) = &plan.rotations[prior_layer] {
+        let mut original_space_contribution = reconstruction.clone();
+        for earlier_layer in (0..=layer).rev() {
+            if let Some(rotation) = &plan.rotations[earlier_layer] {
                 rotation.apply_inverse(&mut original_space_contribution);
             }
         }
@@ -968,27 +1037,45 @@ pub fn audit_prefix_gammas(
         {
             *prefix += contribution;
         }
-        let prefix_dot = r0
+        for ((value, prefix), reconstruction) in residual
+            .iter_mut()
+            .zip(&mut prefix_reconstruction)
+            .zip(reconstruction)
+        {
+            *prefix += reconstruction;
+            *value -= reconstruction;
+        }
+        let prefix_dot = residual
             .iter()
-            .zip(&raw_prefix_reconstruction)
-            .map(|(&residual, &reconstruction)| f64::from(residual) * f64::from(reconstruction))
+            .zip(&prefix_reconstruction)
+            .map(|(&residual, &reconstruction)| {
+                let reconstruction = f64::from(reconstruction);
+                (f64::from(residual) + reconstruction) * reconstruction
+            })
             .sum::<f64>();
-        prefixes.push(PrefixGammaAudit {
-            gamma: gamma_round_trip(norm_sq, prefix_dot),
+        let gamma = gamma_round_trip(norm_sq, prefix_dot);
+        let stored_gamma = f64::from(gamma.f16_value());
+        let corrected_error_norm_sq = residual
+            .iter()
+            .zip(&prefix_reconstruction)
+            .map(|(&residual, &reconstruction)| {
+                (f64::from(residual) + (1.0 - stored_gamma) * f64::from(reconstruction)).powi(2)
+            })
+            .sum::<f64>();
+        prefixes.push(PrefixErrorAudit {
+            gamma,
+            corrected_error_ratio: corrected_error_ratio_round_trip(
+                norm_sq,
+                corrected_error_norm_sq,
+            ),
             prefix_dot,
-            s_eff_sq: prefix_dot / d as f64,
-            layer_raw_scale: raw_scale,
-            layer_scale_f16: scale_f16,
+            layer_scale: scale,
             codes,
             raw_prefix_reconstruction: raw_prefix_reconstruction.clone(),
         });
-
-        for (value, reconstruction) in residual.iter_mut().zip(stored_reconstruction) {
-            *value -= reconstruction;
-        }
     }
 
-    PrefixGammaAuditResult { norm_sq, prefixes }
+    PrefixErrorAuditResult { norm_sq, prefixes }
 }
 
 pub fn prepare_fp_query(query: &[f32], specs: &[LayerSpec]) -> PreparedFpQuery {
@@ -1056,17 +1143,11 @@ fn estimate_prepared_fp_layers(
             if spec.bits == 1 {
                 let words = aligned_le_words(&encoded.codes[layer]);
                 let estimate =
-                    estimate_sign_fp(words.as_ref(), encoded.scales[layer], &query.layers[layer]);
+                    encoded.scales[layer] * estimate_sign_fp(words.as_ref(), &query.layers[layer]);
                 estimate
             } else {
                 let lut = build_lut(&query.layers[layer], &grid.points, spec.bits);
-                estimate_grid(
-                    &encoded.codes[layer],
-                    encoded.scales[layer],
-                    &lut,
-                    d,
-                    spec.bits,
-                )
+                encoded.scales[layer] * score_grid(&encoded.codes[layer], &lut, d, spec.bits)
             }
         })
         .collect()
@@ -1085,23 +1166,22 @@ pub fn reconstruct_first_space(
     let mut total = vec![0.0; d];
     for layer in 0..specs.len() {
         let spec = specs[layer];
-        let mut reconstruction = if spec.bits == 1 {
-            let scale = f16_to_f32(encoded.scales[layer]);
+        let mut reconstruction: Vec<f32> = if spec.bits == 1 {
             let words = aligned_le_words(&encoded.codes[layer]);
             let signs = unpack_sign(words.as_ref(), d);
-            signs.into_iter().map(|sign| scale * sign).collect()
+            signs
+                .into_iter()
+                .map(|sign| encoded.scales[layer] * sign)
+                .collect()
         } else {
-            decode_grid(
-                &encoded.codes[layer],
-                &grids[layer].points,
-                d,
-                spec.bits,
-                encoded.scales[layer],
-            )
+            unpack_grid(&encoded.codes[layer], d, spec.bits)
+                .into_iter()
+                .map(|code| encoded.scales[layer] * grids[layer].points[code as usize])
+                .collect()
         };
-        for prior_layer in (1..=layer).rev() {
-            if specs[prior_layer].rotate {
-                Rotation::new(d, specs[prior_layer].seed).apply_inverse(&mut reconstruction);
+        for earlier_layer in (1..=layer).rev() {
+            if specs[earlier_layer].rotate {
+                Rotation::new(d, specs[earlier_layer].seed).apply_inverse(&mut reconstruction);
             }
         }
         for (sum, value) in total.iter_mut().zip(reconstruction) {
@@ -1142,7 +1222,6 @@ fn validate(d: usize, specs: &[LayerSpec], grids: &[Grid]) {
     validate_specs(d, specs);
     assert_eq!(specs.len(), grids.len());
     for (spec, grid) in specs.iter().zip(grids) {
-        assert!((1..=8).contains(&spec.bits));
         assert_eq!(spec.bits, grid.bits);
         assert!(matches!(spec.bits, 1..=4));
     }
@@ -1150,7 +1229,7 @@ fn validate(d: usize, specs: &[LayerSpec], grids: &[Grid]) {
 
 fn validate_specs(d: usize, specs: &[LayerSpec]) {
     assert!(d > 0);
-    assert!((1..=4).contains(&specs.len()));
+    assert!((1..=3).contains(&specs.len()));
     assert!(specs[0].rotate, "layer 0 must rotate");
 }
 
@@ -1194,7 +1273,7 @@ fn decode_le_words(bytes: &[u8]) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
-    use quant_model::{build_grid, empirical_sigma, sigma_from_rho, DEFAULT_CAL};
+    use quant_model::{build_grid, empirical_sigma, isotropic_sigma};
     use rand_chacha::ChaCha8Rng;
     use rand_core::{RngCore, SeedableRng};
 
@@ -1229,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn reusable_rotation_plan_matches_legacy_query_preparation() {
+    fn reusable_rotation_plan_matches_direct_query_preparation() {
         let d = 100;
         let specs = [
             LayerSpec {
@@ -1247,24 +1326,24 @@ mod tests {
         let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.019).cos()).collect();
         let plan = QueryRotationPlan::new(d, &specs);
 
-        let mut legacy_current = query.clone();
-        let mut legacy_layers = Vec::new();
+        let mut direct_current = query.clone();
+        let mut direct_layers = Vec::new();
         for (layer, spec) in specs.iter().enumerate() {
             if layer == 0 || spec.rotate {
-                Rotation::new(d, spec.seed).apply(&mut legacy_current);
+                Rotation::new(d, spec.seed).apply(&mut direct_current);
             }
-            legacy_layers.push(legacy_current.clone());
+            direct_layers.push(direct_current.clone());
         }
         let planned_fp = prepare_fp_query_with_plan(&query, &plan, specs.len());
-        assert_eq!(planned_fp.layers, legacy_layers);
+        assert_eq!(planned_fp.layers, direct_layers);
         assert_eq!(prepare_fp_query(&query, &specs).layers, planned_fp.layers);
 
         let encoded = encode_layers(&query, None, &specs, &grids);
-        let legacy_split = prepare_split_query(&query, &specs, &grids, 4);
+        let direct_split = prepare_split_query(&query, &specs, &grids, 4);
         let planned_split = prepare_split_query_with_plan(&query, &plan, &grids, 4);
         for layer in 0..specs.len() {
             assert_eq!(
-                legacy_split.score_layer(
+                direct_split.score_layer(
                     layer,
                     &encoded.codes[layer],
                     encoded.scales[layer],
@@ -1388,9 +1467,9 @@ mod tests {
         assert_eq!(fht::debug_apply_count(), 2 * specs.len());
         assert_eq!(storage_signature(&workspace), allocated);
 
-        let legacy = prepare_centroid(&first_values, &specs);
-        assert_eq!(first_values, legacy.original);
-        assert_eq!(first_layers, legacy.layers);
+        let direct = prepare_centroid(&first_values, &specs);
+        assert_eq!(first_values, direct.original);
+        assert_eq!(first_layers, direct.layers);
     }
 
     #[test]
@@ -1455,7 +1534,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn legacy_split_query_rejects_an_implicit_grid_prefix() {
+    fn split_query_rejects_mismatched_schedule_lengths() {
         let d = 64;
         let specs = [
             LayerSpec {
@@ -1517,7 +1596,7 @@ mod tests {
         Rotation::new(d, specs[0].seed).apply(&mut rotated);
         assert_eq!(rotated, target);
         let encoded = encode_layers(&input, None, &specs, &grids);
-        assert_eq!(encoded.scales[1], 0);
+        assert_eq!(encoded.scales[1], 0.0);
         assert!(encoded.codes[1].iter().all(|&byte| byte == 0));
     }
 
@@ -1559,9 +1638,21 @@ mod tests {
                 encode_layers(&residual, Some(&prepared), &specs, &grids)
             })
             .collect();
-        let mut row_major: Vec<f32> = vectors.into_iter().flatten().collect();
+        let mut row_major: Vec<f32> = vectors.iter().flatten().copied().collect();
         let actual =
             encode_batch_in_place(&mut row_major, expected.len(), &prepared, &specs, &grids);
+
+        let mut without_constant_values: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let mut workspace = BatchEncodeWorkspace::with_capacity(d, expected.len(), &specs);
+        let without_constants = encode_batch_in_place_with_workspace(
+            &mut without_constant_values,
+            expected.len(),
+            &prepared,
+            &specs,
+            &grids,
+            &mut workspace,
+            false,
+        );
 
         assert_eq!(actual.rows, expected.len());
         for (layer, batch) in actual.layers.iter().enumerate() {
@@ -1569,7 +1660,7 @@ mod tests {
                 .iter()
                 .flat_map(|encoded| encoded.codes[layer].iter().copied())
                 .collect();
-            let expected_scales: Vec<u16> = expected
+            let expected_scales: Vec<f32> = expected
                 .iter()
                 .map(|encoded| encoded.scales[layer])
                 .collect();
@@ -1581,18 +1672,23 @@ mod tests {
             assert_eq!(batch.scales, expected_scales);
             assert_eq!(batch.constants, expected_constants);
             assert_eq!(batch.gammas.len(), expected.len());
+            assert_eq!(batch.corrected_error_ratios.len(), expected.len());
+            assert_eq!(without_constants.layers[layer].codes, batch.codes);
+            assert_eq!(without_constants.layers[layer].scales, batch.scales);
+            assert_eq!(without_constants.layers[layer].gammas, batch.gammas);
+            assert_eq!(
+                without_constants.layers[layer].corrected_error_ratios,
+                batch.corrected_error_ratios
+            );
+            assert!(without_constants.layers[layer].constants.is_empty());
         }
     }
 
     fn batch_workspace_storage_signature(workspace: &BatchEncodeWorkspace) -> Vec<(usize, usize)> {
         let mut storage = vec![
             (
-                workspace.rotated_original.as_ptr() as usize,
-                workspace.rotated_original.capacity(),
-            ),
-            (
-                workspace.norm_squares.as_ptr() as usize,
-                workspace.norm_squares.capacity(),
+                workspace.prefix_reconstructions.as_ptr() as usize,
+                workspace.prefix_reconstructions.capacity(),
             ),
             (
                 workspace.prefix_dots.as_ptr() as usize,
@@ -1614,12 +1710,20 @@ mod tests {
                 workspace.encoded.layers.as_ptr() as usize,
                 workspace.encoded.layers.capacity(),
             ),
+            (
+                workspace.encoded.residual_norms_squared.as_ptr() as usize,
+                workspace.encoded.residual_norms_squared.capacity(),
+            ),
         ];
         for layer in &workspace.encoded.layers {
             storage.extend([
                 (layer.codes.as_ptr() as usize, layer.codes.capacity()),
                 (layer.scales.as_ptr() as usize, layer.scales.capacity()),
                 (layer.gammas.as_ptr() as usize, layer.gammas.capacity()),
+                (
+                    layer.corrected_error_ratios.as_ptr() as usize,
+                    layer.corrected_error_ratios.capacity(),
+                ),
                 (
                     layer.constants.as_ptr() as usize,
                     layer.constants.capacity(),
@@ -1670,6 +1774,7 @@ mod tests {
             &specs,
             &grids,
             &mut workspace,
+            true,
         )
         .clone();
         assert_eq!(batch_workspace_storage_signature(&workspace), allocated);
@@ -1683,6 +1788,7 @@ mod tests {
             &specs,
             &grids,
             &mut workspace,
+            true,
         );
         assert_eq!(batch_workspace_storage_signature(&workspace), allocated);
 
@@ -1694,15 +1800,23 @@ mod tests {
             &specs,
             &grids,
             &mut workspace,
+            true,
         );
         assert_eq!(repeated, &first);
         assert_eq!(batch_workspace_storage_signature(&workspace), allocated);
     }
 
     #[test]
-    fn cluster_batch_prefix_gammas_match_audit_bit_for_bit() {
+    fn cluster_batch_prefix_metadata_matches_audit_bit_for_bit() {
         for d in [65, 100, 128] {
-            let schedules = [vec![1_u8], vec![1, 1], vec![1, 4]];
+            let schedules = [
+                vec![1_u8],
+                vec![1, 1],
+                vec![1, 4],
+                vec![4],
+                vec![2, 4],
+                vec![3, 1, 2],
+            ];
             for bits in schedules {
                 let specs: Vec<LayerSpec> = bits
                     .iter()
@@ -1727,7 +1841,7 @@ mod tests {
                             .collect()
                     })
                     .collect();
-                let expected: Vec<PrefixGammaAuditResult> = vectors
+                let expected: Vec<PrefixErrorAuditResult> = vectors
                     .iter()
                     .map(|vector| {
                         let residual: Vec<f32> = vector
@@ -1735,7 +1849,7 @@ mod tests {
                             .zip(&centroid)
                             .map(|(&value, &center)| value - center)
                             .collect();
-                        audit_prefix_gammas(&residual, &specs, &grids)
+                        audit_prefix_error_model(&residual, &specs, &grids)
                     })
                     .collect();
                 let mut row_major: Vec<f32> = vectors.into_iter().flatten().collect();
@@ -1752,8 +1866,16 @@ mod tests {
                         .iter()
                         .map(|audit| audit.prefixes[layer].gamma.f16)
                         .collect();
+                    let expected_error_ratios: Vec<u16> = expected
+                        .iter()
+                        .map(|audit| audit.prefixes[layer].corrected_error_ratio.f16)
+                        .collect();
                     assert_eq!(
                         encoded.gammas, expected_gammas,
+                        "d={d} schedule={bits:?} layer={layer}"
+                    );
+                    assert_eq!(
+                        encoded.corrected_error_ratios, expected_error_ratios,
                         "d={d} schedule={bits:?} layer={layer}"
                     );
                 }
@@ -1762,7 +1884,160 @@ mod tests {
     }
 
     #[test]
-    fn cluster_batch_zero_residual_gamma_is_one() {
+    fn serialized_prefix_decode_reconstructs_gamma_error_and_shared_radius() {
+        // This test deliberately does not call the metadata audit or the row
+        // encoder. It starts from packed batch bytes plus stored f32 scales,
+        // decodes every contribution, and independently rebuilds each prefix.
+        // The grid-first case proves that neither the identity nor its odd-d
+        // tail handling depends on a leading sign layer.
+        const D: usize = 100;
+        const ROWS: usize = 3;
+        for bits in [[1_u8, 4_u8], [2_u8, 4_u8]] {
+            let specs: Vec<LayerSpec> = bits
+                .iter()
+                .enumerate()
+                .map(|(layer, &bits)| LayerSpec {
+                    bits,
+                    seed: 0xDEC0_DE00 + layer as u64,
+                    rotate: true,
+                })
+                .collect();
+            let grids: Vec<Grid> = bits.iter().map(|&bits| build_grid(D, bits)).collect();
+            let centroid: Vec<f32> = (0..D)
+                .map(|i| ((i as f32 + 0.75) * 0.017).sin() * 0.13)
+                .collect();
+            let vectors: Vec<Vec<f32>> = (0..ROWS)
+                .map(|row| {
+                    centroid
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &center)| {
+                            center
+                                + ((i * 11 + row * 7) as f32 * 0.029).cos()
+                                    * (0.2 + row as f32 * 0.03)
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut row_major: Vec<f32> = vectors.iter().flatten().copied().collect();
+            let batch = encode_batch_in_place(
+                &mut row_major,
+                ROWS,
+                &prepare_centroid(&centroid, &specs),
+                &specs,
+                &grids,
+            );
+
+            for (row_index, vector) in vectors.iter().enumerate() {
+                let mut residual: Vec<f32> = vector
+                    .iter()
+                    .zip(&centroid)
+                    .map(|(&value, &center)| value - center)
+                    .collect();
+
+                // Independent copy of the format's sixteen-lane binary32
+                // radius accumulation, matching the public vector kernel.
+                let chunks = residual.chunks_exact(16);
+                let tail = chunks.remainder();
+                let mut lanes = [0.0_f32; 16];
+                for chunk in chunks {
+                    for lane in 0..16 {
+                        lanes[lane] += chunk[lane] * chunk[lane];
+                    }
+                }
+                let mut radius_squared = lanes.iter().sum::<f32>();
+                for &value in tail {
+                    radius_squared += value * value;
+                }
+                assert_eq!(
+                    batch.residual_norms_squared[row_index].to_bits(),
+                    radius_squared.to_bits(),
+                    "schedule={bits:?} row={row_index}"
+                );
+
+                let mut prefix_reconstruction = vec![0.0_f32; D];
+                for (layer, (spec, grid)) in specs.iter().zip(&grids).enumerate() {
+                    let rotation = Rotation::new(D, spec.seed);
+                    rotation.apply(&mut residual);
+                    rotation.apply(&mut prefix_reconstruction);
+
+                    let stride = if spec.bits == 1 {
+                        D.div_ceil(64) * std::mem::size_of::<u64>()
+                    } else {
+                        grid_plane::packed_len(D, spec.bits)
+                    };
+                    let codes =
+                        &batch.layers[layer].codes[row_index * stride..(row_index + 1) * stride];
+                    let scale = batch.layers[layer].scales[row_index];
+                    let contribution: Vec<f32> = if spec.bits == 1 {
+                        (0..D)
+                            .map(|i| {
+                                let byte = codes[i / 8];
+                                let sign = if byte & (1 << (i % 8)) != 0 {
+                                    1.0
+                                } else {
+                                    -1.0
+                                };
+                                scale * sign
+                            })
+                            .collect()
+                    } else {
+                        unpack_grid(codes, D, spec.bits)
+                            .into_iter()
+                            .map(|code| scale * grid.points[code as usize])
+                            .collect()
+                    };
+                    for ((residual, prefix), reconstruction) in residual
+                        .iter_mut()
+                        .zip(&mut prefix_reconstruction)
+                        .zip(contribution)
+                    {
+                        *prefix += reconstruction;
+                        *residual -= reconstruction;
+                    }
+
+                    let prefix_dot = residual
+                        .iter()
+                        .zip(&prefix_reconstruction)
+                        .map(|(&residual, &reconstruction)| {
+                            let reconstruction = f64::from(reconstruction);
+                            (f64::from(residual) + reconstruction) * reconstruction
+                        })
+                        .sum::<f64>();
+                    let raw_gamma = if radius_squared == 0.0 && prefix_dot == 0.0 {
+                        1.0
+                    } else {
+                        f64::from(radius_squared) / prefix_dot
+                    };
+                    let expected_gamma = f32_to_f16(raw_gamma.clamp(1.0, 4.0) as f32);
+                    assert_eq!(
+                        batch.layers[layer].gammas[row_index], expected_gamma,
+                        "schedule={bits:?} row={row_index} layer={layer}"
+                    );
+
+                    let stored_gamma = f64::from(f16_to_f32(expected_gamma));
+                    let corrected_error_norm_squared = residual
+                        .iter()
+                        .zip(&prefix_reconstruction)
+                        .map(|(&residual, &reconstruction)| {
+                            (f64::from(residual) + (1.0 - stored_gamma) * f64::from(reconstruction))
+                                .powi(2)
+                        })
+                        .sum::<f64>();
+                    let expected_error_ratio = f32_to_f16(
+                        (corrected_error_norm_squared / f64::from(radius_squared)) as f32,
+                    );
+                    assert_eq!(
+                        batch.layers[layer].corrected_error_ratios[row_index], expected_error_ratio,
+                        "schedule={bits:?} row={row_index} layer={layer}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_batch_zero_residual_metadata_is_canonical() {
         let d = 65;
         let specs = [
             LayerSpec {
@@ -1786,8 +2061,10 @@ mod tests {
             &specs,
             &grids,
         );
+        assert_eq!(batch.residual_norms_squared, [0.0]);
         for layer in batch.layers {
             assert_eq!(layer.gammas, [f32_to_f16(1.0)]);
+            assert_eq!(layer.corrected_error_ratios, [f32_to_f16(0.0)]);
         }
     }
 
@@ -1849,6 +2126,21 @@ mod tests {
     }
 
     #[test]
+    fn corrected_error_ratio_round_trip_is_unclamped() {
+        let zero = corrected_error_ratio_round_trip(0.0, 0.0);
+        assert_eq!(zero.raw, 0.0);
+        assert_eq!(zero.f16_value(), 0.0);
+
+        let fraction = corrected_error_ratio_round_trip(8.0, 3.0);
+        assert_eq!(fraction.raw, 0.375);
+        assert_eq!(fraction.f16_value(), 0.375);
+
+        let above_one = corrected_error_ratio_round_trip(1.0, 2.0);
+        assert_eq!(above_one.raw, 2.0);
+        assert_eq!(above_one.f16_value(), 2.0);
+    }
+
+    #[test]
     fn prefix_gamma_matches_rotated_odd_dimension_encoding() {
         let d = 100;
         let specs = [
@@ -1867,7 +2159,7 @@ mod tests {
         let residual: Vec<f32> = (0..d)
             .map(|i| ((i as f32 + 0.25) * 0.071).sin() * (1.0 + i as f32 / d as f32))
             .collect();
-        let audit = audit_prefix_gammas(&residual, &specs, &grids);
+        let audit = audit_prefix_error_model(&residual, &specs, &grids);
         let encoded = encode_layers(&residual, None, &specs, &grids);
 
         assert_eq!(audit.prefixes.len(), 2);
@@ -1876,7 +2168,7 @@ mod tests {
             .iter()
             .zip(encoded.scales.iter().zip(&encoded.codes).zip(&specs))
         {
-            assert_eq!(prefix.layer_scale_f16, scale);
+            assert_eq!(prefix.layer_scale, scale);
             assert_eq!(&prefix.codes, codes);
             let expected_stride = if spec.bits == 1 {
                 d.div_ceil(64) * std::mem::size_of::<u64>()
@@ -1884,22 +2176,15 @@ mod tests {
                 grid_plane::packed_len(d, spec.bits)
             };
             assert_eq!(prefix.codes.len(), expected_stride);
-            assert_eq!(
-                prefix.s_eff_sq.to_bits(),
-                (prefix.prefix_dot / d as f64).to_bits()
-            );
             assert_eq!(prefix.gamma.f16, f32_to_f16(prefix.gamma.clamped));
             assert!((1.0..=4.0).contains(&prefix.gamma.f16_value()));
+            assert_eq!(
+                prefix.corrected_error_ratio.f16,
+                f32_to_f16(prefix.corrected_error_ratio.raw as f32)
+            );
+            assert!(prefix.corrected_error_ratio.raw >= 0.0);
             assert_eq!(prefix.raw_prefix_reconstruction.len(), d);
         }
-        let derived_depth_two_scale_sq = f64::from(audit.prefixes[0].layer_raw_scale).powi(2)
-            * audit.prefixes[0].gamma.raw
-            / audit.prefixes[1].gamma.raw;
-        assert!(
-            (derived_depth_two_scale_sq / audit.prefixes[1].s_eff_sq - 1.0).abs() <= 1e-5,
-            "derived={derived_depth_two_scale_sq} direct={}",
-            audit.prefixes[1].s_eff_sq
-        );
         assert!((audit.prefixes[0].gamma.raw - std::f64::consts::FRAC_PI_2).abs() < 0.25);
         assert!((audit.prefixes[1].gamma.raw - 1.0).abs() < 0.05);
     }
@@ -1926,7 +2211,7 @@ mod tests {
         const SAMPLES: usize = 256;
         for _ in 0..SAMPLES {
             let residual = random_unit(&mut rng, d);
-            let audit = audit_prefix_gammas(&residual, &specs, &grids);
+            let audit = audit_prefix_error_model(&residual, &specs, &grids);
             gamma_one += audit.prefixes[0].gamma.raw;
             gamma_two += audit.prefixes[1].gamma.raw;
         }
@@ -1955,15 +2240,15 @@ mod tests {
             },
         ];
         let grids = [build_grid(d, 1), build_grid(d, 4)];
-        let audit = audit_prefix_gammas(&vec![0.0; d], &specs, &grids);
+        let audit = audit_prefix_error_model(&vec![0.0; d], &specs, &grids);
         assert_eq!(audit.norm_sq, 0.0);
         for prefix in audit.prefixes {
             assert_eq!(prefix.prefix_dot, 0.0);
-            assert_eq!(prefix.s_eff_sq, 0.0);
-            assert_eq!(prefix.layer_raw_scale, 0.0);
-            assert_eq!(prefix.layer_scale_f16, 0);
+            assert_eq!(prefix.layer_scale, 0.0);
             assert_eq!(prefix.gamma.raw, 1.0);
             assert_eq!(prefix.gamma.f16_value(), 1.0);
+            assert_eq!(prefix.corrected_error_ratio.raw, 0.0);
+            assert_eq!(prefix.corrected_error_ratio.f16_value(), 0.0);
         }
     }
 
@@ -2045,7 +2330,7 @@ mod tests {
         );
         let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.019).cos()).collect();
         let prepared = prepare_split_query(&query, &specs, &grids, 4);
-        let unit_scale = quant_model::f16::f32_to_f16(1.0);
+        let unit_scale = 1.0;
 
         for (layer, encoded) in encoded.layers.iter().enumerate() {
             let stride = encoded.codes.len() / rows;
@@ -2198,7 +2483,7 @@ mod tests {
         let rho = (error_energy / signal_energy).sqrt();
         assert!((rho - 0.0586).abs() <= 0.004, "rho={rho}");
         let empirical = empirical_sigma(&estimates, &truths);
-        let modeled = sigma_from_rho(grids[0].rho_model * grids[1].rho_model, d, DEFAULT_CAL);
+        let modeled = isotropic_sigma(grids[0].rho_model * grids[1].rho_model, d);
         assert!(
             (empirical / modeled - 1.0).abs() <= 0.05,
             "empirical={empirical}, model={modeled}"
@@ -2254,8 +2539,7 @@ mod tests {
                 }
             }
             let measured_rho = (error_energy / signal_energy).sqrt();
-            let sigma_ratio =
-                empirical_sigma(&estimates, &truths) / sigma_from_rho(model_rho, d, DEFAULT_CAL);
+            let sigma_ratio = empirical_sigma(&estimates, &truths) / isotropic_sigma(model_rho, d);
             println!(
                 "d={d} measured_rho={measured_rho:.9} model_rho={model_rho:.9} \
                  sigma_ratio={sigma_ratio:.9}"
@@ -2377,7 +2661,7 @@ mod tests {
         let count = fht::debug_apply_count();
         // Two centroid rotations per cluster plus, for each row and layer,
         // one residual rotation and one original-direction rotation used by
-        // cumulative gamma. This replaces the obsolete pre-gamma
+        // cumulative gamma. This is the complete production
         // `2 * rows + 2` bound without hiding the added exact metadata work.
         assert_eq!(count, 2 * 2 * rows + 2, "Rotation::apply count={count}");
     }

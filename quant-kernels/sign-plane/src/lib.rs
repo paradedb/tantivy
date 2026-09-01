@@ -65,14 +65,18 @@ pub fn unpack(bits: &[u64], d: usize) -> Vec<f32> {
 
 /// Encode signs and return the mean-absolute-value scale after f16 rounding.
 pub fn encode(y: &[f32], out_bits: &mut [u64]) -> u16 {
+    f32_to_f16(encode_f32(y, out_bits))
+}
+
+/// Encode signs and return the exact mean-absolute-value scale.
+pub fn encode_f32(y: &[f32], out_bits: &mut [u64]) -> f32 {
     assert!(!y.is_empty());
     assert_eq!(out_bits.len(), packed_words(y.len()));
     pack(y, out_bits);
     if y.iter().all(|&value| value == 0.0) {
-        return 0;
+        return 0.0;
     }
-    let scale = y.iter().map(|value| value.abs()).sum::<f32>() / y.len() as f32;
-    f32_to_f16(scale)
+    y.iter().map(|value| value.abs()).sum::<f32>() / y.len() as f32
 }
 
 /// Hamming distance between two sign-code vectors.
@@ -150,6 +154,10 @@ pub fn score_asym(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
 
 pub fn estimate_asym(x: &[u64], scale: u16, q: &QueryPlanes) -> f32 {
     f16_to_f32(scale) * estimate_asym_unscaled(x, q)
+}
+
+pub fn estimate_asym_f32(x: &[u64], scale: f32, q: &QueryPlanes) -> f32 {
+    scale * estimate_asym_unscaled(x, q)
 }
 
 /// Score one sign row without applying its stored scale.
@@ -281,6 +289,15 @@ pub fn estimate_asym_batch_unscaled_indexed(
 }
 
 pub fn estimate_fp(x: &[u64], scale: u16, query: &[f32]) -> f32 {
+    f16_to_f32(scale) * estimate_fp_unscaled(x, query)
+}
+
+pub fn estimate_fp_f32(x: &[u64], scale: f32, query: &[f32]) -> f32 {
+    scale * estimate_fp_unscaled(x, query)
+}
+
+/// Score a sign row against a full-precision query without applying its scale.
+pub fn estimate_fp_unscaled(x: &[u64], query: &[f32]) -> f32 {
     assert!(!query.is_empty());
     assert_eq!(x.len(), packed_words(query.len()));
     debug_assert!(tail_is_zero(x, query.len()));
@@ -295,7 +312,7 @@ pub fn estimate_fp(x: &[u64], scale: u16, query: &[f32]) -> f32 {
             }
         })
         .sum();
-    f16_to_f32(scale) * signed_dot
+    signed_dot
 }
 
 #[cfg(test)]

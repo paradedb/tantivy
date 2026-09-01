@@ -664,7 +664,7 @@ where
 {
     /// Create a new `TopNComputer`.
     /// Internally it will allocate a buffer of size `2 * top_n`.
-    pub fn new_with_comparator(top_n: usize, comparator: C) -> Self {
+    pub fn with_comparator(top_n: usize, comparator: C) -> Self {
         let vec_cap = top_n.max(1) * 2;
         TopNComputer {
             buffer: Vec::with_capacity(vec_cap),
@@ -674,6 +674,11 @@ where
             shared_threshold: None,
             segment_ord: 0,
         }
+    }
+
+    /// Create a new `TopNComputer` with an explicit comparator.
+    pub fn new_with_comparator(top_n: usize, comparator: C) -> Self {
+        Self::with_comparator(top_n, comparator)
     }
 
     /// Sets the current threshold.

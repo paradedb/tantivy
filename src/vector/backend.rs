@@ -6,9 +6,9 @@
 //! branches once, on whether the reader carries an [`IvfIndex`]: with it, the
 //! filter is drained into a bitmap and the routed clusters are probed
 //! adaptively; without it, the filter `Scorer` is iterated doc-by-doc and
-//! every vector is scored exactly. Either way, every survivor's bytes are
-//! fetched with one stride-sized read ([`VectorIndexReader::vector_bytes_for_row`])
-//! — the unit the pg-backed `Directory` can serve zero-copy.
+//! every vector is scored exactly. Exact rerank rows are sorted by storage
+//! row and fetched through a block-aware range plan, so scoring slices
+//! borrowed views without issuing a storage call per survivor.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -28,7 +28,7 @@ use super::distance::norm_squared_wide;
 use super::index_reader::{QuantizedLayerReader, VectorIndexReader};
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
 use super::prepared::{PreparedQuery, QuantizedQueryCache, QuantizedQueryCtx};
-use super::quantization::GAMMA_ANALYTICAL_SAFETY;
+use super::quantization::{GAMMA_ANALYTICAL_SAFETY, QUANTIZED_BOUNDARY_KAPPA};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
@@ -51,17 +51,6 @@ type TieBreakHeap<K, CTail> = TopNComputer<
     DocId,
     (NaturalComparator, CTail),
 >;
-
-/// Declared confidence policy: early boundaries use kappa=2, while a terminal
-/// grid boundary uses kappa=4. A terminal sign boundary remains kappa=2.
-#[inline]
-fn quantized_boundary_kappa(layer_idx: usize, active_layers: usize, bits: u8) -> f32 {
-    if layer_idx + 1 == active_layers && bits > 1 {
-        4.0
-    } else {
-        2.0
-    }
-}
 
 /// Per-segment vector search: the segment's [`VectorIndexReader`] plus the
 /// per-query state. Build via [`VectorBackend::for_segment`].
@@ -232,8 +221,7 @@ impl<T: VectorElement> VectorBackend<T> {
         // ascending-doc pushes).
         // `NaturalComparator` because similarity is "higher = better" — see
         // the note on `scan_clusters`.
-        let mut topn =
-            TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
+        let mut topn = TopNComputer::with_comparator(top_n, (NaturalComparator, tie_comparator));
         let alive = segment_reader.alive_bitset();
         let mut rows_read = 0usize;
         // Row reads are ranged and can fail; the `for_each` closure can't
@@ -768,7 +756,7 @@ struct QuantizedCandidate {
     raw_prefix: f32,
     estimate: f32,
     sigma: f32,
-    effective_scale_squared: f32,
+    residual_norm_squared: f32,
     gamma: f32,
     sign_query_error_term: f32,
 }
@@ -783,7 +771,7 @@ struct QuantizedCandidates {
     raw_prefixes: Vec<f32>,
     estimates: Vec<f32>,
     sigmas: Vec<f32>,
-    effective_scale_squared: Vec<f32>,
+    residual_norm_squared: Vec<f32>,
     gammas: Vec<f32>,
     sign_query_error_terms: Vec<f32>,
     eligibility: Vec<u8>,
@@ -798,7 +786,7 @@ impl QuantizedCandidates {
             raw_prefixes: Vec::with_capacity(capacity),
             estimates: Vec::with_capacity(capacity),
             sigmas: Vec::with_capacity(capacity),
-            effective_scale_squared: Vec::with_capacity(capacity),
+            residual_norm_squared: Vec::with_capacity(capacity),
             gammas: Vec::with_capacity(capacity),
             sign_query_error_terms: Vec::with_capacity(capacity),
             eligibility: Vec::with_capacity(capacity),
@@ -820,7 +808,7 @@ impl QuantizedCandidates {
         raw_prefix: f32,
         estimate: f32,
         sigma: f32,
-        effective_scale_squared: f32,
+        residual_norm_squared: f32,
         gamma: f32,
         sign_query_error_term: f32,
     ) {
@@ -830,7 +818,7 @@ impl QuantizedCandidates {
         self.raw_prefixes.push(raw_prefix);
         self.estimates.push(estimate);
         self.sigmas.push(sigma);
-        self.effective_scale_squared.push(effective_scale_squared);
+        self.residual_norm_squared.push(residual_norm_squared);
         self.gammas.push(gamma);
         self.sign_query_error_terms.push(sign_query_error_term);
         self.eligibility.push(1);
@@ -845,7 +833,7 @@ impl QuantizedCandidates {
         raw_prefixes: &[f32],
         estimates: &[f32],
         sigmas: &[f32],
-        effective_scales_squared: &[f32],
+        residual_norms_squared: &[f32],
         gammas: &[f32],
         sign_query_error_terms: &[f32],
     ) {
@@ -855,7 +843,7 @@ impl QuantizedCandidates {
         debug_assert_eq!(raw_prefixes.len(), len);
         debug_assert_eq!(estimates.len(), len);
         debug_assert_eq!(sigmas.len(), len);
-        debug_assert_eq!(effective_scales_squared.len(), len);
+        debug_assert_eq!(residual_norms_squared.len(), len);
         debug_assert_eq!(gammas.len(), len);
         debug_assert_eq!(sign_query_error_terms.len(), len);
         self.rows.extend(rows);
@@ -864,8 +852,8 @@ impl QuantizedCandidates {
         self.raw_prefixes.extend_from_slice(raw_prefixes);
         self.estimates.extend_from_slice(estimates);
         self.sigmas.extend_from_slice(sigmas);
-        self.effective_scale_squared
-            .extend_from_slice(effective_scales_squared);
+        self.residual_norm_squared
+            .extend_from_slice(residual_norms_squared);
         self.gammas.extend_from_slice(gammas);
         self.sign_query_error_terms
             .extend_from_slice(sign_query_error_terms);
@@ -885,7 +873,7 @@ impl QuantizedCandidates {
             raw_prefix: self.raw_prefixes[index],
             estimate: self.estimates[index],
             sigma: self.sigmas[index],
-            effective_scale_squared: self.effective_scale_squared[index],
+            residual_norm_squared: self.residual_norm_squared[index],
             gamma: self.gammas[index],
             sign_query_error_term: self.sign_query_error_terms[index],
         }
@@ -898,7 +886,7 @@ impl QuantizedCandidates {
         self.raw_prefixes.clear();
         self.estimates.clear();
         self.sigmas.clear();
-        self.effective_scale_squared.clear();
+        self.residual_norm_squared.clear();
         self.gammas.clear();
         self.sign_query_error_terms.clear();
         self.eligibility.clear();
@@ -908,7 +896,7 @@ impl QuantizedCandidates {
         self.raw_prefixes.reserve(survivors.len());
         self.estimates.reserve(survivors.len());
         self.sigmas.reserve(survivors.len());
-        self.effective_scale_squared.reserve(survivors.len());
+        self.residual_norm_squared.reserve(survivors.len());
         self.gammas.reserve(survivors.len());
         self.sign_query_error_terms.reserve(survivors.len());
         self.eligibility.reserve(survivors.len());
@@ -920,7 +908,7 @@ impl QuantizedCandidates {
                 survivor.raw_prefix,
                 survivor.estimate,
                 survivor.sigma,
-                survivor.effective_scale_squared,
+                survivor.residual_norm_squared,
                 survivor.gamma,
                 survivor.sign_query_error_term,
             );
@@ -955,31 +943,34 @@ fn decode_f32s(bytes: &[u8], decoded: &mut Vec<f32>) {
     }
 }
 
-/// Pass C: analytical gamma uncertainty over f32-only SoA columns.
+/// Pass C: exact corrected-reconstruction uncertainty over f32-only SoA columns.
 #[inline(always)]
 fn fill_gamma_sigmas(
     sigmas: &mut [f32],
-    effective_scales_squared: &[f32],
+    residual_norms_squared: &[f32],
     gammas: &[f32],
+    error_ratios: &[f32],
     sign_query_error_terms: &[f32],
     score_query_norm_squared: f32,
+    inverse_dimension: f32,
     metric_factor: f32,
 ) {
-    debug_assert_eq!(sigmas.len(), effective_scales_squared.len());
+    debug_assert_eq!(sigmas.len(), residual_norms_squared.len());
     debug_assert_eq!(sigmas.len(), gammas.len());
+    debug_assert_eq!(sigmas.len(), error_ratios.len());
     debug_assert_eq!(sigmas.len(), sign_query_error_terms.len());
-    for (((sigma, &effective_scale_squared), &gamma), &sign_query_error_term) in sigmas
-        .iter_mut()
-        .zip(effective_scales_squared)
-        .zip(gammas)
-        .zip(sign_query_error_terms)
+    for ((((sigma, &residual_norm_squared), &gamma), &error_ratio), &sign_query_error_term) in
+        sigmas
+            .iter_mut()
+            .zip(residual_norms_squared)
+            .zip(gammas)
+            .zip(error_ratios)
+            .zip(sign_query_error_terms)
     {
         let data_variance =
-            effective_scale_squared * gamma * (gamma - 1.0) * score_query_norm_squared;
+            residual_norm_squared * inverse_dimension * error_ratio * score_query_norm_squared;
         let query_variance = gamma * gamma * sign_query_error_term;
-        *sigma = metric_factor
-            * GAMMA_ANALYTICAL_SAFETY
-            * (data_variance + query_variance).max(0.0).sqrt();
+        *sigma = metric_factor * GAMMA_ANALYTICAL_SAFETY * (data_variance + query_variance).sqrt();
     }
 }
 
@@ -987,14 +978,16 @@ fn fill_gamma_sigmas(
 #[inline(always)]
 fn combine_initial_decoded(
     metric: Metric,
+    dimension: usize,
     kernel_scores: &mut [f32],
     bases: &mut [f32],
     estimates: &mut [f32],
     sigmas: &mut [f32],
-    effective_scales_squared: &mut [f32],
+    residual_norms_squared: &mut [f32],
     sign_query_error_terms: &mut [f32],
     decoded_scales: &[f32],
     decoded_gammas: &[f32],
+    decoded_error_ratios: &[f32],
     decoded_constants: &[f32],
     decoded_residual_norms: &[f32],
     cluster_score: f32,
@@ -1003,23 +996,24 @@ fn combine_initial_decoded(
 ) {
     debug_assert_eq!(kernel_scores.len(), decoded_scales.len());
     debug_assert_eq!(kernel_scores.len(), decoded_gammas.len());
+    debug_assert_eq!(kernel_scores.len(), decoded_error_ratios.len());
+    debug_assert_eq!(kernel_scores.len(), decoded_residual_norms.len());
     debug_assert_eq!(bases.len(), decoded_scales.len());
     debug_assert_eq!(estimates.len(), decoded_scales.len());
     debug_assert_eq!(sigmas.len(), decoded_scales.len());
-    debug_assert_eq!(effective_scales_squared.len(), decoded_scales.len());
+    debug_assert_eq!(residual_norms_squared.len(), decoded_scales.len());
     debug_assert_eq!(sign_query_error_terms.len(), decoded_scales.len());
     let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
     match metric {
         Metric::L2 => {
             debug_assert_eq!(decoded_constants.len(), decoded_scales.len());
-            debug_assert_eq!(decoded_residual_norms.len(), decoded_scales.len());
             // Pass B: keep the exact metric base separate from the raw
             // residual prefix. Gamma corrects only the latter.
             for (
                 (
                     (
                         (
-                            (((raw_prefix, base), estimate), effective_scale_squared),
+                            (((raw_prefix, base), estimate), residual_norm_squared),
                             sign_query_error_term,
                         ),
                         &scale,
@@ -1031,108 +1025,168 @@ fn combine_initial_decoded(
                 .iter_mut()
                 .zip(bases.iter_mut())
                 .zip(estimates.iter_mut())
-                .zip(effective_scales_squared.iter_mut())
+                .zip(residual_norms_squared.iter_mut())
                 .zip(sign_query_error_terms.iter_mut())
                 .zip(decoded_scales)
                 .zip(decoded_gammas)
                 .zip(decoded_constants.iter().zip(decoded_residual_norms))
             {
-                let scale_squared = scale * scale;
                 *raw_prefix = scale.mul_add(*raw_prefix, -constant);
                 *base = cluster_score - residual_norm_sq;
                 *estimate = (metric_factor * gamma).mul_add(*raw_prefix, *base);
-                *effective_scale_squared = scale_squared;
-                *sign_query_error_term = scale_squared * sign_query_error_squared;
+                *residual_norm_squared = residual_norm_sq;
+                *sign_query_error_term = scale * scale * sign_query_error_squared;
             }
         }
         Metric::Dot | Metric::Cosine => {
             for (
                 (
                     (
-                        (((raw_prefix, base), estimate), effective_scale_squared),
-                        sign_query_error_term,
+                        (
+                            (((raw_prefix, base), estimate), residual_norm_squared),
+                            sign_query_error_term,
+                        ),
+                        &scale,
                     ),
-                    &scale,
+                    &gamma,
                 ),
-                &gamma,
+                &residual_norm_sq,
             ) in kernel_scores
                 .iter_mut()
                 .zip(bases.iter_mut())
                 .zip(estimates.iter_mut())
-                .zip(effective_scales_squared.iter_mut())
+                .zip(residual_norms_squared.iter_mut())
                 .zip(sign_query_error_terms.iter_mut())
                 .zip(decoded_scales)
                 .zip(decoded_gammas)
+                .zip(decoded_residual_norms)
             {
-                let scale_squared = scale * scale;
                 *raw_prefix *= scale;
                 *base = cluster_score;
                 *estimate = gamma.mul_add(*raw_prefix, *base);
-                *effective_scale_squared = scale_squared;
-                *sign_query_error_term = scale_squared * sign_query_error_squared;
+                *residual_norm_squared = residual_norm_sq;
+                *sign_query_error_term = scale * scale * sign_query_error_squared;
             }
         }
     }
     fill_gamma_sigmas(
         sigmas,
-        effective_scales_squared,
+        residual_norms_squared,
         decoded_gammas,
+        decoded_error_ratios,
         sign_query_error_terms,
         score_query_norm_squared,
+        1.0 / dimension as f32,
         metric_factor,
     );
 }
 
-/// Criterion-only entry for the complete plane-1 cluster shape. The feature
+/// Criterion-only entry for the complete layer-0 cluster shape. The feature
 /// gate keeps this receipt out of the default public API while the function
 /// itself reuses the production kernel, scale decoder, and combine passes.
 #[cfg(feature = "quantization-bench")]
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-pub fn quantization_bench_plane1_cosine_cluster(
+pub fn quantization_bench_layer0_cosine_cluster(
+    dimension: usize,
     prepared: &cascade::PreparedSplitQuery,
     spec: cascade::LayerSpec,
     codes: &[u8],
     code_stride: usize,
     scales: &[u8],
     gammas: &[u8],
+    error_ratios: &[u8],
+    residual_norms: &[u8],
     cluster_score: f32,
     score_query_norm_squared: f32,
     sign_query_error_squared: f32,
     kernel_scores: &mut Vec<f32>,
     decoded_scales: &mut Vec<f32>,
     decoded_gammas: &mut Vec<f32>,
+    decoded_error_ratios: &mut Vec<f32>,
+    decoded_residual_norms: &mut Vec<f32>,
     bases: &mut Vec<f32>,
     estimates: &mut Vec<f32>,
     sigmas: &mut Vec<f32>,
-    effective_scales_squared: &mut Vec<f32>,
+    residual_norms_squared: &mut Vec<f32>,
     sign_query_error_terms: &mut Vec<f32>,
 ) -> f32 {
-    let rows = scales.len() / std::mem::size_of::<u16>();
+    let rows = scales.len() / std::mem::size_of::<f32>();
     assert_eq!(codes.len(), rows * code_stride);
     assert_eq!(gammas.len(), rows * std::mem::size_of::<u16>());
+    assert_eq!(error_ratios.len(), rows * std::mem::size_of::<u16>());
+    assert_eq!(residual_norms.len(), rows * std::mem::size_of::<f32>());
     kernel_scores.resize(rows, 0.0);
     prepared.score_layer_batch_unscaled(0, codes, code_stride, spec, kernel_scores);
-    decode_f16s(scales, decoded_scales);
+    decode_f32s(scales, decoded_scales);
+    finish_quantization_bench_layer0_cosine_cluster(
+        dimension,
+        rows,
+        gammas,
+        error_ratios,
+        residual_norms,
+        cluster_score,
+        score_query_norm_squared,
+        sign_query_error_squared,
+        kernel_scores,
+        decoded_scales,
+        decoded_gammas,
+        decoded_error_ratios,
+        decoded_residual_norms,
+        bases,
+        estimates,
+        sigmas,
+        residual_norms_squared,
+        sign_query_error_terms,
+    )
+}
+
+#[cfg(feature = "quantization-bench")]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn finish_quantization_bench_layer0_cosine_cluster(
+    dimension: usize,
+    rows: usize,
+    gammas: &[u8],
+    error_ratios: &[u8],
+    residual_norms: &[u8],
+    cluster_score: f32,
+    score_query_norm_squared: f32,
+    sign_query_error_squared: f32,
+    kernel_scores: &mut Vec<f32>,
+    decoded_scales: &mut Vec<f32>,
+    decoded_gammas: &mut Vec<f32>,
+    decoded_error_ratios: &mut Vec<f32>,
+    decoded_residual_norms: &mut Vec<f32>,
+    bases: &mut Vec<f32>,
+    estimates: &mut Vec<f32>,
+    sigmas: &mut Vec<f32>,
+    residual_norms_squared: &mut Vec<f32>,
+    sign_query_error_terms: &mut Vec<f32>,
+) -> f32 {
     decode_f16s(gammas, decoded_gammas);
+    decode_f16s(error_ratios, decoded_error_ratios);
+    decode_f32s(residual_norms, decoded_residual_norms);
     bases.resize(rows, 0.0);
     estimates.resize(rows, 0.0);
     sigmas.resize(rows, 0.0);
-    effective_scales_squared.resize(rows, 0.0);
+    residual_norms_squared.resize(rows, 0.0);
     sign_query_error_terms.resize(rows, 0.0);
     combine_initial_decoded(
         Metric::Cosine,
+        dimension,
         kernel_scores,
         bases,
         estimates,
         sigmas,
-        effective_scales_squared,
+        residual_norms_squared,
         sign_query_error_terms,
         decoded_scales,
         decoded_gammas,
+        decoded_error_ratios,
         &[],
-        &[],
+        decoded_residual_norms,
         cluster_score,
         score_query_norm_squared,
         sign_query_error_squared,
@@ -1141,6 +1195,67 @@ pub fn quantization_bench_plane1_cosine_cluster(
     // One value from every output stream makes the writes observable without
     // adding a reduction to the measured per-row loop shape.
     kernel_scores[rows - 1] + estimates[rows - 1] + sigmas[rows - 1]
+}
+
+/// Criterion-only comparison entry for a binary16 scale run. All other
+/// inputs and combine work are identical to
+/// [`quantization_bench_layer0_cosine_cluster`].
+#[cfg(feature = "quantization-bench")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub fn quantization_bench_layer0_cosine_cluster_f16_scales(
+    dimension: usize,
+    prepared: &cascade::PreparedSplitQuery,
+    spec: cascade::LayerSpec,
+    codes: &[u8],
+    code_stride: usize,
+    scales: &[u8],
+    gammas: &[u8],
+    error_ratios: &[u8],
+    residual_norms: &[u8],
+    cluster_score: f32,
+    score_query_norm_squared: f32,
+    sign_query_error_squared: f32,
+    kernel_scores: &mut Vec<f32>,
+    decoded_scales: &mut Vec<f32>,
+    decoded_gammas: &mut Vec<f32>,
+    decoded_error_ratios: &mut Vec<f32>,
+    decoded_residual_norms: &mut Vec<f32>,
+    bases: &mut Vec<f32>,
+    estimates: &mut Vec<f32>,
+    sigmas: &mut Vec<f32>,
+    residual_norms_squared: &mut Vec<f32>,
+    sign_query_error_terms: &mut Vec<f32>,
+) -> f32 {
+    let rows = scales.len() / std::mem::size_of::<u16>();
+    assert_eq!(codes.len(), rows * code_stride);
+    assert_eq!(gammas.len(), rows * std::mem::size_of::<u16>());
+    assert_eq!(error_ratios.len(), rows * std::mem::size_of::<u16>());
+    assert_eq!(residual_norms.len(), rows * std::mem::size_of::<f32>());
+    kernel_scores.resize(rows, 0.0);
+    prepared.score_layer_batch_unscaled(0, codes, code_stride, spec, kernel_scores);
+    decode_f16s(scales, decoded_scales);
+    finish_quantization_bench_layer0_cosine_cluster(
+        dimension,
+        rows,
+        gammas,
+        error_ratios,
+        residual_norms,
+        cluster_score,
+        score_query_norm_squared,
+        sign_query_error_squared,
+        kernel_scores,
+        decoded_scales,
+        decoded_gammas,
+        decoded_error_ratios,
+        decoded_residual_norms,
+        bases,
+        estimates,
+        sigmas,
+        residual_norms_squared,
+        sign_query_error_terms,
+    )
 }
 
 const COSINE_REFINEMENT_BATCH_ROWS: usize = 2_048;
@@ -1154,11 +1269,13 @@ fn cosine_refinement_batches(row_count: usize) -> impl Iterator<Item = Range<usi
 #[inline(always)]
 fn combine_refinement_decoded(
     metric: Metric,
+    dimension: usize,
     candidates: &mut QuantizedCandidates,
     candidate_range: Range<usize>,
     kernel_scores: &[f32],
     decoded_scales: &[f32],
     decoded_gammas: &[f32],
+    decoded_error_ratios: &[f32],
     decoded_constants: &[f32],
     score_query_norm_squared: f32,
     sign_query_error_squared: f32,
@@ -1167,10 +1284,11 @@ fn combine_refinement_decoded(
     debug_assert_eq!(kernel_scores.len(), rows);
     debug_assert_eq!(decoded_scales.len(), rows);
     debug_assert_eq!(decoded_gammas.len(), rows);
+    debug_assert_eq!(decoded_error_ratios.len(), rows);
     let bases = &candidates.bases[candidate_range.clone()];
     let raw_prefixes = &mut candidates.raw_prefixes[candidate_range.clone()];
     let estimates = &mut candidates.estimates[candidate_range.clone()];
-    let effective_scales_squared = &mut candidates.effective_scale_squared[candidate_range.clone()];
+    let residual_norms_squared = &candidates.residual_norm_squared[candidate_range.clone()];
     let current_gammas = &mut candidates.gammas[candidate_range.clone()];
     let sign_query_error_terms = &mut candidates.sign_query_error_terms[candidate_range.clone()];
     let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
@@ -1180,13 +1298,7 @@ fn combine_refinement_decoded(
             for (
                 (
                     (
-                        (
-                            (
-                                (((raw_prefix, estimate), effective_scale_squared), current_gamma),
-                                sign_query_error_term,
-                            ),
-                            &base,
-                        ),
+                        ((((raw_prefix, estimate), current_gamma), sign_query_error_term), &base),
                         &kernel_score,
                     ),
                     (&scale, &gamma),
@@ -1195,7 +1307,6 @@ fn combine_refinement_decoded(
             ) in raw_prefixes
                 .iter_mut()
                 .zip(estimates.iter_mut())
-                .zip(effective_scales_squared.iter_mut())
                 .zip(current_gammas.iter_mut())
                 .zip(sign_query_error_terms.iter_mut())
                 .zip(bases)
@@ -1203,7 +1314,6 @@ fn combine_refinement_decoded(
                 .zip(decoded_scales.iter().zip(decoded_gammas))
                 .zip(decoded_constants)
             {
-                *effective_scale_squared *= *current_gamma / gamma;
                 *current_gamma = gamma;
                 *sign_query_error_term += scale * scale * sign_query_error_squared;
                 *raw_prefix = scale.mul_add(kernel_score, *raw_prefix - constant);
@@ -1213,27 +1323,19 @@ fn combine_refinement_decoded(
         Metric::Dot | Metric::Cosine => {
             for (
                 (
-                    (
-                        (
-                            (((raw_prefix, estimate), effective_scale_squared), current_gamma),
-                            sign_query_error_term,
-                        ),
-                        &base,
-                    ),
+                    ((((raw_prefix, estimate), current_gamma), sign_query_error_term), &base),
                     &kernel_score,
                 ),
                 (&scale, &gamma),
             ) in raw_prefixes
                 .iter_mut()
                 .zip(estimates.iter_mut())
-                .zip(effective_scales_squared.iter_mut())
                 .zip(current_gammas.iter_mut())
                 .zip(sign_query_error_terms.iter_mut())
                 .zip(bases)
                 .zip(kernel_scores)
                 .zip(decoded_scales.iter().zip(decoded_gammas))
             {
-                *effective_scale_squared *= *current_gamma / gamma;
                 *current_gamma = gamma;
                 *sign_query_error_term += scale * scale * sign_query_error_squared;
                 *raw_prefix = scale.mul_add(kernel_score, *raw_prefix);
@@ -1243,10 +1345,12 @@ fn combine_refinement_decoded(
     }
     fill_gamma_sigmas(
         &mut candidates.sigmas[candidate_range],
-        effective_scales_squared,
+        residual_norms_squared,
         current_gammas,
+        decoded_error_ratios,
         sign_query_error_terms,
         score_query_norm_squared,
+        1.0 / dimension as f32,
         metric_factor,
     );
 }
@@ -1268,6 +1372,7 @@ fn apply_refinement_planned(
     kernel_scores: &mut Vec<f32>,
     decoded_scales: &mut Vec<f32>,
     decoded_gammas: &mut Vec<f32>,
+    decoded_error_ratios: &mut Vec<f32>,
     decoded_constants: &mut Vec<f32>,
     read_ranges: &mut Vec<Range<usize>>,
     block_scratch: &mut Vec<(usize, usize)>,
@@ -1281,6 +1386,7 @@ fn apply_refinement_planned(
     kernel_scores.resize(rows, 0.0);
     decoded_scales.resize(rows, 0.0);
     decoded_gammas.resize(rows, 0.0);
+    decoded_error_ratios.resize(rows, 0.0);
     if metric == Metric::L2 {
         decoded_constants.resize(rows, 0.0);
     }
@@ -1322,8 +1428,8 @@ fn apply_refinement_planned(
     }
     debug_assert_eq!(selected_start, rows);
 
-    // Pass A: decode the paired scale and cumulative-gamma runs according to
-    // the blocked sidecar's own page plan.
+    // Pass A: decode scale, cumulative gamma, and corrected-error ratio
+    // according to the blocked sidecar's own page plan.
     layer.plan_sidecar_reads(
         available_rows.clone(),
         &candidates.rows[candidate_range.clone()],
@@ -1332,19 +1438,25 @@ fn apply_refinement_planned(
     );
     selected_start = 0;
     for read_range in read_ranges.iter().cloned() {
-        let sidecar = layer.read_scale_gamma(read_range.clone())?;
+        let sidecar = layer.read_sidecar(read_range.clone())?;
         while selected_start < rows
             && candidates.rows[candidate_range.start + selected_start] < read_range.end
         {
             let row = candidates.rows[candidate_range.start + selected_start];
             debug_assert!(row >= read_range.start);
-            let offset = (row - read_range.start) * std::mem::size_of::<u16>();
-            let scale_bits =
-                sidecar.scales()[offset] as u16 | (sidecar.scales()[offset + 1] as u16) << 8;
-            let gamma_bits =
-                sidecar.gammas()[offset] as u16 | (sidecar.gammas()[offset + 1] as u16) << 8;
-            decoded_scales[selected_start] = f16_to_f32(scale_bits);
+            let scale_offset = (row - read_range.start) * std::mem::size_of::<f32>();
+            let scale_bits = sidecar.scales()[scale_offset] as u32
+                | (sidecar.scales()[scale_offset + 1] as u32) << 8
+                | (sidecar.scales()[scale_offset + 2] as u32) << 16
+                | (sidecar.scales()[scale_offset + 3] as u32) << 24;
+            let gamma_offset = (row - read_range.start) * std::mem::size_of::<u16>();
+            let gamma_bits = sidecar.gammas()[gamma_offset] as u16
+                | (sidecar.gammas()[gamma_offset + 1] as u16) << 8;
+            let error_ratio_bits = sidecar.error_ratios()[gamma_offset] as u16
+                | (sidecar.error_ratios()[gamma_offset + 1] as u16) << 8;
+            decoded_scales[selected_start] = f32::from_bits(scale_bits);
             decoded_gammas[selected_start] = f16_to_f32(gamma_bits);
+            decoded_error_ratios[selected_start] = f16_to_f32(error_ratio_bits);
             selected_start += 1;
         }
     }
@@ -1356,10 +1468,14 @@ fn apply_refinement_planned(
             &candidates.rows[candidate_range.clone()],
             read_ranges,
             block_scratch,
-        );
+        )?;
         selected_start = 0;
         for read_range in read_ranges.iter().cloned() {
-            let constants = layer.read_constants(read_range.clone())?;
+            let constants = layer.read_constants(read_range.clone())?.ok_or_else(|| {
+                TantivyError::DataCorruption(DataCorruption::comment_only(
+                    "quantized L2 field is missing a constants slot",
+                ))
+            })?;
             while selected_start < rows
                 && candidates.rows[candidate_range.start + selected_start] < read_range.end
             {
@@ -1392,26 +1508,18 @@ fn apply_refinement_planned(
     };
     combine_refinement_decoded(
         metric,
+        query.index.config.dim,
         candidates,
         candidate_range,
         &kernel_scores[..rows],
         &decoded_scales[..rows],
         &decoded_gammas[..rows],
+        &decoded_error_ratios[..rows],
         decoded_constants,
         query_norm * query_norm,
         sign_query_error_squared,
     );
     Ok(())
-}
-
-#[cfg(test)]
-#[inline]
-fn quantized_layer_constant(metric: Metric, stored: f32) -> f32 {
-    if metric == Metric::L2 {
-        stored
-    } else {
-        0.0
-    }
 }
 
 struct QuantizedScanCtx {
@@ -1424,7 +1532,7 @@ struct QuantizedScanCtx {
     best_docs: Vec<DocId>,
     /// Best distinct-document rows seen so far, descending by estimate. This
     /// is updated once per completed cluster for the admission bound; the
-    /// exact boundary still uses `kth_scratch` once after plane 1.
+    /// exact boundary still uses `kth_scratch` once after layer 0.
     bound_top: Vec<usize>,
     /// Cluster-local selection scratch populated only after the complete
     /// numeric batch and eligibility pass.
@@ -1432,7 +1540,7 @@ struct QuantizedScanCtx {
     cluster_top_n: usize,
     cluster_start: Option<usize>,
     /// Reused O(k) merge scratch. Replica matching happens here, once per
-    /// cluster, never in the dense plane-1 append loop.
+    /// cluster, never in the dense layer-0 append loop.
     bound_merge: Vec<usize>,
     kth_scratch: Vec<usize>,
     work_spent: WorkUnits,
@@ -1483,7 +1591,7 @@ impl QuantizedScanCtx {
         raw_prefix: f32,
         estimate: f32,
         sigma: f32,
-        effective_scale_squared: f32,
+        residual_norm_squared: f32,
         gamma: f32,
         sign_query_error_term: f32,
     ) {
@@ -1494,7 +1602,7 @@ impl QuantizedScanCtx {
             raw_prefix,
             estimate,
             sigma,
-            effective_scale_squared,
+            residual_norm_squared,
             gamma,
             sign_query_error_term,
         );
@@ -1660,7 +1768,7 @@ impl QuantizedScanCtx {
                 .all(|(&estimate, &sigma)| estimate.is_finite() && sigma.is_finite()),
             "quantized boundary inputs must be finite"
         );
-        // Replica winner selection is boundary work. Plane-1 append and
+        // Replica winner selection is boundary work. Layer-0 append and
         // refinement retain every membership without per-row hashing.
         self.rebuild_best_by_doc();
         let distinct_len = if self.dedup_docs {
@@ -1807,12 +1915,13 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut kernel_scores = Vec::new();
         let mut decoded_scales = Vec::new();
         let mut decoded_gammas = Vec::new();
+        let mut decoded_error_ratios = Vec::new();
         let mut decoded_constants = Vec::new();
         let mut decoded_residual_norms = Vec::new();
         let mut base_scores = Vec::new();
         let mut estimate_scores = Vec::new();
         let mut sigma_scores = Vec::new();
-        let mut effective_scale_squared_scores = Vec::new();
+        let mut residual_norm_squared_scores = Vec::new();
         let mut sign_query_error_terms = Vec::new();
         let mut survivor_rows = Vec::new();
         let mut survivor_read_ranges = Vec::new();
@@ -1848,7 +1957,7 @@ impl<T: VectorElement> VectorBackend<T> {
             }
             let cluster = node as usize;
             let query_bound = admission_gate_enabled
-                .then(|| scan.running_pessimistic_kth(top_n, 2.0))
+                .then(|| scan.running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA))
                 .flatten()
                 .map_or(QueryBound::Filling, |score| QueryBound::Armed {
                     t: to_bound_space(metric, score),
@@ -1876,14 +1985,9 @@ impl<T: VectorElement> VectorBackend<T> {
             scan.work_spent += pricing.open;
             let score_query_norm = query.score_query_norm(sim.score());
             let rows = index.cluster_range(cluster);
-            let needs_l2_rows = metric == Metric::L2;
-            let layer = quantized.layers()[0].read_batch(rows.clone(), needs_l2_rows)?;
-            let residual_norms = if needs_l2_rows {
-                quantized.read_residual_norm_batch(rows.clone())?
-            } else {
-                None
-            };
-            let batch_rows = layer.scales().len() / std::mem::size_of::<u16>();
+            let layer = quantized.layers()[0].read_batch(rows.clone())?;
+            let residual_norms = quantized.read_residual_norm_batch(rows.clone())?;
+            let batch_rows = layer.scales().len() / std::mem::size_of::<f32>();
             kernel_scores.resize(batch_rows, 0.0);
             query.score_layer_batch_unscaled(
                 0,
@@ -1894,33 +1998,36 @@ impl<T: VectorElement> VectorBackend<T> {
 
             // Pass A: isolate all byte/integer decoding from the floating
             // combine loops and reuse the same scratch across clusters.
-            decode_f16s(layer.scales(), &mut decoded_scales);
+            decode_f32s(layer.scales(), &mut decoded_scales);
             decode_f16s(layer.gammas(), &mut decoded_gammas);
-            if needs_l2_rows {
-                decode_f32s(layer.constants(), &mut decoded_constants);
-                let residual_norms = residual_norms.as_ref().ok_or_else(|| {
+            decode_f16s(layer.error_ratios(), &mut decoded_error_ratios);
+            decode_f32s(residual_norms.as_bytes(), &mut decoded_residual_norms);
+            if metric == Metric::L2 {
+                let constants = layer.constants().ok_or_else(|| {
                     TantivyError::DataCorruption(DataCorruption::comment_only(
-                        "quantized L2 field is missing residual-norm slot 14",
+                        "quantized L2 field is missing a constants slot",
                     ))
                 })?;
-                decode_f32s(residual_norms.as_bytes(), &mut decoded_residual_norms);
+                decode_f32s(constants, &mut decoded_constants);
             }
             base_scores.resize(batch_rows, 0.0);
             estimate_scores.resize(batch_rows, 0.0);
             sigma_scores.resize(batch_rows, 0.0);
-            effective_scale_squared_scores.resize(batch_rows, 0.0);
+            residual_norm_squared_scores.resize(batch_rows, 0.0);
             sign_query_error_terms.resize(batch_rows, 0.0);
             let cluster_score = sim.score();
             combine_initial_decoded(
                 metric,
+                query.index.config.dim,
                 &mut kernel_scores,
                 &mut base_scores,
                 &mut estimate_scores,
                 &mut sigma_scores,
-                &mut effective_scale_squared_scores,
+                &mut residual_norm_squared_scores,
                 &mut sign_query_error_terms,
                 &decoded_scales,
                 &decoded_gammas,
+                &decoded_error_ratios,
                 &decoded_constants,
                 &decoded_residual_norms,
                 cluster_score,
@@ -1944,7 +2051,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 &kernel_scores[..batch_rows],
                 &estimate_scores[..batch_rows],
                 &sigma_scores[..batch_rows],
-                &effective_scale_squared_scores[..batch_rows],
+                &residual_norm_squared_scores[..batch_rows],
                 &decoded_gammas[..batch_rows],
                 &sign_query_error_terms[..batch_rows],
             );
@@ -1987,10 +2094,7 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.vectors_visited += visited;
         stats.pruned_filter += pruned_filter;
         stats.pruned_dead += pruned_dead;
-        scan.band(
-            top_n,
-            quantized_boundary_kappa(0, scan_levels, query.index.specs[0].bits),
-        );
+        scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
         #[cfg(test)]
         stats
             .quantized_trace
@@ -2030,6 +2134,7 @@ impl<T: VectorElement> VectorBackend<T> {
                         &mut kernel_scores,
                         &mut decoded_scales,
                         &mut decoded_gammas,
+                        &mut decoded_error_ratios,
                         &mut decoded_constants,
                         &mut survivor_read_ranges,
                         &mut survivor_block_scratch,
@@ -2039,7 +2144,7 @@ impl<T: VectorElement> VectorBackend<T> {
             } else {
                 // L2 retains cluster-local query-residual norms. Dot keeps the
                 // same cluster-local scheduling; only cosine is authorized to
-                // cross cluster boundaries in v1.
+                // cross cluster boundaries.
                 let mut candidate_start = 0;
                 let mut cluster = 0;
                 while candidate_start < scan.candidates.len() {
@@ -2084,6 +2189,7 @@ impl<T: VectorElement> VectorBackend<T> {
                         &mut kernel_scores,
                         &mut decoded_scales,
                         &mut decoded_gammas,
+                        &mut decoded_error_ratios,
                         &mut decoded_constants,
                         &mut survivor_read_ranges,
                         &mut survivor_block_scratch,
@@ -2099,10 +2205,8 @@ impl<T: VectorElement> VectorBackend<T> {
                 layer_start.elapsed().as_nanos() as u64,
             );
             let boundary_start = Instant::now();
-            let kappa =
-                quantized_boundary_kappa(layer_idx, scan_levels, query.index.specs[layer_idx].bits);
             let boundary_stage = enter_vector_stage(Stage::Boundary(layer_idx as u8));
-            scan.band(top_n, kappa);
+            scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
             #[cfg(test)]
             stats
                 .quantized_trace
@@ -2150,23 +2254,23 @@ impl<T: VectorElement> VectorBackend<T> {
             stats.quantized_trace.rerank_docs.sort_unstable();
             stats.quantized_trace.rerank_docs.dedup();
         }
+        let rerank_rows = rerank.iter().map(|&(row, _)| row).collect::<Vec<_>>();
+        let rerank_batch = self.reader.read_vector_rows_planned(
+            &rerank_rows,
+            &mut survivor_read_ranges,
+            &mut survivor_block_scratch,
+        )?;
         drop(rerank_fetch_stage);
         stats.rerank_fetch_ns += rerank_fetch_start.elapsed().as_nanos() as u64;
         stats.rerank_rows += rerank.len();
 
-        let mut topn =
-            TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
-        for (row, doc) in rerank {
-            let fetch_start = Instant::now();
-            let bytes = {
-                let _rerank_fetch_stage = enter_vector_stage(Stage::RerankFetch);
-                self.reader.vector_bytes_for_row(row)?
-            };
-            stats.rerank_fetch_ns += fetch_start.elapsed().as_nanos() as u64;
+        let mut topn = TopNComputer::with_comparator(top_n, (NaturalComparator, tie_comparator));
+        for ((row, doc), (batch_row, bytes)) in rerank.into_iter().zip(rerank_batch.iter()) {
+            debug_assert_eq!(row, batch_row);
             let score_start = Instant::now();
             {
                 let _rerank_score_stage = enter_vector_stage(Stage::RerankScore);
-                let score = self.query.score_doc_bytes(&bytes);
+                let score = self.query.score_doc_bytes(bytes);
                 if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
                     topn.push_unordered(key, doc);
                 }
@@ -2351,8 +2455,7 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        let mut topn =
-            TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
+        let mut topn = TopNComputer::with_comparator(top_n, (NaturalComparator, tie_comparator));
         // `candidates` is the cumulative scored count that drives the gate; the
         // prune counters accumulate into locals and fold into `ProbeStats` once
         // after the loop, keeping the hot per-doc path free of indirection.
@@ -2365,12 +2468,12 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut postings_skipped = 0usize;
         let mut bounds_skips = 0u32;
         let mut termination = ProbeTermination::Exhausted;
-        // P2: the query bound, maintained at cluster boundaries. The
+        // The query bound is maintained at cluster boundaries. The
         // bound-space conversion runs on kth improvement only, inside the
         // tracker.
         let metric = self.query.metric();
         let mut bound_tracker = QueryBoundTracker::new();
-        // P4: `||q||` for the dot margin's Cauchy-Schwarz term; once per
+        // `||q||` for the dot margin's Cauchy-Schwarz term; once per
         // segment-query.
         let q_norm = norm_squared_wide(self.query.query()).sqrt() as f32;
         let bounds = index.bounds();
@@ -2403,7 +2506,7 @@ impl<T: VectorElement> VectorBackend<T> {
             }
             let cluster = cluster as usize;
 
-            // P5: the bounds verdict. The bound is consumed only through
+            // The bound is consumed only through
             // `Armed` (the heap holds k results) — enforced by the enum;
             // Filling probes, and SATURATED probes arithmetically (+inf
             // margin). The margin closure runs on armed clusters only.
@@ -2489,7 +2592,7 @@ impl<T: VectorElement> VectorBackend<T> {
             }
             candidates += survivors.len();
 
-            // P2: fold the exact kth into the bound at the cluster
+            // Fold the exact kth into the bound at the cluster
             // boundary. `kth_best` is O(buffer) and force-truncates —
             // results and every counter above are unaffected (truncation
             // only drops already-lost entries and tightens the push
@@ -2640,15 +2743,6 @@ mod tests {
     /// 3×3 `grid2d::centroids()` grid). Used by tests that need an
     /// "exhaustive" probe ceiling.
     const DEFAULT_NUM_CENTROIDS: usize = 9;
-
-    #[test]
-    fn boundary_kappa_is_large_only_for_a_terminal_grid_layer() {
-        assert_eq!(quantized_boundary_kappa(0, 2, 1), 2.0);
-        assert_eq!(quantized_boundary_kappa(1, 2, 1), 2.0);
-        assert_eq!(quantized_boundary_kappa(1, 2, 4), 4.0);
-        assert_eq!(quantized_boundary_kappa(1, 3, 4), 2.0);
-        assert_eq!(quantized_boundary_kappa(2, 3, 4), 4.0);
-    }
 
     fn push_test_candidate(
         scan: &mut QuantizedScanCtx,
@@ -4290,7 +4384,7 @@ mod tests {
         assert_eq!(
             scan.candidates.docs.iter().filter(|&&doc| doc == 0).count(),
             2,
-            "plane 1 must retain every replica membership"
+            "layer 0 must retain every replica membership"
         );
         assert!(
             scan.best_by_doc.is_empty() && scan.best_docs.is_empty(),
@@ -4344,14 +4438,6 @@ mod tests {
     }
 
     #[test]
-    fn quantized_split_constants_are_l2_only() {
-        let stored = -0.375_f32;
-        assert_eq!(quantized_layer_constant(Metric::L2, stored), stored);
-        assert_eq!(quantized_layer_constant(Metric::Dot, stored), 0.0);
-        assert_eq!(quantized_layer_constant(Metric::Cosine, stored), 0.0);
-    }
-
-    #[test]
     fn cosine_refinement_batches_cross_clusters_and_cap_at_2048() {
         let rows = (0..2_049).collect::<Vec<_>>();
         let clusters = [0..700, 700..1_400, 1_400..2_100];
@@ -4372,18 +4458,20 @@ mod tests {
         let mut bases = [0.0];
         let mut estimates = [0.0];
         let mut sigmas = [0.0];
-        let mut effective_scales_squared = [0.0];
+        let mut residual_norms_squared = [0.0];
         let mut sign_query_error_terms = [0.0];
         combine_initial_decoded(
             Metric::L2,
+            1,
             &mut raw_prefixes,
             &mut bases,
             &mut estimates,
             &mut sigmas,
-            &mut effective_scales_squared,
+            &mut residual_norms_squared,
             &mut sign_query_error_terms,
             &[3.0],
             &[2.0],
+            &[0.5],
             &[5.0],
             &[7.0],
             10.0,
@@ -4396,9 +4484,9 @@ mod tests {
         assert_eq!(bases, [3.0]);
         assert_eq!(raw_prefixes, [1.0]);
         assert_eq!(estimates, [7.0]);
-        assert_eq!(effective_scales_squared, [9.0]);
+        assert_eq!(residual_norms_squared, [7.0]);
         assert_eq!(sign_query_error_terms, [117.0]);
-        let variance: f32 = 9.0 * 2.0 * (2.0 - 1.0) * 11.0 + 4.0 * 117.0;
+        let variance: f32 = 7.0 * 0.5 * 11.0 + 4.0 * 117.0;
         let expected_sigma = 2.0 * 1.15 * variance.sqrt();
         assert!((sigmas[0] - expected_sigma).abs() < 1e-5);
     }
@@ -4411,22 +4499,26 @@ mod tests {
 
         combine_refinement_decoded(
             Metric::L2,
+            1,
             &mut candidates,
             0..1,
             &[2.0],
             &[3.0],
             &[2.0],
+            &[0.5],
             &[5.0],
             7.0,
             11.0,
         );
         combine_refinement_decoded(
             Metric::L2,
+            1,
             &mut candidates,
             1..2,
             &[4.0],
             &[2.0],
             &[1.5],
+            &[0.25],
             &[1.0],
             17.0,
             13.0,
@@ -4435,41 +4527,39 @@ mod tests {
         assert_eq!(candidates.bases, [10.0, 20.0]);
         assert_eq!(candidates.raw_prefixes, [3.0, 8.0]);
         assert_eq!(candidates.estimates, [22.0, 44.0]);
-        assert!((candidates.effective_scale_squared[0] - 4.5).abs() < 1e-6);
-        assert!((candidates.effective_scale_squared[1] - 8.0 / 3.0).abs() < 1e-6);
+        assert_eq!(candidates.residual_norm_squared, [9.0, 4.0]);
         assert_eq!(candidates.sign_query_error_terms, [99.0, 53.0]);
-        let expected0 = 2.0 * 1.15 * 459.0_f32.sqrt();
-        let expected1 = 2.0 * 1.15 * 153.25_f32.sqrt();
+        let expected0 = 2.0 * 1.15 * 427.5_f32.sqrt();
+        let expected1 = 2.0 * 1.15 * 136.25_f32.sqrt();
         assert!((candidates.sigmas[0] - expected0).abs() < 1e-5);
         assert!((candidates.sigmas[1] - expected1).abs() < 1e-5);
     }
 
     #[test]
-    fn gate_b_recall_parity_survivor_sets() {
+    fn survivor_sets_match_kernel_harness() {
         const CANDIDATES: usize = 40;
         const TOP_N: usize = 10;
-        const KAPPA_1: f32 = 2.0;
-        const KAPPA_2: f32 = 4.0;
+        const KAPPA: f32 = QUANTIZED_BOUNDARY_KAPPA;
 
-        let plane1_scores: Vec<f32> = (0..CANDIDATES)
+        let layer0_scores: Vec<f32> = (0..CANDIDATES)
             .map(|row| 2.0 - row as f32 * 0.09 + (row as f32 * 0.7).sin() * 0.08)
             .collect();
-        let plane1_sigmas: Vec<f32> = (0..CANDIDATES)
+        let layer0_sigmas: Vec<f32> = (0..CANDIDATES)
             .map(|row| 0.03 + (row % 5) as f32 * 0.01)
             .collect();
         let refinements: Vec<f32> = (0..CANDIDATES)
             .map(|row| (row as f32 * 0.41).cos() * 0.06)
             .collect();
-        let plane2_sigmas: Vec<f32> = (0..CANDIDATES)
+        let layer1_sigmas: Vec<f32> = (0..CANDIDATES)
             .map(|row| 0.012 + (row % 3) as f32 * 0.004)
             .collect();
 
-        let (first_kth_index, first_kth) = cascade::kth(&plane1_scores, TOP_N);
+        let (first_kth_index, first_kth) = cascade::kth(&layer0_scores, TOP_N);
         let harness_first = cascade::band_filter(
-            &plane1_scores,
-            &plane1_sigmas,
-            KAPPA_1,
-            first_kth - KAPPA_1 * plane1_sigmas[first_kth_index],
+            &layer0_scores,
+            &layer0_sigmas,
+            KAPPA,
+            first_kth - KAPPA * layer0_sigmas[first_kth_index],
         );
 
         let mut scan = QuantizedScanCtx::new(CANDIDATES as DocId, CANDIDATES, false);
@@ -4478,32 +4568,32 @@ mod tests {
                 &mut scan,
                 row,
                 row as DocId,
-                plane1_scores[row],
-                plane1_sigmas[row],
+                layer0_scores[row],
+                layer0_sigmas[row],
             );
         }
-        scan.band(TOP_N, KAPPA_1);
+        scan.band(TOP_N, KAPPA);
         let scan_first: Vec<u32> = scan.candidates.rows.iter().map(|&row| row as u32).collect();
         assert!(
             harness_first.len() < CANDIDATES,
-            "GATE-B plane 1 must measurably filter"
+            "first boundary must measurably filter"
         );
-        assert_eq!(scan_first, harness_first, "plane-1 survivor set");
+        assert_eq!(scan_first, harness_first, "layer-0 survivor set");
 
         let second_scores: Vec<f32> = harness_first
             .iter()
-            .map(|&row| plane1_scores[row as usize] + refinements[row as usize])
+            .map(|&row| layer0_scores[row as usize] + refinements[row as usize])
             .collect();
         let second_sigmas: Vec<f32> = harness_first
             .iter()
-            .map(|&row| plane2_sigmas[row as usize])
+            .map(|&row| layer1_sigmas[row as usize])
             .collect();
         let (second_kth_index, second_kth) = cascade::kth(&second_scores, TOP_N);
         let harness_second_local = cascade::band_filter(
             &second_scores,
             &second_sigmas,
-            KAPPA_2,
-            second_kth - KAPPA_2 * second_sigmas[second_kth_index],
+            KAPPA,
+            second_kth - KAPPA * second_sigmas[second_kth_index],
         );
         let harness_second: Vec<u32> = harness_second_local
             .iter()
@@ -4513,20 +4603,20 @@ mod tests {
         for index in 0..scan.candidates.len() {
             let row = scan.candidates.rows[index];
             scan.candidates.estimates[index] += refinements[row];
-            scan.candidates.sigmas[index] = plane2_sigmas[row];
+            scan.candidates.sigmas[index] = layer1_sigmas[row];
         }
-        scan.band(TOP_N, KAPPA_2);
+        scan.band(TOP_N, KAPPA);
         let scan_second: Vec<u32> = scan.candidates.rows.iter().map(|&row| row as u32).collect();
         assert!(
             harness_second.len() < harness_first.len(),
-            "GATE-B plane 2 must measurably filter"
+            "second boundary must measurably filter"
         );
-        assert_eq!(scan_second, harness_second, "plane-2 survivor set");
+        assert_eq!(scan_second, harness_second, "layer-1 survivor set");
 
         let mut exact_order: Vec<usize> = (0..CANDIDATES).collect();
         exact_order.sort_unstable_by(|&left, &right| {
-            (plane1_scores[right] + refinements[right])
-                .total_cmp(&(plane1_scores[left] + refinements[left]))
+            (layer0_scores[right] + refinements[right])
+                .total_cmp(&(layer0_scores[left] + refinements[left]))
                 .then_with(|| left.cmp(&right))
         });
         let recalled = exact_order[..TOP_N]
@@ -5059,7 +5149,7 @@ mod tests {
     }
 
     // ==================================================================
-    // P5: the bounds gate
+    // Bounds gate
     // ==================================================================
 
     mod bounds_gate_tests {
@@ -5434,7 +5524,7 @@ mod tests {
     }
 
     // ==================================================================
-    // P6: probe-stats telemetry
+    // Probe-stats telemetry
     // ==================================================================
 
     mod bounds_stats_tests {

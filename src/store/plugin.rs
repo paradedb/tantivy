@@ -61,7 +61,7 @@ impl SegmentPlugin for StorePlugin {
                 .map(|(i, store)| store.iter_raw(ctx.readers[i].alive_bitset()))
                 .collect();
 
-            for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
+            for old_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
                 let doc_bytes_it = &mut document_iterators[old_doc_addr.segment_ord as usize];
                 if let Some(doc_bytes_res) = doc_bytes_it.next() {
                     let doc_bytes = doc_bytes_res?;
@@ -219,7 +219,7 @@ impl PluginWriter for StorePluginWriter {
                     1, /* The docstore is configured to have one doc per block, and each doc is
                         * accessed only once: we don't need caching. */
                 )?;
-                for old_doc_id in doc_id_map.iter_old_doc_ids() {
+                for old_doc_id in doc_id_map.iter_source_doc_ids() {
                     let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
                     store_writer
                         .store_bytes(&doc_bytes)

@@ -14,7 +14,7 @@ fn remap_doc_opstamps(
 ) -> Vec<Opstamp> {
     if let Some(doc_id_mapping_opt) = doc_id_mapping_opt {
         doc_id_mapping_opt
-            .iter_old_doc_ids()
+            .iter_source_doc_ids()
             .map(|doc| opstamps[doc as usize])
             .collect()
     } else {

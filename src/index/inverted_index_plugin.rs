@@ -466,7 +466,7 @@ fn merge_fieldnorms(ctx: &PluginMergeContext) -> crate::Result<()> {
             .iter()
             .map(|reader| reader.get_fieldnorms_reader(field))
             .collect::<Result<_, _>>()?;
-        for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
+        for old_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
             let reader = &fieldnorms_readers[old_doc_addr.segment_ord as usize];
             let fieldnorm_id = reader.fieldnorm_id(old_doc_addr.doc_id);
             fieldnorms_data.push(fieldnorm_id);
@@ -578,7 +578,7 @@ fn write_postings_for_field(
             segment_local_map
         })
         .collect();
-    for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
+    for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_source_doc_addrs().enumerate() {
         let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
         segment_map[old_doc_addr.doc_id as usize] = Some(new_doc_id as DocId);
     }

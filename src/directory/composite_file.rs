@@ -203,6 +203,16 @@ impl CompositeFile {
             .map(|byte_range| self.data.slice(byte_range.clone()))
     }
 
+    /// Enumerates the `(field, index)` addresses declared by this composite's
+    /// footer. Layout-specific readers can use this to reject indices outside
+    /// their format without imposing one format's limits on other composite
+    /// files.
+    pub(crate) fn field_indices(&self) -> impl Iterator<Item = (Field, usize)> + '_ {
+        self.offsets_index
+            .keys()
+            .map(|address| (address.field, address.idx))
+    }
+
     /// Returns the space usage per field in this composite file.
     pub fn space_usage(&self, schema: &Schema) -> PerFieldSpaceUsage {
         let mut fields = Vec::new();
@@ -350,6 +360,30 @@ mod test {
             .unwrap()
             .read_bytes()?;
         assert_eq!(aligned.as_slice(), &[9]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_field_indices_enumerates_footer_addresses() -> crate::Result<()> {
+        let mut bytes = Vec::new();
+        {
+            let mut composite = CompositeWrite::wrap(&mut bytes);
+            composite
+                .for_field_with_idx(Field::from_field_id(2), 7)
+                .write_all(&[1])?;
+            composite
+                .for_field_with_idx(Field::from_field_id(0), 3)
+                .write_all(&[2])?;
+            composite.close()?;
+        }
+
+        let composite = CompositeFile::open(&crate::directory::FileSlice::from(bytes))?;
+        let mut addresses = composite.field_indices().collect::<Vec<_>>();
+        addresses.sort_unstable_by_key(|(field, idx)| (field.field_id(), *idx));
+        assert_eq!(
+            addresses,
+            [(Field::from_field_id(0), 3), (Field::from_field_id(2), 7)]
+        );
         Ok(())
     }
 }

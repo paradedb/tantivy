@@ -2225,3 +2225,538 @@ compensating estimators that can be correct by construction.
 | Tantivy nightly fmt / diff check | 1 |
 | ParadeDB nightly fmt / diff check | 1 |
 | x86 workflow run `33240220107` | 1 |
+
+## 2026-08-31 — single-release exact-E format definitive record
+
+This append-only entry supersedes every earlier provisional closeout entry.
+The earlier rows remain only as development history. Measurements below use
+the single-release format at Tantivy measured-code SHA
+`ac00afba9b2afb894f08673cad6d3d7c7cd23a65`, ParadeDB
+`054c1ce715ce0bf8a465f08173f686e7d0bb2481`, and pdbench
+`bacc66ca3f881e26196f4a5d15bf0e00bc43edd8`.
+
+Context: warm cache, Apple M5/ARM, 1,000,000 Cohere vectors, d=1024, one IVF
+segment, 10,000 centroids, posting min/mean/max 1/100/592. Recall and funnel
+counts are machine-independent; latency is this ARM context. The x86 receipt
+comes from Ubuntu GitHub Actions run
+[`33379957399`](https://github.com/paradedb/tantivy/actions/runs/33379957399).
+
+### Exact-E diagnostic gates
+
+Protocol tags: `H1` is 100 held-out stored pseudoqueries crossed with the same
+1,000 interval-sampled rows, excluding every replica membership of the
+pseudoquery. `Q1` is 100 external fixture queries crossed with 1,000 sampled
+rows. Both use production query quantization and the serving estimator. These
+values are external verification only; scanning reads none of them.
+
+| index | source | depth | bias / sigma | spread | samples | result |
+|---|---|---:|---:|---:|---:|---:|
+| q14 | H1 | 1 | 0.028512506 | 0.8665653 | 99,980 | 1 |
+| q14 | H1 | 2 | 0.008394254 | 0.8675993 | 99,980 | 1 |
+| q14 | Q1 | 1 | 0.032729574 | 0.87111425 | 100,000 | 1 |
+| q14 | Q1 | 2 | 0.008829858 | 0.8663652 | 100,000 | 1 |
+| q1 | H1 | 1 | -0.010839013 | 0.8501331 | 99,980 | 1 |
+| q1 | Q1 | 1 | -0.009661898 | 0.84919745 | 100,000 | 1 |
+
+All absolute biases are below 0.3 sigma and all spreads are below 1.15. The
+analytical branch fired; scoring uses exact per-row gamma, exact serialized-E,
+exact per-query sign-plane error, and the declared 1.15 safety. No measured
+bias or spread enters scoring.
+
+| index/source | depth | gamma mean | gamma stddev | p99 | max | lower / upper clamps | gamma-f16 band error p99 / max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q14 H1 | 1 | 1.569604492 | 0.025361299 | 1.62597656 | 1.6640625 | 0 / 0 | 0.002378382 / 0.003915257 |
+| q14 H1 | 2 | 1.003498047 | 0.002223321 | 1.009765625 | 1.01171875 | 63 / 0 | 0.023717992 / 0.043290385 |
+| q14 Q1 | 1 | · | · | · | · | 0 / 0 | 0.002419860 / 0.003977604 |
+| q14 Q1 | 2 | · | · | · | · | 63 / 0 | 0.024199229 / 0.042395606 |
+| q1 H1 | 1 | 1.570185547 | 0.026372958 | 1.6376953 | 1.6728516 | 0 / 0 | 0.002387450 / 0.004500100 |
+| q1 Q1 | 1 | · | · | · | · | 0 / 0 | 0.002457700 / 0.003859160 |
+
+### Deterministic shared-mass cone
+
+d=256; 10,000 rows plus 100 external queries; schedule [1,4]; cosine; mean
+posting 100; uniform kappa=2. Construction is the seeded fixture
+`v = 0.95*c0 + 0.312*t` with a 16-coordinate normalized Gaussian tail.
+
+| source | depth | bias / sigma | spread |
+|---|---:|---:|---:|
+| H1 | 1 | 0.006287771 | 0.87591577 |
+| H1 | 2 | 0.002287775 | 0.86998355 |
+| Q1 | 1 | 0.0078064045 | 0.8766022 |
+| Q1 | 2 | -0.0003073712 | 0.86877036 |
+
+| depth | scored | survivors | survivor fraction | mean recall | min recall | queries with miss |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 10,000.00 | 142.43 | 0.014243 | 1.000 | 1.000 | 0 / 100 |
+| 2 | 142.43 | 18.36 | 0.137796 | 1.000 | 1.000 | 0 / 100 |
+
+### Final-format build economics
+
+| config | build artifact | build s | index bytes | delta vs qoff | delta % | peak RSS bytes |
+|---|---|---:|---:|---:|---:|---:|
+| qoff | `final-format/20260831_151017_build.json` | 123.515799500 | 8,693,366,784 | 0 | 0.000000 | 11,243,028,480 |
+| q14 | `final-format/20260831_151318_build.json` | 158.783946209 | 9,355,968,512 | 662,601,728 | 7.621923 | 11,245,961,216 |
+| q1 | `final-format/20260831_151554_build.json` | 134.506208333 | 8,833,925,120 | 140,558,336 | 1.616846 | 11,244,634,112 |
+
+Peak RSS remains flat at approximately 10.47 GiB across qoff, q1, and q14.
+Against the 2026-08-29 build artifacts, q14 changed +7.876394126 s and
++4,014,080 bytes; q1 changed -0.545202709 s and +4,014,080 bytes. q2, q4,
+p4x, and p16x were removed from the live benchmark set. Grid-first remains a
+format-supported, oracle-tested correctness configuration.
+
+### Final Cohere sweep
+
+All three configurations selected the same achieved-recall points: r90 at
+probe 0.005 / recall 0.897, r95 at probe 0.0109 / recall 0.948, and r99 at
+probe 0.1 / recall 0.993.
+
+Search artifacts: qoff
+`runs/final-format/cohere-1m-qoff/20260831_151929_search.json`, q14
+`runs/final-format/cohere-1m-q14/20260831_152000_search.json`, and q1
+`runs/final-format/cohere-1m-q1/20260831_152030_search.json`.
+
+| target | qoff p50 / p99 ms | q14 p50 / p99 ms | q1 p50 / p99 ms | q14 p50 / p99 vs qoff | q1 p50 / p99 vs qoff |
+|---|---:|---:|---:|---:|---:|
+| r90 | 2.881 / 4.150 | 1.996 / 2.830 | 1.865 / 2.839 | -30.7% / -31.8% | -35.3% / -31.6% |
+| r95 | 4.998 / 6.383 | 2.474 / 3.162 | 2.386 / 3.752 | -50.5% / -50.5% | -52.3% / -41.2% |
+| r99 | 42.573 / 50.691 | 9.964 / 13.228 | 9.859 / 12.493 | -76.6% / -73.9% | -76.8% / -75.4% |
+
+Attribution cells below are `EXPLAIN-population mean ms / percent of total /
+buffer hits`.
+
+#### r90 — probe 0.005, achieved recall 0.897
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| scan init | 0.860 / 27.2 / 688 | 0.958 / 43.6 / 690 | 0.847 / 43.1 / 690 |
+| query prep | 0.000 / 0.0 / 0 | 0.105 / 4.8 / 0 | 0.019 / 1.0 / 0 |
+| routing | 0.391 / 12.4 / 635 | 0.436 / 19.8 / 635 | 0.384 / 19.5 / 635 |
+| exact scan | 1.817 / 57.5 / 2601 | · | · |
+| result assembly | 0.026 / 0.8 / 0 | 0.033 / 1.5 / 0 | 0.042 / 2.1 / 0 |
+| layer 0 scan | · | 0.277 / 12.6 / 203 | 0.260 / 13.2 / 203 |
+| boundary 0 | · | 0.026 / 1.2 / 0 | 0.025 / 1.3 / 0 |
+| layer 1 scan | · | 0.264 / 12.0 / 187 | · |
+| boundary 1 | · | 0.002 / 0.1 / 0 | · |
+| rerank fetch | · | 0.020 / 0.9 / 27 | 0.279 / 14.2 / 465 |
+| rerank score | · | 0.003 / 0.1 / 0 | 0.042 / 2.2 / 0 |
+| unattributed gap | 0.067 / 2.1 / 27 | 0.073 / 3.3 / 27 | 0.066 / 3.3 / 27 |
+| TOTAL | 3.160 / 100 / 3950 | 2.197 / 100 / 1769 | 1.963 / 100 / 2019 |
+
+| footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| timed wall - EXPLAIN wall ms | -0.241 | -0.135 | -0.042 |
+| layer 0 scored -> survivors | · | 5,093.4 -> 371.3 | 5,093.4 -> 385.1 |
+| layer 1 scored -> survivors | · | 371.3 -> 19.5 | · |
+| R / rerank bytes | · | 19.5 / 79,749 | 385.1 / 1,577,370 |
+| layer 0 / layer 1 bytes | · | 713,075 / 193,055 | 713,075 / · |
+| layer 0 ns/row / layer 1 ns/refinement | · | 54.4 / 710.5 | 51.1 / · |
+
+#### r95 — probe 0.0109, achieved recall 0.948
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| scan init | 0.882 / 15.8 / 688 | 0.891 / 33.5 / 690 | 0.858 / 33.2 / 690 |
+| query prep | 0.000 / 0.0 / 0 | 0.100 / 3.7 / 0 | 0.020 / 0.8 / 0 |
+| routing | 0.659 / 11.8 / 1058 | 0.637 / 23.9 / 1058 | 0.620 / 24.0 / 1058 |
+| exact scan | 3.933 / 70.6 / 5612 | · | · |
+| result assembly | 0.028 / 0.5 / 0 | 0.026 / 1.0 / 0 | 0.047 / 1.8 / 0 |
+| layer 0 scan | · | 0.543 / 20.4 / 456 | 0.542 / 20.9 / 456 |
+| boundary 0 | · | 0.042 / 1.6 / 0 | 0.042 / 1.6 / 0 |
+| layer 1 scan | · | 0.335 / 12.6 / 265 | · |
+| boundary 1 | · | 0.002 / 0.1 / 0 | · |
+| rerank fetch | · | 0.019 / 0.7 / 27 | 0.340 / 13.1 / 565 |
+| rerank score | · | 0.003 / 0.1 / 0 | 0.052 / 2.0 / 0 |
+| unattributed gap | 0.069 / 1.2 / 27 | 0.067 / 2.5 / 27 | 0.066 / 2.6 / 27 |
+| TOTAL | 5.571 / 100 / 7385 | 2.663 / 100 / 2524 | 2.588 / 100 / 2797 |
+
+| footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| timed wall - EXPLAIN wall ms | -0.517 | -0.149 | -0.162 |
+| layer 0 scored -> survivors | · | 10,983.9 -> 448.8 | 10,983.9 -> 451.4 |
+| layer 1 scored -> survivors | · | 448.8 -> 19.7 | · |
+| R / rerank bytes | · | 19.7 / 80,650 | 451.4 / 1,848,975 |
+| layer 0 / layer 1 bytes | · | 1,537,749 / 233,392 | 1,537,749 / · |
+| layer 0 ns/row / layer 1 ns/refinement | · | 49.4 / 747.2 | 49.3 / · |
+
+#### r99 — probe 0.1, achieved recall 0.993
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| scan init | 0.975 / 2.2 / 688 | 0.959 / 9.2 / 690 | 0.923 / 9.0 / 690 |
+| query prep | 0.000 / 0.0 / 0 | 0.108 / 1.0 / 0 | 0.024 / 0.2 / 0 |
+| routing | 3.751 / 8.6 / 5068 | 3.143 / 30.2 / 5068 | 3.089 / 30.1 / 5068 |
+| exact scan | 38.768 / 88.9 / 51227 | · | · |
+| result assembly | 0.050 / 0.1 / 0 | 0.041 / 0.4 / 0 | 0.071 / 0.7 / 0 |
+| layer 0 scan | · | 5.124 / 49.3 / 4567 | 5.138 / 50.1 / 4567 |
+| boundary 0 | · | 0.314 / 3.0 / 0 | 0.306 / 3.0 / 0 |
+| layer 1 scan | · | 0.609 / 5.9 / 458 | · |
+| boundary 1 | · | 0.002 / 0.0 / 0 | · |
+| rerank fetch | · | 0.021 / 0.2 / 28 | 0.550 / 5.4 / 806 |
+| rerank score | · | 0.003 / 0.0 / 0 | 0.080 / 0.8 / 0 |
+| unattributed gap | 0.084 / 0.2 / 27 | 0.077 / 0.7 / 27 | 0.076 / 0.7 / 27 |
+| TOTAL | 43.629 / 100 / 57010 | 10.400 / 100 / 10839 | 10.256 / 100 / 11158 |
+
+| footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| timed wall - EXPLAIN wall ms | -0.963 | -0.263 | -0.300 |
+| layer 0 scored -> survivors | · | 100,107.7 -> 595.3 | 100,107.7 -> 615.5 |
+| layer 1 scored -> survivors | · | 595.3 -> 20.3 | · |
+| R / rerank bytes | · | 20.3 / 82,985 | 615.5 / 2,520,965 |
+| layer 0 / layer 1 bytes | · | 14,015,075 / 309,572 | 14,015,075 / · |
+| layer 0 ns/row / layer 1 ns/refinement | · | 51.2 / 1,022.6 | 51.3 / · |
+
+The within-EXPLAIN attribution gap gate passes at every point. The largest
+absolute gap is 0.084 ms, below `max(0.1 ms, 0.5% of stage total)`. The
+timed-wall delta is printed separately and is not folded into that gate.
+
+### Regression guard against statistical centering
+
+`A` is the requested Aug-25 statistical-centering run set
+`155017/155043/155110`; `E` is this exact-E run. q14 r95 has no like-for-like
+A row because A used probe 0.0141 / recall 0.958.
+
+| target | config | A p50 / p99 ms | E p50 / p99 ms | A funnel | E funnel |
+|---|---|---:|---:|---|---|
+| r90 | qoff | 3.580 / 4.909 | 2.881 / 4.150 | · | · |
+| r90 | q14 | 2.966 / 4.215 | 1.996 / 2.830 | 5,093.4 -> 3,849.7 -> 35.9 | 5,093.4 -> 371.3 -> 19.5 |
+| r90 | q1 | 3.158 / 3.656 | 1.865 / 2.839 | 5,093.4 -> 3,897.2 | 5,093.4 -> 385.1 |
+| r95 | qoff | 5.412 / 6.273 | 4.998 / 6.383 | · | · |
+| r95 | q14 | · | 2.474 / 3.162 | · | 10,983.9 -> 448.8 -> 19.7 |
+| r95 | q1 | 4.996 / 6.175 | 2.386 / 3.752 | 10,983.9 -> 6,682.9 | 10,983.9 -> 451.4 |
+| r99 | qoff | 34.678 / 42.936 | 42.573 / 50.691 | · | · |
+| r99 | q14 | 13.914 / 29.347 | 9.964 / 13.228 | 100,107.7 -> 16,591.5 -> 40.7 | 100,107.7 -> 595.3 -> 20.3 |
+| r99 | q1 | 15.239 / 36.618 | 9.859 / 12.493 | 100,107.7 -> 17,397.2 | 100,107.7 -> 615.5 |
+
+Funnel changes are expected because exact per-row correction replaces the
+dataset-fitted statistical center. Candidate recall remains identical to qoff
+at all three achieved-recall points; deterministic oracle fixtures and the
+cone both report 1.000 recall.
+
+### C4 — integrated production-shape and x86 companion
+
+The final-code integrated case streams one 100-row, d=1024 cosine cluster
+through the borrowed packed-code kernel, f32 scale decode, f16 gamma/E decode,
+full estimate combine, and exact-E sigma.
+
+| machine | case | interval | middle / per row | throughput |
+|---|---|---:|---:|---:|
+| M5/ARM | sign-kernel reference | · | 18.5 ns/row | · |
+| x86 CI | final exact-E integrated shape, 100 rows | 3.3333–3.3420 us | 3.3372 us / 33.372 ns | 29.922–30.001 M rows/s |
+
+Criterion middle estimates from successful x86 run `33379957399` are recorded
+next to the matching M5/ARM columns. A dot means no matching ARM result was
+re-run for that case.
+
+| kernel | configuration | M5/ARM | x86 |
+|---|---|---:|---:|
+| FHT apply | d=128 | 611.36 ns | 1.2012 us |
+| FHT apply | d=768 | 3.789 us | 7.1316 us |
+| FHT apply | d=1536 | 7.791 us | 14.148 us |
+| sign symmetric score | d=768 | 2.588 ns | 4.7978 ns |
+| sign asymmetric score | d=768, Bq=4 | 13.869 ns | 26.179 ns |
+| grid encode / score | d=768, b=2 | 1.945 us / 500.79 ns | 3.9496 us / 1.4432 us |
+| grid batch score | d=768, b=2, N=32 | · | 22.471 us |
+| grid encode / score | d=768, b=3 | · / 480.160 ns | 4.2283 us / 1.0294 us |
+| grid batch score | d=768, b=3, N=32 | · | 30.556 us |
+| grid encode / score | d=768, b=4 | 1.740 us / 506.91 ns | 5.6493 us / 1.4527 us |
+| grid batch / packed / indexed | d=768, b=4, N=32 | · | 7.1486 / 4.4033 / 4.2662 us |
+| fp dot | d=128 | 23.485 ns | 95.513 ns |
+| fp dot | d=768 | 279.842 ns | 695.32 ns |
+| fp dot | d=1536 | 641.876 ns | 1.4108 us |
+| decode then dot | d=768 | 582.900 ns | 1.2806 us |
+| boundary ops | 50,000 | 124.20 us | 325.99 us |
+| boundary ops | 500,000 | 809.24 us | 2.0877 ms |
+
+The writer-context encode bench is not invoked by this workflow, so no x86
+writer-encode interval is claimed.
+
+### C5 — assembly verdicts
+
+| loop | verdict |
+|---|---|
+| final exact-E estimate combine | ARM64 packed `fmul.4s` and `fmla.4s` confirmed |
+| final exact-E sigma | ARM64 packed `fmul.4s`, `fadd.4s`, and `fsqrt.4s` confirmed |
+| qoff f32 dot | ARM64 packed `fmul.4s` and `fadd.4s` confirmed |
+| x86 sign kernel | hardware popcount expectation green |
+| x86 FHT | packed add/sub expectation green |
+| eager IdMap decode | team finding: approximately +0.48 ms at open; cache/invalidation proposal deferred |
+
+### Final implementation receipts
+
+| contract | receipt |
+|---|---|
+| strict format 4; fixed 12 slots; rebuild-only mismatch | `src/vector/header.rs:12`, `:31`, `:71`; `src/vector/index_reader.rs:1557` |
+| arbitrary 1–3 layers, widths 1–4, including grid-first | `src/vector/quantization.rs:168`, `:271`, `:612` |
+| f32 scale, serialized gamma, exact serialized-E | `quant-kernels/cascade/src/lib.rs:37`, `:766`, `:803`, `:837`; writer `src/vector/ivf/plugin.rs:1307` |
+| all-metric R0 squared; L2-only optional constants | `src/vector/ivf/plugin.rs:365`; `src/vector/index_reader.rs:1733`, `:1799` |
+| deterministic layout and per-cluster temp-stream build | `src/vector/ivf/plugin.rs:231`, `:285`, `:448`, `:1188` |
+| no build diagnostics or solver rerun | `src/vector/ivf/plugin.rs:524`, `:1622`, `:1648` |
+| exact-E sigma, gamma once, uniform kappa=2 | `src/vector/backend.rs:946`, `:1006`, `:1188`; `src/vector/quantization.rs:37`; `src/vector/backend.rs:1984`, `:2101` |
+| whole-cluster batch scoring and boundary-only filtering | `src/vector/backend.rs:749`, `:1700`, `:1880` |
+| dedup and storage-planned exact fetch | `src/vector/backend.rs:2117`; `src/vector/index_reader.rs:2578` |
+| indexed widths 1–4, odd d, adaptive range reads | `quant-kernels/cascade/src/lib.rs:503`, `:2358`; `quant-kernels/grid-plane/src/lib.rs:800`; `src/vector/index_reader.rs:1087`, `:1174` |
+| process/query context hoisting; level 0 skips it | `src/vector/prepared.rs:47`, `:149`, `:399`, `:422`; `src/vector/backend.rs:71`, `:167` |
+| external diagnostics never affect scoring | `pg_search/src/api/vector.rs:101`, `:275`; `src/vector/prepared.rs:108`, `:541` |
+| oracle E2E matrix incl. [1], [1,4], [1,1,4], [2,4], odd d, L2 slot 2/constants, filters/deletes/replicas | `src/vector/ivf/plugin.rs:2077`, `:2094`, `:2276`, `:2651` |
+| aligned LE words borrow-or-copy | `quant-kernels/cascade/src/lib.rs:1240`, `:1282` |
+| SQL reloption/materialization and d>=64 quantized floor | `pg_search/src/schema/config.rs:113`; `pg_search/src/index/mod.rs:43`; `pg_search/src/postgres/build.rs:210` |
+| generic pdbench layer reporting and exact-byte ledger | `pdbench/src/attribution.rs:547`, `:774`; `pdbench/README.md:195` |
+
+Grep receipts on the shipped vector/quantization paths:
+
+- C1 history vocabulary: zero matches.
+- R2 build-path diagnostics, pseudoquery, calibration, fp-query preparation,
+  or grid-solver hooks: zero matches.
+- No standalone alternate reader, storage, calibration-scorer, or versioned
+  vector modules existed. The in-place branches/functions were deleted.
+- Deleted experimental executables since checkpoint:
+  `quant-kernels/cascade/examples/measure.rs`,
+  `quant-kernels/cascade/src/bin/experiments.rs`, and
+  `quant-kernels/cascade/src/bin/experiments_a2.rs`.
+
+### Declared policy and deferred dispositions
+
+The complete scoring policy constants are uniform kappa=2, analytical safety
+1.15, and gamma clamp [1,4]. Per-checkpoint Gaussian-tail mapping is
+`Q(2) ~= 2.3e-2`; changes route through the design owner. Dataset-fitted
+values are never applied in scoring.
+
+| item | disposition |
+|---|---|
+| reader/searcher cache and eager IdMap decode | team report; no implementation in this branch |
+| cosine constants-slot write and scale-storage alternatives | future format bundle |
+| pshufb/tbl packed-LUT kernel | follow-up project |
+| kappa changes | design-policy decision, not an implementation gap |
+| q2, q4, p4x, p16x live indexes | retired; grid-first correctness remains supported |
+| 10M run | deferred; not claimed |
+| x86 writer-context encode | absent from workflow; no number claimed |
+
+Design rule: empirical measurement is for choosing configurations, never for
+compensating estimators that can be correct by construction.
+
+### Final gates and rollback receipts
+
+| gate | result |
+|---|---:|
+| quant-kernels goldens/determinism | 60 / 60 |
+| Tantivy vector tests | 217 / 217 |
+| pg_regress `vector_quantization` | 2 / 2 |
+| pdbench unit tests | 38 / 38 |
+| Tantivy nightly fmt / diff check | 1 |
+| ParadeDB nightly fmt / diff check | 1 |
+| x86 workflow check / goldens / asm / criterion / full tests / clippy | 1 |
+
+| repository | pre-alpha rollback SHA | measured-code SHA |
+|---|---|---|
+| tantivy | `76822fd10540ee879e0fd200c8f8e5a44b8d8d04` | `ac00afba9b2afb894f08673cad6d3d7c7cd23a65` |
+| paradedb | `6b05384dba565cedc40b95758619c4a85acaf359` | `054c1ce715ce0bf8a465f08173f686e7d0bb2481` |
+| pdbench | `fec22af1465cadb379cbac671d6eae036b224a08` | `bacc66ca3f881e26196f4a5d15bf0e00bc43edd8` |
+
+## 2026-08-31 — terminal closeout receipts: policy, single-path format, and scale storage
+
+This is the terminal history-bearing entry. Shipped code and `FORMAT.md`
+contain only the current contract; this file and git remain the sole design
+history. Receipt-code SHAs are Tantivy
+`3c34a7af7d4ad78e331109708c0cd5a9774ca83c`, ParadeDB
+`054c1ce715ce0bf8a465f08173f686e7d0bb2481`, and pdbench
+`bacc66ca3f881e26196f4a5d15bf0e00bc43edd8`.
+
+### B2 — complete scoring-policy constants
+
+`src/vector/FORMAT.md:188-206` is the complete declared-constants section.
+
+| policy item | normative value |
+|---|---|
+| checkpoint width | uniform `kappa = 2`, every checkpoint and schedule |
+| analytical safety | `1.15`, applied once to sigma |
+| serialized gamma clamp | `[1,4]` |
+| per-checkpoint unit-spread bound | `Q(2) = 0.0227501`, approximately `2.3e-2` |
+| L-checkpoint union bound | `min(1, L * Q(2))` |
+| L = 1 / 2 / 3 | `0.0227501 / 0.0455002 / 0.0682503` |
+| policy owner | changes require the design owner's approval |
+| recall remedy | probe fraction or uniform-kappa policy only; never a per-boundary exception |
+
+### B3 — exact-E uncertainty
+
+At checkpoint `l`, the live dot-space variance is
+
+```text
+(R0²_i * E_l,i / d) * ||u_c||²
++ gamma_l,i² * sum_{j <= l, sign layer j}(scale_j,i² * B_j).
+```
+
+`E_l` is the corrected-error ratio computed against serialized gamma. Sign
+layers contribute their exact prepared-query reconstruction error at their own
+stored scale; grid layers contribute zero. Receipts:
+`src/vector/FORMAT.md:158-186`, `src/vector/backend.rs:946-974`, initial
+query-error accumulation at `src/vector/backend.rs:1034-1039` and refinement
+at `src/vector/backend.rs:1290-1355`, plus grid-zero dispatch at
+`src/vector/backend.rs:1496-1521`.
+
+Retired-formula grep, scoped to shipped code and the normative format (the
+append-only historical rows in this file are intentionally excluded):
+
+```text
+B3 effective-scale / gamma(gamma-1) / projection-model grep: exit 1, 0 matches
+```
+
+### C1-C3 — history-free and single-path code
+
+Boundary-aware vocabulary grep receipts:
+
+```text
+tantivy/src/vector + tantivy/quant-kernels, excluding RESULTS.md:
+  v1|v2|v3|legacy|old_*|new_*|*_compat|retired|amendment|prior
+  exit 1, 0 matches
+
+paradedb pg_search vector/quantization paths:
+  v1|v2|v3|legacy|old_*|new_*|*_compat|retired|amendment|prior
+  exit 1, 0 matches
+
+slot-15 / compatibility version branches / old-layout / per-boundary-kappa grep:
+  exit 1, 0 matches
+
+REAL_QUERY_CALIBRATION / DEFAULT_CAL / sample_count==1000 grep:
+  exit 1, 0 matches
+
+bias-correction / CAL-scorer / held-out-build-hook helper grep:
+  exit 1, 0 matches
+```
+
+| singular production path | receipt |
+|---|---|
+| strict header decoder | `src/vector/header.rs:72-87` |
+| vector-field reader | `src/vector/index_reader.rs:1598` |
+| IVF writer | `src/vector/ivf/plugin.rs:640`, with temp streams/layout at `:1191-1340` |
+| quantized scorer | `src/vector/backend.rs:1852`, with the sole dispatch at `:177` |
+| build-purity source guard | `src/vector/ivf/plugin.rs:1623-1645` |
+| calibration excluded from scorer identity/output | `src/vector/prepared.rs:113-124`, test `:542-587` |
+
+Deleted since the pre-alpha checkpoint:
+
+- files: `quant-kernels/cascade/examples/measure.rs`,
+  `quant-kernels/cascade/src/bin/experiments.rs`, and
+  `quant-kernels/cascade/src/bin/experiments_a2.rs`;
+- version enum/parser branches: `VectorFileVersion::{V1,V2,V3}`, `CURRENT`,
+  the old deserializer, and the `< V2` / `< V3` reader branches;
+- slot-15 access/injection/ignore paths and `QUANTIZED_CALIBRATION`;
+- whole-segment storage: `QuantizedLayerSlots` and `write_quantized_slots`;
+- statistical scorer state: `bias_corrections`, `layer_bias_factor`,
+  `new_with_biases_and_cals`, `for_calibration_measurement`, and
+  `score_sigma_from_scale`;
+- build diagnostics: `DEFAULT_CAL`, `measure_cal`, and
+  `install_held_out_calibration`;
+- the terminal-sign conditional kappa table.
+
+One SQL calibration operation is the sole writer of diagnostic settings:
+`paradedb.vector_calibrate` at `pg_search/src/api/vector.rs:117`. The error
+model and confidence-cone endpoints at `:288` and `:579` are read-only
+verification operations. None participates in build or scoring. This exact
+distinction is normative at `src/vector/FORMAT.md:249-257`.
+
+### C4-C6 — normative format and strict version
+
+The normative body receipts are:
+
+| contract | `FORMAT.md` lines |
+|---|---:|
+| sole framing/decoder | 6-16 |
+| settings and arbitrary 1-3 layer, width 1-4 schedule | 18-42 |
+| fixed 12-slot map and typed absence | 44-73 |
+| f32 scale / f16 gamma / f16 E sidecar and exact serialized-gamma E | 95-142 |
+| exact-E uncertainty and query-error decomposition | 158-186 |
+| complete declared constants | 188-206 |
+| R2 build contract | 208-224 |
+| R3 scan contract | 226-247 |
+| diagnostics contract | 249-257 |
+| sole history pointer | 259 |
+
+Whole-file replacement receipt at commit `0841706d5`:
+
+```text
+src/vector/FORMAT.md | 504 lines changed
+258 insertions(+), 246 deletions(-)
+```
+
+The format identifier is the single `u32 = 4` at
+`src/vector/header.rs:12-13`. `read_header` accepts only equality and emits
+`vector file format version {version} is unsupported; rebuild required` at
+`:81-85`. `test_other_versions_require_rebuild` at `:116-121` checks 1, 2,
+3, and 5. Explicit local receipt:
+
+```text
+test vector::header::tests::test_other_versions_require_rebuild ... ok
+1 passed; 0 failed
+```
+
+### D1-D3 — live-set correction, oracle depth, and bytes
+
+Record correction: q2, q4, p4x, and p16x are retired from the live benchmark
+set because their performance and posting-size questions are closed. The
+format supports rebuilding any of them; retirement is not a format rejection.
+
+The direct-oracle matrix declares
+`SCHEDULES = [[1], [1,4], [1,1,4], [2,4]]` at
+`src/vector/ivf/plugin.rs:2652-2653`, then crosses both metrics, every active
+prefix, odd d=100, filters, deletes, and replication/dedup.
+
+Per posting-membership row at d=1024 cosine:
+
+| component | q14 before | q14 after | q14 delta | q1 before | q1 after | q1 delta |
+|---|---:|---:|---:|---:|---:|---:|
+| packed codes | 640 | 640 | 0 | 128 | 128 | 0 |
+| constants | 8 | 0 | -8 | 4 | 0 | -4 |
+| residual radius R0² | 0 | 4 | +4 | 0 | 4 | +4 |
+| scales | 4 | 8 | +4 | 2 | 4 | +2 |
+| gamma | 4 | 4 | 0 | 2 | 2 | 0 |
+| corrected-error E | 0 | 4 | +4 | 0 | 2 | +2 |
+| **total** | **656** | **660** | **+4** | **136** | **140** | **+4** |
+
+The net is +4,000,000 bytes per one million posting-membership rows
+(3.814697 MiB). Both real indexes contain 1,003,520 rows:
+
+| index | before bytes | after bytes | measured delta | row reconciliation |
+|---|---:|---:|---:|---:|
+| q14 | 9,351,954,432 | 9,355,968,512 | +4,014,080 | 1,003,520 * 4 |
+| q1 | 8,829,911,040 | 8,833,925,120 | +4,014,080 | 1,003,520 * 4 |
+
+### D6 — final M5 exact-E and scale-storage A/B
+
+One Criterion process and session; 256 successive 100-row clusters; d=1024;
+identical query, codes, gamma, E, R0², kernel, and post-scale combine. The
+paired buffers derive from the same f32 source values. The only changed inputs
+are scale byte width/decoder and the inherent f16 value rounding. Benchmark
+source: `benches/vector_quantization_scan.rs:54-64`, cases at `:147` and
+`:185`; both use the shared production combine tail through
+`src/vector/backend.rs:1143-1200`.
+
+| machine / scale storage | 95% interval per 100 rows | middle ns/row | throughput interval | delta vs f32 |
+|---|---:|---:|---:|---:|
+| M5/ARM f32 | 1.3883-1.4153 us | 14.007 | 70.657-72.028 M rows/s | 0.000% |
+| M5/ARM f16 | 1.4032-1.4109 us | 14.065 | 70.876-71.266 M rows/s | +0.414% |
+| x86 CI f32 | 1.3765-1.3798 us | 13.781 | 72.476-72.648 M rows/s | 0.000% |
+| x86 CI f16 | 1.3675-1.3752 us | 13.711 | 72.719-73.126 M rows/s | -0.508% |
+
+M5 absolute middle delta: +0.058 ns/row. The intervals overlap. This is an
+informational layout receipt; no format change follows from it.
+
+### D7 — final gates and receipt SHAs
+
+| gate | result |
+|---|---:|
+| kernel goldens/determinism | 62 / 62 |
+| Tantivy vector suite | 217 / 217 |
+| explicit other-version rebuild test | 1 / 1 |
+| pg_regress `vector_quantization` | 1 / 1 |
+| pdbench unit tests | 38 / 38 |
+| Tantivy nightly format check | 1 |
+| ParadeDB nightly format check | 1 |
+| bench target compile | 1 |
+| M5 same-session criterion | 1 |
+| x86 run `33382629899`: check, all feature tests, clippy, goldens, asm, criterion | 1 |
+
+| repository | branch | receipt-code SHA |
+|---|---|---|
+| Tantivy | `ruchir/quantization` | `3c34a7af7d4ad78e331109708c0cd5a9774ca83c` |
+| ParadeDB | `ruchir/quantization` | `054c1ce715ce0bf8a465f08173f686e7d0bb2481` |
+| pdbench | `ruchir/quantization` | `bacc66ca3f881e26196f4a5d15bf0e00bc43edd8` |

@@ -20,10 +20,12 @@ use cascade::{
 };
 use quant_model::Grid;
 
+#[cfg(test)]
+use super::decode_row;
 use super::{
-    decode_row, decode_row_append, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex,
-    IvfMatrix, IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors,
-    RoutingIndex, CENTROIDS_EXT,
+    decode_row_append, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
+    IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, RoutingIndex,
+    CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory, TempFilePtr};
 use crate::index::SegmentComponent;
@@ -35,9 +37,8 @@ use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT, HEADER_LEN};
 use crate::vector::{
     quantized_code_stride, residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig,
-    RelativeNeighborhoodGraph, VectorQuantizationConfig, VectorQuantizer,
-    QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE,
-    QUANTIZED_SCALE_GAMMA_STRIDE, VEC_EXT,
+    RelativeNeighborhoodGraph, VectorQuantizationConfig, QUANTIZED_CODE_ALIGNMENT,
+    QUANTIZED_CONSTANT_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SIDECAR_STRIDE, VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -133,7 +134,7 @@ impl QuantizedSlotLayout {
 struct QuantizedLayerLayout {
     codes: QuantizedSlotLayout,
     sidecar: QuantizedSlotLayout,
-    constants: QuantizedSlotLayout,
+    constants: Option<QuantizedSlotLayout>,
 }
 
 /// Complete per-field quantized payload table, frozen before the first row is
@@ -143,7 +144,7 @@ struct QuantizedLayerLayout {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QuantizedWriteLayout {
     layers: Vec<QuantizedLayerLayout>,
-    residual_norms: Option<QuantizedSlotLayout>,
+    residual_norms: QuantizedSlotLayout,
 }
 
 impl QuantizedWriteLayout {
@@ -158,25 +159,25 @@ impl QuantizedWriteLayout {
                         posting_offsets,
                     )?,
                     sidecar: QuantizedSlotLayout::from_posting_offsets(
-                        QUANTIZED_SCALE_GAMMA_STRIDE,
+                        QUANTIZED_SIDECAR_STRIDE,
                         posting_offsets,
                     )?,
-                    constants: QuantizedSlotLayout::from_posting_offsets(
-                        QUANTIZED_CONSTANT_STRIDE,
-                        posting_offsets,
-                    )?,
+                    constants: config
+                        .needs_constants()
+                        .then(|| {
+                            QuantizedSlotLayout::from_posting_offsets(
+                                QUANTIZED_CONSTANT_STRIDE,
+                                posting_offsets,
+                            )
+                        })
+                        .transpose()?,
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        let residual_norms = config
-            .needs_residual_norm()
-            .then(|| {
-                QuantizedSlotLayout::from_posting_offsets(
-                    QUANTIZED_RESIDUAL_NORM_STRIDE,
-                    posting_offsets,
-                )
-            })
-            .transpose()?;
+        let residual_norms = QuantizedSlotLayout::from_posting_offsets(
+            QUANTIZED_RESIDUAL_NORM_STRIDE,
+            posting_offsets,
+        )?;
         Ok(Self {
             layers,
             residual_norms,
@@ -273,12 +274,12 @@ impl Write for QuantizedTempSlot {
 struct QuantizedLayerTemps {
     codes: QuantizedTempSlot,
     sidecar: QuantizedTempSlot,
-    constants: QuantizedTempSlot,
+    constants: Option<QuantizedTempSlot>,
 }
 
 struct QuantizedTempSlots {
     layers: Vec<QuantizedLayerTemps>,
-    residual_norms: Option<QuantizedTempSlot>,
+    residual_norms: QuantizedTempSlot,
 }
 
 impl QuantizedTempSlots {
@@ -288,17 +289,15 @@ impl QuantizedTempSlots {
             layers.push(QuantizedLayerTemps {
                 codes: QuantizedTempSlot::create(directory, layer_layout.codes.total_bytes)?,
                 sidecar: QuantizedTempSlot::create(directory, layer_layout.sidecar.total_bytes)?,
-                constants: QuantizedTempSlot::create(
-                    directory,
-                    layer_layout.constants.total_bytes,
-                )?,
+                constants: layer_layout
+                    .constants
+                    .as_ref()
+                    .map(|slot| QuantizedTempSlot::create(directory, slot.total_bytes))
+                    .transpose()?,
             });
         }
-        let residual_norms = layout
-            .residual_norms
-            .as_ref()
-            .map(|slot| QuantizedTempSlot::create(directory, slot.total_bytes))
-            .transpose()?;
+        let residual_norms =
+            QuantizedTempSlot::create(directory, layout.residual_norms.total_bytes)?;
         Ok(Self {
             layers,
             residual_norms,
@@ -330,25 +329,28 @@ impl QuantizedTempSlots {
             )?;
             temp.sidecar.validate_offset(
                 layer_layout.sidecar.cluster_offsets[boundary],
-                &format!("layer {layer} scale/gamma sidecar at cluster boundary {boundary}"),
+                &format!(
+                    "layer {layer} scale/gamma/corrected-error sidecar at cluster boundary \
+                     {boundary}"
+                ),
             )?;
-            temp.constants.validate_offset(
-                layer_layout.constants.cluster_offsets[boundary],
-                &format!("layer {layer} constants at cluster boundary {boundary}"),
-            )?;
-        }
-        match (&self.residual_norms, &layout.residual_norms) {
-            (Some(temp), Some(slot)) => temp.validate_offset(
-                slot.cluster_offsets[boundary],
-                &format!("residual norms at cluster boundary {boundary}"),
-            )?,
-            (None, None) => {}
-            _ => {
-                return Err(TantivyError::InternalError(
-                    "quantized temp slots disagree with residual-norm layout".to_string(),
-                ));
+            match (&temp.constants, &layer_layout.constants) {
+                (Some(temp), Some(slot)) => temp.validate_offset(
+                    slot.cluster_offsets[boundary],
+                    &format!("layer {layer} constants at cluster boundary {boundary}"),
+                )?,
+                (None, None) => {}
+                _ => {
+                    return Err(TantivyError::InternalError(format!(
+                        "layer {layer} temp constants disagree with the metric layout"
+                    )));
+                }
             }
         }
+        self.residual_norms.validate_offset(
+            layout.residual_norms.cluster_offsets[boundary],
+            &format!("residual norms at cluster boundary {boundary}"),
+        )?;
         Ok(())
     }
 
@@ -358,6 +360,10 @@ impl QuantizedTempSlots {
         field: Field,
         cancel: &dyn CancelSentinel,
     ) -> crate::Result<()> {
+        self.residual_norms.splice_into(
+            vec_write.for_field_with_idx(field, vec_slot::RESIDUAL_NORMS),
+            cancel,
+        )?;
         for (layer, temp) in self.layers.iter_mut().enumerate() {
             vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
             temp.codes.splice_into(
@@ -365,19 +371,15 @@ impl QuantizedTempSlots {
                 cancel,
             )?;
             temp.sidecar.splice_into(
-                vec_write.for_field_with_idx(field, vec_slot::quantized_scales(layer)),
+                vec_write.for_field_with_idx(field, vec_slot::quantized_sidecar(layer)),
                 cancel,
             )?;
-            temp.constants.splice_into(
-                vec_write.for_field_with_idx(field, vec_slot::quantized_constants(layer)),
-                cancel,
-            )?;
-        }
-        if let Some(temp) = self.residual_norms.as_mut() {
-            temp.splice_into(
-                vec_write.for_field_with_idx(field, vec_slot::QUANTIZED_RESIDUAL_NORMS),
-                cancel,
-            )?;
+            if let Some(constants) = temp.constants.as_mut() {
+                constants.splice_into(
+                    vec_write.for_field_with_idx(field, vec_slot::quantized_constants(layer)),
+                    cancel,
+                )?;
+            }
         }
         Ok(())
     }
@@ -415,14 +417,17 @@ fn write_f32_run(writer: &mut impl Write, values: &[f32]) -> std::io::Result<()>
 }
 
 #[cfg(test)]
-fn write_scale_gamma_block(
+fn write_sidecar_block(
     writer: &mut impl Write,
-    scales: &[u16],
+    scales: &[f32],
     gammas: &[u16],
+    error_ratios: &[u16],
 ) -> std::io::Result<()> {
     assert_eq!(scales.len(), gammas.len());
-    write_u16_run(writer, scales)?;
-    write_u16_run(writer, gammas)
+    assert_eq!(scales.len(), error_ratios.len());
+    write_f32_run(writer, scales)?;
+    write_u16_run(writer, gammas)?;
+    write_u16_run(writer, error_ratios)
 }
 
 fn quantization_runtime(
@@ -450,53 +455,28 @@ fn quantization_runtime(
                 .ok_or_else(|| {
                     TantivyError::InvalidArgument(format!(
                         "quantization field {:?} layer width {} has no persisted grid/model \
-                         entry; rebuild the pre-release index",
+                         entry; rebuild required",
                         config.field, layer.bits
                     ))
                 })?;
-            let rho_model = grid.rho_model.ok_or_else(|| {
-                TantivyError::InvalidArgument(format!(
-                    "quantization field {:?} layer width {} has no persisted rho_model; rebuild \
-                     the pre-release index",
-                    config.field, layer.bits
-                ))
-            })?;
             Ok(Grid {
                 bits: grid.bits,
                 points: grid.points.clone(),
-                rho_model,
+                rho_model: grid.rho_model,
             })
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok((specs, grids))
 }
 
-/// Cumulative gamma has a format-complete derivation for schedules whose
-/// coarse plane is RaBitQ. Grid-first schedules need an additional stored
-/// effective scale; keep that unresolved policy out of the encoder rather
-/// than fabricating gamma from the grid's RMS scale.
-fn require_leading_sign_gamma(config: &VectorQuantizationConfig) -> crate::Result<()> {
-    if config
-        .layers
-        .first()
-        .is_some_and(|layer| layer.bits == 1 && layer.quantizer == VectorQuantizer::RaBitQ)
-    {
-        return Ok(());
-    }
-    Err(TantivyError::InvalidArgument(format!(
-        "quantization field {:?} uses a grid-first schedule; cumulative gamma storage currently \
-         requires a leading 1-bit RaBitQ layer because grid-first schedules need a separately \
-         stored effective scale",
-        config.field
-    )))
-}
-
 fn write_empty_quantized_slots(
     vec_write: &mut CompositeWrite,
     field: Field,
     layer_count: usize,
-    residual_norms: bool,
+    constants: bool,
 ) -> crate::Result<()> {
+    let writer = vec_write.for_field_with_idx(field, vec_slot::RESIDUAL_NORMS);
+    writer.flush()?;
     for layer in 0..layer_count {
         vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
         {
@@ -504,17 +484,13 @@ fn write_empty_quantized_slots(
             writer.flush()?;
         }
         {
-            let writer = vec_write.for_field_with_idx(field, vec_slot::quantized_scales(layer));
+            let writer = vec_write.for_field_with_idx(field, vec_slot::quantized_sidecar(layer));
             writer.flush()?;
         }
-        {
+        if constants {
             let writer = vec_write.for_field_with_idx(field, vec_slot::quantized_constants(layer));
             writer.flush()?;
         }
-    }
-    if residual_norms {
-        let writer = vec_write.for_field_with_idx(field, vec_slot::QUANTIZED_RESIDUAL_NORMS);
-        writer.flush()?;
     }
     Ok(())
 }
@@ -547,11 +523,11 @@ fn write_empty_field_slots(
             vec_write,
             field,
             config.layers.len(),
-            config.needs_residual_norm(),
+            config.needs_constants(),
         )?;
     }
     // `.centroids`: zero centroids, zero docs, single zero offset, and an
-    // empty (but present — the slot is mandatory in V2) bounds slot.
+    // empty (but present) bounds slot.
     {
         let centroids_w = centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
         IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
@@ -658,7 +634,7 @@ pub(crate) fn merge_ivf(
         };
         let centroid_stride = opts.bytes_per_vector();
         let mut current_cluster = usize::MAX;
-        let mut current_centroid: Vec<f32> = Vec::new();
+        let mut current_centroid = Vec::with_capacity(opts.dim());
 
         match opts.dtype() {
             VectorDType::F32 => {
@@ -669,9 +645,9 @@ pub(crate) fn merge_ivf(
                 let mut target_doc_id: DocId = 0;
                 let mut present_vector_ord = 0usize;
                 let mut sampled_count = 0usize;
-                for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                    let reader = &field_readers[old_doc_addr.segment_ord as usize];
-                    if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
+                for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
+                    let reader = &field_readers[source_doc_addr.segment_ord as usize];
+                    if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
                         let should_sample = sampled_count < training_sample_size
                             && present_vector_ord % training_sample_interval == 0;
                         if should_sample {
@@ -874,15 +850,15 @@ pub(crate) fn merge_ivf(
                             batch_doc_ids.clear();
                             Ok(())
                         };
-                    for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                        let reader = &field_readers[old_doc_addr.segment_ord as usize];
-                        if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
+                    for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
+                        let reader = &field_readers[source_doc_addr.segment_ord as usize];
+                        if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
                             batch_doc_ids.push(target_doc_id);
                             decode_row_append::<f32>(&bytes, opts.dim(), &mut batch_values)?;
                             batch_sources.push((
                                 target_doc_id,
-                                old_doc_addr.segment_ord as usize,
-                                old_doc_addr.doc_id,
+                                source_doc_addr.segment_ord as usize,
+                                source_doc_addr.doc_id,
                             ));
                             if batch_doc_ids.len() == settings.assign_batch_size {
                                 flush_assign_batch(
@@ -928,12 +904,13 @@ pub(crate) fn merge_ivf(
                 // the same `dot * inv_norm_q` fast kernel.
                 let mut centroid_bytes =
                     Vec::with_capacity(num_centroids * opts.bytes_per_vector());
-                // P1: `BoundsBuilder` is the ONLY producer of bounds. The
+                // `BoundsBuilder` is the only producer of bounds. The
                 // fold runs over THIS merge's re-assignment output against
                 // the NEW centroids — combining the sources' stored bounds
                 // would be unsound (their centroids no longer exist), which
                 // is why no bound-combining API exists.
                 let mut bounds_builder = BoundsBuilder::new(num_centroids);
+                let mut stored_centroid = Vec::with_capacity(opts.dim());
                 for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
                     let mut bytes = encode_vector(centroid, opts.dim())?;
                     // Centroids are means of ingest-validated rows, so
@@ -947,14 +924,15 @@ pub(crate) fn merge_ivf(
                             entry.name(),
                         );
                     }
-                    let stored = decode_row::<f32>(&bytes, opts.dim())?;
+                    stored_centroid.clear();
+                    decode_row_append::<f32>(&bytes, opts.dim(), &mut stored_centroid)?;
                     // A degenerate centroid — non-finite, or zero-norm under
                     // cosine renormalization — anchors no residual geometry:
                     // SATURATE, so the cluster always probes. (A non-finite
                     // centroid would also self-saturate through non-finite
                     // residuals, but only if the cluster has members.)
                     if outcome != NormalizeOutcome::Normalized
-                        || stored.iter().any(|value| !value.is_finite())
+                        || stored_centroid.iter().any(|value| !value.is_finite())
                     {
                         bounds_builder.saturate(centroid_ord);
                     }
@@ -1030,16 +1008,18 @@ pub(crate) fn merge_ivf(
                             &bytes
                         };
                         rows_w.write_all(written_bytes)?;
-                        // P1: the bounds fold — every written row, using the exact
-                        // bytes written above against the stored centroid. A
-                        // non-finite row residual saturates its cluster
+                        // The bounds fold uses the exact bytes written above
+                        // against the stored centroid.
+                        // A non-finite row residual saturates its cluster
                         // inside `add_native`.
                         if assigned_vector.cluster != current_cluster {
                             current_cluster = assigned_vector.cluster;
-                            current_centroid = decode_row::<f32>(
+                            current_centroid.clear();
+                            decode_row_append::<f32>(
                                 &centroid_bytes[current_cluster * centroid_stride..]
                                     [..centroid_stride],
                                 opts.dim(),
+                                &mut current_centroid,
                             )?;
                         }
                         bounds_builder.add_native(
@@ -1053,7 +1033,6 @@ pub(crate) fn merge_ivf(
 
                 if let Some(config) = quantization {
                     let quantize_start = Instant::now();
-                    require_leading_sign_gamma(config)?;
                     let (specs, grids) = quantization_runtime(config, opts)?;
                     // Freeze every quantized slot's cluster-byte table before
                     // opening spill files or encoding the first row.
@@ -1065,12 +1044,12 @@ pub(crate) fn merge_ivf(
                     // Two row-major f32 tile buffers live in the cascade
                     // encoder. Rotation and grid packing reuse d-sized
                     // transient buffers across every row in the tile. Include
-                    // the tile's encoded output and f64 gamma accumulators in
+                    // the tile's encoded output and f64 prefix accumulators in
                     // the cap rather than accounting only for rotations. The
-                    // deferred binary16 gamma runs below are deliberately
-                    // one-cluster storage-order buffers (2 bytes per row per
-                    // layer), not tile scratch; include them separately in
-                    // the Part-C peak-memory ledger.
+                    // deferred binary16 gamma and corrected-error runs below are
+                    // deliberately one-cluster storage-order buffers (4 bytes
+                    // per row per layer), not tile scratch; include them
+                    // separately in the peak-memory ledger.
                     const MAX_QUANTIZATION_SCRATCH_BYTES: usize = 1 << 20;
                     let row_bytes = opts.dim() * std::mem::size_of::<f32>();
                     let fixed_scratch = row_bytes
@@ -1090,6 +1069,9 @@ pub(crate) fn merge_ivf(
                         BatchEncodeWorkspace::with_capacity(opts.dim(), tile_rows, &specs);
                     let mut cluster_gammas: Vec<Vec<u16>> =
                         (0..config.layers.len()).map(|_| Vec::new()).collect();
+                    let mut cluster_error_ratios: Vec<Vec<u16>> =
+                        (0..config.layers.len()).map(|_| Vec::new()).collect();
+                    let mut quantized_centroid = Vec::with_capacity(opts.dim());
                     for (cluster, offsets) in cluster_offsets.windows(2).enumerate() {
                         temp_slots.validate_cluster_boundary(&quantized_layout, cluster)?;
                         let start = offsets[0] as usize;
@@ -1098,14 +1080,20 @@ pub(crate) fn merge_ivf(
                             temp_slots.validate_cluster_boundary(&quantized_layout, cluster + 1)?;
                             continue;
                         }
-                        let centroid = decode_row::<f32>(
+                        quantized_centroid.clear();
+                        decode_row_append::<f32>(
                             &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
                             opts.dim(),
+                            &mut quantized_centroid,
                         )?;
-                        let prepared = centroid_workspace.prepare(&centroid);
+                        let prepared = centroid_workspace.prepare(&quantized_centroid);
                         for gammas in &mut cluster_gammas {
                             gammas.clear();
                             gammas.reserve(end - start);
+                        }
+                        for error_ratios in &mut cluster_error_ratios {
+                            error_ratios.clear();
+                            error_ratios.reserve(end - start);
                         }
                         for tile in assigned_vectors[start..end].chunks(tile_rows) {
                             if ctx.cancel.wants_cancel() {
@@ -1145,12 +1133,6 @@ pub(crate) fn merge_ivf(
                                     &mut batch_values,
                                 )?;
                             }
-                            if let Some(residual_norms) = temp_slots.residual_norms.as_mut() {
-                                for row in batch_values.chunks_exact(opts.dim()) {
-                                    residual_norms
-                                        .write_all(&l2_squared(row, &centroid).to_le_bytes())?;
-                                }
-                            }
                             let batch = encode_batch_in_place_with_workspace(
                                 &mut batch_values,
                                 tile.len(),
@@ -1158,22 +1140,48 @@ pub(crate) fn merge_ivf(
                                 &specs,
                                 &grids,
                                 &mut encode_workspace,
+                                config.needs_constants(),
                             );
+                            // Slot 2 is the same binary32 radius value used as
+                            // gamma's numerator and E's denominator. Do not
+                            // recompute it through a second distance path with
+                            // an independently chosen accumulation order.
+                            write_f32_run(
+                                &mut temp_slots.residual_norms,
+                                &batch.residual_norms_squared,
+                            )?;
                             for (layer_index, (target, layer)) in
                                 temp_slots.layers.iter_mut().zip(&batch.layers).enumerate()
                             {
                                 target.codes.write_all(&layer.codes)?;
-                                write_f32_run(&mut target.constants, &layer.constants)?;
-                                write_u16_run(&mut target.sidecar, &layer.scales)?;
+                                match &mut target.constants {
+                                    Some(constants) => {
+                                        write_f32_run(constants, &layer.constants)?;
+                                    }
+                                    None => debug_assert!(layer.constants.is_empty()),
+                                }
+                                write_f32_run(&mut target.sidecar, &layer.scales)?;
                                 cluster_gammas[layer_index].extend_from_slice(&layer.gammas);
+                                cluster_error_ratios[layer_index]
+                                    .extend_from_slice(&layer.corrected_error_ratios);
                             }
                         }
-                        for (target, gammas) in temp_slots.layers.iter_mut().zip(&cluster_gammas) {
+                        for ((target, gammas), error_ratios) in temp_slots
+                            .layers
+                            .iter_mut()
+                            .zip(&cluster_gammas)
+                            .zip(&cluster_error_ratios)
+                        {
                             // A cluster may be much larger than the scratch
-                            // tile. Poll before and during its deferred gamma
-                            // run; scales were already emitted tile-by-tile
-                            // behind the tile-level cancellation check.
+                            // tile. Poll before and during its deferred runs;
+                            // scales were already emitted tile-by-tile behind
+                            // the tile-level cancellation check.
                             write_u16_run_cancellable(&mut target.sidecar, gammas, ctx.cancel)?;
+                            write_u16_run_cancellable(
+                                &mut target.sidecar,
+                                error_ratios,
+                                ctx.cancel,
+                            )?;
                         }
                         temp_slots.validate_cluster_boundary(&quantized_layout, cluster + 1)?;
                     }
@@ -1264,39 +1272,42 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    use common::{BinarySerializable, VInt};
-
     use super::*;
-    use crate::directory::{
-        CompositeFile, DirectoryClone, FileSlice, ManagedDirectory, RamDirectory, TerminatingWrite,
-    };
+    use crate::directory::{DirectoryClone, ManagedDirectory, RamDirectory};
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
-    use crate::vector::header::read_header;
     use crate::vector::ivf::AdaptiveProbeParams;
     use crate::vector::prepared::{QuantizedIndexCtx, QuantizedQueryCtx};
     use crate::vector::tests::ground_truth;
     use crate::vector::{
-        TopDocsByVectorSimilarity, VectorCalibrationMeasurements, VectorGammaAuditQuery,
+        TopDocsByVectorSimilarity, VectorCalibrationMeasurements, VectorErrorAuditQuery,
         VectorQuantizationCalibrationSource, VectorQuantizationLayer,
     };
     use crate::{Index, TantivyDocument};
 
     #[test]
-    fn blocked_scale_gamma_sidecar_is_cluster_local_and_deterministic() {
+    fn blocked_sidecar_is_cluster_local_and_deterministic() {
         let mut bytes = Vec::new();
-        write_scale_gamma_block(&mut bytes, &[0x0102, 0x0304], &[0x1112, 0x1314]).unwrap();
-        write_scale_gamma_block(&mut bytes, &[], &[]).unwrap();
-        write_scale_gamma_block(&mut bytes, &[0x0506], &[0x1516]).unwrap();
+        write_sidecar_block(
+            &mut bytes,
+            &[1.0, 2.0],
+            &[0x1112, 0x1314],
+            &[0x2122, 0x2324],
+        )
+        .unwrap();
+        write_sidecar_block(&mut bytes, &[], &[], &[]).unwrap();
+        write_sidecar_block(&mut bytes, &[3.0], &[0x1516], &[0x2526]).unwrap();
         assert_eq!(
             bytes,
             [
-                0x02, 0x01, 0x04, 0x03, // cluster 0 scale run
+                0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, // cluster 0 scale run
                 0x12, 0x11, 0x14, 0x13, // cluster 0 gamma run
-                0x06, 0x05, // cluster 1 scale run
+                0x22, 0x21, 0x24, 0x23, // cluster 0 corrected-error run
+                0x00, 0x00, 0x40, 0x40, // cluster 1 scale run
                 0x16, 0x15, // cluster 1 gamma run
+                0x26, 0x25, // cluster 1 corrected-error run
             ]
         );
     }
@@ -1323,23 +1334,24 @@ mod tests {
         assert_eq!(layer0.codes.cluster_span(1), 32..32);
         assert_eq!(layer0.codes.cluster_span(2), 32..80);
         assert_eq!(layer0.codes.total_bytes, 80);
-        assert_eq!(layer0.sidecar.row_stride, 4);
-        assert_eq!(layer0.sidecar.cluster_offsets, [0, 8, 8, 20]);
-        assert_eq!(layer0.sidecar.total_bytes, 20);
-        assert_eq!(layer0.constants.cluster_offsets, [0, 8, 8, 20]);
-        assert_eq!(layer0.constants.total_bytes, 20);
+        assert_eq!(layer0.sidecar.row_stride, 8);
+        assert_eq!(layer0.sidecar.cluster_offsets, [0, 16, 16, 40]);
+        assert_eq!(layer0.sidecar.total_bytes, 40);
+        let layer0_constants = layer0.constants.as_ref().unwrap();
+        assert_eq!(layer0_constants.cluster_offsets, [0, 8, 8, 20]);
+        assert_eq!(layer0_constants.total_bytes, 20);
 
         let layer1 = &layout.layers[1];
         assert_eq!(layer1.codes.row_stride, 56);
         assert_eq!(layer1.codes.cluster_offsets, [0, 112, 112, 280]);
         assert_eq!(layer1.codes.total_bytes, 280);
-        assert_eq!(layer1.sidecar.cluster_offsets, [0, 8, 8, 20]);
-        assert_eq!(layer1.constants.cluster_offsets, [0, 8, 8, 20]);
+        assert_eq!(layer1.sidecar.cluster_offsets, [0, 16, 16, 40]);
+        assert_eq!(
+            layer1.constants.as_ref().unwrap().cluster_offsets,
+            [0, 8, 8, 20]
+        );
 
-        let residual_norms = layout
-            .residual_norms
-            .as_ref()
-            .expect("L2 layout must include slot 14");
+        let residual_norms = &layout.residual_norms;
         assert_eq!(residual_norms.row_stride, 4);
         assert_eq!(residual_norms.cluster_offsets, [0, 8, 8, 20]);
         assert_eq!(residual_norms.cluster_span(1), 8..8);
@@ -1349,12 +1361,14 @@ mod tests {
             .layers
             .iter()
             .map(|layer| {
-                layer.codes.total_bytes + layer.sidecar.total_bytes + layer.constants.total_bytes
+                layer.codes.total_bytes
+                    + layer.sidecar.total_bytes
+                    + layer.constants.as_ref().unwrap().total_bytes
             })
             .sum::<usize>()
             + residual_norms.total_bytes;
         assert_eq!(logical_total, 5 * config.bytes_per_row());
-        assert_eq!(logical_total, 460);
+        assert_eq!(logical_total, 500);
 
         // Exercise the production boundary validator against the same table.
         let backing = RamDirectory::create();
@@ -1367,15 +1381,19 @@ mod tests {
                     .write_all(&vec![0; layer.codes.cluster_span(cluster).len()])?;
                 temp.sidecar
                     .write_all(&vec![0; layer.sidecar.cluster_span(cluster).len()])?;
-                temp.constants
-                    .write_all(&vec![0; layer.constants.cluster_span(cluster).len()])?;
+                temp.constants.as_mut().unwrap().write_all(&vec![
+                    0;
+                    layer
+                        .constants
+                        .as_ref()
+                        .unwrap()
+                        .cluster_span(cluster)
+                        .len()
+                ])?;
             }
-            temps.residual_norms.as_mut().unwrap().write_all(&vec![
-                0;
-                residual_norms
-                    .cluster_span(cluster)
-                    .len()
-            ])?;
+            temps
+                .residual_norms
+                .write_all(&vec![0; residual_norms.cluster_span(cluster).len()])?;
             temps.validate_cluster_boundary(&layout, cluster + 1)?;
         }
         Ok(())
@@ -1443,14 +1461,14 @@ mod tests {
         let production_source = &source[..test_module_start];
         for forbidden in [
             "build_grid(",
-            "audit_prefix_gammas(",
+            "audit_prefix_error_model(",
             "prepare_fp_query(",
             "vector_calibrate(",
             "VectorCalibrationMeasurements",
-            "audit_gamma",
-            "diagnostic_gamma",
+            "audit_error",
+            "diagnostic_error",
             "persist_fixture_calibration",
-            "VectorGammaAuditQuery",
+            "VectorErrorAuditQuery",
             ".calibration()",
         ] {
             assert!(
@@ -1461,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_runtime_uses_only_persisted_grid_and_rho() {
+    fn merge_runtime_uses_persisted_grid_and_rho() {
         let config = quant_fixture_config_for(100, Metric::Dot, &[1, 4]);
         let (_, resolved) =
             quantization_runtime(&config, &VectorOptions::new(100, Metric::Dot)).unwrap();
@@ -1474,22 +1492,8 @@ mod tests {
                 .unwrap();
             assert_eq!(grid.bits, persisted.bits);
             assert_eq!(grid.points, persisted.points);
-            assert_eq!(Some(grid.rho_model), persisted.rho_model);
+            assert_eq!(grid.rho_model, persisted.rho_model);
         }
-
-        let mut missing_rho = config;
-        missing_rho.grids[0].rho_model = None;
-        let error =
-            quantization_runtime(&missing_rho, &VectorOptions::new(100, Metric::Dot)).unwrap_err();
-        assert!(error.to_string().contains("no persisted rho_model"));
-    }
-
-    #[test]
-    fn grid_first_gamma_is_an_explicit_unresolved_build_contract() {
-        let config = quant_fixture_config_for(100, Metric::Dot, &[4]);
-        let error = require_leading_sign_gamma(&config).unwrap_err();
-        assert!(error.to_string().contains("grid-first"));
-        assert!(error.to_string().contains("stored effective scale"));
     }
 
     const QUANT_FIXTURE_DIM: usize = 64;
@@ -1568,11 +1572,6 @@ mod tests {
                 .enumerate()
                 .map(|(layer, &bits)| VectorQuantizationLayer {
                     bits,
-                    quantizer: if bits == 1 {
-                        VectorQuantizer::RaBitQ
-                    } else {
-                        VectorQuantizer::TurboQuant
-                    },
                     seed: seeds[layer],
                 })
                 .collect(),
@@ -1632,7 +1631,7 @@ mod tests {
         fixture_calibration_queries_for(Metric::L2, dim)
     }
 
-    fn diagnostic_gamma_measurements(
+    fn diagnostic_error_measurements(
         vector_reader: &crate::vector::VectorIndexReader,
         queries: &[Vec<f32>],
         sample_rows: usize,
@@ -1641,13 +1640,13 @@ mod tests {
         let queries = queries
             .iter()
             .cloned()
-            .map(|values| VectorGammaAuditQuery {
+            .map(|values| VectorErrorAuditQuery {
                 values,
                 excluded_doc_id: None,
             })
             .collect::<Vec<_>>();
         Ok(vector_reader
-            .audit_gamma_queries(
+            .audit_error_queries(
                 VectorQuantizationCalibrationSource::RealQuery,
                 &queries,
                 sample_rows,
@@ -1669,7 +1668,7 @@ mod tests {
         let queries = fixture_calibration_queries_for(metric, dim);
         let mut measurements = VectorCalibrationMeasurements::default();
         for segment in reader.searcher().segment_readers() {
-            if let Some(segment_measurements) = diagnostic_gamma_measurements(
+            if let Some(segment_measurements) = diagnostic_error_measurements(
                 segment.vector_index(field)?.as_ref(),
                 &queries,
                 1_000,
@@ -1683,7 +1682,10 @@ mod tests {
                 measurements.merge(&segment_measurements)?;
             }
         }
-        let calibration = measurements.finish(VectorQuantizationCalibrationSource::RealQuery)?;
+        let calibration = measurements.finish(
+            VectorQuantizationCalibrationSource::RealQuery,
+            "REAL_QUERY_EXACT_E_BQ4",
+        )?;
         let previous = index.load_metas()?;
         let mut updated = index.load_metas()?;
         updated.index_settings.vector_quantization[0]
@@ -1823,26 +1825,6 @@ mod tests {
             .collect()
     }
 
-    fn fixture_hits(index: &Index, query: Vec<f32>) -> crate::Result<Vec<(u32, u32)>> {
-        let reader = index.reader()?;
-        reader.reload()?;
-        let searcher = reader.searcher();
-        let field = index.schema().get_field("embedding")?;
-        let collector = TopDocsByVectorSimilarity::new(field, query, 3).with_adaptive_params(
-            AdaptiveProbeParams {
-                max_probe_fraction: 1.0,
-                min_probe_clusters: 2,
-                ..Default::default()
-            },
-        );
-        Ok(searcher
-            .search(&AllQuery, &collector)?
-            .results
-            .iter()
-            .map(|&(score, address)| (score.to_bits(), address.doc_id))
-            .collect())
-    }
-
     #[derive(Clone, Copy, Debug)]
     enum QuantizedMatrixScenario {
         None,
@@ -1966,16 +1948,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             schedule
         );
-        assert_eq!(
-            quantized.config().needs_residual_norm(),
-            metric == Metric::L2
-        );
         for row in 0..ivf.num_rows() {
-            assert_eq!(
-                quantized.residual_norm(row)?.is_some(),
-                metric == Metric::L2,
-                "slot 14 presence must follow the metric at row {row}"
-            );
+            assert!(quantized.residual_norm(row)?.is_finite());
+            for (layer, stored) in quantized.layers().iter().enumerate() {
+                assert!((1.0..=4.0).contains(&stored.gamma(row)?));
+                let corrected_error = stored.error_ratio(row)?;
+                assert!(corrected_error.is_finite() && corrected_error >= 0.0);
+                assert_eq!(
+                    stored.constant(row)?.is_some(),
+                    metric == Metric::L2,
+                    "layer {layer} split-constant presence must follow the metric at row {row}"
+                );
+            }
         }
         Ok(())
     }
@@ -2073,57 +2057,6 @@ mod tests {
             .to_vec())
     }
 
-    fn vec_composite_slot(
-        bytes: &[u8],
-        field: Field,
-        slot: usize,
-    ) -> crate::Result<Option<Vec<u8>>> {
-        let (_, body) = read_header(&FileSlice::from(bytes.to_vec()))?;
-        Ok(CompositeFile::open(&body)?
-            .open_read_with_idx(field, slot)
-            .map(|slice| slice.read_bytes().map(|bytes| bytes.to_vec()))
-            .transpose()?)
-    }
-
-    fn inject_legacy_slot15(bytes: &[u8], field: Field, payload: &[u8]) -> crate::Result<Vec<u8>> {
-        let (header, body) = bytes.split_at(HEADER_LEN);
-        let footer_len = u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap()) as usize;
-        let footer_start = body.len() - 4 - footer_len;
-        let mut footer_reader = &body[footer_start..body.len() - 4];
-        let entry_count = VInt::deserialize(&mut footer_reader)?.0 as usize;
-        let mut entries = Vec::with_capacity(entry_count);
-        let mut absolute_offset = 0_u64;
-        for _ in 0..entry_count {
-            absolute_offset += VInt::deserialize(&mut footer_reader)?.0;
-            let entry_field = Field::deserialize(&mut footer_reader)?;
-            let entry_slot = VInt::deserialize(&mut footer_reader)?.0;
-            entries.push((absolute_offset, entry_field, entry_slot));
-        }
-        assert!(footer_reader.is_empty());
-
-        let mut new_footer = Vec::new();
-        VInt((entry_count + 1) as u64).serialize(&mut new_footer)?;
-        let mut previous_offset = 0_u64;
-        for &(offset, entry_field, entry_slot) in &entries {
-            VInt(offset - previous_offset).serialize(&mut new_footer)?;
-            entry_field.serialize(&mut new_footer)?;
-            VInt(entry_slot).serialize(&mut new_footer)?;
-            previous_offset = offset;
-        }
-        let legacy_offset = footer_start as u64;
-        VInt(legacy_offset - previous_offset).serialize(&mut new_footer)?;
-        field.serialize(&mut new_footer)?;
-        VInt(vec_slot::QUANTIZED_CALIBRATION as u64).serialize(&mut new_footer)?;
-
-        let mut injected = Vec::with_capacity(bytes.len() + payload.len() + new_footer.len());
-        injected.extend_from_slice(header);
-        injected.extend_from_slice(&body[..footer_start]);
-        injected.extend_from_slice(payload);
-        injected.extend_from_slice(&new_footer);
-        injected.extend_from_slice(&(new_footer.len() as u32).to_le_bytes());
-        Ok(injected)
-    }
-
     fn assert_relative_1e5(actual: f32, expected: f32, context: &str) {
         let tolerance = 1e-5 * expected.abs().max(f32::MIN_POSITIVE);
         assert!(
@@ -2161,9 +2094,15 @@ mod tests {
                 let codes = stored.code_bytes(row)?;
                 let scale = stored.scale(row)?;
                 let constant = stored.constant(row)?;
-                let scan_estimate = scan.score_layer(layer, &codes, scale, constant);
-                let harness_estimate =
-                    harness.score_layer(layer, &codes, scale, constant, specs[layer]);
+                let scan_estimate = scan.score_layer(layer, &codes, scale, constant)?;
+                let harness_estimate = match constant {
+                    Some(constant) => {
+                        harness.score_layer(layer, &codes, scale, constant, specs[layer])
+                    }
+                    None => {
+                        harness.score_layer_without_constant(layer, &codes, scale, specs[layer])
+                    }
+                };
                 assert_relative_1e5(
                     scan_estimate,
                     harness_estimate,
@@ -2178,13 +2117,13 @@ mod tests {
     }
 
     #[test]
-    fn gate_a_bridge_exactness_d768_and_d100() -> crate::Result<()> {
+    fn bridge_exactness_d768_and_d100() -> crate::Result<()> {
         assert_quantized_bridge_exactness(768)?;
         assert_quantized_bridge_exactness(100)
     }
 
     #[test]
-    fn gate_c_level_zero_matches_unquantized_ivf() -> crate::Result<()> {
+    fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
         const DIM: usize = 64;
         let query = vec![0.05_f32; DIM];
         let params = AdaptiveProbeParams {
@@ -2302,17 +2241,19 @@ mod tests {
                     &vector_reader.vector_bytes_for_row(row)?,
                     QUANT_FIXTURE_DIM,
                 )?;
-                let residual: Vec<f32> = vector
-                    .iter()
-                    .zip(&centroid)
-                    .map(|(&value, &center)| value - center)
-                    .collect();
-                let expected = cascade::encode_layers(&residual, Some(&prepared), &specs, &grids);
+                let mut expected_input = vector.clone();
+                let mut workspace = cascade::BatchEncodeWorkspace::new();
+                let expected = cascade::encode_batch_in_place_with_workspace(
+                    &mut expected_input,
+                    1,
+                    &prepared,
+                    &specs,
+                    &grids,
+                    &mut workspace,
+                    true,
+                );
                 assert_eq!(
-                    quantized
-                        .residual_norm(row)?
-                        .expect("L2 fixture requires residual norm")
-                        .to_bits(),
+                    quantized.residual_norm(row)?.to_bits(),
                     l2_squared(&vector, &centroid).to_bits()
                 );
                 for (layer, stored) in quantized.layers().iter().enumerate() {
@@ -2320,13 +2261,30 @@ mod tests {
                     assert_eq!(
                         stored_codes.len(),
                         QUANT_FIXTURE_DIM * usize::from(specs[layer].bits) / 8,
-                        "divisible-d V3 fixture must retain its original row stride"
+                        "divisible dimensions use exact byte strides"
                     );
-                    assert_eq!(stored_codes.as_slice(), expected.codes[layer]);
-                    assert_eq!(stored.scale(row)?, expected.scales[layer]);
                     assert_eq!(
-                        stored.constant(row)?.to_bits(),
-                        expected.constants[layer].to_bits()
+                        stored_codes.as_slice(),
+                        expected.layers[layer].codes.as_slice()
+                    );
+                    assert_eq!(stored.scale(row)?, expected.layers[layer].scales[0]);
+                    assert_eq!(
+                        stored.gamma(row)?.to_bits(),
+                        quant_model::f16::f16_to_f32(expected.layers[layer].gammas[0]).to_bits()
+                    );
+                    assert_eq!(
+                        stored.error_ratio(row)?.to_bits(),
+                        quant_model::f16::f16_to_f32(
+                            expected.layers[layer].corrected_error_ratios[0]
+                        )
+                        .to_bits()
+                    );
+                    assert_eq!(
+                        stored
+                            .constant(row)?
+                            .expect("L2 fixture requires split constants")
+                            .to_bits(),
+                        expected.layers[layer].constants[0].to_bits()
                     );
                 }
             }
@@ -2395,17 +2353,13 @@ mod tests {
 
     #[test]
     fn quantized_top_n_fixture_matrix_matches_direct_exact_oracle() -> crate::Result<()> {
-        const SCHEDULES: [[u8; 2]; 2] = [[1, 4], [1, 1]];
+        const SCHEDULES: &[&[u8]] = &[&[1], &[1, 4], &[1, 1, 4], &[2, 4]];
 
         for metric in [Metric::Cosine, Metric::L2] {
-            for schedule in &SCHEDULES {
-                // One complete metric/schedule cell carries the non-64-aligned
-                // dimension through none, filter, delete, and both active prefix depths.
-                let dim = if metric == Metric::L2 && schedule == &[1, 4] {
-                    100
-                } else {
-                    QUANT_FIXTURE_DIM
-                };
+            for &schedule in SCHEDULES {
+                // Every cell uses an odd dimension so each metric, schedule,
+                // scenario, and active prefix exercises word-rounded codes.
+                let dim = 100;
 
                 let primary = build_quantized_fixture_case_with_calibration(
                     dim, metric, schedule, true, true,
@@ -2415,7 +2369,7 @@ mod tests {
                     QuantizedMatrixScenario::None,
                     QuantizedMatrixScenario::Filter,
                 ] {
-                    for depth in 1..=2 {
+                    for depth in 1..=schedule.len() {
                         run_quantized_matrix_query(&primary, metric, schedule, scenario, depth)?;
                     }
                 }
@@ -2430,7 +2384,7 @@ mod tests {
                 }
                 writer.commit()?;
                 drop(writer);
-                for depth in 1..=2 {
+                for depth in 1..=schedule.len() {
                     run_quantized_matrix_query(
                         &primary,
                         metric,
@@ -2442,49 +2396,6 @@ mod tests {
 
             }
         }
-        Ok(())
-    }
-
-    #[test]
-    fn slot15_is_not_written_and_legacy_bytes_are_ignored() -> crate::Result<()> {
-        let index = build_quantized_fixture(QUANT_FIXTURE_DIM, true)?;
-        let field = index.schema().get_field("embedding")?;
-        let query = fixture_calibration_queries(QUANT_FIXTURE_DIM).remove(0);
-        let baseline = fixture_hits(&index, query.clone())?;
-
-        let original = quantized_vec_file(&index)?;
-        assert_eq!(
-            vec_composite_slot(&original, field, vec_slot::QUANTIZED_CALIBRATION)?,
-            None,
-            "the V3 writer must not emit retired slot 15"
-        );
-
-        // Shape the payload like retired metadata, but make its values
-        // deliberately nonsensical. Opening and scoring must depend only on
-        // settings-backed calibration and therefore ignore these bytes.
-        let mut legacy_payload = 3_u32.to_le_bytes().to_vec();
-        legacy_payload.extend_from_slice(&[0xA5; 28]);
-        let injected = inject_legacy_slot15(&original, field, &legacy_payload)?;
-        assert_eq!(
-            vec_composite_slot(&injected, field, vec_slot::QUANTIZED_CALIBRATION)?,
-            Some(legacy_payload)
-        );
-
-        let segment = index
-            .searchable_segments()?
-            .into_iter()
-            .next()
-            .expect("one merged fixture segment");
-        let path = segment.relative_path(SegmentComponent::Custom(VEC_EXT.to_string()));
-        index
-            .directory()
-            .delete(&path)
-            .expect("delete fixture .vec before slot-15 rewrite");
-        let mut writer = index.directory().open_write(&path)?;
-        writer.write_all(&injected)?;
-        writer.terminate()?;
-
-        assert_eq!(fixture_hits(&index, query)?, baseline);
         Ok(())
     }
 
@@ -2530,7 +2441,10 @@ mod tests {
                     assert_eq!(stored.code_bytes(row)?.as_slice(), expected.codes[layer]);
                     assert_eq!(stored.scale(row)?, expected.scales[layer]);
                     assert_eq!(
-                        stored.constant(row)?.to_bits(),
+                        stored
+                            .constant(row)?
+                            .expect("L2 fixture requires split constants")
+                            .to_bits(),
                         expected.constants[layer].to_bits()
                     );
                 }
@@ -2561,11 +2475,11 @@ mod tests {
     }
 
     #[test]
-    fn quantized_fixture_growth_matches_768_1_plus_4_ledger() -> crate::Result<()> {
+    fn l2_quantized_fixture_growth_matches_768_1_plus_4_ledger() -> crate::Result<()> {
         const DIM: usize = 768;
         const ROWS: usize = 8;
         let config = quant_fixture_config(DIM);
-        assert_eq!(config.bytes_per_row(), 500);
+        assert_eq!(config.bytes_per_row(), 508);
 
         let plain = quantized_vec_file(&build_quantized_fixture(DIM, false)?)?;
         let quantized = quantized_vec_file(&build_quantized_fixture(DIM, true)?)?;
@@ -2579,14 +2493,12 @@ mod tests {
         );
         assert!(physical_growth >= logical_growth);
         assert!(physical_growth <= logical_growth + 512);
-        assert!(
-            (logical_growth as f64 / (ROWS * DIM * 4) as f64 - 0.162_760_416_667).abs() < 1e-12
-        );
+        assert_eq!(logical_growth, ROWS * 508);
         Ok(())
     }
 
     #[test]
-    fn uncalibrated_quantized_slots_use_analytical_gamma_scoring() -> crate::Result<()> {
+    fn quantized_slots_use_analytical_gamma_without_diagnostics() -> crate::Result<()> {
         const DIM: usize = 100;
         let index = build_quantized_fixture_with_calibration(DIM, true, false)?;
         let reader = index.reader()?;
@@ -2596,13 +2508,13 @@ mod tests {
         let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
         let quantized = vector_reader
             .quantization()
-            .expect("uncalibrated index must retain configured quantized slots");
+            .expect("configured quantized slots must remain available without diagnostics");
         assert!(quantized.config().calibration().is_none());
 
         let queries = fixture_calibration_queries(DIM);
         let measurements =
-            diagnostic_gamma_measurements(vector_reader.as_ref(), &queries, 1_000, None)?
-                .expect("uncalibrated slots remain available to explicit calibration");
+            diagnostic_error_measurements(vector_reader.as_ref(), &queries, 1_000, None)?
+                .expect("quantized slots remain available to explicit diagnostics");
         assert!(measurements
             .aggregate()
             .iter()
@@ -2640,7 +2552,7 @@ mod tests {
         assert_eq!(live_posting_rows, 6);
 
         let queries = fixture_calibration_queries(DIM);
-        let measurements = diagnostic_gamma_measurements(
+        let measurements = diagnostic_error_measurements(
             vector_reader.as_ref(),
             &queries,
             usize::MAX,
@@ -2653,7 +2565,7 @@ mod tests {
             .all(|depth| { depth.sample_count == (live_posting_rows * queries.len()) as u64 }));
 
         let bounded =
-            diagnostic_gamma_measurements(vector_reader.as_ref(), &queries, 5, Some(&alive))?
+            diagnostic_error_measurements(vector_reader.as_ref(), &queries, 5, Some(&alive))?
                 .unwrap();
         assert!(bounded
             .aggregate()

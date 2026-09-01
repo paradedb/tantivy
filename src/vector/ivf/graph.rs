@@ -1055,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn new_derives_nodes_from_the_arena() {
+    fn construction_derives_nodes_from_the_arena() {
         let g: Graph<Vec<f32>> = Graph::new(vec![1.0, 2.0, 3.0, 4.0], 2, 8);
         assert_eq!(g.len(), 2);
         assert!(!g.is_empty());
@@ -1085,7 +1085,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "arena not a multiple of dim")]
-    fn new_rejects_a_misaligned_arena() {
+    fn construction_rejects_a_misaligned_arena() {
         let _ = Graph::new(vec![1.0f32, 2.0, 3.0], 2, 4);
     }
 

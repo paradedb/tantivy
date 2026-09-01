@@ -1099,7 +1099,7 @@ mod bench_sorted_index_merge {
     // IndexMerger::open(index.schema(), index.settings().clone(), &segments[..])?;
     // let doc_id_mapping = merger.generate_doc_id_mapping(&sort_by_field).unwrap();
     // b.iter(|| {
-    // let sorted_doc_ids = doc_id_mapping.iter_old_doc_addrs().map(|doc_addr| {
+    // let sorted_doc_ids = doc_id_mapping.iter_source_doc_addrs().map(|doc_addr| {
     // let reader = &merger.readers[doc_addr.segment_ord as usize];
     // let u64_reader: Arc<dyn Column<u64>> = reader
     //.fast_fields()
