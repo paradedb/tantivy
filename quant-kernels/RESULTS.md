@@ -480,3 +480,787 @@ One corrected, single-segment release trace at probe `0.005`:
 | [1,4] | 0.0308 | 30902.870 | 201.090 | 18.330 | 3955567 | 102958 | 75080 | 4133605 |
 | [1,4] | 0.0872 | 87313.500 | 201.790 | 18.340 | 11176128 | 103316 | 75121 | 11354565 |
 | [1,4] | 0.1000 | 100107.680 | 201.830 | 18.330 | 12813783 | 103337 | 75080 | 12992200 |
+
+## Phase B Cohere 1M plane-2 batching gate — 2026-08-25
+
+Warm cache; Apple M5 Max, arm64; existing q14 index reused; κ `(2.0, 4.0)`;
+CAL `2.2659183`; 100 queries and 3 timed samples/query. No index rebuild.
+
+### Grid b=4 batch kernel
+
+| kernel shape | d | rows/batch | ns/batch | ns/refinement |
+|---|---:|---:|---:|---:|
+| fixed-stride, coordinate LUT | 768 | 32 | 3349.0 | 104.656 |
+| fixed-stride, packed-byte LUT | 768 | 32 | 2221.0 | 69.406 |
+| indexed rows, packed-byte LUT | 768 | 32 | 2325.5 | 72.672 |
+| indexed rows, packed-byte LUT, d=1024 linear projection | 1024 | 32 | 3100.7 | 96.897 |
+
+### Search-only plane-2 stage
+
+| implementation | run | recall | refinements | plane-2 ns | ns/refinement | plane-2 buffer hits | reads |
+|---|---|---:|---:|---:|---:|---:|---:|
+| scalar row scorer + dense gather | `20260825_093933_search.json` | 0.897 | 1693.97 | 1306585.04 | 771.315 | 279.20 | 0.00 |
+| scalar row scorer + dense gather | `20260825_093933_search.json` | 0.958 | 2394.43 | 1908711.28 | 797.146 | 523.80 | 0.00 |
+| scalar row scorer + dense gather | `20260825_093933_search.json` | 0.993 | 2947.18 | 2456788.74 | 833.607 | 900.61 | 0.00 |
+| packed batch + dense gather | `20260825_102031_search.json` | 0.897 | 1693.97 | 512009.19 | 302.254 | 279.20 | 0.00 |
+| packed batch + dense gather | `20260825_102031_search.json` | 0.958 | 2394.43 | 809217.20 | 337.958 | 523.80 | 0.00 |
+| packed batch + dense gather | `20260825_102031_search.json` | 0.993 | 2947.18 | 1240818.33 | 421.019 | 900.61 | 0.00 |
+| indexed packed batch + one cluster-range pin | `20260825_102708_search.json` | 0.897 | 1693.97 | 497331.69 | 293.589 | 299.40 | 0.00 |
+| indexed packed batch + one cluster-range pin | `20260825_102708_search.json` | 0.958 | 2394.43 | 802930.06 | 335.332 | 587.09 | 0.00 |
+| indexed packed batch + one cluster-range pin | `20260825_102708_search.json` | 0.993 | 2947.18 | 1215286.25 | 412.356 | 1109.00 | 0.00 |
+
+| gate | target ns/refinement | measured r95 ns/refinement | result |
+|---|---:|---:|---|
+| plane-2 batch | 100.000 | 335.332 | fail |
+
+q1, q2, and q14-p4x builds and the dependent search matrix were not run.
+
+### Existing q14 cluster fixed-cost yardstick
+
+Build layout: `20260824_230518_build.json`; search:
+`20260825_102708_search.json`. Plane-1 least-squares fit across r90/r95/r99:
+`plane1_ns = 2255116.846 + 57.725887 × scored_rows`.
+
+| point | clusters admitted | mean posting rows | plane-1 scored | plane-1 ns | fitted marginal ns/row | fixed intercept ns | intercept / clusters ns |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| r95 | 129.20 | 100.00 | 14188.32 | 3078682.23 | 57.725887 | 2255116.846 | 17454.465 |
+| r99 | 977.07 | 100.00 | 100107.68 | 8033487.67 | 57.725887 | 2255116.846 | 2308.040 |
+
+| fitted component | included work |
+|---|---|
+| fixed / cluster | centroid decode and residual-query norm; code/scale range pin; cluster loop and local-k merge |
+| marginal / row | sign kernel; f16 scale decode; estimate/σ combine; doc-id and candidate-buffer write |
+
+## 2026-08-25 — final integrated scan and real-query CAL (M5/ARM)
+
+Warm cache; Cohere 1M, cosine, d=1024; 100 queries, three timed samples per
+query. Tantivy code commit `7f92c0157fb386fced9aa00e9ac34c037c160368`,
+pg_search pin `f46931610`; search run
+`runs/cohere-1m-q14/20260825_093933_search.json`. Baseline qoff run
+`runs/cohere-1m-qoff/20260824_225312_search.json`.
+
+### Persisted scorer context and integrated kernel
+
+| measure | before | after |
+|---|---:|---:|
+| repeated-query wall p50 ms at probe 0.0141 | ~26.7 | 4.708000 |
+| repeated-query stage-total p50 ms | ~4.7 | 3.558603 |
+| wall minus stage-total p50 ms | ~22.0 | 1.149398 |
+| installed `estimate_asym_batch_unscaled` symbols | 1 | 0 |
+| installed `score_layer_batch_unscaled` symbols | 1 | 0 |
+| installed fused-wrapper symbols | · | 0 |
+
+### CAL materialization
+
+| persisted CAL | samples | stored-query CAL | Gaussian CAL | held-out CAL | REINDEX ms | quantize ms | IVF total ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2.2659183 | 1000 | 1.0342273 | 0.9911006 | 1.0068727 | 126374.372 | 22509 | 62981 |
+
+### Split stage means before / after
+
+The before run is `20260825_030149_search.json`; its plane-1 field includes
+routing because the timer had not yet been split.
+
+| point | probe | stage | before ms | after ms |
+|---|---:|---|---:|---:|
+| r90 | 0.0050 | query prep | 0.055546 | 0.047324 |
+| r90 | 0.0050 | routing | · | 0.297479 |
+| r90 | 0.0050 | plane-1 | 14.285897 | 2.458256 |
+| r90 | 0.0050 | boundary | 0.869953 | 0.035015 |
+| r90 | 0.0050 | plane-2 | 0.213870 | 1.306585 |
+| r90 | 0.0050 | rerank fetch | 0.018510 | 0.032143 |
+| r90 | 0.0050 | rerank score | 0.002576 | 0.005164 |
+| r90 | 0.0050 | stage total | 15.446352 | 4.181965 |
+| r95 | 0.0141 | query prep | 0.054427 | 0.050797 |
+| r95 | 0.0141 | routing | · | 0.628308 |
+| r95 | 0.0141 | plane-1 | 42.049876 | 2.996278 |
+| r95 | 0.0141 | boundary | 0.936807 | 0.065182 |
+| r95 | 0.0141 | plane-2 | 0.235895 | 1.908711 |
+| r95 | 0.0141 | rerank fetch | 0.020385 | 0.034963 |
+| r95 | 0.0141 | rerank score | 0.002821 | 0.005719 |
+| r95 | 0.0141 | stage total | 43.300210 | 5.689958 |
+| r99 | 0.1000 | query prep | 0.061425 | 0.052467 |
+| r99 | 0.1000 | routing | · | 2.524869 |
+| r99 | 0.1000 | plane-1 | 531.717494 | 7.947809 |
+| r99 | 0.1000 | boundary | 1.417156 | 0.222583 |
+| r99 | 0.1000 | plane-2 | 0.256910 | 2.456789 |
+| r99 | 0.1000 | rerank fetch | 0.023374 | 0.037869 |
+| r99 | 0.1000 | rerank score | 0.003047 | 0.005707 |
+| r99 | 0.1000 | stage total | 533.479405 | 13.248092 |
+
+### Stage buffers after
+
+| point | stage | buffer hits | buffer reads |
+|---|---|---:|---:|
+| r95 | query prep | 0.00 | 0.00 |
+| r95 | routing | 1288.40 | 0.00 |
+| r95 | plane-1 | 5461.56 | 0.00 |
+| r95 | boundary | 0.00 | 0.00 |
+| r95 | plane-2 | 523.80 | 0.00 |
+| r95 | rerank fetch | 52.50 | 0.00 |
+| r95 | rerank score | 0.00 | 0.00 |
+| r99 | query prep | 0.00 | 0.00 |
+| r99 | routing | 5068.06 | 0.00 |
+| r99 | plane-1 | 8451.99 | 0.00 |
+| r99 | boundary | 0.00 | 0.00 |
+| r99 | plane-2 | 900.61 | 0.00 |
+| r99 | rerank fetch | 56.21 | 0.00 |
+| r99 | rerank score | 0.00 | 0.00 |
+
+### Wall/stage reconciliation
+
+| point | wall p50 ms | stage-total mean ms | gap ms |
+|---|---:|---:|---:|
+| r90 | 5.275667 | 4.181965 | 1.093702 |
+| r95 | 6.365750 | 5.689958 | 0.675792 |
+| r99 | 13.484708 | 13.248092 | 0.236616 |
+
+### Funnel means
+
+| point | probe | plane-1 scored | survivors | s1 | refinements scored | rerank rows | s2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| r95 | 0.0141 | 14188.320 | 2394.430 | 0.168760643 | 2394.430 | 38.240 | 0.015970398 |
+| r99 | 0.1000 | 100107.680 | 2947.180 | 0.029440099 | 2947.180 | 40.580 | 0.013769095 |
+
+### Matched-probe attribution
+
+| probe | qoff recall vs GT | q14 recall vs GT | candidate recall ratio | product recall | final recall | product-final gap |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.0050 | 0.897000 | 0.897000 | 1.000000000 | 0.897000 | 0.897000 | 0.000000000 |
+| 0.0141 | 0.958000 | 0.958000 | 1.000000000 | 0.958000 | 0.958000 | 0.000000000 |
+| 0.1000 | 0.993000 | 0.993000 | 1.000000000 | 0.993000 | 0.993000 | 0.000000000 |
+
+### Iso-recall performance
+
+| point | qoff probe | q14 probe | qoff recall | q14 recall | qoff p50 ms | q14 p50 ms | p50 ratio | qoff p99 ms | q14 p99 ms | p99 ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| r90 | 0.0050 | 0.0050 | 0.897000 | 0.897000 | 2.529667 | 5.275667 | 2.085518371 | 3.710166 | 7.101166 | 1.913975278 |
+| r95 | 0.0109 | 0.0141 | 0.948000 | 0.958000 | 5.384084 | 6.365750 | 1.182327393 | 6.789792 | 10.186625 | 1.500285281 |
+| r99 | 0.1000 | 0.1000 | 0.993000 | 0.993000 | 39.936209 | 13.484708 | 0.337656186 | 42.528125 | 21.260292 | 0.499911341 |
+
+### Build economics at 1M
+
+| run | build s | index bytes | build-time ratio | size ratio |
+|---|---:|---:|---:|---:|
+| qoff | 99.694642 | 8693366784 | 1.000000000 | 1.000000000 |
+| q14 | 139.525476 | 9347932160 | 1.399528337 | 1.075294807 |
+| q14 − qoff | 39.830834 | 654565376 | 0.399528337 | 0.075294807 |
+
+### Bytes ledger
+
+| schedule | probe | plane-1 rows | refinement rows | rerank rows | plane-1 bytes | refinement bytes | rerank bytes | total bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| [1,4] | 0.0050 | 5093.390 | 1693.970 | 36.580 | 651954 | 867313 | 149832 | 1669098 |
+| [1,4] | 0.0141 | 14188.320 | 2394.430 | 38.240 | 1816105 | 1225948 | 156631 | 3198684 |
+| [1,4] | 0.1000 | 100107.680 | 2947.180 | 40.580 | 12813783 | 1508956 | 166216 | 14488955 |
+
+### x86 criterion and assembly confirmation
+
+GitHub Actions `ubuntu-latest`, x86_64, Rust stable, `-C target-cpu=native`,
+thin LTO, one codegen unit; run `32808177199`, workflow commit
+`c78c4c1dfb30ab56b64f4b75dde5959f2d8e3394`. The ARM column copies the
+Apple M5 Max middle estimate.
+
+| kernel | configuration | ARM | x86 95% CI |
+|---|---|---:|---:|
+| FHT apply | d=128 | 611.36 ns/vector | 1.1860–1.1972 µs/vector |
+| FHT apply | d=768 | 3.789 µs/vector | 7.1949–7.2173 µs/vector |
+| FHT apply | d=1536 | 7.791 µs/vector | 14.235–14.281 µs/vector |
+| sign symmetric score | d=768 | 2.588 ns/vector | 4.6969–4.7137 ns/vector |
+| sign asymmetric score | d=768, Bq=4 | 13.869 ns/vector | 26.127–26.184 ns/vector |
+| grid encode | d=768, b=2 | 1.945 µs/vector | 3.9522–3.9616 µs/vector |
+| grid score | d=768, b=2 | 500.79 ns/vector | 1.4430–1.4460 µs/vector |
+| grid encode | d=768, b=3 | · | 4.2548–4.2641 µs/vector |
+| grid score | d=768, b=3 | 480.160 ns/vector | 1.0291–1.0339 µs/vector |
+| grid encode | d=768, b=4 | 1.740 µs/vector | 5.6945–5.7022 µs/vector |
+| grid score | d=768, b=4 | 506.91 ns/vector | 1.4499–1.4523 µs/vector |
+| fp dot | d=128 | 23.485 ns/vector | 95.951–96.152 ns/vector |
+| fp dot | d=768 | 279.842 ns/vector | 693.49–694.34 ns/vector |
+| fp dot | d=1536 | 641.876 ns/vector | 1.4108–1.4113 µs/vector |
+| decode then dot | d=768 | 582.900 ns/vector | 1.2779–1.2896 µs/vector |
+| boundary ops | 50,000 candidates | 124.20 µs total; 2.484 ns/candidate | 326.76–329.55 µs total; 6.535–6.591 ns/candidate |
+| boundary ops | 500,000 candidates | 809.24 µs total; 1.618 ns/candidate | 2.1031–2.1271 ms total; 4.206–4.254 ns/candidate |
+
+| x86 check | result |
+|---|---:|
+| kernel goldens and determinism | 1 |
+| sign-plane hardware `popcnt` | 1 |
+| FHT packed `addps`/`subps` | 1 |
+| criterion suite | 1 |
+
+## 2026-08-25 — batch-call plane 1 and CAL protocol resolution (M5/ARM)
+
+Warm cache; existing Cohere 1M q14 index; probe `0.0141`; no index rebuild after
+the held-out CAL materialization. Tantivy commits `614a2708c5ba106ad36823ce179dcd4e2a2fc555`
+and `42071ef1bf181b9202c901dfaab5dfdc26854087`; pg_search pin
+`8ca6662ca`.
+
+### CAL protocols
+
+| protocol | corpus | query source | estimator | norm handling | rows | CAL |
+|---|---|---|---|---|---:|---:|
+| prior scan-side | Cohere 1M | benchmark search query | final split-form [1,4], f16 scale × ρ × CAL | production cosine score-query norm | 1000 | 2.265918082 |
+| stored-query diagnostic | Cohere 100K | first stored vector | final split-form [1,4], same stored scales and model σ | production cosine score-query norm | 1021 | 1.0650308 |
+| Gaussian decisive test | Cohere 100K | deterministic Gaussian directions | final split-form [1,4], same stored scales and model σ | exact query norm | 1021 | 0.9672958 |
+| held-out diagnostic | Cohere 100K | stored vectors as pseudo-queries | final split-form [1,4], same stored scales and model σ | source cluster excluded | 1021 | 1.0698010 |
+| stored-query full build | Cohere 1M | first stored vector | final split-form [1,4], same stored scales and model σ | production cosine score-query norm | 1024 | 0.98859084 |
+| Gaussian full build | Cohere 1M | deterministic Gaussian directions | final split-form [1,4], same stored scales and model σ | exact query norm | 1024 | 0.99258050 |
+| held-out persisted | Cohere 1M | stored vectors as pseudo-queries | final split-form [1,4], same stored scales and model σ | source cluster excluded | 1024 | 1.01105810 |
+
+### Matched-query split-stage timing
+
+| stage | pre-batch ns | fused-batch best ns | fused-batch hits | fused-batch reads |
+|---|---:|---:|---:|---:|
+| query prep | 89583 | 64000 | 0 | 0 |
+| routing | 781623 | 722048 | 1107 | 0 |
+| plane-1 scan | 7109002 | 3243285 | 5585 | 0 |
+| boundary ops | 51458 | 24167 | 0 | 0 |
+| plane-2 | 358333 | 237083 | 141 | 0 |
+| rerank fetch | 20292 | 9376 | 24 | 0 |
+| rerank score | 3874 | 1875 | 0 | 0 |
+| stage total | 8414165 | 4301834 | 6857 | 0 |
+
+### Plane-1 10× gate
+
+| run | plane-1 scored | plane-1 ns | ns/row |
+|---:|---:|---:|---:|
+| 1 | 14144 | 3894707 | 275.36 |
+| 2 | 14144 | 3573667 | 252.66 |
+| 3 | 14144 | 3335536 | 235.82 |
+| 4 | 14144 | 3290003 | 232.61 |
+| 5 | 14144 | 3243285 | 229.30 |
+| mean | 14144 | 3467440 | 245.15 |
+| required | 14144 | ≤707200 | ≤50.00 |
+
+| matched-query measure | value |
+|---|---:|
+| plane-1 survivors | 248 |
+| refinements scored | 248 |
+| rerank rows | 18 |
+| best reduction from 502 ns/row | 2.19× |
+| required reduction | 10× |
+
+Search-only workload, compare, and ledger were not run because the plane-1
+10× stop condition fired.
+
+## 2026-08-25 — zero-copy row views, boundary reuse, routing split, measured CAL (M5/ARM)
+
+### Build-time CAL materialization
+
+| field | sampled rows | persisted CAL | REINDEX ms | quantize ms | IVF total ms |
+|---|---:|---:|---:|---:|---:|
+| `emb` | 1024 | 1.075806 | 114560.773 | 21429 | 61667 |
+
+### Matched-query split-stage timing at probe 0.0141
+
+| stage | before ns | after ns | after hits | after reads |
+|---|---:|---:|---:|---:|
+| query prep | 89750 | 89583 | 0 | 0 |
+| routing | · | 781623 | 1107 | 0 |
+| plane-1 scan | 52922375 | 7109002 | 5585 | 0 |
+| boundary ops | 957584 | 51458 | 0 | 0 |
+| plane-2 | 69958 | 358333 | 137 | 0 |
+| rerank fetch | 6917 | 20292 | 22 | 0 |
+| rerank score | 2168 | 3874 | 0 | 0 |
+| stage total | 54048752 | 8414165 | 6851 | 0 |
+
+| matched-query measure | before | after |
+|---|---:|---:|
+| plane-1 scored | 14202 | 14144 |
+| plane-1 survivors | 42 | 257 |
+| refinements scored | 42 | 257 |
+| rerank rows | 12 | 17 |
+| plane-1 reduction | · | 7.444564× |
+| required reduction | · | 10× |
+
+Search-only workload, compare, and ledger were not run because the plane-1 reduction stop condition fired.
+
+## Phase B Cohere 1M plane-1 range-streaming audit — 2026-08-25
+
+Warm cache; Apple M5 Max, arm64; existing q14 index reused; search-only rerun.
+The matched debug trace uses one query at probe `0.0141`. The workload rows use
+100 queries and 3 timed samples/query. Before run `20260825_000346_search.json`;
+after run `20260825_030149_search.json`.
+
+### Plane-1 slot access audit
+
+| path | codes | scales | constants | residual norms |
+|---|---|---|---|---|
+| before | one `FileSlice::read_bytes` per eligible row | one 2-byte read per eligible row | one 4-byte read per eligible row | one 4-byte read per eligible row when present |
+| after | one contiguous range read per admitted cluster | one contiguous range read per admitted cluster | one contiguous range read per admitted cluster | one contiguous range read per admitted cluster when present |
+
+### Matched-query stage timing before / after
+
+| stage | before ns | before hits | before reads | after ns | after hits | after reads |
+|---|---:|---:|---:|---:|---:|---:|
+| query prep | 87292 | 0 | 0 | 89750 | 0 | 0 |
+| plane-1 scan | 54949250 | 7251 | 0 | 52922375 | 7252 | 0 |
+| boundary ops | 972792 | 0 | 0 | 957584 | 0 | 0 |
+| plane-2 | 48250 | 27 | 0 | 69958 | 27 | 0 |
+| rerank fetch | 11584 | 10 | 0 | 6917 | 10 | 0 |
+| rerank score | 1874 | 0 | 0 | 2168 | 0 | 0 |
+| total | 56071042 | 7288 | 0 | 54048752 | 7289 | 0 |
+
+| matched-query measure | before | after |
+|---|---:|---:|
+| candidates | 14202 | 14202 |
+| plane-1 ns/candidate | 3869.12 | 3726.40 |
+| stage-total ns/candidate | 3948.04 | 3805.68 |
+| stage-total delta | · | -3.60666% |
+
+### Search-only workload stage means
+
+| point | probe | query prep ns | plane-1 ns | boundary ns | plane-2 ns | rerank fetch ns | rerank score ns | stage total ns |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| r90 | 0.0050 | 55545.81 | 14285897.09 | 869953.35 | 213870.37 | 18509.56 | 2576.15 | 15446352.33 |
+| r95 | 0.0141 | 54427.09 | 42049875.78 | 936806.59 | 235894.63 | 20385.33 | 2820.97 | 43300210.39 |
+| r99 max tested | 0.1000 | 61424.53 | 531717494.15 | 1417155.82 | 256909.54 | 23374.04 | 3046.99 | 533479405.07 |
+
+| r95 stage | hits | reads |
+|---|---:|---:|
+| query prep | 0.00 | 0.00 |
+| plane-1 scan | 6874.63 | 0.00 |
+| boundary ops | 0.00 | 0.00 |
+| plane-2 | 121.01 | 0.00 |
+| rerank fetch | 25.21 | 0.00 |
+| rerank score | 0.00 | 0.00 |
+
+### Search-only workload result
+
+| point | probe | recall | p50 ms before | p50 ms after | p99 ms before | p99 ms after | plane-1 scored | survivors | refinements | rerank rows |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| r90 | 0.0050 | 0.897000 | 36.816083 | 37.832000 | 40.393167 | 43.515416 | 5093.390 | 190.460 | 190.460 | 17.710 |
+| r95 | 0.0141 | 0.954000 | 64.699333 | 66.175000 | 72.691541 | 75.766167 | 14188.320 | 199.030 | 199.030 | 18.050 |
+| r99 max tested | 0.1000 | 0.978000 | 543.447333 | 555.362042 | 595.358916 | 629.995500 | 100107.680 | 201.830 | 201.830 | 18.330 |
+
+### Real-data CAL sample
+
+| rows | empirical dot-estimate σ | model-chain σ | empirical / model CAL |
+|---:|---:|---:|---:|
+| 1000 | 0.003514966981 | 0.001551233034 | 2.265918082 |
+
+### Matched-probe attribution
+
+| probe | qoff recall vs GT | q14 recall vs GT | candidate recall ratio | product recall | final recall | product-final gap |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.0050 | 0.897000 | 0.897000 | 1.000000000 | 0.897000 | 0.897000 | 0.000000000 |
+| 0.0141 | 0.958000 | 0.954000 | 0.995824635 | 0.954000 | 0.954000 | 0.000000000 |
+| 0.1000 | 0.993000 | 0.978000 | 0.984894260 | 0.978000 | 0.978000 | 0.000000000 |
+
+### Iso-recall performance
+
+| point | qoff probe | q14 probe | qoff recall | q14 recall | qoff p50 ms | q14 p50 ms | qoff p99 ms | q14 p99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| r90 | 0.0050 | 0.0050 | 0.897000 | 0.897000 | 2.529667 | 37.832000 | 3.710166 | 43.515416 |
+| r95 | 0.0109 | 0.0141 | 0.948000 | 0.954000 | 5.384084 | 66.175000 | 6.789792 | 75.766167 |
+| r99 max tested | 0.1000 | 0.1000 | 0.993000 | 0.978000 | 39.936209 | 555.362042 | 42.528125 | 629.995500 |
+
+### Bytes ledger
+
+| schedule | probe | plane-1 rows | refinement rows | rerank rows | plane-1 bytes | refinement bytes | rerank bytes | total bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| [1,4] | 0.0050 | 5093.390 | 190.460 | 17.710 | 651954 | 97516 | 72540 | 822010 |
+| [1,4] | 0.0141 | 14188.320 | 199.030 | 18.050 | 1816105 | 101903 | 73933 | 1991941 |
+| [1,4] | 0.1000 | 100107.680 | 201.830 | 18.330 | 12813783 | 103337 | 75080 | 12992200 |
+
+## 2026-08-25 — posting-size matrix builds and depth-1 validation stop (M5/ARM)
+
+Warm cache; Apple M5 Max, arm64; Cohere 1M, 1024 dimensions. The qoff and
+q14 rows reuse the frozen builds. Persisted CAL is bounded below by the
+query-calibrated `2.265918` envelope; the current build JSON does not expose
+the slot-15 value when held-out calibration raises it.
+
+### Build and storage rows
+
+| config | layers | centroids | posting min / mean / max | build s | index bytes | GiB | delta vs qoff bytes | delta vs qoff | persisted CAL |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| qoff | off | 10000 | 1 / 100 / 592 | 99.694642 | 8693366784 | 8.096329 | 0 | 0.000000% | · |
+| q14 | [1,4] | 10000 | 1 / 100 / 592 | 139.525476 | 9347932160 | 8.705940 | 654565376 | 7.529481% | 2.265918 |
+| q1 | [1] | 10000 | 1 / 100 / 592 | 115.695986 | 8827904000 | 8.221626 | 134537216 | 1.547585% | ≥2.265918 |
+| q2 | [2] | 10000 | 1 / 100 / 592 | 134.538248 | 8956403712 | 8.341301 | 263036928 | 3.025720% | ≥2.265918 |
+| q14-p4x | [1,4] | 2500 | 8 / 400 / 3247 | 140.625852 | 9316032512 | 8.676231 | 622665728 | 7.162538% | ≥2.265918 |
+| q14-p16x | [1,4] | 625 | 49 / 1600 / 6746 | 137.674238 | 9308061696 | 8.668808 | 614694912 | 7.070850% | ≥2.265918 |
+
+### q14-depth1 / q1 matched-probe validation
+
+| probe | recall q14-depth1 | recall q1 | plane-1 rows q14-depth1 | plane-1 rows q1 | R q14-depth1 | R q1 | R ratio q1/q14 | p50 q14-depth1 ms | p50 q1 ms | p50 delta | p99 q14-depth1 ms | p99 q1 ms | p99 delta |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.0050 | 0.897 | 0.897 | 5093.39 | 5093.39 | 1693.97 | 3728.60 | 2.201102× | 4.948125 | 5.409041 | +9.314963% | 5.697041 | 6.015000 | +5.581125% |
+| 0.0084 | 0.934 | 0.934 | 8479.20 | 8479.20 | 2053.19 | 5312.78 | 2.587573× | 5.462750 | 6.564458 | +20.167645% | 6.971375 | 8.227542 | +18.018927% |
+| 0.0109 | 0.948 | 0.948 | 10983.92 | 10983.92 | 2233.36 | 6270.07 | 2.807461× | 5.708458 | 7.085792 | +24.127952% | 8.973666 | 8.359417 | -6.845017% |
+| 0.0141 | 0.958 | 0.958 | 14188.32 | 14188.32 | 2394.43 | 7307.69 | 3.051954× | 5.931708 | 7.951292 | +34.047259% | 8.170583 | 10.019875 | +22.633538% |
+| 0.0400 | 0.981 | 0.981 | 40097.83 | 40097.83 | 2819.93 | 11926.15 | 4.229236× | 8.244500 | 11.318792 | +37.289005% | 13.346709 | 18.443750 | +38.189497% |
+| 0.1000 | 0.993 | 0.993 | 100107.68 | 100107.68 | 2947.18 | 15160.54 | 5.144083× | 14.073666 | 16.730917 | +18.881015% | 23.089708 | 36.398333 | +57.638776% |
+
+| r95 matched stage | q14-depth1 ms | q1 ms | delta q1−q14 ms |
+|---|---:|---:|---:|
+| query prep | 0.139247 | 0.029533 | -0.109714 |
+| routing | 0.636603 | 0.508763 | -0.127840 |
+| plane-1 | 3.536850 | 2.906542 | -0.630308 |
+| boundary | 0.056355 | 0.100053 | +0.043699 |
+| plane-2 | 0.000000 | 0.000000 | 0.000000 |
+| rerank fetch | 1.108913 | 1.819041 | +0.710127 |
+| rerank score | 0.197193 | 0.407568 | +0.210376 |
+
+| validation | required | measured |
+|---|---:|---:|
+| recall agreement | 1 | 1 |
+| latency within noise | 1 | 0 |
+| matrix continuation | 1 | 0 |
+
+## 2026-08-25 — per-depth CAL, page-native pinning, final posting matrix (M5/ARM)
+
+Warm cache; Apple M5 Max, arm64; Cohere 1M, d=1024; qoff run
+`20260824_225312_search.json`. `reached=0` rows are the maximum tested probe,
+not an attained iso-recall point.
+
+### Scalar calibration payloads before the V2 amendment
+
+| build | layers | persisted scalar CAL | protocol |
+|---|---|---:|---|
+| q14 | [1,4] | 2.2659183 | Q |
+| q1 | [1] | 3.3855651 | H |
+| q2 | [2] | 2.2659183 | Q |
+| q14-p4x | [1,4] | 2.2659183 | Q |
+| q14-p16x | [1,4] | 2.2659183 | Q |
+
+| protocol | sample rows | query fixtures | estimator and norm chain |
+|---|---:|---|---|
+| H | 1024 | up to 64 deterministic stored-vector pseudoqueries; source cluster excluded | exact stored codes/scales, split-form prefix reconstruction, f16 scale × prefix rho × production cosine query norm |
+| Q | 1000 | real Cohere benchmark query fixture | production scan estimator and production cosine sigma chain |
+
+### Decisive depth-1 comparison on the original q14/q1 segments
+
+| index | depth | rows | CAL | signed mean | signed stddev | skew | excess kurtosis | abs p50 | abs p90 | abs p95 | abs p99 | abs max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q14 | 1 | 1024 | 3.415396481 | -2.852376392 | 1.797896563 | -0.062988085 | 0.159764561 | 2.898234170 | 5.133585858 | 5.889024067 | 6.917607481 | 9.694315737 |
+| q1 | 1 | 1024 | 3.385565119 | -2.844456640 | 1.752609195 | 0.015945154 | 0.273181635 | 2.841711267 | 5.126303741 | 5.700819732 | 6.826135536 | 9.889067645 |
+
+| comparison | value |
+|---|---:|
+| q14 depth-1 / q1 CAL | 1.008811 |
+| tail-inflation stop fired | 0 |
+
+### V2 per-depth calibration after re-persisting all five indexes
+
+One encoder pass, one accumulator per active prefix. Each depth persists
+`max(H_depth, Q)` and records the sample count belonging to the selected
+value.
+
+| index | CAL depth 1 | samples d1 | CAL depth 2 | samples d2 | H d1 | H d2 | Gaussian d1 | Gaussian d2 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| q14 | 3.4510913 | 1024 | 2.2659183 | 1000 | 3.4510913 | 1.0384827 | 1.2341108 | 0.9909505 |
+| q1 | 3.5052078 | 1024 | · | · | 3.5052078 | · | 1.2577933 | · |
+| q2 | 2.2659183 | 1000 | · | · | 1.7745103 | · | 0.9917887 | · |
+| q14-p4x | 3.5840645 | 1024 | 2.2659183 | 1000 | 3.5840645 | 0.9967075 | 1.1752250 | 1.0275378 |
+| q14-p16x | 3.8888018 | 1024 | 2.2659183 | 1000 | 3.8888018 | 1.0370232 | 1.2688428 | 0.9858556 |
+
+### q14-depth1 / q1 equivalence gate after V2
+
+Runs `20260825_123629_search.json` and `20260825_123659_search.json`.
+
+| probe | recall q14-d1 | recall q1 | R q14-d1 | R q1 | R delta | p50 q14-d1 ms | p50 q1 ms | p50 delta | p99 q14-d1 ms | p99 q1 ms | p99 delta |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.0050 | 0.897 | 0.897 | 3849.74 | 3897.20 | +1.233% | 3.480 | 3.294 | -5.363% | 4.492 | 4.179 | -6.967% |
+| 0.0109 | 0.948 | 0.948 | 6541.68 | 6682.89 | +2.159% | 5.563 | 5.590 | +0.487% | 7.281 | 7.361 | +1.104% |
+| 0.1000 | 0.993 | 0.993 | 16591.51 | 17397.21 | +4.856% | 17.984 | 18.233 | +1.384% | 40.987 | 40.192 | -1.939% |
+
+| gate | measured |
+|---|---:|
+| identical probe/recall rows | 1 |
+| latency agreement within noise | 1 |
+| continuation | 1 |
+
+### Centroid materialization and storage-pin fix
+
+The cosine scan used to read the complete 40.96 MB centroid slot before the
+cluster loop. The score-norm API now uses the query norm for dot/cosine and
+the exact routing `-dist²` for L2. Sparse refinement gathers use the storage
+backend's absolute block ordinal and its 8 KB-class payload rather than an
+8 KB slot-relative approximation.
+
+| q14-depth1 r95 | before | centroid-free |
+|---|---:|---:|
+| plane-1 ns | 3960913.94 | 699003.61 |
+| plane-1 buffer hits | 5355.62 | 335.62 |
+| centroid-component hits | 6257.20 | 1237.20 |
+| plane-1 rows | 10983.92 | 10983.92 |
+| admitted clusters | 98.33 | 98.33 |
+| plane-1 hits / cluster | 54.467 | 3.413 |
+| p50 ms | 9.943 | 5.563 |
+
+| posting mean | r95 clusters | plane-1 hits | hits / cluster | refinement hits before | refinement hits page-native | plane-2 ns/ref page-native |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 129.20 | 441.56 | 3.418 | 893.37 | 854.36 | 257.246 |
+| 400 | 70.92 | 631.24 | 8.901 | 1862.25 | 1636.65 | 248.795 |
+| 1600 | 29.36 | 877.21 | 29.878 | 3201.53 | 2974.20 | 244.118 |
+
+| config | r90 ns/ref | r95 ns/ref | max-probe ns/ref |
+|---|---:|---:|---:|
+| q14 | 244.379 | 257.246 | 305.230 |
+| q14-p4x | 238.471 | 248.795 | 274.336 |
+| q14-p16x | 235.036 | 244.118 | 253.337 |
+
+### Final iso-recall matrix
+
+Depth-2 final runs: q14 `20260825_125216_search.json`, p4x
+`20260825_125256_search.json`, p16x `20260825_125332_search.json`. The
+depth-1 and monolithic rows reuse the post-centroid runs because the
+page-native API is entered only by multi-plane sparse refinement.
+
+| config | target | reached | probe | recall | p50 ms | qoff p50 | delta | p99 ms | qoff p99 | delta |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q14-d2 | r90 | 1 | 0.0050 | 0.897 | 2.838 | 2.530 | +12.2% | 3.187 | 3.710 | -14.1% |
+| q14-d2 | r95 | 1 | 0.0141 | 0.958 | 4.782 | 5.384 | -11.2% | 6.216 | 6.790 | -8.5% |
+| q14-d2 | r99 | 1 | 0.1000 | 0.993 | 13.296 | 39.936 | -66.7% | 27.581 | 42.528 | -35.1% |
+| q14-d1 | r90 | 1 | 0.0050 | 0.897 | 3.480 | 2.530 | +37.6% | 4.492 | 3.710 | +21.1% |
+| q14-d1 | r95 | 1 | 0.0109 | 0.948 | 5.563 | 5.384 | +3.3% | 7.281 | 6.790 | +7.2% |
+| q14-d1 | r99 | 1 | 0.1000 | 0.993 | 17.984 | 39.936 | -55.0% | 40.987 | 42.528 | -3.6% |
+| q1 | r90 | 1 | 0.0050 | 0.897 | 3.294 | 2.530 | +30.2% | 4.179 | 3.710 | +12.6% |
+| q1 | r95 | 1 | 0.0109 | 0.948 | 5.590 | 5.384 | +3.8% | 7.361 | 6.790 | +8.4% |
+| q1 | r99 | 1 | 0.1000 | 0.993 | 18.233 | 39.936 | -54.3% | 40.192 | 42.528 | -5.5% |
+| q2 | r90 | 1 | 0.0050 | 0.897 | 4.530 | 2.530 | +79.1% | 5.851 | 3.710 | +57.7% |
+| q2 | r95 | 1 | 0.0109 | 0.948 | 8.142 | 5.384 | +51.2% | 9.505 | 6.790 | +40.0% |
+| q2 | r99 | 1 | 0.1000 | 0.993 | 58.895 | 39.936 | +47.5% | 68.035 | 42.528 | +60.0% |
+| p4-d2 | r90 | 1 | 0.0124 | 0.901 | 4.290 | 2.530 | +69.6% | 6.842 | 3.710 | +84.4% |
+| p4-d2 | r95 | 1 | 0.0308 | 0.951 | 6.774 | 5.384 | +25.8% | 10.290 | 6.790 | +51.5% |
+| p4-d2 | r99 | 0 | 0.1000 | 0.984 | 11.841 | 39.936 | -70.4% | 27.728 | 42.528 | -34.8% |
+| p4-d1 | r90 | 1 | 0.0124 | 0.901 | 6.398 | 2.530 | +152.9% | 7.566 | 3.710 | +103.9% |
+| p4-d1 | r95 | 1 | 0.0308 | 0.951 | 11.284 | 5.384 | +109.6% | 15.866 | 6.790 | +133.7% |
+| p4-d1 | r99 | 0 | 0.1000 | 0.984 | 17.819 | 39.936 | -55.4% | 42.717 | 42.528 | +0.4% |
+| p16-d2 | r90 | 1 | 0.0270 | 0.900 | 7.919 | 2.530 | +213.1% | 9.865 | 3.710 | +165.9% |
+| p16-d2 | r95 | 1 | 0.0503 | 0.949 | 11.329 | 5.384 | +110.4% | 15.943 | 6.790 | +134.8% |
+| p16-d2 | r99 | 0 | 0.1000 | 0.983 | 16.882 | 39.936 | -57.7% | 29.931 | 42.528 | -29.6% |
+
+### Final funnel and rerank ledger
+
+| config | target | plane 1 | survivors | refinements | R | rerank bytes |
+|---|---|---:|---:|---:|---:|---:|
+| q14-d2 | r90 | 5093.39 | 3849.74 | 3849.74 | 35.94 | 147210 |
+| q14-d2 | r95 | 14188.32 | 7638.78 | 7638.78 | 37.85 | 155034 |
+| q14-d2 | r99 | 100107.68 | 16591.51 | 16591.51 | 40.66 | 166543 |
+| q14-d1 | r90 | 5093.39 | 3849.74 | 0.00 | 3849.74 | 15768535 |
+| q14-d1 | r95 | 10983.92 | 6541.68 | 0.00 | 6541.68 | 26794721 |
+| q14-d1 | r99 | 100107.68 | 16591.51 | 0.00 | 16591.51 | 67958825 |
+| q1 | r90 | 5093.39 | 3897.20 | 0.00 | 3897.20 | 15962931 |
+| q1 | r95 | 10983.92 | 6682.89 | 0.00 | 6682.89 | 27373117 |
+| q1 | r99 | 100107.68 | 17397.21 | 0.00 | 17397.21 | 71258972 |
+| q2 | r90 | 5093.39 | 385.63 | 0.00 | 385.63 | 1579540 |
+| q2 | r95 | 10983.92 | 444.66 | 0.00 | 444.66 | 1821327 |
+| q2 | r99 | 100107.68 | 546.66 | 0.00 | 546.66 | 2239119 |
+| p4-d2 | r90 | 12708.51 | 8547.48 | 8547.48 | 40.57 | 166175 |
+| p4-d2 | r95 | 31036.82 | 15090.57 | 15090.57 | 42.34 | 173425 |
+| p4-d2 | r99 | 100276.87 | 25128.90 | 25128.90 | 42.70 | 174899 |
+| p4-d1 | r90 | 12708.51 | 8547.48 | 0.00 | 8547.48 | 35010478 |
+| p4-d1 | r95 | 31036.82 | 15090.57 | 0.00 | 15090.57 | 61810975 |
+| p4-d1 | r99 | 100276.87 | 25128.90 | 0.00 | 25128.90 | 102927974 |
+| p16-d2 | r90 | 28187.64 | 20573.03 | 20573.03 | 43.80 | 179405 |
+| p16-d2 | r95 | 51346.38 | 30933.39 | 30933.39 | 45.32 | 185631 |
+| p16-d2 | r99 | 101126.84 | 45128.73 | 45128.73 | 46.09 | 188785 |
+
+### Final split-stage means (ms/query)
+
+| config | target | prep | routing | plane 1 | boundary | plane 2 | fetch | rerank | total |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| q14-d2 | r90 | 0.120 | 0.325 | 0.277 | 0.057 | 0.941 | 0.028 | 0.004 | 1.751 |
+| q14-d2 | r95 | 0.120 | 0.662 | 0.766 | 0.135 | 1.965 | 0.031 | 0.005 | 3.684 |
+| q14-d2 | r99 | 0.133 | 2.744 | 5.509 | 0.488 | 5.064 | 0.037 | 0.006 | 13.979 |
+| q14-d1 | r90 | 0.130 | 0.414 | 0.301 | 0.053 | 0.000 | 1.017 | 0.238 | 2.153 |
+| q14-d1 | r95 | 0.141 | 0.771 | 0.699 | 0.111 | 0.000 | 2.015 | 0.426 | 4.165 |
+| q14-d1 | r99 | 0.138 | 3.655 | 6.231 | 0.466 | 0.000 | 6.473 | 1.196 | 18.159 |
+| q1 | r90 | 0.030 | 0.408 | 0.299 | 0.053 | 0.000 | 1.029 | 0.238 | 2.058 |
+| q1 | r95 | 0.032 | 0.693 | 0.642 | 0.105 | 0.000 | 1.959 | 0.421 | 3.852 |
+| q1 | r99 | 0.037 | 3.638 | 6.203 | 0.481 | 0.000 | 6.838 | 1.255 | 18.451 |
+| q2 | r90 | 0.021 | 0.438 | 2.613 | 0.017 | 0.000 | 0.254 | 0.042 | 3.384 |
+| q2 | r95 | 0.023 | 0.762 | 5.752 | 0.028 | 0.000 | 0.311 | 0.050 | 6.927 |
+| q2 | r99 | 0.028 | 4.132 | 52.569 | 0.187 | 0.000 | 0.430 | 0.065 | 57.411 |
+| p4-d2 | r90 | 0.119 | 0.260 | 0.581 | 0.136 | 2.038 | 0.034 | 0.005 | 3.174 |
+| p4-d2 | r95 | 0.120 | 0.406 | 1.413 | 0.279 | 3.754 | 0.036 | 0.005 | 6.014 |
+| p4-d2 | r99 | 0.126 | 0.745 | 4.574 | 0.621 | 6.894 | 0.039 | 0.006 | 13.004 |
+| p4-d1 | r90 | 0.138 | 0.346 | 0.640 | 0.133 | 0.000 | 2.639 | 0.559 | 4.455 |
+| p4-d1 | r95 | 0.142 | 0.553 | 1.570 | 0.279 | 0.000 | 5.115 | 1.015 | 8.673 |
+| p4-d1 | r99 | 0.143 | 0.976 | 5.089 | 0.616 | 0.000 | 9.758 | 1.818 | 18.401 |
+| p16-d2 | r90 | 0.121 | 0.175 | 1.188 | 0.333 | 4.835 | 0.040 | 0.006 | 6.698 |
+| p16-d2 | r95 | 0.126 | 0.189 | 2.173 | 0.563 | 7.551 | 0.043 | 0.006 | 10.651 |
+| p16-d2 | r99 | 0.129 | 0.213 | 4.554 | 1.117 | 11.433 | 0.044 | 0.006 | 17.497 |
+
+### Plane-1 fixed/marginal decomposition
+
+Per-posting-size fits use `plane1_ns = intercept + marginal × rows`. The
+joint sign fit uses `plane1_ns = setup + cluster × clusters + row × rows`.
+
+| plane 1 | mean posting | samples | intercept ns | marginal ns/row | R² |
+|---|---:|---:|---:|---:|---:|
+| sign | 100 | 9 | -15709.161 | 59.890916 | 0.994348210 |
+| b2 grid | 100 | 6 | -124195.058 | 525.403598 | 0.999944949 |
+| sign | 400 | 12 | 25063.919 | 48.032667 | 0.994409772 |
+| sign | 1600 | 3 | -157393.252 | 46.423553 | 0.999259147 |
+
+| joint sign samples | setup ns/query | fixed ns/cluster | marginal ns/row | R² |
+|---:|---:|---:|---:|---:|
+| 24 | 9795.033 | 1613.238 | 43.950095 | 0.994571541 |
+
+### Storage after V2 re-persist
+
+| config | layers | mean posting | index bytes | delta bytes vs qoff | delta vs qoff | CAL vector |
+|---|---|---:|---:|---:|---:|---|
+| qoff | off | 100 | 8693366784 | 0 | 0.000000% | · |
+| q14 | [1,4] | 100 | 9347932160 | 654565376 | 7.529481% | [3.4510913, 2.2659183] |
+| q1 | [1] | 100 | 8827904000 | 134537216 | 1.547585% | [3.5052078] |
+| q2 | [2] | 100 | 8956403712 | 263036928 | 3.025720% | [2.2659183] |
+| q14-p4x | [1,4] | 400 | 9316032512 | 622665728 | 7.162538% | [3.5840645, 2.2659183] |
+| q14-p16x | [1,4] | 1600 | 9308061696 | 614694912 | 7.070850% | [3.8888018, 2.2659183] |
+
+## 2026-08-25 — x86 current-head confirmation
+
+GitHub Actions `ubuntu-latest`, x86_64, Rust stable, `-C target-cpu=native`,
+thin LTO, one codegen unit; run `32823399677`, commit
+`2eed19685dff1062bf2bf1d115a8a2490ecdf801`. ARM values are Apple M5 Max
+middle estimates where the matching benchmark exists.
+
+| kernel | configuration | ARM | x86 95% CI |
+|---|---|---:|---:|
+| FHT apply | d=128 | 611.36 ns/vector | 1.1724–1.1767 µs/vector |
+| FHT apply | d=768 | 3.789 µs/vector | 6.8203–6.9199 µs/vector |
+| FHT apply | d=1536 | 7.791 µs/vector | 13.899–13.965 µs/vector |
+| sign symmetric score | d=768 | 2.588 ns/vector | 3.5171–3.5288 ns/vector |
+| sign asymmetric score | d=768, Bq=4 | 13.869 ns/vector | 26.415–26.513 ns/vector |
+| grid encode | d=768, b=2 | 1.945 µs/vector | 4.1106–4.1216 µs/vector |
+| grid score | d=768, b=2 | 500.79 ns/vector | 1.5467–1.5505 µs/vector |
+| grid batch score | d=768, b=2, N=32 | · | 15.513–15.535 µs/batch |
+| grid encode | d=768, b=3 | · | 4.5028–4.5116 µs/vector |
+| grid score | d=768, b=3 | 480.160 ns/vector | 1.3681–1.3702 µs/vector |
+| grid batch score | d=768, b=3, N=32 | · | 43.648–43.739 µs/batch |
+| grid encode | d=768, b=4 | 1.740 µs/vector | 5.6952–5.7564 µs/vector |
+| grid score | d=768, b=4 | 506.91 ns/vector | 1.5614–1.5648 µs/vector |
+| grid batch score | d=768, b=4, N=32 | · | 17.140–17.271 µs/batch |
+| grid packed batch score | d=768, b=4, N=32 | · | 8.5897–8.6007 µs/batch |
+| grid packed indexed batch score | d=768, b=4, N=32 | · | 8.6094–8.6215 µs/batch |
+| fp dot | d=128 | 23.485 ns/vector | 58.163–58.589 ns/vector |
+| fp dot | d=768 | 279.842 ns/vector | 472.58–473.97 ns/vector |
+| fp dot | d=1536 | 641.876 ns/vector | 977.12–978.74 ns/vector |
+| decode then dot | d=768 | 582.900 ns/vector | 1.2124–1.2149 µs/vector |
+| boundary ops | 50,000 candidates | 124.20 µs total | 300.80–301.75 µs total |
+| boundary ops | 500,000 candidates | 809.24 µs total | 1.9845–1.9926 ms total |
+
+| x86 check | result |
+|---|---:|
+| kernel goldens and determinism | 1 |
+| sign-plane hardware instruction expectation | 1 |
+| FHT packed instruction expectation | 1 |
+| criterion suite | 1 |
+| full workflow | 1 |
+
+## 2026-08-25 — monolithic b4 and three-way real-data report
+
+Apple M5 Max / ARM64, warm cache, Cohere Wikipedia 1M, cosine, unfiltered
+top-10, 100 queries, three timed samples/query. qoff, q1, and q14 are the
+frozen runs from the final posting matrix; q4 is a new build and sweep.
+
+### Scan-path confirmation and integrated asm
+
+| check | result |
+|---|---:|
+| plane-2 cosine contiguous read passes `read_constants=false` | 1 |
+| plane-2 cosine sparse gather passes `read_constants=false` | 1 |
+| per-row running top-k updates | 0 |
+| cluster-local top-k merges per completed cluster | 1 |
+| boundary-only `select_nth_unstable_by` | 1 |
+| sign kernel call edge inside integrated `quantized_top_n` | 0 |
+| inline ARM64 NEON `cnt` sequence | 1 |
+
+Release symbol range:
+`VectorBackend<f32>::quantized_top_n::<NoTieBreak, NaturalComparator>` =
+`0x24e634c..0x24eaf28`. Representative inline sign instructions are
+`0x24e7170 cnt.16b v16, v7`, `0x24e7180 cnt.16b v19, v6`, and
+`0x24e7194 cnt.16b v20, v17`; the range contains no branch to
+`estimate_asym_batch_unscaled`. As a control, the grid kernel remains an
+explicit `bl score_batch_packed_4` at `0x24e6fd0`.
+
+| plane-1 sign refit | samples | marginal ns/row | R² |
+|---|---:|---:|---:|
+| joint integrated release | 24 | 43.950095 | 0.994571541 |
+| q14-only selected points, unseparated cluster cost | 3 | 55.117686 | · |
+
+### q4 build
+
+Build run:
+`pdbench/runs/cohere-1m-q4/20260825_140740_build.json`. Search run:
+`pdbench/runs/cohere-1m-q4/20260825_140936_search.json`.
+
+| layers | rows | clusters | posting min/mean/max | CAL vector | build s | index bytes | delta bytes vs qoff | delta vs qoff |
+|---|---:|---:|---:|---|---:|---:|---:|---:|
+| [4] | 1000000 | 10000 | 1/100/592 | [2.2659183] | 108.459879 | 9213411328 | 520044544 | 5.982084% |
+
+### r90
+
+qoff/q1/q14/q4: probe `0.005`, measured recall `0.897`.
+
+| metric | qoff | [1] | [1,4] | [4] |
+|---|---:|---:|---:|---:|
+| layer-1 scored | · | 5093.39 | 5093.39 | 5093.39 |
+| layer-1 survivors | · | 3897.20 | 3849.74 | 29.08 |
+| layer-1 stage ms | · | 0.299 | 0.277 | 1.248 |
+| layer-2 scored | · | · | 3849.74 | · |
+| layer-2 survivors | · | · | 35.94 | · |
+| layer-2 stage ms | · | · | 0.941 | · |
+| R | · | 3897.20 | 35.94 | 29.08 |
+| rerank fetch ms | · | 1.029 | 0.028 | 0.025 |
+| rerank score ms | · | 0.238 | 0.004 | 0.004 |
+| p50 ms | 2.530 | 3.294 | 2.838 | 3.430 |
+| p99 ms | 3.710 | 4.179 | 3.187 | 4.260 |
+
+### r95
+
+qoff/q1/q4: probe `0.0109`, recall `0.948`; q14: probe `0.0141`, recall
+`0.958`.
+
+| metric | qoff | [1] | [1,4] | [4] |
+|---|---:|---:|---:|---:|
+| layer-1 scored | · | 10983.92 | 14188.32 | 10983.92 |
+| layer-1 survivors | · | 6682.89 | 7638.78 | 30.02 |
+| layer-1 stage ms | · | 0.642 | 0.766 | 2.758 |
+| layer-2 scored | · | · | 7638.78 | · |
+| layer-2 survivors | · | · | 37.85 | · |
+| layer-2 stage ms | · | · | 1.965 | · |
+| R | · | 6682.89 | 37.85 | 30.02 |
+| rerank fetch ms | · | 1.959 | 0.031 | 0.028 |
+| rerank score ms | · | 0.421 | 0.005 | 0.004 |
+| p50 ms | 5.384 | 5.590 | 4.782 | 5.224 |
+| p99 ms | 6.790 | 7.361 | 6.216 | 6.575 |
+
+### r99
+
+qoff/q1/q14/q4: probe `0.1`, measured recall `0.993`.
+
+| metric | qoff | [1] | [1,4] | [4] |
+|---|---:|---:|---:|---:|
+| layer-1 scored | · | 100107.68 | 100107.68 | 100107.68 |
+| layer-1 survivors | · | 17397.21 | 16591.51 | 32.12 |
+| layer-1 stage ms | · | 6.203 | 5.509 | 25.381 |
+| layer-2 scored | · | · | 16591.51 | · |
+| layer-2 survivors | · | · | 40.66 | · |
+| layer-2 stage ms | · | · | 5.064 | · |
+| R | · | 17397.21 | 40.66 | 32.12 |
+| rerank fetch ms | · | 6.838 | 0.037 | 0.033 |
+| rerank score ms | · | 1.255 | 0.006 | 0.005 |
+| p50 ms | 39.936 | 18.233 | 13.296 | 31.471 |
+| p99 ms | 42.528 | 40.192 | 27.581 | 34.514 |
+
+### q14 high-probe tail trace
+
+Probe `0.1`, depth 2, 100 warm instrumented queries; percentile samples are
+nearest-rank selections over EXPLAIN execution time.
+
+| sample | query id | execution ms | prep ms | routing ms | plane-1 ms | boundary ms | plane-2 ms | rerank fetch ms | rerank score ms | L1 scored | L1 survivors | L2 scored | L2 survivors | R | buffer hits | buffer reads |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| p50 | 75 | 13.801 | 0.133 | 2.931 | 5.475 | 0.322 | 3.063 | 0.014 | 0.003 | 99998 | 8693 | 8693 | 19 | 19 | 11436 | 0 |
+| p99 | 97 | 27.495 | 0.147 | 2.930 | 5.548 | 1.224 | 15.623 | 0.035 | 0.008 | 100205 | 59731 | 59731 | 53 | 53 | 15883 | 0 |
+| p99 − p50 | · | 13.694 | 0.014 | -0.002 | 0.073 | 0.902 | 12.560 | 0.021 | 0.005 | 207 | 51038 | 51038 | 34 | 34 | 4447 | 0 |
+
+| tail attribution | extra ms | share of execution delta |
+|---|---:|---:|
+| plane 2 | 12.560 | 91.72% |
+| boundary | 0.902 | 6.59% |
+| all other measured stages | 0.111 | 0.81% |
+| uninstrumented remainder | 0.120 | 0.88% |

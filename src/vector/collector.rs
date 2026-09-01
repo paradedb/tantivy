@@ -575,7 +575,12 @@ mod ivf_e2e_tests {
                 );
                 for stats in untied.stats.iter_mut().chain(&mut tied.stats) {
                     stats.query_prep_ns = 0;
+                    stats.routing_ns = 0;
+                    stats.plane1_ns = 0;
                     stats.boundary_ns = 0;
+                    stats.plane2_ns = 0;
+                    stats.rerank_fetch_ns = 0;
+                    stats.rerank_score_ns = 0;
                 }
                 assert_eq!(
                     format!("{:?}", untied.stats),

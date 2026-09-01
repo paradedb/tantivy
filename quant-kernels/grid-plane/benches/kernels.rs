@@ -1,5 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use grid_plane::{build_lut, encode, packed_len, score};
+use grid_plane::{
+    build_lut, build_packed_lut_4, encode, packed_len, score, score_batch, score_batch_packed_4,
+    score_batch_packed_4_indexed,
+};
 use quant_model::build_grid;
 
 fn bench_kernels(c: &mut Criterion) {
@@ -25,6 +28,57 @@ fn bench_kernels(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("score", bits), &bits, |b, _| {
             b.iter(|| score(black_box(&codes), black_box(&lut), d, bits))
         });
+        let rows = 32;
+        let batch_codes = codes.repeat(rows);
+        let mut batch_out = vec![0.0; rows];
+        group.bench_with_input(BenchmarkId::new("score_batch_32", bits), &bits, |b, _| {
+            b.iter(|| {
+                score_batch(
+                    black_box(&batch_codes),
+                    codes.len(),
+                    black_box(&lut),
+                    d,
+                    bits,
+                    black_box(&mut batch_out),
+                )
+            })
+        });
+        if bits == 4 {
+            let packed_lut = build_packed_lut_4(&lut, d);
+            group.bench_with_input(
+                BenchmarkId::new("score_batch_packed_32", bits),
+                &bits,
+                |b, _| {
+                    b.iter(|| {
+                        score_batch_packed_4(
+                            black_box(&batch_codes),
+                            codes.len(),
+                            black_box(&packed_lut),
+                            d,
+                            black_box(&mut batch_out),
+                        )
+                    })
+                },
+            );
+            let sparse_codes = codes.repeat(rows * 3);
+            let row_offsets: Vec<usize> = (0..rows).map(|row| row * 3).collect();
+            group.bench_with_input(
+                BenchmarkId::new("score_batch_packed_indexed_32", bits),
+                &bits,
+                |b, _| {
+                    b.iter(|| {
+                        score_batch_packed_4_indexed(
+                            black_box(&sparse_codes),
+                            codes.len(),
+                            black_box(&row_offsets),
+                            black_box(&packed_lut),
+                            d,
+                            black_box(&mut batch_out),
+                        )
+                    })
+                },
+            );
+        }
     }
     group.finish();
 }

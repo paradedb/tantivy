@@ -18,22 +18,68 @@ const QUADRATURE_POINTS: usize = 1 << 16;
 /// Settled Phase-A calibration after the N=1000 three-dimension measurement.
 pub const DEFAULT_CAL: f64 = 1.0;
 
+fn sphere_samples(d: usize) -> Vec<(f64, f64)> {
+    assert!(d >= 64);
+    let limit = (d as f64).sqrt();
+    let step = 2.0 * limit / QUADRATURE_POINTS as f64;
+    let exponent = (d as f64 - 3.0) * 0.5;
+    (0..QUADRATURE_POINTS)
+        .map(|i| {
+            let z = -limit + (i as f64 + 0.5) * step;
+            let base = (1.0 - z * z / d as f64).max(0.0);
+            (z, base.powf(exponent))
+        })
+        .collect()
+}
+
+fn rho_from_samples(samples: &[(f64, f64)], points: &[f64]) -> f64 {
+    let boundaries: Vec<f64> = points.windows(2).map(|p| (p[0] + p[1]) * 0.5).collect();
+    let mut error = 0.0;
+    let mut energy = 0.0;
+    for &(z, weight) in samples {
+        let bucket = boundaries.partition_point(|&boundary| z > boundary);
+        error += weight * (z - points[bucket]).powi(2);
+        energy += weight * z * z;
+    }
+    (error / energy).sqrt()
+}
+
+/// Evaluate the exact-density normalized RMSE of persisted reconstruction
+/// points without rerunning the Lloyd-Max solver.
+pub fn rho_model_for_points(d: usize, points: &[f32]) -> f64 {
+    assert!(d >= 64);
+    assert!(points.len() >= 2 && points.len().is_power_of_two());
+    let samples = sphere_samples(d);
+    let points: Vec<f64> = points.iter().map(|&point| f64::from(point)).collect();
+    rho_from_samples(&samples, &points)
+}
+
+/// Exact-density sign grid used only to open legacy metadata that predates
+/// persisted model rho. This is one centroid moment plus one error integral,
+/// not a Lloyd-Max solve.
+pub fn exact_sign_grid(d: usize) -> Grid {
+    let samples = sphere_samples(d);
+    let (mass, moment) = samples
+        .iter()
+        .fold((0.0, 0.0), |(mass, moment), &(z, weight)| {
+            (mass + weight, moment + weight * z.abs())
+        });
+    let magnitude = moment / mass;
+    let points = vec![-magnitude, magnitude];
+    Grid {
+        bits: 1,
+        points: points.iter().map(|&point| point as f32).collect(),
+        rho_model: rho_from_samples(&samples, &points),
+    }
+}
+
 /// Build an exact-density Lloyd-Max grid for a dimension-normalized sphere marginal.
 pub fn build_grid(d: usize, bits: u8) -> Grid {
     assert!(d >= 64);
     assert!((1..=8).contains(&bits));
 
     let count = 1usize << bits;
-    let limit = (d as f64).sqrt();
-    let step = 2.0 * limit / QUADRATURE_POINTS as f64;
-    let exponent = (d as f64 - 3.0) * 0.5;
-    let samples: Vec<(f64, f64)> = (0..QUADRATURE_POINTS)
-        .map(|i| {
-            let z = -limit + (i as f64 + 0.5) * step;
-            let base = (1.0 - z * z / d as f64).max(0.0);
-            (z, base.powf(exponent))
-        })
-        .collect();
+    let samples = sphere_samples(d);
 
     let spread = if count == 2 { 0.8 } else { 3.0 };
     let mut points: Vec<f64> = (0..count)
@@ -69,19 +115,12 @@ pub fn build_grid(d: usize, bits: u8) -> Grid {
         }
     }
 
-    let boundaries: Vec<f64> = points.windows(2).map(|p| (p[0] + p[1]) * 0.5).collect();
-    let mut error = 0.0;
-    let mut energy = 0.0;
-    for &(z, weight) in &samples {
-        let bucket = boundaries.partition_point(|&boundary| z > boundary);
-        error += weight * (z - points[bucket]).powi(2);
-        energy += weight * z * z;
-    }
+    let rho_model = rho_from_samples(&samples, &points);
 
     Grid {
         bits,
         points: points.into_iter().map(|point| point as f32).collect(),
-        rho_model: (error / energy).sqrt(),
+        rho_model,
     }
 }
 

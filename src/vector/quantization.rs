@@ -27,6 +27,123 @@ pub const QUANTIZED_SCALE_STRIDE: usize = 2;
 pub const QUANTIZED_CONSTANT_STRIDE: usize = 4;
 /// One binary32 residual squared norm per posting-membership row when needed.
 pub const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
+/// Version of the per-segment, per-field measured calibration payload.
+pub const QUANTIZED_CALIBRATION_VERSION: u32 = 2;
+const LEGACY_QUANTIZED_CALIBRATION_VERSION: u32 = 1;
+const LEGACY_QUANTIZED_CALIBRATION_METADATA_LEN: usize = 12;
+const QUANTIZED_CALIBRATION_HEADER_LEN: usize = 8;
+const QUANTIZED_CALIBRATION_DEPTH_LEN: usize = 8;
+
+pub(crate) fn quantized_calibration_metadata_len(layer_count: usize) -> usize {
+    QUANTIZED_CALIBRATION_HEADER_LEN + layer_count * QUANTIZED_CALIBRATION_DEPTH_LEN
+}
+
+/// Build-measured uncertainty calibration for one scorer prefix.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VectorQuantizationDepthCalibration {
+    pub(crate) cal: f32,
+    pub(crate) sample_count: u32,
+}
+
+/// One calibration entry for every active prefix depth in a quantized field.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VectorQuantizationCalibration {
+    pub(crate) depths: Vec<VectorQuantizationDepthCalibration>,
+}
+
+impl VectorQuantizationCalibration {
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(quantized_calibration_metadata_len(self.depths.len()));
+        bytes.extend_from_slice(&QUANTIZED_CALIBRATION_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(self.depths.len() as u32).to_le_bytes());
+        for depth in &self.depths {
+            bytes.extend_from_slice(&depth.cal.to_le_bytes());
+            bytes.extend_from_slice(&depth.sample_count.to_le_bytes());
+        }
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8], layer_count: usize) -> crate::Result<Self> {
+        if bytes.len() < std::mem::size_of::<u32>() {
+            return Err(TantivyError::DataCorruption(
+                crate::error::DataCorruption::comment_only(format!(
+                    "quantization calibration metadata has {} bytes; expected a version word",
+                    bytes.len()
+                )),
+            ));
+        }
+        let version = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        if version == LEGACY_QUANTIZED_CALIBRATION_VERSION {
+            if bytes.len() != LEGACY_QUANTIZED_CALIBRATION_METADATA_LEN {
+                return Err(TantivyError::DataCorruption(
+                    crate::error::DataCorruption::comment_only(format!(
+                        "legacy quantization calibration metadata has {} bytes; expected {}",
+                        bytes.len(),
+                        LEGACY_QUANTIZED_CALIBRATION_METADATA_LEN
+                    )),
+                ));
+            }
+            let depth = VectorQuantizationDepthCalibration {
+                cal: f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                sample_count: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            };
+            validate_calibration_depth(depth)?;
+            return Ok(Self {
+                depths: vec![depth; layer_count],
+            });
+        }
+        if version != QUANTIZED_CALIBRATION_VERSION {
+            return Err(TantivyError::DataCorruption(
+                crate::error::DataCorruption::comment_only(format!(
+                    "quantization calibration metadata version {version} is unsupported; expected \
+                     {QUANTIZED_CALIBRATION_VERSION}"
+                )),
+            ));
+        }
+        let expected_len = quantized_calibration_metadata_len(layer_count);
+        if bytes.len() != expected_len {
+            return Err(TantivyError::DataCorruption(
+                crate::error::DataCorruption::comment_only(format!(
+                    "quantization calibration metadata has {} bytes; expected {expected_len}",
+                    bytes.len()
+                )),
+            ));
+        }
+        let stored_layer_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        if stored_layer_count != layer_count {
+            return Err(TantivyError::DataCorruption(
+                crate::error::DataCorruption::comment_only(format!(
+                    "quantization calibration has {stored_layer_count} depths; expected \
+                     {layer_count}"
+                )),
+            ));
+        }
+        let mut depths = Vec::with_capacity(layer_count);
+        for encoded in
+            bytes[QUANTIZED_CALIBRATION_HEADER_LEN..].chunks_exact(QUANTIZED_CALIBRATION_DEPTH_LEN)
+        {
+            let depth = VectorQuantizationDepthCalibration {
+                cal: f32::from_le_bytes(encoded[..4].try_into().unwrap()),
+                sample_count: u32::from_le_bytes(encoded[4..8].try_into().unwrap()),
+            };
+            validate_calibration_depth(depth)?;
+            depths.push(depth);
+        }
+        Ok(Self { depths })
+    }
+}
+
+fn validate_calibration_depth(depth: VectorQuantizationDepthCalibration) -> crate::Result<()> {
+    if !depth.cal.is_finite() || depth.cal < 0.0 {
+        return Err(TantivyError::DataCorruption(
+            crate::error::DataCorruption::comment_only(format!(
+                "quantization calibration must be finite and non-negative, got {}",
+                depth.cal
+            )),
+        ));
+    }
+    Ok(())
+}
 
 /// The stored-code construction and corresponding scoring kernel.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -81,6 +198,11 @@ pub struct VectorQuantizationGrid {
     pub bits: u8,
     pub version: u32,
     pub points: Vec<f32>,
+    /// Exact-density normalized RMSE resolved when the grid is materialized.
+    /// `None` reads pre-amendment V3 metadata; the segment-open resolver has
+    /// a compatibility path that derives it from the persisted points once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rho_model: Option<f64>,
 }
 
 // Grid points are finite after validation. Bit equality also distinguishes
@@ -89,6 +211,7 @@ impl PartialEq for VectorQuantizationGrid {
     fn eq(&self, other: &Self) -> bool {
         self.bits == other.bits
             && self.version == other.version
+            && self.rho_model.map(f64::to_bits) == other.rho_model.map(f64::to_bits)
             && self.points.len() == other.points.len()
             && self
                 .points
@@ -148,9 +271,10 @@ impl VectorQuantizationConfig {
                     spec.bits
                 )));
             }
-            if spec.quantizer == VectorQuantizer::TurboQuant {
-                grid_widths.insert(spec.bits);
-            }
+            // Persist one complete model entry for every width, including
+            // the sign plane. Sign scoring does not consume the points, but
+            // its sigma chain consumes the persisted rho.
+            grid_widths.insert(spec.bits);
         }
 
         let grids = grid_widths
@@ -161,6 +285,7 @@ impl VectorQuantizationConfig {
                     bits,
                     version: GRID_FORMAT_VERSION,
                     points: grid.points,
+                    rho_model: Some(grid.rho_model),
                 }
             })
             .collect();
@@ -233,7 +358,8 @@ impl VectorQuantizationConfig {
             )));
         }
 
-        let mut required_grids = BTreeSet::new();
+        let mut model_widths = BTreeSet::new();
+        let mut required_point_grids = BTreeSet::new();
         for (layer, spec) in self.layers.iter().enumerate() {
             if !(1..=4).contains(&spec.bits) {
                 return Err(invalid(format!(
@@ -249,10 +375,11 @@ impl VectorQuantizationConfig {
                     )));
                 }
                 VectorQuantizer::TurboQuant => {
-                    required_grids.insert(spec.bits);
+                    required_point_grids.insert(spec.bits);
                 }
                 VectorQuantizer::RaBitQ => {}
             }
+            model_widths.insert(spec.bits);
         }
 
         let mut present_grids = BTreeSet::new();
@@ -291,10 +418,26 @@ impl VectorQuantizationConfig {
                     grid.bits
                 )));
             }
+            if grid
+                .rho_model
+                .is_some_and(|rho| !rho.is_finite() || rho < 0.0)
+            {
+                return Err(invalid(format!(
+                    "grid width {} rho_model must be finite and non-negative",
+                    grid.bits
+                )));
+            }
         }
-        if present_grids != required_grids {
+        // Pre-amendment V3 persisted point grids only for TurboQuant widths.
+        // New metadata persists every model width so sign rho never needs to
+        // be resolved again, while the legacy subset remains readable until
+        // its next merge/REINDEX.
+        if !required_point_grids.is_subset(&present_grids)
+            || !present_grids.is_subset(&model_widths)
+        {
             return Err(invalid(format!(
-                "grid widths {present_grids:?} do not match TurboQuant widths {required_grids:?}"
+                "grid widths {present_grids:?} must contain TurboQuant widths \
+                 {required_point_grids:?} and stay within model widths {model_widths:?}"
             )));
         }
         Ok(())
@@ -384,6 +527,7 @@ mod tests {
             bits,
             version: GRID_FORMAT_VERSION,
             points: (0..count).map(|point| point as f32).collect(),
+            rho_model: Some(0.25),
         }
     }
 
@@ -411,6 +555,46 @@ mod tests {
     #[test]
     fn one_plus_four_is_492_bytes_per_dot_row() {
         assert_eq!(config(&[1, 4]).bytes_per_row(), 492);
+    }
+
+    #[test]
+    fn calibration_metadata_round_trips_and_rejects_invalid_values() {
+        let metadata = VectorQuantizationCalibration {
+            depths: vec![
+                VectorQuantizationDepthCalibration {
+                    cal: 2.25,
+                    sample_count: 1_024,
+                },
+                VectorQuantizationDepthCalibration {
+                    cal: 1.75,
+                    sample_count: 1_000,
+                },
+            ],
+        };
+        assert_eq!(
+            VectorQuantizationCalibration::decode(&metadata.encode(), 2).unwrap(),
+            metadata
+        );
+
+        let mut invalid = metadata.encode();
+        invalid[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(VectorQuantizationCalibration::decode(&invalid, 2).is_err());
+
+        let mut legacy = [0_u8; LEGACY_QUANTIZED_CALIBRATION_METADATA_LEN];
+        legacy[..4].copy_from_slice(&LEGACY_QUANTIZED_CALIBRATION_VERSION.to_le_bytes());
+        legacy[4..8].copy_from_slice(&3.25_f32.to_le_bytes());
+        legacy[8..12].copy_from_slice(&777_u32.to_le_bytes());
+        let decoded = VectorQuantizationCalibration::decode(&legacy, 2).unwrap();
+        assert_eq!(
+            decoded.depths,
+            vec![
+                VectorQuantizationDepthCalibration {
+                    cal: 3.25,
+                    sample_count: 777,
+                };
+                2
+            ]
+        );
     }
 
     #[test]
@@ -466,10 +650,14 @@ mod tests {
             VectorQuantizationConfig::materialize("embedding".to_string(), &options, layers)
                 .unwrap();
         assert_eq!(materialized.dim, 64);
-        assert_eq!(materialized.grids.len(), 1);
-        assert_eq!(materialized.grids[0].bits, 4);
-        assert_eq!(materialized.grids[0].version, GRID_FORMAT_VERSION);
-        assert_eq!(materialized.grids[0].points.len(), 16);
+        assert_eq!(materialized.grids.len(), 2);
+        for persisted in &materialized.grids {
+            let recomputed = build_grid(materialized.dim, persisted.bits);
+            assert_eq!(persisted.version, GRID_FORMAT_VERSION);
+            assert_eq!(persisted.points.len(), 1usize << persisted.bits);
+            assert_eq!(persisted.points, recomputed.points);
+            assert_eq!(persisted.rho_model, Some(recomputed.rho_model));
+        }
     }
 
     #[test]

@@ -2,12 +2,16 @@
 
 use fht::Rotation;
 use grid_plane::{
-    build_lut, decode as decode_grid, encode as encode_grid, estimate as estimate_grid,
+    build_lut, build_packed_lut_4, decode as decode_grid, encode as encode_grid,
+    estimate as estimate_grid, score_batch as score_grid_batch,
+    score_batch_packed_4 as score_grid_batch_packed_4,
+    score_batch_packed_4_indexed as score_grid_batch_packed_4_indexed,
 };
 use quant_model::f16::f16_to_f32;
 use quant_model::Grid;
 use sign_plane::{
-    encode as encode_sign, estimate_asym as estimate_sign_asym, estimate_fp as estimate_sign_fp,
+    encode as encode_sign, estimate_asym as estimate_sign_asym,
+    estimate_asym_batch_unscaled as estimate_sign_batch, estimate_fp as estimate_sign_fp,
     prepare_query, unpack as unpack_sign, QueryPlanes,
 };
 
@@ -58,9 +62,26 @@ pub struct PreparedFpQuery {
     layers: Vec<Vec<f32>>,
 }
 
+impl PreparedFpQuery {
+    /// Query in the coordinate space of one encoded layer.
+    pub fn layer(&self, layer: usize) -> &[f32] {
+        &self.layers[layer]
+    }
+
+    /// Query in the coordinate space of the final encoded layer.
+    pub fn final_layer(&self) -> &[f32] {
+        self.layers
+            .last()
+            .expect("validated quantization schedule is non-empty")
+    }
+}
+
 enum PreparedSplitLayer {
     Sign(QueryPlanes),
-    Grid(Vec<f32>),
+    Grid {
+        lut: Vec<f32>,
+        packed_lut_4: Option<Vec<f32>>,
+    },
 }
 
 /// Segment-query state with all rotations, sign bitplanes, and grid LUTs hoisted.
@@ -89,11 +110,10 @@ pub fn prepare_split_query(
                 sign_query_bits,
             )));
         } else {
-            layers.push(PreparedSplitLayer::Grid(build_lut(
-                &current,
-                &grid.points,
-                spec.bits,
-            )));
+            let lut = build_lut(&current, &grid.points, spec.bits);
+            let packed_lut_4 = (spec.bits == 4 && query.len().is_multiple_of(2))
+                .then(|| build_packed_lut_4(&lut, query.len()));
+            layers.push(PreparedSplitLayer::Grid { lut, packed_lut_4 });
         }
     }
     PreparedSplitQuery {
@@ -115,12 +135,98 @@ impl PreparedSplitQuery {
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => {
                 assert_eq!(spec.bits, 1);
-                estimate_sign_asym(&bytes_to_words(codes), scale, query) - constant
+                #[cfg(target_endian = "little")]
+                let estimate = estimate_sign_asym(aligned_le_words(codes), scale, query);
+                #[cfg(not(target_endian = "little"))]
+                let estimate = {
+                    let words = decode_le_words(codes);
+                    estimate_sign_asym(&words, scale, query)
+                };
+                estimate - constant
             }
-            PreparedSplitLayer::Grid(lut) => {
+            PreparedSplitLayer::Grid { lut, .. } => {
                 assert!(spec.bits > 1);
                 estimate_grid(codes, scale, lut, self.d, spec.bits) - constant
             }
+        }
+    }
+
+    /// Score a fixed-stride batch without scales or split constants. This is
+    /// the scan-path kernel boundary: one call covers one cluster or one
+    /// densely gathered survivor stream.
+    #[inline(always)]
+    pub fn score_layer_batch_unscaled(
+        &self,
+        layer: usize,
+        codes: &[u8],
+        code_stride: usize,
+        spec: LayerSpec,
+        out: &mut [f32],
+    ) {
+        assert_eq!(codes.len(), out.len() * code_stride);
+        match &self.layers[layer] {
+            PreparedSplitLayer::Sign(query) => {
+                assert_eq!(spec.bits, 1);
+                assert_eq!(code_stride % std::mem::size_of::<u64>(), 0);
+                #[cfg(target_endian = "little")]
+                estimate_sign_batch(
+                    aligned_le_words(codes),
+                    code_stride / std::mem::size_of::<u64>(),
+                    query,
+                    out,
+                );
+                #[cfg(not(target_endian = "little"))]
+                {
+                    let words = decode_le_words(codes);
+                    estimate_sign_batch(
+                        &words,
+                        code_stride / std::mem::size_of::<u64>(),
+                        query,
+                        out,
+                    );
+                }
+            }
+            PreparedSplitLayer::Grid { lut, packed_lut_4 } => {
+                assert!(spec.bits > 1);
+                if let Some(packed_lut_4) = packed_lut_4 {
+                    score_grid_batch_packed_4(codes, code_stride, packed_lut_4, self.d, out);
+                } else {
+                    score_grid_batch(codes, code_stride, lut, self.d, spec.bits, out);
+                }
+            }
+        }
+    }
+
+    /// Score selected rows from one borrowed contiguous posting range. This
+    /// is the sparse survivor-stream equivalent of the fixed-stride batch
+    /// entry and deliberately has no scalar per-row fallback for b=4.
+    #[inline(always)]
+    pub fn score_layer_batch_unscaled_indexed(
+        &self,
+        layer: usize,
+        codes: &[u8],
+        code_stride: usize,
+        row_offsets: &[usize],
+        spec: LayerSpec,
+        out: &mut [f32],
+    ) {
+        assert_eq!(row_offsets.len(), out.len());
+        match &self.layers[layer] {
+            PreparedSplitLayer::Grid {
+                packed_lut_4: Some(packed_lut_4),
+                ..
+            } => {
+                assert_eq!(spec.bits, 4);
+                score_grid_batch_packed_4_indexed(
+                    codes,
+                    code_stride,
+                    row_offsets,
+                    packed_lut_4,
+                    self.d,
+                    out,
+                );
+            }
+            _ => panic!("indexed survivor batch is only resolved for an even-d b=4 grid layer"),
         }
     }
 }
@@ -161,6 +267,31 @@ pub fn encode_batch_in_place(
     specs: &[LayerSpec],
     grids: &[Grid],
 ) -> EncodedBatch {
+    encode_batch_in_place_with_residual_observer(
+        vectors,
+        rows,
+        centroid,
+        specs,
+        grids,
+        |_, _, _| {},
+    )
+}
+
+/// Encode a row-major cluster tile and expose the remaining residual after
+/// each prefix to a non-owning observer. The observer runs before the next
+/// layer's rotation, so its residual and scale stream are in that prefix's
+/// exact scoring coordinate space.
+pub fn encode_batch_in_place_with_residual_observer<F>(
+    vectors: &mut [f32],
+    rows: usize,
+    centroid: &PreparedCentroid,
+    specs: &[LayerSpec],
+    grids: &[Grid],
+    mut observer: F,
+) -> EncodedBatch
+where
+    F: FnMut(usize, &[f32], &[u16]),
+{
     validate(centroid.d, specs, grids);
     assert_eq!(centroid.specs, specs);
     assert_eq!(vectors.len(), rows * centroid.d);
@@ -248,6 +379,8 @@ pub fn encode_batch_in_place(
                 *value -= encoded;
             }
         }
+
+        observer(layer, vectors, &scales);
 
         layers.push(EncodedLayerBatch {
             codes,
@@ -383,8 +516,18 @@ fn estimate_prepared_fp_layers(
         .enumerate()
         .map(|(layer, (spec, grid))| {
             if spec.bits == 1 {
-                let words = bytes_to_words(&encoded.codes[layer]);
-                estimate_sign_fp(&words, encoded.scales[layer], &query.layers[layer])
+                #[cfg(target_endian = "little")]
+                let estimate = estimate_sign_fp(
+                    aligned_le_words(&encoded.codes[layer]),
+                    encoded.scales[layer],
+                    &query.layers[layer],
+                );
+                #[cfg(not(target_endian = "little"))]
+                let estimate = {
+                    let words = decode_le_words(&encoded.codes[layer]);
+                    estimate_sign_fp(&words, encoded.scales[layer], &query.layers[layer])
+                };
+                estimate
             } else {
                 let lut = build_lut(&query.layers[layer], &grid.points, spec.bits);
                 estimate_grid(
@@ -413,12 +556,15 @@ pub fn reconstruct_first_space(
     for layer in 0..specs.len() {
         let spec = specs[layer];
         let mut reconstruction = if spec.bits == 1 {
-            let words = bytes_to_words(&encoded.codes[layer]);
             let scale = f16_to_f32(encoded.scales[layer]);
-            unpack_sign(&words, d)
-                .into_iter()
-                .map(|sign| scale * sign)
-                .collect()
+            #[cfg(target_endian = "little")]
+            let signs = unpack_sign(aligned_le_words(&encoded.codes[layer]), d);
+            #[cfg(not(target_endian = "little"))]
+            let signs = {
+                let words = decode_le_words(&encoded.codes[layer]);
+                unpack_sign(&words, d)
+            };
+            signs.into_iter().map(|sign| scale * sign).collect()
         } else {
             decode_grid(
                 &encoded.codes[layer],
@@ -487,7 +633,30 @@ fn words_to_bytes(words: &[u64]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-fn bytes_to_words(bytes: &[u8]) -> Vec<u64> {
+#[cfg(target_endian = "little")]
+#[inline]
+fn aligned_le_words(bytes: &[u8]) -> &[u64] {
+    assert_eq!(bytes.len() % std::mem::size_of::<u64>(), 0);
+    debug_assert_eq!(
+        bytes.as_ptr().align_offset(std::mem::align_of::<u64>()),
+        0,
+        "V3 code rows must be u64-aligned"
+    );
+    // SAFETY: V3 code sections begin at a 64-byte-aligned absolute offset and
+    // every code-row stride is a whole number of little-endian u64 words.
+    // `u64` has no invalid bit patterns, and the returned view cannot outlive
+    // the source bytes. This path is compiled only where native u64 loads have
+    // the format's little-endian interpretation.
+    unsafe {
+        std::slice::from_raw_parts(
+            bytes.as_ptr().cast::<u64>(),
+            bytes.len() / std::mem::size_of::<u64>(),
+        )
+    }
+}
+
+#[cfg(not(target_endian = "little"))]
+fn decode_le_words(bytes: &[u8]) -> Vec<u64> {
     assert_eq!(bytes.len() % 8, 0);
     bytes
         .as_chunks::<8>()
@@ -612,6 +781,105 @@ mod tests {
             assert_eq!(batch.codes, expected_codes);
             assert_eq!(batch.scales, expected_scales);
             assert_eq!(batch.constants, expected_constants);
+        }
+    }
+
+    #[test]
+    fn residual_observer_reports_each_exact_prefix_error() {
+        let d = 100;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let centroid: Vec<f32> = (0..d).map(|i| (i as f32 * 0.017).sin() * 0.1).collect();
+        let original: Vec<f32> = centroid
+            .iter()
+            .enumerate()
+            .map(|(i, &center)| center + (i as f32 * 0.029).cos() * 0.2)
+            .collect();
+        let prepared = prepare_centroid(&centroid, &specs);
+        let mut observed = Vec::new();
+        let mut full = original.clone();
+        encode_batch_in_place_with_residual_observer(
+            &mut full,
+            1,
+            &prepared,
+            &specs,
+            &grids,
+            |_, residual, _| observed.push(residual.to_vec()),
+        );
+        let prefix_prepared = prepare_centroid(&centroid, &specs[..1]);
+        let mut prefix = original;
+        encode_batch_in_place(&mut prefix, 1, &prefix_prepared, &specs[..1], &grids[..1]);
+        assert_eq!(observed, vec![prefix, full]);
+    }
+
+    #[test]
+    fn batch_scoring_matches_one_row_calls_for_sign_and_grid() {
+        let d = 100;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let centroid: Vec<f32> = (0..d).map(|i| (i as f32 * 0.013).sin() * 0.1).collect();
+        let rows = 7;
+        let mut vectors: Vec<f32> = (0..rows)
+            .flat_map(|row| {
+                centroid
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, &center)| center + ((i + row) as f32 * 0.031).cos() * 0.2)
+            })
+            .collect();
+        let encoded = encode_batch_in_place(
+            &mut vectors,
+            rows,
+            &prepare_centroid(&centroid, &specs),
+            &specs,
+            &grids,
+        );
+        let query: Vec<f32> = (0..d).map(|i| (i as f32 * 0.019).cos()).collect();
+        let prepared = prepare_split_query(&query, &specs, &grids, 4);
+        let unit_scale = quant_model::f16::f32_to_f16(1.0);
+
+        for (layer, encoded) in encoded.layers.iter().enumerate() {
+            let stride = encoded.codes.len() / rows;
+            let mut batch = vec![0.0; rows];
+            prepared.score_layer_batch_unscaled(
+                layer,
+                &encoded.codes,
+                stride,
+                specs[layer],
+                &mut batch,
+            );
+            for (row, &actual) in batch.iter().enumerate() {
+                let expected = prepared.score_layer(
+                    layer,
+                    &encoded.codes[row * stride..(row + 1) * stride],
+                    unit_scale,
+                    0.0,
+                    specs[layer],
+                );
+                assert_relative_eq(actual, expected);
+            }
         }
     }
 

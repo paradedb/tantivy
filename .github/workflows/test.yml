@@ -50,7 +50,12 @@ jobs:
         components: clippy
         override: true
 
+    # Hosted x86 runners are heterogeneous. Reusing target artifacts compiled
+    # with target-cpu=native can execute unsupported instructions on the next
+    # host, so cache registries/tools but always rebuild native target files.
     - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        cache-targets: false
 
     - name: Run kernel goldens and determinism snapshot
       run: ./quant-kernels/check.sh

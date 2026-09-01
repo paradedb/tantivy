@@ -45,6 +45,8 @@ pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
 pub use flat::FlatVecWriter;
+#[cfg(test)]
+pub use index_reader::QuantizationCalibrationAudit;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo, VectorStorageFormat};
 pub use ivf::{
     BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, BuiltRouter, Candidate, ClusterId,
@@ -75,7 +77,13 @@ pub use crate::schema::{Metric, VectorDType, VectorOptions};
 pub enum VectorIoPhase {
     #[default]
     Other,
-    Rerank,
+    QueryPrep,
+    Routing,
+    Plane1,
+    Boundary,
+    Plane2,
+    RerankFetch,
+    RerankScore,
 }
 
 thread_local! {

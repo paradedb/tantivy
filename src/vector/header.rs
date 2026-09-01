@@ -95,6 +95,8 @@ pub(crate) mod vec_slot {
     /// Exact little-endian f32 residual squared norms for metric policies
     /// that require them during distance assembly.
     pub(crate) const QUANTIZED_RESIDUAL_NORMS: usize = 14;
+    /// Per-segment, per-field measured uncertainty calibration metadata.
+    pub(crate) const QUANTIZED_CALIBRATION: usize = 15;
 }
 
 /// Version stamped into newly written vector files.
@@ -204,5 +206,6 @@ mod tests {
         assert_eq!(vec_slot::quantized_codes(3), 11);
         assert_eq!(vec_slot::quantized_constants(3), 13);
         assert_eq!(vec_slot::QUANTIZED_RESIDUAL_NORMS, 14);
+        assert_eq!(vec_slot::QUANTIZED_CALIBRATION, 15);
     }
 }

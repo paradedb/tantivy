@@ -133,11 +133,73 @@ pub fn score_asym(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
 }
 
 pub fn estimate_asym(x: &[u64], scale: u16, q: &QueryPlanes) -> f32 {
+    f16_to_f32(scale) * estimate_asym_unscaled(x, q)
+}
+
+/// Score one sign row without applying its stored scale.
+#[inline]
+pub fn estimate_asym_unscaled(x: &[u64], q: &QueryPlanes) -> f32 {
     let (positives, weighted_sum) = score_asym(x, q);
     let d = q.d as i64;
     let sign_sum = i64::from(positives) * 2 - d;
     let code_sum = i128::from(weighted_sum) * 2 - i128::from(q.sum_codes);
-    f16_to_f32(scale) * (q.lo * sign_sum as f32 + q.delta * code_sum as f32)
+    q.lo * sign_sum as f32 + q.delta * code_sum as f32
+}
+
+/// Score a fixed-stride row batch in one kernel call, leaving scale and
+/// split-form constant application to the caller's separate SoA pass.
+#[inline(always)]
+pub fn estimate_asym_batch_unscaled(
+    rows: &[u64],
+    words_per_row: usize,
+    q: &QueryPlanes,
+    out: &mut [f32],
+) {
+    assert!(words_per_row > 0);
+    assert_eq!(rows.len(), out.len() * words_per_row);
+    assert!(!q.planes.is_empty());
+    assert!(q.planes.iter().all(|plane| plane.len() == words_per_row));
+
+    // Bq=4 is the production scan configuration. Fuse the sign population
+    // and all four intersections into one word pass so the batch entry never
+    // re-enters the scalar cascade helper per row. Besides removing the call
+    // and its repeated shape assertions, this keeps each sign word live while
+    // all query planes consume it.
+    if let [p0, p1, p2, p3] = q.planes.as_slice() {
+        for (row, score) in rows.chunks_exact(words_per_row).zip(out) {
+            let mut positives = 0_u32;
+            let mut weighted_sum = 0_u64;
+            for ((((signs, &q0), &q1), &q2), &q3) in
+                row.iter().copied().zip(p0).zip(p1).zip(p2).zip(p3)
+            {
+                positives += signs.count_ones();
+                weighted_sum += u64::from((signs & q0).count_ones());
+                weighted_sum += u64::from((signs & q1).count_ones()) << 1;
+                weighted_sum += u64::from((signs & q2).count_ones()) << 2;
+                weighted_sum += u64::from((signs & q3).count_ones()) << 3;
+            }
+            let sign_sum = i64::from(positives) * 2 - q.d as i64;
+            let code_sum = i128::from(weighted_sum) * 2 - i128::from(q.sum_codes);
+            *score = q.lo * sign_sum as f32 + q.delta * code_sum as f32;
+        }
+        return;
+    }
+
+    // Width-generic fallback for the public kernel API. It retains the same
+    // fused batch shape, with the bitplane loop inside the word loop.
+    for (row, score) in rows.chunks_exact(words_per_row).zip(out) {
+        let mut positives = 0_u32;
+        let mut weighted_sum = 0_u64;
+        for (word_idx, &signs) in row.iter().enumerate() {
+            positives += signs.count_ones();
+            for (bit, plane) in q.planes.iter().enumerate() {
+                weighted_sum += u64::from((signs & plane[word_idx]).count_ones()) << bit;
+            }
+        }
+        let sign_sum = i64::from(positives) * 2 - q.d as i64;
+        let code_sum = i128::from(weighted_sum) * 2 - i128::from(q.sum_codes);
+        *score = q.lo * sign_sum as f32 + q.delta * code_sum as f32;
+    }
 }
 
 pub fn estimate_fp(x: &[u64], scale: u16, query: &[f32]) -> f32 {

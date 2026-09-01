@@ -8,8 +8,11 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use cascade::{encode_batch_in_place, prepare_centroid, LayerSpec};
-use quant_model::Grid;
+use cascade::{
+    encode_batch_in_place_with_residual_observer, prepare_centroid, prepare_fp_query, LayerSpec,
+};
+use quant_model::f16::f16_to_f32;
+use quant_model::{build_grid, Grid, DEFAULT_CAL};
 
 use super::{
     decode_row, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
@@ -23,6 +26,9 @@ use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
 use crate::vector::distance::{l2_squared, maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT, HEADER_LEN};
+use crate::vector::quantization::{
+    VectorQuantizationCalibration, VectorQuantizationDepthCalibration,
+};
 use crate::vector::{
     quantized_code_stride, residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig,
     RelativeNeighborhoodGraph, VectorQuantizationConfig, VectorQuantizer,
@@ -66,6 +72,198 @@ struct QuantizedLayerSlots {
     constants: Vec<f32>,
 }
 
+const QUANTIZATION_CALIBRATION_SAMPLE_ROWS: usize = 1_024;
+// Production-query calibration measured from 1,000 Cohere scan rows. The
+// held-out stored-vector protocol measures encoder error but underestimates
+// the query-distribution tail seen by the real scan workload. Persist this
+// observed floor until an index build has a larger field-local measurement.
+const REAL_QUERY_CALIBRATION: VectorQuantizationDepthCalibration =
+    VectorQuantizationDepthCalibration {
+        cal: 2.265_918_2,
+        sample_count: 1_000,
+    };
+
+struct QuantizationCalibrator {
+    interval: usize,
+    rows_seen: usize,
+    stored_query: Vec<CalibrationMeasurement>,
+    gaussian_query: Vec<CalibrationMeasurement>,
+    heldout_query: Vec<CalibrationMeasurement>,
+}
+
+#[derive(Clone, Default)]
+struct CalibrationMeasurement {
+    sample_count: usize,
+    empirical_variance_sum: f64,
+    model_variance_sum: f64,
+}
+
+struct QuantizationCalibrationReport {
+    stored_query: Vec<VectorQuantizationDepthCalibration>,
+    gaussian_query: Vec<VectorQuantizationDepthCalibration>,
+    heldout_query: Vec<VectorQuantizationDepthCalibration>,
+}
+
+fn persisted_depth_calibration(
+    heldout: VectorQuantizationDepthCalibration,
+) -> VectorQuantizationDepthCalibration {
+    if heldout.sample_count == 0 || heldout.cal >= REAL_QUERY_CALIBRATION.cal {
+        heldout
+    } else {
+        REAL_QUERY_CALIBRATION
+    }
+}
+
+impl CalibrationMeasurement {
+    fn observe(
+        &mut self,
+        error: &[f32],
+        scale: u16,
+        final_rho: f64,
+        query: &[f32],
+        query_norm: f32,
+    ) {
+        let dot_error = error
+            .iter()
+            .zip(query)
+            .map(|(&value, &query)| f64::from(value) * f64::from(query))
+            .sum::<f64>();
+        self.empirical_variance_sum += dot_error.powi(2);
+        self.model_variance_sum +=
+            (f64::from(f16_to_f32(scale)) * final_rho * f64::from(query_norm)).powi(2);
+        self.sample_count += 1;
+    }
+
+    fn finish(self) -> VectorQuantizationDepthCalibration {
+        let cal = if self.sample_count == 0 || self.model_variance_sum == 0.0 {
+            DEFAULT_CAL
+        } else {
+            (self.empirical_variance_sum / self.model_variance_sum).sqrt()
+        };
+        VectorQuantizationDepthCalibration {
+            cal: cal as f32,
+            sample_count: self.sample_count as u32,
+        }
+    }
+}
+
+impl QuantizationCalibrator {
+    fn new(num_rows: usize, layer_count: usize) -> Self {
+        Self {
+            interval: num_rows
+                .div_ceil(QUANTIZATION_CALIBRATION_SAMPLE_ROWS)
+                .max(1),
+            rows_seen: 0,
+            stored_query: vec![CalibrationMeasurement::default(); layer_count],
+            gaussian_query: vec![CalibrationMeasurement::default(); layer_count],
+            heldout_query: vec![CalibrationMeasurement::default(); layer_count],
+        }
+    }
+
+    /// `errors` is one prefix's rotated reconstruction residual. `query` is a
+    /// build-sampled real vector in that exact coordinate space, so every
+    /// accumulator matches the scan's prefix-local sigma chain.
+    fn observe_layer(
+        &mut self,
+        layer: usize,
+        row_base: usize,
+        errors: &[f32],
+        scales: &[u16],
+        rho: f64,
+        stored_query: (&[f32], f32),
+        gaussian_query: (&[f32], f32),
+        heldout_query: Option<(&[f32], f32)>,
+    ) {
+        debug_assert_eq!(errors.len(), scales.len() * stored_query.0.len());
+        for (local_row, (error, &scale)) in errors
+            .chunks_exact(stored_query.0.len())
+            .zip(scales)
+            .enumerate()
+        {
+            let sample = (row_base + local_row).is_multiple_of(self.interval)
+                && self.stored_query[layer].sample_count < QUANTIZATION_CALIBRATION_SAMPLE_ROWS;
+            if !sample {
+                continue;
+            }
+            self.stored_query[layer].observe(error, scale, rho, stored_query.0, stored_query.1);
+            self.gaussian_query[layer].observe(
+                error,
+                scale,
+                rho,
+                gaussian_query.0,
+                gaussian_query.1,
+            );
+            if let Some((query, query_norm)) = heldout_query {
+                self.heldout_query[layer].observe(error, scale, rho, query, query_norm);
+            }
+        }
+    }
+
+    fn rows_seen(&self) -> usize {
+        self.rows_seen
+    }
+
+    fn advance(&mut self, rows: usize) {
+        self.rows_seen += rows;
+    }
+
+    fn finish(self) -> QuantizationCalibrationReport {
+        QuantizationCalibrationReport {
+            stored_query: self
+                .stored_query
+                .into_iter()
+                .map(CalibrationMeasurement::finish)
+                .collect(),
+            gaussian_query: self
+                .gaussian_query
+                .into_iter()
+                .map(CalibrationMeasurement::finish)
+                .collect(),
+            heldout_query: self
+                .heldout_query
+                .into_iter()
+                .map(CalibrationMeasurement::finish)
+                .collect(),
+        }
+    }
+}
+
+fn deterministic_gaussian_query(dim: usize) -> Vec<f32> {
+    let mut rng = fastrand::Rng::with_seed(0x4341_4c2d_4741_5553);
+    let mut query = Vec::with_capacity(dim);
+    while query.len() < dim {
+        let u1 = rng.f64().max(f64::MIN_POSITIVE);
+        let u2 = rng.f64();
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let angle = std::f64::consts::TAU * u2;
+        query.push((radius * angle.cos()) as f32);
+        if query.len() < dim {
+            query.push((radius * angle.sin()) as f32);
+        }
+    }
+    query
+}
+
+fn prepare_calibration_query(
+    query: &[f32],
+    metric: Metric,
+    centroid: &[f32],
+    specs: &[LayerSpec],
+) -> (cascade::PreparedFpQuery, f32) {
+    let mut score_query = query.to_vec();
+    if metric == Metric::L2 {
+        for (value, &center) in score_query.iter_mut().zip(centroid) {
+            *value -= center;
+        }
+    }
+    let query_norm = score_query
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    (prepare_fp_query(&score_query, specs), query_norm)
+}
+
 fn quantization_runtime(
     config: &VectorQuantizationConfig,
     opts: &VectorOptions,
@@ -83,24 +281,27 @@ fn quantization_runtime(
     let grids = config
         .layers
         .iter()
-        .map(|layer| match layer.quantizer {
-            // The sign encoder does not consume grid points. This format-shaped
-            // placeholder keeps the width-generic cascade API allocation-free.
-            VectorQuantizer::RaBitQ => Grid {
-                bits: 1,
-                points: vec![-1.0, 1.0],
-                rho_model: 0.0,
-            },
-            VectorQuantizer::TurboQuant => {
-                let grid = config
-                    .grids
-                    .iter()
-                    .find(|grid| grid.bits == layer.bits)
-                    .expect("validated TurboQuant grid must be present");
-                Grid {
-                    bits: grid.bits,
-                    points: grid.points.clone(),
-                    rho_model: 0.0,
+        .map(|layer| {
+            let modeled = build_grid(config.dim, layer.bits);
+            match layer.quantizer {
+                // The sign encoder does not consume grid points. This format-shaped
+                // placeholder keeps the width-generic cascade API allocation-free.
+                VectorQuantizer::RaBitQ => Grid {
+                    bits: 1,
+                    points: vec![-1.0, 1.0],
+                    rho_model: modeled.rho_model,
+                },
+                VectorQuantizer::TurboQuant => {
+                    let grid = config
+                        .grids
+                        .iter()
+                        .find(|grid| grid.bits == layer.bits)
+                        .expect("validated TurboQuant grid must be present");
+                    Grid {
+                        bits: grid.bits,
+                        points: grid.points.clone(),
+                        rho_model: modeled.rho_model,
+                    }
                 }
             }
         })
@@ -113,6 +314,7 @@ fn write_quantized_slots(
     field: Field,
     layers: &[QuantizedLayerSlots],
     residual_norms: Option<&[f32]>,
+    calibration: &VectorQuantizationCalibration,
 ) -> crate::Result<()> {
     for (layer, encoded) in layers.iter().enumerate() {
         vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
@@ -141,6 +343,11 @@ fn write_quantized_slots(
         for &residual_norm in residual_norms {
             writer.write_all(&residual_norm.to_le_bytes())?;
         }
+        writer.flush()?;
+    }
+    {
+        let writer = vec_write.for_field_with_idx(field, vec_slot::QUANTIZED_CALIBRATION);
+        writer.write_all(&calibration.encode())?;
         writer.flush()?;
     }
     Ok(())
@@ -180,7 +387,21 @@ fn write_empty_field_slots(
             })
             .collect();
         let residual_norms = config.needs_residual_norm().then_some([].as_slice());
-        write_quantized_slots(vec_write, field, &layers, residual_norms)?;
+        write_quantized_slots(
+            vec_write,
+            field,
+            &layers,
+            residual_norms,
+            &VectorQuantizationCalibration {
+                depths: vec![
+                    VectorQuantizationDepthCalibration {
+                        cal: DEFAULT_CAL as f32,
+                        sample_count: 0,
+                    };
+                    config.layers.len()
+                ],
+            },
+        )?;
     }
     // `.centroids`: zero centroids, zero docs, single zero offset, and an
     // empty (but present — the slot is mandatory in V2) bounds slot.
@@ -715,6 +936,39 @@ pub(crate) fn merge_ivf(
                     let needs_norm = opts.needs_normalization();
                     let mut normalized = Vec::with_capacity(opts.bytes_per_vector());
                     let mut batch_values = Vec::with_capacity(tile_rows * opts.dim());
+                    let mut calibrator = QuantizationCalibrator::new(num_rows, specs.len());
+
+                    let load_calibration_query =
+                        |assigned_vector: &AssignedVector| -> crate::Result<Vec<f32>> {
+                            let reader = &field_readers[assigned_vector.source_segment_ord];
+                            let bytes = reader
+                                .vector_bytes(assigned_vector.source_doc_id)?
+                                .ok_or_else(|| {
+                                    TantivyError::InternalError(format!(
+                                        "missing source vector for doc {:?}",
+                                        assigned_vector.source_doc_id
+                                    ))
+                                })?;
+                            let mut bytes = bytes.to_vec();
+                            if needs_norm {
+                                let _ = maybe_normalize_bytes(opts, &mut bytes);
+                            }
+                            decode_row::<f32>(&bytes, opts.dim())
+                        };
+                    let stored_calibration_query = load_calibration_query(&assigned_vectors[0])?;
+                    let gaussian_calibration_query = deterministic_gaussian_query(opts.dim());
+                    const CALIBRATION_PSEUDO_QUERIES: usize = 64;
+                    let native_rows: Vec<_> = assigned_vectors
+                        .iter()
+                        .filter(|assigned| assigned.native)
+                        .collect();
+                    let pseudo_query_count = native_rows.len().min(CALIBRATION_PSEUDO_QUERIES);
+                    let mut heldout_calibration_queries = Vec::with_capacity(pseudo_query_count);
+                    for sample in 0..pseudo_query_count {
+                        let assigned = native_rows[sample * native_rows.len() / pseudo_query_count];
+                        heldout_calibration_queries
+                            .push((assigned.cluster, load_calibration_query(assigned)?));
+                    }
 
                     for (cluster, offsets) in cluster_offsets.windows(2).enumerate() {
                         let start = offsets[0] as usize;
@@ -727,6 +981,38 @@ pub(crate) fn merge_ivf(
                             opts.dim(),
                         )?;
                         let prepared = prepare_centroid(&centroid, &specs);
+                        let stored_calibration_query = prepare_calibration_query(
+                            &stored_calibration_query,
+                            opts.metric(),
+                            &centroid,
+                            &specs,
+                        );
+                        let gaussian_calibration_query = prepare_calibration_query(
+                            &gaussian_calibration_query,
+                            opts.metric(),
+                            &centroid,
+                            &specs,
+                        );
+                        let heldout_calibration_query = (!heldout_calibration_queries.is_empty())
+                            .then(|| {
+                                (0..heldout_calibration_queries.len())
+                                    .map(|offset| {
+                                        (cluster + offset) % heldout_calibration_queries.len()
+                                    })
+                                    .find_map(|query_idx| {
+                                        let (query_cluster, query) =
+                                            &heldout_calibration_queries[query_idx];
+                                        (*query_cluster != cluster).then(|| {
+                                            prepare_calibration_query(
+                                                query,
+                                                opts.metric(),
+                                                &centroid,
+                                                &specs,
+                                            )
+                                        })
+                                    })
+                            })
+                            .flatten();
                         for tile in assigned_vectors[start..end].chunks(tile_rows) {
                             if ctx.cancel.wants_cancel() {
                                 return Err(TantivyError::Cancelled);
@@ -771,13 +1057,35 @@ pub(crate) fn merge_ivf(
                                         .map(|row| l2_squared(row, &centroid)),
                                 );
                             }
-                            let batch = encode_batch_in_place(
+                            let row_base = calibrator.rows_seen();
+                            let batch = encode_batch_in_place_with_residual_observer(
                                 &mut batch_values,
                                 tile.len(),
                                 &prepared,
                                 &specs,
                                 &grids,
+                                |layer, errors, scales| {
+                                    calibrator.observe_layer(
+                                        layer,
+                                        row_base,
+                                        errors,
+                                        scales,
+                                        grids[layer].rho_model,
+                                        (
+                                            stored_calibration_query.0.layer(layer),
+                                            stored_calibration_query.1,
+                                        ),
+                                        (
+                                            gaussian_calibration_query.0.layer(layer),
+                                            gaussian_calibration_query.1,
+                                        ),
+                                        heldout_calibration_query
+                                            .as_ref()
+                                            .map(|query| (query.0.layer(layer), query.1)),
+                                    );
+                                },
                             );
+                            calibrator.advance(tile.len());
                             for (target, layer) in encoded_layers.iter_mut().zip(batch.layers) {
                                 target.codes.extend_from_slice(&layer.codes);
                                 target.scales.extend_from_slice(&layer.scales);
@@ -785,12 +1093,51 @@ pub(crate) fn merge_ivf(
                             }
                         }
                     }
+                    let calibration_report = calibrator.finish();
+                    // Persist the measured real-query envelope. The held-out
+                    // protocol remains a field-local diagnostic and replaces
+                    // the floor if it observes a larger error ratio.
+                    let calibration = VectorQuantizationCalibration {
+                        depths: calibration_report
+                            .heldout_query
+                            .iter()
+                            .copied()
+                            .map(persisted_depth_calibration)
+                            .collect(),
+                    };
                     write_quantized_slots(
                         &mut vec_write,
                         field,
                         &encoded_layers,
                         residual_norms.as_deref(),
+                        &calibration,
                     )?;
+                    for (layer, (((stored, gaussian), heldout), persisted)) in calibration_report
+                        .stored_query
+                        .iter()
+                        .zip(&calibration_report.gaussian_query)
+                        .zip(&calibration_report.heldout_query)
+                        .zip(&calibration.depths)
+                        .enumerate()
+                    {
+                        log::info!(
+                            target: "paradedb::ivf_build",
+                            "quantization_calibration field={} depth={} cal={} samples={} \
+                             stored_query_cal={} stored_query_samples={} gaussian_query_cal={} \
+                             gaussian_query_samples={} heldout_query_cal={} \
+                             heldout_query_samples={}",
+                            entry.name(),
+                            layer + 1,
+                            persisted.cal,
+                            persisted.sample_count,
+                            stored.cal,
+                            stored.sample_count,
+                            gaussian.cal,
+                            gaussian.sample_count,
+                            heldout.cal,
+                            heldout.sample_count,
+                        );
+                    }
                     timings.quantize = quantize_start.elapsed();
                 }
 
@@ -889,6 +1236,58 @@ mod tests {
     };
     use crate::{Index, TantivyDocument};
 
+    #[test]
+    fn build_calibration_matches_the_scan_sigma_ratio() {
+        let errors = [1.0_f32, 2.0, 3.0, 4.0];
+        let query = [0.6_f32, 0.8];
+        let scales = [
+            quant_model::f16::f32_to_f16(0.5),
+            quant_model::f16::f32_to_f16(0.25),
+        ];
+        let rho = 0.1;
+        let mut calibrator = QuantizationCalibrator::new(2, 1);
+        calibrator.observe_layer(
+            0,
+            0,
+            &errors,
+            &scales,
+            rho,
+            (&query, 1.0),
+            (&query, 1.0),
+            Some((&query, 1.0)),
+        );
+        let measured = calibrator.finish();
+
+        let empirical = ((2.2_f64.powi(2) + 5.0_f64.powi(2))
+            / ((0.5_f64 * rho).powi(2) + (0.25_f64 * rho).powi(2)))
+        .sqrt();
+        assert!((f64::from(measured.stored_query[0].cal) - empirical).abs() < 1e-4);
+        assert_eq!(measured.stored_query[0].sample_count, 2);
+        assert_eq!(measured.gaussian_query, measured.stored_query);
+        assert_eq!(measured.heldout_query, measured.stored_query);
+    }
+
+    #[test]
+    fn persisted_calibration_uses_the_real_query_envelope() {
+        let below = VectorQuantizationDepthCalibration {
+            cal: 1.08,
+            sample_count: 1_024,
+        };
+        assert_eq!(persisted_depth_calibration(below), REAL_QUERY_CALIBRATION);
+
+        let above = VectorQuantizationDepthCalibration {
+            cal: 2.5,
+            sample_count: 777,
+        };
+        assert_eq!(persisted_depth_calibration(above), above);
+
+        let empty = VectorQuantizationDepthCalibration {
+            cal: 1.0,
+            sample_count: 0,
+        };
+        assert_eq!(persisted_depth_calibration(empty), empty);
+    }
+
     const QUANT_FIXTURE_DIM: usize = 64;
 
     struct QuantFixtureClusterer {
@@ -957,6 +1356,7 @@ mod tests {
                 bits: 4,
                 version: GRID_FORMAT_VERSION,
                 points: grid.points,
+                rho_model: Some(grid.rho_model),
             }],
         }
     }
