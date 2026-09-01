@@ -1,37 +1,4 @@
-//! Per-segment row→doc_id map for vector fields.
-//!
-//! Stored as slot `[0]` of the `.vec` composite file, parallel to the dense
-//! row blob in slot `[1]`. The variant is the storage-mode discriminator: the
-//! flat backend writes `Identity` (dense) or `Bitmap` (sparse); the future IVF
-//! backend writes `Explicit`. Reading the variant tag is all it takes to learn
-//! the mode — there is no separate format byte or metadata file.
-//!
-//! For the flat variants the map also addresses the dense row array via rank
-//! (`rank(doc_id) -> row_id`) and distinguishes "missing vector" from "zero
-//! vector" at query time.
-//!
-//! Mirrors the `Full | Optional` cardinality split in `tantivy-columnar`. For
-//! dense columns (every doc present — the typical case for embeddings) the
-//! `Identity` variant skips the bitmap entirely: `row_id == doc_id` is the
-//! identity map, no rank lookup needed. For sparse columns we delegate to
-//! columnar's [`OptionalIndex`], a roaring-style bitmap with rank/select
-//! support that's also used by fast-field columns elsewhere in tantivy.
-//!
-//! ## On-disk layout
-//!
-//! ```text
-//! [u8 variant_tag] [body]
-//!   tag = 0  (Identity): no body — `num_docs` comes from the caller
-//!                        (typically `segment_reader.max_doc()`)
-//!   tag = 1  (Bitmap):   body = serialized columnar OptionalIndex
-//!   tag = 2  (Explicit): body = row→doc_id permutation, one u32 LE per row
-//! ```
-//!
-//! `Identity`/`Bitmap` are written by the flat backend (`row_id == doc_id` or a
-//! presence bitmap). `Explicit` is written by the IVF backend, where rows are
-//! cluster-sorted and bear no positional relationship to `doc_id`; the variant
-//! tag is therefore the flat-vs-IVF discriminator (`Explicit` ⟺ IVF ⟺ a
-//! sibling `.centroids` file is present).
+//! Per-segment mappings between stored vector rows and document identifiers.
 
 use std::io::{self, Write};
 use std::mem::size_of;
@@ -44,36 +11,32 @@ use crate::DocId;
 
 const VARIANT_IDENTITY: u8 = 0;
 const VARIANT_BITMAP: u8 = 1;
+/// Explicit row-to-document mapping tag.
 pub(crate) const VARIANT_EXPLICIT: u8 = 2;
 
-/// Decode the `row`-th doc_id from a packed little-endian `Explicit` body.
-/// Caller guarantees `row < bytes.len() / 4`.
+/// Decodes one document identifier from an explicit map body.
 #[inline]
 fn explicit_doc_id_at(bytes: &[u8], row: usize) -> DocId {
     let start = row * size_of::<DocId>();
     DocId::from_le_bytes(bytes[start..start + size_of::<DocId>()].try_into().unwrap())
 }
 
-/// Per-field row→doc_id map. Dispatches on cardinality at open time so the hot
-/// path can skip the bitmap entirely when every doc has a value.
+/// Maps stored vector rows to document identifiers.
 pub enum IdMap {
-    /// Every doc has a value. `row_id == doc_id`; no bitmap stored.
+    /// Identity mapping for fields present on every document.
     Identity { num_docs: u32 },
-    /// Some docs may be absent. Rank/contains go through columnar's
-    /// `OptionalIndex` (roaring-style block bitmap).
+    /// Bitmap mapping for optional vector fields.
     Bitmap(OptionalIndex),
-    /// IVF: maps each row to its doc_id. Held as the raw little-endian body
-    /// (one u32 per row) so it can be decoded a row at a time.
+    /// Explicit row-to-document mapping for cluster-ordered rows.
     Explicit(OwnedBytes),
 }
 
 impl IdMap {
-    /// Serialize the appropriate variant given a sorted list of present
-    /// `doc_id`s. Chooses `Identity` if every doc is present, `Bitmap`
-    /// otherwise.
+    /// Serializes an identity or bitmap mapping for sorted document identifiers.
     ///
-    /// The Identity variant writes only the variant tag — `num_docs` is
-    /// supplied at open time (typically from `segment_reader.max_doc()`).
+    /// # Errors
+    ///
+    /// Returns an error when the output cannot be written.
     pub fn serialize<W: Write>(
         present_doc_ids: &[DocId],
         num_docs: u32,
@@ -88,6 +51,11 @@ impl IdMap {
         Ok(())
     }
 
+    /// Serializes an explicit row-to-document mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output cannot be written.
     pub fn serialize_explicit<W: Write>(row_doc_ids: &[DocId], out: &mut W) -> io::Result<()> {
         out.write_all(&[VARIANT_EXPLICIT])?;
         for doc_id in row_doc_ids {
@@ -96,9 +64,11 @@ impl IdMap {
         Ok(())
     }
 
-    /// Parse a serialized id-map section, dispatching on the variant tag.
-    /// `num_docs` is used only when the variant is `Identity` — for `Bitmap`,
-    /// the count is read from the embedded `OptionalIndex` header.
+    /// Opens a serialized row-to-document mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unreadable or invalid input.
     pub fn open(file_slice: FileSlice, num_docs: u32) -> io::Result<IdMap> {
         if file_slice.len() == 0 {
             return Err(io::Error::new(
@@ -128,7 +98,7 @@ impl IdMap {
         }
     }
 
-    /// Number of docs that have a value (= number of stored rows).
+    /// Returns the number of stored rows.
     pub fn num_rows(&self) -> u32 {
         match self {
             IdMap::Identity { num_docs } => *num_docs,
@@ -137,10 +107,7 @@ impl IdMap {
         }
     }
 
-    /// `true` if `doc_id` has a value. The `Explicit` arm is a linear scan —
-    /// the reference semantics the format tests exercise; the read path
-    /// ([`VectorIndexReader`](crate::vector::VectorIndexReader)) uses
-    /// cluster-local binary search instead.
+    /// Returns whether the document has a stored row.
     #[cfg(test)]
     #[inline]
     pub fn contains(&self, doc_id: DocId) -> bool {
@@ -154,13 +121,7 @@ impl IdMap {
         }
     }
 
-    /// Returns the dense row id for `doc_id` if it has a value, else `None`.
-    /// For `Identity`, this is the identity map — no bitmap consulted. For
-    /// `Explicit` this is a linear scan; the IVF read path uses cluster-local
-    /// binary search instead (see
-    /// [`VectorIndexReader`](crate::vector::VectorIndexReader)).
-    /// Callers must pass a `doc_id` within the segment (`doc_id < max_doc`);
-    /// this is asserted in debug builds.
+    /// Returns the stored row for a document when present.
     #[inline]
     pub fn rank_if_exists(&self, doc_id: DocId) -> Option<u32> {
         match self {
@@ -194,8 +155,6 @@ mod tests {
         let n = 100u32;
         let present: Vec<DocId> = (0..n).collect();
 
-        // Wire-level: the serialized output is exactly 1 byte (just the
-        // variant tag); no body — num_docs comes from the caller.
         let mut buf = Vec::new();
         IdMap::serialize(&present, n, &mut buf).unwrap();
         assert_eq!(buf.len(), 1, "Identity variant should write only the tag");
@@ -208,9 +167,6 @@ mod tests {
             assert!(p.contains(d));
             assert_eq!(p.rank_if_exists(d), Some(d));
         }
-        // Out-of-range queries are the caller's responsibility:
-        // `contains` returns false, but `rank_if_exists` requires
-        // `doc_id < num_docs` (asserted in debug builds).
         assert!(!p.contains(n));
     }
 
@@ -243,7 +199,6 @@ mod tests {
 
     #[test]
     fn test_bitmap_across_blocks() {
-        // Exercise multiple roaring-style blocks (each spans 64K docs).
         let n = 1500u32;
         let present: Vec<DocId> = (0..n).filter(|d| d % 3 == 0).collect();
         let p = round_trip(&present, n);
@@ -269,8 +224,6 @@ mod tests {
 
     #[test]
     fn test_explicit_round_trip() {
-        // A cluster-sorted permutation: rows 0..2 are cluster 0 (docs 1,4),
-        // rows 2..4 are cluster 1 (docs 0,3) — not globally sorted.
         let row_doc_ids: Vec<DocId> = vec![1, 4, 0, 3];
         let mut buf = Vec::new();
         IdMap::serialize_explicit(&row_doc_ids, &mut buf).unwrap();
