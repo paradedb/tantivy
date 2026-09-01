@@ -1,28 +1,45 @@
-//! IVF-format merge routine.
-//!
-//! The IVF format is one of two storage modes the unified
-//! [`VectorPlugin`](crate::vector::VectorPlugin) can produce per merge.
-//! This module exposes the merge body so the parent plugin can call it
-//! after the threshold check.
+//! IVF merge-time clustering and vector encoding.
 
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use cascade::prepare_centroid;
+use cascade::{
+    encode_batch_in_place_with_workspace, BatchEncodeWorkspace, LayerSpec,
+    PreparedCentroidWorkspace, QueryRotationPlan,
+};
+use quant_model::Grid;
+
+#[cfg(test)]
+use super::decode_row;
 use super::{
-    decode_row, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
+    decode_row_append, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
     IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, RoutingIndex,
     CENTROIDS_EXT,
 };
-use crate::directory::{CompositeWrite, Directory};
+use crate::directory::{CompositeWrite, Directory, TempFilePtr};
 use crate::index::SegmentComponent;
+use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::PluginMergeContext;
+#[cfg(test)]
+use crate::schema::Metric;
 use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
+#[cfg(test)]
+use crate::vector::distance::l2_squared;
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
-use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT};
+use crate::vector::header::{
+    centroid_slot, write_centroid_header, write_vector_header, CentroidSlot, VectorSlot, CURRENT,
+    HEADER_LEN,
+};
 use crate::vector::{
-    residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig, RelativeNeighborhoodGraph,
-    VEC_EXT,
+    quantized_code_stride, residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig,
+    RelativeNeighborhoodGraph, VectorQuantizationConfig, QUANTIZED_CODE_ALIGNMENT,
+    QUANTIZED_CONSTANT_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SIDECAR_STRIDE, VEC_EXT,
 };
 use crate::{DocId, Executor, TantivyError};
 
@@ -33,8 +50,7 @@ struct AssignedVector {
     source_doc_id: DocId,
 }
 
-/// A multi-threaded [`Executor`] when the host has the parallelism, the
-/// single-threaded one otherwise.
+/// Returns an executor sized to host parallelism.
 fn build_executor(name: &'static str) -> crate::Result<Executor> {
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -53,44 +69,456 @@ struct IvfBuildTimings {
     train: Duration,
     assign: Duration,
     posting_write: Duration,
+    quantize: Duration,
 }
 
-/// Write `field`'s slots in both composites as an empty IVF field: empty
-/// Explicit id-map, empty rows, zero centroids, zero docs, and a single
-/// zero cluster offset. Every vector field must own its slots in every
-/// IVF segment — the reader treats a missing slot as corruption — so both
-/// the "sources report no vectors" fast path and the "every vector-bearing
-/// doc is deleted" path write this same shape.
+/// Logical byte layout for one quantized slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuantizedSlotLayout {
+    row_stride: usize,
+    cluster_offsets: Vec<usize>,
+    total_bytes: usize,
+}
+
+impl QuantizedSlotLayout {
+    fn from_posting_offsets(row_stride: usize, posting_offsets: &[u64]) -> crate::Result<Self> {
+        if posting_offsets.first().copied() != Some(0) {
+            return Err(TantivyError::InternalError(
+                "quantized layout requires posting offsets to start at row 0".to_string(),
+            ));
+        }
+        let mut cluster_offsets = Vec::with_capacity(posting_offsets.len());
+        cluster_offsets.push(0);
+        let mut total_bytes = 0usize;
+        for (cluster, rows) in posting_offsets.windows(2).enumerate() {
+            let posting_rows = rows[1].checked_sub(rows[0]).ok_or_else(|| {
+                TantivyError::InternalError(format!(
+                    "quantized layout posting offsets decrease at cluster {cluster}: {} > {}",
+                    rows[0], rows[1]
+                ))
+            })?;
+            let posting_rows = usize::try_from(posting_rows).map_err(|_| {
+                TantivyError::InternalError(format!(
+                    "quantized layout row count does not fit usize at cluster {cluster}"
+                ))
+            })?;
+            let posting_bytes = posting_rows.checked_mul(row_stride).ok_or_else(|| {
+                TantivyError::InternalError(format!(
+                    "quantized layout byte size overflows at cluster {cluster}"
+                ))
+            })?;
+            total_bytes = total_bytes.checked_add(posting_bytes).ok_or_else(|| {
+                TantivyError::InternalError(
+                    "quantized layout total byte size overflows usize".to_string(),
+                )
+            })?;
+            cluster_offsets.push(total_bytes);
+        }
+        Ok(Self {
+            row_stride,
+            cluster_offsets,
+            total_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn cluster_span(&self, cluster: usize) -> Range<usize> {
+        self.cluster_offsets[cluster]..self.cluster_offsets[cluster + 1]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuantizedLayerLayout {
+    codes: QuantizedSlotLayout,
+    sidecar: QuantizedSlotLayout,
+    constants: Option<QuantizedSlotLayout>,
+}
+
+/// Per-field quantized slot layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuantizedWriteLayout {
+    layers: Vec<QuantizedLayerLayout>,
+    residual_norms: QuantizedSlotLayout,
+}
+
+impl QuantizedWriteLayout {
+    fn build(config: &VectorQuantizationConfig, posting_offsets: &[u64]) -> crate::Result<Self> {
+        let layers = config
+            .layers
+            .iter()
+            .map(|layer| {
+                Ok(QuantizedLayerLayout {
+                    codes: QuantizedSlotLayout::from_posting_offsets(
+                        quantized_code_stride(config.dim, layer.bits),
+                        posting_offsets,
+                    )?,
+                    sidecar: QuantizedSlotLayout::from_posting_offsets(
+                        QUANTIZED_SIDECAR_STRIDE,
+                        posting_offsets,
+                    )?,
+                    constants: config
+                        .needs_constants()
+                        .then(|| {
+                            QuantizedSlotLayout::from_posting_offsets(
+                                QUANTIZED_CONSTANT_STRIDE,
+                                posting_offsets,
+                            )
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let residual_norms = QuantizedSlotLayout::from_posting_offsets(
+            QUANTIZED_RESIDUAL_NORM_STRIDE,
+            posting_offsets,
+        )?;
+        Ok(Self {
+            layers,
+            residual_norms,
+        })
+    }
+
+    fn cluster_count(&self) -> usize {
+        self.layers
+            .first()
+            .map_or(0, |layer| layer.codes.cluster_offsets.len() - 1)
+    }
+}
+
+/// Merge-local spill file for one quantized slot.
+struct QuantizedTempSlot {
+    file: TempFilePtr,
+    expected_len: usize,
+    written_len: usize,
+}
+
+impl QuantizedTempSlot {
+    fn create(directory: &dyn Directory, expected_len: usize) -> crate::Result<Self> {
+        let file = directory.open_temp_file()?;
+        Ok(Self {
+            file,
+            expected_len,
+            written_len: 0,
+        })
+    }
+
+    fn validate_offset(&self, expected: usize, context: &str) -> crate::Result<()> {
+        if self.written_len != expected {
+            return Err(TantivyError::InternalError(format!(
+                "quantized layout mismatch for {context}: wrote {} bytes, expected {expected}",
+                self.written_len
+            )));
+        }
+        Ok(())
+    }
+
+    fn splice_into(
+        &mut self,
+        destination: &mut impl Write,
+        cancel: &dyn CancelSentinel,
+    ) -> crate::Result<()> {
+        self.validate_offset(self.expected_len, "temporary quantized slot")?;
+        self.file.flush()?;
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut chunk = vec![0_u8; 1 << 20];
+        loop {
+            if cancel.wants_cancel() {
+                return Err(TantivyError::Cancelled);
+            }
+            let read = self.file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            destination.write_all(&chunk[..read])?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for QuantizedTempSlot {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.expected_len.saturating_sub(self.written_len);
+        if buf.len() > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "quantized temp slot would exceed layout length {} (written {}, write {})",
+                    self.expected_len,
+                    self.written_len,
+                    buf.len()
+                ),
+            ));
+        }
+        let written = self.file.write(buf)?;
+        self.written_len += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+struct QuantizedLayerTemps {
+    codes: QuantizedTempSlot,
+    sidecar: QuantizedTempSlot,
+    constants: Option<QuantizedTempSlot>,
+}
+
+struct QuantizedTempSlots {
+    layers: Vec<QuantizedLayerTemps>,
+    residual_norms: QuantizedTempSlot,
+}
+
+impl QuantizedTempSlots {
+    fn create(directory: &dyn Directory, layout: &QuantizedWriteLayout) -> crate::Result<Self> {
+        let mut layers = Vec::with_capacity(layout.layers.len());
+        for layer_layout in &layout.layers {
+            layers.push(QuantizedLayerTemps {
+                codes: QuantizedTempSlot::create(directory, layer_layout.codes.total_bytes)?,
+                sidecar: QuantizedTempSlot::create(directory, layer_layout.sidecar.total_bytes)?,
+                constants: layer_layout
+                    .constants
+                    .as_ref()
+                    .map(|slot| QuantizedTempSlot::create(directory, slot.total_bytes))
+                    .transpose()?,
+            });
+        }
+        let residual_norms =
+            QuantizedTempSlot::create(directory, layout.residual_norms.total_bytes)?;
+        Ok(Self {
+            layers,
+            residual_norms,
+        })
+    }
+
+    fn validate_cluster_boundary(
+        &self,
+        layout: &QuantizedWriteLayout,
+        boundary: usize,
+    ) -> crate::Result<()> {
+        if boundary > layout.cluster_count() {
+            return Err(TantivyError::InternalError(format!(
+                "quantized layout boundary {boundary} exceeds cluster count {}",
+                layout.cluster_count()
+            )));
+        }
+        if self.layers.len() != layout.layers.len() {
+            return Err(TantivyError::InternalError(format!(
+                "quantized temp slot layer count {} disagrees with layout layer count {}",
+                self.layers.len(),
+                layout.layers.len()
+            )));
+        }
+        for (layer, (temp, layer_layout)) in self.layers.iter().zip(&layout.layers).enumerate() {
+            temp.codes.validate_offset(
+                layer_layout.codes.cluster_offsets[boundary],
+                &format!("layer {layer} codes at cluster boundary {boundary}"),
+            )?;
+            temp.sidecar.validate_offset(
+                layer_layout.sidecar.cluster_offsets[boundary],
+                &format!(
+                    "layer {layer} scale/gamma/corrected-error sidecar at cluster boundary \
+                     {boundary}"
+                ),
+            )?;
+            match (&temp.constants, &layer_layout.constants) {
+                (Some(temp), Some(slot)) => temp.validate_offset(
+                    slot.cluster_offsets[boundary],
+                    &format!("layer {layer} constants at cluster boundary {boundary}"),
+                )?,
+                (None, None) => {}
+                _ => {
+                    return Err(TantivyError::InternalError(format!(
+                        "layer {layer} temp constants disagree with the metric layout"
+                    )));
+                }
+            }
+        }
+        self.residual_norms.validate_offset(
+            layout.residual_norms.cluster_offsets[boundary],
+            &format!("residual norms at cluster boundary {boundary}"),
+        )?;
+        Ok(())
+    }
+
+    fn splice_into(
+        &mut self,
+        vec_write: &mut CompositeWrite,
+        field: Field,
+        cancel: &dyn CancelSentinel,
+    ) -> crate::Result<()> {
+        self.residual_norms.splice_into(
+            vec_write.for_field_with_idx(field, VectorSlot::ResidualNorms.index()),
+            cancel,
+        )?;
+        for (layer, temp) in self.layers.iter_mut().enumerate() {
+            vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
+            temp.codes.splice_into(
+                vec_write.for_field_with_idx(field, VectorSlot::codes(layer).index()),
+                cancel,
+            )?;
+            temp.sidecar.splice_into(
+                vec_write.for_field_with_idx(field, VectorSlot::sidecar(layer).index()),
+                cancel,
+            )?;
+            if let Some(constants) = temp.constants.as_mut() {
+                constants.splice_into(
+                    vec_write.for_field_with_idx(field, VectorSlot::constants(layer).index()),
+                    cancel,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_u16_run(writer: &mut impl Write, values: &[u16]) -> std::io::Result<()> {
+    for &value in values {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_u16_run_cancellable(
+    writer: &mut impl Write,
+    values: &[u16],
+    cancel: &dyn CancelSentinel,
+) -> crate::Result<()> {
+    const VALUES_PER_CANCEL_POLL: usize = (1024 * 1024) / std::mem::size_of::<u16>();
+    for chunk in values.chunks(VALUES_PER_CANCEL_POLL) {
+        if cancel.wants_cancel() {
+            return Err(TantivyError::Cancelled);
+        }
+        write_u16_run(writer, chunk)?;
+    }
+    Ok(())
+}
+
+fn write_f32_run(writer: &mut impl Write, values: &[f32]) -> std::io::Result<()> {
+    for &value in values {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_sidecar_block(
+    writer: &mut impl Write,
+    scales: &[f32],
+    gammas: &[u16],
+    error_ratios: &[u16],
+) -> std::io::Result<()> {
+    assert_eq!(scales.len(), gammas.len());
+    assert_eq!(scales.len(), error_ratios.len());
+    write_f32_run(writer, scales)?;
+    write_u16_run(writer, gammas)?;
+    write_u16_run(writer, error_ratios)
+}
+
+fn quantization_runtime(
+    config: &VectorQuantizationConfig,
+    opts: &VectorOptions,
+) -> crate::Result<(Vec<LayerSpec>, Vec<Grid>)> {
+    config.validate(opts)?;
+    let specs = config
+        .layers
+        .iter()
+        .map(|layer| LayerSpec {
+            bits: layer.bits,
+            seed: layer.seed,
+            rotate: true,
+        })
+        .collect();
+    let grids = config
+        .layers
+        .iter()
+        .map(|layer| {
+            let grid = config
+                .grids
+                .iter()
+                .find(|grid| grid.bits == layer.bits)
+                .ok_or_else(|| {
+                    TantivyError::InvalidArgument(format!(
+                        "quantization field {:?} layer width {} has no persisted grid/model \
+                         entry; rebuild required",
+                        config.field, layer.bits
+                    ))
+                })?;
+            Ok(Grid {
+                bits: grid.bits,
+                points: grid.points.clone(),
+                rho_model: grid.rho_model,
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok((specs, grids))
+}
+
+fn write_empty_quantized_slots(
+    vec_write: &mut CompositeWrite,
+    field: Field,
+    layer_count: usize,
+    constants: bool,
+) -> crate::Result<()> {
+    let writer = vec_write.for_field_with_idx(field, VectorSlot::ResidualNorms.index());
+    writer.flush()?;
+    for layer in 0..layer_count {
+        vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
+        {
+            let writer = vec_write.for_field_with_idx(field, VectorSlot::codes(layer).index());
+            writer.flush()?;
+        }
+        {
+            let writer = vec_write.for_field_with_idx(field, VectorSlot::sidecar(layer).index());
+            writer.flush()?;
+        }
+        if constants {
+            let writer = vec_write.for_field_with_idx(field, VectorSlot::constants(layer).index());
+            writer.flush()?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes an empty IVF field to both vector composites.
 fn write_empty_field_slots(
     vec_write: &mut CompositeWrite,
     centroids_write: &mut CompositeWrite,
     field: Field,
     opts: &VectorOptions,
+    quantization: Option<&VectorQuantizationConfig>,
 ) -> crate::Result<()> {
-    // `.vec`: empty Explicit id-map + empty rows.
     {
-        let id_map_w = vec_write.for_field_with_idx(field, vec_slot::ID_MAP);
+        let id_map_w = vec_write.for_field_with_idx(field, VectorSlot::IdMap.index());
         IdMap::serialize_explicit(&[], id_map_w)?;
         id_map_w.flush()?;
     }
     {
-        let rows_w = vec_write.for_field_with_idx(field, vec_slot::ROWS);
+        let rows_w = vec_write.for_field_with_idx(field, VectorSlot::Rows.index());
         rows_w.flush()?;
     }
-    // `.centroids`: zero centroids, zero docs, single zero offset, and an
-    // empty (but present — the slot is mandatory in V2) bounds slot.
+    if let Some(config) = quantization {
+        write_empty_quantized_slots(
+            vec_write,
+            field,
+            config.layers.len(),
+            config.needs_constants(),
+        )?;
+    }
     {
-        let centroids_w = centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
+        let centroids_w =
+            centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
         IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
         centroids_w.flush()?;
     }
     {
-        let offsets_w = centroids_write.for_field_with_idx(field, centroid_slot::OFFSETS);
+        let offsets_w = centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
         IvfIndex::serialize_offsets(&[0u64], offsets_w)?;
         offsets_w.flush()?;
     }
     {
-        let bounds_w = centroids_write.for_field_with_idx(field, centroid_slot::BOUNDS);
+        let bounds_w = centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
         IvfIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
         bounds_w.flush()?;
     }
@@ -134,10 +562,10 @@ pub(crate) fn merge_ivf(
         .target_segment
         .relative_path(SegmentComponent::Custom(CENTROIDS_EXT.to_string()));
     let mut vec_file = directory.open_write(&vec_path)?;
-    write_header(&mut vec_file)?;
+    write_vector_header(&mut vec_file)?;
     let mut vec_write = CompositeWrite::wrap(vec_file);
     let mut centroids_file = directory.open_write(&centroids_path)?;
-    write_header(&mut centroids_file)?;
+    write_centroid_header(&mut centroids_file)?;
     let mut centroids_write = CompositeWrite::wrap(centroids_file);
 
     for (field, entry) in ctx.schema.fields() {
@@ -145,7 +573,14 @@ pub(crate) fn merge_ivf(
             FieldType::Vector(opts) => opts,
             _ => continue,
         };
-        // Per-segment readers for this field (cached on the SegmentReaders).
+        let quantization = ctx
+            .settings
+            .vector_quantization
+            .iter()
+            .find(|config| config.field == entry.name());
+        if let Some(config) = quantization {
+            config.validate(opts)?;
+        }
         let field_readers: Vec<_> = ctx
             .readers
             .iter()
@@ -156,7 +591,13 @@ pub(crate) fn merge_ivf(
             .map(|reader| reader.num_vectors())
             .sum::<usize>();
         if vector_count == 0 {
-            write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
+            write_empty_field_slots(
+                &mut vec_write,
+                &mut centroids_write,
+                field,
+                opts,
+                quantization,
+            )?;
             continue;
         }
         let training_sample_size = {
@@ -171,7 +612,7 @@ pub(crate) fn merge_ivf(
         };
         let centroid_stride = opts.bytes_per_vector();
         let mut current_cluster = usize::MAX;
-        let mut current_centroid: Vec<f32> = Vec::new();
+        let mut current_centroid = Vec::with_capacity(opts.dim());
 
         match opts.dtype() {
             VectorDType::F32 => {
@@ -182,15 +623,14 @@ pub(crate) fn merge_ivf(
                 let mut target_doc_id: DocId = 0;
                 let mut present_vector_ord = 0usize;
                 let mut sampled_count = 0usize;
-                for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                    let reader = &field_readers[old_doc_addr.segment_ord as usize];
-                    if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
+                for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
+                    let reader = &field_readers[source_doc_addr.segment_ord as usize];
+                    if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
                         let should_sample = sampled_count < training_sample_size
                             && present_vector_ord % training_sample_interval == 0;
                         if should_sample {
                             training_doc_ids.push(target_doc_id);
-                            training_values
-                                .extend_from_slice(&decode_row::<f32>(&bytes, opts.dim())?);
+                            decode_row_append::<f32>(&bytes, opts.dim(), &mut training_values)?;
                             sampled_count += 1;
                         }
                         present_vector_ord += 1;
@@ -198,11 +638,6 @@ pub(crate) fn merge_ivf(
                     target_doc_id += 1;
                 }
                 debug_assert_eq!(target_doc_id, num_target_docs);
-                // Rows written for docs deleted afterwards still count toward
-                // the sources' `count()` (neither layout rewrites `.vec` on
-                // delete), so the alive-doc walk can come up short of
-                // `vector_count` — never over. Equality holds exactly when no
-                // source carries deletes.
                 debug_assert!(
                     if ctx.readers.iter().any(|reader| reader.has_deletes()) {
                         present_vector_ord <= vector_count
@@ -213,14 +648,13 @@ pub(crate) fn merge_ivf(
                      source count()"
                 );
                 if training_doc_ids.is_empty() {
-                    // `vector_count > 0`, yet the alive-doc walk found
-                    // nothing to sample: every vector-bearing doc was
-                    // deleted. Write the same empty slots as the
-                    // no-vectors fast path — skipping the field would
-                    // leave its slots missing from composites the other
-                    // fields still write, and the reader errors on
-                    // missing slots.
-                    write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
+                    write_empty_field_slots(
+                        &mut vec_write,
+                        &mut centroids_write,
+                        field,
+                        opts,
+                        quantization,
+                    )?;
                     continue;
                 }
 
@@ -332,10 +766,6 @@ pub(crate) fn merge_ivf(
                             if batch_doc_ids.is_empty() {
                                 return Ok(());
                             }
-                            // Poll for cancellation once per batch so a large
-                            // assign phase (minutes on a big segment) stays
-                            // interruptible instead of only checking at phase
-                            // boundaries.
                             if ctx.cancel.wants_cancel() {
                                 return Err(TantivyError::Cancelled);
                             }
@@ -382,15 +812,15 @@ pub(crate) fn merge_ivf(
                             batch_doc_ids.clear();
                             Ok(())
                         };
-                    for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-                        let reader = &field_readers[old_doc_addr.segment_ord as usize];
-                        if let Some(bytes) = reader.vector_bytes(old_doc_addr.doc_id)? {
+                    for source_doc_addr in ctx.doc_id_mapping.iter_source_doc_addrs() {
+                        let reader = &field_readers[source_doc_addr.segment_ord as usize];
+                        if let Some(bytes) = reader.vector_bytes(source_doc_addr.doc_id)? {
                             batch_doc_ids.push(target_doc_id);
-                            batch_values.extend_from_slice(&decode_row::<f32>(&bytes, opts.dim())?);
+                            decode_row_append::<f32>(&bytes, opts.dim(), &mut batch_values)?;
                             batch_sources.push((
                                 target_doc_id,
-                                old_doc_addr.segment_ord as usize,
-                                old_doc_addr.doc_id,
+                                source_doc_addr.segment_ord as usize,
+                                source_doc_addr.doc_id,
                             ));
                             if batch_doc_ids.len() == settings.assign_batch_size {
                                 flush_assign_batch(
@@ -405,13 +835,8 @@ pub(crate) fn merge_ivf(
                     flush_assign_batch(&mut batch_values, &mut batch_doc_ids, &mut batch_sources)?;
                 }
                 debug_assert_eq!(target_doc_id, num_target_docs);
-                // Same alive-doc walk as the training pass above — it must
-                // have found the same vectors (deletes make both fall short
-                // of `vector_count` together, so compare them to each other).
                 debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
-                // The `.centroids` doc count: one posting row per distinct
-                // doc (legacy V2 files could inflate rows via replication;
-                // this writer never does).
+                // The `.centroids` doc count: one posting row per document.
                 let num_present_docs = assigned_vectors.len();
 
                 let mut cluster_counts = vec![0usize; num_centroids];
@@ -430,25 +855,12 @@ pub(crate) fn merge_ivf(
                     cluster_offsets.push(next_offset);
                 }
 
-                // `.centroids` slot [0] payload, built BEFORE the posting
-                // rows so the bounds fold below measures residuals against
-                // the STORED centroid. K-means cluster means are not
-                // unit-norm; for Cosine+F32 normalize each centroid here so
-                // the search path can score both docs and centroids with
-                // the same `dot * inv_norm_q` fast kernel.
                 let mut centroid_bytes =
                     Vec::with_capacity(num_centroids * opts.bytes_per_vector());
-                // P1: `BoundsBuilder` is the ONLY producer of bounds. The
-                // fold runs over THIS merge's re-assignment output against
-                // the NEW centroids — combining the sources' stored bounds
-                // would be unsound (their centroids no longer exist), which
-                // is why no bound-combining API exists.
                 let mut bounds_builder = BoundsBuilder::new(num_centroids);
+                let mut stored_centroid = Vec::with_capacity(opts.dim());
                 for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
                     let mut bytes = encode_vector(centroid, opts.dim())?;
-                    // Centroids are means of ingest-validated rows, so
-                    // NonFinite is should-never-happen; same warn-and-write
-                    // policy as the posting rows below.
                     let outcome = maybe_normalize_bytes(opts, &mut bytes);
                     if outcome == NormalizeOutcome::NonFinite {
                         log::warn!(
@@ -457,14 +869,10 @@ pub(crate) fn merge_ivf(
                             entry.name(),
                         );
                     }
-                    let stored = decode_row::<f32>(&bytes, opts.dim())?;
-                    // A degenerate centroid — non-finite, or zero-norm under
-                    // cosine renormalization — anchors no residual geometry:
-                    // SATURATE, so the cluster always probes. (A non-finite
-                    // centroid would also self-saturate through non-finite
-                    // residuals, but only if the cluster has members.)
+                    stored_centroid.clear();
+                    decode_row_append::<f32>(&bytes, opts.dim(), &mut stored_centroid)?;
                     if outcome != NormalizeOutcome::Normalized
-                        || stored.iter().any(|value| !value.is_finite())
+                        || stored_centroid.iter().any(|value| !value.is_finite())
                     {
                         bounds_builder.saturate(centroid_ord);
                     }
@@ -472,10 +880,8 @@ pub(crate) fn merge_ivf(
                 }
 
                 let posting_start = Instant::now();
-                // `.vec` slot [0]: the row→doc_id permutation (Explicit), in
-                // cluster-sorted row order — parallel to the rows in slot [1].
                 {
-                    let id_map_w = vec_write.for_field_with_idx(field, vec_slot::ID_MAP);
+                    let id_map_w = vec_write.for_field_with_idx(field, VectorSlot::IdMap.index());
                     let row_doc_ids: Vec<DocId> = assigned_vectors
                         .iter()
                         .map(|assigned_vector| assigned_vector.target_doc_id)
@@ -484,14 +890,9 @@ pub(crate) fn merge_ivf(
                     id_map_w.flush()?;
                 }
 
-                // `.vec` slot [1]: the cluster-sorted vector rows.
                 {
-                    // Poll for cancellation every this-many rows during the
-                    // posting-write phase — often enough to stay responsive,
-                    // rare enough to keep the FFI cancel check off the per-row
-                    // path.
                     const CANCEL_POLL_ROWS: usize = 4096;
-                    let rows_w = vec_write.for_field_with_idx(field, vec_slot::ROWS);
+                    let rows_w = vec_write.for_field_with_idx(field, VectorSlot::Rows.index());
                     let needs_norm = opts.needs_normalization();
                     let mut row_buf: Vec<u8> = Vec::with_capacity(opts.bytes_per_vector());
                     for (row_idx, assigned_vector) in assigned_vectors.iter().enumerate() {
@@ -507,21 +908,6 @@ pub(crate) fn merge_ivf(
                                     assigned_vector.source_doc_id
                                 ))
                             })?;
-                        // Sources are already unit-normalized at ingest for
-                        // Cosine+F32 (see `FlatVecWriter`), but re-normalize on
-                        // the way into the cluster rows so the IVF invariant —
-                        // the query path scores pre-normalized rows — holds
-                        // locally, even for a source segment written before
-                        // ingest-time normalization existed. Idempotent. L2/Dot
-                        // don't normalize and write the source bytes directly;
-                        // Cosine+F32 copies into one buffer reused across rows.
-                        //
-                        // Ingest rejects non-finite vectors, so NonFinite here
-                        // is a should-never-happen path: erroring would wedge
-                        // merge retries forever on one poison doc, and dropping
-                        // the row would desync the already-computed assignments
-                        // and IdMap. Warn-and-write-as-is is visible,
-                        // self-limiting, and non-desyncing.
                         let written_bytes: &[u8] = if needs_norm {
                             row_buf.clear();
                             row_buf.extend_from_slice(&bytes);
@@ -540,17 +926,18 @@ pub(crate) fn merge_ivf(
                             &bytes
                         };
                         rows_w.write_all(written_bytes)?;
-                        // P1: the bounds fold — every written row (all rows
-                        // are native without replication), the exact bytes
-                        // written above against the stored centroid. A
-                        // non-finite row residual saturates its cluster
+                        // The bounds fold uses the exact bytes written above
+                        // against the stored centroid.
+                        // A non-finite row residual saturates its cluster
                         // inside `add_native`.
                         if assigned_vector.cluster != current_cluster {
                             current_cluster = assigned_vector.cluster;
-                            current_centroid = decode_row::<f32>(
+                            current_centroid.clear();
+                            decode_row_append::<f32>(
                                 &centroid_bytes[current_cluster * centroid_stride..]
                                     [..centroid_stride],
                                 opts.dim(),
+                                &mut current_centroid,
                             )?;
                         }
                         bounds_builder.add_native(
@@ -562,9 +949,148 @@ pub(crate) fn merge_ivf(
                 }
                 timings.posting_write = posting_start.elapsed();
 
+                if let Some(config) = quantization {
+                    let quantize_start = Instant::now();
+                    let (specs, grids) = quantization_runtime(config, opts)?;
+                    let quantized_layout = QuantizedWriteLayout::build(config, &cluster_offsets)?;
+                    let rotation_plan = Arc::new(QueryRotationPlan::new(opts.dim(), &specs));
+                    let mut centroid_workspace = PreparedCentroidWorkspace::new(rotation_plan);
+                    let mut temp_slots = QuantizedTempSlots::create(directory, &quantized_layout)?;
+
+                    const MAX_QUANTIZATION_SCRATCH_BYTES: usize = 1 << 20;
+                    let row_bytes = opts.dim() * std::mem::size_of::<f32>();
+                    let fixed_scratch = row_bytes
+                        + opts.dim() * std::mem::size_of::<u8>()
+                        + opts.dim().div_ceil(64) * std::mem::size_of::<u64>();
+                    let per_row_scratch =
+                        2 * row_bytes + config.bytes_per_row() + 2 * std::mem::size_of::<f64>();
+                    let tile_rows = MAX_QUANTIZATION_SCRATCH_BYTES
+                        .saturating_sub(fixed_scratch)
+                        .checked_div(per_row_scratch)
+                        .unwrap_or(0)
+                        .max(1);
+                    let needs_norm = opts.needs_normalization();
+                    let mut normalized = Vec::with_capacity(opts.bytes_per_vector());
+                    let mut batch_values = Vec::with_capacity(tile_rows * opts.dim());
+                    let mut encode_workspace =
+                        BatchEncodeWorkspace::with_capacity(opts.dim(), tile_rows, &specs);
+                    let mut cluster_gammas: Vec<Vec<u16>> =
+                        (0..config.layers.len()).map(|_| Vec::new()).collect();
+                    let mut cluster_error_ratios: Vec<Vec<u16>> =
+                        (0..config.layers.len()).map(|_| Vec::new()).collect();
+                    let mut quantized_centroid = Vec::with_capacity(opts.dim());
+                    for (cluster, offsets) in cluster_offsets.windows(2).enumerate() {
+                        temp_slots.validate_cluster_boundary(&quantized_layout, cluster)?;
+                        let start = offsets[0] as usize;
+                        let end = offsets[1] as usize;
+                        if start == end {
+                            temp_slots.validate_cluster_boundary(&quantized_layout, cluster + 1)?;
+                            continue;
+                        }
+                        quantized_centroid.clear();
+                        decode_row_append::<f32>(
+                            &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
+                            opts.dim(),
+                            &mut quantized_centroid,
+                        )?;
+                        let prepared = centroid_workspace.prepare(&quantized_centroid);
+                        for gammas in &mut cluster_gammas {
+                            gammas.clear();
+                            gammas.reserve(end - start);
+                        }
+                        for error_ratios in &mut cluster_error_ratios {
+                            error_ratios.clear();
+                            error_ratios.reserve(end - start);
+                        }
+                        for tile in assigned_vectors[start..end].chunks(tile_rows) {
+                            if ctx.cancel.wants_cancel() {
+                                return Err(TantivyError::Cancelled);
+                            }
+                            batch_values.clear();
+                            for assigned_vector in tile {
+                                let reader = &field_readers[assigned_vector.source_segment_ord];
+                                let bytes = reader
+                                    .vector_bytes(assigned_vector.source_doc_id)?
+                                    .ok_or_else(|| {
+                                        TantivyError::InternalError(format!(
+                                            "missing source vector for doc {:?}",
+                                            assigned_vector.source_doc_id
+                                        ))
+                                    })?;
+                                let encoded_bytes: &[u8] = if needs_norm {
+                                    normalized.clear();
+                                    normalized.extend_from_slice(&bytes);
+                                    if maybe_normalize_bytes(opts, &mut normalized)
+                                        == NormalizeOutcome::NonFinite
+                                    {
+                                        log::warn!(
+                                            "non-finite vector in field '{}' (doc {}) encoded \
+                                             un-normalized during merge",
+                                            entry.name(),
+                                            assigned_vector.target_doc_id,
+                                        );
+                                    }
+                                    &normalized
+                                } else {
+                                    &bytes
+                                };
+                                decode_row_append::<f32>(
+                                    encoded_bytes,
+                                    opts.dim(),
+                                    &mut batch_values,
+                                )?;
+                            }
+                            let batch = encode_batch_in_place_with_workspace(
+                                &mut batch_values,
+                                tile.len(),
+                                prepared,
+                                &specs,
+                                &grids,
+                                &mut encode_workspace,
+                                config.needs_constants(),
+                            );
+                            write_f32_run(
+                                &mut temp_slots.residual_norms,
+                                &batch.residual_norms_squared,
+                            )?;
+                            for (layer_index, (target, layer)) in
+                                temp_slots.layers.iter_mut().zip(&batch.layers).enumerate()
+                            {
+                                target.codes.write_all(&layer.codes)?;
+                                match &mut target.constants {
+                                    Some(constants) => {
+                                        write_f32_run(constants, &layer.constants)?;
+                                    }
+                                    None => debug_assert!(layer.constants.is_empty()),
+                                }
+                                write_f32_run(&mut target.sidecar, &layer.scales)?;
+                                cluster_gammas[layer_index].extend_from_slice(&layer.gammas);
+                                cluster_error_ratios[layer_index]
+                                    .extend_from_slice(&layer.corrected_error_ratios);
+                            }
+                        }
+                        for ((target, gammas), error_ratios) in temp_slots
+                            .layers
+                            .iter_mut()
+                            .zip(&cluster_gammas)
+                            .zip(&cluster_error_ratios)
+                        {
+                            write_u16_run_cancellable(&mut target.sidecar, gammas, ctx.cancel)?;
+                            write_u16_run_cancellable(
+                                &mut target.sidecar,
+                                error_ratios,
+                                ctx.cancel,
+                            )?;
+                        }
+                        temp_slots.validate_cluster_boundary(&quantized_layout, cluster + 1)?;
+                    }
+                    temp_slots.splice_into(&mut vec_write, field, ctx.cancel)?;
+                    timings.quantize = quantize_start.elapsed();
+                }
+
                 {
                     let centroids_w =
-                        centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
+                        centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
                     IvfIndex::serialize_centroids(
                         num_centroids,
                         num_present_docs,
@@ -576,14 +1102,13 @@ pub(crate) fn merge_ivf(
                 }
                 {
                     let offsets_w =
-                        centroids_write.for_field_with_idx(field, centroid_slot::OFFSETS);
+                        centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
                     IvfIndex::serialize_offsets(&cluster_offsets, offsets_w)?;
                     offsets_w.flush()?;
                 }
-                // `.centroids` slot [3]: the per-cluster centroid bounds
-                // this merge's fold produced.
                 {
-                    let bounds_w = centroids_write.for_field_with_idx(field, centroid_slot::BOUNDS);
+                    let bounds_w =
+                        centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
                     IvfIndex::serialize_bounds(
                         BoundKind::Ball,
                         &bounds_builder.finish(),
@@ -622,11 +1147,12 @@ pub(crate) fn merge_ivf(
 
                 log::info!(
                     target: "paradedb::ivf_build",
-                    "ivf_build timings_ms train={} assign={} posting_write={} total={} \
+                    "ivf_build timings_ms train={} assign={} posting_write={} quantize={} total={} \
                      centroids={} vectors={}",
                     timings.train.as_millis(),
                     timings.assign.as_millis(),
                     timings.posting_write.as_millis(),
+                    timings.quantize.as_millis(),
                     field_build_start.elapsed().as_millis(),
                     num_centroids,
                     vector_count,
@@ -638,4 +1164,236 @@ pub(crate) fn merge_ivf(
     vec_write.close()?;
     centroids_write.close()?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::directory::{ManagedDirectory, RamDirectory};
+    use crate::vector::VectorQuantizationLayer;
+
+    fn quant_fixture_config_for(
+        dim: usize,
+        metric: Metric,
+        schedule: &[u8],
+    ) -> VectorQuantizationConfig {
+        let seeds = [0x1111, 0x2222, 0x3333, 0x4444];
+        VectorQuantizationConfig::materialize(
+            "embedding".to_string(),
+            &VectorOptions::new(dim, metric),
+            schedule
+                .iter()
+                .enumerate()
+                .map(|(layer, &bits)| VectorQuantizationLayer {
+                    bits,
+                    seed: seeds[layer],
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn blocked_sidecar_is_cluster_local_and_deterministic() {
+        let mut bytes = Vec::new();
+        write_sidecar_block(
+            &mut bytes,
+            &[1.0, 2.0],
+            &[0x1112, 0x1314],
+            &[0x2122, 0x2324],
+        )
+        .unwrap();
+        write_sidecar_block(&mut bytes, &[], &[], &[]).unwrap();
+        write_sidecar_block(&mut bytes, &[3.0], &[0x1516], &[0x2526]).unwrap();
+        assert_eq!(
+            bytes,
+            [
+                0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40, // cluster 0 scale run
+                0x12, 0x11, 0x14, 0x13, // cluster 0 gamma run
+                0x22, 0x21, 0x24, 0x23, // cluster 0 corrected-error run
+                0x00, 0x00, 0x40, 0x40, // cluster 1 scale run
+                0x16, 0x15, // cluster 1 gamma run
+                0x26, 0x25, // cluster 1 corrected-error run
+            ]
+        );
+    }
+
+    #[test]
+    fn quantized_layout_is_exact_for_odd_d_empty_cluster_l2_1_plus_4() -> crate::Result<()> {
+        let config = quant_fixture_config_for(100, Metric::L2, &[1, 4]);
+        let posting_offsets = [0_u64, 2, 2, 5];
+        let layout = QuantizedWriteLayout::build(&config, &posting_offsets)?;
+        assert_eq!(
+            layout,
+            QuantizedWriteLayout::build(&config, &posting_offsets)?,
+            "layout construction must be deterministic"
+        );
+        assert_eq!(layout.cluster_count(), 3);
+        assert_eq!(layout.layers.len(), 2);
+
+        let layer0 = &layout.layers[0];
+        assert_eq!(layer0.codes.row_stride, 16);
+        assert_eq!(layer0.codes.cluster_offsets, [0, 32, 32, 80]);
+        assert_eq!(layer0.codes.cluster_span(0), 0..32);
+        assert_eq!(layer0.codes.cluster_span(1), 32..32);
+        assert_eq!(layer0.codes.cluster_span(2), 32..80);
+        assert_eq!(layer0.codes.total_bytes, 80);
+        assert_eq!(layer0.sidecar.row_stride, 8);
+        assert_eq!(layer0.sidecar.cluster_offsets, [0, 16, 16, 40]);
+        assert_eq!(layer0.sidecar.total_bytes, 40);
+        let layer0_constants = layer0.constants.as_ref().unwrap();
+        assert_eq!(layer0_constants.cluster_offsets, [0, 8, 8, 20]);
+        assert_eq!(layer0_constants.total_bytes, 20);
+
+        let layer1 = &layout.layers[1];
+        assert_eq!(layer1.codes.row_stride, 56);
+        assert_eq!(layer1.codes.cluster_offsets, [0, 112, 112, 280]);
+        assert_eq!(layer1.codes.total_bytes, 280);
+        assert_eq!(layer1.sidecar.cluster_offsets, [0, 16, 16, 40]);
+        assert_eq!(
+            layer1.constants.as_ref().unwrap().cluster_offsets,
+            [0, 8, 8, 20]
+        );
+
+        let residual_norms = &layout.residual_norms;
+        assert_eq!(residual_norms.row_stride, 4);
+        assert_eq!(residual_norms.cluster_offsets, [0, 8, 8, 20]);
+        assert_eq!(residual_norms.cluster_span(1), 8..8);
+        assert_eq!(residual_norms.total_bytes, 20);
+
+        let logical_total: usize = layout
+            .layers
+            .iter()
+            .map(|layer| {
+                layer.codes.total_bytes
+                    + layer.sidecar.total_bytes
+                    + layer.constants.as_ref().unwrap().total_bytes
+            })
+            .sum::<usize>()
+            + residual_norms.total_bytes;
+        assert_eq!(logical_total, 5 * config.bytes_per_row());
+        assert_eq!(logical_total, 500);
+
+        let backing = RamDirectory::create();
+        let directory = ManagedDirectory::wrap(Box::new(backing))?;
+        let mut temps = QuantizedTempSlots::create(&directory, &layout)?;
+        for cluster in 0..layout.cluster_count() {
+            temps.validate_cluster_boundary(&layout, cluster)?;
+            for (temp, layer) in temps.layers.iter_mut().zip(&layout.layers) {
+                temp.codes
+                    .write_all(&vec![0; layer.codes.cluster_span(cluster).len()])?;
+                temp.sidecar
+                    .write_all(&vec![0; layer.sidecar.cluster_span(cluster).len()])?;
+                temp.constants.as_mut().unwrap().write_all(&vec![
+                    0;
+                    layer
+                        .constants
+                        .as_ref()
+                        .unwrap()
+                        .cluster_span(cluster)
+                        .len()
+                ])?;
+            }
+            temps
+                .residual_norms
+                .write_all(&vec![0; residual_norms.cluster_span(cluster).len()])?;
+            temps.validate_cluster_boundary(&layout, cluster + 1)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn quantized_temp_slot_splices_exact_payload() -> crate::Result<()> {
+        let backing = RamDirectory::create();
+        let directory = ManagedDirectory::wrap(Box::new(backing))?;
+        let mut temp = QuantizedTempSlot::create(&directory, b"first-second".len())?;
+        temp.write_all(b"first")?;
+        temp.write_all(b"-second")?;
+        let mut destination = Vec::new();
+        temp.splice_into(&mut destination, &|| false)?;
+        assert_eq!(destination, b"first-second");
+        Ok(())
+    }
+
+    #[test]
+    fn quantized_temp_slot_rejects_layout_underwrite() -> crate::Result<()> {
+        let backing = RamDirectory::create();
+        let directory = ManagedDirectory::wrap(Box::new(backing))?;
+        let mut temp = QuantizedTempSlot::create(&directory, 4)?;
+        temp.write_all(&[1, 2, 3])?;
+        let mut destination = Vec::new();
+        let error = temp
+            .splice_into(&mut destination, &|| false)
+            .expect_err("layout underwrite must fail before splice");
+        assert!(error.to_string().contains("wrote 3 bytes, expected 4"));
+        assert!(destination.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn quantized_temp_slot_cancellation_stops_between_chunks() -> crate::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        let backing = RamDirectory::create();
+        let directory = ManagedDirectory::wrap(Box::new(backing))?;
+        let expected_len = 2 * 1024 * 1024 + 17;
+        let mut temp = QuantizedTempSlot::create(&directory, expected_len)?;
+        temp.write_all(&vec![0x5a; expected_len])?;
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let cancel = {
+            let polls = Arc::clone(&polls);
+            move || polls.fetch_add(1, AtomicOrdering::SeqCst) >= 1
+        };
+        let mut destination = Vec::new();
+        assert!(matches!(
+            temp.splice_into(&mut destination, &cancel),
+            Err(TantivyError::Cancelled)
+        ));
+        assert_eq!(destination.len(), 1024 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn quantization_merge_source_has_no_estimator_analysis_entrypoint() {
+        let source = include_str!("plugin.rs");
+        let test_module_start = source
+            .rfind("\n#[cfg(test)]\nmod tests {")
+            .expect("plugin source must retain one terminal test module");
+        let production_source = &source[..test_module_start];
+        for forbidden in [
+            "build_grid(",
+            "audit_prefix_error_model(",
+            "prepare_fp_query(",
+            "audit_error",
+            "diagnostic_error",
+            "VectorEstimatorMeasurements",
+            "VectorEstimatorQuery",
+        ] {
+            assert!(
+                !production_source.contains(forbidden),
+                "quantization merge production source contains forbidden analysis hook {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_runtime_uses_persisted_grid_and_rho() {
+        let config = quant_fixture_config_for(100, Metric::Dot, &[1, 4]);
+        let (_, resolved) =
+            quantization_runtime(&config, &VectorOptions::new(100, Metric::Dot)).unwrap();
+        assert_eq!(resolved.len(), 2);
+        for (layer, grid) in resolved.iter().enumerate() {
+            let persisted = config
+                .grids
+                .iter()
+                .find(|grid| grid.bits == config.layers[layer].bits)
+                .unwrap();
+            assert_eq!(grid.bits, persisted.bits);
+            assert_eq!(grid.points, persisted.points);
+            assert_eq!(grid.rho_model, persisted.rho_model);
+        }
+    }
 }

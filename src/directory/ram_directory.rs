@@ -10,8 +10,8 @@ use super::FileHandle;
 use crate::core::META_FILEPATH;
 use crate::directory::error::{DeleteError, OpenReadError, OpenWriteError};
 use crate::directory::{
-    AntiCallToken, Directory, FileSlice, InnerWritePtr, TerminatingWrite, WatchCallback,
-    WatchCallbackList, WatchHandle,
+    AntiCallToken, Directory, FileSlice, InnerWritePtr, TempFilePtr, TerminatingWrite,
+    WatchCallback, WatchCallbackList, WatchHandle,
 };
 
 /// Writer associated with the [`RamDirectory`].
@@ -208,6 +208,10 @@ impl Directory for RamDirectory {
         } else {
             Ok(Box::new(vec_writer))
         }
+    }
+
+    fn open_temp_file(&self) -> io::Result<TempFilePtr> {
+        Ok(Box::new(Cursor::new(Vec::new())))
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {

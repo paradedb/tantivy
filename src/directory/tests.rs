@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::path::Path;
 use std::sync::atomic::Ordering::SeqCst;
@@ -61,6 +61,12 @@ mod mmap_directory_tests {
         let directory = make_directory();
         super::test_watch(&directory);
     }
+
+    #[test]
+    fn test_temp_file() -> std::io::Result<()> {
+        let directory = make_directory();
+        super::test_temp_file(&directory)
+    }
 }
 
 mod ram_directory_tests {
@@ -115,6 +121,75 @@ mod ram_directory_tests {
         let directory = make_directory();
         super::test_watch(&directory);
     }
+
+    #[test]
+    fn test_temp_file() -> std::io::Result<()> {
+        let directory = make_directory();
+        super::test_temp_file(&directory)
+    }
+}
+
+mod managed_directory_tests {
+    use crate::directory::{ManagedDirectory, RamDirectory};
+
+    #[test]
+    fn test_temp_file_delegation() -> std::io::Result<()> {
+        let directory = ManagedDirectory::wrap(Box::new(RamDirectory::default())).unwrap();
+        super::test_temp_file(&directory)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DirectoryWithoutTempFile;
+
+impl Directory for DirectoryWithoutTempFile {
+    fn get_file_handle(&self, _path: &Path) -> Result<Arc<dyn FileHandle>, error::OpenReadError> {
+        unimplemented!()
+    }
+
+    fn delete(&self, _path: &Path) -> Result<(), error::DeleteError> {
+        unimplemented!()
+    }
+
+    fn exists(&self, _path: &Path) -> Result<bool, error::OpenReadError> {
+        unimplemented!()
+    }
+
+    fn open_write_inner(&self, _path: &Path) -> Result<InnerWritePtr, error::OpenWriteError> {
+        unimplemented!()
+    }
+
+    fn atomic_read(&self, _path: &Path) -> Result<Vec<u8>, error::OpenReadError> {
+        unimplemented!()
+    }
+
+    fn atomic_write(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+        unimplemented!()
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        unimplemented!()
+    }
+
+    fn watch(&self, _watch_callback: WatchCallback) -> crate::Result<WatchHandle> {
+        unimplemented!()
+    }
+}
+
+#[test]
+fn test_temp_file_default_is_unsupported() {
+    let error = DirectoryWithoutTempFile.open_temp_file().err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+}
+
+fn test_temp_file(directory: &dyn Directory) -> io::Result<()> {
+    let mut temp_file = directory.open_temp_file()?;
+    temp_file.write_all(b"spill-data")?;
+    assert_eq!(temp_file.seek(SeekFrom::Start(0))?, 0);
+    let mut data = Vec::new();
+    temp_file.read_to_end(&mut data)?;
+    assert_eq!(data, b"spill-data");
+    Ok(())
 }
 
 fn test_simple(directory: &dyn Directory) -> crate::Result<()> {

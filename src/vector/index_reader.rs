@@ -24,11 +24,15 @@ use std::cmp::Ordering;
 use common::{HasLen, OwnedBytes};
 
 use super::flat::IdMap;
-use super::header::{centroid_slot, read_header, vec_slot, VectorFileVersion};
+use super::header::{
+    read_centroid_header, read_vector_header, CentroidSlot, VectorFileVersion, VectorSlot,
+};
 use super::ivf::{IvfIndex, CENTROIDS_EXT};
+use super::quantization::{VectorQuantizationConfig, QUANTIZED_RESIDUAL_NORM_STRIDE};
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
+use crate::error::DataCorruption;
 use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
@@ -59,6 +63,65 @@ pub struct VectorClusterStats {
     pub max_cluster_size: usize,
     pub avg_cluster_size: f64,
     pub empty_clusters: usize,
+}
+
+fn logical_slice(
+    slice: FileSlice,
+    logical_len: usize,
+    description: &str,
+) -> crate::Result<FileSlice> {
+    let physical_len = slice.len();
+    if physical_len < logical_len || physical_len - logical_len >= 64 {
+        return Err(DataCorruption::comment_only(format!(
+            "{description} physical length {physical_len} does not contain logical length \
+             {logical_len} plus at most 63 alignment bytes"
+        ))
+        .into());
+    }
+    if physical_len != logical_len {
+        let trailer = slice.slice(logical_len..physical_len).read_bytes()?;
+        if trailer.iter().any(|&byte| byte != 0) {
+            return Err(DataCorruption::comment_only(format!(
+                "{description} has a non-zero alignment trailer"
+            ))
+            .into());
+        }
+    }
+    Ok(slice.slice_to(logical_len))
+}
+
+fn validate_vector_slot_map(composite: &CompositeFile) -> crate::Result<()> {
+    if let Some((field, slot)) = composite
+        .field_indices()
+        .find(|&(_, slot)| slot >= VectorSlot::COUNT)
+    {
+        return Err(DataCorruption::comment_only(format!(
+            "vector composite field {field:?} declares slot {slot}; format {} permits only slots \
+             0..{}",
+            super::header::VECTOR_FILE_FORMAT_VERSION,
+            VectorSlot::COUNT - 1
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_quantization_file_format(
+    config: Option<&VectorQuantizationConfig>,
+    vector_file_format: VectorFileVersion,
+    field_name: &str,
+) -> crate::Result<()> {
+    if let Some(config) = config {
+        if config.format_version != vector_file_format as u32 {
+            return Err(DataCorruption::comment_only(format!(
+                "vector field {field_name:?} settings format version {} does not match `.vec` \
+                 format version {}; rebuild required",
+                config.format_version, vector_file_format as u32
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Per-(segment, field) vector reader: the row store plus, for IVF segments,
@@ -104,26 +167,38 @@ impl VectorIndexReader {
             Err(OpenReadError::FileDoesNotExist(_)) => return Ok(Self::empty(options)),
             Err(err) => return Err(err.into()),
         };
-        let (_version, body) = read_header(&vec_file)?;
+        let (vector_file_format, body) = read_vector_header(&vec_file)?;
         let vec_composite = CompositeFile::open(&body)?;
+        validate_vector_slot_map(&vec_composite)?;
         let (Some(id_map_slice), Some(rows_slice)) = (
-            vec_composite.open_read_with_idx(field, vec_slot::ID_MAP),
-            vec_composite.open_read_with_idx(field, vec_slot::ROWS),
+            vec_composite.open_read_with_idx(field, VectorSlot::IdMap.index()),
+            vec_composite.open_read_with_idx(field, VectorSlot::Rows.index()),
         ) else {
             return Ok(Self::empty(options));
         };
         let id_map = IdMap::open(id_map_slice, segment_reader.max_doc())?;
+        let quantization_config = segment_reader
+            .index_settings()
+            .vector_quantization
+            .iter()
+            .find(|config| config.field == entry.name())
+            .cloned();
+        validate_quantization_file_format(
+            quantization_config.as_ref(),
+            vector_file_format,
+            entry.name(),
+        )?;
 
         let centroid_slots = match segment_reader
             .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
         {
             Ok(file) => {
-                let (centroids_version, body) = read_header(&file)?;
+                let (centroids_version, body) = read_centroid_header(&file)?;
                 let composite = CompositeFile::open(&body)?;
                 match (
-                    composite.open_read_with_idx(field, centroid_slot::CENTROIDS),
-                    composite.open_read_with_idx(field, centroid_slot::OFFSETS),
-                    composite.open_read_with_idx(field, centroid_slot::BOUNDS),
+                    composite.open_read_with_idx(field, CentroidSlot::Centroids.index()),
+                    composite.open_read_with_idx(field, CentroidSlot::Offsets.index()),
+                    composite.open_read_with_idx(field, CentroidSlot::Bounds.index()),
                 ) {
                     // Slot [2] (the router) stays optional: the write
                     // side skips it for degenerate centroid counts. Slot
@@ -142,7 +217,7 @@ impl VectorIndexReader {
                             centroids_version,
                             centroids,
                             offsets,
-                            composite.open_read_with_idx(field, centroid_slot::ROUTER),
+                            composite.open_read_with_idx(field, CentroidSlot::Router.index()),
                             bounds,
                         ))
                     }
@@ -183,14 +258,45 @@ impl VectorIndexReader {
                 ));
             }
         }
-        if rows_slice.len() != num_rows * options.bytes_per_vector() {
-            return Err(TantivyError::InternalError(format!(
-                "vector rows length {} does not match {} rows of {} bytes",
-                rows_slice.len(),
-                num_rows,
-                options.bytes_per_vector()
-            )));
-        }
+        let rows_slice = logical_slice(
+            rows_slice,
+            num_rows * options.bytes_per_vector(),
+            &format!("vector field {:?} rows", entry.name()),
+        )?;
+
+        // T2 deliberately opens only the unquantized scan inputs. T3 replaces
+        // this local validation with the complete quantized-layer readers.
+        let residual_norm_slot =
+            vec_composite.open_read_with_idx(field, VectorSlot::ResidualNorms.index());
+        let _residual_norms = match (&index, quantization_config, residual_norm_slot) {
+            (Some(_), Some(_), Some(slice)) => Some(logical_slice(
+                slice,
+                num_rows * QUANTIZED_RESIDUAL_NORM_STRIDE,
+                &format!("vector field {:?} residual squared norms", entry.name()),
+            )?),
+            (Some(_), Some(_), None) => {
+                return Err(DataCorruption::comment_only(format!(
+                    "quantized vector field {:?} is missing residual squared norm slot 2",
+                    entry.name()
+                ))
+                .into());
+            }
+            (Some(_), None, Some(_)) => {
+                return Err(DataCorruption::comment_only(format!(
+                    "vector field {:?} carries quantized slots without index metadata",
+                    entry.name()
+                ))
+                .into());
+            }
+            (None, _, Some(_)) => {
+                return Err(DataCorruption::comment_only(format!(
+                    "flat vector field {:?} unexpectedly carries quantized slots",
+                    entry.name()
+                ))
+                .into());
+            }
+            _ => None,
+        };
 
         let num_vectors = match &index {
             Some(index) => index.num_docs(),
@@ -389,5 +495,107 @@ impl VectorIndexReader {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::directory::CompositeWrite;
+    use crate::vector::header::{read_vector_header, write_vector_header};
+
+    #[test]
+    fn aligned_rows_and_residual_norms_are_trimmed_to_logical_lengths() -> crate::Result<()> {
+        let field = Field::from_field_id(0);
+        let mut bytes = Vec::new();
+        write_vector_header(&mut bytes)?;
+        {
+            let mut writer = CompositeWrite::wrap(&mut bytes);
+            let rows = writer.for_field_with_idx(field, VectorSlot::Rows.index());
+            rows.write_all(&[1, 2, 3, 4])?;
+            rows.write_all(&[0; 63])?;
+            writer
+                .for_field_with_idx(Field::from_field_id(1), 0)
+                .write_all(&[9])?;
+
+            let norms = writer.for_field_with_idx(field, VectorSlot::ResidualNorms.index());
+            norms.write_all(&2.5_f32.to_le_bytes())?;
+            norms.write_all(&[0; 63])?;
+            writer
+                .for_field_with_idx(Field::from_field_id(2), 0)
+                .write_all(&[9])?;
+            writer.close()?;
+        }
+
+        let (_, body) = read_vector_header(&FileSlice::from(bytes))?;
+        let composite = CompositeFile::open(&body)?;
+        let rows = logical_slice(
+            composite
+                .open_read_with_idx(field, VectorSlot::Rows.index())
+                .unwrap(),
+            4,
+            "rows fixture",
+        )?
+        .read_bytes()?;
+        let norms = logical_slice(
+            composite
+                .open_read_with_idx(field, VectorSlot::ResidualNorms.index())
+                .unwrap(),
+            4,
+            "residual norms fixture",
+        )?
+        .read_bytes()?;
+
+        assert_eq!(rows.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(
+            f32::from_le_bytes(norms.as_slice().try_into().unwrap()),
+            2.5
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vector_format_rejects_slots_outside_the_fixed_map() -> crate::Result<()> {
+        let field = Field::from_field_id(0);
+        let mut bytes = Vec::new();
+        write_vector_header(&mut bytes)?;
+        {
+            let mut writer = CompositeWrite::wrap(&mut bytes);
+            writer
+                .for_field_with_idx(field, VectorSlot::COUNT)
+                .write_all(&[1])?;
+            writer.close()?;
+        }
+
+        let (_, body) = read_vector_header(&FileSlice::from(bytes))?;
+        let composite = CompositeFile::open(&body)?;
+        let error = validate_vector_slot_map(&composite).unwrap_err();
+        assert!(error.to_string().contains("permits only slots 0..11"));
+        Ok(())
+    }
+
+    #[test]
+    fn quantization_settings_format_must_match_vector_file() -> crate::Result<()> {
+        let options = VectorOptions::new(64, crate::schema::Metric::Dot);
+        let mut config = VectorQuantizationConfig::materialize(
+            "embedding".to_string(),
+            &options,
+            vec![super::super::quantization::VectorQuantizationLayer { bits: 1, seed: 7 }],
+        )?;
+        config.format_version = VectorFileVersion::V2 as u32;
+
+        let error =
+            validate_quantization_file_format(Some(&config), VectorFileVersion::V3, "embedding")
+                .unwrap_err();
+        assert!(error.to_string().contains("rebuild required"));
+        Ok(())
+    }
+
+    #[test]
+    fn nonzero_alignment_trailer_is_corruption() {
+        let slice = FileSlice::from(vec![1, 2, 3, 4, 0, 7]);
+        assert!(logical_slice(slice, 4, "bad fixture").is_err());
     }
 }

@@ -23,7 +23,7 @@ use crate::directory::error::{
 };
 use crate::directory::{
     AntiCallToken, Directory, DirectoryLock, FileHandle, InnerWritePtr, Lock, OwnedBytes,
-    TerminatingWrite, WatchCallback, WatchHandle,
+    TempFilePtr, TerminatingWrite, WatchCallback, WatchHandle,
 };
 
 pub type ArcBytes = Arc<dyn Deref<Target = [u8]> + Send + Sync + 'static>;
@@ -454,6 +454,10 @@ impl Directory for MmapDirectory {
 
         let writer = SafeFileWriter::new(file);
         Ok(Box::new(writer))
+    }
+
+    fn open_temp_file(&self) -> io::Result<TempFilePtr> {
+        Ok(Box::new(tempfile::tempfile()?))
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
