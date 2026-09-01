@@ -108,8 +108,17 @@ pub trait Router: ErasedRouterDescriptor + Send + Sync + 'static {
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()>;
 
     fn serialize(&self, out: &mut dyn Write) -> io::Result<()> {
-        let descriptor = self.descriptor();
-        write_router_header(descriptor.id(), out)?;
+        let id = self.id();
+        if id.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "router ID cannot be empty",
+            ));
+        }
+        let id_len = u16::try_from(id.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "router ID exceeds u16"))?;
+        id_len.serialize(out)?;
+        out.write_all(id.as_bytes())?;
         self.serialize_payload(out)
     }
 }
@@ -223,19 +232,6 @@ impl RouterBinding {
         }
         Ok(router)
     }
-}
-
-fn write_router_header(id: &str, out: &mut dyn Write) -> io::Result<()> {
-    if id.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "router ID cannot be empty",
-        ));
-    }
-    let id_len = u16::try_from(id.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "router ID exceeds u16"))?;
-    id_len.serialize(out)?;
-    out.write_all(id.as_bytes())
 }
 
 #[cfg(test)]
