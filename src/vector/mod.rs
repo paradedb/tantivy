@@ -20,6 +20,7 @@ mod header;
 mod index_reader;
 mod plugin;
 mod prepared;
+pub(crate) mod quantization;
 mod tie_break;
 
 pub mod flat;
@@ -55,6 +56,12 @@ pub use ivf::{
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
+pub use quantization::{
+    quantized_code_stride, VectorNormPolicy, VectorQuantizationConfig, VectorQuantizationGrid,
+    VectorQuantizationLayer, VectorQuantizer, GRID_FORMAT_VERSION, MAX_QUANTIZATION_LAYERS,
+    QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_SCALE_STRIDE,
+    VECTOR_QUANTIZATION_FORMAT_VERSION,
+};
 pub use tie_break::NoTieBreak;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`

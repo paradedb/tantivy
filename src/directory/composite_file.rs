@@ -64,6 +64,42 @@ impl<W: TerminatingWrite + Write> CompositeWrite<W> {
         &mut self.write
     }
 
+    /// Pad the underlying file so the next field begins at an aligned
+    /// absolute file offset.
+    ///
+    /// `prefix_len` is the number of bytes written before this composite
+    /// writer was wrapped (for vector files, the fixed version header). The
+    /// composite format represents adjacent start offsets rather than
+    /// independent lengths, so the padding is a trailer on the preceding
+    /// field. Readers of an aligned layout must validate and trim that
+    /// at-most-`alignment - 1` trailer from the preceding logical payload.
+    pub fn align_next_field(&mut self, alignment: usize, prefix_len: usize) -> io::Result<usize> {
+        if !alignment.is_power_of_two() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "composite field alignment must be a non-zero power of two",
+            ));
+        }
+        let written = usize::try_from(self.write.written_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "composite size does not fit in usize",
+            )
+        })?;
+        let absolute_offset = prefix_len.checked_add(written).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "composite offset overflow")
+        })?;
+        let padding = (alignment - absolute_offset % alignment) % alignment;
+        const ZEROES: [u8; 64] = [0; 64];
+        let mut remaining = padding;
+        while remaining != 0 {
+            let chunk = remaining.min(ZEROES.len());
+            self.write.write_all(&ZEROES[..chunk])?;
+            remaining -= chunk;
+        }
+        Ok(padding)
+    }
+
     /// Close the composite file
     ///
     /// An index of the different field offsets
@@ -186,7 +222,7 @@ mod test {
     use std::io::Write;
     use std::path::Path;
 
-    use common::{BinarySerializable, VInt};
+    use common::{BinarySerializable, HasLen, VInt};
 
     use super::{CompositeFile, CompositeWrite};
     use crate::directory::{Directory, RamDirectory};
@@ -283,6 +319,37 @@ mod test {
                 assert_eq!(file.len(), 3);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_align_next_field_accounts_for_file_prefix() -> crate::Result<()> {
+        let mut bytes = vec![0_u8; 4];
+        {
+            let mut composite = CompositeWrite::wrap(&mut bytes);
+            composite
+                .for_field_with_idx(Field::from_field_id(0), 0)
+                .write_all(&[7])?;
+            let padding = composite.align_next_field(64, 4)?;
+            assert_eq!(padding, 59);
+            composite
+                .for_field_with_idx(Field::from_field_id(0), 1)
+                .write_all(&[9])?;
+            composite.close()?;
+        }
+
+        assert_eq!(bytes[64], 9);
+        let body = crate::directory::FileSlice::from(bytes[4..].to_vec());
+        let composite = CompositeFile::open(&body)?;
+        let preceding = composite
+            .open_read_with_idx(Field::from_field_id(0), 0)
+            .unwrap();
+        assert_eq!(preceding.len(), 60);
+        let aligned = composite
+            .open_read_with_idx(Field::from_field_id(0), 1)
+            .unwrap()
+            .read_bytes()?;
+        assert_eq!(aligned.as_slice(), &[9]);
         Ok(())
     }
 }

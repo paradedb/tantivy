@@ -326,6 +326,7 @@ impl IndexBuilder {
 
     fn validate(&self) -> crate::Result<()> {
         if let Some(schema) = self.schema.as_ref() {
+            self.index_settings.validate_vector_quantization(schema)?;
             if self.index_settings.manual_doc_id_mapping
                 && self.index_settings.sort_by_field.is_some()
             {

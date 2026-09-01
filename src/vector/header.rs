@@ -37,6 +37,9 @@ pub(crate) enum VectorFileVersion {
     /// by the variant payload (see [`RoutingIndex`](crate::vector::ivf::RoutingIndex)).
     /// V2 files keep the bare graph layout in that slot; the file version
     /// selects the parser — the kind byte is never sniffed on V2 payloads.
+    /// `.vec` may also carry field-scoped residual-quantization slots after the
+    /// fp32 rows. Absence of those slots remains the exact/no-quantization
+    /// representation.
     V3 = 3,
 }
 
@@ -69,6 +72,25 @@ pub(crate) mod vec_slot {
     pub(crate) const ID_MAP: usize = 0;
     /// The stored vector rows.
     pub(crate) const ROWS: usize = 1;
+
+    const QUANTIZED_BASE: usize = ROWS + 1;
+    const QUANTIZED_SLOTS_PER_LAYER: usize = 3;
+
+    /// Packed codes for zero-based residual `layer`.
+    pub(crate) const fn quantized_codes(layer: usize) -> usize {
+        assert!(layer < 4, "V3 supports at most four quantization layers");
+        QUANTIZED_BASE + layer * QUANTIZED_SLOTS_PER_LAYER
+    }
+
+    /// Binary16 scales for zero-based residual `layer`.
+    pub(crate) const fn quantized_scales(layer: usize) -> usize {
+        quantized_codes(layer) + 1
+    }
+
+    /// Binary32 split-form constants for zero-based residual `layer`.
+    pub(crate) const fn quantized_constants(layer: usize) -> usize {
+        quantized_codes(layer) + 2
+    }
 }
 
 /// Version stamped into newly written vector files.
@@ -146,9 +168,11 @@ mod tests {
     /// reader's job, where the REINDEX hint can be phrased.
     #[test]
     fn test_prior_version_parses() {
-        let buf = 1u32.to_le_bytes().to_vec();
-        let (version, _) = read_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V1);
+        for (raw, expected) in [(1_u32, VectorFileVersion::V1), (2, VectorFileVersion::V2)] {
+            let buf = raw.to_le_bytes().to_vec();
+            let (version, _) = read_header(&FileSlice::from(buf)).unwrap();
+            assert_eq!(version, expected);
+        }
     }
 
     #[test]
@@ -163,5 +187,17 @@ mod tests {
         let buf = vec![2u8, 0];
         let err = read_header(&FileSlice::from(buf)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_v3_quantized_slot_numbers_are_stable_and_plane_separated() {
+        assert_eq!(vec_slot::quantized_codes(0), 2);
+        assert_eq!(vec_slot::quantized_scales(0), 3);
+        assert_eq!(vec_slot::quantized_constants(0), 4);
+        assert_eq!(vec_slot::quantized_codes(1), 5);
+        assert_eq!(vec_slot::quantized_scales(1), 6);
+        assert_eq!(vec_slot::quantized_constants(1), 7);
+        assert_eq!(vec_slot::quantized_codes(3), 11);
+        assert_eq!(vec_slot::quantized_constants(3), 13);
     }
 }

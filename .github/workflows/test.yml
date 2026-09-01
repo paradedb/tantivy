@@ -18,6 +18,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  quant-kernels-x86:
+
+    name: quant-kernels-x86
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      RUSTFLAGS: -C target-cpu=native
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_BENCH_LTO: thin
+      CARGO_PROFILE_BENCH_CODEGEN_UNITS: 1
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install nightly rustfmt
+      uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+      with:
+        toolchain: nightly
+        profile: minimal
+        components: rustfmt
+
+    - name: Install stable
+      uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+      with:
+        toolchain: stable
+        profile: minimal
+        components: clippy
+        override: true
+
+    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+    - name: Run kernel goldens and determinism snapshot
+      run: ./quant-kernels/check.sh
+
+    - name: Check x86 assembly expectations
+      run: ./quant-kernels/check_asm_x86.sh
+
+    - name: Run criterion suite
+      run: |
+        cargo bench -p fht --bench rotation -- --noplot
+        cargo bench -p sign-plane --bench score -- --noplot
+        cargo bench -p grid-plane --bench kernels -- --noplot
+        cargo bench -p cascade --bench baselines -- --noplot
+        cargo bench -p cascade --bench cascade -- --noplot
+
   check:
 
     runs-on: ubuntu-latest

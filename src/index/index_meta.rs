@@ -10,6 +10,8 @@ use super::SegmentComponent;
 use crate::index::SegmentId;
 use crate::schema::Schema;
 use crate::store::Compressor;
+use crate::vector::quantization::validate_quantization_configs;
+use crate::vector::{BoundsScope, VectorQuantizationConfig};
 use crate::{Inventory, Opstamp, TrackedObject};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -320,6 +322,23 @@ pub struct IndexSettings {
     #[serde(default = "default_vector_clustering_threshold")]
     #[serde(skip_serializing_if = "is_default_vector_clustering_threshold")]
     pub vector_clustering_threshold: usize,
+    /// Which rows a cluster's stored centroid bound covers — captured
+    /// from the index's build-time configuration (the `bounds_scope`
+    /// reloption upstream) so segments written later still fold the
+    /// scope the index was created with. `native` is the only variant
+    /// today.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_default_bounds_scope")]
+    pub vector_bounds_scope: BoundsScope,
+    /// Per-vector-field quantization configuration. The empty default keeps
+    /// existing and flat-only indexes on the exact path.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vector_quantization: Vec<VectorQuantizationConfig>,
+}
+
+fn is_default_bounds_scope(scope: &BoundsScope) -> bool {
+    *scope == BoundsScope::default()
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -353,6 +372,8 @@ impl Default for IndexSettings {
             docstore_compress_dedicated_thread: true,
             codec_types: default_codec_types(),
             vector_clustering_threshold: default_vector_clustering_threshold(),
+            vector_bounds_scope: BoundsScope::default(),
+            vector_quantization: Vec::new(),
         }
     }
 }
@@ -367,6 +388,11 @@ impl IndexSettings {
     /// to IVF storage. See [`IndexSettings::vector_clustering_threshold`].
     pub fn vector_clustering_threshold(&self) -> usize {
         self.vector_clustering_threshold
+    }
+
+    /// Validate field-keyed quantization metadata before an index is built.
+    pub fn validate_vector_quantization(&self, schema: &Schema) -> crate::Result<()> {
+        validate_quantization_configs(&self.vector_quantization, schema)
     }
 }
 
