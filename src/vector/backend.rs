@@ -15,7 +15,7 @@ use super::bounds::{
     QueryBoundTracker, Verdict,
 };
 use super::distance::norm_squared_wide;
-use super::index_reader::{QuantizedLayerReader, VectorIndexReader};
+use super::index_reader::{QuantizedFieldReader, QuantizedLayerReader, VectorIndexReader};
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex, IvfSearchMetrics, Workspace};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
@@ -366,6 +366,12 @@ impl LayerProbeStats {
 pub struct ProbeStats {
     /// Rows scored by the active path.
     pub candidates_scored: usize,
+    /// Eligible layer-0 posting rows.
+    pub layer0_eligible: usize,
+    /// Routed clusters skipped because no row was eligible.
+    pub clusters_skipped_empty: usize,
+    /// Eligible rows charged against the probe budget.
+    pub eligible_charged: usize,
     /// Sparse layer-indexed timing and funnel counters, flattened on the wire.
     #[serde(flatten)]
     pub layers: LayerProbeStatsSet,
@@ -376,6 +382,8 @@ pub struct ProbeStats {
     pub rerank_rows: usize,
     /// Scan initialization time.
     pub scan_init_ns: u64,
+    /// Predicate evaluation and filter-bitset construction time.
+    pub non_vector_search_ns: u64,
     /// Segment-query rotation, bitplane, and LUT preparation time.
     pub query_prep_ns: u64,
     /// Lazy cluster-routing time, including every ranked-stream pull.
@@ -429,7 +437,7 @@ pub struct ProbeStats {
     pub termination: ProbeTermination,
     /// Work units charged by the probe loop.
     pub work_charged: f32,
-    /// Posting-membership rows in the segment.
+    /// Vector rows in the segment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_rows: Option<usize>,
     /// IVF clusters in this segment.
@@ -441,6 +449,7 @@ impl ProbeStats {
     pub(crate) fn stage_elapsed_ns(&self) -> u64 {
         let fixed = self
             .scan_init_ns
+            .saturating_add(self.non_vector_search_ns)
             .saturating_add(self.query_prep_ns)
             .saturating_add(self.routing_ns)
             .saturating_add(self.exact_scan_ns.unwrap_or_default())
@@ -492,6 +501,7 @@ impl ProbeStats {
 
     pub(crate) fn clear_stage_timings(&mut self) {
         self.scan_init_ns = 0;
+        self.non_vector_search_ns = 0;
         self.query_prep_ns = 0;
         self.routing_ns = 0;
         self.layers.clear_timings();
@@ -619,6 +629,24 @@ struct QuantizedCandidate {
     sign_query_error_term: f32,
 }
 
+/// Storage-row selection resolved before a quantized layer is read.
+enum Selection<'a> {
+    All,
+    Rows(&'a [usize]),
+    None,
+}
+
+impl Selection<'_> {
+    #[inline]
+    fn len(&self, rows: &Range<usize>) -> usize {
+        match self {
+            Self::All => rows.len(),
+            Self::Rows(offsets) => offsets.len(),
+            Self::None => 0,
+        }
+    }
+}
+
 /// Row-parallel quantized scan columns.
 struct QuantizedCandidates {
     rows: Vec<usize>,
@@ -630,7 +658,6 @@ struct QuantizedCandidates {
     residual_norm_squared: Vec<f32>,
     gammas: Vec<f32>,
     sign_query_error_terms: Vec<f32>,
-    eligibility: Vec<u8>,
 }
 
 impl QuantizedCandidates {
@@ -645,7 +672,6 @@ impl QuantizedCandidates {
             residual_norm_squared: Vec::with_capacity(capacity),
             gammas: Vec::with_capacity(capacity),
             sign_query_error_terms: Vec::with_capacity(capacity),
-            eligibility: Vec::with_capacity(capacity),
         }
     }
 
@@ -677,13 +703,13 @@ impl QuantizedCandidates {
         self.residual_norm_squared.push(residual_norm_squared);
         self.gammas.push(gamma);
         self.sign_query_error_terms.push(sign_query_error_term);
-        self.eligibility.push(1);
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn append_cluster(
+    fn append_selected(
         &mut self,
         rows: Range<usize>,
+        selection: &Selection<'_>,
         docs: &[DocId],
         bases: &[f32],
         raw_prefixes: &[f32],
@@ -693,7 +719,7 @@ impl QuantizedCandidates {
         gammas: &[f32],
         sign_query_error_terms: &[f32],
     ) {
-        let len = rows.len();
+        let len = selection.len(&rows);
         debug_assert_eq!(docs.len(), len);
         debug_assert_eq!(bases.len(), len);
         debug_assert_eq!(raw_prefixes.len(), len);
@@ -702,7 +728,14 @@ impl QuantizedCandidates {
         debug_assert_eq!(residual_norms_squared.len(), len);
         debug_assert_eq!(gammas.len(), len);
         debug_assert_eq!(sign_query_error_terms.len(), len);
-        self.rows.extend(rows);
+        match selection {
+            Selection::All => self.rows.extend(rows),
+            Selection::Rows(offsets) => self.rows.extend(offsets.iter().map(|&offset| {
+                debug_assert!(offset < rows.len());
+                rows.start + offset
+            })),
+            Selection::None => unreachable!("empty selections are skipped before scoring"),
+        }
         self.docs.extend_from_slice(docs);
         self.bases.extend_from_slice(bases);
         self.raw_prefixes.extend_from_slice(raw_prefixes);
@@ -713,7 +746,6 @@ impl QuantizedCandidates {
         self.gammas.extend_from_slice(gammas);
         self.sign_query_error_terms
             .extend_from_slice(sign_query_error_terms);
-        self.eligibility.resize(self.rows.len(), 1);
     }
 
     #[inline(always)]
@@ -745,7 +777,6 @@ impl QuantizedCandidates {
         self.residual_norm_squared.clear();
         self.gammas.clear();
         self.sign_query_error_terms.clear();
-        self.eligibility.clear();
         self.rows.reserve(survivors.len());
         self.docs.reserve(survivors.len());
         self.bases.reserve(survivors.len());
@@ -755,7 +786,6 @@ impl QuantizedCandidates {
         self.residual_norm_squared.reserve(survivors.len());
         self.gammas.reserve(survivors.len());
         self.sign_query_error_terms.reserve(survivors.len());
-        self.eligibility.reserve(survivors.len());
         for survivor in survivors {
             self.push(
                 survivor.row,
@@ -1204,17 +1234,15 @@ fn combine_refinement_decoded(
     );
 }
 
-/// Scores one storage-ordered survivor batch.
+/// Reads and scores one selected layer range.
 #[inline(always)]
-fn apply_refinement_planned(
+fn score_layer(
     query: &QuantizedQueryCtx,
     layer_idx: usize,
     metric: Metric,
     layer: &QuantizedLayerReader,
-    candidates: &mut QuantizedCandidates,
-    candidate_range: Range<usize>,
-    available_rows: Range<usize>,
-    query_norm: f32,
+    rows: Range<usize>,
+    selection: &Selection<'_>,
     kernel_scores: &mut Vec<f32>,
     decoded_scales: &mut Vec<f32>,
     decoded_gammas: &mut Vec<f32>,
@@ -1222,42 +1250,62 @@ fn apply_refinement_planned(
     decoded_constants: &mut Vec<f32>,
     read_ranges: &mut Vec<Range<usize>>,
     block_scratch: &mut Vec<(usize, usize)>,
+    selected_rows: &mut Vec<usize>,
     row_offsets: &mut Vec<usize>,
-) -> crate::Result<()> {
-    let rows = candidate_range.len();
-    debug_assert!(rows > 0);
-    debug_assert!(candidates.rows[candidate_range.clone()]
-        .windows(2)
-        .all(|pair| pair[0] < pair[1]));
-    kernel_scores.resize(rows, 0.0);
-    decoded_scales.resize(rows, 0.0);
-    decoded_gammas.resize(rows, 0.0);
-    decoded_error_ratios.resize(rows, 0.0);
+) -> crate::Result<usize> {
+    let selected_count = selection.len(&rows);
+    if selected_count == 0 {
+        unreachable!("empty selections are skipped before scoring");
+    }
+    kernel_scores.resize(selected_count, 0.0);
+    decoded_scales.resize(selected_count, 0.0);
+    decoded_gammas.resize(selected_count, 0.0);
+    decoded_error_ratios.resize(selected_count, 0.0);
     if metric == Metric::L2 {
-        decoded_constants.resize(rows, 0.0);
+        decoded_constants.resize(selected_count, 0.0);
     }
 
-    layer.plan_code_reads(
-        available_rows.clone(),
-        &candidates.rows[candidate_range.clone()],
-        read_ranges,
-        block_scratch,
-    );
+    if matches!(selection, Selection::All) {
+        let batch = layer.read_batch(rows)?;
+        query.score_layer_batch_unscaled(
+            layer_idx,
+            batch.codes(),
+            batch.code_stride(),
+            &mut kernel_scores[..selected_count],
+        );
+        decode_f32s(batch.scales(), decoded_scales);
+        decode_f16s(batch.gammas(), decoded_gammas);
+        decode_f16s(batch.error_ratios(), decoded_error_ratios);
+        if metric == Metric::L2 {
+            let constants = batch.constants().ok_or_else(|| {
+                TantivyError::DataCorruption(DataCorruption::comment_only(
+                    "quantized L2 field is missing a constants slot",
+                ))
+            })?;
+            decode_f32s(constants, decoded_constants);
+        }
+        return Ok(selected_count);
+    }
+
+    let Selection::Rows(offsets) = selection else {
+        unreachable!("empty selections are skipped before scoring");
+    };
+    debug_assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+    debug_assert!(offsets.iter().all(|&offset| offset < rows.len()));
+    selected_rows.clear();
+    selected_rows.extend(offsets.iter().map(|&offset| rows.start + offset));
+
+    layer.plan_code_reads(rows.clone(), selected_rows, read_ranges, block_scratch);
     let mut selected_start = 0usize;
     for read_range in read_ranges.iter().cloned() {
         let mut selected_end = selected_start;
-        while selected_end < rows
-            && candidates.rows[candidate_range.start + selected_end] < read_range.end
-        {
-            debug_assert!(
-                candidates.rows[candidate_range.start + selected_end] >= read_range.start
-            );
+        while selected_end < selected_count && selected_rows[selected_end] < read_range.end {
+            debug_assert!(selected_rows[selected_end] >= read_range.start);
             selected_end += 1;
         }
         row_offsets.clear();
         row_offsets.extend(
-            candidates.rows
-                [candidate_range.start + selected_start..candidate_range.start + selected_end]
+            selected_rows[selected_start..selected_end]
                 .iter()
                 .map(|&row| row - read_range.start),
         );
@@ -1271,21 +1319,14 @@ fn apply_refinement_planned(
         );
         selected_start = selected_end;
     }
-    debug_assert_eq!(selected_start, rows);
+    debug_assert_eq!(selected_start, selected_count);
 
-    layer.plan_sidecar_reads(
-        available_rows.clone(),
-        &candidates.rows[candidate_range.clone()],
-        read_ranges,
-        block_scratch,
-    );
+    layer.plan_sidecar_reads(rows.clone(), selected_rows, read_ranges, block_scratch);
     selected_start = 0;
     for read_range in read_ranges.iter().cloned() {
         let sidecar = layer.read_sidecar(read_range.clone())?;
-        while selected_start < rows
-            && candidates.rows[candidate_range.start + selected_start] < read_range.end
-        {
-            let row = candidates.rows[candidate_range.start + selected_start];
+        while selected_start < selected_count && selected_rows[selected_start] < read_range.end {
+            let row = selected_rows[selected_start];
             debug_assert!(row >= read_range.start);
             let scale_offset = (row - read_range.start) * std::mem::size_of::<f32>();
             let scale_bits = sidecar.scales()[scale_offset] as u32
@@ -1303,15 +1344,10 @@ fn apply_refinement_planned(
             selected_start += 1;
         }
     }
-    debug_assert_eq!(selected_start, rows);
+    debug_assert_eq!(selected_start, selected_count);
 
     if metric == Metric::L2 {
-        layer.plan_constant_reads(
-            available_rows,
-            &candidates.rows[candidate_range.clone()],
-            read_ranges,
-            block_scratch,
-        )?;
+        layer.plan_constant_reads(rows, selected_rows, read_ranges, block_scratch)?;
         selected_start = 0;
         for read_range in read_ranges.iter().cloned() {
             let constants = layer.read_constants(read_range.clone())?.ok_or_else(|| {
@@ -1319,10 +1355,9 @@ fn apply_refinement_planned(
                     "quantized L2 field is missing a constants slot",
                 ))
             })?;
-            while selected_start < rows
-                && candidates.rows[candidate_range.start + selected_start] < read_range.end
+            while selected_start < selected_count && selected_rows[selected_start] < read_range.end
             {
-                let row = candidates.rows[candidate_range.start + selected_start];
+                let row = selected_rows[selected_start];
                 debug_assert!(row >= read_range.start);
                 let offset = (row - read_range.start) * std::mem::size_of::<f32>();
                 let bits = constants[offset] as u32
@@ -1333,32 +1368,50 @@ fn apply_refinement_planned(
                 selected_start += 1;
             }
         }
-        debug_assert_eq!(selected_start, rows);
+        debug_assert_eq!(selected_start, selected_count);
+    }
+    Ok(selected_count)
+}
+
+fn decode_selected_residual_norms(
+    quantized: &QuantizedFieldReader,
+    rows: Range<usize>,
+    selection: &Selection<'_>,
+    decoded: &mut Vec<f32>,
+    read_ranges: &mut Vec<Range<usize>>,
+    block_scratch: &mut Vec<(usize, usize)>,
+    selected_rows: &mut Vec<usize>,
+) -> crate::Result<()> {
+    let selected_count = selection.len(&rows);
+    decoded.resize(selected_count, 0.0);
+    if matches!(selection, Selection::All) {
+        let residual_norms = quantized.read_residual_norm_batch(rows)?;
+        decode_f32s(residual_norms.as_bytes(), decoded);
+        return Ok(());
     }
 
-    let decoded_constants = if metric == Metric::L2 {
-        &decoded_constants[..rows]
-    } else {
-        &[]
+    let Selection::Rows(offsets) = selection else {
+        unreachable!("empty selections are skipped before scoring");
     };
-    let sign_query_error_squared = if query.index.specs[layer_idx].bits == 1 {
-        query.query_error_squared(layer_idx) as f32
-    } else {
-        0.0
-    };
-    combine_refinement_decoded(
-        metric,
-        query.index.config.dim,
-        candidates,
-        candidate_range,
-        &kernel_scores[..rows],
-        &decoded_scales[..rows],
-        &decoded_gammas[..rows],
-        &decoded_error_ratios[..rows],
-        decoded_constants,
-        query_norm * query_norm,
-        sign_query_error_squared,
-    );
+    selected_rows.clear();
+    selected_rows.extend(offsets.iter().map(|&offset| rows.start + offset));
+    quantized.plan_residual_norm_reads(rows, selected_rows, read_ranges, block_scratch);
+    let mut selected_start = 0usize;
+    for read_range in read_ranges.iter().cloned() {
+        let residual_norms = quantized.read_residual_norms(read_range.clone())?;
+        while selected_start < selected_count && selected_rows[selected_start] < read_range.end {
+            let row = selected_rows[selected_start];
+            debug_assert!(row >= read_range.start);
+            let offset = (row - read_range.start) * std::mem::size_of::<f32>();
+            decoded[selected_start] = f32::from_le_bytes(
+                residual_norms[offset..offset + std::mem::size_of::<f32>()]
+                    .try_into()
+                    .unwrap(),
+            );
+            selected_start += 1;
+        }
+    }
+    debug_assert_eq!(selected_start, selected_count);
     Ok(())
 }
 
@@ -1448,37 +1501,6 @@ impl QuantizedScanCtx {
         query_norm
     }
 
-    /// Resolves row eligibility at the first boundary.
-    fn mark_eligibility(
-        &mut self,
-        filter: &BitSet,
-        filter_is_all: bool,
-        alive: Option<&AliveBitSet>,
-    ) -> (usize, usize, usize) {
-        let visited = self.candidates.len();
-        if filter_is_all && alive.is_none() {
-            return (visited, 0, 0);
-        }
-
-        let mut pruned_filter = 0usize;
-        let mut pruned_dead = 0usize;
-        for index in 0..self.candidates.len() {
-            let doc = self.candidates.docs[index];
-            if !filter.contains(doc) {
-                pruned_filter += 1;
-                self.candidates.eligibility[index] = 0;
-                continue;
-            }
-            if alive.is_some_and(|alive| !alive.is_alive(doc)) {
-                pruned_dead += 1;
-                self.candidates.eligibility[index] = 0;
-                continue;
-            }
-            self.candidates.eligibility[index] = 1;
-        }
-        (visited, pruned_filter, pruned_dead)
-    }
-
     /// Merges one cluster into the running admission top-k.
     fn finish_cluster_bound(&mut self) {
         let cluster_start = self
@@ -1546,23 +1568,11 @@ impl QuantizedScanCtx {
                 .all(|(&estimate, &sigma)| estimate.is_finite() && sigma.is_finite()),
             "quantized boundary inputs must be finite"
         );
-        let distinct_len = self
-            .candidates
-            .eligibility
-            .iter()
-            .filter(|&&eligible| eligible != 0)
-            .count();
-        if top_n == 0 || distinct_len < top_n {
+        if top_n == 0 || self.candidates.len() < top_n {
             return None;
         }
         self.kth_scratch.clear();
-        self.kth_scratch.extend(
-            self.candidates
-                .eligibility
-                .iter()
-                .enumerate()
-                .filter_map(|(index, &eligible)| (eligible != 0).then_some(index)),
-        );
+        self.kth_scratch.extend(0..self.candidates.len());
         let (_, selected, _) = self
             .kth_scratch
             .select_nth_unstable_by(top_n - 1, |&a, &b| candidate_order(&self.candidates, a, b));
@@ -1574,9 +1584,6 @@ impl QuantizedScanCtx {
         let pessimistic_kth = self.pessimistic_kth(top_n, kappa);
         self.boundary_scratch.clear();
         for index in 0..self.candidates.len() {
-            if self.candidates.eligibility[index] == 0 {
-                continue;
-            }
             if pessimistic_kth.is_none_or(|kth| {
                 self.candidates.estimate(index) + kappa * self.candidates.sigmas[index] >= kth
             }) {
@@ -1596,6 +1603,67 @@ fn candidate_docs(candidates: &QuantizedCandidates) -> Vec<DocId> {
     let mut docs = candidates.docs.clone();
     docs.sort_unstable();
     docs
+}
+
+fn select_cluster_rows<'a>(
+    reader: &VectorIndexReader,
+    rows: Range<usize>,
+    eligibility: &BitSet,
+    filter: &BitSet,
+    filter_is_all: bool,
+    alive: Option<&AliveBitSet>,
+    offsets: &'a mut Vec<usize>,
+    docs: &mut Vec<DocId>,
+) -> (Selection<'a>, usize, usize, usize) {
+    offsets.clear();
+    docs.clear();
+    let visited = rows.len();
+    if filter_is_all && alive.is_none() {
+        docs.extend(rows.map(|row| reader.doc_id_at(row)));
+        return (Selection::All, visited, 0, 0);
+    }
+
+    let mut pruned_filter = 0usize;
+    let mut pruned_dead = 0usize;
+    for (offset, row) in rows.enumerate() {
+        let doc = reader.doc_id_at(row);
+        if !eligibility.contains(doc) {
+            if !filter.contains(doc) {
+                pruned_filter += 1;
+            } else {
+                debug_assert!(alive.is_some_and(|alive| !alive.is_alive(doc)));
+                pruned_dead += 1;
+            }
+            continue;
+        }
+        offsets.push(offset);
+        docs.push(doc);
+    }
+    if offsets.is_empty() {
+        (Selection::None, visited, pruned_filter, pruned_dead)
+    } else {
+        (
+            Selection::Rows(offsets),
+            visited,
+            pruned_filter,
+            pruned_dead,
+        )
+    }
+}
+
+fn candidate_selection<'a>(
+    candidate_rows: &[usize],
+    available_rows: &Range<usize>,
+    offsets: &'a mut Vec<usize>,
+) -> Selection<'a> {
+    debug_assert!(!candidate_rows.is_empty());
+    debug_assert!(candidate_rows.windows(2).all(|pair| pair[0] < pair[1]));
+    debug_assert!(candidate_rows
+        .iter()
+        .all(|row| available_rows.contains(row)));
+    offsets.clear();
+    offsets.extend(candidate_rows.iter().map(|&row| row - available_rows.start));
+    Selection::Rows(offsets)
 }
 
 #[inline]
@@ -1634,13 +1702,29 @@ impl<T: VectorElement> VectorBackend<T> {
         let init_start = Instant::now();
         let init_stage = enter_vector_stage(Stage::ScanInit);
         let max_doc = segment_reader.max_doc();
+        let non_vector_start = Instant::now();
+        let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
         let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
+        let alive = segment_reader.alive_bitset();
+        let eligibility = alive.map(|alive| {
+            let mut eligibility = filter.clone();
+            eligibility.intersect_update(alive.bitset());
+            eligibility
+        });
+        drop(non_vector_stage);
+        let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
+        stats.non_vector_search_ns = stats
+            .non_vector_search_ns
+            .saturating_add(non_vector_search_ns);
         if filter.len() == 0 {
+            drop(init_stage);
+            stats.scan_init_ns = stats.scan_init_ns.saturating_add(
+                (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
+            );
             return Ok(Vec::new());
         }
         let filter_is_all = filter.len() == max_doc as usize;
         let scan_levels = query.active_layers();
-        let alive = segment_reader.alive_bitset();
         let quantized = self
             .reader
             .quantization()
@@ -1665,10 +1749,10 @@ impl<T: VectorElement> VectorBackend<T> {
         let bounds = index.bounds();
         let metric = query.index.config.metric;
         let q_norm = norm_squared_wide(query.query()).sqrt() as f32;
-        let admission_gate_enabled = filter_is_all && alive.is_none();
         let mut bounds_skips = 0u32;
         let mut armed_probe = None;
         let mut cluster_docs = Vec::new();
+        let mut selection_offsets = Vec::new();
         let mut kernel_scores = Vec::new();
         let mut decoded_scales = Vec::new();
         let mut decoded_gammas = Vec::new();
@@ -1680,13 +1764,14 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut sigma_scores = Vec::new();
         let mut residual_norm_squared_scores = Vec::new();
         let mut sign_query_error_terms = Vec::new();
-        let mut survivor_rows = Vec::new();
+        let mut selected_rows = Vec::new();
+        let mut indexed_row_offsets = Vec::new();
         let mut survivor_read_ranges = Vec::new();
         let mut survivor_block_scratch = Vec::new();
         drop(init_stage);
-        stats.scan_init_ns = stats
-            .scan_init_ns
-            .saturating_add(init_start.elapsed().as_nanos() as u64);
+        stats.scan_init_ns = stats.scan_init_ns.saturating_add(
+            (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
+        );
 
         let routing_start = Instant::now();
         let mut ranked = {
@@ -1713,9 +1798,8 @@ impl<T: VectorElement> VectorBackend<T> {
                 break;
             }
             let cluster = node as usize;
-            let query_bound = admission_gate_enabled
-                .then(|| scan.running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA))
-                .flatten()
+            let query_bound = scan
+                .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
                 .map_or(QueryBound::Filling, |score| QueryBound::Armed {
                     t: to_bound_space(metric, score),
                 });
@@ -1740,36 +1824,65 @@ impl<T: VectorElement> VectorBackend<T> {
                 continue;
             }
             scan.work_spent += pricing.open;
-            let score_query_norm = query.score_query_norm(sim.score());
             let rows = index.cluster_range(cluster);
-            let layer = quantized.layers()[0].read_batch(rows.clone())?;
-            let residual_norms = quantized.read_residual_norm_batch(rows.clone())?;
-            let batch_rows = layer.scales().len() / std::mem::size_of::<f32>();
-            kernel_scores.resize(batch_rows, 0.0);
-            query.score_layer_batch_unscaled(
-                0,
-                layer.codes(),
-                layer.code_stride(),
-                &mut kernel_scores[..batch_rows],
-            );
-
-            decode_f32s(layer.scales(), &mut decoded_scales);
-            decode_f16s(layer.gammas(), &mut decoded_gammas);
-            decode_f16s(layer.error_ratios(), &mut decoded_error_ratios);
-            decode_f32s(residual_norms.as_bytes(), &mut decoded_residual_norms);
-            if metric == Metric::L2 {
-                let constants = layer.constants().ok_or_else(|| {
-                    TantivyError::DataCorruption(DataCorruption::comment_only(
-                        "quantized L2 field is missing a constants slot",
-                    ))
-                })?;
-                decode_f32s(constants, &mut decoded_constants);
+            let selection_start = Instant::now();
+            let (selection, visited, pruned_filter, pruned_dead) = {
+                let _routing_stage = enter_vector_stage(Stage::Routing);
+                select_cluster_rows(
+                    &self.reader,
+                    rows.clone(),
+                    eligibility.as_ref().unwrap_or(&filter),
+                    &filter,
+                    filter_is_all,
+                    alive,
+                    &mut selection_offsets,
+                    &mut cluster_docs,
+                )
+            };
+            routing_ns += selection_start.elapsed().as_nanos() as u64;
+            stats.vectors_visited += visited;
+            stats.pruned_filter += pruned_filter;
+            stats.pruned_dead += pruned_dead;
+            let selected_count = selection.len(&rows);
+            if selected_count == 0 {
+                postings_skipped += 1;
+                stats.clusters_skipped_empty += 1;
+                continue;
             }
-            base_scores.resize(batch_rows, 0.0);
-            estimate_scores.resize(batch_rows, 0.0);
-            sigma_scores.resize(batch_rows, 0.0);
-            residual_norm_squared_scores.resize(batch_rows, 0.0);
-            sign_query_error_terms.resize(batch_rows, 0.0);
+
+            let score_query_norm = query.score_query_norm(sim.score());
+            let layer = &quantized.layers()[0];
+            score_layer(
+                query,
+                0,
+                metric,
+                layer,
+                rows.clone(),
+                &selection,
+                &mut kernel_scores,
+                &mut decoded_scales,
+                &mut decoded_gammas,
+                &mut decoded_error_ratios,
+                &mut decoded_constants,
+                &mut survivor_read_ranges,
+                &mut survivor_block_scratch,
+                &mut selected_rows,
+                &mut indexed_row_offsets,
+            )?;
+            decode_selected_residual_norms(
+                quantized,
+                rows.clone(),
+                &selection,
+                &mut decoded_residual_norms,
+                &mut survivor_read_ranges,
+                &mut survivor_block_scratch,
+                &mut selected_rows,
+            )?;
+            base_scores.resize(selected_count, 0.0);
+            estimate_scores.resize(selected_count, 0.0);
+            sigma_scores.resize(selected_count, 0.0);
+            residual_norm_squared_scores.resize(selected_count, 0.0);
+            sign_query_error_terms.resize(selected_count, 0.0);
             let cluster_score = sim.score();
             combine_initial_decoded(
                 metric,
@@ -1790,32 +1903,25 @@ impl<T: VectorElement> VectorBackend<T> {
                 query.query_error_squared(0) as f32,
             );
 
-            cluster_docs.clear();
-            cluster_docs.extend(rows.clone().map(|row| self.reader.doc_id_at(row)));
             scan.set_cluster_query_norm(cluster, score_query_norm);
-            if admission_gate_enabled {
-                scan.begin_cluster(top_n);
-            }
-            scan.candidates.append_cluster(
+            scan.begin_cluster(top_n);
+            scan.candidates.append_selected(
                 rows.clone(),
+                &selection,
                 &cluster_docs,
-                &base_scores[..batch_rows],
-                &kernel_scores[..batch_rows],
-                &estimate_scores[..batch_rows],
-                &sigma_scores[..batch_rows],
-                &residual_norm_squared_scores[..batch_rows],
-                &decoded_gammas[..batch_rows],
-                &sign_query_error_terms[..batch_rows],
+                &base_scores[..selected_count],
+                &kernel_scores[..selected_count],
+                &estimate_scores[..selected_count],
+                &sigma_scores[..selected_count],
+                &residual_norm_squared_scores[..selected_count],
+                &decoded_gammas[..selected_count],
+                &sign_query_error_terms[..selected_count],
             );
-            if admission_gate_enabled {
-                scan.finish_cluster_bound();
-            }
-            scan.work_spent += pricing.row * rows.len() as f64;
-            if rows.is_empty() {
-                postings_skipped += 1;
-            } else {
-                postings_row += 1;
-            }
+            scan.finish_cluster_bound();
+            scan.work_spent += pricing.row * selected_count as f64;
+            stats.layer0_eligible += selected_count;
+            stats.eligible_charged += selected_count;
+            postings_row += 1;
         }
         stats.record_routing(ranked.metrics());
         stats.postings_row += postings_row;
@@ -1841,11 +1947,6 @@ impl<T: VectorElement> VectorBackend<T> {
 
         let boundary_start = Instant::now();
         let boundary_stage = enter_vector_stage(Stage::Boundary(0));
-        let (visited, pruned_filter, pruned_dead) =
-            scan.mark_eligibility(&filter, filter_is_all, alive);
-        stats.vectors_visited += visited;
-        stats.pruned_filter += pruned_filter;
-        stats.pruned_dead += pruned_dead;
         scan.band(top_n, QUANTIZED_BOUNDARY_KAPPA);
         #[cfg(test)]
         stats
@@ -1871,15 +1972,19 @@ impl<T: VectorElement> VectorBackend<T> {
                     let candidate_end = candidate_range.end;
                     let first_row = scan.candidates.rows[candidate_start];
                     let last_row = scan.candidates.rows[candidate_end - 1];
-                    apply_refinement_planned(
+                    let available_rows = first_row..last_row + 1;
+                    let selection = candidate_selection(
+                        &scan.candidates.rows[candidate_range.clone()],
+                        &available_rows,
+                        &mut selection_offsets,
+                    );
+                    let rows = score_layer(
                         query,
                         layer_idx,
                         metric,
                         layer,
-                        &mut scan.candidates,
-                        candidate_range,
-                        first_row..last_row + 1,
-                        query_norm,
+                        available_rows,
+                        &selection,
                         &mut kernel_scores,
                         &mut decoded_scales,
                         &mut decoded_gammas,
@@ -1887,8 +1992,32 @@ impl<T: VectorElement> VectorBackend<T> {
                         &mut decoded_constants,
                         &mut survivor_read_ranges,
                         &mut survivor_block_scratch,
-                        &mut survivor_rows,
+                        &mut selected_rows,
+                        &mut indexed_row_offsets,
                     )?;
+                    let decoded_constants = if metric == Metric::L2 {
+                        &decoded_constants[..rows]
+                    } else {
+                        &[]
+                    };
+                    let sign_query_error_squared = if query.index.specs[layer_idx].bits == 1 {
+                        query.query_error_squared(layer_idx) as f32
+                    } else {
+                        0.0
+                    };
+                    combine_refinement_decoded(
+                        metric,
+                        query.index.config.dim,
+                        &mut scan.candidates,
+                        candidate_range,
+                        &kernel_scores[..rows],
+                        &decoded_scales[..rows],
+                        &decoded_gammas[..rows],
+                        &decoded_error_ratios[..rows],
+                        decoded_constants,
+                        query_norm * query_norm,
+                        sign_query_error_squared,
+                    );
                 }
             } else {
                 let mut candidate_start = 0;
@@ -1923,15 +2052,19 @@ impl<T: VectorElement> VectorBackend<T> {
                         candidate_end += 1;
                     }
                     let query_norm = scan.cluster_query_norm(cluster);
-                    apply_refinement_planned(
+                    let candidate_range = candidate_start..candidate_end;
+                    let selection = candidate_selection(
+                        &scan.candidates.rows[candidate_range.clone()],
+                        &cluster_rows,
+                        &mut selection_offsets,
+                    );
+                    let rows = score_layer(
                         query,
                         layer_idx,
                         metric,
                         layer,
-                        &mut scan.candidates,
-                        candidate_start..candidate_end,
                         cluster_rows,
-                        query_norm,
+                        &selection,
                         &mut kernel_scores,
                         &mut decoded_scales,
                         &mut decoded_gammas,
@@ -1939,8 +2072,32 @@ impl<T: VectorElement> VectorBackend<T> {
                         &mut decoded_constants,
                         &mut survivor_read_ranges,
                         &mut survivor_block_scratch,
-                        &mut survivor_rows,
+                        &mut selected_rows,
+                        &mut indexed_row_offsets,
                     )?;
+                    let decoded_constants = if metric == Metric::L2 {
+                        &decoded_constants[..rows]
+                    } else {
+                        &[]
+                    };
+                    let sign_query_error_squared = if query.index.specs[layer_idx].bits == 1 {
+                        query.query_error_squared(layer_idx) as f32
+                    } else {
+                        0.0
+                    };
+                    combine_refinement_decoded(
+                        metric,
+                        query.index.config.dim,
+                        &mut scan.candidates,
+                        candidate_range,
+                        &kernel_scores[..rows],
+                        &decoded_scales[..rows],
+                        &decoded_gammas[..rows],
+                        &decoded_error_ratios[..rows],
+                        decoded_constants,
+                        query_norm * query_norm,
+                        sign_query_error_squared,
+                    );
                     candidate_start = candidate_end;
                 }
             }
@@ -2049,14 +2206,29 @@ impl<T: VectorElement> VectorBackend<T> {
             return Ok(Vec::new());
         }
 
+        let non_vector_start = Instant::now();
+        let non_vector_stage = enter_vector_stage(Stage::NonVectorSearch);
         let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
+        drop(non_vector_stage);
+        let non_vector_search_ns = non_vector_start.elapsed().as_nanos() as u64;
+        stats.non_vector_search_ns = stats
+            .non_vector_search_ns
+            .saturating_add(non_vector_search_ns);
         if filter.len() == 0 {
+            drop(init_stage);
+            stats.scan_init_ns = stats.scan_init_ns.saturating_add(
+                (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
+            );
             return Ok(Vec::new());
         }
         let alive = segment_reader.alive_bitset();
 
         let num_centroids = index.num_clusters();
         if num_centroids == 0 {
+            drop(init_stage);
+            stats.scan_init_ns = stats.scan_init_ns.saturating_add(
+                (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
+            );
             return Ok(Vec::new());
         }
         let (work_budget, n_avg, x) = self
@@ -2074,9 +2246,9 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.segment_rows = Some(index.num_rows());
         stats.segment_clusters = Some(index.num_clusters());
         drop(init_stage);
-        stats.scan_init_ns = stats
-            .scan_init_ns
-            .saturating_add(init_start.elapsed().as_nanos() as u64);
+        stats.scan_init_ns = stats.scan_init_ns.saturating_add(
+            (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
+        );
         let routing_start = Instant::now();
         let mut ranked = {
             let _routing_stage = enter_vector_stage(Stage::Routing);
@@ -2226,6 +2398,11 @@ impl<T: VectorElement> VectorBackend<T> {
                 postings_skipped += 1;
             } else {
                 postings_row += 1;
+                #[cfg(test)]
+                stats
+                    .quantized_trace
+                    .scored_docs
+                    .extend(survivors.iter().map(|survivor| survivor.doc));
                 for &Survivor { row, doc } in &survivors {
                     let vbytes = self.reader.vector_bytes_for_row(row)?;
                     let score = self.query.score_doc_bytes(&vbytes);
@@ -2255,6 +2432,10 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.record_bound_armed(bound_tracker.armed_at_probe());
         stats.termination = termination;
         stats.work_charged += work_spent.to_f32();
+        #[cfg(test)]
+        {
+            stats.quantized_trace.scored_docs.sort_unstable();
+        }
 
         Ok(topn)
     }
@@ -2293,7 +2474,7 @@ impl<T: VectorElement> VectorBackend<T> {
     }
 }
 
-/// Materializes a filter doc set as a dense membership bitset.
+/// Materializes a filter doc set as a dense eligibility bitset.
 #[inline(never)]
 fn build_filter_bitset(
     weight: &dyn Weight,
@@ -3670,8 +3851,12 @@ mod tests {
     fn probe_stats_serializes_to_json() {
         let mut stats = ProbeStats {
             candidates_scored: 10,
+            layer0_eligible: 10,
+            clusters_skipped_empty: 2,
+            eligible_charged: 10,
             rerank_rows: 4,
             scan_init_ns: 75,
+            non_vector_search_ns: 60,
             query_prep_ns: 125,
             routing_ns: 40,
             rerank_fetch_ns: 50,
@@ -3713,6 +3898,9 @@ mod tests {
             value,
             serde_json::json!({
                 "candidates_scored": 10,
+                "layer0_eligible": 10,
+                "clusters_skipped_empty": 2,
+                "eligible_charged": 10,
                 "layer0_scan_ns": 250,
                 "layer0_scored": 10,
                 "layer0_survivors": 8,
@@ -3723,6 +3911,7 @@ mod tests {
                 "boundary1_ns": 25,
                 "rerank_rows": 4,
                 "scan_init_ns": 75,
+                "non_vector_search_ns": 60,
                 "query_prep_ns": 125,
                 "routing_ns": 40,
                 "rerank_fetch_ns": 50,
@@ -4067,20 +4256,6 @@ mod tests {
         scan.band(1, 2.0);
         assert_eq!(scan.candidates.len(), 1);
         assert_eq!(scan.candidates.rows[0], 0);
-    }
-
-    #[test]
-    fn quantized_boundary_excludes_ineligible_rows_before_pivot_selection() {
-        let mut scan = QuantizedScanCtx::new(3, 3);
-        for (row, score) in [(0, 100.0), (1, 10.0), (2, 9.0)] {
-            push_test_candidate(&mut scan, row, row as DocId, score, 0.0);
-        }
-        let mut filter = BitSet::with_max_value(3);
-        filter.insert(1);
-        filter.insert(2);
-        assert_eq!(scan.mark_eligibility(&filter, false, None), (3, 1, 0));
-        scan.band(1, 0.0);
-        assert_eq!(scan.candidates.rows, [1]);
     }
 
     struct FixedDocsWeight {

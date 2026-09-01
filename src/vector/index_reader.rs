@@ -586,7 +586,7 @@ impl VectorEstimatorMeasurements {
         self.source
     }
 
-    /// Returns the number of sampled posting-membership rows.
+    /// Returns the number of sampled IVF rows.
     pub fn sample_rows(&self) -> u64 {
         self.sample_rows
     }
@@ -1459,6 +1459,33 @@ impl QuantizedFieldReader {
         Ok(QuantizedResidualNormBatch { bytes, rows })
     }
 
+    pub(crate) fn plan_residual_norm_reads(
+        &self,
+        available_rows: Range<usize>,
+        rows: &[usize],
+        read_ranges: &mut Vec<Range<usize>>,
+        block_scratch: &mut Vec<(usize, usize)>,
+    ) {
+        QuantizedLayerReader::plan_slot_reads(
+            &self.residual_norms,
+            QUANTIZED_RESIDUAL_NORM_STRIDE,
+            available_rows,
+            rows,
+            read_ranges,
+            block_scratch,
+        );
+    }
+
+    pub(crate) fn read_residual_norms(&self, rows: Range<usize>) -> crate::Result<OwnedBytes> {
+        Ok(self
+            .residual_norms
+            .slice(
+                rows.start * QUANTIZED_RESIDUAL_NORM_STRIDE
+                    ..rows.end * QUANTIZED_RESIDUAL_NORM_STRIDE,
+            )
+            .read_bytes()?)
+    }
+
     pub(crate) fn index_ctx(&self) -> crate::Result<Arc<QuantizedIndexCtx>> {
         if let Some(index_ctx) = self.index_ctx.get() {
             return Ok(Arc::clone(index_ctx));
@@ -1562,34 +1589,6 @@ impl VectorIndexReader {
             }
         };
 
-        let vec_file = match segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))
-        {
-            Ok(file) => file,
-            Err(OpenReadError::FileDoesNotExist(_)) => return Ok(Self::empty(options)),
-            Err(err) => return Err(err.into()),
-        };
-        let (vector_file_format, body) = read_vector_header(&vec_file)?;
-        let vec_composite = CompositeFile::open(&body)?;
-        validate_vector_slot_map(&vec_composite)?;
-        let (Some(id_map_slice), Some(rows_slice)) = (
-            vec_composite.open_read_with_idx(field, VectorSlot::IdMap.index()),
-            vec_composite.open_read_with_idx(field, VectorSlot::Rows.index()),
-        ) else {
-            return Ok(Self::empty(options));
-        };
-        let id_map = IdMap::open(id_map_slice, segment_reader.max_doc())?;
-        let quantization_config = segment_reader
-            .index_settings()
-            .vector_quantization
-            .iter()
-            .find(|config| config.field == entry.name())
-            .cloned();
-        validate_quantization_file_format(
-            quantization_config.as_ref(),
-            vector_file_format,
-            entry.name(),
-        )?;
-
         let centroid_slots = match segment_reader
             .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
         {
@@ -1622,6 +1621,34 @@ impl VectorIndexReader {
             Err(OpenReadError::FileDoesNotExist(_)) => None,
             Err(err) => return Err(err.into()),
         };
+
+        let vec_file = match segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))
+        {
+            Ok(file) => file,
+            Err(OpenReadError::FileDoesNotExist(_)) => return Ok(Self::empty(options)),
+            Err(err) => return Err(err.into()),
+        };
+        let (vector_file_format, body) = read_vector_header(&vec_file)?;
+        let vec_composite = CompositeFile::open(&body)?;
+        validate_vector_slot_map(&vec_composite)?;
+        let (Some(id_map_slice), Some(rows_slice)) = (
+            vec_composite.open_read_with_idx(field, VectorSlot::IdMap.index()),
+            vec_composite.open_read_with_idx(field, VectorSlot::Rows.index()),
+        ) else {
+            return Ok(Self::empty(options));
+        };
+        let id_map = IdMap::open(id_map_slice, segment_reader.max_doc())?;
+        let quantization_config = segment_reader
+            .index_settings()
+            .vector_quantization
+            .iter()
+            .find(|config| config.field == entry.name())
+            .cloned();
+        validate_quantization_file_format(
+            quantization_config.as_ref(),
+            vector_file_format,
+            entry.name(),
+        )?;
 
         let index = match (&id_map, centroid_slots) {
             (IdMap::Explicit(_), Some((version, centroids, offsets, router, bounds))) => Some(

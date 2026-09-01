@@ -1,6 +1,7 @@
 //! Vector storage, indexing, and scoring.
 //! Includes flat and inverted-file segment layouts.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::io;
 
@@ -84,6 +85,8 @@ pub enum Stage {
     Other,
     /// Reader initialization.
     ScanInit,
+    /// Predicate evaluation and filter-bitset construction.
+    NonVectorSearch,
     /// Query preparation.
     QueryPrep,
     /// Cluster routing.
@@ -100,6 +103,25 @@ pub enum Stage {
     RerankFetch,
     /// Exact rerank scoring.
     RerankScore,
+}
+
+impl Stage {
+    /// Returns the flat telemetry field prefix for this stage.
+    pub fn name(self) -> Option<Cow<'static, str>> {
+        match self {
+            Self::Other => None,
+            Self::ScanInit => Some(Cow::Borrowed("scan_init")),
+            Self::NonVectorSearch => Some(Cow::Borrowed("non_vector_search")),
+            Self::QueryPrep => Some(Cow::Borrowed("query_prep")),
+            Self::Routing => Some(Cow::Borrowed("routing")),
+            Self::LayerScan(layer) => Some(Cow::Owned(format!("layer{layer}_scan"))),
+            Self::Boundary(layer) => Some(Cow::Owned(format!("boundary{layer}"))),
+            Self::ExactScan => Some(Cow::Borrowed("exact_scan")),
+            Self::ResultAssembly => Some(Cow::Borrowed("result_assembly")),
+            Self::RerankFetch => Some(Cow::Borrowed("rerank_fetch")),
+            Self::RerankScore => Some(Cow::Borrowed("rerank_score")),
+        }
+    }
 }
 
 thread_local! {
@@ -120,6 +142,32 @@ pub(crate) fn enter_vector_stage(stage: Stage) -> VectorStageGuard {
 impl Drop for VectorStageGuard {
     fn drop(&mut self) {
         VECTOR_STAGE.set(self.0);
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::Stage;
+
+    #[test]
+    fn stage_names_are_flat_telemetry_prefixes() {
+        assert_eq!(Stage::Other.name(), None);
+        assert_eq!(Stage::ScanInit.name().as_deref(), Some("scan_init"));
+        assert_eq!(
+            Stage::NonVectorSearch.name().as_deref(),
+            Some("non_vector_search")
+        );
+        assert_eq!(Stage::QueryPrep.name().as_deref(), Some("query_prep"));
+        assert_eq!(Stage::Routing.name().as_deref(), Some("routing"));
+        assert_eq!(Stage::LayerScan(2).name().as_deref(), Some("layer2_scan"));
+        assert_eq!(Stage::Boundary(2).name().as_deref(), Some("boundary2"));
+        assert_eq!(Stage::ExactScan.name().as_deref(), Some("exact_scan"));
+        assert_eq!(
+            Stage::ResultAssembly.name().as_deref(),
+            Some("result_assembly")
+        );
+        assert_eq!(Stage::RerankFetch.name().as_deref(), Some("rerank_fetch"));
+        assert_eq!(Stage::RerankScore.name().as_deref(), Some("rerank_score"));
     }
 }
 

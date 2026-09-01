@@ -16,18 +16,18 @@ pub const GRID_FORMAT_VERSION: u32 = 1;
 pub const MAX_QUANTIZATION_LAYERS: usize = 3;
 /// Code sections begin at a 64-byte-aligned file offset.
 pub const QUANTIZED_CODE_ALIGNMENT: usize = 64;
-/// One little-endian binary32 scale per posting-membership row and layer.
+/// One little-endian binary32 scale per vector row and layer.
 pub const QUANTIZED_SCALE_STRIDE: usize = 4;
-/// One binary16 cumulative-prefix gamma per posting-membership row and layer.
+/// One binary16 cumulative-prefix gamma per vector row and layer.
 pub const QUANTIZED_GAMMA_STRIDE: usize = 2;
-/// One binary16 corrected-error ratio per posting-membership row and layer.
+/// One binary16 corrected-error ratio per vector row and layer.
 pub const QUANTIZED_ERROR_RATIO_STRIDE: usize = 2;
-/// Combined per-layer sidecar bytes per posting-membership row.
+/// Combined per-layer sidecar bytes per vector row.
 pub const QUANTIZED_SIDECAR_STRIDE: usize =
     QUANTIZED_SCALE_STRIDE + QUANTIZED_GAMMA_STRIDE + QUANTIZED_ERROR_RATIO_STRIDE;
-/// One binary32 split-form constant per posting-membership row and layer.
+/// One binary32 split-form constant per vector row and layer.
 pub const QUANTIZED_CONSTANT_STRIDE: usize = 4;
-/// One binary32 residual squared norm per posting-membership row.
+/// One binary32 residual squared norm per vector row.
 pub const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
 /// Closed-form uncertainty safety multiplier declared by the scoring policy.
 pub(crate) const GAMMA_ANALYTICAL_SAFETY: f32 = 1.15;
@@ -299,7 +299,7 @@ impl VectorQuantizationConfig {
         Ok(())
     }
 
-    /// Logical quantized bytes stored for one posting-membership row.
+    /// Logical quantized bytes stored for one vector row.
     pub fn bytes_per_row(&self) -> usize {
         let layer_bytes: usize = self
             .layers
@@ -347,7 +347,7 @@ pub(crate) fn validate_quantization_configs(
     Ok(())
 }
 
-/// Packed-code stride for one posting-membership row.
+/// Packed-code stride for one vector row.
 ///
 /// # Panics
 ///

@@ -1813,7 +1813,7 @@ mod tests {
             &AllQuery
         };
         let expected = fixture_exact_hits(index, metric, &query, Some(filter), TOP_N)?;
-        let collector = TopDocsByVectorSimilarity::new(field, query, TOP_N)
+        let collector = TopDocsByVectorSimilarity::new(field, query.clone(), TOP_N)
             .with_adaptive_params(AdaptiveProbeParams {
                 max_probe_fraction: 1.0,
                 min_probe_clusters: 2,
@@ -1828,6 +1828,16 @@ mod tests {
         assert_matrix_results(&context, &fruit.results, &expected, stats);
 
         let layer0 = stats.layers.get(0).expect("layer 0 must execute");
+        assert_eq!(
+            stats.layer0_eligible,
+            layer0.scored(),
+            "{context}: layer 0 must score exactly the admitted eligible rows"
+        );
+        assert_eq!(
+            stats.eligible_charged,
+            layer0.scored(),
+            "{context}: the probe budget must charge exactly the selected rows"
+        );
         assert!(layer0.scored() > 0, "{context}: {stats:?}");
         assert!(
             layer0.survivors() <= layer0.scored(),
@@ -1859,6 +1869,47 @@ mod tests {
             depth,
             "{context}: one identity snapshot per executed boundary"
         );
+        for boundary in &stats.quantized_trace.boundary_docs {
+            assert!(
+                boundary
+                    .iter()
+                    .all(|doc| stats.quantized_trace.scored_docs.contains(doc)),
+                "{context}: a later layer retained a row absent from layer-0 selection"
+            );
+        }
+        assert!(
+            stats.quantized_trace.rerank_docs.iter().all(|doc| stats
+                .quantized_trace
+                .boundary_docs
+                .last()
+                .is_some_and(|boundary| boundary.contains(doc))),
+            "{context}: rerank read a row absent from the final selection"
+        );
+        for max_probe_fraction in [0.25, 1.0] {
+            const ELIGIBILITY_TOP_N: usize = 8;
+            let params = AdaptiveProbeParams {
+                max_probe_fraction,
+                min_probe_clusters: 2,
+                ..Default::default()
+            };
+            let quantized = searcher.search(
+                filter,
+                &TopDocsByVectorSimilarity::new(field, query.clone(), ELIGIBILITY_TOP_N)
+                    .with_adaptive_params(params.clone())
+                    .with_max_scan_levels(depth),
+            )?;
+            let level0 = searcher.search(
+                filter,
+                &TopDocsByVectorSimilarity::new(field, query.clone(), ELIGIBILITY_TOP_N)
+                    .with_adaptive_params(params)
+                    .with_max_scan_levels(0),
+            )?;
+            assert_eq!(
+                quantized.stats[0].quantized_trace.scored_docs,
+                level0.stats[0].quantized_trace.scored_docs,
+                "{context}: selected candidate set at probe fraction {max_probe_fraction}"
+            );
+        }
         match scenario {
             QuantizedMatrixScenario::Filter => {
                 assert!(stats.pruned_filter > 0, "{context}: {stats:?}")
@@ -2454,12 +2505,12 @@ mod tests {
             )?
             .expect("quantized fixture must support estimator measurement");
         assert_eq!(measurements.source(), VectorEstimatorSource::HeldOut);
-        assert_eq!(measurements.sample_rows(), 16);
+        assert_eq!(measurements.sample_rows(), 8);
         assert_eq!(measurements.query_count(), 1);
         assert!(measurements
             .aggregate()
             .iter()
-            .all(|moments| moments.sample_count == 14));
+            .all(|moments| moments.sample_count == 7));
         Ok(())
     }
 }
