@@ -2,7 +2,7 @@ name: Unit tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, ruchir/quantization ]
   pull_request:
     branches: [ main ]
 

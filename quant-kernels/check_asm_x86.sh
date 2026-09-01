@@ -10,6 +10,10 @@ fi
 
 export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/quant-kernels-asm}"
+# Thin LTO defers loop vectorization to the final link, while this check asks
+# rustc for pre-link assembly. Disable LTO here so the inspected artifact is
+# the optimized machine code whose instructions the expectations validate.
+export CARGO_PROFILE_RELEASE_LTO=false
 
 cargo rustc -p sign-plane --release --lib -- --emit=asm
 cargo rustc -p fht --release --lib -- --emit=asm

@@ -599,8 +599,16 @@ struct QuantizedCandidate {
     doc: DocId,
     score: f32,
     sigma: f32,
-    query_residual_norm: f32,
-    residual_norm_sq: f32,
+    score_query_norm: f32,
+}
+
+#[inline]
+fn quantized_layer_constant(metric: Metric, stored: f32) -> f32 {
+    if metric == Metric::L2 {
+        stored
+    } else {
+        0.0
+    }
 }
 
 struct QuantizedScanCtx {
@@ -647,6 +655,12 @@ impl QuantizedScanCtx {
 
     /// The distinct-document k-th estimate widened pessimistically by its σ.
     fn pessimistic_kth(&self, top_n: usize, kappa: f32) -> Option<f32> {
+        debug_assert!(
+            self.candidates
+                .iter()
+                .all(|candidate| candidate.score.is_finite() && candidate.sigma.is_finite()),
+            "quantized boundary inputs must be finite"
+        );
         let best: Vec<usize> = self.best_by_doc.iter().flatten().copied().collect();
         if top_n == 0 || best.len() < top_n {
             return None;
@@ -763,7 +777,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 &centroid_bytes[cluster * centroid_stride..][..centroid_stride],
                 self.reader.dim(),
             )?;
-            let query_residual_norm = query.query_residual_norm(sim.score(), centroid.as_slice());
+            let score_query_norm = query.score_query_norm(sim.score(), centroid.as_slice());
             let mut cluster_scored = 0usize;
             for row in index.cluster_range(cluster) {
                 visited += 1;
@@ -777,14 +791,11 @@ impl<T: VectorElement> VectorBackend<T> {
                     continue;
                 }
                 let layer = &quantized.layers()[0];
-                let estimate = query.score_layer(
-                    0,
-                    &layer.code_bytes(row)?,
-                    layer.scale(row)?,
-                    layer.constant(row)?,
-                );
+                let scale_bits = layer.scale(row)?;
+                let codes = layer.code_bytes(row)?;
+                let constant = quantized_layer_constant(metric, layer.constant(row)?);
+                let estimate = query.score_layer(0, &codes, scale_bits, constant);
                 let stored_residual_norm_sq = quantized.residual_norm(row)?;
-                let residual_norm_sq = stored_residual_norm_sq.unwrap_or(f32::INFINITY);
                 let score = match metric {
                     Metric::L2 => {
                         let residual_norm_sq = stored_residual_norm_sq.ok_or_else(|| {
@@ -800,9 +811,8 @@ impl<T: VectorElement> VectorBackend<T> {
                     row,
                     doc,
                     score,
-                    sigma: query.score_sigma(0, query_residual_norm, residual_norm_sq),
-                    query_residual_norm,
-                    residual_norm_sq,
+                    sigma: query.score_sigma(0, score_query_norm, scale_bits),
+                    score_query_norm,
                 });
                 cluster_scored += 1;
             }
@@ -834,26 +844,25 @@ impl<T: VectorElement> VectorBackend<T> {
             let layer = &quantized.layers()[layer_idx];
             stats.quantized_refinements_scored += scan.candidates.len();
             for candidate in &mut scan.candidates {
+                let scale_bits = layer.scale(candidate.row)?;
                 let refinement = query.score_layer(
                     layer_idx,
                     &layer.code_bytes(candidate.row)?,
-                    layer.scale(candidate.row)?,
-                    layer.constant(candidate.row)?,
+                    scale_bits,
+                    quantized_layer_constant(metric, layer.constant(candidate.row)?),
                 );
                 candidate.score += if query.index.config.metric == Metric::L2 {
                     2.0 * refinement
                 } else {
                     refinement
                 };
-                candidate.sigma = query.score_sigma(
-                    layer_idx,
-                    candidate.query_residual_norm,
-                    candidate.residual_norm_sq,
-                );
+                candidate.sigma =
+                    query.score_sigma(layer_idx, candidate.score_query_norm, scale_bits);
             }
             let final_sign = query.index.specs[layer_idx].bits == 1;
             let boundary_start = Instant::now();
-            scan.band(top_n, if final_sign { 2.0 } else { 4.0 });
+            let kappa = if final_sign { 2.0 } else { 4.0 };
+            scan.band(top_n, kappa);
             stats.boundary_ns += boundary_start.elapsed().as_nanos() as u64;
         }
         stats.quantized_final_survivors += scan.candidates.len();
@@ -2759,8 +2768,7 @@ mod tests {
                 doc,
                 score,
                 sigma: 0.0,
-                query_residual_norm: 1.0,
-                residual_norm_sq: 1.0,
+                score_query_norm: 1.0,
             });
         }
         assert_eq!(scan.pessimistic_kth(2, 2.0), Some(0.0));
@@ -2769,6 +2777,14 @@ mod tests {
             scan.candidates.iter().any(|candidate| candidate.doc == 1),
             "a replica of doc 0 must not displace the second distinct document"
         );
+    }
+
+    #[test]
+    fn quantized_split_constants_are_l2_only() {
+        let stored = -0.375_f32;
+        assert_eq!(quantized_layer_constant(Metric::L2, stored), stored);
+        assert_eq!(quantized_layer_constant(Metric::Dot, stored), 0.0);
+        assert_eq!(quantized_layer_constant(Metric::Cosine, stored), 0.0);
     }
 
     #[test]
@@ -2806,8 +2822,7 @@ mod tests {
                 doc: row as DocId,
                 score: plane1_scores[row],
                 sigma: plane1_sigmas[row],
-                query_residual_norm: 1.0,
-                residual_norm_sq: 1.0,
+                score_query_norm: 1.0,
             });
         }
         scan.band(TOP_N, KAPPA_1);
@@ -2816,6 +2831,10 @@ mod tests {
             .iter()
             .map(|candidate| candidate.row as u32)
             .collect();
+        assert!(
+            harness_first.len() < CANDIDATES,
+            "GATE-B plane 1 must measurably filter"
+        );
         assert_eq!(scan_first, harness_first, "plane-1 survivor set");
 
         let second_scores: Vec<f32> = harness_first
@@ -2848,6 +2867,10 @@ mod tests {
             .iter()
             .map(|candidate| candidate.row as u32)
             .collect();
+        assert!(
+            harness_second.len() < harness_first.len(),
+            "GATE-B plane 2 must measurably filter"
+        );
         assert_eq!(scan_second, harness_second, "plane-2 survivor set");
 
         let mut exact_order: Vec<usize> = (0..CANDIDATES).collect();
@@ -2864,20 +2887,20 @@ mod tests {
     }
 
     #[test]
-    fn quantized_boundary_fails_open_without_a_residual_norm() {
-        let mut scan = QuantizedScanCtx::new(2);
-        for (row, score) in [(0, 100.0), (1, -100.0)] {
+    fn quantized_boundary_filters_with_finite_sigmas() {
+        let mut scan = QuantizedScanCtx::new(3);
+        for (row, score) in [(0, 100.0), (1, 99.0), (2, -100.0)] {
             scan.push(QuantizedCandidate {
                 row,
                 doc: row as DocId,
                 score,
-                sigma: f32::INFINITY,
-                query_residual_norm: 1.0,
-                residual_norm_sq: f32::INFINITY,
+                sigma: 0.1,
+                score_query_norm: 1.0,
             });
         }
-        scan.band(1, 4.0);
-        assert_eq!(scan.candidates.len(), 2);
+        scan.band(1, 2.0);
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(scan.candidates[0].row, 0);
     }
 
     // ============================================================

@@ -762,8 +762,10 @@ fn spec(bits: u8, seed: u64, rotate: bool) -> LayerSpec {
 
 fn bytes_to_words(bytes: &[u8]) -> Vec<u64> {
     bytes
-        .chunks_exact(8)
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
         .collect()
 }
 

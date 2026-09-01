@@ -16,7 +16,8 @@
 use std::sync::Arc;
 
 use cascade::{prepare_split_query, LayerSpec, PreparedSplitQuery};
-use quant_model::{build_grid, Grid};
+use quant_model::f16::f16_to_f32;
+use quant_model::{build_grid, Grid, DEFAULT_CAL};
 
 use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
 use super::quantization::{VectorQuantizationConfig, VectorQuantizer};
@@ -45,7 +46,6 @@ pub(crate) struct QuantizedIndexCtx {
     pub(crate) config: VectorQuantizationConfig,
     pub(crate) specs: Vec<LayerSpec>,
     pub(crate) grids: Vec<Grid>,
-    prefix_rhos: Vec<f64>,
 }
 
 impl QuantizedIndexCtx {
@@ -81,24 +81,11 @@ impl QuantizedIndexCtx {
                 }
             })
             .collect();
-        let mut product = 1.0;
-        let prefix_rhos = grids
-            .iter()
-            .map(|grid| {
-                product *= grid.rho_model;
-                product
-            })
-            .collect();
         Self {
             config,
             specs,
             grids,
-            prefix_rhos,
         }
-    }
-
-    pub(crate) fn prefix_rho(&self, layer: usize) -> f64 {
-        self.prefix_rhos[layer]
     }
 }
 
@@ -157,26 +144,40 @@ impl QuantizedQueryCtx {
         }
     }
 
-    /// Score-space uncertainty. L2's score contains `2 * est`, hence `2σ_dot`.
-    pub(crate) fn score_sigma(
-        &self,
-        layer: usize,
-        query_residual_norm: f32,
-        residual_norm_sq: f32,
-    ) -> f32 {
-        let dot_sigma = self.index.prefix_rho(layer) as f32
-            * query_residual_norm
-            * residual_norm_sq.max(0.0).sqrt()
-            / (self.index.config.dim as f32).sqrt();
+    /// Norm of the query vector used by a layer's dot-product error model.
+    /// L2 estimates `<q-c,r>`; Dot and Cosine estimate `<q,r>` directly.
+    pub(crate) fn score_query_norm(&self, routing_score: f32, centroid: &[f32]) -> f32 {
         if self.index.config.metric == Metric::L2 {
-            2.0 * dot_sigma
+            self.query_residual_norm(routing_score, centroid)
         } else {
-            dot_sigma
+            self.query_norm_sq.sqrt()
         }
+    }
+
+    /// Score-space uncertainty. L2's score contains `2 * est`, hence `2σ_dot`.
+    pub(crate) fn score_sigma(&self, layer: usize, query_residual_norm: f32, scale: u16) -> f32 {
+        score_sigma_from_scale(
+            self.index.config.metric,
+            self.index.grids[layer].rho_model,
+            query_residual_norm,
+            scale,
+        )
     }
 
     pub(crate) fn query(&self) -> &[f32] {
         &self.query
+    }
+}
+
+/// Convert one layer's stored reconstruction scale into score-space uncertainty.
+/// The scale belongs to the residual entering that layer, so the layer-local rho
+/// already represents all error left after that boundary.
+fn score_sigma_from_scale(metric: Metric, rho: f64, query_residual_norm: f32, scale: u16) -> f32 {
+    let dot_sigma = f16_to_f32(scale) * rho as f32 * DEFAULT_CAL as f32 * query_residual_norm;
+    if metric == Metric::L2 {
+        2.0 * dot_sigma
+    } else {
+        dot_sigma
     }
 }
 
@@ -223,5 +224,32 @@ impl<T: VectorElement> PreparedQuery<T> {
             QueryKind::Dot => dot_bytes::<T>(&self.query, doc_bytes),
             QueryKind::Cosine { inv_norm_q } => dot_bytes::<T>(&self.query, doc_bytes) * inv_norm_q,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quant_model::f16::{f16_to_f32, f32_to_f16};
+    use quant_model::DEFAULT_CAL;
+
+    use super::score_sigma_from_scale;
+    use crate::schema::Metric;
+
+    #[test]
+    fn quantized_sigma_decodes_f16_scale_and_applies_rho_and_cal() {
+        let scale_bits = f32_to_f16(0.037_531);
+        let rho = 0.097_3;
+        let query_residual_norm = 0.812_5;
+        let expected =
+            f16_to_f32(scale_bits) * rho as f32 * DEFAULT_CAL as f32 * query_residual_norm;
+
+        let dot = score_sigma_from_scale(Metric::Dot, rho, query_residual_norm, scale_bits);
+        let cosine = score_sigma_from_scale(Metric::Cosine, rho, query_residual_norm, scale_bits);
+        let l2 = score_sigma_from_scale(Metric::L2, rho, query_residual_norm, scale_bits);
+
+        assert_eq!(dot.to_bits(), expected.to_bits());
+        assert_eq!(cosine.to_bits(), expected.to_bits());
+        assert_eq!(l2.to_bits(), (2.0 * expected).to_bits());
+        assert!(cosine.is_finite());
     }
 }

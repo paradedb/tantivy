@@ -320,3 +320,163 @@ tests are pinned by Tantivy commit `f2460aa3`.
 | GATE-A · bridge exactness | green | d=768 and odd d=100; every stored row, per layer and summed, relative 1e-5 | `vector::ivf::plugin::tests::gate_a_bridge_exactness_d768_and_d100` |
 | GATE-B · recall parity | green | 40 harness candidates, k=10, (κ1, κ2)=(2.0, 4.0); plane-1 and plane-2 survivor sets equal, candidate recall 1.0 | `vector::backend::tests::gate_b_recall_parity_survivor_sets` |
 | GATE-C · exact-path equivalence | green | opted-out IVF field, quantization-configured flat/no-slot segment, and quantized IVF with `max_scan_levels=0`; score bits and ordering equal exact oracle | `vector::ivf::plugin::tests::gate_c_exact_path_equivalence` |
+
+## x86 companion measurements — 2026-08-24
+
+GitHub Actions `ubuntu-latest`, x86_64, Rust stable, `-C target-cpu=native`,
+run `32752773516` at Tantivy commit `9f6edc1c`. Criterion intervals are 95%
+confidence intervals from bench builds with thin LTO and one codegen unit.
+The ARM column copies the prior Apple M5 Max middle estimate measured on
+2026-08-20.
+
+| kernel | configuration | ARM | x86 95% CI |
+|---|---|---:|---:|
+| FHT apply | d=128 | 611.36 ns/vector | 1.1782–1.1817 µs/vector |
+| FHT apply | d=768 | 3.789 µs/vector | 7.2355–7.2563 µs/vector |
+| FHT apply | d=1536 | 7.791 µs/vector | 14.183–14.273 µs/vector |
+| sign symmetric score | d=768 | 2.588 ns/vector | 4.7641–4.7839 ns/vector |
+| sign asymmetric score | d=768, Bq=4 | 13.869 ns/vector | 26.475–26.575 ns/vector |
+| grid encode | d=768, b=2 | 1.945 µs/vector | 3.9479–3.9598 µs/vector |
+| grid score | d=768, b=2 | 500.79 ns/vector | 1.4451–1.4481 µs/vector |
+| grid encode | d=768, b=3 | — | 4.2543–4.2621 µs/vector |
+| grid score | d=768, b=3 | 480.160 ns/vector | 1.0310–1.0500 µs/vector |
+| grid encode | d=768, b=4 | 1.740 µs/vector | 5.6932–5.7013 µs/vector |
+| grid score | d=768, b=4 | 506.91 ns/vector | 1.4511–1.4528 µs/vector |
+| fp dot | d=128 | 23.485 ns/vector | 95.745–95.933 ns/vector |
+| fp dot | d=768 | 279.842 ns/vector | 693.28–693.64 ns/vector |
+| fp dot | d=1536 | 641.876 ns/vector | 1.4102–1.4106 µs/vector |
+| decode then dot | d=768 | 582.900 ns/vector | 1.2854–1.2862 µs/vector |
+| boundary ops | 50,000 candidates | 124.20 µs total; 2.484 ns/candidate | 325.97–332.49 µs total; 6.519–6.650 ns/candidate |
+| boundary ops | 500,000 candidates | 809.24 µs total; 1.618 ns/candidate | 2.0905–2.0933 ms total; 4.181–4.187 ns/candidate |
+
+| x86 assembly expectation | result |
+|---|---|
+| sign-plane hardware `popcnt` | green |
+| FHT packed `addps`/`subps` butterfly | green |
+
+## Phase B Cohere 1M milestone — 2026-08-24
+
+Warm cache; Apple M5 Max, arm64; 100 queries; 3 timed samples/query. Funnel
+and recall: machine-independent. Latency: ARM context. x86 kernel CI:
+run `32752773516`.
+
+### q14 funnel means
+
+| point | probe | plane-1 scored | plane-1 survivors | refinements scored | rerank rows | s1 | s2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| r95 | 0.0109 | 10983.920 | 10983.920 | 10983.920 | 10983.920 | 1.000000 | 1.000000 |
+| r99 | 0.1000 | 100107.680 | 100107.680 | 100107.680 | 100107.680 | 1.000000 | 1.000000 |
+
+### Matched-probe attribution
+
+| point | probe | qoff recall vs GT | q14 recall vs GT | candidate recall ratio | product recall | final recall | product-final gap |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| r90 | 0.0050 | 0.897000 | 0.897000 | 1.000000 | 0.897000 | 0.897000 | 0.000000 |
+| r95 | 0.0109 | 0.948000 | 0.948000 | 1.000000 | 0.948000 | 0.948000 | 0.000000 |
+| r99 | 0.1000 | 0.993000 | 0.993000 | 1.000000 | 0.993000 | 0.993000 | 0.000000 |
+
+### Iso-recall performance
+
+| point | qoff probe | q14 probe | qoff p50 ms | q14 p50 ms | p50 delta | qoff p99 ms | q14 p99 ms | p99 delta |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| r90 | 0.0050 | 0.0050 | 2.530 | 43.665 | +1626.1% | 3.710 | 47.778 | +1187.8% |
+| r95 | 0.0109 | 0.0109 | 5.384 | 71.166 | +1221.8% | 6.790 | 80.034 | +1078.7% |
+| r99 | 0.1000 | 0.1000 | 39.936 | 673.033 | +1585.3% | 42.528 | 750.114 | +1663.8% |
+
+### Build economics
+
+| profile | build s | index bytes | index GiB | peak RSS bytes | peak RSS GiB |
+|---|---:|---:|---:|---:|---:|
+| qoff | 99.695 | 8693366784 | 8.096 | 11253743616 | 10.481 |
+| q14 | 139.525 | 9347932160 | 8.706 | 11769741312 | 10.962 |
+| q14 − qoff | +39.831 (+39.953%) | +654565376 (+7.529%) | +0.610 | +515997696 | +0.481 |
+
+### Bytes ledger
+
+| schedule | probe | plane-1 rows | refinement rows | rerank rows | plane-1 bytes | refinement bytes | rerank bytes | total bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| [1,4] | 0.0050 | 5093.390 | 5093.390 | 5093.390 | 651954 | 2607816 | 20862525 | 24122295 |
+| [1,4] | 0.0084 | 8479.200 | 8479.200 | 8479.200 | 1085338 | 4341350 | 34730803 | 40157491 |
+| [1,4] | 0.0109 | 10983.920 | 10983.920 | 10983.920 | 1405942 | 5623767 | 44990136 | 52019845 |
+| [1,4] | 0.0141 | 14188.320 | 14188.320 | 14188.320 | 1816105 | 7264420 | 58115359 | 67195884 |
+| [1,4] | 0.0400 | 40097.830 | 40097.830 | 40097.830 | 5132522 | 20530089 | 164240712 | 189903323 |
+| [1,4] | 0.1000 | 100107.680 | 100107.680 | 100107.680 | 12813783 | 51255132 | 410041057 | 474109972 |
+
+## Phase B Cohere 1M milestone — scan-boundary correction — 2026-08-25
+
+Warm cache; Apple M5 Max, arm64; 100 queries; 3 timed samples/query. Existing
+q14 index reused; search-only rerun. Funnel and recall: machine-independent.
+Latency: ARM context. qoff run `20260824_225312_search.json`; corrected q14 run
+`20260825_000346_search.json`.
+
+### No-op-filter diagnostic
+
+| observation | value |
+|---|---:|
+| scan `n` / `k` | 10 / 10 |
+| built / active levels | 2 / 2 |
+| κ1 / κ2 | 2.0 / 4.0 |
+| boundary ordering | k-th largest, descending `total_cmp` |
+| sampled boundary triples | 5 |
+| sampled σ before correction | +∞ (5/5) |
+| sampled pessimistic k-th before correction | −∞ (5/5) |
+| GATE-B candidates / plane-1 survivors / final survivors | 40 / 13 / 12 |
+| corrected SQL `plane1_survivors < plane1_scored` | 1 / 1 |
+
+One corrected, single-segment release trace at probe `0.005`:
+
+| n / k | candidates | κ | k-th score-array index | candidate index | k-th | pessimistic k-th |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 / 10 | 5068 | 2.0 | 3080 | 182 | 0.6131382 | 0.5880196 |
+
+| sample | estimate | σ | pessimistic k-th |
+|---:|---:|---:|---:|
+| 0 | 0.8746773 | 0.011934095 | 0.5880196 |
+| 1 | 0.7557364 | 0.011511161 | 0.5880196 |
+| 2 | 0.65699345 | 0.012209922 | 0.5880196 |
+| 3 | 0.6537816 | 0.013359199 | 0.5880196 |
+| 4 | 0.66829735 | 0.012743186 | 0.5880196 |
+
+### Corrected q14 funnel means
+
+| point | probe | recall | plane-1 scored | plane-1 survivors | refinements scored | rerank rows | s1 | s2 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| r95 | 0.0141 | 0.954000 | 14188.320 | 199.030 | 199.030 | 18.050 | 0.014027735 | 0.001272173 |
+| r99 max tested | 0.1000 | 0.978000 | 100107.680 | 201.830 | 201.830 | 18.330 | 0.002016129 | 0.000183103 |
+
+### Corrected matched-probe attribution
+
+| probe | qoff recall vs GT | q14 recall vs GT | candidate recall ratio | product recall | final recall | product-final gap |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.0050 | 0.897000 | 0.897000 | 1.000000000 | 0.897000 | 0.897000 | 0.000000000 |
+| 0.0109 | 0.948000 | 0.944000 | 0.995780591 | 0.944000 | 0.944000 | 0.000000000 |
+| 0.0141 | 0.958000 | 0.954000 | 0.995824635 | 0.954000 | 0.954000 | 0.000000000 |
+| 0.1000 | 0.993000 | 0.978000 | 0.984894260 | 0.978000 | 0.978000 | 0.000000000 |
+
+### Corrected iso-recall performance
+
+| point | qoff probe | q14 probe | qoff recall | q14 recall | qoff p50 ms | q14 p50 ms | qoff p99 ms | q14 p99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| r90 | 0.0050 | 0.0050 | 0.897000 | 0.897000 | 2.529667 | 36.816083 | 3.710166 | 40.393167 |
+| r95 | 0.0109 | 0.0141 | 0.948000 | 0.954000 | 5.384084 | 64.699333 | 6.789792 | 72.691541 |
+| r99 max tested | 0.1000 | 0.1000 | 0.993000 | 0.978000 | 39.936209 | 543.447333 | 42.528125 | 595.358916 |
+
+### Build economics (unchanged builds)
+
+| profile | build s | index bytes | index GiB |
+|---|---:|---:|---:|
+| qoff | 99.694642 | 8693366784 | 8.096 |
+| q14 | 139.525476 | 9347932160 | 8.706 |
+| q14 − qoff | +39.830834 (+39.952834%) | +654565376 (+7.529481%) | +0.610 |
+
+### Corrected bytes ledger
+
+| schedule | probe | plane-1 rows | refinement rows | rerank rows | plane-1 bytes | refinement bytes | rerank bytes | total bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| [1,4] | 0.0050 | 5093.390 | 190.460 | 17.710 | 651954 | 97516 | 72540 | 822010 |
+| [1,4] | 0.0109 | 10983.920 | 197.110 | 17.880 | 1405942 | 100920 | 73236 | 1580099 |
+| [1,4] | 0.0141 | 14188.320 | 199.030 | 18.050 | 1816105 | 101903 | 73933 | 1991941 |
+| [1,4] | 0.0183 | 18399.820 | 199.650 | 18.190 | 2355177 | 102221 | 74506 | 2531904 |
+| [1,4] | 0.0308 | 30902.870 | 201.090 | 18.330 | 3955567 | 102958 | 75080 | 4133605 |
+| [1,4] | 0.0872 | 87313.500 | 201.790 | 18.340 | 11176128 | 103316 | 75121 | 11354565 |
+| [1,4] | 0.1000 | 100107.680 | 201.830 | 18.330 | 12813783 | 103337 | 75080 | 12992200 |
