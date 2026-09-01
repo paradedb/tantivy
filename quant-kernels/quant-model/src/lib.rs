@@ -10,8 +10,11 @@ pub mod f16;
 /// A symmetric Lloyd-Max grid for one coordinate of a point on a `d`-sphere.
 #[derive(Clone, Debug)]
 pub struct Grid {
+    /// Quantizer width.
     pub bits: u8,
+    /// Reconstruction points.
     pub points: Vec<f32>,
+    /// Normalized root-mean-square error.
     pub rho_model: f64,
 }
 
@@ -43,8 +46,11 @@ fn rho_from_samples(samples: &[(f64, f64)], points: &[f64]) -> f64 {
     (error / energy).sqrt()
 }
 
-/// Evaluate the exact-density normalized RMSE of persisted reconstruction
-/// points without rerunning the Lloyd-Max solver.
+/// Evaluates normalized RMSE for persisted reconstruction points.
+///
+/// # Panics
+///
+/// Panics when `d < 64` or `points` does not contain a power-of-two grid.
 pub fn rho_model_for_points(d: usize, points: &[f32]) -> f64 {
     assert!(d >= 64);
     assert!(points.len() >= 2 && points.len().is_power_of_two());
@@ -54,6 +60,10 @@ pub fn rho_model_for_points(d: usize, points: &[f32]) -> f64 {
 }
 
 /// Build an exact-density Lloyd-Max grid for a dimension-normalized sphere marginal.
+///
+/// # Panics
+///
+/// Panics when `d < 64` or `bits` is outside `1..=8`.
 pub fn build_grid(d: usize, bits: u8) -> Grid {
     assert!(d >= 64);
     assert!((1..=8).contains(&bits));
@@ -84,7 +94,6 @@ pub fn build_grid(d: usize, bits: u8) -> Grid {
                 points[i] = next;
             }
         }
-        // Preserve exact antisymmetry and keep format generation deterministic.
         for i in 0..count / 2 {
             let magnitude = (points[count - 1 - i] - points[i]) * 0.5;
             points[i] = -magnitude;
@@ -105,12 +114,15 @@ pub fn build_grid(d: usize, bits: u8) -> Grid {
 }
 
 /// One-sided standard-normal tail probability for an interval miss.
+///
+/// # Panics
+///
+/// Panics when `kappa` is negative or non-finite.
 pub fn kappa_miss(kappa: f64) -> f64 {
     assert!(kappa.is_finite() && kappa >= 0.0);
     0.5 * erfc(kappa / 2.0_f64.sqrt())
 }
 
-// Numerical Recipes approximation, with maximum absolute error below 1.2e-7.
 fn erfc(x: f64) -> f64 {
     let z = x.abs();
     let t = 1.0 / (1.0 + 0.5 * z);
@@ -133,11 +145,20 @@ fn erfc(x: f64) -> f64 {
 }
 
 /// Isotropic dot-product error for unit-norm operands.
+///
+/// # Panics
+///
+/// Panics when `rho` is negative or `d` is zero.
 pub fn isotropic_sigma(rho: f64, d: usize) -> f64 {
     assert!(rho >= 0.0 && d > 0);
     rho / (d as f64).sqrt()
 }
 
+/// Returns the root-mean-square error between estimates and truths.
+///
+/// # Panics
+///
+/// Panics when the slices differ in length or are empty.
 pub fn empirical_sigma(estimates: &[f32], truths: &[f32]) -> f64 {
     assert_eq!(estimates.len(), truths.len());
     assert!(!estimates.is_empty());

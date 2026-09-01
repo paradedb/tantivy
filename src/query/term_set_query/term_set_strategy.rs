@@ -64,7 +64,7 @@ impl TryFrom<u8> for StrategyTag {
 }
 
 /// User-tunable density thresholds for `BitsetFromPostings`. Defaults are bench-calibrated
-/// against the SSTable backend (see [`select_strategy`] for the
+/// against the SSTable backend (see `select_strategy` for the
 /// cost-model reasoning) and overridable via the
 /// `paradedb.term_set_*_max_density` GUCs at the consumer side.
 ///

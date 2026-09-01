@@ -22,7 +22,7 @@ use crate::schema::{Type, ValueBytes};
 use crate::{DocId, DocSet, Order, Score, TantivyError, Term};
 
 #[derive(Clone, Debug)]
-/// `FastFieldRangeQuery` is the same as [RangeQuery] but only uses the fast field
+/// Range query over a fast field.
 pub struct FastFieldRangeQuery {
     bounds: BoundsRange<Term>,
 }

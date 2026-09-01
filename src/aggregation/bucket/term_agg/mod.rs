@@ -336,8 +336,8 @@ impl TermsAggregationInternal {
     }
 }
 
-/// Threshold for using dense `Vec` storage ([`VecTermBuckets`] or
-/// [`VecTermBucketsWithLanes`]) for term buckets. Below this many term ordinals the `Vec`
+/// Threshold for using dense `Vec` storage (`VecTermBuckets` or
+/// `VecTermBucketsWithLanes`) for term buckets. Below this many term ordinals the `Vec`
 /// (direct-indexed, no hashing/paging) beats the paged/hashed storages. It preallocates
 /// `num_terms` slots, so the ceiling also bounds its memory.
 ///
@@ -348,16 +348,16 @@ pub const MAX_NUM_TERMS_FOR_VEC: u64 = 20_000;
 const MAX_NUM_BUCKETS_FOR_COUNT_LANES: usize = 100;
 
 /// Threshold below which a terms agg without sub-aggregations uses
-/// [`VecTermBucketsWithLanes`], whose independent count lanes improve throughput when many
+/// `VecTermBucketsWithLanes`, whose independent count lanes improve throughput when many
 /// consecutive values address the same few counters. With sub-aggregations, this threshold selects
-/// [`LowCardSubAggBuffer`] (which buffers docs in a per-bucket `Vec`) while retaining scalar term
+/// `LowCardSubAggBuffer` (which buffers docs in a per-bucket `Vec`) while retaining scalar term
 /// counters. Both specialized layouts only pay off for a handful of buckets, so this is far lower
 /// than [`MAX_NUM_TERMS_FOR_VEC`]. This threshold is tuned independently from
-/// [`MAX_NUM_BUCKETS_FOR_COUNT_LANES`].
+/// `MAX_NUM_BUCKETS_FOR_COUNT_LANES`.
 pub const MAX_NUM_TERMS_FOR_LOWCARD_SUBAGG: u64 = 100;
 
-/// Threshold for using [`PagedTermMap`] storage; larger term-id spaces use
-/// [`HashMapTermBuckets`] instead.
+/// Threshold for using `PagedTermMap` storage; larger term-id spaces use
+/// `HashMapTermBuckets` instead.
 pub const MAX_NUM_TERMS_FOR_PAGED_MAP: u64 = 8_000_000;
 
 /// Above this term count, generate sub-aggregation bucket IDs on first use to avoid IDs for unseen

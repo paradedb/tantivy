@@ -1,11 +1,5 @@
-//! IVF-format merge routine.
-//!
-//! The IVF format is one of two storage modes the unified
-//! [`VectorPlugin`](crate::vector::VectorPlugin) can produce per merge.
-//! This module exposes the merge body so the parent plugin can call it
-//! after the threshold check.
+//! IVF merge-time clustering and vector encoding.
 
-use std::cmp::Ordering;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(test)]
 use std::ops::Range;
@@ -31,10 +25,17 @@ use crate::directory::{CompositeWrite, Directory, TempFilePtr};
 use crate::index::SegmentComponent;
 use crate::indexer::segment_updater::CancelSentinel;
 use crate::plugin::PluginMergeContext;
-use crate::schema::{Field, FieldType, Metric, VectorDType, VectorOptions};
-use crate::vector::distance::{l2_squared, maybe_normalize_bytes, NormalizeOutcome};
+#[cfg(test)]
+use crate::schema::Metric;
+use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
+#[cfg(test)]
+use crate::vector::distance::l2_squared;
+use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
-use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT, HEADER_LEN};
+use crate::vector::header::{
+    centroid_slot, write_centroid_header, write_vector_header, CentroidSlot, VectorSlot, CURRENT,
+    HEADER_LEN,
+};
 use crate::vector::{
     quantized_code_stride, residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig,
     RelativeNeighborhoodGraph, VectorQuantizationConfig, QUANTIZED_CODE_ALIGNMENT,
@@ -49,8 +50,7 @@ struct AssignedVector {
     source_doc_id: DocId,
 }
 
-/// A multi-threaded [`Executor`] when the host has the parallelism, the
-/// single-threaded one otherwise.
+/// Returns an executor sized to host parallelism.
 fn build_executor(name: &'static str) -> crate::Result<Executor> {
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -72,10 +72,7 @@ struct IvfBuildTimings {
     quantize: Duration,
 }
 
-/// Deterministic logical byte layout for one quantized slot. Offsets include
-/// every IVF cluster boundary, including repeated offsets for empty postings;
-/// `total_bytes` is the final boundary. Alignment trailers live outside the
-/// slot payload and are therefore intentionally absent from this table.
+/// Logical byte layout for one quantized slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QuantizedSlotLayout {
     row_stride: usize,
@@ -137,10 +134,7 @@ struct QuantizedLayerLayout {
     constants: Option<QuantizedSlotLayout>,
 }
 
-/// Complete per-field quantized payload table, frozen before the first row is
-/// encoded. The streaming writer uses it both to size each temp slot and to
-/// prove that every cluster ended at the byte boundary implied by its posting
-/// size and fixed row stride.
+/// Per-field quantized slot layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QuantizedWriteLayout {
     layers: Vec<QuantizedLayerLayout>,
@@ -191,10 +185,7 @@ impl QuantizedWriteLayout {
     }
 }
 
-/// One merge-local spill file outside the directory's persistent WORM
-/// namespace. The concrete directory owns cleanup semantics: PostgreSQL uses
-/// a resource-owned `BufFile`, mmap uses an OS temporary file, and tests use a
-/// seekable in-memory cursor.
+/// Merge-local spill file for one quantized slot.
 struct QuantizedTempSlot {
     file: TempFilePtr,
     expected_len: usize,
@@ -231,9 +222,6 @@ impl QuantizedTempSlot {
         self.file.seek(SeekFrom::Start(0))?;
         let mut chunk = vec![0_u8; 1 << 20];
         loop {
-            // Poll before every 1 MiB read so cancellation never requires
-            // copying the rest of a potentially field-sized slot into the
-            // composite destination.
             if cancel.wants_cancel() {
                 return Err(TantivyError::Cancelled);
             }
@@ -361,22 +349,22 @@ impl QuantizedTempSlots {
         cancel: &dyn CancelSentinel,
     ) -> crate::Result<()> {
         self.residual_norms.splice_into(
-            vec_write.for_field_with_idx(field, vec_slot::RESIDUAL_NORMS),
+            vec_write.for_field_with_idx(field, VectorSlot::ResidualNorms.index()),
             cancel,
         )?;
         for (layer, temp) in self.layers.iter_mut().enumerate() {
             vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
             temp.codes.splice_into(
-                vec_write.for_field_with_idx(field, vec_slot::quantized_codes(layer)),
+                vec_write.for_field_with_idx(field, VectorSlot::codes(layer).index()),
                 cancel,
             )?;
             temp.sidecar.splice_into(
-                vec_write.for_field_with_idx(field, vec_slot::quantized_sidecar(layer)),
+                vec_write.for_field_with_idx(field, VectorSlot::sidecar(layer).index()),
                 cancel,
             )?;
             if let Some(constants) = temp.constants.as_mut() {
                 constants.splice_into(
-                    vec_write.for_field_with_idx(field, vec_slot::quantized_constants(layer)),
+                    vec_write.for_field_with_idx(field, VectorSlot::constants(layer).index()),
                     cancel,
                 )?;
             }
@@ -397,8 +385,6 @@ fn write_u16_run_cancellable(
     values: &[u16],
     cancel: &dyn CancelSentinel,
 ) -> crate::Result<()> {
-    // Match the 1 MiB splice polling granularity. This check remains outside
-    // the per-row loop: a chunk contains at most 524,288 binary16 values.
     const VALUES_PER_CANCEL_POLL: usize = (1024 * 1024) / std::mem::size_of::<u16>();
     for chunk in values.chunks(VALUES_PER_CANCEL_POLL) {
         if cancel.wants_cancel() {
@@ -475,32 +461,27 @@ fn write_empty_quantized_slots(
     layer_count: usize,
     constants: bool,
 ) -> crate::Result<()> {
-    let writer = vec_write.for_field_with_idx(field, vec_slot::RESIDUAL_NORMS);
+    let writer = vec_write.for_field_with_idx(field, VectorSlot::ResidualNorms.index());
     writer.flush()?;
     for layer in 0..layer_count {
         vec_write.align_next_field(QUANTIZED_CODE_ALIGNMENT, HEADER_LEN)?;
         {
-            let writer = vec_write.for_field_with_idx(field, vec_slot::quantized_codes(layer));
+            let writer = vec_write.for_field_with_idx(field, VectorSlot::codes(layer).index());
             writer.flush()?;
         }
         {
-            let writer = vec_write.for_field_with_idx(field, vec_slot::quantized_sidecar(layer));
+            let writer = vec_write.for_field_with_idx(field, VectorSlot::sidecar(layer).index());
             writer.flush()?;
         }
         if constants {
-            let writer = vec_write.for_field_with_idx(field, vec_slot::quantized_constants(layer));
+            let writer = vec_write.for_field_with_idx(field, VectorSlot::constants(layer).index());
             writer.flush()?;
         }
     }
     Ok(())
 }
 
-/// Write `field`'s slots in both composites as an empty IVF field: empty
-/// Explicit id-map, empty rows, zero centroids, zero docs, and a single
-/// zero cluster offset. Every vector field must own its slots in every
-/// IVF segment — the reader treats a missing slot as corruption — so both
-/// the "sources report no vectors" fast path and the "every vector-bearing
-/// doc is deleted" path write this same shape.
+/// Writes an empty IVF field to both vector composites.
 fn write_empty_field_slots(
     vec_write: &mut CompositeWrite,
     centroids_write: &mut CompositeWrite,
@@ -508,14 +489,13 @@ fn write_empty_field_slots(
     opts: &VectorOptions,
     quantization: Option<&VectorQuantizationConfig>,
 ) -> crate::Result<()> {
-    // `.vec`: empty Explicit id-map + empty rows.
     {
-        let id_map_w = vec_write.for_field_with_idx(field, vec_slot::ID_MAP);
+        let id_map_w = vec_write.for_field_with_idx(field, VectorSlot::IdMap.index());
         IdMap::serialize_explicit(&[], id_map_w)?;
         id_map_w.flush()?;
     }
     {
-        let rows_w = vec_write.for_field_with_idx(field, vec_slot::ROWS);
+        let rows_w = vec_write.for_field_with_idx(field, VectorSlot::Rows.index());
         rows_w.flush()?;
     }
     if let Some(config) = quantization {
@@ -526,20 +506,19 @@ fn write_empty_field_slots(
             config.needs_constants(),
         )?;
     }
-    // `.centroids`: zero centroids, zero docs, single zero offset, and an
-    // empty (but present) bounds slot.
     {
-        let centroids_w = centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
+        let centroids_w =
+            centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
         IvfIndex::serialize_centroids(0, 0, &[], opts, centroids_w)?;
         centroids_w.flush()?;
     }
     {
-        let offsets_w = centroids_write.for_field_with_idx(field, centroid_slot::OFFSETS);
+        let offsets_w = centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
         IvfIndex::serialize_offsets(&[0u64], offsets_w)?;
         offsets_w.flush()?;
     }
     {
-        let bounds_w = centroids_write.for_field_with_idx(field, centroid_slot::BOUNDS);
+        let bounds_w = centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
         IvfIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
         bounds_w.flush()?;
     }
@@ -583,10 +562,10 @@ pub(crate) fn merge_ivf(
         .target_segment
         .relative_path(SegmentComponent::Custom(CENTROIDS_EXT.to_string()));
     let mut vec_file = directory.open_write(&vec_path)?;
-    write_header(&mut vec_file)?;
+    write_vector_header(&mut vec_file)?;
     let mut vec_write = CompositeWrite::wrap(vec_file);
     let mut centroids_file = directory.open_write(&centroids_path)?;
-    write_header(&mut centroids_file)?;
+    write_centroid_header(&mut centroids_file)?;
     let mut centroids_write = CompositeWrite::wrap(centroids_file);
 
     for (field, entry) in ctx.schema.fields() {
@@ -602,7 +581,6 @@ pub(crate) fn merge_ivf(
         if let Some(config) = quantization {
             config.validate(opts)?;
         }
-        // Per-segment readers for this field (cached on the SegmentReaders).
         let field_readers: Vec<_> = ctx
             .readers
             .iter()
@@ -660,11 +638,6 @@ pub(crate) fn merge_ivf(
                     target_doc_id += 1;
                 }
                 debug_assert_eq!(target_doc_id, num_target_docs);
-                // Rows written for docs deleted afterwards still count toward
-                // the sources' `count()` (neither layout rewrites `.vec` on
-                // delete), so the alive-doc walk can come up short of
-                // `vector_count` — never over. Equality holds exactly when no
-                // source carries deletes.
                 debug_assert!(
                     if ctx.readers.iter().any(|reader| reader.has_deletes()) {
                         present_vector_ord <= vector_count
@@ -675,13 +648,6 @@ pub(crate) fn merge_ivf(
                      source count()"
                 );
                 if training_doc_ids.is_empty() {
-                    // `vector_count > 0`, yet the alive-doc walk found
-                    // nothing to sample: every vector-bearing doc was
-                    // deleted. Write the same empty slots as the
-                    // no-vectors fast path — skipping the field would
-                    // leave its slots missing from composites the other
-                    // fields still write, and the reader errors on
-                    // missing slots.
                     write_empty_field_slots(
                         &mut vec_write,
                         &mut centroids_write,
@@ -800,10 +766,6 @@ pub(crate) fn merge_ivf(
                             if batch_doc_ids.is_empty() {
                                 return Ok(());
                             }
-                            // Poll for cancellation once per batch so a large
-                            // assign phase (minutes on a big segment) stays
-                            // interruptible instead of only checking at phase
-                            // boundaries.
                             if ctx.cancel.wants_cancel() {
                                 return Err(TantivyError::Cancelled);
                             }
@@ -873,9 +835,6 @@ pub(crate) fn merge_ivf(
                     flush_assign_batch(&mut batch_values, &mut batch_doc_ids, &mut batch_sources)?;
                 }
                 debug_assert_eq!(target_doc_id, num_target_docs);
-                // Same alive-doc walk as the training pass above — it must
-                // have found the same vectors (deletes make both fall short
-                // of `vector_count` together, so compare them to each other).
                 debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
                 // The `.centroids` doc count: one posting row per document.
                 let num_present_docs = assigned_vectors.len();
@@ -896,26 +855,12 @@ pub(crate) fn merge_ivf(
                     cluster_offsets.push(next_offset);
                 }
 
-                // `.centroids` slot [0] payload, built BEFORE the posting
-                // rows so the bounds fold below measures residuals against
-                // the STORED centroid. K-means cluster means are not
-                // unit-norm; for Cosine+F32 normalize each centroid here so
-                // the search path can score both docs and centroids with
-                // the same `dot * inv_norm_q` fast kernel.
                 let mut centroid_bytes =
                     Vec::with_capacity(num_centroids * opts.bytes_per_vector());
-                // `BoundsBuilder` is the only producer of bounds. The
-                // fold runs over THIS merge's re-assignment output against
-                // the NEW centroids — combining the sources' stored bounds
-                // would be unsound (their centroids no longer exist), which
-                // is why no bound-combining API exists.
                 let mut bounds_builder = BoundsBuilder::new(num_centroids);
                 let mut stored_centroid = Vec::with_capacity(opts.dim());
                 for (centroid_ord, centroid) in centroid_rows.iter().enumerate() {
                     let mut bytes = encode_vector(centroid, opts.dim())?;
-                    // Centroids are means of ingest-validated rows, so
-                    // NonFinite is should-never-happen; same warn-and-write
-                    // policy as the posting rows below.
                     let outcome = maybe_normalize_bytes(opts, &mut bytes);
                     if outcome == NormalizeOutcome::NonFinite {
                         log::warn!(
@@ -926,11 +871,6 @@ pub(crate) fn merge_ivf(
                     }
                     stored_centroid.clear();
                     decode_row_append::<f32>(&bytes, opts.dim(), &mut stored_centroid)?;
-                    // A degenerate centroid — non-finite, or zero-norm under
-                    // cosine renormalization — anchors no residual geometry:
-                    // SATURATE, so the cluster always probes. (A non-finite
-                    // centroid would also self-saturate through non-finite
-                    // residuals, but only if the cluster has members.)
                     if outcome != NormalizeOutcome::Normalized
                         || stored_centroid.iter().any(|value| !value.is_finite())
                     {
@@ -940,10 +880,8 @@ pub(crate) fn merge_ivf(
                 }
 
                 let posting_start = Instant::now();
-                // `.vec` slot [0]: the row→doc_id permutation (Explicit), in
-                // cluster-sorted row order — parallel to the rows in slot [1].
                 {
-                    let id_map_w = vec_write.for_field_with_idx(field, vec_slot::ID_MAP);
+                    let id_map_w = vec_write.for_field_with_idx(field, VectorSlot::IdMap.index());
                     let row_doc_ids: Vec<DocId> = assigned_vectors
                         .iter()
                         .map(|assigned_vector| assigned_vector.target_doc_id)
@@ -952,14 +890,9 @@ pub(crate) fn merge_ivf(
                     id_map_w.flush()?;
                 }
 
-                // `.vec` slot [1]: the cluster-sorted vector rows.
                 {
-                    // Poll for cancellation every this-many rows during the
-                    // posting-write phase — often enough to stay responsive,
-                    // rare enough to keep the FFI cancel check off the per-row
-                    // path.
                     const CANCEL_POLL_ROWS: usize = 4096;
-                    let rows_w = vec_write.for_field_with_idx(field, vec_slot::ROWS);
+                    let rows_w = vec_write.for_field_with_idx(field, VectorSlot::Rows.index());
                     let needs_norm = opts.needs_normalization();
                     let mut row_buf: Vec<u8> = Vec::with_capacity(opts.bytes_per_vector());
                     for (row_idx, assigned_vector) in assigned_vectors.iter().enumerate() {
@@ -975,21 +908,6 @@ pub(crate) fn merge_ivf(
                                     assigned_vector.source_doc_id
                                 ))
                             })?;
-                        // Sources are already unit-normalized at ingest for
-                        // Cosine+F32 (see `FlatVecWriter`), but re-normalize on
-                        // the way into the cluster rows so the IVF invariant —
-                        // the query path scores pre-normalized rows — holds
-                        // locally, even for a source segment written before
-                        // ingest-time normalization existed. Idempotent. L2/Dot
-                        // don't normalize and write the source bytes directly;
-                        // Cosine+F32 copies into one buffer reused across rows.
-                        //
-                        // Ingest rejects non-finite vectors, so NonFinite here
-                        // is a should-never-happen path: erroring would wedge
-                        // merge retries forever on one poison doc, and dropping
-                        // the row would desync the already-computed assignments
-                        // and IdMap. Warn-and-write-as-is is visible,
-                        // self-limiting, and non-desyncing.
                         let written_bytes: &[u8] = if needs_norm {
                             row_buf.clear();
                             row_buf.extend_from_slice(&bytes);
@@ -1034,22 +952,11 @@ pub(crate) fn merge_ivf(
                 if let Some(config) = quantization {
                     let quantize_start = Instant::now();
                     let (specs, grids) = quantization_runtime(config, opts)?;
-                    // Freeze every quantized slot's cluster-byte table before
-                    // opening spill files or encoding the first row.
                     let quantized_layout = QuantizedWriteLayout::build(config, &cluster_offsets)?;
                     let rotation_plan = Arc::new(QueryRotationPlan::new(opts.dim(), &specs));
                     let mut centroid_workspace = PreparedCentroidWorkspace::new(rotation_plan);
                     let mut temp_slots = QuantizedTempSlots::create(directory, &quantized_layout)?;
 
-                    // Two row-major f32 tile buffers live in the cascade
-                    // encoder. Rotation and grid packing reuse d-sized
-                    // transient buffers across every row in the tile. Include
-                    // the tile's encoded output and f64 prefix accumulators in
-                    // the cap rather than accounting only for rotations. The
-                    // deferred binary16 gamma and corrected-error runs below are
-                    // deliberately one-cluster storage-order buffers (4 bytes
-                    // per row per layer), not tile scratch; include them
-                    // separately in the peak-memory ledger.
                     const MAX_QUANTIZATION_SCRATCH_BYTES: usize = 1 << 20;
                     let row_bytes = opts.dim() * std::mem::size_of::<f32>();
                     let fixed_scratch = row_bytes
@@ -1142,10 +1049,6 @@ pub(crate) fn merge_ivf(
                                 &mut encode_workspace,
                                 config.needs_constants(),
                             );
-                            // Slot 2 is the same binary32 radius value used as
-                            // gamma's numerator and E's denominator. Do not
-                            // recompute it through a second distance path with
-                            // an independently chosen accumulation order.
                             write_f32_run(
                                 &mut temp_slots.residual_norms,
                                 &batch.residual_norms_squared,
@@ -1172,10 +1075,6 @@ pub(crate) fn merge_ivf(
                             .zip(&cluster_gammas)
                             .zip(&cluster_error_ratios)
                         {
-                            // A cluster may be much larger than the scratch
-                            // tile. Poll before and during its deferred runs;
-                            // scales were already emitted tile-by-tile behind
-                            // the tile-level cancellation check.
                             write_u16_run_cancellable(&mut target.sidecar, gammas, ctx.cancel)?;
                             write_u16_run_cancellable(
                                 &mut target.sidecar,
@@ -1191,7 +1090,7 @@ pub(crate) fn merge_ivf(
 
                 {
                     let centroids_w =
-                        centroids_write.for_field_with_idx(field, centroid_slot::CENTROIDS);
+                        centroids_write.for_field_with_idx(field, CentroidSlot::Centroids.index());
                     IvfIndex::serialize_centroids(
                         num_centroids,
                         num_present_docs,
@@ -1203,14 +1102,13 @@ pub(crate) fn merge_ivf(
                 }
                 {
                     let offsets_w =
-                        centroids_write.for_field_with_idx(field, centroid_slot::OFFSETS);
+                        centroids_write.for_field_with_idx(field, CentroidSlot::Offsets.index());
                     IvfIndex::serialize_offsets(&cluster_offsets, offsets_w)?;
                     offsets_w.flush()?;
                 }
-                // `.centroids` slot [3]: the per-cluster centroid bounds
-                // this merge's fold produced.
                 {
-                    let bounds_w = centroids_write.for_field_with_idx(field, centroid_slot::BOUNDS);
+                    let bounds_w =
+                        centroids_write.for_field_with_idx(field, CentroidSlot::Bounds.index());
                     IvfIndex::serialize_bounds(
                         BoundKind::Ball,
                         &bounds_builder.finish(),
@@ -1273,7 +1171,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::directory::{DirectoryClone, ManagedDirectory, RamDirectory};
+    use crate::directory::{ManagedDirectory, RamDirectory};
     use crate::index::IndexSettings;
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
@@ -1282,8 +1180,8 @@ mod tests {
     use crate::vector::prepared::{QuantizedIndexCtx, QuantizedQueryCtx};
     use crate::vector::tests::ground_truth;
     use crate::vector::{
-        TopDocsByVectorSimilarity, VectorCalibrationMeasurements, VectorErrorAuditQuery,
-        VectorQuantizationCalibrationSource, VectorQuantizationLayer,
+        TopDocsByVectorSimilarity, VectorEstimatorMeasurements, VectorEstimatorQuery,
+        VectorEstimatorSource, VectorQuantizationLayer,
     };
     use crate::{Index, TantivyDocument};
 
@@ -1315,8 +1213,6 @@ mod tests {
     #[test]
     fn quantized_layout_is_exact_for_odd_d_empty_cluster_l2_1_plus_4() -> crate::Result<()> {
         let config = quant_fixture_config_for(100, Metric::L2, &[1, 4]);
-        // Three postings with row counts [2, 0, 3]. The repeated middle
-        // boundary is the empty-cluster contract.
         let posting_offsets = [0_u64, 2, 2, 5];
         let layout = QuantizedWriteLayout::build(&config, &posting_offsets)?;
         assert_eq!(
@@ -1370,7 +1266,6 @@ mod tests {
         assert_eq!(logical_total, 5 * config.bytes_per_row());
         assert_eq!(logical_total, 500);
 
-        // Exercise the production boundary validator against the same table.
         let backing = RamDirectory::create();
         let directory = ManagedDirectory::wrap(Box::new(backing))?;
         let mut temps = QuantizedTempSlots::create(&directory, &layout)?;
@@ -1453,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn quantization_merge_source_has_no_calibration_or_analysis_entrypoint() {
+    fn quantization_merge_source_has_no_estimator_analysis_entrypoint() {
         let source = include_str!("plugin.rs");
         let test_module_start = source
             .rfind("\n#[cfg(test)]\nmod tests {")
@@ -1463,13 +1358,10 @@ mod tests {
             "build_grid(",
             "audit_prefix_error_model(",
             "prepare_fp_query(",
-            "vector_calibrate(",
-            "VectorCalibrationMeasurements",
             "audit_error",
             "diagnostic_error",
-            "persist_fixture_calibration",
-            "VectorErrorAuditQuery",
-            ".calibration()",
+            "VectorEstimatorMeasurements",
+            "VectorEstimatorQuery",
         ] {
             assert!(
                 !production_source.contains(forbidden),
@@ -1601,7 +1493,7 @@ mod tests {
         }
     }
 
-    fn fixture_calibration_queries_for(metric: Metric, dim: usize) -> Vec<Vec<f32>> {
+    fn fixture_estimator_queries_for(metric: Metric, dim: usize) -> Vec<Vec<f32>> {
         (0..4)
             .map(|query| match metric {
                 Metric::L2 => {
@@ -1627,101 +1519,41 @@ mod tests {
             .collect()
     }
 
-    fn fixture_calibration_queries(dim: usize) -> Vec<Vec<f32>> {
-        fixture_calibration_queries_for(Metric::L2, dim)
+    fn fixture_estimator_queries(dim: usize) -> Vec<Vec<f32>> {
+        fixture_estimator_queries_for(Metric::L2, dim)
     }
 
-    fn diagnostic_error_measurements(
+    fn estimator_measurements(
         vector_reader: &crate::vector::VectorIndexReader,
         queries: &[Vec<f32>],
         sample_rows: usize,
         alive: Option<&crate::fastfield::AliveBitSet>,
-    ) -> crate::Result<Option<VectorCalibrationMeasurements>> {
+    ) -> crate::Result<Option<VectorEstimatorMeasurements>> {
         let queries = queries
             .iter()
             .cloned()
-            .map(|values| VectorErrorAuditQuery {
+            .map(|values| VectorEstimatorQuery {
                 values,
                 excluded_doc_id: None,
             })
             .collect::<Vec<_>>();
-        Ok(vector_reader
-            .audit_error_queries(
-                VectorQuantizationCalibrationSource::RealQuery,
-                &queries,
-                sample_rows,
-                alive,
-            )?
-            .map(|measurements| measurements.calibration))
+        Ok(vector_reader.measure_estimator_queries(
+            VectorEstimatorSource::Provided,
+            &queries,
+            sample_rows,
+            alive,
+        )?)
     }
 
-    fn persist_fixture_calibration_for(
-        mut index: Index,
-        dim: usize,
-        metric: Metric,
-    ) -> crate::Result<Index> {
-        let reader = index.reader()?;
-        reader.reload().map_err(|error| {
-            TantivyError::InternalError(format!("calibration fixture reload failed: {error}"))
-        })?;
-        let field = index.schema().get_field("embedding")?;
-        let queries = fixture_calibration_queries_for(metric, dim);
-        let mut measurements = VectorCalibrationMeasurements::default();
-        for segment in reader.searcher().segment_readers() {
-            if let Some(segment_measurements) = diagnostic_error_measurements(
-                segment.vector_index(field)?.as_ref(),
-                &queries,
-                1_000,
-                segment.alive_bitset(),
-            )
-            .map_err(|error| {
-                TantivyError::InternalError(format!(
-                    "calibration fixture measurement failed: {error}"
-                ))
-            })? {
-                measurements.merge(&segment_measurements)?;
-            }
-        }
-        let calibration = measurements.finish(
-            VectorQuantizationCalibrationSource::RealQuery,
-            "REAL_QUERY_EXACT_E_BQ4",
-        )?;
-        let previous = index.load_metas()?;
-        let mut updated = index.load_metas()?;
-        updated.index_settings.vector_quantization[0]
-            .install_real_query_calibration(calibration)?;
-        crate::indexer::segment_updater::save_metas(&updated, &previous, index.directory())?;
-        let reopened = Index::open(index.directory().box_clone()).map_err(|error| {
-            TantivyError::InternalError(format!("calibration fixture reopen failed: {error}"))
-        })?;
-        assert_eq!(
-            reopened.settings().vector_quantization[0].calibration(),
-            updated.index_settings.vector_quantization[0].calibration()
-        );
-        *index.settings_mut() = reopened.settings().clone();
-        Ok(index)
+    fn build_quantized_fixture_with_schedule(dim: usize, quantized: bool) -> crate::Result<Index> {
+        build_quantized_fixture_case(dim, Metric::L2, &[1, 4], quantized)
     }
 
-    fn build_quantized_fixture_with_calibration(
-        dim: usize,
-        quantized: bool,
-        calibrated: bool,
-    ) -> crate::Result<Index> {
-        build_quantized_fixture_case_with_calibration(
-            dim,
-            Metric::L2,
-            &[1, 4],
-            quantized,
-            calibrated,
-        )
-    }
-
-    fn build_quantized_fixture_case_with_calibration(
+    fn build_quantized_fixture_case(
         dim: usize,
         metric: Metric,
         schedule: &[u8],
         quantized: bool,
-        calibrated: bool,
     ) -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
         let field = schema_builder.add_vector_field("embedding", VectorOptions::new(dim, metric));
@@ -1737,10 +1569,7 @@ mod tests {
         let index = Index::builder()
             .schema(schema)
             .settings(settings)
-            .ivf_clusterer(Arc::new(QuantFixtureClusterer {
-                dim,
-                metric,
-            }))
+            .ivf_clusterer(Arc::new(QuantFixtureClusterer { dim, metric }))
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 30_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1761,15 +1590,11 @@ mod tests {
         segments.sort();
         writer.merge(&segments).wait()?;
         writer.wait_merging_threads()?;
-        if quantized && calibrated {
-            persist_fixture_calibration_for(index, dim, metric)
-        } else {
-            Ok(index)
-        }
+        Ok(index)
     }
 
     fn build_quantized_fixture(dim: usize, quantized: bool) -> crate::Result<Index> {
-        build_quantized_fixture_with_calibration(dim, quantized, true)
+        build_quantized_fixture_with_schedule(dim, quantized)
     }
 
     fn build_flat_quantized_fixture(dim: usize) -> crate::Result<Index> {
@@ -2123,6 +1948,25 @@ mod tests {
     }
 
     #[test]
+    fn vector_open_rejects_settings_file_format_mismatch() -> crate::Result<()> {
+        let mut index = build_quantized_fixture(QUANT_FIXTURE_DIM, true)?;
+        let field = index.schema().get_field("embedding")?;
+        index.settings_mut().vector_quantization[0].format_version = 2;
+
+        let searcher = index.reader()?.searcher();
+        let message = match searcher.segment_readers()[0].vector_index(field) {
+            Ok(_) => panic!("mismatched settings and `.vec` formats must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("settings format version 2 does not match `.vec` format version 3")
+                && message.contains("rebuild required"),
+            "unexpected error text: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn level_zero_matches_unquantized_ivf() -> crate::Result<()> {
         const DIM: usize = 64;
         let query = vec![0.05_f32; DIM];
@@ -2357,13 +2201,9 @@ mod tests {
 
         for metric in [Metric::Cosine, Metric::L2] {
             for &schedule in SCHEDULES {
-                // Every cell uses an odd dimension so each metric, schedule,
-                // scenario, and active prefix exercises word-rounded codes.
                 let dim = 100;
 
-                let primary = build_quantized_fixture_case_with_calibration(
-                    dim, metric, schedule, true, true,
-                )?;
+                let primary = build_quantized_fixture_case(dim, metric, schedule, true)?;
                 assert_quantized_matrix_storage(&primary, metric, schedule)?;
                 for scenario in [
                     QuantizedMatrixScenario::None,
@@ -2374,7 +2214,6 @@ mod tests {
                     }
                 }
 
-                // Tombstone one deterministic row in each primary cluster.
                 let label = primary.schema().get_field("label")?;
                 let mut writer: crate::IndexWriter<TantivyDocument> =
                     primary.writer_with_num_threads(1, 30_000_000)?;
@@ -2393,7 +2232,6 @@ mod tests {
                         depth,
                     )?;
                 }
-
             }
         }
         Ok(())
@@ -2498,27 +2336,49 @@ mod tests {
     }
 
     #[test]
-    fn quantized_slots_use_analytical_gamma_without_diagnostics() -> crate::Result<()> {
+    fn estimator_measurement_uses_production_path_and_is_centered() -> crate::Result<()> {
         const DIM: usize = 100;
-        let index = build_quantized_fixture_with_calibration(DIM, true, false)?;
+        let index = build_quantized_fixture_with_schedule(DIM, true)?;
         let reader = index.reader()?;
         reader.reload()?;
         let searcher = reader.searcher();
         let field = index.schema().get_field("embedding")?;
         let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
-        let quantized = vector_reader
-            .quantization()
-            .expect("configured quantized slots must remain available without diagnostics");
-        assert!(quantized.config().calibration().is_none());
-
-        let queries = fixture_calibration_queries(DIM);
-        let measurements =
-            diagnostic_error_measurements(vector_reader.as_ref(), &queries, 1_000, None)?
-                .expect("quantized slots remain available to explicit diagnostics");
+        assert!(vector_reader.quantization().is_some());
+        let queries = fixture_estimator_queries(DIM);
+        let estimator_queries = queries
+            .iter()
+            .cloned()
+            .map(|values| VectorEstimatorQuery {
+                values,
+                excluded_doc_id: None,
+            })
+            .collect::<Vec<_>>();
+        let measurements = vector_reader
+            .measure_estimator_queries(
+                VectorEstimatorSource::Provided,
+                &estimator_queries,
+                1_000,
+                None,
+            )?
+            .expect("quantized slots remain available to explicit diagnostics");
+        assert_eq!(measurements.source(), VectorEstimatorSource::Provided);
+        assert_eq!(measurements.sample_rows(), 8);
+        assert_eq!(measurements.query_count(), queries.len() as u32);
         assert!(measurements
             .aggregate()
             .iter()
             .all(|depth| depth.sample_count == 8 * queries.len() as u64));
+        for (depth, moments) in measurements.aggregate().iter().enumerate() {
+            let bias = moments
+                .bias()
+                .expect("fixture must produce estimator errors");
+            assert!(
+                bias.abs() <= 0.3,
+                "depth {} normalized estimator bias {bias} exceeds 0.3",
+                depth + 1
+            );
+        }
 
         let fruit = searcher.search(
             &AllQuery,
@@ -2536,9 +2396,9 @@ mod tests {
     }
 
     #[test]
-    fn external_calibration_samples_only_live_rows() -> crate::Result<()> {
+    fn estimator_samples_only_live_posting_rows() -> crate::Result<()> {
         const DIM: usize = 100;
-        let index = build_quantized_fixture_with_calibration(DIM, true, false)?;
+        let index = build_quantized_fixture_with_schedule(DIM, true)?;
         let reader = index.reader()?;
         reader.reload()?;
         let searcher = reader.searcher();
@@ -2551,26 +2411,55 @@ mod tests {
             .count();
         assert_eq!(live_posting_rows, 6);
 
-        let queries = fixture_calibration_queries(DIM);
-        let measurements = diagnostic_error_measurements(
-            vector_reader.as_ref(),
-            &queries,
-            usize::MAX,
-            Some(&alive),
-        )?
-        .unwrap();
+        let queries = fixture_estimator_queries(DIM);
+        let measurements =
+            estimator_measurements(vector_reader.as_ref(), &queries, usize::MAX, Some(&alive))?
+                .unwrap();
         assert!(measurements
             .aggregate()
             .iter()
             .all(|depth| { depth.sample_count == (live_posting_rows * queries.len()) as u64 }));
 
         let bounded =
-            diagnostic_error_measurements(vector_reader.as_ref(), &queries, 5, Some(&alive))?
-                .unwrap();
+            estimator_measurements(vector_reader.as_ref(), &queries, 5, Some(&alive))?.unwrap();
         assert!(bounded
             .aggregate()
             .iter()
             .all(|depth| depth.sample_count == (5 * queries.len()) as u64));
+        Ok(())
+    }
+
+    #[test]
+    fn held_out_estimator_excludes_the_source_row() -> crate::Result<()> {
+        const DIM: usize = 100;
+        let index = build_quantized_fixture_with_schedule(DIM, true)?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = segment.vector_index(field)?;
+        let queries = vector_reader
+            .sample_estimator_pseudo_queries(1, segment.alive_bitset())?
+            .expect("quantized fixture must support pseudo-query sampling");
+        assert_eq!(queries.len(), 1);
+        assert!(queries.iter().all(|query| query.excluded_doc_id.is_some()));
+
+        let measurements = vector_reader
+            .measure_estimator_queries(
+                VectorEstimatorSource::HeldOut,
+                &queries,
+                usize::MAX,
+                segment.alive_bitset(),
+            )?
+            .expect("quantized fixture must support estimator measurement");
+        assert_eq!(measurements.source(), VectorEstimatorSource::HeldOut);
+        assert_eq!(measurements.sample_rows(), 16);
+        assert_eq!(measurements.query_count(), 1);
+        assert!(measurements
+            .aggregate()
+            .iter()
+            .all(|moments| moments.sample_count == 14));
         Ok(())
     }
 }

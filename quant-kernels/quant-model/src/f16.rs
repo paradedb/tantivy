@@ -1,10 +1,8 @@
 //! IEEE-754 binary16 conversion with round-to-nearest, ties-to-even.
 
 #[inline(always)]
+/// Converts binary16 bits to binary32.
 pub fn f16_to_f32(value: u16) -> f32 {
-    // Branch-free binary16 expansion. `renorm_shift` normalizes subnormals;
-    // `inf_nan_mask` restores the all-ones exponent; `zero_mask` clears the
-    // synthetic exponent that normalization would otherwise give ±0.
     let word = (value as u32) << 16;
     let sign = word & 0x8000_0000;
     let nonsign = word & 0x7fff_ffff;
@@ -18,6 +16,7 @@ pub fn f16_to_f32(value: u16) -> f32 {
     f32::from_bits(sign | magnitude)
 }
 
+/// Converts binary32 to binary16 bits.
 pub fn f32_to_f16(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Configuration for a plugin-defined field type.
 ///
 /// Custom field types are opaque to tantivy's built-in components: they are never indexed,
-/// stored, or turned into fast fields by the built-ins. A [`SegmentPlugin`] consumes the
+/// stored, or turned into fast fields by the built-ins. A segment plugin consumes the
 /// field's values by matching on [`type_name`](Self::type_name) in the schema and writes its
 /// own segment files.
 ///

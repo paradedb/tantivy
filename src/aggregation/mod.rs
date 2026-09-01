@@ -172,7 +172,7 @@ use crate::tokenizer::TokenizerManager;
 /// This allows to have a single AggregationCollector instance per aggregation,
 /// that can handle multiple buckets efficiently.
 ///
-/// The API to call sub-aggregations is therefore a &[(BucketId, &[DocId])].
+/// The API to call sub-aggregations is therefore `&[(BucketId, &[DocId])]`.
 /// For that we'll need a buffer. One Vec per bucket aggregation is needed.
 pub type BucketId = u32;
 

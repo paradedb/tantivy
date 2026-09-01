@@ -170,7 +170,7 @@ impl SSTable for RangeSSTable {
     type ValueWriter = RangeValueWriter;
 }
 
-/// SSTable associating keys to Vec<u32>.
+/// SSTable associating keys to `Vec<u32>`.
 pub struct VecU32ValueSSTable;
 
 impl SSTable for VecU32ValueSSTable {

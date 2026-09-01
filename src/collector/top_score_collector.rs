@@ -457,7 +457,7 @@ impl TopDocs {
     /// // The `Score` in the pair is our tweaked score.
     /// let resulting_docs: Vec<(Score, DocAddress)> =
     ///      searcher.search(&query, &top_docs_by_custom_score).unwrap();
-    /// ``
+    /// ```
     pub fn tweak_score<F, TSortKey>(
         self,
         sort_key_fn: F,

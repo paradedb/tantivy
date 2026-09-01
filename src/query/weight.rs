@@ -69,7 +69,7 @@ pub trait Weight: Send + Sync + 'static {
     /// initial score threshold below which documents may be pruned.
     ///
     /// The default implementation wraps [`Weight::scorer`] in a
-    /// [`BasicPruningScorer`], which simply filters out `(doc, score)` pairs
+    /// `BasicPruningScorer`, which simply filters out `(doc, score)` pairs
     /// below the current threshold. Scorers that can prune more aggressively
     /// (e.g. BlockWAND over a union or intersection) override this.
     fn pruning_scorer(

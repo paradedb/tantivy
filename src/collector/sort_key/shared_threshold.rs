@@ -18,7 +18,7 @@ pub trait SharedThreshold<T>: Send + Sync {
     /// successfully pushed a document yet).
     ///
     /// Among documents with the same sort key, we favor those from segments with a lower ordinal.
-    /// This is consistent with the tie-breaking behavior of [`DocAddress`], which ensures
+    /// This matches the `DocAddress` tie-breaking behavior and ensures
     /// stable sorting across multiple segments.
     fn load(&self) -> Option<(T, SegmentOrdinal)>;
 

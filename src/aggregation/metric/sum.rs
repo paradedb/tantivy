@@ -76,7 +76,7 @@ impl IntermediateSum {
     /// behavior of `IntermediateMin`, `IntermediateMax`, and
     /// `IntermediateAvg`. The Elasticsearch-vs-SQL choice for the
     /// user-visible result is made at the boundary in
-    /// [`IntermediateMetricResult::into_final_metric_result`]: by default
+    /// `IntermediateMetricResult::into_final_metric_result`: by default
     /// `None` is coerced to `Some(0.0)` to match Elasticsearch
     /// (`"value": 0`), and the [`SumAggregation::none_if_no_match`] flag
     /// opts out of that coercion for SQL-style consumers.

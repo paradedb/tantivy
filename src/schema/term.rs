@@ -310,7 +310,7 @@ where B: AsRef<[u8]>
         ValueBytes(data)
     }
 
-    /// Wraps a object holding Vec<u8>
+    /// Wraps a object holding `Vec<u8>`.
     pub fn to_owned(&self) -> ValueBytes<Vec<u8>> {
         ValueBytes(self.0.as_ref().to_vec())
     }

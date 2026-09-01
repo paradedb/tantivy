@@ -338,9 +338,9 @@ impl ToTypePaginationOrder for CompositeKey {
     }
 }
 
-/// After key is a string that encodes the intermediate composite key as "<type>:<value>"
+/// After key is a string that encodes the intermediate composite key as `"<type>:<value>"`.
 /// A wrapper type for CompositeIntermediateKey that serializes/deserializes
-/// to/from the "<type>:<value>" format.
+/// to/from the `"<type>:<value>"` format.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AfterKey(pub CompositeIntermediateKey);
 

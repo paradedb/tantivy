@@ -15,7 +15,7 @@ const DEFAULT_BUFFER_MAX_SIZE: usize = 512 * 1024; // 512K
 ///
 /// TODO: Rather than wrapping a `FileSlice` in buffering, it will usually be better to adjust a
 /// `FileHandle` to directly handle buffering itself.
-/// TODO: See: https://github.com/paradedb/paradedb/issues/3374
+/// TODO: See: <https://github.com/paradedb/paradedb/issues/3374>
 pub struct BufferedFileSlice {
     file_slice: FileSlice,
     buffer: RefCell<OwnedBytes>,

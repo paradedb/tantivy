@@ -20,17 +20,30 @@ use sign_plane::{
     pack as pack_sign, prepare_query, unpack as unpack_sign, QueryPlanes,
 };
 
+/// Minimum stored gamma coefficient.
+pub const GAMMA_MIN: f32 = 1.0;
+/// Maximum stored gamma coefficient.
+pub const GAMMA_MAX: f32 = 4.0;
+
+/// Quantization parameters for one residual layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayerSpec {
+    /// Code width.
     pub bits: u8,
+    /// Rotation seed.
     pub seed: u64,
+    /// Whether this layer rotates its input.
     pub rotate: bool,
 }
 
+/// Encoded layers for one vector.
 #[derive(Clone, Debug)]
 pub struct Encoded {
+    /// Packed code rows by layer.
     pub codes: Vec<Vec<u8>>,
+    /// Row scales by layer.
     pub scales: Vec<f32>,
+    /// Split-form constants by layer.
     pub constants: Vec<f32>,
 }
 
@@ -41,18 +54,9 @@ pub struct EncodedLayerBatch {
     pub codes: Vec<u8>,
     /// One exact binary32 scale per row.
     pub scales: Vec<f32>,
-    /// One binary16 cumulative-prefix gamma per row.
-    ///
-    /// Gamma is exact encode-side metadata for an encoded prefix:
-    /// `||r0||^2 / <r0, rhat_prefix>`, clamped to `[1, 4]` before the f16
-    /// round trip.
+    /// Binary16 cumulative-prefix gamma values.
     pub gammas: Vec<u16>,
-    /// One binary16 corrected-estimator error ratio per row.
-    ///
-    /// `E = ||r0 - gamma_stored * rhat_prefix||^2 / ||r0||^2`, where
-    /// `gamma_stored` is the decoded post-clamp binary16 coefficient used by
-    /// scoring. A zero original residual has the canonical value zero.
-    /// Nonzero values are converted directly to binary16 without clamping.
+    /// Binary16 corrected-error ratios.
     pub corrected_error_ratios: Vec<u16>,
     /// One binary32 split-form constant per row.
     pub constants: Vec<f32>,
@@ -61,20 +65,15 @@ pub struct EncodedLayerBatch {
 /// SoA output from the cluster-scoped batch encoder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EncodedBatch {
+    /// Encoded row count.
     pub rows: usize,
-    /// One shared binary32 `R0²` value per row.
-    ///
-    /// This is both the value serialized in the radius slot and the numerator
-    /// and denominator anchor used for cumulative gamma and corrected error.
+    /// Original residual squared norms.
     pub residual_norms_squared: Vec<f32>,
+    /// Encoded output by layer.
     pub layers: Vec<EncodedLayerBatch>,
 }
 
-/// Reusable storage for cluster-tile encoding.
-///
-/// Construct one workspace for a merge worker and reuse it across tiles and
-/// clusters with the same dimension. The encoder clears lengths between calls
-/// while retaining every scratch and output allocation.
+/// Reusable cluster encoding buffers.
 #[derive(Debug)]
 pub struct BatchEncodeWorkspace {
     prefix_reconstructions: Vec<f32>,
@@ -86,6 +85,7 @@ pub struct BatchEncodeWorkspace {
 }
 
 impl BatchEncodeWorkspace {
+    /// Creates an empty workspace.
     pub fn new() -> Self {
         Self {
             prefix_reconstructions: Vec::new(),
@@ -101,10 +101,7 @@ impl BatchEncodeWorkspace {
         }
     }
 
-    /// Preallocate every tile-sized scratch and output buffer.
-    ///
-    /// Encoding up to `max_rows` with this dimension and schedule does not
-    /// grow any workspace allocation.
+    /// Creates a workspace sized for a cluster tile.
     pub fn with_capacity(d: usize, max_rows: usize, specs: &[LayerSpec]) -> Self {
         validate_specs(d, specs);
         let mut workspace = Self::new();
@@ -149,50 +146,63 @@ impl Default for BatchEncodeWorkspace {
     }
 }
 
-/// One cumulative-prefix correction before and after the storage-shaped f16
-/// round trip. This is audit output only; no production encoder consumes it.
+/// Gamma values around binary16 serialization.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GammaRoundTrip {
+    /// Unclamped gamma.
     pub raw: f64,
+    /// Clamped binary32 gamma.
     pub clamped: f32,
+    /// Serialized binary16 gamma.
     pub f16: u16,
 }
 
 impl GammaRoundTrip {
+    /// Returns the decoded binary16 value.
     pub fn f16_value(self) -> f32 {
         f16_to_f32(self.f16)
     }
 }
 
-/// One corrected-estimator error ratio before and after binary16 storage.
+/// Corrected-error ratio around binary16 serialization.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CorrectedErrorRatioRoundTrip {
+    /// Binary64 ratio before serialization.
     pub raw: f64,
+    /// Serialized binary16 ratio.
     pub f16: u16,
 }
 
 impl CorrectedErrorRatioRoundTrip {
+    /// Returns the decoded binary16 value.
     pub fn f16_value(self) -> f32 {
         f16_to_f32(self.f16)
     }
 }
 
-/// Audit data for one cumulative encoded prefix. Reconstructions and inner
-/// products are expressed in the original, unrotated residual coordinates.
+/// Error-model measurements for one encoded prefix.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrefixErrorAudit {
+    /// Gamma serialization measurements.
     pub gamma: GammaRoundTrip,
+    /// Corrected-error serialization measurements.
     pub corrected_error_ratio: CorrectedErrorRatioRoundTrip,
+    /// Residual-to-reconstruction inner product.
     pub prefix_dot: f64,
+    /// Current layer scale.
     pub layer_scale: f32,
+    /// Current layer codes.
     pub codes: Vec<u8>,
+    /// Cumulative reconstruction in residual coordinates.
     pub raw_prefix_reconstruction: Vec<f32>,
 }
 
 /// Non-persisting metadata audit for every active encoded prefix.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrefixErrorAuditResult {
+    /// Original residual squared norm.
     pub norm_sq: f64,
+    /// Measurements by prefix depth.
     pub prefixes: Vec<PrefixErrorAudit>,
 }
 
@@ -206,11 +216,7 @@ pub struct PreparedCentroid {
     rotation_plan: Arc<QueryRotationPlan>,
 }
 
-/// Reusable cluster-centroid transform and output storage.
-///
-/// A prepared centroid is immutable while its cluster's tiles are encoded.
-/// Calling [`Self::prepare`] for the next cluster overwrites the same buffers
-/// after the previous borrowed view has gone out of scope.
+/// Reusable centroid preparation buffers.
 #[derive(Debug)]
 pub struct PreparedCentroidWorkspace {
     current: Vec<f32>,
@@ -219,6 +225,7 @@ pub struct PreparedCentroidWorkspace {
 }
 
 impl PreparedCentroidWorkspace {
+    /// Creates workspace for a rotation plan.
     pub fn new(plan: Arc<QueryRotationPlan>) -> Self {
         let d = plan.dimension();
         let layer_count = plan.specs.len();
@@ -235,6 +242,11 @@ impl PreparedCentroidWorkspace {
         }
     }
 
+    /// Prepares a centroid and returns its transformed layers.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the centroid dimension does not match the rotation plan.
     pub fn prepare(&mut self, centroid: &[f32]) -> &PreparedCentroid {
         assert_eq!(centroid.len(), self.prepared.d);
         self.prepared.original.clear();
@@ -259,15 +271,12 @@ impl PreparedCentroidWorkspace {
 }
 
 #[derive(Clone, Debug)]
+/// Full-precision query transformed for every layer.
 pub struct PreparedFpQuery {
     layers: Vec<Vec<f32>>,
 }
 
-/// Immutable, reusable rotation state for preparing queries and centroids
-/// against one quantization schedule.
-///
-/// Construct this once with the persisted layer seeds, then reuse it for every
-/// query and cluster centroid. Preparing a prefix applies only its rotations.
+/// Reusable rotations for a quantization schedule.
 #[derive(Clone, Debug)]
 pub struct QueryRotationPlan {
     d: usize,
@@ -276,7 +285,7 @@ pub struct QueryRotationPlan {
 }
 
 impl QueryRotationPlan {
-    /// Expand every rotating layer's seed into its format-stable rotation.
+    /// Expands layer seeds into rotations.
     pub fn new(d: usize, specs: &[LayerSpec]) -> Self {
         validate_specs(d, specs);
         let rotations = specs
@@ -291,10 +300,12 @@ impl QueryRotationPlan {
         }
     }
 
+    /// Returns the vector dimension.
     pub fn dimension(&self) -> usize {
         self.d
     }
 
+    /// Returns the layer specifications.
     pub fn specs(&self) -> &[LayerSpec] {
         &self.specs
     }
@@ -326,6 +337,10 @@ impl PreparedFpQuery {
     }
 
     /// Query in the coordinate space of the final encoded layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the prepared query contains no layers.
     pub fn final_layer(&self) -> &[f32] {
         self.layers
             .last()
@@ -341,28 +356,29 @@ enum PreparedSplitLayer {
     },
 }
 
-/// Segment-query state with all rotations, sign bitplanes, and grid LUTs hoisted.
+/// Prepared sign bitplanes and grid tables for a query.
 pub struct PreparedSplitQuery {
     d: usize,
     layers: Vec<PreparedSplitLayer>,
 }
 
+/// Prepares a split-form query.
 pub fn prepare_split_query(
     query: &[f32],
     specs: &[LayerSpec],
     grids: &[Grid],
     sign_query_bits: u8,
 ) -> PreparedSplitQuery {
-    // The direct entry prepares the complete supplied schedule.
     validate(query.len(), specs, grids);
     let plan = QueryRotationPlan::new(query.len(), specs);
     prepare_split_query_with_plan(query, &plan, grids, sign_query_bits)
 }
 
-/// Prepare a query using pre-expanded rotations from `plan`.
+/// Prepares a split-form query with an existing rotation plan.
 ///
-/// `grids` selects the active schedule prefix: passing `&all_grids[..depth]`
-/// prepares exactly `depth` layers.
+/// # Panics
+///
+/// Panics when query, plan, grids, or bit-width configuration is invalid.
 pub fn prepare_split_query_with_plan(
     query: &[f32],
     plan: &QueryRotationPlan,
@@ -393,10 +409,7 @@ pub fn prepare_split_query_with_plan(
     }
 }
 
-/// Audit-only exact squared query-quantization error for every prepared layer.
-/// Sign layers report the error accumulated while producing the affine
-/// bitplanes consumed by the scoring kernel; grid layers use the rotated f32
-/// query directly and report zero.
+/// Returns squared query-quantization error by layer.
 pub fn audit_split_query_layer_error_squared(
     query: &[f32],
     specs: &[LayerSpec],
@@ -408,7 +421,7 @@ pub fn audit_split_query_layer_error_squared(
     audit_split_query_layer_error_squared_with_plan(query, &plan, grids, sign_query_bits)
 }
 
-/// [`audit_split_query_layer_error_squared`] using already expanded rotations.
+/// Returns squared query-quantization error with an existing rotation plan.
 pub fn audit_split_query_layer_error_squared_with_plan(
     query: &[f32],
     plan: &QueryRotationPlan,
@@ -422,8 +435,7 @@ pub fn audit_split_query_layer_error_squared_with_plan(
 }
 
 impl PreparedSplitQuery {
-    /// Exact squared query-quantization error `B_j` for one prepared layer.
-    /// Grid layers score the f32 query directly and therefore return zero.
+    /// Returns squared query-quantization error for one layer.
     pub fn query_error_squared(&self, layer: usize) -> f64 {
         match &self.layers[layer] {
             PreparedSplitLayer::Sign(query) => query.error_squared(),
@@ -431,7 +443,7 @@ impl PreparedSplitQuery {
         }
     }
 
-    /// Score one stored layer as `kernel * scale - split_constant`.
+    /// Scores one layer with its split-form constant.
     pub fn score_layer(
         &self,
         layer: usize,
@@ -443,7 +455,11 @@ impl PreparedSplitQuery {
         self.score_layer_without_constant(layer, codes, scale, spec) - constant
     }
 
-    /// Score one stored layer for metrics whose format omits split constants.
+    /// Scores one layer without a split-form constant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the layer, codes, or specification does not match the prepared query.
     pub fn score_layer_without_constant(
         &self,
         layer: usize,
@@ -464,9 +480,11 @@ impl PreparedSplitQuery {
         }
     }
 
-    /// Score a fixed-stride batch without scales or split constants. This is
-    /// the scan-path kernel boundary: one call covers one cluster or one
-    /// densely gathered survivor stream.
+    /// Scores a contiguous batch without scales or constants.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the layer, codes, stride, specification, or output shape is invalid.
     #[inline(always)]
     pub fn score_layer_batch_unscaled(
         &self,
@@ -500,11 +518,11 @@ impl PreparedSplitQuery {
         }
     }
 
-    /// Score selected rows from one borrowed contiguous posting range. This
-    /// is the sparse survivor-stream equivalent of the fixed-stride batch
-    /// entry. Every supported layer width remains borrowed in place; b=4
-    /// uses the packed LUT fast path while sign and b=2/b=3 use their indexed
-    /// kernels directly.
+    /// Scores selected rows without scales or constants.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the layer, codes, indices, specification, or output shape is invalid.
     #[inline(always)]
     pub fn score_layer_batch_unscaled_indexed(
         &self,
@@ -562,14 +580,13 @@ impl PreparedSplitQuery {
     }
 }
 
+/// Prepares one centroid.
 pub fn prepare_centroid(centroid: &[f32], specs: &[LayerSpec]) -> PreparedCentroid {
     let plan = Arc::new(QueryRotationPlan::new(centroid.len(), specs));
     prepare_centroid_with_plan(centroid, plan)
 }
 
-/// Prepare one cluster centroid using schedule rotations expanded once by the
-/// caller. Every returned centroid shares the plan's permutation and sign
-/// buffers through `Arc`.
+/// Prepares one centroid with an existing rotation plan.
 pub fn prepare_centroid_with_plan(
     centroid: &[f32],
     plan: Arc<QueryRotationPlan>,
@@ -579,11 +596,7 @@ pub fn prepare_centroid_with_plan(
     workspace.prepared
 }
 
-/// Encode a row-major cluster tile using at most two `rows * d` f32 buffers.
-///
-/// `vectors` is consumed as scratch: the function first subtracts the prepared
-/// centroid, then carries the residual through the rotated layer chain. The
-/// output is layer-separated SoA in the same row order as the input.
+/// Encodes a row-major cluster tile in place.
 pub fn encode_batch_in_place(
     vectors: &mut [f32],
     rows: usize,
@@ -605,12 +618,7 @@ pub fn encode_batch_in_place(
     workspace.encoded
 }
 
-/// Encode a row-major cluster tile while retaining all scratch and output
-/// allocations in `workspace` for the next tile or cluster.
-///
-/// The returned batch borrows the workspace and remains valid until the next
-/// call using that workspace. Callers that stream the layer slices before the
-/// next encode avoid allocating an owned batch per tile.
+/// Encodes a cluster tile with reusable workspace.
 pub fn encode_batch_in_place_with_workspace<'workspace>(
     vectors: &mut [f32],
     rows: usize,
@@ -633,10 +641,7 @@ pub fn encode_batch_in_place_with_workspace<'workspace>(
     &workspace.encoded
 }
 
-/// Encode a row-major cluster tile and expose the remaining residual after
-/// each prefix to a non-owning observer. The observer runs before the next
-/// layer's rotation, so its residual and scale stream are in that prefix's
-/// exact scoring coordinate space.
+/// Encodes a cluster tile and observes residuals after each prefix.
 pub fn encode_batch_in_place_with_residual_observer<F>(
     vectors: &mut [f32],
     rows: usize,
@@ -693,11 +698,6 @@ fn encode_batch_in_place_reusing<F>(
         }
     }
 
-    // Carry the cumulative reconstruction itself through the same rotation
-    // chain as the residual. This buffer is assembled only from the codes and
-    // binary32 scales that are serialized, so gamma and E describe the
-    // reconstruction the scorer actually consumes. The encoder uses exactly
-    // two `rows * d` f32 buffers.
     prefix_reconstructions.clear();
     prefix_reconstructions.resize(rows * d, 0.0);
     encoded.residual_norms_squared.clear();
@@ -863,6 +863,11 @@ fn encode_batch_in_place_reusing<F>(
     }
 }
 
+/// Encodes one residual through every layer.
+///
+/// # Panics
+///
+/// Panics when residual, centroid, schedule, or grid configuration is invalid.
 pub fn encode_layers(
     r: &[f32],
     centroid: Option<&PreparedCentroid>,
@@ -935,7 +940,7 @@ fn gamma_round_trip(norm_sq: f64, prefix_dot: f64) -> GammaRoundTrip {
     } else {
         norm_sq / prefix_dot
     };
-    let clamped = raw.clamp(1.0, 4.0) as f32;
+    let clamped = raw.clamp(f64::from(GAMMA_MIN), f64::from(GAMMA_MAX)) as f32;
     GammaRoundTrip {
         raw,
         clamped,
@@ -943,8 +948,7 @@ fn gamma_round_trip(norm_sq: f64, prefix_dot: f64) -> GammaRoundTrip {
     }
 }
 
-/// Storage-shaped squared norm. Sixteen independent binary32 accumulators
-/// match Tantivy's vector-distance kernel while keeping this crate standalone.
+/// Computes a storage-shaped squared norm.
 #[inline]
 #[allow(unknown_lints)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
@@ -981,13 +985,7 @@ fn corrected_error_ratio_round_trip(
     }
 }
 
-/// Re-encode one residual without persisting anything and expose the
-/// cumulative gamma measurements used by the external audit harness.
-///
-/// Each layer advances its residual with the exact binary32 scale used by
-/// production encoding. Every contribution is inverse-rotated into `r0`'s
-/// original coordinates for reporting. Gamma and the corrected error ratio
-/// are measured in the encoder's equivalent cumulatively rotated coordinates.
+/// Re-encodes one residual and returns cumulative corrected-error measurements.
 pub fn audit_prefix_error_model(
     r0: &[f32],
     specs: &[LayerSpec],
@@ -1078,13 +1076,13 @@ pub fn audit_prefix_error_model(
     PrefixErrorAuditResult { norm_sq, prefixes }
 }
 
+/// Prepares a full-precision query for every layer.
 pub fn prepare_fp_query(query: &[f32], specs: &[LayerSpec]) -> PreparedFpQuery {
     let plan = QueryRotationPlan::new(query.len(), specs);
     prepare_fp_query_with_plan(query, &plan, specs.len())
 }
 
-/// Prepare full-precision query coordinates for one active schedule prefix
-/// using pre-expanded rotations from `plan`.
+/// Prepares full-precision query coordinates for one schedule prefix.
 pub fn prepare_fp_query_with_plan(
     query: &[f32],
     plan: &QueryRotationPlan,
@@ -1095,6 +1093,7 @@ pub fn prepare_fp_query_with_plan(
     }
 }
 
+/// Scores encoded layers with a prepared full-precision query.
 pub fn estimate_prepared_fp(
     encoded: &Encoded,
     query: &PreparedFpQuery,
@@ -1108,6 +1107,10 @@ pub fn estimate_prepared_fp(
 }
 
 /// Score an encoded residual using a segment-wide query and stored centroid constants.
+///
+/// # Panics
+///
+/// Panics when encoded, query, schedule, grid, or dimension shapes disagree.
 pub fn estimate_prepared_fp_split(
     encoded: &Encoded,
     query: &PreparedFpQuery,
@@ -1153,6 +1156,11 @@ fn estimate_prepared_fp_layers(
         .collect()
 }
 
+/// Reconstructs the encoded prefix in the original coordinate space.
+///
+/// # Panics
+///
+/// Panics when encoded, schedule, grid, or dimension shapes disagree.
 pub fn reconstruct_first_space(
     encoded: &Encoded,
     specs: &[LayerSpec],
@@ -1192,6 +1200,10 @@ pub fn reconstruct_first_space(
 }
 
 /// Select the k-th largest finite score, with `k` one-indexed.
+///
+/// # Panics
+///
+/// Panics when `k` is out of range or the score count exceeds `u32::MAX`.
 pub fn kth(scores: &[f32], k: usize) -> (usize, f32) {
     assert!(k > 0 && k <= scores.len());
     debug_assert!(scores.iter().all(|score| score.is_finite()));
@@ -1205,6 +1217,10 @@ pub fn kth(scores: &[f32], k: usize) -> (usize, f32) {
 }
 
 /// Retain candidates whose optimistic score reaches the supplied pessimistic threshold.
+///
+/// # Panics
+///
+/// Panics when score and sigma lengths differ or the score count exceeds `u32::MAX`.
 pub fn band_filter(scores: &[f32], sigmas: &[f32], kappa: f32, kth_pess: f32) -> Vec<u32> {
     assert_eq!(scores.len(), sigmas.len());
     assert!(u32::try_from(scores.len()).is_ok());
@@ -1243,9 +1259,7 @@ fn aligned_le_words(bytes: &[u8]) -> Cow<'_, [u64]> {
 
     #[cfg(target_endian = "little")]
     {
-        // SAFETY: every bit pattern is a valid `u64`. `align_to` returns only
-        // views within `bytes`, and borrowing is allowed only when the entire
-        // input is represented by exactly the expected number of words.
+        // SAFETY: `align_to` validates alignment; empty prefix and suffix gate borrowing.
         let (prefix, words, suffix) = unsafe { bytes.align_to::<u64>() };
         if prefix.is_empty()
             && suffix.is_empty()
@@ -1283,7 +1297,7 @@ mod tests {
     #[test]
     fn aligned_le_words_borrows_aligned_input() {
         let expected = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
-        // SAFETY: every `u64` byte is a valid `u8`, and `u8` has alignment one.
+        // SAFETY: Every `u64` byte representation is valid as `u8`.
         let (prefix, bytes, suffix) = unsafe { expected.as_slice().align_to::<u8>() };
         assert!(prefix.is_empty() && suffix.is_empty());
 
@@ -1885,11 +1899,6 @@ mod tests {
 
     #[test]
     fn serialized_prefix_decode_reconstructs_gamma_error_and_shared_radius() {
-        // This test deliberately does not call the metadata audit or the row
-        // encoder. It starts from packed batch bytes plus stored f32 scales,
-        // decodes every contribution, and independently rebuilds each prefix.
-        // The grid-first case proves that neither the identity nor its odd-d
-        // tail handling depends on a leading sign layer.
         const D: usize = 100;
         const ROWS: usize = 3;
         for bits in [[1_u8, 4_u8], [2_u8, 4_u8]] {
@@ -1935,8 +1944,6 @@ mod tests {
                     .map(|(&value, &center)| value - center)
                     .collect();
 
-                // Independent copy of the format's sixteen-lane binary32
-                // radius accumulation, matching the public vector kernel.
                 let chunks = residual.chunks_exact(16);
                 let tail = chunks.remainder();
                 let mut lanes = [0.0_f32; 16];
@@ -2009,7 +2016,9 @@ mod tests {
                     } else {
                         f64::from(radius_squared) / prefix_dot
                     };
-                    let expected_gamma = f32_to_f16(raw_gamma.clamp(1.0, 4.0) as f32);
+                    let expected_gamma = f32_to_f16(
+                        raw_gamma.clamp(f64::from(GAMMA_MIN), f64::from(GAMMA_MAX)) as f32,
+                    );
                     assert_eq!(
                         batch.layers[layer].gammas[row_index], expected_gamma,
                         "schedule={bits:?} row={row_index} layer={layer}"
@@ -2659,10 +2668,6 @@ mod tests {
         let context = prepare_centroid(&centroid, &specs);
         encode_batch_in_place(&mut vectors, rows, &context, &specs, &grids);
         let count = fht::debug_apply_count();
-        // Two centroid rotations per cluster plus, for each row and layer,
-        // one residual rotation and one original-direction rotation used by
-        // cumulative gamma. This is the complete production
-        // `2 * rows + 2` bound without hiding the added exact metadata work.
         assert_eq!(count, 2 * 2 * rows + 2, "Rotation::apply count={count}");
     }
 

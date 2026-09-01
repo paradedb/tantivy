@@ -21,6 +21,7 @@ struct Round {
 }
 
 #[derive(Clone, Debug)]
+/// A seeded orthogonal transform.
 pub struct Rotation {
     d: usize,
     rounds: Vec<Round>,
@@ -28,6 +29,11 @@ pub struct Rotation {
 }
 
 impl Rotation {
+    /// Creates a rotation for `d` coordinates.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `d` is zero or exceeds `u32::MAX`.
     pub fn new(d: usize, seed: u64) -> Self {
         assert!(d > 0);
         assert!(u32::try_from(d).is_ok());
@@ -57,16 +63,21 @@ impl Rotation {
         }
     }
 
+    /// Applies the rotation in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `x` does not match the rotation dimension.
     pub fn apply(&self, x: &mut [f32]) {
         let mut scratch = vec![0.0; self.d];
         self.apply_with_scratch(x, &mut scratch);
     }
 
-    /// Apply this rotation using caller-owned scratch storage.
+    /// Applies the rotation with caller-owned scratch storage.
     ///
-    /// `scratch` must have exactly the rotation dimension. Reusing one
-    /// allocation across rows keeps the merge-time encode loop allocation
-    /// free without changing the format-stable transform.
+    /// # Panics
+    ///
+    /// Panics when either slice does not match the rotation dimension.
     pub fn apply_with_scratch(&self, x: &mut [f32], scratch: &mut [f32]) {
         assert_eq!(x.len(), self.d);
         assert_eq!(scratch.len(), self.d);
@@ -82,12 +93,21 @@ impl Rotation {
         }
     }
 
+    /// Applies the inverse rotation in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `x` does not match the rotation dimension.
     pub fn apply_inverse(&self, x: &mut [f32]) {
         let mut scratch = vec![0.0; self.d];
         self.apply_inverse_with_scratch(x, &mut scratch);
     }
 
-    /// Apply the inverse rotation using caller-owned scratch storage.
+    /// Applies the inverse rotation with caller-owned scratch storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either slice does not match the rotation dimension.
     pub fn apply_inverse_with_scratch(&self, x: &mut [f32], scratch: &mut [f32]) {
         assert_eq!(x.len(), self.d);
         assert_eq!(scratch.len(), self.d);

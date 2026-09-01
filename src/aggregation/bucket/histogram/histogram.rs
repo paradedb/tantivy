@@ -250,7 +250,7 @@ impl HistogramBounds {
 }
 
 /// The per-bucket identifier stored alongside a bucket's count (e.g. in a
-/// [`SegmentHistogramBucketEntry`] or a term-agg `Bucket`).
+/// `SegmentHistogramBucketEntry` or a term-agg `Bucket`).
 ///
 /// It is [`BucketId`] when the aggregation has sub aggregations (which key their state by it), and
 /// the zero-sized `()` when it does not. Without sub aggregations the id is never read, so storing

@@ -603,7 +603,7 @@ impl Index {
 
     /// Create a default [`IndexReader`] for the given index.
     ///
-    /// See [`Index.reader_builder()`].
+    /// See [`Index::reader_builder`].
     pub fn reader(&self) -> crate::Result<IndexReader> {
         self.reader_builder().try_into()
     }

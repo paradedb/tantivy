@@ -1,19 +1,4 @@
-//! Per-query precomputation hoisted out of the per-doc scoring loop.
-//!
-//! The exact-query state is built per segment backend. Quantized rotations are
-//! process-cached with the index configuration, while bitplanes and LUTs are
-//! built once per collector query and shared by every segment backend.
-//! Hides the metric match and any metric-specific precomputed scalars
-//! (currently only `1/||q||` for cosine) behind
-//! [`PreparedQuery::score_doc_bytes`].
-//!
-//! Stored vectors — including IVF centroids — are unit-normalized at
-//! write time for `Cosine + F32` (see
-//! [`maybe_normalize_bytes`](super::distance::maybe_normalize_bytes)),
-//! so a single scoring entry point covers both per-doc and centroid
-//! scans.
-//!
-//! [`VectorBackend::for_segment`]: super::backend::VectorBackend::for_segment
+//! Prepared exact and quantized query state.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -22,24 +7,23 @@ use cascade::{prepare_split_query_with_plan, LayerSpec, PreparedSplitQuery, Quer
 use quant_model::Grid;
 
 use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
-use super::quantization::{VectorQuantizationConfig, SIGN_QUERY_BITS};
+use super::quantization::{VectorQuantizationConfig, GAMMA_ANALYTICAL_SAFETY, SIGN_QUERY_BITS};
 use super::VectorElement;
 use crate::schema::Metric;
 use crate::TantivyError;
 
+/// Metric-specific prepared vector query.
 pub struct PreparedQuery<T: VectorElement> {
     query: Arc<Vec<T>>,
     kind: QueryKind,
 }
 
-/// Metric-specific per-query state. Each variant carries only what
-/// that metric actually needs — no dead fields for L2 / Dot.
+/// Metric-specific per-query state.
 enum QueryKind {
     L2,
     Dot,
     Cosine {
-        /// `1.0 / ||q||`. `0.0` for a zero / non-finite query norm so a
-        /// degenerate query scores `0.0` against every doc.
+        /// Reciprocal query norm, or zero for a degenerate query.
         inv_norm_q: f32,
     },
 }
@@ -60,6 +44,68 @@ struct QuantizedIndexCacheKey {
 static QUANTIZED_INDEX_CACHE: OnceLock<
     Mutex<HashMap<QuantizedIndexCacheKey, Arc<QuantizedIndexCtx>>>,
 > = OnceLock::new();
+
+/// Applies the metric-specific correction to a cumulative quantized estimate.
+#[inline(always)]
+pub(crate) fn corrected_quantized_estimate(
+    metric: Metric,
+    gamma: f32,
+    raw_prefix: f32,
+    base: f32,
+) -> f32 {
+    let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
+    (metric_factor * gamma).mul_add(raw_prefix, base)
+}
+
+/// Combines the first L2 layer's unscaled kernel output.
+#[inline(always)]
+pub(crate) fn initial_l2_raw_prefix(kernel_score: f32, scale: f32, constant: f32) -> f32 {
+    scale.mul_add(kernel_score, -constant)
+}
+
+/// Combines the first dot-like layer's unscaled kernel output.
+#[inline(always)]
+pub(crate) fn initial_dot_raw_prefix(kernel_score: f32, scale: f32) -> f32 {
+    kernel_score * scale
+}
+
+/// Adds an L2 refinement to the cumulative raw prefix.
+#[inline(always)]
+pub(crate) fn refine_l2_raw_prefix(
+    raw_prefix: f32,
+    kernel_score: f32,
+    scale: f32,
+    constant: f32,
+) -> f32 {
+    scale.mul_add(kernel_score, raw_prefix - constant)
+}
+
+/// Adds a dot-like refinement to the cumulative raw prefix.
+#[inline(always)]
+pub(crate) fn refine_dot_raw_prefix(raw_prefix: f32, kernel_score: f32, scale: f32) -> f32 {
+    scale.mul_add(kernel_score, raw_prefix)
+}
+
+/// Computes the production uncertainty width for a corrected estimate.
+#[inline(always)]
+pub(crate) fn quantized_model_sigma(
+    metric: Metric,
+    dimension: usize,
+    residual_norm_squared: f32,
+    corrected_error_ratio: f32,
+    gamma: f32,
+    score_query_norm_squared: f32,
+    sign_query_error_term: f32,
+) -> f32 {
+    debug_assert_ne!(dimension, 0);
+    let data_variance = residual_norm_squared
+        * (1.0 / dimension as f32)
+        * corrected_error_ratio
+        * score_query_norm_squared;
+    let query_variance = gamma * gamma * sign_query_error_term;
+    let metric_factor = if metric == Metric::L2 { 2.0 } else { 1.0 };
+    metric_factor * GAMMA_ANALYTICAL_SAFETY * (data_variance + query_variance).sqrt()
+}
 
 impl QuantizedIndexCtx {
     fn new(config: VectorQuantizationConfig) -> crate::Result<Self> {
@@ -94,8 +140,6 @@ impl QuantizedIndexCtx {
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        // Seed expansion and permutation construction are index-scoped. The
-        // process cache retains this plan across both segments and queries.
         let rotation_plan = QueryRotationPlan::new(config.dim, &specs);
         Ok(Self {
             config,
@@ -105,14 +149,8 @@ impl QuantizedIndexCtx {
         })
     }
 
-    /// Resolve immutable scorer state once per persisted configuration and
-    /// reuse it across SegmentReader lifetimes in the same backend process.
-    /// SegmentReader's field cache provides the first level; this strong
-    /// process cache closes the pg_search query boundary, which reopens
-    /// segment readers. Entries intentionally live for the process lifetime.
+    /// Resolves process-cached scorer state for one persisted configuration.
     pub(crate) fn resolve(config: VectorQuantizationConfig) -> crate::Result<Arc<Self>> {
-        // Calibration is diagnostic metadata, not scorer state. Keep it out
-        // of both context construction and cache identity.
         let runtime_config = (
             config.field.as_str(),
             config.format_version,
@@ -146,11 +184,7 @@ impl QuantizedIndexCtx {
     }
 }
 
-/// Collector-scoped cache of prepared quantized queries. A collector may be
-/// reused against another index with the same schema, so the process-cached
-/// index-context identity and active prefix are both part of the key. Keeping
-/// the context in the value makes the pointer identity stable for the entry's
-/// lifetime.
+/// Collector-scoped cache of prepared quantized queries.
 #[derive(Default)]
 pub(crate) struct QuantizedQueryCache {
     queries: Mutex<HashMap<(usize, usize), Arc<QuantizedQueryCtx>>>,
@@ -189,8 +223,7 @@ impl QuantizedQueryCache {
     }
 }
 
-/// Immutable query rotations, sign bitplanes, and LUTs shared by every
-/// segment using the same collector, resolved index context, and prefix.
+/// Immutable query rotations, sign bitplanes, and LUTs shared across segments.
 pub(crate) struct QuantizedQueryCtx {
     pub(crate) index: Arc<QuantizedIndexCtx>,
     prepared: PreparedSplitQuery,
@@ -242,8 +275,7 @@ impl QuantizedQueryCtx {
         self.active_layers
     }
 
-    /// Exact squared query-quantization error `B_j` already accumulated while
-    /// preparing this layer's scoring state.
+    /// Squared query-quantization error accumulated through this layer.
     pub(crate) fn query_error_squared(&self, layer: usize) -> f64 {
         self.prepared.query_error_squared(layer)
     }
@@ -282,10 +314,7 @@ impl QuantizedQueryCtx {
         }
     }
 
-    /// Enter the resolved monomorphic kernel once for a fixed-stride batch.
-    /// Scale, sigma, and accumulated-score assembly stay in the caller so the
-    /// survivor loop can fuse those operations directly into its candidate
-    /// buffer.
+    /// Scores a fixed-stride code batch with the resolved layer kernel.
     #[inline(always)]
     pub(crate) fn score_layer_batch_unscaled(
         &self,
@@ -322,10 +351,7 @@ impl QuantizedQueryCtx {
         );
     }
 
-    /// Norm of the query vector used by a layer's dot-product error model.
-    /// L2 estimates `<q-c,r>`; Dot and Cosine estimate `<q,r>` directly.
-    /// The routing score already carries exact `-||q-c||²` for L2, so no
-    /// centroid row is needed on the scan path for any metric.
+    /// Returns the query-vector norm used by the layer error model.
     pub(crate) fn score_query_norm(&self, routing_score: f32) -> f32 {
         if self.index.config.metric == Metric::L2 {
             (-routing_score).max(0.0).sqrt()
@@ -340,14 +366,12 @@ impl QuantizedQueryCtx {
 }
 
 impl<T: VectorElement> PreparedQuery<T> {
+    /// Prepares a query for one metric.
     pub fn new(metric: Metric, query: Arc<Vec<T>>) -> Self {
         let kind = match metric {
             Metric::L2 => QueryKind::L2,
             Metric::Dot => QueryKind::Dot,
             Metric::Cosine => {
-                // Wide accumulation, so a huge-but-finite query norm stays
-                // finite. The degenerate guard remains load-bearing: queries
-                // are user input at search time, not ingest-validated.
                 let nq = norm_squared_wide::<T>(&query).sqrt();
                 let inv_norm_q = if nq == 0.0 || !nq.is_finite() {
                     0.0
@@ -360,6 +384,7 @@ impl<T: VectorElement> PreparedQuery<T> {
         Self { query, kind }
     }
 
+    /// Returns the query metric.
     pub fn metric(&self) -> Metric {
         match self.kind {
             QueryKind::L2 => Metric::L2,
@@ -368,13 +393,12 @@ impl<T: VectorElement> PreparedQuery<T> {
         }
     }
 
+    /// Returns the query coordinates.
     pub fn query(&self) -> &[T] {
         &self.query
     }
 
-    /// Score a stored vector — either a document or an IVF centroid.
-    /// Both are unit-normalized at write time for `Cosine + F32`, so
-    /// the cosine branch collapses to `dot * inv_norm_q`.
+    /// Scores a stored vector row.
     #[inline]
     pub fn score_doc_bytes(&self, doc_bytes: &[u8]) -> f32 {
         match self.kind {
@@ -391,10 +415,7 @@ mod tests {
 
     use super::{QuantizedIndexCtx, QuantizedQueryCache, QuantizedQueryCtx};
     use crate::schema::{Metric, VectorOptions};
-    use crate::vector::{
-        VectorQuantizationCalibrationSource, VectorQuantizationConfig,
-        VectorQuantizationDepthCalibration, VectorQuantizationLayer,
-    };
+    use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
 
     #[test]
     fn resolved_quantized_index_context_is_reused_across_segment_opens() {
@@ -413,7 +434,6 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(config.calibration().is_none());
         let first = QuantizedIndexCtx::resolve(config.clone()).unwrap();
         let reopened = QuantizedIndexCtx::resolve(config).unwrap();
         assert!(Arc::ptr_eq(&first, &reopened));
@@ -536,54 +556,6 @@ mod tests {
             .err()
             .expect("missing grid must be rejected");
         assert!(error.to_string().contains("no persisted grid/model entry"));
-    }
-
-    #[test]
-    fn diagnostic_calibration_does_not_change_query_scoring() {
-        let config = VectorQuantizationConfig::materialize(
-            "diagnostic_calibration".to_string(),
-            &VectorOptions::new(100, Metric::Dot),
-            vec![VectorQuantizationLayer {
-                bits: 1,
-                seed: 0xfeed_5001,
-            }],
-        )
-        .unwrap();
-        let mut diagnostic = config.clone();
-        diagnostic
-            .install_real_query_calibration(vec![VectorQuantizationDepthCalibration {
-                bias: -7.5,
-                spread: 11.25,
-                sample_count: 1_000,
-                source: VectorQuantizationCalibrationSource::RealQuery,
-                protocol: "REAL_QUERY_EXACT_E_BQ4".to_string(),
-            }])
-            .unwrap();
-        let query_values = (0..100)
-            .map(|coordinate| ((coordinate as f32 + 0.75) * 0.113).cos())
-            .collect::<Vec<_>>();
-        let uncalibrated_index = QuantizedIndexCtx::resolve(config).unwrap();
-        let diagnostic_index = QuantizedIndexCtx::resolve(diagnostic).unwrap();
-        assert!(Arc::ptr_eq(&uncalibrated_index, &diagnostic_index));
-        let uncalibrated = QuantizedQueryCtx::new(uncalibrated_index, query_values.clone());
-        let calibrated = QuantizedQueryCtx::new(diagnostic_index, query_values);
-        let mut codes = vec![0; 16];
-        codes[..8].fill(0xa5);
-
-        assert_eq!(
-            uncalibrated
-                .score_layer(0, &codes, 1.0, None)
-                .unwrap()
-                .to_bits(),
-            calibrated
-                .score_layer(0, &codes, 1.0, None)
-                .unwrap()
-                .to_bits()
-        );
-        assert_eq!(
-            uncalibrated.query_error_squared(0).to_bits(),
-            calibrated.query_error_squared(0).to_bits()
-        );
     }
 
     #[test]

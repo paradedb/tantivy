@@ -753,7 +753,7 @@ impl<D: Document> IndexWriter<D> {
         Ok(opstamp)
     }
 
-    /// Delete a specific document by its already-known [`DocAddress`]
+    /// Deletes a document by segment and document identifiers.
     pub fn delete_by_address(&self, segment_id: SegmentId, doc_id: DocId) -> Opstamp {
         let opstamp = self.stamper.stamp();
         self.delete_queue.push(DeleteOperation::ByAddress {

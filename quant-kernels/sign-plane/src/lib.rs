@@ -3,21 +3,22 @@
 use quant_model::f16::{f16_to_f32, f32_to_f16};
 
 #[derive(Clone, Debug)]
+/// Quantized query bitplanes and affine reconstruction parameters.
 pub struct QueryPlanes {
+    /// Query-code bitplanes.
     pub planes: Vec<Vec<u64>>,
+    /// Minimum query value.
     pub lo: f32,
+    /// Query-code step.
     pub delta: f32,
+    /// Sum of query codes.
     pub sum_codes: u64,
     error_squared: f64,
     d: usize,
 }
 
 impl QueryPlanes {
-    /// Exact squared error of the affine query values encoded in `planes`.
-    ///
-    /// This is accumulated while producing the bitplanes, so it describes
-    /// the exact values consumed by the asymmetric sign kernel without a
-    /// second query-encoding pass.
+    /// Returns the query reconstruction's squared error.
     pub fn error_squared(&self) -> f64 {
         self.error_squared
     }
@@ -36,6 +37,11 @@ fn tail_is_zero(words: &[u64], d: usize) -> bool {
     tail == 0 || words.last().is_some_and(|word| word >> tail == 0)
 }
 
+/// Packs vector signs into words.
+///
+/// # Panics
+///
+/// Panics when the input is empty or the output word count is invalid.
 pub fn pack(y: &[f32], out: &mut [u64]) {
     assert!(!y.is_empty());
     assert_eq!(out.len(), packed_words(y.len()));
@@ -48,6 +54,11 @@ pub fn pack(y: &[f32], out: &mut [u64]) {
     debug_assert!(tail_is_zero(out, y.len()));
 }
 
+/// Unpacks words into unit signs.
+///
+/// # Panics
+///
+/// Panics when `d` is zero or the packed word count is invalid.
 pub fn unpack(bits: &[u64], d: usize) -> Vec<f32> {
     assert!(d > 0);
     assert_eq!(bits.len(), packed_words(d));
@@ -64,11 +75,19 @@ pub fn unpack(bits: &[u64], d: usize) -> Vec<f32> {
 }
 
 /// Encode signs and return the mean-absolute-value scale after f16 rounding.
+///
+/// # Panics
+///
+/// Panics when the input is empty or the output word count is invalid.
 pub fn encode(y: &[f32], out_bits: &mut [u64]) -> u16 {
     f32_to_f16(encode_f32(y, out_bits))
 }
 
 /// Encode signs and return the exact mean-absolute-value scale.
+///
+/// # Panics
+///
+/// Panics when the input is empty or the output word count is invalid.
 pub fn encode_f32(y: &[f32], out_bits: &mut [u64]) -> f32 {
     assert!(!y.is_empty());
     assert_eq!(out_bits.len(), packed_words(y.len()));
@@ -80,12 +99,21 @@ pub fn encode_f32(y: &[f32], out_bits: &mut [u64]) -> f32 {
 }
 
 /// Hamming distance between two sign-code vectors.
+///
+/// # Panics
+///
+/// Panics when either input is empty or their word counts differ.
 pub fn score_sym(x: &[u64], q: &[u64]) -> u32 {
     assert!(!x.is_empty());
     assert_eq!(x.len(), q.len());
     x.iter().zip(q).map(|(&a, &b)| (a ^ b).count_ones()).sum()
 }
 
+/// Quantizes a query into affine bitplanes.
+///
+/// # Panics
+///
+/// Panics when the query is empty or `bq` is outside `1..=8`.
 pub fn prepare_query(u: &[f32], bq: u8) -> QueryPlanes {
     assert!(!u.is_empty());
     assert!((1..=8).contains(&bq));
@@ -129,6 +157,10 @@ pub fn prepare_query(u: &[f32], bq: u8) -> QueryPlanes {
 }
 
 /// Return positive-sign count `P` and query-code sum over positive signs `S`.
+///
+/// # Panics
+///
+/// Panics when code and query bitplane shapes disagree.
 pub fn score_asym(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
     assert!(!x.is_empty());
     assert!(!q.planes.is_empty());
@@ -152,15 +184,29 @@ pub fn score_asym(x: &[u64], q: &QueryPlanes) -> (u32, u64) {
     (positives, weighted_sum)
 }
 
+/// Scores one sign row with a binary16 scale.
+///
+/// # Panics
+///
+/// Panics when code and query bitplane shapes disagree.
 pub fn estimate_asym(x: &[u64], scale: u16, q: &QueryPlanes) -> f32 {
     f16_to_f32(scale) * estimate_asym_unscaled(x, q)
 }
 
+/// Scores one sign row with a binary32 scale.
+///
+/// # Panics
+///
+/// Panics when code and query bitplane shapes disagree.
 pub fn estimate_asym_f32(x: &[u64], scale: f32, q: &QueryPlanes) -> f32 {
     scale * estimate_asym_unscaled(x, q)
 }
 
 /// Score one sign row without applying its stored scale.
+///
+/// # Panics
+///
+/// Panics when code and query bitplane shapes disagree.
 #[inline]
 pub fn estimate_asym_unscaled(x: &[u64], q: &QueryPlanes) -> f32 {
     let (positives, weighted_sum) = score_asym(x, q);
@@ -170,8 +216,11 @@ pub fn estimate_asym_unscaled(x: &[u64], q: &QueryPlanes) -> f32 {
     q.lo * sign_sum as f32 + q.delta * code_sum as f32
 }
 
-/// Score a fixed-stride row batch in one kernel call, leaving scale and
-/// split-form constant application to the caller's separate SoA pass.
+/// Scores a contiguous fixed-stride sign batch without row scales.
+///
+/// # Panics
+///
+/// Panics when row, bitplane, stride, or output shapes disagree.
 #[inline(always)]
 pub fn estimate_asym_batch_unscaled(
     rows: &[u64],
@@ -184,11 +233,6 @@ pub fn estimate_asym_batch_unscaled(
     assert!(!q.planes.is_empty());
     assert!(q.planes.iter().all(|plane| plane.len() == words_per_row));
 
-    // Bq=4 is the production scan configuration. Fuse the sign population
-    // and all four intersections into one word pass so the batch entry never
-    // re-enters the scalar cascade helper per row. Besides removing the call
-    // and its repeated shape assertions, this keeps each sign word live while
-    // all query planes consume it.
     if let [p0, p1, p2, p3] = q.planes.as_slice() {
         for (row, score) in rows.chunks_exact(words_per_row).zip(out) {
             let mut positives = 0_u32;
@@ -209,8 +253,6 @@ pub fn estimate_asym_batch_unscaled(
         return;
     }
 
-    // Width-generic fallback for the public kernel API. It retains the same
-    // fused batch shape, with the bitplane loop inside the word loop.
     for (row, score) in rows.chunks_exact(words_per_row).zip(out) {
         let mut positives = 0_u32;
         let mut weighted_sum = 0_u64;
@@ -226,9 +268,11 @@ pub fn estimate_asym_batch_unscaled(
     }
 }
 
-/// Score selected rows from one borrowed fixed-stride posting range without
-/// gathering or copying their packed sign words. `row_offsets` are local row
-/// indices into `rows` and may be sparse or repeated.
+/// Scores selected sign rows from a fixed-stride posting range.
+///
+/// # Panics
+///
+/// Panics when row, index, bitplane, stride, or output shapes disagree.
 #[inline(always)]
 pub fn estimate_asym_batch_unscaled_indexed(
     rows: &[u64],
@@ -246,9 +290,6 @@ pub fn estimate_asym_batch_unscaled_indexed(
     assert!(!q.planes.is_empty());
     assert!(q.planes.iter().all(|plane| plane.len() == words_per_row));
 
-    // Keep the production Bq=4 path fused across all query bitplanes, just as
-    // the contiguous batch entry does. Only the row base comes from the index
-    // stream; the packed posting remains borrowed in place.
     if let [p0, p1, p2, p3] = q.planes.as_slice() {
         for (&row_offset, score) in row_offsets.iter().zip(out) {
             let row_base = row_offset * words_per_row;
@@ -288,15 +329,29 @@ pub fn estimate_asym_batch_unscaled_indexed(
     }
 }
 
+/// Scores one sign row against a full-precision query with a binary16 scale.
+///
+/// # Panics
+///
+/// Panics when the code and query dimensions disagree.
 pub fn estimate_fp(x: &[u64], scale: u16, query: &[f32]) -> f32 {
     f16_to_f32(scale) * estimate_fp_unscaled(x, query)
 }
 
+/// Scores one sign row against a full-precision query with a binary32 scale.
+///
+/// # Panics
+///
+/// Panics when the code and query dimensions disagree.
 pub fn estimate_fp_f32(x: &[u64], scale: f32, query: &[f32]) -> f32 {
     scale * estimate_fp_unscaled(x, query)
 }
 
 /// Score a sign row against a full-precision query without applying its scale.
+///
+/// # Panics
+///
+/// Panics when the query is empty or the code word count is invalid.
 pub fn estimate_fp_unscaled(x: &[u64], query: &[f32]) -> f32 {
     assert!(!query.is_empty());
     assert_eq!(x.len(), packed_words(query.len()));

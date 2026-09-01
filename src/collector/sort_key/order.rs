@@ -273,14 +273,14 @@ impl Comparator<OwnedValue> for NaturalNoneIsHigherComparator {
 /// An enum representing the different sort orders.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum ComparatorEnum {
-    /// Natural order (See [NaturalComparator])
+    /// Natural order.
     #[default]
     Natural,
-    /// Reverse order (See [ReverseComparator])
+    /// Reverse order.
     Reverse,
-    /// Reverse order by treating None as the lowest value. (See [ReverseNoneLowerComparator])
+    /// Reverse order with `None` lowest.
     ReverseNoneLower,
-    /// Natural order but treating None as the highest value. (See [NaturalNoneIsHigherComparator])
+    /// Natural order with `None` highest.
     NaturalNoneHigher,
 }
 

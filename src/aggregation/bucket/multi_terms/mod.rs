@@ -171,9 +171,7 @@ pub struct MultiTermsAggReqData {
     pub missing_accessors: Vec<Option<MultiTermsMissingAccessor>>,
     /// Sub-aggregation descriptor (empty when no sub-aggs).
     pub sub_aggregations: Aggregations,
-    /// True if this multi_terms aggregation is at the top level of the aggregation tree
-    /// (not nested). Used to gate the Vec/Paged packed-key storage tiers, which assume a
-    /// bounded number of parent buckets (mirrors [`TermsAggReqData::is_top_level`]).
+    /// Whether this aggregation is at the top level of the request tree.
     pub is_top_level: bool,
 }
 
@@ -195,7 +193,7 @@ impl MultiTermsAggReqData {
 const MULTI_TERMS_KEY_INLINE_CAPACITY: usize = 3;
 
 /// The composite key for one combination of raw fast-field values, inline-allocated for up to
-/// [`MULTI_TERMS_KEY_INLINE_CAPACITY`] fields.
+/// `MULTI_TERMS_KEY_INLINE_CAPACITY` fields.
 pub type MultiTermsKey = SmallVec<[u64; MULTI_TERMS_KEY_INLINE_CAPACITY]>;
 
 impl AggregationMapKey for MultiTermsKey {

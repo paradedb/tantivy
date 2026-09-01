@@ -2,6 +2,11 @@
 
 use quant_model::f16::{f16_to_f32, f32_to_f16};
 
+/// Returns the packed byte length for a grid-code row.
+///
+/// # Panics
+///
+/// Panics when `d` is zero, `bits` is outside `2..=4`, or the bit length overflows.
 pub fn packed_len(d: usize, bits: u8) -> usize {
     assert!(d > 0);
     assert!(matches!(bits, 2..=4));
@@ -27,6 +32,11 @@ fn tail_is_zero(packed: &[u8], d: usize, bits: u8) -> bool {
     }
 }
 
+/// Packs grid codes into little-endian bit fields.
+///
+/// # Panics
+///
+/// Panics when buffers, codes, or `bits` violate the packed-row layout.
 pub fn pack(codes: &[u8], bits: u8, out: &mut [u8]) {
     assert!(!codes.is_empty());
     assert_eq!(out.len(), packed_len(codes.len(), bits));
@@ -54,6 +64,11 @@ pub fn pack(codes: &[u8], bits: u8, out: &mut [u8]) {
     debug_assert!(tail_is_zero(out, codes.len(), bits));
 }
 
+/// Unpacks one grid-code row.
+///
+/// # Panics
+///
+/// Panics when `d`, `bits`, or the packed-row length is invalid.
 pub fn unpack(packed: &[u8], d: usize, bits: u8) -> Vec<u8> {
     assert!(d > 0);
     assert_eq!(packed.len(), packed_len(d, bits));
@@ -69,21 +84,30 @@ pub fn unpack(packed: &[u8], d: usize, bits: u8) -> Vec<u8> {
 }
 
 /// Encode a vector and return its RMS scale after f16 rounding.
+///
+/// # Panics
+///
+/// Panics when vector, grid, bit width, or output shape is invalid.
 pub fn encode(y: &[f32], grid: &[f32], bits: u8, out: &mut [u8]) -> u16 {
     let mut code_scratch = vec![0_u8; y.len()];
     encode_with_scratch(y, grid, bits, out, &mut code_scratch)
 }
 
 /// Encode a vector and return its exact RMS scale.
+///
+/// # Panics
+///
+/// Panics when vector, grid, bit width, or output shape is invalid.
 pub fn encode_f32(y: &[f32], grid: &[f32], bits: u8, out: &mut [u8]) -> f32 {
     let mut code_scratch = vec![0_u8; y.len()];
     encode_f32_with_scratch(y, grid, bits, out, &mut code_scratch)
 }
 
-/// Encode a vector using caller-owned one-byte-per-coordinate scratch.
+/// Encodes a vector with caller-owned scratch storage.
 ///
-/// The scratch form is byte-identical to [`encode`] and lets a cluster batch
-/// reuse one allocation across every row.
+/// # Panics
+///
+/// Panics when vector, grid, bit width, output, or scratch shape is invalid.
 pub fn encode_with_scratch(
     y: &[f32],
     grid: &[f32],
@@ -95,6 +119,10 @@ pub fn encode_with_scratch(
 }
 
 /// Encode a vector using caller-owned scratch and return its exact RMS scale.
+///
+/// # Panics
+///
+/// Panics when vector, grid, bit width, output, or scratch shape is invalid.
 pub fn encode_f32_with_scratch(
     y: &[f32],
     grid: &[f32],
@@ -125,6 +153,11 @@ pub fn encode_f32_with_scratch(
     scale
 }
 
+/// Decodes one grid-code row.
+///
+/// # Panics
+///
+/// Panics when grid, bit width, code length, or dimension is invalid.
 pub fn decode(codes: &[u8], grid: &[f32], d: usize, bits: u8, scale: u16) -> Vec<f32> {
     let mut decoded = vec![0.0_f32; d];
     decode_into(codes, grid, bits, scale, &mut decoded);
@@ -132,6 +165,10 @@ pub fn decode(codes: &[u8], grid: &[f32], d: usize, bits: u8, scale: u16) -> Vec
 }
 
 /// Decode a packed row into caller-owned output storage.
+///
+/// # Panics
+///
+/// Panics when grid, bit width, code length, or output shape is invalid.
 pub fn decode_into(codes: &[u8], grid: &[f32], bits: u8, scale: u16, out: &mut [f32]) {
     assert!(!out.is_empty());
     assert_eq!(codes.len(), packed_len(out.len(), bits));
@@ -143,6 +180,11 @@ pub fn decode_into(codes: &[u8], grid: &[f32], bits: u8, scale: u16, out: &mut [
     }
 }
 
+/// Builds a coordinate-major query lookup table.
+///
+/// # Panics
+///
+/// Panics when the query is empty or the grid does not match `bits`.
 pub fn build_lut(u: &[f32], grid: &[f32], bits: u8) -> Vec<f32> {
     assert!(!u.is_empty());
     validate_grid(grid, bits);
@@ -153,9 +195,11 @@ pub fn build_lut(u: &[f32], grid: &[f32], bits: u8) -> Vec<f32> {
     lut
 }
 
-/// Fold each pair of b=4 coordinate LUTs into the packed-byte domain. The
-/// result is query-scoped and lets a batch scorer perform one lookup/add per
-/// two coordinates.
+/// Folds pairs of four-bit coordinate tables into byte-indexed tables.
+///
+/// # Panics
+///
+/// Panics when `lut` is not a `d * 16` coordinate table.
 pub fn build_packed_lut_4(lut: &[f32], d: usize) -> Vec<f32> {
     assert_eq!(lut.len(), d * 16);
     let pairs = d / 2;
@@ -182,6 +226,11 @@ fn packed_lut_len_4(d: usize) -> usize {
     (d / 2) * 256 + (d % 2) * 16
 }
 
+/// Scores a contiguous batch of packed four-bit rows.
+///
+/// # Panics
+///
+/// Panics when code, LUT, stride, dimension, or output shapes disagree.
 pub fn score_batch_packed_4(
     codes: &[u8],
     code_stride: usize,
@@ -209,8 +258,7 @@ pub fn score_batch_packed_4(
         for pair in 0..pairs {
             let lut_base = pair * 256;
             for lane in 0..8 {
-                // SAFETY: lengths and strides are validated above; a packed
-                // byte is exactly the 0..256 table index.
+                // SAFETY: Validated row and LUT shapes cover every unchecked index.
                 unsafe {
                     let packed = *codes.get_unchecked(offsets[lane] + pair);
                     sums[lane] += *packed_lut.get_unchecked(lut_base + packed as usize);
@@ -220,8 +268,7 @@ pub fn score_batch_packed_4(
         if !d.is_multiple_of(2) {
             let lut_base = pairs * 256;
             for lane in 0..8 {
-                // SAFETY: an odd dimension leaves one valid low nibble in
-                // byte `pairs` and one trailing 16-entry LUT.
+                // SAFETY: Validated row and LUT shapes cover every unchecked index.
                 unsafe {
                     let packed = *codes.get_unchecked(offsets[lane] + pairs);
                     sums[lane] += *packed_lut.get_unchecked(lut_base + (packed & 0x0f) as usize);
@@ -235,12 +282,14 @@ pub fn score_batch_packed_4(
         let packed_row = &codes[(row + local) * code_stride..(row + local + 1) * code_stride];
         let mut sum = 0.0;
         for pair in 0..pairs {
+            // SAFETY: Validated row and LUT shapes cover every pair and byte value.
             unsafe {
                 sum += *packed_lut
                     .get_unchecked(pair * 256 + *packed_row.get_unchecked(pair) as usize);
             }
         }
         if !d.is_multiple_of(2) {
+            // SAFETY: The odd coordinate adds one validated row byte and 16-entry LUT tail.
             unsafe {
                 sum += *packed_lut.get_unchecked(
                     pairs * 256 + (*packed_row.get_unchecked(pairs) & 0x0f) as usize,
@@ -251,9 +300,11 @@ pub fn score_batch_packed_4(
     }
 }
 
-/// Score selected rows from one borrowed contiguous posting range. Row
-/// offsets are local to `codes`; no survivor code bytes are gathered or
-/// copied before entering this batch kernel.
+/// Scores selected four-bit rows from a contiguous posting range.
+///
+/// # Panics
+///
+/// Panics when code, row-index, LUT, stride, dimension, or output shapes disagree.
 pub fn score_batch_packed_4_indexed(
     codes: &[u8],
     code_stride: usize,
@@ -286,8 +337,7 @@ pub fn score_batch_packed_4_indexed(
         for pair in 0..pairs {
             let lut_base = pair * 256;
             for lane in 0..8 {
-                // SAFETY: row offsets, strides, and LUT dimensions are
-                // validated above; each packed byte is a 0..256 index.
+                // SAFETY: Validated row and LUT shapes cover every unchecked index.
                 unsafe {
                     let packed = *codes.get_unchecked(offsets[lane] + pair);
                     sums[lane] += *packed_lut.get_unchecked(lut_base + packed as usize);
@@ -297,6 +347,7 @@ pub fn score_batch_packed_4_indexed(
         if !d.is_multiple_of(2) {
             let lut_base = pairs * 256;
             for lane in 0..8 {
+                // SAFETY: Validated row indices and LUT shape cover the odd-coordinate tail.
                 unsafe {
                     let packed = *codes.get_unchecked(offsets[lane] + pairs);
                     sums[lane] += *packed_lut.get_unchecked(lut_base + (packed & 0x0f) as usize);
@@ -310,12 +361,14 @@ pub fn score_batch_packed_4_indexed(
         let offset = row_offsets[row + local] * code_stride;
         let mut sum = 0.0;
         for pair in 0..pairs {
+            // SAFETY: Validated row indices and LUT shape cover every pair and byte value.
             unsafe {
                 sum += *packed_lut
                     .get_unchecked(pair * 256 + *codes.get_unchecked(offset + pair) as usize);
             }
         }
         if !d.is_multiple_of(2) {
+            // SAFETY: The odd coordinate adds one validated row byte and 16-entry LUT tail.
             unsafe {
                 sum += *packed_lut.get_unchecked(
                     pairs * 256 + (*codes.get_unchecked(offset + pairs) & 0x0f) as usize,
@@ -326,6 +379,11 @@ pub fn score_batch_packed_4_indexed(
     }
 }
 
+/// Scores one grid-code row without applying its scale.
+///
+/// # Panics
+///
+/// Panics when code, LUT, dimension, or bit-width shapes disagree.
 pub fn score(codes: &[u8], lut: &[f32], d: usize, bits: u8) -> f32 {
     assert!(d > 0);
     assert_eq!(codes.len(), packed_len(d, bits));
@@ -347,16 +405,29 @@ pub fn score(codes: &[u8], lut: &[f32], d: usize, bits: u8) -> f32 {
         .sum()
 }
 
+/// Scores one grid-code row with a binary16 scale.
+///
+/// # Panics
+///
+/// Panics when code, LUT, dimension, or bit-width shapes disagree.
 pub fn estimate(codes: &[u8], scale: u16, lut: &[f32], d: usize, bits: u8) -> f32 {
     f16_to_f32(scale) * score(codes, lut, d, bits)
 }
 
+/// Scores one grid-code row with a binary32 scale.
+///
+/// # Panics
+///
+/// Panics when code, LUT, dimension, or bit-width shapes disagree.
 pub fn estimate_f32(codes: &[u8], scale: f32, lut: &[f32], d: usize, bits: u8) -> f32 {
     scale * score(codes, lut, d, bits)
 }
 
-/// Score a fixed-stride row batch in one kernel call, leaving scale and
-/// split-form constant application to the caller's separate SoA pass.
+/// Scores a contiguous fixed-stride batch without applying row scales.
+///
+/// # Panics
+///
+/// Panics when code, LUT, stride, dimension, bit width, or output shapes disagree.
 pub fn score_batch(
     codes: &[u8],
     code_stride: usize,
@@ -385,9 +456,11 @@ pub fn score_batch(
     }
 }
 
-/// Score selected rows from one borrowed fixed-stride posting range without
-/// gathering or copying their packed code bytes. `row_offsets` are local row
-/// indices into `codes` and may be sparse or repeated.
+/// Scores selected rows from a fixed-stride posting range.
+///
+/// # Panics
+///
+/// Panics when code, row-index, LUT, stride, dimension, bit width, or output shapes disagree.
 pub fn score_batch_indexed(
     codes: &[u8],
     code_stride: usize,
@@ -450,6 +523,7 @@ fn score_batch_4_indexed(
             let low_lut = pair * 32;
             let high_lut = low_lut + 16;
             for lane in 0..8 {
+                // SAFETY: Validated row indices and LUT shape cover every nibble lookup.
                 unsafe {
                     let packed = *codes.get_unchecked(offsets[lane] + pair);
                     sums[lane] += *lut.get_unchecked(low_lut + (packed & 0x0f) as usize);
@@ -460,6 +534,7 @@ fn score_batch_4_indexed(
         if !d.is_multiple_of(2) {
             let low_lut = pairs * 32;
             for lane in 0..8 {
+                // SAFETY: Validated row indices and LUT shape cover the odd-coordinate tail.
                 unsafe {
                     let packed = *codes.get_unchecked(offsets[lane] + pairs);
                     sums[lane] += *lut.get_unchecked(low_lut + (packed & 0x0f) as usize);
@@ -473,6 +548,7 @@ fn score_batch_4_indexed(
         let offset = row_offsets[row + local] * stride;
         let mut sum = 0.0;
         for pair in 0..pairs {
+            // SAFETY: Validated row indices and LUT shape cover every nibble lookup.
             unsafe {
                 let packed = *codes.get_unchecked(offset + pair);
                 let low_lut = pair * 32;
@@ -481,6 +557,7 @@ fn score_batch_4_indexed(
             }
         }
         if !d.is_multiple_of(2) {
+            // SAFETY: The odd coordinate adds one validated row byte and four-bit LUT tail.
             unsafe {
                 sum += *lut.get_unchecked(
                     pairs * 32 + (*codes.get_unchecked(offset + pairs) & 0x0f) as usize,
@@ -521,9 +598,7 @@ fn score_batch_2_indexed(
     }
 }
 
-/// Score eight b=4 rows together so each pair of 16-entry coordinate LUTs is
-/// hot while the batch consumes it. This is the refinement-path shape: one
-/// kernel entry per survivor batch, with no scalar-row scorer calls.
+/// Scores eight packed four-bit rows per inner batch.
 #[inline(always)]
 fn score_batch_4(codes: &[u8], stride: usize, lut: &[f32], d: usize, out: &mut [f32]) {
     let pairs = d / 2;
@@ -544,11 +619,9 @@ fn score_batch_4(codes: &[u8], stride: usize, lut: &[f32], d: usize, out: &mut [
             let low_lut = pair * 32;
             let high_lut = low_lut + 16;
             for lane in 0..8 {
-                // SAFETY: `score_batch` validates `codes == rows * stride`,
-                // `stride == packed_len(d, 4)`, and `lut == d * 16` above.
-                // `row + lane` is an output row, `pair < d / 2`, and each
-                // nibble is in 0..16.
+                // SAFETY: Validated row and LUT shapes cover every unchecked index.
                 let packed = unsafe { *codes.get_unchecked(offsets[lane] + pair) };
+                // SAFETY: Validated LUT shape covers both nibbles of `packed`.
                 unsafe {
                     sums[lane] += *lut.get_unchecked(low_lut + (packed & 0x0f) as usize);
                     sums[lane] += *lut.get_unchecked(high_lut + (packed >> 4) as usize);
@@ -558,8 +631,9 @@ fn score_batch_4(codes: &[u8], stride: usize, lut: &[f32], d: usize, out: &mut [
         if !d.is_multiple_of(2) {
             let low_lut = pairs * 32;
             for lane in 0..8 {
-                // SAFETY: an odd `d` leaves one valid low nibble at `pairs`.
+                // SAFETY: Validated row and LUT shapes cover every unchecked index.
                 let packed = unsafe { *codes.get_unchecked(offsets[lane] + pairs) };
+                // SAFETY: Validated LUT shape covers the odd-coordinate nibble.
                 unsafe {
                     sums[lane] += *lut.get_unchecked(low_lut + (packed & 0x0f) as usize);
                 }
@@ -572,16 +646,17 @@ fn score_batch_4(codes: &[u8], stride: usize, lut: &[f32], d: usize, out: &mut [
         let packed_row = &codes[(row + local) * stride..(row + local + 1) * stride];
         let mut sum = 0.0;
         for pair in 0..pairs {
-            // SAFETY: `pair < d / 2 <= packed_len(d, 4)`.
+            // SAFETY: Validated row and LUT shapes cover every unchecked index.
             let packed = unsafe { *packed_row.get_unchecked(pair) };
             let low_lut = pair * 32;
+            // SAFETY: Validated LUT shape covers both nibbles of `packed`.
             unsafe {
                 sum += *lut.get_unchecked(low_lut + (packed & 0x0f) as usize);
                 sum += *lut.get_unchecked(low_lut + 16 + (packed >> 4) as usize);
             }
         }
         if !d.is_multiple_of(2) {
-            // SAFETY: the odd coordinate and its 16-entry LUT are present.
+            // SAFETY: Validated row and LUT shapes cover every unchecked index.
             unsafe {
                 sum += *lut
                     .get_unchecked(pairs * 32 + (*packed_row.get_unchecked(pairs) & 0x0f) as usize);
