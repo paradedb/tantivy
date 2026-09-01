@@ -30,8 +30,8 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::router::router_factory_for;
-use crate::vector::{IvfClusterer, Router, RouterFactory, VectorPlugin};
+use crate::vector::router::{router_factory_for, RouterFactory};
+use crate::vector::{IvfClusterer, Router, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -264,12 +264,6 @@ impl IndexBuilder {
     /// Select the router used to build and open IVF segments.
     pub fn ivf_router<R: Router + 'static>(mut self) -> crate::Result<Self> {
         configure_ivf_router_factory(&mut self.ivf_router_factory, router_factory_for::<R>())?;
-        Ok(self)
-    }
-
-    /// Select the factory used to build and open IVF segments.
-    pub fn ivf_router_factory(mut self, factory: Arc<dyn RouterFactory>) -> crate::Result<Self> {
-        configure_ivf_router_factory(&mut self.ivf_router_factory, factory)?;
         Ok(self)
     }
 
@@ -930,12 +924,7 @@ impl Index {
 
     /// Select the router used to build and open IVF segments.
     pub fn set_ivf_router<R: Router + 'static>(&mut self) -> crate::Result<()> {
-        self.set_ivf_router_factory(router_factory_for::<R>())
-    }
-
-    /// Select the factory used to build and open IVF segments.
-    pub fn set_ivf_router_factory(&mut self, factory: Arc<dyn RouterFactory>) -> crate::Result<()> {
-        configure_ivf_router_factory(&mut self.ivf_router_factory, factory)
+        configure_ivf_router_factory(&mut self.ivf_router_factory, router_factory_for::<R>())
     }
 
     pub(crate) fn ivf_router_factory(&self) -> Option<&dyn RouterFactory> {

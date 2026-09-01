@@ -126,8 +126,8 @@ impl RouterSearchContext {
 
 /// Builds and routes an IVF index and owns its persisted format.
 ///
-/// `serialize` prefixes the router payload with its ID. The configured
-/// [`RouterFactory`] checks that ID before opening the payload.
+/// `serialize` prefixes the router payload with its ID. The configured router
+/// checks that ID before opening the payload.
 pub trait Router: RouterType + RouterMetadata {
     /// Builds a router over the supplied centroids, which may be empty.
     /// Implementations may reorder rows in place but must preserve the matrix shape.
@@ -161,7 +161,7 @@ pub trait Router: RouterType + RouterMetadata {
     }
 }
 
-pub trait RouterFactory: Send + Sync + 'static {
+pub(crate) trait RouterFactory: Send + Sync + 'static {
     fn descriptor(&self) -> RouterDescriptor;
 
     fn build(

@@ -19,7 +19,8 @@ use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT};
-use crate::vector::{residual_norm, BoundKind, BoundsBuilder, RouterFactory, VEC_EXT};
+use crate::vector::router::RouterFactory;
+use crate::vector::{residual_norm, BoundKind, BoundsBuilder, VEC_EXT};
 use crate::{DocId, TantivyError};
 
 struct AssignedVector {
