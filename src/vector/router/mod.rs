@@ -122,6 +122,9 @@ impl<R: Router> ErasedRouterDescriptor for R {
     }
 }
 
+/// Type-erased constructors for the router type selected on an index.
+/// `Router` represents an existing router, but its `Self: Sized` build and
+/// deserialize functions cannot be called through `dyn Router` before one exists.
 #[derive(Clone, Copy)]
 pub(crate) struct RouterBinding {
     descriptor: RouterDescriptor,
