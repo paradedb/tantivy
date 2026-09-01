@@ -14,10 +14,73 @@ mod exact;
 mod rng;
 mod stacked;
 
-pub(crate) use exact::LazyExactRouter;
+pub use exact::LazyExactRouter;
 
-const ROUTER_MAGIC: &[u8; 8] = b"TVROUTER";
-const ROUTER_HEADER_LEN: usize = ROUTER_MAGIC.len() + size_of::<u16>() + size_of::<u32>();
+const ROUTER_HEADER_LEN: usize = size_of::<u16>();
+
+/// The persisted identity and format compatibility of a router family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouterDescriptor {
+    id: &'static str,
+    vector_file_version: VectorFileVersion,
+}
+
+impl RouterDescriptor {
+    pub const fn new(id: &'static str, vector_file_version: VectorFileVersion) -> Self {
+        Self {
+            id,
+            vector_file_version,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        self.id
+    }
+
+    pub fn vector_file_version(self) -> VectorFileVersion {
+        self.vector_file_version
+    }
+
+    pub(crate) fn validate(self) -> crate::Result<()> {
+        if self.id.is_empty() {
+            return Err(crate::TantivyError::InvalidArgument(
+                "router ID cannot be empty".to_string(),
+            ));
+        }
+        if u16::try_from(self.id.len()).is_err() {
+            return Err(crate::TantivyError::InvalidArgument(format!(
+                "router ID exceeds u16: {}",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Type-level router metadata used by factories before a router is built.
+pub trait RouterType: Send + Sync + 'static {
+    fn router_descriptor() -> RouterDescriptor
+    where Self: Sized;
+}
+
+/// Object-safe access to a router's type-level metadata.
+pub trait RouterMetadata {
+    fn descriptor(&self) -> RouterDescriptor;
+
+    fn id(&self) -> &'static str {
+        self.descriptor().id()
+    }
+
+    fn vector_file_version(&self) -> VectorFileVersion {
+        self.descriptor().vector_file_version()
+    }
+}
+
+impl<R: RouterType> RouterMetadata for R {
+    fn descriptor(&self) -> RouterDescriptor {
+        R::router_descriptor()
+    }
+}
 
 pub struct RouterOpenContext {
     centroids: FileSlice,
@@ -63,10 +126,9 @@ impl RouterSearchContext {
 
 /// Builds and routes an IVF index and owns its persisted format.
 ///
-/// `serialize` wraps the router payload in an envelope containing its ID and
-/// format version. `open_router` removes and validates that envelope before
-/// delegating the payload to `deserialize`.
-pub trait Router: Send + Sync {
+/// `serialize` prefixes the router payload with its ID. The configured
+/// [`RouterFactory`] checks that ID before opening the payload.
+pub trait Router: RouterType + RouterMetadata {
     /// Builds a router over the supplied centroids, which may be empty.
     /// Implementations may reorder rows in place but must preserve the matrix shape.
     fn build_router(
@@ -76,30 +138,12 @@ pub trait Router: Send + Sync {
     where
         Self: Sized;
 
-    fn id(&self) -> &'static str;
-
-    fn vector_file_version(&self) -> VectorFileVersion;
-
-    fn format_version(&self) -> u32;
-
     fn deserialize(
-        format_version: u32,
         payload: FileSlice,
         context: &RouterOpenContext,
     ) -> crate::Result<Box<dyn Router>>
     where
         Self: Sized;
-
-    fn open_router(
-        file_version: VectorFileVersion,
-        slot: FileSlice,
-        context: &RouterOpenContext,
-    ) -> crate::Result<Box<dyn Router>>
-    where
-        Self: Sized,
-    {
-        open_enveloped_router::<Self>(file_version, slot, context)
-    }
 
     fn rank<'a>(
         &'a self,
@@ -111,16 +155,25 @@ pub trait Router: Send + Sync {
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()>;
 
     fn serialize(&self, out: &mut dyn Write) -> io::Result<()> {
-        write_router_header(self.id(), self.format_version(), out)?;
+        let descriptor = RouterMetadata::descriptor(self);
+        write_router_header(descriptor.id(), out)?;
         self.serialize_payload(out)
     }
 }
 
-pub trait RouterFactory: Send + Sync {
+pub trait RouterFactory: Send + Sync + 'static {
+    fn descriptor(&self) -> RouterDescriptor;
+
     fn build(
         &self,
         options: &VectorOptions,
         centroids: &mut IvfCentroids,
+    ) -> crate::Result<Box<dyn Router>>;
+
+    fn deserialize(
+        &self,
+        payload: FileSlice,
+        context: &RouterOpenContext,
     ) -> crate::Result<Box<dyn Router>>;
 
     fn open(
@@ -128,12 +181,76 @@ pub trait RouterFactory: Send + Sync {
         file_version: VectorFileVersion,
         slot: FileSlice,
         context: &RouterOpenContext,
-    ) -> crate::Result<Box<dyn Router>>;
+    ) -> crate::Result<Box<dyn Router>> {
+        let descriptor = self.descriptor();
+        if descriptor.vector_file_version() != file_version {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "router {} requires vector file version {:?}, found {:?}",
+                    descriptor.id(),
+                    descriptor.vector_file_version(),
+                    file_version
+                ),
+            )
+            .into());
+        }
+        if slot.len() < ROUTER_HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "router slot is shorter than its header",
+            )
+            .into());
+        }
+        let header = slot.slice_to(ROUTER_HEADER_LEN).read_bytes()?;
+        let mut cursor = header.as_slice();
+        let id_len = u16::deserialize(&mut cursor)? as usize;
+        let payload_offset = ROUTER_HEADER_LEN
+            .checked_add(id_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "router header overflow"))?;
+        if payload_offset > slot.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "router slot is shorter than its declared ID",
+            )
+            .into());
+        }
+        let id_bytes = slot.slice(ROUTER_HEADER_LEN..payload_offset).read_bytes()?;
+        let persisted_id = std::str::from_utf8(&id_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "router ID is not UTF-8"))?;
+        if persisted_id != descriptor.id() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "configured router {} does not match persisted router {persisted_id}",
+                    descriptor.id()
+                ),
+            )
+            .into());
+        }
+        let router = self.deserialize(slot.slice_from(payload_offset), context)?;
+        if router.descriptor() != descriptor {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "router factory for {} opened router {}",
+                    descriptor.id(),
+                    router.id()
+                ),
+            )
+            .into());
+        }
+        Ok(router)
+    }
 }
 
 struct RouterFactoryFor<R>(PhantomData<fn() -> R>);
 
 impl<R: Router + 'static> RouterFactory for RouterFactoryFor<R> {
+    fn descriptor(&self) -> RouterDescriptor {
+        R::router_descriptor()
+    }
+
     fn build(
         &self,
         options: &VectorOptions,
@@ -142,13 +259,12 @@ impl<R: Router + 'static> RouterFactory for RouterFactoryFor<R> {
         R::build_router(options, centroids)
     }
 
-    fn open(
+    fn deserialize(
         &self,
-        file_version: VectorFileVersion,
-        slot: FileSlice,
+        payload: FileSlice,
         context: &RouterOpenContext,
     ) -> crate::Result<Box<dyn Router>> {
-        R::open_router(file_version, slot, context)
+        R::deserialize(payload, context)
     }
 }
 
@@ -166,82 +282,17 @@ pub struct IvfSearchMetrics {
     pub graph: Option<NeighborhoodGraphSearchMetrics>,
 }
 
-fn write_router_header(id: &str, version: u32, out: &mut dyn Write) -> io::Result<()> {
+fn write_router_header(id: &str, out: &mut dyn Write) -> io::Result<()> {
+    if id.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "router ID cannot be empty",
+        ));
+    }
     let id_len = u16::try_from(id.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "router ID exceeds u16"))?;
-    out.write_all(ROUTER_MAGIC)?;
     id_len.serialize(out)?;
-    version.serialize(out)?;
     out.write_all(id.as_bytes())
-}
-
-fn open_enveloped_router<R: Router>(
-    file_version: VectorFileVersion,
-    slot: FileSlice,
-    context: &RouterOpenContext,
-) -> crate::Result<Box<dyn Router>> {
-    if slot.len() < ROUTER_HEADER_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "router slot is shorter than its header",
-        )
-        .into());
-    }
-    let header = slot.slice_to(ROUTER_HEADER_LEN).read_bytes()?;
-    if &header[..ROUTER_MAGIC.len()] != ROUTER_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid router magic").into());
-    }
-    let mut cursor = &header[ROUTER_MAGIC.len()..];
-    let id_len = u16::deserialize(&mut cursor)? as usize;
-    let format_version = u32::deserialize(&mut cursor)?;
-    let payload_offset = ROUTER_HEADER_LEN
-        .checked_add(id_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "router header overflow"))?;
-    if payload_offset > slot.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "router slot is shorter than its declared ID",
-        )
-        .into());
-    }
-    let id_bytes = slot.slice(ROUTER_HEADER_LEN..payload_offset).read_bytes()?;
-    let id = std::str::from_utf8(&id_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "router ID is not UTF-8"))?;
-    let router = R::deserialize(format_version, slot.slice_from(payload_offset), context)?;
-    if router.id() != id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "router opener {} does not match persisted router {id}",
-                router.id()
-            ),
-        )
-        .into());
-    }
-    if router.vector_file_version() != file_version {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "router {} requires vector file version {:?}, found {:?}",
-                router.id(),
-                router.vector_file_version(),
-                file_version
-            ),
-        )
-        .into());
-    }
-    Ok(router)
-}
-
-fn require_version(id: &str, actual: u32, expected: u32) -> crate::Result<()> {
-    if actual != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported {id} router format version: {actual}"),
-        )
-        .into());
-    }
-    Ok(())
 }
 
 struct EagerRouterRanking {
@@ -282,36 +333,33 @@ mod tests {
     use super::*;
     use crate::vector::Similarity;
 
-    struct TestRouter {
+    struct TestRouter<const KIND: u8> {
         cluster: u32,
     }
 
-    impl Router for TestRouter {
+    impl<const KIND: u8> RouterType for TestRouter<KIND> {
+        fn router_descriptor() -> RouterDescriptor {
+            let id = match KIND {
+                0 => "test.primary",
+                1 => "test.secondary",
+                _ => "test.unknown",
+            };
+            RouterDescriptor::new(id, VectorFileVersion::V3)
+        }
+    }
+
+    impl<const KIND: u8> Router for TestRouter<KIND> {
         fn build_router(
             _options: &VectorOptions,
             _centroids: &mut IvfCentroids,
         ) -> crate::Result<Box<dyn Router>> {
-            Ok(Box::new(TestRouter { cluster: 0 }))
-        }
-
-        fn id(&self) -> &'static str {
-            "test.router"
-        }
-
-        fn vector_file_version(&self) -> VectorFileVersion {
-            VectorFileVersion::V3
-        }
-
-        fn format_version(&self) -> u32 {
-            7
+            Ok(Box::new(TestRouter::<KIND> { cluster: 0 }))
         }
 
         fn deserialize(
-            format_version: u32,
             payload: FileSlice,
             _context: &RouterOpenContext,
         ) -> crate::Result<Box<dyn Router>> {
-            require_version("test.router", format_version, 7)?;
             let bytes = payload.read_bytes()?;
             let mut cursor = bytes.as_slice();
             let cluster = u32::deserialize(&mut cursor)?;
@@ -322,7 +370,7 @@ mod tests {
                 )
                 .into());
             }
-            Ok(Box::new(TestRouter { cluster }))
+            Ok(Box::new(TestRouter::<KIND> { cluster }))
         }
 
         fn rank<'a>(
@@ -350,22 +398,25 @@ mod tests {
     }
 
     impl RouterFactory for CountingRouterFactory {
+        fn descriptor(&self) -> RouterDescriptor {
+            TestRouter::<0>::router_descriptor()
+        }
+
         fn build(
             &self,
             options: &VectorOptions,
             centroids: &mut IvfCentroids,
         ) -> crate::Result<Box<dyn Router>> {
-            TestRouter::build_router(options, centroids)
+            TestRouter::<0>::build_router(options, centroids)
         }
 
-        fn open(
+        fn deserialize(
             &self,
-            file_version: VectorFileVersion,
-            slot: FileSlice,
+            payload: FileSlice,
             context: &RouterOpenContext,
         ) -> crate::Result<Box<dyn Router>> {
             self.opens.fetch_add(1, Ordering::Relaxed);
-            TestRouter::open_router(file_version, slot, context)
+            TestRouter::<0>::deserialize(payload, context)
         }
     }
 
@@ -374,35 +425,29 @@ mod tests {
     }
 
     #[test]
-    fn caller_selected_router_roundtrips_without_core_dispatch() -> crate::Result<()> {
-        let router = TestRouter { cluster: 42 };
+    fn configured_factory_opens_matching_router() -> crate::Result<()> {
+        let router = TestRouter::<0> { cluster: 42 };
         let mut bytes = Vec::new();
         router.serialize(&mut bytes)?;
-
-        let slot = FileSlice::from(bytes);
-        let opened = router_factory_for::<TestRouter>().open(
+        let factory = router_factory_for::<TestRouter<0>>();
+        let opened = factory.open(
             VectorFileVersion::V3,
-            slot,
+            FileSlice::from(bytes),
             &test_context(),
         )?;
-        assert_eq!(opened.id(), "test.router");
-        assert_eq!(opened.vector_file_version(), VectorFileVersion::V3);
-        assert_eq!(opened.format_version(), 7);
-
         let mut workspace = Workspace::new();
-        let mut ranked = opened.rank(
+        let mut ranking = opened.rank(
             &mut workspace,
             &[0.0],
             RouterSearchContext::new(1, Metric::L2),
         );
-        assert_eq!(ranked.next().map(|candidate| candidate.node), Some(42));
-        assert_eq!(ranked.metrics().visited_count, 1);
+        assert_eq!(ranking.next().unwrap().node, 42);
         Ok(())
     }
 
     #[test]
     fn stateful_factory_opens_the_selected_router() -> crate::Result<()> {
-        let router = TestRouter { cluster: 42 };
+        let router = TestRouter::<0> { cluster: 42 };
         let mut bytes = Vec::new();
         router.serialize(&mut bytes)?;
 
@@ -416,35 +461,35 @@ mod tests {
             &test_context(),
         )?;
 
-        assert_eq!(opened.id(), "test.router");
+        assert_eq!(opened.id(), "test.primary");
         assert_eq!(opens.load(Ordering::Relaxed), 1);
         Ok(())
     }
 
     #[test]
-    fn selected_router_rejects_a_different_envelope_id() {
+    fn configured_factory_rejects_a_different_persisted_router() {
+        let router = TestRouter::<1> { cluster: 42 };
         let mut bytes = Vec::new();
-        write_router_header("test.missing-router", 7, &mut bytes).unwrap();
-        42u32.serialize(&mut bytes).unwrap();
-        let error = TestRouter::open_router(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            &test_context(),
-        )
-        .err()
-        .expect("a different router ID must fail");
-        assert!(error.to_string().contains("test.missing-router"));
+        router.serialize(&mut bytes).unwrap();
+        let error = router_factory_for::<TestRouter<0>>()
+            .open(
+                VectorFileVersion::V3,
+                FileSlice::from(bytes),
+                &test_context(),
+            )
+            .err()
+            .expect("a different persisted router must fail");
+        assert!(error.to_string().contains(
+            "configured router test.primary does not match persisted router test.secondary"
+        ));
     }
 
     #[test]
-    fn selected_router_rejects_incompatible_vector_file_version() {
-        let router = TestRouter { cluster: 42 };
-        let mut bytes = Vec::new();
-        router.serialize(&mut bytes).unwrap();
-        let slot = FileSlice::from(bytes);
-        let error = TestRouter::open_router(VectorFileVersion::V2, slot, &test_context())
+    fn pre_v3_router_format_is_rejected() {
+        let error = router_factory_for::<TestRouter<0>>()
+            .open(VectorFileVersion::V2, FileSlice::empty(), &test_context())
             .err()
-            .expect("incompatible vector file version must fail");
+            .expect("pre-V3 router formats must fail");
         assert!(error
             .to_string()
             .contains("requires vector file version V3"));

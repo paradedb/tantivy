@@ -716,11 +716,11 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
     /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
     /// see [`Graph::serialize`] for the format. The metric and tuning knobs are
     /// configuration, not data, so they are not persisted.
-    pub fn serialize_adjacency<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+    pub fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         self.graph.serialize(out)
     }
 
-    /// Opens a serialized RNG (see [`serialize_adjacency`](Self::serialize_adjacency)) over
+    /// Opens a serialized RNG (see [`serialize`](Self::serialize)) over
     /// `vectors` — typically a
     /// [`FileSliceArena`](crate::vector::FileSliceArena) so search fetches centroid
     /// rows lazily. The metric and knobs were never persisted: supply the

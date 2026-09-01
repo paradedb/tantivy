@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 
 use super::{
-    require_version, EagerRouterRanking, Router, RouterOpenContext, RouterRanking,
-    RouterSearchContext,
+    EagerRouterRanking, Router, RouterDescriptor, RouterOpenContext, RouterRanking,
+    RouterSearchContext, RouterType,
 };
 use crate::directory::FileSlice;
 use crate::schema::VectorOptions;
@@ -15,8 +15,20 @@ use crate::vector::ivf::{
 use crate::vector::VectorArena;
 use crate::TantivyError;
 
-const STACKED_ROUTER_VERSION: u32 = 1;
 const STACKED_ROUTER_ID: &str = "tantivy.stacked-ivf";
+
+macro_rules! impl_stacked_router_type {
+    ($router:ty) => {
+        impl RouterType for $router {
+            fn router_descriptor() -> RouterDescriptor {
+                RouterDescriptor::new(STACKED_ROUTER_ID, VectorFileVersion::V3)
+            }
+        }
+    };
+}
+
+impl_stacked_router_type!(InMemoryStackedIvf);
+impl_stacked_router_type!(LazyStackedIvf);
 
 fn build_stacked_router(
     options: &VectorOptions,
@@ -58,11 +70,9 @@ fn build_stacked_router(
 }
 
 fn deserialize_stacked_router(
-    format_version: u32,
     payload: FileSlice,
     context: &RouterOpenContext,
 ) -> crate::Result<Box<dyn Router>> {
-    require_version(STACKED_ROUTER_ID, format_version, STACKED_ROUTER_VERSION)?;
     Ok(Box::new(LazyStackedIvf::open(
         payload,
         context.centroids().clone(),
@@ -100,24 +110,11 @@ impl Router for InMemoryStackedIvf {
         build_stacked_router(options, centroids)
     }
 
-    fn id(&self) -> &'static str {
-        STACKED_ROUTER_ID
-    }
-
-    fn vector_file_version(&self) -> VectorFileVersion {
-        VectorFileVersion::V3
-    }
-
-    fn format_version(&self) -> u32 {
-        STACKED_ROUTER_VERSION
-    }
-
     fn deserialize(
-        format_version: u32,
         payload: FileSlice,
         context: &RouterOpenContext,
     ) -> crate::Result<Box<dyn Router>> {
-        deserialize_stacked_router(format_version, payload, context)
+        deserialize_stacked_router(payload, context)
     }
 
     fn rank<'a>(
@@ -142,24 +139,11 @@ impl Router for LazyStackedIvf {
         build_stacked_router(options, centroids)
     }
 
-    fn id(&self) -> &'static str {
-        STACKED_ROUTER_ID
-    }
-
-    fn vector_file_version(&self) -> VectorFileVersion {
-        VectorFileVersion::V3
-    }
-
-    fn format_version(&self) -> u32 {
-        STACKED_ROUTER_VERSION
-    }
-
     fn deserialize(
-        format_version: u32,
         payload: FileSlice,
         context: &RouterOpenContext,
     ) -> crate::Result<Box<dyn Router>> {
-        deserialize_stacked_router(format_version, payload, context)
+        deserialize_stacked_router(payload, context)
     }
 
     fn rank<'a>(

@@ -108,7 +108,7 @@ impl TestVectorIndexBuilder {
             builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: self.centroids.clone(),
             }));
-            builder = builder.ivf_router::<LazyStackedIvf>();
+            builder = builder.ivf_router::<LazyStackedIvf>()?;
         }
         builder.create_in_ram()
     }
@@ -499,14 +499,9 @@ fn ivf_merge_writes_the_selected_stacked_router() -> crate::Result<()> {
             .open_read_with_idx(index.embedding_field(), 2)
             .expect("IVF merge should write the router slot")
             .read_bytes()?;
-        assert_eq!(&router_bytes[..8], b"TVROUTER");
-        let id_len = u16::from_le_bytes(router_bytes[8..10].try_into().unwrap()) as usize;
-        assert_eq!(
-            u32::from_le_bytes(router_bytes[10..14].try_into().unwrap()),
-            1
-        );
-        assert_eq!(&router_bytes[14..14 + id_len], b"tantivy.stacked-ivf");
-        assert!(router_bytes.len() > 14 + id_len);
+        let id_len = u16::from_le_bytes(router_bytes[..2].try_into().unwrap()) as usize;
+        assert_eq!(&router_bytes[2..2 + id_len], b"tantivy.stacked-ivf");
+        assert!(router_bytes.len() > 2 + id_len);
     }
     Ok(())
 }
@@ -841,18 +836,15 @@ mod grid2d {
 // P1: bounds storage
 // ======================================================================
 
-/// C1 fixture tests: the `.centroids` bounds slot end to end — write
-/// fold, roundtrip, merge recomputation, and the pre-V2 refusal. The
+/// C1 fixture tests: the `.centroids` bounds slot end to end — write,
+/// fold, roundtrip, and merge recomputation. The
 /// pure builder/kind cases live in `vector::bounds::bounds_storage_tests`.
 mod bounds_storage_tests {
-    use std::io::Write;
     use std::sync::Arc;
-
-    use common::HasLen;
 
     use super::{TestVectorIndex, EMBEDDING_FIELD_NAME};
     use crate::collector::TopDocs;
-    use crate::directory::{CompositeFile, CompositeWrite, Directory, RamDirectory};
+    use crate::directory::{CompositeFile, RamDirectory};
     use crate::index::{IndexSettings, SegmentComponent};
     use crate::indexer::NoMergePolicy;
     use crate::query::AllQuery;
@@ -861,7 +853,7 @@ mod bounds_storage_tests {
     use crate::vector::{
         residual_norm, BoundKind, InMemoryStackedIvf, IvfCentroids, IvfClusterer, IvfConfig,
         IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors, LazyStackedIvf, Metric,
-        VectorDType, VectorOptions, VectorStorageFormat, Workspace,
+        RelativeNeighborhoodGraph, VectorDType, VectorOptions, VectorStorageFormat, Workspace,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -1040,7 +1032,7 @@ mod bounds_storage_tests {
             .schema(schema)
             .settings(settings)
             .ivf_clusterer(Arc::new(clusterer))
-            .ivf_router::<LazyStackedIvf>();
+            .ivf_router::<LazyStackedIvf>()?;
         let index = match directory {
             Some(directory) => builder.open_or_create(directory)?,
             None => builder.create_in_ram()?,
@@ -1205,23 +1197,8 @@ mod bounds_storage_tests {
         Ok(())
     }
 
-    /// The two-cluster fixture the version-policy tests below share.
-    fn version_policy_fixture() -> crate::Result<(Index, crate::schema::Field)> {
-        let (index, field) = build_ivf_with_plan(
-            Metric::L2,
-            TestClusterer {
-                fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
-                num_centroids: 2,
-            },
-            &[&[[0.0, 0.0], [0.1, 0.0]], &[[10.0, 10.0], [10.1, 10.0]]],
-            None,
-        )?;
-        merge_all(&index)?;
-        Ok((index, field))
-    }
-
     #[test]
-    fn opening_ivf_requires_an_explicit_router() -> crate::Result<()> {
+    fn opening_ivf_requires_the_configured_router_to_match() -> crate::Result<()> {
         let directory = RamDirectory::create();
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
@@ -1245,132 +1222,35 @@ mod bounds_storage_tests {
             .to_string()
             .contains("requires an explicitly configured Router"));
 
-        reopened.set_ivf_router::<LazyStackedIvf>();
+        reopened.set_ivf_router::<LazyStackedIvf>()?;
         let searcher = reopened.reader()?.searcher();
         searcher.segment_readers()[0].vector_index(field)?;
         Ok(())
     }
 
-    /// Rewrite the merged segment's `.centroids` as a file stamped
-    /// `version` carrying only `slots`, each copied verbatim from the
-    /// original composite — a facsimile of what an older writer produced.
-    /// Reads and writes go through the index's managed directory so the
-    /// file-level footer is stripped and re-appended correctly.
-    fn rewrite_centroids_with_slots(
-        index: &Index,
-        field: crate::schema::Field,
-        version: u32,
-        slots: &[usize],
-    ) -> crate::Result<()> {
-        let segment = index
-            .searchable_segments()?
-            .into_iter()
-            .next()
-            .expect("one merged segment");
-        let path = segment.relative_path(SegmentComponent::Custom(CENTROIDS_EXT.to_string()));
-        let directory = index.directory();
-        let file = directory.open_read(&path)?;
-        assert!(file.len() > 4);
-        let composite = CompositeFile::open(&file.slice_from(4))?;
-        let slot_payloads: Vec<(usize, Vec<u8>)> = slots
-            .iter()
-            .map(|&slot| {
-                let slice = composite
-                    .open_read_with_idx(field, slot)
-                    .unwrap_or_else(|| panic!("slot {slot} missing from the original file"));
-                Ok((slot, slice.read_bytes()?.to_vec()))
-            })
-            .collect::<crate::Result<_>>()?;
-
-        directory.delete(&path).expect("delete .centroids");
-        let mut writer = directory.open_write(&path).expect("rewrite .centroids");
-        writer.write_all(&version.to_le_bytes())?;
-        let mut composite_write = CompositeWrite::wrap(writer);
-        for (slot, payload) in slot_payloads {
-            let slot_w = composite_write.for_field_with_idx(field, slot);
-            slot_w.write_all(&payload)?;
-            slot_w.flush()?;
-        }
-        composite_write.close()?;
-        Ok(())
-    }
-
-    /// A V1 `.centroids` (no bounds slot — the shape 0.25 wrote) opens
-    /// with SATURATED bounds: every cluster probes, search stays correct.
     #[test]
-    fn v1_centroids_without_bounds_opens_saturated() -> crate::Result<()> {
-        let (index, field) = version_policy_fixture()?;
-        rewrite_centroids_with_slots(&index, field, 1, &[0, 1])?;
-
-        let searcher = index.reader()?.searcher();
-        let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
-        let ivf = vec_reader.index().expect("V1 file must open as IVF");
-        assert_eq!(ivf.num_clusters(), 2);
-        assert_eq!(ivf.bounds().kind(), BoundKind::Ball);
-        assert!(
-            ivf.bounds()
-                .values()
-                .iter()
-                .all(|bound| bound.is_infinite()),
-            "V1 bounds must synthesize as SATURATED: {:?}",
-            ivf.bounds().values()
-        );
-
-        // Saturated bounds never certify a skip, so the probe loop scores
-        // everything it routes to — the true nearest doc must win.
-        let query = vec![10.0f32, 10.0];
-        let hits = searcher
-            .search(
-                &AllQuery,
-                &TopDocs::with_limit(1).order_by_similarity(field, query.clone()),
-            )?
-            .results;
-        assert_eq!(hits.len(), 1);
-        let top_bytes = vec_reader
-            .vector_bytes(hits[0].1.doc_id)?
-            .expect("top hit has a vector");
-        let top_vector: Vec<f32> = top_bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
-        assert_eq!(top_vector, query, "top hit must be the exact-match doc");
-        Ok(())
-    }
-
-    /// Bounds are read whenever the slot exists, whatever the stamp: a
-    /// V1-restamped file that still carries slot [3] keeps its real bounds.
-    #[test]
-    fn v1_centroids_with_bounds_reads_them() -> crate::Result<()> {
-        let (index, field) = version_policy_fixture()?;
-        rewrite_centroids_with_slots(&index, field, 1, &[0, 1, 3])?;
-
-        let searcher = index.reader()?.searcher();
-        let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
-        let ivf = vec_reader.index().expect("V1 file must open as IVF");
-        assert!(
-            ivf.bounds().values().iter().all(|bound| bound.is_finite()),
-            "present bounds must be read, not synthesized: {:?}",
-            ivf.bounds().values()
-        );
-        Ok(())
-    }
-
-    /// A V2 `.centroids` without slot [3] is corrupt, not old: V2 writers
-    /// always fold bounds, so absence means the file is damaged.
-    #[test]
-    fn v2_centroids_missing_bounds_is_corrupt() -> crate::Result<()> {
-        let (index, field) = version_policy_fixture()?;
-        rewrite_centroids_with_slots(&index, field, 2, &[0, 1])?;
-
-        let searcher = index.reader()?.searcher();
-        let message = match searcher.segment_readers()[0].vector_index(field) {
-            Ok(_) => panic!("a V2 .centroids without bounds must be refused"),
-            Err(err) => err.to_string(),
+    fn configured_router_cannot_be_changed() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_vector_field(EMBEDDING_FIELD_NAME, VectorOptions::new(2, Metric::L2));
+        let settings = IndexSettings {
+            vector_clustering_threshold: 1,
+            ..IndexSettings::default()
         };
-        assert!(
-            message.contains("no bounds slot") && message.contains("\"embedding\""),
-            "unexpected error text: {message}"
-        );
+        let mut index = Index::builder()
+            .schema(schema_builder.build())
+            .settings(settings)
+            .ivf_clusterer(Arc::new(TestClusterer {
+                fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
+                num_centroids: 2,
+            }))
+            .ivf_router::<RelativeNeighborhoodGraph<Vec<f32>>>()?
+            .create_in_ram()?;
+        let error = index
+            .set_ivf_router::<LazyStackedIvf>()
+            .expect_err("an Index must use one router");
+        assert!(error
+            .to_string()
+            .contains("already configured as tantivy.relative-neighborhood-graph"));
         Ok(())
     }
 
@@ -1419,7 +1299,6 @@ mod bounds_storage_tests {
         let ivf = vec_reader.index().expect("IVF segment");
         assert_eq!(ivf.router().id(), "tantivy.stacked-ivf");
         assert_eq!(ivf.router().vector_file_version(), VectorFileVersion::V3);
-        assert_eq!(ivf.router().format_version(), 1);
         let mut reserialized = Vec::new();
         ivf.router().serialize(&mut reserialized)?;
         assert_eq!(reserialized, stacked_bytes.as_slice());
@@ -1428,14 +1307,9 @@ mod bounds_storage_tests {
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        assert_eq!(&stacked_bytes[..8], b"TVROUTER");
-        let id_len = u16::from_le_bytes(stacked_bytes[8..10].try_into().unwrap()) as usize;
-        assert_eq!(
-            u32::from_le_bytes(stacked_bytes[10..14].try_into().unwrap()),
-            1
-        );
-        assert_eq!(&stacked_bytes[14..14 + id_len], b"tantivy.stacked-ivf");
-        let payload_offset = 14 + id_len;
+        let id_len = u16::from_le_bytes(stacked_bytes[..2].try_into().unwrap()) as usize;
+        assert_eq!(&stacked_bytes[2..2 + id_len], b"tantivy.stacked-ivf");
+        let payload_offset = 2 + id_len;
         let stacked = InMemoryStackedIvf::deserialize_owned(
             &stacked_bytes[payload_offset..],
             stored_rows.clone(),

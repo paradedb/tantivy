@@ -1051,7 +1051,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.to_vec(),
             }))
-            .ivf_router::<LazyStackedIvf>()
+            .ivf_router::<LazyStackedIvf>()?
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1165,7 +1165,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.clone(),
             }))
-            .ivf_router::<LazyStackedIvf>()
+            .ivf_router::<LazyStackedIvf>()?
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1260,7 +1260,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.clone(),
             }))
-            .ivf_router::<LazyStackedIvf>()
+            .ivf_router::<LazyStackedIvf>()?
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -2857,7 +2857,7 @@ mod tests {
                 .ivf_clusterer(Arc::new(InlineClusterer {
                     centroids: centroids.to_vec(),
                 }))
-                .ivf_router::<LazyStackedIvf>()
+                .ivf_router::<LazyStackedIvf>()?
                 .create_in_ram()?;
             let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
             writer.set_merge_policy(Box::new(NoMergePolicy));

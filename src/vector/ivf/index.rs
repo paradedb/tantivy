@@ -13,25 +13,16 @@
 //!     rows in the router's canonical cluster-sorted order when a stacked
 //!     router was built
 //! [1] cluster_offsets (u64[N+1], prefix sum)
-//! [2] a self-describing router envelope. V2 files carry a bare RNG graph.
-//!     Older degenerate IVF segments may omit it and use exact routing.
-//! [3] centroid bounds, REQUIRED from V2 on: a segment-level BoundKind byte,
+//! [2] a self-describing router envelope, REQUIRED: a length-prefixed router
+//!     ID followed by the implementation-owned payload
+//! [3] centroid bounds, REQUIRED: a segment-level BoundKind byte,
 //!     then N · stride(kind) f32s in cluster order — for Ball, one f32 per
 //!     cluster: max ||x - c|| over the cluster's members' stored rows against
 //!     the stored centroid (the merge documents the metric-uniform fold).
-//!     V1 files predate the slot and open with synthesized SATURATED bounds.
 //! ```
 //!
-//! Slot presence is the compatibility mechanism WITHIN a generation: the
-//! composite footer maps `(field, slot)` to ranges, so a reader probes an
-//! optional slot and an older segment simply lacks it. Slot `[2]` works
-//! that way. Slot `[3]` does not, which is why it costs a generation:
-//! absence would have to mean "no bounds", and a silently absent bound is
-//! indistinguishable from a zero one. New segments write a self-describing
-//! router in slot `[2]`; V2 files keep the bare graph layout there. A V1 file
-//! (shipped, and legitimately bounds-less) still opens: its clusters get
-//! SATURATED bounds (`f32::INFINITY` — always probe), so old segments stay
-//! correct-but-unpruned until their next merge rewrites them.
+//! Persisted IVF routers use the V3 layout. Earlier bare-router and
+//! router-less layouts are not supported.
 use std::io::{self, Write};
 use std::mem;
 use std::ops::Range;
@@ -43,10 +34,9 @@ use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
 use crate::vector::router::{
-    LazyExactRouter, Router, RouterFactory, RouterOpenContext, RouterRanking, RouterSearchContext,
+    Router, RouterFactory, RouterOpenContext, RouterRanking, RouterSearchContext,
 };
 use crate::vector::{BoundKind, BoundStore};
-use crate::TantivyError;
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -58,9 +48,7 @@ use crate::TantivyError;
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
     num_centroids: usize,
-    /// Distinct documents with a vector in this field. Equal to
-    /// [`Self::num_rows`] for files this writer produces; legacy V2 files
-    /// could inflate the row total via replication.
+    /// Distinct documents with a vector in this field.
     num_docs: usize,
     /// The centroid rows (slot `[0]` past the two count words).
     centroids_slice: FileSlice,
@@ -77,8 +65,7 @@ pub struct IvfIndex {
 
 impl IvfIndex {
     /// Write slot `[0]` of the `.centroids` composite for a field. `num_docs`
-    /// is the number of distinct docs assigned — NOT the posting-row total,
-    /// which legacy V2 replication could multiply.
+    /// is the number of distinct docs assigned, not the posting-row total.
     pub(crate) fn serialize_centroids<W: Write + ?Sized>(
         num_centroids: usize,
         num_docs: usize,
@@ -144,21 +131,15 @@ impl IvfIndex {
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
     /// the bounds, and the router topology are materialized; the centroid
     /// rows stay behind a [`FileSlice`] for lazy per-node reads.
-    /// `bounds_slice` is `None` only for a V1 file, which predates the slot —
-    /// the caller (`VectorIndexReader::open`) has already rejected a V2+ file
-    /// without it as corrupt. `None` synthesizes SATURATED bounds
-    /// (`f32::INFINITY` per cluster): every cluster probes, no skip is ever
-    /// certified against data the file doesn't have.
-    /// `router_factory` is selected by the caller and validates that the
-    /// persisted router and `version` are compatible with its implementation.
+    /// The persisted router ID must match `router_factory`.
     pub(crate) fn open(
         version: VectorFileVersion,
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
-        router_slice: Option<FileSlice>,
-        router_factory: Option<&dyn RouterFactory>,
-        bounds_slice: Option<FileSlice>,
+        router_slice: FileSlice,
+        router_factory: &dyn RouterFactory,
+        bounds_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
         if centroids_slice.len() < count_words {
@@ -201,60 +182,43 @@ impl IvfIndex {
         }
 
         let router_context = RouterOpenContext::new(centroids_slice.clone(), options.clone());
-        let router_factory = router_factory.ok_or_else(|| {
-            TantivyError::InvalidArgument(
-                "IVF index requires an explicitly configured Router".to_string(),
-            )
-        })?;
-        let router = match router_slice {
-            Some(slice) => router_factory.open(version, slice, &router_context)?,
-            None => Box::new(LazyExactRouter::new(&router_context)),
-        };
+        let router = router_factory.open(version, router_slice, &router_context)?;
 
-        // P1: bounds slot — one kind byte, then the stride-derived payload.
-        // A V1 file has no slot: saturate every cluster instead (always
-        // probe), rather than inventing a bound the writer never folded.
-        let (bound_kind, bounds) = if let Some(bounds_slice) = bounds_slice {
-            let bytes = bounds_slice.read_bytes()?;
-            let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "IVF bounds slot is missing its kind byte",
-                )
-                .into());
-            };
-            let kind = BoundKind::from_code(kind_code)?;
-            let expected = num_centroids
-                .checked_mul(kind.stride(options.dim()))
-                .and_then(|values| values.checked_mul(mem::size_of::<f32>()))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "bounds byte length overflow")
-                })?;
-            if payload.len() != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "IVF bounds byte length mismatch",
-                )
-                .into());
-            }
-            let mut reader = payload;
-            let values: Vec<f32> = (0..num_centroids * kind.stride(options.dim()))
-                .map(|_| f32::deserialize(&mut reader))
-                .collect::<io::Result<_>>()?;
-            // A negative bound is corrupt, never produced: the fold is a
-            // max of norms seeded at 0.0. NaN / +inf are NOT rejected —
-            // they fail open arithmetically at the margin comparisons.
-            if values.iter().any(|&value| value < 0.0) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "IVF bounds slot holds a negative bound",
-                )
-                .into());
-            }
-            (kind, values)
-        } else {
-            (BoundKind::Ball, vec![f32::INFINITY; num_centroids])
+        let bytes = bounds_slice.read_bytes()?;
+        let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF bounds slot is missing its kind byte",
+            )
+            .into());
         };
+        let bound_kind = BoundKind::from_code(kind_code)?;
+        let expected = num_centroids
+            .checked_mul(bound_kind.stride(options.dim()))
+            .and_then(|values| values.checked_mul(mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "bounds byte length overflow")
+            })?;
+        if payload.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF bounds byte length mismatch",
+            )
+            .into());
+        }
+        let mut reader = payload;
+        let bounds: Vec<f32> = (0..num_centroids * bound_kind.stride(options.dim()))
+            .map(|_| f32::deserialize(&mut reader))
+            .collect::<io::Result<_>>()?;
+        // A negative bound is corrupt, never produced: the fold is a max of
+        // norms seeded at 0.0. NaN / +inf fail open in margin comparisons.
+        if bounds.iter().any(|&value| value < 0.0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF bounds slot holds a negative bound",
+            )
+            .into());
+        }
 
         let index = IvfIndex {
             num_centroids,
@@ -286,14 +250,12 @@ impl IvfIndex {
         self.router.as_ref()
     }
 
-    /// Distinct docs with a vector; legacy V2 replication could inflate the
-    /// row total, [`Self::num_rows`].
+    /// Distinct docs with a vector.
     pub(crate) fn num_docs(&self) -> usize {
         self.num_docs
     }
 
-    /// Total posting rows across all clusters — memberships, counting a
-    /// (legacy V2) replicated doc once per cell it lives in.
+    /// Total posting rows across all clusters.
     pub fn num_rows(&self) -> usize {
         self.cluster_offset(self.num_centroids) as usize
     }

@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 
 use super::{
-    open_enveloped_router, require_version, IvfSearchMetrics, Router, RouterOpenContext,
-    RouterRanking, RouterSearchContext,
+    IvfSearchMetrics, Router, RouterDescriptor, RouterOpenContext, RouterRanking,
+    RouterSearchContext, RouterType,
 };
 use crate::directory::FileSlice;
 use crate::schema::{VectorDType, VectorOptions};
@@ -13,11 +13,18 @@ use crate::vector::ivf::graph::{
 use crate::vector::{FileSliceArena, IvfCentroids, VectorArena};
 use crate::Executor;
 
-const GRAPH_ROUTER_VERSION: u32 = 1;
 const GRAPH_ROUTER_ID: &str = "tantivy.relative-neighborhood-graph";
 
+impl<S> RouterType for RelativeNeighborhoodGraph<S>
+where S: VectorArena<Elem = f32> + Send + Sync + 'static
+{
+    fn router_descriptor() -> RouterDescriptor {
+        RouterDescriptor::new(GRAPH_ROUTER_ID, VectorFileVersion::V3)
+    }
+}
+
 impl<S> Router for RelativeNeighborhoodGraph<S>
-where S: VectorArena<Elem = f32> + Send + Sync
+where S: VectorArena<Elem = f32> + Send + Sync + 'static
 {
     fn build_router(
         options: &VectorOptions,
@@ -42,7 +49,7 @@ where S: VectorArena<Elem = f32> + Send + Sync
         graph.build(&executor);
 
         let mut adjacency = Vec::new();
-        graph.serialize_adjacency(&mut adjacency)?;
+        RelativeNeighborhoodGraph::serialize(&graph, &mut adjacency)?;
         Ok(Box::new(RelativeNeighborhoodGraph::open(
             &adjacency,
             matrix.values.clone(),
@@ -52,24 +59,10 @@ where S: VectorArena<Elem = f32> + Send + Sync
         )?))
     }
 
-    fn id(&self) -> &'static str {
-        GRAPH_ROUTER_ID
-    }
-
-    fn vector_file_version(&self) -> VectorFileVersion {
-        VectorFileVersion::V3
-    }
-
-    fn format_version(&self) -> u32 {
-        GRAPH_ROUTER_VERSION
-    }
-
     fn deserialize(
-        format_version: u32,
         payload: FileSlice,
         context: &RouterOpenContext,
     ) -> crate::Result<Box<dyn Router>> {
-        require_version(GRAPH_ROUTER_ID, format_version, GRAPH_ROUTER_VERSION)?;
         let vectors = match context.options().dtype() {
             VectorDType::F32 => FileSliceArena::<f32>::new(context.centroids().clone()),
         };
@@ -81,17 +74,6 @@ where S: VectorArena<Elem = f32> + Send + Sync
             context.options().metric(),
             NeighborhoodGraphConfig::default(),
         )?))
-    }
-
-    fn open_router(
-        file_version: VectorFileVersion,
-        slot: FileSlice,
-        context: &RouterOpenContext,
-    ) -> crate::Result<Box<dyn Router>> {
-        if file_version == VectorFileVersion::V2 {
-            return Self::deserialize(GRAPH_ROUTER_VERSION, slot, context);
-        }
-        open_enveloped_router::<Self>(file_version, slot, context)
     }
 
     fn rank<'a>(
@@ -109,7 +91,7 @@ where S: VectorArena<Elem = f32> + Send + Sync
     }
 
     fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()> {
-        self.serialize_adjacency(out)
+        RelativeNeighborhoodGraph::serialize(self, out)
     }
 }
 

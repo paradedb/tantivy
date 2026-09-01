@@ -419,9 +419,7 @@ pub(crate) fn merge_ivf(
                 // have found the same vectors (deletes make both fall short
                 // of `vector_count` together, so compare them to each other).
                 debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
-                // The `.centroids` doc count: one posting row per distinct
-                // doc (legacy V2 files could inflate rows via replication;
-                // this writer never does).
+                // The `.centroids` doc count: one posting row per distinct doc.
                 let num_present_docs = assigned_vectors.len();
 
                 let mut cluster_counts = vec![0usize; num_centroids];

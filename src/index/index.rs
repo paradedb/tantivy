@@ -147,6 +147,26 @@ fn save_new_metas(
     Ok(())
 }
 
+fn configure_ivf_router_factory(
+    configured: &mut Option<Arc<dyn RouterFactory>>,
+    factory: Arc<dyn RouterFactory>,
+) -> crate::Result<()> {
+    let descriptor = factory.descriptor();
+    descriptor.validate()?;
+    if let Some(existing) = configured {
+        let existing = existing.descriptor();
+        if existing != descriptor {
+            return Err(TantivyError::InvalidArgument(format!(
+                "IVF router is already configured as {}; cannot change it to {}",
+                existing.id(),
+                descriptor.id()
+            )));
+        }
+    }
+    *configured = Some(factory);
+    Ok(())
+}
+
 /// IndexBuilder can be used to create an index.
 ///
 /// Use in conjunction with [`SchemaBuilder`][crate::schema::SchemaBuilder].
@@ -241,18 +261,16 @@ impl IndexBuilder {
         self
     }
 
-    /// Select the router implementation used to build and open IVF routers.
-    #[must_use]
-    pub fn ivf_router<R: Router + 'static>(mut self) -> Self {
-        self.ivf_router_factory = Some(router_factory_for::<R>());
-        self
+    /// Select the router used to build and open IVF segments.
+    pub fn ivf_router<R: Router + 'static>(mut self) -> crate::Result<Self> {
+        configure_ivf_router_factory(&mut self.ivf_router_factory, router_factory_for::<R>())?;
+        Ok(self)
     }
 
-    /// Configure the factory used to build and open IVF routers.
-    #[must_use]
-    pub fn ivf_router_factory(mut self, factory: Arc<dyn RouterFactory>) -> Self {
-        self.ivf_router_factory = Some(factory);
-        self
+    /// Select the factory used to build and open IVF segments.
+    pub fn ivf_router_factory(mut self, factory: Arc<dyn RouterFactory>) -> crate::Result<Self> {
+        configure_ivf_router_factory(&mut self.ivf_router_factory, factory)?;
+        Ok(self)
     }
 
     /// Creates a new index using the [`RamDirectory`].
@@ -910,14 +928,14 @@ impl Index {
         self.ivf_clusterer = Some(clusterer);
     }
 
-    /// Select the router implementation used to build and open IVF routers.
-    pub fn set_ivf_router<R: Router + 'static>(&mut self) {
-        self.ivf_router_factory = Some(router_factory_for::<R>());
+    /// Select the router used to build and open IVF segments.
+    pub fn set_ivf_router<R: Router + 'static>(&mut self) -> crate::Result<()> {
+        self.set_ivf_router_factory(router_factory_for::<R>())
     }
 
-    /// Configure the factory used to build and open IVF routers.
-    pub fn set_ivf_router_factory(&mut self, factory: Arc<dyn RouterFactory>) {
-        self.ivf_router_factory = Some(factory);
+    /// Select the factory used to build and open IVF segments.
+    pub fn set_ivf_router_factory(&mut self, factory: Arc<dyn RouterFactory>) -> crate::Result<()> {
+        configure_ivf_router_factory(&mut self.ivf_router_factory, factory)
     }
 
     pub(crate) fn ivf_router_factory(&self) -> Option<&dyn RouterFactory> {

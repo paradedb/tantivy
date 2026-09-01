@@ -447,7 +447,7 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
             }))
-            .ivf_router::<LazyStackedIvf>()
+            .ivf_router::<LazyStackedIvf>()?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -601,7 +601,7 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
             }))
-            .ivf_router::<LazyStackedIvf>()
+            .ivf_router::<LazyStackedIvf>()?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -775,7 +775,7 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: centroids.clone(),
             }))
-            .ivf_router::<LazyStackedIvf>()
+            .ivf_router::<LazyStackedIvf>()?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
