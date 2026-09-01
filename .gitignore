@@ -19,3 +19,6 @@ variable
 # for `sample record -p`
 profile.json
 profile.json.gz
+
+# Cohere Embed-V3 1M dump used by benches/ivf_recall.rs (~4 GiB)
+data/data_cohere_1m.bin
