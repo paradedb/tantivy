@@ -8,7 +8,19 @@ pub struct QueryPlanes {
     pub lo: f32,
     pub delta: f32,
     pub sum_codes: u64,
+    error_squared: f64,
     d: usize,
+}
+
+impl QueryPlanes {
+    /// Exact squared error of the affine query values encoded in `planes`.
+    ///
+    /// This is accumulated while producing the bitplanes, so it describes
+    /// the exact values consumed by the asymmetric sign kernel without a
+    /// second query-encoding pass.
+    pub fn error_squared(&self) -> f64 {
+        self.error_squared
+    }
 }
 
 fn packed_words(d: usize) -> usize {
@@ -85,11 +97,14 @@ pub fn prepare_query(u: &[f32], bq: u8) -> QueryPlanes {
     };
     let mut planes = vec![vec![0_u64; packed_words(u.len())]; bq as usize];
     let mut sum_codes = 0_u64;
+    let mut error_squared = 0.0_f64;
 
     if delta != 0.0 {
         for (i, &value) in u.iter().enumerate() {
             let code = (((value - lo) / delta).round() as u16).min(levels);
             sum_codes += u64::from(code);
+            let reconstructed = lo + delta * f32::from(code);
+            error_squared += f64::from(value - reconstructed).powi(2);
             for bit in 0..bq {
                 if code & (1_u16 << bit) != 0 {
                     planes[bit as usize][i / 64] |= 1_u64 << (i % 64);
@@ -104,6 +119,7 @@ pub fn prepare_query(u: &[f32], bq: u8) -> QueryPlanes {
         lo,
         delta,
         sum_codes,
+        error_squared,
         d: u.len(),
     }
 }
@@ -332,6 +348,16 @@ mod tests {
                 .collect();
             let quantized_direct = estimate_fp(&packed, scale, &quantized_query);
             assert!((asymmetric - quantized_direct).abs() < 2e-4, "d={d}");
+            let expected_error_squared = query
+                .iter()
+                .zip(&quantized_query)
+                .map(|(&value, &reconstructed)| f64::from(value - reconstructed).powi(2))
+                .sum::<f64>();
+            assert_eq!(
+                prepared.error_squared().to_bits(),
+                expected_error_squared.to_bits(),
+                "d={d}"
+            );
             assert!(direct.is_finite());
 
             let mut query_signs = vec![0_u64; packed_words(d)];
@@ -474,6 +500,7 @@ mod tests {
         let prepared = prepare_query(&constant, 4);
         assert_eq!(prepared.delta, 0.0);
         assert_eq!(prepared.sum_codes, 0);
+        assert_eq!(prepared.error_squared(), 0.0);
         assert!(prepared.planes.iter().flatten().all(|&word| word == 0));
         let scale = f32_to_f16(0.25);
         let estimated = estimate_asym(&bits, scale, &prepared);

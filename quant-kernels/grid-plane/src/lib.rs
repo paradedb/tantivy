@@ -70,9 +70,25 @@ pub fn unpack(packed: &[u8], d: usize, bits: u8) -> Vec<u8> {
 
 /// Encode a vector and return its RMS scale after f16 rounding.
 pub fn encode(y: &[f32], grid: &[f32], bits: u8, out: &mut [u8]) -> u16 {
+    let mut code_scratch = vec![0_u8; y.len()];
+    encode_with_scratch(y, grid, bits, out, &mut code_scratch)
+}
+
+/// Encode a vector using caller-owned one-byte-per-coordinate scratch.
+///
+/// The scratch form is byte-identical to [`encode`] and lets a cluster batch
+/// reuse one allocation across every row.
+pub fn encode_with_scratch(
+    y: &[f32],
+    grid: &[f32],
+    bits: u8,
+    out: &mut [u8],
+    code_scratch: &mut [u8],
+) -> u16 {
     assert!(!y.is_empty());
     validate_grid(grid, bits);
     assert_eq!(out.len(), packed_len(y.len(), bits));
+    assert_eq!(code_scratch.len(), y.len());
     let norm_squared = y.iter().map(|&value| value * value).sum::<f32>();
     if norm_squared == 0.0 {
         out.fill(0);
@@ -80,26 +96,34 @@ pub fn encode(y: &[f32], grid: &[f32], bits: u8, out: &mut [u8]) -> u16 {
     }
 
     let scale = norm_squared.sqrt() / (y.len() as f32).sqrt();
-    let boundaries: Vec<f32> = grid
-        .windows(2)
-        .map(|pair| (pair[0] + pair[1]) * 0.5)
-        .collect();
-    let codes: Vec<u8> = y
-        .iter()
-        .map(|&value| boundaries.partition_point(|&boundary| value / scale > boundary) as u8)
-        .collect();
-    pack(&codes, bits, out);
+    let mut boundaries = [0.0_f32; 15];
+    for (boundary, pair) in boundaries.iter_mut().zip(grid.windows(2)) {
+        *boundary = (pair[0] + pair[1]) * 0.5;
+    }
+    let boundaries = &boundaries[..grid.len() - 1];
+    for (code, &value) in code_scratch.iter_mut().zip(y) {
+        *code = boundaries.partition_point(|&boundary| value / scale > boundary) as u8;
+    }
+    pack(code_scratch, bits, out);
     f32_to_f16(scale)
 }
 
 pub fn decode(codes: &[u8], grid: &[f32], d: usize, bits: u8, scale: u16) -> Vec<f32> {
-    assert!(d > 0);
+    let mut decoded = vec![0.0_f32; d];
+    decode_into(codes, grid, bits, scale, &mut decoded);
+    decoded
+}
+
+/// Decode a packed row into caller-owned output storage.
+pub fn decode_into(codes: &[u8], grid: &[f32], bits: u8, scale: u16, out: &mut [f32]) {
+    assert!(!out.is_empty());
+    assert_eq!(codes.len(), packed_len(out.len(), bits));
     validate_grid(grid, bits);
+    debug_assert!(tail_is_zero(codes, out.len(), bits));
     let scale = f16_to_f32(scale);
-    unpack(codes, d, bits)
-        .into_iter()
-        .map(|code| scale * grid[code as usize])
-        .collect()
+    for (i, value) in out.iter_mut().enumerate() {
+        *value = scale * grid[code_at(codes, i, bits) as usize];
+    }
 }
 
 pub fn build_lut(u: &[f32], grid: &[f32], bits: u8) -> Vec<f32> {
@@ -586,6 +610,15 @@ fn code_at_3(packed: &[u8], i: usize) -> u8 {
     (low | high) & 0b111
 }
 
+#[inline]
+fn code_at(packed: &[u8], i: usize, bits: u8) -> u8 {
+    if bits == 3 {
+        return code_at_3(packed, i);
+    }
+    let per_byte = 8 / bits as usize;
+    (packed[i / per_byte] >> (bits as usize * (i % per_byte))) & ((1_u8 << bits) - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use quant_model::build_grid;
@@ -613,6 +646,38 @@ mod tests {
         let mut packed3 = vec![0; packed_len(128, 3)];
         pack(&codes3, 3, &mut packed3);
         assert_eq!(unpack(&packed3, 128, 3), codes3);
+    }
+
+    #[test]
+    fn caller_scratch_encode_and_decode_match_wrappers() {
+        for (d, bits) in [(65, 2), (100, 3), (769, 4)] {
+            let grid = build_grid(d, bits);
+            let values: Vec<f32> = (0..d).map(|i| ((i as f32 + 0.25) * 0.071).sin()).collect();
+            let mut expected_codes = vec![0_u8; packed_len(d, bits)];
+            let expected_scale = encode(&values, &grid.points, bits, &mut expected_codes);
+            let expected_values = decode(&expected_codes, &grid.points, d, bits, expected_scale);
+
+            let mut actual_codes = vec![0_u8; packed_len(d, bits)];
+            let mut code_scratch = vec![0_u8; d];
+            let actual_scale = encode_with_scratch(
+                &values,
+                &grid.points,
+                bits,
+                &mut actual_codes,
+                &mut code_scratch,
+            );
+            let mut actual_values = vec![f32::NAN; d];
+            decode_into(
+                &actual_codes,
+                &grid.points,
+                bits,
+                actual_scale,
+                &mut actual_values,
+            );
+            assert_eq!(actual_scale, expected_scale);
+            assert_eq!(actual_codes, expected_codes);
+            assert_eq!(actual_values, expected_values);
+        }
     }
 
     #[test]

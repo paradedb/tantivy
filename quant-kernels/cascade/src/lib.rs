@@ -1,22 +1,24 @@
 //! Residual quantization cascade and plane-boundary operations.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use fht::Rotation;
 use grid_plane::{
     build_lut, build_packed_lut_4, decode as decode_grid, encode as encode_grid,
-    estimate as estimate_grid, score_batch as score_grid_batch,
-    score_batch_indexed as score_grid_batch_indexed,
+    encode_with_scratch as encode_grid_with_scratch, estimate as estimate_grid,
+    score_batch as score_grid_batch, score_batch_indexed as score_grid_batch_indexed,
     score_batch_packed_4 as score_grid_batch_packed_4,
-    score_batch_packed_4_indexed as score_grid_batch_packed_4_indexed,
+    score_batch_packed_4_indexed as score_grid_batch_packed_4_indexed, unpack as unpack_grid,
 };
-use quant_model::f16::f16_to_f32;
+use quant_model::f16::{f16_to_f32, f32_to_f16};
 use quant_model::Grid;
 use sign_plane::{
     encode as encode_sign, estimate_asym as estimate_sign_asym,
     estimate_asym_batch_unscaled as estimate_sign_batch,
     estimate_asym_batch_unscaled_indexed as estimate_sign_batch_indexed,
-    estimate_fp as estimate_sign_fp, prepare_query, unpack as unpack_sign, QueryPlanes,
+    estimate_fp as estimate_sign_fp, pack as pack_sign, prepare_query, unpack as unpack_sign,
+    QueryPlanes,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +42,12 @@ pub struct EncodedLayerBatch {
     pub codes: Vec<u8>,
     /// One binary16 scale per row.
     pub scales: Vec<u16>,
+    /// One binary16 cumulative-prefix gamma per row.
+    ///
+    /// Gamma is exact encode-side metadata for a leading-sign schedule:
+    /// `||r0||^2 / <r0, rhat_prefix>`, clamped to `[1, 4]` before the f16
+    /// round trip.
+    pub gammas: Vec<u16>,
     /// One binary32 split-form constant per row.
     pub constants: Vec<f32>,
 }
@@ -51,6 +59,120 @@ pub struct EncodedBatch {
     pub layers: Vec<EncodedLayerBatch>,
 }
 
+/// Reusable storage for cluster-tile encoding.
+///
+/// Construct one workspace for a merge worker and reuse it across tiles and
+/// clusters with the same dimension. The encoder clears lengths between calls
+/// while retaining every scratch and output allocation.
+#[derive(Debug)]
+pub struct BatchEncodeWorkspace {
+    rotated_original: Vec<f32>,
+    norm_squares: Vec<f64>,
+    prefix_dots: Vec<f64>,
+    rotation_scratch: Vec<f32>,
+    sign_words: Vec<u64>,
+    grid_code_scratch: Vec<u8>,
+    encoded: EncodedBatch,
+}
+
+impl BatchEncodeWorkspace {
+    pub fn new() -> Self {
+        Self {
+            rotated_original: Vec::new(),
+            norm_squares: Vec::new(),
+            prefix_dots: Vec::new(),
+            rotation_scratch: Vec::new(),
+            sign_words: Vec::new(),
+            grid_code_scratch: Vec::new(),
+            encoded: EncodedBatch {
+                rows: 0,
+                layers: Vec::new(),
+            },
+        }
+    }
+
+    /// Preallocate every tile-sized scratch and output buffer.
+    ///
+    /// Encoding up to `max_rows` with this dimension and schedule does not
+    /// grow any workspace allocation.
+    pub fn with_capacity(d: usize, max_rows: usize, specs: &[LayerSpec]) -> Self {
+        validate_specs(d, specs);
+        let mut workspace = Self::new();
+        workspace.reserve(d, max_rows, specs);
+        workspace
+    }
+
+    fn reserve(&mut self, d: usize, rows: usize, specs: &[LayerSpec]) {
+        self.rotated_original.reserve(rows * d);
+        self.norm_squares.reserve(rows);
+        self.prefix_dots.reserve(rows);
+        self.rotation_scratch.resize(d, 0.0);
+        self.sign_words.resize(d.div_ceil(64), 0);
+        self.grid_code_scratch.resize(d, 0);
+        self.encoded
+            .layers
+            .resize_with(specs.len(), || EncodedLayerBatch {
+                codes: Vec::new(),
+                scales: Vec::new(),
+                gammas: Vec::new(),
+                constants: Vec::new(),
+            });
+        for (spec, layer) in specs.iter().zip(&mut self.encoded.layers) {
+            let code_stride = if spec.bits == 1 {
+                d.div_ceil(64) * 8
+            } else {
+                grid_plane::packed_len(d, spec.bits)
+            };
+            layer.codes.reserve(rows * code_stride);
+            layer.scales.reserve(rows);
+            layer.gammas.reserve(rows);
+            layer.constants.reserve(rows);
+        }
+    }
+}
+
+impl Default for BatchEncodeWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One cumulative-prefix correction before and after the storage-shaped f16
+/// round trip. This is audit output only; no production encoder consumes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GammaRoundTrip {
+    pub raw: f64,
+    pub clamped: f32,
+    pub f16: u16,
+}
+
+impl GammaRoundTrip {
+    pub fn f16_value(self) -> f32 {
+        f16_to_f32(self.f16)
+    }
+}
+
+/// Audit data for one cumulative encoded prefix. Reconstructions and inner
+/// products are expressed in the original, unrotated residual coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrefixGammaAudit {
+    pub gamma: GammaRoundTrip,
+    pub prefix_dot: f64,
+    pub s_eff_sq: f64,
+    pub layer_raw_scale: f32,
+    pub layer_scale_f16: u16,
+    pub codes: Vec<u8>,
+    pub raw_prefix_reconstruction: Vec<f32>,
+}
+
+/// Non-persisting gamma audit for every active prefix of a `[1, ...]`
+/// schedule.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrefixGammaAuditResult {
+    pub norm_sq: f64,
+    pub prefixes: Vec<PrefixGammaAudit>,
+}
+
 /// Cluster-scoped centroid state shared by every residual encoded in the cluster.
 #[derive(Clone, Debug)]
 pub struct PreparedCentroid {
@@ -58,7 +180,59 @@ pub struct PreparedCentroid {
     specs: Vec<LayerSpec>,
     original: Vec<f32>,
     layers: Vec<Vec<f32>>,
-    rotations: Vec<Option<Rotation>>,
+    rotation_plan: Arc<QueryRotationPlan>,
+}
+
+/// Reusable cluster-centroid transform and output storage.
+///
+/// A prepared centroid is immutable while its cluster's tiles are encoded.
+/// Calling [`Self::prepare`] for the next cluster overwrites the same buffers
+/// after the previous borrowed view has gone out of scope.
+#[derive(Debug)]
+pub struct PreparedCentroidWorkspace {
+    current: Vec<f32>,
+    rotation_scratch: Vec<f32>,
+    prepared: PreparedCentroid,
+}
+
+impl PreparedCentroidWorkspace {
+    pub fn new(plan: Arc<QueryRotationPlan>) -> Self {
+        let d = plan.dimension();
+        let layer_count = plan.specs.len();
+        Self {
+            current: Vec::with_capacity(d),
+            rotation_scratch: vec![0.0; d],
+            prepared: PreparedCentroid {
+                d,
+                specs: plan.specs.clone(),
+                original: Vec::with_capacity(d),
+                layers: (0..layer_count).map(|_| Vec::with_capacity(d)).collect(),
+                rotation_plan: plan,
+            },
+        }
+    }
+
+    pub fn prepare(&mut self, centroid: &[f32]) -> &PreparedCentroid {
+        assert_eq!(centroid.len(), self.prepared.d);
+        self.prepared.original.clear();
+        self.prepared.original.extend_from_slice(centroid);
+        self.current.clear();
+        self.current.extend_from_slice(centroid);
+        for (rotation, layer) in self
+            .prepared
+            .rotation_plan
+            .rotations
+            .iter()
+            .zip(&mut self.prepared.layers)
+        {
+            if let Some(rotation) = rotation {
+                rotation.apply_with_scratch(&mut self.current, &mut self.rotation_scratch);
+            }
+            layer.clear();
+            layer.extend_from_slice(&self.current);
+        }
+        &self.prepared
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,11 +240,11 @@ pub struct PreparedFpQuery {
     layers: Vec<Vec<f32>>,
 }
 
-/// Immutable, reusable rotation state for preparing queries against one
-/// quantization schedule.
+/// Immutable, reusable rotation state for preparing queries and centroids
+/// against one quantization schedule.
 ///
-/// Construct this once with the persisted layer seeds, then reuse it for
-/// every query. Preparing a prefix applies only the rotations in that prefix.
+/// Construct this once with the persisted layer seeds, then reuse it for every
+/// query and cluster centroid. Preparing a prefix applies only its rotations.
 #[derive(Clone, Debug)]
 pub struct QueryRotationPlan {
     d: usize,
@@ -197,7 +371,44 @@ pub fn prepare_split_query_with_plan(
     }
 }
 
+/// Audit-only exact squared query-quantization error for every prepared layer.
+/// Sign layers report the error accumulated while producing the affine
+/// bitplanes consumed by the scoring kernel; grid layers use the rotated f32
+/// query directly and report zero.
+pub fn audit_split_query_layer_error_squared(
+    query: &[f32],
+    specs: &[LayerSpec],
+    grids: &[Grid],
+    sign_query_bits: u8,
+) -> Vec<f64> {
+    validate(query.len(), specs, grids);
+    let plan = QueryRotationPlan::new(query.len(), specs);
+    audit_split_query_layer_error_squared_with_plan(query, &plan, grids, sign_query_bits)
+}
+
+/// [`audit_split_query_layer_error_squared`] using already expanded rotations.
+pub fn audit_split_query_layer_error_squared_with_plan(
+    query: &[f32],
+    plan: &QueryRotationPlan,
+    grids: &[Grid],
+    sign_query_bits: u8,
+) -> Vec<f64> {
+    let prepared = prepare_split_query_with_plan(query, plan, grids, sign_query_bits);
+    (0..prepared.layers.len())
+        .map(|layer| prepared.query_error_squared(layer))
+        .collect()
+}
+
 impl PreparedSplitQuery {
+    /// Exact squared query-quantization error `B_j` for one prepared layer.
+    /// Grid layers score the f32 query directly and therefore return zero.
+    pub fn query_error_squared(&self, layer: usize) -> f64 {
+        match &self.layers[layer] {
+            PreparedSplitLayer::Sign(query) => query.error_squared(),
+            PreparedSplitLayer::Grid { .. } => 0.0,
+        }
+    }
+
     /// Score one stored layer as `kernel * scale - split_constant`.
     pub fn score_layer(
         &self,
@@ -320,27 +531,20 @@ impl PreparedSplitQuery {
 }
 
 pub fn prepare_centroid(centroid: &[f32], specs: &[LayerSpec]) -> PreparedCentroid {
-    validate_specs(centroid.len(), specs);
-    let mut current = centroid.to_vec();
-    let mut layers = Vec::with_capacity(specs.len());
-    let mut rotations = Vec::with_capacity(specs.len());
-    for (layer, spec) in specs.iter().enumerate() {
-        if layer == 0 || spec.rotate {
-            let rotation = Rotation::new(centroid.len(), spec.seed);
-            rotation.apply(&mut current);
-            rotations.push(Some(rotation));
-        } else {
-            rotations.push(None);
-        }
-        layers.push(current.clone());
-    }
-    PreparedCentroid {
-        d: centroid.len(),
-        specs: specs.to_vec(),
-        original: centroid.to_vec(),
-        layers,
-        rotations,
-    }
+    let plan = Arc::new(QueryRotationPlan::new(centroid.len(), specs));
+    prepare_centroid_with_plan(centroid, plan)
+}
+
+/// Prepare one cluster centroid using schedule rotations expanded once by the
+/// caller. Every returned centroid shares the plan's permutation and sign
+/// buffers through `Arc`.
+pub fn prepare_centroid_with_plan(
+    centroid: &[f32],
+    plan: Arc<QueryRotationPlan>,
+) -> PreparedCentroid {
+    let mut workspace = PreparedCentroidWorkspace::new(plan);
+    workspace.prepare(centroid);
+    workspace.prepared
 }
 
 /// Encode a row-major cluster tile using at most two `rows * d` f32 buffers.
@@ -355,14 +559,43 @@ pub fn encode_batch_in_place(
     specs: &[LayerSpec],
     grids: &[Grid],
 ) -> EncodedBatch {
-    encode_batch_in_place_with_residual_observer(
+    let mut workspace = BatchEncodeWorkspace::new();
+    encode_batch_in_place_reusing(
         vectors,
         rows,
         centroid,
         specs,
         grids,
+        &mut workspace,
         |_, _, _| {},
-    )
+    );
+    workspace.encoded
+}
+
+/// Encode a row-major cluster tile while retaining all scratch and output
+/// allocations in `workspace` for the next tile or cluster.
+///
+/// The returned batch borrows the workspace and remains valid until the next
+/// call using that workspace. Callers that stream the layer slices before the
+/// next encode avoid allocating an owned batch per tile.
+pub fn encode_batch_in_place_with_workspace<'workspace>(
+    vectors: &mut [f32],
+    rows: usize,
+    centroid: &PreparedCentroid,
+    specs: &[LayerSpec],
+    grids: &[Grid],
+    workspace: &'workspace mut BatchEncodeWorkspace,
+) -> &'workspace EncodedBatch {
+    encode_batch_in_place_reusing(
+        vectors,
+        rows,
+        centroid,
+        specs,
+        grids,
+        workspace,
+        |_, _, _| {},
+    );
+    &workspace.encoded
 }
 
 /// Encode a row-major cluster tile and expose the remaining residual after
@@ -375,109 +608,190 @@ pub fn encode_batch_in_place_with_residual_observer<F>(
     centroid: &PreparedCentroid,
     specs: &[LayerSpec],
     grids: &[Grid],
-    mut observer: F,
+    observer: F,
 ) -> EncodedBatch
 where
+    F: FnMut(usize, &[f32], &[u16]),
+{
+    let mut workspace = BatchEncodeWorkspace::new();
+    encode_batch_in_place_reusing(
+        vectors,
+        rows,
+        centroid,
+        specs,
+        grids,
+        &mut workspace,
+        observer,
+    );
+    workspace.encoded
+}
+
+fn encode_batch_in_place_reusing<F>(
+    vectors: &mut [f32],
+    rows: usize,
+    centroid: &PreparedCentroid,
+    specs: &[LayerSpec],
+    grids: &[Grid],
+    workspace: &mut BatchEncodeWorkspace,
+    mut observer: F,
+) where
     F: FnMut(usize, &[f32], &[u16]),
 {
     validate(centroid.d, specs, grids);
     assert_eq!(centroid.specs, specs);
     assert_eq!(vectors.len(), rows * centroid.d);
+    assert_eq!(
+        specs[0].bits, 1,
+        "production prefix gamma requires a leading sign plane"
+    );
 
     let d = centroid.d;
+    let BatchEncodeWorkspace {
+        rotated_original,
+        norm_squares,
+        prefix_dots,
+        rotation_scratch,
+        sign_words,
+        grid_code_scratch,
+        encoded,
+    } = workspace;
     for row in vectors.chunks_exact_mut(d) {
         for (value, &center) in row.iter_mut().zip(&centroid.original) {
             *value -= center;
         }
     }
 
-    let mut reconstruction = vec![0.0_f32; vectors.len()];
-    let mut layers = Vec::with_capacity(specs.len());
+    // Preserve the exact original residual and carry it through the same
+    // cumulative rotations as the encode residual. This makes the layer-local
+    // dot with each raw reconstruction equal to
+    // `<r0, inverse_rotated(layer_reconstruction)>` without an inverse FHT per
+    // row. The one extra forward transform per rotating layer supersedes the
+    // historical two-FHT data-path accounting: cumulative gamma needs both
+    // the changing residual and the unchanged original direction.
+    rotated_original.clear();
+    rotated_original.extend_from_slice(vectors);
+    norm_squares.clear();
+    norm_squares.reserve(rows);
+    for row in rotated_original.chunks_exact(d) {
+        norm_squares.push(
+            row.iter()
+                .map(|&value| f64::from(value).powi(2))
+                .sum::<f64>(),
+        );
+    }
+    prefix_dots.clear();
+    prefix_dots.resize(rows, 0.0);
+    rotation_scratch.resize(d, 0.0);
+    sign_words.resize(d.div_ceil(64), 0);
+    grid_code_scratch.resize(d, 0);
+    encoded.rows = rows;
+    encoded
+        .layers
+        .resize_with(specs.len(), || EncodedLayerBatch {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gammas: Vec::new(),
+            constants: Vec::new(),
+        });
     for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
         if layer == 0 || spec.rotate {
-            let rotation = centroid.rotations[layer]
+            let rotation = centroid.rotation_plan.rotations[layer]
                 .as_ref()
                 .expect("rotating layer must have a prepared rotation");
             for row in vectors.chunks_exact_mut(d) {
-                rotation.apply(row);
+                rotation.apply_with_scratch(row, rotation_scratch);
+            }
+            for row in rotated_original.chunks_exact_mut(d) {
+                rotation.apply_with_scratch(row, rotation_scratch);
             }
         }
 
-        reconstruction.fill(0.0);
         let code_stride = if spec.bits == 1 {
             d.div_ceil(64) * 8
         } else {
             grid_plane::packed_len(d, spec.bits)
         };
-        let mut codes = Vec::with_capacity(rows * code_stride);
-        let mut scales = Vec::with_capacity(rows);
+        let EncodedLayerBatch {
+            codes,
+            scales,
+            gammas,
+            constants,
+        } = &mut encoded.layers[layer];
+        codes.clear();
+        codes.reserve(rows * code_stride);
+        scales.clear();
+        scales.reserve(rows);
+        gammas.clear();
+        gammas.reserve(rows);
+        constants.clear();
+        constants.reserve(rows);
 
-        for (residual, reconstructed) in vectors
-            .chunks_exact(d)
-            .zip(reconstruction.chunks_exact_mut(d))
+        for (row_index, (residual, original)) in vectors
+            .chunks_exact_mut(d)
+            .zip(rotated_original.chunks_exact(d))
+            .enumerate()
         {
             if spec.bits == 1 {
-                let mut words = vec![0_u64; d.div_ceil(64)];
-                let scale = encode_sign(residual, &mut words);
-                let reconstruction_scale = f16_to_f32(scale);
-                for (i, value) in reconstructed.iter_mut().enumerate() {
-                    let sign = if words[i / 64] & (1_u64 << (i % 64)) != 0 {
+                pack_sign(residual, sign_words);
+                let raw_scale = residual.iter().map(|value| value.abs()).sum::<f32>() / d as f32;
+                let scale = f32_to_f16(raw_scale);
+                let stored_scale = f16_to_f32(scale);
+                let mut layer_dot = 0.0_f64;
+                let mut constant = 0.0_f32;
+                for i in 0..d {
+                    let sign = if sign_words[i / 64] & (1_u64 << (i % 64)) != 0 {
                         1.0
                     } else {
                         -1.0
                     };
-                    *value = reconstruction_scale * sign;
+                    layer_dot += f64::from(original[i]) * f64::from(raw_scale * sign);
+                    let reconstruction = stored_scale * sign;
+                    constant += centroid.layers[layer][i] * reconstruction;
+                    residual[i] -= reconstruction;
                 }
-                for word in words {
+                prefix_dots[row_index] += layer_dot;
+                gammas.push(gamma_round_trip(norm_squares[row_index], prefix_dots[row_index]).f16);
+                for &word in sign_words.iter() {
                     codes.extend_from_slice(&word.to_le_bytes());
                 }
                 scales.push(scale);
+                constants.push(constant);
             } else {
                 let code_start = codes.len();
                 codes.resize(code_start + code_stride, 0);
-                let scale =
-                    encode_grid(residual, &grid.points, spec.bits, &mut codes[code_start..]);
-                reconstructed.copy_from_slice(&decode_grid(
-                    &codes[code_start..],
+                let raw_norm_squared = residual.iter().map(|&value| value * value).sum::<f32>();
+                let raw_scale = if raw_norm_squared == 0.0 {
+                    0.0
+                } else {
+                    raw_norm_squared.sqrt() / (d as f32).sqrt()
+                };
+                let scale = encode_grid_with_scratch(
+                    residual,
                     &grid.points,
-                    d,
                     spec.bits,
-                    scale,
-                ));
+                    &mut codes[code_start..],
+                    grid_code_scratch,
+                );
+                debug_assert_eq!(scale, f32_to_f16(raw_scale));
+                let stored_scale = f16_to_f32(scale);
+                let mut layer_dot = 0.0_f64;
+                let mut constant = 0.0_f32;
+                for i in 0..d {
+                    let point = grid.points[grid_code_scratch[i] as usize];
+                    layer_dot += f64::from(original[i]) * f64::from(raw_scale * point);
+                    let reconstruction = stored_scale * point;
+                    constant += centroid.layers[layer][i] * reconstruction;
+                    residual[i] -= reconstruction;
+                }
+                prefix_dots[row_index] += layer_dot;
+                gammas.push(gamma_round_trip(norm_squares[row_index], prefix_dots[row_index]).f16);
                 scales.push(scale);
+                constants.push(constant);
             }
         }
 
-        let constants = reconstruction
-            .chunks_exact(d)
-            .map(|row| {
-                centroid.layers[layer]
-                    .iter()
-                    .zip(row)
-                    .map(|(&center, &value)| center * value)
-                    .sum()
-            })
-            .collect();
-
-        for (residual, reconstructed) in vectors
-            .chunks_exact_mut(d)
-            .zip(reconstruction.chunks_exact(d))
-        {
-            for (value, &encoded) in residual.iter_mut().zip(reconstructed) {
-                *value -= encoded;
-            }
-        }
-
-        observer(layer, vectors, &scales);
-
-        layers.push(EncodedLayerBatch {
-            codes,
-            scales,
-            constants,
-        });
+        observer(layer, vectors, scales);
     }
-
-    EncodedBatch { rows, layers }
 }
 
 pub fn encode_layers(
@@ -498,7 +812,9 @@ pub fn encode_layers(
 
     for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
         if layer == 0 || spec.rotate {
-            if let Some(rotation) = centroid.and_then(|context| context.rotations[layer].as_ref()) {
+            if let Some(rotation) =
+                centroid.and_then(|context| context.rotation_plan.rotations[layer].as_ref())
+            {
                 rotation.apply(&mut residual);
             } else {
                 Rotation::new(r.len(), spec.seed).apply(&mut residual);
@@ -541,6 +857,138 @@ pub fn encode_layers(
         scales,
         constants,
     }
+}
+
+fn gamma_round_trip(norm_sq: f64, prefix_dot: f64) -> GammaRoundTrip {
+    let raw = if norm_sq == 0.0 && prefix_dot == 0.0 {
+        1.0
+    } else {
+        norm_sq / prefix_dot
+    };
+    let clamped = raw.clamp(1.0, 4.0) as f32;
+    GammaRoundTrip {
+        raw,
+        clamped,
+        f16: f32_to_f16(clamped),
+    }
+}
+
+/// Re-encode one residual without persisting anything and expose the
+/// cumulative gamma measurements used by the external audit harness.
+///
+/// The first layer must be the sign plane. Each layer advances its residual
+/// with the same f16 reconstruction as production encoding, while the prefix
+/// reported here uses that layer's pre-f16 raw scale. Every contribution is
+/// inverse-rotated into `r0`'s original coordinates before the cumulative
+/// inner product is measured. Grid-only schedules are intentionally outside
+/// this audit contract.
+pub fn audit_prefix_gammas(
+    r0: &[f32],
+    specs: &[LayerSpec],
+    grids: &[Grid],
+) -> PrefixGammaAuditResult {
+    validate(r0.len(), specs, grids);
+    assert_eq!(
+        specs[0].bits, 1,
+        "gamma audit requires a leading sign plane"
+    );
+
+    let d = r0.len();
+    let plan = QueryRotationPlan::new(d, specs);
+    let norm_sq = r0
+        .iter()
+        .map(|&value| f64::from(value).powi(2))
+        .sum::<f64>();
+    let mut residual = r0.to_vec();
+    let mut raw_prefix_reconstruction = vec![0.0_f32; d];
+    let mut prefixes = Vec::with_capacity(specs.len());
+
+    for (layer, (spec, grid)) in specs.iter().zip(grids).enumerate() {
+        if let Some(rotation) = &plan.rotations[layer] {
+            rotation.apply(&mut residual);
+        }
+
+        let (codes, raw_scale, scale_f16, raw_reconstruction, stored_reconstruction) = if spec.bits
+            == 1
+        {
+            let mut words = vec![0_u64; d.div_ceil(64)];
+            let raw_scale = residual.iter().map(|value| value.abs()).sum::<f32>() / d as f32;
+            let scale_f16 = encode_sign(&residual, &mut words);
+            debug_assert_eq!(scale_f16, f32_to_f16(raw_scale));
+            let signs = unpack_sign(&words, d);
+            let stored_scale = f16_to_f32(scale_f16);
+            let raw_reconstruction: Vec<f32> = signs.iter().map(|&sign| raw_scale * sign).collect();
+            let stored_reconstruction: Vec<f32> =
+                signs.into_iter().map(|sign| stored_scale * sign).collect();
+            (
+                words_to_bytes(&words),
+                raw_scale,
+                scale_f16,
+                raw_reconstruction,
+                stored_reconstruction,
+            )
+        } else {
+            let norm_squared = residual.iter().map(|&value| value * value).sum::<f32>();
+            let raw_scale = if norm_squared == 0.0 {
+                0.0
+            } else {
+                norm_squared.sqrt() / (d as f32).sqrt()
+            };
+            let mut codes = vec![0_u8; grid_plane::packed_len(d, spec.bits)];
+            let scale_f16 = encode_grid(&residual, &grid.points, spec.bits, &mut codes);
+            debug_assert_eq!(scale_f16, f32_to_f16(raw_scale));
+            let unpacked = unpack_grid(&codes, d, spec.bits);
+            let stored_scale = f16_to_f32(scale_f16);
+            let raw_reconstruction: Vec<f32> = unpacked
+                .iter()
+                .map(|&code| raw_scale * grid.points[code as usize])
+                .collect();
+            let stored_reconstruction: Vec<f32> = unpacked
+                .into_iter()
+                .map(|code| stored_scale * grid.points[code as usize])
+                .collect();
+            (
+                codes,
+                raw_scale,
+                scale_f16,
+                raw_reconstruction,
+                stored_reconstruction,
+            )
+        };
+
+        let mut original_space_contribution = raw_reconstruction;
+        for prior_layer in (0..=layer).rev() {
+            if let Some(rotation) = &plan.rotations[prior_layer] {
+                rotation.apply_inverse(&mut original_space_contribution);
+            }
+        }
+        for (prefix, contribution) in raw_prefix_reconstruction
+            .iter_mut()
+            .zip(original_space_contribution)
+        {
+            *prefix += contribution;
+        }
+        let prefix_dot = r0
+            .iter()
+            .zip(&raw_prefix_reconstruction)
+            .map(|(&residual, &reconstruction)| f64::from(residual) * f64::from(reconstruction))
+            .sum::<f64>();
+        prefixes.push(PrefixGammaAudit {
+            gamma: gamma_round_trip(norm_sq, prefix_dot),
+            prefix_dot,
+            s_eff_sq: prefix_dot / d as f64,
+            layer_raw_scale: raw_scale,
+            layer_scale_f16: scale_f16,
+            codes,
+            raw_prefix_reconstruction: raw_prefix_reconstruction.clone(),
+        });
+
+        for (value, reconstruction) in residual.iter_mut().zip(stored_reconstruction) {
+            *value -= reconstruction;
+        }
+    }
+
+    PrefixGammaAuditResult { norm_sq, prefixes }
 }
 
 pub fn prepare_fp_query(query: &[f32], specs: &[LayerSpec]) -> PreparedFpQuery {
@@ -733,9 +1181,8 @@ fn aligned_le_words(bytes: &[u8]) -> Cow<'_, [u64]> {
 
 fn decode_le_words(bytes: &[u8]) -> Vec<u64> {
     assert_eq!(bytes.len() % 8, 0);
-    let chunks = bytes.chunks_exact(8);
-    assert!(chunks.remainder().is_empty());
-    chunks
+    bytes
+        .chunks(8)
         .map(|chunk| {
             let bytes: [u8; 8] = chunk
                 .try_into()
@@ -871,6 +1318,79 @@ mod tests {
         let mut expected = query;
         Rotation::new(d, specs[0].seed).apply(&mut expected);
         assert_eq!(fp.layers[0], expected);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn centroid_preparation_shares_one_expanded_plan_and_rotates_once_per_cluster() {
+        let d = 100;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let plan = Arc::new(QueryRotationPlan::new(d, &specs));
+        let mut workspace = PreparedCentroidWorkspace::new(Arc::clone(&plan));
+        let first_values: Vec<f32> = (0..d).map(|i| (i as f32 * 0.013).sin()).collect();
+        let second_values: Vec<f32> = (0..d).map(|i| (i as f32 * 0.017).cos()).collect();
+        let storage_signature = |workspace: &PreparedCentroidWorkspace| {
+            let mut storage = vec![
+                (
+                    workspace.current.as_ptr() as usize,
+                    workspace.current.capacity(),
+                ),
+                (
+                    workspace.rotation_scratch.as_ptr() as usize,
+                    workspace.rotation_scratch.capacity(),
+                ),
+                (
+                    workspace.prepared.original.as_ptr() as usize,
+                    workspace.prepared.original.capacity(),
+                ),
+                (
+                    workspace.prepared.layers.as_ptr() as usize,
+                    workspace.prepared.layers.capacity(),
+                ),
+            ];
+            storage.extend(
+                workspace
+                    .prepared
+                    .layers
+                    .iter()
+                    .map(|layer| (layer.as_ptr() as usize, layer.capacity())),
+            );
+            storage
+        };
+        let allocated = storage_signature(&workspace);
+        assert!(allocated.iter().all(|(_, capacity)| *capacity > 0));
+
+        fht::debug_reset_apply_count();
+        let first_layers = {
+            let first = workspace.prepare(&first_values);
+            assert!(Arc::ptr_eq(&first.rotation_plan, &plan));
+            let first_clone = first.clone();
+            assert!(Arc::ptr_eq(
+                &first.rotation_plan,
+                &first_clone.rotation_plan
+            ));
+            first.layers.clone()
+        };
+        assert_eq!(storage_signature(&workspace), allocated);
+        let second = workspace.prepare(&second_values);
+        assert!(Arc::ptr_eq(&second.rotation_plan, &plan));
+        assert_eq!(fht::debug_apply_count(), 2 * specs.len());
+        assert_eq!(storage_signature(&workspace), allocated);
+
+        let legacy = prepare_centroid(&first_values, &specs);
+        assert_eq!(first_values, legacy.original);
+        assert_eq!(first_layers, legacy.layers);
     }
 
     #[test]
@@ -1060,6 +1580,214 @@ mod tests {
             assert_eq!(batch.codes, expected_codes);
             assert_eq!(batch.scales, expected_scales);
             assert_eq!(batch.constants, expected_constants);
+            assert_eq!(batch.gammas.len(), expected.len());
+        }
+    }
+
+    fn batch_workspace_storage_signature(workspace: &BatchEncodeWorkspace) -> Vec<(usize, usize)> {
+        let mut storage = vec![
+            (
+                workspace.rotated_original.as_ptr() as usize,
+                workspace.rotated_original.capacity(),
+            ),
+            (
+                workspace.norm_squares.as_ptr() as usize,
+                workspace.norm_squares.capacity(),
+            ),
+            (
+                workspace.prefix_dots.as_ptr() as usize,
+                workspace.prefix_dots.capacity(),
+            ),
+            (
+                workspace.rotation_scratch.as_ptr() as usize,
+                workspace.rotation_scratch.capacity(),
+            ),
+            (
+                workspace.sign_words.as_ptr() as usize,
+                workspace.sign_words.capacity(),
+            ),
+            (
+                workspace.grid_code_scratch.as_ptr() as usize,
+                workspace.grid_code_scratch.capacity(),
+            ),
+            (
+                workspace.encoded.layers.as_ptr() as usize,
+                workspace.encoded.layers.capacity(),
+            ),
+        ];
+        for layer in &workspace.encoded.layers {
+            storage.extend([
+                (layer.codes.as_ptr() as usize, layer.codes.capacity()),
+                (layer.scales.as_ptr() as usize, layer.scales.capacity()),
+                (layer.gammas.as_ptr() as usize, layer.gammas.capacity()),
+                (
+                    layer.constants.as_ptr() as usize,
+                    layer.constants.capacity(),
+                ),
+            ]);
+        }
+        storage
+    }
+
+    #[test]
+    fn batch_workspace_reuses_every_allocation_across_tiles() {
+        let d = 100;
+        let max_rows = 8;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let centroid: Vec<f32> = (0..d).map(|i| (i as f32 * 0.013).sin() * 0.1).collect();
+        let make_vectors = |rows| {
+            (0..rows)
+                .flat_map(|row| {
+                    centroid
+                        .iter()
+                        .enumerate()
+                        .map(move |(i, &center)| center + ((i + row) as f32 * 0.031).cos() * 0.2)
+                })
+                .collect::<Vec<f32>>()
+        };
+        let prepared = prepare_centroid(&centroid, &specs);
+        let mut workspace = BatchEncodeWorkspace::with_capacity(d, max_rows, &specs);
+        let allocated = batch_workspace_storage_signature(&workspace);
+        assert!(allocated.iter().all(|(_, capacity)| *capacity > 0));
+
+        let mut first_vectors = make_vectors(max_rows);
+        let first = encode_batch_in_place_with_workspace(
+            &mut first_vectors,
+            max_rows,
+            &prepared,
+            &specs,
+            &grids,
+            &mut workspace,
+        )
+        .clone();
+        assert_eq!(batch_workspace_storage_signature(&workspace), allocated);
+
+        let small_rows = 3;
+        let mut small_vectors = make_vectors(small_rows);
+        encode_batch_in_place_with_workspace(
+            &mut small_vectors,
+            small_rows,
+            &prepared,
+            &specs,
+            &grids,
+            &mut workspace,
+        );
+        assert_eq!(batch_workspace_storage_signature(&workspace), allocated);
+
+        let mut repeated_vectors = make_vectors(max_rows);
+        let repeated = encode_batch_in_place_with_workspace(
+            &mut repeated_vectors,
+            max_rows,
+            &prepared,
+            &specs,
+            &grids,
+            &mut workspace,
+        );
+        assert_eq!(repeated, &first);
+        assert_eq!(batch_workspace_storage_signature(&workspace), allocated);
+    }
+
+    #[test]
+    fn cluster_batch_prefix_gammas_match_audit_bit_for_bit() {
+        for d in [65, 100, 128] {
+            let schedules = [vec![1_u8], vec![1, 1], vec![1, 4]];
+            for bits in schedules {
+                let specs: Vec<LayerSpec> = bits
+                    .iter()
+                    .enumerate()
+                    .map(|(layer, &bits)| LayerSpec {
+                        bits,
+                        seed: 0x4741_4d4d_4100 + layer as u64,
+                        rotate: true,
+                    })
+                    .collect();
+                let grids: Vec<Grid> = bits.iter().map(|&bits| build_grid(d, bits)).collect();
+                let centroid: Vec<f32> = (0..d)
+                    .map(|i| ((i as f32 + 0.5) * 0.013).sin() * 0.1)
+                    .collect();
+                let rows = 4;
+                let vectors: Vec<Vec<f32>> = (0..rows)
+                    .map(|row| {
+                        centroid
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &center)| center + ((i + row * 7) as f32 * 0.031).cos() * 0.2)
+                            .collect()
+                    })
+                    .collect();
+                let expected: Vec<PrefixGammaAuditResult> = vectors
+                    .iter()
+                    .map(|vector| {
+                        let residual: Vec<f32> = vector
+                            .iter()
+                            .zip(&centroid)
+                            .map(|(&value, &center)| value - center)
+                            .collect();
+                        audit_prefix_gammas(&residual, &specs, &grids)
+                    })
+                    .collect();
+                let mut row_major: Vec<f32> = vectors.into_iter().flatten().collect();
+                let batch = encode_batch_in_place(
+                    &mut row_major,
+                    rows,
+                    &prepare_centroid(&centroid, &specs),
+                    &specs,
+                    &grids,
+                );
+
+                for (layer, encoded) in batch.layers.iter().enumerate() {
+                    let expected_gammas: Vec<u16> = expected
+                        .iter()
+                        .map(|audit| audit.prefixes[layer].gamma.f16)
+                        .collect();
+                    assert_eq!(
+                        encoded.gammas, expected_gammas,
+                        "d={d} schedule={bits:?} layer={layer}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cluster_batch_zero_residual_gamma_is_one() {
+        let d = 65;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let centroid = vec![0.25_f32; d];
+        let mut vectors = centroid.clone();
+        let batch = encode_batch_in_place(
+            &mut vectors,
+            1,
+            &prepare_centroid(&centroid, &specs),
+            &specs,
+            &grids,
+        );
+        for layer in batch.layers {
+            assert_eq!(layer.gammas, [f32_to_f16(1.0)]);
         }
     }
 
@@ -1100,6 +1828,186 @@ mod tests {
         let mut prefix = original;
         encode_batch_in_place(&mut prefix, 1, &prefix_prepared, &specs[..1], &grids[..1]);
         assert_eq!(observed, vec![prefix, full]);
+    }
+
+    #[test]
+    fn gamma_round_trip_handles_zero_and_both_clamps() {
+        let zero = gamma_round_trip(0.0, 0.0);
+        assert_eq!(zero.raw, 1.0);
+        assert_eq!(zero.clamped, 1.0);
+        assert_eq!(zero.f16_value(), 1.0);
+
+        let lower = gamma_round_trip(1.0, 2.0);
+        assert_eq!(lower.raw, 0.5);
+        assert_eq!(lower.clamped, 1.0);
+        assert_eq!(lower.f16_value(), 1.0);
+
+        let upper = gamma_round_trip(8.0, 1.0);
+        assert_eq!(upper.raw, 8.0);
+        assert_eq!(upper.clamped, 4.0);
+        assert_eq!(upper.f16_value(), 4.0);
+    }
+
+    #[test]
+    fn prefix_gamma_matches_rotated_odd_dimension_encoding() {
+        let d = 100;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 0x4741_4d4d_4101,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 0x4741_4d4d_4102,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let residual: Vec<f32> = (0..d)
+            .map(|i| ((i as f32 + 0.25) * 0.071).sin() * (1.0 + i as f32 / d as f32))
+            .collect();
+        let audit = audit_prefix_gammas(&residual, &specs, &grids);
+        let encoded = encode_layers(&residual, None, &specs, &grids);
+
+        assert_eq!(audit.prefixes.len(), 2);
+        for (prefix, ((&scale, codes), spec)) in audit
+            .prefixes
+            .iter()
+            .zip(encoded.scales.iter().zip(&encoded.codes).zip(&specs))
+        {
+            assert_eq!(prefix.layer_scale_f16, scale);
+            assert_eq!(&prefix.codes, codes);
+            let expected_stride = if spec.bits == 1 {
+                d.div_ceil(64) * std::mem::size_of::<u64>()
+            } else {
+                grid_plane::packed_len(d, spec.bits)
+            };
+            assert_eq!(prefix.codes.len(), expected_stride);
+            assert_eq!(
+                prefix.s_eff_sq.to_bits(),
+                (prefix.prefix_dot / d as f64).to_bits()
+            );
+            assert_eq!(prefix.gamma.f16, f32_to_f16(prefix.gamma.clamped));
+            assert!((1.0..=4.0).contains(&prefix.gamma.f16_value()));
+            assert_eq!(prefix.raw_prefix_reconstruction.len(), d);
+        }
+        let derived_depth_two_scale_sq = f64::from(audit.prefixes[0].layer_raw_scale).powi(2)
+            * audit.prefixes[0].gamma.raw
+            / audit.prefixes[1].gamma.raw;
+        assert!(
+            (derived_depth_two_scale_sq / audit.prefixes[1].s_eff_sq - 1.0).abs() <= 1e-5,
+            "derived={derived_depth_two_scale_sq} direct={}",
+            audit.prefixes[1].s_eff_sq
+        );
+        assert!((audit.prefixes[0].gamma.raw - std::f64::consts::FRAC_PI_2).abs() < 0.25);
+        assert!((audit.prefixes[1].gamma.raw - 1.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn prefix_gamma_gaussian_distribution_matches_sign_and_refined_limits() {
+        let d = 769;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let mut rng = ChaCha8Rng::seed_from_u64(0x4741_4d4d_4153_5441);
+        let mut gamma_one = 0.0_f64;
+        let mut gamma_two = 0.0_f64;
+        const SAMPLES: usize = 256;
+        for _ in 0..SAMPLES {
+            let residual = random_unit(&mut rng, d);
+            let audit = audit_prefix_gammas(&residual, &specs, &grids);
+            gamma_one += audit.prefixes[0].gamma.raw;
+            gamma_two += audit.prefixes[1].gamma.raw;
+        }
+        gamma_one /= SAMPLES as f64;
+        gamma_two /= SAMPLES as f64;
+        assert!(
+            (gamma_one - std::f64::consts::FRAC_PI_2).abs() <= 0.03,
+            "gamma1={gamma_one}"
+        );
+        assert!((gamma_two - 1.0).abs() <= 0.02, "gamma2={gamma_two}");
+    }
+
+    #[test]
+    fn prefix_gamma_zero_residual_is_canonical() {
+        let d = 65;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let audit = audit_prefix_gammas(&vec![0.0; d], &specs, &grids);
+        assert_eq!(audit.norm_sq, 0.0);
+        for prefix in audit.prefixes {
+            assert_eq!(prefix.prefix_dot, 0.0);
+            assert_eq!(prefix.s_eff_sq, 0.0);
+            assert_eq!(prefix.layer_raw_scale, 0.0);
+            assert_eq!(prefix.layer_scale_f16, 0);
+            assert_eq!(prefix.gamma.raw, 1.0);
+            assert_eq!(prefix.gamma.f16_value(), 1.0);
+        }
+    }
+
+    #[test]
+    fn split_query_error_audit_matches_sign_bitplanes_and_grid_is_exact() {
+        let d = 100;
+        let specs = [
+            LayerSpec {
+                bits: 1,
+                seed: 11,
+                rotate: true,
+            },
+            LayerSpec {
+                bits: 4,
+                seed: 22,
+                rotate: true,
+            },
+        ];
+        let grids = [build_grid(d, 1), build_grid(d, 4)];
+        let query: Vec<f32> = (0..d).map(|i| ((i as f32 + 0.5) * 0.037).cos()).collect();
+        let errors = audit_split_query_layer_error_squared(&query, &specs, &grids, 4);
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0] > 0.0);
+        assert_eq!(errors[1], 0.0);
+
+        let sign_specs = [
+            specs[0],
+            LayerSpec {
+                bits: 1,
+                seed: specs[1].seed,
+                rotate: true,
+            },
+        ];
+        let sign_grids = [build_grid(d, 1), build_grid(d, 1)];
+        let sign_errors =
+            audit_split_query_layer_error_squared(&query, &sign_specs, &sign_grids, 4);
+        assert_eq!(sign_errors.len(), 2);
+        assert!(sign_errors.iter().all(|error| *error > 0.0));
+
+        let constant = vec![0.25; d];
+        let constant_errors =
+            audit_split_query_layer_error_squared(&constant, &specs[..1], &grids[..1], 4);
+        assert!(constant_errors[0] >= 0.0);
+        assert!(constant_errors[0].is_finite());
     }
 
     #[test]
@@ -1435,7 +2343,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn centroid_rotations_are_cluster_scoped() {
+    fn cumulative_gamma_rotation_count_is_cluster_scoped_and_explicit() {
         let d = 768;
         let specs = [
             LayerSpec {
@@ -1452,14 +2360,26 @@ mod tests {
         let grids = [build_grid(d, 1), build_grid(d, 4)];
         let mut rng = ChaCha8Rng::seed_from_u64(0x0052_4f54_434f_554e);
         let centroid = random_unit(&mut rng, d);
+        let rows = 100;
+        let mut vectors: Vec<f32> = (0..rows)
+            .flat_map(|_| {
+                let residual = random_unit(&mut rng, d);
+                centroid
+                    .iter()
+                    .zip(residual)
+                    .map(|(&center, residual)| center + residual)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         fht::debug_reset_apply_count();
         let context = prepare_centroid(&centroid, &specs);
-        for _ in 0..100 {
-            let residual = random_unit(&mut rng, d);
-            encode_layers(&residual, Some(&context), &specs, &grids);
-        }
+        encode_batch_in_place(&mut vectors, rows, &context, &specs, &grids);
         let count = fht::debug_apply_count();
-        assert!(count <= 2 * 100 + 2, "Rotation::apply count={count}");
+        // Two centroid rotations per cluster plus, for each row and layer,
+        // one residual rotation and one original-direction rotation used by
+        // cumulative gamma. This replaces the obsolete pre-gamma
+        // `2 * rows + 2` bound without hiding the added exact metadata work.
+        assert_eq!(count, 2 * 2 * rows + 2, "Rotation::apply count={count}");
     }
 
     #[test]

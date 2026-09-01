@@ -1716,3 +1716,512 @@ score/bias combine, and sigma pass.
 | tantivy | `ruchir/quantization` | this append-only record; measured code parent `9903c3665894c91b985a0c3e5e5dd83f436de274` |
 | paradedb | `ruchir/quantization` | `78a17a1cab362ace94e0693a994162883b535610` |
 | pdbench | `ruchir/quantization` | `f7846119f6ff99bf900c22f79abb527d78234ac4` |
+
+## 2026-08-29 — pre-alpha-correction rollback checkpoint
+
+Commit message in all three repositories: `pre-alpha-correction checkpoint — closeout state, statistical centering (bias, spread) per depth`.
+
+| repository | branch | rollback SHA |
+|---|---|---|
+| tantivy | `ruchir/quantization` | `76822fd10540ee879e0fd200c8f8e5a44b8d8d04` |
+| paradedb | `ruchir/quantization` | `6b05384dba565cedc40b95758619c4a85acaf359` |
+| pdbench | `ruchir/quantization` | `fec22af1465cadb379cbac671d6eae036b224a08` |
+
+## 2026-08-29 — gamma-corrected analytical-band gates (M5/ARM)
+
+Read-only diagnostics; no format, settings, writer, merge, or production-scan
+behavior changed. Measured code: Tantivy
+`ae38e42f415db235c7a00305c3fc73bfc2e5a8c1`; pg_search
+`3a02bbc5606c5803c68865d676ea33ec60f8dded`; reproducible SQL fixture
+`pdbench/scripts/vector_gamma_cone_fixture.sql` at
+`b35cf464eceab82ea4fb042742c9e86dc9f02716`.
+
+### Protocol labels and legacy-row correction
+
+The historical stored-vector protocol previously labeled `H` is relabeled
+`H0`. It used at most 64 pseudoqueries over 1,024 rows and the legacy,
+uncorrected estimator. The corresponding old real-query fit is `Q0`. These
+rows are retained for provenance but are not comparable to the gamma-corrected
+Part-2 `H1`/`Q1` cross-product protocol and do not participate in the
+analytical-band decision.
+
+| corpus | source | depth | bias | spread | samples / shape | estimator |
+|---|---|---:|---:|---:|---|---|
+| Cohere 1M q14 | H0 · historical held-out | 1 | -2.852376392 | 1.797896563 | 1,024 rows; ≤64 pseudoqueries | legacy scoring |
+| Cohere 1M q14 | Q0 · historical real-query | 1 | -3.218186 | 1.808974 | 100,000 cross-products | legacy scoring |
+
+`H1` is exactly 100 deterministic distinct stored pseudoqueries crossed with
+one shared set of 1,000 interval-sampled rows; all replica memberships of a
+pseudoquery are excluded only in its origin segment. `Q1` is exactly 100
+external queries crossed with the same 1,000 rows, with no exclusion because
+external queries have no residency. Both use the production quantized-query
+estimator, cumulative f16 gamma, decoded f16 scale streams, per-cluster query
+norms, and exact query-side sign-plane error; grid query error is zero.
+
+### Cohere H1/Q1 cross-product gate
+
+| source | depth | residual bias | corrected spread | samples |
+|---|---:|---:|---:|---:|
+| H1 · held-out | 1 | -0.008726251 | 0.98474103 | 99,980 |
+| H1 · held-out | 2 | -0.008970319 | 1.0115472 | 99,980 |
+| Q1 · real query | 1 | -0.0075790817 | 0.97456175 | 100,000 |
+| Q1 · real query | 2 | 0.028446307 | 1.0128034 | 100,000 |
+
+### Cone fixture and H1/Q1 cross-product gate
+
+| fixture item | value |
+|---|---:|
+| metric / schedule / d | cosine / [1,4] / 256 |
+| stored rows / external queries | 10,000 / 100 |
+| deterministic seed | `0x434f4e45` / 1129270853 |
+| axis | coordinate 70; value 0.95 |
+| sparse tail | 16 coordinates; L2 norm 0.312 |
+| IVF centroids / mean posting | 100 / 100 |
+| top-k / boundary kappa | 10 / (2,4) |
+| routing | all clusters admitted |
+
+Rows are ids 1–10,000; external queries are ids 10,001–10,100 from the same
+deterministic generator. The exact construction, index reloptions, audits,
+and construction receipt are in the pdbench SQL fixture cited above.
+
+| source | depth | residual bias | corrected spread | samples |
+|---|---:|---:|---:|---:|
+| H1 · held-out | 1 | -0.004230598 | 0.945769 | 98,800 |
+| H1 · held-out | 2 | 0.005085274 | 1.0254445 | 98,800 |
+| Q1 · external cone query | 1 | -0.0062666424 | 0.9439173 | 100,000 |
+| Q1 · external cone query | 2 | 0.01385187 | 1.023004 | 100,000 |
+
+### Cumulative gamma distributions
+
+These are raw cumulative gamma diagnostics. Zero and clamp counts describe
+the audit's prospective f16 sidecar round trip; no sidecar or format change
+was made. Clamp never substitutes a measured bias.
+
+| corpus | depth | mean | spread | min | p50 | p95 | p99 | max | zero | clamp |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Cohere 1M | 1 | 1.5697652201 | 0.0252963742 | 1.471780667 | 1.56967845 | 1.610036065 | 1.633710299 | 1.653227637 | 0 | 0 |
+| Cohere 1M | 2 | 1.0033292877 | 0.0023199732 | 0.996207152 | 1.003235903 | 1.007283988 | 1.009110717 | 1.01190149 | 0 | 72 |
+| cone | 1 | 1.570043242 | 0.051206926 | 1.418580862 | 1.569535224 | 1.662026695 | 1.70084284 | 1.731611991 | 0 | 0 |
+| cone | 2 | 1.00326896 | 0.004614348 | 0.988036369 | 1.003017825 | 1.01103054 | 1.014711523 | 1.023550798 | 0 | 236 |
+
+### Prospective f16 band-error round trip
+
+| corpus | source | depth | absolute p99 | absolute max |
+|---|---|---:|---:|---:|
+| Cohere 1M | H1 | 1 | 0.00271822 | 0.00460494 |
+| Cohere 1M | H1 | 2 | 0.02793516 | 0.05317521 |
+| Cohere 1M | Q1 | 1 | 0.002829855 | 0.004680733 |
+| Cohere 1M | Q1 | 2 | 0.029247923 | 0.04821694 |
+| cone | H1 | 1 | 0.000922599 | 0.002438368 |
+| cone | H1 | 2 | 0.008182466 | 0.019790426 |
+| cone | Q1 | 1 | 0.000919912 | 0.002043952 |
+| cone | Q1 | 2 | 0.008219298 | 0.018107317 |
+
+### Analytical spread-source decision
+
+| check | Cohere | cone | gate / selected rule |
+|---|---:|---:|---|
+| maximum corrected spread | 1.0128034 | 1.0254445 | ≤1.15 · green |
+| maximum absolute residual bias | 0.028446307 | 0.01385187 | ≤0.1σ · green |
+| normalized analytical score scale | 1 | 1 | `S = 1` |
+| fixed safety multiplier | 1.15 | 1.15 | analytical sigma × 1.15 |
+
+The analytical branch fired: measured calibration is retained as a
+verification/regression gate, not as an estimator correction or a persisted
+band-width source.
+
+### All-clusters confidence-cone candidate gate
+
+Survivor fraction is the mean of each query's fraction, not the ratio of the
+two mean count columns.
+
+| depth | kappa | mean scored rows | mean survivor rows | mean survivor fraction | candidate recall mean | candidate recall min | queries with miss |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 10000 | 130.8 | 0.01308 | 1 | 1 | 0 / 100 |
+| 2 | 4 | 130.8 | 32.9 | 0.2621382554285913 | 1 | 1 | 0 / 100 |
+
+| diagnostic | value |
+|---|---:|
+| external queries | 100 |
+| exact top-k | 10 |
+| elapsed | 433.241 ms |
+| final candidate-recall gate | green |
+
+## 2026-08-29 — definitive gamma-corrected closeout (M5/ARM warm cache; x86 CI)
+
+This append-only section supersedes the earlier cone values above and records
+the final production-scoring implementation. Measured code tips were Tantivy
+`441e161581d4de2ac0dd69385ec2d64211a600ed`, pg_search
+`a400c095df91a6695366f35d7eed98a5269a1fe3`, and pdbench
+`8f245aa8791b9395b8bae87f06bacc92d5d19f1b`. The Tantivy branch-tip commit
+that appends this record is intentionally reported by the final handoff rather
+than self-referencing this file.
+
+Machine context: Apple M5 Max MacBook Pro, arm64, warm cache, Cohere Wikipedia
+1M, cosine, d=1024, k=10, 100 queries, 300 timed samples, and 100 EXPLAIN
+samples. The x86 companion is GitHub Actions `ubuntu-latest`, x86_64, run
+`33240220107`, measured-code SHA `441e161581d4de2ac0dd69385ec2d64211a600ed`.
+
+### Final cone correction and analytical-band gate
+
+The preceding cone rows came from the prospective sidecar audit and a
+pre-safety survivor pass. The tables below are the final encoded-sidecar,
+production-sigma, analytical-safety (`1.15`) measurements and supersede those
+rows without editing them in place.
+
+| source | depth | residual bias | corrected spread | samples |
+|---|---:|---:|---:|---:|
+| H1 · held-out | 1 | -0.030952634 | 0.9538644 | 98,800 |
+| H1 · held-out | 2 | -0.005916219 | 1.0109242 | 98,800 |
+| Q1 · external cone query | 1 | -0.028580278 | 0.94856834 | 100,000 |
+| Q1 · external cone query | 2 | -0.0063786674 | 1.0102737 | 100,000 |
+
+| depth | mean gamma | spread | min | p50 | p95 | p99 | max | zero-scale | clamped |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1.5741685634 | 0.051514437 | 1.431855914 | 1.570480975 | 1.661387481 | 1.700610800 | 1.754300443 | 0 | 0 |
+| 2 | 1.0033980811 | 0.004775215 | 0.988620245 | 1.003288433 | 1.011366199 | 1.015668072 | 1.020316310 | 0 | 239 |
+
+| source | depth | f16 band-error p99 | f16 band-error max |
+|---|---:|---:|---:|
+| H1 | 1 | 0.000920843 | 0.002924014 |
+| H1 | 2 | 0.007884074 | 0.025521957 |
+| Q1 | 1 | 0.000916438 | 0.001884230 |
+| Q1 | 2 | 0.007745150 | 0.026760074 |
+
+| depth | kappa | mean scored | mean survivors | mean survivor fraction | recall mean | recall min | queries with miss |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 10,000 | 149.91 | 0.014991 | 1 | 1 | 0 / 100 |
+| 2 | 4 | 149.91 | 41.27 | 0.28252277498 | 1 | 1 | 0 / 100 |
+
+| gate | Cohere H1/Q1 | cone H1/Q1 | limit | result |
+|---|---:|---:|---:|---:|
+| max absolute residual bias | 0.028446307 | 0.030952634 | 0.3 sigma | 1 |
+| max corrected spread | 1.0128034 | 1.0109242 | 1.15 | 1 |
+| candidate recall | · | 1.000 | 1.000 | 1 |
+
+Spread branch: analytical. Scoring uses closed-form `S=1` and the declared
+`1.15` safety factor; H1/Q1 measurements remain external verification only.
+
+Kappa is confidence policy, not fitted calibration. Under `S=1`, the
+single-member, single-boundary worst-case mapping is `Q(2) ~= 2.3e-2` and
+`Q(4) ~= 3.2e-5`. The early boundary uses the smaller policy width because
+each unit is paid in survivors; the terminal grid boundary uses the larger
+width because caution is cheap after refinement. Fixture candidate recall is
+the policy tripwire.
+
+### Post-build external diagnostic calibration
+
+These values are persisted diagnostic metadata and are not scorer inputs.
+
+| config | depth | source | bias | spread | cross-products |
+|---|---:|---|---:|---:|---:|
+| q14 | 1 | real_query | 0.0068319463 | 0.99689597 | 100,000 |
+| q14 | 2 | real_query | -0.0061864364 | 1.017428 | 100,000 |
+| q1 | 1 | real_query | -0.027587187 | 0.985537 | 100,000 |
+
+| config | depth | statistic | mean | stddev | min | max |
+|---|---:|---|---:|---:|---:|---:|
+| q14 | 1 | per-query bias | 0.006831946296 | 0.049274820654 | -0.105030817007 | 0.106613082470 |
+| q14 | 1 | per-query spread | 0.995439883601 | 0.021748821144 | 0.948478178357 | 1.053085410457 |
+| q14 | 2 | per-query bias | -0.006186436329 | 0.175919048808 | -0.322344561596 | 0.514837219769 |
+| q14 | 2 | per-query spread | 1.001730729423 | 0.027347429636 | 0.912858166507 | 1.065865280686 |
+| q1 | 1 | per-query bias | -0.027587186975 | 0.051410008520 | -0.139298126123 | 0.114563992149 |
+| q1 | 1 | per-query spread | 0.983967823335 | 0.021154443422 | 0.941607964209 | 1.034858965397 |
+
+### C1 — final gap gate
+
+Gap is computed inside the EXPLAIN sample population. The limit is
+`max(0.1 ms, 0.5% of stage sum)`. Timed-wall minus EXPLAIN-wall remains a
+separate quantity.
+
+| target | config | EXPLAIN stage sum ms | gap ms | limit ms | timed - EXPLAIN ms | pass |
+|---|---|---:|---:|---:|---:|---:|
+| r90 | qoff | 2.937 | 0.062 | 0.100 | -0.169 | 1 |
+| r90 | q14 | 1.838 | 0.063 | 0.100 | 0.038 | 1 |
+| r90 | q1 | 2.083 | 0.079 | 0.100 | -0.105 | 1 |
+| r95 | qoff | 5.155 | 0.066 | 0.100 | -0.407 | 1 |
+| r95 | q14 | 2.401 | 0.065 | 0.100 | -0.039 | 1 |
+| r95 | q1 | 2.462 | 0.068 | 0.100 | -0.008 | 1 |
+| r99 | qoff | 38.768 | 0.080 | 0.194 | -1.023 | 1 |
+| r99 | q14 | 9.073 | 0.070 | 0.100 | -0.191 | 1 |
+| r99 | q1 | 10.941 | 0.090 | 0.100 | -1.280 | 1 |
+
+The qoff high-probe timed/EXPLAIN delta is closed as CustomScan tuple emission
+outside the measured vector stages.
+
+### C2/C3 — definitive sweeps and attribution
+
+Run files:
+
+- qoff: `runs/cohere-1m-qoff/20260829_124850_search.json`
+- q14: `runs/cohere-1m-q14/20260829_125213_search.json`
+- q1: `runs/cohere-1m-q1/20260829_125509_search.json`
+
+All three configurations achieved identical recall at the paired sweep point:
+r90 `0.005 / 0.897`, r95 `0.0109 / 0.948`, r99 `0.1 / 0.993`.
+Attribution cells are `mean ms / percent of EXPLAIN total / buffer hits`.
+
+#### r90 — probe 0.005, achieved recall 0.897
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| scan init | 0.871 / 29.0 / 688 | 0.867 / 45.6 / 690 | 0.958 / 44.3 / 690 |
+| query prep | 0.000 / 0.0 / 0 | 0.101 / 5.3 / 0 | 0.025 / 1.2 / 0 |
+| routing | 0.391 / 13.1 / 635 | 0.345 / 18.1 / 635 | 0.433 / 20.0 / 635 |
+| exact scan | 1.651 / 55.1 / 2601 | · | · |
+| result assembly | 0.023 / 0.8 / 0 | 0.024 / 1.3 / 0 | 0.056 / 2.6 / 0 |
+| layer 0 scan | · | 0.218 / 11.5 / 156 | 0.253 / 11.7 / 156 |
+| boundary 0 | · | 0.024 / 1.2 / 0 | 0.027 / 1.2 / 0 |
+| layer 1 scan | · | 0.222 / 11.7 / 183 | · |
+| boundary 1 | · | 0.002 / 0.1 / 0 | · |
+| rerank fetch | · | 0.032 / 1.7 / 50 | 0.287 / 13.3 / 455 |
+| rerank score | · | 0.005 / 0.2 / 0 | 0.043 / 2.0 / 0 |
+| unattributed gap | 0.062 / 2.1 / 27 | 0.063 / 3.3 / 27 | 0.079 / 3.7 / 27 |
+| TOTAL | 2.999 / 100 / 3950 | 1.901 / 100 / 1741 | 2.162 / 100 / 1962 |
+
+| footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| wall p50 / p99 ms | 2.782 / 3.927 | 1.913 / 2.758 | 1.953 / 3.709 |
+| layer 0 scored -> survivors | · | 5093.4 -> 383.3 | 5093.4 -> 373.1 |
+| layer 1 scored -> survivors | · | 383.3 -> 36.9 | · |
+| rerank rows / bytes | · | 36.9 / 151,020 | 373.1 / 1,528,340 |
+| layer 0 logical bytes | · | 672,327 | 672,327 |
+| layer 1 logical bytes | · | 197,767 | · |
+| layer 0 ns/scored row | · | 42.9 | 49.7 |
+| layer 1 ns/refinement | · | 579.8 | · |
+
+#### r95 — probe 0.0109, achieved recall 0.948
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| scan init | 0.857 / 16.4 / 688 | 0.869 / 35.2 / 690 | 0.864 / 34.1 / 690 |
+| query prep | 0.000 / 0.0 / 0 | 0.100 / 4.1 / 0 | 0.020 / 0.8 / 0 |
+| routing | 0.667 / 12.8 / 1058 | 0.566 / 22.9 / 1058 | 0.623 / 24.6 / 1058 |
+| exact scan | 3.606 / 69.1 / 5612 | · | · |
+| result assembly | 0.025 / 0.5 / 0 | 0.026 / 1.0 / 0 | 0.046 / 1.8 / 0 |
+| layer 0 scan | · | 0.461 / 18.7 / 350 | 0.490 / 19.4 / 350 |
+| boundary 0 | · | 0.041 / 1.7 / 0 | 0.044 / 1.8 / 0 |
+| layer 1 scan | · | 0.299 / 12.1 / 260 | · |
+| boundary 1 | · | 0.002 / 0.1 / 0 | · |
+| rerank fetch | · | 0.033 / 1.3 / 53 | 0.326 / 12.9 / 564 |
+| rerank score | · | 0.005 / 0.2 / 0 | 0.050 / 2.0 / 0 |
+| unattributed gap | 0.066 / 1.3 / 27 | 0.065 / 2.6 / 27 | 0.068 / 2.7 / 27 |
+| TOTAL | 5.221 / 100 / 7385 | 2.466 / 100 / 2438 | 2.530 / 100 / 2689 |
+
+| footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| wall p50 / p99 ms | 4.778 / 5.791 | 2.392 / 2.970 | 2.484 / 3.303 |
+| layer 0 scored -> survivors | · | 10983.9 -> 465.9 | 10983.9 -> 447.8 |
+| layer 1 scored -> survivors | · | 465.9 -> 38.3 | · |
+| rerank rows / bytes | · | 38.3 / 156,836 | 447.8 / 1,834,312 |
+| layer 0 logical bytes | · | 1,449,877 | 1,449,877 |
+| layer 1 logical bytes | · | 240,384 | · |
+| layer 0 ns/scored row | · | 42.0 | 44.6 |
+| layer 1 ns/refinement | · | 641.9 | · |
+
+#### r99 — probe 0.1, achieved recall 0.993
+
+| stage | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| scan init | 0.972 / 2.5 / 688 | 0.907 / 9.9 / 690 | 1.020 / 9.2 / 690 |
+| query prep | 0.000 / 0.0 / 0 | 0.104 / 1.1 / 0 | 0.028 / 0.3 / 0 |
+| routing | 3.545 / 9.1 / 5068 | 2.822 / 30.9 / 5068 | 3.736 / 33.9 / 5068 |
+| exact scan | 34.206 / 88.1 / 51227 | · | · |
+| result assembly | 0.045 / 0.1 / 0 | 0.035 / 0.4 / 0 | 0.085 / 0.8 / 0 |
+| layer 0 scan | · | 4.331 / 47.4 / 3498 | 5.117 / 46.4 / 3498 |
+| boundary 0 | · | 0.296 / 3.2 / 0 | 0.328 / 3.0 / 0 |
+| layer 1 scan | · | 0.531 / 5.8 / 453 | · |
+| boundary 1 | · | 0.003 / 0.0 / 0 | · |
+| rerank fetch | · | 0.040 / 0.4 / 58 | 0.556 / 5.0 / 772 |
+| rerank score | · | 0.005 / 0.1 / 0 | 0.072 / 0.6 / 0 |
+| unattributed gap | 0.080 / 0.2 / 27 | 0.070 / 0.8 / 27 | 0.090 / 0.8 / 27 |
+| TOTAL | 38.848 / 100 / 57010 | 9.143 / 100 / 9795 | 11.031 / 100 / 10056 |
+
+| footer | qoff | q14 | q1 |
+|---|---:|---:|---:|
+| wall p50 / p99 ms | 37.805 / 40.349 | 8.907 / 10.758 | 9.433 / 13.969 |
+| layer 0 scored -> survivors | · | 100107.7 -> 627.4 | 100107.7 -> 587.0 |
+| layer 1 scored -> survivors | · | 627.4 -> 41.8 | · |
+| rerank rows / bytes | · | 41.8 / 171,090 | 587.0 / 2,404,475 |
+| layer 0 logical bytes | · | 13,214,214 | 13,214,214 |
+| layer 1 logical bytes | · | 323,713 | · |
+| layer 0 ns/scored row | · | 43.3 | 51.1 |
+| layer 1 ns/refinement | · | 846.2 | · |
+
+| config | schedule | persisted external diagnostic `(bias, spread)` | mean posting |
+|---|---|---|---:|
+| qoff | off | · | 100.0 |
+| q14 | [1,4] | [(0.0068319463,0.99689597),(-0.0061864364,1.017428)] | 100.0 |
+| q1 | [1] | [(-0.027587187,0.985537)] | 100.0 |
+
+### Build economics and streaming-memory receipt
+
+| config | build JSON | build s | index bytes | delta vs qoff | delta % | peak RSS bytes | CPU avg / max % |
+|---|---|---:|---:|---:|---:|---:|---:|
+| qoff | `20260829_124810_build.json` | 89.590465792 | 8,693,366,784 | 0 | 0 | 11,251,040,256 | 310.690 / 1683.9 |
+| q14 | `20260829_125131_build.json` | 150.907552083 | 9,351,954,432 | 658,587,648 | 7.575749 | 11,234,590,720 | 207.351 / 1633.3 |
+| q1 | `20260829_125435_build.json` | 135.051411042 | 8,829,911,040 | 136,544,256 | 1.570672 | 11,251,236,864 | 222.903 / 1666.2 |
+
+Each build produced one IVF segment with 1,000,000 vectors, 10,000 centroids,
+mean posting 100.0, min 1, max 592, and zero empty postings. Against the prior
+q14 statistical-centering build (`20260825_205721_build.json`), peak RSS fell
+from 11,760,009,216 to 11,234,590,720 bytes: -525,418,496 bytes. Build time
+changed from 114.258098542 to 150.907552083 seconds.
+
+The exact-scan baseline shifted from 374 to 275 ns/row across the shared
+storage-layer pin-cache and block-geometry change. Every pre/post comparison
+in this section therefore uses the re-measured qoff run.
+
+### C4 — integrated production-shape micro-benchmark
+
+The benchmark streams successive 100-row, d=1024 cosine clusters through the
+real borrowed-code batch path with f16 scale/gamma decode, full estimate
+combine, and analytical sigma.
+
+| machine | reference / case | rows | 95% CI | throughput |
+|---|---|---:|---:|---:|
+| M5/ARM | sign-kernel reference | 100 | 18.5 ns/row | · |
+| M5/ARM | integrated production shape | 100 | 14.077–14.092 ns/row | 70.962–71.037 M rows/s |
+| x86 CI | integrated production shape | 100 | 32.837–32.868 ns/row | 30.425–30.453 M rows/s |
+
+### Pending x86 companion item — final branch workflow
+
+GitHub Actions run `33240220107` completed green at measured-code SHA
+`441e161581d4de2ac0dd69385ec2d64211a600ed`. Values are Criterion middle
+estimates; ARM values are the matching Apple M5 measurements where present.
+
+| kernel | configuration | ARM | x86 |
+|---|---|---:|---:|
+| FHT apply | d=128 | 611.36 ns | 1.1988 us |
+| FHT apply | d=768 | 3.789 us | 7.1107 us |
+| FHT apply | d=1536 | 7.791 us | 14.130 us |
+| sign symmetric score | d=768 | 2.588 ns | 4.8157 ns |
+| sign asymmetric score | d=768, Bq=4 | 13.869 ns | 26.201 ns |
+| grid encode | d=768, b=2 | 1.945 us | 3.9374 us |
+| grid score | d=768, b=2 | 500.79 ns | 1.4447 us |
+| grid batch score | d=768, b=2, N=32 | · | 22.499 us |
+| grid encode | d=768, b=3 | · | 4.2196 us |
+| grid score | d=768, b=3 | 480.160 ns | 956.72 ns |
+| grid batch score | d=768, b=3, N=32 | · | 32.808 us |
+| grid encode | d=768, b=4 | 1.740 us | 5.6314 us |
+| grid score | d=768, b=4 | 506.91 ns | 1.4515 us |
+| grid batch score | d=768, b=4, N=32 | · | 7.4211 us |
+| grid packed batch score | d=768, b=4, N=32 | · | 4.3941 us |
+| grid packed indexed batch score | d=768, b=4, N=32 | · | 4.2713 us |
+| fp dot | d=128 | 23.485 ns | 95.839 ns |
+| fp dot | d=768 | 279.842 ns | 694.64 ns |
+| fp dot | d=1536 | 641.876 ns | 1.4104 us |
+| decode then dot | d=768 | 582.900 ns | 1.2987 us |
+| boundary ops | 50,000 candidates | 124.20 us | 323.40 us |
+| boundary ops | 500,000 candidates | 809.24 us | 2.0565 ms |
+
+| x86 workflow check | result |
+|---|---:|
+| kernel goldens and determinism | 1 |
+| sign-plane hardware popcount expectation | 1 |
+| FHT packed add/sub expectation | 1 |
+| integrated production-shape benchmark | 1 |
+| criterion suite | 1 |
+| full workflow | 1 |
+
+The separate writer-context encode benchmark is registered but is not invoked
+by this workflow, so no x86 writer-encode interval is claimed.
+
+### C5 — assembly verdicts
+
+| loop | verdict | receipt |
+|---|---|---|
+| fissioned estimate combine | packed ARM64 SIMD confirmed | `quantization_bench_plane1_cosine_cluster`: packed `fmul.4s` and `fmla.4s` |
+| fissioned analytical sigma | packed ARM64 SIMD confirmed | same symbol: packed `fmul.4s` and `fsqrt.4s` |
+| qoff fp32 dot | packed ARM64 SIMD confirmed | `tantivy::vector::distance::dot::<f32>`: packed `fmul.4s` and `fadd.4s` |
+| x86 sign kernel | hardware popcount confirmed | workflow assembly expectation green |
+| x86 FHT | packed add/sub confirmed | workflow assembly expectation green |
+| eager IdMap/open | team-report finding | qoff open cost approximately +0.48 ms; cache/invalidation proposal remains deferred |
+
+### Statistical-centering checkpoint versus gamma-corrected production
+
+`A` is the requested historical run set `155017/155043/155110`; `B` is the
+definitive run set above. Funnels shift by design because gamma replaces the
+dataset-fitted centering correction. q14 r95 is not delta-compared: A was
+probe 0.0141 / recall 0.958, while B is probe 0.0109 / recall 0.948.
+
+| target | config | phase | probe / recall | p50 / p99 ms | layer 0 scored -> survivors | layer 1 scored -> survivors | R |
+|---|---|---|---|---:|---:|---:|---:|
+| r90 | qoff | A | .005 / .897 | 3.580 / 4.909 | · | · | 0 |
+| r90 | qoff | B | .005 / .897 | 2.782 / 3.927 | · | · | 0 |
+| r90 | q14 | A | .005 / .897 | 2.966 / 4.215 | 5093.39 -> 3849.74 | 3849.74 -> 35.94 | 35.94 |
+| r90 | q14 | B | .005 / .897 | 1.913 / 2.758 | 5093.39 -> 383.27 | 383.27 -> 36.87 | 36.87 |
+| r90 | q1 | A | .005 / .897 | 3.158 / 3.656 | 5093.39 -> 3897.20 | · | 3897.20 |
+| r90 | q1 | B | .005 / .897 | 1.953 / 3.709 | 5093.39 -> 373.13 | · | 373.13 |
+| r95 | qoff | A | .0109 / .948 | 5.412 / 6.273 | · | · | 0 |
+| r95 | qoff | B | .0109 / .948 | 4.778 / 5.791 | · | · | 0 |
+| r95 | q14 | A | .0141 / .958 | 5.065 / 6.587 | 14188.32 -> 7638.78 | 7638.78 -> 37.85 | 37.85 |
+| r95 | q14 | B | .0109 / .948 | 2.392 / 2.970 | 10983.92 -> 465.86 | 465.86 -> 38.29 | 38.29 |
+| r95 | q1 | A | .0109 / .948 | 4.996 / 6.175 | 10983.92 -> 6682.89 | · | 6682.89 |
+| r95 | q1 | B | .0109 / .948 | 2.484 / 3.303 | 10983.92 -> 447.83 | · | 447.83 |
+| r99 | qoff | A | .1 / .993 | 34.678 / 42.936 | · | · | 0 |
+| r99 | qoff | B | .1 / .993 | 37.805 / 40.349 | · | · | 0 |
+| r99 | q14 | A | .1 / .993 | 13.914 / 29.347 | 100107.68 -> 16591.51 | 16591.51 -> 40.66 | 40.66 |
+| r99 | q14 | B | .1 / .993 | 8.907 / 10.758 | 100107.68 -> 627.35 | 627.35 -> 41.77 | 41.77 |
+| r99 | q1 | A | .1 / .993 | 15.239 / 36.618 | 100107.68 -> 17397.21 | · | 17397.21 |
+| r99 | q1 | B | .1 / .993 | 9.433 / 13.969 | 100107.68 -> 587.03 | · | 587.03 |
+
+### A/B implementation receipt table
+
+| item | status | code receipt |
+|---|---|---|
+| R1 · no dataset-fitted scorer constants | complete | `src/vector/FORMAT.md:227`; scorer state excludes calibration in `src/vector/prepared.rs:115`; production correction/sigma in `src/vector/backend.rs:958` |
+| R2 · build is constants + encode + write | complete | normative rule `src/vector/FORMAT.md:234`; merge entry/streaming flow `src/vector/ivf/plugin.rs:518` and `:1207`; no sampling reachable from merge |
+| R3 · whole-cluster batch scoring | complete | normative rule `src/vector/FORMAT.md:243`; cluster batch loop `src/vector/backend.rs:1877`; segment boundary pass `src/vector/backend.rs:1983` |
+| cumulative gamma construction | complete | exact prefix dot and clamp in `quant-kernels/cascade/src/lib.rs:629`; zero residual and clamp tests at `:1765` and `:1834` |
+| sidecar format and effective scale | complete | blocked scale/gamma layout and equations in `src/vector/FORMAT.md:69` and `:108`; decode in `src/vector/backend.rs:1325`; effective-scale update at `:1206` |
+| query-error decomposition | complete | sign bitplane error `quant-kernels/sign-plane/src/lib.rs:85`; grid exact-query zero term `quant-kernels/cascade/src/lib.rs:374`; production accumulation `src/vector/backend.rs:1208` |
+| correction applied exactly once | complete | raw prefix retained and gamma fused once at `src/vector/backend.rs:1210` and `:1240`; no calibration bias in scorer context |
+| kappa policy | complete | policy mapping `src/vector/FORMAT.md:202`; code `src/vector/backend.rs:55`; policy tests `src/vector/backend.rs:2645` |
+| aligned little-endian words | complete | `align_to` borrow-or-copy fallback `quant-kernels/cascade/src/lib.rs:1162`; aligned and unaligned tests at `:1205` |
+| correctness fixture matrix | complete | matrix harness `src/vector/ivf/plugin.rs:2094`; cosine/L2, replication, deletes, filters, schedules, prefixes, and odd-d matrix at `:2692` |
+| B1 fissioned combines | complete | branchless f16 decoder `quant-kernels/quant-model/src/f16.rs:3`; f32 SoA sigma loop `src/vector/backend.rs:958`; no duplicate f16 decode/residual `.get` pass |
+| B2 indexed generalization | complete | indexed sign `quant-kernels/sign-plane/src/lib.rs:221`; indexed grid/odd-d `quant-kernels/grid-plane/src/lib.rs:738`; adaptive reads `src/vector/index_reader.rs:967` and `:1025`; cross-cluster batch `src/vector/backend.rs:1254` |
+| B3 query-context hoisting | complete | cached rotation plans `src/vector/prepared.rs:47`; per-query shared bitplanes/LUT `src/vector/prepared.rs:165`; level-0 skips quantized context `src/vector/backend.rs:94` |
+| B4 bookkeeping | complete | tracked cluster-local top-k `src/vector/backend.rs:1551`; dedup at boundary `:1653` and rerank `:2121`; no push-loop HashMap |
+| streamed build storage | complete | per-slot directory temp spills `src/vector/ivf/plugin.rs:283`; PostgreSQL BufFile adapter `pg_search/src/index/directory/mvcc.rs`; q14 peak-RSS receipt above |
+| external diagnostic calibration only | complete | SQL diagnostics `pg_search/src/api/vector.rs:101`; scorer state exclusion `src/vector/prepared.rs:115`; protocol-tagged results above |
+| grid-first effective-scale rule | documented/out of scope | storage requirement `src/vector/FORMAT.md:119`; explicit merge rejection `src/vector/ivf/plugin.rs:564` |
+
+### Averages-eliminated ledger
+
+| former aggregate or shortcut | disposition |
+|---|---|
+| persisted depth bias applied during scoring | eliminated: exact cumulative per-row gamma |
+| persisted spread applied to band width | eliminated: closed-form sigma with declared safety 1.15 |
+| global Bq=4 query-error assumption | eliminated: exact per-query sign-bitplane reconstruction error |
+| merge-time held-out calibration sampler | eliminated from build; external diagnostics only |
+| sample-count/source-tag numeric hacks | eliminated from scoring and build paths |
+| Lloyd-Max rerun during row encode | eliminated: format-grid constants resolved before streaming encode |
+
+Design rule: empirical measurement is for choosing configurations, never for
+compensating estimators that can be correct by construction.
+
+### Deferred dispositions
+
+| item | disposition |
+|---|---|
+| reader/searcher cache and eager IdMap decode | team report with page attribution and invalidation proposal; no branch implementation |
+| cosine constants-slot write and f16-to-f32 scale-storage question | format-amendment bundle |
+| pshufb/tbl packed-LUT kernel | follow-up kernel project |
+| kappa changes | design policy; future budget changes route through Ruchir |
+| grid-first [2]/[4] effective scale | measured-dead/out of scope; format rule and build error retained |
+| 10M run | deferred; streaming merge prerequisite is complete, run not claimed |
+| x86 writer-context encode interval | absent from current workflow; no number claimed |
+
+### Final validation
+
+| gate | result |
+|---|---:|
+| quant-kernels release goldens/determinism | 58 / 58 |
+| Tantivy `cargo test --lib vector::` | 220 / 220 |
+| pg_regress `vector_quantization` on final pinned pair | 1 |
+| pdbench unit tests | 36 / 36 |
+| Tantivy nightly fmt / diff check | 1 |
+| ParadeDB nightly fmt / diff check | 1 |
+| x86 workflow run `33240220107` | 1 |

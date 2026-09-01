@@ -23,10 +23,16 @@ pub const MAX_QUANTIZATION_LAYERS: usize = 4;
 pub const QUANTIZED_CODE_ALIGNMENT: usize = 64;
 /// One binary16 scale per posting-membership row and layer.
 pub const QUANTIZED_SCALE_STRIDE: usize = 2;
+/// One binary16 cumulative-prefix gamma per posting-membership row and layer.
+pub const QUANTIZED_GAMMA_STRIDE: usize = 2;
+/// Combined per-layer sidecar bytes per posting-membership row.
+pub const QUANTIZED_SCALE_GAMMA_STRIDE: usize = QUANTIZED_SCALE_STRIDE + QUANTIZED_GAMMA_STRIDE;
 /// One binary32 split-form constant per posting-membership row and layer.
 pub const QUANTIZED_CONSTANT_STRIDE: usize = 4;
 /// One binary32 residual squared norm per posting-membership row when needed.
 pub const QUANTIZED_RESIDUAL_NORM_STRIDE: usize = 4;
+/// Closed-form uncertainty safety multiplier declared by the V3 scoring policy.
+pub(crate) const GAMMA_ANALYTICAL_SAFETY: f32 = 1.15;
 /// Origin of one settings-backed calibration measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -129,8 +135,8 @@ pub struct VectorQuantizationGrid {
     pub version: u32,
     pub points: Vec<f32>,
     /// Exact-density normalized RMSE resolved when the grid is materialized.
-    /// `None` reads pre-amendment V3 metadata; the segment-open resolver has
-    /// a compatibility path that derives it from the persisted points once.
+    /// `None` remains deserializable so pre-amendment V3 metadata can produce
+    /// a precise validation error; segment open and merge never recompute it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rho_model: Option<f64>,
 }
@@ -379,8 +385,8 @@ impl VectorQuantizationConfig {
         Ok(())
     }
 
-    /// Returns the settings-backed calibration, or `None` when quantized
-    /// scoring must remain unavailable.
+    /// Returns settings-backed diagnostic calibration when one was recorded.
+    /// Production scoring never consumes this metadata.
     pub fn calibration(&self) -> Option<&[VectorQuantizationDepthCalibration]> {
         self.calibration.as_deref()
     }
@@ -440,7 +446,7 @@ impl VectorQuantizationConfig {
             .iter()
             .map(|layer| {
                 quantized_code_stride(self.dim, layer.bits)
-                    + QUANTIZED_SCALE_STRIDE
+                    + QUANTIZED_SCALE_GAMMA_STRIDE
                     + QUANTIZED_CONSTANT_STRIDE
             })
             .sum();
@@ -581,8 +587,8 @@ mod tests {
     }
 
     #[test]
-    fn one_plus_four_is_492_bytes_per_dot_row() {
-        assert_eq!(config(&[1, 4]).bytes_per_row(), 492);
+    fn one_plus_four_is_496_bytes_per_dot_row() {
+        assert_eq!(config(&[1, 4]).bytes_per_row(), 496);
     }
 
     #[test]
@@ -629,10 +635,10 @@ mod tests {
     }
 
     #[test]
-    fn one_plus_four_is_496_bytes_per_l2_row() {
+    fn one_plus_four_is_500_bytes_per_l2_row() {
         let mut config = config(&[1, 4]);
         config.metric = Metric::L2;
-        assert_eq!(config.bytes_per_row(), 496);
+        assert_eq!(config.bytes_per_row(), 500);
         assert!(config.needs_residual_norm());
     }
 

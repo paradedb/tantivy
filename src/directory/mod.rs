@@ -15,7 +15,7 @@ pub mod error;
 
 mod composite_file;
 
-use std::io::BufWriter;
+use std::io::{BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
 
 pub use common::buffered_file_slice::BufferedFileSlice;
@@ -57,6 +57,17 @@ pub type WritePtr = BufWriter<InnerWritePtr>;
 
 /// An unbuffered WritePtr.
 pub type InnerWritePtr = Box<dyn TerminatingWrite + Send + Sync>;
+
+/// A seekable temporary file owned by a [`Directory`] implementation.
+///
+/// Temporary files are independent from the directory's managed WORM files and disappear when
+/// the returned handle is dropped according to the implementation's temporary-file semantics.
+pub trait TempFile: Read + Write + Seek {}
+
+impl<T> TempFile for T where T: Read + Write + Seek {}
+
+/// A boxed seekable temporary file.
+pub type TempFilePtr = Box<dyn TempFile>;
 
 #[cfg(test)]
 mod tests;

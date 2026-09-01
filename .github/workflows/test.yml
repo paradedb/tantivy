@@ -70,6 +70,7 @@ jobs:
         cargo bench -p grid-plane --bench kernels -- --noplot
         cargo bench -p cascade --bench baselines -- --noplot
         cargo bench -p cascade --bench cascade -- --noplot
+        cargo bench -p tantivy --bench vector_quantization_scan --features quantization-bench -- --noplot
 
   check:
 

@@ -19,14 +19,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cascade::{prepare_split_query_with_plan, LayerSpec, PreparedSplitQuery, QueryRotationPlan};
-#[cfg(test)]
-use quant_model::f16::f16_to_f32;
-use quant_model::{exact_sign_grid, rho_model_for_points, Grid};
+use quant_model::Grid;
 
 use super::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
-use super::quantization::{VectorQuantizationConfig, VectorQuantizer};
+use super::quantization::VectorQuantizationConfig;
 use super::VectorElement;
 use crate::schema::Metric;
+use crate::TantivyError;
 
 pub struct PreparedQuery<T: VectorElement> {
     query: Arc<Vec<T>>,
@@ -51,15 +50,11 @@ pub(crate) struct QuantizedIndexCtx {
     pub(crate) specs: Vec<LayerSpec>,
     pub(crate) grids: Vec<Grid>,
     rotation_plan: QueryRotationPlan,
-    biases: Vec<f32>,
-    cals: Vec<f32>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct QuantizedIndexCacheKey {
     config_json: String,
-    bias_bits: Vec<u32>,
-    cal_bits: Vec<u32>,
 }
 
 static QUANTIZED_INDEX_CACHE: OnceLock<
@@ -67,25 +62,7 @@ static QUANTIZED_INDEX_CACHE: OnceLock<
 > = OnceLock::new();
 
 impl QuantizedIndexCtx {
-    pub(crate) fn calibrations(&self) -> &[f32] {
-        &self.cals
-    }
-
-    pub(crate) fn biases(&self) -> &[f32] {
-        &self.biases
-    }
-
-    pub(crate) fn new_with_biases_and_cals(
-        config: VectorQuantizationConfig,
-        biases: Vec<f32>,
-        cals: Vec<f32>,
-    ) -> Self {
-        assert!(
-            (biases.is_empty() && cals.is_empty())
-                || (biases.len() == config.layers.len() && cals.len() == config.layers.len())
-        );
-        assert!(biases.iter().all(|bias| bias.is_finite()));
-        assert!(cals.iter().all(|cal| cal.is_finite() && *cal >= 0.0));
+    fn new(config: VectorQuantizationConfig) -> crate::Result<Self> {
         let specs: Vec<LayerSpec> = config
             .layers
             .iter()
@@ -99,36 +76,40 @@ impl QuantizedIndexCtx {
             .layers
             .iter()
             .map(|layer| {
-                if let Some(stored) = config.grids.iter().find(|grid| grid.bits == layer.bits) {
-                    Grid {
-                        bits: layer.bits,
-                        points: stored.points.clone(),
-                        rho_model: stored.rho_model.unwrap_or_else(|| {
-                            // Compatibility for pre-amendment V3 metadata:
-                            // evaluate the persisted points once, without a
-                            // Lloyd-Max solve. The resolved context is then
-                            // cached process-wide across segment reopens.
-                            rho_model_for_points(config.dim, &stored.points)
-                        }),
-                    }
-                } else {
-                    debug_assert_eq!(layer.quantizer, VectorQuantizer::RaBitQ);
-                    debug_assert_eq!(layer.bits, 1);
-                    exact_sign_grid(config.dim)
-                }
+                let stored = config
+                    .grids
+                    .iter()
+                    .find(|grid| grid.bits == layer.bits)
+                    .ok_or_else(|| {
+                        TantivyError::InvalidArgument(format!(
+                            "quantization field {:?} layer width {} has no persisted grid/model \
+                             entry; rebuild the pre-release index",
+                            config.field, layer.bits
+                        ))
+                    })?;
+                let rho_model = stored.rho_model.ok_or_else(|| {
+                    TantivyError::InvalidArgument(format!(
+                        "quantization field {:?} layer width {} has no persisted rho_model; \
+                         rebuild the pre-release index",
+                        config.field, layer.bits
+                    ))
+                })?;
+                Ok(Grid {
+                    bits: layer.bits,
+                    points: stored.points.clone(),
+                    rho_model,
+                })
             })
-            .collect();
+            .collect::<crate::Result<Vec<_>>>()?;
         // Seed expansion and permutation construction are index-scoped. The
         // process cache retains this plan across both segments and queries.
         let rotation_plan = QueryRotationPlan::new(config.dim, &specs);
-        Self {
+        Ok(Self {
             config,
             specs,
             grids,
             rotation_plan,
-            biases,
-            cals,
-        }
+        })
     }
 
     /// Resolve immutable scorer state once per persisted configuration and
@@ -136,42 +117,48 @@ impl QuantizedIndexCtx {
     /// SegmentReader's field cache provides the first level; this strong
     /// process cache closes the pg_search query boundary, which reopens
     /// segment readers. Entries intentionally live for the process lifetime.
-    pub(crate) fn resolve(
-        config: VectorQuantizationConfig,
-        biases: Vec<f32>,
-        cals: Vec<f32>,
-    ) -> Arc<Self> {
+    pub(crate) fn resolve(config: VectorQuantizationConfig) -> crate::Result<Arc<Self>> {
+        // Calibration is diagnostic metadata, not scorer state. Keep it out
+        // of both context construction and cache identity.
+        let runtime_config = (
+            config.field.as_str(),
+            config.format_version,
+            config.dim,
+            config.metric,
+            config.norm_policy,
+            config.layers.as_slice(),
+            config.grids.as_slice(),
+        );
         let key = QuantizedIndexCacheKey {
-            config_json: serde_json::to_string(&config)
-                .expect("vector quantization config must serialize"),
-            bias_bits: biases.iter().map(|bias| bias.to_bits()).collect(),
-            cal_bits: cals.iter().map(|cal| cal.to_bits()).collect(),
+            config_json: serde_json::to_string(&runtime_config).map_err(|error| {
+                TantivyError::InternalError(format!(
+                    "vector quantization config failed to serialize for context caching: {error}"
+                ))
+            })?,
         };
         let cache = QUANTIZED_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         let mut cache = cache.lock().expect("quantized index cache lock poisoned");
         if let Some(resolved) = cache.get(&key) {
-            return Arc::clone(resolved);
+            return Ok(Arc::clone(resolved));
         }
-        let resolved = Arc::new(Self::new_with_biases_and_cals(config, biases, cals));
+        let resolved = Arc::new(Self::new(config)?);
         cache.insert(key, Arc::clone(&resolved));
-        resolved
+        Ok(resolved)
     }
 
-    pub(crate) fn resolve_from_config(config: VectorQuantizationConfig) -> Option<Arc<Self>> {
-        let calibration = config.calibration()?;
-        let biases = calibration.iter().map(|depth| depth.bias).collect();
-        let spreads = calibration.iter().map(|depth| depth.spread).collect();
-        Some(Self::resolve(config, biases, spreads))
+    pub(crate) fn resolve_from_config(
+        config: VectorQuantizationConfig,
+    ) -> crate::Result<Arc<Self>> {
+        Self::resolve(config)
     }
 
-    /// An uncentered context used only to measure settings calibration. It is
-    /// never exposed to the production scan fallback.
-    pub(crate) fn for_calibration_measurement(config: VectorQuantizationConfig) -> Arc<Self> {
-        Arc::new(Self::new_with_biases_and_cals(
-            config,
-            Vec::new(),
-            Vec::new(),
-        ))
+    /// Diagnostic measurements use the same persisted scorer state as
+    /// production. Persisted calibration metadata does not participate in
+    /// query preparation or scoring.
+    pub(crate) fn for_calibration_measurement(
+        config: VectorQuantizationConfig,
+    ) -> crate::Result<Arc<Self>> {
+        Self::resolve(config)
     }
 }
 
@@ -271,6 +258,12 @@ impl QuantizedQueryCtx {
         self.active_layers
     }
 
+    /// Exact squared query-quantization error `B_j` already accumulated while
+    /// preparing this layer's scoring state.
+    pub(crate) fn query_error_squared(&self, layer: usize) -> f64 {
+        self.prepared.query_error_squared(layer)
+    }
+
     pub(crate) fn score_layer(&self, layer: usize, codes: &[u8], scale: u16, constant: f32) -> f32 {
         self.prepared
             .score_layer(layer, codes, scale, constant, self.index.specs[layer])
@@ -316,30 +309,6 @@ impl QuantizedQueryCtx {
         );
     }
 
-    #[inline(always)]
-    pub(crate) fn layer_sigma_factor(&self, layer: usize, query_norm: f32) -> f32 {
-        self.index.grids[layer].rho_model as f32
-            * self.index.cals[layer]
-            * query_norm
-            * if self.index.config.metric == Metric::L2 {
-                2.0
-            } else {
-                1.0
-            }
-    }
-
-    #[inline(always)]
-    pub(crate) fn layer_bias_factor(&self, layer: usize, query_norm: f32) -> f32 {
-        self.index.grids[layer].rho_model as f32
-            * self.index.biases[layer]
-            * query_norm
-            * if self.index.config.metric == Metric::L2 {
-                2.0
-            } else {
-                1.0
-            }
-    }
-
     /// Norm of the query vector used by a layer's dot-product error model.
     /// L2 estimates `<q-c,r>`; Dot and Cosine estimate `<q,r>` directly.
     /// The routing score already carries exact `-||q-c||²` for L2, so no
@@ -354,25 +323,6 @@ impl QuantizedQueryCtx {
 
     pub(crate) fn query(&self) -> &[f32] {
         &self.query
-    }
-}
-
-/// Convert one layer's stored reconstruction scale into score-space uncertainty.
-/// The scale belongs to the residual entering that layer, so the layer-local rho
-/// already represents all error left after that boundary.
-#[cfg(test)]
-fn score_sigma_from_scale(
-    metric: Metric,
-    rho: f64,
-    cal: f32,
-    query_residual_norm: f32,
-    scale: u16,
-) -> f32 {
-    let dot_sigma = f16_to_f32(scale) * rho as f32 * cal * query_residual_norm;
-    if metric == Metric::L2 {
-        2.0 * dot_sigma
-    } else {
-        dot_sigma
     }
 }
 
@@ -426,12 +376,12 @@ impl<T: VectorElement> PreparedQuery<T> {
 mod tests {
     use std::sync::Arc;
 
-    use quant_model::f16::{f16_to_f32, f32_to_f16};
-    use quant_model::DEFAULT_CAL;
-
-    use super::{score_sigma_from_scale, QuantizedIndexCtx, QuantizedQueryCache};
+    use super::{QuantizedIndexCtx, QuantizedQueryCache, QuantizedQueryCtx};
     use crate::schema::{Metric, VectorOptions};
-    use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer, VectorQuantizer};
+    use crate::vector::{
+        VectorQuantizationCalibrationSource, VectorQuantizationConfig,
+        VectorQuantizationDepthCalibration, VectorQuantizationLayer, VectorQuantizer,
+    };
 
     #[test]
     fn resolved_quantized_index_context_is_reused_across_segment_opens() {
@@ -452,8 +402,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let first = QuantizedIndexCtx::resolve(config.clone(), vec![0.0, 0.0], vec![2.27, 2.31]);
-        let reopened = QuantizedIndexCtx::resolve(config, vec![0.0, 0.0], vec![2.27, 2.31]);
+        assert!(config.calibration().is_none());
+        let first = QuantizedIndexCtx::resolve(config.clone()).unwrap();
+        let reopened = QuantizedIndexCtx::resolve(config).unwrap();
         assert!(Arc::ptr_eq(&first, &reopened));
     }
 
@@ -476,7 +427,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let index = QuantizedIndexCtx::resolve(config, vec![0.0, 0.0], vec![2.27, 2.31]);
+        let index = QuantizedIndexCtx::resolve(config).unwrap();
         let cache = QuantizedQueryCache::default();
         let query = vec![0.25_f32; 100];
 
@@ -503,9 +454,9 @@ mod tests {
             }],
         )
         .unwrap();
-        let first_index = QuantizedIndexCtx::resolve(config.clone(), vec![0.0], vec![2.27]);
+        let first_index = QuantizedIndexCtx::resolve(config.clone()).unwrap();
         config.field = "second_query_index".to_string();
-        let second_index = QuantizedIndexCtx::resolve(config, vec![0.0], vec![2.27]);
+        let second_index = QuantizedIndexCtx::resolve(config).unwrap();
         assert!(!Arc::ptr_eq(&first_index, &second_index));
 
         let cache = QuantizedQueryCache::default();
@@ -535,7 +486,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let index = QuantizedIndexCtx::resolve(config, vec![0.0, 0.0], vec![2.27, 2.31]);
+        let index = QuantizedIndexCtx::resolve(config).unwrap();
         let cache = QuantizedQueryCache::default();
         let query = vec![0.75_f32; 100];
 
@@ -562,45 +513,79 @@ mod tests {
     }
 
     #[test]
-    fn quantized_sigma_decodes_f16_scale_and_applies_rho_and_cal() {
-        let scale_bits = f32_to_f16(0.037_531);
-        let rho = 0.097_3;
-        let query_residual_norm = 0.812_5;
-        let expected =
-            f16_to_f32(scale_bits) * rho as f32 * DEFAULT_CAL as f32 * query_residual_norm;
+    fn quantized_index_context_requires_persisted_grid_and_rho() {
+        let config = VectorQuantizationConfig::materialize(
+            "strict_persisted_model".to_string(),
+            &VectorOptions::new(100, Metric::Dot),
+            vec![VectorQuantizationLayer {
+                bits: 1,
+                quantizer: VectorQuantizer::RaBitQ,
+                seed: 0xfeed_4001,
+            }],
+        )
+        .unwrap();
 
-        let dot = score_sigma_from_scale(
-            Metric::Dot,
-            rho,
-            DEFAULT_CAL as f32,
-            query_residual_norm,
-            scale_bits,
-        );
-        let cosine = score_sigma_from_scale(
-            Metric::Cosine,
-            rho,
-            DEFAULT_CAL as f32,
-            query_residual_norm,
-            scale_bits,
-        );
-        let l2 = score_sigma_from_scale(
-            Metric::L2,
-            rho,
-            DEFAULT_CAL as f32,
-            query_residual_norm,
-            scale_bits,
-        );
+        let mut missing_grid = config.clone();
+        missing_grid.grids.clear();
+        let error = QuantizedIndexCtx::resolve(missing_grid)
+            .err()
+            .expect("missing grid must be rejected");
+        assert!(error.to_string().contains("no persisted grid/model entry"));
 
-        assert_eq!(dot.to_bits(), expected.to_bits());
-        assert_eq!(cosine.to_bits(), expected.to_bits());
-        assert_eq!(l2.to_bits(), (2.0 * expected).to_bits());
-        assert!(cosine.is_finite());
+        let mut missing_rho = config;
+        missing_rho.grids[0].rho_model = None;
+        let error = QuantizedIndexCtx::resolve(missing_rho)
+            .err()
+            .expect("missing rho must be rejected");
+        assert!(error.to_string().contains("no persisted rho_model"));
     }
 
     #[test]
-    fn quantized_sigma_selects_calibration_by_prefix_depth() {
+    fn diagnostic_calibration_does_not_change_query_scoring() {
         let config = VectorQuantizationConfig::materialize(
-            "per_depth_calibration".to_string(),
+            "diagnostic_calibration".to_string(),
+            &VectorOptions::new(100, Metric::Dot),
+            vec![VectorQuantizationLayer {
+                bits: 1,
+                quantizer: VectorQuantizer::RaBitQ,
+                seed: 0xfeed_5001,
+            }],
+        )
+        .unwrap();
+        let mut diagnostic = config.clone();
+        diagnostic
+            .install_real_query_calibration(vec![VectorQuantizationDepthCalibration {
+                bias: -7.5,
+                spread: 11.25,
+                sample_count: 1_000,
+                source: VectorQuantizationCalibrationSource::RealQuery,
+            }])
+            .unwrap();
+        let query_values = (0..100)
+            .map(|coordinate| ((coordinate as f32 + 0.75) * 0.113).cos())
+            .collect::<Vec<_>>();
+        let uncalibrated_index = QuantizedIndexCtx::resolve(config).unwrap();
+        let diagnostic_index = QuantizedIndexCtx::resolve(diagnostic).unwrap();
+        assert!(Arc::ptr_eq(&uncalibrated_index, &diagnostic_index));
+        let uncalibrated = QuantizedQueryCtx::new(uncalibrated_index, query_values.clone());
+        let calibrated = QuantizedQueryCtx::new(diagnostic_index, query_values);
+        let mut codes = vec![0; 16];
+        codes[..8].fill(0xa5);
+
+        assert_eq!(
+            uncalibrated.score_layer(0, &codes, 0x3c00, 0.125).to_bits(),
+            calibrated.score_layer(0, &codes, 0x3c00, 0.125).to_bits()
+        );
+        assert_eq!(
+            uncalibrated.query_error_squared(0).to_bits(),
+            calibrated.query_error_squared(0).to_bits()
+        );
+    }
+
+    #[test]
+    fn query_error_is_exact_for_sign_layers_and_zero_for_grid_luts() {
+        let config = VectorQuantizationConfig::materialize(
+            "query_error_by_kernel".to_string(),
             &VectorOptions::new(100, Metric::Dot),
             vec![
                 VectorQuantizationLayer {
@@ -616,29 +601,23 @@ mod tests {
             ],
         )
         .unwrap();
-        let query = super::QuantizedQueryCtx::new(
-            Arc::new(QuantizedIndexCtx::new_with_biases_and_cals(
-                config,
-                vec![-1.5, 0.25],
-                vec![3.5, 2.25],
-            )),
-            vec![0.1; 100],
+        let query_values = (0..100)
+            .map(|coordinate| ((coordinate as f32 + 0.25) * 0.173).sin())
+            .collect::<Vec<_>>();
+        let index = QuantizedIndexCtx::resolve(config).unwrap();
+        let expected = cascade::audit_split_query_layer_error_squared_with_plan(
+            &query_values,
+            &index.rotation_plan,
+            &index.grids,
+            4,
         );
+        let query = QuantizedQueryCtx::new(index, query_values);
+
         assert_eq!(
-            query.layer_sigma_factor(0, 1.0).to_bits(),
-            (query.index.grids[0].rho_model as f32 * 3.5).to_bits()
+            query.query_error_squared(0).to_bits(),
+            expected[0].to_bits()
         );
-        assert_eq!(
-            query.layer_sigma_factor(1, 1.0).to_bits(),
-            (query.index.grids[1].rho_model as f32 * 2.25).to_bits()
-        );
-        assert_eq!(
-            query.layer_bias_factor(0, 1.0).to_bits(),
-            (query.index.grids[0].rho_model as f32 * -1.5).to_bits()
-        );
-        assert_eq!(
-            query.layer_bias_factor(1, 1.0).to_bits(),
-            (query.index.grids[1].rho_model as f32 * 0.25).to_bits()
-        );
+        assert!(query.query_error_squared(0) > 0.0);
+        assert_eq!(query.query_error_squared(1), 0.0);
     }
 }

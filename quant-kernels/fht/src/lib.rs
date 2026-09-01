@@ -58,29 +58,45 @@ impl Rotation {
     }
 
     pub fn apply(&self, x: &mut [f32]) {
+        let mut scratch = vec![0.0; self.d];
+        self.apply_with_scratch(x, &mut scratch);
+    }
+
+    /// Apply this rotation using caller-owned scratch storage.
+    ///
+    /// `scratch` must have exactly the rotation dimension. Reusing one
+    /// allocation across rows keeps the merge-time encode loop allocation
+    /// free without changing the format-stable transform.
+    pub fn apply_with_scratch(&self, x: &mut [f32], scratch: &mut [f32]) {
         assert_eq!(x.len(), self.d);
+        assert_eq!(scratch.len(), self.d);
         #[cfg(debug_assertions)]
         APPLY_COUNT.with(|count| count.set(count.get() + 1));
-        let mut scratch = vec![0.0; self.d];
         for round in &self.rounds {
             apply_signs(x, &round.signs);
             for (target, &source) in round.perm.iter().enumerate() {
                 scratch[target] = x[source as usize];
             }
-            x.copy_from_slice(&scratch);
+            x.copy_from_slice(scratch);
             block_hadamard(x, &self.blocks);
         }
     }
 
     pub fn apply_inverse(&self, x: &mut [f32]) {
-        assert_eq!(x.len(), self.d);
         let mut scratch = vec![0.0; self.d];
+        self.apply_inverse_with_scratch(x, &mut scratch);
+    }
+
+    /// Apply the inverse rotation using caller-owned scratch storage.
+    pub fn apply_inverse_with_scratch(&self, x: &mut [f32], scratch: &mut [f32]) {
+        assert_eq!(x.len(), self.d);
+        assert_eq!(scratch.len(), self.d);
         for round in self.rounds.iter().rev() {
             block_hadamard(x, &self.blocks);
             for (target, &source) in round.inv_perm.iter().enumerate() {
                 scratch[target] = x[source as usize];
             }
-            x.copy_from_slice(&scratch);
+            x.copy_from_slice(scratch);
             apply_signs(x, &round.signs);
         }
     }
@@ -248,6 +264,26 @@ mod tests {
                     "d={d}: {actual} != {expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn caller_scratch_matches_allocating_wrappers() {
+        for d in [65, 100, 768, 769] {
+            let rotation = Rotation::new(d, 99);
+            let original = input(d, 0.73);
+            let mut allocating = original.clone();
+            rotation.apply(&mut allocating);
+
+            let mut reused = original.clone();
+            let mut scratch = vec![f32::NAN; d];
+            rotation.apply_with_scratch(&mut reused, &mut scratch);
+            assert_eq!(reused, allocating, "forward mismatch at d={d}");
+
+            rotation.apply_inverse_with_scratch(&mut reused, &mut scratch);
+            let mut expected = allocating;
+            rotation.apply_inverse(&mut expected);
+            assert_eq!(reused, expected, "inverse mismatch at d={d}");
         }
     }
 

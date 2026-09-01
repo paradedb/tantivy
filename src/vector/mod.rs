@@ -52,8 +52,10 @@ pub use distance::{
 };
 pub use flat::FlatVecWriter;
 pub use index_reader::{
-    VectorCalibrationMeasurements, VectorCalibrationMoments, VectorClusterStats, VectorIndexReader,
-    VectorInfo, VectorStorageFormat,
+    VectorAuditMoments, VectorCalibrationMeasurements, VectorCalibrationMoments,
+    VectorClusterStats, VectorGammaAuditMeasurements, VectorGammaAuditQuery,
+    VectorGammaConeAuditMeasurements, VectorGammaConeDepthMeasurements,
+    VectorGammaDepthMeasurements, VectorIndexReader, VectorInfo, VectorStorageFormat,
 };
 pub use ivf::{
     BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, BuiltRouter, Candidate, ClusterId,
@@ -70,8 +72,9 @@ pub use quantization::{
     quantized_code_stride, VectorNormPolicy, VectorQuantizationCalibrationSource,
     VectorQuantizationConfig, VectorQuantizationDepthCalibration, VectorQuantizationGrid,
     VectorQuantizationLayer, VectorQuantizer, GRID_FORMAT_VERSION, MAX_QUANTIZATION_LAYERS,
-    QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE,
-    QUANTIZED_SCALE_STRIDE, VECTOR_QUANTIZATION_FORMAT_VERSION,
+    QUANTIZED_CODE_ALIGNMENT, QUANTIZED_CONSTANT_STRIDE, QUANTIZED_GAMMA_STRIDE,
+    QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_GAMMA_STRIDE, QUANTIZED_SCALE_STRIDE,
+    VECTOR_QUANTIZATION_FORMAT_VERSION,
 };
 pub use tie_break::NoTieBreak;
 
