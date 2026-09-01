@@ -53,7 +53,7 @@ pub use ivf::{
     IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, LazyStackedIvf, LazyStore,
     MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    SuperKMeansLevelClusterer, Workspace,
+    StackedSearchStats, SuperKMeansLevelClusterer, Workspace,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
