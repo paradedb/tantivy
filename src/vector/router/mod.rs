@@ -1,6 +1,4 @@
 use std::io::{self, Write};
-use std::marker::PhantomData;
-use std::sync::Arc;
 
 use common::{BinarySerializable, HasLen};
 
@@ -122,23 +120,40 @@ impl<R: Router> ErasedRouterDescriptor for R {
     }
 }
 
-pub(crate) trait RouterFactory: Send + Sync + 'static {
-    fn descriptor(&self) -> RouterDescriptor;
-
-    fn build(
-        &self,
-        options: &VectorOptions,
-        centroids: &mut IvfCentroids,
-    ) -> crate::Result<Box<dyn Router>>;
-
-    fn deserialize(
-        &self,
+#[derive(Clone, Copy)]
+pub(crate) struct RouterBinding {
+    descriptor: RouterDescriptor,
+    build:
+        fn(options: &VectorOptions, centroids: &mut IvfCentroids) -> crate::Result<Box<dyn Router>>,
+    deserialize: fn(
         payload: FileSlice,
         centroids: FileSlice,
         options: &VectorOptions,
-    ) -> crate::Result<Box<dyn Router>>;
+    ) -> crate::Result<Box<dyn Router>>,
+}
 
-    fn open(
+impl RouterBinding {
+    pub(crate) fn new<R: Router>() -> Self {
+        Self {
+            descriptor: R::router_descriptor(),
+            build: R::build_router,
+            deserialize: R::deserialize,
+        }
+    }
+
+    pub(crate) fn descriptor(&self) -> RouterDescriptor {
+        self.descriptor
+    }
+
+    pub(crate) fn build(
+        &self,
+        options: &VectorOptions,
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Box<dyn Router>> {
+        (self.build)(options, centroids)
+    }
+
+    pub(crate) fn open(
         &self,
         file_version: VectorFileVersion,
         slot: FileSlice,
@@ -191,12 +206,12 @@ pub(crate) trait RouterFactory: Send + Sync + 'static {
             )
             .into());
         }
-        let router = self.deserialize(slot.slice_from(payload_offset), centroids, options)?;
+        let router = (self.deserialize)(slot.slice_from(payload_offset), centroids, options)?;
         if router.descriptor() != descriptor {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "router factory for {} opened router {}",
+                    "configured router {} opened router {}",
                     descriptor.id(),
                     router.id()
                 ),
@@ -205,35 +220,6 @@ pub(crate) trait RouterFactory: Send + Sync + 'static {
         }
         Ok(router)
     }
-}
-
-struct RouterFactoryFor<R>(PhantomData<fn() -> R>);
-
-impl<R: Router + 'static> RouterFactory for RouterFactoryFor<R> {
-    fn descriptor(&self) -> RouterDescriptor {
-        R::router_descriptor()
-    }
-
-    fn build(
-        &self,
-        options: &VectorOptions,
-        centroids: &mut IvfCentroids,
-    ) -> crate::Result<Box<dyn Router>> {
-        R::build_router(options, centroids)
-    }
-
-    fn deserialize(
-        &self,
-        payload: FileSlice,
-        centroids: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Box<dyn Router>> {
-        R::deserialize(payload, centroids, options)
-    }
-}
-
-pub(crate) fn router_factory_for<R: Router + 'static>() -> Arc<dyn RouterFactory> {
-    Arc::new(RouterFactoryFor::<R>(PhantomData))
 }
 
 pub trait RouterRanking: Iterator<Item = Candidate> {
@@ -292,8 +278,6 @@ impl RouterRanking for EagerRouterRanking {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
     use crate::vector::Similarity;
 
@@ -356,42 +340,14 @@ mod tests {
         }
     }
 
-    struct CountingRouterFactory {
-        opens: Arc<AtomicUsize>,
-    }
-
-    impl RouterFactory for CountingRouterFactory {
-        fn descriptor(&self) -> RouterDescriptor {
-            TestRouter::<0>::router_descriptor()
-        }
-
-        fn build(
-            &self,
-            options: &VectorOptions,
-            centroids: &mut IvfCentroids,
-        ) -> crate::Result<Box<dyn Router>> {
-            TestRouter::<0>::build_router(options, centroids)
-        }
-
-        fn deserialize(
-            &self,
-            payload: FileSlice,
-            centroids: FileSlice,
-            options: &VectorOptions,
-        ) -> crate::Result<Box<dyn Router>> {
-            self.opens.fetch_add(1, Ordering::Relaxed);
-            TestRouter::<0>::deserialize(payload, centroids, options)
-        }
-    }
-
     #[test]
-    fn configured_factory_opens_matching_router() -> crate::Result<()> {
+    fn configured_router_opens_matching_payload() -> crate::Result<()> {
         let router = TestRouter::<0> { cluster: 42 };
         let mut bytes = Vec::new();
         router.serialize(&mut bytes)?;
-        let factory = router_factory_for::<TestRouter<0>>();
+        let binding = RouterBinding::new::<TestRouter<0>>();
         let options = VectorOptions::new(1, Metric::L2);
-        let opened = factory.open(
+        let opened = binding.open(
             VectorFileVersion::V3,
             FileSlice::from(bytes),
             FileSlice::empty(),
@@ -404,35 +360,12 @@ mod tests {
     }
 
     #[test]
-    fn stateful_factory_opens_the_selected_router() -> crate::Result<()> {
-        let router = TestRouter::<0> { cluster: 42 };
-        let mut bytes = Vec::new();
-        router.serialize(&mut bytes)?;
-
-        let opens = Arc::new(AtomicUsize::new(0));
-        let factory: Arc<dyn RouterFactory> = Arc::new(CountingRouterFactory {
-            opens: opens.clone(),
-        });
-        let options = VectorOptions::new(1, Metric::L2);
-        let opened = factory.open(
-            VectorFileVersion::V3,
-            FileSlice::from(bytes),
-            FileSlice::empty(),
-            &options,
-        )?;
-
-        assert_eq!(opened.id(), "test.primary");
-        assert_eq!(opens.load(Ordering::Relaxed), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn configured_factory_rejects_a_different_persisted_router() {
+    fn configured_router_rejects_a_different_persisted_router() {
         let router = TestRouter::<1> { cluster: 42 };
         let mut bytes = Vec::new();
         router.serialize(&mut bytes).unwrap();
         let options = VectorOptions::new(1, Metric::L2);
-        let error = router_factory_for::<TestRouter<0>>()
+        let error = RouterBinding::new::<TestRouter<0>>()
             .open(
                 VectorFileVersion::V3,
                 FileSlice::from(bytes),
@@ -449,7 +382,7 @@ mod tests {
     #[test]
     fn pre_v3_router_format_is_rejected() {
         let options = VectorOptions::new(1, Metric::L2);
-        let error = router_factory_for::<TestRouter<0>>()
+        let error = RouterBinding::new::<TestRouter<0>>()
             .open(
                 VectorFileVersion::V2,
                 FileSlice::empty(),

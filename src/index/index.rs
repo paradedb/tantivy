@@ -30,7 +30,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::router::{router_factory_for, RouterFactory};
+use crate::vector::router::RouterBinding;
 use crate::vector::{IvfClusterer, Router, VectorPlugin};
 use crate::SegmentReader;
 
@@ -147,11 +147,11 @@ fn save_new_metas(
     Ok(())
 }
 
-fn configure_ivf_router_factory(
-    configured: &mut Option<Arc<dyn RouterFactory>>,
-    factory: Arc<dyn RouterFactory>,
+fn configure_ivf_router(
+    configured: &mut Option<RouterBinding>,
+    router: RouterBinding,
 ) -> crate::Result<()> {
-    let descriptor = factory.descriptor();
+    let descriptor = router.descriptor();
     descriptor.validate()?;
     if let Some(existing) = configured {
         let existing = existing.descriptor();
@@ -163,7 +163,7 @@ fn configure_ivf_router_factory(
             )));
         }
     }
-    *configured = Some(factory);
+    *configured = Some(router);
     Ok(())
 }
 
@@ -201,7 +201,7 @@ pub struct IndexBuilder {
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
-    ivf_router_factory: Option<Arc<dyn RouterFactory>>,
+    ivf_router: Option<RouterBinding>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -218,7 +218,7 @@ impl IndexBuilder {
             fast_field_tokenizer_manager: TokenizerManager::default(),
             custom_plugins: Vec::new(),
             ivf_clusterer: None,
-            ivf_router_factory: None,
+            ivf_router: None,
         }
     }
 
@@ -263,7 +263,7 @@ impl IndexBuilder {
 
     /// Select the router used to build and open IVF segments.
     pub fn ivf_router<R: Router + 'static>(mut self) -> crate::Result<Self> {
-        configure_ivf_router_factory(&mut self.ivf_router_factory, router_factory_for::<R>())?;
+        configure_ivf_router(&mut self.ivf_router, RouterBinding::new::<R>())?;
         Ok(self)
     }
 
@@ -343,7 +343,7 @@ impl IndexBuilder {
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
             index.custom_plugins.extend(self.custom_plugins);
-            index.ivf_router_factory = self.ivf_router_factory;
+            index.ivf_router = self.ivf_router;
             if let Some(clusterer) = self.ivf_clusterer {
                 index.set_ivf_clusterer(clusterer);
             }
@@ -356,7 +356,7 @@ impl IndexBuilder {
     }
 
     fn validate(&self) -> crate::Result<()> {
-        if self.ivf_clusterer.is_some() && self.ivf_router_factory.is_none() {
+        if self.ivf_clusterer.is_some() && self.ivf_router.is_none() {
             return Err(TantivyError::InvalidArgument(
                 "an IvfClusterer requires an explicitly configured Router".to_string(),
             ));
@@ -428,7 +428,7 @@ impl IndexBuilder {
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
         index.custom_plugins.extend(self.custom_plugins);
-        index.ivf_router_factory = self.ivf_router_factory;
+        index.ivf_router = self.ivf_router;
         if let Some(clusterer) = self.ivf_clusterer {
             index.set_ivf_clusterer(clusterer);
         }
@@ -448,7 +448,7 @@ pub struct Index {
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
-    ivf_router_factory: Option<Arc<dyn RouterFactory>>,
+    ivf_router: Option<RouterBinding>,
 }
 
 impl Index {
@@ -570,7 +570,7 @@ impl Index {
             inventory,
             custom_plugins: Vec::new(),
             ivf_clusterer: None,
-            ivf_router_factory: None,
+            ivf_router: None,
         }
     }
 
@@ -924,11 +924,11 @@ impl Index {
 
     /// Select the router used to build and open IVF segments.
     pub fn set_ivf_router<R: Router + 'static>(&mut self) -> crate::Result<()> {
-        configure_ivf_router_factory(&mut self.ivf_router_factory, router_factory_for::<R>())
+        configure_ivf_router(&mut self.ivf_router, RouterBinding::new::<R>())
     }
 
-    pub(crate) fn ivf_router_factory(&self) -> Option<&dyn RouterFactory> {
-        self.ivf_router_factory.as_deref()
+    pub(crate) fn ivf_router(&self) -> Option<&RouterBinding> {
+        self.ivf_router.as_ref()
     }
 
     pub(crate) fn ivf_clusterer(&self) -> Option<&dyn IvfClusterer> {

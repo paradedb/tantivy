@@ -44,7 +44,7 @@ impl SegmentPlugin for VectorPlugin {
             merge_ivf(
                 &ctx,
                 ctx.target_segment.index().ivf_clusterer(),
-                ctx.target_segment.index().ivf_router_factory(),
+                ctx.target_segment.index().ivf_router(),
             )
         }
     }

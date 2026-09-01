@@ -146,8 +146,8 @@ impl VectorIndexReader {
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((version, centroids, offsets, router, bounds))) => {
-                let router_factory = segment_reader.ivf_router_factory().ok_or_else(|| {
+            (IdMap::Explicit(_), Some((version, centroids, offsets, router_slot, bounds))) => {
+                let router = segment_reader.ivf_router().ok_or_else(|| {
                     TantivyError::InvalidArgument(
                         "IVF index requires an explicitly configured Router".to_string(),
                     )
@@ -157,8 +157,8 @@ impl VectorIndexReader {
                     &options,
                     centroids,
                     offsets,
+                    router_slot,
                     router,
-                    router_factory,
                     bounds,
                 )?)
             }

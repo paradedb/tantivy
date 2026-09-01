@@ -19,7 +19,7 @@ use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
 use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT};
-use crate::vector::router::RouterFactory;
+use crate::vector::router::RouterBinding;
 use crate::vector::{residual_norm, BoundKind, BoundsBuilder, VEC_EXT};
 use crate::{DocId, TantivyError};
 
@@ -88,13 +88,13 @@ fn write_empty_field_slots(
 }
 
 fn build_router(
-    router_factory: &dyn RouterFactory,
+    router: &RouterBinding,
     opts: &VectorOptions,
     centroids: &mut IvfCentroids,
 ) -> crate::Result<Box<dyn crate::vector::Router>> {
     let IvfCentroids::F32(matrix) = &*centroids;
     let shape = (matrix.rows, matrix.dims, matrix.values.len());
-    let router = router_factory.build(opts, centroids)?;
+    let router = router.build(opts, centroids)?;
     let IvfCentroids::F32(matrix) = &*centroids;
     if (matrix.rows, matrix.dims, matrix.values.len()) != shape {
         return Err(TantivyError::InvalidArgument(
@@ -116,7 +116,7 @@ fn build_router(
 pub(crate) fn merge_ivf(
     ctx: &PluginMergeContext,
     clusterer: Option<&dyn IvfClusterer>,
-    router_factory: Option<&dyn RouterFactory>,
+    router: Option<&RouterBinding>,
 ) -> crate::Result<()> {
     if ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);
@@ -136,7 +136,7 @@ pub(crate) fn merge_ivf(
                 .to_string(),
         )
     })?;
-    let router_factory = router_factory.ok_or_else(|| {
+    let router = router.ok_or_else(|| {
         TantivyError::InvalidArgument(
             "vector_clustering_threshold selected IVF merge, but no Router is configured"
                 .to_string(),
@@ -184,7 +184,7 @@ pub(crate) fn merge_ivf(
                 rows: 0,
                 dims: opts.dim(),
             });
-            let router = build_router(router_factory, opts, &mut centroids)?;
+            let router = build_router(router, opts, &mut centroids)?;
             write_empty_field_slots(
                 &mut vec_write,
                 &mut centroids_write,
@@ -260,7 +260,7 @@ pub(crate) fn merge_ivf(
                         rows: 0,
                         dims: opts.dim(),
                     });
-                    let router = build_router(router_factory, opts, &mut centroids)?;
+                    let router = build_router(router, opts, &mut centroids)?;
                     write_empty_field_slots(
                         &mut vec_write,
                         &mut centroids_write,
@@ -312,7 +312,7 @@ pub(crate) fn merge_ivf(
                 }
                 let num_centroids = centroid_matrix.rows;
 
-                let router = build_router(router_factory, opts, &mut centroids)?;
+                let router = build_router(router, opts, &mut centroids)?;
                 let IvfCentroids::F32(centroid_matrix) = &centroids;
 
                 // Float working copy of the trained centroids — the

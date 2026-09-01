@@ -33,7 +33,7 @@ use super::graph::Workspace;
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
-use crate::vector::router::{Router, RouterFactory, RouterRanking};
+use crate::vector::router::{Router, RouterBinding, RouterRanking};
 use crate::vector::{BoundKind, BoundStore};
 
 /// The IVF routing index over one field's clusters: says which clusters —
@@ -129,14 +129,14 @@ impl IvfIndex {
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
     /// the bounds, and the router topology are materialized; the centroid
     /// rows stay behind a [`FileSlice`] for lazy per-node reads.
-    /// The persisted router ID must match `router_factory`.
+    /// The persisted router ID must match the configured router.
     pub(crate) fn open(
         version: VectorFileVersion,
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         router_slice: FileSlice,
-        router_factory: &dyn RouterFactory,
+        router: &RouterBinding,
         bounds_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -179,8 +179,7 @@ impl IvfIndex {
             .into());
         }
 
-        let router =
-            router_factory.open(version, router_slice, centroids_slice.clone(), options)?;
+        let router = router.open(version, router_slice, centroids_slice.clone(), options)?;
 
         let bytes = bounds_slice.read_bytes()?;
         let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
