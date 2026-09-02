@@ -13,8 +13,7 @@
 //!     rows in the router's canonical cluster-sorted order when a stacked
 //!     router was built
 //! [1] cluster_offsets (u64[N+1], prefix sum)
-//! [2] a self-describing router envelope, REQUIRED: a length-prefixed router
-//!     ID followed by the implementation-owned payload
+//! [2] a router-kind byte followed by the selected router's payload, REQUIRED
 //! [3] centroid bounds, REQUIRED: a segment-level BoundKind byte,
 //!     then N · stride(kind) f32s in cluster order — for Ball, one f32 per
 //!     cluster: max ||x - c|| over the cluster's members' stored rows against
@@ -32,8 +31,8 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
-use crate::vector::router::{Router, RouterBinding};
-use crate::vector::{BoundKind, BoundStore, Candidate};
+use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace};
+use crate::vector::{BoundKind, BoundStore};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -52,7 +51,7 @@ pub struct IvfIndex {
     /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
     cluster_offsets: OwnedBytes,
     metric: Metric,
-    router: Box<dyn Router>,
+    router: OpenedRouter,
     /// Slot `[3]`, pinned: the segment-level bound kind.
     bound_kind: BoundKind,
     /// Slot `[3]`, pinned: the per-cluster bound payload,
@@ -128,14 +127,14 @@ impl IvfIndex {
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
     /// the bounds, and the router topology are materialized; the centroid
     /// rows stay behind a [`FileSlice`] for lazy per-node reads.
-    /// The persisted router ID must match the configured router.
+    /// The persisted router kind must match the configured router.
     pub(crate) fn open(
         version: VectorFileVersion,
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         router_slice: FileSlice,
-        router: &RouterBinding,
+        router: RouterKind,
         bounds_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -242,8 +241,8 @@ impl IvfIndex {
         self.num_centroids
     }
 
-    pub fn router(&self) -> &dyn Router {
-        self.router.as_ref()
+    pub fn router(&self) -> RouterKind {
+        self.router.kind()
     }
 
     /// Distinct docs with a vector.
@@ -293,10 +292,11 @@ impl IvfIndex {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
-    pub(crate) fn rank_clusters<'a>(
-        &'a self,
-        query: &'a [f32],
-    ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
-        self.router.rank(query, self.metric)
+    pub(crate) fn rank_clusters<'router, 'workspace>(
+        &'router self,
+        workspace: &'workspace mut RouterWorkspace,
+        query: &'router [f32],
+    ) -> RouterIter<'router, 'workspace> {
+        self.router.rank(workspace, query, self.metric)
     }
 }

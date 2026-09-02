@@ -768,13 +768,6 @@ impl LazyStackedIvf {
         }
         Ok(*index.expect("at least one level"))
     }
-
-    pub(crate) fn serialize_router_payload<W: Write + ?Sized>(
-        &self,
-        out: &mut W,
-    ) -> io::Result<()> {
-        serialize_stacked_index(self, out)
-    }
 }
 
 impl<C, M> IvfIndex<C, M>

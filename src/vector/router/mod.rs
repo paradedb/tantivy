@@ -1,9 +1,13 @@
+use std::fmt;
 use std::io::{self, Write};
 
 use common::{BinarySerializable, HasLen};
 
-use super::ivf::graph::Candidate;
-use super::ivf::IvfCentroids;
+use super::ivf::graph::{
+    Candidate, NeighborhoodGraphSearchMetrics, RelativeNeighborhoodGraph, ResumableSearchIterator,
+    Workspace,
+};
+use super::ivf::{InMemoryStore, IvfCentroids, LazyStore, MultiLevelIvf};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
@@ -12,333 +16,289 @@ mod exact;
 mod rng;
 mod stacked;
 
-pub use exact::LazyExactRouter;
-
-const ROUTER_HEADER_LEN: usize = size_of::<u16>();
-
-/// The persisted identity and format compatibility of a router family.
+/// The routing structure used for every IVF segment in an index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RouterDescriptor {
-    id: &'static str,
-    vector_file_version: VectorFileVersion,
+#[repr(u8)]
+pub enum RouterKind {
+    Rng = 0,
+    Stacked = 1,
+    Exact = 2,
 }
 
-impl RouterDescriptor {
-    pub const fn new(id: &'static str, vector_file_version: VectorFileVersion) -> Self {
-        Self {
-            id,
-            vector_file_version,
+impl RouterKind {
+    fn from_code(code: u8) -> io::Result<Self> {
+        match code {
+            0 => Ok(Self::Rng),
+            1 => Ok(Self::Stacked),
+            2 => Ok(Self::Exact),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown router kind: {other}"),
+            )),
         }
-    }
-
-    pub fn id(self) -> &'static str {
-        self.id
-    }
-
-    pub fn vector_file_version(self) -> VectorFileVersion {
-        self.vector_file_version
-    }
-
-    pub(crate) fn validate(self) -> crate::Result<()> {
-        if self.id.is_empty() {
-            return Err(crate::TantivyError::InvalidArgument(
-                "router ID cannot be empty".to_string(),
-            ));
-        }
-        if u16::try_from(self.id.len()).is_err() {
-            return Err(crate::TantivyError::InvalidArgument(format!(
-                "router ID exceeds u16: {}",
-                self.id
-            )));
-        }
-        Ok(())
-    }
-}
-
-pub(crate) trait ErasedRouterDescriptor {
-    fn erased_descriptor(&self) -> RouterDescriptor;
-}
-
-/// Builds and routes an IVF index and owns its persisted format.
-///
-/// `serialize` prefixes the router payload with its ID. The configured router
-/// checks that ID before opening the payload.
-#[allow(private_bounds)]
-pub trait Router: ErasedRouterDescriptor + Send + Sync + 'static {
-    /// Return this router's persisted identity and compatible vector file version.
-    fn router_descriptor() -> RouterDescriptor
-    where Self: Sized;
-
-    fn descriptor(&self) -> RouterDescriptor {
-        ErasedRouterDescriptor::erased_descriptor(self)
-    }
-
-    fn id(&self) -> &'static str {
-        self.descriptor().id()
-    }
-
-    fn vector_file_version(&self) -> VectorFileVersion {
-        self.descriptor().vector_file_version()
-    }
-
-    /// Builds a router over the supplied centroids, which may be empty.
-    /// Implementations may reorder rows in place but must preserve the matrix shape.
-    fn build_router(
-        options: &VectorOptions,
-        centroids: &mut IvfCentroids,
-    ) -> crate::Result<Box<dyn Router>>
-    where
-        Self: Sized;
-
-    fn deserialize(
-        payload: FileSlice,
-        centroids: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Box<dyn Router>>
-    where
-        Self: Sized;
-
-    /// Rank centroids for a query.
-    fn rank<'a>(
-        &'a self,
-        query: &'a [f32],
-        metric: Metric,
-    ) -> Box<dyn Iterator<Item = Candidate> + 'a>;
-
-    fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()>;
-
-    fn serialize(&self, out: &mut dyn Write) -> io::Result<()> {
-        let id = self.id();
-        if id.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "router ID cannot be empty",
-            ));
-        }
-        let id_len = u16::try_from(id.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "router ID exceeds u16"))?;
-        id_len.serialize(out)?;
-        out.write_all(id.as_bytes())?;
-        self.serialize_payload(out)
-    }
-}
-
-impl<R: Router> ErasedRouterDescriptor for R {
-    fn erased_descriptor(&self) -> RouterDescriptor {
-        R::router_descriptor()
-    }
-}
-
-/// Type-erased constructors for the router type selected on an index.
-/// `Router` represents an existing router, but its `Self: Sized` build and
-/// deserialize functions cannot be called through `dyn Router` before one exists.
-#[derive(Clone, Copy)]
-pub(crate) struct RouterBinding {
-    descriptor: RouterDescriptor,
-    build:
-        fn(options: &VectorOptions, centroids: &mut IvfCentroids) -> crate::Result<Box<dyn Router>>,
-    deserialize: fn(
-        payload: FileSlice,
-        centroids: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Box<dyn Router>>,
-}
-
-impl RouterBinding {
-    pub(crate) fn new<R: Router>() -> Self {
-        Self {
-            descriptor: R::router_descriptor(),
-            build: R::build_router,
-            deserialize: R::deserialize,
-        }
-    }
-
-    pub(crate) fn descriptor(&self) -> RouterDescriptor {
-        self.descriptor
     }
 
     pub(crate) fn build(
-        &self,
+        self,
         options: &VectorOptions,
         centroids: &mut IvfCentroids,
-    ) -> crate::Result<Box<dyn Router>> {
-        (self.build)(options, centroids)
+    ) -> crate::Result<BuiltRouter> {
+        match self {
+            Self::Rng => Ok(Router::Rng(rng::build(options, centroids)?)),
+            Self::Stacked => Ok(Router::Stacked(stacked::build(options, centroids)?)),
+            Self::Exact => Ok(Router::Exact(exact::build(options, centroids))),
+        }
     }
 
     pub(crate) fn open(
-        &self,
+        self,
         file_version: VectorFileVersion,
         slot: FileSlice,
         centroids: FileSlice,
         options: &VectorOptions,
-    ) -> crate::Result<Box<dyn Router>> {
-        let descriptor = self.descriptor();
-        if descriptor.vector_file_version() != file_version {
+    ) -> crate::Result<OpenedRouter> {
+        if file_version != VectorFileVersion::V3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "router {} requires vector file version {:?}, found {:?}",
-                    descriptor.id(),
-                    descriptor.vector_file_version(),
-                    file_version
-                ),
+                format!("router {self} requires vector file version V3, found {file_version:?}"),
             )
             .into());
         }
-        if slot.len() < ROUTER_HEADER_LEN {
+        if slot.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "router slot is shorter than its header",
+                "router slot is missing its kind byte",
             )
             .into());
         }
-        let header = slot.slice_to(ROUTER_HEADER_LEN).read_bytes()?;
-        let mut cursor = header.as_slice();
-        let id_len = u16::deserialize(&mut cursor)? as usize;
-        let payload_offset = ROUTER_HEADER_LEN
-            .checked_add(id_len)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "router header overflow"))?;
-        if payload_offset > slot.len() {
+        let persisted = Self::from_code(slot.read_byte(0)?)?;
+        if persisted != self {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "router slot is shorter than its declared ID",
+                format!("configured router {self} does not match persisted router {persisted}"),
             )
             .into());
         }
-        let id_bytes = slot.slice(ROUTER_HEADER_LEN..payload_offset).read_bytes()?;
-        let persisted_id = std::str::from_utf8(&id_bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "router ID is not UTF-8"))?;
-        if persisted_id != descriptor.id() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "configured router {} does not match persisted router {persisted_id}",
-                    descriptor.id()
-                ),
-            )
-            .into());
+        let payload = slot.slice_from(1);
+        match self {
+            Self::Rng => Ok(Router::Rng(rng::open(payload, centroids, options)?)),
+            Self::Stacked => Ok(Router::Stacked(stacked::open(payload, centroids, options)?)),
+            Self::Exact => Ok(Router::Exact(exact::open(payload, centroids, options)?)),
         }
-        let router = (self.deserialize)(slot.slice_from(payload_offset), centroids, options)?;
-        if router.descriptor() != descriptor {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "configured router {} opened router {}",
-                    descriptor.id(),
-                    router.id()
-                ),
-            )
-            .into());
-        }
-        Ok(router)
     }
+}
+
+impl fmt::Display for RouterKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Rng => "rng",
+            Self::Stacked => "stacked",
+            Self::Exact => "exact",
+        })
+    }
+}
+
+pub(crate) enum Router<S: super::VectorArena<Elem = f32>> {
+    Rng(RelativeNeighborhoodGraph<S>),
+    Stacked(MultiLevelIvf<S, S>),
+    Exact(exact::ExactRouter<S>),
+}
+
+pub(crate) type BuiltRouter = Router<InMemoryStore>;
+pub(crate) type OpenedRouter = Router<LazyStore>;
+
+impl BuiltRouter {
+    pub(crate) fn kind(&self) -> RouterKind {
+        match self {
+            Self::Rng(_) => RouterKind::Rng,
+            Self::Stacked(_) => RouterKind::Stacked,
+            Self::Exact(_) => RouterKind::Exact,
+        }
+    }
+
+    pub(crate) fn serialize<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
+        (self.kind() as u8).serialize(out)?;
+        match self {
+            Self::Rng(router) => router.serialize(out),
+            Self::Stacked(router) => router.serialize_router_payload(out),
+            Self::Exact(router) => router.serialize_payload(out),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RouterWorkspace {
+    rng: Workspace,
+}
+
+pub(crate) enum RouterIter<'router, 'workspace> {
+    Rng(ResumableSearchIterator<'router, 'workspace, LazyStore>),
+    Stacked(stacked::Ranking),
+    Exact(exact::Ranking),
+}
+
+impl RouterIter<'_, '_> {
+    pub(crate) fn metrics(&self) -> RouterMetrics {
+        match self {
+            Self::Rng(ranking) => RouterMetrics::Rng(ranking.metrics()),
+            Self::Stacked(ranking) => RouterMetrics::Stacked {
+                candidate_count: ranking.candidate_count(),
+            },
+            Self::Exact(ranking) => RouterMetrics::Exact {
+                visited_count: ranking.visited_count(),
+            },
+        }
+    }
+}
+
+impl Iterator for RouterIter<'_, '_> {
+    type Item = Candidate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Rng(ranking) => ranking.next(),
+            Self::Stacked(ranking) => ranking.next(),
+            Self::Exact(ranking) => ranking.next(),
+        }
+    }
+}
+
+impl OpenedRouter {
+    pub(crate) fn kind(&self) -> RouterKind {
+        match self {
+            Self::Rng(_) => RouterKind::Rng,
+            Self::Stacked(_) => RouterKind::Stacked,
+            Self::Exact(_) => RouterKind::Exact,
+        }
+    }
+
+    pub(crate) fn rank<'router, 'workspace>(
+        &'router self,
+        workspace: &'workspace mut RouterWorkspace,
+        query: &'router [f32],
+        metric: Metric,
+    ) -> RouterIter<'router, 'workspace> {
+        match self {
+            Self::Rng(router) => RouterIter::Rng(rng::rank(router, &mut workspace.rng, query)),
+            Self::Stacked(router) => RouterIter::Stacked(stacked::rank(router, query, metric)),
+            Self::Exact(router) => RouterIter::Exact(router.rank(query)),
+        }
+    }
+}
+
+/// Router-specific statistics captured after a ranking iterator stops.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RouterMetrics {
+    Rng(NeighborhoodGraphSearchMetrics),
+    Stacked { candidate_count: usize },
+    Exact { visited_count: usize },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::Similarity;
+    use crate::vector::IvfMatrix;
 
-    struct TestRouter<const KIND: u8> {
-        cluster: u32,
-    }
-
-    impl<const KIND: u8> Router for TestRouter<KIND> {
-        fn router_descriptor() -> RouterDescriptor {
-            let id = match KIND {
-                0 => "test.primary",
-                1 => "test.secondary",
-                _ => "test.unknown",
-            };
-            RouterDescriptor::new(id, VectorFileVersion::V3)
-        }
-
-        fn build_router(
-            _options: &VectorOptions,
-            _centroids: &mut IvfCentroids,
-        ) -> crate::Result<Box<dyn Router>> {
-            Ok(Box::new(TestRouter::<KIND> { cluster: 0 }))
-        }
-
-        fn deserialize(
-            payload: FileSlice,
-            _centroids: FileSlice,
-            _options: &VectorOptions,
-        ) -> crate::Result<Box<dyn Router>> {
-            let bytes = payload.read_bytes()?;
-            let mut cursor = bytes.as_slice();
-            let cluster = u32::deserialize(&mut cursor)?;
-            if !cursor.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "test router payload has trailing bytes",
-                )
-                .into());
-            }
-            Ok(Box::new(TestRouter::<KIND> { cluster }))
-        }
-
-        fn rank<'a>(
-            &'a self,
-            _query: &'a [f32],
-            _metric: Metric,
-        ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
-            Box::new(
-                vec![Candidate {
-                    sim: Similarity::new(1.0),
-                    node: self.cluster,
-                }]
-                .into_iter(),
-            )
-        }
-
-        fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()> {
-            self.cluster.serialize(out)
-        }
+    fn centroids() -> IvfCentroids {
+        IvfCentroids::F32(IvfMatrix {
+            values: vec![0.0, 1.0, 2.0],
+            rows: 3,
+            dims: 1,
+        })
     }
 
     #[test]
     fn configured_router_opens_matching_payload() -> crate::Result<()> {
-        let router = TestRouter::<0> { cluster: 42 };
-        let mut bytes = Vec::new();
-        router.serialize(&mut bytes)?;
-        let binding = RouterBinding::new::<TestRouter<0>>();
         let options = VectorOptions::new(1, Metric::L2);
-        let opened = binding.open(
+        let mut centroids = centroids();
+        let built = RouterKind::Exact.build(&options, &mut centroids)?;
+        let mut bytes = Vec::new();
+        built.serialize(&mut bytes)?;
+        let rows = match centroids {
+            IvfCentroids::F32(matrix) => matrix
+                .values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        };
+        let opened = RouterKind::Exact.open(
             VectorFileVersion::V3,
             FileSlice::from(bytes),
-            FileSlice::empty(),
+            FileSlice::from(rows),
             &options,
         )?;
-        let mut ranking = opened.rank(&[0.0], Metric::L2);
-        assert_eq!(ranking.next().unwrap().node, 42);
+        let mut workspace = RouterWorkspace::default();
+        let mut ranking = opened.rank(&mut workspace, &[1.1], Metric::L2);
+        assert_eq!(ranking.next().unwrap().node, 1);
+        assert!(matches!(
+            ranking.metrics(),
+            RouterMetrics::Exact { visited_count: 3 }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rng_ranking_reuses_workspace_and_reports_graph_metrics() -> crate::Result<()> {
+        let options = VectorOptions::new(1, Metric::L2);
+        let mut centroids = centroids();
+        let built = RouterKind::Rng.build(&options, &mut centroids)?;
+        let mut bytes = Vec::new();
+        built.serialize(&mut bytes)?;
+        assert_eq!(bytes[0], RouterKind::Rng as u8);
+        let rows = match centroids {
+            IvfCentroids::F32(matrix) => matrix
+                .values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        };
+        let opened = RouterKind::Rng.open(
+            VectorFileVersion::V3,
+            FileSlice::from(bytes),
+            FileSlice::from(rows),
+            &options,
+        )?;
+        let mut workspace = RouterWorkspace::default();
+        for query in [[0.1], [1.9]] {
+            let mut ranking = opened.rank(&mut workspace, &query, Metric::L2);
+            assert!(ranking.next().is_some());
+            let metrics = ranking.metrics();
+            match metrics {
+                RouterMetrics::Rng(metrics) => {
+                    assert!(metrics.visited_count > 0);
+                    assert_eq!(metrics.result_count, 1);
+                }
+                metrics => panic!("expected RNG metrics, got {metrics:?}"),
+            }
+            let json = serde_json::to_value(metrics).unwrap();
+            assert_eq!(json["kind"], "rng");
+            assert!(json["visited_count"].as_u64().unwrap() > 0);
+        }
         Ok(())
     }
 
     #[test]
     fn configured_router_rejects_a_different_persisted_router() {
-        let router = TestRouter::<1> { cluster: 42 };
-        let mut bytes = Vec::new();
-        router.serialize(&mut bytes).unwrap();
         let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterBinding::new::<TestRouter<0>>()
+        let error = RouterKind::Stacked
             .open(
                 VectorFileVersion::V3,
-                FileSlice::from(bytes),
+                FileSlice::from(vec![RouterKind::Exact as u8]),
                 FileSlice::empty(),
                 &options,
             )
             .err()
             .expect("a different persisted router must fail");
-        assert!(error.to_string().contains(
-            "configured router test.primary does not match persisted router test.secondary"
-        ));
+        assert!(error
+            .to_string()
+            .contains("configured router stacked does not match persisted router exact"));
     }
 
     #[test]
     fn pre_v3_router_format_is_rejected() {
         let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterBinding::new::<TestRouter<0>>()
+        let error = RouterKind::Exact
             .open(
                 VectorFileVersion::V2,
                 FileSlice::empty(),
@@ -350,5 +310,20 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires vector file version V3"));
+    }
+
+    #[test]
+    fn unknown_router_kind_is_rejected() {
+        let options = VectorOptions::new(1, Metric::L2);
+        let error = RouterKind::Exact
+            .open(
+                VectorFileVersion::V3,
+                FileSlice::from(vec![u8::MAX]),
+                FileSlice::empty(),
+                &options,
+            )
+            .err()
+            .expect("unknown router kinds must fail");
+        assert!(error.to_string().contains("unknown router kind: 255"));
     }
 }

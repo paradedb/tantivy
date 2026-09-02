@@ -2,73 +2,20 @@ use std::io::{self, Write};
 
 use common::HasLen;
 
-use super::{Router, RouterDescriptor};
 use crate::directory::FileSlice;
-use crate::schema::Metric;
-use crate::vector::header::VectorFileVersion;
-use crate::vector::ivf::graph::Candidate;
-use crate::vector::{FileSliceArena, IvfCentroids, VectorArena, VectorOptions};
+use crate::schema::{Metric, VectorOptions};
+use crate::vector::ivf::{Candidate, InMemoryStore, LazyStore};
+use crate::vector::{IvfCentroids, VectorArena};
 
-const EXACT_ROUTER_ID: &str = "tantivy.exact";
-
-pub struct ExactRouter<S> {
+pub(crate) struct ExactRouter<S> {
     centroids: S,
     num_centroids: usize,
     dim: usize,
     metric: Metric,
 }
 
-pub type LazyExactRouter = ExactRouter<FileSliceArena<f32>>;
-
-impl<S> Router for ExactRouter<S>
-where S: VectorArena<Elem = f32> + Send + Sync + 'static
-{
-    fn router_descriptor() -> RouterDescriptor {
-        RouterDescriptor::new(EXACT_ROUTER_ID, VectorFileVersion::V3)
-    }
-
-    fn build_router(
-        options: &VectorOptions,
-        centroids: &mut IvfCentroids,
-    ) -> crate::Result<Box<dyn Router>> {
-        let IvfCentroids::F32(matrix) = centroids;
-        Ok(Box::new(ExactRouter::<Vec<f32>> {
-            centroids: matrix.values.clone(),
-            num_centroids: matrix.rows,
-            dim: options.dim(),
-            metric: options.metric(),
-        }))
-    }
-
-    fn deserialize(
-        payload: FileSlice,
-        centroids: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Box<dyn Router>> {
-        if payload.len() != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "exact router payload must be empty",
-            )
-            .into());
-        }
-        let num_centroids = centroids
-            .len()
-            .checked_div(options.bytes_per_vector())
-            .unwrap_or(0);
-        Ok(Box::new(LazyExactRouter {
-            centroids: FileSliceArena::new(centroids),
-            num_centroids,
-            dim: options.dim(),
-            metric: options.metric(),
-        }))
-    }
-
-    fn rank<'a>(
-        &'a self,
-        query: &'a [f32],
-        _metric: Metric,
-    ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
+impl<S: VectorArena<Elem = f32>> ExactRouter<S> {
+    pub(super) fn rank(&self, query: &[f32]) -> Ranking {
         let mut ranked = (0..self.num_centroids)
             .map(|cluster| Candidate {
                 sim: self
@@ -78,10 +25,69 @@ where S: VectorArena<Elem = f32> + Send + Sync + 'static
             })
             .collect::<Vec<_>>();
         ranked.sort_unstable_by(|a, b| b.cmp(a));
-        Box::new(ranked.into_iter())
+        Ranking {
+            ranked: ranked.into_iter(),
+            visited_count: self.num_centroids,
+        }
     }
 
-    fn serialize_payload(&self, _out: &mut dyn Write) -> io::Result<()> {
+    pub(super) fn serialize_payload<W: Write + ?Sized>(&self, _out: &mut W) -> io::Result<()> {
         Ok(())
+    }
+}
+
+pub(super) fn build(
+    options: &VectorOptions,
+    centroids: &IvfCentroids,
+) -> ExactRouter<InMemoryStore> {
+    let IvfCentroids::F32(matrix) = centroids;
+    ExactRouter {
+        centroids: InMemoryStore::new(matrix.values.clone(), options.dim()),
+        num_centroids: matrix.rows,
+        dim: options.dim(),
+        metric: options.metric(),
+    }
+}
+
+pub(super) fn open(
+    payload: FileSlice,
+    centroids: FileSlice,
+    options: &VectorOptions,
+) -> crate::Result<ExactRouter<LazyStore>> {
+    if !payload.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exact router payload must be empty",
+        )
+        .into());
+    }
+    let num_centroids = centroids
+        .len()
+        .checked_div(options.bytes_per_vector())
+        .unwrap_or(0);
+    Ok(ExactRouter {
+        centroids: LazyStore::new(centroids, options.dim()),
+        num_centroids,
+        dim: options.dim(),
+        metric: options.metric(),
+    })
+}
+
+pub(crate) struct Ranking {
+    ranked: std::vec::IntoIter<Candidate>,
+    visited_count: usize,
+}
+
+impl Ranking {
+    pub(super) fn visited_count(&self) -> usize {
+        self.visited_count
+    }
+}
+
+impl Iterator for Ranking {
+    type Item = Candidate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.ranked.next()
     }
 }

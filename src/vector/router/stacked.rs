@@ -1,23 +1,16 @@
-use std::io::{self, Write};
-
-use super::{Router, RouterDescriptor};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
-use crate::vector::header::VectorFileVersion;
-use crate::vector::ivf::graph::Candidate;
 use crate::vector::ivf::{
-    InMemoryStackedIvf, IvfCentroids, IvfConfig as StackedIvfConfig, IvfIndexBuilder,
-    LazyStackedIvf, MultiLevelIvf, SuperKMeansLevelClusterer,
+    Candidate, ClusterId, InMemoryStackedIvf, IvfConfig, IvfIndexBuilder, LazyStackedIvf,
+    SuperKMeansLevelClusterer,
 };
-use crate::vector::VectorArena;
+use crate::vector::IvfCentroids;
 use crate::TantivyError;
 
-const STACKED_ROUTER_ID: &str = "tantivy.stacked-ivf";
-
-fn build_stacked_router(
+pub(super) fn build(
     options: &VectorOptions,
     centroids: &mut IvfCentroids,
-) -> crate::Result<Box<dyn Router>> {
+) -> crate::Result<InMemoryStackedIvf> {
     let IvfCentroids::F32(matrix) = &*centroids;
     let clusterer = SuperKMeansLevelClusterer::default();
     let (index, permutation) = IvfIndexBuilder::new(
@@ -25,7 +18,7 @@ fn build_stacked_router(
         matrix.rows,
         options.dim(),
         &clusterer,
-        StackedIvfConfig::default(),
+        IvfConfig::default(),
     )
     .build();
     let IvfCentroids::F32(matrix) = centroids;
@@ -50,104 +43,49 @@ fn build_stacked_router(
             .copy_from_slice(&matrix.values[old * matrix.dims..(old + 1) * matrix.dims]);
     }
     matrix.values = values;
-    Ok(Box::new(index))
+    Ok(index)
 }
 
-fn deserialize_stacked_router(
+pub(super) fn open(
     payload: FileSlice,
     centroids: FileSlice,
     options: &VectorOptions,
-) -> crate::Result<Box<dyn Router>> {
-    Ok(Box::new(LazyStackedIvf::open(
+) -> crate::Result<LazyStackedIvf> {
+    Ok(LazyStackedIvf::open(
         payload,
         centroids,
         options.dim(),
-        StackedIvfConfig::default(),
-    )?))
+        IvfConfig::default(),
+    )?)
 }
 
-fn rank_stacked<'a, C, M>(
-    index: &MultiLevelIvf<C, M>,
-    query: &[f32],
-    metric: Metric,
-) -> Box<dyn Iterator<Item = Candidate> + 'a>
-where
-    C: VectorArena<Elem = f32>,
-    M: VectorArena<Elem = f32>,
-{
-    let ranked = index
-        .search(query, index.nlist(), 1.0, metric)
-        .into_iter()
-        .map(|candidate| Candidate {
+pub(super) fn rank(index: &LazyStackedIvf, query: &[f32], metric: Metric) -> Ranking {
+    let ranked = index.search(query, index.nlist(), 1.0, metric);
+    let candidate_count = ranked.len();
+    Ranking {
+        ranked: ranked.into_iter(),
+        candidate_count,
+    }
+}
+
+pub(crate) struct Ranking {
+    ranked: std::vec::IntoIter<Candidate<ClusterId>>,
+    candidate_count: usize,
+}
+
+impl Ranking {
+    pub(super) fn candidate_count(&self) -> usize {
+        self.candidate_count
+    }
+}
+
+impl Iterator for Ranking {
+    type Item = Candidate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.ranked.next().map(|candidate| Candidate {
             sim: candidate.sim,
             node: candidate.node.0,
         })
-        .collect::<Vec<_>>();
-    Box::new(ranked.into_iter())
-}
-
-impl Router for InMemoryStackedIvf {
-    fn router_descriptor() -> RouterDescriptor {
-        RouterDescriptor::new(STACKED_ROUTER_ID, VectorFileVersion::V3)
-    }
-
-    fn build_router(
-        options: &VectorOptions,
-        centroids: &mut IvfCentroids,
-    ) -> crate::Result<Box<dyn Router>> {
-        build_stacked_router(options, centroids)
-    }
-
-    fn deserialize(
-        payload: FileSlice,
-        centroids: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Box<dyn Router>> {
-        deserialize_stacked_router(payload, centroids, options)
-    }
-
-    fn rank<'a>(
-        &'a self,
-        query: &'a [f32],
-        metric: Metric,
-    ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
-        rank_stacked(self, query, metric)
-    }
-
-    fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()> {
-        self.serialize_router_payload(out)
-    }
-}
-
-impl Router for LazyStackedIvf {
-    fn router_descriptor() -> RouterDescriptor {
-        RouterDescriptor::new(STACKED_ROUTER_ID, VectorFileVersion::V3)
-    }
-
-    fn build_router(
-        options: &VectorOptions,
-        centroids: &mut IvfCentroids,
-    ) -> crate::Result<Box<dyn Router>> {
-        build_stacked_router(options, centroids)
-    }
-
-    fn deserialize(
-        payload: FileSlice,
-        centroids: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Box<dyn Router>> {
-        deserialize_stacked_router(payload, centroids, options)
-    }
-
-    fn rank<'a>(
-        &'a self,
-        query: &'a [f32],
-        metric: Metric,
-    ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
-        rank_stacked(self, query, metric)
-    }
-
-    fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()> {
-        self.serialize_router_payload(out)
     }
 }

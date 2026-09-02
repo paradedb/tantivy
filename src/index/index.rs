@@ -30,8 +30,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::router::RouterBinding;
-use crate::vector::{IvfClusterer, Router, VectorPlugin};
+use crate::vector::{IvfClusterer, RouterKind, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -148,18 +147,14 @@ fn save_new_metas(
 }
 
 fn configure_ivf_router(
-    configured: &mut Option<RouterBinding>,
-    router: RouterBinding,
+    configured: &mut Option<RouterKind>,
+    router: RouterKind,
 ) -> crate::Result<()> {
-    let descriptor = router.descriptor();
-    descriptor.validate()?;
     if let Some(existing) = configured {
-        let existing = existing.descriptor();
-        if existing != descriptor {
+        if *existing != router {
             return Err(TantivyError::InvalidArgument(format!(
                 "IVF router is already configured as {}; cannot change it to {}",
-                existing.id(),
-                descriptor.id()
+                existing, router
             )));
         }
     }
@@ -201,7 +196,7 @@ pub struct IndexBuilder {
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
-    ivf_router: Option<RouterBinding>,
+    ivf_router: Option<RouterKind>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -262,8 +257,8 @@ impl IndexBuilder {
     }
 
     /// Select the router used to build and open IVF segments.
-    pub fn ivf_router<R: Router + 'static>(mut self) -> crate::Result<Self> {
-        configure_ivf_router(&mut self.ivf_router, RouterBinding::new::<R>())?;
+    pub fn ivf_router(mut self, router: RouterKind) -> crate::Result<Self> {
+        configure_ivf_router(&mut self.ivf_router, router)?;
         Ok(self)
     }
 
@@ -448,7 +443,7 @@ pub struct Index {
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
-    ivf_router: Option<RouterBinding>,
+    ivf_router: Option<RouterKind>,
 }
 
 impl Index {
@@ -923,12 +918,12 @@ impl Index {
     }
 
     /// Select the router used to build and open IVF segments.
-    pub fn set_ivf_router<R: Router + 'static>(&mut self) -> crate::Result<()> {
-        configure_ivf_router(&mut self.ivf_router, RouterBinding::new::<R>())
+    pub fn set_ivf_router(&mut self, router: RouterKind) -> crate::Result<()> {
+        configure_ivf_router(&mut self.ivf_router, router)
     }
 
-    pub(crate) fn ivf_router(&self) -> Option<&RouterBinding> {
-        self.ivf_router.as_ref()
+    pub(crate) fn ivf_router(&self) -> Option<RouterKind> {
+        self.ivf_router
     }
 
     pub(crate) fn ivf_clusterer(&self) -> Option<&dyn IvfClusterer> {

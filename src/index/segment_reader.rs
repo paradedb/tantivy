@@ -20,8 +20,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::router::RouterBinding;
-use crate::vector::VectorIndexReader;
+use crate::vector::{RouterKind, VectorIndexReader};
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -86,7 +85,7 @@ impl SegmentReader {
         self.index.settings().sort_by_field.as_ref()
     }
 
-    pub(crate) fn ivf_router(&self) -> Option<&RouterBinding> {
+    pub(crate) fn ivf_router(&self) -> Option<RouterKind> {
         self.index.ivf_router()
     }
 

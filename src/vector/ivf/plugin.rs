@@ -18,8 +18,8 @@ use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
-use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT};
-use crate::vector::router::RouterBinding;
+use crate::vector::header::{centroid_slot, vec_slot, write_header};
+use crate::vector::router::{BuiltRouter, RouterKind};
 use crate::vector::{residual_norm, BoundKind, BoundsBuilder, VEC_EXT};
 use crate::{DocId, TantivyError};
 
@@ -50,7 +50,7 @@ fn write_empty_field_slots(
     centroids_write: &mut CompositeWrite,
     field: Field,
     opts: &VectorOptions,
-    router: &dyn crate::vector::Router,
+    router: &BuiltRouter,
 ) -> crate::Result<()> {
     // `.vec`: empty Explicit id-map + empty rows.
     {
@@ -88,10 +88,10 @@ fn write_empty_field_slots(
 }
 
 fn build_router(
-    router: &RouterBinding,
+    router: RouterKind,
     opts: &VectorOptions,
     centroids: &mut IvfCentroids,
-) -> crate::Result<Box<dyn crate::vector::Router>> {
+) -> crate::Result<BuiltRouter> {
     let IvfCentroids::F32(matrix) = &*centroids;
     let shape = (matrix.rows, matrix.dims, matrix.values.len());
     let router = router.build(opts, centroids)?;
@@ -101,22 +101,13 @@ fn build_router(
             "Router changed the centroid matrix shape while building".to_string(),
         ));
     }
-    let router_version = router.vector_file_version();
-    if router_version != CURRENT {
-        return Err(TantivyError::InvalidArgument(format!(
-            "router {} requires vector file version {:?}, but this merge writes {:?}",
-            router.id(),
-            router_version,
-            CURRENT
-        )));
-    }
     Ok(router)
 }
 
 pub(crate) fn merge_ivf(
     ctx: &PluginMergeContext,
     clusterer: Option<&dyn IvfClusterer>,
-    router: Option<&RouterBinding>,
+    router: Option<RouterKind>,
 ) -> crate::Result<()> {
     if ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);
@@ -185,13 +176,7 @@ pub(crate) fn merge_ivf(
                 dims: opts.dim(),
             });
             let router = build_router(router, opts, &mut centroids)?;
-            write_empty_field_slots(
-                &mut vec_write,
-                &mut centroids_write,
-                field,
-                opts,
-                router.as_ref(),
-            )?;
+            write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts, &router)?;
             continue;
         }
         let training_sample_size = {
@@ -266,7 +251,7 @@ pub(crate) fn merge_ivf(
                         &mut centroids_write,
                         field,
                         opts,
-                        router.as_ref(),
+                        &router,
                     )?;
                     continue;
                 }

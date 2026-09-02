@@ -25,6 +25,7 @@ use super::distance::norm_squared_wide;
 use super::index_reader::VectorIndexReader;
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
 use super::prepared::PreparedQuery;
+use super::router::{RouterMetrics, RouterWorkspace};
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
 use crate::collector::sort_key::{Comparator, NaturalComparator};
@@ -293,6 +294,8 @@ pub struct ProbeStats {
     /// Flat/exact-path stride-sized row reads — one per survivor scored.
     /// Filled only by the exact (non-IVF) path.
     pub exact_rows_read: usize,
+    /// Statistics from the configured router's ranking implementation.
+    pub routing: Option<RouterMetrics>,
     /// Clusters the bounds gate passed over with a Skip verdict, without
     /// opening them: their margins proved they could not improve the
     /// armed result. Each charged the open share. Disjoint from the
@@ -550,7 +553,8 @@ impl<T: VectorElement> VectorBackend<T> {
         // Routing operates in `f32` (centroid rows are `f32` today), so the
         // query is widened losslessly per element.
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
-        let mut ranked = index.rank_clusters(&query_f32);
+        let mut routing_workspace = RouterWorkspace::default();
+        let mut ranked = index.rank_clusters(&mut routing_workspace, &query_f32);
 
         let topn = self.scan_clusters(
             index,
@@ -565,6 +569,7 @@ impl<T: VectorElement> VectorBackend<T> {
             &query_f32,
             stats,
         )?;
+        stats.routing = Some(ranked.metrics());
 
         let segment_ord = self.segment_ord;
         Ok(topn
@@ -886,7 +891,7 @@ mod tests {
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, TestVectorIndex};
     use crate::vector::{
-        IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, LazyStackedIvf,
+        IvfCentroids, IvfClusterer, IvfMatrix, IvfTrainingVectors, IvfVectors, RouterKind,
         VectorClusterStats, VectorDType, VectorInfo, VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
@@ -1040,7 +1045,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.to_vec(),
             }))
-            .ivf_router::<LazyStackedIvf>()?
+            .ivf_router(RouterKind::Stacked)?
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1154,7 +1159,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.clone(),
             }))
-            .ivf_router::<LazyStackedIvf>()?
+            .ivf_router(RouterKind::Stacked)?
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1249,7 +1254,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.clone(),
             }))
-            .ivf_router::<LazyStackedIvf>()?
+            .ivf_router(RouterKind::Stacked)?
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -2258,6 +2263,7 @@ mod tests {
             postings_row: 1,
             postings_skipped: 1,
             exact_rows_read: 0,
+            routing: None,
             bounds_skips: 2,
             bound_armed_at_probe: Some(1),
             termination: ProbeTermination::Ceiling,
@@ -2276,6 +2282,7 @@ mod tests {
                 "postings_row": 1,
                 "postings_skipped": 1,
                 "exact_rows_read": 0,
+                "routing": null,
                 "bounds_skips": 2,
                 "bound_armed_at_probe": 1,
                 "termination": "Ceiling",
@@ -2809,7 +2816,7 @@ mod tests {
                 .ivf_clusterer(Arc::new(InlineClusterer {
                     centroids: centroids.to_vec(),
                 }))
-                .ivf_router::<LazyStackedIvf>()?
+                .ivf_router(RouterKind::Stacked)?
                 .create_in_ram()?;
             let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
             writer.set_merge_policy(Box::new(NoMergePolicy));

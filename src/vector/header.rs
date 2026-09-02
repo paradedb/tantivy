@@ -33,8 +33,8 @@ pub enum VectorFileVersion {
     /// unaffected by the change and V1 `.vec` files stay readable — flat
     /// segments have no clusters and no bounds.
     V2 = 2,
-    /// `.centroids` slot `[2]` carries a self-describing router envelope.
-    /// V2 files keep the bare graph layout in that slot.
+    /// `.centroids` slot `[2]` carries a router-kind discriminant followed by
+    /// the selected router's payload.
     V3 = 3,
 }
 
@@ -44,7 +44,7 @@ pub(crate) mod centroid_slot {
     pub(crate) const CENTROIDS: usize = 0;
     /// Per-cluster posting offsets.
     pub(crate) const OFFSETS: usize = 1;
-    /// The self-describing router payload.
+    /// The router kind and payload.
     pub(crate) const ROUTER: usize = 2;
     /// Per-cluster centroid bounds.
     pub(crate) const BOUNDS: usize = 3;

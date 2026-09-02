@@ -1,87 +1,72 @@
-use std::io::{self, Write};
-
-use super::{Router, RouterDescriptor};
 use crate::directory::FileSlice;
-use crate::schema::{Metric, VectorDType, VectorOptions};
-use crate::vector::header::VectorFileVersion;
-use crate::vector::ivf::graph::{NeighborhoodGraphConfig, RelativeNeighborhoodGraph};
-use crate::vector::{Candidate, FileSliceArena, IvfCentroids, VectorArena};
+use crate::schema::{VectorDType, VectorOptions};
+use crate::vector::ivf::{
+    InMemoryStore, LazyStore, NeighborhoodGraphConfig, RelativeNeighborhoodGraph,
+    ResumableSearchIterator, Workspace,
+};
+use crate::vector::IvfCentroids;
 use crate::Executor;
 
-const GRAPH_ROUTER_ID: &str = "tantivy.relative-neighborhood-graph";
+pub(super) fn build(
+    options: &VectorOptions,
+    centroids: &IvfCentroids,
+) -> crate::Result<RelativeNeighborhoodGraph<InMemoryStore>> {
+    let IvfCentroids::F32(matrix) = centroids;
+    let config = NeighborhoodGraphConfig::default();
+    let mut graph = RelativeNeighborhoodGraph::new(
+        matrix.values.as_slice(),
+        options.dim(),
+        options.metric(),
+        config,
+    );
+    let num_threads = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    let executor = if num_threads > 1 {
+        Executor::multi_thread(num_threads, "rng-build-")?
+    } else {
+        Executor::single_thread()
+    };
+    graph.build(&executor);
 
-impl<S> Router for RelativeNeighborhoodGraph<S>
-where S: VectorArena<Elem = f32> + Send + Sync + 'static
-{
-    fn router_descriptor() -> RouterDescriptor {
-        RouterDescriptor::new(GRAPH_ROUTER_ID, VectorFileVersion::V3)
-    }
+    let mut adjacency = Vec::new();
+    graph.serialize(&mut adjacency)?;
+    Ok(RelativeNeighborhoodGraph::open(
+        &adjacency,
+        InMemoryStore::new(matrix.values.clone(), options.dim()),
+        options.dim(),
+        options.metric(),
+        config,
+    )?)
+}
 
-    fn build_router(
-        options: &VectorOptions,
-        centroids: &mut IvfCentroids,
-    ) -> crate::Result<Box<dyn Router>> {
-        let IvfCentroids::F32(matrix) = centroids;
-        let config = NeighborhoodGraphConfig::default();
-        let mut graph = RelativeNeighborhoodGraph::new(
-            matrix.values.as_slice(),
-            options.dim(),
-            options.metric(),
-            config.clone(),
-        );
-        let num_threads = std::thread::available_parallelism()
-            .map(|parallelism| parallelism.get())
-            .unwrap_or(1);
-        let executor = if num_threads > 1 {
-            Executor::multi_thread(num_threads, "rng-build-")?
-        } else {
-            Executor::single_thread()
-        };
-        graph.build(&executor);
+pub(super) fn open(
+    payload: FileSlice,
+    centroids: FileSlice,
+    options: &VectorOptions,
+) -> crate::Result<RelativeNeighborhoodGraph<LazyStore>> {
+    let vectors = match options.dtype() {
+        VectorDType::F32 => LazyStore::new(centroids, options.dim()),
+    };
+    let adjacency = payload.read_bytes()?;
+    Ok(RelativeNeighborhoodGraph::open(
+        &adjacency,
+        vectors,
+        options.dim(),
+        options.metric(),
+        NeighborhoodGraphConfig::default(),
+    )?)
+}
 
-        let mut adjacency = Vec::new();
-        RelativeNeighborhoodGraph::serialize(&graph, &mut adjacency)?;
-        Ok(Box::new(RelativeNeighborhoodGraph::open(
-            &adjacency,
-            matrix.values.clone(),
-            options.dim(),
-            options.metric(),
-            config,
-        )?))
-    }
-
-    fn deserialize(
-        payload: FileSlice,
-        centroids: FileSlice,
-        options: &VectorOptions,
-    ) -> crate::Result<Box<dyn Router>> {
-        let vectors = match options.dtype() {
-            VectorDType::F32 => FileSliceArena::<f32>::new(centroids),
-        };
-        let adjacency = payload.read_bytes()?;
-        Ok(Box::new(RelativeNeighborhoodGraph::open(
-            &adjacency,
-            vectors,
-            options.dim(),
-            options.metric(),
-            NeighborhoodGraphConfig::default(),
-        )?))
-    }
-
-    fn rank<'a>(
-        &'a self,
-        query: &'a [f32],
-        _metric: Metric,
-    ) -> Box<dyn Iterator<Item = Candidate> + 'a> {
-        let seeds = (0..self.len())
-            .step_by((self.len() / 8).max(1))
-            .take(8)
-            .map(|node| node as u32)
-            .collect::<Vec<_>>();
-        Box::new(self.search_iter_owned(query, &seeds))
-    }
-
-    fn serialize_payload(&self, out: &mut dyn Write) -> io::Result<()> {
-        RelativeNeighborhoodGraph::serialize(self, out)
-    }
+pub(super) fn rank<'router, 'workspace>(
+    router: &'router RelativeNeighborhoodGraph<LazyStore>,
+    workspace: &'workspace mut Workspace,
+    query: &'router [f32],
+) -> ResumableSearchIterator<'router, 'workspace, LazyStore> {
+    let seeds = (0..router.len())
+        .step_by((router.len() / 8).max(1))
+        .take(8)
+        .map(|node| node as u32)
+        .collect::<Vec<_>>();
+    router.search_iter(workspace, query, &seeds)
 }

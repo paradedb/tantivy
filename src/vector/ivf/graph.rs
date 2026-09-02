@@ -497,7 +497,7 @@ impl Default for NeighborhoodGraphConfig {
 /// already yielded.
 pub struct SearchIterator<'g, 'w, S: VectorArena, const RESUMABLE: bool> {
     rng: &'g RelativeNeighborhoodGraph<S>,
-    workspace: SearchWorkspace<'w>,
+    workspace: &'w mut Workspace,
     query: &'g [S::Elem],
     /// Beam width of each round.
     ef: usize,
@@ -518,20 +518,6 @@ pub type ResumableSearchIterator<'g, 'w, S> = SearchIterator<'g, 'w, S, true>;
 /// [`search`](RelativeNeighborhoodGraph::search) drives it.
 type OneShotSearchIterator<'g, 'w, S> = SearchIterator<'g, 'w, S, false>;
 
-enum SearchWorkspace<'w> {
-    Borrowed(&'w mut Workspace),
-    Owned(Workspace),
-}
-
-impl SearchWorkspace<'_> {
-    fn as_mut(&mut self) -> &mut Workspace {
-        match self {
-            SearchWorkspace::Borrowed(workspace) => workspace,
-            SearchWorkspace::Owned(workspace) => workspace,
-        }
-    }
-}
-
 impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RESUMABLE> {
     fn new(
         rng: &'g RelativeNeighborhoodGraph<S>,
@@ -540,33 +526,22 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         seeds: &[NodeId],
         ef: usize,
     ) -> Self {
-        Self::from_workspace(rng, SearchWorkspace::Borrowed(workspace), query, seeds, ef)
-    }
-
-    fn from_workspace(
-        rng: &'g RelativeNeighborhoodGraph<S>,
-        mut workspace: SearchWorkspace<'w>,
-        query: &'g [S::Elem],
-        seeds: &[NodeId],
-        ef: usize,
-    ) -> Self {
         debug_assert_eq!(query.len(), rng.graph.dim(), "query dimension mismatch");
         let n = rng.graph.len();
-        let ws = workspace.as_mut();
-        ws.begin_query(n);
+        workspace.begin_query(n);
 
         let arena = rng.graph.arena();
         let dim = rng.graph.dim();
         let mut metrics = NeighborhoodGraphSearchMetrics::default();
 
         for &node_id in seeds {
-            if node_id as usize >= n || ws.visited.contains(node_id) {
+            if node_id as usize >= n || workspace.visited.contains(node_id) {
                 continue;
             }
-            ws.visited.insert(node_id);
+            workspace.visited.insert(node_id);
             metrics.visited_count += 1;
             let sim = arena.similarity(rng.metric, dim, node_id, query);
-            ws.frontier.push(Candidate { sim, node: node_id });
+            workspace.frontier.push(Candidate { sim, node: node_id });
         }
 
         SearchIterator {
@@ -592,7 +567,7 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         let arena = graph.arena();
         let dim = graph.dim();
         let metric = self.rng.metric;
-        let ws = self.workspace.as_mut();
+        let ws = &mut *self.workspace;
 
         self.metrics.termination_reason = SearchTerminationReason::GraphExhausted;
 
@@ -650,23 +625,6 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         // back yields descending similarity with ascending-id ties.
         self.batch
             .sort_unstable_by(|a, b| a.sim.cmp(&b.sim).then_with(|| b.node.cmp(&a.node)));
-    }
-}
-
-impl<'g, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'static, S, RESUMABLE> {
-    fn new_owned(
-        rng: &'g RelativeNeighborhoodGraph<S>,
-        query: &'g [S::Elem],
-        seeds: &[NodeId],
-        ef: usize,
-    ) -> Self {
-        Self::from_workspace(
-            rng,
-            SearchWorkspace::Owned(Workspace::new()),
-            query,
-            seeds,
-            ef,
-        )
     }
 }
 
@@ -752,14 +710,6 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         seeds: &[NodeId],
     ) -> ResumableSearchIterator<'g, 'w, S> {
         ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef)
-    }
-
-    pub(crate) fn search_iter_owned<'g>(
-        &'g self,
-        query: &'g [S::Elem],
-        seeds: &[NodeId],
-    ) -> ResumableSearchIterator<'g, 'static, S> {
-        ResumableSearchIterator::new_owned(self, query, seeds, self.config.ef)
     }
 
     /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;
