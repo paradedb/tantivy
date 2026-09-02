@@ -52,7 +52,7 @@ pub struct IntermediateCount {
 
 impl IntermediateCount {
     /// Creates a new [`IntermediateCount`] instance from a [`SegmentStatsCollector`].
-    pub(crate) fn from_stats(stats: IntermediateStats) -> Self {
+    pub fn from_stats(stats: IntermediateStats) -> Self {
         Self { stats }
     }
     /// Merges the other intermediate result into self.

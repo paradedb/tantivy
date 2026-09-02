@@ -52,7 +52,7 @@ pub struct IntermediateAverage {
 
 impl IntermediateAverage {
     /// Creates a new [`IntermediateAverage`] instance from a [`SegmentStatsCollector`].
-    pub(crate) fn from_stats(stats: IntermediateStats) -> Self {
+    pub fn from_stats(stats: IntermediateStats) -> Self {
         Self { stats }
     }
 

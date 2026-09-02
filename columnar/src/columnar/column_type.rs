@@ -58,7 +58,8 @@ impl ColumnType {
         self == &ColumnType::DateTime
     }
 
-    pub(crate) fn try_from_code(code: u8) -> Result<ColumnType, InvalidData> {
+    /// The inverse of [`Self::to_code`].
+    pub fn try_from_code(code: u8) -> Result<ColumnType, InvalidData> {
         COLUMN_TYPES.get(code as usize).copied().ok_or(InvalidData)
     }
 }

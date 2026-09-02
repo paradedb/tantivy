@@ -886,6 +886,19 @@ pub struct IntermediateTermBucketResult {
 }
 
 impl IntermediateTermBucketResult {
+    /// Buckets computed outside of tantivy, for a caller that finalizes through it.
+    pub fn new(
+        entries: FxHashMap<IntermediateKey, IntermediateTermBucketEntry>,
+        sum_other_doc_count: u64,
+        doc_count_error_upper_bound: u64,
+    ) -> Self {
+        Self {
+            entries,
+            sum_other_doc_count,
+            doc_count_error_upper_bound,
+        }
+    }
+
     /// Returns a reference to the map of bucket entries keyed by [`IntermediateKey`].
     pub fn entries(&self) -> &FxHashMap<IntermediateKey, IntermediateTermBucketEntry> {
         &self.entries
@@ -943,12 +956,20 @@ impl IntermediateTermBucketResult {
                     .expect("expected type string, which is always sortable")
                 });
             }
+            // Ties break on the key, so the order does not depend on how the
+            // entries were merged.
             OrderTarget::Count => {
-                if req.order.order == Order::Desc {
-                    buckets.sort_unstable_by_key(|bucket| std::cmp::Reverse(bucket.doc_count()));
-                } else {
-                    buckets.sort_unstable_by_key(|bucket| bucket.doc_count());
-                }
+                buckets.sort_by(|left, right| {
+                    let by_count = match order {
+                        Order::Desc => right.doc_count().cmp(&left.doc_count()),
+                        Order::Asc => left.doc_count().cmp(&right.doc_count()),
+                    };
+                    by_count.then_with(|| {
+                        left.key
+                            .partial_cmp(&right.key)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                });
             }
             OrderTarget::SubAggregation(name) => {
                 let (agg_name, agg_property) = get_agg_name_and_property(&name);
@@ -963,9 +984,16 @@ impl IntermediateTermBucketResult {
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
 
-                buckets_with_val.sort_by(|(_, val1), (_, val2)| match &order {
-                    Order::Desc => val2.total_cmp(val1),
-                    Order::Asc => val1.total_cmp(val2),
+                buckets_with_val.sort_by(|(left, val1), (right, val2)| {
+                    let by_val = match &order {
+                        Order::Desc => val2.total_cmp(val1),
+                        Order::Asc => val1.total_cmp(val2),
+                    };
+                    by_val.then_with(|| {
+                        left.key
+                            .partial_cmp(&right.key)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                 });
                 buckets = buckets_with_val
                     .into_iter()
