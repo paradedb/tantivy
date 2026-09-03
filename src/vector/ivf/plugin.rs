@@ -1179,7 +1179,10 @@ mod tests {
     use crate::vector::ivf::AdaptiveProbeParams;
     use crate::vector::prepared::{QuantizedIndexCtx, QuantizedQueryCtx};
     use crate::vector::tests::ground_truth;
-    use crate::vector::{TopDocsByVectorSimilarity, VectorQuantizationLayer};
+    use crate::vector::{
+        TopDocsByVectorSimilarity, VectorEstimatorMeasurements, VectorEstimatorQuery,
+        VectorEstimatorSource, VectorQuantizationLayer,
+    };
     use crate::{Index, TantivyDocument};
 
     #[test]
@@ -1490,6 +1493,58 @@ mod tests {
         }
     }
 
+    fn fixture_estimator_queries_for(metric: Metric, dim: usize) -> Vec<Vec<f32>> {
+        (0..4)
+            .map(|query| match metric {
+                Metric::L2 => {
+                    let center = if query < 2 { 0.0 } else { 1.0 };
+                    (0..dim)
+                        .map(|coordinate| {
+                            center + ((query * dim + coordinate) as f32 * 0.023).cos() * 0.1
+                        })
+                        .collect()
+                }
+                Metric::Cosine => {
+                    let cluster = usize::from(query >= 2);
+                    let mut vector: Vec<f32> = (0..dim)
+                        .map(|coordinate| ((query * dim + coordinate) as f32 * 0.023).cos() * 0.025)
+                        .collect();
+                    vector[cluster] += 1.0;
+                    vector
+                }
+                Metric::Dot => {
+                    unreachable!("quantized matrix fixture covers L2 and cosine")
+                }
+            })
+            .collect()
+    }
+
+    fn fixture_estimator_queries(dim: usize) -> Vec<Vec<f32>> {
+        fixture_estimator_queries_for(Metric::L2, dim)
+    }
+
+    fn estimator_measurements(
+        vector_reader: &crate::vector::VectorIndexReader,
+        queries: &[Vec<f32>],
+        sample_rows: usize,
+        alive: Option<&crate::fastfield::AliveBitSet>,
+    ) -> crate::Result<Option<VectorEstimatorMeasurements>> {
+        let queries = queries
+            .iter()
+            .cloned()
+            .map(|values| VectorEstimatorQuery {
+                values,
+                excluded_doc_id: None,
+            })
+            .collect::<Vec<_>>();
+        Ok(vector_reader.measure_estimator_queries(
+            VectorEstimatorSource::Provided,
+            &queries,
+            sample_rows,
+            alive,
+        )?)
+    }
+
     fn build_quantized_fixture_with_schedule(dim: usize, quantized: bool) -> crate::Result<Index> {
         build_quantized_fixture_case(dim, Metric::L2, &[1, 4], quantized)
     }
@@ -1772,32 +1827,39 @@ mod tests {
             format!("metric={metric:?} schedule={schedule:?} scenario={scenario:?} depth={depth}");
         assert_matrix_results(&context, &fruit.results, &expected, stats);
 
-        let trace = &stats.quantized_trace;
-        let layer0_scored = trace.scored_docs.len();
-        let layer0_survivors = trace
-            .boundary_docs
-            .first()
-            .expect("layer 0 boundary must execute")
-            .len();
+        let layer0 = stats.layers.get(0).expect("layer 0 must execute");
         assert_eq!(
-            stats.candidates_scored, layer0_scored,
+            stats.layer0_eligible,
+            layer0.scored(),
             "{context}: layer 0 must score exactly the admitted eligible rows"
         );
-        assert!(layer0_scored > 0, "{context}: {stats:?}");
-        assert!(layer0_survivors <= layer0_scored, "{context}: {stats:?}");
+        assert_eq!(
+            stats.eligible_charged,
+            layer0.scored(),
+            "{context}: the probe budget must charge exactly the selected rows"
+        );
+        assert!(layer0.scored() > 0, "{context}: {stats:?}");
+        assert!(
+            layer0.survivors() <= layer0.scored(),
+            "{context}: {stats:?}"
+        );
         if depth == 1 {
-            assert_eq!(trace.boundary_docs.len(), 1, "{context}: {stats:?}");
+            assert!(stats.layers.get(1).is_none(), "{context}: {stats:?}");
         } else {
-            let layer1_survivors = trace
-                .boundary_docs
-                .get(1)
-                .expect("layer 1 boundary must execute")
-                .len();
-            assert!(layer1_survivors <= layer0_survivors, "{context}: {stats:?}");
+            let layer1 = stats.layers.get(1).expect("layer 1 must execute");
+            assert_eq!(
+                layer1.scored(),
+                layer0.survivors(),
+                "{context}: every boundary-0 survivor must be refined"
+            );
+            assert!(
+                layer1.survivors() <= layer1.scored(),
+                "{context}: {stats:?}"
+            );
         }
         if metric == Metric::L2 && matches!(scenario, QuantizedMatrixScenario::None) {
             assert!(
-                layer0_survivors < layer0_scored,
+                layer0.survivors() < layer0.scored(),
                 "{context}: the unfiltered L2 matrix cell must prove that boundary 0 measurably \
                  drops at least one scored candidate: {stats:?}"
             );
@@ -1991,17 +2053,18 @@ mod tests {
         assert_eq!(unquantized_fruit.stats.len(), 1);
         let level_zero = &level_zero_fruit.stats[0];
         let baseline = &unquantized_fruit.stats[0];
-        assert!(level_zero.quantized_trace.boundary_docs.is_empty());
-        assert!(level_zero.routing.visited_count > 0, "{level_zero:?}");
+        assert!(level_zero.layers.get(0).is_none(), "{level_zero:?}");
+        assert!(level_zero.routing_visited_count > 0, "{level_zero:?}");
         assert!(level_zero.clusters_probed() > 0, "{level_zero:?}");
         assert!(level_zero.candidates_scored > 0, "{level_zero:?}");
+        assert!(level_zero.exact_scan_ns.is_some(), "{level_zero:?}");
         assert_eq!(level_zero.candidates_scored, baseline.candidates_scored);
         assert_eq!(level_zero.exact_rows_read, baseline.exact_rows_read);
         assert_eq!(level_zero.postings_row, baseline.postings_row);
         assert_eq!(level_zero.postings_skipped, baseline.postings_skipped);
         assert_eq!(
-            level_zero.routing.visited_count,
-            baseline.routing.visited_count
+            level_zero.routing_visited_count,
+            baseline.routing_visited_count
         );
         assert_eq!(
             level_zero.work_charged.to_bits(),
@@ -2037,9 +2100,9 @@ mod tests {
         );
         let stats = &fruit.stats[0];
         assert_eq!(stats.exact_rows_read, 8, "{stats:?}");
-        assert_eq!(stats.routing.visited_count, 0, "{stats:?}");
+        assert_eq!(stats.routing_visited_count, 0, "{stats:?}");
         assert_eq!(stats.clusters_probed(), 0, "{stats:?}");
-        assert!(stats.quantized_trace.boundary_docs.is_empty());
+        assert!(stats.layers.get(0).is_none(), "{stats:?}");
         Ok(())
     }
 
@@ -2134,15 +2197,18 @@ mod tests {
         assert!(quantized.index_ctx_is_initialized());
         assert_eq!(quantized_fruit.stats.len(), 1);
         let stats = &quantized_fruit.stats[0];
-        let trace = &stats.quantized_trace;
-        let layer0_scored = trace.scored_docs.len();
-        let layer0_survivors = trace.boundary_docs[0].len();
-        let layer1_survivors = trace.boundary_docs[1].len();
-        assert!(layer0_scored > 0, "{stats:?}");
-        assert!(layer0_survivors <= layer0_scored, "{stats:?}");
-        assert!(layer1_survivors <= layer0_survivors, "{stats:?}");
-        assert!(trace.rerank_docs.len() <= layer1_survivors, "{stats:?}");
-        assert_eq!(stats.exact_rows_read, trace.rerank_docs.len(), "{stats:?}");
+        let layer0 = stats.layers.get(0).expect("layer 0 must execute");
+        let layer1 = stats.layers.get(1).expect("layer 1 must execute");
+        assert!(layer0.scored() > 0, "{stats:?}");
+        assert!(layer0.survivors() <= layer0.scored(), "{stats:?}");
+        assert_eq!(
+            layer1.scored(),
+            layer0.survivors(),
+            "the two-layer fixture refines every first-boundary survivor: {stats:?}"
+        );
+        assert!(layer1.survivors() <= layer0.survivors(), "{stats:?}");
+        assert!(stats.rerank_rows <= layer1.survivors(), "{stats:?}");
+        assert_eq!(stats.exact_rows_read, stats.rerank_rows, "{stats:?}");
         let hits = quantized_fruit.results;
         let mut expected: Vec<(f32, u32)> = (0..8)
             .map(|doc| {
@@ -2317,6 +2383,134 @@ mod tests {
         assert!(physical_growth >= logical_growth);
         assert!(physical_growth <= logical_growth + 512);
         assert_eq!(logical_growth, ROWS * 508);
+        Ok(())
+    }
+
+    #[test]
+    fn estimator_measurement_uses_production_path_and_is_centered() -> crate::Result<()> {
+        const DIM: usize = 100;
+        let index = build_quantized_fixture_with_schedule(DIM, true)?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
+        assert!(vector_reader.quantization().is_some());
+        let queries = fixture_estimator_queries(DIM);
+        let estimator_queries = queries
+            .iter()
+            .cloned()
+            .map(|values| VectorEstimatorQuery {
+                values,
+                excluded_doc_id: None,
+            })
+            .collect::<Vec<_>>();
+        let measurements = vector_reader
+            .measure_estimator_queries(
+                VectorEstimatorSource::Provided,
+                &estimator_queries,
+                1_000,
+                None,
+            )?
+            .expect("quantized slots remain available to explicit diagnostics");
+        assert_eq!(measurements.source(), VectorEstimatorSource::Provided);
+        assert_eq!(measurements.sample_rows(), 8);
+        assert_eq!(measurements.query_count(), queries.len() as u32);
+        assert!(measurements
+            .aggregate()
+            .iter()
+            .all(|depth| depth.sample_count == 8 * queries.len() as u64));
+        for (depth, moments) in measurements.aggregate().iter().enumerate() {
+            let bias = moments
+                .bias()
+                .expect("fixture must produce estimator errors");
+            assert!(
+                bias.abs() <= 0.3,
+                "depth {} normalized estimator bias {bias} exceeds 0.3",
+                depth + 1
+            );
+        }
+
+        let fruit = searcher.search(
+            &AllQuery,
+            &TopDocsByVectorSimilarity::new(field, queries[0].clone(), 3).with_adaptive_params(
+                AdaptiveProbeParams {
+                    max_probe_fraction: 1.0,
+                    min_probe_clusters: 2,
+                    ..Default::default()
+                },
+            ),
+        )?;
+        assert!(fruit.stats[0].layers.get(0).is_some());
+        assert!(fruit.stats[0].postings_row > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn estimator_samples_only_live_posting_rows() -> crate::Result<()> {
+        const DIM: usize = 100;
+        let index = build_quantized_fixture_with_schedule(DIM, true)?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = segment.vector_index(field)?;
+        let alive = crate::fastfield::AliveBitSet::for_test_from_deleted_docs(&[1, 3], 8);
+        let live_posting_rows = (0..vector_reader.index().unwrap().num_rows())
+            .filter(|&row| alive.is_alive(vector_reader.doc_id_at(row)))
+            .count();
+        assert_eq!(live_posting_rows, 6);
+
+        let queries = fixture_estimator_queries(DIM);
+        let measurements =
+            estimator_measurements(vector_reader.as_ref(), &queries, usize::MAX, Some(&alive))?
+                .unwrap();
+        assert!(measurements
+            .aggregate()
+            .iter()
+            .all(|depth| { depth.sample_count == (live_posting_rows * queries.len()) as u64 }));
+
+        let bounded =
+            estimator_measurements(vector_reader.as_ref(), &queries, 5, Some(&alive))?.unwrap();
+        assert!(bounded
+            .aggregate()
+            .iter()
+            .all(|depth| depth.sample_count == (5 * queries.len()) as u64));
+        Ok(())
+    }
+
+    #[test]
+    fn held_out_estimator_excludes_the_source_row() -> crate::Result<()> {
+        const DIM: usize = 100;
+        let index = build_quantized_fixture_with_schedule(DIM, true)?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let segment = &searcher.segment_readers()[0];
+        let field = index.schema().get_field("embedding")?;
+        let vector_reader = segment.vector_index(field)?;
+        let queries = vector_reader
+            .sample_estimator_pseudo_queries(1, segment.alive_bitset())?
+            .expect("quantized fixture must support pseudo-query sampling");
+        assert_eq!(queries.len(), 1);
+        assert!(queries.iter().all(|query| query.excluded_doc_id.is_some()));
+
+        let measurements = vector_reader
+            .measure_estimator_queries(
+                VectorEstimatorSource::HeldOut,
+                &queries,
+                usize::MAX,
+                segment.alive_bitset(),
+            )?
+            .expect("quantized fixture must support estimator measurement");
+        assert_eq!(measurements.source(), VectorEstimatorSource::HeldOut);
+        assert_eq!(measurements.sample_rows(), 8);
+        assert_eq!(measurements.query_count(), 1);
+        assert!(measurements
+            .aggregate()
+            .iter()
+            .all(|moments| moments.sample_count == 7));
         Ok(())
     }
 }
