@@ -42,7 +42,7 @@ impl RouterKind {
         self,
         options: &VectorOptions,
         centroids: &mut IvfCentroids,
-    ) -> crate::Result<BuiltRouter> {
+    ) -> crate::Result<InMemoryRouter> {
         match self {
             Self::Rng => Ok(Router::Rng(rng::build(options, centroids)?)),
             Self::Stacked => Ok(Router::Stacked(stacked::build(options, centroids)?)),
@@ -56,7 +56,7 @@ impl RouterKind {
         slot: FileSlice,
         centroids: FileSlice,
         options: &VectorOptions,
-    ) -> crate::Result<OpenedRouter> {
+    ) -> crate::Result<LazyRouter> {
         if file_version != VectorFileVersion::V3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -104,10 +104,27 @@ pub(crate) enum Router<S: super::VectorArena<Elem = f32>> {
     Exact(exact::ExactRouter<S>),
 }
 
-pub(crate) type BuiltRouter = Router<InMemoryStore>;
-pub(crate) type OpenedRouter = Router<LazyStore>;
+pub(crate) type InMemoryRouter = Router<InMemoryStore>;
+pub(crate) type LazyRouter = Router<LazyStore>;
 
-impl BuiltRouter {
+impl InMemoryRouter {
+    pub(crate) fn from(
+        kind: RouterKind,
+        options: &VectorOptions,
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Self> {
+        let IvfCentroids::F32(matrix) = &*centroids;
+        let shape = (matrix.rows, matrix.dims, matrix.values.len());
+        let router = kind.build(options, centroids)?;
+        let IvfCentroids::F32(matrix) = &*centroids;
+        if (matrix.rows, matrix.dims, matrix.values.len()) != shape {
+            return Err(crate::TantivyError::InvalidArgument(
+                "Router changed the centroid matrix shape while building".to_string(),
+            ));
+        }
+        Ok(router)
+    }
+
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Rng(_) => RouterKind::Rng,
@@ -135,9 +152,7 @@ pub(crate) struct RouterWorkspace {
 /// and exact routers rank the same way regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RoutingParams {
-    /// Clusters the caller expects to probe. The stacked router ranks at
-    /// least this many members when APS is on; with APS off it ranks every
-    /// member of the lists its nprobe fraction selects.
+    /// Maximum centroid candidates returned by the stacked router.
     pub k: usize,
     /// Stacked-router recall target in `(0, 1]`. `1.0` disables APS and
     /// routes with the fixed nprobe fractions. APS is also disabled above
@@ -185,7 +200,7 @@ impl Iterator for RouterIter<'_, '_> {
     }
 }
 
-impl OpenedRouter {
+impl LazyRouter {
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Rng(_) => RouterKind::Rng,
@@ -334,7 +349,7 @@ mod tests {
         })
     }
 
-    fn open_stacked(dim: usize, n_per: usize) -> crate::Result<OpenedRouter> {
+    fn open_stacked(dim: usize, n_per: usize) -> crate::Result<LazyRouter> {
         let options = VectorOptions::new(dim, Metric::L2);
         let mut centroids = blob_centroids(dim, n_per);
         let built = RouterKind::Stacked.build(&options, &mut centroids)?;
@@ -408,7 +423,10 @@ mod tests {
         let ranking = opened.rank(&mut workspace, &query, Metric::L2, params);
         let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");
-        assert!(candidates <= 4, "returned set must honor params.k, got {candidates}");
+        assert!(
+            candidates <= 4,
+            "returned set must honor params.k, got {candidates}"
+        );
         assert!(lists >= 1, "nprobe path must still open parent lists");
         assert!(scored >= candidates);
         // Full expand of all router lists would score every centroid; with
@@ -441,7 +459,10 @@ mod tests {
             &mut workspace,
             &query,
             Metric::L2,
-            RoutingParams { k: 400, recall: 1.0 },
+            RoutingParams {
+                k: 400,
+                recall: 1.0,
+            },
         );
         let (_, _, scored_large, _) = stacked_metrics(large.metrics());
         assert!(

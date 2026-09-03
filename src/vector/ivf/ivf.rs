@@ -1342,8 +1342,6 @@ mod tests {
         }
     }
 
-    #[test]
-
     /// Empty lists after `add_level` share start offsets with the next
     /// non-empty list. Cover validation must still accept the partition
     /// (reproduces the centroid_ratio-sensitive open failure).
@@ -1362,8 +1360,7 @@ mod tests {
             branching_factor: 64,
             ..IvfConfig::default()
         };
-        let (index, _perm) =
-            IvfIndexBuilder::new(data, n, dim, &clusterer, config.clone()).build();
+        let (index, _perm) = IvfIndexBuilder::new(data, n, dim, &clusterer, config.clone()).build();
         assert!(
             index.depth() >= 2,
             "need a parent so permute_lists scrambles L0 list order"
@@ -1389,6 +1386,7 @@ mod tests {
         .expect("empty lists after add_level must still open");
     }
 
+    #[test]
     fn test_slice_backed_open_rejects_truncation() {
         let dim = 2;
         let n = 32;

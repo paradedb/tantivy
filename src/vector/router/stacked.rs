@@ -106,8 +106,7 @@ pub(super) fn rank(
     // parent list ranking.
     let k = params.k.clamp(1, index.vectors.len().max(1));
     let expansion_budget = k.saturating_mul(LEAF_EXPANSION_SLACK);
-    let (ranked, stats) =
-        index.search_limited(query, k, recall, metric, Some(expansion_budget));
+    let (ranked, stats) = index.search_limited(query, k, recall, metric, Some(expansion_budget));
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),

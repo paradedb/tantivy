@@ -87,6 +87,15 @@ pub trait Weight: Send + Sync + 'static {
     /// Returns an [`Explanation`] for the given document.
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation>;
 
+    /// `true` iff this weight matches EVERY document of every segment
+    /// (deletes are a separate, per-segment concern). Lets consumers that
+    /// would otherwise materialize the match set — e.g. the vector search
+    /// driver's per-segment filter bitsets — skip it entirely for
+    /// unfiltered queries. Conservative `false` is always sound.
+    fn matches_all_docs(&self) -> bool {
+        false
+    }
+
     /// Returns the number documents within the given [`SegmentReader`].
     fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
         let mut scorer = self.scorer(reader, 1.0)?;
