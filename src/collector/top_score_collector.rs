@@ -349,10 +349,10 @@ impl TopDocs {
     /// inferred from the `query` argument; it must match the schema's
     /// declared dtype.
     ///
-    /// The driving query (passed to `searcher.search`) decides which docs
-    /// are candidates. For brute-force scan over every doc, pair this with
-    /// [`AllQuery`](crate::query::AllQuery); pair with a filter query to
-    /// restrict candidates.
+    /// The filter passed to [`TopDocsByVectorSimilarity::search`] decides
+    /// which docs are candidates. For brute-force scan over every doc, use
+    /// [`AllQuery`](crate::query::AllQuery); use a filter query to restrict
+    /// candidates.
     pub fn order_by_similarity<T>(
         self,
         field: Field,
