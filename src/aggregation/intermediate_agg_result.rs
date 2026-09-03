@@ -885,6 +885,15 @@ pub struct IntermediateTermBucketResult {
     pub(crate) doc_count_error_upper_bound: u64,
 }
 
+/// A total order over bucket keys for the tie-break of a sort: keys of one
+/// type order by value, `NaN` included, and keys of different types by type.
+fn cmp_keys(left: &Key, right: &Key) -> Ordering {
+    match (left, right) {
+        (Key::F64(left), Key::F64(right)) => left.total_cmp(right),
+        _ => left.partial_cmp(right).unwrap_or(Ordering::Equal),
+    }
+}
+
 impl IntermediateTermBucketResult {
     /// Buckets computed outside of tantivy, for a caller that finalizes through it.
     pub fn new(
@@ -964,11 +973,7 @@ impl IntermediateTermBucketResult {
                         Order::Desc => right.doc_count().cmp(&left.doc_count()),
                         Order::Asc => left.doc_count().cmp(&right.doc_count()),
                     };
-                    by_count.then_with(|| {
-                        left.key
-                            .partial_cmp(&right.key)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    by_count.then_with(|| cmp_keys(&left.key, &right.key))
                 });
             }
             OrderTarget::SubAggregation(name) => {
@@ -989,11 +994,7 @@ impl IntermediateTermBucketResult {
                         Order::Desc => val2.total_cmp(val1),
                         Order::Asc => val1.total_cmp(val2),
                     };
-                    by_val.then_with(|| {
-                        left.key
-                            .partial_cmp(&right.key)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    by_val.then_with(|| cmp_keys(&left.key, &right.key))
                 });
                 buckets = buckets_with_val
                     .into_iter()
