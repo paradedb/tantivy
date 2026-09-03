@@ -23,15 +23,16 @@ pub use graph::{
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
     Workspace,
 };
-pub use index::{IvfIndex, IvfSearchMetrics, RoutingIndex};
+pub use index::IvfIndex;
 pub use ivf::{
-    AddLevelError, ClusterId, FlatStore, IvfConfig, IvfIndex as MultiLevelIvf, IvfIndexBuilder,
-    IvfLevelClusterer, PersistedStackedIvf, SliceStore, StackedIvfIndex, SuperKMeansLevelClusterer,
+    AddLevelError, ClusterId, InMemoryStackedIvf, InMemoryStore, IvfConfig,
+    IvfIndex as MultiLevelIvf, IvfIndexBuilder, IvfLevelClusterer, LazyStackedIvf, LazyStore,
+    SuperKMeansLevelClusterer,
 };
 pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, encode_vector};
 pub use training::{
-    BuiltRouter, IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
-    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfTrainingBatch,
+    IvfTrainingVectors, IvfVectorBatch, IvfVectors,
 };

@@ -9,9 +9,8 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::{
-    decode_row, encode_vector, BuiltRouter, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix,
-    IvfMatrixView, IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, RoutingIndex,
-    CENTROIDS_EXT,
+    decode_row, encode_vector, IvfCentroids, IvfClusterer, IvfIndex, IvfMatrix, IvfMatrixView,
+    IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, CENTROIDS_EXT,
 };
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
@@ -19,31 +18,16 @@ use crate::plugin::PluginMergeContext;
 use crate::schema::{Field, FieldType, VectorDType, VectorOptions};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::flat::IdMap;
-use crate::vector::header::{centroid_slot, vec_slot, write_header, CURRENT};
-use crate::vector::{
-    residual_norm, BoundKind, BoundsBuilder, NeighborhoodGraphConfig, RelativeNeighborhoodGraph,
-    VEC_EXT,
-};
-use crate::{DocId, Executor, TantivyError};
+use crate::vector::header::{centroid_slot, vec_slot, write_header};
+use crate::vector::router::{BuiltRouter, RouterKind};
+use crate::vector::{residual_norm, BoundKind, BoundsBuilder, VEC_EXT};
+use crate::{DocId, TantivyError};
 
 struct AssignedVector {
     cluster: usize,
     target_doc_id: DocId,
     source_segment_ord: usize,
     source_doc_id: DocId,
-}
-
-/// A multi-threaded [`Executor`] when the host has the parallelism, the
-/// single-threaded one otherwise.
-fn build_executor(name: &'static str) -> crate::Result<Executor> {
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    if num_threads > 1 {
-        Executor::multi_thread(num_threads, name)
-    } else {
-        Ok(Executor::single_thread())
-    }
 }
 
 /// Per-field IVF build timings (one phase per field), emitted at end of build
@@ -66,6 +50,7 @@ fn write_empty_field_slots(
     centroids_write: &mut CompositeWrite,
     field: Field,
     opts: &VectorOptions,
+    router: &BuiltRouter,
 ) -> crate::Result<()> {
     // `.vec`: empty Explicit id-map + empty rows.
     {
@@ -94,12 +79,35 @@ fn write_empty_field_slots(
         IvfIndex::serialize_bounds(BoundKind::Ball, &[], bounds_w)?;
         bounds_w.flush()?;
     }
+    {
+        let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
+        router.serialize(router_w)?;
+        router_w.flush()?;
+    }
     Ok(())
+}
+
+fn build_router(
+    router: RouterKind,
+    opts: &VectorOptions,
+    centroids: &mut IvfCentroids,
+) -> crate::Result<BuiltRouter> {
+    let IvfCentroids::F32(matrix) = &*centroids;
+    let shape = (matrix.rows, matrix.dims, matrix.values.len());
+    let router = router.build(opts, centroids)?;
+    let IvfCentroids::F32(matrix) = &*centroids;
+    if (matrix.rows, matrix.dims, matrix.values.len()) != shape {
+        return Err(TantivyError::InvalidArgument(
+            "Router changed the centroid matrix shape while building".to_string(),
+        ));
+    }
+    Ok(router)
 }
 
 pub(crate) fn merge_ivf(
     ctx: &PluginMergeContext,
     clusterer: Option<&dyn IvfClusterer>,
+    router: Option<RouterKind>,
 ) -> crate::Result<()> {
     if ctx.cancel.wants_cancel() {
         return Err(TantivyError::Cancelled);
@@ -116,6 +124,12 @@ pub(crate) fn merge_ivf(
     let clusterer = clusterer.ok_or_else(|| {
         TantivyError::InvalidArgument(
             "vector_clustering_threshold selected IVF merge, but no IvfClusterer is configured"
+                .to_string(),
+        )
+    })?;
+    let router = router.ok_or_else(|| {
+        TantivyError::InvalidArgument(
+            "vector_clustering_threshold selected IVF merge, but no Router is configured"
                 .to_string(),
         )
     })?;
@@ -156,7 +170,13 @@ pub(crate) fn merge_ivf(
             .map(|reader| reader.num_vectors())
             .sum::<usize>();
         if vector_count == 0 {
-            write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
+            let mut centroids = IvfCentroids::F32(IvfMatrix {
+                values: Vec::new(),
+                rows: 0,
+                dims: opts.dim(),
+            });
+            let router = build_router(router, opts, &mut centroids)?;
+            write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts, &router)?;
             continue;
         }
         let training_sample_size = {
@@ -220,7 +240,19 @@ pub(crate) fn merge_ivf(
                     // leave its slots missing from composites the other
                     // fields still write, and the reader errors on
                     // missing slots.
-                    write_empty_field_slots(&mut vec_write, &mut centroids_write, field, opts)?;
+                    let mut centroids = IvfCentroids::F32(IvfMatrix {
+                        values: Vec::new(),
+                        rows: 0,
+                        dims: opts.dim(),
+                    });
+                    let router = build_router(router, opts, &mut centroids)?;
+                    write_empty_field_slots(
+                        &mut vec_write,
+                        &mut centroids_write,
+                        field,
+                        opts,
+                        &router,
+                    )?;
                     continue;
                 }
 
@@ -234,7 +266,7 @@ pub(crate) fn merge_ivf(
                     },
                 });
                 let train_start = Instant::now();
-                let centroids = clusterer.train(opts, training_vectors)?;
+                let mut centroids = clusterer.train(opts, training_vectors)?;
 
                 timings.train = train_start.elapsed();
 
@@ -265,43 +297,7 @@ pub(crate) fn merge_ivf(
                 }
                 let num_centroids = centroid_matrix.rows;
 
-                // Optional router (slot [2]). Default clusterers return `None`
-                // and the merge builds a routing RNG. When present, a stacked
-                // build's canonical cluster-sort permutation is applied to the
-                // trained centroid matrix before assign.
-                let built_router = clusterer.build_router(opts, &centroids)?;
-                let centroids = match &built_router {
-                    Some(BuiltRouter::Stacked { perm, .. }) => {
-                        let IvfCentroids::F32(matrix) = &centroids;
-                        if perm.len() != num_centroids {
-                            return Err(TantivyError::InvalidArgument(format!(
-                                "build_router returned a permutation over {} centroids, expected \
-                                 {num_centroids}",
-                                perm.len()
-                            )));
-                        }
-                        let dims = matrix.dims;
-                        let mut values = vec![0.0f32; matrix.values.len()];
-                        let mut seen = vec![false; num_centroids];
-                        for (old, &new) in perm.iter().enumerate() {
-                            let new = new as usize;
-                            if new >= num_centroids || seen[new] {
-                                return Err(TantivyError::InvalidArgument(
-                                    "build_router permutation is not a bijection".to_string(),
-                                ));
-                            }
-                            seen[new] = true;
-                            values[new * dims..(new + 1) * dims]
-                                .copy_from_slice(&matrix.values[old * dims..(old + 1) * dims]);
-                        }
-                        IvfCentroids::F32(IvfMatrix {
-                            values,
-                            rows: matrix.rows,
-                            dims,
-                        })
-                    }
-                    _ => centroids,
-                };
+                let router = build_router(router, opts, &mut centroids)?;
                 let IvfCentroids::F32(centroid_matrix) = &centroids;
 
                 // Float working copy of the trained centroids — the
@@ -409,9 +405,7 @@ pub(crate) fn merge_ivf(
                 // have found the same vectors (deletes make both fall short
                 // of `vector_count` together, so compare them to each other).
                 debug_assert_eq!(assigned_vectors.len(), present_vector_ord);
-                // The `.centroids` doc count: one posting row per distinct
-                // doc (legacy V2 files could inflate rows via replication;
-                // this writer never does).
+                // The `.centroids` doc count: one posting row per distinct doc.
                 let num_present_docs = assigned_vectors.len();
 
                 let mut cluster_counts = vec![0usize; num_centroids];
@@ -592,33 +586,12 @@ pub(crate) fn merge_ivf(
                     bounds_w.flush()?;
                 }
 
-                // `.centroids` slot [2]: the tagged router. Skipped when no
-                // clusterer router was built and `num_centroids <= 1`.
-                if num_centroids > 1 {
-                    if ctx.cancel.wants_cancel() {
-                        return Err(TantivyError::Cancelled);
-                    }
-                    let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
-                    match built_router.as_ref() {
-                        Some(BuiltRouter::Stacked { index, .. }) => {
-                            RoutingIndex::serialize_stacked(CURRENT, index, router_w)?;
-                        }
-                        Some(BuiltRouter::Graph(graph)) => {
-                            RoutingIndex::serialize_graph(CURRENT, graph, router_w)?;
-                        }
-                        None => {
-                            let mut rng = RelativeNeighborhoodGraph::new(
-                                centroid_matrix.values.as_slice(),
-                                opts.dim(),
-                                opts.metric(),
-                                NeighborhoodGraphConfig::default(),
-                            );
-                            rng.build(&build_executor("rng-build-")?);
-                            RoutingIndex::serialize_graph(CURRENT, &rng, router_w)?;
-                        }
-                    }
-                    router_w.flush()?;
+                if ctx.cancel.wants_cancel() {
+                    return Err(TantivyError::Cancelled);
                 }
+                let router_w = centroids_write.for_field_with_idx(field, centroid_slot::ROUTER);
+                router.serialize(router_w)?;
+                router_w.flush()?;
 
                 log::info!(
                     target: "paradedb::ivf_build",

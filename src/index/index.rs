@@ -30,7 +30,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{IvfClusterer, VectorPlugin};
+use crate::vector::{IvfClusterer, RouterKind, VectorPlugin};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -146,6 +146,22 @@ fn save_new_metas(
     Ok(())
 }
 
+fn configure_ivf_router(
+    configured: &mut Option<RouterKind>,
+    router: RouterKind,
+) -> crate::Result<()> {
+    if let Some(existing) = configured {
+        if *existing != router {
+            return Err(TantivyError::InvalidArgument(format!(
+                "IVF router is already configured as {}; cannot change it to {}",
+                existing, router
+            )));
+        }
+    }
+    *configured = Some(router);
+    Ok(())
+}
+
 /// IndexBuilder can be used to create an index.
 ///
 /// Use in conjunction with [`SchemaBuilder`][crate::schema::SchemaBuilder].
@@ -180,6 +196,7 @@ pub struct IndexBuilder {
     fast_field_tokenizer_manager: TokenizerManager,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
+    ivf_router: Option<RouterKind>,
 }
 impl Default for IndexBuilder {
     fn default() -> Self {
@@ -196,6 +213,7 @@ impl IndexBuilder {
             fast_field_tokenizer_manager: TokenizerManager::default(),
             custom_plugins: Vec::new(),
             ivf_clusterer: None,
+            ivf_router: None,
         }
     }
 
@@ -236,6 +254,12 @@ impl IndexBuilder {
     pub fn ivf_clusterer(mut self, clusterer: Arc<dyn IvfClusterer>) -> Self {
         self.ivf_clusterer = Some(clusterer);
         self
+    }
+
+    /// Select the router used to build and open IVF segments.
+    pub fn ivf_router(mut self, router: RouterKind) -> crate::Result<Self> {
+        configure_ivf_router(&mut self.ivf_router, router)?;
+        Ok(self)
     }
 
     /// Creates a new index using the [`RamDirectory`].
@@ -305,6 +329,7 @@ impl IndexBuilder {
 
     /// Opens or creates a new index in the provided directory
     pub fn open_or_create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+        self.validate()?;
         let dir: Box<dyn Directory> = dir.into();
         if !Index::exists(&*dir)? {
             return self.create(dir);
@@ -313,6 +338,7 @@ impl IndexBuilder {
         index.set_tokenizers(self.tokenizer_manager.clone());
         if index.schema() == self.get_expect_schema()? {
             index.custom_plugins.extend(self.custom_plugins);
+            index.ivf_router = self.ivf_router;
             if let Some(clusterer) = self.ivf_clusterer {
                 index.set_ivf_clusterer(clusterer);
             }
@@ -325,6 +351,11 @@ impl IndexBuilder {
     }
 
     fn validate(&self) -> crate::Result<()> {
+        if self.ivf_clusterer.is_some() && self.ivf_router.is_none() {
+            return Err(TantivyError::InvalidArgument(
+                "an IvfClusterer requires an explicitly configured Router".to_string(),
+            ));
+        }
         if let Some(schema) = self.schema.as_ref() {
             if self.index_settings.manual_doc_id_mapping
                 && self.index_settings.sort_by_field.is_some()
@@ -392,6 +423,7 @@ impl IndexBuilder {
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
         index.custom_plugins.extend(self.custom_plugins);
+        index.ivf_router = self.ivf_router;
         if let Some(clusterer) = self.ivf_clusterer {
             index.set_ivf_clusterer(clusterer);
         }
@@ -411,6 +443,7 @@ pub struct Index {
     inventory: SegmentMetaInventory,
     custom_plugins: Vec<Arc<dyn SegmentPlugin>>,
     ivf_clusterer: Option<Arc<dyn IvfClusterer>>,
+    ivf_router: Option<RouterKind>,
 }
 
 impl Index {
@@ -532,6 +565,7 @@ impl Index {
             inventory,
             custom_plugins: Vec::new(),
             ivf_clusterer: None,
+            ivf_router: None,
         }
     }
 
@@ -881,6 +915,15 @@ impl Index {
     /// Configure the clusterer used when vector merges cross the IVF threshold.
     pub fn set_ivf_clusterer(&mut self, clusterer: Arc<dyn IvfClusterer>) {
         self.ivf_clusterer = Some(clusterer);
+    }
+
+    /// Select the router used to build and open IVF segments.
+    pub fn set_ivf_router(&mut self, router: RouterKind) -> crate::Result<()> {
+        configure_ivf_router(&mut self.ivf_router, router)
+    }
+
+    pub(crate) fn ivf_router(&self) -> Option<RouterKind> {
+        self.ivf_router
     }
 
     pub(crate) fn ivf_clusterer(&self) -> Option<&dyn IvfClusterer> {

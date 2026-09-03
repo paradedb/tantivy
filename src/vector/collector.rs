@@ -325,7 +325,7 @@ mod ivf_e2e_tests {
     use crate::query::AllQuery;
     use crate::schema::{Field, Schema, FAST, STORED, STRING};
     use crate::vector::tests::{exhaustive_params, ground_truth, Grid2DClusterer, TestVectorIndex};
-    use crate::vector::{Metric, VectorDType, VectorOptions, VectorStorageFormat};
+    use crate::vector::{Metric, RouterKind, VectorDType, VectorOptions, VectorStorageFormat};
     use crate::{DocAddress, Index, Order, Score, TantivyDocument, TantivyError};
 
     /// IVF + exhaustive probing matches the global oracle. The shared
@@ -380,7 +380,6 @@ mod ivf_e2e_tests {
                 s.pruned_filter + s.pruned_dead + s.pruned_seen + s.candidates_scored,
                 "invariant per segment: {s:?}"
             );
-            assert!(s.routing.visited_count > 0);
             total_visited += s.vectors_visited;
         }
         assert!(total_visited > 0, "exhaustive probe should visit docs");
@@ -447,6 +446,7 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 0.0], [10.0, 10.0]],
             }))
+            .ivf_router(RouterKind::Stacked)?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -600,6 +600,7 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: vec![[0.0, 10.0], [0.0, -10.0]],
             }))
+            .ivf_router(RouterKind::Stacked)?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -773,6 +774,7 @@ mod ivf_e2e_tests {
             .ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: centroids.clone(),
             }))
+            .ivf_router(RouterKind::Stacked)?
             .create_in_ram()?;
         let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));

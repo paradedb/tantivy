@@ -620,7 +620,6 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
                 });
             }
         }
-
         self.batch.extend(ws.results.drain().map(|Reverse(c)| c));
         // Ascending similarity with descending-id ties, so popping from the
         // back yields descending similarity with ascending-id ties.

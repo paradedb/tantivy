@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 use common::{HasLen, OwnedBytes};
 
 use super::flat::IdMap;
-use super::header::{centroid_slot, read_header, vec_slot, VectorFileVersion};
+use super::header::{centroid_slot, read_header, vec_slot};
 use super::ivf::{IvfIndex, CENTROIDS_EXT};
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
@@ -44,10 +44,7 @@ pub enum VectorStorageFormat {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorInfo {
     pub format: VectorStorageFormat,
-    /// Distinct documents with a vector in this field. The per-cluster
-    /// numbers (`cluster_stats`, [`VectorIndexReader::cluster_sizes`]) count
-    /// posting rows, so with legacy V2 replication their sum could exceed
-    /// `num_vectors`.
+    /// Distinct documents with a vector in this field.
     pub num_vectors: usize,
     pub num_centroids: Option<usize>,
     pub cluster_stats: Option<VectorClusterStats>,
@@ -66,9 +63,7 @@ pub struct VectorClusterStats {
 /// pinned-vs-deferred split.
 pub struct VectorIndexReader {
     options: VectorOptions,
-    /// Distinct docs with a vector (the IdMap row count for flat storage; the
-    /// persisted doc count for IVF, whose row total legacy V2 replication
-    /// could inflate).
+    /// Distinct docs with a vector.
     num_vectors: usize,
     /// `false` for the placeholder built by [`Self::empty`] — the segment has
     /// no vector data for this field at all.
@@ -114,52 +109,59 @@ impl VectorIndexReader {
         };
         let id_map = IdMap::open(id_map_slice, segment_reader.max_doc())?;
 
-        let centroid_slots = match segment_reader
-            .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))
-        {
-            Ok(file) => {
-                let (centroids_version, body) = read_header(&file)?;
-                let composite = CompositeFile::open(&body)?;
-                match (
-                    composite.open_read_with_idx(field, centroid_slot::CENTROIDS),
-                    composite.open_read_with_idx(field, centroid_slot::OFFSETS),
-                    composite.open_read_with_idx(field, centroid_slot::BOUNDS),
-                ) {
-                    // Slot [2] (the router) stays optional: the write
-                    // side skips it for degenerate centroid counts. Slot
-                    // [3] (bounds) is read whenever present; when absent,
-                    // a V1 file simply predates it — `IvfIndex::open`
-                    // synthesizes SATURATED bounds — while a V2+ file
-                    // without it is corrupt, not old.
-                    (Some(centroids), Some(offsets), bounds) => {
-                        if bounds.is_none() && centroids_version >= VectorFileVersion::V2 {
+        let centroid_slots =
+            match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
+                Ok(file) => {
+                    let (centroids_version, body) = read_header(&file)?;
+                    let composite = CompositeFile::open(&body)?;
+                    match (
+                        composite.open_read_with_idx(field, centroid_slot::CENTROIDS),
+                        composite.open_read_with_idx(field, centroid_slot::OFFSETS),
+                        composite.open_read_with_idx(field, centroid_slot::ROUTER),
+                        composite.open_read_with_idx(field, centroid_slot::BOUNDS),
+                    ) {
+                        (Some(centroids), Some(offsets), Some(router), Some(bounds)) => {
+                            Some((centroids_version, centroids, offsets, router, bounds))
+                        }
+                        (Some(_), Some(_), None, _) => {
                             return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has a V2 `.centroids` file with no bounds slot",
+                                "vector field {:?} has no router slot",
                                 entry.name()
                             )));
                         }
-                        Some((
-                            centroids_version,
-                            centroids,
-                            offsets,
-                            composite.open_read_with_idx(field, centroid_slot::ROUTER),
-                            bounds,
-                        ))
+                        (Some(_), Some(_), Some(_), None) => {
+                            return Err(TantivyError::InternalError(format!(
+                                "vector field {:?} has no bounds slot",
+                                entry.name()
+                            )));
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 }
-            }
-            Err(OpenReadError::FileDoesNotExist(_)) => None,
-            Err(err) => return Err(err.into()),
-        };
+                Err(OpenReadError::FileDoesNotExist(_)) => None,
+                Err(err) => return Err(err.into()),
+            };
 
         // The id-map variant and the `.centroids` sidecar are two signals of
         // one write-path decision; a mismatch means a corrupt segment, never a
         // fallback.
         let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((version, centroids, offsets, router, bounds))) => Some(
-                IvfIndex::open(version, &options, centroids, offsets, router, bounds)?,
-            ),
+            (IdMap::Explicit(_), Some((version, centroids, offsets, router_slot, bounds))) => {
+                let router = segment_reader.ivf_router().ok_or_else(|| {
+                    TantivyError::InvalidArgument(
+                        "IVF index requires an explicitly configured Router".to_string(),
+                    )
+                })?;
+                Some(IvfIndex::open(
+                    version,
+                    &options,
+                    centroids,
+                    offsets,
+                    router_slot,
+                    router,
+                    bounds,
+                )?)
+            }
             (IdMap::Explicit(_), None) => {
                 return Err(TantivyError::InternalError(format!(
                     "vector field {:?} has cluster-sorted rows but no `.centroids` data",
