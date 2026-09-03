@@ -885,7 +885,34 @@ pub struct IntermediateTermBucketResult {
     pub(crate) doc_count_error_upper_bound: u64,
 }
 
+/// A total order over bucket keys for the tie-break of a sort: keys of one
+/// type order by value, `NaN` included, and keys of different types by type.
+///
+/// Every bucket sort falls back to this, the way Elasticsearch adds `_key`
+/// ascending as the tie-breaker of any order, so the result does not depend
+/// on the order the segments were merged in. The comparison only runs when
+/// the sort keys tie; an order without ties pays nothing.
+fn cmp_keys(left: &Key, right: &Key) -> Ordering {
+    match (left, right) {
+        (Key::F64(left), Key::F64(right)) => left.total_cmp(right),
+        _ => left.partial_cmp(right).unwrap_or(Ordering::Equal),
+    }
+}
+
 impl IntermediateTermBucketResult {
+    /// Buckets computed outside of tantivy, for a caller that finalizes through it.
+    pub fn new(
+        entries: FxHashMap<IntermediateKey, IntermediateTermBucketEntry>,
+        sum_other_doc_count: u64,
+        doc_count_error_upper_bound: u64,
+    ) -> Self {
+        Self {
+            entries,
+            sum_other_doc_count,
+            doc_count_error_upper_bound,
+        }
+    }
+
     /// Returns a reference to the map of bucket entries keyed by [`IntermediateKey`].
     pub fn entries(&self) -> &FxHashMap<IntermediateKey, IntermediateTermBucketEntry> {
         &self.entries
@@ -944,11 +971,13 @@ impl IntermediateTermBucketResult {
                 });
             }
             OrderTarget::Count => {
-                if req.order.order == Order::Desc {
-                    buckets.sort_unstable_by_key(|bucket| std::cmp::Reverse(bucket.doc_count()));
-                } else {
-                    buckets.sort_unstable_by_key(|bucket| bucket.doc_count());
-                }
+                buckets.sort_by(|left, right| {
+                    let by_count = match order {
+                        Order::Desc => right.doc_count().cmp(&left.doc_count()),
+                        Order::Asc => left.doc_count().cmp(&right.doc_count()),
+                    };
+                    by_count.then_with(|| cmp_keys(&left.key, &right.key))
+                });
             }
             OrderTarget::SubAggregation(name) => {
                 let (agg_name, agg_property) = get_agg_name_and_property(&name);
@@ -963,9 +992,12 @@ impl IntermediateTermBucketResult {
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
 
-                buckets_with_val.sort_by(|(_, val1), (_, val2)| match &order {
-                    Order::Desc => val2.total_cmp(val1),
-                    Order::Asc => val1.total_cmp(val2),
+                buckets_with_val.sort_by(|(left, val1), (right, val2)| {
+                    let by_val = match &order {
+                        Order::Desc => val2.total_cmp(val1),
+                        Order::Asc => val1.total_cmp(val2),
+                    };
+                    by_val.then_with(|| cmp_keys(&left.key, &right.key))
                 });
                 buckets = buckets_with_val
                     .into_iter()
