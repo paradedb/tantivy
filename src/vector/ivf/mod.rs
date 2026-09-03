@@ -1,9 +1,4 @@
-//! IVF (inverted-file) vector storage format.
-//!
-//! The unified [`VectorPlugin`](crate::vector::VectorPlugin) routes to
-//! this module when the merge target meets
-//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold),
-//! which defaults to 10k docs.
+//! Inverted-file vector storage and cluster routing.
 
 pub(crate) mod bkt;
 pub(crate) mod graph;
@@ -30,7 +25,7 @@ pub use ivf::{
 };
 pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;
-pub(crate) use training::{decode_row, encode_vector};
+pub(crate) use training::{decode_row, decode_row_append, encode_vector};
 pub use training::{
     BuiltRouter, IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings,
     IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors,

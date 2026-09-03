@@ -282,7 +282,7 @@ fn fixture_uses_selected_storage_format() -> crate::Result<()> {
 fn vector_files_stamp_format_version_header() -> crate::Result<()> {
     use crate::directory::CompositeFile;
     use crate::index::SegmentComponent;
-    use crate::vector::header::{read_header, VectorFileVersion};
+    use crate::vector::header::{read_centroid_header, read_vector_header, VectorFileVersion};
     use crate::vector::ivf::CENTROIDS_EXT;
     use crate::vector::VEC_EXT;
 
@@ -296,7 +296,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
         for segment_reader in searcher.segment_readers() {
             let vec_file =
                 segment_reader.open_read(SegmentComponent::Custom(VEC_EXT.to_string()))?;
-            let (version, body) = read_header(&vec_file)?;
+            let (version, body) = read_vector_header(&vec_file)?;
             assert_eq!(version, VectorFileVersion::V3);
             // Body must be a valid composite — proves the stamp sits in front
             // of the framing, not inside a slot.
@@ -314,7 +314,7 @@ fn vector_files_stamp_format_version_header() -> crate::Result<()> {
                 VectorStorageFormat::Ivf => {
                     let centroids_file = segment_reader
                         .open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
-                    let (version, body) = read_header(&centroids_file)?;
+                    let (version, body) = read_centroid_header(&centroids_file)?;
                     assert_eq!(version, VectorFileVersion::V3);
                     CompositeFile::open(&body)?;
                 }
@@ -474,7 +474,7 @@ fn ivf_merge_writes_centroid_graph_slot() -> crate::Result<()> {
     for segment_reader in searcher.segment_readers() {
         let centroids_file =
             segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
-        let (_version, body) = super::header::read_header(&centroids_file)?;
+        let (_version, body) = super::header::read_centroid_header(&centroids_file)?;
         let composite = CompositeFile::open(&body)?;
         let graph_bytes = composite
             .open_read_with_idx(index.embedding_field(), 2)
@@ -1367,7 +1367,7 @@ mod bounds_storage_tests {
     /// staying exact.
     #[test]
     fn ivf_merge_writes_stacked_slot_at_v3() -> crate::Result<()> {
-        use crate::vector::header::{read_header, VectorFileVersion};
+        use crate::vector::header::{read_centroid_header, VectorFileVersion};
 
         // 8 fixed centroids on a line; two tight docs per centroid split
         // across two commits.
@@ -1393,7 +1393,7 @@ mod bounds_storage_tests {
         let segment_reader = &searcher.segment_readers()[0];
         let centroids_file =
             segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string()))?;
-        let (version, body) = read_header(&centroids_file)?;
+        let (version, body) = read_centroid_header(&centroids_file)?;
         assert_eq!(version, VectorFileVersion::V3, "stacked files stamp V3");
         let composite = CompositeFile::open(&body)?;
         let stacked_bytes = composite
