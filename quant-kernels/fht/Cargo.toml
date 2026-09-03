@@ -1,0 +1,16 @@
+[package]
+name = "fht"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand_chacha.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "rotation"
+harness = false
+
