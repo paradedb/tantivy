@@ -42,7 +42,7 @@ impl RouterKind {
         self,
         options: &VectorOptions,
         centroids: &mut IvfCentroids,
-    ) -> crate::Result<BuiltRouter> {
+    ) -> crate::Result<InMemoryRouter> {
         match self {
             Self::Rng => Ok(Router::Rng(rng::build(options, centroids)?)),
             Self::Stacked => Ok(Router::Stacked(stacked::build(options, centroids)?)),
@@ -56,7 +56,7 @@ impl RouterKind {
         slot: FileSlice,
         centroids: FileSlice,
         options: &VectorOptions,
-    ) -> crate::Result<OpenedRouter> {
+    ) -> crate::Result<LazyRouter> {
         if file_version != VectorFileVersion::V3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -104,10 +104,27 @@ pub(crate) enum Router<S: super::VectorArena<Elem = f32>> {
     Exact(exact::ExactRouter<S>),
 }
 
-pub(crate) type BuiltRouter = Router<InMemoryStore>;
-pub(crate) type OpenedRouter = Router<LazyStore>;
+pub(crate) type InMemoryRouter = Router<InMemoryStore>;
+pub(crate) type LazyRouter = Router<LazyStore>;
 
-impl BuiltRouter {
+impl InMemoryRouter {
+    pub(crate) fn from(
+        kind: RouterKind,
+        options: &VectorOptions,
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Self> {
+        let IvfCentroids::F32(matrix) = &*centroids;
+        let shape = (matrix.rows, matrix.dims, matrix.values.len());
+        let router = kind.build(options, centroids)?;
+        let IvfCentroids::F32(matrix) = &*centroids;
+        if (matrix.rows, matrix.dims, matrix.values.len()) != shape {
+            return Err(crate::TantivyError::InvalidArgument(
+                "Router changed the centroid matrix shape while building".to_string(),
+            ));
+        }
+        Ok(router)
+    }
+
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Rng(_) => RouterKind::Rng,
@@ -163,7 +180,7 @@ impl Iterator for RouterIter<'_, '_> {
     }
 }
 
-impl OpenedRouter {
+impl LazyRouter {
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Rng(_) => RouterKind::Rng,

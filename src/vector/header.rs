@@ -1,14 +1,9 @@
-//! Format version for the per-segment vector files (`.vec` and `.centroids`).
+//! Format version for the vector files: the per-segment `.vec` and the
+//! index-level `centroids.<version>` set file.
 //!
 //! A fixed 4-byte header (a `u32` version) is prepended to every file, ahead of
 //! the [`CompositeFile`](crate::directory::CompositeFile) body. The version is
 //! the wire-layout *generation* — bump it when the framing changes incompatibly.
-//!
-//! For `.vec`, the version is orthogonal to the
-//! [`IdMap`](super::flat::id_map) variant, which selects the storage *mode*
-//! (flat vs IVF) within a generation. For `.centroids`, it versions the IVF
-//! routing composite (centroids, cluster offsets, optional router, required
-//! bounds).
 
 use std::io::{self, Read, Write};
 
@@ -19,45 +14,48 @@ use crate::directory::FileSlice;
 /// Length of the version header in bytes (a single `u32`).
 pub(crate) const HEADER_LEN: usize = 4;
 
-/// On-disk format version of a vector segment file (`.vec` or `.centroids`).
+/// On-disk format version of a vector file (`.vec` or `centroids.<version>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VectorFileVersion {
     V1 = 1,
-    /// `.centroids` carries per-cluster centroid bounds (slot `[3]`) as a
-    /// REQUIRED slot: the bounds gate certifies skips against it, and a
-    /// silently absent bound is indistinguishable from a zero one — so a V2
-    /// file missing the slot is corrupt. A V1 `.centroids` (which shipped,
-    /// and legitimately predates the slot) still opens: its clusters get
-    /// SATURATED bounds (`f32::INFINITY`, always probe), correct but
-    /// unpruned until the next merge rewrites the segment. `.vec` is
-    /// unaffected by the change and V1 `.vec` files stay readable — flat
-    /// segments have no clusters and no bounds.
+    /// The retired `.centroids` sidecar carried per-cluster centroid bounds
+    /// (slot `[3]`) as a REQUIRED slot.
     V2 = 2,
-    /// `.centroids` slot `[2]` carries a router-kind discriminant followed by
-    /// the selected router's payload.
+    /// Centroids are an index-level artifact: the `centroids` file holds the
+    /// centroid rows and the routing structure once per
+    /// index, and every segment assigns against it. `.vec` becomes the
+    /// single per-segment file — cluster-sorted rows plus the per-segment
+    /// remainder (offsets, bounds, IVF meta) — and the per-segment
+    /// `.centroids` sidecar and the flat (doc-ordered) layout are gone.
+    /// A pre-V3 `.vec` is rejected at open with a REINDEX message.
     V3 = 3,
 }
 
-/// `.centroids` composite slot indices for the V3 layout.
-pub(crate) mod centroid_slot {
-    /// The centroid rows themselves.
-    pub(crate) const CENTROIDS: usize = 0;
-    /// Per-cluster posting offsets.
-    pub(crate) const OFFSETS: usize = 1;
-    /// The router kind and payload.
-    pub(crate) const ROUTER: usize = 2;
-    /// Per-cluster centroid bounds.
+/// `.vec` composite slot indices. Slots `[2..=4]` exist exactly when the
+/// field has vector rows in the segment (there is no flat layout from
+/// [`VectorFileVersion::V3`] on); a field with no vectors owns no slots at
+/// all, and a partial slot set is corrupt.
+pub(crate) mod vec_slot {
+    /// Row→doc-id permutation (`IdMap::Explicit`), cluster-sorted, parallel
+    /// to [`ROWS`].
+    pub(crate) const ID_MAP: usize = 0;
+    /// The stored vector rows, cluster-sorted.
+    pub(crate) const ROWS: usize = 1;
+    /// Per-cluster posting offsets: `u64[C+1]` prefix sum over the rows.
+    pub(crate) const OFFSETS: usize = 2;
+    /// Per-cluster centroid bounds: a segment-level kind byte, then the
+    /// per-cluster payload folded over this segment's NATIVE rows.
     pub(crate) const BOUNDS: usize = 3;
+    /// Per-segment IVF metadata: distinct doc count and centroid count.
+    pub(crate) const IVF_META: usize = 4;
 }
 
-/// `.vec` composite slot indices. A different file with a different
-/// layout from `.centroids` — naming both is what stops one file's slot
-/// number being read against the other's meaning.
-pub(crate) mod vec_slot {
-    /// Dense row-id to doc-id map.
-    pub(crate) const ID_MAP: usize = 0;
-    /// The stored vector rows.
-    pub(crate) const ROWS: usize = 1;
+/// `centroids` composite slot indices (the index-level centroid-index file).
+pub(crate) mod centroid_index_slot {
+    /// `num_centroids: u32` + the centroid rows (normalized at creation).
+    pub(crate) const CENTROIDS: usize = 0;
+    /// The required router-kind discriminant and payload over the centroids.
+    pub(crate) const ROUTER: usize = 1;
 }
 
 /// Version stamped into newly written vector files.
@@ -131,13 +129,15 @@ mod tests {
     }
 
     /// A prior generation still PARSES here — the header module knows
-    /// versions, not policy. Rejecting a V1 `.centroids` is the vector
+    /// versions, not policy. Rejecting a pre-V3 `.vec` is the vector
     /// reader's job, where the REINDEX hint can be phrased.
     #[test]
     fn test_prior_version_parses() {
-        let buf = 1u32.to_le_bytes().to_vec();
-        let (version, _) = read_header(&FileSlice::from(buf)).unwrap();
-        assert_eq!(version, VectorFileVersion::V1);
+        for (raw, expected) in [(1u32, VectorFileVersion::V1), (2, VectorFileVersion::V2)] {
+            let buf = raw.to_le_bytes().to_vec();
+            let (version, _) = read_header(&FileSlice::from(buf)).unwrap();
+            assert_eq!(version, expected);
+        }
     }
 
     #[test]
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_truncated_header_rejected() {
-        let buf = vec![2u8, 0];
+        let buf = vec![3u8, 0];
         let err = read_header(&FileSlice::from(buf)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
