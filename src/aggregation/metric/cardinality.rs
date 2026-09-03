@@ -907,6 +907,24 @@ impl CardinalityCollector {
         }
     }
 
+    /// A collector fed by the caller, through [`Self::insert_u64`] and
+    /// [`Self::insert_bytes`], rather than from a segment. The column type salts
+    /// the numeric values the way segment collection does, so the estimate
+    /// merges with one collected from an index.
+    pub fn for_column_type(column_type: ColumnType) -> Self {
+        Self::new(column_type as u8)
+    }
+
+    /// Insert a numeric column value in its stored `u64` form.
+    pub fn insert_u64(&mut self, value: u64) {
+        self.insert(value);
+    }
+
+    /// Insert a term the way the str path does: from its bytes, without a salt.
+    pub fn insert_bytes(&mut self, term: &[u8]) {
+        self.insert_coupon(Coupon::from_hash(term));
+    }
+
     /// Insert a value into the HLL sketch, salted by the column type.
     /// The salt ensures that identical u64 values from different column types
     /// (e.g. bool `false` vs i64 `0`) are counted as distinct.
@@ -929,7 +947,8 @@ impl CardinalityCollector {
         self.sketch.serialize()
     }
 
-    pub(crate) fn merge_fruits(&mut self, right: CardinalityCollector) -> crate::Result<()> {
+    /// Merge another collector's sketch into this one.
+    pub fn merge_fruits(&mut self, right: CardinalityCollector) -> crate::Result<()> {
         let mut union = HllUnion::new(LG_K);
         union.update(&self.sketch);
         union.update(&right.sketch);
