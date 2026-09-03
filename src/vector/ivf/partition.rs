@@ -1,14 +1,4 @@
-//! Trinary-projection-tree (TPT) partitioning, the candidate generator that
-//! seeds the initial KNN graph before
-//! [`refine`](super::RelativeNeighborhoodGraph::refine).
-//!
-//! A TPT recursively splits a slice of node ids along a sparse random
-//! hyperplane — only the few highest-variance dimensions carry a weight, the
-//! rest are implicitly zero (the "trinary" sparsity). Each split direction is
-//! *fit on a sample* of the slice but *applied to the whole slice*, so the fit
-//! cost is independent of slice size. Recursion bottoms out at
-//! [`leaf_size`](TPTreeConfig::leaf_size); the leaves are small contiguous index
-//! ranges the builder brute-forces into exact KNN edges.
+//! Trinary-projection-tree partitioning for graph construction.
 
 use std::ops::Range;
 
@@ -17,19 +7,13 @@ use super::graph::NodeId;
 /// Tuning knobs for [`TPTree`].
 #[derive(Clone, Copy, Debug)]
 pub struct TPTreeConfig {
-    /// Max points in a leaf before recursion stops. The per-leaf exact KNN is
-    /// quadratic in this, so it trades build cost for init-graph recall.
+    /// Maximum points per leaf.
     pub leaf_size: usize,
-    /// How many points of each slice to sample when fitting a split
-    /// direction. The split is fit on the sample, then applied to the whole
-    /// slice.
+    /// Samples used to fit each split.
     pub samples: usize,
-    /// How many of the highest-variance dimensions carry a nonzero projection
-    /// weight; every other dimension is weighted zero.
+    /// Dimensions used by each sparse projection.
     pub top_dims: usize,
-    /// Random unit-norm projections tried per split; the one that spreads the
-    /// sample most (max projected variance) wins, with the single
-    /// highest-variance axis as the baseline.
+    /// Candidate projections evaluated per split.
     pub iterations: usize,
 }
 
@@ -44,7 +28,7 @@ impl Default for TPTreeConfig {
     }
 }
 
-/// A single TPT over a flat, `dim`-strided vector arena.
+/// Trinary projection tree over strided vectors.
 pub struct TPTree<'a> {
     vectors: &'a [f32],
     dim: usize,
@@ -53,14 +37,7 @@ pub struct TPTree<'a> {
 }
 
 impl<'a> TPTree<'a> {
-    /// * `config` (`TPTreeConfig`) — split and leaf-size configuration.
-    /// * `dim` (`usize`) — vector dimensionality; must be non-zero.
-    /// * `vectors` (`&[f32]`) — flat `dim`-strided buffer; length must be a multiple of `dim`.
-    /// * `seed` (`u64`) — fixed split-direction RNG seed: builds must be reproducible; the value
-    ///   doesn't matter.
-    ///
-    /// Returns (`TPTree`): the tree; callers that union several trees reuse
-    /// one instance so the RNG advances from tree to tree.
+    /// Creates a partition tree over strided vectors.
     pub fn new(config: TPTreeConfig, dim: usize, vectors: &'a [f32], seed: u64) -> Self {
         debug_assert!(dim > 0, "dim must be non-zero");
         debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
@@ -72,9 +49,7 @@ impl<'a> TPTree<'a> {
         }
     }
 
-    /// Partitions `indices` in place and returns the leaf ranges into it.
-    /// Each returned range is a contiguous run of `indices` holding one
-    /// leaf's node ids (at most [`leaf_size`](TPTreeConfig::leaf_size)).
+    /// Partitions node identifiers in place and returns leaf ranges.
     pub fn partition(&mut self, indices: &mut [NodeId]) -> Vec<Range<usize>> {
         let mut leaves = Vec::new();
         if !indices.is_empty() {
@@ -88,8 +63,7 @@ impl<'a> TPTree<'a> {
         self.vectors[node as usize * self.dim + d]
     }
 
-    /// Recursively splits `indices` (whose first element sits at absolute
-    /// `offset` in the original array), appending leaf ranges to `leaves`.
+    /// Recursively partitions one node range.
     fn subdivide(&mut self, indices: &mut [NodeId], offset: usize, leaves: &mut Vec<Range<usize>>) {
         if indices.len() <= self.config.leaf_size {
             leaves.push(offset..offset + indices.len());
@@ -101,10 +75,7 @@ impl<'a> TPTree<'a> {
         self.subdivide(right, offset + split, leaves);
     }
 
-    /// Picks a split hyperplane for `indices` and partitions the slice around
-    /// it in place, returning the boundary `split` (left = `[0, split)`,
-    /// right = `[split, len)`). The boundary is always in `1..len`, so each
-    /// child is strictly smaller and the recursion terminates.
+    /// Partitions nodes around a fitted projection.
     fn choose_split(&mut self, indices: &mut [NodeId]) -> usize {
         let n = indices.len();
         let dim = self.dim;
@@ -121,7 +92,6 @@ impl<'a> TPTree<'a> {
             *m /= sample as f32;
         }
 
-        // Sum of squared deviations; comparisons only, so never normalized.
         let mut variance = vec![0.0f32; dim];
         for &node in &indices[..sample] {
             for (d, var) in variance.iter_mut().enumerate() {
@@ -134,13 +104,11 @@ impl<'a> TPTree<'a> {
         dims.sort_unstable_by(|&a, &b| variance[b].total_cmp(&variance[a]));
         dims.truncate(top_dims);
 
-        // Baseline: project onto the single highest-variance axis.
         let mut best_weight = vec![0.0f32; top_dims];
         best_weight[0] = 1.0;
         let mut best_mean = mean[dims[0]];
         let mut best_var = variance[dims[0]];
 
-        // Random unit-norm projections; keep whichever spreads the sample most.
         let mut proj = vec![0.0f32; sample];
         let mut weight = vec![0.0f32; top_dims];
         for _ in 0..self.config.iterations {
@@ -180,8 +148,6 @@ impl<'a> TPTree<'a> {
             }
         }
 
-        // Partition the whole slice (not just the sample) around the chosen
-        // hyperplane. Signed so `j` can cross below zero.
         let mut i: isize = 0;
         let mut j: isize = n as isize - 1;
         while i <= j {
@@ -198,8 +164,6 @@ impl<'a> TPTree<'a> {
             }
         }
 
-        // Everything landed on one side (e.g. identical vectors): fall back to
-        // a median split so the recursion still shrinks.
         let split = i as usize;
         if split == 0 || split == n {
             n / 2
@@ -219,18 +183,15 @@ mod tests {
 
     #[test]
     fn partition_separates_two_far_clusters() {
-        // Two clusters far apart in the x–z plane (y is low-variance noise).
-        // One split must cleanly separate them: max-variance projection puts
-        // the threshold in the gap, so no leaf mixes the two.
         let pts = [
             [1., 5., 1.],
             [2., 5., 0.],
             [0., 4., 2.],
-            [1., 6., 1.], // cluster A: ids 0..4
+            [1., 6., 1.],
             [9., 5., 10.],
             [10., 5., 9.],
             [8., 4., 11.],
-            [9., 6., 10.], // cluster B: ids 4..8
+            [9., 6., 10.],
         ];
         let v = arena(&pts);
         let config = TPTreeConfig {
@@ -255,9 +216,6 @@ mod tests {
 
     #[test]
     fn partition_terminates_on_identical_vectors() {
-        // Every vector identical → no projection separates anything. The
-        // median-split fallback must still drive recursion to leaves rather
-        // than loop forever.
         let v = vec![0.0f32; 3 * 8];
         let config = TPTreeConfig {
             leaf_size: 2,
