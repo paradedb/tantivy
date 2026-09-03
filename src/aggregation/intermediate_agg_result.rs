@@ -887,6 +887,11 @@ pub struct IntermediateTermBucketResult {
 
 /// A total order over bucket keys for the tie-break of a sort: keys of one
 /// type order by value, `NaN` included, and keys of different types by type.
+///
+/// Every bucket sort falls back to this, the way Elasticsearch adds `_key`
+/// ascending as the tie-breaker of any order, so the result does not depend
+/// on the order the segments were merged in. The comparison only runs when
+/// the sort keys tie; an order without ties pays nothing.
 fn cmp_keys(left: &Key, right: &Key) -> Ordering {
     match (left, right) {
         (Key::F64(left), Key::F64(right)) => left.total_cmp(right),
@@ -965,8 +970,6 @@ impl IntermediateTermBucketResult {
                     .expect("expected type string, which is always sortable")
                 });
             }
-            // Ties break on the key, so the order does not depend on how the
-            // entries were merged.
             OrderTarget::Count => {
                 buckets.sort_by(|left, right| {
                     let by_count = match order {
