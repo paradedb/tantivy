@@ -1328,6 +1328,7 @@ mod bounds_storage_tests {
             let query = [c[0] + 0.3, 0.2];
             let owned: Vec<_> = stacked
                 .search(&query, 2, 1.0, Metric::L2)
+                .0
                 .into_iter()
                 .take(2)
                 .collect();

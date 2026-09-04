@@ -2,12 +2,18 @@
 //! against exact ground truth as a function of `nprobe`.
 //!
 //! Usage:
-//!   cargo bench --bench ivf_recall -- [n] [queries] [train_fraction]
+//!   [DATASET=cohere|sift] cargo bench --bench ivf_recall -- [n] [queries]
 //!
-//! Loads `data/data_cohere_1m.bin` (or `$COHERE_PATH`): Cohere Embed-V3,
-//! 1M × 1024 little-endian f32s. Download with superkmeans-rs
-//! `scripts/download_cohere.py`. Falls back to synthetic blobs if the
-//! dump is missing.
+//! `cohere` (default): `data/data_cohere_1m.bin` (or `$COHERE_PATH`),
+//! Cohere Embed-V3, 1M × 1024 little-endian f32s. Download with
+//! superkmeans-rs `scripts/download_cohere.py`. Queries are held-out
+//! rows from the tail of the requested prefix.
+//!
+//! `sift`: `data/sift/` (or `$SIFT_DIR`) holding texmex `sift_base.fvecs`
+//! and `sift_query.fvecs` (1M × 128). Queries come from the query file.
+//! Download: `curl -O ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz`.
+//!
+//! Falls back to synthetic blobs if the dataset is missing.
 
 use std::env;
 use std::fs::File;
@@ -17,19 +23,38 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use tantivy::schema::Metric;
-use tantivy::vector::{IvfConfig, IvfIndexBuilder, SuperKMeansLevelClusterer, l2_squared};
+use tantivy::vector::{l2_squared, IvfConfig, IvfIndexBuilder, SuperKMeansLevelClusterer};
 
 const COHERE_N: usize = 1_000_000;
 const COHERE_D: usize = 1024;
 const TOP_K: usize = 10;
-const BRANCHING_FACTOR: usize = 16;
+const BRANCHING_FACTOR: usize = 200;
+const MAX_LEAF_SIZE: usize = 100;
+/// Quake's `f_M`: initial candidate fraction at L0.
+const APS_FRACTION: f32 = 0.02;
+
+fn data_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data")
+}
 
 fn cohere_path() -> PathBuf {
     env::var_os("COHERE_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/data_cohere_1m.bin")
-        })
+        .unwrap_or_else(|| data_dir().join("data_cohere_1m.bin"))
+}
+
+fn sift_dir() -> PathBuf {
+    env::var_os("SIFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir().join("sift"))
+}
+
+/// Base rows, query rows, and dimension.
+struct Dataset {
+    name: String,
+    base: Vec<f32>,
+    queries: Vec<f32>,
+    d: usize,
 }
 
 /// Read the first `rows` vectors of the Cohere dump, or `None` if it is absent.
@@ -59,6 +84,102 @@ fn load_cohere(rows: usize) -> Option<(Vec<f32>, usize)> {
     Some((floats, COHERE_D))
 }
 
+/// Read up to `rows` vectors from a texmex `.fvecs` file: each row is a
+/// little-endian `i32` dimension followed by that many `f32`s.
+fn load_fvecs(path: &PathBuf, rows: usize) -> Option<(Vec<f32>, usize)> {
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; 4];
+    file.read_exact(&mut header).ok()?;
+    let d = i32::from_le_bytes(header) as usize;
+    assert!(d > 0, "fvecs dim must be positive");
+    let meta = std::fs::metadata(path).ok()?;
+    let row_bytes = (d + 1) * size_of::<f32>();
+    let available = meta.len() as usize / row_bytes;
+    let rows = rows.min(available);
+
+    let mut file = File::open(path).ok()?;
+    let mut raw = vec![0u8; rows * row_bytes];
+    file.read_exact(&mut raw).ok()?;
+    let mut floats = Vec::with_capacity(rows * d);
+    for row in raw.chunks_exact(row_bytes) {
+        let dim = i32::from_le_bytes(row[..4].try_into().unwrap()) as usize;
+        assert_eq!(dim, d, "fvecs rows must share one dimension");
+        floats.extend(
+            row[4..]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
+        );
+    }
+    Some((floats, d))
+}
+
+fn load_sift(n: usize, n_queries: usize) -> Option<Dataset> {
+    let dir = sift_dir();
+    let (base, d) = load_fvecs(&dir.join("sift_base.fvecs"), n)?;
+    let (queries, dq) = load_fvecs(&dir.join("sift_query.fvecs"), n_queries)?;
+    assert_eq!(d, dq, "SIFT base and query dims differ");
+    Some(Dataset {
+        name: format!(
+            "SIFT1M (first {} base rows) from {}",
+            base.len() / d,
+            dir.display()
+        ),
+        base,
+        queries,
+        d,
+    })
+}
+
+fn load_dataset(n: usize, n_queries: usize) -> Dataset {
+    let which = env::var("DATASET").unwrap_or_else(|_| "cohere".to_string());
+    match which.as_str() {
+        "sift" => {
+            if let Some(ds) = load_sift(n, n_queries) {
+                return ds;
+            }
+            println!(
+                "SIFT not found under {} (set SIFT_DIR). Download:\n  \
+                 curl -O ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz && tar xzf sift.tar.gz",
+                sift_dir().display()
+            );
+        }
+        "cohere" => {
+            if let Some((all, d)) = load_cohere(n + n_queries) {
+                let name = format!(
+                    "Cohere 1M (first {} rows) from {}",
+                    n + n_queries,
+                    cohere_path().display()
+                );
+                return split_tail(name, all, d, n_queries);
+            }
+            println!(
+                "Cohere dump not found. Place 1M×1024 f32s at {} or set COHERE_PATH.\n\
+                 Download: uv run --script scripts/download_cohere.py (paradedb/superkmeans-rs)",
+                cohere_path().display()
+            );
+        }
+        other => panic!("unknown DATASET={other}; expected cohere or sift"),
+    }
+    let d = 64;
+    let n_syn = n.min(4_000);
+    let n_queries = n_queries.min(50);
+    let all = make_blobs(n_syn + n_queries, d, 32, 42);
+    split_tail("synthetic blobs".to_string(), all, d, n_queries)
+}
+
+/// Hold out the last `n_queries` rows of `all` as queries.
+fn split_tail(name: String, mut all: Vec<f32>, d: usize, n_queries: usize) -> Dataset {
+    let total = all.len() / d;
+    let n_queries = n_queries.min(total.saturating_sub(1));
+    let queries = all.split_off((total - n_queries) * d);
+    Dataset {
+        name,
+        base: all,
+        queries,
+        d,
+    }
+}
+
 fn make_blobs(n: usize, d: usize, n_clusters: usize, seed: u64) -> Vec<f32> {
     let mut state = seed;
     let mut next = || {
@@ -82,13 +203,15 @@ fn make_blobs(n: usize, d: usize, n_clusters: usize, seed: u64) -> Vec<f32> {
     data
 }
 
-/// Exact top-`TOP_K` neighbors of each query, by brute force (L2).
+/// Exact top-`k` neighbors of each query, by brute force (L2), sorted
+/// nearest-first so any prefix is the exact top-`k'` for `k' <= k`.
 fn ground_truth(
     base: &[f32],
     n: usize,
     queries: &[f32],
     n_queries: usize,
     d: usize,
+    k: usize,
 ) -> Vec<Vec<u32>> {
     (0..n_queries)
         .into_par_iter()
@@ -97,8 +220,9 @@ fn ground_truth(
             let mut scored: Vec<(f32, u32)> = (0..n)
                 .map(|i| (l2_squared(query, &base[i * d..(i + 1) * d]), i as u32))
                 .collect();
-            scored.select_nth_unstable_by(TOP_K - 1, |a, b| a.0.total_cmp(&b.0));
-            scored.truncate(TOP_K);
+            scored.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
+            scored.truncate(k);
+            scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             scored.into_iter().map(|(_, i)| i).collect()
         })
         .collect()
@@ -110,6 +234,45 @@ fn invert_perm(perm: &[u32]) -> Vec<u32> {
         inv[new as usize] = old as u32;
     }
     inv
+}
+
+/// Mean (recall@k, similarity computations, lists scanned, ms/query) over
+/// all queries. Counts cover every level of the stack, so `%_sims` is total
+/// query cost relative to brute force, not just L0 rows touched.
+fn evaluate(
+    index: &tantivy::vector::InMemoryStackedIvf,
+    queries: &[f32],
+    n_queries: usize,
+    d: usize,
+    recall_target: f32,
+    truth: &[Vec<u32>],
+    inv: &[u32],
+) -> (f64, f64, f64, f64) {
+    let t0 = Instant::now();
+    let (recall_sum, cand_sum, list_sum) = (0..n_queries)
+        .into_par_iter()
+        .map(|q| {
+            let query = &queries[q * d..(q + 1) * d];
+            let (hits, stats) = index.search(query, TOP_K, recall_target, Metric::L2);
+            let found = hits
+                .iter()
+                .filter(|h| truth[q].contains(&inv[usize::from(h.node)]))
+                .count();
+            (
+                found as f64 / TOP_K as f64,
+                stats.members_scored as f64,
+                stats.lists_scanned as f64,
+            )
+        })
+        .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+    let elapsed = t0.elapsed().as_secs_f64();
+    let nq = n_queries as f64;
+    (
+        recall_sum / nq,
+        cand_sum / nq,
+        list_sum / nq,
+        1e3 * elapsed / nq,
+    )
 }
 
 fn main() {
@@ -130,53 +293,31 @@ fn main() {
         .get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
-    let train_fraction: f64 = positional
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1.0);
 
-    let (all, d) = match load_cohere(n + n_queries) {
-        Some(v) => {
-            println!(
-                "dataset: Cohere 1M (first {} rows) from {}",
-                n + n_queries,
-                cohere_path().display()
-            );
-            v
-        }
-        None => {
-            println!(
-                "dataset: synthetic blobs (Cohere dump not found).\n\
-                 Place 1M×1024 f32s at {} or set COHERE_PATH.\n\
-                 Download: uv run --script scripts/download_cohere.py\n\
-                 (from paradedb/superkmeans-rs)",
-                cohere_path().display()
-            );
-            let d = 64;
-            let n_syn = n.min(4_000);
-            (make_blobs(n_syn + n_queries.min(50), d, 32, 42), d)
-        }
-    };
-    let n = (all.len() / d).saturating_sub(n_queries).max(1);
-    let n_queries = n_queries.min(all.len() / d - n);
-    let (base, queries) = all.split_at(n * d);
+    let dataset = load_dataset(n, n_queries);
+    println!("dataset: {}", dataset.name);
+    let d = dataset.d;
+    let base = dataset.base.as_slice();
+    let queries = dataset.queries.as_slice();
+    let n = base.len() / d;
+    let n_queries = queries.len() / d;
 
-    if (train_fraction - 1.0).abs() > f64::EPSILON {
-        println!(
-            "note: train_fraction={train_fraction} is ignored; \
-             stacked IVF trains on all {n} members"
-        );
-    }
-
-    println!("n={n} d={d} queries={n_queries} top_k={TOP_K} branching={BRANCHING_FACTOR}");
+    println!(
+        "n={n} d={d} queries={n_queries} top_k={TOP_K} \
+         branching={BRANCHING_FACTOR} max_leaf_size={MAX_LEAF_SIZE}"
+    );
 
     print!("computing exact ground truth... ");
     let t0 = Instant::now();
-    let truth = ground_truth(base, n, queries, n_queries, d);
+    let truth = ground_truth(base, n, queries, n_queries, d, TOP_K);
     println!("{:.1}s", t0.elapsed().as_secs_f64());
 
     let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-    let config = IvfConfig::new(BRANCHING_FACTOR);
+    let config = IvfConfig {
+        branching_factor: BRANCHING_FACTOR,
+        max_leaf_size: MAX_LEAF_SIZE,
+        ..Default::default()
+    };
     println!("building stacked IVF...");
     let t0 = Instant::now();
     let (mut index, perm) = IvfIndexBuilder::new(base.to_vec(), n, d, &clusterer, config).build();
@@ -188,13 +329,15 @@ fn main() {
         index.nlist(),
         build_secs
     );
-
     let nlist = index.nlist();
+
+    // Fixed-nprobe baseline. With `recall=1.0` the top level ranks every
+    // centroid, so routing is exact: this is flat IVF with an oracle nprobe.
     println!(
         "\n{:<8} {:<10} {:<12} {:<10} {:>6}",
         "nprobe",
         "lists",
-        "%_of_base",
+        "%_sims",
         format!("recall@{TOP_K}"),
         "ms/q"
     );
@@ -203,73 +346,31 @@ fn main() {
             break;
         }
         index.config.nprobe_fraction = nprobe as f32 / nlist as f32;
-
-        let t0 = Instant::now();
-        let (recall_sum, cand_sum, list_sum) = (0..n_queries)
-            .into_par_iter()
-            .map(|q| {
-                let query = &queries[q * d..(q + 1) * d];
-                let stats = index.search_with_stats(query, TOP_K, 1.0, Metric::L2);
-                let found = stats
-                    .hits
-                    .iter()
-                    .filter(|h| truth[q].contains(&inv[usize::from(h.node)]))
-                    .count();
-                (
-                    found as f64 / TOP_K as f64,
-                    stats.members_scored as f64,
-                    stats.lists_scanned as f64,
-                )
-            })
-            .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
-        let elapsed = t0.elapsed().as_secs_f64();
-
-        let mean_cand = cand_sum / n_queries as f64;
-        let mean_lists = list_sum / n_queries as f64;
+        let (recall, cands, lists, ms) = evaluate(&index, queries, n_queries, d, 1.0, &truth, &inv);
         println!(
-            "{nprobe:<8} {mean_lists:<10.1} {:<12.2} {:<10.4} {:>6.2}",
-            100.0 * mean_cand / n as f64,
-            recall_sum / n_queries as f64,
-            1e3 * elapsed / n_queries as f64,
+            "{nprobe:<8} {lists:<10.1} {:<12.2} {recall:<10.4} {ms:>6.2}",
+            100.0 * cands / n as f64
         );
     }
 
-    index.config.nprobe_fraction = 0.10;
+    index.config.nprobe_fraction = APS_FRACTION;
     println!(
-        "\n{:<8} {:<10} {:<12} {:<10} {:>6}",
+        "\nAPS: f_M={APS_FRACTION} -> {} candidate lists, parent recall {}\n\
+         {:<8} {:<10} {:<12} {:<10} {:>6}",
+        index.n_probe(),
+        index.config.parent_recall_target,
         "target",
         "lists",
-        "%_of_base",
+        "%_sims",
         format!("recall@{TOP_K}"),
         "ms/q"
     );
-    for target in [0.80f32, 0.90, 0.99] {
-        let t0 = Instant::now();
-        let (recall_sum, cand_sum, list_sum) = (0..n_queries)
-            .into_par_iter()
-            .map(|q| {
-                let query = &queries[q * d..(q + 1) * d];
-                let stats = index.search_with_stats(query, TOP_K, target, Metric::L2);
-                let found = stats
-                    .hits
-                    .iter()
-                    .filter(|h| truth[q].contains(&inv[usize::from(h.node)]))
-                    .count();
-                (
-                    found as f64 / TOP_K as f64,
-                    stats.members_scored as f64,
-                    stats.lists_scanned as f64,
-                )
-            })
-            .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
-        let elapsed = t0.elapsed().as_secs_f64();
-        let mean_cand = cand_sum / n_queries as f64;
-        let mean_lists = list_sum / n_queries as f64;
+    for target in [0.80f32, 0.90, 0.95, 0.99] {
+        let (recall, cands, lists, ms) =
+            evaluate(&index, queries, n_queries, d, target, &truth, &inv);
         println!(
-            "{target:<8.2} {mean_lists:<10.1} {:<12.2} {:<10.4} {:>6.2}",
-            100.0 * mean_cand / n as f64,
-            recall_sum / n_queries as f64,
-            1e3 * elapsed / n_queries as f64,
+            "{target:<8.2} {lists:<10.1} {:<12.2} {recall:<10.4} {ms:>6.2}",
+            100.0 * cands / n as f64
         );
     }
 }
