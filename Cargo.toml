@@ -178,6 +178,7 @@ columnar-zstd-compression = ["columnar/zstd-compression"]
 
 failpoints = ["fail", "fail/failpoints"]
 unstable = []                            # useful for benches.
+quantization-bench = []                  # non-default C4/C5 measurement receipts
 
 paradedb = ["columnar/paradedb"]
 
@@ -291,3 +292,8 @@ harness = false
 [[bench]]
 name = "vector_quantization_writer"
 harness = false
+
+[[bench]]
+name = "vector_quantization_scan"
+harness = false
+required-features = ["quantization-bench"]

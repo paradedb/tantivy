@@ -1,54 +1,25 @@
-//! Distance kernels for the flat vector index.
-//!
-//! Each kernel uses a chunked-scalar accumulator pattern: an array of
-//! `LANES` independent f32 accumulators with no loop-carried dependency.
-//! LLVM's autovectorizer turns this into AVX2 / AVX-512 / NEON FMA loops
-//! on the platforms that support them, without any explicit `std::arch`
-//! intrinsics.
-//!
-//! `LANES = 16` matches the f32 width of an AVX-512 register
-//! (`512 bits / sizeof::<f32>() == 16`), and is a multiple of the AVX2
-//! (8) and NEON (4) widths.
-//!
-//! Kernels are generic over [`VectorElement`]. For `f32` the arithmetic
-//! methods compile to plain `fsub` / `fmul` / `fadd`; quantized dtypes
-//! plug in their own decode + arithmetic via the trait.
+//! Vector distance and similarity kernels.
 
 use std::cmp::Ordering;
 
 use crate::schema::{Metric, VectorDType, VectorOptions};
 use crate::vector::{Accumulator, VectorElement};
 
-/// A "higher is better" similarity score — the one ranking convention of the
-/// whole vector module.
-///
-/// The raw kernels below ([`l2_squared`], [`dot`], …) return bare `f32`s in
-/// whatever space the math lives in; [`Metric::similarity`] is the boundary
-/// that folds them all into similarity space (negating L2) and wraps the
-/// result. Downstream code — edge ordering, beam search, RNG occlusion —
-/// compares `Similarity` values directly and never re-negates, so a distance
-/// can't be confused for a similarity without an explicit
-/// [`Similarity::new`].
-///
-/// Ordered totally via [`f32::total_cmp`], so it works directly in heaps and
-/// sorts: greater means more similar, and "best-first" always means
-/// descending `Similarity`.
+/// Totally ordered higher-is-better similarity score.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Similarity(f32);
 
 impl Similarity {
-    /// Less similar than any real score (`-∞`); the empty-slot sentinel.
+    /// Similarity below every finite score.
     pub const WORST: Similarity = Similarity(f32::NEG_INFINITY);
 
-    /// Wraps a raw score that is *already* in similarity space (higher is
-    /// better). Callers converting from a distance must negate first — that
-    /// negation is exactly what this type exists to make explicit.
+    /// Wraps a higher-is-better score.
     #[inline]
     pub fn new(score: f32) -> Self {
         Similarity(score)
     }
 
-    /// The raw score, e.g. to hand off as a document [`Score`](crate::Score).
+    /// Returns the raw score.
     #[inline]
     pub fn score(self) -> f32 {
         self.0
@@ -71,7 +42,7 @@ impl PartialOrd for Similarity {
     }
 }
 
-/// 16 = 512 (avx512 register width) / 32 (sizeof::<f32>() in bits).
+/// Number of independent reduction accumulators.
 const LANES: usize = 16;
 
 /// Squared Euclidean distance.
@@ -124,10 +95,7 @@ pub fn norm_squared<T: VectorElement>(a: &[T]) -> f32 {
     norm_squared_wide(a) as f32
 }
 
-/// `norm_squared` with wide per-lane accumulation: elements widen to
-/// [`VectorElement::Acc`] *before* squaring ([`VectorElement::mul_wide`]),
-/// so no finite input can overflow the narrow element type — for f32,
-/// any sum of finite squares is finite in f64.
+/// Sum of squares using widened accumulation.
 #[inline]
 pub(crate) fn norm_squared_wide<T: VectorElement>(a: &[T]) -> f64 {
     let chunks = a.chunks_exact(LANES);
@@ -149,8 +117,7 @@ pub(crate) fn norm_squared_wide<T: VectorElement>(a: &[T]) -> f64 {
     acc.to_f64()
 }
 
-/// Cosine similarity: `dot(a, b) / (||a|| * ||b||)`. Returns 0.0 if either
-/// vector has zero norm — avoids NaN propagating into top-K heaps.
+/// Cosine similarity, or zero when either vector has zero norm.
 #[inline]
 pub fn cosine<T: VectorElement>(a: &[T], b: &[T]) -> f32 {
     let na = norm_squared(a).sqrt();
@@ -161,18 +128,7 @@ pub fn cosine<T: VectorElement>(a: &[T], b: &[T]) -> f32 {
     dot(a, b) / (na * nb)
 }
 
-// =====================================================================
-// Byte-input variants: avoid materializing the doc-side vector into an
-// intermediate scratch buffer. The doc bytes are decoded inline inside
-// the chunked accumulator, so the segment scan touches each byte
-// exactly once regardless of directory backend (mmap, RAM, or custom).
-// =====================================================================
-
 /// `l2_squared` where the doc side is little-endian bytes encoding `T`.
-///
-/// Uses `chunks_exact` so LLVM sees fixed-length inner slices and can
-/// elide bounds checks + autovectorize the chunked accumulator into
-/// 4-wide NEON / 8-wide AVX2 / 16-wide AVX-512 SIMD.
 #[inline]
 pub fn l2_squared_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {
     debug_assert_eq!(doc_bytes.len(), query.len() * T::SIZE_BYTES);
@@ -220,6 +176,14 @@ pub fn dot_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {
     acc
 }
 
+/// Runs the binary32 byte-backed dot kernel.
+#[cfg(feature = "quantization-bench")]
+#[doc(hidden)]
+#[inline(never)]
+pub fn quantization_bench_dot_bytes_f32(query: &[f32], doc_bytes: &[u8]) -> f32 {
+    dot_bytes::<f32>(query, doc_bytes)
+}
+
 /// `norm_squared` over little-endian bytes encoding `T`.
 #[inline]
 pub fn norm_squared_bytes<T: VectorElement>(doc_bytes: &[u8]) -> f32 {
@@ -257,19 +221,13 @@ pub(crate) fn norm_squared_bytes_wide<T: VectorElement>(doc_bytes: &[u8]) -> f64
 pub(crate) enum NormalizeOutcome {
     /// Row rescaled to unit norm.
     Normalized,
-    /// Zero vector: normalization is undefined but the data is honest;
-    /// row left unchanged. `dot(q, 0) = 0`, so it scores 0 everywhere.
+    /// Zero vector left unchanged.
     ZeroSkipped,
-    /// With wide accumulation, a non-finite norm occurs IF AND ONLY IF
-    /// the input contains a NaN or ±inf element (finite f32 elements
-    /// sum to at most ~1.8e80, always finite in f64). Row left
-    /// unchanged; the caller decides policy.
+    /// Non-finite row left unchanged.
     NonFinite,
 }
 
-/// L2-normalize a little-endian `T` row in place, with all internal
-/// arithmetic in f64 (see [`norm_squared_bytes_wide`]). Elements narrow
-/// back to `T` only at write-back, where every value is `<= 1`.
+/// Normalizes a little-endian row in place using widened arithmetic.
 pub(crate) fn normalize_bytes_inplace<T: VectorElement>(row: &mut [u8]) -> NormalizeOutcome {
     debug_assert_eq!(row.len() % T::SIZE_BYTES, 0);
     let norm = norm_squared_bytes_wide::<T>(row).sqrt();
@@ -290,13 +248,7 @@ pub(crate) fn normalize_bytes_inplace<T: VectorElement>(row: &mut [u8]) -> Norma
     NormalizeOutcome::Normalized
 }
 
-/// L2-normalize `row` in place if `opts` requires write-time
-/// unit-normalization (see [`VectorOptions::needs_normalization`]).
-///
-/// Pre-normalizing at write time lets
-/// [`PreparedQuery::score_doc_bytes`](crate::vector::PreparedQuery::score_doc_bytes)
-/// reduce per-doc cosine work to `dot * inv_norm_q` — no per-doc
-/// `norm_squared_bytes` pass.
+/// Normalizes a row when required by its vector options.
 pub(crate) fn maybe_normalize_bytes(opts: &VectorOptions, row: &mut [u8]) -> NormalizeOutcome {
     debug_assert_eq!(row.len(), opts.bytes_per_vector());
     if !opts.needs_normalization() {
@@ -319,11 +271,7 @@ pub fn cosine_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {
 }
 
 impl Metric {
-    /// Compute the [`Similarity`] of two vectors.
-    ///
-    /// L2 distance is negated (squared, then sign-flipped) here, and only
-    /// here, so all metrics share the same "higher is better" convention.
-    /// Magnitude differences across metrics are the caller's problem.
+    /// Computes vector similarity.
     #[inline]
     pub fn similarity<T: VectorElement>(self, query: &[T], doc: &[T]) -> Similarity {
         Similarity(match self {
@@ -333,9 +281,7 @@ impl Metric {
         })
     }
 
-    /// Like [`similarity`](Self::similarity), but the doc side is
-    /// little-endian bytes — typically a borrowed slice straight out
-    /// of the segment's file.
+    /// Computes similarity with a little-endian document row.
     #[inline]
     pub fn similarity_bytes<T: VectorElement>(self, query: &[T], doc_bytes: &[u8]) -> Similarity {
         Similarity(match self {
@@ -355,7 +301,6 @@ mod tests {
     fn test_l2_squared() {
         let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
         let b: [f32; 4] = [4.0, 3.0, 2.0, 1.0];
-        // (1-4)^2 + (2-3)^2 + (3-2)^2 + (4-1)^2 = 9+1+1+9 = 20
         assert!((l2_squared(&a, &b) - 20.0).abs() < 1e-6);
     }
 
@@ -363,7 +308,6 @@ mod tests {
     fn test_dot() {
         let a: [f32; 3] = [1.0, 2.0, 3.0];
         let b: [f32; 3] = [4.0, 5.0, 6.0];
-        // 1*4 + 2*5 + 3*6 = 4+10+18 = 32
         assert!((dot(&a, &b) - 32.0).abs() < 1e-6);
     }
 
@@ -408,7 +352,6 @@ mod tests {
 
     #[test]
     fn test_byte_kernels_match_f32_kernels() {
-        // Random-ish data that exercises both the chunked path and the tail.
         let dim = LANES + 5;
         let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.137 - 1.3).collect();
         let b: Vec<f32> = (0..dim).map(|i| (i as f32).sin()).collect();
@@ -423,11 +366,9 @@ mod tests {
 
     #[test]
     fn test_long_vector_chunking() {
-        // Exercise both the chunked path and the tail.
         let dim = LANES * 2 + 3;
         let a: Vec<f32> = (0..dim).map(|i| i as f32 * 0.1).collect();
         let b: Vec<f32> = (0..dim).map(|i| (i + 1) as f32 * 0.1).collect();
-        // L2² = sum (-0.1)^2 = dim * 0.01
         let expected = dim as f32 * 0.01;
         assert!((l2_squared(&a, &b) - expected).abs() < 1e-4);
     }
@@ -452,7 +393,6 @@ mod tests {
         let out = floats(&buf);
         let n: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((n - 1.0).abs() < 1e-6, "norm={n}, out={out:?}");
-        // Direction preserved (dot with input ⇒ original L2 norm).
         let dot = 3.0 * out[0] + 0.0 * out[1] + 4.0 * out[2];
         assert!((dot - 5.0).abs() < 1e-5, "dot={dot}");
     }
@@ -525,8 +465,6 @@ mod tests {
 
     #[test]
     fn wide_accumulation_single_square() {
-        // 1e20² = 1e40 overflows f32 (max ~3.4e38); the old narrow kernel
-        // returned inf and the guard left the row raw.
         let mut buf = bytes(&[1e20_f32, 1.0]);
         let n2 = norm_squared_bytes_wide::<f32>(&buf);
         assert!(n2.is_finite(), "n2={n2}");
@@ -538,15 +476,12 @@ mod tests {
         let out = floats(&buf);
         let n: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((n - 1.0).abs() < 1e-3, "norm={n}, out={out:?}");
-        // Direction preserved: dominated by the first component.
         assert!((out[0] - 1.0).abs() < 1e-3, "out={out:?}");
         assert!(out[1] >= 0.0, "out={out:?}");
     }
 
     #[test]
     fn wide_accumulation_sum_across_dims() {
-        // Each square (2.5e35) is a finite f32, but 1536 of them sum to
-        // ~3.8e38 > f32::MAX — the old fold overflowed across dimensions.
         let v = vec![5e17_f32; 1536];
         let mut buf = bytes(&v);
         assert!(norm_squared_bytes_wide::<f32>(&buf).is_finite());
@@ -561,8 +496,6 @@ mod tests {
 
     #[test]
     fn normalize_extreme_norm_exceeding_f32_max() {
-        // Norm ≈ 5.2e38 exceeds f32::MAX: the f64 inv multiply is load-
-        // bearing all the way to the final narrowing.
         let mut buf = bytes(&[3e38_f32, 3e38, 3e38]);
         assert_eq!(
             normalize_bytes_inplace::<f32>(&mut buf),
@@ -590,8 +523,6 @@ mod tests {
 
     #[test]
     fn norm_squared_consistency() {
-        // The wide-backed wrappers must agree with plain f32 arithmetic
-        // on ordinary data.
         let vectors: Vec<Vec<f32>> = vec![
             vec![3.0, 4.0],
             vec![0.1; 33],

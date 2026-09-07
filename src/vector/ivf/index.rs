@@ -44,24 +44,22 @@ use crate::vector::{BoundKind, BoundStore};
 /// id-map) lives on [`VectorIndexReader`](crate::vector::VectorIndexReader).
 pub struct IvfIndex {
     num_centroids: usize,
-    /// Distinct documents with a vector in this field.
+    /// Documents with a vector in this field.
     num_docs: usize,
-    /// The centroid rows (slot `[0]` past the two count words).
+    /// Centroid rows.
     centroids_slice: FileSlice,
-    /// Slot `[1]`: the `u64[N+1]` prefix sum, pinned.
+    /// Cluster-row prefix offsets.
     cluster_offsets: OwnedBytes,
     metric: Metric,
     router: OpenedRouter,
     /// Slot `[3]`, pinned: the segment-level bound kind.
     bound_kind: BoundKind,
-    /// Slot `[3]`, pinned: the per-cluster bound payload,
-    /// `num_centroids * bound_kind.stride(dim)` f32s in cluster order.
+    /// Per-cluster bound payload.
     bounds: Vec<f32>,
 }
 
 impl IvfIndex {
-    /// Write slot `[0]` of the `.centroids` composite for a field. `num_docs`
-    /// is the number of distinct docs assigned, not the posting-row total.
+    /// Writes slot `[0]` of the `.centroids` composite for a field.
     pub(crate) fn serialize_centroids<W: Write + ?Sized>(
         num_centroids: usize,
         num_docs: usize,
@@ -89,7 +87,7 @@ impl IvfIndex {
         out.write_all(centroid_bytes)
     }
 
-    /// Write slot `[1]` of the `.centroids` composite for a field.
+    /// Writes cluster-row prefix offsets.
     pub(crate) fn serialize_offsets<W: Write + ?Sized>(
         cluster_offsets: &[u64],
         out: &mut W,
@@ -100,18 +98,7 @@ impl IvfIndex {
         Ok(())
     }
 
-    /// Write slot `[3]` of the `.centroids` composite for a field: the
-    /// segment-level kind byte, then the per-cluster payload.
-    ///
-    /// * `kind` (`BoundKind`) — the segment-level bound kind.
-    /// * `values` (`&[f32]`) — `num_centroids * kind.stride(dim)` values in cluster order; the
-    ///   caller's [`BoundsBuilder`] output.
-    /// * `out` (`&mut W`) — the slot writer.
-    ///
-    /// Returns (`io::Result<()>`): write errors only — the payload length
-    /// is validated at open, against the count words of slot `[0]`.
-    ///
-    /// [`BoundsBuilder`]: crate::vector::BoundsBuilder
+    /// Writes the segment bound kind and per-cluster payload.
     pub(crate) fn serialize_bounds<W: Write + ?Sized>(
         kind: BoundKind,
         values: &[f32],
@@ -225,8 +212,6 @@ impl IvfIndex {
             bound_kind,
             bounds,
         };
-        // Every distinct doc owns at least its primary row, so a doc count
-        // above the row total means a corrupt file.
         if index.num_docs > index.num_rows() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -237,6 +222,7 @@ impl IvfIndex {
         Ok(index)
     }
 
+    /// Returns the number of clusters.
     pub fn num_clusters(&self) -> usize {
         self.num_centroids
     }
@@ -245,12 +231,12 @@ impl IvfIndex {
         self.router.kind()
     }
 
-    /// Distinct docs with a vector.
+    /// Returns the number of documents with a vector.
     pub(crate) fn num_docs(&self) -> usize {
         self.num_docs
     }
 
-    /// Total posting rows across all clusters.
+    /// Returns the posting-row count across all clusters.
     pub fn num_rows(&self) -> usize {
         self.cluster_offset(self.num_centroids) as usize
     }
@@ -261,33 +247,31 @@ impl IvfIndex {
         u64::from_le_bytes(self.cluster_offsets[start..end].try_into().unwrap())
     }
 
-    /// The contiguous row range of `cluster` within the `.vec` rows.
+    /// Returns a cluster's contiguous vector-row range.
     #[inline]
     pub fn cluster_range(&self, cluster: usize) -> Range<usize> {
         debug_assert!(cluster < self.num_centroids, "cluster out of bounds");
         self.cluster_offset(cluster) as usize..self.cluster_offset(cluster + 1) as usize
     }
 
-    /// The stored centroid bounds of this segment's clusters.
-    ///
-    /// Returns (`BoundStore`): a view over the pinned slot `[3]` payload —
-    /// segment-level kind plus per-cluster values; `f32::INFINITY` =
-    /// SATURATED (always probes).
+    /// Returns the stored centroid bounds.
     #[inline]
     pub fn bounds(&self) -> BoundStore<'_> {
         BoundStore::new(self.bound_kind, &self.bounds)
     }
 
-    /// Per-cluster posting-list sizes, in cluster order — memberships, like
-    /// [`Self::num_rows`].
+    /// Returns posting sizes in cluster order.
     pub(crate) fn cluster_sizes(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.num_centroids).map(|cluster| {
             (self.cluster_offset(cluster + 1) - self.cluster_offset(cluster)) as usize
         })
     }
 
-    /// The centroid rows, materialized in one read — for introspection and
-    /// tests only. Routing fetches per-node ranges through the lazy arena.
+    /// Materializes all centroid rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the centroid slot cannot be read.
     pub fn centroid_bytes(&self) -> crate::Result<OwnedBytes> {
         Ok(self.centroids_slice.read_bytes()?)
     }
