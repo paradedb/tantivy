@@ -2692,6 +2692,7 @@ mod tests {
         let first_gamma = f16_to_f32(first.gammas[0]);
         let first_error_ratio = f16_to_f32(first.corrected_error_ratios[0]);
         let first_constant = (metric == Metric::L2).then_some(first.constants[0]);
+        let mut diagnostic_arithmetic = ArithmeticError::default();
         let diagnostic_first_raw = super::super::index_reader::diagnostic_advance_raw_prefix(
             &query,
             metric,
@@ -2700,6 +2701,9 @@ mod tests {
             first_scale,
             first_constant,
             0.0,
+            cluster_score,
+            residual_norm_squared,
+            &mut diagnostic_arithmetic,
         )
         .unwrap();
         let diagnostic_first_estimate =
@@ -2715,6 +2719,13 @@ mod tests {
             score_query_norm_squared,
             diagnostic_sign_query_error_term,
         );
+        let diagnostic_first_sigma = diagnostic_arithmetic.sigma(
+            metric,
+            diagnostic_first_sigma,
+            first_gamma,
+            diagnostic_first_raw,
+            base,
+        );
 
         let mut first_kernel = [0.0];
         query.score_layer_batch_unscaled(0, &first.codes, first.codes.len(), &mut first_kernel);
@@ -2723,6 +2734,7 @@ mod tests {
         let mut sigmas = [0.0];
         let mut residual_norms = [0.0];
         let mut sign_query_error_terms = [0.0];
+        let mut arithmetic = [ArithmeticError::default()];
         let first_constants = first_constant.map_or_else(Vec::new, |constant| vec![constant]);
         combine_initial_decoded(
             metric,
@@ -2733,6 +2745,7 @@ mod tests {
             &mut sigmas,
             &mut residual_norms,
             &mut sign_query_error_terms,
+            &mut arithmetic,
             &[first_scale],
             &[first_gamma],
             &[first_error_ratio],
@@ -2758,6 +2771,7 @@ mod tests {
             first_gamma,
             sign_query_error_terms[0],
         );
+        candidates.arithmetic_variances[0] = arithmetic[0];
         let refinement = &encoded.layers[1];
         let refinement_scale = refinement.scales[0];
         let refinement_gamma = f16_to_f32(refinement.gammas[0]);
@@ -2771,6 +2785,9 @@ mod tests {
             refinement_scale,
             refinement_constant,
             diagnostic_first_raw,
+            cluster_score,
+            residual_norm_squared,
+            &mut diagnostic_arithmetic,
         )
         .unwrap();
         let diagnostic_refined_estimate =
@@ -2783,6 +2800,13 @@ mod tests {
             refinement_gamma,
             score_query_norm_squared,
             diagnostic_sign_query_error_term,
+        );
+        let diagnostic_refined_sigma = diagnostic_arithmetic.sigma(
+            metric,
+            diagnostic_refined_sigma,
+            refinement_gamma,
+            diagnostic_refined_raw,
+            base,
         );
 
         let mut refinement_kernel = [0.0];
