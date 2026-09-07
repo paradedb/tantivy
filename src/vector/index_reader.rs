@@ -28,6 +28,7 @@ use std::sync::Arc;
 use common::{HasLen, OwnedBytes};
 use quant_model::f16::f16_to_f32;
 
+use super::backend::{Estimate, Threshold};
 use super::flat::IdMap;
 use super::header::{
     read_centroid_header, read_vector_header, CentroidSlot, VectorFileVersion, VectorSlot,
@@ -35,8 +36,8 @@ use super::header::{
 use super::ivf::{decode_row, IvfIndex, CENTROIDS_EXT};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
-    quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, PreparedQuery,
-    QuantizedIndexCtx, QuantizedQueryCtx,
+    quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
+    PreparedQuery, QuantizedIndexCtx, QuantizedQueryCtx,
 };
 use super::quantization::{
     quantized_code_stride, quantized_code_tail_is_zero, VectorQuantizationConfig,
@@ -429,9 +430,30 @@ pub(crate) fn diagnostic_advance_raw_prefix(
     scale: f32,
     constant: Option<f32>,
     raw_prefix: f32,
+    cluster_score: f32,
+    residual_norm_squared: f32,
+    arithmetic: &mut ArithmeticError,
 ) -> crate::Result<f32> {
     let mut kernel_score = [0.0];
     query.score_layer_batch_unscaled(depth, codes, codes.len(), &mut kernel_score);
+    if depth == 0 {
+        *arithmetic = ArithmeticError::initial(
+            metric,
+            kernel_score[0],
+            scale,
+            constant.unwrap_or(0.0),
+            cluster_score,
+            residual_norm_squared,
+        );
+    } else {
+        arithmetic.refine(
+            metric,
+            raw_prefix,
+            kernel_score[0],
+            scale,
+            constant.unwrap_or(0.0),
+        );
+    }
     match (metric, depth, constant) {
         (Metric::L2, 0, Some(constant)) => {
             Ok(initial_l2_raw_prefix(kernel_score[0], scale, constant))
@@ -468,6 +490,7 @@ struct ErrorConeCandidates {
     sign_query_error_terms: Vec<f32>,
     estimates: Vec<f32>,
     sigmas: Vec<f32>,
+    arithmetic_errors: Vec<ArithmeticError>,
 }
 
 impl ErrorConeCandidates {
@@ -490,6 +513,7 @@ impl ErrorConeCandidates {
         self.sign_query_error_terms.push(sign_query_error_term);
         self.estimates.push(estimate);
         self.sigmas.push(sigma);
+        self.arithmetic_errors.push(ArithmeticError::default());
     }
 
     fn distinct_doc_count(&self) -> usize {
@@ -514,10 +538,9 @@ impl ErrorConeCandidates {
         let mut best_by_doc: HashMap<DocId, usize> = HashMap::new();
         for index in 0..self.len() {
             let doc = self.docs[index];
-            if best_by_doc
-                .get(&doc)
-                .is_none_or(|&previous| error_cone_candidate_order(self, index, previous).is_lt())
-            {
+            if best_by_doc.get(&doc).is_none_or(|&previous| {
+                error_cone_candidate_order(self, index, previous, kappa).is_lt()
+            }) {
                 best_by_doc.insert(doc, index);
             }
         }
@@ -526,16 +549,19 @@ impl ErrorConeCandidates {
         } else {
             let mut best: Vec<usize> = best_by_doc.into_values().collect();
             let (_, pivot, _) = best.select_nth_unstable_by(top_k - 1, |&left, &right| {
-                error_cone_candidate_order(self, left, right)
+                error_cone_candidate_order(self, left, right, kappa)
             });
             let pivot = *pivot;
-            Some(self.estimates[pivot] - kappa * self.sigmas[pivot])
+            Some(Threshold(
+                Estimate(self.estimates[pivot]).lower(self.sigmas[pivot], kappa),
+            ))
         };
 
         let mut survivors: Vec<usize> = (0..self.len())
             .filter(|&index| {
                 threshold.is_none_or(|threshold| {
-                    self.estimates[index] + kappa * self.sigmas[index] >= threshold
+                    threshold
+                        .admits(Estimate(self.estimates[index]).upper(self.sigmas[index], kappa))
                 })
             })
             .collect();
@@ -557,6 +583,7 @@ impl ErrorConeCandidates {
                 self.estimates[index],
                 self.sigmas[index],
             );
+            *compacted.arithmetic_errors.last_mut().unwrap() = self.arithmetic_errors[index];
         }
         *self = compacted;
     }
@@ -566,9 +593,16 @@ fn error_cone_candidate_order(
     candidates: &ErrorConeCandidates,
     left: usize,
     right: usize,
+    kappa: f32,
 ) -> Ordering {
-    candidates.estimates[right]
-        .total_cmp(&candidates.estimates[left])
+    Estimate(candidates.estimates[right])
+        .lower(candidates.sigmas[right], kappa)
+        .0
+        .total_cmp(
+            &Estimate(candidates.estimates[left])
+                .lower(candidates.sigmas[left], kappa)
+                .0,
+        )
         .then(candidates.rows[left].cmp(&candidates.rows[right]))
 }
 
@@ -1932,6 +1966,12 @@ impl VectorIndexReader {
         self.quantization.as_ref()
     }
 
+    /// Whether this segment contains the field's quantized storage slots. Field
+    /// policy can enable quantization while a small flat segment stores no codes.
+    pub fn has_quantized_storage(&self) -> bool {
+        self.quantization.is_some()
+    }
+
     /// Storage info for tooling; `None` if the segment has no vector data for
     /// the field.
     /// Returns vector storage information when the field is present.
@@ -2247,6 +2287,7 @@ impl VectorIndexReader {
                     let exact_score = exact_queries[query_idx].score_doc_bytes(&vector_bytes);
                     let mut raw_prefix_estimate = 0.0_f32;
                     let mut sign_query_error_term = 0.0_f32;
+                    let mut arithmetic = ArithmeticError::default();
                     for (depth, (codes, scale, constant, stored_gamma, corrected_error_ratio)) in
                         stored_layers.iter().enumerate()
                     {
@@ -2258,6 +2299,9 @@ impl VectorIndexReader {
                             *scale,
                             *constant,
                             raw_prefix_estimate,
+                            cluster_score,
+                            residual_norm_squared,
+                            &mut arithmetic,
                         )?;
                         if measurement_ctx.specs[depth].bits == 1 {
                             sign_query_error_term +=
@@ -2272,6 +2316,13 @@ impl VectorIndexReader {
                             gamma,
                             query_norm_squared,
                             sign_query_error_term,
+                        );
+                        let model_sigma = arithmetic.sigma(
+                            self.options.metric(),
+                            model_sigma,
+                            gamma,
+                            raw_prefix_estimate,
+                            base,
                         );
                         measurements.depths[depth]
                             .sigma
@@ -2454,10 +2505,21 @@ impl VectorIndexReader {
                     }
                     let scale = layer.scale(row)?;
                     let constant = layer.constant(row)?;
-                    let raw_prefix =
-                        query.score_layer(0, layer.code_bytes(row)?, scale, constant)?;
                     let gamma = gammas[0][row];
                     let residual_norm_squared = residual_norms_squared[row];
+                    let mut arithmetic = ArithmeticError::default();
+                    let raw_prefix = diagnostic_advance_raw_prefix(
+                        &query,
+                        metric,
+                        0,
+                        layer.code_bytes(row)?,
+                        scale,
+                        constant,
+                        0.0,
+                        cluster_scores[cluster],
+                        residual_norm_squared,
+                        &mut arithmetic,
+                    )?;
                     let base = if metric == Metric::L2 {
                         cluster_scores[cluster] - residual_norm_squared
                     } else {
@@ -2479,6 +2541,7 @@ impl VectorIndexReader {
                         query_norm * query_norm,
                         sign_query_error_term,
                     );
+                    let sigma = arithmetic.sigma(metric, sigma, gamma, raw_prefix, base);
                     if !estimate.is_finite() || !sigma.is_finite() {
                         return Err(DataCorruption::comment_only(format!(
                             "exact-E cone row {row} produced a non-finite depth-1 estimate or \
@@ -2487,6 +2550,7 @@ impl VectorIndexReader {
                         .into());
                     }
                     candidates.push(row, doc, raw_prefix, sign_query_error_term, estimate, sigma);
+                    *candidates.arithmetic_errors.last_mut().unwrap() = arithmetic;
                 }
             }
 
@@ -2524,8 +2588,18 @@ impl VectorIndexReader {
                         let layer = &quantization.layers()[depth];
                         let scale = stored_scales[depth][row];
                         let constant = layer.constant(row)?;
-                        candidates.raw_prefixes[candidate] +=
-                            query.score_layer(depth, &layer.code_bytes(row)?, scale, constant)?;
+                        candidates.raw_prefixes[candidate] = diagnostic_advance_raw_prefix(
+                            &query,
+                            metric,
+                            depth,
+                            &layer.code_bytes(row)?,
+                            scale,
+                            constant,
+                            candidates.raw_prefixes[candidate],
+                            cluster_scores[cluster],
+                            residual_norms_squared[row],
+                            &mut candidates.arithmetic_errors[candidate],
+                        )?;
                         if measurement_ctx.specs[depth].bits == 1 {
                             candidates.sign_query_error_terms[candidate] +=
                                 scale * scale * query.query_error_squared(depth) as f32;
@@ -2552,6 +2626,13 @@ impl VectorIndexReader {
                             gamma,
                             query_norm * query_norm,
                             candidates.sign_query_error_terms[candidate],
+                        );
+                        let sigma = candidates.arithmetic_errors[candidate].sigma(
+                            metric,
+                            sigma,
+                            gamma,
+                            candidates.raw_prefixes[candidate],
+                            base,
                         );
                         candidates.sigmas[candidate] = sigma;
                         if !candidates.estimates[candidate].is_finite() || !sigma.is_finite() {

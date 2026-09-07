@@ -2296,7 +2296,8 @@ mod tests {
             "{stats:?}"
         );
         assert_eq!(stats.bounds_skips, 1, "{stats:?}");
-        assert_eq!(stats.bound_armed_at_probe, Some(0), "{stats:?}");
+        assert_eq!(stats.bound_armed_count, 1, "{stats:?}");
+        assert_eq!(stats.bound_armed_probe_sum, 0, "{stats:?}");
         assert_eq!(stats.clusters_probed(), 1, "{stats:?}");
         Ok(())
     }
