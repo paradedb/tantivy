@@ -1,6 +1,10 @@
 //! Per-segment vector search execution.
 //! Supports flat scans and routed quantized scans.
 
+#[cfg(test)]
+#[path = "review_reproductions.rs"]
+mod review_regressions;
+
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -18,8 +22,8 @@ use super::index_reader::{QuantizedFieldReader, QuantizedLayerReader, VectorInde
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
-    quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, PreparedQuery,
-    QuantizedQueryCache, QuantizedQueryCtx,
+    quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
+    PreparedQuery, QuantizedQueryCache, QuantizedQueryCtx,
 };
 use super::quantization::QUANTIZED_BOUNDARY_KAPPA;
 use super::router::{RouterMetrics, RouterWorkspace};
@@ -411,6 +415,38 @@ struct Survivor {
     doc: DocId,
 }
 
+/// A point estimate in score space. Pruning only compares its typed endpoints.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Estimate(pub(super) f32);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LowerEndpoint(pub(super) f32);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct UpperEndpoint(pub(super) f32);
+
+/// The k-th largest lower endpoint in score space (larger is better).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Threshold(pub(super) LowerEndpoint);
+
+impl Estimate {
+    pub(super) fn lower(self, sigma: f32, kappa: f32) -> LowerEndpoint {
+        debug_assert!(sigma >= 0.0 && kappa >= 0.0);
+        LowerEndpoint(self.0 - kappa * sigma)
+    }
+
+    pub(super) fn upper(self, sigma: f32, kappa: f32) -> UpperEndpoint {
+        debug_assert!(sigma >= 0.0 && kappa >= 0.0);
+        UpperEndpoint(self.0 + kappa * sigma)
+    }
+}
+
+impl Threshold {
+    pub(super) fn admits(self, upper: UpperEndpoint) -> bool {
+        upper.0 >= self.0 .0
+    }
+}
+
 /// One row surviving a quantized boundary.
 #[derive(Clone, Copy)]
 struct QuantizedCandidate {
@@ -423,6 +459,7 @@ struct QuantizedCandidate {
     residual_norm_squared: f32,
     gamma: f32,
     sign_query_error_term: f32,
+    arithmetic_variance: ArithmeticError,
 }
 
 /// Storage-row selection resolved before a quantized layer is read.
@@ -454,6 +491,7 @@ struct QuantizedCandidates {
     residual_norm_squared: Vec<f32>,
     gammas: Vec<f32>,
     sign_query_error_terms: Vec<f32>,
+    arithmetic_variances: Vec<ArithmeticError>,
 }
 
 impl QuantizedCandidates {
@@ -468,6 +506,7 @@ impl QuantizedCandidates {
             residual_norm_squared: Vec::with_capacity(capacity),
             gammas: Vec::with_capacity(capacity),
             sign_query_error_terms: Vec::with_capacity(capacity),
+            arithmetic_variances: Vec::with_capacity(capacity),
         }
     }
 
@@ -499,6 +538,7 @@ impl QuantizedCandidates {
         self.residual_norm_squared.push(residual_norm_squared);
         self.gammas.push(gamma);
         self.sign_query_error_terms.push(sign_query_error_term);
+        self.arithmetic_variances.push(ArithmeticError::default());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -514,6 +554,7 @@ impl QuantizedCandidates {
         residual_norms_squared: &[f32],
         gammas: &[f32],
         sign_query_error_terms: &[f32],
+        arithmetic_variances: &[ArithmeticError],
     ) {
         let len = selection.len(&rows);
         debug_assert_eq!(docs.len(), len);
@@ -524,6 +565,7 @@ impl QuantizedCandidates {
         debug_assert_eq!(residual_norms_squared.len(), len);
         debug_assert_eq!(gammas.len(), len);
         debug_assert_eq!(sign_query_error_terms.len(), len);
+        debug_assert_eq!(arithmetic_variances.len(), len);
         match selection {
             Selection::All => self.rows.extend(rows),
             Selection::Rows(offsets) => self.rows.extend(offsets.iter().map(|&offset| {
@@ -542,11 +584,13 @@ impl QuantizedCandidates {
         self.gammas.extend_from_slice(gammas);
         self.sign_query_error_terms
             .extend_from_slice(sign_query_error_terms);
+        self.arithmetic_variances
+            .extend_from_slice(arithmetic_variances);
     }
 
     #[inline(always)]
-    fn estimate(&self, index: usize) -> f32 {
-        self.estimates[index]
+    fn estimate(&self, index: usize) -> Estimate {
+        Estimate(self.estimates[index])
     }
 
     fn materialize(&self, index: usize) -> QuantizedCandidate {
@@ -560,6 +604,7 @@ impl QuantizedCandidates {
             residual_norm_squared: self.residual_norm_squared[index],
             gamma: self.gammas[index],
             sign_query_error_term: self.sign_query_error_terms[index],
+            arithmetic_variance: self.arithmetic_variances[index],
         }
     }
 
@@ -573,6 +618,7 @@ impl QuantizedCandidates {
         self.residual_norm_squared.clear();
         self.gammas.clear();
         self.sign_query_error_terms.clear();
+        self.arithmetic_variances.clear();
         self.rows.reserve(survivors.len());
         self.docs.reserve(survivors.len());
         self.bases.reserve(survivors.len());
@@ -582,6 +628,7 @@ impl QuantizedCandidates {
         self.residual_norm_squared.reserve(survivors.len());
         self.gammas.reserve(survivors.len());
         self.sign_query_error_terms.reserve(survivors.len());
+        self.arithmetic_variances.reserve(survivors.len());
         for survivor in survivors {
             self.push(
                 survivor.row,
@@ -594,6 +641,7 @@ impl QuantizedCandidates {
                 survivor.gamma,
                 survivor.sign_query_error_term,
             );
+            *self.arithmetic_variances.last_mut().unwrap() = survivor.arithmetic_variance;
         }
     }
 }
@@ -670,6 +718,7 @@ fn combine_initial_decoded(
     sigmas: &mut [f32],
     residual_norms_squared: &mut [f32],
     sign_query_error_terms: &mut [f32],
+    arithmetic_variances: &mut [ArithmeticError],
     decoded_scales: &[f32],
     decoded_gammas: &[f32],
     decoded_error_ratios: &[f32],
@@ -688,6 +737,17 @@ fn combine_initial_decoded(
     debug_assert_eq!(sigmas.len(), decoded_scales.len());
     debug_assert_eq!(residual_norms_squared.len(), decoded_scales.len());
     debug_assert_eq!(sign_query_error_terms.len(), decoded_scales.len());
+    debug_assert_eq!(arithmetic_variances.len(), decoded_scales.len());
+    for (index, error) in arithmetic_variances.iter_mut().enumerate() {
+        *error = ArithmeticError::initial(
+            metric,
+            kernel_scores[index],
+            decoded_scales[index],
+            decoded_constants.get(index).copied().unwrap_or(0.0),
+            cluster_score,
+            decoded_residual_norms[index],
+        );
+    }
     match metric {
         Metric::L2 => {
             debug_assert_eq!(decoded_constants.len(), decoded_scales.len());
@@ -761,6 +821,15 @@ fn combine_initial_decoded(
         dimension,
         metric,
     );
+    for (index, sigma) in sigmas.iter_mut().enumerate() {
+        *sigma = arithmetic_variances[index].sigma(
+            metric,
+            *sigma,
+            decoded_gammas[index],
+            kernel_scores[index],
+            bases[index],
+        );
+    }
 }
 
 /// Runs the complete layer-0 cluster scoring shape.
@@ -853,6 +922,7 @@ fn finish_quantization_bench_layer0_cosine_cluster(
     sigmas.resize(rows, 0.0);
     residual_norms_squared.resize(rows, 0.0);
     sign_query_error_terms.resize(rows, 0.0);
+    let mut arithmetic_variances = vec![ArithmeticError::default(); rows];
     combine_initial_decoded(
         Metric::Cosine,
         dimension,
@@ -862,6 +932,7 @@ fn finish_quantization_bench_layer0_cosine_cluster(
         sigmas,
         residual_norms_squared,
         sign_query_error_terms,
+        &mut arithmetic_variances,
         decoded_scales,
         decoded_gammas,
         decoded_error_ratios,
@@ -967,6 +1038,16 @@ fn combine_refinement_decoded(
     let residual_norms_squared = &candidates.residual_norm_squared[candidate_range.clone()];
     let current_gammas = &mut candidates.gammas[candidate_range.clone()];
     let sign_query_error_terms = &mut candidates.sign_query_error_terms[candidate_range.clone()];
+    let arithmetic_variances = &mut candidates.arithmetic_variances[candidate_range.clone()];
+    for (index, error) in arithmetic_variances.iter_mut().enumerate() {
+        error.refine(
+            metric,
+            raw_prefixes[index],
+            kernel_scores[index],
+            decoded_scales[index],
+            decoded_constants.get(index).copied().unwrap_or(0.0),
+        );
+    }
     match metric {
         Metric::L2 => {
             debug_assert_eq!(decoded_constants.len(), rows);
@@ -1019,7 +1100,7 @@ fn combine_refinement_decoded(
         }
     }
     fill_gamma_sigmas(
-        &mut candidates.sigmas[candidate_range],
+        &mut candidates.sigmas[candidate_range.clone()],
         residual_norms_squared,
         current_gammas,
         decoded_error_ratios,
@@ -1028,6 +1109,15 @@ fn combine_refinement_decoded(
         dimension,
         metric,
     );
+    for (index, sigma) in candidates.sigmas[candidate_range].iter_mut().enumerate() {
+        *sigma = arithmetic_variances[index].sigma(
+            metric,
+            *sigma,
+            current_gammas[index],
+            raw_prefixes[index],
+            bases[index],
+        );
+    }
 }
 
 /// Reads and scores one selected layer range.
@@ -1216,8 +1306,9 @@ struct QuantizedScanCtx {
     boundary_scratch: Vec<QuantizedCandidate>,
     /// Query-residual norms by cluster.
     cluster_query_norms: Vec<f32>,
-    /// Running top document estimates.
+    /// Running top lower endpoints, all evaluated with `bound_kappa`.
     bound_top: Vec<usize>,
+    bound_kappa: f32,
     /// Cluster-local selection scratch.
     cluster_top: Vec<usize>,
     cluster_top_n: usize,
@@ -1236,6 +1327,7 @@ impl QuantizedScanCtx {
             boundary_scratch: Vec::with_capacity(candidate_capacity),
             cluster_query_norms: Vec::new(),
             bound_top: Vec::new(),
+            bound_kappa: QUANTIZED_BOUNDARY_KAPPA,
             cluster_top: Vec::new(),
             cluster_top_n: 0,
             cluster_start: None,
@@ -1299,6 +1391,12 @@ impl QuantizedScanCtx {
 
     /// Merges one cluster into the running admission top-k.
     fn finish_cluster_bound(&mut self) {
+        self.finish_cluster_bound_with_kappa(QUANTIZED_BOUNDARY_KAPPA);
+    }
+
+    fn finish_cluster_bound_with_kappa(&mut self, kappa: f32) {
+        debug_assert!(self.bound_top.is_empty() || self.bound_kappa == kappa);
+        self.bound_kappa = kappa;
         let cluster_start = self
             .cluster_start
             .take()
@@ -1314,24 +1412,25 @@ impl QuantizedScanCtx {
             if self.cluster_top.len() < top_n {
                 self.cluster_top.push(index);
                 if self.cluster_top.len() == top_n {
-                    self.cluster_top
-                        .sort_unstable_by(|&a, &b| candidate_order(&self.candidates, a, b));
+                    self.cluster_top.sort_unstable_by(|&a, &b| {
+                        lower_endpoint_order(&self.candidates, a, b, kappa)
+                    });
                 }
                 continue;
             }
             let tracked_min = *self.cluster_top.last().unwrap();
-            if !candidate_precedes(&self.candidates, index, tracked_min) {
+            if !lower_endpoint_order(&self.candidates, index, tracked_min, kappa).is_lt() {
                 continue;
             }
-            let insert_at = self
-                .cluster_top
-                .partition_point(|&kept| candidate_precedes(&self.candidates, kept, index));
+            let insert_at = self.cluster_top.partition_point(|&kept| {
+                lower_endpoint_order(&self.candidates, kept, index, kappa).is_lt()
+            });
             self.cluster_top.insert(insert_at, index);
             self.cluster_top.pop();
         }
         if self.cluster_top.len() < top_n {
             self.cluster_top
-                .sort_unstable_by(|&a, &b| candidate_order(&self.candidates, a, b));
+                .sort_unstable_by(|&a, &b| lower_endpoint_order(&self.candidates, a, b, kappa));
         }
 
         self.bound_merge.clear();
@@ -1341,21 +1440,27 @@ impl QuantizedScanCtx {
         }
         self.cluster_top.clear();
         self.bound_merge
-            .sort_unstable_by(|&a, &b| candidate_order(&self.candidates, a, b));
+            .sort_unstable_by(|&a, &b| lower_endpoint_order(&self.candidates, a, b, kappa));
         self.bound_merge.truncate(top_n);
         std::mem::swap(&mut self.bound_top, &mut self.bound_merge);
     }
 
-    fn running_pessimistic_kth(&self, top_n: usize, kappa: f32) -> Option<f32> {
+    fn running_pessimistic_kth(&self, top_n: usize, kappa: f32) -> Option<Threshold> {
         if top_n == 0 || self.bound_top.len() < top_n {
             return None;
         }
+        debug_assert_eq!(self.bound_kappa, kappa);
         let index = *self.bound_top.last().unwrap();
-        Some(self.candidates.estimate(index) - kappa * self.candidates.sigmas[index])
+        Some(Threshold(
+            self.candidates
+                .estimate(index)
+                .lower(self.candidates.sigmas[index], kappa),
+        ))
     }
 
-    /// The k-th estimate widened pessimistically by its σ.
-    fn pessimistic_kth(&mut self, top_n: usize, kappa: f32) -> Option<f32> {
+    /// Select by lower endpoint itself; ordering by estimate can prune a true top-k row
+    /// even when every confidence interval encloses its exact score.
+    fn pessimistic_kth(&mut self, top_n: usize, kappa: f32) -> Option<Threshold> {
         debug_assert!(
             self.candidates
                 .estimates
@@ -1371,9 +1476,15 @@ impl QuantizedScanCtx {
         self.kth_scratch.extend(0..self.candidates.len());
         let (_, selected, _) = self
             .kth_scratch
-            .select_nth_unstable_by(top_n - 1, |&a, &b| candidate_order(&self.candidates, a, b));
+            .select_nth_unstable_by(top_n - 1, |&a, &b| {
+                lower_endpoint_order(&self.candidates, a, b, kappa)
+            });
         let index = *selected;
-        Some(self.candidates.estimate(index) - kappa * self.candidates.sigmas[index])
+        Some(Threshold(
+            self.candidates
+                .estimate(index)
+                .lower(self.candidates.sigmas[index], kappa),
+        ))
     }
 
     fn band(&mut self, top_n: usize, kappa: f32) {
@@ -1381,7 +1492,11 @@ impl QuantizedScanCtx {
         self.boundary_scratch.clear();
         for index in 0..self.candidates.len() {
             if pessimistic_kth.is_none_or(|kth| {
-                self.candidates.estimate(index) + kappa * self.candidates.sigmas[index] >= kth
+                kth.admits(
+                    self.candidates
+                        .estimate(index)
+                        .upper(self.candidates.sigmas[index], kappa),
+                )
             }) {
                 self.boundary_scratch
                     .push(self.candidates.materialize(index));
@@ -1463,16 +1578,18 @@ fn candidate_selection<'a>(
 }
 
 #[inline]
-fn candidate_order(candidates: &QuantizedCandidates, a: usize, b: usize) -> std::cmp::Ordering {
+fn lower_endpoint_order(
+    candidates: &QuantizedCandidates,
+    a: usize,
+    b: usize,
+    kappa: f32,
+) -> std::cmp::Ordering {
     candidates
         .estimate(b)
-        .total_cmp(&candidates.estimate(a))
+        .lower(candidates.sigmas[b], kappa)
+        .0
+        .total_cmp(&candidates.estimate(a).lower(candidates.sigmas[a], kappa).0)
         .then(candidates.rows[a].cmp(&candidates.rows[b]))
-}
-
-#[inline]
-fn candidate_precedes(candidates: &QuantizedCandidates, a: usize, b: usize) -> bool {
-    candidate_order(candidates, a, b).is_lt()
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -1544,6 +1661,7 @@ impl<T: VectorElement> VectorBackend<T> {
         let mut sigma_scores = Vec::new();
         let mut residual_norm_squared_scores = Vec::new();
         let mut sign_query_error_terms = Vec::new();
+        let mut arithmetic_variances = Vec::new();
         let mut selected_rows = Vec::new();
         let mut indexed_row_offsets = Vec::new();
         let mut survivor_read_ranges = Vec::new();
@@ -1563,7 +1681,7 @@ impl<T: VectorElement> VectorBackend<T> {
             let query_bound = scan
                 .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
                 .map_or(QueryBound::Filling, |score| QueryBound::Armed {
-                    t: to_bound_space(metric, score),
+                    t: to_bound_space(metric, score.0 .0),
                 });
             if armed_probe.is_none() && matches!(query_bound, QueryBound::Armed { .. }) {
                 armed_probe = Some((postings_row + postings_skipped).saturating_sub(1) as u32);
@@ -1639,6 +1757,7 @@ impl<T: VectorElement> VectorBackend<T> {
             sigma_scores.resize(selected_count, 0.0);
             residual_norm_squared_scores.resize(selected_count, 0.0);
             sign_query_error_terms.resize(selected_count, 0.0);
+            arithmetic_variances.resize(selected_count, ArithmeticError::default());
             let cluster_score = sim.score();
             combine_initial_decoded(
                 metric,
@@ -1649,6 +1768,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 &mut sigma_scores,
                 &mut residual_norm_squared_scores,
                 &mut sign_query_error_terms,
+                &mut arithmetic_variances,
                 &decoded_scales,
                 &decoded_gammas,
                 &decoded_error_ratios,
@@ -1672,6 +1792,7 @@ impl<T: VectorElement> VectorBackend<T> {
                 &residual_norm_squared_scores[..selected_count],
                 &decoded_gammas[..selected_count],
                 &sign_query_error_terms[..selected_count],
+                &arithmetic_variances[..selected_count],
             );
             scan.finish_cluster_bound();
             scan.work_spent += pricing.row * selected_count as f64;
@@ -3316,10 +3437,16 @@ mod tests {
         for (row, score, sigma) in [(0, 10.0, 0.0), (1, 9.0, 1.0), (2, 9.0, 100.0)] {
             push_test_candidate(&mut scan, row, row as DocId, score, sigma);
         }
-        scan.finish_cluster_bound();
+        scan.finish_cluster_bound_with_kappa(2.0);
 
-        assert_eq!(scan.running_pessimistic_kth(2, 2.0), Some(7.0));
-        assert_eq!(scan.pessimistic_kth(2, 2.0), Some(7.0));
+        assert_eq!(
+            scan.running_pessimistic_kth(2, 2.0),
+            Some(Threshold(LowerEndpoint(7.0)))
+        );
+        assert_eq!(
+            scan.pessimistic_kth(2, 2.0),
+            Some(Threshold(LowerEndpoint(7.0)))
+        );
     }
 
     #[test]
@@ -3337,7 +3464,7 @@ mod tests {
                     0.01 + (row % 5) as f32 * 0.003,
                 );
             }
-            scan.finish_cluster_bound();
+            scan.finish_cluster_bound_with_kappa(2.0);
             assert_eq!(
                 scan.running_pessimistic_kth(TOP_N, 2.0),
                 scan.pessimistic_kth(TOP_N, 2.0),
@@ -3349,8 +3476,10 @@ mod tests {
     fn independent_admission_top(scan: &QuantizedScanCtx, top_n: usize) -> Vec<usize> {
         let mut indices = (0..scan.candidates.len()).collect::<Vec<_>>();
         indices.sort_unstable_by(|&left, &right| {
-            let left_estimate = scan.candidates.estimates[left];
-            let right_estimate = scan.candidates.estimates[right];
+            let left_estimate =
+                scan.candidates.estimates[left] - 2.0 * scan.candidates.sigmas[left];
+            let right_estimate =
+                scan.candidates.estimates[right] - 2.0 * scan.candidates.sigmas[right];
             right_estimate
                 .total_cmp(&left_estimate)
                 .then(scan.candidates.rows[left].cmp(&scan.candidates.rows[right]))
@@ -3386,7 +3515,7 @@ mod tests {
                 for &(row, doc, estimate, sigma) in *rows {
                     push_test_candidate(&mut scan, row, doc, estimate, sigma);
                 }
-                scan.finish_cluster_bound();
+                scan.finish_cluster_bound_with_kappa(2.0);
 
                 let expected = independent_admission_top(&scan, top_n);
                 let actual_rows = scan
@@ -3405,7 +3534,9 @@ mod tests {
 
                 let expected_kth = (expected.len() == top_n).then(|| {
                     let index = expected[top_n - 1];
-                    scan.candidates.estimates[index] - 2.0 * scan.candidates.sigmas[index]
+                    Threshold(LowerEndpoint(
+                        scan.candidates.estimates[index] - 2.0 * scan.candidates.sigmas[index],
+                    ))
                 });
                 assert_eq!(
                     scan.running_pessimistic_kth(top_n, 2.0),
@@ -3448,6 +3579,7 @@ mod tests {
             &mut sigmas,
             &mut residual_norms_squared,
             &mut sign_query_error_terms,
+            &mut [ArithmeticError::default()],
             &[3.0],
             &[2.0],
             &[0.5],
@@ -3531,13 +3663,13 @@ mod tests {
             .map(|row| 0.012 + (row % 3) as f32 * 0.004)
             .collect();
 
-        let (first_kth_index, first_kth) = cascade::kth(&layer0_scores, TOP_N);
-        let harness_first = cascade::band_filter(
-            &layer0_scores,
-            &layer0_sigmas,
-            KAPPA,
-            first_kth - KAPPA * layer0_sigmas[first_kth_index],
-        );
+        let lower: Vec<f32> = layer0_scores
+            .iter()
+            .zip(&layer0_sigmas)
+            .map(|(&estimate, &sigma)| estimate - KAPPA * sigma)
+            .collect();
+        let (_, first_kth) = cascade::kth(&lower, TOP_N);
+        let harness_first = cascade::band_filter(&layer0_scores, &layer0_sigmas, KAPPA, first_kth);
 
         let mut scan = QuantizedScanCtx::new(CANDIDATES as DocId, CANDIDATES);
         for row in 0..CANDIDATES {
@@ -3565,13 +3697,14 @@ mod tests {
             .iter()
             .map(|&row| layer1_sigmas[row as usize])
             .collect();
-        let (second_kth_index, second_kth) = cascade::kth(&second_scores, TOP_N);
-        let harness_second_local = cascade::band_filter(
-            &second_scores,
-            &second_sigmas,
-            KAPPA,
-            second_kth - KAPPA * second_sigmas[second_kth_index],
-        );
+        let lower: Vec<f32> = second_scores
+            .iter()
+            .zip(&second_sigmas)
+            .map(|(&estimate, &sigma)| estimate - KAPPA * sigma)
+            .collect();
+        let (_, second_kth) = cascade::kth(&lower, TOP_N);
+        let harness_second_local =
+            cascade::band_filter(&second_scores, &second_sigmas, KAPPA, second_kth);
         let harness_second: Vec<u32> = harness_second_local
             .iter()
             .map(|&local| harness_first[local as usize])

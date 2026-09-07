@@ -1,0 +1,83 @@
+diff --git a/src/vector/backend.rs b/src/vector/backend.rs
+index 972214ff..1132a4d1 100644
+--- a/src/vector/backend.rs
++++ b/src/vector/backend.rs
+@@ -5083,3 +5083,78 @@ mod tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod review_reproductions {
++    use super::*;
++
++    #[test]
++    fn review_boundary_preserves_topk_when_all_intervals_cover_truth() {
++        let mut scan = QuantizedScanCtx::new(3, 3);
++        let examples: [(f32, f32, f32); 3] = [
++            (0.10, 0.015, 0.065),
++            (0.09, 0.001, 0.090),
++            (0.08, 0.001, 0.080),
++        ];
++        scan.begin_cluster(2);
++        for (row, &(estimate, sigma, truth)) in examples.iter().enumerate() {
++            assert!((truth - estimate).abs() <= QUANTIZED_BOUNDARY_KAPPA * sigma);
++            scan.push(row, row as u32, 0.0, estimate, estimate, sigma, 1.0, 1.0, 0.0);
++        }
++        scan.finish_cluster_bound();
++        eprintln!("admission threshold = {:?}; boundary threshold = {:?}",
++            scan.running_pessimistic_kth(2, QUANTIZED_BOUNDARY_KAPPA),
++            scan.pessimistic_kth(2, QUANTIZED_BOUNDARY_KAPPA));
++        scan.band(2, QUANTIZED_BOUNDARY_KAPPA);
++        eprintln!("surviving docs = {:?}; true top 2 = [1, 2]", scan.candidates.docs);
++        assert!(scan.candidates.docs.contains(&2), "true runner-up was pruned despite valid intervals");
++    }
++}
++
++#[cfg(test)]
++mod review_l2_reproduction {
++    use super::*;
++    use cascade::{encode_batch_in_place, prepare_centroid, prepare_split_query, LayerSpec};
++    use quant_model::{build_grid, f16::f16_to_f32};
++
++    #[test]
++    fn review_grid_l2_query_at_centroid_preserves_nearest_row() {
++        const D: usize = 64;
++        const N: usize = 64;
++        let specs = [LayerSpec { bits: 4, seed: 7, rotate: true }];
++        let grids = [build_grid(D, 4)];
++        let centroid: Vec<f32> = (0..D).map(|i| 100_000.0 + (i % 13) as f32).collect();
++        let prepared_centroid = prepare_centroid(&centroid, &specs);
++        let mut vectors: Vec<f32> = (0..N).flat_map(|row| {
++            centroid.iter().enumerate().map(move |(i, &c)| c + ((row * D + i) as f32 * 0.037).sin())
++        }).collect();
++        let encoded = encode_batch_in_place(&mut vectors, N, &prepared_centroid, &specs, &grids);
++        let layer = &encoded.layers[0];
++        let query = prepare_split_query(&centroid, &specs, &grids, 4);
++        let mut scores = vec![0.0; N];
++        query.score_layer_batch_unscaled(0, &layer.codes, layer.codes.len()/N, specs[0], &mut scores);
++        let truths: Vec<f32> = encoded.residual_norms_squared.iter().map(|r| -r).collect();
++        let estimates: Vec<f32> = (0..N).map(|i| {
++            let raw = initial_l2_raw_prefix(scores[i], layer.scales[i], layer.constants[i]);
++            corrected_quantized_estimate(Metric::L2, f16_to_f32(layer.gammas[i]), raw, truths[i])
++        }).collect();
++        let best = (0..N).max_by(|&a, &b| truths[a].total_cmp(&truths[b])).unwrap();
++        let estimated_best = (0..N).max_by(|&a, &b| estimates[a].total_cmp(&estimates[b])).unwrap();
++        let sigmas: Vec<f32> = (0..N).map(|i| quantized_model_sigma(
++            Metric::L2, D, encoded.residual_norms_squared[i],
++            f16_to_f32(layer.corrected_error_ratios[i]), f16_to_f32(layer.gammas[i]), 0.0, 0.0
++        )).collect();
++        assert!(sigmas.iter().all(|&s| s == 0.0));
++        eprintln!("exact best row {best}: truth={}, estimate={}; estimated best row {estimated_best}: truth={}, estimate={}; all sigmas=0",
++            truths[best], estimates[best], truths[estimated_best], estimates[estimated_best]);
++        let mut scan = QuantizedScanCtx::new(N as u32, N);
++        for i in 0..N {
++            scan.push(i, i as u32, truths[i], 0.0, estimates[i], sigmas[i],
++                encoded.residual_norms_squared[i], f16_to_f32(layer.gammas[i]), 0.0);
++        }
++        scan.band(1, QUANTIZED_BOUNDARY_KAPPA);
++        eprintln!("surviving docs after band = {:?}", scan.candidates.docs);
++        assert!(scan.candidates.docs.contains(&(best as u32)),
++            "L2 cancellation prunes the nearest row with zero confidence width");
++    }
++}

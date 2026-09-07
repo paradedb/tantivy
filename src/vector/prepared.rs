@@ -1,7 +1,7 @@
 //! Prepared exact and quantized query state.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cascade::{prepare_split_query_with_plan, LayerSpec, PreparedSplitQuery, QueryRotationPlan};
 use quant_model::Grid;
@@ -42,7 +42,7 @@ struct QuantizedIndexCacheKey {
 }
 
 static QUANTIZED_INDEX_CACHE: OnceLock<
-    Mutex<HashMap<QuantizedIndexCacheKey, Arc<QuantizedIndexCtx>>>,
+    Mutex<HashMap<QuantizedIndexCacheKey, Weak<QuantizedIndexCtx>>>,
 > = OnceLock::new();
 
 /// Applies the metric-specific correction to a cumulative quantized estimate.
@@ -78,6 +78,105 @@ pub(crate) fn refine_l2_raw_prefix(
     constant: f32,
 ) -> f32 {
     scale.mul_add(kernel_score, raw_prefix - constant)
+}
+
+/// Analytical f32 subtraction error, in raw-prefix units. The two split-form
+/// operands were rounded independently; cancellation does not remove their error.
+/// This is machine epsilon times the sum of operand magnitudes, not a fitted
+/// constant. Refinements additionally account for `raw_prefix - constant`.
+#[inline(always)]
+pub(crate) fn l2_arithmetic_variance(
+    kernel_score: f32,
+    scale: f32,
+    constant: f32,
+    previous_prefix: Option<f32>,
+) -> f32 {
+    // c = 2: independently rounded split operands, then the fused subtraction.
+    let subtraction = rounding_error(scale * kernel_score, constant, 2.0);
+    // c = 1: the separate `previous_prefix - constant` subtraction.
+    let refinement = previous_prefix.map_or(0.0, |prefix| rounding_error(prefix, constant, 1.0));
+    subtraction * subtraction + refinement * refinement
+}
+
+/// Propagate raw-prefix arithmetic error through the L2 `2 * gamma` correction
+/// and combine it in quadrature with the statistical model width.
+#[inline(always)]
+pub(crate) fn rounding_error(a: f32, b: f32, rounding_count: f32) -> f32 {
+    rounding_count * f32::EPSILON * (a.abs() + b.abs())
+}
+
+/// Arithmetic uncertainty is kept separately so a refinement can change gamma
+/// without losing or double-scaling the error accumulated in the raw prefix.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ArithmeticError {
+    pub(crate) raw_variance: f32,
+    pub(crate) base_variance: f32,
+}
+
+impl ArithmeticError {
+    pub(crate) fn initial(
+        metric: Metric,
+        kernel: f32,
+        scale: f32,
+        constant: f32,
+        cluster_score: f32,
+        residual_norm_sq: f32,
+    ) -> Self {
+        let raw_variance = if metric == Metric::L2 {
+            l2_arithmetic_variance(kernel, scale, constant, None)
+        } else {
+            // c = 1: the initial scale * kernel multiplication.
+            rounding_error(scale * kernel, 0.0, 1.0).powi(2)
+        };
+        let base_variance = if metric == Metric::L2 {
+            // c = 1: cluster_score - residual_norm_sq.
+            rounding_error(cluster_score, residual_norm_sq, 1.0).powi(2)
+        } else {
+            0.0
+        };
+        Self {
+            raw_variance,
+            base_variance,
+        }
+    }
+
+    pub(crate) fn refine(
+        &mut self,
+        metric: Metric,
+        prefix: f32,
+        kernel: f32,
+        scale: f32,
+        constant: f32,
+    ) {
+        self.raw_variance += if metric == Metric::L2 {
+            l2_arithmetic_variance(kernel, scale, constant, Some(prefix))
+        } else {
+            // c = 2: rounded layer contribution plus the refinement addition.
+            rounding_error(scale * kernel, prefix, 2.0).powi(2)
+        };
+    }
+
+    pub(crate) fn sigma(
+        self,
+        metric: Metric,
+        model_sigma: f32,
+        gamma: f32,
+        prefix: f32,
+        base: f32,
+    ) -> f32 {
+        let factor = if metric == Metric::L2 {
+            2.0 * gamma
+        } else {
+            gamma
+        };
+        // c = 1: the final fused base-plus-corrected-residual expression. This
+        // includes cosine's base-plus-residual sum even if its model width is zero.
+        let final_error = rounding_error(factor * prefix, base, 1.0);
+        model_sigma.hypot(
+            (factor * factor * self.raw_variance + self.base_variance + final_error * final_error)
+                .sqrt(),
+        )
+    }
 }
 
 /// Adds a dot-like refinement to the cumulative raw prefix.
@@ -149,7 +248,8 @@ impl QuantizedIndexCtx {
         })
     }
 
-    /// Resolves process-cached scorer state for one persisted configuration.
+    /// Shares scorer state held by live readers/queries. The registry owns only weak
+    /// references and removes dead keys on each lookup, including distinct rebuild seeds.
     pub(crate) fn resolve(config: VectorQuantizationConfig) -> crate::Result<Arc<Self>> {
         let runtime_config = (
             config.field.as_str(),
@@ -169,11 +269,12 @@ impl QuantizedIndexCtx {
         };
         let cache = QUANTIZED_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         let mut cache = cache.lock().expect("quantized index cache lock poisoned");
-        if let Some(resolved) = cache.get(&key) {
-            return Ok(Arc::clone(resolved));
+        cache.retain(|_, context| context.strong_count() != 0);
+        if let Some(resolved) = cache.get(&key).and_then(Weak::upgrade) {
+            return Ok(resolved);
         }
         let resolved = Arc::new(Self::new(config)?);
-        cache.insert(key, Arc::clone(&resolved));
+        cache.insert(key, Arc::downgrade(&resolved));
         Ok(resolved)
     }
 
@@ -416,6 +517,32 @@ mod tests {
     use super::{QuantizedIndexCtx, QuantizedQueryCache, QuantizedQueryCtx};
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
+
+    #[test]
+    fn dropped_readers_do_not_retain_distinct_seed_contexts() {
+        let mut config = VectorQuantizationConfig::materialize(
+            "review_cache_lifetime".to_string(),
+            &VectorOptions::new(64, Metric::L2),
+            vec![VectorQuantizationLayer { bits: 4, seed: 0 }],
+        )
+        .unwrap();
+        for seed in 0..256 {
+            config.layers[0].seed = seed;
+            let context = QuantizedIndexCtx::resolve(config.clone()).unwrap();
+            let weak = Arc::downgrade(&context);
+            drop(context);
+            assert!(
+                weak.upgrade().is_none(),
+                "seed {seed} retained without a reader"
+            );
+            let registry = super::QUANTIZED_INDEX_CACHE.get().unwrap().lock().unwrap();
+            let retained = registry
+                .keys()
+                .filter(|key| key.config_json.contains("review_cache_lifetime"))
+                .count();
+            assert!(retained <= 1, "dead seed keys accumulated: {retained}");
+        }
+    }
 
     #[test]
     fn resolved_quantized_index_context_is_reused_across_segment_opens() {
