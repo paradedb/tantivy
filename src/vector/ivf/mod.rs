@@ -5,6 +5,7 @@
 //! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold),
 //! which defaults to 10k docs.
 
+mod aps;
 pub(crate) mod bkt;
 pub(crate) mod graph;
 mod index;
@@ -17,6 +18,7 @@ mod training;
 /// The IVF cluster-routing file. Written per field, only for IVF segments.
 pub(crate) const CENTROIDS_EXT: &str = "centroids";
 
+pub use aps::APS_MAX_DIM;
 pub use bkt::{BKTree, BKTreeNode, BKTreeSearchIterator, NodeId as BktNodeId};
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
@@ -27,9 +29,9 @@ pub use index::IvfIndex;
 pub use ivf::{
     AddLevelError, ClusterId, InMemoryStackedIvf, InMemoryStore, IvfConfig,
     IvfIndex as MultiLevelIvf, IvfIndexBuilder, IvfLevelClusterer, LazyStackedIvf, LazyStore,
-    SuperKMeansLevelClusterer,
+    StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
 };
-pub use params::{AdaptiveProbeParams, WorkModel};
+pub use params::{AdaptiveProbeParams, WorkModel, DEFAULT_ROUTER_RECALL};
 pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, encode_vector};
 pub use training::{

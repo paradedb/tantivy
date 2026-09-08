@@ -852,7 +852,7 @@ mod bounds_storage_tests {
     use crate::vector::{
         residual_norm, BoundKind, InMemoryStackedIvf, IvfCentroids, IvfClusterer, IvfConfig,
         IvfMatrix, IvfMergeSettings, IvfTrainingVectors, IvfVectors, Metric, RouterKind,
-        VectorDType, VectorOptions, VectorStorageFormat,
+        RoutingParams, VectorDType, VectorOptions, VectorStorageFormat,
     };
     use crate::{Index, IndexWriter, TantivyDocument};
 
@@ -1328,10 +1328,14 @@ mod bounds_storage_tests {
             let query = [c[0] + 0.3, 0.2];
             let owned: Vec<_> = stacked
                 .search(&query, 2, 1.0, Metric::L2)
+                .0
                 .into_iter()
                 .take(2)
                 .collect();
-            let lazy: Vec<_> = ivf.rank_clusters(&mut workspace, &query).take(2).collect();
+            let lazy: Vec<_> = ivf
+                .rank_clusters(&mut workspace, &query, RoutingParams::default())
+                .take(2)
+                .collect();
             assert_eq!(owned.len(), lazy.len());
             for (o, l) in owned.iter().zip(&lazy) {
                 assert_eq!(u32::from(o.node), l.node);
