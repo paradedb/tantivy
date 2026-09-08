@@ -8,6 +8,12 @@ use std::sync::{Mutex, OnceLock};
 use crate::schema::Metric;
 use crate::vector::Similarity;
 
+/// Dimensions at or above this route with the fixed nprobe fractions even
+/// when a recall target is requested. The recall profile rests on
+/// `I_x((d+1)/2, 1/2)`; past a few hundred dimensions the continued
+/// fraction and cap volumes degenerate and the estimate is not trustworthy.
+pub const APS_MAX_DIM: usize = 256;
+
 const BETA_TABLE_LEN: usize = 1024;
 const BETA_STOP: f64 = 1.0e-8;
 const BETA_TINY: f64 = 1.0e-30;

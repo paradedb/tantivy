@@ -256,9 +256,16 @@ pub type InMemoryStackedIvf = IvfIndex<InMemoryStore, InMemoryStore>;
 pub type LazyStackedIvf = IvfIndex<LazyStore, LazyStore>;
 
 /// File-backed row-major `f32` matrix.
+///
+/// Rows are fetched per call through a [`FileSliceArena`] unless the store
+/// was opened [`pinned`](Self::pinned), in which case the decoded rows are
+/// held in memory. Router-level centroids are pinned at open: they are
+/// `nlist × dim` (tiny next to the member rows) and APS needs the full
+/// matrix to compute query-to-bisector distances.
 pub struct LazyStore {
     arena: FileSliceArena<f32>,
     dim: usize,
+    pinned: Option<Vec<f32>>,
 }
 
 impl LazyStore {
@@ -267,7 +274,30 @@ impl LazyStore {
         LazyStore {
             arena: FileSliceArena::new(rows),
             dim,
+            pinned: None,
         }
+    }
+
+    /// Wraps `rows` and decodes them into memory once, so
+    /// [`CentroidMatrix`] is available and scoring skips the file.
+    pub fn pinned(rows: FileSlice, dim: usize) -> io::Result<Self> {
+        let bytes = rows.read_bytes()?;
+        if bytes.len() % (dim * mem::size_of::<f32>()) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned store bytes are not a multiple of the row stride",
+            ));
+        }
+        let values = bytes
+            .as_slice()
+            .chunks_exact(mem::size_of::<f32>())
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4-byte chunk")))
+            .collect();
+        Ok(LazyStore {
+            arena: FileSliceArena::new(rows),
+            dim,
+            pinned: Some(values),
+        })
     }
 
     pub fn dim(&self) -> usize {
@@ -295,7 +325,10 @@ impl VectorArena for LazyStore {
         index: u32,
         query: &[Self::Elem],
     ) -> Similarity {
-        self.arena.similarity(metric, dim, index, query)
+        match &self.pinned {
+            Some(rows) => metric.similarity(query, &rows[index as usize * dim..][..dim]),
+            None => self.arena.similarity(metric, dim, index, query),
+        }
     }
 }
 
@@ -348,9 +381,7 @@ where
         .serialize(&mut topology)?;
 
     fn serialize_level<C, M>(index: &IvfIndex<C, M>, out: &mut Vec<u8>) -> io::Result<()>
-    where
-        C: SerializableStore,
-    {
+    where C: SerializableStore {
         let nlist = index.centroids.len();
         if index.offsets.len() != nlist {
             return Err(io::Error::new(
@@ -390,8 +421,8 @@ where
     Ok(())
 }
 
-/// Row-major centroid access for APS. Slice-backed stores return `None`
-/// and search falls back to scanning every candidate list.
+/// Row-major centroid access for APS. Stores without an in-memory matrix
+/// return `None` and search falls back to scanning every candidate list.
 pub(crate) trait CentroidMatrix {
     fn centroid_matrix(&self) -> Option<(&[f32], usize)>;
 }
@@ -404,7 +435,7 @@ impl CentroidMatrix for InMemoryStore {
 
 impl CentroidMatrix for LazyStore {
     fn centroid_matrix(&self) -> Option<(&[f32], usize)> {
-        None
+        self.pinned.as_deref().map(|rows| (rows, self.dim))
     }
 }
 
@@ -794,14 +825,17 @@ impl LazyStackedIvf {
             start = end;
         }
 
+        // Every level's centroids are pinned: they are what APS reads, and
+        // they are small. L0 members (the caller's rows) stay file-backed;
+        // a parent's members are the level below's centroids, pinned too.
         let mut index: Option<Box<LazyStackedIvf>> = None;
         for level in (0..level_topology.len()).rev() {
             let (_, offsets) = &level_topology[level];
             let (level_members, level_member_count) = if level == 0 {
-                (member_rows.clone(), num_members)
+                (LazyStore::new(member_rows.clone(), dim), num_members)
             } else {
                 (
-                    centroid_slices[level - 1].clone(),
+                    LazyStore::pinned(centroid_slices[level - 1].clone(), dim)?,
                     level_topology[level - 1].0,
                 )
             };
@@ -819,8 +853,8 @@ impl LazyStackedIvf {
                 },
                 parent: index,
                 offsets: offsets.clone(),
-                centroids: LazyStore::new(centroid_slices[level].clone(), dim),
-                vectors: LazyStore::new(level_members, dim),
+                centroids: LazyStore::pinned(centroid_slices[level].clone(), dim)?,
+                vectors: level_members,
             }));
         }
         Ok(*index.expect("at least one level"))
@@ -1029,7 +1063,8 @@ mod tests {
         let n = 16;
         let data = line_data(n);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (index, member_perm) = InMemoryStackedIvf::build(data, n, dim, &clusterer, test_config(4));
+        let (index, member_perm) =
+            InMemoryStackedIvf::build(data, n, dim, &clusterer, test_config(4));
         assert!(index.nlist() > 1);
         assert_eq!(index.vectors.len(), n);
         assert_eq!(member_perm.len(), n);
@@ -1328,7 +1363,8 @@ mod tests {
         let n_per = 32;
         let data = two_blobs(n_per);
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
-        let (mut index, _) = InMemoryStackedIvf::build(data, n_per * 2, 2, &clusterer, test_config(2));
+        let (mut index, _) =
+            InMemoryStackedIvf::build(data, n_per * 2, 2, &clusterer, test_config(2));
         index.config.nprobe_fraction = 1.0;
         let query = [0.0f32, 0.0];
         let (full_hits, full) = index.search(&query, 4, 1.0, Metric::L2);
@@ -1345,6 +1381,50 @@ mod tests {
                 || low_hits.iter().any(|h| h.node == full_hits[0].node),
             "low-recall top hit should be in or as good as the full-scan nearest"
         );
+    }
+
+    /// An opened (file-backed) index pins its centroids, so APS runs there
+    /// too: a low recall target scans fewer lists than the full nprobe
+    /// pass, and the two agree on the nearest member.
+    #[test]
+    fn test_opened_index_runs_aps() {
+        let n_per = 32;
+        let data = two_blobs(n_per);
+        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
+        let (mut index, _) =
+            InMemoryStackedIvf::build(data, n_per * 2, 2, &clusterer, test_config(2));
+        index.config.nprobe_fraction = 1.0;
+
+        let mut slot = Vec::new();
+        index.serialize_router_payload(&mut slot).unwrap();
+        let member_bytes: Vec<u8> = index
+            .vectors
+            .as_slice()
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let opened = LazyStackedIvf::open(
+            FileSlice::from(slot),
+            FileSlice::from(member_bytes),
+            2,
+            index.config.clone(),
+        )
+        .unwrap();
+        assert!(
+            opened.centroids.centroid_matrix().is_some(),
+            "opened router centroids must be pinned for APS"
+        );
+
+        let query = [0.0f32, 0.0];
+        let (full_hits, full) = opened.search(&query, 4, 1.0, Metric::L2);
+        let (low_hits, low) = opened.search(&query, 4, 0.8, Metric::L2);
+        assert!(
+            low.lists_scanned < full.lists_scanned,
+            "APS 0.8 scanned {} lists, full scanned {}",
+            low.lists_scanned,
+            full.lists_scanned
+        );
+        assert_eq!(low_hits[0].node, full_hits[0].node);
     }
 
     #[test]
