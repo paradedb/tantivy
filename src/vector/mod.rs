@@ -68,7 +68,7 @@ pub use ivf::{
     IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, LazyStackedIvf, LazyStore,
     MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    StackedSearchStats, SuperKMeansLevelClusterer, Workspace,
+    StackedSearchStats, SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
@@ -79,7 +79,7 @@ pub use quantization::{
     QUANTIZED_GAMMA_STRIDE, QUANTIZED_RESIDUAL_NORM_STRIDE, QUANTIZED_SCALE_STRIDE,
     QUANTIZED_SIDECAR_STRIDE, VECTOR_QUANTIZATION_FORMAT_VERSION,
 };
-pub use router::{RouterKind, RouterMetrics};
+pub use router::{RouterKind, RouterMetrics, RoutingParams};
 pub use tie_break::NoTieBreak;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`

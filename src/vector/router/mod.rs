@@ -131,6 +131,30 @@ pub(crate) struct RouterWorkspace {
     rng: Workspace,
 }
 
+/// Per-query routing knobs. Only the stacked router reads them; the RNG
+/// and exact routers rank the same way regardless.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoutingParams {
+    /// Clusters the caller expects to probe. The stacked router ranks at
+    /// least this many members when APS is on; with APS off it ranks every
+    /// member of the lists its nprobe fraction selects.
+    pub k: usize,
+    /// Stacked-router recall target in `(0, 1]`. `1.0` disables APS and
+    /// routes with the fixed nprobe fractions. APS is also disabled above
+    /// [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM) regardless of this
+    /// value.
+    pub recall: f32,
+}
+
+impl Default for RoutingParams {
+    fn default() -> Self {
+        Self {
+            k: usize::MAX,
+            recall: 1.0,
+        }
+    }
+}
+
 pub(crate) enum RouterIter<'router, 'workspace> {
     Rng(ResumableSearchIterator<'router, 'workspace, LazyStore>),
     Stacked(stacked::Ranking),
@@ -141,9 +165,7 @@ impl RouterIter<'_, '_> {
     pub(crate) fn metrics(&self) -> RouterMetrics {
         match self {
             Self::Rng(ranking) => RouterMetrics::Rng(ranking.metrics()),
-            Self::Stacked(ranking) => RouterMetrics::Stacked {
-                candidate_count: ranking.candidate_count(),
-            },
+            Self::Stacked(ranking) => ranking.metrics(),
             Self::Exact(ranking) => RouterMetrics::Exact {
                 visited_count: ranking.visited_count(),
             },
@@ -177,10 +199,13 @@ impl OpenedRouter {
         workspace: &'workspace mut RouterWorkspace,
         query: &'router [f32],
         metric: Metric,
+        params: RoutingParams,
     ) -> RouterIter<'router, 'workspace> {
         match self {
             Self::Rng(router) => RouterIter::Rng(rng::rank(router, &mut workspace.rng, query)),
-            Self::Stacked(router) => RouterIter::Stacked(stacked::rank(router, query, metric)),
+            Self::Stacked(router) => {
+                RouterIter::Stacked(stacked::rank(router, query, metric, params))
+            }
             Self::Exact(router) => RouterIter::Exact(router.rank(query)),
         }
     }
@@ -191,8 +216,20 @@ impl OpenedRouter {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RouterMetrics {
     Rng(NeighborhoodGraphSearchMetrics),
-    Stacked { candidate_count: usize },
-    Exact { visited_count: usize },
+    Stacked {
+        /// Ranked centroids handed to the probe loop.
+        candidate_count: usize,
+        /// Router lists opened, summed over every router level.
+        lists_scanned: usize,
+        /// Similarity computations spent routing, summed over every level.
+        members_scored: usize,
+        /// Recall target the bottom router level actually used; `1.0`
+        /// means the fixed nprobe path (requested, or forced by dimension).
+        recall_target: f32,
+    },
+    Exact {
+        visited_count: usize,
+    },
 }
 
 #[cfg(test)]
@@ -229,7 +266,7 @@ mod tests {
             &options,
         )?;
         let mut workspace = RouterWorkspace::default();
-        let mut ranking = opened.rank(&mut workspace, &[1.1], Metric::L2);
+        let mut ranking = opened.rank(&mut workspace, &[1.1], Metric::L2, RoutingParams::default());
         assert_eq!(ranking.next().unwrap().node, 1);
         assert!(matches!(
             ranking.metrics(),
@@ -261,7 +298,8 @@ mod tests {
         )?;
         let mut workspace = RouterWorkspace::default();
         for query in [[0.1], [1.9]] {
-            let mut ranking = opened.rank(&mut workspace, &query, Metric::L2);
+            let mut ranking =
+                opened.rank(&mut workspace, &query, Metric::L2, RoutingParams::default());
             assert!(ranking.next().is_some());
             let metrics = ranking.metrics();
             match metrics {
@@ -276,6 +314,117 @@ mod tests {
             assert!(json["visited_count"].as_u64().unwrap() > 0);
         }
         Ok(())
+    }
+
+    /// Two well-separated blobs of `dim`-d centroids, `n_per` each.
+    fn blob_centroids(dim: usize, n_per: usize) -> IvfCentroids {
+        let mut values = Vec::with_capacity(2 * n_per * dim);
+        for blob in 0..2 {
+            for i in 0..n_per {
+                for d in 0..dim {
+                    let base = if blob == 0 { 0.0 } else { 100.0 };
+                    values.push(base + if d == 0 { i as f32 * 0.05 } else { 0.0 });
+                }
+            }
+        }
+        IvfCentroids::F32(IvfMatrix {
+            values,
+            rows: 2 * n_per,
+            dims: dim,
+        })
+    }
+
+    fn open_stacked(dim: usize, n_per: usize) -> crate::Result<OpenedRouter> {
+        let options = VectorOptions::new(dim, Metric::L2);
+        let mut centroids = blob_centroids(dim, n_per);
+        let built = RouterKind::Stacked.build(&options, &mut centroids)?;
+        let mut bytes = Vec::new();
+        built.serialize(&mut bytes)?;
+        let rows = match centroids {
+            IvfCentroids::F32(matrix) => matrix
+                .values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        };
+        RouterKind::Stacked.open(
+            VectorFileVersion::V3,
+            FileSlice::from(bytes),
+            FileSlice::from(rows),
+            &options,
+        )
+    }
+
+    fn stacked_metrics(metrics: RouterMetrics) -> (usize, usize, usize, f32) {
+        match metrics {
+            RouterMetrics::Stacked {
+                candidate_count,
+                lists_scanned,
+                members_scored,
+                recall_target,
+            } => (
+                candidate_count,
+                lists_scanned,
+                members_scored,
+                recall_target,
+            ),
+            other => panic!("expected stacked metrics, got {other:?}"),
+        }
+    }
+
+    /// Below `APS_MAX_DIM` the requested recall target is honoured and the
+    /// ranking is bounded by `k`; the metrics report the router's work.
+    #[test]
+    fn stacked_ranking_uses_requested_recall_below_dim_cap() -> crate::Result<()> {
+        let opened = open_stacked(2, 64)?;
+        let mut workspace = RouterWorkspace::default();
+        let query = vec![0.0f32; 2];
+        let params = RoutingParams { k: 8, recall: 0.5 };
+        let ranking = opened.rank(&mut workspace, &query, Metric::L2, params);
+        let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
+        assert_eq!(recall, 0.5);
+        assert!(candidates >= 1 && candidates <= 8, "{candidates}");
+        assert!(lists >= 1);
+        assert!(scored >= candidates);
+        let json = serde_json::to_value(ranking.metrics()).unwrap();
+        assert_eq!(json["kind"], "stacked");
+        assert!(json["lists_scanned"].as_u64().unwrap() >= 1);
+        Ok(())
+    }
+
+    /// At or above `APS_MAX_DIM` the recall target is forced to `1.0` and
+    /// the router ranks every member of its selected lists, not just `k`.
+    #[test]
+    fn stacked_ranking_falls_back_to_nprobe_at_dim_cap() -> crate::Result<()> {
+        let dim = crate::vector::ivf::APS_MAX_DIM;
+        let opened = open_stacked(dim, 32)?;
+        let mut workspace = RouterWorkspace::default();
+        let query = vec![0.0f32; dim];
+        let params = RoutingParams { k: 2, recall: 0.5 };
+        let ranking = opened.rank(&mut workspace, &query, Metric::L2, params);
+        let (candidates, _, _, recall) = stacked_metrics(ranking.metrics());
+        assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");
+        assert!(
+            candidates > 2,
+            "nprobe path ranks every member of the selected lists, got {candidates}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn effective_recall_guards() {
+        assert_eq!(stacked::effective_recall(2, 0.9), 0.9);
+        assert_eq!(stacked::effective_recall(2, 1.0), 1.0);
+        assert_eq!(stacked::effective_recall(2, 1.5), 1.0);
+        assert_eq!(stacked::effective_recall(2, f32::NAN), 1.0);
+        assert_eq!(
+            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM, 0.9),
+            1.0
+        );
+        assert_eq!(
+            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM - 1, 0.9),
+            0.9
+        );
     }
 
     #[test]
