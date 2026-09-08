@@ -153,8 +153,8 @@ fn load_dataset(n: usize, n_queries: usize) -> Dataset {
                 return split_tail(name, all, d, n_queries);
             }
             println!(
-                "Cohere dump not found. Place 1M×1024 f32s at {} or set COHERE_PATH.\n\
-                 Download: uv run --script scripts/download_cohere.py (paradedb/superkmeans-rs)",
+                "Cohere dump not found. Place 1M×1024 f32s at {} or set COHERE_PATH.\nDownload: \
+                 uv run --script scripts/download_cohere.py (paradedb/superkmeans-rs)",
                 cohere_path().display()
             );
         }
@@ -303,8 +303,8 @@ fn main() {
     let n_queries = queries.len() / d;
 
     println!(
-        "n={n} d={d} queries={n_queries} top_k={TOP_K} \
-         branching={BRANCHING_FACTOR} max_leaf_size={MAX_LEAF_SIZE}"
+        "n={n} d={d} queries={n_queries} top_k={TOP_K} branching={BRANCHING_FACTOR} \
+         max_leaf_size={MAX_LEAF_SIZE}"
     );
 
     print!("computing exact ground truth... ");
@@ -355,8 +355,8 @@ fn main() {
 
     index.config.nprobe_fraction = APS_FRACTION;
     println!(
-        "\nAPS: f_M={APS_FRACTION} -> {} candidate lists, parent recall {}\n\
-         {:<8} {:<10} {:<12} {:<10} {:>6}",
+        "\nAPS: f_M={APS_FRACTION} -> {} candidate lists, parent recall {}\n{:<8} {:<10} {:<12} \
+         {:<10} {:>6}",
         index.n_probe(),
         index.config.parent_recall_target,
         "target",

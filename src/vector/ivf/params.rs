@@ -72,6 +72,14 @@ pub struct AdaptiveProbeParams {
     /// holding a [`Searcher`](crate::Searcher) - see [`WorkModel`]. `None`
     /// falls back to per-segment normalization.
     pub work_model: Option<WorkModel>,
+    /// Recall target for the stacked router's cluster ranking, in
+    /// `(0, 1]`. Below `1.0` the router stops scanning its lists once the
+    /// estimated recall of the top clusters reaches it (APS); `1.0` routes
+    /// with the fixed nprobe fractions. Ignored by other routers, and
+    /// forced to `1.0` at or above
+    /// [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM). Default
+    /// [`DEFAULT_ROUTER_RECALL`], PROVISIONAL.
+    pub router_recall_target: f32,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -80,11 +88,34 @@ impl Default for AdaptiveProbeParams {
             max_probe_fraction: 0.01,
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
+            router_recall_target: DEFAULT_ROUTER_RECALL,
         }
     }
 }
 
 pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
+
+/// Default [`AdaptiveProbeParams::router_recall_target`].
+pub const DEFAULT_ROUTER_RECALL: f32 = 0.9;
+
+/// How many more clusters than the work budget the stacked router is asked
+/// to rank under APS, so the bounds gate and a selective filter can pull
+/// past the nominal budget without exhausting the ranking.
+pub(crate) const ROUTER_K_SLACK: usize = 2;
+
+impl AdaptiveProbeParams {
+    /// The number of clusters the stacked router is asked to rank for a
+    /// segment whose resolved work budget is `budget` units (~ that many
+    /// average clusters): `ROUTER_K_SLACK × ceil(budget)`, floored at
+    /// `min_probe_clusters` and capped at the segment's cluster count.
+    pub(crate) fn router_k(&self, budget: f64, clusters_in_segment: usize) -> usize {
+        let base = budget.ceil().max(0.0) as usize;
+        base.saturating_mul(ROUTER_K_SLACK)
+            .max(self.min_probe_clusters)
+            .min(clusters_in_segment)
+            .max(1)
+    }
+}
 
 impl AdaptiveProbeParams {
     /// The segment's work-unit budget: `max_probe_fraction *
@@ -209,6 +240,18 @@ mod tests {
             "allocation sums to f*C index-wide: {big} + {small}"
         );
         Ok(())
+    }
+
+    /// The stacked router is asked for a slack multiple of the budget,
+    /// lifted to the probe floor and capped at the segment's clusters.
+    #[test]
+    fn router_k_tracks_budget_with_slack_and_caps() {
+        let params = AdaptiveProbeParams::default();
+        assert_eq!(params.router_k(20.0, 1000), 40);
+        assert_eq!(params.router_k(20.4, 1000), 42);
+        assert_eq!(params.router_k(2.0, 1000), super::MIN_PROBE_CLUSTERS);
+        assert_eq!(params.router_k(20.0, 30), 30);
+        assert_eq!(params.router_k(0.0, 0), 1);
     }
 
     #[test]

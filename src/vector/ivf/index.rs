@@ -31,7 +31,7 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
-use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace};
+use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace, RoutingParams};
 use crate::vector::{BoundKind, BoundStore};
 
 /// The IVF routing index over one field's clusters: says which clusters —
@@ -292,11 +292,15 @@ impl IvfIndex {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
+    /// Rank this segment's clusters for `query`, nearest first. `params`
+    /// steers the stacked router only (how many clusters the caller will
+    /// probe and its recall target); other routers ignore it.
     pub(crate) fn rank_clusters<'router, 'workspace>(
         &'router self,
         workspace: &'workspace mut RouterWorkspace,
         query: &'router [f32],
+        params: RoutingParams,
     ) -> RouterIter<'router, 'workspace> {
-        self.router.rank(workspace, query, self.metric)
+        self.router.rank(workspace, query, self.metric, params)
     }
 }

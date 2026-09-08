@@ -39,7 +39,7 @@ use super::prepared::{
     PreparedQuery, QuantizedQueryCtx, VectorQuery,
 };
 use super::quantization::QUANTIZED_BOUNDARY_KAPPA;
-use super::router::{RouterMetrics, RouterWorkspace};
+use super::router::{RouterMetrics, RouterWorkspace, RoutingParams};
 use super::tie_break::NoTieBreak;
 use super::{enter_vector_stage, Stage, VectorElement};
 use crate::collector::sort_key::{Comparator, NaturalComparator};
@@ -540,7 +540,9 @@ impl ProbeStats {
         self.routing = Some(routing);
         self.routing_visited_count += match routing {
             RouterMetrics::Rng(graph) => graph.visited_count,
-            RouterMetrics::Stacked { candidate_count } => candidate_count,
+            RouterMetrics::Stacked {
+                candidate_count, ..
+            } => candidate_count,
             RouterMetrics::Exact { visited_count } => visited_count,
         };
         if let RouterMetrics::Rng(graph) = routing {
@@ -2069,10 +2071,14 @@ impl<T: VectorElement> VectorBackend<T> {
             (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
         );
 
+        let routing = RoutingParams {
+            k: self.adaptive.router_k(work_budget, index.num_clusters()),
+            recall: self.adaptive.router_recall_target,
+        };
         let routing_start = Instant::now();
         let mut ranked = {
             let _routing_stage = enter_vector_stage(Stage::Routing);
-            index.rank_clusters(&mut routing_ws, query.query())
+            index.rank_clusters(&mut routing_ws, query.query(), routing)
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
         let routing_before_scan = routing_ns;
@@ -2581,10 +2587,17 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.scan_init_ns = stats.scan_init_ns.saturating_add(
             (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
         );
+        // The stacked router is told how many clusters this budget buys and
+        // the recall target; it drops to the fixed nprobe path itself when
+        // the dimension is past `APS_MAX_DIM`.
+        let routing = RoutingParams {
+            k: self.adaptive.router_k(work_budget, num_centroids),
+            recall: self.adaptive.router_recall_target,
+        };
         let routing_start = Instant::now();
         let mut ranked = {
             let _routing_stage = enter_vector_stage(Stage::Routing);
-            index.rank_clusters(&mut routing_ws, &query_f32)
+            index.rank_clusters(&mut routing_ws, &query_f32, routing)
         };
         let mut routing_ns = routing_start.elapsed().as_nanos() as u64;
         let routing_before_scan = routing_ns;
@@ -4557,6 +4570,10 @@ mod tests {
         let params = AdaptiveProbeParams {
             max_probe_fraction: 0.2,
             min_probe_clusters: 1,
+            // Route exhaustively: with APS on, the stacked router hands the
+            // loop only the clusters the recall target needs, and on this
+            // tiny fixture the ranking runs out before the budget binds.
+            router_recall_target: 1.0,
             ..Default::default()
         };
         let searcher = index.index.reader()?.searcher();
