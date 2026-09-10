@@ -756,7 +756,12 @@ fn ranges_cover_members(ranges: &[(u64, u64)], n: usize) -> bool {
         return n == 0;
     }
     let mut packed: Vec<(u64, u64)> = ranges.to_vec();
-    packed.sort_unstable_by_key(|&(start, _)| start);
+    // Sort by (start, end) so empty ranges `(s, s)` precede a non-empty
+    // `(s, e)` that shares their start. List-id order after `permute_lists`
+    // is arbitrary, and sorting by start alone leaves that tie unstable —
+    // an empty range after its sibling fails the adjacency check even though
+    // the ranges still partition `[0, n)`.
+    packed.sort_unstable();
     if packed[0].0 != 0 || packed.last().map(|&(_, end)| end as usize) != Some(n) {
         return false;
     }
@@ -1295,6 +1300,52 @@ mod tests {
     }
 
     #[test]
+
+    /// Empty lists after `add_level` share start offsets with the next
+    /// non-empty list. Cover validation must still accept the partition
+    /// (reproduces the centroid_ratio-sensitive open failure).
+    #[test]
+    fn stacked_open_accepts_empty_lists_after_add_level() {
+        let dim = 32usize;
+        let n = 20_000usize;
+        let mut data = vec![0.0f32; n * dim];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = ((i * 2654435761usize) % 1000) as f32 / 1000.0;
+        }
+        let clusterer = SuperKMeansLevelClusterer { iters_per_split: 1 };
+        let config = IvfConfig {
+            nprobe_fraction: PARENT_NPROBE_FRACTION,
+            max_leaf_size: DEFAULT_MAX_LEAF_SIZE,
+            branching_factor: 64,
+            ..IvfConfig::default()
+        };
+        let (index, _perm) =
+            IvfIndexBuilder::new(data, n, dim, &clusterer, config.clone()).build();
+        assert!(
+            index.depth() >= 2,
+            "need a parent so permute_lists scrambles L0 list order"
+        );
+        assert!(
+            index.offsets.iter().any(|&(start, end)| start == end),
+            "need at least one empty list to exercise the tie-break"
+        );
+        let mut slot = Vec::new();
+        index.serialize_router_payload(&mut slot).unwrap();
+        let member_bytes: Vec<u8> = index
+            .vectors
+            .as_slice()
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        LazyStackedIvf::open(
+            FileSlice::from(slot),
+            FileSlice::from(member_bytes),
+            dim,
+            config,
+        )
+        .expect("empty lists after add_level must still open");
+    }
+
     fn test_slice_backed_open_rejects_truncation() {
         let dim = 2;
         let n = 32;
