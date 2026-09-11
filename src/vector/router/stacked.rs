@@ -93,15 +93,15 @@ pub(super) fn rank(
     params: RoutingParams,
 ) -> Ranking {
     let recall = effective_recall(query.len(), params.recall);
-    // Members of this level are the segment's centroids. On the nprobe
-    // path rank every member the selected lists contain, so a selective
-    // filter can pull deep into the ranking; on the APS path `k` is what
-    // the stopping rule fills, so rank the caller's cluster count.
-    let k = if recall < 1.0 {
-        params.k.clamp(1, index.vectors.len().max(1))
-    } else {
-        index.vectors.len()
-    };
+    // Always return at most `params.k` L0 centroids. That `k` tracks the
+    // caller's probe budget (`router_k` ← `max_probe`), so easy queries
+    // request fewer candidates and harder ones more.
+    //
+    // The search still opens the parent nprobe lists and scores every
+    // member into a size-`k` heap: scanning all members of the selected
+    // lists avoids the classic IVF boundary miss; capping the heap (and
+    // thus `candidate_count`) is what ties the returned set to probe.
+    let k = params.k.clamp(1, index.vectors.len().max(1));
     let (ranked, stats) = index.search(query, k, recall, metric);
     let candidate_count = ranked.len();
     Ranking {
