@@ -392,8 +392,9 @@ mod tests {
         Ok(())
     }
 
-    /// At or above `APS_MAX_DIM` the recall target is forced to `1.0` and
-    /// the router ranks every member of its selected lists, not just `k`.
+    /// At or above `APS_MAX_DIM` the recall target is forced to `1.0` (fixed
+    /// nprobe list selection), but the returned set is still capped at `k`
+    /// so the caller's probe budget limits `candidate_count`.
     #[test]
     fn stacked_ranking_falls_back_to_nprobe_at_dim_cap() -> crate::Result<()> {
         let dim = crate::vector::ivf::APS_MAX_DIM;
@@ -402,11 +403,13 @@ mod tests {
         let query = vec![0.0f32; dim];
         let params = RoutingParams { k: 2, recall: 0.5 };
         let ranking = opened.rank(&mut workspace, &query, Metric::L2, params);
-        let (candidates, _, _, recall) = stacked_metrics(ranking.metrics());
+        let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");
+        assert!(candidates <= 2, "returned set must honor params.k, got {candidates}");
+        assert!(lists >= 1, "nprobe path must still open parent lists");
         assert!(
-            candidates > 2,
-            "nprobe path ranks every member of the selected lists, got {candidates}"
+            scored >= candidates,
+            "all members of selected lists are scored into the k-heap ({scored} < {candidates})"
         );
         Ok(())
     }
