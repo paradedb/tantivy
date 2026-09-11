@@ -393,23 +393,56 @@ mod tests {
     }
 
     /// At or above `APS_MAX_DIM` the recall target is forced to `1.0` (fixed
-    /// nprobe list selection), but the returned set is still capped at `k`
-    /// so the caller's probe budget limits `candidate_count`.
+    /// nprobe list selection). The returned set is capped at `k`, and L0
+    /// expansion stops after `LEAF_EXPANSION_SLACK × k` members scored.
     #[test]
     fn stacked_ranking_falls_back_to_nprobe_at_dim_cap() -> crate::Result<()> {
         let dim = crate::vector::ivf::APS_MAX_DIM;
-        let opened = open_stacked(dim, 32)?;
+        let opened = open_stacked(dim, 64)?;
         let mut workspace = RouterWorkspace::default();
         let query = vec![0.0f32; dim];
-        let params = RoutingParams { k: 2, recall: 0.5 };
+        let params = RoutingParams { k: 4, recall: 0.5 };
         let ranking = opened.rank(&mut workspace, &query, Metric::L2, params);
         let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");
-        assert!(candidates <= 2, "returned set must honor params.k, got {candidates}");
+        assert!(candidates <= 4, "returned set must honor params.k, got {candidates}");
         assert!(lists >= 1, "nprobe path must still open parent lists");
+        assert!(scored >= candidates);
+        // Full expand of Quake nprobe would score far more than slack×k at
+        // this size; the leaf budget must bind.
+        let budget = 4 * crate::vector::ivf::LEAF_EXPANSION_SLACK;
         assert!(
-            scored >= candidates,
-            "all members of selected lists are scored into the k-heap ({scored} < {candidates})"
+            scored <= budget * 8,
+            "L0 expansion should be bounded by slack×k (plus parent work); \
+             scored={scored} budget={budget}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stacked_leaf_expansion_scales_with_k() -> crate::Result<()> {
+        let dim = crate::vector::ivf::APS_MAX_DIM;
+        let opened = open_stacked(dim, 128)?;
+        let mut workspace = RouterWorkspace::default();
+        let query = vec![0.0f32; dim];
+        let small = opened.rank(
+            &mut workspace,
+            &query,
+            Metric::L2,
+            RoutingParams { k: 4, recall: 1.0 },
+        );
+        let (_, _, scored_small, _) = stacked_metrics(small.metrics());
+        drop(small);
+        let large = opened.rank(
+            &mut workspace,
+            &query,
+            Metric::L2,
+            RoutingParams { k: 32, recall: 1.0 },
+        );
+        let (_, _, scored_large, _) = stacked_metrics(large.metrics());
+        assert!(
+            scored_large > scored_small,
+            "larger k should expand more L0 members ({scored_large} <= {scored_small})"
         );
         Ok(())
     }

@@ -64,6 +64,12 @@ impl From<usize> for ClusterId {
 /// Default `nprobe_fraction` for parent levels (L1, L2, …).
 pub const PARENT_NPROBE_FRACTION: f32 = 0.25;
 
+/// At the router leaf (L0), stop expanding parent-selected lists once this
+/// many members have been scored into the size-`k` heap (`slack × k`).
+/// Parent levels keep Quake-fat nprobe and always expand every list they
+/// select; only L0 uses this cap (see [`IvfIndex::search_limited`]).
+pub const LEAF_EXPANSION_SLACK: usize = 2;
+
 /// Recall target used when this level searches its parent.
 pub const PARENT_RECALL_TARGET: f32 = 0.99;
 
@@ -894,12 +900,33 @@ where
     /// centroid first. When `recall < 1.0` and centroids are in-memory,
     /// scanning stops once the estimated recall of the lists scanned so
     /// far reaches `recall` (Quake APS).
+    ///
+    /// Parent levels always expand every selected list (Quake nprobe). The
+    /// router leaf should call [`Self::search_limited`] so L0 expansion can
+    /// stop after `LEAF_EXPANSION_SLACK × k` members.
     pub fn search(
         &self,
         query: &[C::Elem],
         k: usize,
         recall: f32,
         metric: Metric,
+    ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
+        self.search_limited(query, k, recall, metric, None)
+    }
+
+    /// Like [`Self::search`], but when `expansion_member_budget` is set,
+    /// stop expanding further lists once that many **members at this level**
+    /// have been scored into the size-`k` heap (lists are still fully
+    /// scanned; the budget is checked after each list). Parent ranking
+    /// still uses full [`Self::n_probe`] — the budget does not shrink
+    /// parent fanout.
+    pub fn search_limited(
+        &self,
+        query: &[C::Elem],
+        k: usize,
+        recall: f32,
+        metric: Metric,
+        expansion_member_budget: Option<usize>,
     ) -> (Vec<Candidate<ClusterId>>, StackedSearchStats) {
         if k == 0 {
             return (Vec::new(), StackedSearchStats::default());
@@ -909,6 +936,7 @@ where
         let can_aps = recall < 1.0 && self.centroids.centroid_matrix().is_some();
 
         // Candidate lists, nearest centroid first; `candidates[0]` is P0.
+        // Parents always search with a full expansion (no member budget).
         let (candidates, mut stats) = if let Some(parent) = &self.parent {
             let parent_recall = if can_aps {
                 self.config.parent_recall_target
@@ -951,12 +979,20 @@ where
             Vec::new()
         };
 
+        // Parent work is already in `stats`; the leaf budget only counts
+        // members scored while expanding lists at this level.
+        let members_before = stats.members_scored;
         let mut result = BinaryHeap::with_capacity(k);
         for (i, c) in candidates.iter().enumerate() {
             stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
             stats.lists_scanned += 1;
             if can_aps && self.estimated_recall(&boundary, &result, k, i, dim, metric) >= recall {
                 break;
+            }
+            if let Some(budget) = expansion_member_budget {
+                if stats.members_scored.saturating_sub(members_before) >= budget {
+                    break;
+                }
             }
         }
 
