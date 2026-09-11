@@ -2,7 +2,8 @@ use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::ivf::{
     Candidate, ClusterId, InMemoryStackedIvf, IvfConfig, IvfIndexBuilder, LazyStackedIvf,
-    StackedSearchStats, SuperKMeansLevelClusterer, APS_MAX_DIM, PARENT_NPROBE_FRACTION,
+    StackedSearchStats, SuperKMeansLevelClusterer, APS_MAX_DIM, LEAF_EXPANSION_SLACK,
+    PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
 use crate::vector::IvfCentroids;
@@ -97,12 +98,15 @@ pub(super) fn rank(
     // caller's probe budget (`router_k` ← `max_probe`), so easy queries
     // request fewer candidates and harder ones more.
     //
-    // The search still opens the parent nprobe lists and scores every
-    // member into a size-`k` heap: scanning all members of the selected
-    // lists avoids the classic IVF boundary miss; capping the heap (and
-    // thus `candidate_count`) is what ties the returned set to probe.
+    // Parents still use Quake-fat nprobe and expand every list they select.
+    // Only this leaf early-stops L0 expansion after `LEAF_EXPANSION_SLACK × k`
+    // members have been scored (nearest lists first; each opened list is
+    // fully scanned) so max_probe can cut routing work without thinning
+    // parent list ranking.
     let k = params.k.clamp(1, index.vectors.len().max(1));
-    let (ranked, stats) = index.search(query, k, recall, metric);
+    let expansion_budget = k.saturating_mul(LEAF_EXPANSION_SLACK);
+    let (ranked, stats) =
+        index.search_limited(query, k, recall, metric, Some(expansion_budget));
     let candidate_count = ranked.len();
     Ranking {
         ranked: ranked.into_iter(),

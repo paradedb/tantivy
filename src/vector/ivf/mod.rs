@@ -29,7 +29,7 @@ pub use index::IvfIndex;
 pub use ivf::{
     AddLevelError, ClusterId, InMemoryStackedIvf, InMemoryStore, IvfConfig,
     IvfIndex as MultiLevelIvf, IvfIndexBuilder, IvfLevelClusterer, LazyStackedIvf, LazyStore,
-    StackedSearchStats, SuperKMeansLevelClusterer, PARENT_NPROBE_FRACTION,
+    StackedSearchStats, SuperKMeansLevelClusterer, LEAF_EXPANSION_SLACK, PARENT_NPROBE_FRACTION,
 };
 pub use params::{AdaptiveProbeParams, WorkModel, DEFAULT_ROUTER_RECALL};
 pub(crate) use plugin::merge_ivf;
