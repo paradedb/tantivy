@@ -74,7 +74,14 @@ pub const LEAF_EXPANSION_SLACK: usize = 2;
 pub const PARENT_RECALL_TARGET: f32 = 0.99;
 
 /// Default L0 list size: `nlist ≈ n / max_leaf_size`.
-pub const DEFAULT_MAX_LEAF_SIZE: usize = 10;
+///
+/// Sized for a Quake-like stacked router over segment centroids: with
+/// ~1M vectors → ~8k IVF centroids (`centroid_ratio ≈ 0.01`/`0.005`),
+/// `max_leaf_size = 200` yields ~40 router lists (~200 centroids each).
+/// The previous default of 10 produced ~800 skinny lists and too much
+/// centroid-ranking overhead relative to Quake's SIFT10M shape
+/// (40k L0 / 500 L1).
+pub const DEFAULT_MAX_LEAF_SIZE: usize = 200;
 
 /// Search and clustering knobs for this level. Not persisted.
 #[derive(Clone, Debug)]

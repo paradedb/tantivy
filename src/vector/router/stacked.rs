@@ -13,8 +13,9 @@ use crate::TantivyError;
 /// `.centroids`) is L0 and is probed by the caller's work budget; every
 /// level of this router sits above it and is a parent, so the bottom router
 /// level uses [`PARENT_NPROBE_FRACTION`] too rather than the standalone
-/// L0 default. Build-only knobs (`branching_factor`, `max_leaf_size`) keep
-/// their defaults; the config is not persisted, so open must agree with
+/// L0 default (`0.02`). Build-only knobs (`branching_factor`,
+/// `max_leaf_size = 200`) keep their defaults so ~8k centroids fold into
+/// ~40 fat lists; the config is not persisted, so open must agree with
 /// build only on what search reads.
 fn router_config() -> IvfConfig {
     IvfConfig {

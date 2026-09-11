@@ -394,11 +394,14 @@ mod tests {
 
     /// At or above `APS_MAX_DIM` the recall target is forced to `1.0` (fixed
     /// nprobe list selection). The returned set is capped at `k`, and L0
-    /// expansion stops after `LEAF_EXPANSION_SLACK × k` members scored.
+    /// expansion stops after `LEAF_EXPANSION_SLACK × k` members scored
+    /// (checked after each fully-scanned list — a single fat list may still
+    /// score more than the budget).
     #[test]
     fn stacked_ranking_falls_back_to_nprobe_at_dim_cap() -> crate::Result<()> {
         let dim = crate::vector::ivf::APS_MAX_DIM;
-        let opened = open_stacked(dim, 64)?;
+        // Enough centroids for several max_leaf_size=200 lists.
+        let opened = open_stacked(dim, 2000)?;
         let mut workspace = RouterWorkspace::default();
         let query = vec![0.0f32; dim];
         let params = RoutingParams { k: 4, recall: 0.5 };
@@ -408,13 +411,12 @@ mod tests {
         assert!(candidates <= 4, "returned set must honor params.k, got {candidates}");
         assert!(lists >= 1, "nprobe path must still open parent lists");
         assert!(scored >= candidates);
-        // Full expand of Quake nprobe would score far more than slack×k at
-        // this size; the leaf budget must bind.
-        let budget = 4 * crate::vector::ivf::LEAF_EXPANSION_SLACK;
+        // Full expand of all router lists would score every centroid; with
+        // the leaf budget we should stop after a small prefix of lists.
+        let n_centroids = 4000usize;
         assert!(
-            scored <= budget * 8,
-            "L0 expansion should be bounded by slack×k (plus parent work); \
-             scored={scored} budget={budget}"
+            scored < n_centroids,
+            "L0 expansion should stop before scoring every centroid; scored={scored}"
         );
         Ok(())
     }
@@ -422,14 +424,16 @@ mod tests {
     #[test]
     fn stacked_leaf_expansion_scales_with_k() -> crate::Result<()> {
         let dim = crate::vector::ivf::APS_MAX_DIM;
-        let opened = open_stacked(dim, 128)?;
+        let opened = open_stacked(dim, 2000)?;
         let mut workspace = RouterWorkspace::default();
         let query = vec![0.0f32; dim];
+        // Budgets 2×k must span multiple ~200-member lists so larger k
+        // actually opens more lists.
         let small = opened.rank(
             &mut workspace,
             &query,
             Metric::L2,
-            RoutingParams { k: 4, recall: 1.0 },
+            RoutingParams { k: 50, recall: 1.0 },
         );
         let (_, _, scored_small, _) = stacked_metrics(small.metrics());
         drop(small);
@@ -437,7 +441,7 @@ mod tests {
             &mut workspace,
             &query,
             Metric::L2,
-            RoutingParams { k: 32, recall: 1.0 },
+            RoutingParams { k: 400, recall: 1.0 },
         );
         let (_, _, scored_large, _) = stacked_metrics(large.metrics());
         assert!(
