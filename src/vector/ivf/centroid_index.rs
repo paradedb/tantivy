@@ -38,8 +38,8 @@ use crate::TantivyError;
 /// The consumer-provided centroid producer, pulled once at index creation.
 ///
 /// Implementors train the base centroids; Tantivy builds their router.
-/// Segments assign against the serialized set through the index's selected
-/// router, so this trait owns only the centroid data.
+/// Segments assign batches against the serialized centroid matrix; the
+/// selected router is used for queries.
 pub trait CentroidProducer: Send + Sync + 'static {
     /// The centroids for `field`. Required for every vector field in the
     /// schema; erroring here fails index creation.
@@ -287,6 +287,13 @@ impl FieldCentroids {
         self.num_centroids
     }
 
+    pub(crate) fn decode_rows(&self) -> Vec<f32> {
+        self.rows
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("f32 centroid")))
+            .collect()
+    }
+
     /// The stored bytes of centroid `c`.
     pub(crate) fn centroid_bytes(&self, c: usize) -> &[u8] {
         &self.rows[c * self.stride..(c + 1) * self.stride]
@@ -355,12 +362,9 @@ impl FieldRouter {
         self.num_centroids
     }
 
+    #[cfg(test)]
     pub(crate) fn router(&self) -> &LazyRouter {
         &self.router
-    }
-
-    pub(crate) fn routing_options(&self) -> &VectorOptions {
-        &self.routing_options
     }
 
     pub(crate) fn rank_clusters<'router, 'workspace>(

@@ -4,14 +4,9 @@
 //!
 //! WRITE SIDE — both write paths (per-commit serialize and merge) assign
 //! every vector against the same frozen centroid index, taking the
-//! primary cell and the `replicas - 1` next-nearest cells from ONE k-NN
-//! call per vector ([`assign_cells`]). The selector mirrors the
-//! query-time router's ranking per metric, so cells predict where a
-//! query would look. Everything runs on the CALLING thread: assignment
-//! reads centroid rows through the index's `Directory`, and an embedder
-//! like pg_search runs inside a Postgres backend, where FFI from a
-//! spawned thread aborts the transaction — so no path in the vector
-//! write pipeline spawns.
+//! primary cell and the `replicas - 1` next-nearest cells using batched
+//! matrix multiplication. Centroids are materialized on the calling thread
+//! before assignment, so the numerical kernel never accesses the Directory.
 //!
 //! READ SIDE — a segment keeps only what is genuinely per-segment: which
 //! rows landed in which cluster, and the residual geometry of those
@@ -40,12 +35,13 @@ use std::mem;
 use std::ops::Range;
 
 use common::{BinarySerializable, HasLen, OwnedBytes};
+use superkmeans::gemm::sgemm_row_major_b_transposed;
 
+use crate::collector::sort_key::NaturalComparator;
+use crate::collector::TopNComputer;
 use crate::directory::FileSlice;
-use crate::schema::VectorOptions;
-use crate::vector::router::{LazyRouter, RouterWorkspace};
-use crate::vector::{BoundKind, BoundStore};
-use crate::Executor;
+use crate::schema::{Metric, VectorOptions};
+use crate::vector::{BoundKind, BoundStore, Similarity};
 
 /// The per-segment IVF remainder for one field: which contiguous row
 /// ranges of the `.vec` rows form each cluster, plus the per-cluster
@@ -301,135 +297,217 @@ impl SegmentClusters {
 
 // ---- computing assignments ------------------------------------------
 
-/// Rows assigned per [`Executor`] work item when a batch is split across
-/// threads. Small enough to load-balance while amortizing task overhead.
-const ASSIGN_CHUNK_ROWS: usize = 256;
+const ASSIGN_ROW_TILE: usize = 256;
+const ASSIGN_CENTROID_TILE: usize = 1024;
 
-/// Assign a batch of vectors to their cells: per vector,
-/// `cells_per_vector` distinct centroid ids, nearest first — index 0 is the
-/// primary, the rest are replica cells. `values` is `dim`-strided,
-/// row-parallel output order. Chunks the batch across `executor`.
-pub(crate) fn assign_cells(
-    router: &LazyRouter,
-    num_centroids: usize,
-    options: &VectorOptions,
-    values: &[f32],
-    cells_per_vector: usize,
-    executor: &Executor,
-) -> crate::Result<Vec<Vec<usize>>> {
-    let dim = options.dim();
-    debug_assert_eq!(values.len() % dim.max(1), 0);
-    let num_rows = values.len() / dim.max(1);
-    let assign_chunk = |range: std::ops::Range<usize>| -> crate::Result<Vec<Vec<usize>>> {
-        let mut workspace = RouterWorkspace::default();
-        range
-            .map(|row| {
-                let v = &values[row * dim..(row + 1) * dim];
-                let mut cells = Vec::with_capacity(cells_per_vector);
-                for candidate in router
-                    .rank(&mut workspace, v, options.metric(), Default::default())
-                    .take(cells_per_vector)
-                {
-                    let cluster = candidate.node as usize;
-                    if cluster >= num_centroids {
-                        return Err(crate::TantivyError::InvalidArgument(format!(
-                            "router {} returned cluster {cluster}, but the centroid index has \
-                             {num_centroids} clusters",
-                            router.kind()
-                        )));
-                    }
-                    if cells.contains(&cluster) {
-                        return Err(crate::TantivyError::InvalidArgument(format!(
-                            "router {} returned cluster {cluster} more than once",
-                            router.kind()
-                        )));
-                    }
-                    cells.push(cluster);
-                }
-                if cells.len() != cells_per_vector {
-                    return Err(crate::TantivyError::InvalidArgument(format!(
-                        "router {} returned {} clusters, expected {cells_per_vector}",
-                        router.kind(),
-                        cells.len()
-                    )));
-                }
-                Ok(cells)
-            })
-            .collect()
-    };
-    if executor.num_threads() <= 1 || num_rows <= ASSIGN_CHUNK_ROWS {
-        return assign_chunk(0..num_rows);
+pub(crate) struct BatchAssigner {
+    centroids: Vec<f32>,
+    centroid_norms: Vec<f32>,
+    dim: usize,
+    metric: Metric,
+    scores: Vec<f32>,
+}
+
+impl BatchAssigner {
+    pub(crate) fn new(centroids: Vec<f32>, options: &VectorOptions) -> Self {
+        let dim = options.dim();
+        assert!(dim > 0 && !centroids.is_empty() && centroids.len() % dim == 0);
+        let centroid_norms = if options.metric() == Metric::L2 {
+            superkmeans::squared_norms(&centroids, centroids.len() / dim, dim)
+        } else {
+            Vec::new()
+        };
+        Self {
+            centroids,
+            centroid_norms,
+            dim,
+            metric: options.metric(),
+            scores: Vec::new(),
+        }
     }
-    let chunk_starts = (0..num_rows).step_by(ASSIGN_CHUNK_ROWS);
-    let per_chunk = executor.map(
-        |start| assign_chunk(start..(start + ASSIGN_CHUNK_ROWS).min(num_rows)),
-        chunk_starts,
-    )?;
-    Ok(per_chunk.into_iter().flatten().collect())
+
+    pub(crate) fn assign_cells(
+        &mut self,
+        values: &[f32],
+        cells_per_vector: usize,
+    ) -> Vec<Vec<usize>> {
+        assert_eq!(values.len() % self.dim, 0);
+        let num_centroids = self.centroids.len() / self.dim;
+        assert!((1..=num_centroids).contains(&cells_per_vector));
+        let num_rows = values.len() / self.dim;
+        let row_norms = if self.metric == Metric::L2 {
+            superkmeans::squared_norms(values, num_rows, self.dim)
+        } else {
+            Vec::new()
+        };
+        self.scores.resize(
+            num_rows.min(ASSIGN_ROW_TILE) * num_centroids.min(ASSIGN_CENTROID_TILE),
+            0.0,
+        );
+        let mut assignments = Vec::with_capacity(num_rows);
+        for (row_tile, rows) in values.chunks(ASSIGN_ROW_TILE * self.dim).enumerate() {
+            let row_count = rows.len() / self.dim;
+            let mut nearest: Vec<_> = (0..row_count)
+                .map(|_| TopNComputer::new_with_comparator(cells_per_vector, NaturalComparator))
+                .collect();
+            for (tile, centroids) in self
+                .centroids
+                .chunks(ASSIGN_CENTROID_TILE * self.dim)
+                .enumerate()
+            {
+                let centroid_count = centroids.len() / self.dim;
+                sgemm_row_major_b_transposed(
+                    row_count,
+                    self.dim,
+                    centroid_count,
+                    rows,
+                    centroids,
+                    &mut self.scores[..row_count * centroid_count],
+                );
+                for (row, top) in nearest.iter_mut().enumerate() {
+                    for col in 0..centroid_count {
+                        let centroid = tile * ASSIGN_CENTROID_TILE + col;
+                        let dot = self.scores[row * centroid_count + col];
+                        let score = match self.metric {
+                            Metric::L2 => {
+                                let norms = row_norms[row_tile * ASSIGN_ROW_TILE + row]
+                                    + self.centroid_norms[centroid];
+                                let distance = norms - 2.0 * dot;
+                                let error = (norms + 2.0 * dot.abs())
+                                    * (2.0 * self.dim as f32 * f32::EPSILON);
+                                if !distance.is_finite() || distance <= error {
+                                    Metric::L2
+                                        .similarity(
+                                            &rows[row * self.dim..(row + 1) * self.dim],
+                                            &centroids[col * self.dim..(col + 1) * self.dim],
+                                        )
+                                        .score()
+                                } else {
+                                    -distance
+                                }
+                            }
+                            // Cosine rows and centroids are normalized before assignment.
+                            Metric::Cosine | Metric::Dot => dot,
+                        };
+                        top.push(Similarity::new(score), centroid);
+                    }
+                }
+            }
+            assignments.extend(nearest.into_iter().map(|top| {
+                top.into_sorted_vec()
+                    .into_iter()
+                    .map(|hit| hit.doc)
+                    .collect()
+            }));
+        }
+        assignments
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::schema::Metric;
-    use crate::vector::header::VectorFileVersion;
-    use crate::vector::router::RouterKind;
+    use rand::{Rng, SeedableRng};
 
-    fn exact_router(metric: Metric, values: Vec<f32>, dim: usize) -> (LazyRouter, VectorOptions) {
-        let options = VectorOptions::new(dim, metric);
-        let centroid_bytes = values
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let router = RouterKind::Exact
-            .open(
-                VectorFileVersion::V3,
-                FileSlice::from(vec![RouterKind::Exact as u8]),
-                FileSlice::from(centroid_bytes),
-                &options,
-            )
-            .unwrap();
-        (router, options)
-    }
+    use super::*;
 
     /// Pins the Dot selection semantics: cells follow RAW dot — the
     /// query-time router's ranking — not angular order. Centroid norms are
     /// deliberately unequal so the two orderings disagree.
     #[test]
-    fn dot_selector_uses_raw_dot_not_angular() -> crate::Result<()> {
+    fn dot_selector_uses_raw_dot_not_angular() {
         let centroids: Vec<f32> = vec![
             10.0, 0.0, // long, off-direction: dot 10, cosine 0.45
             0.0, 1.0, // short, near-direction: dot 2, cosine 0.89
             7.0, 7.0, // long, near-direction: dot 21, cosine 0.95
         ];
-        let (router, options) = exact_router(Metric::Dot, centroids, 2);
-        let picked = assign_cells(
-            &router,
-            3,
-            &options,
-            &[1.0_f32, 2.0],
-            3,
-            &Executor::single_thread(),
-        )?
-        .remove(0);
+        let mut assigner = BatchAssigner::new(centroids, &VectorOptions::new(2, Metric::Dot));
+        let picked = assigner.assign_cells(&[1.0_f32, 2.0], 3).remove(0);
         // Raw-dot order: [7,7] (21), then [10,0] (10), then [0,1] (2).
         // Angular order would put [0,1] ahead of [10,0].
         assert_eq!(picked, vec![2, 0, 1], "must rank by raw dot");
-        Ok(())
     }
 
-    /// Assignment yields nearest-first distinct cells for every row, and the
-    /// parallel chunking preserves row order.
     #[test]
-    fn assign_cells_is_nearest_first_and_order_preserving() -> crate::Result<()> {
-        let (router, options) = exact_router(Metric::L2, vec![0.0, 0.0, 10.0, 0.0, 0.0, 10.0], 2);
+    fn assign_cells_is_nearest_first_and_order_preserving() {
+        let mut assigner = BatchAssigner::new(
+            vec![0.0, 0.0, 10.0, 0.0, 0.0, 10.0],
+            &VectorOptions::new(2, Metric::L2),
+        );
         let values: Vec<f32> = vec![
             1.0, 0.0, // nearest 0, then 1
             9.0, 1.0, // nearest 1, then 0
             0.5, 9.0, // nearest 2, then 0
         ];
-        let cells = assign_cells(&router, 3, &options, &values, 2, &Executor::single_thread())?;
+        let cells = assigner.assign_cells(&values, 2);
         assert_eq!(cells, vec![vec![0, 1], vec![1, 0], vec![2, 0]]);
-        Ok(())
+    }
+
+    #[test]
+    fn batches_match_scalar_assignment_across_tiles_and_metrics() {
+        let dim = 9;
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+            let mut centroids: Vec<f32> = (0..(ASSIGN_CENTROID_TILE + 7) * dim)
+                .map(|_| rng.random_range(-20..=20) as f32)
+                .collect();
+            let mut values: Vec<f32> = (0..(ASSIGN_ROW_TILE + 3) * dim)
+                .map(|_| rng.random_range(-20..=20) as f32)
+                .collect();
+            if metric == Metric::Cosine {
+                for row in centroids
+                    .chunks_exact_mut(dim)
+                    .chain(values.chunks_exact_mut(dim))
+                {
+                    let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    for x in row {
+                        *x /= norm;
+                    }
+                }
+            }
+            let mut assigner =
+                BatchAssigner::new(centroids.clone(), &VectorOptions::new(dim, metric));
+            for replicas in [1, 3] {
+                let assigned = assigner.assign_cells(&values, replicas);
+                for (row, actual) in values.chunks_exact(dim).zip(assigned) {
+                    let mut expected: Vec<_> = centroids
+                        .chunks_exact(dim)
+                        .enumerate()
+                        .map(|(id, centroid)| (metric.similarity(row, centroid), id))
+                        .collect();
+                    expected.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                    assert_eq!(
+                        actual,
+                        expected[..replicas].iter().map(|c| c.1).collect::<Vec<_>>(),
+                        "{metric:?}"
+                    );
+                }
+            }
+            assert!(assigner.assign_cells(&[], 1).is_empty());
+            assert_eq!(assigner.assign_cells(&values[..dim], 1).len(), 1);
+            assert!(assigner.scores.capacity() <= ASSIGN_ROW_TILE * ASSIGN_CENTROID_TILE);
+        }
+    }
+
+    #[test]
+    fn ties_and_positive_dot_scores_across_centroid_tiles() {
+        let mut centroids = vec![0.0; (ASSIGN_CENTROID_TILE + 2) * 2];
+        centroids[..2].copy_from_slice(&[10.0, 0.0]);
+        centroids[ASSIGN_CENTROID_TILE * 2..].copy_from_slice(&[1.0, 0.0, 10.0, 0.0]);
+        let mut assigner = BatchAssigner::new(centroids, &VectorOptions::new(2, Metric::Dot));
+        assert_eq!(
+            assigner.assign_cells(&[1.0, 0.0], 2),
+            vec![vec![0, ASSIGN_CENTROID_TILE + 1]]
+        );
+        assert_eq!(assigner.assign_cells(&[0.0, 0.0], 3), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn l2_assignment_handles_cancellation_and_overflow() {
+        let mut assigner = BatchAssigner::new(
+            vec![1e6, 1e6, 1e6 + 1.0, 1e6],
+            &VectorOptions::new(2, Metric::L2),
+        );
+        assert_eq!(assigner.assign_cells(&[1e6 + 1.0, 1e6], 1), vec![vec![1]]);
+        assert_eq!(assigner.assign_cells(&[3e38, 3e38], 2), vec![vec![0, 1]]);
     }
 }

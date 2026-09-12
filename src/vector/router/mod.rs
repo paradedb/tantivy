@@ -201,6 +201,7 @@ impl Iterator for RouterIter<'_, '_> {
 }
 
 impl LazyRouter {
+    #[cfg(test)]
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Rng(_) => RouterKind::Rng,

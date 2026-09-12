@@ -20,7 +20,7 @@ use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
-use crate::{DocId, Executor, TantivyError};
+use crate::{DocId, TantivyError};
 
 /// Per-field in-memory state: the doc ids that have a value (ascending),
 /// plus a dense byte array — analogous to fast-fields' `Optional`
@@ -158,12 +158,12 @@ impl PluginWriter for VecWriter {
         let meta = index.load_metas()?;
         let set = match meta.centroid_index.as_ref() {
             Some(centroid_index) => {
-                let set_search = index.cached_centroid_index()?;
+                index.cached_centroid_index()?;
                 let set_reader = CentroidIndexReader::open(
                     index.directory(),
                     std::path::Path::new(centroid_index),
                 )?;
-                Some((set_search, set_reader))
+                Some(set_reader)
             }
             None => None,
         };
@@ -171,7 +171,6 @@ impl PluginWriter for VecWriter {
         let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
         write_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
-        let executor = Executor::single_thread();
         let cancel = || false;
         let schema = segment.schema();
 
@@ -198,7 +197,7 @@ impl PluginWriter for VecWriter {
                 continue;
             }
 
-            let Some((set_search, set_reader)) = &set else {
+            let Some(set_reader) = &set else {
                 // Flat layout (no centroid index — the mutable/staging
                 // tier): the `Identity`/`Bitmap` id-map and the
                 // doc-ordered rows, nothing else. Searched exhaustively;
@@ -213,21 +212,12 @@ impl PluginWriter for VecWriter {
             };
 
             let field_centroids = set_reader.field_centroids(*field, &buf.opts)?;
-            let field_router = set_search.field_router(*field).ok_or_else(|| {
-                TantivyError::InternalError(format!(
-                    "centroid index has no router for field '{}'",
-                    schema.get_field_entry(*field).name()
-                ))
-            })?;
             let params = IvfFieldWriteParams {
-                router: field_router.router(),
-                routing_options: field_router.routing_options(),
                 field: *field,
                 opts: &buf.opts,
                 set: &field_centroids,
                 replicas: index.settings().vector_replicas,
                 bounds_scope: index.settings().vector_bounds_scope,
-                executor: &executor,
                 cancel: &cancel,
                 field_name: schema.get_field_entry(*field).name(),
             };

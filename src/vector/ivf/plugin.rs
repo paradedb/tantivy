@@ -7,14 +7,14 @@
 //! segments. (Indexes without a centroid index write the flat layout
 //! instead — see [`flat`](crate::vector::flat).) Neither trains anything —
 //! training happened wherever the consumer ran it before index creation;
-//! here vectors are only assigned through the selected router.
+//! here batches are assigned against the stored centroid matrix.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use common::BitSet;
 
-use super::assignments::assign_cells;
+use super::assignments::BatchAssigner;
 use super::{decode_row, SegmentClusters};
 use crate::directory::{CompositeWrite, Directory};
 use crate::index::SegmentComponent;
@@ -25,13 +25,10 @@ use crate::vector::distance::{maybe_normalize_bytes, norm_squared_bytes_wide, No
 use crate::vector::header::{vec_slot, write_header};
 use crate::vector::id_map::IdMap;
 use crate::vector::ivf::centroid_index::{CentroidIndexReader, FieldCentroids};
-use crate::vector::router::LazyRouter;
 use crate::vector::{residual_norm, BoundKind, BoundsBuilder, BoundsScope, VEC_EXT};
-use crate::{DocId, Executor, TantivyError};
+use crate::{DocId, TantivyError};
 
-/// Vectors decoded and assigned per selector call. Bounds the assign
-/// pass's working set; parallelism happens inside
-/// [`assign_cells`](super::assign::assign_cells).
+/// Vectors decoded per assignment batch; score tiles are bounded separately.
 const ASSIGN_BATCH_SIZE: usize = 2048;
 
 /// Cosine-normalized rows have unit norm up to f32 rounding; a stored
@@ -62,12 +59,9 @@ pub(crate) struct IvfFieldWriteParams<'a> {
     pub(crate) field: Field,
     pub(crate) opts: &'a VectorOptions,
     pub(crate) set: &'a FieldCentroids,
-    pub(crate) router: &'a LazyRouter,
-    pub(crate) routing_options: &'a VectorOptions,
     /// Cells per vector (primary + replicas); clamped to the centroid count.
     pub(crate) replicas: usize,
     pub(crate) bounds_scope: BoundsScope,
-    pub(crate) executor: &'a Executor,
     pub(crate) cancel: &'a dyn CancelSentinel,
     /// Field name, for log/error messages.
     pub(crate) field_name: &'a str,
@@ -106,6 +100,7 @@ pub(crate) fn write_ivf_field(
     let mut assigned: Vec<AssignedVector> = Vec::new();
     let mut num_present_docs = 0usize;
     {
+        let mut assigner = BatchAssigner::new(params.set.decode_rows(), opts);
         let mut batch_values: Vec<f32> = Vec::with_capacity(ASSIGN_BATCH_SIZE * dim);
         let mut batch_rows: Vec<(DocId, u64)> = Vec::with_capacity(ASSIGN_BATCH_SIZE);
         let mut flush = |batch_values: &mut Vec<f32>,
@@ -119,14 +114,7 @@ pub(crate) fn write_ivf_field(
             if params.cancel.wants_cancel() {
                 return Err(TantivyError::Cancelled);
             }
-            let cells = assign_cells(
-                params.router,
-                num_centroids,
-                params.routing_options,
-                batch_values,
-                cells_per_vector,
-                params.executor,
-            )?;
+            let cells = assigner.assign_cells(batch_values, cells_per_vector);
             debug_assert_eq!(cells.len(), batch_rows.len());
             for (cells, (doc_id, handle)) in cells.into_iter().zip(batch_rows.drain(..)) {
                 let Some((&primary, replica_cells)) = cells.split_first() else {
@@ -361,6 +349,7 @@ fn merge_ivf_field(
         if !flat_sources.is_empty() {
             let dim = params.opts.dim();
             let cells_per_vector = params.replicas.max(1).min(num_centroids.max(1));
+            let mut assigner = BatchAssigner::new(params.set.decode_rows(), params.opts);
             let mut batch_values: Vec<f32> = Vec::with_capacity(ASSIGN_BATCH_SIZE * dim);
             let mut batch_rows: Vec<(DocId, u32, u32)> = Vec::with_capacity(ASSIGN_BATCH_SIZE);
             let mut flush = |batch_values: &mut Vec<f32>,
@@ -372,14 +361,7 @@ fn merge_ivf_field(
                 if cancel.wants_cancel() {
                     return Err(TantivyError::Cancelled);
                 }
-                let cells = assign_cells(
-                    params.router,
-                    num_centroids,
-                    params.routing_options,
-                    batch_values,
-                    cells_per_vector,
-                    params.executor,
-                )?;
+                let cells = assigner.assign_cells(batch_values, cells_per_vector);
                 for (cells, (target_doc, seg, row)) in cells.into_iter().zip(batch_rows.drain(..)) {
                     let Some((&primary, replica_cells)) = cells.split_first() else {
                         return Err(TantivyError::InternalError(format!(
@@ -634,7 +616,7 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
                 .to_string(),
         ));
     };
-    let set_search = index.cached_centroid_index()?;
+    index.cached_centroid_index()?;
     let directory = index.directory();
     let set_reader = CentroidIndexReader::open(directory, std::path::Path::new(centroid_index))?;
 
@@ -644,9 +626,6 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     let mut vec_file = directory.open_write(&vec_path)?;
     write_header(&mut vec_file)?;
     let mut vec_write = CompositeWrite::wrap(vec_file);
-    // Flat sources are bounded (the mutable tier); no thread pool for
-    // their assignment, same as the per-commit path.
-    let executor = Executor::single_thread();
 
     // Source doc -> target doc, built once for every field. `DOC_DROPPED`
     // marks a doc the merge is dropping (deleted, or otherwise absent
@@ -697,27 +676,14 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
                 }
             }
         }
-        // Every clustered source assigned against THIS set (there is
-        // exactly one, immutable for the index's life), and assignment is
-        // deterministic, so the merged postings are exactly what
-        // re-assignment would produce — carry them over instead of
-        // re-running a k-NN per vector. Flat sources are the exception:
-        // their rows are assigned inside.
-        let field_router = set_search.field_router(field).ok_or_else(|| {
-            TantivyError::InternalError(format!(
-                "centroid index has no router for field '{}'",
-                entry.name()
-            ))
-        })?;
+        // Clustered sources already have memberships against this immutable
+        // set. Carry them over; only flat sources need assignment.
         let params = IvfFieldWriteParams {
-            router: field_router.router(),
-            routing_options: field_router.routing_options(),
             field,
             opts,
             set: &field_centroids,
             replicas: index.settings().vector_replicas,
             bounds_scope: index.settings().vector_bounds_scope,
-            executor: &executor,
             cancel: ctx.cancel,
             field_name: entry.name(),
         };
