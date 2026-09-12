@@ -21,6 +21,10 @@ impl Query for AllQuery {
 pub struct AllWeight;
 
 impl Weight for AllWeight {
+    fn matches_all_docs(&self) -> bool {
+        true
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let all_scorer = AllScorer::new(reader.max_doc());
         if boost != 1.0 {
