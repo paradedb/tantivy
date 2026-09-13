@@ -595,15 +595,21 @@ fn is_sorted(mut it: impl Iterator<Item = usize>) -> bool {
 /// # }
 /// ```
 pub struct SnippetGenerator {
-    terms_text: BTreeMap<String, Score>,
-    tokenizer: TextAnalyzer,
-    field: Field,
+    sources: Vec<SnippetSource>,
     max_num_chars: usize,
     matches_limit: Option<usize>,
     matches_offset: Option<usize>,
     snippets_limit: usize,
     snippets_offset: usize,
     sort_order: SnippetSortOrder,
+}
+
+/// One field's contribution to a `SnippetGenerator`: the terms the query matched in the
+/// field, and the tokenizer the field's text is analyzed with.
+struct SnippetSource {
+    terms_text: BTreeMap<String, Score>,
+    tokenizer: TextAnalyzer,
+    field: Field,
 }
 
 impl SnippetGenerator {
@@ -615,9 +621,11 @@ impl SnippetGenerator {
         max_num_chars: usize,
     ) -> Self {
         SnippetGenerator {
-            terms_text,
-            tokenizer,
-            field,
+            sources: vec![SnippetSource {
+                terms_text,
+                tokenizer,
+                field,
+            }],
             max_num_chars,
             matches_limit: None,
             matches_offset: None,
@@ -672,17 +680,12 @@ impl SnippetGenerator {
             }
         }
         let tokenizer = searcher.index().tokenizer_for_field(field)?;
-        Ok(SnippetGenerator {
+        Ok(SnippetGenerator::new(
             terms_text,
             tokenizer,
             field,
-            max_num_chars: DEFAULT_MAX_NUM_CHARS,
-            matches_limit: None,
-            matches_offset: None,
-            snippets_limit: 1,
-            snippets_offset: 0,
-            sort_order: SnippetSortOrder::default(),
-        })
+            DEFAULT_MAX_NUM_CHARS,
+        ))
     }
 
     /// Sets a maximum number of chars. Default is 150.
@@ -708,7 +711,7 @@ impl SnippetGenerator {
 
     #[cfg(test)]
     pub(crate) fn terms_text(&self) -> &BTreeMap<String, Score> {
-        &self.terms_text
+        &self.sources[0].terms_text
     }
 
     /// Generates a snippet for the given `Document`.
@@ -716,33 +719,27 @@ impl SnippetGenerator {
     /// This method extract the text associated with the `SnippetGenerator`'s field
     /// and computes a snippet.
     pub fn snippet_from_doc<D: Document>(&self, doc: &D) -> Snippet {
-        let mut text = String::new();
-        for (field, value) in doc.iter_fields_and_values() {
-            let value = value as D::Value<'_>;
-            if field != self.field {
-                continue;
-            }
-
-            if let Some(val) = value.as_str() {
-                text.push(' ');
-                text.push_str(val);
-            }
-        }
-
+        let text = self.doc_text(doc);
         self.snippet(text.trim())
     }
 
     /// Generates a snippet for the given text.
     pub fn snippet(&self, text: &str) -> Snippet {
-        let fragment_candidates = search_fragments(
-            &mut self.tokenizer.clone(),
+        let fragment_candidates = self.search_all_fragments(text);
+        select_best_fragment_combination(&fragment_candidates[..], text)
+    }
+
+    /// Fragment candidates for `text`, across every source of the generator.
+    fn search_all_fragments(&self, text: &str) -> Vec<FragmentCandidate> {
+        let source = &self.sources[0];
+        search_fragments(
+            &mut source.tokenizer.clone(),
             text,
-            &self.terms_text,
+            &source.terms_text,
             self.max_num_chars,
             self.matches_limit,
             self.matches_offset,
-        );
-        select_best_fragment_combination(&fragment_candidates[..], text)
+        )
     }
 
     /// Generates multiple snippets for the given text.
@@ -754,14 +751,7 @@ impl SnippetGenerator {
     /// If `snippets_limit` is set to 0 (via `set_snippets_limit`), all matching snippets
     /// are returned.
     pub fn snippets(&self, text: &str) -> Vec<Snippet> {
-        let fragment_candidates = search_fragments(
-            &mut self.tokenizer.clone(),
-            text,
-            &self.terms_text,
-            self.max_num_chars,
-            self.matches_limit,
-            self.matches_offset,
-        );
+        let fragment_candidates = self.search_all_fragments(text);
         select_top_fragments(
             &fragment_candidates[..],
             text,
@@ -780,10 +770,20 @@ impl SnippetGenerator {
     /// The `snippets_offset` and `snippets_limit` parameters are applied to this sorted
     /// list of snippets, allowing for consistent paging through the results.
     pub fn snippets_from_doc<D: Document>(&self, doc: &D) -> Vec<Snippet> {
+        let text = self.doc_text(doc);
+        self.snippets(text.trim())
+    }
+
+    /// The document's text for the first source's field.
+    ///
+    /// Every source of a generator is expected to analyze the same text, so one field is
+    /// enough; reading them all would concatenate that text once per field.
+    fn doc_text<D: Document>(&self, doc: &D) -> String {
+        let field = self.sources[0].field;
         let mut text = String::new();
-        for (field, value) in doc.iter_fields_and_values() {
+        for (doc_field, value) in doc.iter_fields_and_values() {
             let value = value as D::Value<'_>;
-            if field != self.field {
+            if doc_field != field {
                 continue;
             }
 
@@ -792,8 +792,7 @@ impl SnippetGenerator {
                 text.push_str(val);
             }
         }
-
-        self.snippets(text.trim())
+        text
     }
 }
 
