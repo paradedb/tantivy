@@ -904,25 +904,31 @@ impl SnippetGenerator {
         self.snippets(text.trim())
     }
 
-    /// The document's text for the first source's field.
+    /// The document's text, taken from the first source that stores it.
     ///
-    /// Every source of a generator is expected to analyze the same text, so one field is
-    /// enough; reading them all would concatenate that text once per field.
+    /// Every source of a generator analyzes the same text, so one field's value is the
+    /// whole story and reading them all would repeat it once per field. Which field holds
+    /// it is not fixed: an alias is often indexed without being stored, so the sources are
+    /// tried in the order the caller listed them and the first one with a value wins.
     fn doc_text<D: Document>(&self, doc: &D) -> String {
-        let field = self.sources[0].field;
-        let mut text = String::new();
-        for (doc_field, value) in doc.iter_fields_and_values() {
-            let value = value as D::Value<'_>;
-            if doc_field != field {
-                continue;
-            }
+        for source in &self.sources {
+            let mut text = String::new();
+            for (doc_field, value) in doc.iter_fields_and_values() {
+                let value = value as D::Value<'_>;
+                if doc_field != source.field {
+                    continue;
+                }
 
-            if let Some(val) = value.as_str() {
-                text.push(' ');
-                text.push_str(val);
+                if let Some(val) = value.as_str() {
+                    text.push(' ');
+                    text.push_str(val);
+                }
+            }
+            if !text.is_empty() {
+                return text;
             }
         }
-        text
+        String::new()
     }
 }
 
@@ -1397,6 +1403,32 @@ Survey in 2016, 2017, and 2018."#;
             select_best_fragment_combination(&fragments[..], text).to_html(),
             "<b>alpha beta.</b>"
         );
+    }
+
+    #[test]
+    fn test_snippet_generator_reads_text_from_a_stored_source() -> crate::Result<()> {
+        // An alias is routinely indexed without being stored. Listed first, it must not hide
+        // the text that a later source does store.
+        use crate::schema::STORED;
+        let mut schema_builder = Schema::builder();
+        let indexed_only = schema_builder.add_text_field("indexed_only", TEXT);
+        let stored = schema_builder.add_text_field("stored", TEXT | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.add_document(doc!(indexed_only => TEST_TEXT, stored => TEST_TEXT))?;
+            index_writer.commit()?;
+        }
+        let searcher = index.reader().unwrap().searcher();
+        let query = QueryParser::for_index(&index, vec![indexed_only])
+            .parse_query("rust")
+            .unwrap();
+        let generator =
+            SnippetGenerator::create_for_fields(&searcher, &*query, [indexed_only, stored])?;
+        let doc: crate::TantivyDocument = searcher.doc(crate::DocAddress::new(0, 0))?;
+        let html = generator.snippet_from_doc(&doc).to_html();
+        assert!(html.contains("<b>Rust</b>"), "got: {html}");
+        Ok(())
     }
 
     #[test]
