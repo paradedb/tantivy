@@ -1332,10 +1332,12 @@ Survey in 2016, 2017, and 2018."#;
             .unwrap();
         let single = SnippetGenerator::create(&searcher, &*query, text_field)?;
         let listed = SnippetGenerator::create_for_fields(&searcher, &*query, [text_field])?;
-        assert_eq!(
-            single.snippet(TEST_TEXT).to_html(),
-            listed.snippet(TEST_TEXT).to_html()
+        let html = single.snippet(TEST_TEXT).to_html();
+        assert!(
+            html.contains("<b>"),
+            "expected a match to highlight: {html}"
         );
+        assert_eq!(html, listed.snippet(TEST_TEXT).to_html());
         Ok(())
     }
 
