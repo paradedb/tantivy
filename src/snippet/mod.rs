@@ -906,13 +906,13 @@ mod tests {
 
     use super::{
         collapse_overlapped_ranges, search_fragments, select_best_fragment_combination,
-        select_top_fragments,
+        select_top_fragments, SnippetSource,
     };
     use crate::query::QueryParser;
     use crate::schema::{Schema, TEXT};
     use crate::snippet::{SnippetGenerator, SnippetSortOrder};
     use crate::tokenizer::{NgramTokenizer, SimpleTokenizer};
-    use crate::Index;
+    use crate::{Index, Term};
 
     const TEST_TEXT: &str = r#"Rust is a systems programming language sponsored by
 Mozilla which describes it as a "safe, concurrent, practical language", supporting functional and
@@ -1233,6 +1233,145 @@ Survey in 2016, 2017, and 2018."#;
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_snippet_generator_multiple_fields() -> crate::Result<()> {
+        use crate::query::{BooleanQuery, TermQuery};
+        use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        let mut schema_builder = Schema::builder();
+        let simple_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("default")
+                .set_index_option(IndexRecordOption::Basic),
+        );
+        let stemmed_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("en_stem")
+                .set_index_option(IndexRecordOption::Basic),
+        );
+        let text_field = schema_builder.add_text_field("text", simple_options);
+        let stemmed_field = schema_builder.add_text_field("text_stem", stemmed_options);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let text = "the borrowed certificates were returned quickly";
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => text, stemmed_field => text))?;
+            index_writer.commit()?;
+        }
+        let searcher = index.reader().unwrap().searcher();
+        // "borrowed" only exists unstemmed, "certif" only exists stemmed: each source can
+        // highlight a match the other cannot see.
+        let query = BooleanQuery::union(vec![
+            Box::new(TermQuery::new(
+                Term::from_field_text(text_field, "borrowed"),
+                IndexRecordOption::Basic,
+            )),
+            Box::new(TermQuery::new(
+                Term::from_field_text(stemmed_field, "certif"),
+                IndexRecordOption::Basic,
+            )),
+        ]);
+        let generator =
+            SnippetGenerator::create_for_fields(&searcher, &query, [text_field, stemmed_field])?;
+        let snippet = generator.snippet(text);
+        assert_eq!(
+            snippet.to_html(),
+            "the <b>borrowed</b> <b>certificates</b> were returned quickly"
+        );
+
+        // Each field alone still renders only its own match.
+        let unstemmed_only = SnippetGenerator::create(&searcher, &query, text_field)?;
+        assert_eq!(
+            unstemmed_only.snippet(text).to_html(),
+            "the <b>borrowed</b> certificates were returned quickly"
+        );
+        let stemmed_only = SnippetGenerator::create(&searcher, &query, stemmed_field)?;
+        assert_eq!(
+            stemmed_only.snippet(text).to_html(),
+            "the borrowed <b>certificates</b> were returned quickly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_snippet_generator_multiple_fields_same_span() {
+        // Both sources match the same word: the span is highlighted once in the html, and
+        // the fragment carries one range per source.
+        let terms = btreemap! { String::from("rust") => 1.0 };
+        let make_source = || SnippetSource {
+            terms_text: terms.clone(),
+            tokenizer: From::from(SimpleTokenizer::default()),
+            field: crate::schema::Field::from_field_id(0),
+        };
+        let sources = [make_source(), make_source()];
+        let fragments = super::search_fragments_merged(&sources, TEST_TEXT, 100, None, None);
+        let snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
+        assert_eq!(snippet.highlighted().len(), 2);
+        assert_eq!(snippet.highlighted()[0], snippet.highlighted()[1]);
+        assert_eq!(
+            snippet.to_html(),
+            "<b>Rust</b> is a systems programming language sponsored by\nMozilla which describes \
+             it as a &quot;safe"
+        );
+    }
+
+    #[test]
+    fn test_snippet_generator_single_field_delegates() -> crate::Result<()> {
+        // create() and create_for_fields() with one field produce the same snippet.
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", crate::schema::TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => TEST_TEXT))?;
+            index_writer.commit()?;
+        }
+        let searcher = index.reader().unwrap().searcher();
+        let query = QueryParser::for_index(&index, vec![text_field])
+            .parse_query("rust design")
+            .unwrap();
+        let single = SnippetGenerator::create(&searcher, &*query, text_field)?;
+        let listed = SnippetGenerator::create_for_fields(&searcher, &*query, [text_field])?;
+        assert_eq!(
+            single.snippet(TEST_TEXT).to_html(),
+            listed.snippet(TEST_TEXT).to_html()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_snippet_generator_multiple_fields_empty_index() -> crate::Result<()> {
+        // An empty index yields empty term sets, never an error or a panic.
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", crate::schema::TEXT);
+        let stemmed_field = schema_builder.add_text_field("text_stem", crate::schema::TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let searcher = index.reader().unwrap().searcher();
+        let query = QueryParser::for_index(&index, vec![text_field])
+            .parse_query("rust")
+            .unwrap();
+        let generator =
+            SnippetGenerator::create_for_fields(&searcher, &*query, [text_field, stemmed_field])?;
+        assert!(generator.snippet(TEST_TEXT).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_snippet_generator_no_fields() {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", crate::schema::TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let searcher = index.reader().unwrap().searcher();
+        let query = QueryParser::for_index(&index, vec![text_field])
+            .parse_query("rust")
+            .unwrap();
+        let result = SnippetGenerator::create_for_fields(&searcher, &*query, []);
+        assert!(matches!(
+            result,
+            Err(crate::TantivyError::InvalidArgument(_))
+        ));
     }
 
     #[test]
