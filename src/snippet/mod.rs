@@ -106,7 +106,7 @@ use htmlescape::encode_minimal;
 use crate::query::Query;
 use crate::schema::document::{Document, Value};
 use crate::schema::Field;
-use crate::tokenizer::{TextAnalyzer, Token};
+use crate::tokenizer::TextAnalyzer;
 use crate::{Score, Searcher, Term};
 
 /// The sort order for snippets.
@@ -142,20 +142,6 @@ impl FragmentCandidate {
             start_offset,
             stop_offset: start_offset,
             highlighted: vec![],
-        }
-    }
-
-    /// Updates `score` and `highlighted` fields of the objects.
-    ///
-    /// taking the token and terms, the token is added to the fragment.
-    /// if the token is one of the terms, the score
-    /// and highlighted fields are updated in the fragment.
-    fn try_add_token(&mut self, token: &Token, terms: &BTreeMap<String, Score>) {
-        self.stop_offset = token.offset_to;
-
-        if let Some(&score) = terms.get(&token.text.to_lowercase()) {
-            self.highlighted
-                .push((token.offset_from..token.offset_to, score));
         }
     }
 
@@ -264,6 +250,53 @@ impl Snippet {
 ///
 /// Fragments must be valid in the sense that `&text[fragment.start..fragment.stop]`\
 /// has to be a valid string.
+/// Accumulates a walk over tokens into fragment candidates.
+///
+/// Fragment boundary and scoring decisions live here so that every walk shape (a single
+/// token stream, or several of them merged) produces fragments the same way.
+struct FragmentAccumulator {
+    max_num_chars: usize,
+    fragment: FragmentCandidate,
+    fragments: Vec<FragmentCandidate>,
+}
+
+impl FragmentAccumulator {
+    fn new(max_num_chars: usize) -> FragmentAccumulator {
+        FragmentAccumulator {
+            max_num_chars,
+            fragment: FragmentCandidate::new(0),
+            fragments: Vec::new(),
+        }
+    }
+
+    /// Extends the current fragment with a token, starting a new fragment once this one is
+    /// full. A token that matched a term carries its score and is highlighted.
+    fn observe(&mut self, offset_from: usize, offset_to: usize, score: Option<Score>) {
+        if (offset_to - self.fragment.start_offset) > self.max_num_chars {
+            if self.fragment.score() > 0.0 {
+                let full =
+                    std::mem::replace(&mut self.fragment, FragmentCandidate::new(offset_from));
+                self.fragments.push(full);
+            } else {
+                self.fragment = FragmentCandidate::new(offset_from);
+            }
+        }
+        self.fragment.stop_offset = offset_to;
+        if let Some(score) = score {
+            self.fragment
+                .highlighted
+                .push((offset_from..offset_to, score));
+        }
+    }
+
+    fn finish(mut self) -> Vec<FragmentCandidate> {
+        if self.fragment.score() > 0.0 {
+            self.fragments.push(self.fragment);
+        }
+        self.fragments
+    }
+}
+
 fn search_fragments(
     tokenizer: &mut TextAnalyzer,
     text: &str,
@@ -273,24 +306,26 @@ fn search_fragments(
     matches_offset: Option<usize>,
 ) -> Vec<FragmentCandidate> {
     let mut token_stream = tokenizer.token_stream(text);
-    let mut fragment = FragmentCandidate::new(0);
-    let mut fragments: Vec<FragmentCandidate> = vec![];
+    let mut accumulator = FragmentAccumulator::new(max_num_chars);
 
     // Process all fragments first, without applying offset/limit to token stream
     while let Some(next) = token_stream.next() {
-        if (next.offset_to - fragment.start_offset) > max_num_chars {
-            if fragment.score() > 0.0 {
-                fragments.push(fragment)
-            };
-            fragment = FragmentCandidate::new(next.offset_from);
-        }
-
-        fragment.try_add_token(next, terms);
-    }
-    if fragment.score() > 0.0 {
-        fragments.push(fragment)
+        accumulator.observe(
+            next.offset_from,
+            next.offset_to,
+            terms.get(&next.text.to_lowercase()).copied(),
+        );
     }
 
+    apply_matches_window(accumulator.finish(), matches_limit, matches_offset)
+}
+
+/// Applies `matches_offset` and `matches_limit` across the highlights of all fragments.
+fn apply_matches_window(
+    fragments: Vec<FragmentCandidate>,
+    matches_limit: Option<usize>,
+    matches_offset: Option<usize>,
+) -> Vec<FragmentCandidate> {
     if matches_offset.is_none() && matches_limit.is_none() {
         return fragments;
     }
