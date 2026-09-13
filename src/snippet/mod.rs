@@ -153,6 +153,30 @@ impl FragmentCandidate {
         self.highlighted.iter().map(|(_, score)| score).sum()
     }
 
+    /// Collapses overlapping highlights into one range each, summing their scores.
+    ///
+    /// Several sources can match the same span, and a tokenizer that emits overlapping
+    /// tokens can match twice within one source. Downstream a highlight is one match: it
+    /// renders once, `highlighted()` reports it once, and `matches_offset` steps over it
+    /// once. Summing keeps `score()` unchanged by the collapse, so fragment ranking is
+    /// exactly what it was before the ranges were merged. Only true overlaps merge,
+    /// matching `collapse_overlapped_ranges`, so adjacent matches stay distinct.
+    fn merge_highlighted(&mut self) {
+        self.highlighted
+            .sort_by_key(|(range, _)| (range.start, range.end));
+        let mut merged: Vec<(Range<usize>, Score)> = Vec::with_capacity(self.highlighted.len());
+        for (range, score) in self.highlighted.drain(..) {
+            match merged.last_mut() {
+                Some((last, last_score)) if last.end > range.start => {
+                    last.end = last.end.max(range.end);
+                    *last_score += score;
+                }
+                _ => merged.push((range, score)),
+            }
+        }
+        self.highlighted = merged;
+    }
+
     fn len(&self) -> usize {
         self.highlighted.len()
     }
@@ -294,6 +318,7 @@ impl FragmentAccumulator {
     /// Keeps a finished fragment if anything matched inside it.
     fn keep(&mut self, mut fragment: FragmentCandidate) {
         if fragment.score() > 0.0 {
+            fragment.merge_highlighted();
             self.fragments.push(fragment);
         }
     }
@@ -1307,24 +1332,49 @@ Survey in 2016, 2017, and 2018."#;
 
     #[test]
     fn test_snippet_generator_multiple_fields_same_span() {
-        // Both sources match the same word: the span is highlighted once in the html, and
-        // the fragment carries one range per source.
+        // Both sources match the same word. That is one match: one range, and the scores of
+        // the sources that found it added together.
         let terms = btreemap! { String::from("rust") => 1.0 };
-        let make_source = || SnippetSource {
-            terms_text: terms.clone(),
-            tokenizer: From::from(SimpleTokenizer::default()),
-            field: crate::schema::Field::from_field_id(0),
-        };
-        let sources = [make_source(), make_source()];
+        let sources = [
+            source(terms.clone(), From::from(SimpleTokenizer::default()), 0),
+            source(terms, From::from(SimpleTokenizer::default()), 1),
+        ];
         let fragments = super::search_fragments_merged(&sources, TEST_TEXT, 100, None, None);
-        let snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
-        assert_eq!(snippet.highlighted().len(), 2);
-        assert_eq!(snippet.highlighted()[0], snippet.highlighted()[1]);
+        let first = &fragments[0];
+        assert_eq!(first.highlighted.len(), 1);
+        assert_eq!(first.highlighted[0], (0..4, 2.0));
         assert_eq!(
-            snippet.to_html(),
+            select_best_fragment_combination(&fragments[..], TEST_TEXT).to_html(),
             "<b>Rust</b> is a systems programming language sponsored by\nMozilla which describes \
              it as a &quot;safe"
         );
+    }
+
+    #[test]
+    fn test_snippet_generator_matches_window_skips_distinct_matches() {
+        // Two sources, two matches, so four raw highlights that collapse to two matches.
+        // An offset of one has to land on the second match, not on the duplicate of the
+        // first.
+        let text = "alpha bravo alpha";
+        let terms = btreemap! { String::from("alpha") => 1.0 };
+        let sources = [
+            source(terms.clone(), From::from(SimpleTokenizer::default()), 0),
+            source(terms, From::from(SimpleTokenizer::default()), 1),
+        ];
+        let all = super::search_fragments_merged(&sources, text, 100, None, None);
+        let ranges = |fragments: &[FragmentCandidate]| -> Vec<Range<usize>> {
+            fragments
+                .iter()
+                .flat_map(|fragment| fragment.highlighted.iter().map(|(range, _)| range.clone()))
+                .collect()
+        };
+        assert_eq!(ranges(&all), vec![0..5, 12..17]);
+
+        let skipped = super::search_fragments_merged(&sources, text, 100, None, Some(1));
+        assert_eq!(ranges(&skipped), vec![12..17]);
+
+        let limited = super::search_fragments_merged(&sources, text, 100, Some(1), None);
+        assert_eq!(ranges(&limited), vec![0..5]);
     }
 
     #[test]
