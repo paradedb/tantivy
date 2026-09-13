@@ -182,10 +182,10 @@ impl SegmentClusters {
                 )
                 .into());
             }
-            let mut reader = payload;
-            let values: Vec<f32> = (0..num_centroids * kind.stride(options.dim()))
-                .map(|_| f32::deserialize(&mut reader))
-                .collect::<io::Result<_>>()?;
+            let values: Vec<f32> = payload
+                .chunks_exact(mem::size_of::<f32>())
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect();
             // A negative bound is corrupt, never produced: the fold is a
             // max of norms seeded at 0.0. NaN / +inf are NOT rejected —
             // they fail open arithmetically at the margin comparisons.
@@ -207,11 +207,17 @@ impl SegmentClusters {
             non_empty: vec![0u64; num_centroids.div_ceil(64)],
             num_non_empty: 0,
         };
-        for cluster in 0..num_centroids {
-            if index.cluster_offset(cluster + 1) > index.cluster_offset(cluster) {
+        let mut offsets = index
+            .cluster_offsets
+            .chunks_exact(mem::size_of::<u64>())
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+        let mut previous = offsets.next().unwrap();
+        for (cluster, offset) in offsets.enumerate() {
+            if offset > previous {
                 index.non_empty[cluster / 64] |= 1u64 << (cluster % 64);
                 index.num_non_empty += 1;
             }
+            previous = offset;
         }
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt file.
