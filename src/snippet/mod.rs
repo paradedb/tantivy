@@ -96,6 +96,10 @@
 //!
 //! SnippetGenerator needs to be created from the `Searcher` and the query, and the field on which
 //! the `SnippetGenerator` should generate the snippets.
+//!
+//! A generator can also carry several fields at once (`create_for_fields`), for fields that
+//! analyze the same source text under different tokenizers: snippets are then selected over
+//! the union of every field's matches.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -106,7 +110,7 @@ use htmlescape::encode_minimal;
 use crate::query::Query;
 use crate::schema::document::{Document, Value};
 use crate::schema::Field;
-use crate::tokenizer::TextAnalyzer;
+use crate::tokenizer::{BoxTokenStream, TextAnalyzer};
 use crate::{Score, Searcher, Term};
 
 /// The sort order for snippets.
@@ -318,6 +322,64 @@ fn search_fragments(
     }
 
     apply_matches_window(accumulator.finish(), matches_limit, matches_offset)
+}
+
+/// Merged variant of `search_fragments` for a generator with several sources.
+///
+/// Each source tokenizes `text` on its own, and the streams are consumed in offset order so
+/// the accumulator sees one interleaved walk: fragment boundaries fall where they would for
+/// a single stream, and a fragment collects the matches of every source that scored inside
+/// it. Tokens are ordered by (offset_from, offset_to), with the source index as a
+/// deterministic tie break.
+fn search_fragments_merged(
+    sources: &[SnippetSource],
+    text: &str,
+    max_num_chars: usize,
+    matches_limit: Option<usize>,
+    matches_offset: Option<usize>,
+) -> Vec<FragmentCandidate> {
+    let mut analyzers: Vec<TextAnalyzer> = sources
+        .iter()
+        .map(|source| source.tokenizer.clone())
+        .collect();
+    let mut streams: Vec<_> = analyzers
+        .iter_mut()
+        .map(|analyzer| analyzer.token_stream(text))
+        .collect();
+    let mut heads: Vec<Option<(usize, usize, Option<Score>)>> = streams
+        .iter_mut()
+        .zip(sources)
+        .map(|(stream, source)| next_event(stream, &source.terms_text))
+        .collect();
+
+    let mut accumulator = FragmentAccumulator::new(max_num_chars);
+    while let Some(next) = heads
+        .iter()
+        .enumerate()
+        .filter_map(|(index, head)| head.map(|(from, to, _)| (from, to, index)))
+        .min()
+    {
+        let (_, _, index) = next;
+        let (offset_from, offset_to, score) = heads[index].take().unwrap();
+        heads[index] = next_event(&mut streams[index], &sources[index].terms_text);
+        accumulator.observe(offset_from, offset_to, score);
+    }
+
+    apply_matches_window(accumulator.finish(), matches_limit, matches_offset)
+}
+
+/// The next token of `stream` as (offset_from, offset_to, matched score).
+fn next_event(
+    stream: &mut BoxTokenStream,
+    terms: &BTreeMap<String, Score>,
+) -> Option<(usize, usize, Option<Score>)> {
+    stream.next().map(|token| {
+        (
+            token.offset_from,
+            token.offset_to,
+            terms.get(&token.text.to_lowercase()).copied(),
+        )
+    })
 }
 
 /// Applies `matches_offset` and `matches_limit` across the highlights of all fragments.
@@ -649,43 +711,74 @@ impl SnippetGenerator {
         query: &dyn Query,
         field: Field,
     ) -> crate::Result<SnippetGenerator> {
-        let mut terms: BTreeSet<Term> = BTreeSet::new();
-        for segment_reader in searcher.segment_readers() {
-            query.query_terms(field, segment_reader, &mut |term, _| {
-                if term.field() == field {
-                    terms.insert(term.clone());
-                }
-            });
-        }
-        let mut terms_text: BTreeMap<String, Score> = Default::default();
-        for term in terms {
-            let term_value = term.value();
-            let term_str = if let Some(term_str) = term_value.as_str() {
-                term_str
-            } else if let Some(json_value_bytes) =
-                term_value.as_json_value_bytes().map(|v| v.to_owned())
-            {
-                if let Some(json_str) = json_value_bytes.as_str() {
-                    &json_str.to_string()
+        Self::create_for_fields(searcher, query, [field])
+    }
+
+    /// Creates a snippet generator with one source per field.
+    ///
+    /// The fields are expected to analyze the same source text under different tokenizers,
+    /// as when one of them is an alias of another. Snippets are then selected over the
+    /// union of every field's matches, so a passage matched through any of the fields can
+    /// be highlighted. A span matched by several sources at once is highlighted once, but
+    /// contributes each source's score to its fragment.
+    pub fn create_for_fields(
+        searcher: &Searcher,
+        query: &dyn Query,
+        fields: impl IntoIterator<Item = Field>,
+    ) -> crate::Result<SnippetGenerator> {
+        let mut sources = Vec::new();
+        for field in fields {
+            let mut terms: BTreeSet<Term> = BTreeSet::new();
+            for segment_reader in searcher.segment_readers() {
+                query.query_terms(field, segment_reader, &mut |term, _| {
+                    if term.field() == field {
+                        terms.insert(term.clone());
+                    }
+                });
+            }
+            let mut terms_text: BTreeMap<String, Score> = Default::default();
+            for term in terms {
+                let term_value = term.value();
+                let term_str = if let Some(term_str) = term_value.as_str() {
+                    term_str
+                } else if let Some(json_value_bytes) =
+                    term_value.as_json_value_bytes().map(|v| v.to_owned())
+                {
+                    if let Some(json_str) = json_value_bytes.as_str() {
+                        &json_str.to_string()
+                    } else {
+                        continue;
+                    }
                 } else {
                     continue;
+                };
+                let doc_freq = searcher.doc_freq(&term)?;
+                if doc_freq > 0 {
+                    let score = 1.0 / (1.0 + doc_freq as Score);
+                    terms_text.insert(term_str.to_string(), score);
                 }
-            } else {
-                continue;
-            };
-            let doc_freq = searcher.doc_freq(&term)?;
-            if doc_freq > 0 {
-                let score = 1.0 / (1.0 + doc_freq as Score);
-                terms_text.insert(term_str.to_string(), score);
             }
+            let tokenizer = searcher.index().tokenizer_for_field(field)?;
+            sources.push(SnippetSource {
+                terms_text,
+                tokenizer,
+                field,
+            });
         }
-        let tokenizer = searcher.index().tokenizer_for_field(field)?;
-        Ok(SnippetGenerator::new(
-            terms_text,
-            tokenizer,
-            field,
-            DEFAULT_MAX_NUM_CHARS,
-        ))
+        if sources.is_empty() {
+            return Err(crate::TantivyError::InvalidArgument(
+                "a snippet generator requires at least one field".to_string(),
+            ));
+        }
+        Ok(SnippetGenerator {
+            sources,
+            max_num_chars: DEFAULT_MAX_NUM_CHARS,
+            matches_limit: None,
+            matches_offset: None,
+            snippets_limit: 1,
+            snippets_offset: 0,
+            sort_order: SnippetSortOrder::default(),
+        })
     }
 
     /// Sets a maximum number of chars. Default is 150.
@@ -731,11 +824,19 @@ impl SnippetGenerator {
 
     /// Fragment candidates for `text`, across every source of the generator.
     fn search_all_fragments(&self, text: &str) -> Vec<FragmentCandidate> {
-        let source = &self.sources[0];
-        search_fragments(
-            &mut source.tokenizer.clone(),
+        if let [source] = &self.sources[..] {
+            return search_fragments(
+                &mut source.tokenizer.clone(),
+                text,
+                &source.terms_text,
+                self.max_num_chars,
+                self.matches_limit,
+                self.matches_offset,
+            );
+        }
+        search_fragments_merged(
+            &self.sources,
             text,
-            &source.terms_text,
             self.max_num_chars,
             self.matches_limit,
             self.matches_offset,
