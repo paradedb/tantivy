@@ -1239,58 +1239,56 @@ Survey in 2016, 2017, and 2018."#;
     fn test_snippet_generator_multiple_fields() -> crate::Result<()> {
         use crate::query::{BooleanQuery, TermQuery};
         use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        let indexed_with = |tokenizer: &str| {
+            TextOptions::default().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer(tokenizer)
+                    .set_index_option(IndexRecordOption::Basic),
+            )
+        };
         let mut schema_builder = Schema::builder();
-        let simple_options = TextOptions::default().set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer("default")
-                .set_index_option(IndexRecordOption::Basic),
-        );
-        let stemmed_options = TextOptions::default().set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer("en_stem")
-                .set_index_option(IndexRecordOption::Basic),
-        );
-        let text_field = schema_builder.add_text_field("text", simple_options);
-        let stemmed_field = schema_builder.add_text_field("text_stem", stemmed_options);
+        let words = schema_builder.add_text_field("words", indexed_with("default"));
+        let runs = schema_builder.add_text_field("runs", indexed_with("whitespace"));
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let text = "the borrowed certificates were returned quickly";
+        let text = "search is fast, rust-lang is safe";
         {
             let mut index_writer = index.writer_for_tests()?;
-            index_writer.add_document(doc!(text_field => text, stemmed_field => text))?;
+            index_writer.add_document(doc!(words => text, runs => text))?;
             index_writer.commit()?;
         }
         let searcher = index.reader().unwrap().searcher();
-        // "borrowed" only exists unstemmed, "certif" only exists stemmed: each source can
-        // highlight a match the other cannot see.
+        // "fast" is a term only under `default`, which strips the trailing comma, and
+        // "rust-lang" is a term only under `whitespace`, which does not split on the dash.
+        // Neither source can highlight the other's match on its own.
         let query = BooleanQuery::union(vec![
             Box::new(TermQuery::new(
-                Term::from_field_text(text_field, "borrowed"),
+                Term::from_field_text(words, "fast"),
                 IndexRecordOption::Basic,
             )),
             Box::new(TermQuery::new(
-                Term::from_field_text(stemmed_field, "certif"),
+                Term::from_field_text(runs, "rust-lang"),
                 IndexRecordOption::Basic,
             )),
         ]);
-        let generator =
-            SnippetGenerator::create_for_fields(&searcher, &query, [text_field, stemmed_field])?;
-        let snippet = generator.snippet(text);
+        let generator = SnippetGenerator::create_for_fields(&searcher, &query, [words, runs])?;
         assert_eq!(
-            snippet.to_html(),
-            "the <b>borrowed</b> <b>certificates</b> were returned quickly"
+            generator.snippet(text).to_html(),
+            "search is <b>fast</b>, <b>rust-lang</b> is safe"
         );
 
         // Each field alone still renders only its own match.
-        let unstemmed_only = SnippetGenerator::create(&searcher, &query, text_field)?;
         assert_eq!(
-            unstemmed_only.snippet(text).to_html(),
-            "the <b>borrowed</b> certificates were returned quickly"
+            SnippetGenerator::create(&searcher, &query, words)?
+                .snippet(text)
+                .to_html(),
+            "search is <b>fast</b>, rust-lang is safe"
         );
-        let stemmed_only = SnippetGenerator::create(&searcher, &query, stemmed_field)?;
         assert_eq!(
-            stemmed_only.snippet(text).to_html(),
-            "the borrowed <b>certificates</b> were returned quickly"
+            SnippetGenerator::create(&searcher, &query, runs)?
+                .snippet(text)
+                .to_html(),
+            "search is fast, <b>rust-lang</b> is safe"
         );
         Ok(())
     }
