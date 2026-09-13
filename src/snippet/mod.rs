@@ -277,15 +277,13 @@ impl FragmentAccumulator {
     /// full. A token that matched a term carries its score and is highlighted.
     fn observe(&mut self, offset_from: usize, offset_to: usize, score: Option<Score>) {
         if (offset_to - self.fragment.start_offset) > self.max_num_chars {
-            if self.fragment.score() > 0.0 {
-                let full =
-                    std::mem::replace(&mut self.fragment, FragmentCandidate::new(offset_from));
-                self.fragments.push(full);
-            } else {
-                self.fragment = FragmentCandidate::new(offset_from);
-            }
+            let full = std::mem::replace(&mut self.fragment, FragmentCandidate::new(offset_from));
+            self.keep(full);
         }
-        self.fragment.stop_offset = offset_to;
+        // Tokens can overlap, and a merged walk can hand over a token that ends before the
+        // one before it, so the end of a fragment only ever grows. A fragment that shrank
+        // would leave a highlight reaching past the text it is rendered against.
+        self.fragment.stop_offset = self.fragment.stop_offset.max(offset_to);
         if let Some(score) = score {
             self.fragment
                 .highlighted
@@ -293,10 +291,16 @@ impl FragmentAccumulator {
         }
     }
 
-    fn finish(mut self) -> Vec<FragmentCandidate> {
-        if self.fragment.score() > 0.0 {
-            self.fragments.push(self.fragment);
+    /// Keeps a finished fragment if anything matched inside it.
+    fn keep(&mut self, mut fragment: FragmentCandidate) {
+        if fragment.score() > 0.0 {
+            self.fragments.push(fragment);
         }
+    }
+
+    fn finish(mut self) -> Vec<FragmentCandidate> {
+        let last = std::mem::replace(&mut self.fragment, FragmentCandidate::new(0));
+        self.keep(last);
         self.fragments
     }
 }
@@ -906,13 +910,13 @@ mod tests {
 
     use super::{
         collapse_overlapped_ranges, search_fragments, select_best_fragment_combination,
-        select_top_fragments, SnippetSource,
+        select_top_fragments, FragmentCandidate, SnippetSource,
     };
     use crate::query::QueryParser;
     use crate::schema::{Schema, TEXT};
     use crate::snippet::{SnippetGenerator, SnippetSortOrder};
-    use crate::tokenizer::{NgramTokenizer, SimpleTokenizer};
-    use crate::{Index, Term};
+    use crate::tokenizer::{NgramTokenizer, RawTokenizer, SimpleTokenizer, TextAnalyzer};
+    use crate::{Index, Score, Term};
 
     const TEST_TEXT: &str = r#"Rust is a systems programming language sponsored by
 Mozilla which describes it as a "safe, concurrent, practical language", supporting functional and
@@ -1293,6 +1297,14 @@ Survey in 2016, 2017, and 2018."#;
         Ok(())
     }
 
+    fn source(terms: BTreeMap<String, Score>, tokenizer: TextAnalyzer, id: u32) -> SnippetSource {
+        SnippetSource {
+            terms_text: terms,
+            tokenizer,
+            field: crate::schema::Field::from_field_id(id),
+        }
+    }
+
     #[test]
     fn test_snippet_generator_multiple_fields_same_span() {
         // Both sources match the same word: the span is highlighted once in the html, and
@@ -1312,6 +1324,28 @@ Survey in 2016, 2017, and 2018."#;
             snippet.to_html(),
             "<b>Rust</b> is a systems programming language sponsored by\nMozilla which describes \
              it as a &quot;safe"
+        );
+    }
+
+    #[test]
+    fn test_snippet_generator_overlapping_tokens_across_sources() {
+        // The raw token covers the trailing period, the last word token does not. Ordered by
+        // offset the word token comes last, so a fragment that took each token's end as its
+        // own would stop at 10 and leave the raw match reaching to 11.
+        let text = "alpha beta.";
+        let sources = [
+            source(
+                btreemap! { text.to_string() => 1.0 },
+                From::from(RawTokenizer::default()),
+                0,
+            ),
+            source(BTreeMap::new(), From::from(SimpleTokenizer::default()), 1),
+        ];
+        let fragments = super::search_fragments_merged(&sources, text, 100, None, None);
+        assert_eq!(fragments[0].stop_offset, text.len());
+        assert_eq!(
+            select_best_fragment_combination(&fragments[..], text).to_html(),
+            "<b>alpha beta.</b>"
         );
     }
 
