@@ -140,7 +140,7 @@ impl PluginWriter for FlatVecWriter {
         write_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
 
-        for (field, buf) in &self.fields {
+        for (field, buf) in self.fields {
             // Compute (present, row_bytes) in target doc-id order. For
             // the no-remap case the writer already accumulates in
             // ascending insertion (= target) order.
@@ -157,18 +157,18 @@ impl PluginWriter for FlatVecWriter {
                 }
                 (p, r)
             } else {
-                (buf.present_doc_ids.clone(), buf.row_bytes.clone())
+                (buf.present_doc_ids, buf.row_bytes)
             };
 
             // Slice (field, 0): row→doc_id map. Picks Identity if every
             // doc is present (typical for dense embeddings, just one
             // tag byte) or Bitmap otherwise.
-            let id_map_w = composite.for_field_with_idx(*field, 0);
+            let id_map_w = composite.for_field_with_idx(field, 0);
             IdMap::serialize(&present, self.num_docs, id_map_w)?;
             id_map_w.flush()?;
 
             // Slice (field, 1): dense LE byte rows, one per present doc.
-            let rows_w = composite.for_field_with_idx(*field, 1);
+            let rows_w = composite.for_field_with_idx(field, 1);
             rows_w.write_all(&row_bytes)?;
             rows_w.flush()?;
         }
