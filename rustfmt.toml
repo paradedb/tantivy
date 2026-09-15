@@ -1,6 +1,10 @@
 comment_width = 120
 format_strings = true
 group_imports = "StdExternalCrate"
+ignore = [
+    "src/aggregation/bucket/term_agg/mod.rs",
+    "src/store/reader.rs",
+]
 imports_granularity = "Module"
 normalize_comments = true
 where_single_line = true
