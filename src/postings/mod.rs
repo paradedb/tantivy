@@ -1,5 +1,14 @@
 //! Postings module (also called inverted index)
 
+thread_local! {
+    static READ_BUFFER_SIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Selects eager reads (zero) or buffered lazy reads for this thread.
+pub fn set_postings_read_buffer_size(size: usize) {
+    READ_BUFFER_SIZE.set(size);
+}
+
 mod block_search;
 
 pub(crate) use self::block_search::search_block;

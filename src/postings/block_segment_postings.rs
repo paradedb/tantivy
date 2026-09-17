@@ -1,10 +1,13 @@
 use std::io;
 
-use common::VInt;
+use common::buffered_file_slice::BufferedFileSlice;
+use common::{HasLen, VInt};
 
-use crate::directory::OwnedBytes;
+use crate::directory::{FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
-use crate::postings::compression::{BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_SIZE};
+use crate::postings::compression::{
+    compressed_block_size, BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_SIZE,
+};
 use crate::postings::{BlockInfo, FreqReadingOption, SkipReader};
 use crate::query::Bm25Weight;
 use crate::schema::IndexRecordOption;
@@ -30,6 +33,7 @@ pub struct BlockSegmentPostings {
     block_max_score_cache: Option<Score>,
     doc_freq: u32,
     data: OwnedBytes,
+    lazy_data: Option<(BufferedFileSlice, usize)>,
     skip_reader: SkipReader,
 }
 
@@ -97,10 +101,66 @@ impl BlockSegmentPostings {
     pub(crate) fn open(
         doc_freq: u32,
         bytes: OwnedBytes,
-        mut record_option: IndexRecordOption,
+        record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
         let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
+        Self::open_with_data(
+            doc_freq,
+            skip_data_opt,
+            postings_data,
+            None,
+            record_option,
+            requested_option,
+        )
+    }
+
+    pub(crate) fn open_from_file(
+        doc_freq: u32,
+        file: FileSlice,
+        record_option: IndexRecordOption,
+        requested_option: IndexRecordOption,
+    ) -> io::Result<Self> {
+        let buffer_size = super::READ_BUFFER_SIZE.get();
+        if buffer_size == 0 || doc_freq < COMPRESSION_BLOCK_SIZE as u32 {
+            return Self::open(
+                doc_freq,
+                file.read_bytes()?,
+                record_option,
+                requested_option,
+            );
+        }
+        let mut header = file.read_bytes_slice(0..file.len().min(10))?;
+        let header_len = header.len();
+        let skip_len = VInt::deserialize_u64(&mut header)? as usize;
+        let header_len = header_len - header.len();
+        let postings_start = header_len
+            .checked_add(skip_len)
+            .filter(|end| *end <= file.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Invalid postings skip length")
+            })?;
+        let skips = file.read_bytes_slice(header_len..postings_start)?;
+        let payload = file.slice(postings_start..);
+        let payload_len = payload.len();
+        Self::open_with_data(
+            doc_freq,
+            Some(skips),
+            OwnedBytes::empty(),
+            Some((BufferedFileSlice::new(payload, buffer_size), payload_len)),
+            record_option,
+            requested_option,
+        )
+    }
+
+    fn open_with_data(
+        doc_freq: u32,
+        skip_data_opt: Option<OwnedBytes>,
+        postings_data: OwnedBytes,
+        lazy_data: Option<(BufferedFileSlice, usize)>,
+        mut record_option: IndexRecordOption,
+        requested_option: IndexRecordOption,
+    ) -> io::Result<Self> {
         let skip_reader = match skip_data_opt {
             Some(skip_data) => {
                 let block_count = doc_freq as usize / COMPRESSION_BLOCK_SIZE;
@@ -132,6 +192,7 @@ impl BlockSegmentPostings {
             block_max_score_cache: None,
             doc_freq,
             data: postings_data,
+            lazy_data,
             skip_reader,
         };
         block_segment_postings.load_block();
@@ -195,6 +256,7 @@ impl BlockSegmentPostings {
         let (skip_data_opt, postings_data) =
             split_into_skips_and_postings(doc_freq, postings_data)?;
         self.data = postings_data;
+        self.lazy_data = None;
         self.block_max_score_cache = None;
         self.block_loaded = false;
         if let Some(skip_data) = skip_data_opt {
@@ -344,6 +406,37 @@ impl BlockSegmentPostings {
             return;
         }
         let offset = self.skip_reader.byte_offset();
+        let lazy_bytes = self.lazy_data.as_ref().map(|(reader, len)| {
+            let end = match self.skip_reader.block_info() {
+                BlockInfo::BitPacked {
+                    doc_num_bits,
+                    tf_num_bits,
+                    ..
+                } => {
+                    offset
+                        + compressed_block_size(doc_num_bits)
+                        + if self.freq_reading_option == FreqReadingOption::ReadFreq {
+                            compressed_block_size(tf_num_bits)
+                        } else {
+                            0
+                        }
+                }
+                BlockInfo::VInt { num_docs: 0 } => offset,
+                BlockInfo::VInt { .. } => *len,
+            };
+            if end == offset {
+                OwnedBytes::empty()
+            } else {
+                reader
+                    .get_bytes(offset as u64..end as u64)
+                    .expect("Failed to read postings block")
+            }
+        });
+        let data = match lazy_bytes.as_ref() {
+            Some(bytes) => bytes.as_slice(),
+            None if self.skip_reader.block_info() == (BlockInfo::VInt { num_docs: 0 }) => &[],
+            None => &self.data.as_slice()[offset..],
+        };
         match self.skip_reader.block_info() {
             BlockInfo::BitPacked {
                 doc_num_bits,
@@ -358,7 +451,7 @@ impl BlockSegmentPostings {
                     } else {
                         None
                     },
-                    &self.data.as_slice()[offset..],
+                    data,
                     self.skip_reader.last_doc_in_previous_block,
                     doc_num_bits,
                     tf_num_bits,
@@ -370,7 +463,7 @@ impl BlockSegmentPostings {
                     if num_docs == 0 {
                         &[]
                     } else {
-                        &self.data.as_slice()[offset..]
+                        data
                     }
                 };
                 decode_vint_block(
@@ -407,6 +500,7 @@ impl BlockSegmentPostings {
             block_max_score_cache: None,
             doc_freq: 0,
             data: OwnedBytes::empty(),
+            lazy_data: None,
             skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic),
         }
     }
@@ -428,6 +522,100 @@ mod tests {
     use crate::postings::SegmentPostings;
     use crate::schema::{IndexRecordOption, Schema, Term, INDEXED};
     use crate::DocId;
+
+    #[test]
+    fn test_lazy_postings_reads_and_seeks() -> crate::Result<()> {
+        use crate::directory::{FileHandle, FileSlice, OwnedBytes};
+        use crate::index::Bm25Params;
+        use crate::postings::serializer::PostingsSerializer;
+        use std::ops::Range;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug)]
+        struct TrackedFile {
+            bytes: OwnedBytes,
+            reads: Arc<Mutex<Vec<Range<usize>>>>,
+        }
+        impl HasLen for TrackedFile {
+            fn len(&self) -> usize {
+                self.bytes.len()
+            }
+        }
+        impl FileHandle for TrackedFile {
+            fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+                self.reads.lock().unwrap().push(range.clone());
+                Ok(self.bytes.slice(range))
+            }
+        }
+
+        for count in [0, 1, 127, 128, 129, 256, 257, 100_003] {
+            for record in [
+                IndexRecordOption::Basic,
+                IndexRecordOption::WithFreqs,
+                IndexRecordOption::WithFreqsAndPositions,
+            ] {
+                for dense in [false, true] {
+                    let mut serializer =
+                        PostingsSerializer::new(20.0, record, None, Bm25Params::default());
+                    serializer.new_term(count, record.has_freq());
+                    let docs: Vec<_> = (0..count)
+                        .map(|i| if dense { i } else { i * 13 + i % 7 })
+                        .collect();
+                    for (i, &doc) in docs.iter().enumerate() {
+                        serializer.write_doc(doc, if dense { 1 } else { (i % 17 + 1) as u32 });
+                    }
+                    let mut bytes = Vec::new();
+                    serializer.close_term(count, &mut bytes)?;
+                    let bytes = OwnedBytes::new(bytes);
+                    for requested in [IndexRecordOption::Basic, IndexRecordOption::WithFreqs] {
+                        for size in [1, 4096, 8192, 65536] {
+                            let reads = Arc::new(Mutex::new(Vec::new()));
+                            let file = FileSlice::new(Arc::new(TrackedFile {
+                                bytes: bytes.clone(),
+                                reads: reads.clone(),
+                            }));
+                            super::super::set_postings_read_buffer_size(size);
+                            let lazy = BlockSegmentPostings::open_from_file(
+                                count, file, record, requested,
+                            )?;
+                            super::super::set_postings_read_buffer_size(0);
+                            let eager = BlockSegmentPostings::open(
+                                count,
+                                bytes.clone(),
+                                record,
+                                requested,
+                            )?;
+                            if count > 100_000 && !dense && size == 1 {
+                                let read_bytes: usize =
+                                    reads.lock().unwrap().iter().map(|r| r.len()).sum();
+                                assert!(read_bytes < bytes.len() / 2);
+                            }
+                            let mut scanned = lazy.clone();
+                            let mut expected = eager.clone();
+                            loop {
+                                assert_eq!(scanned.docs(), expected.docs());
+                                assert_eq!(scanned.freqs(), expected.freqs());
+                                if expected.docs().is_empty() {
+                                    break;
+                                }
+                                scanned.advance();
+                                expected.advance();
+                            }
+                            let mut sought = SegmentPostings::from_block_postings(lazy, None);
+                            let mut expected = SegmentPostings::from_block_postings(eager, None);
+                            for target in
+                                [0, 126, 127, 128, 129, 255, 256, 1000, 100_000, 2_000_000]
+                            {
+                                assert_eq!(sought.seek(target), expected.seek(target));
+                                assert_eq!(sought.term_freq(), expected.term_freq());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_empty_segment_postings() {
