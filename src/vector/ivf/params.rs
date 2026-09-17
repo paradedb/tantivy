@@ -96,7 +96,7 @@ impl Default for AdaptiveProbeParams {
 pub(crate) const MIN_PROBE_CLUSTERS: usize = 16;
 
 /// Default [`AdaptiveProbeParams::router_recall_target`].
-pub const DEFAULT_ROUTER_RECALL: f32 = 0.9;
+pub const DEFAULT_ROUTER_RECALL: f32 = 0.99;
 
 /// How many more clusters than the work budget the stacked router is asked
 /// to rank under APS, so the bounds gate and a selective filter can pull
