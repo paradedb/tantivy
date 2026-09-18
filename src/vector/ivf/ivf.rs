@@ -70,6 +70,9 @@ pub const PARENT_RECALL_TARGET: f32 = 0.99;
 /// Default fan-out of the Multi-level IVF index
 pub const DEFAULT_BRANCHING_FACTOR: usize = 100;
 
+/// Default relative change in `ρ` that triggers an APS recall profile recompute.
+pub const APS_RECOMPUTE_THRESHOLD: f32 = 0.10;
+
 /// Search and clustering knobs for this level. Not persisted.
 #[derive(Clone, Debug)]
 pub struct IvfConfig {
@@ -943,11 +946,33 @@ where
             Vec::new()
         };
 
+        let mut rho: Option<f32> = None;
+        let mut profile: Vec<f32> = Vec::new();
+        let mut est = 0.0f32;
+
         let mut result = BinaryHeap::with_capacity(k);
         for (i, c) in candidates.iter().enumerate() {
             stats.members_scored += self.scan_cluster(query, metric, c.node, &mut result, k);
             stats.lists_scanned += 1;
-            if can_aps && self.estimated_recall(&boundary, &result, k, i, dim, metric) >= recall {
+            if !can_aps {
+                continue;
+            }
+
+            let Some(Reverse(kth)) = result.peek().filter(|_| result.len() >= k) else {
+                continue;
+            };
+            let new_rho = aps::radius_from_kth(kth.sim, metric);
+            let recompute =
+                rho.map_or(true, |old| (old - new_rho).abs() > APS_RECOMPUTE_THRESHOLD * old);
+            if recompute {
+                rho = Some(new_rho);
+                profile =
+                    aps::compute_recall_profile(&boundary, new_rho, dim, aps::is_euclidean(metric));
+                est = profile[..=i].iter().sum();
+            } else {
+                est += profile.get(i).copied().unwrap_or(0.0);
+            }
+            if est >= recall {
                 break;
             }
         }
@@ -958,26 +983,6 @@ where
             .map(|Reverse(c)| c)
             .collect();
         (hits, stats)
-    }
-
-    /// Estimated recall after scanning `candidates[..=scanned]`: the share
-    /// of the query ball (radius = distance to the current k-th result)
-    /// covered by those lists. `0.0` until `k` results exist.
-    fn estimated_recall(
-        &self,
-        boundary: &[f32],
-        result: &BinaryHeap<Reverse<Candidate<ClusterId>>>,
-        k: usize,
-        scanned: usize,
-        dim: usize,
-        metric: Metric,
-    ) -> f32 {
-        let Some(Reverse(kth)) = result.peek().filter(|_| result.len() >= k) else {
-            return 0.0;
-        };
-        let rho = aps::radius_from_kth(kth.sim, metric);
-        let profile = aps::compute_recall_profile(boundary, rho, dim, aps::is_euclidean(metric));
-        profile[..=scanned].iter().sum()
     }
 
     fn scan_cluster(
