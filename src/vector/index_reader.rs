@@ -308,6 +308,21 @@ impl VectorIndexReader {
         Ok(bytes)
     }
 
+    /// Read a contiguous range of dense vector rows.
+    pub fn vector_bytes_for_rows(&self, rows: std::ops::Range<usize>) -> crate::Result<OwnedBytes> {
+        let num_rows = self.id_map.as_ref().map(IdMap::num_rows).unwrap_or(0) as usize;
+        if rows.start > rows.end || rows.end > num_rows {
+            return Err(TantivyError::InvalidArgument(format!(
+                "vector rows {rows:?} are out of bounds"
+            )));
+        }
+        let stride = self.options.bytes_per_vector();
+        Ok(self
+            .rows_slice
+            .slice(rows.start * stride..rows.end * stride)
+            .read_bytes()?)
+    }
+
     /// The doc id stored at `row` — decoded from the pinned permutation
     /// for clustered segments, positional for flat ones. Panics on the
     /// empty placeholder.

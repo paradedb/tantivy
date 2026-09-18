@@ -31,6 +31,7 @@
 
 pub(crate) mod backend;
 pub(crate) mod collector;
+pub(crate) mod parallel;
 pub(crate) mod prepared;
 pub(crate) mod tie_break;
 
@@ -468,11 +469,6 @@ fn resolve_budget<TChild>(
     num_centroids: usize,
     segments: &[SegmentSearch<'_, TChild>],
 ) -> crate::Result<(WorkUnits, WorkUnits, WorkUnits)> {
-    if !(adaptive.max_probe_fraction > 0.0) {
-        return Err(TantivyError::InvalidArgument(
-            "max_probe_fraction must be greater than 0".to_string(),
-        ));
-    }
     let total_docs: usize = segments.iter().map(|s| s.ivf().num_docs()).sum();
     let total_nonempty: usize = segments
         .iter()
@@ -480,6 +476,20 @@ fn resolve_budget<TChild>(
         .sum();
     // Native docs as WRITTEN: dead rows charge nothing (alive pre-pass),
     // so deletes only ever cheapen a scan.
+    resolve_budget_counts(adaptive, num_centroids, total_docs, total_nonempty)
+}
+
+fn resolve_budget_counts(
+    adaptive: &AdaptiveProbeParams,
+    num_centroids: usize,
+    total_docs: usize,
+    total_nonempty: usize,
+) -> crate::Result<(WorkUnits, WorkUnits, WorkUnits)> {
+    if !(adaptive.max_probe_fraction > 0.0) {
+        return Err(TantivyError::InvalidArgument(
+            "max_probe_fraction must be greater than 0".to_string(),
+        ));
+    }
     let n_avg = total_docs as f64 / num_centroids.max(1) as f64;
     let x = open_share(n_avg);
     let capacity =

@@ -27,6 +27,13 @@ pub enum ProbeTermination {
 /// — the loop is global, so the counters are too.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
+    pub routing_time_ns: u64,
+    pub filter_time_ns: u64,
+    pub probe_time_ns: u64,
+    pub segment_setup_time_ns: u64,
+    pub pruned_invisible: usize,
+    #[serde(skip)]
+    pub cluster_flags: Vec<u8>,
     /// Docs that passed filter + alive + seen and were scored against the
     /// query. This stays the "scored" bucket and equals the final survivor
     /// `candidates`.
@@ -199,6 +206,10 @@ impl WorkUnits {
     #[inline]
     pub fn new(units: f64) -> WorkUnits {
         WorkUnits(units)
+    }
+
+    pub(super) fn get(self) -> f64 {
+        self.0
     }
 
     /// The single narrowing point, for the telemetry fold.
@@ -1953,6 +1964,352 @@ mod tests {
         )?;
         assert_eq!(before_labeled, labeled(&after)?);
         assert_eq!(stats.exact_rows_read, 0, "no flat segments remain");
+        Ok(())
+    }
+    #[test]
+    fn adaptive_budget_is_independent_of_workers_and_completion_order() -> crate::Result<()> {
+        use std::sync::{Barrier, Mutex};
+
+        use crate::vector::{
+            ClusterWork, PreparedVectorSearch, ProbeBudget, ProbeWave, VectorSearchControl,
+        };
+        struct Shared {
+            barrier: Barrier,
+            next: Vec<std::sync::atomic::AtomicUsize>,
+            costs: Mutex<Vec<ClusterWork>>,
+            wave: Mutex<ProbeWave>,
+            hits: Mutex<Vec<(Score, DocAddress)>>,
+            limit: usize,
+        }
+        struct Control<'a> {
+            shared: &'a Shared,
+            worker: usize,
+        }
+        impl VectorSearchControl for Control<'_> {
+            fn work_sharing(&self) -> bool {
+                true
+            }
+            fn claim_work(&mut self, segment: u32) -> usize {
+                self.shared.next[segment as usize]
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            }
+            fn select_wave(
+                &mut self,
+                _: usize,
+                start: usize,
+                costs: &[ClusterWork],
+                budget: ProbeBudget,
+                spent: f64,
+            ) -> ProbeWave {
+                std::thread::sleep(std::time::Duration::from_micros((self.worker * 13) as u64));
+                {
+                    let mut total = self.shared.costs.lock().unwrap();
+                    total.resize(costs.len(), ClusterWork::default());
+                    for (total, cost) in total.iter_mut().zip(costs) {
+                        total.opens += cost.opens;
+                        total.rows += cost.rows;
+                    }
+                }
+                if self.shared.barrier.wait().is_leader() {
+                    let mut costs = self.shared.costs.lock().unwrap();
+                    *self.shared.wave.lock().unwrap() = budget.select(start, &costs, spent);
+                    costs.clear();
+                    for next in &self.shared.next {
+                        next.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                self.shared.barrier.wait();
+                let wave = *self.shared.wave.lock().unwrap();
+                self.shared.barrier.wait();
+                wave
+            }
+            fn publish(&mut self, candidates: &[(Score, DocAddress)]) {
+                let mut hits = self.shared.hits.lock().unwrap();
+                hits.extend_from_slice(candidates);
+                hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                hits.dedup_by_key(|hit| hit.1);
+                hits.truncate(self.shared.limit);
+            }
+            fn synchronize(&mut self, _: usize, _: Option<Score>) -> Option<Score> {
+                self.shared.barrier.wait();
+                let threshold = (self.shared.limit <= 1024)
+                    .then(|| {
+                        self.shared
+                            .hits
+                            .lock()
+                            .unwrap()
+                            .get(self.shared.limit - 1)
+                            .map(|hit| hit.0)
+                    })
+                    .flatten();
+                self.shared.barrier.wait();
+                threshold
+            }
+        }
+        let centroids: Vec<_> = (0..400)
+            .map(|i| [(i % 20) as f32, (i / 20) as f32])
+            .collect();
+        let labels: Vec<_> = (0..2400)
+            .map(|i| {
+                if i % 7 == 0 {
+                    "keep".to_owned()
+                } else {
+                    format!("d{i}")
+                }
+            })
+            .collect();
+        let docs: Vec<_> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let c = centroids[i % centroids.len()];
+                (
+                    label.as_str(),
+                    [c[0] + (i / 400) as f32 * 0.01, c[1] + 0.03],
+                )
+            })
+            .collect();
+        let commits: Vec<_> = docs.chunks(300).collect();
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            for replicas in [1, 2] {
+                let (index, field, label) =
+                    build_ivf(metric, &centroids, &commits, replicas, false)?;
+                let searcher = index.reader()?.searcher();
+                let query = vec![6.8f32, 8.1];
+                for fraction in [0.02, 0.15, 0.7, 1.0] {
+                    let params = AdaptiveProbeParams {
+                        max_probe_fraction: fraction,
+                        min_probe_clusters: 1,
+                    };
+                    let plan = PreparedVectorSearch::new(&searcher, field, &query, &params)?;
+                    let filters: Vec<Box<dyn Query>> = vec![
+                        Box::new(AllQuery),
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(label, "keep"),
+                            IndexRecordOption::Basic,
+                        )),
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(label, "missing"),
+                            IndexRecordOption::Basic,
+                        )),
+                    ];
+                    for filter in filters {
+                        let all = filter
+                            .weight(EnableScoring::disabled_from_searcher(&searcher))?
+                            .matches_all_docs();
+                        let compare_legacy =
+                            metric == Metric::L2 && replicas == 1 && fraction == 0.7 && all;
+                        let limit = if compare_legacy { docs.len() + 1 } else { 10 };
+                        let collector =
+                            TopDocs::with_limit(limit).order_by_similarity(field, query.clone());
+                        let serial = collector.search_prepared(
+                            &searcher,
+                            filter.as_ref(),
+                            &plan,
+                            0..searcher.segment_readers().len() as u32,
+                            &mut (),
+                        )?;
+                        if compare_legacy {
+                            let legacy = TopDocs::with_limit(limit)
+                                .order_by_similarity(field, query.clone())
+                                .with_adaptive_params(params.clone())
+                                .search(&searcher, filter.as_ref())?;
+                            assert!(legacy.stats.candidates_scored > 1000);
+                            assert_eq!(legacy.stats.bounds_skips, 0);
+                            assert_eq!(legacy.results, serial.results);
+                            assert_eq!(
+                                legacy.stats.candidates_scored,
+                                serial.stats.candidates_scored
+                            );
+                            assert_eq!(legacy.stats.segment_opens, serial.stats.segment_opens);
+                        }
+                        for workers in [1, 2, 4, 8] {
+                            let shared = Shared {
+                                barrier: Barrier::new(workers),
+                                next: (0..searcher.segment_readers().len())
+                                    .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                                    .collect(),
+                                costs: Mutex::new(Vec::new()),
+                                wave: Mutex::new(ProbeWave::default()),
+                                hits: Mutex::new(Vec::new()),
+                                limit,
+                            };
+                            let results = std::thread::scope(|scope| {
+                                let handles: Vec<_> = (0..workers)
+                                    .map(|worker| {
+                                        let (searcher, collector, filter, plan, shared) = (
+                                            &searcher,
+                                            &collector,
+                                            filter.as_ref(),
+                                            &plan,
+                                            &shared,
+                                        );
+                                        scope.spawn(move || {
+                                            std::thread::sleep(std::time::Duration::from_micros(
+                                                (worker * 47) as u64,
+                                            ));
+                                            collector
+                                                .search_prepared(
+                                                    searcher,
+                                                    filter,
+                                                    plan,
+                                                    (0..searcher.segment_readers().len() as u32)
+                                                        .filter(|ord| {
+                                                            *ord as usize % workers == worker
+                                                        }),
+                                                    &mut Control { shared, worker },
+                                                )
+                                                .unwrap()
+                                        })
+                                    })
+                                    .collect();
+                                handles
+                                    .into_iter()
+                                    .map(|handle| handle.join().unwrap())
+                                    .collect::<Vec<_>>()
+                            });
+                            if replicas == 1
+                                && filter
+                                    .weight(EnableScoring::disabled_from_searcher(&searcher))?
+                                    .matches_all_docs()
+                            {
+                                assert!(shared.next.iter().any(|next| next
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    > 0));
+                            }
+                            let mut hits: Vec<_> = results
+                                .iter()
+                                .flat_map(|fruit| fruit.results.iter().copied())
+                                .collect();
+                            hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                            hits.truncate(limit);
+                            assert_eq!(
+                                hits, serial.results,
+                                "metric={metric:?}, replicas={replicas}, budget={fraction}, \
+                                 workers={workers}"
+                            );
+                            assert_eq!(
+                                results
+                                    .iter()
+                                    .map(|r| r.stats.candidates_scored)
+                                    .sum::<usize>(),
+                                serial.stats.candidates_scored
+                            );
+                            assert_eq!(
+                                results.iter().map(|r| r.stats.bounds_skips).sum::<u32>(),
+                                serial.stats.bounds_skips
+                            );
+                            let work: f32 = results.iter().map(|r| r.stats.work_charged).sum();
+                            assert!(
+                                (work - serial.stats.work_charged).abs() < 0.01,
+                                "{work} vs {}",
+                                serial.stats.work_charged
+                            );
+                        }
+                        if fraction == 1.0
+                            && filter
+                                .weight(EnableScoring::disabled_from_searcher(&searcher))?
+                                .matches_all_docs()
+                        {
+                            assert_eq!(
+                                serial.results,
+                                ground_truth::top_k(&index, field, metric, &query, limit)?
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_checks_eligibility_before_heap_and_deduplicates_replicas() -> crate::Result<()> {
+        use crate::vector::{PreparedVectorSearch, VectorSearchControl};
+        struct Eligible;
+        impl VectorSearchControl for Eligible {
+            fn accept(&mut self, doc: DocAddress) -> bool {
+                doc.doc_id % 2 == 0
+            }
+        }
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        for replicas in [1, 2, 3] {
+            let (index, field, _) = build_ivf(
+                Metric::L2,
+                &centroids,
+                &[&docs[..18], &docs[18..]],
+                replicas,
+                false,
+            )?;
+            let searcher = index.reader()?.searcher();
+            let query = vec![1.0f32, 1.0];
+            let plan = PreparedVectorSearch::new(
+                &searcher,
+                field,
+                &query,
+                &exhaustive_params(centroids.len()),
+            )?;
+            let truth: Vec<_> = ground_truth::top_k(&index, field, Metric::L2, &query, 100)?
+                .into_iter()
+                .filter(|(_, doc)| doc.doc_id % 2 == 0)
+                .take(10)
+                .collect();
+            let fruit = TopDocs::with_limit(10)
+                .order_by_similarity(field, query)
+                .search_prepared(
+                    &searcher,
+                    &AllQuery,
+                    &plan,
+                    0..searcher.segment_readers().len() as u32,
+                    &mut Eligible,
+                )?;
+            assert_eq!(fruit.results, truth);
+            assert!(fruit.stats.pruned_invisible > 0);
+            if replicas > 1 {
+                assert!(fruit.stats.pruned_seen > 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_searches_flat_segments_and_filters() -> crate::Result<()> {
+        use crate::vector::PreparedVectorSearch;
+        let (index, field, label) = mixed_fixture()?;
+        let searcher = index.reader()?.searcher();
+        let query = vec![100.0f32, 101.0];
+        let plan = PreparedVectorSearch::new(&searcher, field, &query, &exhaustive_params(4))?;
+        let collector = TopDocs::with_limit(10).order_by_similarity(field, query.clone());
+        let result = collector.search_prepared(
+            &searcher,
+            &AllQuery,
+            &plan,
+            0..searcher.segment_readers().len() as u32,
+            &mut (),
+        )?;
+        assert_eq!(
+            result.results,
+            ground_truth::top_k(&index, field, Metric::L2, &query, 10)?
+        );
+        assert_eq!(result.stats.exact_rows_read, 8);
+        for value in ["f0", "c0", "missing"] {
+            let filter = TermQuery::new(
+                Term::from_field_text(label, value),
+                IndexRecordOption::Basic,
+            );
+            let result = collector.search_prepared(
+                &searcher,
+                &filter,
+                &plan,
+                0..searcher.segment_readers().len() as u32,
+                &mut (),
+            )?;
+            assert_eq!(result.results.len(), usize::from(value != "missing"));
+            if let Some((_, doc)) = result.results.first() {
+                assert_eq!(stored_label_at(&index, label, *doc)?, value);
+            }
+        }
         Ok(())
     }
 }

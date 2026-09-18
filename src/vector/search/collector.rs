@@ -140,33 +140,40 @@ where
         self.collect_global(searcher, weight.as_ref())
     }
 
+    pub fn search_prepared(
+        &self,
+        searcher: &Searcher,
+        filter: &dyn Query,
+        plan: &super::parallel::PreparedVectorSearch,
+        segments: impl Iterator<Item = crate::SegmentOrdinal>,
+        control: &mut dyn super::parallel::VectorSearchControl,
+    ) -> crate::Result<VectorSimilarityFruit> {
+        self.check_schema(searcher.schema())?;
+        let weight = filter.weight(EnableScoring::disabled_from_searcher(searcher))?;
+        let (hits, mut stats) = super::parallel::search(
+            searcher,
+            weight.as_ref(),
+            self.field,
+            &self.query,
+            self.segment_top_n(),
+            &self.tie_break,
+            plan,
+            segments,
+            control,
+        )?;
+        stats.routing = plan.routing;
+        stats.routing_time_ns = plan.routing_time_ns;
+        let results = hits
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .map(|((score, _), address)| (score, address))
+            .collect();
+        Ok(VectorSimilarityFruit { results, stats })
+    }
+
     fn check_schema(&self, schema: &Schema) -> crate::Result<()> {
-        let entry = schema.get_field_entry(self.field);
-        let opts = match entry.field_type() {
-            FieldType::Vector(o) => o,
-            _ => {
-                return Err(TantivyError::SchemaError(format!(
-                    "field {:?} is not a vector field",
-                    entry.name(),
-                )));
-            }
-        };
-        if opts.dim() != self.query.len() {
-            return Err(TantivyError::SchemaError(format!(
-                "query vector length {} does not match field {:?} dim {}",
-                self.query.len(),
-                entry.name(),
-                opts.dim(),
-            )));
-        }
-        if opts.dtype() != T::DTYPE {
-            return Err(TantivyError::SchemaError(format!(
-                "query dtype {:?} does not match field {:?} dtype {:?}",
-                T::DTYPE,
-                entry.name(),
-                opts.dtype(),
-            )));
-        }
+        check_query_schema(schema, self.field, &self.query)?;
         if self.tie_break.requires_scoring() {
             // `requires_scoring` is false below, so the filter's BM25 score is
             // never computed and every doc would tie-break on the same
@@ -616,4 +623,38 @@ mod e2e_tests {
         );
         Ok(())
     }
+}
+
+pub(super) fn check_query_schema<T: VectorElement>(
+    schema: &Schema,
+    field: Field,
+    query: &[T],
+) -> crate::Result<()> {
+    let entry = schema.get_field_entry(field);
+    let opts = match entry.field_type() {
+        FieldType::Vector(o) => o,
+        _ => {
+            return Err(TantivyError::SchemaError(format!(
+                "field {:?} is not a vector field",
+                entry.name(),
+            )));
+        }
+    };
+    if opts.dim() != query.len() {
+        return Err(TantivyError::SchemaError(format!(
+            "query vector length {} does not match field {:?} dim {}",
+            query.len(),
+            entry.name(),
+            opts.dim(),
+        )));
+    }
+    if opts.dtype() != T::DTYPE {
+        return Err(TantivyError::SchemaError(format!(
+            "query dtype {:?} does not match field {:?} dtype {:?}",
+            T::DTYPE,
+            entry.name(),
+            opts.dtype(),
+        )));
+    }
+    Ok(())
 }

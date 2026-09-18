@@ -56,6 +56,10 @@ pub use search::backend::{
     set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 pub use search::collector::{TopDocsByVectorSimilarity, VectorSimilarityFruit};
+pub use search::parallel::{
+    ClusterWork, PreparedVectorSearch, ProbeBudget, ProbeWave, RankedCluster, VectorSearchControl,
+    PROBE_WAVE_SIZE,
+};
 pub use search::prepared::PreparedQuery;
 pub use search::tie_break::NoTieBreak;
 pub use writer::{VecWriter, VectorPlugin};
