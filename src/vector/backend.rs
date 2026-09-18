@@ -25,7 +25,7 @@ use super::distance::norm_squared_wide;
 use super::index_reader::VectorIndexReader;
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
 use super::prepared::PreparedQuery;
-use super::router::{RouterMetrics, RouterWorkspace};
+use super::router::{RouterMetrics, RouterWorkspace, RoutingParams};
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
 use crate::collector::sort_key::{Comparator, NaturalComparator};
@@ -554,7 +554,14 @@ impl<T: VectorElement> VectorBackend<T> {
         // query is widened losslessly per element.
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
         let mut routing_workspace = RouterWorkspace::default();
-        let mut ranked = index.rank_clusters(&mut routing_workspace, &query_f32);
+        // The stacked router is told how many clusters this budget buys and
+        // the recall target; it drops to the fixed nprobe path itself when
+        // the dimension is past `APS_MAX_DIM`.
+        let routing = RoutingParams {
+            k: self.adaptive.router_k(work_budget, num_centroids),
+            recall: self.adaptive.router_recall_target,
+        };
+        let mut ranked = index.rank_clusters(&mut routing_workspace, &query_f32, routing);
 
         let topn = self.scan_clusters(
             index,
@@ -2213,6 +2220,10 @@ mod tests {
         let params = AdaptiveProbeParams {
             max_probe_fraction: 0.2,
             min_probe_clusters: 1,
+            // Route exhaustively: with APS on, the stacked router hands the
+            // loop only the clusters the recall target needs, and on this
+            // tiny fixture the ranking runs out before the budget binds.
+            router_recall_target: 1.0,
             ..Default::default()
         };
         let searcher = index.index.reader()?.searcher();

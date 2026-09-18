@@ -53,11 +53,11 @@ pub use ivf::{
     IvfTrainingBatch, IvfTrainingVectors, IvfVectorBatch, IvfVectors, LazyStackedIvf, LazyStore,
     MultiLevelIvf, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
-    SuperKMeansLevelClusterer, Workspace,
+    StackedSearchStats, SuperKMeansLevelClusterer, Workspace, APS_MAX_DIM,
 };
 pub use plugin::VectorPlugin;
 pub use prepared::PreparedQuery;
-pub use router::{RouterKind, RouterMetrics};
+pub use router::{RouterKind, RouterMetrics, RoutingParams};
 pub use tie_break::NoTieBreak;
 
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
