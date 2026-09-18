@@ -7,25 +7,26 @@
 //! routing state is parsed once and pinned in memory, while the bulk payload
 //! stays behind [`FileSlice`]s and is fetched with ranged reads at query time.
 //!
-//! The reader is "store + optional index":
-//! - The **store** is the segment's `.vec` composite: slot `[0]` is the row→doc_id [`IdMap`], slot
-//!   `[1]` the dense vector rows (deferred).
-//! - The **index** ([`IvfIndex`]) exists if the segment was merged with IVF clustering, and is
-//!   loaded from the sibling `.centroids` composite. It tells a query which clusters — contiguous
-//!   row ranges of slot `[1]` — to probe. Without it, search falls back to an exact scan.
+//! The segment's `.vec` composite holds one of two layouts, discriminated
+//! by the [`IdMap`] variant tag in slot `[0]`:
 //!
-//! The pairing is an invariant of the write path (`VectorPlugin`): the IVF
-//! merge writes cluster-sorted rows + an `Explicit` id-map + `.centroids`;
-//! every other writer produces doc-ordered rows + `Identity`/`Bitmap` and no
-//! sidecar. [`VectorIndexReader::open`] validates the two signals agree.
-
-use std::cmp::Ordering;
+//! * clustered — an `Explicit` (cluster-sorted) id-map, the dense rows in slot `[1]`, and slots
+//!   `[2..=4]` the per-segment IVF remainder parsed into [`SegmentClusters`] — offsets, bounds, and
+//!   doc counts. The centroid rows themselves live in the index-level `centroids` file (see
+//!   [`centroid_index`](super::centroid_index)); this reader never touches them.
+//! * flat — an `Identity`/`Bitmap` (doc-ordered) id-map and the rows, nothing else. Written by
+//!   indexes without a centroid index (the mutable/staging tier) and searched exhaustively;
+//!   [`Self::index`] is `None`.
+//!
+//! A field with no vectors owns no slots at all; any other partial slot
+//! set — or a tag that disagrees with the slots present — is corrupt, not
+//! old.
 
 use common::{HasLen, OwnedBytes};
 
-use super::flat::IdMap;
-use super::header::{centroid_slot, read_header, vec_slot};
-use super::ivf::{IvfIndex, CENTROIDS_EXT};
+use super::header::{read_header, vec_slot, VectorFileVersion};
+use super::id_map::IdMap;
+use super::ivf::SegmentClusters;
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
@@ -33,21 +34,16 @@ use crate::index::SegmentComponent;
 use crate::schema::{Field, FieldType, VectorOptions};
 use crate::{DocId, SegmentReader, TantivyError};
 
-/// Which on-disk layout a segment's vector data uses, surfaced through
-/// [`VectorInfo`] for tooling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VectorStorageFormat {
-    Flat,
-    Ivf,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorInfo {
-    pub format: VectorStorageFormat,
-    /// Distinct documents with a vector in this field.
+    /// Distinct documents with a vector in this field. The per-cluster
+    /// numbers (`cluster_stats`, [`VectorIndexReader::cluster_sizes`]) count
+    /// posting rows, so with replication their sum exceeds `num_vectors`.
     pub num_vectors: usize,
-    pub num_centroids: Option<usize>,
-    pub cluster_stats: Option<VectorClusterStats>,
+    /// `0` for a flat (unclustered) segment, which assigned against
+    /// nothing and is searched exhaustively.
+    pub num_centroids: usize,
+    pub cluster_stats: VectorClusterStats,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,22 +54,23 @@ pub struct VectorClusterStats {
     pub empty_clusters: usize,
 }
 
-/// Per-(segment, field) vector reader: the row store plus, for IVF segments,
-/// the routing index. See the module docs for the layout and the
+/// Per-(segment, field) vector reader: the row store plus the per-segment
+/// IVF remainder. See the module docs for the layout and the
 /// pinned-vs-deferred split.
 pub struct VectorIndexReader {
     options: VectorOptions,
-    /// Distinct docs with a vector.
+    /// Distinct docs with a vector (the persisted IVF doc count; the row
+    /// total replication inflates is [`SegmentClusters::num_rows`]).
     num_vectors: usize,
     /// `false` for the placeholder built by [`Self::empty`] — the segment has
     /// no vector data for this field at all.
     present: bool,
     /// `.vec` slot `[0]`
-    id_map: IdMap,
+    id_map: Option<IdMap>,
     /// `.vec` slot `[1]`: the dense vector rows. Never materialized whole;
     /// queries fetch per-cluster (or per-doc) ranges.
     rows_slice: FileSlice,
-    index: Option<IvfIndex>,
+    index: Option<SegmentClusters>,
 }
 
 impl VectorIndexReader {
@@ -99,82 +96,54 @@ impl VectorIndexReader {
             Err(OpenReadError::FileDoesNotExist(_)) => return Ok(Self::empty(options)),
             Err(err) => return Err(err.into()),
         };
-        let (_version, body) = read_header(&vec_file)?;
+        let (version, body) = read_header(&vec_file)?;
+        // V3 moved the centroids to the index level, removed the flat
+        // layout, and folded the per-segment remainder into `.vec`. There
+        // is no pre-V3 execution path to fall back to — an old segment is
+        // refused with the one remedy there is.
+        if version < VectorFileVersion::V3 {
+            return Err(TantivyError::InvalidArgument(format!(
+                "Vector file predates the V3 index-level centroid format; the segment must be \
+                 rebuilt with the current index version: <{:?}>",
+                entry.name()
+            )));
+        }
         let vec_composite = CompositeFile::open(&body)?;
-        let (Some(id_map_slice), Some(rows_slice)) = (
+        let slots = (
             vec_composite.open_read_with_idx(field, vec_slot::ID_MAP),
             vec_composite.open_read_with_idx(field, vec_slot::ROWS),
-        ) else {
-            return Ok(Self::empty(options));
+            vec_composite.open_read_with_idx(field, vec_slot::OFFSETS),
+            vec_composite.open_read_with_idx(field, vec_slot::BOUNDS),
+            vec_composite.open_read_with_idx(field, vec_slot::IVF_META),
+        );
+        let (id_map_slice, rows_slice, ivf_slices) = match slots {
+            (Some(a), Some(b), Some(c), Some(d), Some(e)) => (a, b, Some((c, d, e))),
+            (Some(a), Some(b), None, None, None) => (a, b, None),
+            (None, None, None, None, None) => return Ok(Self::empty(options)),
+            _ => {
+                return Err(TantivyError::InternalError(format!(
+                    "vector field {:?} has a partial `.vec` slot set — the file is corrupt",
+                    entry.name()
+                )));
+            }
         };
+
         let id_map = IdMap::open(id_map_slice, segment_reader.max_doc())?;
-
-        let centroid_slots =
-            match segment_reader.open_read(SegmentComponent::Custom(CENTROIDS_EXT.to_string())) {
-                Ok(file) => {
-                    let (centroids_version, body) = read_header(&file)?;
-                    let composite = CompositeFile::open(&body)?;
-                    match (
-                        composite.open_read_with_idx(field, centroid_slot::CENTROIDS),
-                        composite.open_read_with_idx(field, centroid_slot::OFFSETS),
-                        composite.open_read_with_idx(field, centroid_slot::ROUTER),
-                        composite.open_read_with_idx(field, centroid_slot::BOUNDS),
-                    ) {
-                        (Some(centroids), Some(offsets), Some(router), Some(bounds)) => {
-                            Some((centroids_version, centroids, offsets, router, bounds))
-                        }
-                        (Some(_), Some(_), None, _) => {
-                            return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has no router slot",
-                                entry.name()
-                            )));
-                        }
-                        (Some(_), Some(_), Some(_), None) => {
-                            return Err(TantivyError::InternalError(format!(
-                                "vector field {:?} has no bounds slot",
-                                entry.name()
-                            )));
-                        }
-                        _ => None,
-                    }
-                }
-                Err(OpenReadError::FileDoesNotExist(_)) => None,
-                Err(err) => return Err(err.into()),
-            };
-
-        // The id-map variant and the `.centroids` sidecar are two signals of
-        // one write-path decision; a mismatch means a corrupt segment, never a
-        // fallback.
-        let index = match (&id_map, centroid_slots) {
-            (IdMap::Explicit(_), Some((version, centroids, offsets, router_slot, bounds))) => {
-                let router = segment_reader.ivf_router().ok_or_else(|| {
-                    TantivyError::InvalidArgument(
-                        "IVF index requires an explicitly configured Router".to_string(),
-                    )
-                })?;
-                Some(IvfIndex::open(
-                    version,
-                    &options,
-                    centroids,
-                    offsets,
-                    router_slot,
-                    router,
-                    bounds,
-                )?)
-            }
-            (IdMap::Explicit(_), None) => {
-                return Err(TantivyError::InternalError(format!(
-                    "vector field {:?} has cluster-sorted rows but no `.centroids` data",
-                    entry.name()
-                )));
-            }
-            (_, Some(_)) => {
-                return Err(TantivyError::InternalError(format!(
-                    "vector field {:?} has `.centroids` data but doc-ordered rows",
-                    entry.name()
-                )));
-            }
-            (_, None) => None,
+        if id_map.is_flat() == ivf_slices.is_some() {
+            return Err(TantivyError::InternalError(format!(
+                "vector field {:?}: the id-map variant disagrees with the slots present — the \
+                 file is corrupt",
+                entry.name()
+            )));
+        }
+        let index = match ivf_slices {
+            Some((offsets_slice, bounds_slice, meta_slice)) => Some(SegmentClusters::open(
+                &options,
+                offsets_slice,
+                bounds_slice,
+                meta_slice,
+            )?),
+            None => None,
         };
 
         let num_rows = id_map.num_rows() as usize;
@@ -203,7 +172,7 @@ impl VectorIndexReader {
             num_vectors,
             present: true,
             rows_slice,
-            id_map,
+            id_map: Some(id_map),
             index,
         })
     }
@@ -216,7 +185,7 @@ impl VectorIndexReader {
             num_vectors: 0,
             present: false,
             rows_slice: FileSlice::empty(),
-            id_map: IdMap::Identity { num_docs: 0 },
+            id_map: None,
             index: None,
         }
     }
@@ -238,9 +207,9 @@ impl VectorIndexReader {
         self.num_vectors == 0
     }
 
-    /// The routing index, present iff the segment's rows are IVF-clustered.
-    /// `None` means search must scan the rows exactly.
-    pub fn index(&self) -> Option<&IvfIndex> {
+    /// The per-segment IVF remainder; `None` for a flat (unclustered)
+    /// segment and for the [`empty`](Self::empty) placeholder.
+    pub fn clusters(&self) -> Option<&SegmentClusters> {
         self.index.as_ref()
     }
 
@@ -250,12 +219,17 @@ impl VectorIndexReader {
         if !self.present {
             return None;
         }
-        let Some(index) = &self.index else {
+        let Some(index) = self.index.as_ref() else {
+            // Flat (unclustered) segment: zero centroids, version 0.
             return Some(VectorInfo {
-                format: VectorStorageFormat::Flat,
                 num_vectors: self.num_vectors,
-                num_centroids: None,
-                cluster_stats: None,
+                num_centroids: 0,
+                cluster_stats: VectorClusterStats {
+                    min_cluster_size: 0,
+                    max_cluster_size: 0,
+                    avg_cluster_size: 0.0,
+                    empty_clusters: 0,
+                },
             });
         };
         let mut empty_clusters = 0;
@@ -280,21 +254,20 @@ impl VectorIndexReader {
             min_cluster_size
         };
         Some(VectorInfo {
-            format: VectorStorageFormat::Ivf,
             num_vectors: self.num_vectors,
-            num_centroids: Some(num_centroids),
-            cluster_stats: Some(VectorClusterStats {
+            num_centroids,
+            cluster_stats: VectorClusterStats {
                 min_cluster_size,
                 max_cluster_size,
                 avg_cluster_size,
                 empty_clusters,
-            }),
+            },
         })
     }
 
     /// Per-cluster posting-list sizes in cluster order — the distribution
     /// behind [`Self::info`]'s aggregate cluster stats. `None` when the
-    /// field's storage is not IVF.
+    /// segment has no vector data for the field.
     pub fn cluster_sizes(&self) -> Option<Vec<u32>> {
         self.index
             .as_ref()
@@ -321,7 +294,8 @@ impl VectorIndexReader {
     /// beforehand (e.g. from a cluster's row range), so no doc→row lookup
     /// happens here.
     pub fn vector_bytes_for_row(&self, row: usize) -> crate::Result<OwnedBytes> {
-        if row >= self.id_map.num_rows() as usize {
+        let num_rows = self.id_map.as_ref().map(IdMap::num_rows).unwrap_or(0);
+        if row >= num_rows as usize {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector row {row} is out of bounds"
             )));
@@ -334,23 +308,19 @@ impl VectorIndexReader {
         Ok(bytes)
     }
 
-    /// The doc id stored at `row` of the cluster-sorted permutation, decoded
-    /// on demand from the pinned `Explicit` id-map. IVF storage only.
+    /// The doc id stored at `row` — decoded from the pinned permutation
+    /// for clustered segments, positional for flat ones. Panics on the
+    /// empty placeholder.
     #[inline]
     pub fn doc_id_at(&self, row: usize) -> DocId {
-        let IdMap::Explicit(bytes) = &self.id_map else {
-            unreachable!("doc_id_at is only meaningful for cluster-sorted (IVF) storage");
-        };
-        let start = row * std::mem::size_of::<DocId>();
-        DocId::from_le_bytes(
-            bytes[start..start + std::mem::size_of::<DocId>()]
-                .try_into()
-                .unwrap(),
-        )
+        self.id_map
+            .as_ref()
+            .expect("doc_id_at called on a segment with no vector data")
+            .doc_id_at(row)
     }
 
-    /// The doc ids assigned to `cluster`, ascending; `None` if the storage is
-    /// not IVF or `cluster` is out of bounds.
+    /// The doc ids assigned to `cluster`, ascending; `None` if the segment
+    /// has no vector data or `cluster` is out of bounds.
     pub fn cluster_doc_ids(&self, cluster: usize) -> Option<Vec<DocId>> {
         let index = self.index.as_ref()?;
         if cluster >= index.num_clusters() {
@@ -364,32 +334,29 @@ impl VectorIndexReader {
         )
     }
 
-    /// Doc → dense row. For clustered storage, rows are cluster-sorted and
-    /// ascending by doc id within each cluster, so this scans clusters and
-    /// binary-searches each one over the pinned id-map bytes. For the flat
-    /// id-maps (`Identity`/`Bitmap`) the mapping is strictly ascending in
-    /// doc id — the property the exact path's run builder leans on.
+    /// Doc → dense row. Flat rows ascend by doc id, so the id-map ranks
+    /// directly. Clustered rows are cluster-sorted and ascending by doc id
+    /// within each cluster, so this scans clusters and binary-searches each
+    /// one over the pinned id-map bytes.
     pub(crate) fn row_id(&self, doc_id: DocId) -> Option<usize> {
-        match &self.id_map {
-            IdMap::Identity { num_docs } => (doc_id < *num_docs).then_some(doc_id as usize),
-            IdMap::Bitmap(_) => self.id_map.rank_if_exists(doc_id).map(|row| row as usize),
-            IdMap::Explicit(_) => {
-                let index = self.index.as_ref()?;
-                for cluster in 0..index.num_clusters() {
-                    let rows = index.cluster_range(cluster);
-                    let mut lo = rows.start;
-                    let mut hi = rows.end;
-                    while lo < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        match self.doc_id_at(mid).cmp(&doc_id) {
-                            Ordering::Less => lo = mid + 1,
-                            Ordering::Greater => hi = mid,
-                            Ordering::Equal => return Some(mid),
-                        }
-                    }
+        use std::cmp::Ordering;
+        let id_map = self.id_map.as_ref()?;
+        let Some(index) = self.index.as_ref() else {
+            return id_map.rank_if_exists(doc_id).map(|row| row as usize);
+        };
+        for cluster in 0..index.num_clusters() {
+            let rows = index.cluster_range(cluster);
+            let mut lo = rows.start;
+            let mut hi = rows.end;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                match self.doc_id_at(mid).cmp(&doc_id) {
+                    Ordering::Less => lo = mid + 1,
+                    Ordering::Greater => hi = mid,
+                    Ordering::Equal => return Some(mid),
                 }
-                None
             }
         }
+        None
     }
 }

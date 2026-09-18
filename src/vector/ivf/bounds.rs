@@ -79,6 +79,16 @@ impl BoundKind {
     }
 }
 
+/// Which rows a cluster's stored bound covers. Captured into the stored
+/// [`IndexSettings`](crate::index::IndexSettings) at build.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum BoundsScope {
+    /// The fold runs over a cluster's native members only; replica spill is excluded.
+    #[default]
+    #[serde(rename = "native")]
+    Native,
+}
+
 /// Read view over the bounds payload of one segment's `.centroids` field
 /// slot.
 pub struct BoundStore<'a> {
@@ -472,6 +482,14 @@ mod bounds_storage_tests {
         builder.add_native(0, f32::INFINITY);
         builder.add_native(0, 0.25);
         assert_eq!(builder.finish()[0], f32::INFINITY);
+    }
+
+    #[test]
+    fn bounds_scope_serde_is_the_reloption_token() {
+        let json = serde_json::to_string(&BoundsScope::Native).unwrap();
+        assert_eq!(json, "\"native\"");
+        let back: BoundsScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, BoundsScope::Native);
     }
 
     /// Little-endian `f32` row bytes, as the row store holds them.

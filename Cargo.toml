@@ -156,6 +156,8 @@ failpoints = ["fail", "fail/failpoints"]
 unstable = []                            # useful for benches.
 
 paradedb = ["columnar/paradedb"]
+accelerate = ["superkmeans/accelerate"]
+openblas = ["superkmeans/openblas"]
 
 quickwit = ["sstable", "futures-util", "futures-channel"]
 

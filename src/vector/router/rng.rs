@@ -27,7 +27,9 @@ pub(super) fn build(
     } else {
         Executor::single_thread()
     };
-    graph.build(&executor);
+    if matrix.rows > 1 {
+        graph.build(&executor);
+    }
 
     let mut adjacency = Vec::new();
     graph.serialize(&mut adjacency)?;
