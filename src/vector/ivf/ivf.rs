@@ -67,8 +67,8 @@ pub const PARENT_NPROBE_FRACTION: f32 = 0.25;
 /// Recall target used when this level searches its parent.
 pub const PARENT_RECALL_TARGET: f32 = 0.99;
 
-/// Default L0 list size: `nlist ≈ n / max_leaf_size`.
-pub const DEFAULT_MAX_LEAF_SIZE: usize = 10;
+/// Default fan-out of the Multi-level IVF index
+pub const DEFAULT_BRANCHING_FACTOR: usize = 100;
 
 /// Search and clustering knobs for this level. Not persisted.
 #[derive(Clone, Debug)]
@@ -78,8 +78,6 @@ pub struct IvfConfig {
     /// IVF tree fan-out. Parent lists hold about this many children, and
     /// stacking stops when the top has at most this many lists.
     pub branching_factor: usize,
-    /// Target L0 list size: `nlist ≈ n / max_leaf_size`.
-    pub max_leaf_size: usize,
     /// Recall target this level passes to its parent when APS is on.
     /// `1.0` makes the parent scan its full candidate set (exact routing
     /// when the parent is the top level).
@@ -90,8 +88,7 @@ impl Default for IvfConfig {
     fn default() -> Self {
         Self {
             nprobe_fraction: 0.02,
-            branching_factor: 64,
-            max_leaf_size: DEFAULT_MAX_LEAF_SIZE,
+            branching_factor: DEFAULT_BRANCHING_FACTOR,
             parent_recall_target: PARENT_RECALL_TARGET,
         }
     }
@@ -109,8 +106,6 @@ impl IvfConfig {
         Self {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
             branching_factor: self.branching_factor,
-            // Each parent list should hold about `branching_factor` children.
-            max_leaf_size: self.branching_factor,
             parent_recall_target: self.parent_recall_target,
         }
     }
@@ -121,12 +116,7 @@ impl IvfConfig {
             "branching_factor must be >= 2, got {}",
             self.branching_factor
         );
-        assert!(
-            self.max_leaf_size >= 1,
-            "max_leaf_size must be >= 1, got {}",
-            self.max_leaf_size
-        );
-        (n / self.max_leaf_size).max(1).min(n)
+        (n / self.branching_factor).max(1).min(n)
     }
 }
 
@@ -381,7 +371,9 @@ where
         .serialize(&mut topology)?;
 
     fn serialize_level<C, M>(index: &IvfIndex<C, M>, out: &mut Vec<u8>) -> io::Result<()>
-    where C: SerializableStore {
+    where
+        C: SerializableStore,
+    {
         let nlist = index.centroids.len();
         if index.offsets.len() != nlist {
             return Err(io::Error::new(
@@ -1036,7 +1028,6 @@ mod tests {
     fn test_config(branching_factor: usize) -> IvfConfig {
         IvfConfig {
             branching_factor,
-            max_leaf_size: branching_factor,
             ..Default::default()
         }
     }
@@ -1206,16 +1197,14 @@ mod tests {
     }
 
     #[test]
-    fn test_nlist_uses_max_leaf_size_not_branching() {
+    fn test_nlist() {
         let config = IvfConfig {
-            branching_factor: 64,
-            max_leaf_size: 10,
+            branching_factor: 10,
             ..Default::default()
         };
         assert_eq!(config.nlist_for(200_000), 20_000);
         let parent = config.for_parent();
-        assert_eq!(parent.max_leaf_size, 64);
-        assert_eq!(parent.nlist_for(20_000), 312);
+        assert_eq!(parent.nlist_for(20_000), 2000);
     }
 
     #[test]
@@ -1315,12 +1304,10 @@ mod tests {
         let clusterer = SuperKMeansLevelClusterer { iters_per_split: 1 };
         let config = IvfConfig {
             nprobe_fraction: PARENT_NPROBE_FRACTION,
-            max_leaf_size: DEFAULT_MAX_LEAF_SIZE,
             branching_factor: 64,
             ..IvfConfig::default()
         };
-        let (index, _perm) =
-            IvfIndexBuilder::new(data, n, dim, &clusterer, config.clone()).build();
+        let (index, _perm) = IvfIndexBuilder::new(data, n, dim, &clusterer, config.clone()).build();
         assert!(
             index.depth() >= 2,
             "need a parent so permute_lists scrambles L0 list order"
