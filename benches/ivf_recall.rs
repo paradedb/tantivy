@@ -28,8 +28,7 @@ use tantivy::vector::{l2_squared, IvfConfig, IvfIndexBuilder, SuperKMeansLevelCl
 const COHERE_N: usize = 1_000_000;
 const COHERE_D: usize = 1024;
 const TOP_K: usize = 10;
-const BRANCHING_FACTOR: usize = 200;
-const MAX_LEAF_SIZE: usize = 100;
+const BRANCHING_FACTOR: usize = 100;
 /// Quake's `f_M`: initial candidate fraction at L0.
 const APS_FRACTION: f32 = 0.02;
 
@@ -302,10 +301,7 @@ fn main() {
     let n = base.len() / d;
     let n_queries = queries.len() / d;
 
-    println!(
-        "n={n} d={d} queries={n_queries} top_k={TOP_K} branching={BRANCHING_FACTOR} \
-         max_leaf_size={MAX_LEAF_SIZE}"
-    );
+    println!("n={n} d={d} queries={n_queries} top_k={TOP_K} branching={BRANCHING_FACTOR}");
 
     print!("computing exact ground truth... ");
     let t0 = Instant::now();
@@ -315,7 +311,6 @@ fn main() {
     let clusterer = SuperKMeansLevelClusterer { iters_per_split: 3 };
     let config = IvfConfig {
         branching_factor: BRANCHING_FACTOR,
-        max_leaf_size: MAX_LEAF_SIZE,
         ..Default::default()
     };
     println!("building stacked IVF...");

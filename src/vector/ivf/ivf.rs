@@ -1199,12 +1199,13 @@ mod tests {
     #[test]
     fn test_nlist() {
         let config = IvfConfig {
-            branching_factor: 10,
+            branching_factor: 100,
             ..Default::default()
         };
-        assert_eq!(config.nlist_for(200_000), 20_000);
-        let parent = config.for_parent();
-        assert_eq!(parent.nlist_for(20_000), 2000);
+        assert_eq!(config.nlist_for(200_000), 2_000);
+        assert_eq!(config.nlist_for(20_000), 200);
+        assert_eq!(config.nlist_for(200), 2);
+        assert_eq!(config.nlist_for(2), 1);
     }
 
     #[test]
