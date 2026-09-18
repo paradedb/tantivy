@@ -105,6 +105,11 @@ impl Bm25Weight {
         }
     }
 
+    #[inline]
+    pub(crate) fn is_zero(&self) -> bool {
+        self.weight == 0.0
+    }
+
     pub fn for_terms(
         statistics: &dyn Bm25StatisticsProvider,
         terms: &[Term],

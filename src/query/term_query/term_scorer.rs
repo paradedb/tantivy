@@ -1,3 +1,6 @@
+use common::HasLen;
+
+use crate::directory::FileSlice;
 use crate::docset::DocSet;
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
@@ -6,10 +9,19 @@ use crate::query::{Explanation, Scorer};
 use crate::{DocId, Score};
 
 #[derive(Clone)]
+struct MaxScoreBounds {
+    scores: std::sync::Arc<[Score]>,
+    first_block: usize,
+    suffix: bool,
+}
+
+#[derive(Clone)]
 pub struct TermScorer {
     postings: SegmentPostings,
     fieldnorm_reader: FieldNormReader,
+    norm_sidecar: Option<FileSlice>,
     similarity_weight: Bm25Weight,
+    max_score_bounds: Option<MaxScoreBounds>,
 }
 
 impl TermScorer {
@@ -21,8 +33,15 @@ impl TermScorer {
         TermScorer {
             postings,
             fieldnorm_reader,
+            norm_sidecar: None,
             similarity_weight,
+            max_score_bounds: None,
         }
+    }
+
+    pub(crate) fn set_norm_sidecar(&mut self, lane: FileSlice) {
+        debug_assert_eq!(lane.len(), self.postings.doc_freq() as usize);
+        self.norm_sidecar = Some(lane);
     }
 
     pub(crate) fn seek_block(&mut self, target_doc: DocId) {
@@ -69,9 +88,14 @@ impl TermScorer {
     ///
     /// (The result is on the other hand guaranteed to be correct if there is only one segment).
     pub fn block_max_score(&mut self) -> Score {
-        self.postings
-            .block_cursor
-            .block_max_score(&self.fieldnorm_reader, &self.similarity_weight)
+        if self.similarity_weight.is_zero() {
+            return 0.0;
+        }
+        self.postings.block_cursor.block_max_score_with_norms(
+            &self.fieldnorm_reader,
+            &self.similarity_weight,
+            self.norm_sidecar.as_ref(),
+        )
     }
 
     pub fn term_freq(&self) -> u32 {
@@ -79,17 +103,66 @@ impl TermScorer {
     }
 
     pub fn fieldnorm_id(&self) -> u8 {
-        self.fieldnorm_reader.fieldnorm_id(self.doc())
+        if let Some(lane) = &self.norm_sidecar {
+            lane.read_byte(self.postings.posting_ordinal())
+                .expect("failed to read posting fieldnorm byte")
+        } else {
+            self.fieldnorm_reader.fieldnorm_id(self.doc())
+        }
     }
 
     pub fn explain(&self) -> Explanation {
+        if self.similarity_weight.is_zero() {
+            return Explanation::new("TermQuery with zero scoring weight", 0.0);
+        }
         let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
         self.similarity_weight.explain(fieldnorm_id, term_freq)
     }
 
     pub fn max_score(&self) -> Score {
-        self.similarity_weight.max_score()
+        if let Some(bounds) = &self.max_score_bounds {
+            let block = if bounds.suffix {
+                self.block_ordinal() - bounds.first_block
+            } else {
+                0
+            };
+            bounds.scores[block]
+        } else {
+            self.similarity_weight.max_score()
+        }
+    }
+
+    pub(crate) fn prepare_max_score_bounds(&mut self) {
+        let mode = crate::postings::MAX_SCORE_BOUND_MODE.get();
+        if mode == 0
+            || self.similarity_weight.is_zero()
+            || self.freq_reading_option() != FreqReadingOption::ReadFreq
+        {
+            return;
+        }
+        let mut scores = self.postings.block_cursor.score_bounds(
+            &self.fieldnorm_reader,
+            &self.similarity_weight,
+            self.norm_sidecar.as_ref(),
+        );
+        for i in (0..scores.len() - 1).rev() {
+            scores[i] = scores[i].max(scores[i + 1]);
+        }
+        if mode == 1 {
+            scores.truncate(1);
+        }
+        self.max_score_bounds = Some(MaxScoreBounds {
+            scores: scores.into(),
+            first_block: self.block_ordinal(),
+            suffix: mode == 2,
+        });
+    }
+
+    fn block_ordinal(&self) -> usize {
+        let cursor = &self.postings.block_cursor;
+        (cursor.doc_freq() - cursor.skip_reader().remaining_docs()) as usize
+            / crate::postings::compression::COMPRESSION_BLOCK_SIZE
     }
 
     pub fn last_doc_in_block(&self) -> DocId {
@@ -143,6 +216,9 @@ impl DocSet for TermScorer {
 impl Scorer for TermScorer {
     #[inline]
     fn score(&mut self) -> Score {
+        if self.similarity_weight.is_zero() {
+            return 0.0;
+        }
         let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
         self.similarity_weight.score(fieldnorm_id, term_freq)
@@ -163,6 +239,69 @@ mod tests {
     use crate::{
         assert_nearly_equals, DocId, DocSet, Index, IndexWriter, Score, Searcher, Term, TERMINATED,
     };
+
+    #[test]
+    fn test_segment_score_bound_includes_strong_partial_tail() {
+        for mode in [1, 2] {
+            crate::postings::set_max_score_bound_mode(mode);
+            let fieldnorms = vec![100; 129];
+            let postings: Vec<_> = (0..129)
+                .map(|doc| (doc, if doc == 128 { 100 } else { 1 }))
+                .collect();
+            let weight = Bm25Weight::for_one_term(129, 129, 100.0, Bm25Params::default());
+            let mut scorer = TermScorer::create_for_test(&postings, &fieldnorms, weight);
+            let first_block_bound = scorer.block_max_score();
+            scorer.prepare_max_score_bounds();
+            let bound = scorer.max_score();
+            assert!(bound > first_block_bound);
+            assert_eq!(scorer.seek(128), 128);
+            assert_eq!(scorer.score(), bound);
+        }
+        crate::postings::set_max_score_bound_mode(0);
+    }
+
+    #[test]
+    fn test_segment_and_suffix_score_bounds_with_tails_and_custom_bm25() {
+        use crate::postings::set_max_score_bound_mode;
+        for count in [1, 127, 128, 129, 256, 301] {
+            for params in [
+                Bm25Params::default(),
+                Bm25Params::new(0.5, 0.0),
+                Bm25Params::new(2.0, 1.0),
+            ] {
+                let fieldnorms = vec![100; count];
+                let postings: Vec<_> = (0..count as u32)
+                    .map(|doc| (doc, if doc < 128 { 4 } else { 1 }))
+                    .collect();
+                for mode in [1, 2] {
+                    set_max_score_bound_mode(mode);
+                    let weight =
+                        Bm25Weight::for_one_term(count as u64, count as u64, 100.0, params);
+                    let mut scorer =
+                        TermScorer::create_for_test(&postings, &fieldnorms, weight.clone());
+                    scorer.prepare_max_score_bounds();
+                    let initial_bound = scorer.max_score();
+                    assert!(initial_bound < weight.max_score());
+                    let mut previous_bound = initial_bound;
+                    for (doc, _) in &postings {
+                        assert_eq!(scorer.doc(), *doc);
+                        let bound = scorer.max_score();
+                        assert!(bound <= previous_bound);
+                        assert!(scorer.score() <= bound);
+                        if mode == 1 {
+                            assert_eq!(bound, initial_bound);
+                        }
+                        previous_bound = bound;
+                        scorer.advance();
+                    }
+                    if mode == 2 && count > 128 {
+                        assert!(previous_bound < initial_bound);
+                    }
+                }
+            }
+        }
+        set_max_score_bound_mode(0);
+    }
 
     #[test]
     fn test_term_scorer_max_score() -> crate::Result<()> {

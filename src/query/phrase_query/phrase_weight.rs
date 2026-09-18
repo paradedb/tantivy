@@ -1,3 +1,4 @@
+use super::phrase_scorer::PhrasePruningScorer;
 use super::PhraseScorer;
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
@@ -89,7 +90,12 @@ impl Weight for PhraseWeight {
         boost: Score,
         init_threshold: Score,
     ) -> crate::Result<Box<dyn PruningScorer>> {
-        if let Some(scorer) = self.phrase_scorer(reader, boost)? {
+        if let Some(mut scorer) = self.phrase_scorer(reader, boost)? {
+            if crate::postings::PHRASE_SCORE_BOUND.get()
+                && scorer.enable_score_bound(init_threshold)
+            {
+                return Ok(Box::new(PhrasePruningScorer::new(scorer, init_threshold)));
+            }
             Ok(Box::new(BasicPruningScorer::new(
                 Box::new(scorer),
                 init_threshold,

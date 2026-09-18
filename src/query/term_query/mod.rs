@@ -2,6 +2,11 @@ mod term_query;
 mod term_scorer;
 mod term_weight;
 
+#[cfg(test)]
+mod dense_term_tests;
+#[cfg(test)]
+mod norm_sidecar_tests;
+
 pub use self::term_query::TermQuery;
 pub use self::term_scorer::TermScorer;
 

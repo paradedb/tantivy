@@ -54,6 +54,12 @@ impl SegmentPostings {
         self.block_cursor.doc_freq()
     }
 
+    pub(crate) fn posting_ordinal(&self) -> usize {
+        debug_assert!(self.block_cursor.block_is_loaded());
+        debug_assert_ne!(self.doc(), TERMINATED);
+        (self.doc_freq() - self.block_cursor.skip_reader().remaining_docs()) as usize + self.cur
+    }
+
     /// Creates a segment postings object with the given documents
     /// and no frequency encoded.
     ///

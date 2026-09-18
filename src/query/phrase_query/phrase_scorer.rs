@@ -55,6 +55,9 @@ pub struct PhraseScorer<TPostings: Postings> {
     left_slops: Vec<u8>,
     positions_buffer: Vec<u32>,
     slops_buffer: Vec<u8>,
+    anchor_filter: bool,
+    anchor_doc: Option<DocId>,
+    score_threshold: Option<Score>,
 }
 
 /// Returns true if and only if the two sorted arrays contain a common element
@@ -382,12 +385,27 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 PostingsWithOffset::new(postings, (max_offset - offset) as u32)
             })
             .collect::<Vec<_>>();
-        let intersection_docset = Intersection::new(postings_with_offsets, num_docs);
+        let anchor_filter =
+            slop == 0 && num_docsets >= 3 && crate::postings::PHRASE_ANCHOR_FILTER.get();
+        let mut left_positions = Vec::with_capacity(100);
+        let mut right_positions = Vec::with_capacity(100);
+        let mut anchor_doc = None;
+        let intersection_docset = if anchor_filter {
+            Intersection::new_with_filter(postings_with_offsets, num_docs, |left, right| {
+                left.positions(&mut left_positions);
+                right.positions(&mut right_positions);
+                intersection(&mut left_positions, &right_positions);
+                anchor_doc = Some(left.doc());
+                !left_positions.is_empty()
+            })
+        } else {
+            Intersection::new(postings_with_offsets, num_docs)
+        };
         let mut scorer = PhraseScorer {
             intersection_docset,
             num_terms: num_docsets,
-            left_positions: Vec::with_capacity(100),
-            right_positions: Vec::with_capacity(100),
+            left_positions,
+            right_positions,
             phrase_count: 0u32,
             similarity_weight_opt,
             fieldnorm_reader,
@@ -395,6 +413,9 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             left_slops: Vec::with_capacity(100),
             slops_buffer: Vec::with_capacity(100),
             positions_buffer: Vec::with_capacity(100),
+            anchor_filter,
+            anchor_doc,
+            score_threshold: None,
         };
         if scorer.doc() != TERMINATED && !scorer.phrase_match() {
             scorer.advance();
@@ -406,12 +427,56 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         self.phrase_count
     }
 
+    pub(crate) fn enable_score_bound(&mut self, threshold: Score) -> bool {
+        if self.slop != 0
+            || !self.similarity_weight_opt.as_ref().is_some_and(|weight| {
+                let score = weight.score(0, 1);
+                score.is_finite() && score >= 0.0
+            })
+        {
+            return false;
+        }
+        self.score_threshold = Some(threshold);
+        true
+    }
+
+    fn may_exceed_threshold(&mut self) -> bool {
+        if self.score_threshold.is_none() {
+            return true;
+        }
+        let min_tf = (0..self.num_terms)
+            .map(|i| {
+                self.intersection_docset
+                    .docset_mut_specialized(i)
+                    .postings
+                    .term_freq()
+            })
+            .min()
+            .unwrap();
+        self.frequency_may_exceed_threshold(min_tf)
+    }
+
+    fn frequency_may_exceed_threshold(&self, frequency: u32) -> bool {
+        let Some(threshold) = self.score_threshold else {
+            return true;
+        };
+        let bound = self
+            .similarity_weight_opt
+            .as_ref()
+            .unwrap()
+            .score(0, frequency);
+        !bound.is_finite() || bound > threshold
+    }
+
     pub(crate) fn get_intersection(&mut self) -> &[u32] {
         intersection(&mut self.left_positions, &self.right_positions);
         &self.left_positions
     }
 
     fn phrase_match(&mut self) -> bool {
+        if !self.may_exceed_threshold() {
+            return false;
+        }
         if self.similarity_weight_opt.is_some() {
             let count = self.compute_phrase_count();
             self.phrase_count = count;
@@ -461,15 +526,18 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn compute_phrase_match(&mut self) {
-        {
+        let start = if self.anchor_filter && self.anchor_doc == Some(self.doc()) {
+            2
+        } else {
             self.intersection_docset
                 .docset_mut_specialized(0)
                 .positions(&mut self.left_positions);
             if self.has_slop() {
                 self.left_slops.clear();
             }
-        }
-        for i in 1..self.num_terms - 1 {
+            1
+        };
+        for i in start..self.num_terms - 1 {
             {
                 self.intersection_docset
                     .docset_mut_specialized(i)
@@ -509,12 +577,103 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     fn has_slop(&self) -> bool {
         self.slop > 0
     }
+
+    fn seek_anchor(&mut self, target: DocId) -> DocId {
+        let left_positions = &mut self.left_positions;
+        let right_positions = &mut self.right_positions;
+        let anchor_doc = &mut self.anchor_doc;
+        let threshold = self.score_threshold;
+        let weight = self.similarity_weight_opt.as_ref();
+        self.intersection_docset
+            .seek_with_filter(target, &mut |left, right| {
+                if let (Some(threshold), Some(weight)) = (threshold, weight) {
+                    let bound =
+                        weight.score(0, left.postings.term_freq().min(right.postings.term_freq()));
+                    if bound.is_finite() && bound <= threshold {
+                        return false;
+                    }
+                }
+                left.positions(left_positions);
+                right.positions(right_positions);
+                intersection(left_positions, right_positions);
+                *anchor_doc = Some(left.doc());
+                !left_positions.is_empty()
+            })
+    }
+}
+
+pub(crate) struct PhrasePruningScorer<TPostings: Postings> {
+    scorer: PhraseScorer<TPostings>,
+    threshold: Score,
+    score: Score,
+}
+
+impl<TPostings: Postings> PhrasePruningScorer<TPostings> {
+    pub(crate) fn new(mut scorer: PhraseScorer<TPostings>, threshold: Score) -> Self {
+        assert!(scorer.enable_score_bound(threshold));
+        let mut pruning = Self {
+            scorer,
+            threshold,
+            score: Score::MIN,
+        };
+        pruning.skip_noncompetitive();
+        pruning
+    }
+
+    fn skip_noncompetitive(&mut self) -> DocId {
+        while self.scorer.doc() != TERMINATED {
+            if self
+                .scorer
+                .frequency_may_exceed_threshold(self.scorer.phrase_count)
+            {
+                self.score = self.scorer.score();
+                if self.score > self.threshold {
+                    return self.scorer.doc();
+                }
+            }
+            self.scorer.advance();
+        }
+        self.score = Score::MIN;
+        TERMINATED
+    }
+}
+
+impl<TPostings: Postings + 'static> Scorer for PhrasePruningScorer<TPostings> {
+    fn score(&mut self) -> Score {
+        self.score
+    }
+}
+
+impl<TPostings: Postings + 'static> crate::query::PruningScorer for PhrasePruningScorer<TPostings> {
+    fn set_threshold(&mut self, score: Score) {
+        self.threshold = score;
+        self.scorer.score_threshold = Some(score);
+    }
+}
+
+impl<TPostings: Postings> DocSet for PhrasePruningScorer<TPostings> {
+    fn advance(&mut self) -> DocId {
+        self.scorer.advance();
+        self.skip_noncompetitive()
+    }
+
+    fn doc(&self) -> DocId {
+        self.scorer.doc()
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.scorer.size_hint()
+    }
 }
 
 impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
     fn advance(&mut self) -> DocId {
         loop {
-            let doc = self.intersection_docset.advance();
+            let doc = if self.anchor_filter {
+                self.seek_anchor(self.doc().saturating_add(1))
+            } else {
+                self.intersection_docset.advance()
+            };
             if doc == TERMINATED || self.phrase_match() {
                 return doc;
             }
@@ -523,7 +682,11 @@ impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
 
     fn seek(&mut self, target: DocId) -> DocId {
         debug_assert!(target >= self.doc());
-        let doc = self.intersection_docset.seek(target);
+        let doc = if self.anchor_filter {
+            self.seek_anchor(target)
+        } else {
+            self.intersection_docset.seek(target)
+        };
         if doc == TERMINATED || self.phrase_match() {
             return doc;
         }
@@ -537,6 +700,14 @@ impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
             target,
             self.doc()
         );
+        if self.anchor_filter {
+            let doc = self.seek(target);
+            return if doc == target {
+                SeekDangerResult::Found
+            } else {
+                SeekDangerResult::SeekLowerBound(doc)
+            };
+        }
         let seek_res = self.intersection_docset.seek_danger(target);
         if seek_res != SeekDangerResult::Found {
             return seek_res;
@@ -589,6 +760,204 @@ impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_phrase_anchor_skips_remaining_membership() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use crate::postings::LoadedPostings;
+
+        struct CountedPostings {
+            inner: LoadedPostings,
+            seeks: Arc<AtomicUsize>,
+        }
+        impl DocSet for CountedPostings {
+            fn advance(&mut self) -> DocId {
+                self.inner.advance()
+            }
+            fn seek(&mut self, target: DocId) -> DocId {
+                self.seeks.fetch_add(1, Ordering::Relaxed);
+                self.inner.seek(target)
+            }
+            fn doc(&self) -> DocId {
+                self.inner.doc()
+            }
+            fn size_hint(&self) -> u32 {
+                self.inner.size_hint()
+            }
+        }
+        impl Postings for CountedPostings {
+            fn term_freq(&self) -> u32 {
+                self.inner.term_freq()
+            }
+            fn append_positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
+                self.inner.append_positions_with_offset(offset, output);
+            }
+        }
+        let mut observations = Vec::new();
+        for enabled in [false, true] {
+            crate::postings::set_phrase_anchor_filter(enabled);
+            let dense_seeks = Arc::new(AtomicUsize::new(0));
+            let postings = vec![
+                (
+                    0,
+                    CountedPostings {
+                        inner: LoadedPostings::from((
+                            vec![10, 20, 30],
+                            vec![vec![0], vec![0], vec![0, 10]],
+                        )),
+                        seeks: Arc::new(AtomicUsize::new(0)),
+                    },
+                ),
+                (
+                    1,
+                    CountedPostings {
+                        inner: LoadedPostings::from((
+                            vec![10, 20, 30],
+                            vec![vec![9], vec![9], vec![1, 11]],
+                        )),
+                        seeks: Arc::new(AtomicUsize::new(0)),
+                    },
+                ),
+                (
+                    2,
+                    CountedPostings {
+                        inner: LoadedPostings::from(((0..64).collect(), vec![vec![2, 12]; 64])),
+                        seeks: dense_seeks.clone(),
+                    },
+                ),
+            ];
+            let weight = Bm25Weight::for_one_term(3, 64, 20.0, crate::Bm25Params::default());
+            let mut scorer = PhraseScorer::new(
+                postings,
+                Some(weight),
+                FieldNormReader::for_test(&[20; 64]),
+                0,
+            );
+            assert_eq!(scorer.doc(), 30);
+            assert_eq!(scorer.phrase_count(), 2);
+            assert_eq!(scorer.seek(30), 30);
+            assert_eq!(scorer.phrase_count(), 2);
+            observations.push(dense_seeks.load(Ordering::Relaxed));
+            assert_eq!(scorer.advance(), TERMINATED);
+        }
+        crate::postings::set_phrase_anchor_filter(false);
+        assert_eq!(observations, [4, 1]);
+    }
+
+    #[test]
+    fn test_phrase_anchor_matches_existing_counts_offsets_repetition_and_slop() -> crate::Result<()>
+    {
+        use crate::query::{EnableScoring, PhraseQuery, Query};
+        use crate::schema::{IndexRecordOption, Schema, TEXT};
+        use crate::{Index, Term};
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for body in [
+            "a b c a b c",
+            "a x b c",
+            "a a a a",
+            "a b a b a",
+            "b c a",
+            "a x x b c",
+            "a b c",
+            "c b a",
+            "a a b a a b",
+            "z",
+        ] {
+            writer.add_document(crate::doc!(text => body))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let segment = searcher.segment_reader(0);
+        let inverted = segment.inverted_index(text)?;
+        for spec in [
+            vec![(0, "a"), (1, "b"), (2, "c")],
+            vec![(0, "a"), (1, "a"), (2, "a")],
+            vec![(0, "a"), (2, "b"), (3, "c")],
+            vec![(0, "a"), (1, "b"), (2, "a"), (3, "b")],
+        ] {
+            for slop in [0, 1, 2] {
+                let terms: Vec<_> = spec
+                    .iter()
+                    .map(|&(offset, term)| (offset, Term::from_field_text(text, term)))
+                    .collect();
+                let query = PhraseQuery::new_with_offset_and_slop(terms.clone(), slop);
+                let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+                let mut outcomes = Vec::new();
+                for enabled in [false, true] {
+                    crate::postings::set_phrase_anchor_filter(enabled);
+                    let mut scorer = weight.scorer(segment, 1.0)?;
+                    let mut docs = Vec::new();
+                    while scorer.doc() != TERMINATED {
+                        docs.push((scorer.doc(), scorer.score()));
+                        scorer.advance();
+                    }
+                    let unscored_weight =
+                        query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+                    let mut unscored = unscored_weight.scorer(segment, 1.0)?;
+                    let mut unscored_docs = Vec::new();
+                    while unscored.doc() != TERMINATED {
+                        unscored_docs.push(unscored.doc());
+                        unscored.advance();
+                    }
+                    for target in 0..10 {
+                        let mut exact = weight.scorer(segment, 1.0)?;
+                        if target < exact.doc() {
+                            continue;
+                        }
+                        assert_eq!(
+                            exact.seek_danger(target) == SeekDangerResult::Found,
+                            docs.iter().any(|&(doc, _)| doc == target),
+                            "spec={spec:?}, slop={slop}, enabled={enabled}, target={target}"
+                        );
+                    }
+                    let postings = terms
+                        .iter()
+                        .map(|(offset, term)| {
+                            Ok((
+                                *offset,
+                                inverted
+                                    .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?
+                                    .unwrap(),
+                            ))
+                        })
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    let bm25 = Bm25Weight::for_terms(
+                        &searcher,
+                        &terms
+                            .iter()
+                            .map(|(_, term)| term.clone())
+                            .collect::<Vec<_>>(),
+                    )?;
+                    let mut phrase = PhraseScorer::new(
+                        postings,
+                        Some(bm25),
+                        FieldNormReader::for_test(&[6; 10]),
+                        slop,
+                    );
+                    let mut counts = Vec::new();
+                    for target in 0..10 {
+                        if target < phrase.doc() {
+                            continue;
+                        }
+                        let found = phrase.seek(target);
+                        if found == TERMINATED {
+                            break;
+                        }
+                        counts.push((found, phrase.phrase_count()));
+                    }
+                    outcomes.push((docs, counts, unscored_docs));
+                }
+                assert_eq!(outcomes[0], outcomes[1], "spec={spec:?}, slop={slop}");
+            }
+        }
+        crate::postings::set_phrase_anchor_filter(false);
+        Ok(())
+    }
 
     fn test_intersection_sym(left: &[u32], right: &[u32], expected: &[u32]) {
         test_intersection_aux(left, right, expected, 0);

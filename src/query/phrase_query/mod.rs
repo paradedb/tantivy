@@ -3,6 +3,8 @@ mod phrase_scorer;
 mod phrase_weight;
 pub mod regex_phrase_query;
 pub mod regex_phrase_weight;
+#[cfg(test)]
+mod score_bound_tests;
 
 pub use self::phrase_query::PhraseQuery;
 pub(crate) use self::phrase_scorer::intersection_count;

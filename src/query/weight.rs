@@ -56,6 +56,11 @@ pub(crate) fn for_each_pruning_scorer<TScorer: PruningScorer + ?Sized>(
 ///
 /// See [`Query`](crate::query::Query).
 pub trait Weight: Send + Sync + 'static {
+    /// Identifies a direct nonnegative term weight without opening its postings.
+    fn term_score_is_zero(&self) -> Option<bool> {
+        None
+    }
+
     /// Returns the scorer for the given segment.
     ///
     /// `boost` is a multiplier to apply to the score.

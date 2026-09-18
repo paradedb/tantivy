@@ -102,7 +102,19 @@ impl TermQuery {
             EnableScoring::Enabled {
                 statistics_provider,
                 ..
-            } => Bm25Weight::for_terms(statistics_provider, std::slice::from_ref(&self.term))?,
+            } => {
+                let weight =
+                    Bm25Weight::for_terms(statistics_provider, std::slice::from_ref(&self.term))?;
+                let ratio = crate::postings::DENSE_TERM_RATIO.get();
+                if ratio > 0.0
+                    && statistics_provider.doc_freq(&self.term)? as f64
+                        >= statistics_provider.total_num_docs()? as f64 * ratio
+                {
+                    weight.boost_by(0.0)
+                } else {
+                    weight
+                }
+            }
             EnableScoring::Disabled { .. } => Bm25Weight::new(
                 Explanation::new("<no score>", 1.0f32),
                 1.0f32,

@@ -79,6 +79,25 @@ fn go_to_first_doc<TDocSet: DocSet>(docsets: &mut [TDocSet]) -> DocId {
 }
 
 impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
+    pub(crate) fn new_with_filter(
+        mut docsets: Vec<TDocSet>,
+        segment_num_docs: u32,
+        mut filter: impl FnMut(&mut TDocSet, &mut TDocSet) -> bool,
+    ) -> Self {
+        assert!(docsets.len() >= 2);
+        docsets.sort_by_key(|docset| docset.cost());
+        let left = docsets.remove(0);
+        let right = docsets.remove(0);
+        let mut intersection = Self {
+            left,
+            right,
+            others: docsets,
+            segment_num_docs,
+        };
+        intersection.seek_with_filter(intersection.left.doc(), &mut filter);
+        intersection
+    }
+
     /// num_docs is the number of documents in the segment.
     pub(crate) fn new(
         mut docsets: Vec<TDocSet>,
@@ -283,6 +302,38 @@ fn and_blocks_and_return_is_empty(
 }
 
 impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> {
+    pub(crate) fn seek_with_filter(
+        &mut self,
+        mut candidate: DocId,
+        filter: &mut impl FnMut(&mut TDocSet, &mut TDocSet) -> bool,
+    ) -> DocId {
+        'outer: while candidate < TERMINATED {
+            candidate = self.left.seek(candidate);
+            if candidate == TERMINATED {
+                break;
+            }
+            if let SeekDangerResult::SeekLowerBound(next) = self.right.seek_danger(candidate) {
+                candidate = next;
+                continue;
+            }
+            if !filter(&mut self.left, &mut self.right) {
+                candidate += 1;
+                continue;
+            }
+            debug_assert_eq!(self.left.doc(), candidate);
+            debug_assert_eq!(self.right.doc(), candidate);
+            for other in &mut self.others {
+                if let SeekDangerResult::SeekLowerBound(next) = other.seek_danger(candidate) {
+                    candidate = next;
+                    continue 'outer;
+                }
+            }
+            return candidate;
+        }
+        self.left.seek(TERMINATED);
+        TERMINATED
+    }
+
     fn count_including_deleted_sparse(&mut self) -> u32 {
         let mut count = 0u32;
         let mut doc = self.doc();

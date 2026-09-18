@@ -1,3 +1,5 @@
+use common::HasLen;
+
 use super::term_scorer::TermScorer;
 use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fieldnorm::FieldNormReader;
@@ -36,6 +38,15 @@ impl TermOrEmptyOrAllScorer {
 }
 
 impl Weight for TermWeight {
+    fn term_score_is_zero(&self) -> Option<bool> {
+        let maximum = self.similarity_weight.max_score();
+        let zero = self.similarity_weight.is_zero();
+        (self.scoring_enabled
+            && maximum.is_finite()
+            && (zero || self.similarity_weight.score(255, 1) > 0.0))
+            .then_some(zero)
+    }
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         Ok(self.specialized_scorer(reader, boost)?.into_boxed_scorer())
     }
@@ -225,13 +236,21 @@ impl TermWeight {
 
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let similarity_weight = self.similarity_weight.boost_by(boost);
-        Ok(TermOrEmptyOrAllScorer::TermScorer(Box::new(
-            TermScorer::new(segment_postings, fieldnorm_reader, similarity_weight),
-        )))
+        let mut scorer = TermScorer::new(segment_postings, fieldnorm_reader, similarity_weight);
+        if self.scoring_enabled && !self.similarity_weight.is_zero() {
+            if let Some(lane) = crate::postings::NORM_SIDECAR_PROVIDER
+                .get()
+                .and_then(|provider| provider(reader.segment_id(), &self.term))
+                .filter(|lane| lane.len() == term_info.doc_freq as usize)
+            {
+                scorer.set_norm_sidecar(lane);
+            }
+        }
+        Ok(TermOrEmptyOrAllScorer::TermScorer(Box::new(scorer)))
     }
 
     fn fieldnorm_reader(&self, segment_reader: &SegmentReader) -> crate::Result<FieldNormReader> {
-        if self.scoring_enabled {
+        if self.scoring_enabled && !self.similarity_weight.is_zero() {
             if let Some(field_norm_reader) = segment_reader
                 .fieldnorms_readers()
                 .get_field(self.term.field())?

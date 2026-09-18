@@ -1,5 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
+#[cfg(feature = "postings-diagnostics")]
+use crate::postings::diagnostics;
 use crate::query::scorer::PruningScorer;
 use crate::query::term_query::TermScorer;
 #[cfg(test)]
@@ -52,6 +54,7 @@ fn find_pivot_doc(
 fn block_max_was_too_low_advance_one_scorer(
     scorers: &mut [TermScorerWithMaxScore],
     pivot_len: usize,
+    defer_seek: bool,
 ) {
     debug_assert!(scorers.iter().map(|scorer| scorer.doc()).is_sorted());
     let mut scorer_to_seek = pivot_len - 1;
@@ -76,7 +79,7 @@ fn block_max_was_too_low_advance_one_scorer(
             doc_to_seek_after = scorer.doc();
         }
     }
-    scorers[scorer_to_seek].seek(doc_to_seek_after);
+    scorers[scorer_to_seek].seek_after_rejection(doc_to_seek_after, defer_seek);
 
     restore_ordering(scorers, scorer_to_seek);
     debug_assert!(scorers.iter().map(|scorer| scorer.doc()).is_sorted());
@@ -119,7 +122,9 @@ fn align_scorers(
             //
             // Termination is still guaranteed since we can only consider the same
             // pivot at most term_scorers.len() - 1 times.
-            restore_ordering(term_scorers, i);
+            if i < term_scorers.len() {
+                restore_ordering(term_scorers, i);
+            }
             return false;
         }
     }
@@ -172,13 +177,88 @@ pub fn block_wand_single_scorer(
 struct TermScorerWithMaxScore {
     scorer: Box<TermScorer>,
     max_score: Score,
+    suffix_max_score: bool,
+    doc: DocId,
+    #[cfg(feature = "postings-diagnostics")]
+    rejection_loaded_block: Option<DocId>,
+}
+
+impl TermScorerWithMaxScore {
+    #[inline]
+    fn doc(&self) -> DocId {
+        self.doc
+    }
+
+    #[inline]
+    fn advance(&mut self) -> DocId {
+        debug_assert_eq!(self.doc, self.scorer.doc());
+        self.doc = self.scorer.advance();
+        if self.suffix_max_score {
+            self.max_score = self.scorer.max_score();
+        }
+        self.doc
+    }
+
+    #[inline]
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.doc = self.scorer.seek(target);
+        if self.suffix_max_score {
+            self.max_score = self.scorer.max_score();
+        }
+        self.doc
+    }
+
+    fn seek_block(&mut self, target: DocId) {
+        self.scorer.seek_block(target);
+        if self.suffix_max_score {
+            self.max_score = self.scorer.max_score();
+        }
+    }
+
+    fn seek_after_rejection(&mut self, target: DocId, defer_seek: bool) {
+        #[cfg(feature = "postings-diagnostics")]
+        let before = diagnostics::decoded_count();
+        if defer_seek
+            && (!self.scorer.block_cursor().block_is_loaded()
+                || target > self.scorer.last_doc_in_block())
+        {
+            debug_assert!(target > self.doc);
+            self.doc = target;
+        } else {
+            self.seek(target);
+        }
+        #[cfg(feature = "postings-diagnostics")]
+        if diagnostics::rejection_seek(before) {
+            self.rejection_loaded_block = Some(self.scorer.last_doc_in_block());
+        }
+    }
+
+    #[inline]
+    fn score(&mut self) -> Score {
+        debug_assert_eq!(self.doc, self.scorer.doc());
+        #[cfg(feature = "postings-diagnostics")]
+        if self.rejection_loaded_block == Some(self.scorer.last_doc_in_block()) {
+            diagnostics::rejection_block_scored();
+            self.rejection_loaded_block = None;
+        }
+        self.scorer.score()
+    }
 }
 
 impl From<TermScorer> for TermScorerWithMaxScore {
-    fn from(scorer: TermScorer) -> Self {
+    fn from(mut scorer: TermScorer) -> Self {
+        scorer.prepare_max_score_bounds();
         let scorer = Box::new(scorer);
         let max_score = scorer.max_score();
-        TermScorerWithMaxScore { scorer, max_score }
+        let doc = scorer.doc();
+        TermScorerWithMaxScore {
+            scorer,
+            max_score,
+            suffix_max_score: crate::postings::MAX_SCORE_BOUND_MODE.get() == 2,
+            doc,
+            #[cfg(feature = "postings-diagnostics")]
+            rejection_loaded_block: None,
+        }
     }
 }
 
@@ -204,6 +284,8 @@ impl DerefMut for TermScorerWithMaxScore {
 /// - All scorers read frequencies (`FreqReadingOption::ReadFreq`)
 pub struct BlockWandUnionScorer {
     scorers: Vec<TermScorerWithMaxScore>,
+    candidate_tf_bound: bool,
+    defer_seeks: bool,
     threshold: Score,
     current: (DocId, Score),
 }
@@ -211,7 +293,9 @@ impl BlockWandUnionScorer {
     /// Construction positions `current` on the first match
     pub fn new(mut scorers: Vec<TermScorer>, threshold: Score) -> Self {
         debug_assert!(scorers.len() > 1);
-        scorers.retain(|scorer| scorer.doc() < TERMINATED);
+        scorers.retain(|scorer| {
+            scorer.doc() < TERMINATED && !(threshold > 0.0 && scorer.bm25_weight().is_zero())
+        });
         let mut scorers: Vec<TermScorerWithMaxScore> = scorers
             .into_iter()
             .map(TermScorerWithMaxScore::from)
@@ -221,6 +305,8 @@ impl BlockWandUnionScorer {
 
         let mut scorer = Self {
             scorers,
+            candidate_tf_bound: crate::postings::CANDIDATE_TF_BOUND.get(),
+            defer_seeks: crate::postings::DEFER_UNION_SEEKS.get(),
             threshold,
             current: (0, Score::MIN),
         };
@@ -238,6 +324,10 @@ impl Scorer for BlockWandUnionScorer {
 impl PruningScorer for BlockWandUnionScorer {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
+        if self.threshold <= 0.0 && score > 0.0 {
+            self.scorers
+                .retain(|scorer| !scorer.bm25_weight().is_zero());
+        }
         self.threshold = score;
     }
 }
@@ -269,20 +359,48 @@ impl DocSet for BlockWandUnionScorer {
                 // We could get away by simply advancing the scorers to DocId + 1 but it would
                 // be inefficient. The optimization requires proper explanation and was
                 // isolated in a different function.
-                block_max_was_too_low_advance_one_scorer(&mut self.scorers, pivot_len);
+                block_max_was_too_low_advance_one_scorer(
+                    &mut self.scorers,
+                    pivot_len,
+                    self.defer_seeks,
+                );
                 continue;
             }
 
             // Block max condition is observed.
             //
             // Let's try and advance all scorers before the pivot to the pivot.
-            if !align_scorers(&mut self.scorers, pivot_doc, before_pivot_len) {
+            let align_len = if self.defer_seeks {
+                pivot_len
+            } else {
+                before_pivot_len
+            };
+            if !align_scorers(&mut self.scorers, pivot_doc, align_len) {
                 // At least of the scorer does not contain the pivot.
                 //
                 // Let's stop scoring this pivot and go through the pivot selection again.
                 // Note that the current pivot is not necessarily a bad candidate and it
                 // may be picked again.
                 continue;
+            }
+
+            if self.candidate_tf_bound {
+                let upper: Score = self.scorers[..pivot_len]
+                    .iter()
+                    .map(|scorer| {
+                        super::candidate_bound::optimistic_score(
+                            scorer.bm25_weight(),
+                            scorer.term_freq(),
+                        )
+                    })
+                    .sum();
+                let rejected = upper <= threshold;
+                #[cfg(feature = "postings-diagnostics")]
+                diagnostics::candidate_bound(rejected, pivot_len);
+                if rejected {
+                    advance_all_scorers_on_pivot(&mut self.scorers, pivot_len);
+                    continue;
+                }
             }
 
             // At this point, all scorers are positioned on the doc.
@@ -602,7 +720,18 @@ mod tests {
                 TermScorer::create_for_test(postings, &fieldnorms_expanded[..], bm25_weight)
             })
             .collect();
-        for top_k in 1..4 {
+        for (top_k, defer, bounds_mode, tf_bound) in (1..4).flat_map(|top_k| {
+            [false, true].into_iter().flat_map(move |defer| {
+                (0..=2).flat_map(move |bounds_mode| {
+                    [false, true]
+                        .into_iter()
+                        .map(move |tf_bound| (top_k, defer, bounds_mode, tf_bound))
+                })
+            })
+        }) {
+            crate::postings::set_union_deferred_seeks(defer);
+            crate::postings::set_max_score_bound_mode(bounds_mode);
+            crate::postings::set_candidate_tf_bound(tf_bound);
             let checkpoints_for_each_pruning =
                 compute_checkpoints_for_each_pruning(term_scorers.clone(), top_k);
             let checkpoints_manual =
@@ -616,6 +745,40 @@ mod tests {
                 assert!(nearly_equals(left_score, right_score));
             }
         }
+        crate::postings::set_max_score_bound_mode(0);
+        crate::postings::set_candidate_tf_bound(false);
+        crate::postings::set_union_deferred_seeks(false);
+    }
+
+    #[cfg(feature = "postings-diagnostics")]
+    #[test]
+    fn test_deferred_rejection_loads() {
+        use crate::postings::diagnostics;
+        let fieldnorms = vec![200; 4096];
+        let postings: Vec<_> = (0..4096)
+            .map(|doc| (doc, if doc < 16 { 100 } else { 1 }))
+            .collect();
+        let mut results = Vec::new();
+        let mut counts = Vec::new();
+        for defer in [false, true] {
+            crate::postings::set_union_deferred_seeks(defer);
+            diagnostics::reset(true);
+            let scorers = (0..2)
+                .map(|_| {
+                    let weight = Bm25Weight::for_one_term(4096, 8192, 200.0, Bm25Params::default());
+                    TermScorer::create_for_test(&postings, &fieldnorms, weight)
+                })
+                .collect();
+            results.push(compute_checkpoints_for_each_pruning(scorers, 10));
+            counts.push(diagnostics::take());
+        }
+        assert_eq!(results[0], results[1]);
+        assert!(counts[0].union_rejection_loads > 0);
+        assert_eq!(counts[0].union_rejection_loads_scored, 0);
+        assert_eq!(counts[1].union_rejection_loads, 0);
+        assert!(counts[1].blocks_decoded < counts[0].blocks_decoded);
+        diagnostics::reset(false);
+        crate::postings::set_union_deferred_seeks(false);
     }
 
     proptest! {
@@ -630,6 +793,16 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(500))]
         #[test]
         fn test_block_wand_single_term_scorer((posting_lists, fieldnorms) in gen_term_scorers(1)) {
+            test_block_wand_aux(&posting_lists[..], &fieldnorms[..]);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+        #[test]
+        fn test_block_wand_many_term_scorers(
+            (posting_lists, fieldnorms) in (3usize..11).prop_flat_map(gen_term_scorers)
+        ) {
             test_block_wand_aux(&posting_lists[..], &fieldnorms[..]);
         }
     }

@@ -42,6 +42,8 @@ pub struct BlockWandIntersectionScorer {
 
     candidate_doc_ids: [u32; COMPRESSION_BLOCK_SIZE],
     candidate_scores: [f32; COMPRESSION_BLOCK_SIZE],
+    candidate_term_freqs: [u32; COMPRESSION_BLOCK_SIZE],
+    membership_first: bool,
     num_candidates: usize,
     candidate_idx: usize,
 
@@ -72,6 +74,9 @@ impl BlockWandIntersectionScorer {
         let bm25_weight = leader.bm25_weight().clone();
 
         let internal_doc = leader.doc();
+        let membership_first = crate::postings::INTERSECTION_MEMBERSHIP_FIRST.get()
+            && (!crate::postings::INTERSECTION_MEMBERSHIP_ADAPTIVE.get()
+                || u64::from(leader.size_hint()) * 256 <= u64::from(fieldnorm_reader.num_docs()));
 
         let mut scorer = Self {
             leader,
@@ -83,6 +88,8 @@ impl BlockWandIntersectionScorer {
             bm25_weight,
             candidate_doc_ids: [0u32; COMPRESSION_BLOCK_SIZE],
             candidate_scores: [0f32; COMPRESSION_BLOCK_SIZE],
+            candidate_term_freqs: [0u32; COMPRESSION_BLOCK_SIZE],
+            membership_first,
             num_candidates: 0,
             candidate_idx: 0,
             threshold,
@@ -95,6 +102,9 @@ impl BlockWandIntersectionScorer {
     }
 
     fn handle_candidates(&mut self) -> Option<DocId> {
+        if self.membership_first {
+            return self.handle_candidates_membership_first();
+        }
         // Pass 2: Check intersection membership only for survivors.
         // score_threshold may be stale (threshold can increase from callbacks),
         // but that's conservative — we may check a few extra candidates, never miss one.
@@ -131,6 +141,37 @@ impl BlockWandIntersectionScorer {
                 return Some(candidate_doc);
             }
             self.candidate_idx += 1;
+        }
+        None
+    }
+
+    fn handle_candidates_membership_first(&mut self) -> Option<DocId> {
+        'next_candidate: while self.candidate_idx < self.num_candidates {
+            let idx = self.candidate_idx;
+            let candidate_doc = self.candidate_doc_ids[idx];
+            self.candidate_idx += 1;
+            for secondary in &mut self.secondaries {
+                if secondary.doc() > candidate_doc || secondary.seek(candidate_doc) != candidate_doc
+                {
+                    #[cfg(feature = "postings-diagnostics")]
+                    crate::postings::diagnostics::intersection_membership(false);
+                    continue 'next_candidate;
+                }
+            }
+            #[cfg(feature = "postings-diagnostics")]
+            crate::postings::diagnostics::intersection_membership(true);
+
+            let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(candidate_doc);
+            let mut score = self
+                .bm25_weight
+                .score(fieldnorm_id, self.candidate_term_freqs[idx]);
+            for secondary in &mut self.secondaries {
+                score += secondary.score();
+            }
+            if score > self.threshold {
+                self.current = (candidate_doc, score);
+                return Some(candidate_doc);
+            }
         }
         None
     }
@@ -230,6 +271,12 @@ impl DocSet for BlockWandIntersectionScorer {
             for (candidate_doc, term_freq) in
                 block_docs.iter().copied().zip(block_freqs.iter().copied())
             {
+                if self.membership_first {
+                    self.candidate_doc_ids[num_candidates] = candidate_doc;
+                    self.candidate_term_freqs[num_candidates] = term_freq;
+                    num_candidates += 1;
+                    continue;
+                }
                 let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(candidate_doc);
                 let leader_score = self.bm25_weight.score(fieldnorm_id, term_freq);
                 self.candidate_doc_ids[num_candidates] = candidate_doc;
@@ -401,6 +448,118 @@ mod tests {
 
     const MAX_TERM_FREQ: u32 = 100u32;
 
+    #[test]
+    fn test_membership_adaptive_selectivity_boundary() {
+        for (max_doc, doc_freq, expected) in [
+            (255, 1, false),
+            (256, 1, true),
+            (257, 1, true),
+            (256, 2, false),
+        ] {
+            let norms = vec![10; max_doc];
+            let postings: Vec<_> = (0..doc_freq).map(|doc| (doc, 1)).collect();
+            let scorer = TermScorer::create_for_test(
+                &postings,
+                &norms,
+                Bm25Weight::for_one_term(
+                    doc_freq as u64,
+                    max_doc as u64,
+                    10.0,
+                    crate::Bm25Params::default(),
+                ),
+            );
+            for (enabled, adaptive) in [(false, false), (false, true), (true, false), (true, true)]
+            {
+                crate::postings::set_intersection_membership_first(enabled);
+                crate::postings::set_intersection_membership_adaptive(adaptive);
+                let intersection = super::BlockWandIntersectionScorer::new(
+                    vec![scorer.clone(), scorer.clone()],
+                    Score::MIN,
+                );
+                assert_eq!(
+                    intersection.membership_first,
+                    enabled && (!adaptive || expected)
+                );
+            }
+        }
+        crate::postings::set_intersection_membership_first(false);
+        crate::postings::set_intersection_membership_adaptive(false);
+    }
+
+    #[test]
+    fn test_membership_first_avoids_nonmatching_fieldnorm_reads() {
+        use std::io;
+        use std::ops::Range;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        use crate::directory::{FileHandle, FileSlice, OwnedBytes};
+        use crate::fieldnorm::FieldNormReader;
+        use crate::postings::SegmentPostings;
+        use crate::HasLen;
+
+        #[derive(Debug)]
+        struct CountedNorms {
+            bytes: Vec<u8>,
+            reads: AtomicUsize,
+        }
+        impl HasLen for CountedNorms {
+            fn len(&self) -> usize {
+                self.bytes.len()
+            }
+        }
+        impl FileHandle for CountedNorms {
+            fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+                self.reads.fetch_add(range.len(), AtomicOrdering::Relaxed);
+                Ok(OwnedBytes::new(self.bytes[range].to_vec()))
+            }
+        }
+
+        for spacing in [2, 256] {
+            let fieldnorms = vec![10; 512 * spacing + 2];
+            let norms = Arc::new(CountedNorms {
+                bytes: vec![FieldNormReader::fieldnorm_to_id(10); fieldnorms.len()],
+                reads: AtomicUsize::new(0),
+            });
+            let make_scorers = || {
+                [(512, 0), (513, 1)]
+                    .into_iter()
+                    .map(|(count, offset)| {
+                        let postings: Vec<_> = (0..count)
+                            .map(|doc| (doc * spacing as u32 + offset, 1))
+                            .collect();
+                        TermScorer::new(
+                            SegmentPostings::create_from_docs_and_tfs(&postings, Some(&fieldnorms)),
+                            FieldNormReader::open(FileSlice::new(norms.clone())),
+                            Bm25Weight::for_one_term(
+                                count as u64,
+                                fieldnorms.len() as u64,
+                                10.0,
+                                crate::Bm25Params::default(),
+                            ),
+                        )
+                    })
+                    .collect()
+            };
+            for mode in 0..3 {
+                crate::postings::set_intersection_membership_first(mode != 0);
+                crate::postings::set_intersection_membership_adaptive(mode == 2);
+                assert!(compute_checkpoints_block_wand_intersection(make_scorers(), 10).is_empty());
+                let reads = norms.reads.swap(0, AtomicOrdering::Relaxed);
+                if mode == 0 || (mode == 2 && spacing == 2) {
+                    assert!(
+                        reads >= 512,
+                        "mode={mode}, spacing={spacing}, reads={reads}"
+                    );
+                } else {
+                    assert_eq!(reads, 0, "mode={mode}, spacing={spacing}");
+                }
+            }
+        }
+        crate::postings::set_intersection_membership_first(false);
+        crate::postings::set_intersection_membership_adaptive(false);
+    }
+
     fn posting_list(max_doc: u32) -> BoxedStrategy<Vec<(DocId, u32)>> {
         (1..max_doc + 1)
             .prop_flat_map(move |doc_freq| {
@@ -482,7 +641,9 @@ mod tests {
                 .collect()
         };
 
-        for top_k in 1..4 {
+        for (top_k, mode) in (1..4).flat_map(|top_k| (0..3).map(move |mode| (top_k, mode))) {
+            crate::postings::set_intersection_membership_first(mode != 0);
+            crate::postings::set_intersection_membership_adaptive(mode == 2);
             let checkpoints_optimized =
                 compute_checkpoints_block_wand_intersection(make_scorers(), top_k);
             let checkpoints_naive = compute_checkpoints_naive_intersection(make_scorers(), top_k);
@@ -501,6 +662,8 @@ mod tests {
                 );
             }
         }
+        crate::postings::set_intersection_membership_first(false);
+        crate::postings::set_intersection_membership_adaptive(false);
     }
 
     proptest! {

@@ -1,8 +1,8 @@
 use std::io;
 
-use common::{BinarySerializable, VInt};
+use common::{BinarySerializable, HasLen, VInt};
 
-use crate::directory::OwnedBytes;
+use crate::directory::{FileSlice, OwnedBytes};
 use crate::positions::COMPRESSION_BLOCK_SIZE;
 use crate::postings::compression::{BlockDecoder, VIntDecoder};
 
@@ -20,6 +20,8 @@ use crate::postings::compression::{BlockDecoder, VIntDecoder};
 pub struct PositionReader {
     bit_widths: OwnedBytes,
     positions: OwnedBytes,
+    positions_file: Option<FileSlice>,
+    positions_byte_offset: usize,
 
     block_decoder: BlockDecoder,
 
@@ -46,6 +48,8 @@ impl PositionReader {
         Ok(PositionReader {
             bit_widths: bit_widths.clone(),
             positions: positions.clone(),
+            positions_file: None,
+            positions_byte_offset: 0,
             block_decoder: BlockDecoder::default(),
             block_offset: i64::MAX as u64,
             anchor_offset: 0u64,
@@ -54,11 +58,27 @@ impl PositionReader {
         })
     }
 
+    pub(crate) fn open_from_file(file: FileSlice) -> io::Result<Self> {
+        let mut header = file.read_bytes_slice(0..file.len().min(10))?;
+        let header_len = header.len();
+        let block_count = VInt::deserialize(&mut header)?.0 as usize;
+        let metadata_len = (header_len - header.len())
+            .checked_add(block_count)
+            .filter(|&end| end <= file.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Invalid position metadata")
+            })?;
+        let mut reader = Self::open(file.read_bytes_slice(0..metadata_len)?)?;
+        reader.positions_file = Some(file.slice(metadata_len..));
+        Ok(reader)
+    }
+
     fn reset(&mut self) {
         self.positions = self.original_positions.clone();
         self.bit_widths = self.original_bit_widths.clone();
         self.block_offset = i64::MAX as u64;
         self.anchor_offset = 0u64;
+        self.positions_byte_offset = 0;
     }
 
     /// Advance from num_blocks bitpacked blocks.
@@ -72,7 +92,11 @@ impl PositionReader {
             .sum();
         let num_bytes_to_skip = num_bits * COMPRESSION_BLOCK_SIZE / 8;
         self.bit_widths.advance(num_blocks);
-        self.positions.advance(num_bytes_to_skip);
+        if self.positions_file.is_some() {
+            self.positions_byte_offset += num_bytes_to_skip;
+        } else {
+            self.positions.advance(num_bytes_to_skip);
+        }
         self.anchor_offset += (num_blocks * COMPRESSION_BLOCK_SIZE) as u64;
     }
 
@@ -87,16 +111,30 @@ impl PositionReader {
             .sum::<usize>()
             * COMPRESSION_BLOCK_SIZE
             / 8;
-        let compressed_data = &self.positions.as_slice()[byte_offset..];
+        let compressed_data = match &self.positions_file {
+            Some(file) => {
+                let start = self.positions_byte_offset + byte_offset;
+                let end = bit_widths.get(block_rel_id).map_or(file.len(), |&width| {
+                    start + width as usize * COMPRESSION_BLOCK_SIZE / 8
+                });
+                if start == end {
+                    OwnedBytes::empty()
+                } else {
+                    file.read_bytes_slice(start..end)
+                        .expect("failed to read position block")
+                }
+            }
+            None => self.positions.slice(byte_offset..self.positions.len()),
+        };
         if bit_widths.len() > block_rel_id {
             // that block is bitpacked.
             let bit_width = bit_widths[block_rel_id];
             self.block_decoder
-                .uncompress_block_unsorted(compressed_data, bit_width, false);
+                .uncompress_block_unsorted(&compressed_data, bit_width, false);
         } else {
             // that block is vint encoded.
             self.block_decoder
-                .uncompress_vint_unsorted_until_end(compressed_data);
+                .uncompress_vint_unsorted_until_end(&compressed_data);
         }
         self.block_offset = self.anchor_offset + (block_rel_id * COMPRESSION_BLOCK_SIZE) as u64;
     }

@@ -140,6 +140,7 @@ debug-assertions = true
 overflow-checks = true
 
 [features]
+postings-diagnostics = []
 default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer"]
 stemmer = ["frostem"]
 mmap = ["fs4", "tempfile", "memmap2"]

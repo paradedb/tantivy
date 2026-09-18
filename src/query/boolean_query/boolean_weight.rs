@@ -600,6 +600,78 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
+        let mut cutoff = threshold;
+        let mut zero_only = false;
+        if crate::postings::DENSE_TERM_RATIO.get() > 0.0
+            && self.scoring_enabled
+            && TScoreCombiner::SUPPORTS_BLOCK_WAND
+            && self.minimum_number_should_match <= 1
+            && self
+                .weights
+                .iter()
+                .all(|(occur, _)| *occur == Occur::Should)
+        {
+            let zero_weights: Option<Vec<bool>> = self
+                .weights
+                .iter()
+                .map(|(_, weight)| weight.term_score_is_zero())
+                .collect();
+            if let Some(zero_weights) = zero_weights {
+                if zero_weights.contains(&true) && zero_weights.contains(&false) {
+                    let positive_scorers = self
+                        .weights
+                        .iter()
+                        .zip(&zero_weights)
+                        .filter(|(_, zero)| !**zero)
+                        .map(|((_, weight), _)| weight.scorer(reader, 1.0))
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    let positive_union =
+                        scorer_union(positive_scorers, &self.score_combiner_fn, reader.num_docs());
+                    let mut positive_callback = |doc, score| {
+                        cutoff = callback(doc, score);
+                        cutoff
+                    };
+                    match positive_union {
+                        SpecializedScorer::TermUnion(mut scorers) => {
+                            scorers.retain(|scorer| scorer.doc() < TERMINATED);
+                            match scorers.len() {
+                                0 => {}
+                                1 => for_each_pruning_scorer(
+                                    &mut BlockWandSingleScorer::new(
+                                        scorers.pop().unwrap(),
+                                        threshold,
+                                    ),
+                                    &mut positive_callback,
+                                ),
+                                _ => for_each_pruning_scorer(
+                                    &mut BlockWandUnionScorer::new(scorers, threshold),
+                                    &mut positive_callback,
+                                ),
+                            }
+                        }
+                        other => for_each_pruning_scorer(
+                            &mut BasicPruningScorer::new(
+                                into_box_scorer(other, &self.score_combiner_fn, reader.num_docs()),
+                                threshold,
+                            ),
+                            &mut positive_callback,
+                        ),
+                    }
+                    if cutoff > 0.0 {
+                        return Ok(());
+                    }
+                    zero_only = true;
+                }
+            }
+        }
+        let threshold = cutoff;
+        let mut zero_callback = |doc, score| {
+            if !zero_only || score == 0.0 {
+                cutoff = callback(doc, score);
+            }
+            cutoff
+        };
+        let callback = &mut zero_callback as &mut dyn FnMut(DocId, Score) -> Score;
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
         match scorer {
             // Block-WAND scores by summing the matching terms, so it may only

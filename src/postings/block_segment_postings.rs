@@ -3,6 +3,8 @@ use std::io;
 use common::buffered_file_slice::BufferedFileSlice;
 use common::{HasLen, VInt};
 
+#[cfg(feature = "postings-diagnostics")]
+use super::diagnostics::{self, ReadGuard, ReadKind};
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::{
@@ -125,12 +127,20 @@ impl BlockSegmentPostings {
         if buffer_size == 0 || doc_freq < COMPRESSION_BLOCK_SIZE as u32 {
             return Self::open(
                 doc_freq,
-                file.read_bytes()?,
+                {
+                    #[cfg(feature = "postings-diagnostics")]
+                    let _guard = ReadGuard::enter(ReadKind::Eager { doc_freq });
+                    file.read_bytes()?
+                },
                 record_option,
                 requested_option,
             );
         }
-        let mut header = file.read_bytes_slice(0..file.len().min(10))?;
+        let mut header = {
+            #[cfg(feature = "postings-diagnostics")]
+            let _guard = ReadGuard::enter(ReadKind::Header);
+            file.read_bytes_slice(0..file.len().min(10))?
+        };
         let header_len = header.len();
         let skip_len = VInt::deserialize_u64(&mut header)? as usize;
         let header_len = header_len - header.len();
@@ -140,7 +150,11 @@ impl BlockSegmentPostings {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "Invalid postings skip length")
             })?;
-        let skips = file.read_bytes_slice(header_len..postings_start)?;
+        let skips = {
+            #[cfg(feature = "postings-diagnostics")]
+            let _guard = ReadGuard::enter(ReadKind::Skips);
+            file.read_bytes_slice(header_len..postings_start)?
+        };
         let payload = file.slice(postings_start..);
         let payload_len = payload.len();
         Self::open_with_data(
@@ -161,6 +175,13 @@ impl BlockSegmentPostings {
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<Self> {
+        #[cfg(feature = "postings-diagnostics")]
+        diagnostics::opened(
+            doc_freq,
+            lazy_data
+                .as_ref()
+                .map_or(postings_data.len(), |(_, len)| *len),
+        );
         let skip_reader = match skip_data_opt {
             Some(skip_data) => {
                 let block_count = doc_freq as usize / COMPRESSION_BLOCK_SIZE;
@@ -209,6 +230,15 @@ impl BlockSegmentPostings {
         fieldnorm_reader: &FieldNormReader,
         bm25_weight: &Bm25Weight,
     ) -> Score {
+        self.block_max_score_with_norms(fieldnorm_reader, bm25_weight, None)
+    }
+
+    pub(crate) fn block_max_score_with_norms(
+        &mut self,
+        fieldnorm_reader: &FieldNormReader,
+        bm25_weight: &Bm25Weight,
+        norm_sidecar: Option<&FileSlice>,
+    ) -> Score {
         if let Some(score) = self.block_max_score_cache {
             return score;
         }
@@ -223,10 +253,19 @@ impl BlockSegmentPostings {
         if self.block_is_loaded() {
             let docs = self.doc_decoder.output_array().iter().cloned();
             let freqs = self.freq_decoder.output_array().iter().cloned();
-            let bm25_scores = docs.zip(freqs).map(|(doc, term_freq)| {
-                let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
-                bm25_weight.score(fieldnorm_id, term_freq)
-            });
+            let first_ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize;
+            let bm25_scores = docs
+                .zip(freqs)
+                .enumerate()
+                .map(|(offset, (doc, term_freq))| {
+                    let fieldnorm_id = if let Some(lane) = norm_sidecar {
+                        lane.read_byte(first_ordinal + offset)
+                            .expect("failed to read posting fieldnorm byte")
+                    } else {
+                        fieldnorm_reader.fieldnorm_id(doc)
+                    };
+                    bm25_weight.score(fieldnorm_id, term_freq)
+                });
             let block_max_score = max_score(bm25_scores).unwrap_or(0.0);
             self.block_max_score_cache = Some(block_max_score);
             return block_max_score;
@@ -242,6 +281,35 @@ impl BlockSegmentPostings {
         self.freq_reading_option
     }
 
+    pub(crate) fn score_bounds(
+        &self,
+        fieldnorm_reader: &FieldNormReader,
+        bm25_weight: &Bm25Weight,
+        norm_sidecar: Option<&FileSlice>,
+    ) -> Vec<Score> {
+        let mut cursor = self.clone();
+        let mut bounds = Vec::with_capacity(
+            cursor.skip_reader.remaining_docs() as usize / COMPRESSION_BLOCK_SIZE + 1,
+        );
+        while let Some(bound) = cursor.skip_reader.block_max_score(bm25_weight) {
+            bounds.push(bound);
+            cursor.skip_reader.advance();
+            cursor.block_loaded = false;
+            cursor.block_max_score_cache = None;
+        }
+        if cursor.skip_reader.has_remaining_docs() {
+            cursor.load_block();
+            bounds.push(cursor.block_max_score_with_norms(
+                fieldnorm_reader,
+                bm25_weight,
+                norm_sidecar,
+            ));
+        } else {
+            bounds.push(0.0);
+        }
+        bounds
+    }
+
     // Resets the block segment postings on another position
     // in the postings file.
     //
@@ -255,6 +323,8 @@ impl BlockSegmentPostings {
     pub(crate) fn reset(&mut self, doc_freq: u32, postings_data: OwnedBytes) -> io::Result<()> {
         let (skip_data_opt, postings_data) =
             split_into_skips_and_postings(doc_freq, postings_data)?;
+        #[cfg(feature = "postings-diagnostics")]
+        diagnostics::opened(doc_freq, postings_data.len());
         self.data = postings_data;
         self.lazy_data = None;
         self.block_max_score_cache = None;
@@ -386,7 +456,11 @@ impl BlockSegmentPostings {
     /// If all docs are smaller than target, the block loaded may be empty,
     /// or be the last an incomplete VInt block.
     pub(crate) fn seek_block(&mut self, target_doc: DocId) {
+        #[cfg(feature = "postings-diagnostics")]
+        let before = self.skip_reader.remaining_docs();
         if self.skip_reader.seek(target_doc) {
+            #[cfg(feature = "postings-diagnostics")]
+            diagnostics::seek_skipped(before, self.skip_reader.remaining_docs(), self.block_loaded);
             self.block_max_score_cache = None;
             self.block_loaded = false;
         }
@@ -405,6 +479,8 @@ impl BlockSegmentPostings {
         if self.block_is_loaded() {
             return;
         }
+        #[cfg(feature = "postings-diagnostics")]
+        diagnostics::decoded(self.skip_reader.remaining_docs());
         let offset = self.skip_reader.byte_offset();
         let lazy_bytes = self.lazy_data.as_ref().map(|(reader, len)| {
             let end = match self.skip_reader.block_info() {
@@ -427,6 +503,8 @@ impl BlockSegmentPostings {
             if end == offset {
                 OwnedBytes::empty()
             } else {
+                #[cfg(feature = "postings-diagnostics")]
+                let _guard = ReadGuard::enter(ReadKind::Payload);
                 reader
                     .get_bytes(offset as u64..end as u64)
                     .expect("Failed to read postings block")
@@ -523,13 +601,63 @@ mod tests {
     use crate::schema::{IndexRecordOption, Schema, Term, INDEXED};
     use crate::DocId;
 
+    #[cfg(feature = "postings-diagnostics")]
+    #[test]
+    fn test_postings_diagnostics() -> crate::Result<()> {
+        use super::diagnostics;
+        use crate::directory::FileSlice;
+        use crate::index::Bm25Params;
+        use crate::postings::serializer::PostingsSerializer;
+
+        let option = IndexRecordOption::WithFreqs;
+        let mut serializer = PostingsSerializer::new(20.0, option, None, Bm25Params::default());
+        serializer.new_term(400, true);
+        for doc in 0..400 {
+            serializer.write_doc(doc, 1);
+        }
+        let mut bytes = Vec::new();
+        serializer.close_term(400, &mut bytes)?;
+        let metadata_len = diagnostics::metadata_len(400, &bytes)?;
+        assert!(metadata_len > 0 && metadata_len < bytes.len());
+        assert_eq!(diagnostics::metadata_len(127, &bytes)?, 0);
+        for size in [0, 1, 4096] {
+            diagnostics::reset(true);
+            super::super::set_postings_read_buffer_size(size);
+            let mut postings = BlockSegmentPostings::open_from_file(
+                400,
+                FileSlice::from(bytes.clone()),
+                option,
+                option,
+            )?;
+            postings.seek_block(128);
+            postings.seek_block(256);
+            postings.load_block();
+            postings.load_block();
+            postings.advance();
+            postings.advance();
+            let counters = diagnostics::take();
+            assert_eq!(counters.lists_opened, 1);
+            assert_eq!(counters.blocks_available, 4);
+            assert_eq!(counters.blocks_decoded, 3);
+            assert_eq!(counters.blocks_seek_skipped, 1);
+            assert_eq!(
+                counters.payload_bytes_available,
+                (bytes.len() - metadata_len) as u64
+            );
+        }
+        diagnostics::reset(false);
+        super::super::set_postings_read_buffer_size(0);
+        Ok(())
+    }
+
     #[test]
     fn test_lazy_postings_reads_and_seeks() -> crate::Result<()> {
+        use std::ops::Range;
+        use std::sync::{Arc, Mutex};
+
         use crate::directory::{FileHandle, FileSlice, OwnedBytes};
         use crate::index::Bm25Params;
         use crate::postings::serializer::PostingsSerializer;
-        use std::ops::Range;
-        use std::sync::{Arc, Mutex};
 
         #[derive(Debug)]
         struct TrackedFile {
@@ -606,6 +734,7 @@ mod tests {
                             for target in
                                 [0, 126, 127, 128, 129, 255, 256, 1000, 100_000, 2_000_000]
                             {
+                                let target = target.max(expected.doc());
                                 assert_eq!(sought.seek(target), expected.seek(target));
                                 assert_eq!(sought.term_freq(), expected.term_freq());
                             }

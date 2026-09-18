@@ -1,12 +1,75 @@
 //! Postings module (also called inverted index)
 
+pub use crate::positions::set_lazy_position_reads;
+
+pub type NormSidecarProvider =
+    fn(crate::index::SegmentId, &crate::Term) -> Option<crate::directory::FileSlice>;
+
 thread_local! {
+    pub(crate) static DENSE_TERM_RATIO: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    pub(crate) static NORM_SIDECAR_PROVIDER: std::cell::Cell<Option<NormSidecarProvider>> = const { std::cell::Cell::new(None) };
+    pub(crate) static PHRASE_ANCHOR_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static PHRASE_SCORE_BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static INTERSECTION_MEMBERSHIP_ADAPTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static CANDIDATE_TF_BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static INTERSECTION_MEMBERSHIP_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static MAX_SCORE_BOUND_MODE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static DEFER_UNION_SEEKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static READ_BUFFER_SIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Omits dense TermQuery leaves from scoring; zero disables the policy.
+pub fn set_dense_term_ratio(ratio: f64) {
+    assert!(ratio.is_finite() && (0.0..=1.0).contains(&ratio));
+    DENSE_TERM_RATIO.set(ratio);
+}
+
+/// Sets an optional exact fieldnorm lane provider for the current thread.
+pub fn set_norm_sidecar_provider(provider: Option<NormSidecarProvider>) {
+    NORM_SIDECAR_PROVIDER.set(provider);
 }
 
 /// Selects eager reads (zero) or buffered lazy reads for this thread.
 pub fn set_postings_read_buffer_size(size: usize) {
     READ_BUFFER_SIZE.set(size);
+}
+
+/// Selects theoretical (0), segment (1), or suffix (2) term score bounds.
+pub fn set_max_score_bound_mode(mode: usize) {
+    assert!(mode <= 2);
+    MAX_SCORE_BOUND_MODE.set(mode);
+}
+
+#[cfg(feature = "postings-diagnostics")]
+pub mod diagnostics;
+
+/// Defers union rejection seeks until a candidate needs alignment.
+pub fn set_union_deferred_seeks(enabled: bool) {
+    DEFER_UNION_SEEKS.set(enabled);
+}
+
+/// Checks conjunction membership before reading document lengths for scoring.
+pub fn set_intersection_membership_first(enabled: bool) {
+    INTERSECTION_MEMBERSHIP_FIRST.set(enabled);
+}
+
+/// Restricts membership-first conjunctions to leaders present in at most 1/256 documents.
+pub fn set_intersection_membership_adaptive(enabled: bool) {
+    INTERSECTION_MEMBERSHIP_ADAPTIVE.set(enabled);
+}
+
+/// Tests exact phrase anchors before seeking the remaining term lists.
+pub fn set_phrase_anchor_filter(enabled: bool) {
+    PHRASE_ANCHOR_FILTER.set(enabled);
+}
+
+pub fn set_phrase_score_bound(enabled: bool) {
+    PHRASE_SCORE_BOUND.set(enabled);
+}
+
+/// Checks a candidate's term-frequency upper bound before reading fieldnorms.
+pub fn set_candidate_tf_bound(enabled: bool) {
+    CANDIDATE_TF_BOUND.set(enabled);
 }
 
 mod block_search;

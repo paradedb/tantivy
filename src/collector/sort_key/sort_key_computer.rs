@@ -5,7 +5,7 @@ use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::sort_key_top_collector::TopBySortKeySegmentCollector;
 use crate::collector::{default_collect_segment_impl, TopNComputer};
 use crate::schema::Schema;
-use crate::{DocId, Result, Score, SegmentOrdinal, SegmentReader};
+use crate::{DocAddress, DocId, Result, Score, SegmentOrdinal, SegmentReader};
 
 /// A `SegmentSortKeyComputer` makes it possible to modify the default score
 /// for a given document belonging to a specific segment.
@@ -163,6 +163,10 @@ pub trait SortKeyComputer: Sync {
     > {
         None
     }
+
+    fn record_segment_top_k(&self, _hits: &[(Self::SortKey, DocAddress)], _k: usize) {}
+
+    fn finish_top_k(&self) {}
 
     /// Computes the top-k results for a segment.
     ///

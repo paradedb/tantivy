@@ -32,6 +32,14 @@
 mod reader;
 mod serializer;
 
+thread_local! {
+    pub(crate) static LAZY_POSITION_READS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn set_lazy_position_reads(enabled: bool) {
+    LAZY_POSITION_READS.set(enabled);
+}
+
 use bitpacking::{BitPacker, BitPacker4x};
 
 pub use self::reader::PositionReader;
@@ -231,6 +239,97 @@ pub(crate) mod tests {
             let mut buf = [0u32; 1];
             position_reader.read(offset, &mut buf);
             assert_eq!(buf[0], offset as u32);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_lazy_position_reads_match_eager() -> crate::Result<()> {
+        use std::ops::Range;
+        use std::sync::{Arc, Mutex};
+
+        use common::HasLen;
+
+        use crate::directory::{FileHandle, FileSlice};
+
+        #[derive(Debug)]
+        struct TrackedFile {
+            bytes: OwnedBytes,
+            reads: Arc<Mutex<Vec<Range<usize>>>>,
+        }
+        impl HasLen for TrackedFile {
+            fn len(&self) -> usize {
+                self.bytes.len()
+            }
+        }
+        impl FileHandle for TrackedFile {
+            fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+                assert!(
+                    !range.is_empty(),
+                    "empty reads are not supported by every FileHandle"
+                );
+                self.reads.lock().unwrap().push(range.clone());
+                Ok(self.bytes.slice(range))
+            }
+        }
+
+        for count in [0, 1, 127, 128, 129, 255, 256, 257, 10_003] {
+            for pattern in 0..3 {
+                let values: Vec<_> = (0..count)
+                    .map(|i| match pattern {
+                        0 => 0,
+                        1 => (i * 37 % 4096) as u32,
+                        _ if i / 128 % 2 == 0 => 0,
+                        _ => [1, 127, 128, 65535, u32::MAX][i % 5],
+                    })
+                    .collect();
+                let bytes = create_positions_data(&values)?;
+                let reads = Arc::new(Mutex::new(Vec::new()));
+                let file = FileSlice::new(Arc::new(TrackedFile {
+                    bytes: bytes.clone(),
+                    reads: reads.clone(),
+                }));
+                let mut lazy = PositionReader::open_from_file(file)?;
+                let mut eager = PositionReader::open(bytes.clone())?;
+                if count == 10_003 && pattern == 1 {
+                    let opened: usize = reads.lock().unwrap().iter().map(|range| range.len()).sum();
+                    assert!(opened < bytes.len() / 20);
+                    reads.lock().unwrap().clear();
+                    let mut one = [0];
+                    lazy.read(8192, &mut one);
+                    assert_eq!(one[0], values[8192]);
+                    let fetched: usize =
+                        reads.lock().unwrap().iter().map(|range| range.len()).sum();
+                    assert!(fetched < bytes.len() / 20);
+                    let read_count = reads.lock().unwrap().len();
+                    lazy.read(8193, &mut one);
+                    assert_eq!(one[0], values[8193]);
+                    assert_eq!(reads.lock().unwrap().len(), read_count);
+                }
+
+                let mut offsets = vec![0, count / 2, count.saturating_sub(1)];
+                offsets.extend([127, 128, 129, 255, 256]);
+                offsets.retain(|&offset| offset < count);
+                offsets.extend(offsets.clone().into_iter().rev());
+                for offset in offsets {
+                    for requested in [0, 1, 127, 128, 129, 399, count] {
+                        let len = requested.min(count - offset);
+                        let mut actual = vec![0; len];
+                        let mut expected = vec![0; len];
+                        lazy.read(offset as u64, &mut actual);
+                        eager.read(offset as u64, &mut expected);
+                        assert_eq!(actual, expected);
+                        assert_eq!(actual, values[offset..offset + len]);
+
+                        let mut cloned = lazy.clone();
+                        let clone_offset = count - len;
+                        cloned.read(clone_offset as u64, &mut actual);
+                        assert_eq!(actual, values[clone_offset..]);
+                        cloned.read(offset as u64, &mut actual);
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
         }
         Ok(())
     }

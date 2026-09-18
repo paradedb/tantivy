@@ -232,11 +232,16 @@ impl InvertedIndexReader {
         let block_postings = self.read_block_postings_from_terminfo(term_info, option)?;
         let position_reader = {
             if option.has_positions() {
-                let positions_data = self
-                    .positions_file_slice
-                    .open()?
-                    .read_bytes_slice(term_info.positions_range.clone())?;
-                let position_reader = PositionReader::open(positions_data)?;
+                let positions_file = self.positions_file_slice.open()?;
+                let position_reader = if crate::positions::LAZY_POSITION_READS.get() {
+                    PositionReader::open_from_file(
+                        positions_file.slice(term_info.positions_range.clone()),
+                    )?
+                } else {
+                    PositionReader::open(
+                        positions_file.read_bytes_slice(term_info.positions_range.clone())?,
+                    )?
+                };
                 Some(position_reader)
             } else {
                 None

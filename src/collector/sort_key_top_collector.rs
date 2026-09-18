@@ -69,11 +69,13 @@ where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
     }
 
     fn merge_fruits(&self, segment_fruits: Vec<Self::Fruit>) -> Result<Self::Fruit> {
-        Ok(merge_top_k(
+        let result = merge_top_k(
             segment_fruits.into_iter().flatten(),
             self.doc_range.clone(),
             self.sort_key_computer.comparator(),
-        ))
+        );
+        self.sort_key_computer.finish_top_k();
+        Ok(result)
     }
 
     fn collect_segment(
@@ -85,7 +87,10 @@ where TSortKeyComputer: SortKeyComputer + Send + Sync + 'static
         let mut segment_collector = self.for_segment(segment_ord, reader)?;
         self.sort_key_computer
             .collect_segment_top_k(weight, reader, &mut segment_collector)?;
-        Ok(segment_collector.harvest())
+        let hits = segment_collector.harvest();
+        self.sort_key_computer
+            .record_segment_top_k(&hits, self.doc_range.end);
+        Ok(hits)
     }
 }
 
