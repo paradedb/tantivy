@@ -1,7 +1,9 @@
 //! Deterministic foreground-merge allocation reproduction.
 //! Usage: merge_memory <disjoint|interleaved> <docs-per-segment> <repetitions>
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
+
 use tantivy::collector::Count;
 use tantivy::indexer::{IndexWriterOptions, NoMergePolicy};
 use tantivy::query::PhraseQuery;
@@ -125,6 +127,19 @@ fn main() -> tantivy::Result<()> {
     for id in 0..(4 * n) as u32 {
         assert_eq!(keys.first(id), Some(id as u64));
     }
-    println!("{{\"mode\":\"{}\",\"docs\":{},\"repetitions\":{},\"input_segments\":{},\"writer_budget_bytes\":{},\"baseline_bytes\":{},\"merge_peak_live_bytes\":{},\"merge_peak_above_baseline_bytes\":{},\"merge_ms\":{},\"correctness\":\"pass\"}}",mode,4*n,reps,ids.len(),budget,baseline,peak,peak.saturating_sub(baseline),elapsed.as_millis());
+    println!(
+        "{{\"mode\":\"{}\",\"docs\":{},\"repetitions\":{},\"input_segments\":{},\"\
+         writer_budget_bytes\":{},\"baseline_bytes\":{},\"merge_peak_live_bytes\":{},\"\
+         merge_peak_above_baseline_bytes\":{},\"merge_ms\":{},\"correctness\":\"pass\"}}",
+        mode,
+        4 * n,
+        reps,
+        ids.len(),
+        budget,
+        baseline,
+        peak,
+        peak.saturating_sub(baseline),
+        elapsed.as_millis()
+    );
     Ok(())
 }
