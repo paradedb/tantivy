@@ -10,6 +10,7 @@ pub(crate) mod compression;
 mod indexing_context;
 mod json_postings_writer;
 mod loaded_postings;
+mod merger;
 mod per_field_postings_writer;
 mod postings;
 mod postings_writer;
@@ -21,6 +22,7 @@ pub(crate) mod skip;
 mod term_info;
 
 pub use loaded_postings::LoadedPostings;
+pub(crate) use merger::{next_mapped_doc, PostingsMerger};
 pub(crate) use stacker::compute_table_memory_size;
 
 pub use self::block_segment_postings::BlockSegmentPostings;
