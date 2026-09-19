@@ -99,6 +99,12 @@ jobs:
           cargo +stable nextest run --features ${{ matrix.features.flags }} --no-default-features --verbose --workspace
         fi
 
+    - name: Check sorted merge memory
+      if: matrix.features.label == 'quickwit'
+      run: |
+        bash run-memory-matrix.sh > merge-memory.jsonl
+        python3 check-merge-memory.py merge-memory.jsonl
+
     - name: Run doctests
       run: |
         # if matrix.feature.flags is empty then run on --lib to avoid compiling examples

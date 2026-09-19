@@ -7,7 +7,8 @@
 //! (`add_document`) and while merging.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 
 use columnar::MonotonicallyMappableToU64;
@@ -542,6 +543,17 @@ fn estimate_total_num_tokens(readers: &[SegmentReader], field: Field) -> crate::
     Ok(total_num_tokens)
 }
 
+/// Skip deleted/filtered documents, leaving the cursor on the next mapped posting.
+fn next_mapped_doc(postings: &mut SegmentPostings, mapping: &[Option<DocId>]) -> Option<DocId> {
+    while postings.doc() != TERMINATED {
+        if let Some(doc) = mapping[postings.doc() as usize] {
+            return Some(doc);
+        }
+        postings.advance();
+    }
+    None
+}
+
 fn write_postings_for_field(
     readers: &[SegmentReader],
     schema: &Schema,
@@ -596,7 +608,7 @@ fn write_postings_for_field(
     );
 
     let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
-    let mut doc_id_and_positions = vec![];
+    let mut next_docs = BinaryHeap::with_capacity(readers.len());
 
     while merged_terms.advance() {
         segment_postings_containing_the_term.clear();
@@ -646,43 +658,56 @@ fn write_postings_for_field(
 
         field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
 
-        for (segment_ord, mut segment_postings) in segment_postings_containing_the_term.drain(..) {
-            let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
-
-            let mut doc = segment_postings.doc();
-            while doc != TERMINATED {
-                if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
+        if doc_id_mapping.is_trivial() {
+            for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
+                let mapping = &merged_doc_id_map[segment_ord];
+                while let Some(doc) = next_mapped_doc(&mut postings, mapping) {
                     let term_freq = if has_term_freq {
-                        segment_postings.positions(&mut positions_buffer);
-                        segment_postings.term_freq()
+                        postings.positions(&mut positions_buffer);
+                        postings.term_freq()
                     } else {
                         positions_buffer.clear();
-                        0u32
+                        0
                     };
-
-                    if !doc_id_mapping.is_trivial() {
-                        doc_id_and_positions.push((
-                            remapped_doc_id,
-                            term_freq,
-                            positions_buffer.to_vec(),
-                        ));
-                    } else {
-                        let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                        field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
-                    }
+                    let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                    field_serializer.write_doc(doc, term_freq, delta_positions);
+                    postings.advance();
                 }
-
-                doc = segment_postings.advance();
             }
-        }
-        if !doc_id_mapping.is_trivial() {
-            doc_id_and_positions.sort_unstable_by_key(|&(doc_id, _, _)| doc_id);
-
-            for (doc_id, term_freq, positions) in &doc_id_and_positions {
-                let delta_positions = delta_computer.compute_delta(positions);
-                field_serializer.write_doc(*doc_id, *term_freq, delta_positions);
+        } else {
+            // The sorted merge interleaves segments while preserving document order
+            // within each segment. Thus each postings cursor is also ordered by its
+            // mapped document id. Keep one cursor per segment instead of copying
+            // every document's positions for the entire term before sorting them.
+            next_docs.clear();
+            for (cursor, (segment_ord, postings)) in
+                segment_postings_containing_the_term.iter_mut().enumerate()
+            {
+                if let Some(doc) = next_mapped_doc(postings, &merged_doc_id_map[*segment_ord]) {
+                    next_docs.push(Reverse((doc, cursor)));
+                }
             }
-            doc_id_and_positions.clear();
+            while let Some(Reverse((doc, cursor))) = next_docs.pop() {
+                let (segment_ord, postings) = &mut segment_postings_containing_the_term[cursor];
+                let term_freq = if has_term_freq {
+                    postings.positions(&mut positions_buffer);
+                    postings.term_freq()
+                } else {
+                    positions_buffer.clear();
+                    0
+                };
+                let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                field_serializer.write_doc(doc, term_freq, delta_positions);
+                postings.advance();
+                if let Some(next_doc) = next_mapped_doc(postings, &merged_doc_id_map[*segment_ord])
+                {
+                    debug_assert!(
+                        next_doc > doc,
+                        "merge mapping must preserve per-segment order"
+                    );
+                    next_docs.push(Reverse((next_doc, cursor)));
+                }
+            }
         }
         field_serializer.close_term()?;
     }
