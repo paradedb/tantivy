@@ -6,9 +6,8 @@
 //! branches once, on whether the reader carries an [`IvfIndex`]: with it, the
 //! filter is drained into a bitmap and the routed clusters are probed
 //! adaptively; without it, the filter `Scorer` is iterated doc-by-doc and
-//! every vector is scored exactly. Either way, every survivor's bytes are
-//! fetched with one stride-sized read ([`VectorIndexReader::vector_bytes_for_row`])
-//! — the unit the pg-backed `Directory` can serve zero-copy.
+//! every vector is scored exactly. IVF survivors are fetched in adjacent
+//! row batches through borrowed storage chunks; exact scans read one row at a time.
 
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
@@ -54,6 +53,8 @@ pub struct VectorBackend<T: VectorElement> {
     query: Arc<PreparedQuery<T>>,
     adaptive: AdaptiveProbeParams,
     segment_ord: SegmentOrdinal,
+    #[cfg(test)]
+    chunked_reads: bool,
 }
 
 impl<T: VectorElement> VectorBackend<T> {
@@ -74,6 +75,8 @@ impl<T: VectorElement> VectorBackend<T> {
             query,
             adaptive,
             segment_ord,
+            #[cfg(test)]
+            chunked_reads: true,
         })
     }
 
@@ -281,7 +284,7 @@ pub struct ProbeStats {
     /// Touched docs rejected by the replica `seen` dedup.
     pub pruned_seen: usize,
     /// Probed clusters whose surviving rows' posting bytes were fetched —
-    /// one stride-sized ranged read per surviving row. Counts clusters,
+    /// batching adjacent surviving rows. Counts clusters,
     /// not rows.
     pub postings_row: usize,
     /// Probed clusters that fetched no posting bytes at all: the
@@ -590,8 +593,8 @@ impl<T: VectorElement> VectorBackend<T> {
     /// the open share, without touching its rows. A probed cluster is
     /// then gated per row — [`Self::collect_cluster_survivors`] runs
     /// `filter → alive → seen` off the pinned id-map with no posting
-    /// bytes in hand — and only the survivors' bytes are fetched, one
-    /// stride-sized read per surviving row. Cluster-order arrival of
+    /// bytes in hand — and only the survivors' bytes are fetched, in
+    /// adjacent row batches. Cluster-order arrival of
     /// survivors forbids the ascending-doc shortcut in `push`; use
     /// `push_unordered`.
     ///
@@ -656,6 +659,7 @@ impl<T: VectorElement> VectorBackend<T> {
         // The probed cluster's gate survivors; allocated once, reused
         // across clusters.
         let mut survivors: Vec<Survivor> = Vec::new();
+        let mut row_scratch = Vec::new();
         // f64 accumulation in the loop; f32 only at the telemetry fold.
         let mut work_spent = WorkUnits::ZERO;
         let work_budget = pricing.budget;
@@ -743,14 +747,67 @@ impl<T: VectorElement> VectorBackend<T> {
                 postings_skipped += 1;
             } else {
                 postings_row += 1;
-                // One stride-sized read per survivor — the unit the
-                // pg-backed `Directory` serves zero-copy (see
-                // `vector_bytes_for_row`).
-                for &Survivor { row, doc } in &survivors {
-                    let vbytes = self.reader.vector_bytes_for_row(row)?;
-                    let score = self.query.score_doc_bytes(&vbytes);
-                    if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                        topn.push_unordered(key, doc);
+                #[cfg(test)]
+                if !self.chunked_reads {
+                    for &Survivor { row, doc } in &survivors {
+                        let bytes = self.reader.vector_bytes_for_row(row)?;
+                        let score = self.query.score_doc_bytes(&bytes);
+                        if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                            topn.push_unordered(key, doc);
+                        }
+                    }
+                }
+                #[cfg(not(test))]
+                let chunked_reads = true;
+                #[cfg(test)]
+                let chunked_reads = self.chunked_reads;
+                if chunked_reads {
+                    let mut begin = 0;
+                    while begin < survivors.len() {
+                        let mut end = begin + 1;
+                        while end < survivors.len()
+                            && end - begin < 64
+                            && survivors[end].row == survivors[end - 1].row + 1
+                        {
+                            end += 1;
+                        }
+                        let first_row = survivors[begin].row;
+                        let rows = first_row..survivors[end - 1].row + 1;
+                        let mut accept_score = |row: usize, score: Score| {
+                            let doc = survivors[begin + row - first_row].doc;
+                            if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                                topn.push_unordered(key, doc);
+                            }
+                        };
+                        if let Some(mut accumulator) = self.query.dot_accumulator() {
+                            let stride = self.reader.options().bytes_per_vector();
+                            self.reader.visit_vector_row_fragments(
+                                rows,
+                                |row, offset, bytes| {
+                                    let score = if offset == 0 && bytes.len() == stride {
+                                        Some(self.query.score_doc_bytes(bytes))
+                                    } else {
+                                        self.query.score_doc_fragment(
+                                            &mut accumulator,
+                                            bytes,
+                                            offset + bytes.len() == stride,
+                                        )
+                                    };
+                                    if let Some(score) = score {
+                                        accept_score(row, score);
+                                    }
+                                },
+                            )?;
+                        } else {
+                            self.reader.visit_vector_rows(
+                                rows,
+                                &mut row_scratch,
+                                |row, bytes| {
+                                    accept_score(row, self.query.score_doc_bytes(bytes));
+                                },
+                            )?;
+                        }
+                        begin = end;
                     }
                 }
             }
@@ -2692,6 +2749,63 @@ mod tests {
             "expected IVF storage"
         );
         backend.top_n(weight, segment_reader, k)
+    }
+
+    #[test]
+    fn chunked_probes_preserve_results_and_work() -> crate::Result<()> {
+        let centroids = [[1.0, 1.0], [10.0, 1.0], [1.0, 10.0], [10.0, 10.0]];
+        let labels: Vec<_> = (0..560).map(|i| format!("d{i}")).collect();
+        let docs: Vec<_> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let c = centroids[i / 140];
+                let offset = (i % 140) as f32 * 0.001;
+                (label.as_str(), [c[0] + offset, c[1] - offset])
+            })
+            .collect();
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            for replicas in [1, 3] {
+                let (index, field, _) = build_inline_ivf(metric, &centroids, &docs, replicas)?;
+                let searcher = index.reader()?.searcher();
+                let reader = &searcher.segment_readers()[0];
+                for fraction in [0.1, 0.5, 1.0] {
+                    for modulus in [1, 3, 17] {
+                        let weight = FixedDocsWeight {
+                            max_doc: reader.max_doc(),
+                            docs: (0..reader.max_doc())
+                                .filter(|doc| doc % modulus == 0)
+                                .collect(),
+                        };
+                        for limit in [7, 600] {
+                            let mut backend = VectorBackend::<f32>::for_segment(
+                                reader,
+                                0,
+                                field,
+                                Arc::new(vec![0.71, 0.38]),
+                                AdaptiveProbeParams {
+                                    max_probe_fraction: fraction,
+                                    min_probe_clusters: 1,
+                                    ..Default::default()
+                                },
+                            )?;
+                            backend.chunked_reads = false;
+                            let original = backend.top_n(&weight, reader, limit)?;
+                            backend.chunked_reads = true;
+                            let chunked = backend.top_n(&weight, reader, limit)?;
+                            assert_eq!(chunked.0, original.0);
+                            assert_eq!(
+                                serde_json::to_value(&chunked.1)?,
+                                serde_json::to_value(&original.1)?,
+                                "{metric:?}, replicas={replicas}, fraction={fraction}, \
+                                 modulus={modulus}, limit={limit}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every touched row lands in exactly one prune bucket.
