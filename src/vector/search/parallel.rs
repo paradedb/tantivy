@@ -81,9 +81,18 @@ pub struct PreparedVectorSearch {
     pub initial_wave: Option<ProbeWave>,
     pub routing: Option<RouterMetrics>,
     pub routing_time_ns: u64,
+    pub precomputed_centroids: usize,
 }
 
 pub trait VectorSearchControl {
+    #[cfg(test)]
+    fn stream_row_scores(&self) -> bool {
+        true
+    }
+    #[cfg(test)]
+    fn coalesce_direct_ranges(&self) -> bool {
+        true
+    }
     fn work_sharing(&self) -> bool {
         false
     }
@@ -133,6 +142,28 @@ impl PreparedVectorSearch {
         field: Field,
         query: &[T],
         adaptive: &AdaptiveProbeParams,
+        all_docs: bool,
+    ) -> crate::Result<Self> {
+        Self::prepare(searcher, field, query, adaptive, all_docs, false)
+    }
+
+    pub fn new_with_precomputed_centroid_scores<T: VectorElement>(
+        searcher: &Searcher,
+        field: Field,
+        query: &[T],
+        adaptive: &AdaptiveProbeParams,
+        all_docs: bool,
+    ) -> crate::Result<Self> {
+        Self::prepare(searcher, field, query, adaptive, all_docs, true)
+    }
+
+    fn prepare<T: VectorElement>(
+        searcher: &Searcher,
+        field: Field,
+        query: &[T],
+        adaptive: &AdaptiveProbeParams,
+        all_docs: bool,
+        precompute: bool,
     ) -> crate::Result<Self> {
         super::collector::check_query_schema(searcher.schema(), field, query)?;
         let started = Instant::now();
@@ -144,10 +175,12 @@ impl PreparedVectorSearch {
             initial_wave: None,
             routing: None,
             routing_time_ns: 0,
+            precomputed_centroids: 0,
         };
         let mut options = None;
         let mut docs = 0;
         let mut nonempty = 0;
+        let mut vectors = Vec::new();
         for reader in searcher.segment_readers() {
             let vector = reader.vector_index(field)?;
             plan.shareable &= reader.alive_bitset().is_none()
@@ -159,6 +192,7 @@ impl PreparedVectorSearch {
                 docs += ivf.num_docs();
                 nonempty += ivf.num_non_empty_clusters();
             }
+            vectors.push(vector);
         }
         let Some(options) = options else {
             return Ok(plan);
@@ -184,29 +218,52 @@ impl PreparedVectorSearch {
                 }
             }
         }
+        let capacity = plan.budget.charge(ClusterWork {
+            opens: nonempty as u64,
+            rows: docs as u64,
+        });
+        let scores = if precompute
+            && all_docs
+            && plan.shareable
+            && capacity > 0.0
+            && plan.budget.limit >= capacity * 0.5
+        {
+            router.precompute_scores(&values)?
+        } else {
+            None
+        };
+        plan.precomputed_centroids = scores.as_ref().map_or(0, Vec::len);
         let mut workspace = RouterWorkspace::default();
-        let mut ranked = router.rank_clusters(&mut workspace, &values);
-        plan.clusters = ranked
-            .by_ref()
-            .map(|candidate| RankedCluster {
-                id: candidate.node,
-                similarity: candidate.sim.score(),
-            })
-            .collect();
-        if plan.shareable && !plan.clusters.is_empty() {
-            let mut costs = vec![ClusterWork::default(); plan.clusters.len().min(PROBE_WAVE_SIZE)];
-            for reader in searcher.segment_readers() {
-                let vector = reader.vector_index(field)?;
-                let clusters = vector.clusters().unwrap();
-                for (cost, cluster) in costs.iter_mut().zip(&plan.clusters) {
-                    if let Some(range) = clusters.non_empty_cluster_range(cluster.id as usize) {
+        let mut ranked =
+            router.rank_clusters_with_scores(&mut workspace, &values, scores.as_deref());
+        let mut candidates = ranked.by_ref().map(|candidate| RankedCluster {
+            id: candidate.node,
+            similarity: candidate.sim.score(),
+        });
+        if all_docs && plan.shareable {
+            let mut wave = ProbeWave::default();
+            for cluster in candidates.by_ref() {
+                plan.clusters.push(cluster);
+                if wave.spent >= plan.budget.limit {
+                    break;
+                }
+                let mut cost = ClusterWork::default();
+                for vector in &vectors {
+                    if let Some(range) = vector
+                        .clusters()
+                        .unwrap()
+                        .non_empty_cluster_range(cluster.id as usize)
+                    {
                         cost.opens += 1;
                         cost.rows += range.len() as u64;
                     }
                 }
+                wave.spent += plan.budget.charge(cost);
+                wave.end = plan.clusters.len();
             }
-            let wave = plan.budget.select(0, &costs, 0.0);
             plan.initial_wave = (wave.end > 0).then_some(wave);
+        } else {
+            plan.clusters = candidates.collect();
         }
         plan.routing = Some(ranked.metrics());
         plan.routing_time_ns = started.elapsed().as_nanos() as u64;
@@ -297,6 +354,7 @@ struct ProbeCollector<'a, T: VectorElement, S: SortKeyComputer> {
     control: &'a mut dyn VectorSearchControl,
     stats: ProbeStats,
     work: ClusterWork,
+    row_scratch: Vec<u8>,
 }
 
 impl<T: VectorElement, S: SortKeyComputer> ProbeCollector<'_, T, S> {
@@ -306,7 +364,6 @@ impl<T: VectorElement, S: SortKeyComputer> ProbeCollector<'_, T, S> {
         survivors: &[Survivor],
         threshold: Option<Score>,
     ) -> crate::Result<()> {
-        let stride = segment.vec.options().bytes_per_vector();
         let mut begin = 0;
         while begin < survivors.len() {
             self.control.check_interrupt();
@@ -317,13 +374,13 @@ impl<T: VectorElement, S: SortKeyComputer> ProbeCollector<'_, T, S> {
             {
                 end += 1;
             }
-            let bytes = segment
-                .vec
-                .vector_bytes_for_rows(survivors[begin].row..survivors[end - 1].row + 1)?;
-            for (i, survivor) in survivors[begin..end].iter().enumerate() {
-                let score = self
-                    .prepared
-                    .score_doc_bytes(&bytes[i * stride..(i + 1) * stride]);
+            let first_row = survivors[begin].row;
+            let rows = first_row..survivors[end - 1].row + 1;
+            let accumulator = self.prepared.dot_accumulator();
+            #[cfg(test)]
+            let accumulator = accumulator.filter(|_| self.control.stream_row_scores());
+            let mut accept_score = |row: usize, score: Score| {
+                let survivor = &survivors[begin + row - first_row];
                 if self
                     .heap
                     .threshold
@@ -331,19 +388,85 @@ impl<T: VectorElement, S: SortKeyComputer> ProbeCollector<'_, T, S> {
                     .is_some_and(|((t, _), _)| score < *t)
                     || threshold.is_some_and(|t| score < t)
                 {
-                    continue;
+                    return;
                 }
                 let address = DocAddress::new(segment.ord, survivor.doc);
                 if !self.control.accept(address) {
                     self.stats.pruned_invisible += 1;
-                    continue;
+                    return;
                 }
                 let key = segment.tie.segment_sort_key(survivor.doc, score);
                 let key = segment.tie.convert_segment_sort_key(key);
                 self.heap.push_unordered((score, key), address);
                 self.pending.push_unordered(score, address);
+            };
+            if let Some(mut accumulator) = accumulator {
+                let stride = segment.vec.options().bytes_per_vector();
+                segment
+                    .vec
+                    .visit_vector_row_fragments(rows, |row, offset, bytes| {
+                        let score = if offset == 0 && bytes.len() == stride {
+                            Some(self.prepared.score_doc_bytes(bytes))
+                        } else {
+                            self.prepared.score_doc_fragment(
+                                &mut accumulator,
+                                bytes,
+                                offset + bytes.len() == stride,
+                            )
+                        };
+                        if let Some(score) = score {
+                            accept_score(row, score);
+                        }
+                    })?;
+            } else {
+                segment
+                    .vec
+                    .visit_vector_rows(rows, &mut self.row_scratch, |row, bytes| {
+                        accept_score(row, self.prepared.score_doc_bytes(bytes));
+                    })?;
             }
             begin = end;
+        }
+        Ok(())
+    }
+
+    fn record_probe(&mut self, rank: usize, probe: &ClusterProbe) -> bool {
+        self.work.opens += probe.work.opens;
+        self.work.rows += probe.work.rows;
+        if probe.skipped {
+            self.stats.bounds_skips += 1;
+            return false;
+        }
+        if probe.work.opens == 0 {
+            return false;
+        }
+        self.stats.segment_opens += 1;
+        self.stats.vectors_visited += probe.visited;
+        self.stats.pruned_filter += probe.filtered;
+        self.stats.pruned_dead += probe.dead;
+        self.stats.pruned_seen += probe.duplicates;
+        self.stats.candidates_scored += probe.work.rows as usize;
+        self.stats.cluster_flags[rank] |= if probe.work.rows == 0 { 1 } else { 3 };
+        true
+    }
+
+    fn score_direct_range(
+        &mut self,
+        segment: &mut SegmentSearch<'_, S::Child>,
+        range: Range<usize>,
+        scratch: &mut Vec<Survivor>,
+        threshold: Option<Score>,
+    ) -> crate::Result<()> {
+        for start in (range.start..range.end).step_by(64) {
+            collect_cluster_survivors(
+                &segment.vec,
+                start..(start + 64).min(range.end),
+                None,
+                None,
+                None,
+                scratch,
+            );
+            self.score(segment, scratch, threshold)?;
         }
         Ok(())
     }
@@ -357,22 +480,9 @@ impl<T: VectorElement, S: SortKeyComputer> ProbeCollector<'_, T, S> {
         scratch: &mut Vec<Survivor>,
         threshold: Option<Score>,
     ) -> crate::Result<()> {
-        self.work.opens += probe.work.opens;
-        self.work.rows += probe.work.rows;
-        if probe.skipped {
-            self.stats.bounds_skips += 1;
+        if !self.record_probe(rank, probe) {
             return Ok(());
         }
-        if probe.work.opens == 0 {
-            return Ok(());
-        }
-        self.stats.segment_opens += 1;
-        self.stats.vectors_visited += probe.visited;
-        self.stats.pruned_filter += probe.filtered;
-        self.stats.pruned_dead += probe.dead;
-        self.stats.pruned_seen += probe.duplicates;
-        self.stats.candidates_scored += probe.work.rows as usize;
-        self.stats.cluster_flags[rank] |= if probe.work.rows == 0 { 1 } else { 3 };
         if let Some(range) = &probe.direct {
             collect_cluster_survivors(&segment.vec, range.clone(), None, None, None, scratch);
             self.score(segment, scratch, threshold)?;
@@ -455,6 +565,7 @@ where
         pending: TopNComputer::new_with_comparator(top_n, NaturalComparator),
         limit: top_n,
         work: ClusterWork::default(),
+        row_scratch: Vec::new(),
         control,
         stats: ProbeStats {
             cluster_flags: vec![0; plan.clusters.len()],
@@ -462,6 +573,11 @@ where
         },
     };
     let all = weight.matches_all_docs();
+    if plan.initial_wave.is_some() && !all {
+        return Err(TantivyError::InvalidArgument(
+            "a budgeted all-docs vector plan cannot search a filtered query".into(),
+        ));
+    }
     let mut segments = Vec::new();
     let mut scratch = Vec::new();
     for ord in segment_ordinals {
@@ -523,7 +639,9 @@ where
         return Ok((Vec::new(), collector.stats));
     }
     let sharing = all && plan.shareable && collector.control.work_sharing();
-    let initial_wave = sharing.then_some(plan.initial_wave).flatten();
+    let initial_wave = (all && plan.shareable)
+        .then_some(plan.initial_wave)
+        .flatten();
     let mut threshold = if initial_wave.is_some() {
         None
     } else {
@@ -534,13 +652,20 @@ where
     let mut spent = 0.0;
     let assigned = segments.len();
     while start < plan.clusters.len() && spent < plan.budget.limit {
-        let end = (start + PROBE_WAVE_SIZE).min(plan.clusters.len());
         let initial_wave = (start == 0).then_some(initial_wave).flatten();
-        let mut costs = vec![ClusterWork::default(); end - start];
+        let end = initial_wave.map_or_else(
+            || (start + PROBE_WAVE_SIZE).min(plan.clusters.len()),
+            |wave| wave.end,
+        );
+        let mut costs = if initial_wave.is_none() {
+            vec![ClusterWork::default(); end - start]
+        } else {
+            Vec::new()
+        };
         let mut prepared_segments = Vec::with_capacity(segments.len());
         for segment in segments[..assigned]
             .iter_mut()
-            .filter(|_| initial_wave.is_none())
+            .filter(|_| initial_wave.is_none() || !sharing)
         {
             collector.control.check_interrupt();
             let mut probes = Vec::with_capacity(end - start);
@@ -555,14 +680,18 @@ where
                     &mut scratch,
                     &mut rows,
                 );
-                costs[offset].opens += probe.work.opens;
-                costs[offset].rows += probe.work.rows;
+                if initial_wave.is_none() {
+                    costs[offset].opens += probe.work.opens;
+                    costs[offset].rows += probe.work.rows;
+                }
                 probes.push(probe);
             }
             prepared_segments.push((probes, rows));
         }
         let wave = if let Some(wave) = initial_wave {
-            collector.control.publish_initial_wave(wave);
+            if sharing {
+                collector.control.publish_initial_wave(wave);
+            }
             wave
         } else {
             collector
@@ -581,8 +710,10 @@ where
                 .collect();
             let first_helper =
                 (assigned_ordinals.first().copied().unwrap_or(0) as usize + 1) % segment_count;
+
             let order_segments = assigned_ordinals
-                .into_iter()
+                .iter()
+                .copied()
                 .chain((0..segment_count).map(|i| ((first_helper + i) % segment_count) as u32));
             for ord in order_segments {
                 loop {
@@ -604,6 +735,11 @@ where
                     };
                     let segment = &mut segments[position];
                     let begin = batch * PROBE_BATCH_SIZE;
+                    #[cfg(not(test))]
+                    let coalesce = true;
+                    #[cfg(test)]
+                    let coalesce = collector.control.coalesce_direct_ranges();
+                    let mut contiguous: Option<Range<usize>> = None;
                     for &rank in &order[begin..(begin + PROBE_BATCH_SIZE).min(order.len())] {
                         let probe = ClusterProbe::prepare(
                             segment,
@@ -614,7 +750,44 @@ where
                             &mut scratch,
                             &mut Vec::new(),
                         );
+                        if coalesce {
+                            if probe.work.opens == 0 {
+                                collector.record_probe(rank, &probe);
+                                continue;
+                            }
+                            if let Some(range) = &probe.direct {
+                                if contiguous
+                                    .as_ref()
+                                    .is_some_and(|pending| pending.end != range.start)
+                                {
+                                    let pending = contiguous.take().unwrap();
+                                    collector.score_direct_range(
+                                        segment,
+                                        pending,
+                                        &mut scratch,
+                                        threshold,
+                                    )?;
+                                }
+                                let start = contiguous
+                                    .as_ref()
+                                    .map_or(range.start, |pending| pending.start);
+                                contiguous = Some(start..range.end);
+                                collector.record_probe(rank, &probe);
+                                continue;
+                            }
+                            if let Some(pending) = contiguous.take() {
+                                collector.score_direct_range(
+                                    segment,
+                                    pending,
+                                    &mut scratch,
+                                    threshold,
+                                )?;
+                            }
+                        }
                         collector.probe(segment, rank, &probe, &[], &mut scratch, threshold)?;
+                    }
+                    if let Some(pending) = contiguous {
+                        collector.score_direct_range(segment, pending, &mut scratch, threshold)?;
                     }
                 }
             }

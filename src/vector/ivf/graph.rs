@@ -499,6 +499,7 @@ pub struct SearchIterator<'g, 'w, S: VectorArena, const RESUMABLE: bool> {
     rng: &'g RelativeNeighborhoodGraph<S>,
     workspace: &'w mut Workspace,
     query: &'g [S::Elem],
+    scores: Option<&'g [Similarity]>,
     /// Beam width of each round.
     ef: usize,
     /// The current converged batch, sorted ascending so popping from the back
@@ -525,9 +526,11 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
         query: &'g [S::Elem],
         seeds: &[NodeId],
         ef: usize,
+        scores: Option<&'g [Similarity]>,
     ) -> Self {
         debug_assert_eq!(query.len(), rng.graph.dim(), "query dimension mismatch");
         let n = rng.graph.len();
+        assert!(scores.is_none_or(|scores| scores.len() == n));
         workspace.begin_query(n);
 
         let arena = rng.graph.arena();
@@ -540,7 +543,10 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
             }
             workspace.visited.insert(node_id);
             metrics.visited_count += 1;
-            let sim = arena.similarity(rng.metric, dim, node_id, query);
+            let sim = scores.map_or_else(
+                || arena.similarity(rng.metric, dim, node_id, query),
+                |scores| scores[node_id as usize],
+            );
             workspace.frontier.push(Candidate { sim, node: node_id });
         }
 
@@ -548,6 +554,7 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
             rng,
             workspace,
             query,
+            scores,
             ef,
             batch: Vec::new(),
             metrics,
@@ -613,7 +620,10 @@ impl<'g, 'w, S: VectorArena, const RESUMABLE: bool> SearchIterator<'g, 'w, S, RE
                 ws.visited.insert(neighbor);
                 self.metrics.visited_count += 1;
 
-                let sim = arena.similarity(metric, dim, neighbor, self.query);
+                let sim = self.scores.map_or_else(
+                    || arena.similarity(metric, dim, neighbor, self.query),
+                    |scores| scores[neighbor as usize],
+                );
                 ws.frontier.push(Candidate {
                     sim,
                     node: neighbor,
@@ -685,7 +695,8 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         if self.graph.is_empty() || k == 0 {
             return (Vec::new(), NeighborhoodGraphSearchMetrics::default());
         }
-        let mut iter = OneShotSearchIterator::new(self, ws, query, seeds, self.config.ef.max(k));
+        let mut iter =
+            OneShotSearchIterator::new(self, ws, query, seeds, self.config.ef.max(k), None);
         let out: Vec<Candidate> = iter.by_ref().take(k).collect();
         let metrics = iter.metrics();
         (out, metrics)
@@ -709,7 +720,17 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
         query: &'g [S::Elem],
         seeds: &[NodeId],
     ) -> ResumableSearchIterator<'g, 'w, S> {
-        ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef)
+        ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef, None)
+    }
+
+    pub(crate) fn search_iter_with_scores<'g, 'w>(
+        &'g self,
+        ws: &'w mut Workspace,
+        query: &'g [S::Elem],
+        seeds: &[NodeId],
+        scores: &'g [Similarity],
+    ) -> ResumableSearchIterator<'g, 'w, S> {
+        ResumableSearchIterator::new(self, ws, query, seeds, self.config.ef, Some(scores))
     }
 
     /// Writes the durable part of the index — the inner [`Graph`]'s adjacency;

@@ -220,6 +220,74 @@ pub fn dot_bytes<T: VectorElement>(query: &[T], doc_bytes: &[u8]) -> f32 {
     acc
 }
 
+pub(crate) struct DotAccumulator {
+    sums: [f32; LANES],
+    carry: [u8; 64],
+    carry_len: usize,
+    position: usize,
+}
+
+impl DotAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            sums: [0.0; LANES],
+            carry: [0; 64],
+            carry_len: 0,
+            position: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push<T: VectorElement>(&mut self, query: &[T], mut bytes: &[u8]) {
+        debug_assert_eq!(T::SIZE_BYTES, 4);
+        let mut sums = self.sums;
+        let mut position = self.position;
+        if self.carry_len > 0 {
+            let take = (64 - self.carry_len).min(bytes.len());
+            self.carry[self.carry_len..self.carry_len + take].copy_from_slice(&bytes[..take]);
+            self.carry_len += take;
+            bytes = &bytes[take..];
+            if self.carry_len < 64 {
+                return;
+            }
+            let qc = &query[position..position + LANES];
+            for i in 0..LANES {
+                let value = T::decode_le(&self.carry[i * 4..(i + 1) * 4]);
+                sums[i] += T::product(qc[i], value);
+            }
+            position += LANES;
+            self.carry_len = 0;
+        }
+        let mut chunks = bytes.chunks_exact(64);
+        for (qc, bc) in query[position..].chunks_exact(LANES).zip(chunks.by_ref()) {
+            for i in 0..LANES {
+                let value = T::decode_le(&bc[i * 4..(i + 1) * 4]);
+                sums[i] += T::product(qc[i], value);
+            }
+            position += LANES;
+        }
+        self.sums = sums;
+        self.position = position;
+        let remainder = chunks.remainder();
+        self.carry[..remainder.len()].copy_from_slice(remainder);
+        self.carry_len = remainder.len();
+    }
+
+    #[inline]
+    pub(crate) fn finish<T: VectorElement>(&mut self, query: &[T]) -> f32 {
+        debug_assert_eq!(self.position * 4 + self.carry_len, query.len() * 4);
+        let mut score: f32 = self.sums.iter().sum();
+        for (i, &q) in query[self.position..].iter().enumerate() {
+            let value = T::decode_le(&self.carry[i * 4..(i + 1) * 4]);
+            score += T::product(q, value);
+        }
+        self.sums.fill(0.0);
+        self.position = 0;
+        self.carry_len = 0;
+        score
+    }
+}
+
 /// `norm_squared` over little-endian bytes encoding `T`.
 #[inline]
 pub fn norm_squared_bytes<T: VectorElement>(doc_bytes: &[u8]) -> f32 {

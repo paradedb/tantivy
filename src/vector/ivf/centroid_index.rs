@@ -28,8 +28,9 @@ use super::{decode_row, encode_vector, IvfCentroids};
 use crate::core::CENTROIDS_FILEPATH;
 use crate::directory::{CompositeFile, CompositeWrite, Directory, FileSlice};
 use crate::schema::{Field, FieldType, Metric, Schema, VectorOptions};
-use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome, Similarity};
 use crate::vector::header::{centroid_index_slot, read_header, write_header, VectorFileVersion};
+use crate::vector::index_reader::visit_rows;
 use crate::vector::router::{InMemoryRouter, LazyRouter, RouterIter, RouterKind, RouterWorkspace};
 use crate::TantivyError;
 
@@ -326,7 +327,7 @@ impl CachedCentroidIndex {
             let router = router.open(
                 reader.version,
                 reader.router_slice(field)?,
-                rows_slice,
+                rows_slice.clone(),
                 &routing_options,
             )?;
             fields.insert(
@@ -335,6 +336,7 @@ impl CachedCentroidIndex {
                     num_centroids,
                     routing_options,
                     router,
+                    rows: rows_slice,
                 },
             );
         }
@@ -353,6 +355,7 @@ pub(crate) struct FieldRouter {
     num_centroids: usize,
     routing_options: VectorOptions,
     router: LazyRouter,
+    rows: FileSlice,
 }
 
 impl FieldRouter {
@@ -370,7 +373,215 @@ impl FieldRouter {
         workspace: &'workspace mut RouterWorkspace,
         query: &'router [f32],
     ) -> RouterIter<'router, 'workspace> {
+        self.rank_clusters_with_scores(workspace, query, None)
+    }
+
+    pub(crate) fn rank_clusters_with_scores<'router, 'workspace>(
+        &'router self,
+        workspace: &'workspace mut RouterWorkspace,
+        query: &'router [f32],
+        scores: Option<&'router [Similarity]>,
+    ) -> RouterIter<'router, 'workspace> {
         self.router
-            .rank(workspace, query, self.routing_options.metric())
+            .rank(workspace, query, self.routing_options.metric(), scores)
+    }
+
+    pub(crate) fn precompute_scores(
+        &self,
+        query: &[f32],
+    ) -> crate::Result<Option<Vec<Similarity>>> {
+        const MAX_SCORE_BYTES: usize = 1024 * 1024;
+        if !matches!(self.router, LazyRouter::Rng(_))
+            || self.num_centroids > MAX_SCORE_BYTES / std::mem::size_of::<Similarity>()
+        {
+            return Ok(None);
+        }
+        let mut scores = Vec::with_capacity(self.num_centroids);
+        let mut scratch = Vec::new();
+        for begin in (0..self.num_centroids).step_by(64) {
+            visit_rows(
+                &self.rows,
+                self.routing_options.bytes_per_vector(),
+                begin..(begin + 64).min(self.num_centroids),
+                &mut scratch,
+                |_, bytes| {
+                    scores.push(self.routing_options.metric().similarity_bytes(query, bytes))
+                },
+            )?;
+        }
+        Ok(Some(scores))
+    }
+}
+
+#[cfg(test)]
+mod score_tests {
+    use std::io;
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::directory::FileHandle;
+    use crate::vector::distance::norm_squared_wide;
+    use crate::vector::ivf::graph::Graph;
+
+    #[derive(Debug)]
+    struct CountedRows {
+        bytes: OwnedBytes,
+        chunk_size: usize,
+        requests: Mutex<Vec<Range<usize>>>,
+    }
+
+    impl HasLen for CountedRows {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl FileHandle for CountedRows {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            self.requests.lock().unwrap().push(range.clone());
+            Ok(self.bytes.slice(range))
+        }
+
+        fn read_bytes_chunks(
+            &self,
+            range: Range<usize>,
+            visitor: &mut dyn FnMut(&[u8]),
+        ) -> io::Result<()> {
+            let bytes = self.read_bytes(range)?;
+            if self.chunk_size == 0 {
+                visitor(&bytes);
+            } else {
+                for chunk in bytes.chunks(self.chunk_size) {
+                    visitor(chunk);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn field_router(
+        metric: Metric,
+        count: usize,
+        dim: usize,
+        chunk_size: usize,
+    ) -> crate::Result<(FieldRouter, Arc<CountedRows>)> {
+        let options = VectorOptions::new(dim, metric);
+        let mut bytes = Vec::new();
+        for row in 0..count {
+            let mut values: Vec<u8> = (0..dim)
+                .flat_map(|col| (((row / 2 + col * 3) % 23) as f32 * 0.125).to_le_bytes())
+                .collect();
+            maybe_normalize_bytes(&options, &mut values);
+            bytes.extend_from_slice(&values);
+        }
+        let file = Arc::new(CountedRows {
+            bytes: OwnedBytes::new(bytes),
+            chunk_size,
+            requests: Mutex::new(Vec::new()),
+        });
+        let rows = FileSlice::new(file.clone());
+        let mut graph = Graph::new(vec![0.0f32; count * dim], dim, 2);
+        for row in 0..count {
+            if row > 0 {
+                graph.add_edge(row as u32, row as u32 - 1, Similarity::new(1.0));
+            }
+            if row + 1 < count {
+                graph.add_edge(row as u32, row as u32 + 1, Similarity::new(1.0));
+            }
+        }
+        let mut payload = vec![RouterKind::Rng as u8];
+        graph.serialize(&mut payload)?;
+        let routing_options = router_options(&options);
+        let router = RouterKind::Rng.open(
+            VectorFileVersion::V3,
+            FileSlice::from(payload),
+            rows.clone(),
+            &routing_options,
+        )?;
+        Ok((
+            FieldRouter {
+                num_centroids: count,
+                routing_options,
+                router,
+                rows,
+            },
+            file,
+        ))
+    }
+
+    #[test]
+    fn streamed_scores_preserve_rng_order_bits_and_metrics() -> crate::Result<()> {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            for chunk_size in [0, 29] {
+                let (router, file) = field_router(metric, 139, 17, chunk_size)?;
+                let mut query: Vec<_> = (0..17).map(|i| i as f32 * 0.03 - 0.2).collect();
+                if metric == Metric::Cosine {
+                    let norm = norm_squared_wide(&query).sqrt();
+                    for value in &mut query {
+                        *value = (f64::from(*value) / norm) as f32;
+                    }
+                }
+                let scores = router.precompute_scores(&query)?.unwrap();
+                assert_eq!(scores.len(), 139);
+                let requests = file.requests.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert!(requests.iter().all(|range| range.len() <= 64 * 17 * 4));
+                assert_eq!(requests.first().unwrap().start, 0);
+                assert_eq!(requests.last().unwrap().end, file.len());
+                drop(requests);
+                let mut lazy_workspace = RouterWorkspace::default();
+                let mut scored_workspace = RouterWorkspace::default();
+                let mut lazy = router.rank_clusters(&mut lazy_workspace, &query);
+                let mut scored =
+                    router.rank_clusters_with_scores(&mut scored_workspace, &query, Some(&scores));
+                for _ in 0..140 {
+                    let expected = lazy.next();
+                    let reads = file.requests.lock().unwrap().len();
+                    let actual = scored.next();
+                    assert_eq!(file.requests.lock().unwrap().len(), reads);
+                    assert_eq!(
+                        actual.map(|c| (c.node, c.sim.score().to_bits())),
+                        expected.map(|c| (c.node, c.sim.score().to_bits())),
+                    );
+                    assert_eq!(
+                        serde_json::to_value(scored.metrics())?,
+                        serde_json::to_value(lazy.metrics())?,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn score_cap_and_non_rng_leave_rows_lazy() -> crate::Result<()> {
+        let (router, file) = field_router(Metric::Dot, 1024 * 1024 / 4 + 1, 1, 0)?;
+        assert!(router.precompute_scores(&[1.0])?.is_none());
+        assert!(file.requests.lock().unwrap().is_empty());
+
+        let options = VectorOptions::new(1, Metric::Dot);
+        let mut centroids = IvfCentroids::F32(crate::vector::IvfMatrix {
+            values: vec![0.0, 1.0, 1.0],
+            rows: 3,
+            dims: 1,
+        });
+        let built = RouterKind::Exact.build(&options, &mut centroids)?;
+        let mut payload = Vec::new();
+        built.serialize(&mut payload)?;
+        let rows = FileSlice::from(vec![0; 12]);
+        let router = FieldRouter {
+            num_centroids: 3,
+            routing_options: options.clone(),
+            router: RouterKind::Exact.open(
+                VectorFileVersion::V3,
+                FileSlice::from(payload),
+                rows.clone(),
+                &options,
+            )?,
+            rows,
+        };
+        assert!(router.precompute_scores(&[1.0])?.is_none());
+        Ok(())
     }
 }
