@@ -22,6 +22,7 @@ mod distance;
 mod header;
 mod id_map;
 mod index_reader;
+pub(crate) mod routing_metadata;
 mod search;
 mod writer;
 
@@ -32,6 +33,7 @@ pub mod router;
 pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
+pub(crate) const VMETA_EXT: &str = "vmeta";
 
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,

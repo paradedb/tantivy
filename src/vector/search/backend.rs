@@ -2879,6 +2879,128 @@ mod tests {
     }
 
     #[test]
+    fn routing_metadata_sidecar_preserves_legacy_prefix_work_and_results() -> crate::Result<()> {
+        use crate::directory::{Directory, TerminatingWrite};
+        use crate::index::SegmentComponent;
+        use crate::vector::routing_metadata::VectorRoutingMetadata;
+        use crate::vector::VMETA_EXT;
+
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        for (replicas, merge, delete) in [
+            (1, false, false),
+            (1, false, true),
+            (2, false, false),
+            (2, true, true),
+        ] {
+            let (index, field, label) = build_ivf(
+                Metric::L2,
+                &centroids,
+                &[&docs[..18], &docs[18..]],
+                replicas,
+                merge,
+            )?;
+            if delete {
+                let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+                writer.set_merge_policy(Box::new(NoMergePolicy));
+                writer.delete_term(Term::from_field_text(label, docs[0].0));
+                writer.commit()?;
+                writer.wait_merging_threads()?;
+            }
+            let segments = index.searchable_segments()?;
+            let paths: Vec<_> = segments
+                .iter()
+                .map(|segment| {
+                    segment.relative_path(SegmentComponent::Custom(VMETA_EXT.to_string()))
+                })
+                .collect();
+            assert!(paths
+                .iter()
+                .all(|path| index.directory().exists(path).unwrap()));
+            let query = vec![1.0f32, 1.5];
+            let collector = TopDocs::with_limit(10).order_by_similarity(field, query.clone());
+            let filters: Vec<Box<dyn Query>> = vec![
+                Box::new(AllQuery),
+                Box::new(TermQuery::new(
+                    Term::from_field_text(label, docs[3].0),
+                    IndexRecordOption::Basic,
+                )),
+                Box::new(TermQuery::new(
+                    Term::from_field_text(label, "missing"),
+                    IndexRecordOption::Basic,
+                )),
+            ];
+            let run = || -> crate::Result<Vec<_>> {
+                let searcher = index.reader()?.searcher();
+                let mut observations = Vec::new();
+                for fraction in [0.001, 0.5, 1.0] {
+                    let params = AdaptiveProbeParams {
+                        max_probe_fraction: fraction,
+                        min_probe_clusters: 1,
+                    };
+                    for (i, filter) in filters.iter().enumerate() {
+                        let plan =
+                            PreparedVectorSearch::new(&searcher, field, &query, &params, i == 0)?;
+                        let fruit = collector.search_prepared(
+                            &searcher,
+                            filter.as_ref(),
+                            &plan,
+                            0..searcher.segment_readers().len() as u32,
+                            &mut (),
+                        )?;
+                        let mut stats = serde_json::to_value(&fruit.stats)?;
+                        stats
+                            .as_object_mut()
+                            .unwrap()
+                            .retain(|key, _| !key.ends_with("_time_ns"));
+                        let plan = serde_json::json!({
+                            "incremental": plan.incremental,
+                            "shareable": plan.shareable,
+                            "centroids": plan.num_centroids,
+                            "budget": [plan.budget.limit.to_bits(), plan.budget.open.to_bits(), plan.budget.row.to_bits()],
+                            "wave": plan.initial_wave.map(|wave| (wave.end, wave.spent.to_bits())),
+                            "clusters": plan.clusters.iter().map(|cluster| (cluster.id, cluster.similarity.to_bits())).collect::<Vec<_>>(),
+                            "routing": plan.routing,
+                        });
+                        let results: Vec<_> = fruit
+                            .results
+                            .iter()
+                            .map(|(score, addr)| (score.to_bits(), *addr))
+                            .collect();
+                        observations.push((plan, stats, results, fruit.stats.cluster_flags));
+                    }
+                }
+                Ok(observations)
+            };
+            let expected = run()?;
+            for path in &paths {
+                index.directory().delete(path).unwrap();
+                assert_eq!(run()?, expected);
+            }
+            let searcher = index.reader()?.searcher();
+            for segment in searcher.segment_readers() {
+                let routing = VectorRoutingMetadata::open(segment, field)?;
+                let full = segment.vector_index(field)?;
+                assert_eq!(routing.num_docs(), full.num_vectors());
+                assert_eq!(routing.num_rows(), full.clusters().unwrap().num_rows());
+            }
+            let mut write = index.directory().open_write(&paths[0])?;
+            use std::io::Write;
+            write.write_all(b"corrupt routing metadata")?;
+            write.terminate()?;
+            assert!(PreparedVectorSearch::new(
+                &index.reader()?.searcher(),
+                field,
+                &query,
+                &exhaustive_params(centroids.len()),
+                true,
+            )
+            .is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn precomputed_centroid_plan_preserves_prefix_and_eligibility() -> crate::Result<()> {
         let (centroids, labels) = replication_fixture();
         let docs = replication_docs(&centroids, &labels);

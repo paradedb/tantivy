@@ -300,8 +300,8 @@ impl VectorIndexMetadata {
         }
     }
 
-    pub(crate) fn options(&self) -> &VectorOptions {
-        &self.options
+    pub(crate) fn num_vectors(&self) -> usize {
+        self.num_vectors
     }
 
     pub(crate) fn clusters(&self) -> Option<&SegmentClusters> {

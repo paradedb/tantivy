@@ -13,7 +13,7 @@ use super::header::{vec_slot, write_header};
 use super::id_map::IdMap;
 use super::ivf::centroid_index::CentroidIndexReader;
 use super::ivf::{write_ivf_field, IvfFieldWriteParams};
-use super::VEC_EXT;
+use super::{routing_metadata, VEC_EXT, VMETA_EXT};
 use crate::directory::CompositeWrite;
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
@@ -171,6 +171,10 @@ impl PluginWriter for VecWriter {
         let mut write = segment.open_write(SegmentComponent::Custom(VEC_EXT.to_string()))?;
         write_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
+        let mut metadata_file =
+            segment.open_write(SegmentComponent::Custom(VMETA_EXT.to_string()))?;
+        routing_metadata::write_header(&mut metadata_file)?;
+        let mut metadata_write = CompositeWrite::wrap(metadata_file);
         let cancel = || false;
         let schema = segment.schema();
 
@@ -208,6 +212,9 @@ impl PluginWriter for VecWriter {
                 let rows_w = composite.for_field_with_idx(field, vec_slot::ROWS);
                 rows_w.write_all(&row_bytes)?;
                 rows_w.flush()?;
+                let metadata_w = metadata_write.for_field(field);
+                routing_metadata::serialize_field(metadata_w, present.len(), None)?;
+                metadata_w.flush()?;
                 continue;
             };
 
@@ -223,6 +230,7 @@ impl PluginWriter for VecWriter {
             };
             write_ivf_field(
                 &mut composite,
+                &mut metadata_write,
                 &params,
                 &mut |sink| {
                     for (row_idx, &doc_id) in present.iter().enumerate() {
@@ -241,6 +249,7 @@ impl PluginWriter for VecWriter {
             )?;
         }
         composite.close()?;
+        metadata_write.close()?;
         Ok(())
     }
 
@@ -271,7 +280,7 @@ pub struct VectorPlugin;
 
 impl crate::plugin::SegmentPlugin for VectorPlugin {
     fn extensions(&self) -> &[&str] {
-        &[VEC_EXT]
+        &[VEC_EXT, VMETA_EXT]
     }
 
     fn create_writer(

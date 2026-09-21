@@ -20,6 +20,7 @@ use crate::vector::ivf::bounds::{
 };
 use crate::vector::ivf::AdaptiveProbeParams;
 use crate::vector::router::RouterWorkspace;
+use crate::vector::routing_metadata::VectorRoutingMetadata;
 use crate::vector::{RouterMetrics, VectorElement};
 use crate::{DocAddress, Score, Searcher, SegmentOrdinal, TantivyError};
 
@@ -202,15 +203,14 @@ impl PreparedVectorSearch {
         let mut vectors = Vec::new();
         let phase_started = Instant::now();
         for reader in searcher.segment_readers() {
-            let vector = reader.vector_index_metadata(field)?;
+            let vector = VectorRoutingMetadata::open(reader, field)?;
             plan.shareable &= reader.alive_bitset().is_none()
-                && vector
-                    .clusters()
-                    .is_some_and(|ivf| ivf.num_rows() == ivf.num_docs());
-            if let Some(ivf) = vector.clusters() {
+                && vector.is_clustered()
+                && vector.num_rows() == vector.num_docs();
+            if vector.is_clustered() {
                 options = Some(vector.options().clone());
-                docs += ivf.num_docs();
-                nonempty += ivf.num_non_empty_clusters();
+                docs += vector.num_docs();
+                nonempty += vector.num_non_empty_clusters();
             }
             vectors.push(vector);
         }
@@ -223,6 +223,14 @@ impl PreparedVectorSearch {
         plan.num_centroids = searcher.index().centroid_count(field)?.ok_or_else(|| {
             TantivyError::InternalError(format!("missing centroid router for {field:?}"))
         })?;
+        if vectors
+            .iter()
+            .any(|vector| vector.is_clustered() && vector.num_clusters() != plan.num_centroids)
+        {
+            return Err(TantivyError::InternalError(
+                "centroid and segment cluster counts differ".into(),
+            ));
+        }
         plan.routing_phases.router_open_time_ns = phase_started.elapsed().as_nanos() as u64;
         let (limit, open, row) =
             super::resolve_budget_counts(adaptive, plan.num_centroids, docs, nonempty)?;
@@ -287,13 +295,9 @@ impl PreparedVectorSearch {
                 }
                 let mut cost = ClusterWork::default();
                 for vector in &vectors {
-                    if let Some(range) = vector
-                        .clusters()
-                        .unwrap()
-                        .non_empty_cluster_range(cluster.id as usize)
-                    {
+                    if let Some(rows) = vector.cluster_rows(cluster.id as usize)? {
                         cost.opens += 1;
-                        cost.rows += range.len() as u64;
+                        cost.rows += rows as u64;
                     }
                 }
                 wave.spent += plan.budget.charge(cost);

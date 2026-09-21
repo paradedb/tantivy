@@ -25,7 +25,9 @@ use crate::vector::distance::{maybe_normalize_bytes, norm_squared_bytes_wide, No
 use crate::vector::header::{vec_slot, write_header};
 use crate::vector::id_map::IdMap;
 use crate::vector::ivf::centroid_index::{CentroidIndexReader, FieldCentroids};
-use crate::vector::{residual_norm, BoundKind, BoundsBuilder, BoundsScope, VEC_EXT};
+use crate::vector::{
+    residual_norm, routing_metadata, BoundKind, BoundsBuilder, BoundsScope, VEC_EXT, VMETA_EXT,
+};
 use crate::{DocId, TantivyError};
 
 /// Vectors decoded per assignment batch; score tiles are bounded separately.
@@ -79,6 +81,7 @@ pub(crate) struct IvfFieldWriteParams<'a> {
 /// docs written.
 pub(crate) fn write_ivf_field(
     vec_write: &mut CompositeWrite,
+    metadata_write: &mut CompositeWrite,
     params: &IvfFieldWriteParams<'_>,
     iterate: &mut dyn FnMut(
         &mut dyn FnMut(DocId, u64, &[u8]) -> crate::Result<()>,
@@ -287,6 +290,11 @@ pub(crate) fn write_ivf_field(
         SegmentClusters::serialize_ivf_meta(num_present_docs, num_centroids, meta_w)?;
         meta_w.flush()?;
     }
+    {
+        let metadata_w = metadata_write.for_field(params.field);
+        routing_metadata::serialize_field(metadata_w, num_present_docs, Some(&cluster_offsets))?;
+        metadata_w.flush()?;
+    }
 
     log::info!(
         target: "paradedb::ivf_build",
@@ -323,6 +331,7 @@ const DOC_DROPPED: DocId = DocId::MAX;
 /// Returns the distinct doc count written.
 fn merge_ivf_field(
     vec_write: &mut CompositeWrite,
+    metadata_write: &mut CompositeWrite,
     params: &IvfFieldWriteParams<'_>,
     field_readers: &[std::sync::Arc<crate::vector::VectorIndexReader>],
     old_to_new: &[Vec<DocId>],
@@ -567,6 +576,11 @@ fn merge_ivf_field(
         SegmentClusters::serialize_ivf_meta(num_present_docs, num_centroids, meta_w)?;
         meta_w.flush()?;
     }
+    {
+        let metadata_w = metadata_write.for_field(field);
+        routing_metadata::serialize_field(metadata_w, num_present_docs, Some(&cluster_offsets))?;
+        metadata_w.flush()?;
+    }
 
     log::info!(
         target: "paradedb::ivf_build",
@@ -626,6 +640,12 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     let mut vec_file = directory.open_write(&vec_path)?;
     write_header(&mut vec_file)?;
     let mut vec_write = CompositeWrite::wrap(vec_file);
+    let metadata_path = ctx
+        .target_segment
+        .relative_path(SegmentComponent::Custom(VMETA_EXT.to_string()));
+    let mut metadata_file = directory.open_write(&metadata_path)?;
+    routing_metadata::write_header(&mut metadata_file)?;
+    let mut metadata_write = CompositeWrite::wrap(metadata_file);
 
     // Source doc -> target doc, built once for every field. `DOC_DROPPED`
     // marks a doc the merge is dropping (deleted, or otherwise absent
@@ -689,6 +709,7 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
         };
         merge_ivf_field(
             &mut vec_write,
+            &mut metadata_write,
             &params,
             &field_readers,
             &old_to_new,
@@ -697,5 +718,6 @@ pub(crate) fn merge_ivf(ctx: &PluginMergeContext) -> crate::Result<()> {
     }
 
     vec_write.close()?;
+    metadata_write.close()?;
     Ok(())
 }
