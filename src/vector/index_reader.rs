@@ -24,8 +24,8 @@
 
 use common::{HasLen, OwnedBytes};
 
+use super::flat::IdMap;
 use super::header::{read_header, vec_slot, VectorFileVersion};
-use super::id_map::IdMap;
 use super::ivf::SegmentClusters;
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;

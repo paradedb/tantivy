@@ -8,18 +8,18 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use super::distance::{maybe_normalize_bytes, NormalizeOutcome};
-use super::header::{vec_slot, write_header};
 use super::id_map::IdMap;
-use super::ivf::centroid_index::CentroidIndexReader;
-use super::ivf::{write_ivf_field, IvfFieldWriteParams};
-use super::VEC_EXT;
 use crate::directory::CompositeWrite;
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
 use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
+use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
+use crate::vector::header::{vec_slot, write_header};
+use crate::vector::ivf::centroid_index::CentroidIndexReader;
+use crate::vector::ivf::{write_ivf_field, IvfFieldWriteParams};
+use crate::vector::VEC_EXT;
 use crate::{DocId, TantivyError};
 
 /// Per-field in-memory state: the doc ids that have a value (ascending),
@@ -259,29 +259,5 @@ impl PluginWriter for VecWriter {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
-    }
-}
-
-/// The segment plugin owning vector storage end-to-end: [`VecWriter`]
-/// during indexing, [`merge_ivf`](super::ivf) during merges, and
-/// [`VectorIndexReader`](super::VectorIndexReader) behind
-/// [`SegmentReader::vector_index`](crate::SegmentReader::vector_index)
-/// during reads.
-pub struct VectorPlugin;
-
-impl crate::plugin::SegmentPlugin for VectorPlugin {
-    fn extensions(&self) -> &[&str] {
-        &[VEC_EXT]
-    }
-
-    fn create_writer(
-        &self,
-        ctx: &crate::plugin::PluginWriterContext,
-    ) -> crate::Result<Box<dyn PluginWriter>> {
-        Ok(Box::new(VecWriter::for_schema(&ctx.segment.schema())))
-    }
-
-    fn merge(&self, ctx: crate::plugin::PluginMergeContext) -> crate::Result<()> {
-        super::ivf::merge_ivf(&ctx)
     }
 }

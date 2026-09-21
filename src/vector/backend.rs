@@ -317,42 +317,6 @@ mod tests {
     }
 
     /// Every doc address matching `filter`, across all segments.
-    fn collect_filter_doc_set(
-        index: &Index,
-        filter: &dyn Query,
-    ) -> crate::Result<std::collections::HashSet<DocAddress>> {
-        let searcher = index.reader()?.searcher();
-        let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
-        let mut set = std::collections::HashSet::new();
-        for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
-            weight.for_each_no_score(segment_reader, &mut |docs| {
-                for &doc in docs {
-                    set.insert(DocAddress::new(seg_ord as u32, doc));
-                }
-            })?;
-        }
-        Ok(set)
-    }
-
-    /// The stored label of `addr` — the segment-independent doc identity.
-    fn stored_label_at(
-        index: &Index,
-        label_field: crate::schema::Field,
-        addr: DocAddress,
-    ) -> crate::Result<String> {
-        use crate::schema::document::Value;
-        use crate::schema::TantivyDocument;
-        let searcher = index.reader()?.searcher();
-        let doc: TantivyDocument = searcher.doc(addr)?;
-        Ok(doc
-            .get_first(label_field)
-            .and_then(|v| v.as_str())
-            .expect("stored label")
-            .to_string())
-    }
-
-    // ---- Inline fixtures ----
-
     #[test]
     fn global_rng_routing_uses_one_budget() -> crate::Result<()> {
         let fixture = TestVectorIndex::builder(VectorDType::F32)
@@ -585,6 +549,211 @@ mod tests {
     /// brute-force oracle — per metric. Dot is EXHAUSTIVE-PROBE ONLY by
     /// design: it isn't a metric (no triangle inequality), so adaptive
     /// Dot recall is a benchmark question, deferred.
+    #[test]
+    fn merge_segments_with_deletes() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let n = docs.len();
+
+        let mut sb = Schema::builder();
+        let embed_field = sb.add_vector_field(
+            "embedding",
+            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let index = Index::builder()
+            .schema(sb.build())
+            .centroid_producer(Arc::new(InlineCentroidProducer {
+                centroids: centroids.clone(),
+            }))
+            .ivf_router(RouterKind::Rng)?
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let mid = n / 2;
+        for chunk in [&docs[..mid], &docs[mid..]] {
+            for (label, v) in chunk {
+                let mut doc = TantivyDocument::new();
+                doc.add_text(label_field, label);
+                doc.add_vector(embed_field, v.as_slice());
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+
+        // Tombstone docs in BOTH sources (d0/d7 in the first commit,
+        // d35 in the second), then merge everything into one segment.
+        let deleted = ["d0", "d7", "d35"];
+        for label in deleted {
+            writer.delete_term(Term::from_field_text(label_field, label));
+        }
+        writer.commit()?;
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let alive = n - deleted.len();
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
+        let segment_reader = &searcher.segment_readers()[0];
+        let vec_reader = segment_reader.vector_index(embed_field)?;
+        assert_eq!(
+            vec_reader.num_vectors(),
+            alive,
+            "deleted docs must not be counted"
+        );
+        // Every alive doc holds exactly one (replicas=1) membership, and
+        // the memberships cover the merged doc space exactly.
+        let ivf = vec_reader.clusters().expect("expected IVF storage");
+        assert_eq!(ivf.num_rows(), alive);
+        let mut all_docs: Vec<u32> = (0..ivf.num_clusters())
+            .flat_map(|c| vec_reader.cluster_doc_ids(c).expect("in-bounds"))
+            .collect();
+        all_docs.sort_unstable();
+        let expected: Vec<u32> = (0..alive as u32).collect();
+        assert_eq!(all_docs, expected, "memberships must cover the alive docs");
+        Ok(())
+    }
+
+    /// Merging when every doc carrying a vector for ONE field is deleted,
+    /// while another field keeps live vectors: the emptied field owns no
+    /// `.vec` slots at all and reads back as the empty placeholder — not
+    /// an error — while the live field is untouched.
+    #[test]
+    fn merge_deleting_every_doc_of_one_field_writes_no_slots() -> crate::Result<()> {
+        let (centroids, labels) = replication_fixture();
+        let docs = replication_docs(&centroids, &labels);
+        let n = docs.len();
+
+        let mut sb = Schema::builder();
+        let doomed_field = sb.add_vector_field(
+            "embedding_doomed",
+            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let kept_field = sb.add_vector_field(
+            "embedding_kept",
+            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
+        );
+        let label_field = sb.add_text_field("label", STRING | STORED);
+        let index = Index::builder()
+            .schema(sb.build())
+            .centroid_producer(Arc::new(InlineCentroidProducer {
+                centroids: centroids.clone(),
+            }))
+            .ivf_router(RouterKind::Rng)?
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        // Even docs carry the doomed field, odd docs the kept one, split
+        // across two commits so BOTH sources hold doomed vectors.
+        let mid = n / 2;
+        for (i, (label, v)) in docs.iter().enumerate() {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(label_field, label);
+            let field = if i % 2 == 0 { doomed_field } else { kept_field };
+            doc.add_vector(field, v.as_slice());
+            writer.add_document(doc)?;
+            if i + 1 == mid {
+                writer.commit()?;
+            }
+        }
+        writer.commit()?;
+
+        // Tombstone every doomed-field doc, then merge everything.
+        for (i, (label, _)) in docs.iter().enumerate() {
+            if i % 2 == 0 {
+                writer.delete_term(Term::from_field_text(label_field, label));
+            }
+        }
+        writer.commit()?;
+        let segment_ids = index.searchable_segment_ids()?;
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
+        let segment_reader = &searcher.segment_readers()[0];
+
+        // The emptied field reads back as the empty placeholder.
+        let vec_reader = segment_reader.vector_index(doomed_field)?;
+        assert_eq!(vec_reader.num_vectors(), 0);
+        assert!(vec_reader.is_empty());
+        assert!(vec_reader.info().is_none(), "no slots ⇒ no info");
+        assert!(vec_reader.clusters().is_none());
+
+        // The live field is untouched: every alive doc is counted.
+        let kept_count = n / 2;
+        assert_eq!(
+            segment_reader.vector_index(kept_field)?.num_vectors(),
+            kept_count
+        );
+        Ok(())
+    }
+
+    /// Captures `paradedb::ivf_build` log records so a test can read back the
+    /// timings line the build emits.
+    struct CaptureLogger;
+    static CAPTURED_IVF_BUILD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.target() == "paradedb::ivf_build"
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                CAPTURED_IVF_BUILD
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}", r.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+
+    /// Every field build emits one parseable `ivf_build timings_ms ...`
+    /// line. Builds a larger index so the phase timings are measurable,
+    /// captures the line, and prints it (run with `--nocapture`) so we can
+    /// see where build time goes.
+    #[test]
+    fn ivf_build_emits_timings_log() -> crate::Result<()> {
+        let _ = log::set_logger(&CAPTURE_LOGGER);
+        log::set_max_level(log::LevelFilter::Info);
+
+        // 200 centroids on a 20×10 grid; ~5000 docs clustered around them.
+        let mut centroids: Vec<[f32; 2]> = Vec::new();
+        for x in 0..20 {
+            for y in 0..10 {
+                centroids.push([x as f32 * 10.0, y as f32 * 10.0]);
+            }
+        }
+        let n_per = 25usize;
+        let labels: Vec<String> = (0..centroids.len() * n_per)
+            .map(|i| format!("d{i}"))
+            .collect();
+        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
+            .map(|i| {
+                let c = centroids[i / n_per];
+                let off = (i % n_per) as f32 * 0.05;
+                (labels[i].as_str(), [c[0] + off, c[1] + off])
+            })
+            .collect();
+
+        let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
+        let _ = build_inline_ivf(Metric::L2, &centroids, &docs, 8)?;
+        let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
+        let line = lines
+            .iter()
+            .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
+            .expect("expected an ivf_build timings line for the 200-centroid build");
+        assert!(line.contains("replicas=8"));
+        assert!(line.contains("assign="));
+        eprintln!("IVF_BUILD_SAMPLE {line}");
+        Ok(())
+    }
+    // ---- The flat (mutable/staging) tier ----
+
+    /// [`build_ivf`] without a centroid index: every segment stores flat.
     #[test]
     fn global_search_matches_brute_force_oracle_per_metric() -> crate::Result<()> {
         for (metric, queries) in [
@@ -954,7 +1123,7 @@ mod tests {
             total_docs += ivf.num_docs();
         }
         let n_avg = total_docs as f64 / centroids.len() as f64;
-        let x = crate::vector::search::backend::open_share(n_avg);
+        let x = crate::vector::backend::open_share(n_avg);
         let capacity = total_nonempty as f64 * x + (1.0 - x) * total_docs as f64 / n_avg;
 
         let (_, stats) = run_global(
@@ -1439,211 +1608,6 @@ mod tests {
     /// `.vec`), so the alive-doc merge iteration legitimately comes up
     /// short of `vector_count`. The merge must tolerate that, and the
     /// resulting segment must hold — and count — the alive docs only.
-    #[test]
-    fn merge_segments_with_deletes() -> crate::Result<()> {
-        let (centroids, labels) = replication_fixture();
-        let docs = replication_docs(&centroids, &labels);
-        let n = docs.len();
-
-        let mut sb = Schema::builder();
-        let embed_field = sb.add_vector_field(
-            "embedding",
-            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
-        );
-        let label_field = sb.add_text_field("label", STRING | STORED);
-        let index = Index::builder()
-            .schema(sb.build())
-            .centroid_producer(Arc::new(InlineCentroidProducer {
-                centroids: centroids.clone(),
-            }))
-            .ivf_router(RouterKind::Rng)?
-            .create_in_ram()?;
-        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
-        writer.set_merge_policy(Box::new(NoMergePolicy));
-        let mid = n / 2;
-        for chunk in [&docs[..mid], &docs[mid..]] {
-            for (label, v) in chunk {
-                let mut doc = TantivyDocument::new();
-                doc.add_text(label_field, label);
-                doc.add_vector(embed_field, v.as_slice());
-                writer.add_document(doc)?;
-            }
-            writer.commit()?;
-        }
-
-        // Tombstone docs in BOTH sources (d0/d7 in the first commit,
-        // d35 in the second), then merge everything into one segment.
-        let deleted = ["d0", "d7", "d35"];
-        for label in deleted {
-            writer.delete_term(Term::from_field_text(label_field, label));
-        }
-        writer.commit()?;
-        let segment_ids = index.searchable_segment_ids()?;
-        writer.merge(&segment_ids).wait()?;
-        writer.wait_merging_threads()?;
-
-        let alive = n - deleted.len();
-        let searcher = index.reader()?.searcher();
-        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
-        let segment_reader = &searcher.segment_readers()[0];
-        let vec_reader = segment_reader.vector_index(embed_field)?;
-        assert_eq!(
-            vec_reader.num_vectors(),
-            alive,
-            "deleted docs must not be counted"
-        );
-        // Every alive doc holds exactly one (replicas=1) membership, and
-        // the memberships cover the merged doc space exactly.
-        let ivf = vec_reader.clusters().expect("expected IVF storage");
-        assert_eq!(ivf.num_rows(), alive);
-        let mut all_docs: Vec<u32> = (0..ivf.num_clusters())
-            .flat_map(|c| vec_reader.cluster_doc_ids(c).expect("in-bounds"))
-            .collect();
-        all_docs.sort_unstable();
-        let expected: Vec<u32> = (0..alive as u32).collect();
-        assert_eq!(all_docs, expected, "memberships must cover the alive docs");
-        Ok(())
-    }
-
-    /// Merging when every doc carrying a vector for ONE field is deleted,
-    /// while another field keeps live vectors: the emptied field owns no
-    /// `.vec` slots at all and reads back as the empty placeholder — not
-    /// an error — while the live field is untouched.
-    #[test]
-    fn merge_deleting_every_doc_of_one_field_writes_no_slots() -> crate::Result<()> {
-        let (centroids, labels) = replication_fixture();
-        let docs = replication_docs(&centroids, &labels);
-        let n = docs.len();
-
-        let mut sb = Schema::builder();
-        let doomed_field = sb.add_vector_field(
-            "embedding_doomed",
-            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
-        );
-        let kept_field = sb.add_vector_field(
-            "embedding_kept",
-            VectorOptions::new(2, Metric::L2).with_dtype(VectorDType::F32),
-        );
-        let label_field = sb.add_text_field("label", STRING | STORED);
-        let index = Index::builder()
-            .schema(sb.build())
-            .centroid_producer(Arc::new(InlineCentroidProducer {
-                centroids: centroids.clone(),
-            }))
-            .ivf_router(RouterKind::Rng)?
-            .create_in_ram()?;
-        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
-        writer.set_merge_policy(Box::new(NoMergePolicy));
-
-        // Even docs carry the doomed field, odd docs the kept one, split
-        // across two commits so BOTH sources hold doomed vectors.
-        let mid = n / 2;
-        for (i, (label, v)) in docs.iter().enumerate() {
-            let mut doc = TantivyDocument::new();
-            doc.add_text(label_field, label);
-            let field = if i % 2 == 0 { doomed_field } else { kept_field };
-            doc.add_vector(field, v.as_slice());
-            writer.add_document(doc)?;
-            if i + 1 == mid {
-                writer.commit()?;
-            }
-        }
-        writer.commit()?;
-
-        // Tombstone every doomed-field doc, then merge everything.
-        for (i, (label, _)) in docs.iter().enumerate() {
-            if i % 2 == 0 {
-                writer.delete_term(Term::from_field_text(label_field, label));
-            }
-        }
-        writer.commit()?;
-        let segment_ids = index.searchable_segment_ids()?;
-        writer.merge(&segment_ids).wait()?;
-        writer.wait_merging_threads()?;
-
-        let searcher = index.reader()?.searcher();
-        assert_eq!(searcher.segment_readers().len(), 1, "one merged segment");
-        let segment_reader = &searcher.segment_readers()[0];
-
-        // The emptied field reads back as the empty placeholder.
-        let vec_reader = segment_reader.vector_index(doomed_field)?;
-        assert_eq!(vec_reader.num_vectors(), 0);
-        assert!(vec_reader.is_empty());
-        assert!(vec_reader.info().is_none(), "no slots ⇒ no info");
-        assert!(vec_reader.clusters().is_none());
-
-        // The live field is untouched: every alive doc is counted.
-        let kept_count = n / 2;
-        assert_eq!(
-            segment_reader.vector_index(kept_field)?.num_vectors(),
-            kept_count
-        );
-        Ok(())
-    }
-
-    /// Captures `paradedb::ivf_build` log records so a test can read back the
-    /// timings line the build emits.
-    struct CaptureLogger;
-    static CAPTURED_IVF_BUILD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    impl log::Log for CaptureLogger {
-        fn enabled(&self, m: &log::Metadata) -> bool {
-            m.target() == "paradedb::ivf_build"
-        }
-        fn log(&self, r: &log::Record) {
-            if self.enabled(r.metadata()) {
-                CAPTURED_IVF_BUILD
-                    .lock()
-                    .unwrap()
-                    .push(format!("{}", r.args()));
-            }
-        }
-        fn flush(&self) {}
-    }
-    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
-
-    /// Every field build emits one parseable `ivf_build timings_ms ...`
-    /// line. Builds a larger index so the phase timings are measurable,
-    /// captures the line, and prints it (run with `--nocapture`) so we can
-    /// see where build time goes.
-    #[test]
-    fn ivf_build_emits_timings_log() -> crate::Result<()> {
-        let _ = log::set_logger(&CAPTURE_LOGGER);
-        log::set_max_level(log::LevelFilter::Info);
-
-        // 200 centroids on a 20×10 grid; ~5000 docs clustered around them.
-        let mut centroids: Vec<[f32; 2]> = Vec::new();
-        for x in 0..20 {
-            for y in 0..10 {
-                centroids.push([x as f32 * 10.0, y as f32 * 10.0]);
-            }
-        }
-        let n_per = 25usize;
-        let labels: Vec<String> = (0..centroids.len() * n_per)
-            .map(|i| format!("d{i}"))
-            .collect();
-        let docs: Vec<(&str, [f32; 2])> = (0..centroids.len() * n_per)
-            .map(|i| {
-                let c = centroids[i / n_per];
-                let off = (i % n_per) as f32 * 0.05;
-                (labels[i].as_str(), [c[0] + off, c[1] + off])
-            })
-            .collect();
-
-        let before = CAPTURED_IVF_BUILD.lock().unwrap().len();
-        let _ = build_inline_ivf(Metric::L2, &centroids, &docs, 8)?;
-        let lines: Vec<String> = CAPTURED_IVF_BUILD.lock().unwrap()[before..].to_vec();
-        let line = lines
-            .iter()
-            .find(|l| l.contains("ivf_build timings_ms") && l.contains("centroids=200"))
-            .expect("expected an ivf_build timings line for the 200-centroid build");
-        assert!(line.contains("replicas=8"));
-        assert!(line.contains("assign="));
-        eprintln!("IVF_BUILD_SAMPLE {line}");
-        Ok(())
-    }
-    // ---- The flat (mutable/staging) tier ----
-
-    /// [`build_ivf`] without a centroid index: every segment stores flat.
     fn build_flat(
         metric: Metric,
         commits: &[&[(&str, [f32; 2])]],
@@ -1806,6 +1770,42 @@ mod tests {
     /// fourth AND near the first — fresh data both inside and outside the
     /// clustered vocabulary's reach.
     const MIXED_CENTROIDS: [[f32; 2]; 4] = [[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [100.0, 100.0]];
+
+    fn collect_filter_doc_set(
+        index: &Index,
+        filter: &dyn Query,
+    ) -> crate::Result<std::collections::HashSet<DocAddress>> {
+        let searcher = index.reader()?.searcher();
+        let weight = filter.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let mut set = std::collections::HashSet::new();
+        for (seg_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
+            weight.for_each_no_score(segment_reader, &mut |docs| {
+                for &doc in docs {
+                    set.insert(DocAddress::new(seg_ord as u32, doc));
+                }
+            })?;
+        }
+        Ok(set)
+    }
+
+    /// The stored label of `addr` — the segment-independent doc identity.
+    fn stored_label_at(
+        index: &Index,
+        label_field: crate::schema::Field,
+        addr: DocAddress,
+    ) -> crate::Result<String> {
+        use crate::schema::document::Value;
+        use crate::schema::TantivyDocument;
+        let searcher = index.reader()?.searcher();
+        let doc: TantivyDocument = searcher.doc(addr)?;
+        Ok(doc
+            .get_first(label_field)
+            .and_then(|v| v.as_str())
+            .expect("stored label")
+            .to_string())
+    }
+
+    // ---- Inline fixtures ----
 
     fn mixed_fixture() -> crate::Result<(Index, crate::schema::Field, crate::schema::Field)> {
         let clustered: Vec<(String, [f32; 2])> = (0..30)

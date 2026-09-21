@@ -18,8 +18,9 @@
 use std::sync::Arc;
 
 use super::backend::ProbeStats;
+use super::search::global_top_n_by;
 use super::tie_break::NoTieBreak;
-use super::{global_top_n_by, VectorElement};
+use super::VectorElement;
 use crate::collector::SortKeyComputer;
 use crate::query::{EnableScoring, Query, Weight};
 use crate::schema::{Field, FieldType, Schema};

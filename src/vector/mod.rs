@@ -1,16 +1,9 @@
 //! Vector storage and search.
 //!
-//! The module root holds what every side shares: the element trait
-//! [`VectorElement`], the arenas, the [`distance`] kernels, the on-disk
-//! framing ([`header`], [`id_map`]), the per-segment read surface
-//! ([`VectorIndexReader`]), and the write entry ([`VecWriter`] /
-//! [`VectorPlugin`], which pick the layout: clustered when the index has
-//! a centroid index, flat when it does not). The clustered design lives
-//! in [`ivf`] — the index-level centroid index (vocabulary + router) and
-//! each segment's [`SegmentClusters`] (cluster → row-range postings),
-//! plus assignment, bounds, and the field write/merge. The whole query
-//! path — the cross-segment driver, collector, prepared query,
-//! tie-break, and the work-unit model — lives in `search`.
+//! The index-level centroid index owns the shared centroid matrix and router.
+//! Segment writers assign vectors to those centroids and store their rows,
+//! offsets, and bounds. The cross-segment driver in [`search`] ranks centroids
+//! once and probes every segment with one result heap and work budget.
 //!
 //! The schema-level field configuration ([`VectorOptions`](crate::schema::VectorOptions),
 //! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema
@@ -18,13 +11,18 @@
 
 use std::io;
 
+mod backend;
+mod bounds;
+mod collector;
 mod distance;
 mod header;
-mod id_map;
 mod index_reader;
+mod plugin;
+mod prepared;
 mod search;
-mod writer;
+mod tie_break;
 
+pub mod flat;
 pub mod ivf;
 pub mod router;
 
@@ -33,15 +31,20 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
-pub use distance::{
-    cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
+pub use backend::{
+    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS,
 };
-pub use header::VectorFileVersion;
-pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo};
-pub use ivf::bounds::{
+pub use bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
     BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
+pub use collector::{TopDocsByVectorSimilarity, VectorSimilarityFruit};
+pub use distance::{
+    cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
+};
+pub use flat::VecWriter;
+pub use header::VectorFileVersion;
+pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo};
 pub(crate) use ivf::centroid_index::CachedCentroidIndex;
 pub use ivf::centroid_index::CentroidProducer;
 pub use ivf::{
@@ -51,14 +54,10 @@ pub use ivf::{
     NeighborhoodGraphSearchMetrics, NodeId, RelativeNeighborhoodGraph, ResumableSearchIterator,
     SearchIterator, SearchTerminationReason, SegmentClusters, SuperKMeansLevelClusterer, Workspace,
 };
+pub use plugin::VectorPlugin;
+pub use prepared::PreparedQuery;
 pub use router::{RouterKind, RouterMetrics};
-pub use search::backend::{
-    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS,
-};
-pub use search::collector::{TopDocsByVectorSimilarity, VectorSimilarityFruit};
-pub use search::prepared::PreparedQuery;
-pub use search::tie_break::NoTieBreak;
-pub use writer::{VecWriter, VectorPlugin};
+pub use tie_break::NoTieBreak;
 
 pub use crate::core::CENTROIDS_FILEPATH;
 // The schema-level vector types are re-exported here so `crate::vector::{...}`
@@ -192,8 +191,7 @@ impl VectorElement for f32 {
     }
 }
 
-/// A flat, `dim`-strided arena of vectors a [`Graph`] is built over or
-/// searched against.
+/// A flat, `dim`-strided arena of vectors addressed by dense row index.
 ///
 /// The arena owns its representation — typed slices via the blanket impl,
 /// raw little-endian file bytes for reloaded storage — and scores a typed
@@ -206,12 +204,12 @@ pub trait VectorArena {
     /// The number of vectors held, at `dim` elements each.
     fn num_vectors(&self, dim: usize) -> usize;
 
-    /// [`Similarity`] of `query` to vector `node`.
+    /// [`Similarity`] of `query` to the vector at dense row `index`.
     fn similarity(
         &self,
         metric: Metric,
         dim: usize,
-        node: NodeId,
+        index: u32,
         query: &[Self::Elem],
     ) -> Similarity;
 }
@@ -227,17 +225,17 @@ impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
     }
 
     #[inline]
-    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> Similarity {
-        metric.similarity(query, &self[node as usize * dim..][..dim])
+    fn similarity(&self, metric: Metric, dim: usize, index: u32, query: &[T]) -> Similarity {
+        metric.similarity(query, &self[index as usize * dim..][..dim])
     }
 }
 
 /// A [`VectorArena`] over raw little-endian `T` rows behind a
 /// [`FileSlice`](crate::directory::FileSlice): each [`similarity`] call
-/// fetches only that node's row with one stride-sized ranged read, scored
-/// with the byte kernels ([`Metric::similarity_bytes`]). The arena is never
+/// fetches only that row with one stride-sized ranged read, scored with the
+/// byte kernels ([`Metric::similarity_bytes`]). The arena is never
 /// materialized whole — under `MmapDirectory` a read is a zero-copy view,
-/// and under a copying `Directory` only the visited nodes' bytes are fetched.
+/// and under a copying `Directory` only the visited rows' bytes are fetched.
 ///
 /// This is the search-time counterpart of the typed blanket impl: a
 /// [`Graph`] reloaded from disk wraps its file-resident vectors in one of
@@ -272,17 +270,15 @@ impl<T: VectorElement> VectorArena for FileSliceArena<T> {
 
     /// # Panics
     ///
-    /// The trait has no error channel, so a failed read panics. Row bounds
-    /// are guaranteed by the graph (node ids come from the adjacency, which
-    /// is length-validated against this arena at open); an I/O failure here
-    /// means the underlying `Directory` could not produce bytes it already
-    /// promised via the slice.
+    /// The trait has no error channel, so a failed read panics. Callers must
+    /// pass in-range row indices; an I/O failure here means the underlying
+    /// `Directory` could not produce bytes it already promised via the slice.
     #[inline]
-    fn similarity(&self, metric: Metric, dim: usize, node: NodeId, query: &[T]) -> Similarity {
+    fn similarity(&self, metric: Metric, dim: usize, index: u32, query: &[T]) -> Similarity {
         let stride = dim * T::SIZE_BYTES;
         let bytes = self
             .slice
-            .slice(node as usize * stride..(node as usize + 1) * stride)
+            .slice(index as usize * stride..(index as usize + 1) * stride)
             .read_bytes()
             .expect("failed to read vector arena row");
         metric.similarity_bytes(query, &bytes)

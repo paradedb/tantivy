@@ -9,22 +9,22 @@
 
 pub(crate) mod assignments;
 pub(crate) mod bkt;
-pub(crate) mod bounds;
 pub(crate) mod centroid_index;
 pub(crate) mod graph;
+mod index;
 mod ivf;
 mod params;
 mod partition;
 mod plugin;
-mod types;
+mod training;
 
-pub use assignments::SegmentClusters;
 pub use bkt::{BKTree, BKTreeNode, BKTreeSearchIterator, NodeId as BktNodeId};
 pub use graph::{
     Candidate, Graph, NeighborhoodGraphConfig, NeighborhoodGraphSearchMetrics, NodeId,
     RelativeNeighborhoodGraph, ResumableSearchIterator, SearchIterator, SearchTerminationReason,
     Workspace,
 };
+pub use index::SegmentClusters;
 pub use ivf::{
     AddLevelError, ClusterId, InMemoryStackedIvf, InMemoryStore, IvfConfig,
     IvfIndex as MultiLevelIvf, IvfIndexBuilder, IvfLevelClusterer, LazyStackedIvf, LazyStore,
@@ -32,5 +32,5 @@ pub use ivf::{
 };
 pub use params::AdaptiveProbeParams;
 pub(crate) use plugin::{merge_ivf, write_ivf_field, IvfFieldWriteParams};
-pub(crate) use types::{decode_row, encode_vector};
-pub use types::{IvfCentroids, IvfMatrix};
+pub(crate) use training::{decode_row, encode_vector};
+pub use training::{IvfCentroids, IvfMatrix};
