@@ -47,12 +47,20 @@ jobs:
     - name: Check Formatting
       run: cargo +nightly-2026-08-28 fmt --all -- --check
 
+    - name: Configure Linux features
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libopenblas-dev
+        # Accelerate links an Apple framework; Linux uses OpenBLAS instead.
+        features=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tantivy") | .features | keys | map(select(. != "accelerate")) | join(",")')
+        echo "TANTIVY_CHECK_FEATURES=$features" >> "$GITHUB_ENV"
+
     - name: Check Stable Compilation
-      run: cargo build --all-features
+      run: cargo build --features "$TANTIVY_CHECK_FEATURES"
 
 
     - name: Check Bench Compilation
-      run: cargo +nightly-2026-08-28 bench --no-run --profile=dev --all-features
+      run: cargo +nightly-2026-08-28 bench --no-run --profile=dev --features "$TANTIVY_CHECK_FEATURES"
 
     - uses: actions-rs/clippy-check@b5b5f21f4797c02da247df37026fcd0a5024aa4d # v1.0.7
       with:
