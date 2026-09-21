@@ -21,6 +21,25 @@ pub enum ProbeTermination {
     Exhausted,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[repr(C)]
+pub struct RoutingPhases {
+    pub segment_metadata_time_ns: u64,
+    pub router_open_time_ns: u64,
+    pub centroid_precompute_time_ns: u64,
+    /// Ranking and prefix authorization, including incremental publication.
+    pub router_prefix_time_ns: u64,
+}
+
+impl std::ops::AddAssign for RoutingPhases {
+    fn add_assign(&mut self, rhs: Self) {
+        self.segment_metadata_time_ns += rhs.segment_metadata_time_ns;
+        self.router_open_time_ns += rhs.router_open_time_ns;
+        self.centroid_precompute_time_ns += rhs.centroid_precompute_time_ns;
+        self.router_prefix_time_ns += rhs.router_prefix_time_ns;
+    }
+}
+
 /// Probe-loop instrumentation for one query, filled by the cross-segment
 /// loop in [`search`](super::search): a prune breakdown of every doc the
 /// inner loop touched, plus posting-fetch counters. One instance per query
@@ -28,6 +47,8 @@ pub enum ProbeTermination {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
     pub routing_time_ns: u64,
+    #[serde(flatten)]
+    pub routing_phases: RoutingPhases,
     pub precomputed_centroids: usize,
     pub filter_time_ns: u64,
     pub probe_time_ns: u64,
@@ -1754,6 +1775,17 @@ mod tests {
             min_probe_clusters: 1,
             ..Default::default()
         };
+        let plan = PreparedVectorSearch::new(
+            &index.reader()?.searcher(),
+            embed_field,
+            &query,
+            &params,
+            true,
+        )?;
+        assert!(plan.routing_phases.segment_metadata_time_ns <= plan.routing_time_ns);
+        assert_eq!(plan.routing_phases.router_open_time_ns, 0);
+        assert_eq!(plan.routing_phases.centroid_precompute_time_ns, 0);
+        assert_eq!(plan.routing_phases.router_prefix_time_ns, 0);
         let (hits, stats) = run_global(&index, embed_field, &AllQuery, query.clone(), 5, params)?;
         let truth = ground_truth::top_k(&index, embed_field, Metric::L2, &query, 5)?;
         assert_eq!(hits, truth);
@@ -2217,6 +2249,10 @@ mod tests {
                                 for key in [
                                     "routing",
                                     "routing_time_ns",
+                                    "segment_metadata_time_ns",
+                                    "router_open_time_ns",
+                                    "centroid_precompute_time_ns",
+                                    "router_prefix_time_ns",
                                     "filter_time_ns",
                                     "probe_time_ns",
                                     "segment_setup_time_ns",
@@ -2362,6 +2398,7 @@ mod tests {
             capacity: Option<ClusterWork>,
             synchronizations: usize,
             routes: usize,
+            finished: Option<(u64, RoutingPhases)>,
         }
         impl VectorSearchControl for CapacityControl {
             fn add_capacity(&mut self, capacity: ClusterWork) {
@@ -2381,6 +2418,9 @@ mod tests {
                 assert!(self.synchronizations > 0);
                 self.routes += 1;
                 true
+            }
+            fn finish(&mut self, stats: &ProbeStats) {
+                self.finished = Some((stats.routing_time_ns, stats.routing_phases));
             }
         }
         let centroids = [[0.0f32, 0.0], [10.0, 0.0], [20.0, 0.0]];
@@ -2450,6 +2490,9 @@ mod tests {
             );
             assert_eq!(control.routes, 0);
             assert_eq!(control.synchronizations, 2);
+            assert_eq!(control.finished, Some((0, RoutingPhases::default())));
+            assert_eq!(actual.stats.routing_phases, boundary.routing_phases);
+            assert_eq!(actual.stats.routing_time_ns, boundary.routing_time_ns);
             let lazy = collector.search_prepared(&searcher, &filter, &plan, 0..3, &mut ())?;
             assert_eq!(lazy.stats.precomputed_centroids, 0);
             assert_eq!(lazy.stats.exact_rows_read, 0);
@@ -2468,6 +2511,19 @@ mod tests {
             assert_eq!(actual.stats.exact_rows_read, 0);
             assert_eq!(actual.stats.precomputed_centroids, centroids.len());
             assert_eq!(control.routes, 1);
+            let (producer_time, producer_phases) = control.finished.unwrap();
+            assert_eq!(producer_phases.segment_metadata_time_ns, 0);
+            let producer_sum = producer_phases.router_open_time_ns
+                + producer_phases.centroid_precompute_time_ns
+                + producer_phases.router_prefix_time_ns;
+            assert!(producer_sum <= producer_time);
+            let mut expected_phases = producer_phases;
+            expected_phases += limited.routing_phases;
+            assert_eq!(actual.stats.routing_phases, expected_phases);
+            assert_eq!(
+                actual.stats.routing_time_ns,
+                producer_time + limited.routing_time_ns
+            );
             assert_eq!(actual.results, lazy.results);
             assert_eq!(actual.stats.candidates_scored, lazy.stats.candidates_scored);
             assert_eq!(
@@ -2546,6 +2602,21 @@ mod tests {
                         &searcher, field, &query, &params, all,
                     )?;
                     assert_eq!(lazy.precomputed_centroids, 0);
+                    assert_eq!(lazy.routing_phases.centroid_precompute_time_ns, 0);
+                    for plan in [&lazy, &scored] {
+                        let phases = plan.routing_phases;
+                        let sum = phases.segment_metadata_time_ns
+                            + phases.router_open_time_ns
+                            + phases.centroid_precompute_time_ns
+                            + phases.router_prefix_time_ns;
+                        assert!(sum <= plan.routing_time_ns);
+                        if !all {
+                            assert_eq!(phases.router_prefix_time_ns, 0);
+                        }
+                        if plan.precomputed_centroids == 0 {
+                            assert_eq!(phases.centroid_precompute_time_ns, 0);
+                        }
+                    }
                     assert_eq!(
                         scored.precomputed_centroids,
                         if all && fraction >= 0.3 {
@@ -2591,6 +2662,8 @@ mod tests {
                             &mut (),
                         )?;
                         assert_eq!(actual.results, expected.results);
+                        assert_eq!(actual.stats.routing_phases, scored.routing_phases);
+                        assert_eq!(actual.stats.routing_time_ns, scored.routing_time_ns);
                         assert_eq!(
                             actual.stats.candidates_scored,
                             expected.stats.candidates_scored

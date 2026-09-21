@@ -54,7 +54,8 @@ pub use ivf::{
 };
 pub use router::{RouterKind, RouterMetrics};
 pub use search::backend::{
-    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, DEFAULT_FIXED_PROBE_COST_ROWS,
+    set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, RoutingPhases,
+    DEFAULT_FIXED_PROBE_COST_ROWS,
 };
 pub use search::collector::{TopDocsByVectorSimilarity, VectorSimilarityFruit};
 pub use search::parallel::{

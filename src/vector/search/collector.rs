@@ -163,6 +163,7 @@ where
         )?;
         stats.routing = stats.routing.or(plan.routing);
         stats.routing_time_ns += plan.routing_time_ns;
+        stats.routing_phases += plan.routing_phases;
         let results = hits
             .into_iter()
             .skip(self.offset)

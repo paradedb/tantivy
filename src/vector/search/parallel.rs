@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use common::BitSet;
 
-use super::backend::{ProbeStats, ProbeTermination};
+use super::backend::{ProbeStats, ProbeTermination, RoutingPhases};
 use super::prepared::PreparedQuery;
 use super::{
     build_filter_bitset, collect_cluster_survivors, FilterState, GlobalHeap, SegmentSearch,
@@ -84,6 +84,7 @@ pub struct PreparedVectorSearch {
     pub initial_wave: Option<ProbeWave>,
     pub routing: Option<RouterMetrics>,
     pub routing_time_ns: u64,
+    pub routing_phases: RoutingPhases,
     pub precomputed_centroids: usize,
 }
 
@@ -188,12 +189,14 @@ impl PreparedVectorSearch {
             initial_wave: None,
             routing: None,
             routing_time_ns: 0,
+            routing_phases: RoutingPhases::default(),
             precomputed_centroids: 0,
         };
         let mut options = None;
         let mut docs = 0;
         let mut nonempty = 0;
         let mut vectors = Vec::new();
+        let phase_started = Instant::now();
         for reader in searcher.segment_readers() {
             let vector = reader.vector_index_metadata(field)?;
             plan.shareable &= reader.alive_bitset().is_none()
@@ -207,12 +210,16 @@ impl PreparedVectorSearch {
             }
             vectors.push(vector);
         }
+        plan.routing_phases.segment_metadata_time_ns = phase_started.elapsed().as_nanos() as u64;
         let Some(options) = options else {
+            plan.routing_time_ns = started.elapsed().as_nanos() as u64;
             return Ok(plan);
         };
+        let phase_started = Instant::now();
         plan.num_centroids = searcher.index().centroid_count(field)?.ok_or_else(|| {
             TantivyError::InternalError(format!("missing centroid router for {field:?}"))
         })?;
+        plan.routing_phases.router_open_time_ns = phase_started.elapsed().as_nanos() as u64;
         let (limit, open, row) =
             super::resolve_budget_counts(adaptive, plan.num_centroids, docs, nonempty)?;
         plan.budget = ProbeBudget {
@@ -225,10 +232,12 @@ impl PreparedVectorSearch {
             plan.routing_time_ns = started.elapsed().as_nanos() as u64;
             return Ok(plan);
         }
+        let phase_started = Instant::now();
         let set = searcher.index().cached_centroid_index()?;
         let router = set.field_router(field).ok_or_else(|| {
             TantivyError::InternalError(format!("missing centroid router for {field:?}"))
         })?;
+        plan.routing_phases.router_open_time_ns += phase_started.elapsed().as_nanos() as u64;
         let mut values: Vec<f32> = query.iter().map(|value| value.to_f32()).collect();
         if options.metric() == Metric::Cosine {
             let norm = norm_squared_wide(&values).sqrt();
@@ -248,11 +257,16 @@ impl PreparedVectorSearch {
             && capacity > 0.0
             && plan.budget.limit >= capacity * 0.3
         {
-            router.precompute_scores(&values)?
+            let phase_started = Instant::now();
+            let scores = router.precompute_scores(&values)?;
+            plan.routing_phases.centroid_precompute_time_ns =
+                phase_started.elapsed().as_nanos() as u64;
+            scores
         } else {
             None
         };
         plan.precomputed_centroids = scores.as_ref().map_or(0, Vec::len);
+        let phase_started = Instant::now();
         let mut workspace = RouterWorkspace::default();
         let mut ranked =
             router.rank_clusters_with_scores(&mut workspace, &values, scores.as_deref());
@@ -284,6 +298,7 @@ impl PreparedVectorSearch {
             plan.initial_wave = (wave.end > 0).then_some(wave);
         }
         plan.routing = Some(ranked.metrics());
+        plan.routing_phases.router_prefix_time_ns = phase_started.elapsed().as_nanos() as u64;
         plan.routing_time_ns = started.elapsed().as_nanos() as u64;
         Ok(plan)
     }
@@ -724,6 +739,10 @@ where
             })
         })
         .transpose()?;
+    if routes_clusters {
+        collector.stats.routing_phases.router_open_time_ns =
+            routing_started.elapsed().as_nanos() as u64;
+    }
     let mut values: Vec<f32> = if routes_clusters {
         query.iter().map(|value| value.to_f32()).collect()
     } else {
@@ -746,16 +765,25 @@ where
         capacity.rows > 0
             && plan.budget.limit >= plan.budget.charge(capacity) * FILTERED_PRECOMPUTE_FRACTION
     }) {
-        router
+        let phase_started = Instant::now();
+        let scores = router
             .expect("routing producer required")
-            .precompute_scores(&values)?
+            .precompute_scores(&values)?;
+        collector.stats.routing_phases.centroid_precompute_time_ns =
+            phase_started.elapsed().as_nanos() as u64;
+        scores
     } else {
         None
     };
     collector.stats.precomputed_centroids = scores.as_ref().map_or(0, Vec::len);
+    let phase_started = routes_clusters.then(Instant::now);
     let mut workspace = RouterWorkspace::default();
     let mut ranked = router
         .map(|router| router.rank_clusters_with_scores(&mut workspace, &values, scores.as_deref()));
+    if let Some(phase_started) = phase_started {
+        collector.stats.routing_phases.router_prefix_time_ns =
+            phase_started.elapsed().as_nanos() as u64;
+    }
     let mut routing_time_ns = if routes_clusters {
         routing_started.elapsed().as_nanos() as u64
     } else {
@@ -777,7 +805,9 @@ where
                     })
                 });
             if routes_clusters {
-                routing_time_ns += started.elapsed().as_nanos() as u64;
+                let elapsed = started.elapsed().as_nanos() as u64;
+                routing_time_ns += elapsed;
+                collector.stats.routing_phases.router_prefix_time_ns += elapsed;
             }
             collector
                 .stats
