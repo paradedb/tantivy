@@ -202,11 +202,8 @@ impl IvfIndex {
                 let vectors = match options.dtype() {
                     VectorDType::F32 => FileSliceArena::<f32>::new(centroids_slice.clone()),
                 };
-                // Adjacency length is validated against the arena's node
-                // count inside `Graph::open`.
-                let adjacency = slice.read_bytes()?;
-                Some(RelativeNeighborhoodGraph::open(
-                    &adjacency,
+                Some(RelativeNeighborhoodGraph::open_lazy(
+                    slice,
                     vectors,
                     options.dim(),
                     options.metric(),
