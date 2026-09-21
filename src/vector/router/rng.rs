@@ -50,9 +50,8 @@ pub(super) fn open(
     let vectors = match options.dtype() {
         VectorDType::F32 => LazyStore::new(centroids, options.dim()),
     };
-    let adjacency = payload.read_bytes()?;
-    Ok(RelativeNeighborhoodGraph::open(
-        &adjacency,
+    Ok(RelativeNeighborhoodGraph::open_lazy(
+        payload,
         vectors,
         options.dim(),
         options.metric(),

@@ -25,10 +25,12 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::io::{self, Write};
 use std::ops::Deref;
+use std::sync::OnceLock;
 
-use common::{BinarySerializable, BitSet};
+use common::{BinarySerializable, BitSet, HasLen};
 
 use super::partition;
+use crate::directory::FileSlice;
 use crate::schema::Metric;
 use crate::vector::{Similarity, VectorArena, VectorElement};
 use crate::Executor;
@@ -38,6 +40,13 @@ pub type NodeId = u32;
 
 /// Sentinel marking an unused neighbor slot; node ids never reach [`NodeId::MAX`].
 pub const EMPTY: NodeId = NodeId::MAX;
+
+const ADJACENCY_GROUP_NODES: usize = 8;
+
+struct LazyAdjacency {
+    payload: FileSlice,
+    groups: Box<[OnceLock<Box<[NodeId]>>]>,
+}
 
 /// A single-threaded *k*-nearest-neighbor graph over `dim`-dimensional vectors
 /// stored in the arena `S` (any [`VectorArena`], typed or byte-backed).
@@ -55,6 +64,7 @@ pub struct Graph<S> {
     /// sorted best-first (most similar first) and [`EMPTY`]-padded. The durable
     /// search structure.
     neighbors: Vec<NodeId>,
+    lazy_neighbors: Option<LazyAdjacency>,
     /// Per-edge similarities driving top-*k* eviction during construction.
     /// Empty for a graph reconstructed via [`for_reload`](Graph::for_reload).
     sims: Vec<Similarity>,
@@ -72,6 +82,7 @@ impl<S: VectorArena> Graph<S> {
             dim,
             vectors,
             neighbors: vec![EMPTY; n * max_edges],
+            lazy_neighbors: None,
             sims: vec![Similarity::WORST; n * max_edges],
         }
     }
@@ -87,6 +98,7 @@ impl<S: VectorArena> Graph<S> {
             dim,
             vectors,
             neighbors: vec![EMPTY; n * max_edges],
+            lazy_neighbors: None,
             sims: Vec::new(),
         }
     }
@@ -100,34 +112,115 @@ impl<S: VectorArena> Graph<S> {
     pub fn open(adjacency: &[u8], vectors: S, dim: usize) -> io::Result<Graph<S>> {
         let mut cursor = adjacency;
         let max_edges = u32::deserialize(&mut cursor)? as usize;
+        Self::validate_adjacency(&vectors, dim, max_edges, cursor.len())?;
+        Ok(Graph {
+            max_edges,
+            dim,
+            vectors,
+            neighbors: Self::decode_neighbors(cursor),
+            lazy_neighbors: None,
+            sims: Vec::new(),
+        })
+    }
+
+    fn validate_adjacency(
+        vectors: &S,
+        dim: usize,
+        max_edges: usize,
+        byte_len: usize,
+    ) -> io::Result<usize> {
         if max_edges == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "serialized graph has zero max_edges",
             ));
         }
-        let n = Self::node_count(&vectors, dim, max_edges);
-        let expected = n * max_edges * std::mem::size_of::<NodeId>();
-        if cursor.len() != expected {
+        let n = Self::node_count(vectors, dim, max_edges);
+        let expected = n
+            .checked_mul(max_edges)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<NodeId>()))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "adjacency length overflow")
+            })?;
+        if byte_len != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "serialized graph adjacency is {} bytes, expected {expected} for {n} nodes",
-                    cursor.len()
+                    byte_len
                 ),
             ));
         }
-        let neighbors: Vec<NodeId> = cursor
+        Ok(n)
+    }
+
+    fn decode_neighbors(bytes: &[u8]) -> Vec<NodeId> {
+        bytes
             .chunks_exact(std::mem::size_of::<NodeId>())
             .map(|chunk| NodeId::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
+            .collect()
+    }
+
+    /// Checks the header and shape now; adjacency read failures panic on access.
+    pub(crate) fn open_lazy(adjacency: FileSlice, vectors: S, dim: usize) -> io::Result<Self> {
+        let header_len = std::mem::size_of::<u32>();
+        if adjacency.len() < header_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing max_edges header",
+            ));
+        }
+        let header = adjacency.slice_to(header_len).read_bytes()?;
+        let max_edges = u32::deserialize(&mut header.as_slice())? as usize;
+        let payload = adjacency.slice_from(header_len);
+        let n = Self::validate_adjacency(&vectors, dim, max_edges, payload.len())?;
         Ok(Graph {
             max_edges,
             dim,
             vectors,
-            neighbors,
+            neighbors: Vec::new(),
+            lazy_neighbors: Some(LazyAdjacency {
+                payload,
+                groups: (0..n.div_ceil(ADJACENCY_GROUP_NODES))
+                    .map(|_| OnceLock::new())
+                    .collect(),
+            }),
             sims: Vec::new(),
         })
+    }
+
+    fn neighbor_row(&self, node: NodeId) -> &[NodeId] {
+        let base = node as usize * self.max_edges;
+        if let Some(lazy) = &self.lazy_neighbors {
+            let group = node as usize / ADJACENCY_GROUP_NODES;
+            let neighbors = lazy.groups[group].get_or_init(|| {
+                let stride = std::mem::size_of::<NodeId>();
+                let first = group * ADJACENCY_GROUP_NODES;
+                let end = (first + ADJACENCY_GROUP_NODES).min(self.len());
+                let range = first * self.max_edges * stride..end * self.max_edges * stride;
+                let bytes = lazy
+                    .payload
+                    .read_bytes_slice(range.clone())
+                    .expect("failed to read graph adjacency group");
+                assert_eq!(bytes.len(), range.len(), "short graph adjacency group");
+                Self::decode_neighbors(&bytes).into_boxed_slice()
+            });
+            let offset = node as usize % ADJACENCY_GROUP_NODES * self.max_edges;
+            return &neighbors[offset..offset + self.max_edges];
+        }
+        &self.neighbors[base..base + self.max_edges]
+    }
+
+    fn materialize_neighbors(&mut self) {
+        if let Some(lazy) = &self.lazy_neighbors {
+            let bytes = lazy
+                .payload
+                .read_bytes()
+                .expect("failed to read graph adjacency");
+            assert_eq!(bytes.len(), lazy.payload.len(), "short graph adjacency");
+            self.neighbors = Self::decode_neighbors(&bytes);
+            self.lazy_neighbors = None;
+        }
     }
 
     /// Validates the constructor arguments and derives the node count.
@@ -150,6 +243,7 @@ impl<S: VectorArena> Graph<S> {
     /// ignored. Only valid on a build graph ([`new`](Graph::new)); use
     /// [`push_edge`](Graph::push_edge) on a reloaded one.
     pub fn add_edge(&mut self, from: NodeId, to: NodeId, sim: Similarity) {
+        self.materialize_neighbors();
         debug_assert_eq!(
             self.sims.len(),
             self.neighbors.len(),
@@ -176,6 +270,7 @@ impl<S: VectorArena> Graph<S> {
     /// without locks. Only valid on a build graph ([`new`](Graph::new)), which
     /// has the similarity buffer.
     pub(crate) fn edge_lists_mut(&mut self) -> impl Iterator<Item = EdgeListMut<'_>> {
+        self.materialize_neighbors();
         debug_assert_eq!(
             self.sims.len(),
             self.neighbors.len(),
@@ -198,6 +293,7 @@ impl<S: VectorArena> Graph<S> {
     /// stored in best-first order. Panics if `from` already has `max_edges`
     /// neighbors.
     pub fn push_edge(&mut self, from: NodeId, to: NodeId) {
+        self.materialize_neighbors();
         debug_assert!((from as usize) < self.len(), "from out of range");
         let k = self.max_edges;
         let degree = self.degree(from);
@@ -212,6 +308,7 @@ impl<S: VectorArena> Graph<S> {
     /// Does not maintain the build-time similarity buffer, so it must not be
     /// interleaved with [`add_edge`](Graph::add_edge) on the same node.
     pub fn set_neighbors(&mut self, node: NodeId, neighbors: &[NodeId]) {
+        self.materialize_neighbors();
         let k = self.max_edges;
         assert!(neighbors.len() <= k, "too many neighbors for node");
         debug_assert!((node as usize) < self.len(), "node out of range");
@@ -224,8 +321,7 @@ impl<S: VectorArena> Graph<S> {
     /// The number of neighbors currently recorded for `node`.
     #[inline]
     pub fn degree(&self, node: NodeId) -> usize {
-        let base = node as usize * self.max_edges;
-        self.neighbors[base..base + self.max_edges]
+        self.neighbor_row(node)
             .iter()
             .take_while(|&&n| n != EMPTY)
             .count()
@@ -234,8 +330,12 @@ impl<S: VectorArena> Graph<S> {
     /// Borrows `node`'s neighbor ids, best-first. Excludes empty slots.
     #[inline]
     pub fn neighbors(&self, node: NodeId) -> &[NodeId] {
-        let base = node as usize * self.max_edges;
-        &self.neighbors[base..base + self.degree(node)]
+        let row = self.neighbor_row(node);
+        let degree = row
+            .iter()
+            .take_while(|&&neighbor| neighbor != EMPTY)
+            .count();
+        &row[..degree]
     }
 
     /// The number of nodes in the graph.
@@ -278,6 +378,21 @@ impl<S: VectorArena> Graph<S> {
         let max_edges = u32::try_from(self.max_edges)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "max_edges exceeds u32"))?;
         max_edges.serialize(out)?;
+        if let Some(lazy) = &self.lazy_neighbors {
+            let mut written = 0;
+            for bytes in lazy.payload.stream_file_chunks() {
+                let bytes = bytes?;
+                written += bytes.len();
+                out.write_all(&bytes)?;
+            }
+            if written != lazy.payload.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short graph adjacency",
+                ));
+            }
+            return Ok(());
+        }
         for &neighbor in &self.neighbors {
             neighbor.serialize(out)?;
         }
@@ -756,6 +871,20 @@ impl<S: VectorArena> RelativeNeighborhoodGraph<S> {
     ) -> io::Result<Self> {
         Ok(RelativeNeighborhoodGraph {
             graph: Graph::open(adjacency, vectors, dim)?,
+            metric,
+            config: params,
+        })
+    }
+
+    pub(crate) fn open_lazy(
+        adjacency: FileSlice,
+        vectors: S,
+        dim: usize,
+        metric: Metric,
+        params: NeighborhoodGraphConfig,
+    ) -> io::Result<Self> {
+        Ok(RelativeNeighborhoodGraph {
+            graph: Graph::open_lazy(adjacency, vectors, dim)?,
             metric,
             config: params,
         })
@@ -1291,6 +1420,248 @@ mod rng_tests {
             }
         }
         rng
+    }
+
+    #[derive(Debug)]
+    struct CountedAdjacency {
+        bytes: common::OwnedBytes,
+        requests: std::sync::Mutex<Vec<std::ops::Range<usize>>>,
+        copying: bool,
+        fault: u8,
+    }
+
+    impl common::HasLen for CountedAdjacency {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl crate::directory::FileHandle for CountedAdjacency {
+        fn read_bytes(&self, mut range: std::ops::Range<usize>) -> io::Result<common::OwnedBytes> {
+            self.requests.lock().unwrap().push(range.clone());
+            if range.start >= 4 {
+                match self.fault {
+                    1 => range.end = range.end.saturating_sub(1),
+                    2 => return Err(io::Error::other("injected adjacency failure")),
+                    _ => {}
+                }
+            }
+            let bytes = self.bytes.slice(range);
+            Ok(if self.copying {
+                common::OwnedBytes::new(bytes.to_vec())
+            } else {
+                bytes
+            })
+        }
+    }
+
+    #[test]
+    fn lazy_adjacency_reads_only_requested_groups_and_preserves_mutation() -> io::Result<()> {
+        let vectors: Vec<f32> = (0..17).map(|node| node as f32).collect();
+        let mut original = Graph::new(vectors.clone(), 1, 3);
+        original.set_neighbors(0, &[1]);
+        original.set_neighbors(8, &[1]);
+        original.set_neighbors(16, &[1]);
+        let mut bytes = Vec::new();
+        original.serialize(&mut bytes)?;
+        bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
+        let file = std::sync::Arc::new(CountedAdjacency {
+            bytes: common::OwnedBytes::new(bytes.clone()),
+            requests: Default::default(),
+            copying: true,
+            fault: 0,
+        });
+        let mut lazy = Graph::open_lazy(FileSlice::new(file.clone()), vectors.clone(), 1)?;
+        assert_eq!(*file.requests.lock().unwrap(), [0..4]);
+        assert_eq!(lazy.neighbors(0), &[1]);
+        let borrowed = lazy.neighbors(0);
+        let borrowed_ptr = borrowed.as_ptr();
+        assert_eq!(lazy.degree(0), 1);
+        assert_eq!(lazy.neighbors(0), &[1]);
+        assert!(lazy.neighbors(7).is_empty());
+        assert_eq!(*file.requests.lock().unwrap(), [0..4, 4..100]);
+        std::thread::scope(|scope| {
+            for node in [8, 16, 8, 16] {
+                let lazy = &lazy;
+                scope.spawn(move || assert_eq!(lazy.neighbors(node), &[1]));
+            }
+        });
+        assert_eq!(borrowed, &[1]);
+        assert_eq!(borrowed_ptr, lazy.neighbors(0).as_ptr());
+        let mut requests = file.requests.lock().unwrap().clone();
+        requests.sort_by_key(|range| range.start);
+        assert_eq!(requests, [0..4, 4..100, 100..196, 196..208]);
+        assert!(lazy.neighbors(1).is_empty());
+        let mut serialized = Vec::new();
+        lazy.serialize(&mut serialized)?;
+        assert_eq!(serialized, bytes);
+        let mut eager = Graph::open(&bytes, vectors, 1)?;
+        for graph in [&mut eager, &mut lazy] {
+            graph.push_edge(0, 2);
+            graph.set_neighbors(1, &[2, 0]);
+        }
+        assert!(lazy.lazy_neighbors.is_none());
+        serialized.clear();
+        lazy.serialize(&mut serialized)?;
+        let mut expected = Vec::new();
+        eager.serialize(&mut expected)?;
+        assert_eq!(serialized, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_adjacency_group_boundaries() -> io::Result<()> {
+        for count in [7usize, 8, 9, 19] {
+            let vectors = vec![0.0f32; count];
+            let original = Graph::new(vectors.clone(), 1, 3);
+            let mut bytes = Vec::new();
+            original.serialize(&mut bytes)?;
+            let file = std::sync::Arc::new(CountedAdjacency {
+                bytes: common::OwnedBytes::new(bytes),
+                requests: Default::default(),
+                copying: true,
+                fault: 0,
+            });
+            let lazy = Graph::open_lazy(FileSlice::new(file.clone()), vectors, 1)?;
+            let borrowed = lazy.neighbor_row(count as NodeId - 1);
+            let mut expected = vec![0..4];
+            for node in [count - 1, 0, 7.min(count - 1), 8.min(count - 1), count - 1] {
+                assert!(lazy.neighbors(node as NodeId).is_empty());
+                let first = node / ADJACENCY_GROUP_NODES * ADJACENCY_GROUP_NODES;
+                let range = 4 + first * 12..4 + (first + ADJACENCY_GROUP_NODES).min(count) * 12;
+                if !expected.contains(&range) {
+                    expected.push(range);
+                }
+            }
+            assert_eq!(*file.requests.lock().unwrap(), expected);
+            assert_eq!(borrowed, &[EMPTY; 3]);
+            assert_eq!(
+                borrowed.as_ptr(),
+                lazy.neighbor_row(count as NodeId - 1).as_ptr()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_adjacency_rejects_invalid_shapes_and_defers_row_io_errors() {
+        for bytes in [
+            vec![],
+            vec![1, 0, 0],
+            vec![0; 4],
+            vec![1, 0, 0, 0],
+            vec![1, 0, 0, 0, 1],
+        ] {
+            assert!(Graph::open(&bytes, vec![0.0f32], 1).is_err());
+            assert!(Graph::open_lazy(FileSlice::from(bytes), vec![0.0f32], 1).is_err());
+        }
+        let bytes = [1u32, EMPTY]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        for fault in [1, 2] {
+            let file = std::sync::Arc::new(CountedAdjacency {
+                bytes: common::OwnedBytes::new(bytes.clone()),
+                requests: Default::default(),
+                copying: true,
+                fault,
+            });
+            let mut lazy = Graph::open_lazy(FileSlice::new(file), vec![0.0f32], 1).unwrap();
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lazy.neighbors(0)))
+                    .is_err()
+            );
+            assert!(lazy.serialize(&mut Vec::new()).is_err());
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || lazy.set_neighbors(0, &[])
+            ))
+            .is_err());
+        }
+        let empty = Graph::open_lazy(
+            FileSlice::from(1u32.to_le_bytes().to_vec()),
+            Vec::<f32>::new(),
+            1,
+        )
+        .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn lazy_adjacency_preserves_exact_prefixes_scores_and_metrics() -> io::Result<()> {
+        let built = line_index(257);
+        let mut bytes = Vec::new();
+        built.serialize(&mut bytes)?;
+        for metric in [Metric::L2, Metric::Cosine] {
+            let vectors: Vec<f32> = (0..257).map(|i| (i / 2 + 1) as f32).collect();
+            for prefix in [1, 16, 64, 129, 257, usize::MAX] {
+                for precomputed in [false, true] {
+                    let file = std::sync::Arc::new(CountedAdjacency {
+                        bytes: common::OwnedBytes::new(bytes.clone()),
+                        requests: Default::default(),
+                        copying: true,
+                        fault: 0,
+                    });
+                    let eager = RelativeNeighborhoodGraph::open(
+                        &bytes,
+                        vectors.as_slice(),
+                        1,
+                        metric,
+                        built.config,
+                    )?;
+                    let lazy = RelativeNeighborhoodGraph::open_lazy(
+                        FileSlice::new(file.clone()),
+                        vectors.as_slice(),
+                        1,
+                        metric,
+                        built.config,
+                    )?;
+                    let query = [54.5];
+                    let seeds = [0, 64, 128, 256];
+                    let scores: Vec<_> = vectors
+                        .iter()
+                        .map(|v| metric.similarity(&query, &[*v]))
+                        .collect();
+                    let mut ew = Workspace::new();
+                    let mut lw = Workspace::new();
+                    let mut ei = if precomputed {
+                        eager.search_iter_with_scores(&mut ew, &query, &seeds, &scores)
+                    } else {
+                        eager.search_iter(&mut ew, &query, &seeds)
+                    };
+                    let mut li = if precomputed {
+                        lazy.search_iter_with_scores(&mut lw, &query, &seeds, &scores)
+                    } else {
+                        lazy.search_iter(&mut lw, &query, &seeds)
+                    };
+                    let expected: Vec<_> = ei
+                        .by_ref()
+                        .take(prefix)
+                        .map(|c| (c.node, c.sim.score().to_bits()))
+                        .collect();
+                    let actual: Vec<_> = li
+                        .by_ref()
+                        .take(prefix)
+                        .map(|c| (c.node, c.sim.score().to_bits()))
+                        .collect();
+                    assert_eq!(actual, expected);
+                    assert_eq!(
+                        serde_json::to_value(li.metrics()).unwrap(),
+                        serde_json::to_value(ei.metrics()).unwrap()
+                    );
+                    let requests = file.requests.lock().unwrap();
+                    assert_eq!(requests[0], 0..4);
+                    let mut unique = std::collections::HashSet::new();
+                    for range in &requests[1..] {
+                        let group_bytes = ADJACENCY_GROUP_NODES * 4 * built.config.max_edges;
+                        assert_eq!(range.len(), group_bytes.min(bytes.len() - range.start));
+                        assert_eq!((range.start - 4) % group_bytes, 0);
+                        assert!(unique.insert(range.start));
+                    }
+                    assert!(unique.len() <= li.metrics().expanded_count);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
