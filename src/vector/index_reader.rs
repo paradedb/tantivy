@@ -143,6 +143,50 @@ pub(crate) fn visit_rows(
     Ok(())
 }
 
+pub(crate) fn visit_row_fragments(
+    slice: &FileSlice,
+    stride: usize,
+    rows: std::ops::Range<usize>,
+    mut visitor: impl FnMut(usize, usize, &[u8]),
+) -> crate::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if stride == 0 {
+        return Err(TantivyError::InvalidArgument(
+            "vector stride is zero".into(),
+        ));
+    }
+    let expected = rows.len() * stride;
+    let (mut received, mut offset, mut row) = (0, 0, rows.start);
+    let mut invalid = false;
+    slice.read_bytes_chunks(rows.start * stride..rows.end * stride, &mut |mut bytes| {
+        if invalid || bytes.len() > expected - received {
+            invalid = true;
+            return;
+        }
+        received += bytes.len();
+        while !bytes.is_empty() {
+            let len = (stride - offset).min(bytes.len());
+            visitor(row, offset, &bytes[..len]);
+            bytes = &bytes[len..];
+            offset += len;
+            if offset == stride {
+                row += 1;
+                offset = 0;
+            }
+        }
+    })?;
+    if invalid || received != expected || row != rows.end || offset != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "vector row fragments do not cover the requested range",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl VectorIndexMetadata {
     /// Opens `field`'s vector data in `segment_reader`'s segment. Returns the
     /// [`empty`](Self::empty) placeholder when the segment carries no vector
@@ -476,7 +520,7 @@ impl VectorIndexReader {
     pub(crate) fn visit_vector_row_fragments(
         &self,
         rows: std::ops::Range<usize>,
-        mut visitor: impl FnMut(usize, usize, &[u8]),
+        visitor: impl FnMut(usize, usize, &[u8]),
     ) -> crate::Result<()> {
         let num_rows = self.id_map.as_ref().map(|map| map.num_rows()).unwrap_or(0) as usize;
         if rows.start > rows.end || rows.end > num_rows {
@@ -484,46 +528,12 @@ impl VectorIndexReader {
                 "vector rows {rows:?} are out of bounds"
             )));
         }
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let stride = self.options.bytes_per_vector();
-        if stride == 0 {
-            return Err(TantivyError::InvalidArgument(
-                "vector stride is zero".into(),
-            ));
-        }
-        let expected = rows.len() * stride;
-        let (mut received, mut offset, mut row) = (0, 0, rows.start);
-        let mut invalid = false;
-        self.rows_slice.read_bytes_chunks(
-            rows.start * stride..rows.end * stride,
-            &mut |mut bytes| {
-                if invalid || bytes.len() > expected - received {
-                    invalid = true;
-                    return;
-                }
-                received += bytes.len();
-                while !bytes.is_empty() {
-                    let len = (stride - offset).min(bytes.len());
-                    visitor(row, offset, &bytes[..len]);
-                    bytes = &bytes[len..];
-                    offset += len;
-                    if offset == stride {
-                        row += 1;
-                        offset = 0;
-                    }
-                }
-            },
-        )?;
-        if invalid || received != expected || row != rows.end || offset != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "vector row fragments do not cover the requested range",
-            )
-            .into());
-        }
-        Ok(())
+        visit_row_fragments(
+            &self.rows_slice,
+            self.options.bytes_per_vector(),
+            rows,
+            visitor,
+        )
     }
 
     /// The doc id stored at `row` — decoded from the pinned permutation
