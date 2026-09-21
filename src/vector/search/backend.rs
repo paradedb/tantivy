@@ -2363,7 +2363,7 @@ mod tests {
                 build_ivf(metric, &centroids, &[&docs[..18], &docs[18..]], 1, false)?;
             let searcher = index.reader()?.searcher();
             let query = vec![1.0f32, 1.5];
-            for fraction in [0.1, 0.5, 0.8, 1.0] {
+            for fraction in [0.1, 0.299, 0.3, 0.5, 0.8, 1.0] {
                 let params = AdaptiveProbeParams {
                     max_probe_fraction: fraction,
                     min_probe_clusters: 1,
@@ -2376,7 +2376,7 @@ mod tests {
                     assert_eq!(lazy.precomputed_centroids, 0);
                     assert_eq!(
                         scored.precomputed_centroids,
-                        if all && fraction >= 0.5 {
+                        if all && fraction >= 0.3 {
                             centroids.len()
                         } else {
                             0

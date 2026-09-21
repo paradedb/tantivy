@@ -240,7 +240,7 @@ impl PreparedVectorSearch {
             && all_docs
             && plan.shareable
             && capacity > 0.0
-            && plan.budget.limit >= capacity * 0.5
+            && plan.budget.limit >= capacity * 0.3
         {
             router.precompute_scores(&values)?
         } else {
