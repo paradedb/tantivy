@@ -306,6 +306,19 @@ impl SegmentClusters {
 const ASSIGN_ROW_TILE: usize = 256;
 const ASSIGN_CENTROID_TILE: usize = 1024;
 
+fn best_score_position(scores: &[f32]) -> usize {
+    let ordered = |score: f32| {
+        let bits = score.to_bits() as i32;
+        bits ^ (((bits >> 31) as u32) >> 1) as i32
+    };
+    // An integer maximum vectorizes while preserving Similarity's total order.
+    let best = scores.iter().copied().map(ordered).max().unwrap();
+    scores
+        .iter()
+        .position(|&score| ordered(score) == best)
+        .unwrap()
+}
+
 pub(crate) struct BatchAssigner {
     centroids: Vec<f32>,
     centroid_norms: Vec<f32>,
@@ -371,6 +384,15 @@ impl BatchAssigner {
                     &mut self.scores[..row_count * centroid_count],
                 );
                 for (row, top) in nearest.iter_mut().enumerate() {
+                    if cells_per_vector == 1 && self.metric != Metric::L2 {
+                        let scores = &self.scores[row * centroid_count..(row + 1) * centroid_count];
+                        let col = best_score_position(scores);
+                        top.push(
+                            Similarity::new(scores[col]),
+                            tile * ASSIGN_CENTROID_TILE + col,
+                        );
+                        continue;
+                    }
                     for col in 0..centroid_count {
                         let centroid = tile * ASSIGN_CENTROID_TILE + col;
                         let dot = self.scores[row * centroid_count + col];
@@ -415,6 +437,39 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::*;
+
+    #[test]
+    fn best_score_preserves_total_order_and_first_tie() {
+        let values = [
+            f32::from_bits(0xffc00001),
+            f32::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            f32::INFINITY,
+            f32::from_bits(0x7fc00001),
+            f32::from_bits(0x7fc00002),
+        ];
+        for &a in &values {
+            for &b in &values {
+                for &c in &values {
+                    let scores = [a, b, c, a];
+                    let mut top = TopNComputer::new_with_comparator(1, NaturalComparator);
+                    for (id, &score) in scores.iter().enumerate() {
+                        top.push(Similarity::new(score), id);
+                    }
+                    let expected = top.into_sorted_vec();
+                    let actual = best_score_position(&scores);
+                    assert_eq!(actual, expected[0].doc);
+                    assert_eq!(
+                        scores[actual].to_bits(),
+                        expected[0].sort_key.score().to_bits()
+                    );
+                }
+            }
+        }
+    }
 
     /// Pins the Dot selection semantics: cells follow RAW dot — the
     /// query-time router's ranking — not angular order. Centroid norms are
@@ -504,6 +559,8 @@ mod tests {
             assigner.assign_cells(&[1.0, 0.0], 2),
             vec![vec![0, ASSIGN_CENTROID_TILE + 1]]
         );
+        assert_eq!(assigner.assign_cells(&[1.0, 0.0], 1), vec![vec![0]]);
+        assert_eq!(assigner.assign_cells(&[0.0, 0.0], 1), vec![vec![0]]);
         assert_eq!(assigner.assign_cells(&[0.0, 0.0], 3), vec![vec![0, 1, 2]]);
     }
 
