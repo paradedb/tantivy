@@ -20,7 +20,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::VectorIndexReader;
+use crate::vector::{VectorIndexMetadata, VectorIndexReader};
 use crate::{DocId, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -41,6 +41,7 @@ pub struct SegmentReader {
 
     inv_idx_reader_cache: Arc<RwLock<HashMap<Field, Arc<InvertedIndexReader>>>>,
     vector_reader_cache: Arc<RwLock<HashMap<Field, Arc<VectorIndexReader>>>>,
+    vector_metadata_cache: Arc<RwLock<HashMap<Field, Arc<VectorIndexMetadata>>>>,
     delete_opstamp: Option<Opstamp>,
 
     max_doc: DocId,
@@ -183,6 +184,28 @@ impl SegmentReader {
         Ok(reader)
     }
 
+    pub(crate) fn vector_index_metadata(
+        &self,
+        field: Field,
+    ) -> crate::Result<Arc<VectorIndexMetadata>> {
+        if let Some(metadata) = self
+            .vector_metadata_cache
+            .read()
+            .expect("Lock poisoned. This should never happen")
+            .get(&field)
+        {
+            return Ok(Arc::clone(metadata));
+        }
+        let metadata = Arc::new(VectorIndexMetadata::open(self, field)?);
+        Ok(Arc::clone(
+            self.vector_metadata_cache
+                .write()
+                .expect("Lock poisoned. This should never happen")
+                .entry(field)
+                .or_insert(metadata),
+        ))
+    }
+
     /// Open a new segment for reading.
     pub fn open(segment: &Segment) -> crate::Result<SegmentReader> {
         Self::open_with_custom_alive_set(segment, None)
@@ -200,6 +223,7 @@ impl SegmentReader {
 
             inv_idx_reader_cache: Default::default(),
             vector_reader_cache: Default::default(),
+            vector_metadata_cache: Default::default(),
             delete_opstamp: segment.meta().delete_opstamp(),
 
             max_doc: segment.meta().max_doc(),

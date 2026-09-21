@@ -75,6 +75,7 @@ impl ProbeBudget {
 #[derive(Clone, Debug)]
 pub struct PreparedVectorSearch {
     pub clusters: Vec<RankedCluster>,
+    pub incremental: bool,
     pub num_centroids: usize,
     pub shareable: bool,
     pub budget: ProbeBudget,
@@ -85,6 +86,18 @@ pub struct PreparedVectorSearch {
 }
 
 pub trait VectorSearchControl {
+    fn routes_clusters(&mut self) -> bool {
+        true
+    }
+    fn extend_clusters(
+        &mut self,
+        start: usize,
+        clusters: &mut Vec<RankedCluster>,
+        next: &mut dyn FnMut() -> Option<RankedCluster>,
+    ) {
+        let remaining = (start + PROBE_WAVE_SIZE + 1).saturating_sub(clusters.len());
+        clusters.extend(std::iter::from_fn(next).take(remaining));
+    }
     #[cfg(test)]
     fn stream_row_scores(&self) -> bool {
         true
@@ -127,14 +140,7 @@ impl VectorSearchControl for () {}
 
 impl PreparedVectorSearch {
     pub fn cluster_capacity(searcher: &Searcher, field: Field) -> crate::Result<usize> {
-        if searcher.index().load_metas()?.centroid_index.is_none() {
-            return Ok(0);
-        }
-        Ok(searcher
-            .index()
-            .cached_centroid_index()?
-            .field_router(field)
-            .map_or(0, |router| router.num_centroids()))
+        Ok(searcher.index().centroid_count(field)?.unwrap_or(0))
     }
 
     pub fn new<T: VectorElement>(
@@ -169,6 +175,7 @@ impl PreparedVectorSearch {
         let started = Instant::now();
         let mut plan = Self {
             clusters: Vec::new(),
+            incremental: false,
             num_centroids: 0,
             shareable: true,
             budget: ProbeBudget::default(),
@@ -182,7 +189,7 @@ impl PreparedVectorSearch {
         let mut nonempty = 0;
         let mut vectors = Vec::new();
         for reader in searcher.segment_readers() {
-            let vector = reader.vector_index(field)?;
+            let vector = reader.vector_index_metadata(field)?;
             plan.shareable &= reader.alive_bitset().is_none()
                 && vector
                     .clusters()
@@ -197,11 +204,9 @@ impl PreparedVectorSearch {
         let Some(options) = options else {
             return Ok(plan);
         };
-        let set = searcher.index().cached_centroid_index()?;
-        let router = set.field_router(field).ok_or_else(|| {
+        plan.num_centroids = searcher.index().centroid_count(field)?.ok_or_else(|| {
             TantivyError::InternalError(format!("missing centroid router for {field:?}"))
         })?;
-        plan.num_centroids = router.num_centroids();
         let (limit, open, row) =
             super::resolve_budget_counts(adaptive, plan.num_centroids, docs, nonempty)?;
         plan.budget = ProbeBudget {
@@ -209,6 +214,15 @@ impl PreparedVectorSearch {
             open: open.get(),
             row: row.get(),
         };
+        if !all_docs || !plan.shareable {
+            plan.incremental = true;
+            plan.routing_time_ns = started.elapsed().as_nanos() as u64;
+            return Ok(plan);
+        }
+        let set = searcher.index().cached_centroid_index()?;
+        let router = set.field_router(field).ok_or_else(|| {
+            TantivyError::InternalError(format!("missing centroid router for {field:?}"))
+        })?;
         let mut values: Vec<f32> = query.iter().map(|value| value.to_f32()).collect();
         if options.metric() == Metric::Cosine {
             let norm = norm_squared_wide(&values).sqrt();
@@ -262,8 +276,6 @@ impl PreparedVectorSearch {
                 wave.end = plan.clusters.len();
             }
             plan.initial_wave = (wave.end > 0).then_some(wave);
-        } else {
-            plan.clusters = candidates.collect();
         }
         plan.routing = Some(ranked.metrics());
         plan.routing_time_ns = started.elapsed().as_nanos() as u64;
@@ -648,13 +660,74 @@ where
         collector.synchronize(owned)
     };
     let q_norm = norm_squared_wide(collector.prepared.query()).sqrt() as f32;
+    let mut incremental_clusters = Vec::new();
+    let routes_clusters = plan.incremental && collector.control.routes_clusters();
+    let routing_started = Instant::now();
+    let set = routes_clusters
+        .then(|| searcher.index().cached_centroid_index())
+        .transpose()?;
+    let router = set
+        .as_ref()
+        .map(|set| {
+            set.field_router(field).ok_or_else(|| {
+                TantivyError::InternalError(format!("missing centroid router for {field:?}"))
+            })
+        })
+        .transpose()?;
+    let mut values: Vec<f32> = if routes_clusters {
+        query.iter().map(|value| value.to_f32()).collect()
+    } else {
+        Vec::new()
+    };
+    if routes_clusters && metric == Metric::Cosine {
+        let norm = norm_squared_wide(&values).sqrt();
+        if norm.is_finite() && norm > 0.0 {
+            for value in &mut values {
+                *value = (f64::from(*value) / norm) as f32;
+            }
+        }
+    }
+    let mut workspace = RouterWorkspace::default();
+    let mut ranked = router.map(|router| router.rank_clusters(&mut workspace, &values));
+    let mut routing_time_ns = if routes_clusters {
+        routing_started.elapsed().as_nanos() as u64
+    } else {
+        0
+    };
     let mut start = 0;
     let mut spent = 0.0;
     let assigned = segments.len();
-    while start < plan.clusters.len() && spent < plan.budget.limit {
+    while spent < plan.budget.limit {
+        if plan.incremental {
+            let started = Instant::now();
+            collector
+                .control
+                .extend_clusters(start, &mut incremental_clusters, &mut || {
+                    let candidate = ranked.as_mut().expect("routing producer required").next();
+                    candidate.map(|candidate| RankedCluster {
+                        id: candidate.node,
+                        similarity: candidate.sim.score(),
+                    })
+                });
+            if routes_clusters {
+                routing_time_ns += started.elapsed().as_nanos() as u64;
+            }
+            collector
+                .stats
+                .cluster_flags
+                .resize(incremental_clusters.len(), 0);
+        }
+        let clusters = if plan.incremental {
+            &incremental_clusters
+        } else {
+            &plan.clusters
+        };
+        if start == clusters.len() {
+            break;
+        }
         let initial_wave = (start == 0).then_some(initial_wave).flatten();
         let end = initial_wave.map_or_else(
-            || (start + PROBE_WAVE_SIZE).min(plan.clusters.len()),
+            || (start + PROBE_WAVE_SIZE).min(clusters.len()),
             |wave| wave.end,
         );
         let mut costs = if initial_wave.is_none() {
@@ -670,7 +743,7 @@ where
             collector.control.check_interrupt();
             let mut probes = Vec::with_capacity(end - start);
             let mut rows = Vec::new();
-            for (offset, cluster) in plan.clusters[start..end].iter().enumerate() {
+            for (offset, cluster) in clusters[start..end].iter().enumerate() {
                 let probe = ClusterProbe::prepare(
                     segment,
                     cluster,
@@ -701,7 +774,7 @@ where
         assert!(wave.end >= start && wave.end <= end);
         let mut order: Vec<_> = (start..wave.end).collect();
         let keep = 16usize.saturating_sub(start).min(order.len());
-        order[keep..].sort_unstable_by_key(|&rank| plan.clusters[rank].id);
+        order[keep..].sort_unstable_by_key(|&rank| clusters[rank].id);
         if sharing {
             let segment_count = searcher.segment_readers().len();
             let assigned_ordinals: Vec<_> = segments[..assigned]
@@ -743,7 +816,7 @@ where
                     for &rank in &order[begin..(begin + PROBE_BATCH_SIZE).min(order.len())] {
                         let probe = ClusterProbe::prepare(
                             segment,
-                            &plan.clusters[rank],
+                            &clusters[rank],
                             threshold,
                             metric,
                             q_norm,
@@ -804,7 +877,14 @@ where
         start = wave.end;
     }
     collector.stats.work_charged = plan.budget.charge(collector.work) as f32;
-    collector.stats.termination = if start < plan.clusters.len() {
+    collector.stats.routing = ranked.as_ref().map(|ranked| ranked.metrics());
+    collector.stats.routing_time_ns = routing_time_ns;
+    let ranked_len = if plan.incremental {
+        incremental_clusters.len()
+    } else {
+        plan.clusters.len()
+    };
+    collector.stats.termination = if start < ranked_len {
         ProbeTermination::Ceiling
     } else {
         ProbeTermination::Exhausted

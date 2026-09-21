@@ -28,7 +28,9 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::vector::{CachedCentroidIndex, CentroidProducer, RouterKind, VectorPlugin};
+use crate::vector::{
+    CachedCentroidIndex, CentroidIndexReader, CentroidProducer, RouterKind, VectorPlugin,
+};
 use crate::SegmentReader;
 
 fn load_metas(
@@ -991,6 +993,28 @@ impl Index {
         self.segment(segment_meta)
     }
 
+    pub(crate) fn centroid_count(&self, field: Field) -> crate::Result<Option<usize>> {
+        let FieldType::Vector(options) = self.schema.get_field_entry(field).field_type() else {
+            return Err(TantivyError::InvalidArgument(format!(
+                "field {field:?} is not a vector field"
+            )));
+        };
+        if let Some(set) = self
+            .centroid_index_cache
+            .read()
+            .expect("centroid index cache poisoned")
+            .as_ref()
+        {
+            return Ok(set.field_router(field).map(|router| router.num_centroids()));
+        }
+        let Some(filename) = self.load_metas()?.centroid_index else {
+            return Ok(None);
+        };
+        let reader = CentroidIndexReader::open(&self.directory, Path::new(&filename))?;
+        let (count, _) = reader.field_rows(field, options)?;
+        Ok(Some(count))
+    }
+
     /// The search-time view of the centroid index, opened on first use
     /// and cached for the life of this `Index` (and all its clones) — the
     /// file is immutable, so the cache never invalidates.
@@ -1075,5 +1099,35 @@ impl Index {
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Index({:?})", self.directory)
+    }
+}
+
+#[cfg(test)]
+mod centroid_count_tests {
+    use super::*;
+    use crate::schema::{Metric, VectorDType, VectorOptions};
+
+    #[test]
+    fn centroid_count_does_not_load_router() -> crate::Result<()> {
+        let mut fixture =
+            crate::vector::tests::TestVectorIndex::builder(VectorDType::F32).build()?;
+        let field = fixture.embedding_field();
+        fixture.index.set_ivf_router(RouterKind::Rng)?;
+        let count = fixture.index.centroid_count(field)?.unwrap();
+        assert!(count > 0);
+        assert!(fixture.index.centroid_index_cache.read().unwrap().is_none());
+        let router = fixture.index.cached_centroid_index()?;
+        assert_eq!(router.field_router(field).unwrap().num_centroids(), count);
+        assert_eq!(fixture.index.centroid_count(field)?, Some(count));
+        Ok(())
+    }
+
+    #[test]
+    fn centroid_count_without_index_is_none() -> crate::Result<()> {
+        let mut builder = Schema::builder();
+        let field = builder.add_vector_field("embedding", VectorOptions::new(2, Metric::L2));
+        let index = Index::builder().schema(builder.build()).create_in_ram()?;
+        assert_eq!(index.centroid_count(field)?, None);
+        Ok(())
     }
 }

@@ -161,8 +161,8 @@ where
             segments,
             control,
         )?;
-        stats.routing = plan.routing;
-        stats.routing_time_ns = plan.routing_time_ns;
+        stats.routing = stats.routing.or(plan.routing);
+        stats.routing_time_ns += plan.routing_time_ns;
         let results = hits
             .into_iter()
             .skip(self.offset)

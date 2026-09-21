@@ -22,10 +22,12 @@
 //! set — or a tag that disagrees with the slots present — is corrupt, not
 //! old.
 
+use std::sync::Arc;
+
 use common::{HasLen, OwnedBytes};
 
 use super::header::{read_header, vec_slot, VectorFileVersion};
-use super::id_map::IdMap;
+use super::id_map::{IdMap, VARIANT_EXPLICIT};
 use super::ivf::SegmentClusters;
 use super::VEC_EXT;
 use crate::directory::error::OpenReadError;
@@ -66,11 +68,21 @@ pub struct VectorIndexReader {
     /// no vector data for this field at all.
     present: bool,
     /// `.vec` slot `[0]`
-    id_map: Option<IdMap>,
+    id_map: Option<Arc<IdMap>>,
     /// `.vec` slot `[1]`: the dense vector rows. Never materialized whole;
     /// queries fetch per-cluster (or per-doc) ranges.
     rows_slice: FileSlice,
-    index: Option<SegmentClusters>,
+    index: Option<Arc<SegmentClusters>>,
+}
+
+pub(crate) struct VectorIndexMetadata {
+    options: VectorOptions,
+    num_vectors: usize,
+    present: bool,
+    id_map_slice: Option<FileSlice>,
+    flat_id_map: Option<Arc<IdMap>>,
+    rows_slice: FileSlice,
+    index: Option<Arc<SegmentClusters>>,
 }
 
 pub(crate) fn visit_rows(
@@ -131,7 +143,7 @@ pub(crate) fn visit_rows(
     Ok(())
 }
 
-impl VectorIndexReader {
+impl VectorIndexMetadata {
     /// Opens `field`'s vector data in `segment_reader`'s segment. Returns the
     /// [`empty`](Self::empty) placeholder when the segment carries no vector
     /// data for the field (no `.vec` file, or the field has no slots in it),
@@ -186,8 +198,8 @@ impl VectorIndexReader {
             }
         };
 
-        let id_map = IdMap::open(id_map_slice, segment_reader.max_doc())?;
-        if id_map.is_flat() == ivf_slices.is_some() {
+        let (num_rows, flat_id_map) = id_map_metadata(&id_map_slice, segment_reader.max_doc())?;
+        if flat_id_map.is_some() == ivf_slices.is_some() {
             return Err(TantivyError::InternalError(format!(
                 "vector field {:?}: the id-map variant disagrees with the slots present — the \
                  file is corrupt",
@@ -195,16 +207,12 @@ impl VectorIndexReader {
             )));
         }
         let index = match ivf_slices {
-            Some((offsets_slice, bounds_slice, meta_slice)) => Some(SegmentClusters::open(
-                &options,
-                offsets_slice,
-                bounds_slice,
-                meta_slice,
-            )?),
+            Some((offsets_slice, bounds_slice, meta_slice)) => Some(Arc::new(
+                SegmentClusters::open(&options, offsets_slice, bounds_slice, meta_slice)?,
+            )),
             None => None,
         };
 
-        let num_rows = id_map.num_rows() as usize;
         if let Some(index) = &index {
             if index.num_rows() != num_rows {
                 return Err(TantivyError::InternalError(
@@ -230,8 +238,70 @@ impl VectorIndexReader {
             num_vectors,
             present: true,
             rows_slice,
-            id_map: Some(id_map),
+            id_map_slice: Some(id_map_slice),
+            flat_id_map: flat_id_map.map(Arc::new),
             index,
+        })
+    }
+
+    fn empty(options: VectorOptions) -> Self {
+        Self {
+            options,
+            num_vectors: 0,
+            present: false,
+            id_map_slice: None,
+            flat_id_map: None,
+            rows_slice: FileSlice::empty(),
+            index: None,
+        }
+    }
+
+    pub(crate) fn options(&self) -> &VectorOptions {
+        &self.options
+    }
+
+    pub(crate) fn clusters(&self) -> Option<&SegmentClusters> {
+        self.index.as_deref()
+    }
+}
+
+fn id_map_metadata(slice: &FileSlice, num_docs: u32) -> std::io::Result<(usize, Option<IdMap>)> {
+    if !slice.is_empty() && slice.slice(0..1).read_bytes()?[0] == VARIANT_EXPLICIT {
+        let bytes = slice.len() - 1;
+        if bytes % std::mem::size_of::<DocId>() != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "explicit id map body is not a whole number of u32 doc ids",
+            ));
+        }
+        Ok((bytes / std::mem::size_of::<DocId>(), None))
+    } else {
+        let map = IdMap::open(slice.clone(), num_docs)?;
+        Ok((map.num_rows() as usize, Some(map)))
+    }
+}
+
+impl VectorIndexReader {
+    pub(crate) fn open(segment_reader: &SegmentReader, field: Field) -> crate::Result<Self> {
+        let metadata = segment_reader.vector_index_metadata(field)?;
+        if !metadata.present {
+            return Ok(Self::empty(metadata.options.clone()));
+        }
+        let id_map = match &metadata.flat_id_map {
+            Some(map) => Some(Arc::clone(map)),
+            None => metadata
+                .id_map_slice
+                .as_ref()
+                .map(|slice| IdMap::open(slice.clone(), segment_reader.max_doc()).map(Arc::new))
+                .transpose()?,
+        };
+        Ok(Self {
+            options: metadata.options.clone(),
+            num_vectors: metadata.num_vectors,
+            present: metadata.present,
+            id_map,
+            rows_slice: metadata.rows_slice.clone(),
+            index: metadata.index.clone(),
         })
     }
 
@@ -268,7 +338,7 @@ impl VectorIndexReader {
     /// The per-segment IVF remainder; `None` for a flat (unclustered)
     /// segment and for the [`empty`](Self::empty) placeholder.
     pub fn clusters(&self) -> Option<&SegmentClusters> {
-        self.index.as_ref()
+        self.index.as_deref()
     }
 
     /// Storage info for tooling; `None` if the segment has no vector data for
@@ -352,7 +422,7 @@ impl VectorIndexReader {
     /// beforehand (e.g. from a cluster's row range), so no doc→row lookup
     /// happens here.
     pub fn vector_bytes_for_row(&self, row: usize) -> crate::Result<OwnedBytes> {
-        let num_rows = self.id_map.as_ref().map(IdMap::num_rows).unwrap_or(0);
+        let num_rows = self.id_map.as_ref().map(|map| map.num_rows()).unwrap_or(0);
         if row >= num_rows as usize {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector row {row} is out of bounds"
@@ -368,7 +438,7 @@ impl VectorIndexReader {
 
     /// Read a contiguous range of dense vector rows.
     pub fn vector_bytes_for_rows(&self, rows: std::ops::Range<usize>) -> crate::Result<OwnedBytes> {
-        let num_rows = self.id_map.as_ref().map(IdMap::num_rows).unwrap_or(0) as usize;
+        let num_rows = self.id_map.as_ref().map(|map| map.num_rows()).unwrap_or(0) as usize;
         if rows.start > rows.end || rows.end > num_rows {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector rows {rows:?} are out of bounds"
@@ -388,7 +458,7 @@ impl VectorIndexReader {
         scratch: &mut Vec<u8>,
         visitor: impl FnMut(usize, &[u8]),
     ) -> crate::Result<()> {
-        let num_rows = self.id_map.as_ref().map(IdMap::num_rows).unwrap_or(0) as usize;
+        let num_rows = self.id_map.as_ref().map(|map| map.num_rows()).unwrap_or(0) as usize;
         if rows.start > rows.end || rows.end > num_rows {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector rows {rows:?} are out of bounds"
@@ -408,7 +478,7 @@ impl VectorIndexReader {
         rows: std::ops::Range<usize>,
         mut visitor: impl FnMut(usize, usize, &[u8]),
     ) -> crate::Result<()> {
-        let num_rows = self.id_map.as_ref().map(IdMap::num_rows).unwrap_or(0) as usize;
+        let num_rows = self.id_map.as_ref().map(|map| map.num_rows()).unwrap_or(0) as usize;
         if rows.start > rows.end || rows.end > num_rows {
             return Err(TantivyError::InvalidArgument(format!(
                 "vector rows {rows:?} are out of bounds"
@@ -520,6 +590,87 @@ mod tests {
     use crate::schema::Metric;
 
     #[derive(Debug)]
+    struct HeaderOnlyIdMap;
+
+    impl HasLen for HeaderOnlyIdMap {
+        fn len(&self) -> usize {
+            1 + 10_000_000 * std::mem::size_of::<DocId>()
+        }
+    }
+
+    impl FileHandle for HeaderOnlyIdMap {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            assert_eq!(range, 0..1, "routing must not materialize document ids");
+            Ok(OwnedBytes::new(vec![VARIANT_EXPLICIT]))
+        }
+    }
+
+    #[test]
+    fn explicit_id_map_metadata_reads_only_the_tag() -> crate::Result<()> {
+        let slice = FileSlice::new(Arc::new(HeaderOnlyIdMap));
+        let (rows, map) = id_map_metadata(&slice, 10_000_000)?;
+        assert_eq!(rows, 10_000_000);
+        assert!(map.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn id_map_metadata_matches_full_reader_validation() -> crate::Result<()> {
+        let mut encodings = Vec::new();
+        for ids in [&[0, 1, 2][..], &[0, 2][..], &[][..]] {
+            let mut bytes = Vec::new();
+            IdMap::serialize(ids, 3, &mut bytes)?;
+            encodings.push(bytes);
+        }
+        let mut explicit = Vec::new();
+        IdMap::serialize_explicit(&[2, 0, 1], &mut explicit)?;
+        encodings.push(explicit);
+        for bytes in encodings {
+            let slice = FileSlice::from(bytes);
+            let reader = IdMap::open(slice.clone(), 3)?;
+            let (rows, map) = id_map_metadata(&slice, 3)?;
+            assert_eq!(rows, reader.num_rows() as usize);
+            assert_eq!(map.is_some(), reader.is_flat());
+        }
+        for bytes in [vec![], vec![255], vec![VARIANT_EXPLICIT, 0]] {
+            let slice = FileSlice::from(bytes);
+            let expected = IdMap::open(slice.clone(), 3).err().unwrap();
+            let actual = id_map_metadata(&slice, 3).err().unwrap();
+            assert_eq!(actual.kind(), expected.kind());
+            assert_eq!(actual.to_string(), expected.to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_reader_reuses_routing_metadata() -> crate::Result<()> {
+        let fixture =
+            crate::vector::tests::TestVectorIndex::builder(crate::schema::VectorDType::F32)
+                .build()?;
+        let field = fixture.embedding_field();
+        let searcher = fixture.index.reader()?.searcher();
+        for segment in searcher.segment_readers() {
+            let metadata = segment.vector_index_metadata(field)?;
+            let cached = segment.vector_index_metadata(field)?;
+            assert!(Arc::ptr_eq(&metadata, &cached));
+            let full = segment.vector_index(field)?;
+            assert!(Arc::ptr_eq(
+                metadata.index.as_ref().unwrap(),
+                full.index.as_ref().unwrap()
+            ));
+            assert_eq!(metadata.num_vectors, full.num_vectors());
+            let expected = IdMap::open(
+                metadata.id_map_slice.as_ref().unwrap().clone(),
+                segment.max_doc(),
+            )?;
+            for row in 0..expected.num_rows() as usize {
+                assert_eq!(full.doc_id_at(row), expected.doc_id_at(row));
+            }
+        }
+        Ok(())
+    }
+
+    #[derive(Debug)]
     struct FragmentedFile {
         bytes: Vec<u8>,
         chunk_size: usize,
@@ -574,7 +725,7 @@ mod tests {
             options: VectorOptions::new(dim, Metric::Dot),
             num_vectors: 5,
             present: true,
-            id_map: Some(IdMap::Identity { num_docs: 5 }),
+            id_map: Some(Arc::new(IdMap::Identity { num_docs: 5 })),
             rows_slice: FileSlice::new(file.clone()).slice(offset..end),
             index: None,
         };

@@ -37,13 +37,14 @@ pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };
 pub use header::VectorFileVersion;
+pub(crate) use index_reader::VectorIndexMetadata;
 pub use index_reader::{VectorClusterStats, VectorIndexReader, VectorInfo};
 pub use ivf::bounds::{
     bounds_verdict, margin_ball_ball, margin_ball_halfspace, residual_norm, to_bound_space,
     BoundKind, BoundStore, BoundsBuilder, BoundsScope, HeapPeek, QueryBound, Verdict,
 };
-pub(crate) use ivf::centroid_index::CachedCentroidIndex;
 pub use ivf::centroid_index::CentroidProducer;
+pub(crate) use ivf::centroid_index::{CachedCentroidIndex, CentroidIndexReader};
 pub use ivf::{
     BKTree, BKTreeNode, BKTreeSearchIterator, BktNodeId, Candidate, ClusterId, Graph,
     InMemoryStackedIvf, InMemoryStore, IvfCentroids, IvfConfig, IvfIndexBuilder, IvfLevelClusterer,

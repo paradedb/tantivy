@@ -267,8 +267,8 @@ mod tests {
     use crate::vector::tests::{exhaustive_params, ground_truth, TestVectorIndex};
     use crate::vector::{
         CentroidProducer, ClusterWork, IvfCentroids, IvfMatrix, Metric, NoTieBreak,
-        PreparedVectorSearch, ProbeBudget, ProbeWave, RouterKind, VectorDType, VectorInfo,
-        VectorOptions, VectorSearchControl, PROBE_WAVE_SIZE,
+        PreparedVectorSearch, ProbeBudget, ProbeWave, RankedCluster, RouterKind, VectorDType,
+        VectorInfo, VectorOptions, VectorSearchControl, PROBE_WAVE_SIZE,
     };
     use crate::{DocAddress, Index, IndexWriter, Score, TantivyDocument};
 
@@ -1980,6 +1980,7 @@ mod tests {
     }
     struct ParallelProbeState {
         barrier: Barrier,
+        ranked: Mutex<Vec<RankedCluster>>,
         next: Vec<std::sync::atomic::AtomicUsize>,
         costs: Mutex<Vec<ClusterWork>>,
         wave: Mutex<ProbeWave>,
@@ -1993,6 +1994,27 @@ mod tests {
         worker: usize,
     }
     impl VectorSearchControl for ParallelProbeControl<'_> {
+        fn routes_clusters(&mut self) -> bool {
+            self.worker == 0
+        }
+        fn extend_clusters(
+            &mut self,
+            start: usize,
+            clusters: &mut Vec<RankedCluster>,
+            next: &mut dyn FnMut() -> Option<RankedCluster>,
+        ) {
+            if self.worker == 0 {
+                let mut ranked = self.shared.ranked.lock().unwrap();
+                let remaining = (start + PROBE_WAVE_SIZE + 1).saturating_sub(ranked.len());
+                ranked.extend(std::iter::from_fn(next).take(remaining));
+            }
+            self.shared.barrier.wait();
+            {
+                let ranked = self.shared.ranked.lock().unwrap();
+                clusters.extend_from_slice(&ranked[clusters.len()..]);
+            }
+            self.shared.barrier.wait();
+        }
         fn work_sharing(&self) -> bool {
             true
         }
@@ -2073,6 +2095,7 @@ mod tests {
         fn new(workers: usize, segments: usize, limit: usize) -> Self {
             Self {
                 barrier: Barrier::new(workers),
+                ranked: Mutex::new(Vec::new()),
                 next: (0..segments)
                     .map(|_| std::sync::atomic::AtomicUsize::new(0))
                     .collect(),
@@ -2158,6 +2181,51 @@ mod tests {
                                 worker: 0,
                             },
                         )?;
+                        if plan.incremental {
+                            let set = searcher.index().cached_centroid_index()?;
+                            let router = set.field_router(field).unwrap();
+                            let mut values = query.clone();
+                            if metric == Metric::Cosine {
+                                let norm =
+                                    crate::vector::distance::norm_squared_wide(&values).sqrt();
+                                for value in &mut values {
+                                    *value = (f64::from(*value) / norm) as f32;
+                                }
+                            }
+                            let mut workspace = crate::vector::router::RouterWorkspace::default();
+                            let mut eager = plan.clone();
+                            eager.incremental = false;
+                            eager.clusters = router
+                                .rank_clusters(&mut workspace, &values)
+                                .map(|candidate| RankedCluster {
+                                    id: candidate.node,
+                                    similarity: candidate.sim.score(),
+                                })
+                                .collect();
+                            let expected = collector.search_prepared(
+                                &searcher,
+                                filter.as_ref(),
+                                &eager,
+                                0..searcher.segment_readers().len() as u32,
+                                &mut (),
+                            )?;
+                            assert_eq!(serial.results, expected.results);
+                            let semantic = |stats: &ProbeStats| -> crate::Result<_> {
+                                let mut value = serde_json::to_value(stats)?;
+                                let fields = value.as_object_mut().unwrap();
+                                for key in [
+                                    "routing",
+                                    "routing_time_ns",
+                                    "filter_time_ns",
+                                    "probe_time_ns",
+                                    "segment_setup_time_ns",
+                                ] {
+                                    fields.remove(key);
+                                }
+                                Ok(value)
+                            };
+                            assert_eq!(semantic(&serial.stats)?, semantic(&expected.stats)?);
+                        }
                         if compare_legacy {
                             let legacy = TopDocs::with_limit(limit)
                                 .order_by_similarity(field, query.clone())
@@ -2225,6 +2293,17 @@ mod tests {
                                 .iter()
                                 .flat_map(|fruit| fruit.results.iter().copied())
                                 .collect();
+                            if plan.incremental {
+                                let routing: Vec<_> = results
+                                    .iter()
+                                    .filter_map(|result| result.stats.routing)
+                                    .collect();
+                                assert_eq!(routing.len(), 1);
+                                assert_eq!(
+                                    serde_json::to_value(routing[0])?,
+                                    serde_json::to_value(serial.stats.routing)?
+                                );
+                            }
                             hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
                             hits.truncate(limit);
                             assert_eq!(
@@ -2409,10 +2488,10 @@ mod tests {
         assert_eq!(searcher.segment_readers().len(), 8);
         let query = vec![53.0f32, 69.0];
         let full_plan =
-            PreparedVectorSearch::new(&searcher, field, &query, &exhaustive_params(count), false)?;
+            PreparedVectorSearch::new(&searcher, field, &query, &exhaustive_params(count), true)?;
         assert_eq!(full_plan.clusters.len(), count);
         assert!(full_plan.shareable);
-        assert!(full_plan.initial_wave.is_none());
+        assert!(full_plan.initial_wave.is_some());
         let limit = owned_docs.len() + 1;
         let collector = TopDocs::with_limit(limit).order_by_similarity(field, query.clone());
         let all_hits = ground_truth::top_k(&index, field, Metric::L2, &query, limit)?;
@@ -2473,7 +2552,8 @@ mod tests {
                         a.id == b.id && a.similarity.to_bits() == b.similarity.to_bits()
                     }));
                 } else {
-                    assert_eq!(plan.clusters.len(), count);
+                    assert!(plan.clusters.is_empty());
+                    assert!(plan.incremental);
                     assert!(plan.initial_wave.is_none());
                 }
                 let serial =
@@ -2629,7 +2709,8 @@ mod tests {
         assert!(error.to_string().contains("cannot search a filtered query"));
         let filtered = PreparedVectorSearch::new(&searcher, field, &query, &params, false)?;
         assert!(filtered.initial_wave.is_none());
-        assert_eq!(filtered.clusters.len(), centroids.len());
+        assert!(filtered.clusters.is_empty());
+        assert!(filtered.incremental);
         let result = collector.search_prepared(&searcher, &filter, &filtered, 0..1, &mut ())?;
         assert_eq!(result.results.len(), 1);
         assert_eq!(stored_label_at(&index, label, result.results[0].1)?, "keep");
@@ -2657,7 +2738,8 @@ mod tests {
         let deleted = PreparedVectorSearch::new(&searcher, field, &query, &params, true)?;
         assert!(!deleted.shareable);
         assert!(deleted.initial_wave.is_none());
-        assert_eq!(deleted.clusters.len(), centroids.len());
+        assert!(deleted.clusters.is_empty());
+        assert!(deleted.incremental);
         let result = collector.search_prepared(&searcher, &AllQuery, &deleted, 0..1, &mut ())?;
         assert_eq!(result.results.len(), 3);
         assert_eq!(result.stats.pruned_dead, 1);
