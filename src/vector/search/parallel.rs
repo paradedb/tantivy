@@ -96,6 +96,10 @@ pub trait VectorSearchControl {
     fn routes_clusters(&mut self) -> bool {
         true
     }
+    /// Whether the producer can extend the prefix without other participants.
+    fn can_overlap_routing(&self) -> bool {
+        false
+    }
     fn extend_clusters(
         &mut self,
         start: usize,
@@ -727,6 +731,11 @@ where
     let q_norm = norm_squared_wide(collector.prepared.query()).sqrt() as f32;
     let mut incremental_clusters = Vec::new();
     let routes_clusters = !direct && plan.incremental && collector.control.routes_clusters();
+    let overlap_routing = routes_clusters
+        && !all
+        && plan.shareable
+        && collector.control.work_sharing()
+        && collector.control.can_overlap_routing();
     let routing_started = Instant::now();
     let set = routes_clusters
         .then(|| searcher.index().cached_centroid_index())
@@ -789,23 +798,33 @@ where
     } else {
         0
     };
+    let mut extend_clusters =
+        |control: &mut dyn VectorSearchControl, start, clusters: &mut Vec<RankedCluster>| {
+            let started = Instant::now();
+            control.extend_clusters(start, clusters, &mut || {
+                ranked
+                    .as_mut()
+                    .expect("routing producer required")
+                    .next()
+                    .map(|candidate| RankedCluster {
+                        id: candidate.node,
+                        similarity: candidate.sim.score(),
+                    })
+            });
+            if routes_clusters {
+                started.elapsed().as_nanos() as u64
+            } else {
+                0
+            }
+        };
+    let mut prefetched_start = None;
     let mut start = 0;
     let mut spent = 0.0;
     let assigned = segments.len();
     while !direct && spent < plan.budget.limit {
         if plan.incremental {
-            let started = Instant::now();
-            collector
-                .control
-                .extend_clusters(start, &mut incremental_clusters, &mut || {
-                    let candidate = ranked.as_mut().expect("routing producer required").next();
-                    candidate.map(|candidate| RankedCluster {
-                        id: candidate.node,
-                        similarity: candidate.sim.score(),
-                    })
-                });
-            if routes_clusters {
-                let elapsed = started.elapsed().as_nanos() as u64;
+            if prefetched_start.take() != Some(start) {
+                let elapsed = extend_clusters(collector.control, start, &mut incremental_clusters);
                 routing_time_ns += elapsed;
                 collector.stats.routing_phases.router_prefix_time_ns += elapsed;
             }
@@ -968,6 +987,13 @@ where
                     collector.probe(segment, rank, probe, rows, &mut scratch, threshold)?;
                 }
             }
+        }
+        if overlap_routing && wave.end > start && wave.spent < plan.budget.limit {
+            collector.control.check_interrupt();
+            let elapsed = extend_clusters(collector.control, wave.end, &mut incremental_clusters);
+            routing_time_ns += elapsed;
+            collector.stats.routing_phases.router_prefix_time_ns += elapsed;
+            prefetched_start = Some(wave.end);
         }
         threshold = collector.synchronize(owned);
         spent = wave.spent;

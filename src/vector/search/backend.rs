@@ -277,7 +277,7 @@ mod tests {
     // compare against `ground_truth::top_k`. Write-path tests assert
     // the stored state through the reader's introspection surface.
     // ============================================================
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
 
     use super::*;
     use crate::collector::TopDocs;
@@ -2011,9 +2011,28 @@ mod tests {
         assert_eq!(stats.exact_rows_read, 0, "no flat segments remain");
         Ok(())
     }
+    #[derive(Clone, Debug, PartialEq)]
+    enum ProbeEvent {
+        Extend {
+            start: usize,
+            len: usize,
+            calls: usize,
+        },
+        Select {
+            start: usize,
+            end: usize,
+            spent: u64,
+        },
+        Synchronize,
+    }
     struct ParallelProbeState {
         barrier: Barrier,
         ranked: Mutex<Vec<RankedCluster>>,
+        rank_ready: Condvar,
+        rank_exhausted: std::sync::atomic::AtomicBool,
+        independent_routing: bool,
+        overlap_routing: bool,
+        events: Mutex<Vec<ProbeEvent>>,
         next: Vec<std::sync::atomic::AtomicUsize>,
         costs: Mutex<Vec<ClusterWork>>,
         wave: Mutex<ProbeWave>,
@@ -2030,12 +2049,50 @@ mod tests {
         fn routes_clusters(&mut self) -> bool {
             self.worker == 0
         }
+        fn can_overlap_routing(&self) -> bool {
+            self.shared.overlap_routing
+        }
         fn extend_clusters(
             &mut self,
             start: usize,
             clusters: &mut Vec<RankedCluster>,
             next: &mut dyn FnMut() -> Option<RankedCluster>,
         ) {
+            if self.shared.independent_routing {
+                let target = start + PROBE_WAVE_SIZE + 1;
+                let mut ranked = self.shared.ranked.lock().unwrap();
+                if self.worker == 0 {
+                    let mut calls = 0;
+                    let remaining = target.saturating_sub(ranked.len());
+                    ranked.extend(
+                        std::iter::from_fn(|| {
+                            calls += 1;
+                            next()
+                        })
+                        .take(remaining),
+                    );
+                    self.shared
+                        .rank_exhausted
+                        .store(ranked.len() < target, std::sync::atomic::Ordering::Relaxed);
+                    self.shared.events.lock().unwrap().push(ProbeEvent::Extend {
+                        start,
+                        len: ranked.len(),
+                        calls,
+                    });
+                    self.shared.rank_ready.notify_all();
+                } else {
+                    while ranked.len() < target
+                        && !self
+                            .shared
+                            .rank_exhausted
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        ranked = self.shared.rank_ready.wait(ranked).unwrap();
+                    }
+                }
+                clusters.extend_from_slice(&ranked[clusters.len()..]);
+                return;
+            }
             if self.worker == 0 {
                 let mut ranked = self.shared.ranked.lock().unwrap();
                 let remaining = (start + PROBE_WAVE_SIZE + 1).saturating_sub(ranked.len());
@@ -2099,6 +2156,13 @@ mod tests {
             self.shared.barrier.wait();
             let wave = *self.shared.wave.lock().unwrap();
             self.shared.barrier.wait();
+            if self.worker == 0 && self.shared.independent_routing {
+                self.shared.events.lock().unwrap().push(ProbeEvent::Select {
+                    start,
+                    end: wave.end,
+                    spent: wave.spent.to_bits(),
+                });
+            }
             wave
         }
         fn publish(&mut self, candidates: &[(Score, DocAddress)]) {
@@ -2109,6 +2173,13 @@ mod tests {
             hits.truncate(self.shared.limit);
         }
         fn synchronize(&mut self, _: usize, _: Option<Score>) -> Option<Score> {
+            if self.worker == 0 && self.shared.independent_routing {
+                self.shared
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push(ProbeEvent::Synchronize);
+            }
             self.shared.barrier.wait();
             let threshold = (self.shared.limit <= 1024)
                 .then(|| {
@@ -2129,6 +2200,11 @@ mod tests {
             Self {
                 barrier: Barrier::new(workers),
                 ranked: Mutex::new(Vec::new()),
+                rank_ready: Condvar::new(),
+                rank_exhausted: std::sync::atomic::AtomicBool::new(false),
+                independent_routing: false,
+                overlap_routing: false,
+                events: Mutex::new(Vec::new()),
                 next: (0..segments)
                     .map(|_| std::sync::atomic::AtomicUsize::new(0))
                     .collect(),
@@ -2140,6 +2216,226 @@ mod tests {
                 selections: Mutex::new(Vec::new()),
             }
         }
+    }
+
+    #[test]
+    fn overlapped_filtered_prefix_preserves_budget_eof_and_work() -> crate::Result<()> {
+        assert!(!().can_overlap_routing());
+        for count in [7, 255, 256, 257, 529] {
+            let centroids: Vec<_> = (0..count).map(|i| [i as f32, 0.0]).collect();
+            let segments: Vec<Vec<_>> = (0..4)
+                .map(|segment| {
+                    centroids
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| i % 11 != 7)
+                        .map(|(i, &point)| {
+                            (
+                                if segment < 3 && i % 3 != 1 {
+                                    "keep"
+                                } else {
+                                    "other"
+                                },
+                                point,
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let commits: Vec<_> = segments.iter().map(Vec::as_slice).collect();
+            let (index, field, label) = build_ivf_with_router(
+                Metric::L2,
+                &centroids,
+                &commits,
+                1,
+                false,
+                RouterKind::Exact,
+            )?;
+            let searcher = index.reader()?.searcher();
+            assert_eq!(searcher.segment_readers().len(), 4);
+            let query = vec![0.0f32, 0.0];
+            let all_limit = searcher.num_docs() as usize + 1;
+            let mut plan = PreparedVectorSearch::new(
+                &searcher,
+                field,
+                &query,
+                &exhaustive_params(count),
+                false,
+            )?;
+            assert!(plan.shareable && plan.incremental);
+            plan.budget.open = 1.0;
+            plan.budget.row = 0.0;
+            let first_wave_charge = 3.0
+                * (0..count.min(PROBE_WAVE_SIZE))
+                    .filter(|i| i % 11 != 7)
+                    .count() as f64;
+            let mut budgets = vec![
+                0.0,
+                0.5,
+                3.0,
+                first_wave_charge - 0.5,
+                first_wave_charge,
+                first_wave_charge + 0.5,
+                count as f64 * 3.0 + 1.0,
+            ];
+            budgets.sort_by(f64::total_cmp);
+            budgets.dedup();
+            for budget in budgets {
+                plan.budget.limit = budget;
+                let limits = if count == 529 {
+                    vec![10, all_limit]
+                } else {
+                    vec![all_limit]
+                };
+                for limit in limits {
+                    let collector =
+                        TopDocs::with_limit(limit).order_by_similarity(field, query.clone());
+                    for workers in [1, 2, 4] {
+                        let filter = TermQuery::new(
+                            Term::from_field_text(label, "keep"),
+                            IndexRecordOption::Basic,
+                        );
+                        let run = |overlap| {
+                            let mut shared = ParallelProbeState::new(workers, 4, limit);
+                            shared.independent_routing = true;
+                            shared.overlap_routing = overlap;
+                            shared.reverse_delays = workers != 2;
+                            let results = std::thread::scope(|scope| {
+                                let handles: Vec<_> = (0..workers)
+                                    .map(|worker| {
+                                        let (searcher, collector, plan, filter, shared) =
+                                            (&searcher, &collector, &plan, &filter, &shared);
+                                        scope.spawn(move || {
+                                            collector
+                                                .search_prepared(
+                                                    searcher,
+                                                    filter,
+                                                    plan,
+                                                    (0..4).filter(|ord| {
+                                                        *ord as usize % workers == worker
+                                                    }),
+                                                    &mut ParallelProbeControl { shared, worker },
+                                                )
+                                                .unwrap()
+                                        })
+                                    })
+                                    .collect();
+                                handles
+                                    .into_iter()
+                                    .map(|handle| handle.join().unwrap())
+                                    .collect::<Vec<_>>()
+                            });
+                            let prefix: Vec<_> = shared
+                                .ranked
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .map(|cluster| (cluster.id, cluster.similarity.to_bits()))
+                                .collect();
+                            let events = shared.events.lock().unwrap().clone();
+                            (results, prefix, events)
+                        };
+                        let (baseline, prefix, events) = run(false);
+                        let (overlapped, actual_prefix, actual_events) = run(true);
+                        assert_eq!(
+                            actual_prefix, prefix,
+                            "count={count}, budget={budget}, workers={workers}"
+                        );
+                        for (actual, expected) in overlapped.iter().zip(&baseline) {
+                            let hits = |results: &[(Score, DocAddress)]| {
+                                results
+                                    .iter()
+                                    .map(|(score, doc)| (score.to_bits(), *doc))
+                                    .collect::<Vec<_>>()
+                            };
+                            assert_eq!(hits(&actual.results), hits(&expected.results));
+                            let semantic = |stats: &ProbeStats| {
+                                let mut value = serde_json::to_value(stats).unwrap();
+                                value
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .retain(|key, _| !key.ends_with("_time_ns"));
+                                value
+                            };
+                            assert_eq!(semantic(&actual.stats), semantic(&expected.stats));
+                            assert_eq!(actual.stats.cluster_flags, expected.stats.cluster_flags);
+                        }
+                        let extensions = |events: &[ProbeEvent]| {
+                            events
+                                .iter()
+                                .filter(|event| matches!(event, ProbeEvent::Extend { .. }))
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(extensions(&actual_events), extensions(&events));
+                        let selections = |events: &[ProbeEvent]| {
+                            events
+                                .iter()
+                                .filter(|event| matches!(event, ProbeEvent::Select { .. }))
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(selections(&actual_events), selections(&events));
+                        let syncs = |events: &[ProbeEvent]| {
+                            events
+                                .iter()
+                                .filter(|event| matches!(event, ProbeEvent::Synchronize))
+                                .count()
+                        };
+                        assert_eq!(syncs(&actual_events), syncs(&events));
+                        let mut previous_len = 0;
+                        for event in extensions(&actual_events) {
+                            let ProbeEvent::Extend { start, len, calls } = event else {
+                                unreachable!()
+                            };
+                            let target = start + PROBE_WAVE_SIZE + 1;
+                            assert_eq!(len, count.min(target));
+                            assert_eq!(calls, len - previous_len + usize::from(count < target));
+                            previous_len = len;
+                        }
+                        for (i, event) in events.iter().enumerate() {
+                            if matches!(event, ProbeEvent::Select { .. }) {
+                                assert_eq!(events[i + 1], ProbeEvent::Synchronize);
+                            }
+                        }
+                        for (i, event) in actual_events.iter().enumerate() {
+                            if let ProbeEvent::Select { start, end, spent } = event {
+                                if end > start && f64::from_bits(*spent) < budget {
+                                    assert!(
+                                        matches!(actual_events[i + 1], ProbeEvent::Extend { start, .. } if start == *end)
+                                    );
+                                    assert_eq!(actual_events[i + 2], ProbeEvent::Synchronize);
+                                } else {
+                                    assert_eq!(actual_events[i + 1], ProbeEvent::Synchronize);
+                                }
+                            }
+                        }
+                        if budget > count as f64 * 3.0 {
+                            assert_eq!(prefix.len(), count);
+                            assert!(overlapped
+                                .iter()
+                                .all(|result| result.stats.termination
+                                    == ProbeTermination::Exhausted));
+                            let matching = collect_filter_doc_set(&index, &filter)?;
+                            let expected: Vec<_> =
+                                ground_truth::top_k(&index, field, Metric::L2, &query, all_limit)?
+                                    .into_iter()
+                                    .filter(|(_, doc)| matching.contains(doc))
+                                    .take(limit)
+                                    .collect();
+                            let mut hits: Vec<_> = overlapped
+                                .iter()
+                                .flat_map(|result| result.results.iter().copied())
+                                .collect();
+                            hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                            hits.truncate(limit);
+                            assert_eq!(hits, expected);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
