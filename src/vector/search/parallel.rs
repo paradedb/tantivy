@@ -26,6 +26,7 @@ use crate::{DocAddress, Score, Searcher, SegmentOrdinal, TantivyError};
 pub const PROBE_WAVE_SIZE: usize = 256;
 const PROBE_BATCH_SIZE: usize = 32;
 const FILTERED_PRECOMPUTE_FRACTION: f64 = 0.125;
+const FILTERED_SCAN_BUDGET_FRACTION: f64 = 0.5;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -674,9 +675,43 @@ where
     } else {
         collector.synchronize(owned)
     };
+    let direct = !all
+        && plan.shareable
+        && collector.control.capacity().is_some_and(|capacity| {
+            capacity.rows as f64 * plan.budget.row
+                <= plan.budget.limit * FILTERED_SCAN_BUDGET_FRACTION
+        });
+    if direct {
+        for segment in &mut segments {
+            for begin in (0..segment.ivf().num_rows()).step_by(64) {
+                collector.control.check_interrupt();
+                let filter = match &segment.filter {
+                    FilterState::Built(filter) => Some(filter),
+                    _ => None,
+                };
+                let (visited, filtered, dead, seen, scored) = collect_cluster_survivors(
+                    &segment.vec,
+                    begin..(begin + 64).min(segment.ivf().num_rows()),
+                    filter,
+                    segment.alive,
+                    None,
+                    &mut scratch,
+                );
+                collector.stats.vectors_visited += visited;
+                collector.stats.pruned_filter += filtered;
+                collector.stats.pruned_dead += dead;
+                collector.stats.pruned_seen += seen;
+                collector.stats.candidates_scored += scored;
+                collector.stats.exact_rows_read += scored;
+                collector.work.rows += scored as u64;
+                collector.score(segment, &scratch, None)?;
+            }
+        }
+        collector.synchronize(owned);
+    }
     let q_norm = norm_squared_wide(collector.prepared.query()).sqrt() as f32;
     let mut incremental_clusters = Vec::new();
-    let routes_clusters = plan.incremental && collector.control.routes_clusters();
+    let routes_clusters = !direct && plan.incremental && collector.control.routes_clusters();
     let routing_started = Instant::now();
     let set = routes_clusters
         .then(|| searcher.index().cached_centroid_index())
@@ -729,7 +764,7 @@ where
     let mut start = 0;
     let mut spent = 0.0;
     let assigned = segments.len();
-    while spent < plan.budget.limit {
+    while !direct && spent < plan.budget.limit {
         if plan.incremental {
             let started = Instant::now();
             collector

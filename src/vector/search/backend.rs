@@ -80,9 +80,9 @@ pub struct ProbeStats {
     /// opens at `x` per non-empty (cluster, segment) pair, scored rows
     /// at `(1 - x)/n_avg`.
     pub work_charged: f32,
-    /// Rows fetched and scored by the exact tier — flat (unclustered)
-    /// segments scanned exhaustively. Mandatory work, outside the probe
-    /// budget; disjoint from every clustered counter above.
+    /// Rows fetched and scored by exhaustive physical scans. Flat segments
+    /// are mandatory work outside the probe budget. Exact filtered scans
+    /// of clustered segments also count as candidates and charge row work.
     pub exact_rows_read: usize,
     /// Statistics from the configured router's ranking implementation.
     pub routing: Option<RouterMetrics>,
@@ -2360,25 +2360,26 @@ mod tests {
         #[derive(Default)]
         struct CapacityControl {
             capacity: Option<ClusterWork>,
-            synchronized: bool,
+            synchronizations: usize,
+            routes: usize,
         }
         impl VectorSearchControl for CapacityControl {
             fn add_capacity(&mut self, capacity: ClusterWork) {
-                assert!(!self.synchronized);
+                assert_eq!(self.synchronizations, 0);
                 assert!(self.capacity.is_none());
                 self.capacity = Some(capacity);
             }
             fn capacity(&self) -> Option<ClusterWork> {
-                assert!(self.synchronized);
+                assert!(self.synchronizations > 0);
                 self.capacity
             }
             fn synchronize(&mut self, _: usize, local: Option<Score>) -> Option<Score> {
-                assert!(self.capacity.is_some());
-                self.synchronized = true;
+                self.synchronizations += 1;
                 local
             }
             fn routes_clusters(&mut self) -> bool {
-                assert!(self.synchronized);
+                assert!(self.synchronizations > 0);
+                self.routes += 1;
                 true
             }
         }
@@ -2410,25 +2411,65 @@ mod tests {
             false,
         )?;
         assert!(plan.shareable);
-        let collector = TopDocs::with_limit(10).order_by_similarity(field, query);
+        let collector = TopDocs::with_limit(10).order_by_similarity(field, query.clone());
         for (term, opens, rows) in [("keep", 6, 3), ("missing", 0, 0)] {
             let filter =
                 TermQuery::new(Term::from_field_text(label, term), IndexRecordOption::Basic);
+            let mut boundary = plan.clone();
+            boundary.budget.limit = 2.0 * (rows as f64 * plan.budget.row);
             let mut control = CapacityControl::default();
             let actual =
-                collector.search_prepared(&searcher, &filter, &plan, 0..3, &mut control)?;
+                collector.search_prepared(&searcher, &filter, &boundary, 0..3, &mut control)?;
             let capacity = control.capacity.unwrap();
             assert_eq!(capacity.opens, opens);
             assert_eq!(capacity.rows, rows);
+            let matching = collect_filter_doc_set(&index, &filter)?;
+            let expected: Vec<_> = ground_truth::top_k(
+                &index,
+                field,
+                Metric::L2,
+                &query,
+                searcher.num_docs() as usize,
+            )?
+            .into_iter()
+            .filter(|(_, addr)| matching.contains(addr))
+            .take(10)
+            .collect();
+            assert_eq!(actual.results, expected);
             assert_eq!(actual.stats.candidates_scored as u64, rows);
-            assert_eq!(actual.results.len() as u64, rows);
+            assert_eq!(actual.stats.exact_rows_read as u64, rows);
+            assert_eq!(actual.stats.vectors_visited as u64, opens);
+            assert_eq!(actual.stats.pruned_filter as u64, opens - rows);
+            assert_eq!(actual.stats.segment_opens, 0);
+            assert_eq!(actual.stats.clusters_probed(), 0);
+            assert_eq!(actual.stats.precomputed_centroids, 0);
+            assert!(actual.stats.routing.is_none());
             assert_eq!(
-                actual.stats.precomputed_centroids,
-                if rows > 0 { centroids.len() } else { 0 }
+                actual.stats.work_charged,
+                (rows as f64 * plan.budget.row) as f32
             );
+            assert_eq!(control.routes, 0);
+            assert_eq!(control.synchronizations, 2);
             let lazy = collector.search_prepared(&searcher, &filter, &plan, 0..3, &mut ())?;
             assert_eq!(lazy.stats.precomputed_centroids, 0);
+            assert_eq!(lazy.stats.exact_rows_read, 0);
+            assert!(lazy.stats.routing.is_some());
             assert_eq!(actual.results, lazy.results);
+            if rows == 0 {
+                continue;
+            }
+            let mut limited = boundary.clone();
+            limited.budget.limit -= 0.01 * plan.budget.row;
+            assert!(limited.budget.limit >= limited.budget.charge(capacity) * 0.125);
+            let mut control = CapacityControl::default();
+            let actual =
+                collector.search_prepared(&searcher, &filter, &limited, 0..3, &mut control)?;
+            let lazy = collector.search_prepared(&searcher, &filter, &limited, 0..3, &mut ())?;
+            assert_eq!(actual.stats.exact_rows_read, 0);
+            assert_eq!(actual.stats.precomputed_centroids, centroids.len());
+            assert_eq!(control.routes, 1);
+            assert_eq!(actual.results, lazy.results);
+            assert_eq!(actual.stats.candidates_scored, lazy.stats.candidates_scored);
             assert_eq!(
                 actual.stats.work_charged.to_bits(),
                 lazy.stats.work_charged.to_bits()
@@ -2438,6 +2479,50 @@ mod tests {
                 serde_json::to_value(lazy.stats.routing)?
             );
         }
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        writer.delete_term(Term::from_field_text(label, "keep"));
+        writer.commit()?;
+        writer.wait_merging_threads()?;
+        let searcher = index.reader()?.searcher();
+        let deleted = PreparedVectorSearch::new(
+            &searcher,
+            field,
+            &query,
+            &exhaustive_params(centroids.len()),
+            false,
+        )?;
+        assert!(!deleted.shareable);
+        let filter = TermQuery::new(
+            Term::from_field_text(label, "other"),
+            IndexRecordOption::Basic,
+        );
+        let mut control = CapacityControl::default();
+        let actual = collector.search_prepared(&searcher, &filter, &deleted, 0..3, &mut control)?;
+        assert!(control.capacity.is_none());
+        assert_eq!(actual.stats.exact_rows_read, 0);
+        assert!(actual.stats.routing.is_some());
+        let (index, field, label) = build_ivf(Metric::L2, &centroids, &[&first, &last], 2, false)?;
+        let searcher = index.reader()?.searcher();
+        let replicated = PreparedVectorSearch::new(
+            &searcher,
+            field,
+            &query,
+            &exhaustive_params(centroids.len()),
+            false,
+        )?;
+        assert!(!replicated.shareable);
+        let filter = TermQuery::new(
+            Term::from_field_text(label, "keep"),
+            IndexRecordOption::Basic,
+        );
+        let mut control = CapacityControl::default();
+        let actual = TopDocs::with_limit(10)
+            .order_by_similarity(field, query)
+            .search_prepared(&searcher, &filter, &replicated, 0..2, &mut control)?;
+        assert!(control.capacity.is_none());
+        assert_eq!(actual.stats.exact_rows_read, 0);
+        assert!(actual.stats.routing.is_some());
         Ok(())
     }
 
