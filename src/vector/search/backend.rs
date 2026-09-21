@@ -28,6 +28,7 @@ pub enum ProbeTermination {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ProbeStats {
     pub routing_time_ns: u64,
+    pub precomputed_centroids: usize,
     pub filter_time_ns: u64,
     pub probe_time_ns: u64,
     pub segment_setup_time_ns: u64,
@@ -2350,6 +2351,92 @@ mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_capacity_excludes_empty_segments_and_precedes_routing() -> crate::Result<()> {
+        #[derive(Default)]
+        struct CapacityControl {
+            capacity: Option<ClusterWork>,
+            synchronized: bool,
+        }
+        impl VectorSearchControl for CapacityControl {
+            fn add_capacity(&mut self, capacity: ClusterWork) {
+                assert!(!self.synchronized);
+                assert!(self.capacity.is_none());
+                self.capacity = Some(capacity);
+            }
+            fn capacity(&self) -> Option<ClusterWork> {
+                assert!(self.synchronized);
+                self.capacity
+            }
+            fn synchronize(&mut self, _: usize, local: Option<Score>) -> Option<Score> {
+                assert!(self.capacity.is_some());
+                self.synchronized = true;
+                local
+            }
+            fn routes_clusters(&mut self) -> bool {
+                assert!(self.synchronized);
+                true
+            }
+        }
+        let centroids = [[0.0f32, 0.0], [10.0, 0.0], [20.0, 0.0]];
+        let first = [
+            ("keep", [0.0, 0.0]),
+            ("other", [10.0, 0.0]),
+            ("other", [20.0, 0.0]),
+        ];
+        let empty = [
+            ("other", [0.0, 0.0]),
+            ("other", [10.0, 0.0]),
+            ("other", [20.0, 0.0]),
+        ];
+        let last = [
+            ("keep", [0.0, 0.0]),
+            ("keep", [10.0, 0.0]),
+            ("other", [20.0, 0.0]),
+        ];
+        let (index, field, label) =
+            build_ivf(Metric::L2, &centroids, &[&first, &empty, &last], 1, false)?;
+        let searcher = index.reader()?.searcher();
+        let query = vec![0.0f32, 0.0];
+        let plan = PreparedVectorSearch::new(
+            &searcher,
+            field,
+            &query,
+            &exhaustive_params(centroids.len()),
+            false,
+        )?;
+        assert!(plan.shareable);
+        let collector = TopDocs::with_limit(10).order_by_similarity(field, query);
+        for (term, opens, rows) in [("keep", 6, 3), ("missing", 0, 0)] {
+            let filter =
+                TermQuery::new(Term::from_field_text(label, term), IndexRecordOption::Basic);
+            let mut control = CapacityControl::default();
+            let actual =
+                collector.search_prepared(&searcher, &filter, &plan, 0..3, &mut control)?;
+            let capacity = control.capacity.unwrap();
+            assert_eq!(capacity.opens, opens);
+            assert_eq!(capacity.rows, rows);
+            assert_eq!(actual.stats.candidates_scored as u64, rows);
+            assert_eq!(actual.results.len() as u64, rows);
+            assert_eq!(
+                actual.stats.precomputed_centroids,
+                if rows > 0 { centroids.len() } else { 0 }
+            );
+            let lazy = collector.search_prepared(&searcher, &filter, &plan, 0..3, &mut ())?;
+            assert_eq!(lazy.stats.precomputed_centroids, 0);
+            assert_eq!(actual.results, lazy.results);
+            assert_eq!(
+                actual.stats.work_charged.to_bits(),
+                lazy.stats.work_charged.to_bits()
+            );
+            assert_eq!(
+                serde_json::to_value(actual.stats.routing)?,
+                serde_json::to_value(lazy.stats.routing)?
+            );
         }
         Ok(())
     }

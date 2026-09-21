@@ -25,6 +25,7 @@ use crate::{DocAddress, Score, Searcher, SegmentOrdinal, TantivyError};
 
 pub const PROBE_WAVE_SIZE: usize = 256;
 const PROBE_BATCH_SIZE: usize = 32;
+const FILTERED_PRECOMPUTE_FRACTION: f64 = 0.125;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -86,6 +87,10 @@ pub struct PreparedVectorSearch {
 }
 
 pub trait VectorSearchControl {
+    fn add_capacity(&mut self, _capacity: ClusterWork) {}
+    fn capacity(&self) -> Option<ClusterWork> {
+        None
+    }
     fn routes_clusters(&mut self) -> bool {
         true
     }
@@ -591,6 +596,7 @@ where
         ));
     }
     let mut segments = Vec::new();
+    let mut local_capacity = ClusterWork::default();
     let mut scratch = Vec::new();
     for ord in segment_ordinals {
         if owned == 0 {
@@ -640,6 +646,12 @@ where
                     "centroid and segment cluster counts differ".into(),
                 ));
             }
+            if plan.shareable {
+                if let FilterState::Built(filter) = &segment.filter {
+                    local_capacity.opens += segment.ivf().num_non_empty_clusters() as u64;
+                    local_capacity.rows += filter.len().min(segment.ivf().num_docs()) as u64;
+                }
+            }
             if segment.needs_dedup {
                 segment.seen = Some(BitSet::with_max_value(segment.reader.max_doc()));
             }
@@ -654,6 +666,9 @@ where
     let initial_wave = (all && plan.shareable)
         .then_some(plan.initial_wave)
         .flatten();
+    if !all && plan.shareable {
+        collector.control.add_capacity(local_capacity);
+    }
     let mut threshold = if initial_wave.is_some() {
         None
     } else {
@@ -687,8 +702,25 @@ where
             }
         }
     }
+    let capacity = if routes_clusters && !all && plan.shareable {
+        collector.control.capacity()
+    } else {
+        None
+    };
+    let scores = if capacity.is_some_and(|capacity| {
+        capacity.rows > 0
+            && plan.budget.limit >= plan.budget.charge(capacity) * FILTERED_PRECOMPUTE_FRACTION
+    }) {
+        router
+            .expect("routing producer required")
+            .precompute_scores(&values)?
+    } else {
+        None
+    };
+    collector.stats.precomputed_centroids = scores.as_ref().map_or(0, Vec::len);
     let mut workspace = RouterWorkspace::default();
-    let mut ranked = router.map(|router| router.rank_clusters(&mut workspace, &values));
+    let mut ranked = router
+        .map(|router| router.rank_clusters_with_scores(&mut workspace, &values, scores.as_deref()));
     let mut routing_time_ns = if routes_clusters {
         routing_started.elapsed().as_nanos() as u64
     } else {
