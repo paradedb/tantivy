@@ -358,15 +358,28 @@ impl IndexBuilder {
         }
         if let Some(schema) = self.schema.as_ref() {
             self.index_settings.validate_vector_quantization(schema)?;
-            if self.index_settings.manual_doc_id_mapping
-                && self.index_settings.sort_by_field.is_some()
-            {
+            if self.index_settings.manual_doc_id_mapping && self.index_settings.has_sorting() {
                 return Err(TantivyError::InvalidArgument(
                     "IndexSettings::manual_doc_id_mapping cannot be combined with sort_by_field"
                         .to_string(),
                 ));
             }
-            if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref() {
+            if self.index_settings.sort_by_field.is_some()
+                && !self.index_settings.sort_by_fields.is_empty()
+            {
+                return Err(TantivyError::InvalidArgument(
+                    "Cannot specify both `sort_by_field` and `sort_by_fields` in IndexSettings"
+                        .to_string(),
+                ));
+            }
+            let mut seen_fields = std::collections::HashSet::new();
+            for sort_by_field in self.index_settings.sort_by_fields() {
+                if !seen_fields.insert(&sort_by_field.field) {
+                    return Err(TantivyError::InvalidArgument(format!(
+                        "Duplicate field {} in sort fields",
+                        sort_by_field.field
+                    )));
+                }
                 let schema_field = schema.get_field(&sort_by_field.field).map_err(|_| {
                     TantivyError::InvalidArgument(format!(
                         "Field to sort index {} not found in schema",
