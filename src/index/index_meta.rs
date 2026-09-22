@@ -287,8 +287,11 @@ impl Eq for Bm25Params {}
 pub struct IndexSettings {
     /// Sorts the documents by information
     /// provided in `IndexSortByField`
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_by_field: Option<IndexSortByField>,
+    /// Sorts the documents by compound sort keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sort_by_fields: Vec<IndexSortByField>,
     /// If true, enables caller-provided doc id mappings at segment finalization time.
     /// Always skip serializing this field since it's only used at segment finalization time.
     #[doc(hidden)]
@@ -347,6 +350,7 @@ impl Default for IndexSettings {
     fn default() -> Self {
         Self {
             sort_by_field: None,
+            sort_by_fields: Vec::new(),
             manual_doc_id_mapping: false,
             docstore_compression: Compressor::default(),
             docstore_blocksize: default_docstore_blocksize(),
@@ -368,6 +372,31 @@ impl IndexSettings {
     pub fn vector_clustering_threshold(&self) -> usize {
         self.vector_clustering_threshold
     }
+
+    /// Returns the sort fields configured for the index.
+    ///
+    /// If `sort_by_fields` is set, it takes precedence.
+    /// Otherwise, if `sort_by_field` is set, it returns a single-element slice.
+    /// If neither is set, returns an empty slice.
+    pub fn sort_by_fields(&self) -> &[IndexSortByField] {
+        if !self.sort_by_fields.is_empty() {
+            &self.sort_by_fields
+        } else if let Some(ref field) = self.sort_by_field {
+            std::slice::from_ref(field)
+        } else {
+            &[]
+        }
+    }
+
+    /// Returns the primary sort field, if sorting is configured.
+    pub fn primary_sort_by_field(&self) -> Option<&IndexSortByField> {
+        self.sort_by_fields().first()
+    }
+
+    /// Returns true if index sorting is configured.
+    pub fn has_sorting(&self) -> bool {
+        !self.sort_by_fields().is_empty()
+    }
 }
 
 /// Settings to presort the documents in an index
@@ -381,6 +410,16 @@ pub struct IndexSortByField {
     pub field: String,
     /// The order to sort the documents by
     pub order: Order,
+}
+
+impl IndexSortByField {
+    /// Creates a new `IndexSortByField`.
+    pub fn new(field: impl Into<String>, order: Order) -> Self {
+        Self {
+            field: field.into(),
+            order,
+        }
+    }
 }
 /// The order to sort by
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -637,6 +676,7 @@ mod tests {
             index_settings,
             IndexSettings {
                 sort_by_field: None,
+                sort_by_fields: Vec::new(),
                 manual_doc_id_mapping: false,
                 docstore_compression: Compressor::default(),
                 docstore_compress_dedicated_thread: true,

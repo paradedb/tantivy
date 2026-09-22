@@ -46,7 +46,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         } = self;
         let max_doc = segment_writer.max_doc();
         segment_writer.finalize()?;
-        let did_remapping = segment.index().settings().sort_by_field.is_some();
+        let did_remapping = segment.index().settings().has_sorting();
         Self::finalize_inner(segment, max_doc, did_remapping, false)
     }
 
