@@ -31,6 +31,19 @@ impl<TDocSet: DocSet> BitSetPostingUnion<TDocSet> {
 }
 
 impl<TDocSet: Postings> Postings for BitSetPostingUnion<TDocSet> {
+    fn fieldnorm_id(&self) -> Option<u8> {
+        let doc = self.bitset.doc();
+        for postings in self.docsets.borrow_mut().iter_mut() {
+            if postings.doc() < doc {
+                postings.seek(doc);
+            }
+            if postings.doc() == doc {
+                return postings.fieldnorm_id();
+            }
+        }
+        None
+    }
+
     fn term_freq(&self) -> u32 {
         let curr_doc = self.bitset.doc();
         let mut term_freq = 0;

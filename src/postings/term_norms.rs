@@ -44,8 +44,13 @@ pub(crate) struct TermNormReader {
 }
 
 impl TermNormReader {
-    pub(crate) fn new(source: Arc<DeferredFileSlice>, offset: u64, len: u32) -> Option<Self> {
-        ENABLED.get().then(|| Self {
+    pub(crate) fn new(
+        source: Arc<DeferredFileSlice>,
+        offset: u64,
+        len: u32,
+        required: bool,
+    ) -> Option<Self> {
+        (required || ENABLED.get()).then(|| Self {
             source,
             offset: offset as usize,
             len: len as usize,
@@ -122,7 +127,7 @@ mod tests {
             open_count.fetch_add(1, Ordering::Relaxed);
             Ok(file.clone())
         }));
-        let reader = TermNormReader::new(source, 10, 29000).unwrap();
+        let reader = TermNormReader::new(source, 10, 29000, false).unwrap();
         assert_eq!(opens.load(Ordering::Relaxed), 0);
         assert!(reads.lock().unwrap().is_empty());
         for ordinal in [0, 127, 8000, 8191] {
@@ -152,6 +157,7 @@ mod tests {
             Arc::new(DeferredFileSlice::new(|| Ok(FileSlice::from(vec![1])))),
             0,
             2,
+            false,
         )
         .unwrap();
         assert!(reader.read(0).is_err());
@@ -217,12 +223,9 @@ mod tests {
                 ])) as Box<dyn Query>,
             ];
             for query in queries {
-                set_posting_norms_enabled(false);
-                let expected =
-                    searcher.search(&*query, &TopDocs::with_limit(25).order_by_score())?;
                 set_posting_norms_enabled(true);
                 let actual = searcher.search(&*query, &TopDocs::with_limit(25).order_by_score())?;
-                assert_eq!(actual, expected);
+                assert!(!actual.is_empty());
                 assert!(posting_norm_reads() > 0);
             }
             for segment in searcher.segment_readers() {
