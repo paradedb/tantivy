@@ -210,6 +210,42 @@ impl Bm25Weight {
     }
 
     #[inline]
+    pub(crate) fn max_score_for_term_freq(&self, term_freq: u32) -> Score {
+        if self.weight >= 0.0 {
+            self.score(0, term_freq)
+        } else {
+            Score::INFINITY
+        }
+    }
+
+    pub(crate) fn max_score_for_min_norm(&self, min_norm: u8, max_tf: u32) -> Score {
+        if self.weight >= 0.0 && self.average_fieldnorm > 0.0 {
+            let bound = self.score(min_norm, max_tf);
+            if !bound.is_nan() {
+                return bound;
+            }
+        }
+        Score::INFINITY
+    }
+
+    pub(crate) fn term_freq_cutoff(&self, min_norm: u8, max_tf: u32, threshold: Score) -> u32 {
+        if !(self.weight >= 0.0) {
+            return 0;
+        }
+        let (mut low, mut high) = (0, max_tf);
+        while low < high {
+            let delta = high - low;
+            let mid = low + delta / 2 + delta % 2;
+            if self.score(min_norm, mid) <= threshold {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    }
+
+    #[inline]
     pub(crate) fn tf_factor(&self, fieldnorm_id: u8, term_freq: u32) -> Score {
         let term_freq = term_freq as Score;
         let norm = self.cache[fieldnorm_id as usize];
@@ -257,6 +293,60 @@ mod tests {
     fn test_idf() {
         let score: Score = 2.0;
         assert_nearly_equals!(idf(1, 2), score.ln());
+    }
+
+    #[test]
+    fn test_term_freq_upper_bound() {
+        use super::Bm25Weight;
+        use crate::index::Bm25Params;
+
+        for k1 in [0.0, 1.2, 10_000.0] {
+            for b in [0.0, 0.75, 1.0] {
+                for average_length in [0.1, 1.0, 100.0] {
+                    for boost in [-1.0, 0.0, 1.0, 10.0] {
+                        let weight = Bm25Weight::for_one_term(
+                            10,
+                            100,
+                            average_length,
+                            Bm25Params::new(k1, b),
+                        )
+                        .boost_by(boost);
+                        for tf in [1, 2, 100, u32::MAX] {
+                            let bound = weight.max_score_for_term_freq(tf);
+                            for norm in 0..=255 {
+                                assert!(weight.score(norm, tf) <= bound);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_tf_cutoff_matches_float_score_comparison() {
+        use super::Bm25Weight;
+        use crate::index::Bm25Params;
+
+        for (k1, b) in [(0.0, 0.0), (1.2, 0.75), (1.2, 1.0), (10000.0, 0.5)] {
+            for boost in [-1.0, 0.0, 1.0] {
+                let weight =
+                    Bm25Weight::for_one_term(10, 100, 1.1, Bm25Params::new(k1, b)).boost_by(boost);
+                for norm in [0, 1, 2, 20, 255] {
+                    for threshold in [Score::MIN, 0.0, weight.score(norm, 2), 100.0, Score::NAN] {
+                        let cutoff = weight.term_freq_cutoff(norm, u32::MAX, threshold);
+                        for tf in [1, 2, 3, 255, u32::MAX - 1, u32::MAX] {
+                            if tf <= cutoff {
+                                assert!(weight.score(norm, tf) <= threshold);
+                            }
+                        }
+                        if boost >= 0.0 && !threshold.is_nan() && cutoff < u32::MAX {
+                            assert!(weight.score(norm, cutoff + 1) > threshold);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

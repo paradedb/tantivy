@@ -334,6 +334,8 @@ pub struct BlockWandSingleScorer {
     scorer: TermScorer,
     threshold: Score,
     current: (DocId, Score),
+    cutoff_cache: Option<(DocId, Score, [u32; 3])>,
+    subblock_cache: Option<(DocId, Score)>,
 }
 impl BlockWandSingleScorer {
     /// Construction positions `current` on the first match
@@ -342,6 +344,8 @@ impl BlockWandSingleScorer {
             scorer: term_scorer,
             threshold,
             current: (0, Score::MIN),
+            cutoff_cache: None,
+            subblock_cache: None,
         };
         // advance to fill current
         scorer.advance();
@@ -371,6 +375,8 @@ impl DocSet for BlockWandSingleScorer {
             // the threshold.
             while self.scorer.block_max_score() <= threshold {
                 let last_doc_in_block = self.scorer.last_doc_in_block();
+                #[cfg(test)]
+                crate::fieldnorm::threshold_trace::skipped(last_doc_in_block);
                 if last_doc_in_block == TERMINATED {
                     self.current = (TERMINATED, Score::MIN);
                     return TERMINATED;
@@ -384,12 +390,45 @@ impl DocSet for BlockWandSingleScorer {
                 self.current = (TERMINATED, Score::MIN);
                 return TERMINATED;
             }
+            let block_end = self.scorer.last_doc_in_block();
+            let cutoffs = match self.cutoff_cache {
+                Some((end, cached_threshold, cutoffs))
+                    if end == block_end && cached_threshold == threshold =>
+                {
+                    cutoffs
+                }
+                _ => {
+                    let cutoffs = self.scorer.term_freq_cutoffs(threshold);
+                    self.cutoff_cache = Some((block_end, threshold, cutoffs));
+                    cutoffs
+                }
+            };
             loop {
-                let score = self.scorer.score();
-                if score > threshold {
-                    self.current = (doc, score);
-                    self.scorer.advance();
-                    break 'outer;
+                if self.subblock_cache.is_none_or(|(end, _)| doc > end) {
+                    self.subblock_cache = self.scorer.subblock_bound();
+                }
+                if let Some((end, bound)) = self.subblock_cache {
+                    if bound <= threshold {
+                        doc = end + 1;
+                        self.scorer.seek_block(doc);
+                        continue 'outer;
+                    }
+                }
+                let tf = self.scorer.term_freq();
+                #[cfg(test)]
+                crate::fieldnorm::threshold_trace::candidate(
+                    doc,
+                    block_end,
+                    threshold,
+                    tf > cutoffs[tf.saturating_sub(1).min(2) as usize],
+                );
+                if tf > cutoffs[tf.saturating_sub(1).min(2) as usize] {
+                    let score = self.scorer.score();
+                    if score > threshold {
+                        self.current = (doc, score);
+                        self.scorer.advance();
+                        break 'outer;
+                    }
                 }
                 debug_assert!(doc <= self.scorer.last_doc_in_block());
                 if doc == self.scorer.last_doc_in_block() {
@@ -538,6 +577,60 @@ mod tests {
     }
 
     const MAX_TERM_FREQ: u32 = 100u32;
+
+    #[test]
+    fn test_single_term_prunes_before_reading_fieldnorm() {
+        use std::ops::Range;
+        use std::sync::Arc;
+
+        use common::{HasLen, OwnedBytes};
+
+        use crate::directory::{FileHandle, FileSlice};
+        use crate::fieldnorm::FieldNormReader;
+        use crate::postings::SegmentPostings;
+
+        #[derive(Debug)]
+        struct WinnerOnlyFieldnorm;
+
+        impl HasLen for WinnerOnlyFieldnorm {
+            fn len(&self) -> usize {
+                128
+            }
+        }
+
+        impl FileHandle for WinnerOnlyFieldnorm {
+            fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+                assert_eq!(range, 127..128);
+                Ok(OwnedBytes::new(vec![1]))
+            }
+        }
+
+        for per_class_case in [false, true] {
+            if per_class_case && !cfg!(feature = "tf-class-min-fieldnorm") {
+                continue;
+            }
+            let docs: Vec<_> = (0..128)
+                .map(|doc| (doc, if doc == 127 { 2 } else { 1 }))
+                .collect();
+            let weight = Bm25Weight::for_one_term(128, 1000, 10.0, Bm25Params::default());
+            let threshold = if per_class_case {
+                weight.score(1, 1) * 0.95
+            } else {
+                weight.score(0, 1)
+            };
+            let winning_score = weight.score(1, 2);
+            assert!(winning_score > threshold);
+            let mut fieldnorms = [if per_class_case { 20 } else { 1 }; 128];
+            fieldnorms[127] = 1;
+            let postings = SegmentPostings::create_from_docs_and_tfs(&docs, Some(&fieldnorms));
+            let norms = FieldNormReader::open(FileSlice::new(Arc::new(WinnerOnlyFieldnorm)));
+            let scorer = TermScorer::new(postings, norms, weight);
+            let mut pruning = super::BlockWandSingleScorer::new(scorer, threshold);
+            assert_eq!(pruning.doc(), 127);
+            assert_eq!(pruning.score(), winning_score);
+            assert_eq!(pruning.advance(), TERMINATED);
+        }
+    }
 
     fn posting_list(max_doc: u32) -> BoxedStrategy<Vec<(DocId, u32)>> {
         (1..max_doc + 1)

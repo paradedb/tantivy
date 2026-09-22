@@ -327,6 +327,7 @@ pub struct PostingsSerializer {
     avg_fieldnorm: Score,
     bm25_params: Bm25Params,
     term_has_freq: bool,
+    subblock_summaries: Vec<super::subblock::SubblockSummary>,
 }
 
 impl PostingsSerializer {
@@ -354,6 +355,7 @@ impl PostingsSerializer {
             avg_fieldnorm,
             bm25_params,
             term_has_freq: false,
+            subblock_summaries: Vec::new(),
         }
     }
 
@@ -412,6 +414,9 @@ impl PostingsSerializer {
                 self.skip_write.write_total_term_freq(sum_freq);
             }
             let mut blockwand_params = (0u8, 0u32);
+            let mut min_fieldnorms = [u8::MAX; 3];
+            let mut subblocks = [super::subblock::SubblockSummary::default(); 8];
+            let mut posting_idx = 0usize;
             if let Some(bm25_weight) = self.bm25_weight.as_ref() {
                 if let Some(fieldnorm_reader) = self.fieldnorm_reader.as_ref() {
                     let docs = self.block.doc_ids().iter().cloned();
@@ -419,6 +424,19 @@ impl PostingsSerializer {
                     let fieldnorms = docs.map(|doc| fieldnorm_reader.fieldnorm_id(doc));
                     blockwand_params = fieldnorms
                         .zip(term_freqs)
+                        .inspect(|&(norm, tf)| {
+                            if cfg!(feature = "subblock-pruning") {
+                                subblocks[posting_idx / super::subblock::SUBBLOCK_SIZE].record(norm, tf);
+                                posting_idx += 1;
+                            }
+                            if cfg!(any(
+                                feature = "block-min-fieldnorm",
+                                feature = "tf-class-min-fieldnorm"
+                            )) {
+                                let class = tf.saturating_sub(1).min(2) as usize;
+                                min_fieldnorms[class] = min_fieldnorms[class].min(norm);
+                            }
+                        })
                         .max_by(
                             |(left_fieldnorm_id, left_term_freq),
                              (right_fieldnorm_id, right_term_freq)| {
@@ -435,7 +453,19 @@ impl PostingsSerializer {
                 }
             }
             let (fieldnorm_id, term_freq) = blockwand_params;
+            if cfg!(feature = "subblock-pruning") && posting_idx > 0 {
+                self.subblock_summaries.extend_from_slice(&subblocks);
+            }
             self.skip_write.write_blockwand_max(fieldnorm_id, term_freq);
+            if self.fieldnorm_reader.is_some()
+                && cfg!(any(
+                    feature = "block-min-fieldnorm",
+                    feature = "tf-class-min-fieldnorm"
+                ))
+            {
+                self.skip_write
+                    .write_min_fieldnorms(min_fieldnorms, cfg!(feature = "tf-class-min-fieldnorm"));
+            }
         }
         self.block.clear();
     }
@@ -457,6 +487,18 @@ impl PostingsSerializer {
         output_write: &mut impl std::io::Write,
     ) -> io::Result<()> {
         if !self.block.is_empty() {
+            if cfg!(feature = "subblock-pruning") && self.term_has_freq {
+                if let Some(norms) = &self.fieldnorm_reader {
+                    for (docs, freqs) in self.block.doc_ids().chunks(super::subblock::SUBBLOCK_SIZE)
+                        .zip(self.block.term_freqs().chunks(super::subblock::SUBBLOCK_SIZE)) {
+                        let mut summary = super::subblock::SubblockSummary::default();
+                        for (&doc, &tf) in docs.iter().zip(freqs) {
+                            summary.record(norms.fieldnorm_id(doc), tf);
+                        }
+                        self.subblock_summaries.push(summary);
+                    }
+                }
+            }
             // we have doc ids waiting to be written
             // this happens when the number of doc ids is
             // not a perfect multiple of our block size.
@@ -478,6 +520,10 @@ impl PostingsSerializer {
             }
             self.block.clear();
         }
+        if !self.subblock_summaries.is_empty() {
+            assert_eq!(self.subblock_summaries.len(), (doc_freq as usize).div_ceil(super::subblock::SUBBLOCK_SIZE));
+            super::subblock::write_summaries(&self.subblock_summaries, output_write)?;
+        }
         if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
             let skip_data = self.skip_write.data();
             VInt(skip_data.len() as u64).serialize(output_write)?;
@@ -486,6 +532,7 @@ impl PostingsSerializer {
         output_write.write_all(&self.postings_write[..])?;
         self.skip_write.clear();
         self.postings_write.clear();
+        self.subblock_summaries.clear();
         self.bm25_weight = None;
         Ok(())
     }

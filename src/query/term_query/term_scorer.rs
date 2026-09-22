@@ -100,8 +100,39 @@ impl TermScorer {
         self.similarity_weight.max_score()
     }
 
+    pub(crate) fn term_freq_cutoffs(&self, threshold: Score) -> [u32; 3] {
+        #[cfg(test)]
+        if crate::fieldnorm::threshold_trace::disable_tf_filter() {
+            return [0; 3];
+        }
+        let cursor = &self.postings.block_cursor;
+        let minima = if matches!(self.freq_reading_option(), FreqReadingOption::ReadFreq) {
+            cursor.skip_reader().min_fieldnorms()
+        } else {
+            [0; 3]
+        };
+        let max_tf = cursor.freqs().iter().copied().max().unwrap_or(0);
+        if minima[0] == minima[1] && minima[1] == minima[2] {
+            return [self
+                .similarity_weight
+                .term_freq_cutoff(minima[0], max_tf, threshold); 3];
+        }
+        [
+            self.similarity_weight
+                .term_freq_cutoff(minima[0], 1, threshold),
+            self.similarity_weight
+                .term_freq_cutoff(minima[1], 2, threshold),
+            self.similarity_weight
+                .term_freq_cutoff(minima[2], max_tf, threshold),
+        ]
+    }
+
     pub fn last_doc_in_block(&self) -> DocId {
         self.postings.block_cursor.skip_reader().last_doc_in_block()
+    }
+
+    pub(crate) fn subblock_bound(&self) -> Option<(DocId, Score)> {
+        self.postings.block_cursor.subblock_bound(self.postings.block_offset(), &self.similarity_weight)
     }
 
     /// Returns a mutable reference to the underlying block cursor.
@@ -184,7 +215,7 @@ mod tests {
         crate::assert_nearly_equals!(max_scorer, 1.3990127);
         assert_eq!(term_scorer.doc(), 2);
         assert_eq!(term_scorer.term_freq(), 3);
-        assert_nearly_equals!(term_scorer.block_max_score(), 1.3676447);
+        assert_nearly_equals!(term_scorer.block_max_score(), if cfg!(feature = "subblock-pruning") {1.3862944} else {1.3676447});
         assert_nearly_equals!(term_scorer.score(), 1.0892314);
         assert_eq!(term_scorer.advance(), 3);
         assert_eq!(term_scorer.doc(), 3);
@@ -255,7 +286,11 @@ mod tests {
                 block_max_score_computed = block_max_score_computed.max(term_scorer.score());
                 term_scorer.advance();
              }
-             assert_nearly_equals!(block_max_score_computed, block_max_score);
+             if cfg!(feature = "subblock-pruning") {
+                 assert!(block_max_score >= block_max_score_computed);
+             } else {
+                 assert_nearly_equals!(block_max_score_computed, block_max_score);
+             }
          }
         }
     }
@@ -281,7 +316,7 @@ mod tests {
         assert_nearly_equals!(docs.block_max_score(), 3.4597192);
         docs.seek_block(256);
         // the block is not loaded yet.
-        assert_nearly_equals!(docs.block_max_score(), 5.2971773);
+        assert_nearly_equals!(docs.block_max_score(), if cfg!(feature = "subblock-pruning") {3.9539647} else {5.2971773});
         assert_eq!(256, docs.seek(256));
         assert_nearly_equals!(docs.block_max_score(), 3.9539647);
     }

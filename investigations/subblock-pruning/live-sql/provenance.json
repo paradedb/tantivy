@@ -1,0 +1,17 @@
+{
+  "experiment": "Live PostgreSQL title/database top-10; same-index pruning off/on",
+  "diagnostic_port": 29950,
+  "baseline_port_untouched": 29949,
+  "binaries_before": {
+    "/Users/mingying/benchmarker/bm25-io-investigation-20260921/runtime/pg18/lib/postgresql/pg_search.dylib": "a6fc735ce77ce943f56927ab5a5a2dc2086e3f73a4c9e7c2e7953f6b4817a508",
+    "/Users/mingying/benchmarker/hn-page-bitmap/native-topk/main-runtime/pg18/lib/postgresql/pg_search.dylib": "ebb686b263efe400a90604ba3d06ebc871ead7e6943a9a0661db3085a594a660"
+  },
+  "tantivy_root_head": "9f3cae12941d0aacda4158c40bcb0b0d2a53c1c0",
+  "pg_search_head": "d2abf71f912bea544c7e8d41505d2739911604e5",
+  "prototype_binary_sha256": "7747101ba5031b1ee6c35d507388771f42a74145011f69de018354bd145be18d",
+  "binaries_after": {
+    "/Users/mingying/benchmarker/bm25-io-investigation-20260921/runtime/pg18/lib/postgresql/pg_search.dylib": "a6fc735ce77ce943f56927ab5a5a2dc2086e3f73a4c9e7c2e7953f6b4817a508",
+    "/Users/mingying/benchmarker/hn-page-bitmap/native-topk/main-runtime/pg18/lib/postgresql/pg_search.dylib": "ebb686b263efe400a90604ba3d06ebc871ead7e6943a9a0661db3085a594a660"
+  },
+  "binaries_restored_and_baseline_unchanged": true
+}

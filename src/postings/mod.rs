@@ -20,6 +20,7 @@ mod segment_postings;
 pub mod serializer;
 pub(crate) mod skip;
 mod term_info;
+pub(crate) mod subblock;
 
 pub use loaded_postings::LoadedPostings;
 pub(crate) use merger::{next_mapped_doc, PostingsMerger};

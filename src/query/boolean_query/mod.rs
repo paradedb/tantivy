@@ -842,3 +842,7 @@ mod proptest_boolean_query {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "../../../investigations/min-norm/benchmark.rs"]
+mod min_norm_benchmark;

@@ -31,6 +31,7 @@ pub struct BlockSegmentPostings {
     doc_freq: u32,
     data: OwnedBytes,
     skip_reader: SkipReader,
+    subblock_summaries: OwnedBytes,
 }
 
 pub(crate) fn decode_bitpacked_block(
@@ -100,6 +101,7 @@ impl BlockSegmentPostings {
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
+        let (subblock_summaries, bytes) = super::subblock::read_summaries(doc_freq, bytes)?;
         let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
         let skip_reader = match skip_data_opt {
             Some(skip_data) => {
@@ -133,6 +135,7 @@ impl BlockSegmentPostings {
             doc_freq,
             data: postings_data,
             skip_reader,
+            subblock_summaries,
         };
         block_segment_postings.load_block();
         Ok(block_segment_postings)
@@ -148,8 +151,21 @@ impl BlockSegmentPostings {
         fieldnorm_reader: &FieldNormReader,
         bm25_weight: &Bm25Weight,
     ) -> Score {
+        #[cfg(test)]
+        if let Some(bound) = crate::fieldnorm::threshold_trace::block_bound(
+            self.skip_reader.last_doc_in_block(),
+        ) {
+            return bound;
+        }
         if let Some(score) = self.block_max_score_cache {
             return score;
+        }
+        if let Some(summaries) = self.current_subblock_summaries() {
+            let bound = summaries.chunks_exact(2)
+                .map(|bytes| super::subblock::SubblockSummary::from_bytes(bytes).bound(bm25_weight))
+                .reduce(Score::max).unwrap_or(0.0);
+            self.block_max_score_cache = Some(bound);
+            return bound;
         }
         if let Some(skip_reader_max_score) = self.skip_reader.block_max_score(bm25_weight) {
             // if we are on a full block, the skip reader should have the block max information
@@ -160,6 +176,8 @@ impl BlockSegmentPostings {
         // this is the last block of the segment posting list.
         // If it is actually loaded, we can compute block max manually.
         if self.block_is_loaded() {
+            #[cfg(test)]
+            let _phase = crate::fieldnorm::threshold_trace::bound_phase();
             let docs = self.doc_decoder.output_array().iter().cloned();
             let freqs = self.freq_decoder.output_array().iter().cloned();
             let bm25_scores = docs.zip(freqs).map(|(doc, term_freq)| {
@@ -181,6 +199,24 @@ impl BlockSegmentPostings {
         self.freq_reading_option
     }
 
+    fn current_subblock_summaries(&self) -> Option<&[u8]> {
+        if self.subblock_summaries.is_empty() || self.freq_reading_option != FreqReadingOption::ReadFreq {
+            return None;
+        }
+        let remaining = self.skip_reader.remaining_docs() as usize;
+        let start = (self.doc_freq as usize - remaining) / super::subblock::SUBBLOCK_SIZE * 2;
+        let len = remaining.min(128).div_ceil(super::subblock::SUBBLOCK_SIZE) * 2;
+        Some(&self.subblock_summaries[start..start + len])
+    }
+
+    pub(crate) fn subblock_bound(&self, offset: usize, weight: &Bm25Weight) -> Option<(DocId, Score)> {
+        let summaries = self.current_subblock_summaries()?;
+        let group = offset / super::subblock::SUBBLOCK_SIZE;
+        let summary = super::subblock::SubblockSummary::from_bytes(&summaries[group * 2..group * 2 + 2]);
+        let end = ((group + 1) * super::subblock::SUBBLOCK_SIZE).min(self.block_len()) - 1;
+        Some((self.doc(end), summary.bound(weight)))
+    }
+
     // Resets the block segment postings on another position
     // in the postings file.
     //
@@ -192,6 +228,8 @@ impl BlockSegmentPostings {
     //
     // This does not reset the positions list.
     pub(crate) fn reset(&mut self, doc_freq: u32, postings_data: OwnedBytes) -> io::Result<()> {
+        let (subblock_summaries, postings_data) = super::subblock::read_summaries(doc_freq, postings_data)?;
+        self.subblock_summaries = subblock_summaries;
         let (skip_data_opt, postings_data) =
             split_into_skips_and_postings(doc_freq, postings_data)?;
         self.data = postings_data;
@@ -409,6 +447,11 @@ impl BlockSegmentPostings {
             }
         }
         self.block_loaded = true;
+        #[cfg(test)]
+        crate::fieldnorm::threshold_trace::decoded(
+            self.skip_reader.last_doc_in_block(),
+            self.doc_decoder.output_len,
+        );
     }
 
     /// Advance to the next block.
@@ -430,6 +473,7 @@ impl BlockSegmentPostings {
             doc_freq: 0,
             data: OwnedBytes::empty(),
             skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic),
+            subblock_summaries: OwnedBytes::empty(),
         }
     }
 
@@ -450,6 +494,53 @@ mod tests {
     use crate::postings::SegmentPostings;
     use crate::schema::{IndexRecordOption, Schema, Term, INDEXED};
     use crate::DocId;
+
+    #[test]
+    fn test_serialized_minimum_norm_is_not_block_max_norm() {
+        let docs: Vec<_> = (0..128)
+            .map(|doc| (doc, if doc == 127 { 4 } else { 1 }))
+            .collect();
+        let mut norms = [20; 128];
+        norms[0] = 1;
+        norms[127] = 3;
+        let postings = SegmentPostings::create_from_docs_and_tfs(&docs, Some(&norms));
+        let skip = postings.block_cursor.skip_reader();
+        let super::BlockInfo::BitPacked {
+            block_wand_fieldnorm_id,
+            ..
+        } = skip.block_info()
+        else {
+            panic!()
+        };
+        assert_eq!(block_wand_fieldnorm_id, 3);
+        let expected = if cfg!(feature = "tf-class-min-fieldnorm") {
+            [1, 255, 3]
+        } else if cfg!(feature = "block-min-fieldnorm") {
+            [1; 3]
+        } else {
+            [0; 3]
+        };
+        assert_eq!(skip.min_fieldnorms(), expected);
+    }
+
+    #[test]
+    fn test_tf_class_bound_disabled_when_frequencies_are_skipped() {
+        use crate::fieldnorm::FieldNormReader;
+        use crate::query::{Bm25Weight, TermScorer};
+        let docs: Vec<_> = (0..128)
+            .map(|doc| (doc, if doc == 127 { 2 } else { 1 }))
+            .collect();
+        let mut norms = [20; 128];
+        norms[127] = 1;
+        let mut postings = SegmentPostings::create_from_docs_and_tfs(&docs, Some(&norms));
+        postings.block_cursor.freq_reading_option = super::FreqReadingOption::SkipFreq;
+        postings.block_cursor.freq_decoder = super::BlockDecoder::with_val(1);
+        let weight = Bm25Weight::for_one_term(128, 1000, 10.0, crate::Bm25Params::default());
+        let threshold = weight.score(20, 1) * 1.1;
+        assert!(weight.score(1, 1) > threshold);
+        let scorer = TermScorer::new(postings, FieldNormReader::for_test(&norms), weight);
+        assert_eq!(scorer.term_freq_cutoffs(threshold), [0; 3]);
+    }
 
     #[test]
     fn test_empty_segment_postings() {

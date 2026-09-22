@@ -169,6 +169,9 @@ default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", 
 stemmer = ["frostem"]
 mmap = ["fs4", "tempfile", "memmap2"]
 stopwords = []
+block-min-fieldnorm = []
+tf-class-min-fieldnorm = []
+subblock-pruning = []
 
 lz4-compression = ["lz4_flex"]
 zstd-compression = ["zstd"]

@@ -7,9 +7,9 @@ use crate::{DocId, Score, TERMINATED};
 // doc num bits uses the following encoding:
 // given 0b a b cdefgh
 //         |1|2|3|  4  |
-// - 1: unused
+// - 1: one minimum-fieldnorm byte follows the skip entry
 // - 2: is delta-1 encoded. 0 if not, 1, if yes
-// - 3: unused
+// - 3: three TF-class minimum-fieldnorm bytes follow the skip entry
 // - 4: a 5 bit number in 0..32, the actual bitwidth. Bitpacking could in theory say this is 32
 //   (requiring a 6th bit), but the biggest doc_id we can want to encode is TERMINATED-1, which can
 //   be represented on 31b without delta encoding.
@@ -54,14 +54,19 @@ pub(crate) fn write_u32(val: u32, buf: &mut Vec<u8>) {
 
 pub struct SkipSerializer {
     buffer: Vec<u8>,
+    last_doc_offset: usize,
 }
 
 impl SkipSerializer {
     pub fn new() -> SkipSerializer {
-        SkipSerializer { buffer: Vec::new() }
+        SkipSerializer {
+            buffer: Vec::new(),
+            last_doc_offset: 0,
+        }
     }
 
     pub fn write_doc(&mut self, last_doc: DocId, doc_num_bits: u8) {
+        self.last_doc_offset = self.buffer.len();
         write_u32(last_doc, &mut self.buffer);
         self.buffer.push(encode_bitwidth(doc_num_bits, true));
     }
@@ -78,6 +83,16 @@ impl SkipSerializer {
         let block_wand_tf = encode_block_wand_max_tf(term_freq);
         self.buffer
             .extend_from_slice(&[fieldnorm_id, block_wand_tf]);
+    }
+
+    pub(crate) fn write_min_fieldnorms(&mut self, minima: [u8; 3], per_tf: bool) {
+        if per_tf {
+            self.buffer[self.last_doc_offset + 4] |= 0x20;
+            self.buffer.extend_from_slice(&minima);
+        } else {
+            self.buffer[self.last_doc_offset + 4] |= 0x80;
+            self.buffer.push(*minima.iter().min().unwrap());
+        }
     }
 
     pub fn data(&self) -> &[u8] {
@@ -101,6 +116,7 @@ pub(crate) struct SkipReader {
     block_info: BlockInfo,
 
     position_offset: u64,
+    min_fieldnorms: [u8; 3],
 }
 
 #[derive(Clone, Eq, PartialEq, Copy, Debug)]
@@ -139,6 +155,7 @@ impl SkipReader {
             byte_offset: 0,
             remaining_docs: doc_freq,
             position_offset: 0u64,
+            min_fieldnorms: [0; 3],
         };
         if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
             skip_reader.read_block_info();
@@ -162,6 +179,7 @@ impl SkipReader {
         self.block_info = BlockInfo::VInt { num_docs: doc_freq };
         self.byte_offset = 0;
         self.remaining_docs = doc_freq;
+        self.min_fieldnorms = [0; 3];
         self.position_offset = 0u64;
         if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
             self.read_block_info();
@@ -204,7 +222,7 @@ impl SkipReader {
 
     fn read_block_info(&mut self) {
         let bytes = self.owned_read.as_slice();
-        let advance_len: usize;
+        let mut advance_len: usize;
         self.last_doc_in_block = read_u32(bytes);
         let (doc_num_bits, strict_delta_encoded) = decode_bitwidth(bytes[4]);
         match self.skip_info {
@@ -249,7 +267,22 @@ impl SkipReader {
                 };
             }
         }
+        self.min_fieldnorms = if bytes[4] & 0x20 != 0 {
+            let minima = bytes[advance_len..advance_len + 3].try_into().unwrap();
+            advance_len += 3;
+            minima
+        } else if bytes[4] & 0x80 != 0 {
+            let minimum = bytes[advance_len];
+            advance_len += 1;
+            [minimum; 3]
+        } else {
+            [0; 3]
+        };
         self.owned_read.advance(advance_len);
+    }
+
+    pub(crate) fn min_fieldnorms(&self) -> [u8; 3] {
+        self.min_fieldnorms
     }
 
     pub fn block_info(&self) -> BlockInfo {
@@ -295,6 +328,7 @@ impl SkipReader {
             self.read_block_info();
         } else {
             self.last_doc_in_block = TERMINATED;
+            self.min_fieldnorms = [0; 3];
             self.block_info = BlockInfo::VInt {
                 num_docs: self.remaining_docs,
             };
@@ -310,6 +344,34 @@ mod tests {
     };
     use crate::directory::OwnedBytes;
     use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
+
+    #[test]
+    fn test_minimum_norm_metadata_and_legacy_entries() {
+        let mut writer = SkipSerializer::new();
+        for (i, mode) in [None, Some(false), Some(true)].into_iter().enumerate() {
+            writer.write_doc((i as u32 + 1) * 128 - 1, 2);
+            writer.write_term_freq(1);
+            writer.write_blockwand_max(20, 2);
+            if let Some(per_tf) = mode {
+                writer.write_min_fieldnorms([12, 3, 1], per_tf);
+            }
+        }
+        assert_eq!(writer.data().len(), 8 + 9 + 11);
+        let mut reader = SkipReader::new(
+            OwnedBytes::new(writer.data().to_vec()),
+            385,
+            IndexRecordOption::WithFreqs,
+        );
+        assert_eq!(reader.min_fieldnorms(), [0; 3]);
+        reader.advance();
+        assert_eq!(reader.min_fieldnorms(), [1; 3]);
+        reader.advance();
+        assert_eq!(reader.min_fieldnorms(), [12, 3, 1]);
+        reader.advance();
+        assert_eq!(reader.min_fieldnorms(), [0; 3]);
+        reader.reset(OwnedBytes::empty(), 1);
+        assert_eq!(reader.min_fieldnorms(), [0; 3]);
+    }
 
     #[test]
     fn test_encode_block_wand_max_tf() {

@@ -21,6 +21,10 @@ mod reader;
 mod serializer;
 mod writer;
 
+#[cfg(test)]
+#[path = "../../investigations/threshold-oracle/trace.rs"]
+pub(crate) mod threshold_trace;
+
 use self::code::{fieldnorm_to_id, id_to_fieldnorm};
 pub use self::reader::{FieldNormReader, FieldNormReaders};
 pub use self::serializer::FieldNormsSerializer;
