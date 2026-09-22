@@ -25,7 +25,7 @@ use super::distance::norm_squared_wide;
 use super::index_reader::VectorIndexReader;
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
 use super::prepared::PreparedQuery;
-use super::router::{RouterMetrics, RouterWorkspace};
+use super::router::{RouterKind, RouterMetrics, RouterWorkspace};
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
 use crate::collector::sort_key::{Comparator, NaturalComparator};
@@ -486,6 +486,47 @@ struct UnitPricing {
     row: WorkUnits,
 }
 
+impl UnitPricing {
+    fn precompute_centroids(
+        self,
+        clusters: usize,
+        docs: usize,
+        rows: usize,
+        max_doc: usize,
+    ) -> bool {
+        const MAX_SCORES: usize = (1 << 20) / std::mem::size_of::<super::Similarity>();
+        let capacity = self.open * clusters as f64 + self.row * docs as f64;
+        clusters > 0
+            && clusters <= MAX_SCORES
+            && docs == rows
+            && docs == max_doc
+            && self.budget >= capacity * 0.3
+    }
+}
+
+fn precompute_centroid_scores(
+    index: &IvfIndex,
+    weight: &dyn Weight,
+    segment_reader: &SegmentReader,
+    pricing: UnitPricing,
+    query: &[f32],
+) -> crate::Result<Option<Vec<super::Similarity>>> {
+    if weight.matches_all_docs()
+        && segment_reader.alive_bitset().is_none()
+        && index.router() == RouterKind::Rng
+        && pricing.precompute_centroids(
+            index.num_clusters(),
+            index.num_docs(),
+            index.num_rows(),
+            segment_reader.max_doc() as usize,
+        )
+    {
+        Ok(Some(index.centroid_scores(query)?))
+    } else {
+        Ok(None)
+    }
+}
+
 /// One gate survivor from the pre-pass over a cluster's rows: `row`
 /// indexes into the segment-wide dense rows slot.
 #[derive(Clone, Copy)]
@@ -553,8 +594,15 @@ impl<T: VectorElement> VectorBackend<T> {
         // Routing operates in `f32` (centroid rows are `f32` today), so the
         // query is widened losslessly per element.
         let query_f32: Vec<f32> = self.query.query().iter().map(|e| e.to_f32()).collect();
+        let scores =
+            precompute_centroid_scores(index, weight, segment_reader, pricing, &query_f32)?;
         let mut routing_workspace = RouterWorkspace::default();
-        let mut ranked = index.rank_clusters(&mut routing_workspace, &query_f32);
+        let mut ranked = match scores.as_deref() {
+            Some(scores) => {
+                index.rank_clusters_with_scores(&mut routing_workspace, &query_f32, scores)
+            }
+            None => index.rank_clusters(&mut routing_workspace, &query_f32),
+        };
 
         let topn = self.scan_clusters(
             index,
@@ -1026,6 +1074,15 @@ mod tests {
         centroids: &[[f32; 2]],
         docs: &[(&str, [f32; 2])],
     ) -> crate::Result<(Index, Field, Field)> {
+        build_inline_ivf_with_router(metric, centroids, docs, RouterKind::Stacked)
+    }
+
+    fn build_inline_ivf_with_router(
+        metric: Metric,
+        centroids: &[[f32; 2]],
+        docs: &[(&str, [f32; 2])],
+        router: RouterKind,
+    ) -> crate::Result<(Index, Field, Field)> {
         assert!(docs.len() >= 2, "need ≥ 2 docs for ≥ 2 source segments");
         let mut sb = Schema::builder();
         let embed_field = sb.add_vector_field(
@@ -1045,7 +1102,7 @@ mod tests {
             .ivf_clusterer(Arc::new(InlineClusterer {
                 centroids: centroids.to_vec(),
             }))
-            .ivf_router(RouterKind::Stacked)?
+            .ivf_router(router)?
             .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -1064,6 +1121,182 @@ mod tests {
         writer.merge(&segment_ids).wait()?;
         writer.wait_merging_threads()?;
         Ok((index, embed_field, label_field))
+    }
+
+    #[test]
+    fn centroid_precompute_budget_admission() -> crate::Result<()> {
+        for n_avg in [0.1, 10.0, 10_000.0] {
+            for fraction in [0.299, 0.3, 1.0] {
+                let params = AdaptiveProbeParams {
+                    max_probe_fraction: fraction,
+                    min_probe_clusters: 0,
+                    work_model: Some(super::super::ivf::WorkModel { n_avg }),
+                };
+                let (budget, avg, x) = params.resolved_work_budget(1000, 10_000)?;
+                let pricing = UnitPricing {
+                    budget: WorkUnits::new(budget),
+                    open: WorkUnits::new(x),
+                    row: WorkUnits::new((1.0 - x) / avg),
+                };
+                assert_eq!(
+                    pricing.precompute_centroids(1000, 10_000, 10_000, 10_000),
+                    fraction >= 0.3,
+                    "n_avg={n_avg}, fraction={fraction}",
+                );
+            }
+        }
+        for (clusters, expected) in [(32, true), (128, false)] {
+            let (budget, avg, x) =
+                AdaptiveProbeParams::default().resolved_work_budget(clusters, 1000)?;
+            let pricing = UnitPricing {
+                budget: WorkUnits::new(budget),
+                open: WorkUnits::new(x),
+                row: WorkUnits::new((1.0 - x) / avg),
+            };
+            assert_eq!(
+                pricing.precompute_centroids(clusters, 1000, 1000, 1000),
+                expected
+            );
+        }
+        let pricing = UnitPricing {
+            budget: WorkUnits::new(1_000_000.0),
+            open: WorkUnits::new(1.0),
+            row: WorkUnits::ZERO,
+        };
+        assert!(pricing.precompute_centroids(262_144, 1000, 1000, 1000));
+        assert!(!pricing.precompute_centroids(262_145, 1000, 1000, 1000));
+        assert!(!pricing.precompute_centroids(0, 1000, 1000, 1000));
+        assert!(!pricing.precompute_centroids(100, 1000, 1001, 1000));
+        assert!(!pricing.precompute_centroids(100, 1000, 1000, 1001));
+        Ok(())
+    }
+
+    #[test]
+    fn centroid_precompute_preserves_results_and_work() -> crate::Result<()> {
+        let centroids: Vec<_> = (0..65).map(|i| [(i / 2) as f32, (i % 7) as f32]).collect();
+        let docs: Vec<_> = centroids
+            .iter()
+            .cycle()
+            .take(130)
+            .map(|&p| ("all", p))
+            .collect();
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let (index, field, _) =
+                build_inline_ivf_with_router(metric, &centroids, &docs, RouterKind::Rng)?;
+            let searcher = index.reader()?.searcher();
+            let segment = &searcher.segment_readers()[0];
+            let all = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            let filtered = FixedDocsWeight {
+                max_doc: segment.max_doc(),
+                docs: (0..segment.max_doc()).collect(),
+            };
+            for fraction in [0.299, 0.3, 1.0] {
+                let params = AdaptiveProbeParams {
+                    max_probe_fraction: fraction,
+                    min_probe_clusters: 1,
+                    work_model: None,
+                };
+                let (budget, avg, x) = params.resolved_work_budget(65, 130)?;
+                let pricing = UnitPricing {
+                    budget: WorkUnits::new(budget),
+                    open: WorkUnits::new(x),
+                    row: WorkUnits::new((1.0 - x) / avg),
+                };
+                let reader = segment.vector_index(field)?;
+                let ivf = reader.index().unwrap();
+                assert_eq!(
+                    precompute_centroid_scores(ivf, all.as_ref(), segment, pricing, &[0.5, 0.7])?
+                        .is_some(),
+                    fraction >= 0.3,
+                );
+                assert!(
+                    precompute_centroid_scores(ivf, &filtered, segment, pricing, &[0.5, 0.7])?
+                        .is_none()
+                );
+                for query in [vec![0.0, 0.0], vec![0.5, 0.7], vec![5.0, 7.0]] {
+                    for k in [1, 10, 130] {
+                        let (actual, actual_stats) = run_top_n_with_weight(
+                            &index,
+                            field,
+                            query.clone(),
+                            k,
+                            params.clone(),
+                            all.as_ref(),
+                        )?;
+                        let (expected, expected_stats) = run_top_n_with_weight(
+                            &index,
+                            field,
+                            query.clone(),
+                            k,
+                            params.clone(),
+                            &filtered,
+                        )?;
+                        assert_eq!(actual.len(), expected.len());
+                        for ((a_score, a_doc), (e_score, e_doc)) in actual.iter().zip(&expected) {
+                            assert_eq!(a_doc, e_doc);
+                            assert_eq!(a_score.to_bits(), e_score.to_bits());
+                        }
+                        assert_eq!(
+                            serde_json::to_value(actual_stats)?,
+                            serde_json::to_value(expected_stats)?
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn centroid_precompute_skips_other_routers_and_deletes() -> crate::Result<()> {
+        let pricing = UnitPricing {
+            budget: WorkUnits::new(100.0),
+            open: WorkUnits::new(0.5),
+            row: WorkUnits::new(0.5),
+        };
+        for router in [RouterKind::Stacked, RouterKind::Exact, RouterKind::Rng] {
+            let (index, field, label) = build_inline_ivf_with_router(
+                Metric::L2,
+                &[[0.0, 0.0], [1.0, 1.0]],
+                &[("delete", [0.0, 0.0]), ("keep", [1.0, 1.0])],
+                router,
+            )?;
+            let searcher = index.reader()?.searcher();
+            let segment = &searcher.segment_readers()[0];
+            let all = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+            let reader = segment.vector_index(field)?;
+            assert_eq!(
+                precompute_centroid_scores(
+                    reader.index().unwrap(),
+                    all.as_ref(),
+                    segment,
+                    pricing,
+                    &[0.5, 0.7]
+                )?
+                .is_some(),
+                router == RouterKind::Rng,
+            );
+            if router == RouterKind::Rng {
+                let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+                writer.set_merge_policy(Box::new(NoMergePolicy));
+                writer.delete_term(Term::from_field_text(label, "delete"));
+                writer.commit()?;
+                writer.wait_merging_threads()?;
+                let searcher = index.reader()?.searcher();
+                let segment = &searcher.segment_readers()[0];
+                assert!(segment.alive_bitset().is_some());
+                let reader = segment.vector_index(field)?;
+                assert!(precompute_centroid_scores(
+                    reader.index().unwrap(),
+                    all.as_ref(),
+                    segment,
+                    pricing,
+                    &[0.5, 0.7]
+                )?
+                .is_none());
+            }
+        }
+        Ok(())
     }
 
     /// Decode a stored little-endian `[f32; 2]` row.
