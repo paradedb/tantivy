@@ -632,9 +632,11 @@ mod tests {
     #[test]
     fn row_visitor_rejects_invalid_ranges_and_incomplete_data() {
         let (reader, _) = fragmented_reader(3, 7, 5, 0);
-        for rows in [4..6, 3..2, 6..6] {
+        for (start, end) in [(4, 6), (3, 2), (6, 6)] {
             assert!(reader
-                .visit_vector_rows(rows, &mut Vec::new(), |_, _| panic!("invalid row visited"))
+                .visit_vector_rows(start..end, &mut Vec::new(), |_, _| panic!(
+                    "invalid row visited"
+                ))
                 .is_err());
         }
         for delta in [-1, 1] {
@@ -675,9 +677,9 @@ mod tests {
     #[test]
     fn row_fragments_reject_invalid_ranges_and_incomplete_data() {
         let (reader, _) = fragmented_reader(3, 7, 5, 0);
-        for rows in [4..6, 3..2, 6..6] {
+        for (start, end) in [(4, 6), (3, 2), (6, 6)] {
             assert!(reader
-                .visit_vector_row_fragments(rows, |_, _, _| panic!("invalid row visited"))
+                .visit_vector_row_fragments(start..end, |_, _, _| panic!("invalid row visited"))
                 .is_err());
         }
         for delta in [-1, 1] {
