@@ -79,6 +79,108 @@ pub struct VectorIndexReader {
     index: Option<IvfIndex>,
 }
 
+pub(crate) fn visit_rows(
+    slice: &FileSlice,
+    stride: usize,
+    rows: std::ops::Range<usize>,
+    scratch: &mut Vec<u8>,
+    mut visitor: impl FnMut(usize, &[u8]),
+) -> crate::Result<()> {
+    scratch.clear();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if stride == 0 {
+        return Err(TantivyError::InvalidArgument(
+            "vector stride is zero".into(),
+        ));
+    }
+    let expected = rows.len() * stride;
+    let mut received = 0;
+    let mut row = rows.start;
+    let mut invalid = false;
+    slice.read_bytes_chunks(rows.start * stride..rows.end * stride, &mut |mut bytes| {
+        if invalid || bytes.len() > expected - received {
+            invalid = true;
+            return;
+        }
+        received += bytes.len();
+        if !scratch.is_empty() {
+            let take = (stride - scratch.len()).min(bytes.len());
+            scratch.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if scratch.len() < stride {
+                return;
+            }
+            visitor(row, scratch);
+            row += 1;
+            scratch.clear();
+        }
+        let mut whole_rows = bytes.chunks_exact(stride);
+        for bytes in &mut whole_rows {
+            visitor(row, bytes);
+            row += 1;
+        }
+        let remainder = whole_rows.remainder();
+        if !remainder.is_empty() && scratch.capacity() < stride {
+            scratch.reserve_exact(stride);
+        }
+        scratch.extend_from_slice(remainder);
+    })?;
+    if invalid || received != expected || row != rows.end || !scratch.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "vector row chunks do not cover the requested range",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub(crate) fn visit_row_fragments(
+    slice: &FileSlice,
+    stride: usize,
+    rows: std::ops::Range<usize>,
+    mut visitor: impl FnMut(usize, usize, &[u8]),
+) -> crate::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if stride == 0 {
+        return Err(TantivyError::InvalidArgument(
+            "vector stride is zero".into(),
+        ));
+    }
+    let expected = rows.len() * stride;
+    let (mut received, mut offset, mut row) = (0, 0, rows.start);
+    let mut invalid = false;
+    slice.read_bytes_chunks(rows.start * stride..rows.end * stride, &mut |mut bytes| {
+        if invalid || bytes.len() > expected - received {
+            invalid = true;
+            return;
+        }
+        received += bytes.len();
+        while !bytes.is_empty() {
+            let len = (stride - offset).min(bytes.len());
+            visitor(row, offset, &bytes[..len]);
+            bytes = &bytes[len..];
+            offset += len;
+            if offset == stride {
+                row += 1;
+                offset = 0;
+            }
+        }
+    })?;
+    if invalid || received != expected || row != rows.end || offset != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "vector row fragments do not cover the requested range",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl VectorIndexReader {
     /// Opens `field`'s vector data in `segment_reader`'s segment. Returns the
     /// [`empty`](Self::empty) placeholder when the segment carries no vector
@@ -335,6 +437,47 @@ impl VectorIndexReader {
         Ok(bytes)
     }
 
+    /// Visits rows in order, reusing `scratch` only for rows split across storage chunks.
+    pub fn visit_vector_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        scratch: &mut Vec<u8>,
+        visitor: impl FnMut(usize, &[u8]),
+    ) -> crate::Result<()> {
+        let num_rows = self.id_map.num_rows() as usize;
+        if rows.start > rows.end || rows.end > num_rows {
+            return Err(TantivyError::InvalidArgument(format!(
+                "vector rows {rows:?} are out of bounds"
+            )));
+        }
+        visit_rows(
+            &self.rows_slice,
+            self.options.bytes_per_vector(),
+            rows,
+            scratch,
+            visitor,
+        )
+    }
+
+    pub(crate) fn visit_vector_row_fragments(
+        &self,
+        rows: std::ops::Range<usize>,
+        visitor: impl FnMut(usize, usize, &[u8]),
+    ) -> crate::Result<()> {
+        let num_rows = self.id_map.num_rows() as usize;
+        if rows.start > rows.end || rows.end > num_rows {
+            return Err(TantivyError::InvalidArgument(format!(
+                "vector rows {rows:?} are out of bounds"
+            )));
+        }
+        visit_row_fragments(
+            &self.rows_slice,
+            self.options.bytes_per_vector(),
+            rows,
+            visitor,
+        )
+    }
+
     /// The doc id stored at `row` of the cluster-sorted permutation, decoded
     /// on demand from the pinned `Explicit` id-map. IVF storage only.
     #[inline]
@@ -391,6 +534,213 @@ impl VectorIndexReader {
                 }
                 None
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::ops::Range;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::directory::FileHandle;
+    use crate::schema::Metric;
+
+    #[derive(Debug)]
+    struct FragmentedFile {
+        bytes: Vec<u8>,
+        chunk_size: usize,
+        length_delta: isize,
+        fail_after_chunk: bool,
+    }
+
+    impl HasLen for FragmentedFile {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl FileHandle for FragmentedFile {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            Ok(OwnedBytes::new(self.bytes[range].to_vec()))
+        }
+
+        fn read_bytes_chunks(
+            &self,
+            range: Range<usize>,
+            visitor: &mut dyn FnMut(&[u8]),
+        ) -> io::Result<()> {
+            let mut start = range.start;
+            let end = range.end.checked_add_signed(self.length_delta).unwrap();
+            while start < end {
+                let next = ((start / self.chunk_size + 1) * self.chunk_size).min(end);
+                visitor(&self.bytes[start..next]);
+                if self.fail_after_chunk {
+                    return Err(io::Error::other("injected chunk read failure"));
+                }
+                start = next;
+            }
+            Ok(())
+        }
+    }
+
+    fn fragmented_reader(
+        dim: usize,
+        chunk_size: usize,
+        offset: usize,
+        length_delta: isize,
+    ) -> (VectorIndexReader, Arc<FragmentedFile>) {
+        let mut bytes = vec![0; offset];
+        for value in 0..dim * 5 {
+            bytes.extend_from_slice(&(value as f32 * 0.25).to_le_bytes());
+        }
+        let end = bytes.len();
+        bytes.extend_from_slice(&[0; 16]);
+        let file = Arc::new(FragmentedFile {
+            bytes,
+            chunk_size,
+            length_delta,
+            fail_after_chunk: false,
+        });
+        let reader = VectorIndexReader {
+            options: VectorOptions::new(dim, Metric::Dot),
+            num_vectors: 5,
+            present: true,
+            id_map: IdMap::Identity { num_docs: 5 },
+            rows_slice: FileSlice::new(file.clone()).slice(offset..end),
+            index: None,
+        };
+        (reader, file)
+    }
+
+    #[test]
+    fn row_visitors_propagate_storage_errors() {
+        for fragments in [false, true] {
+            let (mut reader, file) = fragmented_reader(3, 7, 5, 0);
+            let failing = FragmentedFile {
+                bytes: file.bytes.clone(),
+                chunk_size: 7,
+                length_delta: 0,
+                fail_after_chunk: true,
+            };
+            reader.rows_slice = FileSlice::new(Arc::new(failing)).slice(5..65);
+            let result = if fragments {
+                reader.visit_vector_row_fragments(1..4, |_, _, _| {})
+            } else {
+                reader.visit_vector_rows(1..4, &mut Vec::new(), |_, _| {})
+            };
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("injected chunk read failure"));
+        }
+    }
+
+    #[test]
+    fn row_visitor_preserves_fragmented_rows() -> crate::Result<()> {
+        for dim in [1, 3, 1024, 4099] {
+            for chunk_size in [1, 3, 7, 8160, 16321] {
+                let (reader, _) = fragmented_reader(dim, chunk_size, 5, 0);
+                let stride = reader.options.bytes_per_vector();
+                let mut scratch = Vec::new();
+                for rows in [0..5, 1..4, 4..5, 2..2] {
+                    let expected = reader
+                        .rows_slice
+                        .slice(rows.start * stride..rows.end * stride)
+                        .read_bytes()?;
+                    let mut visited = Vec::new();
+                    reader.visit_vector_rows(rows.clone(), &mut scratch, |row, bytes| {
+                        assert_eq!(row, rows.start + visited.len());
+                        assert_eq!(bytes.len(), stride);
+                        visited.push(bytes.to_vec());
+                    })?;
+                    assert_eq!(visited.concat(), expected.as_slice());
+                    assert!(scratch.is_empty());
+                    assert!(scratch.capacity() <= stride);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn row_visitor_borrows_whole_rows() -> crate::Result<()> {
+        let (reader, file) = fragmented_reader(3, 48, 0, 0);
+        let mut scratch = Vec::new();
+        reader.visit_vector_rows(0..5, &mut scratch, |row, bytes| {
+            assert_eq!(
+                bytes.as_ptr() as usize,
+                file.bytes.as_ptr() as usize + row * 12
+            );
+        })?;
+        assert_eq!(scratch.capacity(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn row_visitor_rejects_invalid_ranges_and_incomplete_data() {
+        let (reader, _) = fragmented_reader(3, 7, 5, 0);
+        for (start, end) in [(4, 6), (3, 2), (6, 6)] {
+            assert!(reader
+                .visit_vector_rows(start..end, &mut Vec::new(), |_, _| panic!(
+                    "invalid row visited"
+                ))
+                .is_err());
+        }
+        for delta in [-1, 1] {
+            let (reader, _) = fragmented_reader(3, 7, 5, delta);
+            let err = reader
+                .visit_vector_rows(1..4, &mut Vec::new(), |_, _| {})
+                .unwrap_err();
+            assert!(err.to_string().contains("do not cover the requested range"));
+        }
+    }
+
+    #[test]
+    fn row_fragments_borrow_and_cover_arbitrary_byte_boundaries() -> crate::Result<()> {
+        for dim in [1, 3, 1024, 4099] {
+            for chunk_size in [1, 3, 7, 8160, 16321] {
+                let (reader, file) = fragmented_reader(dim, chunk_size, 5, 0);
+                let stride = reader.options.bytes_per_vector();
+                for rows in [0..5, 1..4, 4..5, 2..2] {
+                    let expected = reader
+                        .rows_slice
+                        .slice(rows.start * stride..rows.end * stride)
+                        .read_bytes()?;
+                    let mut actual = Vec::new();
+                    reader.visit_vector_row_fragments(rows.clone(), |row, offset, bytes| {
+                        assert_eq!(row, rows.start + actual.len() / stride);
+                        assert_eq!(offset, actual.len() % stride);
+                        assert_eq!(
+                            bytes.as_ptr() as usize,
+                            file.bytes.as_ptr() as usize + 5 + row * stride + offset,
+                        );
+                        assert!(!bytes.is_empty() && offset + bytes.len() <= stride);
+                        actual.extend_from_slice(bytes);
+                    })?;
+                    assert_eq!(actual.as_slice(), expected.as_slice());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn row_fragments_reject_invalid_ranges_and_incomplete_data() {
+        let (reader, _) = fragmented_reader(3, 7, 5, 0);
+        for (start, end) in [(4, 6), (3, 2), (6, 6)] {
+            assert!(reader
+                .visit_vector_row_fragments(start..end, |_, _, _| panic!("invalid row visited"))
+                .is_err());
+        }
+        for delta in [-1, 1] {
+            let (reader, _) = fragmented_reader(3, 7, 5, delta);
+            let err = reader
+                .visit_vector_row_fragments(1..4, |_, _, _| {})
+                .unwrap_err();
+            assert!(err.to_string().contains("do not cover the requested range"));
         }
     }
 }

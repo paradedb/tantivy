@@ -6,9 +6,8 @@
 //! branches once, on whether the reader carries an [`IvfIndex`]: with it, the
 //! filter is drained into a bitmap and the routed clusters are probed
 //! adaptively; without it, the filter `Scorer` is iterated doc-by-doc and
-//! every vector is scored exactly. Either way, every survivor's bytes are
-//! fetched with one stride-sized read ([`VectorIndexReader::vector_bytes_for_row`])
-//! — the unit the pg-backed `Directory` can serve zero-copy.
+//! every vector is scored exactly. Adjacent surviving rows are read in batches
+//! of at most 64, borrowing storage chunks for scoring.
 
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
@@ -151,7 +150,7 @@ impl<T: VectorElement> VectorBackend<T> {
     }
 
     /// Flat/exact scan: drain the filter DocSet doc-by-doc, scoring each
-    /// survivor from one stride-sized row read. Fills only the
+    /// survivor in adjacent-row batches. Fills only the
     /// `exact_rows_read` stat.
     fn exact_top_n<K, CTail>(
         &self,
@@ -175,6 +174,8 @@ impl<T: VectorElement> VectorBackend<T> {
             TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
         let alive = segment_reader.alive_bitset();
         let mut rows_read = 0usize;
+        let mut survivors = Vec::with_capacity(64);
+        let mut scratch = Vec::new();
         // Row reads are ranged and can fail; the `for_each` closure can't
         // return an error, so the first one is parked here and re-raised
         // after the walk.
@@ -192,20 +193,31 @@ impl<T: VectorElement> VectorBackend<T> {
                 let Some(row) = self.reader.row_id(doc) else {
                     continue;
                 };
-                match self.reader.vector_bytes_for_row(row) {
-                    Ok(vbytes) => {
-                        rows_read += 1;
-                        let score = self.query.score_doc_bytes(&vbytes);
-                        if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
-                            topn.push(key, doc);
-                        }
-                    }
-                    Err(err) => {
+                survivors.push(Survivor { row, doc });
+                if survivors.len() == 64 {
+                    if let Err(err) =
+                        self.score_survivors(&survivors, &mut scratch, |doc, score| {
+                            rows_read += 1;
+                            if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                                topn.push(key, doc);
+                            }
+                        })
+                    {
                         read_err = Some(err);
                         return;
                     }
+                    survivors.clear();
                 }
             }
+            if let Err(err) = self.score_survivors(&survivors, &mut scratch, |doc, score| {
+                rows_read += 1;
+                if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
+                    topn.push(key, doc);
+                }
+            }) {
+                read_err = Some(err);
+            }
+            survivors.clear();
         })?;
         if let Some(err) = read_err {
             return Err(err);
@@ -498,6 +510,53 @@ struct Survivor {
 }
 
 impl<T: VectorElement> VectorBackend<T> {
+    fn score_survivors(
+        &self,
+        survivors: &[Survivor],
+        scratch: &mut Vec<u8>,
+        mut accept: impl FnMut(DocId, Score),
+    ) -> crate::Result<()> {
+        let mut begin = 0;
+        while begin < survivors.len() {
+            let mut end = begin + 1;
+            while end < survivors.len()
+                && end - begin < 64
+                && survivors[end].row == survivors[end - 1].row + 1
+            {
+                end += 1;
+            }
+            let first = survivors[begin].row;
+            let range = first..survivors[end - 1].row + 1;
+            let mut score_row =
+                |row: usize, score| accept(survivors[begin + row - first].doc, score);
+            if let Some(mut accumulator) = self.query.dot_accumulator() {
+                let stride = self.reader.options().bytes_per_vector();
+                self.reader
+                    .visit_vector_row_fragments(range, |row, offset, bytes| {
+                        let score = if offset == 0 && bytes.len() == stride {
+                            Some(self.query.score_doc_bytes(bytes))
+                        } else {
+                            self.query.score_doc_fragment(
+                                &mut accumulator,
+                                bytes,
+                                offset + bytes.len() == stride,
+                            )
+                        };
+                        if let Some(score) = score {
+                            score_row(row, score);
+                        }
+                    })?;
+            } else {
+                self.reader
+                    .visit_vector_rows(range, scratch, |row, bytes| {
+                        score_row(row, self.query.score_doc_bytes(bytes));
+                    })?;
+            }
+            begin = end;
+        }
+        Ok(())
+    }
+
     /// Top-N by IVF probe. Fills `stats` with this segment's probe-loop
     /// counters.
     #[allow(clippy::too_many_arguments)]
@@ -590,8 +649,8 @@ impl<T: VectorElement> VectorBackend<T> {
     /// the open share, without touching its rows. A probed cluster is
     /// then gated per row — [`Self::collect_cluster_survivors`] runs
     /// `filter → alive → seen` off the pinned id-map with no posting
-    /// bytes in hand — and only the survivors' bytes are fetched, one
-    /// stride-sized read per surviving row. Cluster-order arrival of
+    /// bytes in hand — and only the survivors' bytes are fetched, in
+    /// batches of up to 64 adjacent rows. Cluster-order arrival of
     /// survivors forbids the ascending-doc shortcut in `push`; use
     /// `push_unordered`.
     ///
@@ -656,6 +715,7 @@ impl<T: VectorElement> VectorBackend<T> {
         // The probed cluster's gate survivors; allocated once, reused
         // across clusters.
         let mut survivors: Vec<Survivor> = Vec::new();
+        let mut scratch = Vec::new();
         // f64 accumulation in the loop; f32 only at the telemetry fold.
         let mut work_spent = WorkUnits::ZERO;
         let work_budget = pricing.budget;
@@ -743,16 +803,11 @@ impl<T: VectorElement> VectorBackend<T> {
                 postings_skipped += 1;
             } else {
                 postings_row += 1;
-                // One stride-sized read per survivor — the unit the
-                // pg-backed `Directory` serves zero-copy (see
-                // `vector_bytes_for_row`).
-                for &Survivor { row, doc } in &survivors {
-                    let vbytes = self.reader.vector_bytes_for_row(row)?;
-                    let score = self.query.score_doc_bytes(&vbytes);
+                self.score_survivors(&survivors, &mut scratch, |doc, score| {
                     if let Some(key) = tie_break_key(&topn, tie_break, score, doc) {
                         topn.push_unordered(key, doc);
                     }
-                }
+                })?;
             }
             candidates += survivors.len();
 
@@ -2641,7 +2696,7 @@ mod tests {
     //
     // The probe loop decides each cluster's survivors from the pinned
     // id-map BEFORE touching posting bytes, then fetches survivors with
-    // one stride-sized read per row — or nothing at all when the gate
+    // adjacent-row batches — or nothing at all when the gate
     // leaves no survivors. These tests pin the skip/fetch behavior and
     // that the two `postings_*` counters partition the probed clusters.
     // ============================================================
@@ -2984,13 +3039,67 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn batched_survivors_preserve_score_bits_and_arrival_order() -> crate::Result<()> {
+        let dim = 17;
+        let docs: Vec<_> = (0..160)
+            .map(|row| {
+                (
+                    "doc",
+                    Some(
+                        (0..dim)
+                            .map(|i| ((i * 13 + row * 7) % 43) as f32 * 0.06257 - 1.0)
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
+        let (index, field, _) = build_flat(dim, &docs)?;
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_readers()[0].vector_index(field)?;
+        let survivors: Vec<_> = (0..129)
+            .chain([133, 134, 140, 139])
+            .map(|row| Survivor {
+                row,
+                doc: (159 - row) as DocId,
+            })
+            .collect();
+        for metric in [Metric::Dot, Metric::Cosine, Metric::L2] {
+            let backend = VectorBackend {
+                reader: reader.clone(),
+                query: Arc::new(PreparedQuery::new(
+                    metric,
+                    Arc::new((0..dim).map(|i| i as f32 * 0.0137 - 0.2).collect()),
+                )),
+                adaptive: AdaptiveProbeParams::default(),
+                segment_ord: 0,
+            };
+            let expected: Vec<_> = survivors
+                .iter()
+                .map(|s| {
+                    let bytes = reader.vector_bytes_for_row(s.row).unwrap();
+                    (s.doc, backend.query.score_doc_bytes(&bytes).to_bits())
+                })
+                .collect();
+            let mut actual = Vec::new();
+            let mut scratch = Vec::new();
+            backend.score_survivors(&survivors, &mut scratch, |doc, score| {
+                actual.push((doc, score.to_bits()))
+            })?;
+            assert_eq!(actual, expected, "{metric:?}");
+            backend.score_survivors(&[], &mut scratch, |_, _| panic!("empty survivors scored"))?;
+            assert!(scratch.capacity() <= dim * 4);
+        }
+        Ok(())
+    }
+
     /// Flat-path behavior across filter selectivities: hand-built filters
     /// admitting {0, 1, 50, 100}% of docs return every admitted doc
     /// exactly once, the probe-loop counters stay zeroed, and the path
-    /// serves exactly one stride-sized row read per survivor.
+    /// reads and scores each surviving row exactly once.
     #[test]
     fn flat_exact_reads_one_row_per_survivor() -> crate::Result<()> {
-        let n = 40usize;
+        let n = 140usize;
         let labels: Vec<String> = (0..n).map(|i| format!("d{i}")).collect();
         let docs: Vec<(&str, Option<Vec<f32>>)> = (0..n)
             .map(|i| (labels[i].as_str(), Some(vec![i as f32 * 0.1, 1.0])))
