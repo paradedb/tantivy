@@ -26,7 +26,7 @@ use crate::{DocAddress, Score, Searcher, SegmentOrdinal, TantivyError};
 
 pub const PROBE_WAVE_SIZE: usize = 256;
 const PROBE_BATCH_SIZE: usize = 32;
-const FILTERED_PRECOMPUTE_FRACTION: f64 = 0.125;
+const FILTERED_PRECOMPUTE_FRACTION: f64 = 0.08;
 const FILTERED_SCAN_BUDGET_FRACTION: f64 = 0.5;
 
 #[derive(Clone, Copy, Debug)]
