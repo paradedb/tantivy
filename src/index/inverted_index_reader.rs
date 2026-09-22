@@ -32,6 +32,7 @@ pub struct InvertedIndexReader {
     termdict: TermDictionary,
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
+    posting_norms_file_slice: std::sync::Arc<DeferredFileSlice>,
     record_option: IndexRecordOption,
     total_num_tokens: u64,
 }
@@ -76,9 +77,16 @@ impl InvertedIndexReader {
             termdict,
             postings_file_slice: postings_body,
             positions_file_slice,
+            posting_norms_file_slice: std::sync::Arc::new(DeferredFileSlice::new(|| {
+                Ok(FileSlice::empty())
+            })),
             record_option,
             total_num_tokens,
         })
+    }
+
+    pub(crate) fn set_posting_norms_file(&mut self, source: DeferredFileSlice) {
+        self.posting_norms_file_slice = std::sync::Arc::new(source);
     }
 
     /// Creates an empty `InvertedIndexReader` object, which
@@ -88,6 +96,9 @@ impl InvertedIndexReader {
             termdict: TermDictionary::empty(),
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
+            posting_norms_file_slice: std::sync::Arc::new(DeferredFileSlice::new(|| {
+                Ok(FileSlice::empty())
+            })),
             record_option,
             total_num_tokens: 0u64,
         }
@@ -181,6 +192,7 @@ impl InvertedIndexReader {
             .slice(term_info.postings_range.clone());
         let postings_bytes = postings_slice.read_bytes()?;
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
+        block_postings.set_term_norm_source(self.posting_norms_file_slice.clone());
         Ok(())
     }
 
@@ -210,12 +222,14 @@ impl InvertedIndexReader {
         let postings_data = self
             .postings_file_slice
             .slice(term_info.postings_range.clone());
-        BlockSegmentPostings::open(
+        let mut postings = BlockSegmentPostings::open(
             term_info.doc_freq,
             postings_data.read_bytes()?,
             self.record_option,
             requested_option,
-        )
+        )?;
+        postings.set_term_norm_source(self.posting_norms_file_slice.clone());
+        Ok(postings)
     }
 
     /// Returns a posting object given a `term_info`.

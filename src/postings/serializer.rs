@@ -51,6 +51,7 @@ pub struct InvertedIndexSerializer {
     postings_write: CompositeWrite<WritePtr>,
     positions_write: CompositeWrite<WritePtr>,
     schema: Schema,
+    posting_norms_write: Option<CompositeWrite<WritePtr>>,
 }
 
 impl InvertedIndexSerializer {
@@ -62,6 +63,13 @@ impl InvertedIndexSerializer {
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
+            posting_norms_write: if cfg!(feature = "posting-norms") {
+                Some(CompositeWrite::wrap(segment.open_write(
+                    crate::index::SegmentComponent::Custom("pnorm".into()),
+                )?))
+            } else {
+                None
+            },
         };
         Ok(inv_index_serializer)
     }
@@ -85,7 +93,7 @@ impl InvertedIndexSerializer {
             .index_record_option()
             .unwrap_or(IndexRecordOption::Basic);
         let bm25_params = field_entry.field_type().bm25_params().unwrap_or_default();
-        FieldSerializer::create(
+        let mut serializer = FieldSerializer::create(
             index_record_option,
             total_num_tokens,
             term_dictionary_write,
@@ -93,7 +101,17 @@ impl InvertedIndexSerializer {
             positions_write,
             fieldnorm_reader,
             bm25_params,
-        )
+        )?;
+        serializer.posting_norms_write = self
+            .posting_norms_write
+            .as_mut()
+            .map(|writer| writer.for_field(field));
+        serializer.posting_norms_start_offset = serializer
+            .posting_norms_write
+            .as_ref()
+            .map(|writer| writer.written_bytes())
+            .unwrap_or(0);
+        Ok(serializer)
     }
 
     /// Closes the serializer.
@@ -101,6 +119,9 @@ impl InvertedIndexSerializer {
         self.terms_write.close()?;
         self.postings_write.close()?;
         self.positions_write.close()?;
+        if let Some(writer) = self.posting_norms_write {
+            writer.close()?;
+        }
         Ok(())
     }
 }
@@ -115,6 +136,8 @@ pub struct FieldSerializer<'a, W: Write = WritePtr> {
     term_open: bool,
     postings_write: &'a mut CountingWriter<W>,
     postings_start_offset: u64,
+    posting_norms_write: Option<&'a mut CountingWriter<W>>,
+    posting_norms_start_offset: u64,
 }
 
 impl<'a, W: Write> FieldSerializer<'a, W> {
@@ -155,6 +178,8 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             term_open: false,
             postings_write,
             postings_start_offset,
+            posting_norms_write: None,
+            posting_norms_start_offset: 0,
         })
     }
 
@@ -236,8 +261,27 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             return Ok(());
         };
 
+        let has_posting_norms = self.posting_norms_write.is_some()
+            && self.postings_serializer.term_has_freq
+            && self.postings_serializer.fieldnorm_reader.is_some();
+        if has_posting_norms {
+            let offset = self.posting_norms_write.as_ref().unwrap().written_bytes()
+                - self.posting_norms_start_offset;
+            self.postings_write.write_all(&super::term_norms::MAGIC)?;
+            offset.serialize(self.postings_write)?;
+        }
         self.postings_serializer
             .close_term(self.current_term_info.doc_freq, self.postings_write)?;
+        if has_posting_norms {
+            assert_eq!(
+                self.postings_serializer.posting_norms.len(),
+                self.current_term_info.doc_freq as usize
+            );
+            self.posting_norms_write
+                .as_mut()
+                .unwrap()
+                .write_all(&self.postings_serializer.posting_norms)?;
+        }
         self.current_term_info.postings_range.end = self.postings_offset();
         if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {
             positions_serializer.close_term()?;
@@ -327,6 +371,7 @@ pub struct PostingsSerializer {
     avg_fieldnorm: Score,
     bm25_params: Bm25Params,
     term_has_freq: bool,
+    posting_norms: Vec<u8>,
 }
 
 impl PostingsSerializer {
@@ -354,12 +399,14 @@ impl PostingsSerializer {
             avg_fieldnorm,
             bm25_params,
             term_has_freq: false,
+            posting_norms: Vec::new(),
         }
     }
 
     /// Starts the serialization for a new term.
     /// * term_doc_freq - the number of documents containing the term.
     pub fn new_term(&mut self, term_doc_freq: u32, record_term_freq: bool) {
+        self.posting_norms.clear();
         self.bm25_weight = None;
 
         self.term_has_freq = self.mode.has_freq() && record_term_freq;
@@ -419,6 +466,11 @@ impl PostingsSerializer {
                     let fieldnorms = docs.map(|doc| fieldnorm_reader.fieldnorm_id(doc));
                     blockwand_params = fieldnorms
                         .zip(term_freqs)
+                        .inspect(|&(norm, _)| {
+                            if cfg!(feature = "posting-norms") {
+                                self.posting_norms.push(norm);
+                            }
+                        })
                         .max_by(
                             |(left_fieldnorm_id, left_term_freq),
                              (right_fieldnorm_id, right_term_freq)| {
@@ -457,6 +509,16 @@ impl PostingsSerializer {
         output_write: &mut impl std::io::Write,
     ) -> io::Result<()> {
         if !self.block.is_empty() {
+            if cfg!(feature = "posting-norms") && self.term_has_freq {
+                if let Some(norms) = &self.fieldnorm_reader {
+                    self.posting_norms.extend(
+                        self.block
+                            .doc_ids()
+                            .iter()
+                            .map(|&doc| norms.fieldnorm_id(doc)),
+                    );
+                }
+            }
             // we have doc ids waiting to be written
             // this happens when the number of doc ids is
             // not a perfect multiple of our block size.
