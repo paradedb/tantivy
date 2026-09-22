@@ -1,0 +1,24 @@
+Iteration 1
+Iteration 2
+Iteration 3
+Iteration 4
+Iteration 5
+Iteration 6
+Iteration 7
+Iteration 8
+Iteration 9
+Iteration 10
+Iteration 11
+Iteration 12
+title-database-unscored {'raw': {'execution_ms': 0.147, 'shared_hits': 103.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 0.1445, 'shared_hits': 98.0, 'shared_reads': 0.0}}
+title-database-count {'raw': {'execution_ms': 7.0504999999999995, 'shared_hits': 13297.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 6.916, 'shared_hits': 13240.0, 'shared_reads': 0.0}}
+title-the-unscored {'raw': {'execution_ms': 0.1345, 'shared_hits': 106.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 0.1355, 'shared_hits': 103.0, 'shared_reads': 0.0}}
+title-the-count {'raw': {'execution_ms': 32.5265, 'shared_hits': 17083.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 32.421, 'shared_hits': 17039.0, 'shared_reads': 0.0}}
+title-the-top10 {'raw': {'execution_ms': 4.2780000000000005, 'shared_hits': 738.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 4.342499999999999, 'shared_hits': 577.0, 'shared_reads': 0.0}}
+title-the-database-top10 {'raw': {'execution_ms': 1.6469999999999998, 'shared_hits': 775.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 1.4785, 'shared_hits': 603.0, 'shared_reads': 0.0}}
+text-database-unscored {'raw': {'execution_ms': 0.1275, 'shared_hits': 102.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 0.127, 'shared_hits': 97.0, 'shared_reads': 0.0}}
+text-database-count {'raw': {'execution_ms': 18.647, 'shared_hits': 16843.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 18.721, 'shared_hits': 16800.0, 'shared_reads': 0.0}}
+text-the-unscored {'raw': {'execution_ms': 0.27, 'shared_hits': 360.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 0.273, 'shared_hits': 356.0, 'shared_reads': 0.0}}
+text-the-count {'raw': {'execution_ms': 204.59449999999998, 'shared_hits': 11266.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 204.63549999999998, 'shared_hits': 11225.0, 'shared_reads': 0.0}}
+text-the-top10 {'raw': {'execution_ms': 93.3625, 'shared_hits': 12213.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 87.46199999999999, 'shared_hits': 11840.0, 'shared_reads': 0.0}}
+text-the-database-top10 {'raw': {'execution_ms': 12.3615, 'shared_hits': 10715.0, 'shared_reads': 0.0}, 'inline': {'execution_ms': 13.013, 'shared_hits': 11969.0, 'shared_reads': 0.0}}

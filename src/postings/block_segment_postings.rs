@@ -34,6 +34,8 @@ pub struct BlockSegmentPostings {
     subblock_summaries: OwnedBytes,
     term_norm_offset: Option<u64>,
     embedded_norm_directory: Option<super::packed_norms::EmbeddedNormDirectory>,
+    inline_norms: Option<super::inline_norms::InlineNorms>,
+    lazy_inline_norms: Option<crate::directory::FileSlice>,
     term_norms: Option<super::term_norms::TermNormReader>,
 }
 
@@ -104,6 +106,7 @@ impl BlockSegmentPostings {
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
+        let (inline_norms, bytes) = super::inline_norms::InlineNorms::read_header(doc_freq, bytes)?;
         let (term_norm_offset, bytes) = super::term_norms::read_header(bytes)?;
         let (embedded_norm_directory, bytes) =
             super::packed_norms::EmbeddedNormDirectory::read_header(bytes)?;
@@ -144,6 +147,8 @@ impl BlockSegmentPostings {
             subblock_summaries,
             term_norm_offset,
             embedded_norm_directory,
+            inline_norms,
+            lazy_inline_norms: None,
             term_norms: None,
         };
         block_segment_postings.load_block();
@@ -214,12 +219,23 @@ impl BlockSegmentPostings {
         &mut self,
         source: std::sync::Arc<common::file_slice::DeferredFileSlice>,
     ) {
-        self.term_norms = self.term_norm_offset.and_then(|offset| {
-            super::term_norms::TermNormReader::new(source, offset, self.doc_freq)
-        });
+        self.term_norms = self
+            .term_norm_offset
+            .or_else(|| {
+                (self.inline_norms.is_some() || self.lazy_inline_norms.is_some()).then_some(0)
+            })
+            .and_then(|offset| {
+                super::term_norms::TermNormReader::new(source, offset, self.doc_freq)
+            });
         if let Some(norms) = &mut self.term_norms {
             norms.embedded_directory = self.embedded_norm_directory.clone();
+            norms.inline_norms = self.inline_norms.clone();
+            norms.lazy_inline_norms = self.lazy_inline_norms.clone();
         }
+    }
+
+    pub(crate) fn set_lazy_inline_norms(&mut self, source: Option<crate::directory::FileSlice>) {
+        self.lazy_inline_norms = source;
     }
 
     pub(crate) fn disable_term_norms(&mut self) {
@@ -283,6 +299,10 @@ impl BlockSegmentPostings {
     //
     // This does not reset the positions list.
     pub(crate) fn reset(&mut self, doc_freq: u32, postings_data: OwnedBytes) -> io::Result<()> {
+        let (inline_norms, postings_data) =
+            super::inline_norms::InlineNorms::read_header(doc_freq, postings_data)?;
+        self.inline_norms = inline_norms;
+        self.lazy_inline_norms = None;
         let (term_norm_offset, postings_data) = super::term_norms::read_header(postings_data)?;
         let (embedded_norm_directory, postings_data) =
             super::packed_norms::EmbeddedNormDirectory::read_header(postings_data)?;
@@ -538,6 +558,8 @@ impl BlockSegmentPostings {
             subblock_summaries: OwnedBytes::empty(),
             term_norm_offset: None,
             embedded_norm_directory: None,
+            inline_norms: None,
+            lazy_inline_norms: None,
             term_norms: None,
         }
     }

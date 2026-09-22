@@ -1,0 +1,31 @@
+{
+  "raw_sidecar_bytes": 1191369357,
+  "old_packed_sidecar_bytes": 1082981764,
+  "postings_delta_bytes": 971048548,
+  "terms_delta_bytes": 174000,
+  "saved_component_bytes": 220146809,
+  "raw_format_component_bytes": 6779804623,
+  "inline_format_component_bytes": 6559657814,
+  "total_component_percent_saved": 3.247096653097757,
+  "fields": {
+    "title": {
+      "raw_norm_bytes": 31415250,
+      "raw_header_bytes": 23824548,
+      "inline_bytes": 33335083,
+      "old_norm_representation_bytes": 55239798,
+      "saved_bytes": 21904715,
+      "percent_saved": 39.65386513542283
+    },
+    "text": {
+      "raw_norm_bytes": 1159953217,
+      "raw_header_bytes": 166067658,
+      "inline_bytes": 1127605661,
+      "old_norm_representation_bytes": 1326020875,
+      "saved_bytes": 198415214,
+      "percent_saved": 14.96320440656713
+    }
+  },
+  "old_norm_representation_bytes": 1381260673,
+  "inline_norm_representation_bytes": 1160940744,
+  "norm_representation_percent_saved": 15.950640838957701
+}

@@ -8,6 +8,7 @@ pub(crate) mod block_segment_postings;
 
 pub(crate) mod compression;
 mod indexing_context;
+pub(crate) mod inline_norms;
 mod json_postings_writer;
 mod loaded_postings;
 mod merger;
@@ -24,6 +25,7 @@ pub(crate) mod subblock;
 mod term_info;
 pub(crate) mod term_norms;
 
+pub use inline_norms::rewrite_inline_posting_norms;
 pub use packed_norms::{PackedNormRewriter, PackedNormStats, PackedNormWriter};
 pub use term_norms::set_embedded_norm_directory_enabled;
 pub use term_norms::set_packed_posting_norms_enabled;

@@ -199,8 +199,15 @@ impl InvertedIndexReader {
         let postings_slice = self
             .postings_file_slice
             .slice(term_info.postings_range.clone());
-        let postings_bytes = postings_slice.read_bytes()?;
+        let (postings_bytes, inline_norms) = if block_postings.freq_reading_option()
+            != crate::postings::FreqReadingOption::ReadFreq
+        {
+            crate::postings::inline_norms::read_without_norms(postings_slice)?
+        } else {
+            (postings_slice.read_bytes()?, None)
+        };
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
+        block_postings.set_lazy_inline_norms(inline_norms);
         block_postings.set_term_norm_source(self.posting_norms_file_slice.clone());
         if let Some(source) = &self.packed_norms {
             block_postings.set_packed_norm_source(source.clone());
@@ -234,12 +241,18 @@ impl InvertedIndexReader {
         let postings_data = self
             .postings_file_slice
             .slice(term_info.postings_range.clone());
+        let (postings_bytes, inline_norms) = if requested_option == IndexRecordOption::Basic {
+            crate::postings::inline_norms::read_without_norms(postings_data)?
+        } else {
+            (postings_data.read_bytes()?, None)
+        };
         let mut postings = BlockSegmentPostings::open(
             term_info.doc_freq,
-            postings_data.read_bytes()?,
+            postings_bytes,
             self.record_option,
             requested_option,
         )?;
+        postings.set_lazy_inline_norms(inline_norms);
         postings.set_term_norm_source(self.posting_norms_file_slice.clone());
         if let Some(source) = &self.packed_norms {
             postings.set_packed_norm_source(source.clone());

@@ -1,0 +1,182 @@
+[
+  {
+    "docs": 2841903,
+    "segment": "eb76c643dffe4ce18003d09dce2f1863",
+    "postings_bytes": 364250821,
+    "component_bytes": {
+      "idx": 364250821,
+      "pos": 190544914,
+      "fast": 54943010,
+      "term": 30629175,
+      "pnorm": 117156283,
+      "stats": 178,
+      "bpnorm": 106484459,
+      "fieldnorm": 5683850
+    },
+    "fieldnorm_bytes": 5683850,
+    "posting_norm_bytes": 117156283,
+    "packed_posting_norm_bytes": 106484459
+  },
+  {
+    "docs": 2838888,
+    "segment": "b186860cda6c4aea8afafba1198c6ab9",
+    "postings_bytes": 364499178,
+    "component_bytes": {
+      "idx": 364499178,
+      "pos": 190586943,
+      "fast": 54813643,
+      "term": 30598483,
+      "pnorm": 117199981,
+      "stats": 171,
+      "bpnorm": 106532786,
+      "fieldnorm": 5677820
+    },
+    "fieldnorm_bytes": 5677820,
+    "posting_norm_bytes": 117199981,
+    "packed_posting_norm_bytes": 106532786
+  },
+  {
+    "docs": 2848277,
+    "segment": "09e6d775f1e3435881bfa65a659da170",
+    "postings_bytes": 364549438,
+    "component_bytes": {
+      "idx": 364549438,
+      "pos": 190547580,
+      "fast": 55075765,
+      "term": 30741915,
+      "pnorm": 117123307,
+      "stats": 220,
+      "bpnorm": 106460079,
+      "fieldnorm": 5696598
+    },
+    "fieldnorm_bytes": 5696598,
+    "posting_norm_bytes": 117123307,
+    "packed_posting_norm_bytes": 106460079
+  },
+  {
+    "docs": 2841222,
+    "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+    "postings_bytes": 364849587,
+    "component_bytes": {
+      "idx": 364849587,
+      "pos": 190738346,
+      "fast": 54951508,
+      "term": 30716626,
+      "pnorm": 117320259,
+      "stats": 211,
+      "bpnorm": 106637998,
+      "fieldnorm": 5682488
+    },
+    "fieldnorm_bytes": 5682488,
+    "posting_norm_bytes": 117320259,
+    "packed_posting_norm_bytes": 106637998
+  },
+  {
+    "docs": 2844031,
+    "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+    "postings_bytes": 365182070,
+    "component_bytes": {
+      "idx": 365182070,
+      "pos": 191047801,
+      "fast": 54965433,
+      "term": 30656272,
+      "pnorm": 117422007,
+      "stats": 170,
+      "bpnorm": 106737911,
+      "fieldnorm": 5688106
+    },
+    "fieldnorm_bytes": 5688106,
+    "posting_norm_bytes": 117422007,
+    "packed_posting_norm_bytes": 106737911
+  },
+  {
+    "docs": 2860468,
+    "segment": "952f1be13273443181ade989398abb9b",
+    "postings_bytes": 369499645,
+    "component_bytes": {
+      "idx": 369499645,
+      "pos": 195164397,
+      "fast": 54985757,
+      "term": 30399688,
+      "pnorm": 119337827,
+      "stats": 212,
+      "bpnorm": 108482536,
+      "fieldnorm": 5720980
+    },
+    "fieldnorm_bytes": 5720980,
+    "posting_norm_bytes": 119337827,
+    "packed_posting_norm_bytes": 108482536
+  },
+  {
+    "docs": 2902246,
+    "segment": "9bfdcce177344e53b0af62abd21ab30a",
+    "postings_bytes": 374531122,
+    "component_bytes": {
+      "idx": 374531122,
+      "pos": 197809626,
+      "fast": 55916200,
+      "term": 30886331,
+      "pnorm": 120821681,
+      "stats": 195,
+      "bpnorm": 109849273,
+      "fieldnorm": 5804536
+    },
+    "fieldnorm_bytes": 5804536,
+    "posting_norm_bytes": 120821681,
+    "packed_posting_norm_bytes": 109849273
+  },
+  {
+    "docs": 2903133,
+    "segment": "f95824e6498d4161a8258e04c2d939c3",
+    "postings_bytes": 375070606,
+    "component_bytes": {
+      "idx": 375070606,
+      "pos": 198058490,
+      "fast": 55864854,
+      "term": 30765853,
+      "pnorm": 121160453,
+      "stats": 223,
+      "bpnorm": 110131490,
+      "fieldnorm": 5806310
+    },
+    "fieldnorm_bytes": 5806310,
+    "posting_norm_bytes": 121160453,
+    "packed_posting_norm_bytes": 110131490
+  },
+  {
+    "docs": 2989299,
+    "segment": "722b2cc326774eab96019ec88ce833a7",
+    "postings_bytes": 384976727,
+    "component_bytes": {
+      "idx": 384976727,
+      "pos": 202878202,
+      "fast": 57436541,
+      "term": 31575318,
+      "pnorm": 124281391,
+      "stats": 196,
+      "bpnorm": 112978004,
+      "fieldnorm": 5978642
+    },
+    "fieldnorm_bytes": 5978642,
+    "posting_norm_bytes": 124281391,
+    "packed_posting_norm_bytes": 112978004
+  },
+  {
+    "docs": 2868090,
+    "segment": "f2cb57ddb7764036a46406913fb0a474",
+    "postings_bytes": 370217635,
+    "component_bytes": {
+      "idx": 370217635,
+      "pos": 195615556,
+      "fast": 55178916,
+      "term": 30460281,
+      "pnorm": 119546168,
+      "stats": 231,
+      "bpnorm": 108687228,
+      "fieldnorm": 5736224
+    },
+    "fieldnorm_bytes": 5736224,
+    "posting_norm_bytes": 119546168,
+    "packed_posting_norm_bytes": 108687228
+  }
+]

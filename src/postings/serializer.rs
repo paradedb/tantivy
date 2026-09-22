@@ -64,14 +64,18 @@ impl InvertedIndexSerializer {
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
-            posting_norms_write: if cfg!(feature = "posting-norms") {
+            posting_norms_write: if cfg!(feature = "posting-norms")
+                && !cfg!(feature = "inline-posting-norms")
+            {
                 Some(CompositeWrite::wrap(segment.open_write(
                     crate::index::SegmentComponent::Custom("pnorm".into()),
                 )?))
             } else {
                 None
             },
-            packed_norms_write: if cfg!(feature = "bitpacked-posting-norms") {
+            packed_norms_write: if cfg!(feature = "bitpacked-posting-norms")
+                && !cfg!(feature = "inline-posting-norms")
+            {
                 Some(CompositeWrite::wrap(segment.open_write(
                     crate::index::SegmentComponent::Custom("bpnorm".into()),
                 )?))
@@ -609,6 +613,13 @@ impl PostingsSerializer {
                 self.postings_write.write_all(block_encoded)?;
             }
             self.block.clear();
+        }
+        if cfg!(feature = "inline-posting-norms")
+            && self.term_has_freq
+            && self.fieldnorm_reader.is_some()
+        {
+            assert_eq!(self.posting_norms.len(), doc_freq as usize);
+            super::inline_norms::write_header(&self.posting_norms, output_write)?;
         }
         if !self.subblock_summaries.is_empty() {
             assert_eq!(

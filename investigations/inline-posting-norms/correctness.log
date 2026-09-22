@@ -1,0 +1,6 @@
+title-single {'count': 10980, 'score_digest': '92225f64da0ee3fa1f73744ceea673bd554e323b10880bb95f804ec5a09c2094', 'matches_exhaustive_top_scores': True, 'exact_selected_scores': True} unscored and count: zero norm reads
+title-and {'count': 143, 'score_digest': '81ca056855d62e6ab1470eb9fe9e0da72fc36dfa2c417af4a7c02b990f094867', 'matches_exhaustive_top_scores': True, 'exact_selected_scores': True} unscored and count: zero norm reads
+title-or {'count': 13074, 'score_digest': '4823ee3a1e414746c147383ef9a608445a0fda5e74e22aa0392a6cec309cbdaa', 'matches_exhaustive_top_scores': True, 'exact_selected_scores': True} unscored and count: zero norm reads
+text-single {'count': 140613, 'score_digest': '1a1f147711836b9ae1caa907058b55259d2d3977efe5aea5c168dd303e8b415a', 'matches_exhaustive_top_scores': True, 'exact_selected_scores': True} unscored and count: zero norm reads
+text-and {'count': 6187, 'score_digest': '55401894a09298cd910c4f1e1d591d2e90a8ba64c012055138344f47ea64e9a3', 'matches_exhaustive_top_scores': True, 'exact_selected_scores': True} unscored and count: zero norm reads
+text-or {'count': 166965, 'score_digest': 'a87cc98cc02812e04956f462ec8579c9e06b6f1a0ae4cf8ae482652d77efbf3e', 'matches_exhaustive_top_scores': True, 'exact_selected_scores': True} unscored and count: zero norm reads

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use common::file_slice::DeferredFileSlice;
 use common::{BinarySerializable, HasLen};
 
-use crate::directory::{BufferedFileSlice, OwnedBytes};
+use crate::directory::{BufferedFileSlice, FileSlice, OwnedBytes};
 
 pub(crate) const MAGIC: [u8; 10] = [127, 127, 127, 127, 127, 127, 127, 127, 127, 130];
 const BUFFER_SIZE: usize = 8192;
@@ -52,6 +52,9 @@ pub(crate) struct TermNormReader {
     len: usize,
     packed_source: Option<Arc<super::packed_norms::PackedNormSource>>,
     pub(crate) embedded_directory: Option<super::packed_norms::EmbeddedNormDirectory>,
+    pub(crate) inline_norms: Option<super::inline_norms::InlineNorms>,
+    pub(crate) lazy_inline_norms: Option<FileSlice>,
+    inline_buffer: RefCell<Option<super::inline_norms::InlineNorms>>,
     buffer: RefCell<Option<NormBuffer>>,
 }
 
@@ -69,6 +72,9 @@ impl TermNormReader {
             len: len as usize,
             packed_source: None,
             embedded_directory: None,
+            inline_norms: None,
+            lazy_inline_norms: None,
+            inline_buffer: RefCell::new(None),
             buffer: RefCell::new(None),
         })
     }
@@ -87,6 +93,23 @@ impl TermNormReader {
             ));
         }
         READS.set(READS.get() + 1);
+        if let Some(norms) = &self.inline_norms {
+            return norms.read(ordinal);
+        }
+        if let Some(source) = &self.lazy_inline_norms {
+            let mut buffer = self.inline_buffer.borrow_mut();
+            if buffer.is_none() {
+                let (norms, rest) = super::inline_norms::InlineNorms::read_header(
+                    self.len as u32,
+                    source.read_bytes()?,
+                )?;
+                if norms.is_none() || !rest.is_empty() {
+                    return Err(io::Error::other("invalid deferred inline norms"));
+                }
+                *buffer = norms;
+            }
+            return buffer.as_ref().unwrap().read(ordinal);
+        }
         let mut buffer = self.buffer.borrow_mut();
         if buffer.is_none() {
             if let Some(source) = &self.packed_source {
@@ -257,6 +280,14 @@ mod tests {
                 reader.reload()?;
             }
             let searcher = reader.searcher();
+            if cfg!(feature = "inline-posting-norms") {
+                assert!(index.directory().list_managed_files()?.iter().all(|path| {
+                    !matches!(
+                        path.extension().and_then(|ext| ext.to_str()),
+                        Some("pnorm" | "bpnorm")
+                    )
+                }));
+            }
             let make_term = |word: &str| {
                 Box::new(TermQuery::new(
                     Term::from_field_text(title, word),
@@ -323,14 +354,19 @@ mod tests {
                     );
                     postings.advance();
                 }
-                let mut block =
-                    inv.read_block_postings_from_terminfo(&info, IndexRecordOption::WithFreqs)?;
-                block.seek(200);
-                inv.reset_block_postings_from_terminfo(&info, &mut block)?;
-                assert_eq!(
-                    block.fieldnorm_id_at(0, &norms),
-                    norms.fieldnorm_id(block.doc(0))
-                );
+                for option in [IndexRecordOption::WithFreqs, IndexRecordOption::Basic] {
+                    let mut block = inv.read_block_postings_from_terminfo(&info, option)?;
+                    assert_eq!(
+                        block.fieldnorm_id_at(0, &norms),
+                        norms.fieldnorm_id(block.doc(0))
+                    );
+                    block.seek(200);
+                    inv.reset_block_postings_from_terminfo(&info, &mut block)?;
+                    assert_eq!(
+                        block.fieldnorm_id_at(0, &norms),
+                        norms.fieldnorm_id(block.doc(0))
+                    );
+                }
             }
         }
         set_posting_norms_enabled(true);
