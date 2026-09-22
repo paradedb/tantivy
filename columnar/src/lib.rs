@@ -50,8 +50,8 @@ pub use iterable::Iterable;
 pub const DEFAULT_CODEC_TYPES: [CodecType; 2] = [CodecType::Bitpacked, CodecType::BlockwiseLinear];
 pub use columnar::{
     CURRENT_VERSION, ColumnType, ColumnarReader, ColumnarWriter, HasAssociatedColumnType,
-    MergeRowOrder, ShuffleMergeOrder, StackMergeOrder, Version, compute_merged_term_ord_mapping,
-    merge_columnar,
+    MergeRowOrder, ShuffleMergeOrder, SortColumn, StackMergeOrder, Version,
+    compute_merged_term_ord_mapping, merge_columnar,
 };
 use sstable::VoidSSTable;
 pub use value::{NumericalType, NumericalValue};
