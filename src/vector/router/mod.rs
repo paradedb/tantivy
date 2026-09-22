@@ -178,8 +178,20 @@ impl OpenedRouter {
         query: &'router [f32],
         metric: Metric,
     ) -> RouterIter<'router, 'workspace> {
+        self.rank_with_scores(workspace, query, metric, None)
+    }
+
+    pub(crate) fn rank_with_scores<'router, 'workspace>(
+        &'router self,
+        workspace: &'workspace mut RouterWorkspace,
+        query: &'router [f32],
+        metric: Metric,
+        scores: Option<&'router [crate::vector::Similarity]>,
+    ) -> RouterIter<'router, 'workspace> {
         match self {
-            Self::Rng(router) => RouterIter::Rng(rng::rank(router, &mut workspace.rng, query)),
+            Self::Rng(router) => {
+                RouterIter::Rng(rng::rank(router, &mut workspace.rng, query, scores))
+            }
             Self::Stacked(router) => RouterIter::Stacked(stacked::rank(router, query, metric)),
             Self::Exact(router) => RouterIter::Exact(router.rank(query)),
         }

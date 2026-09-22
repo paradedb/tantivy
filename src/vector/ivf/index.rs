@@ -32,7 +32,7 @@ use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
 use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace};
-use crate::vector::{BoundKind, BoundStore};
+use crate::vector::{BoundKind, BoundStore, Similarity};
 
 /// The IVF routing index over one field's clusters: says which clusters —
 /// contiguous row ranges of the `.vec` rows — a query should probe.
@@ -292,11 +292,258 @@ impl IvfIndex {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
+    pub(crate) fn centroid_scores(&self, query: &[f32]) -> crate::Result<Vec<Similarity>> {
+        let mut scores = Vec::with_capacity(self.num_centroids);
+        if self.num_centroids == 0 {
+            return Ok(scores);
+        }
+        let stride = self.centroids_slice.len() / self.num_centroids;
+        for start in (0..self.num_centroids).step_by(64) {
+            let end = (start + 64).min(self.num_centroids);
+            let bytes = self
+                .centroids_slice
+                .slice(start * stride..end * stride)
+                .read_bytes()?;
+            if bytes.len() != (end - start) * stride {
+                return Err(
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "short centroid read").into(),
+                );
+            }
+            scores.extend(
+                bytes
+                    .chunks_exact(stride)
+                    .map(|row| self.metric.similarity_bytes(query, row)),
+            );
+        }
+        Ok(scores)
+    }
+
+    pub(crate) fn rank_clusters_with_scores<'router, 'workspace>(
+        &'router self,
+        workspace: &'workspace mut RouterWorkspace,
+        query: &'router [f32],
+        scores: &'router [Similarity],
+    ) -> RouterIter<'router, 'workspace> {
+        self.router
+            .rank_with_scores(workspace, query, self.metric, Some(scores))
+    }
+
     pub(crate) fn rank_clusters<'router, 'workspace>(
         &'router self,
         workspace: &'workspace mut RouterWorkspace,
         query: &'router [f32],
     ) -> RouterIter<'router, 'workspace> {
         self.router.rank(workspace, query, self.metric)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::directory::FileHandle;
+    use crate::vector::ivf::{LazyStore, NeighborhoodGraphConfig, RelativeNeighborhoodGraph};
+
+    #[derive(Debug)]
+    struct ScoreFile {
+        bytes: OwnedBytes,
+        reads: AtomicUsize,
+        bytes_read: AtomicUsize,
+        fault: AtomicUsize,
+        copy: bool,
+    }
+
+    impl HasLen for ScoreFile {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl FileHandle for ScoreFile {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.bytes_read.fetch_add(range.len(), Ordering::Relaxed);
+            match self.fault.load(Ordering::Relaxed) {
+                1 => return Err(io::Error::other("centroid read failed")),
+                2 => return Ok(self.bytes.slice(range.start..range.end - 1)),
+                _ => {}
+            }
+            if self.copy {
+                Ok(OwnedBytes::new(self.bytes[range].to_vec()))
+            } else {
+                Ok(self.bytes.slice(range))
+            }
+        }
+    }
+
+    fn score_fixture(
+        n: usize,
+        dim: usize,
+        metric: Metric,
+        copy: bool,
+    ) -> (IvfIndex, Arc<ScoreFile>) {
+        let mut state = 17u64;
+        let bytes: Vec<u8> = (0..n * dim)
+            .flat_map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                ((state >> 40) as f32 / (1u32 << 24) as f32 - 0.5).to_le_bytes()
+            })
+            .collect();
+        let file = Arc::new(ScoreFile {
+            bytes: OwnedBytes::new(bytes),
+            reads: AtomicUsize::new(0),
+            bytes_read: AtomicUsize::new(0),
+            fault: AtomicUsize::new(0),
+            copy,
+        });
+        let centroids_slice = FileSlice::new(file.clone());
+        let mut adjacency = 8u32.to_le_bytes().to_vec();
+        for node in 0..n {
+            for step in [1, 7, 19, 43, 101, 251, 509, 1021] {
+                adjacency.extend_from_slice(&(((node + step) % n) as u32).to_le_bytes());
+            }
+        }
+        let router = OpenedRouter::Rng(
+            RelativeNeighborhoodGraph::open(
+                &adjacency,
+                LazyStore::new(centroids_slice.clone(), dim),
+                dim,
+                metric,
+                NeighborhoodGraphConfig::default(),
+            )
+            .unwrap(),
+        );
+        let cluster_offsets = OwnedBytes::new(
+            (0..=n)
+                .flat_map(|i| (i as u64).to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        (
+            IvfIndex {
+                num_centroids: n,
+                num_docs: n,
+                centroids_slice,
+                cluster_offsets,
+                metric,
+                router,
+                bound_kind: BoundKind::Ball,
+                bounds: vec![0.0; n],
+            },
+            file,
+        )
+    }
+
+    #[test]
+    fn centroid_scores_preserve_bytes_and_batch_boundaries() -> crate::Result<()> {
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            for n in [0, 1, 63, 64, 65, 129] {
+                for dim in [2, 17, 1024] {
+                    let (index, file) = score_fixture(n, dim, metric, false);
+                    let query: Vec<f32> = (0..dim).map(|i| (i % 13) as f32 / 13.0).collect();
+                    let scores = index.centroid_scores(&query)?;
+                    assert_eq!(scores.len(), n);
+                    assert_eq!(file.reads.load(Ordering::Relaxed), n.div_ceil(64));
+                    assert_eq!(file.bytes_read.load(Ordering::Relaxed), n * dim * 4);
+                    for (score, bytes) in scores.iter().zip(file.bytes.chunks_exact(dim * 4)) {
+                        assert_eq!(
+                            score.score().to_bits(),
+                            metric.similarity_bytes(&query, bytes).score().to_bits()
+                        );
+                    }
+                    if n > 0 {
+                        let mut lazy_ws = RouterWorkspace::default();
+                        let mut scored_ws = RouterWorkspace::default();
+                        let mut lazy = index.rank_clusters(&mut lazy_ws, &query);
+                        let mut scored =
+                            index.rank_clusters_with_scores(&mut scored_ws, &query, &scores);
+                        for _ in 0..=n {
+                            assert_eq!(
+                                lazy.next().map(|c| (c.node, c.sim.score().to_bits())),
+                                scored.next().map(|c| (c.node, c.sim.score().to_bits()))
+                            );
+                            assert_eq!(
+                                serde_json::to_value(lazy.metrics())?,
+                                serde_json::to_value(scored.metrics())?
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn centroid_scores_propagate_read_failures() {
+        let (index, file) = score_fixture(65, 17, Metric::Dot, false);
+        for fault in [1, 2] {
+            file.fault.store(fault, Ordering::Relaxed);
+            assert!(index.centroid_scores(&[0.5; 17]).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "routing-only timing screen; run in release on an otherwise idle host"]
+    fn benchmark_centroid_precompute() -> crate::Result<()> {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for n in [32usize, 512, 4096] {
+            for copy in [false, true] {
+                let (index, file) = score_fixture(n, 1024, Metric::Dot, copy);
+                let query = vec![0.25; 1024];
+                for fraction in [0.01f64, 0.3, 1.0] {
+                    let prefix = ((n as f64 * fraction).ceil() as usize).max(16).min(n);
+                    let mut elapsed = [0u128; 2];
+                    let mut reads = [0; 2];
+                    let mut bytes = [0; 2];
+                    for iteration in 0..22 {
+                        for mode in [iteration % 2, 1 - iteration % 2] {
+                            file.reads.store(0, Ordering::Relaxed);
+                            file.bytes_read.store(0, Ordering::Relaxed);
+                            let start = Instant::now();
+                            let scores = if mode == 1 {
+                                Some(index.centroid_scores(&query)?)
+                            } else {
+                                None
+                            };
+                            let mut workspace = RouterWorkspace::default();
+                            let mut ranked = match scores.as_deref() {
+                                Some(scores) => {
+                                    index.rank_clusters_with_scores(&mut workspace, &query, scores)
+                                }
+                                None => index.rank_clusters(&mut workspace, &query),
+                            };
+                            for candidate in ranked.by_ref().take(prefix) {
+                                black_box(candidate);
+                            }
+                            black_box(ranked.metrics());
+                            let ns = start.elapsed().as_nanos();
+                            if iteration >= 2 {
+                                elapsed[mode] += ns;
+                                reads[mode] += file.reads.load(Ordering::Relaxed);
+                                bytes[mode] += file.bytes_read.load(Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "centroid_precompute n={n} dim=1024 copy={copy} prefix={prefix} \
+                         fraction={fraction} lazy_ns={} precomputed_ns={} lazy_reads={} \
+                         precomputed_reads={} lazy_bytes={} precomputed_bytes={}",
+                        elapsed[0] / 20,
+                        elapsed[1] / 20,
+                        reads[0] / 20,
+                        reads[1] / 20,
+                        bytes[0] / 20,
+                        bytes[1] / 20
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
