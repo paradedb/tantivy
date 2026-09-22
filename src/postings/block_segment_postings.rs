@@ -31,6 +31,8 @@ pub struct BlockSegmentPostings {
     doc_freq: u32,
     data: OwnedBytes,
     skip_reader: SkipReader,
+    term_norm_offset: Option<u64>,
+    term_norms: Option<super::term_norms::TermNormReader>,
 }
 
 pub(crate) fn decode_bitpacked_block(
@@ -100,6 +102,7 @@ impl BlockSegmentPostings {
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
+        let (term_norm_offset, bytes) = super::term_norms::read_header(bytes)?;
         let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
         let skip_reader = match skip_data_opt {
             Some(skip_data) => {
@@ -133,6 +136,8 @@ impl BlockSegmentPostings {
             doc_freq,
             data: postings_data,
             skip_reader,
+            term_norm_offset,
+            term_norms: None,
         };
         block_segment_postings.load_block();
         Ok(block_segment_postings)
@@ -162,8 +167,8 @@ impl BlockSegmentPostings {
         if self.block_is_loaded() {
             let docs = self.doc_decoder.output_array().iter().cloned();
             let freqs = self.freq_decoder.output_array().iter().cloned();
-            let bm25_scores = docs.zip(freqs).map(|(doc, term_freq)| {
-                let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
+            let bm25_scores = docs.zip(freqs).enumerate().map(|(offset, (_, term_freq))| {
+                let fieldnorm_id = self.fieldnorm_id_at(offset, fieldnorm_reader);
                 bm25_weight.score(fieldnorm_id, term_freq)
             });
             let block_max_score = max_score(bm25_scores).unwrap_or(0.0);
@@ -181,6 +186,30 @@ impl BlockSegmentPostings {
         self.freq_reading_option
     }
 
+    pub(crate) fn set_term_norm_source(
+        &mut self,
+        source: std::sync::Arc<common::file_slice::DeferredFileSlice>,
+    ) {
+        self.term_norms = self.term_norm_offset.and_then(|offset| {
+            super::term_norms::TermNormReader::new(source, offset, self.doc_freq)
+        });
+    }
+
+    pub(crate) fn disable_term_norms(&mut self) {
+        self.term_norms = None;
+    }
+
+    pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
+        if let Some(norms) = &self.term_norms {
+            let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + offset;
+            norms
+                .read(ordinal)
+                .expect("failed to read posting fieldnorm")
+        } else {
+            fallback.fieldnorm_id(self.doc(offset))
+        }
+    }
+
     // Resets the block segment postings on another position
     // in the postings file.
     //
@@ -192,6 +221,9 @@ impl BlockSegmentPostings {
     //
     // This does not reset the positions list.
     pub(crate) fn reset(&mut self, doc_freq: u32, postings_data: OwnedBytes) -> io::Result<()> {
+        let (term_norm_offset, postings_data) = super::term_norms::read_header(postings_data)?;
+        self.term_norm_offset = term_norm_offset;
+        self.term_norms = None;
         let (skip_data_opt, postings_data) =
             split_into_skips_and_postings(doc_freq, postings_data)?;
         self.data = postings_data;
@@ -408,6 +440,8 @@ impl BlockSegmentPostings {
             doc_freq: 0,
             data: OwnedBytes::empty(),
             skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic),
+            term_norm_offset: None,
+            term_norms: None,
         }
     }
 

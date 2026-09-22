@@ -20,10 +20,12 @@ mod segment_postings;
 pub mod serializer;
 pub(crate) mod skip;
 mod term_info;
+pub(crate) mod term_norms;
 
 pub use loaded_postings::LoadedPostings;
 pub(crate) use merger::{next_mapped_doc, PostingsMerger};
 pub(crate) use stacker::compute_table_memory_size;
+pub use term_norms::{posting_norm_reads, set_posting_norms_enabled};
 
 pub use self::block_segment_postings::BlockSegmentPostings;
 pub(crate) use self::indexing_context::IndexingContext;
