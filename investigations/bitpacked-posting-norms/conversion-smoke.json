@@ -1,0 +1,148 @@
+{
+  "storage": [
+    {
+      "fields": [
+        {
+          "field": "body",
+          "stats": {
+            "raw_bytes": 1794,
+            "raw_blocks": 0,
+            "packed_bytes": 1456,
+            "packed_blocks": 15,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 685,
+            "raw_blocks": 0,
+            "packed_bytes": 137,
+            "packed_blocks": 5,
+            "constant_blocks": 1
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "709c4ec38c3f44918546d2382096bc97",
+      "raw_bytes": 2534,
+      "packed_bytes": 1690
+    }
+  ],
+  "rows_match": true,
+  "plan": [
+    {
+      "Plan": {
+        "Node Type": "Sort",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 10.02,
+        "Total Cost": 10.02,
+        "Plan Rows": 1,
+        "Plan Width": 8,
+        "Actual Rows": 600.0,
+        "Actual Loops": 1,
+        "Disabled": false,
+        "Output": [
+          "id",
+          "(pdb.score(id))"
+        ],
+        "Sort Key": [
+          "diagnostic_bitpacked_norms_smoke.id"
+        ],
+        "Sort Method": "quicksort",
+        "Sort Space Used": 39,
+        "Sort Space Type": "Memory",
+        "Shared Hit Blocks": 61,
+        "Shared Read Blocks": 0,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 0,
+        "Plans": [
+          {
+            "Node Type": "Custom Scan",
+            "Parent Relationship": "Outer",
+            "Custom Plan Provider": "ParadeDB Base Scan",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Relation Name": "diagnostic_bitpacked_norms_smoke",
+            "Schema": "public",
+            "Alias": "diagnostic_bitpacked_norms_smoke",
+            "Startup Cost": 10.0,
+            "Total Cost": 10.01,
+            "Plan Rows": 1,
+            "Plan Width": 8,
+            "Actual Rows": 600.0,
+            "Actual Loops": 1,
+            "Disabled": false,
+            "Output": [
+              "id",
+              "pdb.score(id)"
+            ],
+            "Table": "diagnostic_bitpacked_norms_smoke",
+            "Index": "diagnostic_bitpacked_norms_smoke_idx",
+            "Segment Count": 1,
+            "Worker Selection": "Row-capped",
+            "Heap Fetches": 0,
+            "Virtual Tuples": 600,
+            "Invisible Tuples": 0,
+            "IO Breakdown": "{\"scope\":\"this backend; ExecCustomScan calls only\",\"total\":{\"hits\":61,\"reads\":0},\"components\":{\"bpnorm\":{\"hits\":3,\"reads\":0},\"fast\":{\"hits\":3,\"reads\":0},\"fieldnorm\":{\"hits\":3,\"reads\":0},\"idx\":{\"hits\":3,\"reads\":0},\"metadata\":{\"hits\":43,\"reads\":0},\"pos\":{\"hits\":3,\"reads\":0},\"term\":{\"hits\":3,\"reads\":0}},\"file_read_calls\":{\"bpnorm/read_bytes\":10,\"fast/read_bytes\":23,\"fieldnorm/read_bytes\":2,\"idx/read_bytes\":6,\"pos/read_bytes\":6,\"term/read_bytes\":12},\"unique_pages_scope\":\"RelationBufferAccess only; excludes heap pages\",\"tracked\":{\"hits\":61,\"reads\":0,\"unique_pages\":58},\"untracked\":{\"hits\":0,\"reads\":0},\"buckets\":{\"execute/bpnorm/block_map\":{\"hits\":2,\"reads\":0},\"execute/bpnorm/read_bytes\":{\"hits\":1,\"reads\":0},\"execute/fast/block_map\":{\"hits\":2,\"reads\":0},\"execute/fast/read_bytes\":{\"hits\":1,\"reads\":0},\"execute/fieldnorm/block_map\":{\"hits\":2,\"reads\":0},\"execute/fieldnorm/read_bytes\":{\"hits\":1,\"reads\":0},\"execute/idx/block_map\":{\"hits\":2,\"reads\":0},\"execute/idx/read_bytes\":{\"hits\":1,\"reads\":0},\"execute/metadata/direct\":{\"hits\":34,\"reads\":0},\"execute/pos/block_map\":{\"hits\":2,\"reads\":0},\"execute/pos/read_bytes\":{\"hits\":1,\"reads\":0},\"execute/term/block_map\":{\"hits\":2,\"reads\":0},\"execute/term/read_bytes\":{\"hits\":1,\"reads\":0},\"reader_setup/metadata/direct\":{\"hits\":9,\"reads\":0}},\"unique_pages_by_bucket\":{\"execute/bpnorm/block_map\":2,\"execute/bpnorm/read_bytes\":1,\"execute/fast/block_map\":2,\"execute/fast/read_bytes\":1,\"execute/fieldnorm/block_map\":2,\"execute/fieldnorm/read_bytes\":1,\"execute/idx/block_map\":2,\"execute/idx/read_bytes\":1,\"execute/metadata/direct\":34,\"execute/pos/block_map\":2,\"execute/pos/read_bytes\":1,\"execute/term/block_map\":2,\"execute/term/read_bytes\":1,\"reader_setup/metadata/direct\":7}}",
+            "Exec Method": "ColumnarExecState",
+            "Columnar": "id",
+            "Scores": true,
+            "Tantivy Query": "{\"boolean\":{\"must\":[{\"with_index\":{\"query\":{\"term\":{\"field\":\"title\",\"value\":\"database\"}}}},{\"with_index\":{\"query\":{\"term\":{\"field\":\"body\",\"value\":\"postgres\"}}}}]}}",
+            "Shared Hit Blocks": 61,
+            "Shared Read Blocks": 0,
+            "Shared Dirtied Blocks": 0,
+            "Shared Written Blocks": 0,
+            "Local Hit Blocks": 0,
+            "Local Read Blocks": 0,
+            "Local Dirtied Blocks": 0,
+            "Local Written Blocks": 0,
+            "Temp Read Blocks": 0,
+            "Temp Written Blocks": 0
+          }
+        ]
+      },
+      "Planning": {
+        "Shared Hit Blocks": 64,
+        "Shared Read Blocks": 0,
+        "Shared Dirtied Blocks": 0,
+        "Shared Written Blocks": 0,
+        "Local Hit Blocks": 0,
+        "Local Read Blocks": 0,
+        "Local Dirtied Blocks": 0,
+        "Local Written Blocks": 0,
+        "Temp Read Blocks": 0,
+        "Temp Written Blocks": 0
+      },
+      "Planning Time": 0.167,
+      "Triggers": [],
+      "Execution Time": 0.209
+    }
+  ]
+}

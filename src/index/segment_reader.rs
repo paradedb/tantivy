@@ -326,6 +326,22 @@ impl SegmentReader {
                     io::Error::new(io::ErrorKind::InvalidData, "missing posting norm field")
                 })
         }));
+        let packed_path = self.relative_path(SegmentComponent::Custom("bpnorm".into()));
+        let packed_directory = self.index.directory().clone();
+        inv_idx_reader.set_packed_norms_file(DeferredFileSlice::new(move || {
+            if !packed_directory
+                .exists(&packed_path)
+                .map_err(io::Error::other)?
+            {
+                return Ok(FileSlice::empty());
+            }
+            let source = packed_directory
+                .open_read(&packed_path)
+                .map_err(io::Error::other)?;
+            Ok(CompositeFile::open(&source)?
+                .open_read(field)
+                .unwrap_or_else(FileSlice::empty))
+        }));
         let inv_idx_reader = Arc::new(inv_idx_reader);
 
         // by releasing the lock in between, we may end up opening the inverting index

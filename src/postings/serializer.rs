@@ -52,6 +52,7 @@ pub struct InvertedIndexSerializer {
     positions_write: CompositeWrite<WritePtr>,
     schema: Schema,
     posting_norms_write: Option<CompositeWrite<WritePtr>>,
+    packed_norms_write: Option<CompositeWrite<WritePtr>>,
 }
 
 impl InvertedIndexSerializer {
@@ -66,6 +67,13 @@ impl InvertedIndexSerializer {
             posting_norms_write: if cfg!(feature = "posting-norms") {
                 Some(CompositeWrite::wrap(segment.open_write(
                     crate::index::SegmentComponent::Custom("pnorm".into()),
+                )?))
+            } else {
+                None
+            },
+            packed_norms_write: if cfg!(feature = "bitpacked-posting-norms") {
+                Some(CompositeWrite::wrap(segment.open_write(
+                    crate::index::SegmentComponent::Custom("bpnorm".into()),
                 )?))
             } else {
                 None
@@ -111,6 +119,10 @@ impl InvertedIndexSerializer {
             .as_ref()
             .map(|writer| writer.written_bytes())
             .unwrap_or(0);
+        serializer.packed_norms_write = self
+            .packed_norms_write
+            .as_mut()
+            .map(|writer| super::PackedNormWriter::new(writer.for_field(field)));
         Ok(serializer)
     }
 
@@ -120,6 +132,9 @@ impl InvertedIndexSerializer {
         self.postings_write.close()?;
         self.positions_write.close()?;
         if let Some(writer) = self.posting_norms_write {
+            writer.close()?;
+        }
+        if let Some(writer) = self.packed_norms_write {
             writer.close()?;
         }
         Ok(())
@@ -138,6 +153,7 @@ pub struct FieldSerializer<'a, W: Write = WritePtr> {
     postings_start_offset: u64,
     posting_norms_write: Option<&'a mut CountingWriter<W>>,
     posting_norms_start_offset: u64,
+    packed_norms_write: Option<super::PackedNormWriter<&'a mut CountingWriter<W>>>,
 }
 
 impl<'a, W: Write> FieldSerializer<'a, W> {
@@ -180,6 +196,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             postings_start_offset,
             posting_norms_write: None,
             posting_norms_start_offset: 0,
+            packed_norms_write: None,
         })
     }
 
@@ -281,6 +298,9 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
                 .as_mut()
                 .unwrap()
                 .write_all(&self.postings_serializer.posting_norms)?;
+            if let Some(writer) = &mut self.packed_norms_write {
+                writer.write_all(&self.postings_serializer.posting_norms)?;
+            }
         }
         self.current_term_info.postings_range.end = self.postings_offset();
         if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {
@@ -297,6 +317,9 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     /// Closes the current field.
     pub fn close(mut self) -> io::Result<()> {
         self.close_term()?;
+        if let Some(writer) = self.packed_norms_write.take() {
+            writer.finish()?;
+        }
         if let Some(positions_serializer) = self.positions_serializer_opt {
             positions_serializer.close()?;
         }

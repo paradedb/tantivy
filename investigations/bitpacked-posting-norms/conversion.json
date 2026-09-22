@@ -1,0 +1,975 @@
+{
+  "seconds": 20.428411499975482,
+  "segments": [
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3158594,
+            "raw_blocks": 0,
+            "packed_bytes": 1752997,
+            "packed_blocks": 24677,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 113997600,
+            "raw_blocks": 0,
+            "packed_bytes": 104731227,
+            "packed_blocks": 890604,
+            "constant_blocks": 3
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "eb76c643dffe4ce18003d09dce2f1863",
+      "raw_bytes": 117156283,
+      "packed_bytes": 106484459
+    },
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3153388,
+            "raw_blocks": 0,
+            "packed_bytes": 1763793,
+            "packed_blocks": 24636,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 114046504,
+            "raw_blocks": 0,
+            "packed_bytes": 104768758,
+            "packed_blocks": 890989,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "b186860cda6c4aea8afafba1198c6ab9",
+      "raw_bytes": 117199981,
+      "packed_bytes": 106532786
+    },
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3177036,
+            "raw_blocks": 0,
+            "packed_bytes": 1770963,
+            "packed_blocks": 24821,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 113946182,
+            "raw_blocks": 0,
+            "packed_bytes": 104688881,
+            "packed_blocks": 890204,
+            "constant_blocks": 1
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "09e6d775f1e3435881bfa65a659da170",
+      "raw_bytes": 117123307,
+      "packed_bytes": 106460079
+    },
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3166853,
+            "raw_blocks": 0,
+            "packed_bytes": 1762203,
+            "packed_blocks": 24742,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 114153317,
+            "raw_blocks": 0,
+            "packed_bytes": 104875560,
+            "packed_blocks": 891823,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+      "raw_bytes": 117320259,
+      "packed_bytes": 106637998
+    },
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3156831,
+            "raw_blocks": 0,
+            "packed_bytes": 1752759,
+            "packed_blocks": 24663,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 114265087,
+            "raw_blocks": 0,
+            "packed_bytes": 104984917,
+            "packed_blocks": 892694,
+            "constant_blocks": 2
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+      "raw_bytes": 117422007,
+      "packed_bytes": 106737911
+    },
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3059372,
+            "raw_blocks": 0,
+            "packed_bytes": 1689695,
+            "packed_blocks": 23902,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 116278366,
+            "raw_blocks": 0,
+            "packed_bytes": 106792606,
+            "packed_blocks": 908424,
+            "constant_blocks": 1
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "952f1be13273443181ade989398abb9b",
+      "raw_bytes": 119337827,
+      "packed_bytes": 108482536
+    },
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3138124,
+            "raw_blocks": 0,
+            "packed_bytes": 1734524,
+            "packed_blocks": 24517,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 117683468,
+            "raw_blocks": 0,
+            "packed_bytes": 108114514,
+            "packed_blocks": 919403,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "9bfdcce177344e53b0af62abd21ab30a",
+      "raw_bytes": 120821681,
+      "packed_bytes": 109849273
+    },
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3118064,
+            "raw_blocks": 0,
+            "packed_bytes": 1721193,
+            "packed_blocks": 24360,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 118042300,
+            "raw_blocks": 0,
+            "packed_bytes": 108410062,
+            "packed_blocks": 922206,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "f95824e6498d4161a8258e04c2d939c3",
+      "raw_bytes": 121160453,
+      "packed_bytes": 110131490
+    },
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3207167,
+            "raw_blocks": 0,
+            "packed_bytes": 1769877,
+            "packed_blocks": 25056,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 121074135,
+            "raw_blocks": 0,
+            "packed_bytes": 111207892,
+            "packed_blocks": 945892,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "722b2cc326774eab96019ec88ce833a7",
+      "raw_bytes": 124281391,
+      "packed_bytes": 112978004
+    },
+    {
+      "fields": [
+        {
+          "field": "title",
+          "stats": {
+            "raw_bytes": 3079821,
+            "raw_blocks": 0,
+            "packed_bytes": 1700832,
+            "packed_blocks": 24062,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "text",
+          "stats": {
+            "raw_bytes": 116466258,
+            "raw_blocks": 0,
+            "packed_bytes": 106986161,
+            "packed_blocks": 909893,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "type",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "url",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "by",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "score",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "id",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "time",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        },
+        {
+          "field": "ctid",
+          "stats": {
+            "raw_bytes": 0,
+            "raw_blocks": 0,
+            "packed_bytes": 21,
+            "packed_blocks": 0,
+            "constant_blocks": 0
+          }
+        }
+      ],
+      "segment": "f2cb57ddb7764036a46406913fb0a474",
+      "raw_bytes": 119546168,
+      "packed_bytes": 108687228
+    }
+  ]
+}

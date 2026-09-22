@@ -33,6 +33,7 @@ pub struct InvertedIndexReader {
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
     posting_norms_file_slice: std::sync::Arc<DeferredFileSlice>,
+    packed_norms: Option<std::sync::Arc<crate::postings::packed_norms::PackedNormSource>>,
     record_option: IndexRecordOption,
     total_num_tokens: u64,
 }
@@ -82,11 +83,18 @@ impl InvertedIndexReader {
             })),
             record_option,
             total_num_tokens,
+            packed_norms: None,
         })
     }
 
     pub(crate) fn set_posting_norms_file(&mut self, source: DeferredFileSlice) {
         self.posting_norms_file_slice = std::sync::Arc::new(source);
+    }
+
+    pub(crate) fn set_packed_norms_file(&mut self, source: DeferredFileSlice) {
+        self.packed_norms = Some(std::sync::Arc::new(
+            crate::postings::packed_norms::PackedNormSource::new(source),
+        ));
     }
 
     /// Creates an empty `InvertedIndexReader` object, which
@@ -101,6 +109,7 @@ impl InvertedIndexReader {
             })),
             record_option,
             total_num_tokens: 0u64,
+            packed_norms: None,
         }
     }
 
@@ -193,6 +202,9 @@ impl InvertedIndexReader {
         let postings_bytes = postings_slice.read_bytes()?;
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
         block_postings.set_term_norm_source(self.posting_norms_file_slice.clone());
+        if let Some(source) = &self.packed_norms {
+            block_postings.set_packed_norm_source(source.clone());
+        }
         Ok(())
     }
 
@@ -229,6 +241,9 @@ impl InvertedIndexReader {
             requested_option,
         )?;
         postings.set_term_norm_source(self.posting_norms_file_slice.clone());
+        if let Some(source) = &self.packed_norms {
+            postings.set_packed_norm_source(source.clone());
+        }
         Ok(postings)
     }
 

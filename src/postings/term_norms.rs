@@ -13,6 +13,11 @@ const BUFFER_SIZE: usize = 8192;
 thread_local! {
     static READS: Cell<u64> = const { Cell::new(0) };
     static ENABLED: Cell<bool> = const { Cell::new(true) };
+    static PACKED_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+pub fn set_packed_posting_norms_enabled(enabled: bool) -> bool {
+    PACKED_ENABLED.replace(enabled)
 }
 
 /// Selects term-local norm reads for newly opened scorers in this thread.
@@ -40,7 +45,14 @@ pub(crate) struct TermNormReader {
     source: Arc<DeferredFileSlice>,
     offset: usize,
     len: usize,
-    buffer: RefCell<Option<BufferedFileSlice>>,
+    packed_source: Option<Arc<super::packed_norms::PackedNormSource>>,
+    buffer: RefCell<Option<NormBuffer>>,
+}
+
+#[derive(Clone)]
+enum NormBuffer {
+    Raw(BufferedFileSlice),
+    Packed(super::packed_norms::PackedNormReader),
 }
 
 impl TermNormReader {
@@ -49,8 +61,15 @@ impl TermNormReader {
             source,
             offset: offset as usize,
             len: len as usize,
+            packed_source: None,
             buffer: RefCell::new(None),
         })
+    }
+
+    pub(crate) fn set_packed_source(&mut self, source: Arc<super::packed_norms::PackedNormSource>) {
+        if PACKED_ENABLED.get() {
+            self.packed_source = Some(source);
+        }
     }
 
     pub(crate) fn read(&self, ordinal: usize) -> io::Result<u8> {
@@ -63,6 +82,19 @@ impl TermNormReader {
         READS.set(READS.get() + 1);
         let mut buffer = self.buffer.borrow_mut();
         if buffer.is_none() {
+            if let Some(source) = &self.packed_source {
+                let end = self
+                    .offset
+                    .checked_add(self.len)
+                    .ok_or_else(|| io::Error::other("norm offset overflow"))?;
+                if let Some(reader) =
+                    super::packed_norms::PackedNormReader::open(source, Some(self.offset..end))?
+                {
+                    *buffer = Some(NormBuffer::Packed(reader));
+                }
+            }
+        }
+        if buffer.is_none() {
             let source = self.source.open()?;
             let end = self
                 .offset
@@ -71,12 +103,19 @@ impl TermNormReader {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "truncated posting norms")
                 })?;
-            *buffer = Some(BufferedFileSlice::new(
+            *buffer = Some(NormBuffer::Raw(BufferedFileSlice::new(
                 source.slice(self.offset..end),
                 BUFFER_SIZE,
-            ));
+            )));
         }
-        buffer.as_ref().unwrap().read_byte(ordinal as u64)
+        match buffer.as_ref().unwrap() {
+            NormBuffer::Raw(buffer) => buffer.read_byte(ordinal as u64),
+            NormBuffer::Packed(buffer) => buffer.read(
+                self.offset
+                    .checked_add(ordinal)
+                    .ok_or_else(|| io::Error::other("norm offset overflow"))?,
+            ),
+        }
     }
 }
 

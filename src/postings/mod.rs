@@ -22,8 +22,11 @@ pub(crate) mod skip;
 mod term_info;
 pub(crate) mod subblock;
 pub(crate) mod term_norms;
+pub(crate) mod packed_norms;
 
 pub use term_norms::{posting_norm_reads, set_posting_norms_enabled};
+pub use term_norms::set_packed_posting_norms_enabled;
+pub use packed_norms::{PackedNormStats, PackedNormWriter};
 
 pub use loaded_postings::LoadedPostings;
 pub(crate) use merger::{next_mapped_doc, PostingsMerger};

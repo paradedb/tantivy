@@ -1,0 +1,65 @@
+{
+  "title": {
+    "raw_bytes": 31415250,
+    "raw_blocks": 0,
+    "packed_bytes": 17418836,
+    "packed_blocks": 245436,
+    "constant_blocks": 0
+  },
+  "text": {
+    "raw_bytes": 1159953217,
+    "raw_blocks": 0,
+    "packed_bytes": 1065560578,
+    "packed_blocks": 9062132,
+    "constant_blocks": 7
+  },
+  "type": {
+    "raw_bytes": 0,
+    "raw_blocks": 0,
+    "packed_bytes": 210,
+    "packed_blocks": 0,
+    "constant_blocks": 0
+  },
+  "url": {
+    "raw_bytes": 0,
+    "raw_blocks": 0,
+    "packed_bytes": 210,
+    "packed_blocks": 0,
+    "constant_blocks": 0
+  },
+  "by": {
+    "raw_bytes": 0,
+    "raw_blocks": 0,
+    "packed_bytes": 210,
+    "packed_blocks": 0,
+    "constant_blocks": 0
+  },
+  "score": {
+    "raw_bytes": 0,
+    "raw_blocks": 0,
+    "packed_bytes": 210,
+    "packed_blocks": 0,
+    "constant_blocks": 0
+  },
+  "id": {
+    "raw_bytes": 0,
+    "raw_blocks": 0,
+    "packed_bytes": 210,
+    "packed_blocks": 0,
+    "constant_blocks": 0
+  },
+  "time": {
+    "raw_bytes": 0,
+    "raw_blocks": 0,
+    "packed_bytes": 210,
+    "packed_blocks": 0,
+    "constant_blocks": 0
+  },
+  "ctid": {
+    "raw_bytes": 0,
+    "raw_blocks": 0,
+    "packed_bytes": 210,
+    "packed_blocks": 0,
+    "constant_blocks": 0
+  }
+}

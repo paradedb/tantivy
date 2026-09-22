@@ -219,6 +219,15 @@ impl BlockSegmentPostings {
         self.term_norms = None;
     }
 
+    pub(crate) fn set_packed_norm_source(
+        &mut self,
+        source: std::sync::Arc<super::packed_norms::PackedNormSource>,
+    ) {
+        if let Some(norms) = &mut self.term_norms {
+            norms.set_packed_source(source);
+        }
+    }
+
     pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
         if let Some(norms) = &self.term_norms {
             let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + offset;

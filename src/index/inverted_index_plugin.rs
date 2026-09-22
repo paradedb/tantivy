@@ -62,7 +62,7 @@ fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<
 
 impl SegmentPlugin for InvertedIndexPlugin {
     fn extensions(&self) -> &[&str] {
-        &["fieldnorm", "term", "idx", "pos", "pnorm"]
+        &["fieldnorm", "term", "idx", "pos", "pnorm", "bpnorm"]
     }
 
     fn create_writer(&self, _ctx: &PluginWriterContext) -> crate::Result<Box<dyn PluginWriter>> {
@@ -125,11 +125,16 @@ impl SegmentPlugin for InvertedIndexPlugin {
                 ComponentSpaceUsage::PerField(positions),
             ),
         ]);
-        if let Ok(file) = segment_reader.open_read(SegmentComponent::Custom("pnorm".into())) {
-            usage.insert(
-                "posting_norms".into(),
-                ComponentSpaceUsage::PerField(CompositeFile::open(&file)?.space_usage(schema)),
-            );
+        for (extension, name) in [
+            ("pnorm", "posting_norms"),
+            ("bpnorm", "packed_posting_norms"),
+        ] {
+            if let Ok(file) = segment_reader.open_read(SegmentComponent::Custom(extension.into())) {
+                usage.insert(
+                    name.into(),
+                    ComponentSpaceUsage::PerField(CompositeFile::open(&file)?.space_usage(schema)),
+                );
+            }
         }
         Ok(usage)
     }
