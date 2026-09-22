@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, OnceLock};
 
 use common::file_slice::DeferredFileSlice;
-use common::HasLen;
+use common::{BinarySerializable, HasLen};
 use tantivy_bitpacker::{compute_num_bits, minmax, BitPacker, BitUnpacker};
 
 use crate::directory::{BufferedFileSlice, FileSlice, OwnedBytes};
@@ -11,6 +11,93 @@ use crate::directory::{BufferedFileSlice, FileSlice, OwnedBytes};
 const BLOCK_LEN: usize = 128;
 const FOOTER_LEN: usize = 21;
 const MAGIC: &[u8; 4] = b"PNB1";
+const EMBEDDED_MAGIC: [u8; 10] = [127, 127, 127, 127, 127, 127, 127, 127, 127, 131];
+
+#[derive(Clone)]
+pub(crate) struct EmbeddedNormDirectory {
+    len: usize,
+    payload_len: usize,
+    offset_width: usize,
+    directory: OwnedBytes,
+}
+
+impl EmbeddedNormDirectory {
+    pub(crate) fn read_header(mut bytes: OwnedBytes) -> io::Result<(Option<Self>, OwnedBytes)> {
+        if !bytes.starts_with(&EMBEDDED_MAGIC) {
+            return Ok((None, bytes));
+        }
+        bytes.advance(EMBEDDED_MAGIC.len());
+        let len = usize::try_from(u64::deserialize(&mut bytes)?).map_err(|_| invalid())?;
+        let payload_len = usize::try_from(u64::deserialize(&mut bytes)?).map_err(|_| invalid())?;
+        let offset_width = u8::deserialize(&mut bytes)? as usize;
+        let directory_len = u32::deserialize(&mut bytes)? as usize;
+        if !matches!(offset_width, 4 | 8) || directory_len > bytes.len() {
+            return Err(invalid());
+        }
+        let (directory, rest) = bytes.split(directory_len);
+        Ok((
+            Some(Self {
+                len,
+                payload_len,
+                offset_width,
+                directory,
+            }),
+            rest,
+        ))
+    }
+}
+
+pub struct PackedNormRewriter {
+    source: Arc<PackedNormSource>,
+}
+
+impl PackedNormRewriter {
+    pub fn new(source: FileSlice) -> Self {
+        Self {
+            source: Arc::new(PackedNormSource::new(DeferredFileSlice::new(move || {
+                Ok(source.clone())
+            }))),
+        }
+    }
+
+    pub fn rewrite(&self, bytes: OwnedBytes, doc_freq: u32) -> io::Result<Vec<u8>> {
+        let (offset, rest) = super::term_norms::read_header(bytes.clone())?;
+        let Some(offset) = offset else {
+            return Ok(bytes.to_vec());
+        };
+        if rest.starts_with(&EMBEDDED_MAGIC) {
+            return Ok(bytes.to_vec());
+        }
+        let offset = usize::try_from(offset).map_err(|_| invalid())?;
+        let end = offset.checked_add(doc_freq as usize).ok_or_else(invalid)?;
+        let meta = self.source.metadata()?.ok_or_else(invalid)?;
+        if end > meta.len {
+            return Err(invalid());
+        }
+        let first = offset / BLOCK_LEN;
+        let after = end.div_ceil(BLOCK_LEN);
+        let count = after - first + usize::from(after < meta.len.div_ceil(BLOCK_LEN));
+        let directory = meta
+            .source
+            .slice(
+                meta.directory_start + first * meta.offset_width
+                    ..meta.directory_start + (first + count) * meta.offset_width,
+            )
+            .read_bytes()?;
+        let mut result = Vec::with_capacity(bytes.len() + 31 + directory.len());
+        result.extend_from_slice(&bytes[..bytes.len() - rest.len()]);
+        result.extend_from_slice(&EMBEDDED_MAGIC);
+        (meta.len as u64).serialize(&mut result)?;
+        (meta.directory_start as u64).serialize(&mut result)?;
+        (meta.offset_width as u8).serialize(&mut result)?;
+        u32::try_from(directory.len())
+            .map_err(|_| invalid())?
+            .serialize(&mut result)?;
+        result.extend_from_slice(&directory);
+        result.extend_from_slice(&rest);
+        Ok(result)
+    }
+}
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct PackedNormStats {
@@ -190,6 +277,50 @@ pub(crate) struct PackedNormReader {
 }
 
 impl PackedNormReader {
+    pub(crate) fn open_embedded(
+        source: &Arc<PackedNormSource>,
+        meta: &EmbeddedNormDirectory,
+        range: std::ops::Range<usize>,
+    ) -> io::Result<Self> {
+        if range.start > range.end || range.end > meta.len {
+            return Err(invalid());
+        }
+        let first_block = range.start / BLOCK_LEN;
+        let after_block = range.end.div_ceil(BLOCK_LEN);
+        let has_end = after_block < meta.len.div_ceil(BLOCK_LEN);
+        if meta.directory.len()
+            != (after_block - first_block + usize::from(has_end)) * meta.offset_width
+        {
+            return Err(invalid());
+        }
+        let payload_len = if has_end {
+            let offset = (after_block - first_block) * meta.offset_width;
+            let mut bytes = [0; 8];
+            bytes[..meta.offset_width]
+                .copy_from_slice(&meta.directory[offset..offset + meta.offset_width]);
+            usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| invalid())?
+        } else {
+            meta.payload_len
+        };
+        let file = source.source.open()?;
+        if payload_len > meta.payload_len || meta.payload_len > file.len() {
+            return Err(invalid());
+        }
+        Ok(Self {
+            len: meta.len,
+            offset_width: meta.offset_width,
+            payload: BufferedFileSlice::new(file.slice_to(payload_len), 8192),
+            directory: BufferedFileSlice::new(
+                FileSlice::new(Arc::new(meta.directory.clone())),
+                8192,
+            ),
+            payload_len,
+            first_block,
+            range,
+            block: RefCell::new((usize::MAX, 0, BitUnpacker::new(0), OwnedBytes::empty())),
+        })
+    }
+
     pub(crate) fn open(
         source: &Arc<PackedNormSource>,
         range: Option<std::ops::Range<usize>>,
@@ -279,6 +410,62 @@ impl PackedNormReader {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn embedded_directories_preserve_norms_without_opening_footer() {
+        for width in 0..=8 {
+            let mask = (1u16 << width) - 1;
+            let values: Vec<u8> = (0..8193)
+                .map(|i| ((i as u16).wrapping_mul(73) & mask) as u8)
+                .collect();
+            let mut data = Vec::new();
+            let mut writer = PackedNormWriter::new(&mut data);
+            writer.write_all(&values).unwrap();
+            writer.finish().unwrap();
+            let file = FileSlice::from(data);
+            let rewriter = PackedNormRewriter::new(file.clone());
+            let source = Arc::new(PackedNormSource::new(DeferredFileSlice::new(move || {
+                Ok(file.clone())
+            })));
+            for range in [0..1, 1..127, 127..129, 128..256, 155..8192, 8192..8193] {
+                let mut original = super::super::term_norms::MAGIC.to_vec();
+                (range.start as u64).serialize(&mut original).unwrap();
+                original.extend_from_slice(b"postings body");
+                let rewritten = rewriter
+                    .rewrite(OwnedBytes::new(original), (range.end - range.start) as u32)
+                    .unwrap();
+                assert_eq!(
+                    rewriter
+                        .rewrite(
+                            OwnedBytes::new(rewritten.clone()),
+                            (range.end - range.start) as u32
+                        )
+                        .unwrap(),
+                    rewritten
+                );
+                let (offset, bytes) =
+                    super::super::term_norms::read_header(OwnedBytes::new(rewritten)).unwrap();
+                assert_eq!(offset.unwrap(), range.start as u64);
+                let (meta, body) = EmbeddedNormDirectory::read_header(bytes.clone()).unwrap();
+                assert_eq!(&*body, b"postings body");
+                let reader =
+                    PackedNormReader::open_embedded(&source, &meta.unwrap(), range.clone())
+                        .unwrap();
+                for i in range.clone().rev() {
+                    assert_eq!(reader.read(i).unwrap(), values[i]);
+                }
+                assert_eq!(
+                    reader.clone().read(range.start).unwrap(),
+                    values[range.start]
+                );
+                assert!(reader.read(range.end).is_err());
+                assert!(source.metadata.get().is_none());
+                for len in EMBEDDED_MAGIC.len()..bytes.len() - body.len() {
+                    assert!(EmbeddedNormDirectory::read_header(bytes.slice(0..len)).is_err());
+                }
+            }
+        }
+    }
 
     #[test]
     fn all_widths_tails_and_random_access() {

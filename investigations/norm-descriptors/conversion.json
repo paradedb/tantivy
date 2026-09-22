@@ -1,0 +1,812 @@
+[
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 30612757,
+        "starting_block": 244613
+      },
+      "segment": "eb76c643dffe4ce18003d09dce2f1863",
+      "postings": {
+        "total_bytes": 273388909,
+        "starting_block": 1613695
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 30612382,
+        "starting_block": 438401
+      },
+      "segment": "eb76c643dffe4ce18003d09dce2f1863",
+      "postings": {
+        "total_bytes": 268808425,
+        "starting_block": 438403
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 131907,
+        "new_postings": 11880638,
+        "old_postings": 11679868
+      },
+      {
+        "field": "text",
+        "terms": 911134,
+        "new_postings": 223470280,
+        "old_postings": 219090566
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1022561,
+        "old_postings": 1022561
+      },
+      {
+        "field": "url",
+        "terms": 375779,
+        "new_postings": 1928161,
+        "old_postings": 1928161
+      },
+      {
+        "field": "by",
+        "terms": 220261,
+        "new_postings": 6444622,
+        "old_postings": 6444622
+      },
+      {
+        "field": "score",
+        "terms": 950,
+        "new_postings": 1181838,
+        "old_postings": 1181838
+      },
+      {
+        "field": "id",
+        "terms": 2841903,
+        "new_postings": 9253956,
+        "old_postings": 9253956
+      },
+      {
+        "field": "time",
+        "terms": 2709085,
+        "new_postings": 8952793,
+        "old_postings": 8952793
+      },
+      {
+        "field": "ctid",
+        "terms": 2841903,
+        "new_postings": 9253956,
+        "old_postings": 9253956
+      }
+    ],
+    "seconds": 6.40076700001373
+  },
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 30581708,
+        "starting_block": 299136
+      },
+      "segment": "b186860cda6c4aea8afafba1198c6ab9",
+      "postings": {
+        "total_bytes": 273627027,
+        "starting_block": 1613713
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 30581485,
+        "starting_block": 439803
+      },
+      "segment": "b186860cda6c4aea8afafba1198c6ab9",
+      "postings": {
+        "total_bytes": 269048221,
+        "starting_block": 439805
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 131555,
+        "new_postings": 11858754,
+        "old_postings": 11658802
+      },
+      {
+        "field": "text",
+        "terms": 919946,
+        "new_postings": 223787265,
+        "old_postings": 219408411
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1017996,
+        "old_postings": 1017996
+      },
+      {
+        "field": "url",
+        "terms": 374333,
+        "new_postings": 1919840,
+        "old_postings": 1919840
+      },
+      {
+        "field": "by",
+        "terms": 220412,
+        "new_postings": 6436280,
+        "old_postings": 6436280
+      },
+      {
+        "field": "score",
+        "terms": 946,
+        "new_postings": 1178900,
+        "old_postings": 1178900
+      },
+      {
+        "field": "id",
+        "terms": 2838888,
+        "new_postings": 9241896,
+        "old_postings": 9241896
+      },
+      {
+        "field": "time",
+        "terms": 2707580,
+        "new_postings": 8944096,
+        "old_postings": 8944096
+      },
+      {
+        "field": "ctid",
+        "terms": 2838888,
+        "new_postings": 9241896,
+        "old_postings": 9241896
+      }
+    ],
+    "seconds": 6.302750583010493
+  },
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 30724935,
+        "starting_block": 295674
+      },
+      "segment": "09e6d775f1e3435881bfa65a659da170",
+      "postings": {
+        "total_bytes": 273751420,
+        "starting_block": 1613731
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 30724868,
+        "starting_block": 440528
+      },
+      "segment": "09e6d775f1e3435881bfa65a659da170",
+      "postings": {
+        "total_bytes": 269173003,
+        "starting_block": 440530
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 131731,
+        "new_postings": 11921969,
+        "old_postings": 11720317
+      },
+      {
+        "field": "text",
+        "terms": 918835,
+        "new_postings": 223697471,
+        "old_postings": 219320706
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1019989,
+        "old_postings": 1019989
+      },
+      {
+        "field": "url",
+        "terms": 376230,
+        "new_postings": 1929782,
+        "old_postings": 1929782
+      },
+      {
+        "field": "by",
+        "terms": 220085,
+        "new_postings": 6457967,
+        "old_postings": 6457967
+      },
+      {
+        "field": "score",
+        "terms": 925,
+        "new_postings": 1181614,
+        "old_postings": 1181614
+      },
+      {
+        "field": "id",
+        "terms": 2848277,
+        "new_postings": 9279452,
+        "old_postings": 9279452
+      },
+      {
+        "field": "time",
+        "terms": 2717521,
+        "new_postings": 8983620,
+        "old_postings": 8983620
+      },
+      {
+        "field": "ctid",
+        "terms": 2848277,
+        "new_postings": 9279452,
+        "old_postings": 9279452
+      }
+    ],
+    "seconds": 6.670686707977438
+  },
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 30699439,
+        "starting_block": 351880
+      },
+      "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+      "postings": {
+        "total_bytes": 273893606,
+        "starting_block": 1613749
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 30699130,
+        "starting_block": 441362
+      },
+      "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+      "postings": {
+        "total_bytes": 269307631,
+        "starting_block": 441364
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 131536,
+        "new_postings": 11884861,
+        "old_postings": 11683500
+      },
+      {
+        "field": "text",
+        "terms": 919206,
+        "new_postings": 223976486,
+        "old_postings": 219591872
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1021543,
+        "old_postings": 1021543
+      },
+      {
+        "field": "url",
+        "terms": 375255,
+        "new_postings": 1926910,
+        "old_postings": 1926910
+      },
+      {
+        "field": "by",
+        "terms": 220982,
+        "new_postings": 6446669,
+        "old_postings": 6446669
+      },
+      {
+        "field": "score",
+        "terms": 948,
+        "new_postings": 1180819,
+        "old_postings": 1180819
+      },
+      {
+        "field": "id",
+        "terms": 2841222,
+        "new_postings": 9251232,
+        "old_postings": 9251232
+      },
+      {
+        "field": "time",
+        "terms": 2709259,
+        "new_postings": 8953750,
+        "old_postings": 8953750
+      },
+      {
+        "field": "ctid",
+        "terms": 2841222,
+        "new_postings": 9251232,
+        "old_postings": 9251232
+      }
+    ],
+    "seconds": 6.549090584012447
+  },
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 30639331,
+        "starting_block": 396677
+      },
+      "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+      "postings": {
+        "total_bytes": 274139952,
+        "starting_block": 1613768
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 30639163,
+        "starting_block": 441369
+      },
+      "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+      "postings": {
+        "total_bytes": 269551680,
+        "starting_block": 441373
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 131636,
+        "new_postings": 11874775,
+        "old_postings": 11674673
+      },
+      {
+        "field": "text",
+        "terms": 919348,
+        "new_postings": 224184979,
+        "old_postings": 219796809
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1022324,
+        "old_postings": 1022324
+      },
+      {
+        "field": "url",
+        "terms": 373713,
+        "new_postings": 1927119,
+        "old_postings": 1927119
+      },
+      {
+        "field": "by",
+        "terms": 220782,
+        "new_postings": 6456051,
+        "old_postings": 6456051
+      },
+      {
+        "field": "score",
+        "terms": 956,
+        "new_postings": 1181693,
+        "old_postings": 1181693
+      },
+      {
+        "field": "id",
+        "terms": 2844031,
+        "new_postings": 9262468,
+        "old_postings": 9262468
+      },
+      {
+        "field": "time",
+        "terms": 2713023,
+        "new_postings": 8967971,
+        "old_postings": 8967971
+      },
+      {
+        "field": "ctid",
+        "terms": 2844031,
+        "new_postings": 9262468,
+        "old_postings": 9262468
+      }
+    ],
+    "seconds": 6.56135054101469
+  },
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 30382267,
+        "starting_block": 297595
+      },
+      "segment": "952f1be13273443181ade989398abb9b",
+      "postings": {
+        "total_bytes": 276838835,
+        "starting_block": 1613786
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 30381934,
+        "starting_block": 1209464
+      },
+      "segment": "952f1be13273443181ade989398abb9b",
+      "postings": {
+        "total_bytes": 272181951,
+        "starting_block": 1209530
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 131465,
+        "new_postings": 11689162,
+        "old_postings": 11494095
+      },
+      {
+        "field": "text",
+        "terms": 919295,
+        "new_postings": 226916575,
+        "old_postings": 222454758
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1007429,
+        "old_postings": 1007429
+      },
+      {
+        "field": "url",
+        "terms": 359739,
+        "new_postings": 1883114,
+        "old_postings": 1883114
+      },
+      {
+        "field": "by",
+        "terms": 225365,
+        "new_postings": 6532769,
+        "old_postings": 6532769
+      },
+      {
+        "field": "score",
+        "terms": 989,
+        "new_postings": 1156084,
+        "old_postings": 1156084
+      },
+      {
+        "field": "id",
+        "terms": 2860468,
+        "new_postings": 9328216,
+        "old_postings": 9328216
+      },
+      {
+        "field": "time",
+        "terms": 2711997,
+        "new_postings": 8997166,
+        "old_postings": 8997166
+      },
+      {
+        "field": "ctid",
+        "terms": 2860468,
+        "new_postings": 9328216,
+        "old_postings": 9328216
+      }
+    ],
+    "seconds": 6.6528923329897225
+  },
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 30869135,
+        "starting_block": 1036129
+      },
+      "segment": "9bfdcce177344e53b0af62abd21ab30a",
+      "postings": {
+        "total_bytes": 280721219,
+        "starting_block": 1613804
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 30868761,
+        "starting_block": 1213001
+      },
+      "segment": "9bfdcce177344e53b0af62abd21ab30a",
+      "postings": {
+        "total_bytes": 276012513,
+        "starting_block": 1213003
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 133741,
+        "new_postings": 11940450,
+        "old_postings": 11741657
+      },
+      {
+        "field": "text",
+        "terms": 929887,
+        "new_postings": 229854977,
+        "old_postings": 225345064
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1028085,
+        "old_postings": 1028085
+      },
+      {
+        "field": "url",
+        "terms": 370243,
+        "new_postings": 1933759,
+        "old_postings": 1933759
+      },
+      {
+        "field": "by",
+        "terms": 227822,
+        "new_postings": 6636226,
+        "old_postings": 6636226
+      },
+      {
+        "field": "score",
+        "terms": 999,
+        "new_postings": 1180203,
+        "old_postings": 1180203
+      },
+      {
+        "field": "id",
+        "terms": 2902246,
+        "new_postings": 9495328,
+        "old_postings": 9495328
+      },
+      {
+        "field": "time",
+        "terms": 2751897,
+        "new_postings": 9156759,
+        "old_postings": 9156759
+      },
+      {
+        "field": "ctid",
+        "terms": 2902246,
+        "new_postings": 9495328,
+        "old_postings": 9495328
+      }
+    ],
+    "seconds": 6.546006999997189
+  },
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 30747957,
+        "starting_block": 1619652
+      },
+      "segment": "f95824e6498d4161a8258e04c2d939c3",
+      "postings": {
+        "total_bytes": 280951317,
+        "starting_block": 1613823
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 30747645,
+        "starting_block": 1213740
+      },
+      "segment": "f95824e6498d4161a8258e04c2d939c3",
+      "postings": {
+        "total_bytes": 276231942,
+        "starting_block": 1213742
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 132868,
+        "new_postings": 11866575,
+        "old_postings": 11668201
+      },
+      {
+        "field": "text",
+        "terms": 926703,
+        "new_postings": 230184874,
+        "old_postings": 225663873
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1023772,
+        "old_postings": 1023772
+      },
+      {
+        "field": "url",
+        "terms": 366854,
+        "new_postings": 1921430,
+        "old_postings": 1921430
+      },
+      {
+        "field": "by",
+        "terms": 227285,
+        "new_postings": 6627747,
+        "old_postings": 6627747
+      },
+      {
+        "field": "score",
+        "terms": 1001,
+        "new_postings": 1175235,
+        "old_postings": 1175235
+      },
+      {
+        "field": "id",
+        "terms": 2903133,
+        "new_postings": 9498876,
+        "old_postings": 9498876
+      },
+      {
+        "field": "time",
+        "terms": 2749698,
+        "new_postings": 9153828,
+        "old_postings": 9153828
+      },
+      {
+        "field": "ctid",
+        "terms": 2903133,
+        "new_postings": 9498876,
+        "old_postings": 9498876
+      }
+    ],
+    "seconds": 6.606341375008924
+  },
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 31557725,
+        "starting_block": 1658752
+      },
+      "segment": "722b2cc326774eab96019ec88ce833a7",
+      "postings": {
+        "total_bytes": 288375918,
+        "starting_block": 1613837
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 31557465,
+        "starting_block": 1218195
+      },
+      "segment": "722b2cc326774eab96019ec88ce833a7",
+      "postings": {
+        "total_bytes": 283545294,
+        "starting_block": 1218197
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 135220,
+        "new_postings": 12153512,
+        "old_postings": 11948892
+      },
+      {
+        "field": "text",
+        "terms": 943496,
+        "new_postings": 235943295,
+        "old_postings": 231317291
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1056130,
+        "old_postings": 1056130
+      },
+      {
+        "field": "url",
+        "terms": 378417,
+        "new_postings": 1991535,
+        "old_postings": 1991535
+      },
+      {
+        "field": "by",
+        "terms": 230406,
+        "new_postings": 6838016,
+        "old_postings": 6838016
+      },
+      {
+        "field": "score",
+        "terms": 985,
+        "new_postings": 1210604,
+        "old_postings": 1210604
+      },
+      {
+        "field": "id",
+        "terms": 2989299,
+        "new_postings": 9843540,
+        "old_postings": 9843540
+      },
+      {
+        "field": "time",
+        "terms": 2836047,
+        "new_postings": 9495642,
+        "old_postings": 9495642
+      },
+      {
+        "field": "ctid",
+        "terms": 2989299,
+        "new_postings": 9843540,
+        "old_postings": 9843540
+      }
+    ],
+    "seconds": 6.674451750004664
+  },
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 30443480,
+        "starting_block": 1696617
+      },
+      "segment": "f2cb57ddb7764036a46406913fb0a474",
+      "postings": {
+        "total_bytes": 277381421,
+        "starting_block": 1662622
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 30443109,
+        "starting_block": 1210016
+      },
+      "segment": "f2cb57ddb7764036a46406913fb0a474",
+      "postings": {
+        "total_bytes": 272717621,
+        "starting_block": 1210018
+      }
+    },
+    "fields": [
+      {
+        "field": "title",
+        "terms": 131927,
+        "new_postings": 11744492,
+        "old_postings": 11548455
+      },
+      {
+        "field": "text",
+        "terms": 918131,
+        "new_postings": 227271292,
+        "old_postings": 222803529
+      },
+      {
+        "field": "type",
+        "terms": 5,
+        "new_postings": 1010381,
+        "old_postings": 1010381
+      },
+      {
+        "field": "url",
+        "terms": 362945,
+        "new_postings": 1895363,
+        "old_postings": 1895363
+      },
+      {
+        "field": "by",
+        "terms": 225789,
+        "new_postings": 6553698,
+        "old_postings": 6553698
+      },
+      {
+        "field": "score",
+        "terms": 980,
+        "new_postings": 1159268,
+        "old_postings": 1159268
+      },
+      {
+        "field": "id",
+        "terms": 2868090,
+        "new_postings": 9358704,
+        "old_postings": 9358704
+      },
+      {
+        "field": "time",
+        "terms": 2720901,
+        "new_postings": 9029415,
+        "old_postings": 9029415
+      },
+      {
+        "field": "ctid",
+        "terms": 2868090,
+        "new_postings": 9358704,
+        "old_postings": 9358704
+      }
+    ],
+    "seconds": 6.4804382089932915
+  }
+]

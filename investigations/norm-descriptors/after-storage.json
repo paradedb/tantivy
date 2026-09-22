@@ -1,0 +1,82 @@
+[
+  {
+    "docs": 2841903,
+    "segment": "eb76c643dffe4ce18003d09dce2f1863",
+    "postings_bytes": 273388909,
+    "fieldnorm_bytes": 5683850,
+    "posting_norm_bytes": 117156283,
+    "packed_posting_norm_bytes": 106484459
+  },
+  {
+    "docs": 2838888,
+    "segment": "b186860cda6c4aea8afafba1198c6ab9",
+    "postings_bytes": 273627027,
+    "fieldnorm_bytes": 5677820,
+    "posting_norm_bytes": 117199981,
+    "packed_posting_norm_bytes": 106532786
+  },
+  {
+    "docs": 2848277,
+    "segment": "09e6d775f1e3435881bfa65a659da170",
+    "postings_bytes": 273751420,
+    "fieldnorm_bytes": 5696598,
+    "posting_norm_bytes": 117123307,
+    "packed_posting_norm_bytes": 106460079
+  },
+  {
+    "docs": 2841222,
+    "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+    "postings_bytes": 273893606,
+    "fieldnorm_bytes": 5682488,
+    "posting_norm_bytes": 117320259,
+    "packed_posting_norm_bytes": 106637998
+  },
+  {
+    "docs": 2844031,
+    "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+    "postings_bytes": 274139952,
+    "fieldnorm_bytes": 5688106,
+    "posting_norm_bytes": 117422007,
+    "packed_posting_norm_bytes": 106737911
+  },
+  {
+    "docs": 2860468,
+    "segment": "952f1be13273443181ade989398abb9b",
+    "postings_bytes": 276838835,
+    "fieldnorm_bytes": 5720980,
+    "posting_norm_bytes": 119337827,
+    "packed_posting_norm_bytes": 108482536
+  },
+  {
+    "docs": 2902246,
+    "segment": "9bfdcce177344e53b0af62abd21ab30a",
+    "postings_bytes": 280721219,
+    "fieldnorm_bytes": 5804536,
+    "posting_norm_bytes": 120821681,
+    "packed_posting_norm_bytes": 109849273
+  },
+  {
+    "docs": 2903133,
+    "segment": "f95824e6498d4161a8258e04c2d939c3",
+    "postings_bytes": 280951317,
+    "fieldnorm_bytes": 5806310,
+    "posting_norm_bytes": 121160453,
+    "packed_posting_norm_bytes": 110131490
+  },
+  {
+    "docs": 2989299,
+    "segment": "722b2cc326774eab96019ec88ce833a7",
+    "postings_bytes": 288375918,
+    "fieldnorm_bytes": 5978642,
+    "posting_norm_bytes": 124281391,
+    "packed_posting_norm_bytes": 112978004
+  },
+  {
+    "docs": 2868090,
+    "segment": "f2cb57ddb7764036a46406913fb0a474",
+    "postings_bytes": 277381421,
+    "fieldnorm_bytes": 5736224,
+    "posting_norm_bytes": 119546168,
+    "packed_posting_norm_bytes": 108687228
+  }
+]

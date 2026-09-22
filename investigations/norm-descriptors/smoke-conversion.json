@@ -1,0 +1,52 @@
+[
+  {
+    "new": {
+      "terms": {
+        "total_bytes": 1012,
+        "starting_block": 380
+      },
+      "segment": "cdea48499cca493b8afa844e230d565b",
+      "postings": {
+        "total_bytes": 4698,
+        "starting_block": 377
+      }
+    },
+    "old": {
+      "terms": {
+        "total_bytes": 1012,
+        "starting_block": 354
+      },
+      "segment": "cdea48499cca493b8afa844e230d565b",
+      "postings": {
+        "total_bytes": 4478,
+        "starting_block": 356
+      }
+    },
+    "fields": [
+      {
+        "field": "body",
+        "terms": 2,
+        "new_postings": 1096,
+        "old_postings": 986
+      },
+      {
+        "field": "title",
+        "terms": 2,
+        "new_postings": 1386,
+        "old_postings": 1276
+      },
+      {
+        "field": "id",
+        "terms": 600,
+        "new_postings": 1080,
+        "old_postings": 1080
+      },
+      {
+        "field": "ctid",
+        "terms": 600,
+        "new_postings": 1080,
+        "old_postings": 1080
+      }
+    ]
+  }
+]

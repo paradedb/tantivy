@@ -1,0 +1,2504 @@
+{
+  "title-single": {
+    "query": "SELECT id,title,by,score FROM hn_items WHERE title === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "embedded": [
+        [
+          173402,
+          "Database agnostic != database ignorant",
+          "nreece",
+          9,
+          6.2588186
+        ],
+        [
+          3940737,
+          "Stig Database",
+          "jamesbritt",
+          4,
+          5.936894
+        ],
+        [
+          458864,
+          "Database Troubles ",
+          "nickb",
+          11,
+          5.936894
+        ],
+        [
+          22034176,
+          "Nutrition Database",
+          "bookofjoe",
+          2,
+          5.936894
+        ],
+        [
+          1265075,
+          "Database Development",
+          "symtex",
+          1,
+          5.936894
+        ],
+        [
+          5020007,
+          "Database Expert",
+          "philipzhong1980",
+          1,
+          5.936894
+        ],
+        [
+          14862644,
+          "Cinemetrics \u2013 Database",
+          "jonbaer",
+          2,
+          5.936894
+        ],
+        [
+          7964029,
+          "FreeTuxTV Database",
+          "TuxLyn",
+          1,
+          5.936894
+        ],
+        [
+          19186171,
+          "Database Encryption",
+          "baby",
+          2,
+          5.936894
+        ],
+        [
+          22985444,
+          "Database Marketing",
+          "godelmachine",
+          2,
+          5.936894
+        ]
+      ],
+      "original_raw": [
+        [
+          173402,
+          "Database agnostic != database ignorant",
+          "nreece",
+          9,
+          6.2588186
+        ],
+        [
+          3940737,
+          "Stig Database",
+          "jamesbritt",
+          4,
+          5.936894
+        ],
+        [
+          458864,
+          "Database Troubles ",
+          "nickb",
+          11,
+          5.936894
+        ],
+        [
+          22034176,
+          "Nutrition Database",
+          "bookofjoe",
+          2,
+          5.936894
+        ],
+        [
+          1265075,
+          "Database Development",
+          "symtex",
+          1,
+          5.936894
+        ],
+        [
+          5020007,
+          "Database Expert",
+          "philipzhong1980",
+          1,
+          5.936894
+        ],
+        [
+          14862644,
+          "Cinemetrics \u2013 Database",
+          "jonbaer",
+          2,
+          5.936894
+        ],
+        [
+          7964029,
+          "FreeTuxTV Database",
+          "TuxLyn",
+          1,
+          5.936894
+        ],
+        [
+          19186171,
+          "Database Encryption",
+          "baby",
+          2,
+          5.936894
+        ],
+        [
+          22985444,
+          "Database Marketing",
+          "godelmachine",
+          2,
+          5.936894
+        ]
+      ],
+      "original_packed": [
+        [
+          173402,
+          "Database agnostic != database ignorant",
+          "nreece",
+          9,
+          6.2588186
+        ],
+        [
+          3940737,
+          "Stig Database",
+          "jamesbritt",
+          4,
+          5.936894
+        ],
+        [
+          458864,
+          "Database Troubles ",
+          "nickb",
+          11,
+          5.936894
+        ],
+        [
+          22034176,
+          "Nutrition Database",
+          "bookofjoe",
+          2,
+          5.936894
+        ],
+        [
+          1265075,
+          "Database Development",
+          "symtex",
+          1,
+          5.936894
+        ],
+        [
+          5020007,
+          "Database Expert",
+          "philipzhong1980",
+          1,
+          5.936894
+        ],
+        [
+          14862644,
+          "Cinemetrics \u2013 Database",
+          "jonbaer",
+          2,
+          5.936894
+        ],
+        [
+          7964029,
+          "FreeTuxTV Database",
+          "TuxLyn",
+          1,
+          5.936894
+        ],
+        [
+          19186171,
+          "Database Encryption",
+          "baby",
+          2,
+          5.936894
+        ],
+        [
+          22985444,
+          "Database Marketing",
+          "godelmachine",
+          2,
+          5.936894
+        ]
+      ],
+      "rewritten_raw": [
+        [
+          173402,
+          "Database agnostic != database ignorant",
+          "nreece",
+          9,
+          6.2588186
+        ],
+        [
+          3940737,
+          "Stig Database",
+          "jamesbritt",
+          4,
+          5.936894
+        ],
+        [
+          458864,
+          "Database Troubles ",
+          "nickb",
+          11,
+          5.936894
+        ],
+        [
+          22034176,
+          "Nutrition Database",
+          "bookofjoe",
+          2,
+          5.936894
+        ],
+        [
+          1265075,
+          "Database Development",
+          "symtex",
+          1,
+          5.936894
+        ],
+        [
+          5020007,
+          "Database Expert",
+          "philipzhong1980",
+          1,
+          5.936894
+        ],
+        [
+          14862644,
+          "Cinemetrics \u2013 Database",
+          "jonbaer",
+          2,
+          5.936894
+        ],
+        [
+          7964029,
+          "FreeTuxTV Database",
+          "TuxLyn",
+          1,
+          5.936894
+        ],
+        [
+          19186171,
+          "Database Encryption",
+          "baby",
+          2,
+          5.936894
+        ],
+        [
+          22985444,
+          "Database Marketing",
+          "godelmachine",
+          2,
+          5.936894
+        ]
+      ],
+      "rewritten_packed": [
+        [
+          173402,
+          "Database agnostic != database ignorant",
+          "nreece",
+          9,
+          6.2588186
+        ],
+        [
+          3940737,
+          "Stig Database",
+          "jamesbritt",
+          4,
+          5.936894
+        ],
+        [
+          458864,
+          "Database Troubles ",
+          "nickb",
+          11,
+          5.936894
+        ],
+        [
+          22034176,
+          "Nutrition Database",
+          "bookofjoe",
+          2,
+          5.936894
+        ],
+        [
+          1265075,
+          "Database Development",
+          "symtex",
+          1,
+          5.936894
+        ],
+        [
+          5020007,
+          "Database Expert",
+          "philipzhong1980",
+          1,
+          5.936894
+        ],
+        [
+          14862644,
+          "Cinemetrics \u2013 Database",
+          "jonbaer",
+          2,
+          5.936894
+        ],
+        [
+          7964029,
+          "FreeTuxTV Database",
+          "TuxLyn",
+          1,
+          5.936894
+        ],
+        [
+          19186171,
+          "Database Encryption",
+          "baby",
+          2,
+          5.936894
+        ],
+        [
+          22985444,
+          "Database Marketing",
+          "godelmachine",
+          2,
+          5.936894
+        ]
+      ]
+    },
+    "summary": {
+      "original_raw": {
+        "execution_ms": 0.783,
+        "shared_hits": 428.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 62.0,
+        "postings_hits": 104.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2038.0
+      },
+      "original_packed": {
+        "execution_ms": 0.819,
+        "shared_hits": 487.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 121.0,
+        "postings_hits": 104.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2038.0
+      },
+      "rewritten_raw": {
+        "execution_ms": 0.8125,
+        "shared_hits": 512.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 62.0,
+        "postings_hits": 181.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2038.0
+      },
+      "rewritten_packed": {
+        "execution_ms": 0.8065,
+        "shared_hits": 571.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 121.0,
+        "postings_hits": 181.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2038.0
+      },
+      "embedded": {
+        "execution_ms": 0.8075000000000001,
+        "shared_hits": 551.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 101.0,
+        "postings_hits": 181.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2038.0
+      }
+    }
+  },
+  "title-and": {
+    "query": "SELECT id,title,by,score FROM hn_items WHERE title === 'postgres' AND title === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "embedded": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "original_raw": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "original_packed": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "rewritten_raw": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "rewritten_packed": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ]
+    },
+    "summary": {
+      "original_raw": {
+        "execution_ms": 1.0194999999999999,
+        "shared_hits": 492.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 72.0,
+        "postings_hits": 114.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2380.0
+      },
+      "original_packed": {
+        "execution_ms": 1.0675,
+        "shared_hits": 561.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 141.0,
+        "postings_hits": 114.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2380.0
+      },
+      "rewritten_raw": {
+        "execution_ms": 1.0385,
+        "shared_hits": 576.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 72.0,
+        "postings_hits": 191.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2380.0
+      },
+      "rewritten_packed": {
+        "execution_ms": 1.0755,
+        "shared_hits": 645.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 141.0,
+        "postings_hits": 191.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2380.0
+      },
+      "embedded": {
+        "execution_ms": 1.0485,
+        "shared_hits": 615.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 111.0,
+        "postings_hits": 191.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 2380.0
+      }
+    }
+  },
+  "title-or": {
+    "query": "SELECT id,title,by,score FROM hn_items WHERE title === 'postgres' OR title === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "embedded": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "original_raw": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "original_packed": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "rewritten_raw": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "rewritten_packed": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ]
+    },
+    "summary": {
+      "original_raw": {
+        "execution_ms": 1.055,
+        "shared_hits": 492.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 72.0,
+        "postings_hits": 114.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 7297.0
+      },
+      "original_packed": {
+        "execution_ms": 1.1065,
+        "shared_hits": 561.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 141.0,
+        "postings_hits": 114.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 7297.0
+      },
+      "rewritten_raw": {
+        "execution_ms": 1.0715,
+        "shared_hits": 576.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 72.0,
+        "postings_hits": 191.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 7297.0
+      },
+      "rewritten_packed": {
+        "execution_ms": 1.124,
+        "shared_hits": 645.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 141.0,
+        "postings_hits": 191.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 7297.0
+      },
+      "embedded": {
+        "execution_ms": 1.0975000000000001,
+        "shared_hits": 615.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 111.0,
+        "postings_hits": 191.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 7297.0
+      }
+    }
+  },
+  "text-single": {
+    "query": "SELECT id,title,by,score FROM hn_items WHERE text === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "embedded": [
+        [
+          767773,
+          "India email database",
+          "feros1990",
+          1,
+          10.538096
+        ],
+        [
+          4145544,
+          "Restaurant Database Software ",
+          "chdexperts",
+          1,
+          10.161247
+        ],
+        [
+          17698365,
+          "",
+          "komali2",
+          0,
+          10.054385
+        ],
+        [
+          10082949,
+          "",
+          "Nadya",
+          0,
+          9.99126
+        ],
+        [
+          17500899,
+          "",
+          "kgwgk",
+          0,
+          9.99126
+        ],
+        [
+          1214732,
+          "",
+          "figgs",
+          0,
+          9.9690485
+        ],
+        [
+          26133525,
+          "",
+          "SV_BubbleTime",
+          0,
+          9.947942
+        ],
+        [
+          6456058,
+          "",
+          "kkowalczyk",
+          0,
+          9.94463
+        ],
+        [
+          16400908,
+          "",
+          "mjburgess",
+          0,
+          9.904998
+        ],
+        [
+          6690051,
+          "",
+          "dkhenry",
+          0,
+          9.904998
+        ]
+      ],
+      "original_raw": [
+        [
+          767773,
+          "India email database",
+          "feros1990",
+          1,
+          10.538096
+        ],
+        [
+          4145544,
+          "Restaurant Database Software ",
+          "chdexperts",
+          1,
+          10.161247
+        ],
+        [
+          17698365,
+          "",
+          "komali2",
+          0,
+          10.054385
+        ],
+        [
+          10082949,
+          "",
+          "Nadya",
+          0,
+          9.99126
+        ],
+        [
+          17500899,
+          "",
+          "kgwgk",
+          0,
+          9.99126
+        ],
+        [
+          1214732,
+          "",
+          "figgs",
+          0,
+          9.9690485
+        ],
+        [
+          26133525,
+          "",
+          "SV_BubbleTime",
+          0,
+          9.947942
+        ],
+        [
+          6456058,
+          "",
+          "kkowalczyk",
+          0,
+          9.94463
+        ],
+        [
+          16400908,
+          "",
+          "mjburgess",
+          0,
+          9.904998
+        ],
+        [
+          6690051,
+          "",
+          "dkhenry",
+          0,
+          9.904998
+        ]
+      ],
+      "original_packed": [
+        [
+          767773,
+          "India email database",
+          "feros1990",
+          1,
+          10.538096
+        ],
+        [
+          4145544,
+          "Restaurant Database Software ",
+          "chdexperts",
+          1,
+          10.161247
+        ],
+        [
+          17698365,
+          "",
+          "komali2",
+          0,
+          10.054385
+        ],
+        [
+          10082949,
+          "",
+          "Nadya",
+          0,
+          9.99126
+        ],
+        [
+          17500899,
+          "",
+          "kgwgk",
+          0,
+          9.99126
+        ],
+        [
+          1214732,
+          "",
+          "figgs",
+          0,
+          9.9690485
+        ],
+        [
+          26133525,
+          "",
+          "SV_BubbleTime",
+          0,
+          9.947942
+        ],
+        [
+          6456058,
+          "",
+          "kkowalczyk",
+          0,
+          9.94463
+        ],
+        [
+          16400908,
+          "",
+          "mjburgess",
+          0,
+          9.904998
+        ],
+        [
+          6690051,
+          "",
+          "dkhenry",
+          0,
+          9.904998
+        ]
+      ],
+      "rewritten_raw": [
+        [
+          767773,
+          "India email database",
+          "feros1990",
+          1,
+          10.538096
+        ],
+        [
+          4145544,
+          "Restaurant Database Software ",
+          "chdexperts",
+          1,
+          10.161247
+        ],
+        [
+          17698365,
+          "",
+          "komali2",
+          0,
+          10.054385
+        ],
+        [
+          10082949,
+          "",
+          "Nadya",
+          0,
+          9.99126
+        ],
+        [
+          17500899,
+          "",
+          "kgwgk",
+          0,
+          9.99126
+        ],
+        [
+          1214732,
+          "",
+          "figgs",
+          0,
+          9.9690485
+        ],
+        [
+          26133525,
+          "",
+          "SV_BubbleTime",
+          0,
+          9.947942
+        ],
+        [
+          6456058,
+          "",
+          "kkowalczyk",
+          0,
+          9.94463
+        ],
+        [
+          16400908,
+          "",
+          "mjburgess",
+          0,
+          9.904998
+        ],
+        [
+          6690051,
+          "",
+          "dkhenry",
+          0,
+          9.904998
+        ]
+      ],
+      "rewritten_packed": [
+        [
+          767773,
+          "India email database",
+          "feros1990",
+          1,
+          10.538096
+        ],
+        [
+          4145544,
+          "Restaurant Database Software ",
+          "chdexperts",
+          1,
+          10.161247
+        ],
+        [
+          17698365,
+          "",
+          "komali2",
+          0,
+          10.054385
+        ],
+        [
+          10082949,
+          "",
+          "Nadya",
+          0,
+          9.99126
+        ],
+        [
+          17500899,
+          "",
+          "kgwgk",
+          0,
+          9.99126
+        ],
+        [
+          1214732,
+          "",
+          "figgs",
+          0,
+          9.9690485
+        ],
+        [
+          26133525,
+          "",
+          "SV_BubbleTime",
+          0,
+          9.947942
+        ],
+        [
+          6456058,
+          "",
+          "kkowalczyk",
+          0,
+          9.94463
+        ],
+        [
+          16400908,
+          "",
+          "mjburgess",
+          0,
+          9.904998
+        ],
+        [
+          6690051,
+          "",
+          "dkhenry",
+          0,
+          9.904998
+        ]
+      ]
+    },
+    "summary": {
+      "original_raw": {
+        "execution_ms": 1.2555,
+        "shared_hits": 542.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 77.0,
+        "postings_hits": 133.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 25890.0
+      },
+      "original_packed": {
+        "execution_ms": 1.3215,
+        "shared_hits": 592.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 127.0,
+        "postings_hits": 133.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 25890.0
+      },
+      "rewritten_raw": {
+        "execution_ms": 1.2839999999999998,
+        "shared_hits": 627.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 77.0,
+        "postings_hits": 213.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 25890.0
+      },
+      "rewritten_packed": {
+        "execution_ms": 1.322,
+        "shared_hits": 677.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 127.0,
+        "postings_hits": 213.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 25890.0
+      },
+      "embedded": {
+        "execution_ms": 1.3285,
+        "shared_hits": 665.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 115.0,
+        "postings_hits": 213.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 25890.0
+      }
+    }
+  },
+  "text-and": {
+    "query": "SELECT id,title,by,score FROM hn_items WHERE text === 'postgres' AND text === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "embedded": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "original_raw": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "original_packed": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "rewritten_raw": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "rewritten_packed": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ]
+    },
+    "summary": {
+      "original_raw": {
+        "execution_ms": 1.375,
+        "shared_hits": 635.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 90.0,
+        "postings_hits": 153.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 34555.0
+      },
+      "original_packed": {
+        "execution_ms": 1.435,
+        "shared_hits": 695.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 150.0,
+        "postings_hits": 153.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 34555.0
+      },
+      "rewritten_raw": {
+        "execution_ms": 1.397,
+        "shared_hits": 720.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 90.0,
+        "postings_hits": 233.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 34555.0
+      },
+      "rewritten_packed": {
+        "execution_ms": 1.4505,
+        "shared_hits": 780.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 150.0,
+        "postings_hits": 233.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 34555.0
+      },
+      "embedded": {
+        "execution_ms": 1.4335,
+        "shared_hits": 758.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 128.0,
+        "postings_hits": 233.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 34555.0
+      }
+    }
+  },
+  "text-or": {
+    "query": "SELECT id,title,by,score FROM hn_items WHERE text === 'postgres' OR text === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "embedded": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "original_raw": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "original_packed": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "rewritten_raw": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "rewritten_packed": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ]
+    },
+    "summary": {
+      "original_raw": {
+        "execution_ms": 1.6265,
+        "shared_hits": 635.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 90.0,
+        "postings_hits": 153.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 14166.0
+      },
+      "original_packed": {
+        "execution_ms": 1.7275,
+        "shared_hits": 695.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 150.0,
+        "postings_hits": 153.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 14166.0
+      },
+      "rewritten_raw": {
+        "execution_ms": 1.6395,
+        "shared_hits": 720.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 90.0,
+        "postings_hits": 233.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 14166.0
+      },
+      "rewritten_packed": {
+        "execution_ms": 1.7320000000000002,
+        "shared_hits": 780.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 150.0,
+        "postings_hits": 233.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 14166.0
+      },
+      "embedded": {
+        "execution_ms": 1.7149999999999999,
+        "shared_hits": 758.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "norm_stream_hits": 128.0,
+        "postings_hits": 233.0,
+        "global_norm_lookups": 0.0,
+        "norm_lookups": 14166.0
+      }
+    }
+  }
+}

@@ -11,6 +11,7 @@ mod indexing_context;
 mod json_postings_writer;
 mod loaded_postings;
 mod merger;
+pub(crate) mod packed_norms;
 mod per_field_postings_writer;
 mod postings;
 mod postings_writer;
@@ -19,14 +20,14 @@ mod segment_postings;
 /// Serializer module for the inverted index
 pub mod serializer;
 pub(crate) mod skip;
-mod term_info;
 pub(crate) mod subblock;
+mod term_info;
 pub(crate) mod term_norms;
-pub(crate) mod packed_norms;
 
-pub use term_norms::{posting_norm_reads, set_posting_norms_enabled};
+pub use packed_norms::{PackedNormRewriter, PackedNormStats, PackedNormWriter};
+pub use term_norms::set_embedded_norm_directory_enabled;
 pub use term_norms::set_packed_posting_norms_enabled;
-pub use packed_norms::{PackedNormStats, PackedNormWriter};
+pub use term_norms::{posting_norm_reads, set_posting_norms_enabled};
 
 pub use loaded_postings::LoadedPostings;
 pub(crate) use merger::{next_mapped_doc, PostingsMerger};

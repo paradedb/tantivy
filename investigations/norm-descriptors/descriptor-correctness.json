@@ -1,0 +1,716 @@
+{
+  "title-single": {
+    "raw": {
+      "count": 10980,
+      "score_digest": "92225f64da0ee3fa1f73744ceea673bd554e323b10880bb95f804ec5a09c2094",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "packed": {
+      "count": 10980,
+      "score_digest": "92225f64da0ee3fa1f73744ceea673bd554e323b10880bb95f804ec5a09c2094",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "unscored_plan": [
+      {
+        "Plan": {
+          "Node Type": "Limit",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 10.0,
+          "Total Cost": 10.15,
+          "Plan Rows": 10,
+          "Plan Width": 27,
+          "Actual Rows": 10.0,
+          "Actual Loops": 1,
+          "Disabled": false,
+          "Output": [
+            "id",
+            "title",
+            "by",
+            "score"
+          ],
+          "Shared Hit Blocks": 88,
+          "Shared Read Blocks": 10,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Custom Scan",
+              "Parent Relationship": "Outer",
+              "Custom Plan Provider": "ParadeDB Base Scan",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Relation Name": "hn_items",
+              "Schema": "public",
+              "Alias": "hn_items",
+              "Startup Cost": 10.0,
+              "Total Cost": 10.15,
+              "Plan Rows": 10,
+              "Plan Width": 27,
+              "Actual Rows": 10.0,
+              "Actual Loops": 1,
+              "Disabled": false,
+              "Output": [
+                "id",
+                "title",
+                "by",
+                "score"
+              ],
+              "Table": "hn_items",
+              "Index": "hn_items_idx",
+              "Segment Count": 10,
+              "Worker Selection": "Cost model",
+              "Heap Fetches": 10,
+              "Virtual Tuples": 0,
+              "Invisible Tuples": 0,
+              "IO Breakdown": "{\"scope\":\"this backend; ExecCustomScan calls only\",\"total\":{\"hits\":88,\"reads\":10},\"components\":{\"fast\":{\"hits\":18,\"reads\":0},\"heap\":{\"hits\":0,\"reads\":10},\"idx\":{\"hits\":5,\"reads\":0},\"metadata\":{\"hits\":59,\"reads\":0},\"term\":{\"hits\":6,\"reads\":0}},\"file_read_calls\":{\"fast/read_bytes\":29,\"idx/read_bytes\":4,\"term/read_bytes\":6},\"unique_pages_scope\":\"RelationBufferAccess only; excludes heap pages\",\"tracked\":{\"hits\":88,\"reads\":10,\"unique_pages\":83},\"untracked\":{\"hits\":0,\"reads\":0},\"buckets\":{\"execute/fast/block_map\":{\"hits\":5,\"reads\":0},\"execute/fast/read_bytes\":{\"hits\":13,\"reads\":0},\"execute/heap/visibility_and_fetch\":{\"hits\":0,\"reads\":10},\"execute/idx/block_map\":{\"hits\":2,\"reads\":0},\"execute/idx/read_bytes\":{\"hits\":3,\"reads\":0},\"execute/term/block_map\":{\"hits\":2,\"reads\":0},\"execute/term/read_bytes\":{\"hits\":4,\"reads\":0},\"reader_setup/metadata/direct\":{\"hits\":59,\"reads\":0}},\"unique_pages_by_bucket\":{\"execute/fast/block_map\":5,\"execute/fast/read_bytes\":13,\"execute/idx/block_map\":2,\"execute/idx/read_bytes\":3,\"execute/term/block_map\":2,\"execute/term/read_bytes\":4,\"reader_setup/metadata/direct\":55}}",
+              "Exec Method": "TopKScanExecState",
+              "Scores": false,
+              "   TopK Limit": 10,
+              "   Queries": 1,
+              "Tantivy Query": "{\"with_index\":{\"query\":{\"term\":{\"field\":\"title\",\"value\":\"database\"}}}}",
+              "Shared Hit Blocks": 88,
+              "Shared Read Blocks": 10,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0
+            }
+          ]
+        },
+        "Settings": {
+          "effective_cache_size": "8GB",
+          "work_mem": "16MB",
+          "max_parallel_workers": "6",
+          "random_page_cost": "1.1",
+          "jit": "off",
+          "max_parallel_workers_per_gather": "0"
+        },
+        "Planning": {
+          "Shared Hit Blocks": 222,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning Time": 0.693,
+        "Triggers": [],
+        "Execution Time": 1.223
+      }
+    ],
+    "unscored_norm_lookups": 0,
+    "count_norm_lookups": 0
+  },
+  "title-and": {
+    "raw": {
+      "count": 143,
+      "score_digest": "81ca056855d62e6ab1470eb9fe9e0da72fc36dfa2c417af4a7c02b990f094867",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "packed": {
+      "count": 143,
+      "score_digest": "81ca056855d62e6ab1470eb9fe9e0da72fc36dfa2c417af4a7c02b990f094867",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "unscored_plan": [
+      {
+        "Plan": {
+          "Node Type": "Limit",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 10.0,
+          "Total Cost": 10.71,
+          "Plan Rows": 10,
+          "Plan Width": 27,
+          "Actual Rows": 10.0,
+          "Actual Loops": 1,
+          "Disabled": false,
+          "Output": [
+            "id",
+            "title",
+            "by",
+            "score"
+          ],
+          "Shared Hit Blocks": 99,
+          "Shared Read Blocks": 10,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Custom Scan",
+              "Parent Relationship": "Outer",
+              "Custom Plan Provider": "ParadeDB Base Scan",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Relation Name": "hn_items",
+              "Schema": "public",
+              "Alias": "hn_items",
+              "Startup Cost": 10.0,
+              "Total Cost": 10.71,
+              "Plan Rows": 10,
+              "Plan Width": 27,
+              "Actual Rows": 10.0,
+              "Actual Loops": 1,
+              "Disabled": false,
+              "Output": [
+                "id",
+                "title",
+                "by",
+                "score"
+              ],
+              "Table": "hn_items",
+              "Index": "hn_items_idx",
+              "Segment Count": 10,
+              "Worker Selection": "Cost model",
+              "Heap Fetches": 10,
+              "Virtual Tuples": 0,
+              "Invisible Tuples": 0,
+              "IO Breakdown": "{\"scope\":\"this backend; ExecCustomScan calls only\",\"total\":{\"hits\":99,\"reads\":10},\"components\":{\"fast\":{\"hits\":27,\"reads\":0},\"heap\":{\"hits\":0,\"reads\":10},\"idx\":{\"hits\":6,\"reads\":0},\"metadata\":{\"hits\":59,\"reads\":0},\"term\":{\"hits\":7,\"reads\":0}},\"file_read_calls\":{\"fast/read_bytes\":29,\"idx/read_bytes\":5,\"term/read_bytes\":7},\"unique_pages_scope\":\"RelationBufferAccess only; excludes heap pages\",\"tracked\":{\"hits\":99,\"reads\":10,\"unique_pages\":94},\"untracked\":{\"hits\":0,\"reads\":0},\"buckets\":{\"execute/fast/block_map\":{\"hits\":5,\"reads\":0},\"execute/fast/read_bytes\":{\"hits\":22,\"reads\":0},\"execute/heap/visibility_and_fetch\":{\"hits\":0,\"reads\":10},\"execute/idx/block_map\":{\"hits\":2,\"reads\":0},\"execute/idx/read_bytes\":{\"hits\":4,\"reads\":0},\"execute/term/block_map\":{\"hits\":2,\"reads\":0},\"execute/term/read_bytes\":{\"hits\":5,\"reads\":0},\"reader_setup/metadata/direct\":{\"hits\":59,\"reads\":0}},\"unique_pages_by_bucket\":{\"execute/fast/block_map\":5,\"execute/fast/read_bytes\":22,\"execute/idx/block_map\":2,\"execute/idx/read_bytes\":4,\"execute/term/block_map\":2,\"execute/term/read_bytes\":5,\"reader_setup/metadata/direct\":55}}",
+              "Exec Method": "TopKScanExecState",
+              "Scores": false,
+              "   TopK Limit": 10,
+              "   Queries": 1,
+              "Tantivy Query": "{\"boolean\":{\"must\":[{\"with_index\":{\"query\":{\"term\":{\"field\":\"title\",\"value\":\"postgres\"}}}},{\"with_index\":{\"query\":{\"term\":{\"field\":\"title\",\"value\":\"database\"}}}}]}}",
+              "Shared Hit Blocks": 99,
+              "Shared Read Blocks": 10,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0
+            }
+          ]
+        },
+        "Settings": {
+          "effective_cache_size": "8GB",
+          "work_mem": "16MB",
+          "max_parallel_workers": "6",
+          "random_page_cost": "1.1",
+          "jit": "off",
+          "max_parallel_workers_per_gather": "0"
+        },
+        "Planning": {
+          "Shared Hit Blocks": 249,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning Time": 0.416,
+        "Triggers": [],
+        "Execution Time": 1.287
+      }
+    ],
+    "unscored_norm_lookups": 0,
+    "count_norm_lookups": 0
+  },
+  "title-or": {
+    "raw": {
+      "count": 13074,
+      "score_digest": "4823ee3a1e414746c147383ef9a608445a0fda5e74e22aa0392a6cec309cbdaa",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "packed": {
+      "count": 13074,
+      "score_digest": "4823ee3a1e414746c147383ef9a608445a0fda5e74e22aa0392a6cec309cbdaa",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "unscored_plan": [
+      {
+        "Plan": {
+          "Node Type": "Limit",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 10.0,
+          "Total Cost": 10.15,
+          "Plan Rows": 10,
+          "Plan Width": 27,
+          "Actual Rows": 10.0,
+          "Actual Loops": 1,
+          "Disabled": false,
+          "Output": [
+            "id",
+            "title",
+            "by",
+            "score"
+          ],
+          "Shared Hit Blocks": 96,
+          "Shared Read Blocks": 2,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Custom Scan",
+              "Parent Relationship": "Outer",
+              "Custom Plan Provider": "ParadeDB Base Scan",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Relation Name": "hn_items",
+              "Schema": "public",
+              "Alias": "hn_items",
+              "Startup Cost": 10.0,
+              "Total Cost": 10.15,
+              "Plan Rows": 10,
+              "Plan Width": 27,
+              "Actual Rows": 10.0,
+              "Actual Loops": 1,
+              "Disabled": false,
+              "Output": [
+                "id",
+                "title",
+                "by",
+                "score"
+              ],
+              "Table": "hn_items",
+              "Index": "hn_items_idx",
+              "Segment Count": 10,
+              "Worker Selection": "Cost model",
+              "Heap Fetches": 10,
+              "Virtual Tuples": 0,
+              "Invisible Tuples": 0,
+              "IO Breakdown": "{\"scope\":\"this backend; ExecCustomScan calls only\",\"total\":{\"hits\":96,\"reads\":2},\"components\":{\"fast\":{\"hits\":16,\"reads\":0},\"heap\":{\"hits\":8,\"reads\":2},\"idx\":{\"hits\":6,\"reads\":0},\"metadata\":{\"hits\":59,\"reads\":0},\"term\":{\"hits\":7,\"reads\":0}},\"file_read_calls\":{\"fast/read_bytes\":29,\"idx/read_bytes\":5,\"term/read_bytes\":7},\"unique_pages_scope\":\"RelationBufferAccess only; excludes heap pages\",\"tracked\":{\"hits\":96,\"reads\":2,\"unique_pages\":83},\"untracked\":{\"hits\":0,\"reads\":0},\"buckets\":{\"execute/fast/block_map\":{\"hits\":5,\"reads\":0},\"execute/fast/read_bytes\":{\"hits\":11,\"reads\":0},\"execute/heap/visibility_and_fetch\":{\"hits\":8,\"reads\":2},\"execute/idx/block_map\":{\"hits\":2,\"reads\":0},\"execute/idx/read_bytes\":{\"hits\":4,\"reads\":0},\"execute/term/block_map\":{\"hits\":2,\"reads\":0},\"execute/term/read_bytes\":{\"hits\":5,\"reads\":0},\"reader_setup/metadata/direct\":{\"hits\":59,\"reads\":0}},\"unique_pages_by_bucket\":{\"execute/fast/block_map\":5,\"execute/fast/read_bytes\":11,\"execute/idx/block_map\":2,\"execute/idx/read_bytes\":4,\"execute/term/block_map\":2,\"execute/term/read_bytes\":5,\"reader_setup/metadata/direct\":55}}",
+              "Exec Method": "TopKScanExecState",
+              "Scores": false,
+              "   TopK Limit": 10,
+              "   Queries": 1,
+              "Tantivy Query": "{\"boolean\":{\"should\":[{\"with_index\":{\"query\":{\"term\":{\"field\":\"title\",\"value\":\"postgres\"}}}},{\"with_index\":{\"query\":{\"term\":{\"field\":\"title\",\"value\":\"database\"}}}}]}}",
+              "Shared Hit Blocks": 96,
+              "Shared Read Blocks": 2,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0
+            }
+          ]
+        },
+        "Settings": {
+          "effective_cache_size": "8GB",
+          "work_mem": "16MB",
+          "max_parallel_workers": "6",
+          "random_page_cost": "1.1",
+          "jit": "off",
+          "max_parallel_workers_per_gather": "0"
+        },
+        "Planning": {
+          "Shared Hit Blocks": 249,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning Time": 0.425,
+        "Triggers": [],
+        "Execution Time": 0.489
+      }
+    ],
+    "unscored_norm_lookups": 0,
+    "count_norm_lookups": 0
+  },
+  "text-single": {
+    "raw": {
+      "count": 140613,
+      "score_digest": "1a1f147711836b9ae1caa907058b55259d2d3977efe5aea5c168dd303e8b415a",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "packed": {
+      "count": 140613,
+      "score_digest": "1a1f147711836b9ae1caa907058b55259d2d3977efe5aea5c168dd303e8b415a",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "unscored_plan": [
+      {
+        "Plan": {
+          "Node Type": "Limit",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 10.0,
+          "Total Cost": 10.15,
+          "Plan Rows": 10,
+          "Plan Width": 27,
+          "Actual Rows": 10.0,
+          "Actual Loops": 1,
+          "Disabled": false,
+          "Output": [
+            "id",
+            "title",
+            "by",
+            "score"
+          ],
+          "Shared Hit Blocks": 87,
+          "Shared Read Blocks": 10,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Custom Scan",
+              "Parent Relationship": "Outer",
+              "Custom Plan Provider": "ParadeDB Base Scan",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Relation Name": "hn_items",
+              "Schema": "public",
+              "Alias": "hn_items",
+              "Startup Cost": 10.0,
+              "Total Cost": 10.15,
+              "Plan Rows": 10,
+              "Plan Width": 27,
+              "Actual Rows": 10.0,
+              "Actual Loops": 1,
+              "Disabled": false,
+              "Output": [
+                "id",
+                "title",
+                "by",
+                "score"
+              ],
+              "Table": "hn_items",
+              "Index": "hn_items_idx",
+              "Segment Count": 10,
+              "Worker Selection": "Cost model",
+              "Heap Fetches": 10,
+              "Virtual Tuples": 0,
+              "Invisible Tuples": 0,
+              "IO Breakdown": "{\"scope\":\"this backend; ExecCustomScan calls only\",\"total\":{\"hits\":87,\"reads\":10},\"components\":{\"fast\":{\"hits\":10,\"reads\":0},\"heap\":{\"hits\":0,\"reads\":10},\"idx\":{\"hits\":9,\"reads\":0},\"metadata\":{\"hits\":59,\"reads\":0},\"term\":{\"hits\":9,\"reads\":0}},\"file_read_calls\":{\"fast/read_bytes\":17,\"idx/read_bytes\":4,\"term/read_bytes\":6},\"unique_pages_scope\":\"RelationBufferAccess only; excludes heap pages\",\"tracked\":{\"hits\":87,\"reads\":10,\"unique_pages\":82},\"untracked\":{\"hits\":0,\"reads\":0},\"buckets\":{\"execute/fast/block_map\":{\"hits\":5,\"reads\":0},\"execute/fast/read_bytes\":{\"hits\":5,\"reads\":0},\"execute/heap/visibility_and_fetch\":{\"hits\":0,\"reads\":10},\"execute/idx/block_map\":{\"hits\":2,\"reads\":0},\"execute/idx/read_bytes\":{\"hits\":7,\"reads\":0},\"execute/term/block_map\":{\"hits\":2,\"reads\":0},\"execute/term/read_bytes\":{\"hits\":7,\"reads\":0},\"reader_setup/metadata/direct\":{\"hits\":59,\"reads\":0}},\"unique_pages_by_bucket\":{\"execute/fast/block_map\":5,\"execute/fast/read_bytes\":5,\"execute/idx/block_map\":2,\"execute/idx/read_bytes\":7,\"execute/term/block_map\":2,\"execute/term/read_bytes\":7,\"reader_setup/metadata/direct\":55}}",
+              "Exec Method": "TopKScanExecState",
+              "Scores": false,
+              "   TopK Limit": 10,
+              "   Queries": 1,
+              "Tantivy Query": "{\"with_index\":{\"query\":{\"term\":{\"field\":\"text\",\"value\":\"database\"}}}}",
+              "Shared Hit Blocks": 87,
+              "Shared Read Blocks": 10,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0
+            }
+          ]
+        },
+        "Settings": {
+          "effective_cache_size": "8GB",
+          "work_mem": "16MB",
+          "max_parallel_workers": "6",
+          "random_page_cost": "1.1",
+          "jit": "off",
+          "max_parallel_workers_per_gather": "0"
+        },
+        "Planning": {
+          "Shared Hit Blocks": 195,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning Time": 0.346,
+        "Triggers": [],
+        "Execution Time": 5.456
+      }
+    ],
+    "unscored_norm_lookups": 0,
+    "count_norm_lookups": 0
+  },
+  "text-and": {
+    "raw": {
+      "count": 6187,
+      "score_digest": "55401894a09298cd910c4f1e1d591d2e90a8ba64c012055138344f47ea64e9a3",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "packed": {
+      "count": 6187,
+      "score_digest": "55401894a09298cd910c4f1e1d591d2e90a8ba64c012055138344f47ea64e9a3",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "unscored_plan": [
+      {
+        "Plan": {
+          "Node Type": "Limit",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 10.0,
+          "Total Cost": 18.77,
+          "Plan Rows": 10,
+          "Plan Width": 27,
+          "Actual Rows": 10.0,
+          "Actual Loops": 1,
+          "Disabled": false,
+          "Output": [
+            "id",
+            "title",
+            "by",
+            "score"
+          ],
+          "Shared Hit Blocks": 96,
+          "Shared Read Blocks": 10,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Custom Scan",
+              "Parent Relationship": "Outer",
+              "Custom Plan Provider": "ParadeDB Base Scan",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Relation Name": "hn_items",
+              "Schema": "public",
+              "Alias": "hn_items",
+              "Startup Cost": 10.0,
+              "Total Cost": 18.77,
+              "Plan Rows": 10,
+              "Plan Width": 27,
+              "Actual Rows": 10.0,
+              "Actual Loops": 1,
+              "Disabled": false,
+              "Output": [
+                "id",
+                "title",
+                "by",
+                "score"
+              ],
+              "Table": "hn_items",
+              "Index": "hn_items_idx",
+              "Segment Count": 10,
+              "Worker Selection": "Cost model",
+              "Heap Fetches": 10,
+              "Virtual Tuples": 0,
+              "Invisible Tuples": 0,
+              "IO Breakdown": "{\"scope\":\"this backend; ExecCustomScan calls only\",\"total\":{\"hits\":96,\"reads\":10},\"components\":{\"fast\":{\"hits\":16,\"reads\":0},\"heap\":{\"hits\":0,\"reads\":10},\"idx\":{\"hits\":11,\"reads\":0},\"metadata\":{\"hits\":59,\"reads\":0},\"term\":{\"hits\":10,\"reads\":0}},\"file_read_calls\":{\"fast/read_bytes\":25,\"idx/read_bytes\":5,\"term/read_bytes\":7},\"unique_pages_scope\":\"RelationBufferAccess only; excludes heap pages\",\"tracked\":{\"hits\":96,\"reads\":10,\"unique_pages\":91},\"untracked\":{\"hits\":0,\"reads\":0},\"buckets\":{\"execute/fast/block_map\":{\"hits\":5,\"reads\":0},\"execute/fast/read_bytes\":{\"hits\":11,\"reads\":0},\"execute/heap/visibility_and_fetch\":{\"hits\":0,\"reads\":10},\"execute/idx/block_map\":{\"hits\":2,\"reads\":0},\"execute/idx/read_bytes\":{\"hits\":9,\"reads\":0},\"execute/term/block_map\":{\"hits\":2,\"reads\":0},\"execute/term/read_bytes\":{\"hits\":8,\"reads\":0},\"reader_setup/metadata/direct\":{\"hits\":59,\"reads\":0}},\"unique_pages_by_bucket\":{\"execute/fast/block_map\":5,\"execute/fast/read_bytes\":11,\"execute/idx/block_map\":2,\"execute/idx/read_bytes\":9,\"execute/term/block_map\":2,\"execute/term/read_bytes\":8,\"reader_setup/metadata/direct\":55}}",
+              "Exec Method": "TopKScanExecState",
+              "Scores": false,
+              "   TopK Limit": 10,
+              "   Queries": 1,
+              "Tantivy Query": "{\"boolean\":{\"must\":[{\"with_index\":{\"query\":{\"term\":{\"field\":\"text\",\"value\":\"postgres\"}}}},{\"with_index\":{\"query\":{\"term\":{\"field\":\"text\",\"value\":\"database\"}}}}]}}",
+              "Shared Hit Blocks": 96,
+              "Shared Read Blocks": 10,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0
+            }
+          ]
+        },
+        "Settings": {
+          "effective_cache_size": "8GB",
+          "work_mem": "16MB",
+          "max_parallel_workers": "6",
+          "random_page_cost": "1.1",
+          "jit": "off",
+          "max_parallel_workers_per_gather": "0"
+        },
+        "Planning": {
+          "Shared Hit Blocks": 267,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning Time": 0.382,
+        "Triggers": [],
+        "Execution Time": 1.049
+      }
+    ],
+    "unscored_norm_lookups": 0,
+    "count_norm_lookups": 0
+  },
+  "text-or": {
+    "raw": {
+      "count": 166965,
+      "score_digest": "a87cc98cc02812e04956f462ec8579c9e06b6f1a0ae4cf8ae482652d77efbf3e",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "packed": {
+      "count": 166965,
+      "score_digest": "a87cc98cc02812e04956f462ec8579c9e06b6f1a0ae4cf8ae482652d77efbf3e",
+      "matches_exhaustive_top_scores": true,
+      "exact_selected_scores": true
+    },
+    "unscored_plan": [
+      {
+        "Plan": {
+          "Node Type": "Limit",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 10.0,
+          "Total Cost": 10.15,
+          "Plan Rows": 10,
+          "Plan Width": 27,
+          "Actual Rows": 10.0,
+          "Actual Loops": 1,
+          "Disabled": false,
+          "Output": [
+            "id",
+            "title",
+            "by",
+            "score"
+          ],
+          "Shared Hit Blocks": 96,
+          "Shared Read Blocks": 4,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Custom Scan",
+              "Parent Relationship": "Outer",
+              "Custom Plan Provider": "ParadeDB Base Scan",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Relation Name": "hn_items",
+              "Schema": "public",
+              "Alias": "hn_items",
+              "Startup Cost": 10.0,
+              "Total Cost": 10.15,
+              "Plan Rows": 10,
+              "Plan Width": 27,
+              "Actual Rows": 10.0,
+              "Actual Loops": 1,
+              "Disabled": false,
+              "Output": [
+                "id",
+                "title",
+                "by",
+                "score"
+              ],
+              "Table": "hn_items",
+              "Index": "hn_items_idx",
+              "Segment Count": 10,
+              "Worker Selection": "Cost model",
+              "Heap Fetches": 10,
+              "Virtual Tuples": 0,
+              "Invisible Tuples": 0,
+              "IO Breakdown": "{\"scope\":\"this backend; ExecCustomScan calls only\",\"total\":{\"hits\":96,\"reads\":4},\"components\":{\"fast\":{\"hits\":10,\"reads\":0},\"heap\":{\"hits\":6,\"reads\":4},\"idx\":{\"hits\":11,\"reads\":0},\"metadata\":{\"hits\":59,\"reads\":0},\"term\":{\"hits\":10,\"reads\":0}},\"file_read_calls\":{\"fast/read_bytes\":17,\"idx/read_bytes\":5,\"term/read_bytes\":7},\"unique_pages_scope\":\"RelationBufferAccess only; excludes heap pages\",\"tracked\":{\"hits\":96,\"reads\":4,\"unique_pages\":85},\"untracked\":{\"hits\":0,\"reads\":0},\"buckets\":{\"execute/fast/block_map\":{\"hits\":5,\"reads\":0},\"execute/fast/read_bytes\":{\"hits\":5,\"reads\":0},\"execute/heap/visibility_and_fetch\":{\"hits\":6,\"reads\":4},\"execute/idx/block_map\":{\"hits\":2,\"reads\":0},\"execute/idx/read_bytes\":{\"hits\":9,\"reads\":0},\"execute/term/block_map\":{\"hits\":2,\"reads\":0},\"execute/term/read_bytes\":{\"hits\":8,\"reads\":0},\"reader_setup/metadata/direct\":{\"hits\":59,\"reads\":0}},\"unique_pages_by_bucket\":{\"execute/fast/block_map\":5,\"execute/fast/read_bytes\":5,\"execute/idx/block_map\":2,\"execute/idx/read_bytes\":9,\"execute/term/block_map\":2,\"execute/term/read_bytes\":8,\"reader_setup/metadata/direct\":55}}",
+              "Exec Method": "TopKScanExecState",
+              "Scores": false,
+              "   TopK Limit": 10,
+              "   Queries": 1,
+              "Tantivy Query": "{\"boolean\":{\"should\":[{\"with_index\":{\"query\":{\"term\":{\"field\":\"text\",\"value\":\"postgres\"}}}},{\"with_index\":{\"query\":{\"term\":{\"field\":\"text\",\"value\":\"database\"}}}}]}}",
+              "Shared Hit Blocks": 96,
+              "Shared Read Blocks": 4,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0
+            }
+          ]
+        },
+        "Settings": {
+          "effective_cache_size": "8GB",
+          "work_mem": "16MB",
+          "max_parallel_workers": "6",
+          "random_page_cost": "1.1",
+          "jit": "off",
+          "max_parallel_workers_per_gather": "0"
+        },
+        "Planning": {
+          "Shared Hit Blocks": 267,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning Time": 0.448,
+        "Triggers": [],
+        "Execution Time": 0.67
+      }
+    ],
+    "unscored_norm_lookups": 0,
+    "count_norm_lookups": 0
+  }
+}

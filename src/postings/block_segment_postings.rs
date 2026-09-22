@@ -33,6 +33,7 @@ pub struct BlockSegmentPostings {
     skip_reader: SkipReader,
     subblock_summaries: OwnedBytes,
     term_norm_offset: Option<u64>,
+    embedded_norm_directory: Option<super::packed_norms::EmbeddedNormDirectory>,
     term_norms: Option<super::term_norms::TermNormReader>,
 }
 
@@ -104,6 +105,8 @@ impl BlockSegmentPostings {
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
         let (term_norm_offset, bytes) = super::term_norms::read_header(bytes)?;
+        let (embedded_norm_directory, bytes) =
+            super::packed_norms::EmbeddedNormDirectory::read_header(bytes)?;
         let (subblock_summaries, bytes) = super::subblock::read_summaries(doc_freq, bytes)?;
         let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
         let skip_reader = match skip_data_opt {
@@ -140,6 +143,7 @@ impl BlockSegmentPostings {
             skip_reader,
             subblock_summaries,
             term_norm_offset,
+            embedded_norm_directory,
             term_norms: None,
         };
         block_segment_postings.load_block();
@@ -213,6 +217,9 @@ impl BlockSegmentPostings {
         self.term_norms = self.term_norm_offset.and_then(|offset| {
             super::term_norms::TermNormReader::new(source, offset, self.doc_freq)
         });
+        if let Some(norms) = &mut self.term_norms {
+            norms.embedded_directory = self.embedded_norm_directory.clone();
+        }
     }
 
     pub(crate) fn disable_term_norms(&mut self) {
@@ -277,7 +284,10 @@ impl BlockSegmentPostings {
     // This does not reset the positions list.
     pub(crate) fn reset(&mut self, doc_freq: u32, postings_data: OwnedBytes) -> io::Result<()> {
         let (term_norm_offset, postings_data) = super::term_norms::read_header(postings_data)?;
+        let (embedded_norm_directory, postings_data) =
+            super::packed_norms::EmbeddedNormDirectory::read_header(postings_data)?;
         self.term_norm_offset = term_norm_offset;
+        self.embedded_norm_directory = embedded_norm_directory;
         self.term_norms = None;
         let (subblock_summaries, postings_data) =
             super::subblock::read_summaries(doc_freq, postings_data)?;
@@ -527,6 +537,7 @@ impl BlockSegmentPostings {
             skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic),
             subblock_summaries: OwnedBytes::empty(),
             term_norm_offset: None,
+            embedded_norm_directory: None,
             term_norms: None,
         }
     }

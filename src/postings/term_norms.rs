@@ -14,6 +14,11 @@ thread_local! {
     static READS: Cell<u64> = const { Cell::new(0) };
     static ENABLED: Cell<bool> = const { Cell::new(true) };
     static PACKED_ENABLED: Cell<bool> = const { Cell::new(true) };
+    static EMBEDDED_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+pub fn set_embedded_norm_directory_enabled(enabled: bool) -> bool {
+    EMBEDDED_ENABLED.replace(enabled)
 }
 
 pub fn set_packed_posting_norms_enabled(enabled: bool) -> bool {
@@ -46,6 +51,7 @@ pub(crate) struct TermNormReader {
     offset: usize,
     len: usize,
     packed_source: Option<Arc<super::packed_norms::PackedNormSource>>,
+    pub(crate) embedded_directory: Option<super::packed_norms::EmbeddedNormDirectory>,
     buffer: RefCell<Option<NormBuffer>>,
 }
 
@@ -62,6 +68,7 @@ impl TermNormReader {
             offset: offset as usize,
             len: len as usize,
             packed_source: None,
+            embedded_directory: None,
             buffer: RefCell::new(None),
         })
     }
@@ -87,7 +94,19 @@ impl TermNormReader {
                     .offset
                     .checked_add(self.len)
                     .ok_or_else(|| io::Error::other("norm offset overflow"))?;
-                if let Some(reader) =
+                if let Some(meta) = self
+                    .embedded_directory
+                    .as_ref()
+                    .filter(|_| EMBEDDED_ENABLED.get())
+                {
+                    *buffer = Some(NormBuffer::Packed(
+                        super::packed_norms::PackedNormReader::open_embedded(
+                            source,
+                            meta,
+                            self.offset..end,
+                        )?,
+                    ));
+                } else if let Some(reader) =
                     super::packed_norms::PackedNormReader::open(source, Some(self.offset..end))?
                 {
                     *buffer = Some(NormBuffer::Packed(reader));
