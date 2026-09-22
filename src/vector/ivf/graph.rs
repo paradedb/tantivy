@@ -604,7 +604,8 @@ impl<T: VectorElement, S: Deref<Target = [T]>> RelativeNeighborhoodGraph<S> {
     pub fn refine(&mut self, executor: &Executor)
     where S: Sync {
         let len = self.graph.len();
-        if len == 0 {
+        // A lone centroid is a valid router and has no neighbors to refine.
+        if len <= 1 {
             return;
         }
 
@@ -1326,6 +1327,27 @@ mod rng_tests {
         }
         assert!(rng.graph.neighbors(0).contains(&1));
         assert!(rng.graph.neighbors(1).contains(&0));
+    }
+
+    #[test]
+    fn build_and_reload_single_centroid() {
+        let vectors = [1.0_f32, 2.0];
+        let config = NeighborhoodGraphConfig::default();
+        let mut rng = RelativeNeighborhoodGraph::new(vectors.as_slice(), 2, Metric::L2, config);
+        rng.build(&Executor::single_thread());
+        assert!(rng.graph.neighbors(0).is_empty());
+
+        let mut serialized = Vec::new();
+        rng.serialize(&mut serialized).unwrap();
+        let reloaded =
+            RelativeNeighborhoodGraph::open(&serialized, vectors.as_slice(), 2, Metric::L2, config)
+                .unwrap();
+        let mut workspace = Workspace::new();
+        let (results, metrics) = reloaded.search(&mut workspace, &[1.0, 2.0], &[0], 8);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].node, 0);
+        assert_eq!(metrics.result_count, 1);
+        assert_eq!(metrics.edges_scanned, 0);
     }
 
     #[test]
