@@ -30,15 +30,21 @@ struct MappedPostings<'a> {
     postings: SegmentPostings,
     mapping: &'a [Option<DocId>],
     current_doc: DocId,
+    segment_ord: usize,
 }
 
 impl<'a> MappedPostings<'a> {
-    fn new(mut postings: SegmentPostings, mapping: &'a [Option<DocId>]) -> Option<Self> {
+    fn new(
+        mut postings: SegmentPostings,
+        mapping: &'a [Option<DocId>],
+        segment_ord: usize,
+    ) -> Option<Self> {
         let current_doc = next_mapped_doc(&mut postings, mapping)?;
         Some(Self {
             postings,
             mapping,
             current_doc,
+            segment_ord,
         })
     }
 
@@ -106,7 +112,9 @@ impl<'a> PostingsMerger<'a> {
         let (lower, _) = segments.size_hint();
         let mut heap = BinaryHeap::with_capacity(lower);
         for (segment_ord, postings) in segments {
-            if let Some(cursor) = MappedPostings::new(postings, &doc_id_map[segment_ord]) {
+            if let Some(cursor) =
+                MappedPostings::new(postings, &doc_id_map[segment_ord], segment_ord)
+            {
                 heap.push(Reverse(Box::new(cursor)));
             }
         }
@@ -158,6 +166,14 @@ impl<'a> PostingsMerger<'a> {
             .0
             .postings
             .term_freq()
+    }
+
+    pub(crate) fn fieldnorm_id(&self, fallbacks: &[crate::fieldnorm::FieldNormReader]) -> u8 {
+        let cursor = &self.heap.peek().expect("advance() returned true").0;
+        cursor
+            .postings
+            .fieldnorm_id()
+            .unwrap_or_else(|| fallbacks[cursor.segment_ord].fieldnorm_id(cursor.postings.doc()))
     }
 
     /// Fill `output` with the current document's positions.

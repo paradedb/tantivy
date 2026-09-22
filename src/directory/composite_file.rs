@@ -169,14 +169,15 @@ impl CompositeFile {
 
     /// Returns the space usage per field in this composite file.
     pub fn space_usage(&self, schema: &Schema) -> PerFieldSpaceUsage {
-        let mut fields = Vec::new();
+        let mut fields = std::collections::BTreeMap::new();
         for (&field_addr, byte_range) in &self.offsets_index {
             let field_name = schema.get_field_name(field_addr.field).to_string();
-            let mut field_usage = FieldUsage::empty(field_name);
+            let field_usage = fields
+                .entry(field_addr.field)
+                .or_insert_with(|| FieldUsage::empty(field_name));
             field_usage.add_field_idx(field_addr.idx, byte_range.len().into());
-            fields.push(field_usage);
         }
-        PerFieldSpaceUsage::new(fields)
+        PerFieldSpaceUsage::new(fields.into_values().collect())
     }
 }
 

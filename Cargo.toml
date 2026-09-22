@@ -141,7 +141,7 @@ debug-assertions = true
 overflow-checks = true
 
 [features]
-default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer"]
+default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer", "posting-norms"]
 stemmer = ["frostem"]
 mmap = ["fs4", "tempfile", "memmap2"]
 stopwords = []

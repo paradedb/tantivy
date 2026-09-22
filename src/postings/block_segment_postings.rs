@@ -189,10 +189,19 @@ impl BlockSegmentPostings {
     pub(crate) fn set_term_norm_source(
         &mut self,
         source: std::sync::Arc<common::file_slice::DeferredFileSlice>,
-    ) {
+        storage: crate::fieldnorm::NormStorage,
+    ) -> io::Result<()> {
+        let required = storage == crate::fieldnorm::NormStorage::Posting;
+        if required && self.term_norm_offset.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing required posting norm header",
+            ));
+        }
         self.term_norms = self.term_norm_offset.and_then(|offset| {
-            super::term_norms::TermNormReader::new(source, offset, self.doc_freq)
+            super::term_norms::TermNormReader::new(source, offset, self.doc_freq, required)
         });
+        Ok(())
     }
 
     pub(crate) fn disable_term_norms(&mut self) {
@@ -200,14 +209,17 @@ impl BlockSegmentPostings {
     }
 
     pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
-        if let Some(norms) = &self.term_norms {
+        self.posting_fieldnorm_id_at(offset)
+            .unwrap_or_else(|| fallback.fieldnorm_id(self.doc(offset)))
+    }
+
+    pub(crate) fn posting_fieldnorm_id_at(&self, offset: usize) -> Option<u8> {
+        self.term_norms.as_ref().map(|norms| {
             let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + offset;
             norms
                 .read(ordinal)
                 .expect("failed to read posting fieldnorm")
-        } else {
-            fallback.fieldnorm_id(self.doc(offset))
-        }
+        })
     }
 
     // Resets the block segment postings on another position

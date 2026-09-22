@@ -34,6 +34,7 @@ pub struct InvertedIndexReader {
     positions_file_slice: DeferredFileSlice,
     posting_norms_file_slice: std::sync::Arc<DeferredFileSlice>,
     record_option: IndexRecordOption,
+    pub(crate) norm_storage: crate::fieldnorm::NormStorage,
     total_num_tokens: u64,
 }
 
@@ -81,6 +82,7 @@ impl InvertedIndexReader {
                 Ok(FileSlice::empty())
             })),
             record_option,
+            norm_storage: crate::fieldnorm::NormStorage::Legacy,
             total_num_tokens,
         })
     }
@@ -100,8 +102,14 @@ impl InvertedIndexReader {
                 Ok(FileSlice::empty())
             })),
             record_option,
+            norm_storage: crate::fieldnorm::NormStorage::Legacy,
             total_num_tokens: 0u64,
         }
+    }
+
+    /// Returns the norm storage declared by this field's postings metadata.
+    pub fn norm_storage(&self) -> crate::fieldnorm::NormStorage {
+        self.norm_storage
     }
 
     /// Returns the term info associated with the term.
@@ -192,7 +200,8 @@ impl InvertedIndexReader {
             .slice(term_info.postings_range.clone());
         let postings_bytes = postings_slice.read_bytes()?;
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
-        block_postings.set_term_norm_source(self.posting_norms_file_slice.clone());
+        block_postings
+            .set_term_norm_source(self.posting_norms_file_slice.clone(), self.norm_storage)?;
         Ok(())
     }
 
@@ -228,7 +237,7 @@ impl InvertedIndexReader {
             self.record_option,
             requested_option,
         )?;
-        postings.set_term_norm_source(self.posting_norms_file_slice.clone());
+        postings.set_term_norm_source(self.posting_norms_file_slice.clone(), self.norm_storage)?;
         Ok(postings)
     }
 
