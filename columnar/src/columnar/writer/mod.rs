@@ -84,65 +84,127 @@ impl ColumnarWriter {
     /// the lowest possible score.
     ///
     /// The sort applied is stable.
-    pub fn sort_order(&self, sort_field: &str, num_docs: RowId, reversed: bool) -> Vec<u32> {
-        let Some(numerical_col_writer) = self
+    fn extract_sort_key_column(
+        &self,
+        sort_field: &str,
+        num_docs: RowId,
+    ) -> Option<Vec<Option<u64>>> {
+        let mut symbols_buffer = Vec::new();
+        if let Some(numerical_col_writer) = self
             .numerical_field_hash_map
             .get::<NumericalColumnWriter>(sort_field.as_bytes())
             .or_else(|| {
                 self.datetime_field_hash_map
                     .get::<NumericalColumnWriter>(sort_field.as_bytes())
             })
-        else {
-            let str_or_bytes_column_opt = self
-                .str_field_hash_map
-                .get::<StrOrBytesColumnWriter>(sort_field.as_bytes())
-                .or_else(|| {
-                    self.bytes_field_hash_map
-                        .get::<StrOrBytesColumnWriter>(sort_field.as_bytes())
-                });
-            let Some(str_or_bytes_column) = str_or_bytes_column_opt else {
-                return Vec::new();
-            };
-
+        {
+            let mut keys = vec![None; num_docs as usize];
+            let mut current_doc_opt = None;
+            for op in
+                numerical_col_writer.operation_iterator(&self.arena, None, &mut symbols_buffer)
+            {
+                match op {
+                    ColumnOperation::NewDoc(doc) => {
+                        current_doc_opt = Some(doc);
+                    }
+                    ColumnOperation::Value(val) => {
+                        if let Some(current_doc) = current_doc_opt.take() {
+                            if (current_doc as usize) < keys.len() {
+                                keys[current_doc as usize] = Some(match val {
+                                    NumericalValue::U64(v) => v.to_u64(),
+                                    NumericalValue::I64(v) => v.to_u64(),
+                                    NumericalValue::F64(v) => v.to_u64(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Some(keys)
+        } else if let Some(str_or_bytes_column) = self
+            .str_field_hash_map
+            .get::<StrOrBytesColumnWriter>(sort_field.as_bytes())
+            .or_else(|| {
+                self.bytes_field_hash_map
+                    .get::<StrOrBytesColumnWriter>(sort_field.as_bytes())
+            })
+        {
             let dictionary_builder = &self.dictionaries[str_or_bytes_column.dictionary_id as usize];
             let term_id_mapping = dictionary_builder.build_term_id_mapping(&self.arena);
-            let mut symbols_buffer = Vec::new();
+            let mut keys = vec![None; num_docs as usize];
+            let mut current_doc_opt = None;
+            for op in str_or_bytes_column.operation_iterator(&self.arena, None, &mut symbols_buffer)
+            {
+                match op {
+                    ColumnOperation::NewDoc(doc) => {
+                        current_doc_opt = Some(doc);
+                    }
+                    ColumnOperation::Value(uid) => {
+                        if let Some(current_doc) = current_doc_opt.take() {
+                            if (current_doc as usize) < keys.len() {
+                                keys[current_doc as usize] =
+                                    Some(term_id_mapping.to_ord(uid).0 as u64);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(keys)
+        } else {
+            None
+        }
+    }
 
-            return collect_sort_order_from_ops(
-                str_or_bytes_column.operation_iterator(&self.arena, None, &mut symbols_buffer),
-                num_docs,
+    /// Returns the list of doc ids from 0..num_docs sorted by the `sort_field`
+    /// column.
+    ///
+    /// If the column is multivalued, use the first value for scoring.
+    /// If no value is associated to a specific row, the document is assigned
+    /// the lowest possible score.
+    ///
+    /// The sort applied is stable.
+    pub fn sort_order(&self, sort_field: &str, num_docs: RowId, reversed: bool) -> Vec<u32> {
+        self.sort_order_compound(
+            &[SortColumn {
+                name: sort_field,
                 reversed,
-                |uid| Some(term_id_mapping.to_ord(uid).0),
-                None,
-                |a, b| a.cmp(b),
-            );
-        };
-        let mut symbols_buffer = Vec::new();
-        collect_sort_order_from_ops(
-            numerical_col_writer.operation_iterator(&self.arena, None, &mut symbols_buffer),
+            }],
             num_docs,
-            reversed,
-            // MonotonicallyMappableToU64 converts each value to u64 in an
-            // order-preserving way (u64: identity, i64: XOR sign bit, f64: bit
-            // manipulation). Converting once per document lets the comparator be
-            // a simple u64 cmp instead of unwrapping the NumericalValue variant
-            // on every comparison.
-            //
-            // For f64, NaN maps to a deterministic u64 via raw bit manipulation,
-            // so it sorts to a consistent position. Sorting only requires total
-            // ordering, not IEEE 754 equality semantics where NaN != NaN.
-            |nv| {
-                Some(match nv {
-                    NumericalValue::U64(v) => v.to_u64(),
-                    NumericalValue::I64(v) => v.to_u64(),
-                    NumericalValue::F64(v) => v.to_u64(),
-                })
-            },
-            // None for missing values. Option<u64> sorts None < Some(_),
-            // placing nulls before non-null values.
-            None,
-            |a, b| a.cmp(b),
         )
+    }
+
+    /// Returns the list of doc ids from 0..num_docs sorted by compound sort columns.
+    ///
+    /// The sort applied is stable: ties across all sort columns are broken by the original doc id.
+    pub fn sort_order_compound(&self, sort_columns: &[SortColumn], num_docs: RowId) -> Vec<u32> {
+        if sort_columns.is_empty() {
+            return (0..num_docs).collect();
+        }
+        let mut key_columns: Vec<Vec<Option<u64>>> = Vec::with_capacity(sort_columns.len());
+        for sort_col in sort_columns {
+            let Some(keys) = self.extract_sort_key_column(sort_col.name, num_docs) else {
+                return Vec::new();
+            };
+            key_columns.push(keys);
+        }
+
+        let mut doc_ids: Vec<RowId> = (0..num_docs).collect();
+        doc_ids.sort_unstable_by(|&doc_a, &doc_b| {
+            for (col_idx, sort_col) in sort_columns.iter().enumerate() {
+                let key_a = key_columns[col_idx][doc_a as usize];
+                let key_b = key_columns[col_idx][doc_b as usize];
+                let cmp = if sort_col.reversed {
+                    key_b.cmp(&key_a)
+                } else {
+                    key_a.cmp(&key_b)
+                };
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+            doc_a.cmp(&doc_b)
+        });
+        doc_ids
     }
 
     /// Records a column type. This is useful to bypass the coercion process,
@@ -487,54 +549,19 @@ impl ColumnarWriter {
     }
 }
 
-/// Shared sorting pattern for both numeric and Str/Bytes sort fields.
-///
-/// Iterates column operations, fills gaps for missing docs with `default_key`, converts each value
-/// to a sort key via `value_to_key`, then sorts by the key using `cmp_keys`. Returns the doc ids
-/// in sorted order.
-fn collect_sort_order_from_ops<V, K: Clone>(
-    ops: impl Iterator<Item = ColumnOperation<V>>,
-    num_docs: RowId,
-    reversed: bool,
-    value_to_key: impl Fn(V) -> K,
-    default_key: K,
-    cmp_keys: impl Fn(&K, &K) -> std::cmp::Ordering,
-) -> Vec<u32> {
-    let mut doc_sort_keys: Vec<(K, RowId)> = Vec::with_capacity(num_docs as usize);
-    let mut start_doc_check_fill: RowId = 0;
-    let mut current_doc_opt: Option<RowId> = None;
+/// Column sort specification for sorting documents in a columnar writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SortColumn<'a> {
+    /// Field name of the column to sort by.
+    pub name: &'a str,
+    /// Whether to sort in descending (reversed) order.
+    pub reversed: bool,
+}
 
-    for op in ops {
-        match op {
-            ColumnOperation::NewDoc(doc) => {
-                current_doc_opt = Some(doc);
-            }
-            ColumnOperation::Value(val) => {
-                if let Some(current_doc) = current_doc_opt {
-                    // Fill gaps since the last doc with the default key.
-                    doc_sort_keys.extend(
-                        (start_doc_check_fill..current_doc).map(|doc| (default_key.clone(), doc)),
-                    );
-                    start_doc_check_fill = current_doc + 1;
-                    // For multivalued fields, only the first value is used.
-                    current_doc_opt = None;
-
-                    doc_sort_keys.push((value_to_key(val), current_doc));
-                }
-            }
-        }
+impl<'a> SortColumn<'a> {
+    pub fn new(name: &'a str, reversed: bool) -> Self {
+        Self { name, reversed }
     }
-    // Fill remaining docs at the tail.
-    doc_sort_keys.extend((start_doc_check_fill..num_docs).map(|doc| (default_key.clone(), doc)));
-
-    doc_sort_keys.sort_by(|(left_key, _), (right_key, _)| {
-        let cmp = cmp_keys(left_key, right_key);
-        if reversed { cmp.reverse() } else { cmp }
-    });
-    doc_sort_keys
-        .into_iter()
-        .map(|(_sort_key, doc)| doc)
-        .collect()
 }
 
 // Serialize [Dictionary, Column, dictionary num bytes U32::LE]

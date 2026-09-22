@@ -11,11 +11,11 @@ mod tests {
     use crate::query::QueryParser;
     use crate::schema::{
         self, BytesOptions, Facet, FacetOptions, IndexRecordOption, NumericOptions,
-        TextFieldIndexing, TextOptions, Value, FAST, STRING,
+        TextFieldIndexing, TextOptions, Value, FAST, STRING, TEXT,
     };
     use crate::{
-        DocAddress, DocSet, IndexSettings, IndexSortByField, IndexWriter, Order, TantivyDocument,
-        Term,
+        DocAddress, DocId, DocSet, IndexSettings, IndexSortByField, IndexWriter, Order,
+        TantivyDocument, Term,
     };
 
     fn create_test_index_posting_list_issue(index_settings: Option<IndexSettings>) -> Index {
@@ -1042,8 +1042,292 @@ mod tests {
     //         assert_eq!(doc.get_first(int_field).unwrap().as_u64(), Some(20));
     //         let doc = searcher.doc(DocAddress::new(0, 5)).unwrap();
     //         assert_eq!(doc.get_first(int_field).unwrap().as_u64(), Some(1_000));
-    //     }
-    // }
+    #[test]
+    fn test_single_segment_compound_sort() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let cat_field = schema_builder.add_text_field("category", STRING | FAST);
+        let score_field = schema_builder.add_u64_field("score", FAST);
+        let schema = schema_builder.build();
+
+        let index = Index::builder()
+            .schema(schema)
+            .settings(IndexSettings {
+                sort_by_fields: vec![
+                    IndexSortByField::new("category", Order::Asc),
+                    IndexSortByField::new("score", Order::Desc),
+                ],
+                ..Default::default()
+            })
+            .create_in_ram()?;
+
+        {
+            let mut writer = index.writer_for_tests()?;
+            writer.add_document(doc!(cat_field => "b", score_field => 10u64))?;
+            writer.add_document(doc!(cat_field => "a", score_field => 20u64))?;
+            writer.add_document(doc!(cat_field => "a", score_field => 30u64))?;
+            writer.add_document(doc!(cat_field => "b", score_field => 50u64))?;
+            writer.add_document(doc!(cat_field => "a", score_field => 10u64))?;
+            writer.commit()?;
+        }
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let seg_reader = searcher.segment_readers().last().unwrap();
+        let cat_ff = seg_reader.fast_fields().str("category")?.unwrap();
+        let score_ff = seg_reader.fast_fields().u64("score")?;
+
+        let get_str = |doc: DocId| -> String {
+            let ord = cat_ff.ords().first(doc).unwrap();
+            let mut s = String::new();
+            cat_ff.ord_to_str(ord, &mut s).unwrap();
+            s
+        };
+
+        // Expected order:
+        // doc 0: ("a", 30)
+        // doc 1: ("a", 20)
+        // doc 2: ("a", 10)
+        // doc 3: ("b", 50)
+        // doc 4: ("b", 10)
+        assert_eq!(get_str(0), "a");
+        assert_eq!(score_ff.first(0), Some(30));
+
+        assert_eq!(get_str(1), "a");
+        assert_eq!(score_ff.first(1), Some(20));
+
+        assert_eq!(get_str(2), "a");
+        assert_eq!(score_ff.first(2), Some(10));
+
+        assert_eq!(get_str(3), "b");
+        assert_eq!(score_ff.first(3), Some(50));
+
+        assert_eq!(get_str(4), "b");
+        assert_eq!(score_ff.first(4), Some(10));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_compound_sorted_index_overlapping() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let cat_field = schema_builder.add_text_field("category", STRING | FAST);
+        let score_field = schema_builder.add_u64_field("score", FAST);
+        let schema = schema_builder.build();
+
+        let index = Index::builder()
+            .schema(schema)
+            .settings(IndexSettings {
+                sort_by_fields: vec![
+                    IndexSortByField::new("category", Order::Asc),
+                    IndexSortByField::new("score", Order::Desc),
+                ],
+                ..Default::default()
+            })
+            .create_in_ram()?;
+
+        {
+            let mut writer = index.writer_for_tests()?;
+            // Segment 1
+            writer.add_document(doc!(cat_field => "a", score_field => 20u64))?;
+            writer.add_document(doc!(cat_field => "b", score_field => 10u64))?;
+            writer.add_document(doc!(cat_field => "a", score_field => 5u64))?;
+            writer.commit()?;
+
+            // Segment 2
+            writer.add_document(doc!(cat_field => "a", score_field => 15u64))?;
+            writer.add_document(doc!(cat_field => "b", score_field => 30u64))?;
+            writer.add_document(doc!(cat_field => "c", score_field => 1u64))?;
+            writer.commit()?;
+
+            let segment_ids = index.searchable_segment_ids()?;
+            assert_eq!(segment_ids.len(), 2);
+            writer.merge(&segment_ids).wait()?;
+            writer.wait_merging_threads()?;
+        }
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let seg_reader = searcher.segment_readers().last().unwrap();
+        let cat_ff = seg_reader.fast_fields().str("category")?.unwrap();
+        let score_ff = seg_reader.fast_fields().u64("score")?;
+
+        let get_str = |doc: DocId| -> String {
+            let ord = cat_ff.ords().first(doc).unwrap();
+            let mut s = String::new();
+            cat_ff.ord_to_str(ord, &mut s).unwrap();
+            s
+        };
+
+        // Expected merged order:
+        // doc 0: ("a", 20)
+        // doc 1: ("a", 15)
+        // doc 2: ("a", 5)
+        // doc 3: ("b", 30)
+        // doc 4: ("b", 10)
+        // doc 5: ("c", 1)
+        assert_eq!(get_str(0), "a");
+        assert_eq!(score_ff.first(0), Some(20));
+
+        assert_eq!(get_str(1), "a");
+        assert_eq!(score_ff.first(1), Some(15));
+
+        assert_eq!(get_str(2), "a");
+        assert_eq!(score_ff.first(2), Some(5));
+
+        assert_eq!(get_str(3), "b");
+        assert_eq!(score_ff.first(3), Some(30));
+
+        assert_eq!(get_str(4), "b");
+        assert_eq!(score_ff.first(4), Some(10));
+
+        assert_eq!(get_str(5), "c");
+        assert_eq!(score_ff.first(5), Some(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_compound_sorted_index_disjunct_stacking() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let year_field = schema_builder.add_u64_field("year", FAST);
+        let rating_field = schema_builder.add_u64_field("rating", FAST);
+        let schema = schema_builder.build();
+
+        let index = Index::builder()
+            .schema(schema)
+            .settings(IndexSettings {
+                sort_by_fields: vec![
+                    IndexSortByField::new("year", Order::Asc),
+                    IndexSortByField::new("rating", Order::Desc),
+                ],
+                ..Default::default()
+            })
+            .create_in_ram()?;
+
+        {
+            let mut writer = index.writer_for_tests()?;
+            // Segment 1 (year = 2020)
+            writer.add_document(doc!(year_field => 2020u64, rating_field => 3u64))?;
+            writer.add_document(doc!(year_field => 2020u64, rating_field => 5u64))?;
+            writer.commit()?;
+
+            // Segment 2 (year = 2021) - strictly disjunct on year (2020 < 2021)
+            writer.add_document(doc!(year_field => 2021u64, rating_field => 2u64))?;
+            writer.add_document(doc!(year_field => 2021u64, rating_field => 4u64))?;
+            writer.commit()?;
+
+            let segment_ids = index.searchable_segment_ids()?;
+            assert_eq!(segment_ids.len(), 2);
+            writer.merge(&segment_ids).wait()?;
+            writer.wait_merging_threads()?;
+        }
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let seg_reader = searcher.segment_readers().last().unwrap();
+        let year_ff = seg_reader.fast_fields().u64("year")?;
+        let rating_ff = seg_reader.fast_fields().u64("rating")?;
+
+        // Expected order:
+        // doc 0: (2020, 5)
+        // doc 1: (2020, 3)
+        // doc 2: (2021, 4)
+        // doc 3: (2021, 2)
+        assert_eq!(year_ff.first(0), Some(2020));
+        assert_eq!(rating_ff.first(0), Some(5));
+
+        assert_eq!(year_ff.first(1), Some(2020));
+        assert_eq!(rating_ff.first(1), Some(3));
+
+        assert_eq!(year_ff.first(2), Some(2021));
+        assert_eq!(rating_ff.first(2), Some(4));
+
+        assert_eq!(year_ff.first(3), Some(2021));
+        assert_eq!(rating_ff.first(3), Some(2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_compound_sort_validation() {
+        let mut schema_builder = schema::Schema::builder();
+        schema_builder.add_u64_field("score", FAST);
+        schema_builder.add_text_field("title", TEXT); // not fast
+        let schema = schema_builder.build();
+
+        // Duplicate sort fields
+        let res = Index::builder()
+            .schema(schema.clone())
+            .settings(IndexSettings {
+                sort_by_fields: vec![
+                    IndexSortByField::new("score", Order::Asc),
+                    IndexSortByField::new("score", Order::Desc),
+                ],
+                ..Default::default()
+            })
+            .create_in_ram();
+        assert!(res.is_err());
+
+        // Conflicting sort_by_field and sort_by_fields
+        let res = Index::builder()
+            .schema(schema.clone())
+            .settings(IndexSettings {
+                sort_by_field: Some(IndexSortByField::new("score", Order::Asc)),
+                sort_by_fields: vec![IndexSortByField::new("score", Order::Asc)],
+                ..Default::default()
+            })
+            .create_in_ram();
+        assert!(res.is_err());
+
+        // Non-fast field in sort_by_fields
+        let res = Index::builder()
+            .schema(schema.clone())
+            .settings(IndexSettings {
+                sort_by_fields: vec![IndexSortByField::new("title", Order::Asc)],
+                ..Default::default()
+            })
+            .create_in_ram();
+        assert!(res.is_err());
+
+        // manual_doc_id_mapping combined with sort_by_fields
+        let res = Index::builder()
+            .schema(schema)
+            .settings(IndexSettings {
+                manual_doc_id_mapping: true,
+                sort_by_fields: vec![IndexSortByField::new("score", Order::Asc)],
+                ..Default::default()
+            })
+            .create_in_ram();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_meta_json_serialization_roundtrip() {
+        let settings = IndexSettings {
+            sort_by_fields: vec![
+                IndexSortByField::new("col1", Order::Asc),
+                IndexSortByField::new("col2", Order::Desc),
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let deserialized: IndexSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(settings, deserialized);
+        assert_eq!(deserialized.sort_by_fields().len(), 2);
+        assert_eq!(deserialized.primary_sort_by_field().unwrap().field, "col1");
+
+        // Deserializing legacy format with sort_by_field
+        let legacy_json = r#"{"sort_by_field":{"field":"col1","order":"Asc"}}"#;
+        let legacy_settings: IndexSettings = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_settings.sort_by_fields().len(), 1);
+        assert_eq!(
+            legacy_settings.primary_sort_by_field().unwrap().field,
+            "col1"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "unstable"))]
@@ -1153,7 +1437,7 @@ mod bench_sorted_index_merge {
         )?;
         b.iter(|| {
             merger
-                .generate_doc_id_mapping_with_sort_by_field(&sort_by_field)
+                .generate_doc_id_mapping_with_sort_by_fields(std::slice::from_ref(&sort_by_field))
                 .unwrap();
         });
 

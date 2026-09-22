@@ -113,14 +113,13 @@ impl FastFieldsWriter {
         self.columnar_writer.mem_usage()
     }
 
-    pub(crate) fn sort_order(
+    pub(crate) fn sort_order_compound(
         &self,
-        sort_field: &str,
+        sort_columns: &[columnar::SortColumn],
         num_docs: DocId,
-        reversed: bool,
     ) -> Vec<DocId> {
         self.columnar_writer
-            .sort_order(sort_field, num_docs, reversed)
+            .sort_order_compound(sort_columns, num_docs)
     }
 
     /// Indexes all of the fastfields of a new document.

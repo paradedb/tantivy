@@ -1,4 +1,4 @@
-use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
+use super::doc_id_mapping::{get_doc_id_mapping_from_fields, DocIdMapping};
 use super::operation::AddOperation;
 use crate::fastfield::FastFieldsPluginWriter;
 use crate::index::{InvertedIndexPluginWriter, Segment};
@@ -111,14 +111,12 @@ impl SegmentWriter {
             ));
         }
 
-        let mapping: Option<DocIdMapping> = self
-            .segment
-            .index()
-            .settings()
-            .sort_by_field
-            .clone()
-            .map(|sort_by_field| get_doc_id_mapping_from_field(sort_by_field, &self))
-            .transpose()?;
+        let sort_by_fields = self.segment.index().settings().sort_by_fields();
+        let mapping: Option<DocIdMapping> = if !sort_by_fields.is_empty() {
+            Some(get_doc_id_mapping_from_fields(sort_by_fields, &self)?)
+        } else {
+            None
+        };
         self.finalize_inner(mapping.as_ref())
     }
 
@@ -133,7 +131,7 @@ impl SegmentWriter {
                 "IndexSettings::manual_doc_id_mapping must be set to true".to_string(),
             ));
         }
-        if settings.sort_by_field.is_some() {
+        if settings.has_sorting() {
             return Err(TantivyError::InvalidArgument(
                 "IndexSettings::manual_doc_id_mapping cannot be combined with sort_by_field"
                     .to_string(),

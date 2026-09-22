@@ -12,7 +12,7 @@ use crate::dynamic_column::{DynamicColumn, DynamicColumnHandle};
 use crate::value::{Coerce, NumericalValue};
 use crate::{
     BytesColumn, Cardinality, Column, ColumnarReader, ColumnarWriter, RowAddr, RowId,
-    ShuffleMergeOrder, StackMergeOrder,
+    ShuffleMergeOrder, SortColumn, StackMergeOrder,
 };
 
 #[test]
@@ -373,6 +373,101 @@ fn test_sort_order_datetime_close_timestamps() {
 
     let asc = dataframe_writer.sort_order("ts", 2, false);
     assert_eq!(asc, vec![1, 0]); // smaller timestamp first
+}
+
+#[test]
+fn test_sort_order_compound_numeric_numeric() {
+    let mut writer = ColumnarWriter::default();
+    // doc 0: (1, 20)
+    writer.record_numerical(0, "a", 1u64);
+    writer.record_numerical(0, "b", 20u64);
+    // doc 1: (2, 10)
+    writer.record_numerical(1, "a", 2u64);
+    writer.record_numerical(1, "b", 10u64);
+    // doc 2: (1, 10)
+    writer.record_numerical(2, "a", 1u64);
+    writer.record_numerical(2, "b", 10u64);
+    // doc 3: (1, 20) -- tie with doc 0
+    writer.record_numerical(3, "a", 1u64);
+    writer.record_numerical(3, "b", 20u64);
+
+    let asc_asc = writer.sort_order_compound(
+        &[SortColumn::new("a", false), SortColumn::new("b", false)],
+        4,
+    );
+    // (1, 10) -> doc 2
+    // (1, 20) -> doc 0, doc 3 (stably tie-broken by doc id)
+    // (2, 10) -> doc 1
+    assert_eq!(asc_asc, vec![2, 0, 3, 1]);
+
+    let asc_desc = writer.sort_order_compound(
+        &[SortColumn::new("a", false), SortColumn::new("b", true)],
+        4,
+    );
+    // (1, 20) -> doc 0, doc 3 (stably tie-broken by doc id)
+    // (1, 10) -> doc 2
+    // (2, 10) -> doc 1
+    assert_eq!(asc_desc, vec![0, 3, 2, 1]);
+}
+
+#[test]
+fn test_sort_order_compound_mixed_types() {
+    let mut writer = ColumnarWriter::default();
+    // doc 0: ("a", 10)
+    writer.record_str(0, "category", "a");
+    writer.record_numerical(0, "score", 10u64);
+    // doc 1: ("b", 5)
+    writer.record_str(1, "category", "b");
+    writer.record_numerical(1, "score", 5u64);
+    // doc 2: ("a", 20)
+    writer.record_str(2, "category", "a");
+    writer.record_numerical(2, "score", 20u64);
+
+    let sorted = writer.sort_order_compound(
+        &[
+            SortColumn::new("category", false),
+            SortColumn::new("score", true),
+        ],
+        3,
+    );
+    // "a" with score 20 -> doc 2
+    // "a" with score 10 -> doc 0
+    // "b" with score 5  -> doc 1
+    assert_eq!(sorted, vec![2, 0, 1]);
+}
+
+#[test]
+fn test_sort_order_compound_null_handling() {
+    let mut writer = ColumnarWriter::default();
+    // doc 0: (None, 10)
+    writer.record_numerical(0, "b", 10u64);
+    // doc 1: (1, None)
+    writer.record_numerical(1, "a", 1u64);
+    // doc 2: (1, 20)
+    writer.record_numerical(2, "a", 1u64);
+    writer.record_numerical(2, "b", 20u64);
+    // doc 3: (None, None)
+
+    let sorted_asc_asc = writer.sort_order_compound(
+        &[SortColumn::new("a", false), SortColumn::new("b", false)],
+        4,
+    );
+    // a=None: doc 3 (b=None), doc 0 (b=10)
+    // a=1: doc 1 (b=None), doc 2 (b=20)
+    assert_eq!(sorted_asc_asc, vec![3, 0, 1, 2]);
+
+    let sorted_desc_desc =
+        writer.sort_order_compound(&[SortColumn::new("a", true), SortColumn::new("b", true)], 4);
+    // a=1: doc 2 (b=20), doc 1 (b=None)
+    // a=None: doc 0 (b=10), doc 3 (b=None)
+    assert_eq!(sorted_desc_desc, vec![2, 1, 0, 3]);
+}
+
+#[test]
+fn test_sort_order_compound_empty() {
+    let writer = ColumnarWriter::default();
+    let sorted = writer.sort_order_compound(&[], 5);
+    assert_eq!(sorted, vec![0, 1, 2, 3, 4]);
 }
 
 fn num_strategy() -> impl Strategy<Value = NumericalValue> {
