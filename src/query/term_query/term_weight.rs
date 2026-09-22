@@ -220,8 +220,11 @@ impl TermWeight {
             )));
         }
 
-        let segment_postings: SegmentPostings =
+        let mut segment_postings: SegmentPostings =
             inverted_index.read_postings_from_terminfo(&term_info, self.index_record_option)?;
+        if !self.scoring_enabled {
+            segment_postings.block_cursor.disable_term_norms();
+        }
 
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let similarity_weight = self.similarity_weight.boost_by(boost);
