@@ -11,6 +11,7 @@ use super::ivf::{InMemoryStore, IvfCentroids, LazyStore, MultiLevelIvf};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
+use crate::vector::Similarity;
 
 mod exact;
 mod rng;
@@ -42,7 +43,7 @@ impl RouterKind {
         self,
         options: &VectorOptions,
         centroids: &mut IvfCentroids,
-    ) -> crate::Result<BuiltRouter> {
+    ) -> crate::Result<InMemoryRouter> {
         match self {
             Self::Rng => Ok(Router::Rng(rng::build(options, centroids)?)),
             Self::Stacked => Ok(Router::Stacked(stacked::build(options, centroids)?)),
@@ -56,7 +57,7 @@ impl RouterKind {
         slot: FileSlice,
         centroids: FileSlice,
         options: &VectorOptions,
-    ) -> crate::Result<OpenedRouter> {
+    ) -> crate::Result<LazyRouter> {
         if file_version != VectorFileVersion::V3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -104,10 +105,27 @@ pub(crate) enum Router<S: super::VectorArena<Elem = f32>> {
     Exact(exact::ExactRouter<S>),
 }
 
-pub(crate) type BuiltRouter = Router<InMemoryStore>;
-pub(crate) type OpenedRouter = Router<LazyStore>;
+pub(crate) type InMemoryRouter = Router<InMemoryStore>;
+pub(crate) type LazyRouter = Router<LazyStore>;
 
-impl BuiltRouter {
+impl InMemoryRouter {
+    pub(crate) fn from(
+        kind: RouterKind,
+        options: &VectorOptions,
+        centroids: &mut IvfCentroids,
+    ) -> crate::Result<Self> {
+        let IvfCentroids::F32(matrix) = &*centroids;
+        let shape = (matrix.rows, matrix.dims, matrix.values.len());
+        let router = kind.build(options, centroids)?;
+        let IvfCentroids::F32(matrix) = &*centroids;
+        if (matrix.rows, matrix.dims, matrix.values.len()) != shape {
+            return Err(crate::TantivyError::InvalidArgument(
+                "Router changed the centroid matrix shape while building".to_string(),
+            ));
+        }
+        Ok(router)
+    }
+
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Rng(_) => RouterKind::Rng,
@@ -163,7 +181,8 @@ impl Iterator for RouterIter<'_, '_> {
     }
 }
 
-impl OpenedRouter {
+impl LazyRouter {
+    #[cfg(test)]
     pub(crate) fn kind(&self) -> RouterKind {
         match self {
             Self::Rng(_) => RouterKind::Rng,
@@ -177,9 +196,12 @@ impl OpenedRouter {
         workspace: &'workspace mut RouterWorkspace,
         query: &'router [f32],
         metric: Metric,
+        scores: Option<&'router [Similarity]>,
     ) -> RouterIter<'router, 'workspace> {
         match self {
-            Self::Rng(router) => RouterIter::Rng(rng::rank(router, &mut workspace.rng, query)),
+            Self::Rng(router) => {
+                RouterIter::Rng(rng::rank(router, &mut workspace.rng, query, scores))
+            }
             Self::Stacked(router) => RouterIter::Stacked(stacked::rank(router, query, metric)),
             Self::Exact(router) => RouterIter::Exact(router.rank(query)),
         }
@@ -229,7 +251,7 @@ mod tests {
             &options,
         )?;
         let mut workspace = RouterWorkspace::default();
-        let mut ranking = opened.rank(&mut workspace, &[1.1], Metric::L2);
+        let mut ranking = opened.rank(&mut workspace, &[1.1], Metric::L2, None);
         assert_eq!(ranking.next().unwrap().node, 1);
         assert!(matches!(
             ranking.metrics(),
@@ -261,7 +283,7 @@ mod tests {
         )?;
         let mut workspace = RouterWorkspace::default();
         for query in [[0.1], [1.9]] {
-            let mut ranking = opened.rank(&mut workspace, &query, Metric::L2);
+            let mut ranking = opened.rank(&mut workspace, &query, Metric::L2, None);
             assert!(ranking.next().is_some());
             let metrics = ranking.metrics();
             match metrics {
