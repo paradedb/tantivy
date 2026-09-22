@@ -194,17 +194,22 @@ impl SegmentClusters {
             non_empty: vec![0u64; num_centroids.div_ceil(64)],
             num_non_empty: 0,
         };
-        let mut offsets = index
-            .cluster_offsets
-            .chunks_exact(mem::size_of::<u64>())
-            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
-        let mut previous = offsets.next().unwrap();
-        for (cluster, offset) in offsets.enumerate() {
-            if offset > previous {
-                index.non_empty[cluster / 64] |= 1u64 << (cluster % 64);
-                index.num_non_empty += 1;
+        let offset_width = mem::size_of::<u64>();
+        let mut previous =
+            u64::from_le_bytes(index.cluster_offsets[..offset_width].try_into().unwrap());
+        for (word, group) in index
+            .non_empty
+            .iter_mut()
+            .zip(index.cluster_offsets[offset_width..].chunks(64 * offset_width))
+        {
+            let mut mask = 0u64;
+            for (bit, bytes) in group.chunks_exact(offset_width).enumerate() {
+                let offset = u64::from_le_bytes(bytes.try_into().unwrap());
+                mask |= u64::from(offset > previous) << bit;
+                previous = offset;
             }
-            previous = offset;
+            *word = mask;
+            index.num_non_empty += mask.count_ones() as usize;
         }
         // Every distinct doc owns at least its primary row, so a doc count
         // above the row total means a corrupt file.
@@ -285,5 +290,103 @@ impl SegmentClusters {
         (0..self.num_centroids).map(|cluster| {
             (self.cluster_offset(cluster + 1) - self.cluster_offset(cluster)) as usize
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::{Rng, SeedableRng};
+
+    use super::*;
+    use crate::schema::Metric;
+
+    fn open_test_clusters(offsets: &[u64], num_docs: usize) -> crate::Result<SegmentClusters> {
+        let count = offsets.len() - 1;
+        let mut offset_bytes = Vec::new();
+        SegmentClusters::serialize_offsets(offsets, &mut offset_bytes)?;
+        let mut bounds = Vec::new();
+        SegmentClusters::serialize_bounds(BoundKind::Ball, &vec![0.0; count], &mut bounds)?;
+        let mut meta = Vec::new();
+        SegmentClusters::serialize_ivf_meta(num_docs, count, &mut meta)?;
+        SegmentClusters::open(
+            &VectorOptions::new(2, Metric::L2),
+            FileSlice::from(offset_bytes),
+            FileSlice::from(bounds),
+            FileSlice::from(meta),
+        )
+    }
+
+    #[test]
+    fn cluster_presence_matches_offsets_across_word_boundaries() -> crate::Result<()> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for count in [0usize, 1, 7, 63, 64, 65, 127, 128, 129, 4107] {
+            for occupancy in [0, 2, 50, 98, 100] {
+                let mut offsets = vec![0u64];
+                for _ in 0..count {
+                    let rows = if rng.random_range(0..100) < occupancy {
+                        rng.random_range(1..32)
+                    } else {
+                        0
+                    };
+                    offsets.push(offsets.last().unwrap() + rows);
+                }
+                let num_rows = *offsets.last().unwrap() as usize;
+                let clusters = open_test_clusters(&offsets, num_rows)?;
+                assert_eq!(clusters.num_clusters(), count);
+                assert_eq!(clusters.num_rows(), num_rows);
+                assert_eq!(clusters.num_docs(), num_rows);
+                let expected_count = offsets.windows(2).filter(|pair| pair[1] > pair[0]).count();
+                assert_eq!(clusters.num_non_empty_clusters(), expected_count);
+                assert_eq!(
+                    clusters
+                        .non_empty
+                        .iter()
+                        .map(|word| word.count_ones() as usize)
+                        .sum::<usize>(),
+                    expected_count
+                );
+                assert_eq!(clusters.non_empty.len(), count.div_ceil(64));
+                if count % 64 != 0 {
+                    assert_eq!(clusters.non_empty.last().unwrap() >> (count % 64), 0);
+                }
+                for (cluster, pair) in offsets.windows(2).enumerate() {
+                    let range = pair[0] as usize..pair[1] as usize;
+                    assert_eq!(clusters.cluster_range(cluster), range);
+                    assert_eq!(clusters.has_cluster(cluster), !range.is_empty());
+                    assert_eq!(
+                        clusters.non_empty_cluster_range(cluster),
+                        (!range.is_empty()).then_some(range)
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_presence_preserves_strict_offset_comparison() -> crate::Result<()> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(77);
+        for count in [63usize, 64, 65, 127, 128, 129] {
+            let offsets: Vec<u64> = (0..=count)
+                .map(|i| match i % 6 {
+                    0 | 1 => u64::MAX,
+                    2 | 3 => 0,
+                    _ => rng.random(),
+                })
+                .collect();
+            let clusters = open_test_clusters(&offsets, 0)?;
+            let mut expected = vec![0u64; count.div_ceil(64)];
+            let mut expected_count = 0;
+            for (cluster, pair) in offsets.windows(2).enumerate() {
+                if pair[1] > pair[0] {
+                    expected[cluster / 64] |= 1 << (cluster % 64);
+                    expected_count += 1;
+                }
+                assert_eq!(clusters.has_cluster(cluster), pair[1] > pair[0]);
+            }
+            assert_eq!(clusters.non_empty, expected);
+            assert_eq!(clusters.num_non_empty_clusters(), expected_count);
+        }
+        Ok(())
     }
 }

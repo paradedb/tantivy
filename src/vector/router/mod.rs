@@ -11,6 +11,7 @@ use super::ivf::{InMemoryStore, IvfCentroids, LazyStore, MultiLevelIvf};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
+use crate::vector::Similarity;
 
 mod exact;
 mod rng;
@@ -195,9 +196,12 @@ impl LazyRouter {
         workspace: &'workspace mut RouterWorkspace,
         query: &'router [f32],
         metric: Metric,
+        scores: Option<&'router [Similarity]>,
     ) -> RouterIter<'router, 'workspace> {
         match self {
-            Self::Rng(router) => RouterIter::Rng(rng::rank(router, &mut workspace.rng, query)),
+            Self::Rng(router) => {
+                RouterIter::Rng(rng::rank(router, &mut workspace.rng, query, scores))
+            }
             Self::Stacked(router) => RouterIter::Stacked(stacked::rank(router, query, metric)),
             Self::Exact(router) => RouterIter::Exact(router.rank(query)),
         }
@@ -247,7 +251,7 @@ mod tests {
             &options,
         )?;
         let mut workspace = RouterWorkspace::default();
-        let mut ranking = opened.rank(&mut workspace, &[1.1], Metric::L2);
+        let mut ranking = opened.rank(&mut workspace, &[1.1], Metric::L2, None);
         assert_eq!(ranking.next().unwrap().node, 1);
         assert!(matches!(
             ranking.metrics(),
@@ -279,7 +283,7 @@ mod tests {
         )?;
         let mut workspace = RouterWorkspace::default();
         for query in [[0.1], [1.9]] {
-            let mut ranking = opened.rank(&mut workspace, &query, Metric::L2);
+            let mut ranking = opened.rank(&mut workspace, &query, Metric::L2, None);
             assert!(ranking.next().is_some());
             let metrics = ranking.metrics();
             match metrics {

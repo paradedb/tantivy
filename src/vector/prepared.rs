@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use super::VectorElement;
-use crate::schema::Metric;
-use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide};
+use crate::schema::{Metric, VectorDType};
+use crate::vector::distance::{dot_bytes, l2_squared_bytes, norm_squared_wide, DotAccumulator};
 
 pub struct PreparedQuery<T: VectorElement> {
     query: Arc<Vec<T>>,
@@ -77,5 +77,119 @@ impl<T: VectorElement> PreparedQuery<T> {
             QueryKind::Dot => dot_bytes::<T>(&self.query, doc_bytes),
             QueryKind::Cosine { inv_norm_q } => dot_bytes::<T>(&self.query, doc_bytes) * inv_norm_q,
         }
+    }
+
+    pub(crate) fn dot_accumulator(&self) -> Option<DotAccumulator> {
+        (T::DTYPE == VectorDType::F32 && T::SIZE_BYTES == 4 && !matches!(self.kind, QueryKind::L2))
+            .then(DotAccumulator::new)
+    }
+
+    #[inline]
+    pub(crate) fn score_doc_fragment(
+        &self,
+        accumulator: &mut DotAccumulator,
+        bytes: &[u8],
+        complete: bool,
+    ) -> Option<f32> {
+        accumulator.push::<T>(&self.query, bytes);
+        complete.then(|| {
+            let dot = accumulator.finish::<T>(&self.query);
+            match self.kind {
+                QueryKind::Dot => dot,
+                QueryKind::Cosine { inv_norm_q } => dot * inv_norm_q,
+                QueryKind::L2 => unreachable!("L2 uses the contiguous row scorer"),
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn fragmented_dot_scores_match_contiguous_bits() {
+        for dim in [1, 15, 16, 17, 31, 33, 1024] {
+            for profile in 0..3 {
+                let query: Vec<f32> = (0..dim)
+                    .map(|i| match profile {
+                        0 => ((i * 17 % 31) as f32 - 15.0) * 0.03137,
+                        1 => [1.0e20, -1.0e20, 1.0e-20, -1.0e-20][i % 4],
+                        _ => {
+                            if i % 2 == 0 {
+                                0.0
+                            } else {
+                                -0.0
+                            }
+                        }
+                    })
+                    .collect();
+                let doc: Vec<f32> = (0..dim)
+                    .map(|i| ((i * 13 % 43) as f32 - 21.0) * 0.06257)
+                    .collect();
+                let doc = bytes(&doc);
+                for metric in [Metric::Dot, Metric::Cosine] {
+                    let prepared = PreparedQuery::new(metric, Arc::new(query.clone()));
+                    let expected = prepared.score_doc_bytes(&doc).to_bits();
+                    let mut accumulator = prepared.dot_accumulator().unwrap();
+                    for split in 0..=doc.len() {
+                        assert!(prepared
+                            .score_doc_fragment(&mut accumulator, &doc[..split], false)
+                            .is_none());
+                        let score = prepared
+                            .score_doc_fragment(&mut accumulator, &doc[split..], true)
+                            .unwrap();
+                        assert_eq!(
+                            score.to_bits(),
+                            expected,
+                            "{metric:?}, dim={dim}, split={split}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_dot_scores_handle_many_chunks_and_row_reuse() {
+        for dim in [3, 17, 1024, 4099] {
+            for chunk_size in [1, 3, 7, 63, 64, 65, 8160] {
+                for metric in [Metric::Dot, Metric::Cosine] {
+                    let query = (0..dim).map(|i| i as f32 * 0.003 - 0.2).collect();
+                    let prepared = PreparedQuery::new(metric, Arc::new(query));
+                    let mut accumulator = prepared.dot_accumulator().unwrap();
+                    for row in 0..3 {
+                        let doc = bytes(
+                            &(0..dim)
+                                .map(|i| ((i + row * 7) % 23) as f32 * 0.125 - 1.0)
+                                .collect::<Vec<_>>(),
+                        );
+                        let mut actual = None;
+                        for (i, fragment) in doc.chunks(chunk_size).enumerate() {
+                            assert!(actual.is_none());
+                            actual = prepared.score_doc_fragment(
+                                &mut accumulator,
+                                fragment,
+                                (i + 1) * chunk_size >= doc.len(),
+                            );
+                        }
+                        assert_eq!(
+                            actual.unwrap().to_bits(),
+                            prepared.score_doc_bytes(&doc).to_bits(),
+                            "{metric:?}, dim={dim}, chunks={chunk_size}",
+                        );
+                    }
+                }
+            }
+        }
+        let prepared = PreparedQuery::new(Metric::L2, Arc::new(vec![1.0f32; 17]));
+        assert!(prepared.dot_accumulator().is_none());
     }
 }

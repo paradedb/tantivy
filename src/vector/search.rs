@@ -184,6 +184,9 @@ where
     let mut topn: GlobalHeap<S, S::Comparator> =
         TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_break.comparator()));
 
+    let mut survivors = Vec::new();
+    let mut row_scratch = Vec::new();
+
     // The exact tier.
     for flat in &mut flats {
         let filter: Option<BitSet> = if matches_all_docs {
@@ -197,29 +200,25 @@ where
             Some(filter)
         };
         let alive = flat.reader.alive_bitset();
-        for row in 0..flat.vec.num_vectors() {
-            let doc = flat.vec.doc_id_at(row);
-            if let Some(filter) = &filter {
-                if !filter.contains(doc) {
-                    continue;
-                }
-            }
-            if let Some(bs) = alive {
-                if !bs.is_alive(doc) {
-                    continue;
-                }
-            }
-            let vbytes = flat.vec.vector_bytes_for_row(row)?;
-            let score = prepared.score_doc_bytes(&vbytes);
-            stats.exact_rows_read += 1;
-            if let Some(((threshold_score, _), _)) = &topn.threshold {
-                if score < *threshold_score {
-                    continue;
-                }
-            }
-            let segment_key = flat.tie.segment_sort_key(doc, score);
-            let global_key = flat.tie.convert_segment_sort_key(segment_key);
-            topn.push_unordered((score, global_key), DocAddress::new(flat.ord, doc));
+        for begin in (0..flat.vec.num_vectors()).step_by(64) {
+            collect_cluster_survivors(
+                &flat.vec,
+                begin..(begin + 64).min(flat.vec.num_vectors()),
+                filter.as_ref(),
+                alive,
+                None,
+                &mut survivors,
+            );
+            stats.exact_rows_read += survivors.len();
+            score_survivors::<T, S>(
+                &flat.vec,
+                &mut flat.tie,
+                flat.ord,
+                &prepared,
+                &survivors,
+                &mut row_scratch,
+                &mut topn,
+            )?;
         }
     }
 
@@ -261,8 +260,28 @@ where
                 }
             }
         }
+        let clean = matches_all_docs
+            && segments.len() == searcher.segment_readers().len()
+            && segments
+                .iter()
+                .all(|segment| segment.alive.is_none() && !segment.needs_dedup);
+        let capacity = segments.iter().fold(WorkUnits::ZERO, |total, segment| {
+            total
+                + pricing_open * segment.ivf().num_non_empty_clusters() as f64
+                + pricing_row * segment.ivf().num_docs() as f64
+        });
+        let scores = if clean && capacity > WorkUnits::ZERO && work_budget >= capacity * 0.3 {
+            router.precompute_scores(&query_f32)?
+        } else {
+            None
+        };
         let mut routing_workspace = RouterWorkspace::default();
-        let mut ranked = router.rank_clusters(&mut routing_workspace, &query_f32);
+        let mut ranked = match scores.as_deref() {
+            Some(scores) => {
+                router.rank_clusters_with_scores(&mut routing_workspace, &query_f32, Some(scores))
+            }
+            None => router.rank_clusters(&mut routing_workspace, &query_f32),
+        };
 
         // The global query bound, maintained at cluster boundaries; `||q||`
         // once, for the dot margin's Cauchy-Schwarz term.
@@ -274,8 +293,6 @@ where
         // Ranked clusters that did any work in any segment — the arming index's
         // denominator and the boundary at which the kth folds into the bound.
         let mut touched_clusters = 0u32;
-        // The probed cluster's gate survivors; allocated once, reused.
-        let mut survivors: Vec<Survivor> = Vec::new();
 
         for Candidate { sim, node: cluster } in &mut ranked {
             // Boundary rule: open iff remaining > 0. The tripping pull proves
@@ -394,25 +411,15 @@ where
                 cluster_scored = true;
                 stats.candidates_scored += survivors.len();
 
-                // Gate 5: fetch + score — one stride-sized read per survivor
-                // (the unit the pg-backed `Directory` serves zero-copy).
-                for &Survivor { row, doc } in &survivors {
-                    let vbytes = segment.vec.vector_bytes_for_row(row)?;
-                    let score = prepared.score_doc_bytes(&vbytes);
-                    // The skip is exact: `(s, t) < (ts, tt)` requires either
-                    // `s < ts`, or a tie the composite comparator resolves —
-                    // so a candidate rejected on similarity alone could never
-                    // have survived, and its tie-break conversion (a possible
-                    // dictionary lookup) is pure waste.
-                    if let Some(((threshold_score, _), _)) = &topn.threshold {
-                        if score < *threshold_score {
-                            continue;
-                        }
-                    }
-                    let segment_key = segment.tie.segment_sort_key(doc, score);
-                    let global_key = segment.tie.convert_segment_sort_key(segment_key);
-                    topn.push_unordered((score, global_key), DocAddress::new(segment.ord, doc));
-                }
+                score_survivors::<T, S>(
+                    &segment.vec,
+                    &mut segment.tie,
+                    segment.ord,
+                    &prepared,
+                    &survivors,
+                    &mut row_scratch,
+                    &mut topn,
+                )?;
             }
 
             if cluster_scored {
@@ -448,6 +455,69 @@ where
         .map(|cd| (cd.sort_key, cd.doc))
         .collect();
     Ok((hits, stats))
+}
+
+fn score_survivors<T, S>(
+    vectors: &VectorIndexReader,
+    tie: &mut S::Child,
+    ord: SegmentOrdinal,
+    prepared: &PreparedQuery<T>,
+    survivors: &[Survivor],
+    scratch: &mut Vec<u8>,
+    topn: &mut GlobalHeap<S, S::Comparator>,
+) -> crate::Result<()>
+where
+    T: VectorElement,
+    S: SortKeyComputer,
+{
+    let mut begin = 0;
+    while begin < survivors.len() {
+        let mut end = begin + 1;
+        while end < survivors.len()
+            && end - begin < 64
+            && survivors[end].row == survivors[end - 1].row + 1
+        {
+            end += 1;
+        }
+        let first = survivors[begin].row;
+        let range = first..survivors[end - 1].row + 1;
+        let mut accept = |row: usize, score: Score| {
+            if topn
+                .threshold
+                .as_ref()
+                .is_some_and(|((threshold, _), _)| score < *threshold)
+            {
+                return;
+            }
+            let doc = survivors[begin + row - first].doc;
+            let key = tie.segment_sort_key(doc, score);
+            let key = tie.convert_segment_sort_key(key);
+            topn.push_unordered((score, key), DocAddress::new(ord, doc));
+        };
+        if let Some(mut accumulator) = prepared.dot_accumulator() {
+            let stride = vectors.options().bytes_per_vector();
+            vectors.visit_vector_row_fragments(range, |row, offset, bytes| {
+                let score = if offset == 0 && bytes.len() == stride {
+                    Some(prepared.score_doc_bytes(bytes))
+                } else {
+                    prepared.score_doc_fragment(
+                        &mut accumulator,
+                        bytes,
+                        offset + bytes.len() == stride,
+                    )
+                };
+                if let Some(score) = score {
+                    accept(row, score);
+                }
+            })?;
+        } else {
+            vectors.visit_vector_rows(range, scratch, |row, bytes| {
+                accept(row, prepared.score_doc_bytes(bytes))
+            })?;
+        }
+        begin = end;
+    }
+    Ok(())
 }
 
 /// The query's global work budget and unit prices.

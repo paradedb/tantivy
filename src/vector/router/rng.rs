@@ -4,7 +4,7 @@ use crate::vector::ivf::{
     InMemoryStore, LazyStore, NeighborhoodGraphConfig, RelativeNeighborhoodGraph,
     ResumableSearchIterator, Workspace,
 };
-use crate::vector::IvfCentroids;
+use crate::vector::{IvfCentroids, Similarity};
 use crate::Executor;
 
 pub(super) fn build(
@@ -50,9 +50,8 @@ pub(super) fn open(
     let vectors = match options.dtype() {
         VectorDType::F32 => LazyStore::new(centroids, options.dim()),
     };
-    let adjacency = payload.read_bytes()?;
-    Ok(RelativeNeighborhoodGraph::open(
-        &adjacency,
+    Ok(RelativeNeighborhoodGraph::open_lazy(
+        payload,
         vectors,
         options.dim(),
         options.metric(),
@@ -64,11 +63,15 @@ pub(super) fn rank<'router, 'workspace>(
     router: &'router RelativeNeighborhoodGraph<LazyStore>,
     workspace: &'workspace mut Workspace,
     query: &'router [f32],
+    scores: Option<&'router [Similarity]>,
 ) -> ResumableSearchIterator<'router, 'workspace, LazyStore> {
     let seeds = (0..router.len())
         .step_by((router.len() / 8).max(1))
         .take(8)
         .map(|node| node as u32)
         .collect::<Vec<_>>();
-    router.search_iter(workspace, query, &seeds)
+    match scores {
+        Some(scores) => router.search_iter_with_scores(workspace, query, &seeds, scores),
+        None => router.search_iter(workspace, query, &seeds),
+    }
 }

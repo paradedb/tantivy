@@ -1299,6 +1299,60 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn precomputed_and_lazy_serial_search_preserve_results_and_work() -> crate::Result<()> {
+        for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+            let fixture = TestVectorIndex::builder(VectorDType::F32)
+                .metric(metric)
+                .selectivities(&[1.0])
+                .build()?;
+            let filter = TermQuery::new(
+                Term::from_field_text(fixture.label_field(), "selectivity_1"),
+                IndexRecordOption::Basic,
+            );
+            for fraction in [0.299, 0.3, 1.0] {
+                for k in [1, 10, FIXTURE_NUM_DOCS] {
+                    let params = AdaptiveProbeParams {
+                        max_probe_fraction: fraction,
+                        min_probe_clusters: 1,
+                    };
+                    let (actual, mut actual_stats) = run_global(
+                        &fixture.index,
+                        fixture.embedding_field(),
+                        &AllQuery,
+                        vec![0.5, 0.7],
+                        k,
+                        params.clone(),
+                    )?;
+                    let (expected, mut expected_stats) = run_global(
+                        &fixture.index,
+                        fixture.embedding_field(),
+                        &filter,
+                        vec![0.5, 0.7],
+                        k,
+                        params,
+                    )?;
+                    assert_eq!(actual.len(), expected.len());
+                    for ((actual_score, actual_doc), (expected_score, expected_doc)) in
+                        actual.iter().zip(&expected)
+                    {
+                        assert_eq!(actual_doc, expected_doc);
+                        assert_eq!(actual_score.to_bits(), expected_score.to_bits());
+                    }
+                    assert_eq!(actual_stats.filters_built, 0);
+                    actual_stats.filters_built = 0;
+                    expected_stats.filters_built = 0;
+                    assert_eq!(
+                        serde_json::to_value(actual_stats)?,
+                        serde_json::to_value(expected_stats)?,
+                        "{metric:?}, fraction={fraction}, k={k}",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// While the heap is still FILLING (k larger than everything seen),
     /// the bound never arms and nothing is ever skipped.
     #[test]
