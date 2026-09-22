@@ -25,6 +25,19 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
     /// This method may panic if the range requested is invalid.
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes>;
 
+    /// Visits consecutive borrowed chunks covering the requested range in order.
+    /// An empty range does not invoke `visitor`.
+    fn read_bytes_chunks(
+        &self,
+        range: Range<usize>,
+        visitor: &mut dyn FnMut(&[u8]),
+    ) -> io::Result<()> {
+        if !range.is_empty() {
+            visitor(&self.read_bytes(range)?);
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     async fn read_bytes_async(&self, _byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         Err(io::Error::new(
@@ -292,6 +305,27 @@ impl FileSlice {
             .read_bytes(self.range.start + range.start..self.range.start + range.end)
     }
 
+    /// Visits borrowed chunks within a range relative to this slice.
+    pub fn read_bytes_chunks(
+        &self,
+        range: Range<usize>,
+        visitor: &mut dyn FnMut(&[u8]),
+    ) -> io::Result<()> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "range out of bounds",
+            ));
+        }
+        if range.is_empty() {
+            return Ok(());
+        }
+        self.data.read_bytes_chunks(
+            self.range.start + range.start..self.range.start + range.end,
+            visitor,
+        )
+    }
+
     #[doc(hidden)]
     pub async fn read_bytes_slice_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         assert!(
@@ -358,6 +392,14 @@ impl FileSlice {
 impl FileHandle for FileSlice {
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
         self.read_bytes_slice(range)
+    }
+
+    fn read_bytes_chunks(
+        &self,
+        range: Range<usize>,
+        visitor: &mut dyn FnMut(&[u8]),
+    ) -> io::Result<()> {
+        FileSlice::read_bytes_chunks(self, range, visitor)
     }
 
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
@@ -478,6 +520,58 @@ mod tests {
     fn test_slice_read_slice() -> io::Result<()> {
         let slice_deref = FileSlice::new(Arc::new(&b"abcdef"[..]));
         assert_eq!(slice_deref.read_bytes_slice(1..4)?.as_ref(), b"bcd");
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_bytes_chunks_default_and_empty() -> io::Result<()> {
+        let handle: &dyn FileHandle = &(&b"abcdef"[..]);
+        let mut chunks = Vec::new();
+        handle.read_bytes_chunks(1..5, &mut |bytes| chunks.push(bytes.to_vec()))?;
+        handle.read_bytes_chunks(3..3, &mut |_| panic!("empty range visited"))?;
+        assert_eq!(chunks, vec![b"bcde".to_vec()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_bytes_chunks_nested_slice() -> io::Result<()> {
+        #[derive(Debug)]
+        struct Chunked;
+
+        impl HasLen for Chunked {
+            fn len(&self) -> usize {
+                8
+            }
+        }
+
+        impl FileHandle for Chunked {
+            fn read_bytes(&self, _: std::ops::Range<usize>) -> io::Result<crate::OwnedBytes> {
+                panic!("chunk override bypassed");
+            }
+
+            fn read_bytes_chunks(
+                &self,
+                range: std::ops::Range<usize>,
+                visitor: &mut dyn FnMut(&[u8]),
+            ) -> io::Result<()> {
+                for chunk in b"abcdefgh"[range].chunks(2) {
+                    visitor(chunk);
+                }
+                Ok(())
+            }
+        }
+
+        let slice = FileSlice::new(Arc::new(Chunked)).slice(1..7);
+        let nested = FileSlice::new(Arc::new(slice)).slice(1..5);
+        let mut chunks = Vec::new();
+        nested.read_bytes_chunks(1..4, &mut |bytes| chunks.push(bytes.to_vec()))?;
+        assert_eq!(chunks, vec![b"de".to_vec(), b"f".to_vec()]);
+        nested.read_bytes_chunks(4..4, &mut |_| panic!("empty range visited"))?;
+        for (start, end) in [(3, 2), (0, 5), (5, 5)] {
+            let range = start..end;
+            let err = nested.read_bytes_chunks(range, &mut |_| panic!("invalid range visited"));
+            assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
         Ok(())
     }
 
