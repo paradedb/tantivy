@@ -19,5 +19,3 @@ variable
 # for `sample record -p`
 profile.json
 profile.json.gz
-
-/tests/compat_tests_data/index_v8/.tantivy-*.lock
