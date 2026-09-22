@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use common::file_slice::DeferredFileSlice;
 use common::HasLen;
 
 use super::{fieldnorm_to_id, id_to_fieldnorm};
@@ -63,7 +64,17 @@ impl From<ReaderImplEnum> for FieldNormReader {
 #[derive(Clone)]
 enum ReaderImplEnum {
     FromFileSlice(FileSlice),
-    Const { num_docs: u32, fieldnorm_id: u8 },
+    Deferred {
+        source: Arc<DeferredFileSlice>,
+        num_docs: u32,
+    },
+    Posting {
+        num_docs: u32,
+    },
+    Const {
+        num_docs: u32,
+        fieldnorm_id: u8,
+    },
 }
 
 impl FieldNormReader {
@@ -84,11 +95,25 @@ impl FieldNormReader {
         ReaderImplEnum::FromFileSlice(fieldnorm_file).into()
     }
 
+    pub(crate) fn deferred(source: DeferredFileSlice, num_docs: u32) -> Self {
+        ReaderImplEnum::Deferred {
+            source: Arc::new(source),
+            num_docs,
+        }
+        .into()
+    }
+
+    pub(crate) fn posting(num_docs: u32) -> Self {
+        ReaderImplEnum::Posting { num_docs }.into()
+    }
+
     /// Returns the number of documents in this segment.
     pub fn num_docs(&self) -> u32 {
         match &self.0 {
             ReaderImplEnum::FromFileSlice(file_slice) => file_slice.len() as u32,
-            ReaderImplEnum::Const { num_docs, .. } => *num_docs,
+            ReaderImplEnum::Const { num_docs, .. }
+            | ReaderImplEnum::Deferred { num_docs, .. }
+            | ReaderImplEnum::Posting { num_docs } => *num_docs,
         }
     }
 
@@ -105,6 +130,13 @@ impl FieldNormReader {
                 .read_byte(doc_id as usize)
                 .expect("failed to read fieldnorm byte"),
             ReaderImplEnum::Const { fieldnorm_id, .. } => *fieldnorm_id,
+            ReaderImplEnum::Deferred { source, .. } => source
+                .open()
+                .and_then(|file| file.read_byte(doc_id as usize))
+                .expect("failed to read required legacy fieldnorm"),
+            ReaderImplEnum::Posting { .. } => {
+                panic!("posting-local norms require a matching posting")
+            }
         }
     }
 

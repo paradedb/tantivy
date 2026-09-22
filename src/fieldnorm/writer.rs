@@ -91,6 +91,21 @@ impl FieldNormsWriter {
         }
     }
 
+    pub(crate) fn take_field(
+        &mut self,
+        field: Field,
+        doc_id_map: Option<&DocIdMapping>,
+    ) -> Option<super::FieldNormReader> {
+        self.fieldnorms_buffers[field.field_id() as usize]
+            .take()
+            .map(|norms| {
+                let norms = doc_id_map
+                    .map(|mapping| mapping.remap(&norms))
+                    .unwrap_or(norms);
+                super::FieldNormReader::open(crate::directory::FileSlice::from(norms))
+            })
+    }
+
     /// Serialize the seen fieldnorm values to the serializer for all fields.
     pub fn serialize(
         &self,

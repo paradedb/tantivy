@@ -5,7 +5,7 @@ use common::{BinarySerializable, CountingWriter, VInt};
 
 use super::TermInfo;
 use crate::directory::{CompositeWrite, WritePtr};
-use crate::fieldnorm::FieldNormReader;
+use crate::fieldnorm::{FieldNormReader, NormStorage};
 use crate::index::{Bm25Params, Segment};
 use crate::positions::PositionSerializer;
 use crate::postings::compression::{BlockEncoder, VIntEncoder, COMPRESSION_BLOCK_SIZE};
@@ -74,6 +74,14 @@ impl InvertedIndexSerializer {
         Ok(inv_index_serializer)
     }
 
+    #[cfg(all(test, feature = "posting-norms"))]
+    pub(crate) fn use_legacy_norms(&mut self) -> io::Result<()> {
+        if let Some(writer) = self.posting_norms_write.take() {
+            writer.close()?;
+        }
+        Ok(())
+    }
+
     /// Must be called before starting pushing terms of
     /// a given field.
     ///
@@ -86,6 +94,15 @@ impl InvertedIndexSerializer {
     ) -> io::Result<FieldSerializer<'_>> {
         let field_entry: &FieldEntry = self.schema.get_field_entry(field);
         let term_dictionary_write = self.terms_write.for_field(field);
+        if self.posting_norms_write.is_some() {
+            let storage = if fieldnorm_reader.is_some() {
+                NormStorage::Posting
+            } else {
+                NormStorage::Disabled
+            };
+            self.postings_write
+                .for_field_with_idx(field, storage as usize);
+        }
         let postings_write = self.postings_write.for_field(field);
         let positions_write = self.positions_write.for_field(field);
         let index_record_option = field_entry
@@ -240,8 +257,24 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     /// Term frequencies and positions may be ignored by the serializer depending
     /// on the configuration of the field in the `Schema`.
     pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32, position_deltas: &[u32]) {
+        let norm = self
+            .postings_serializer
+            .fieldnorm_reader
+            .as_ref()
+            .map(|reader| reader.fieldnorm_id(doc_id));
+        self.write_doc_with_fieldnorm(doc_id, term_freq, position_deltas, norm);
+    }
+
+    pub(crate) fn write_doc_with_fieldnorm(
+        &mut self,
+        doc_id: DocId,
+        term_freq: u32,
+        position_deltas: &[u32],
+        norm: Option<u8>,
+    ) {
         self.current_term_info.doc_freq += 1;
-        self.postings_serializer.write_doc(doc_id, term_freq);
+        self.postings_serializer
+            .write_doc_with_fieldnorm(doc_id, term_freq, norm);
         if let Some(ref mut positions_serializer) = self.positions_serializer_opt.as_mut() {
             assert_eq!(term_freq as usize, position_deltas.len());
             positions_serializer.write_positions_delta(position_deltas);
@@ -262,7 +295,6 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
         };
 
         let has_posting_norms = self.posting_norms_write.is_some()
-            && self.postings_serializer.term_has_freq
             && self.postings_serializer.fieldnorm_reader.is_some();
         if has_posting_norms {
             let offset = self.posting_norms_write.as_ref().unwrap().written_bytes()
@@ -309,6 +341,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
 struct Block {
     doc_ids: [DocId; COMPRESSION_BLOCK_SIZE],
     term_freqs: [u32; COMPRESSION_BLOCK_SIZE],
+    fieldnorms: [u8; COMPRESSION_BLOCK_SIZE],
     len: usize,
 }
 
@@ -317,6 +350,7 @@ impl Block {
         Block {
             doc_ids: [0u32; COMPRESSION_BLOCK_SIZE],
             term_freqs: [0u32; COMPRESSION_BLOCK_SIZE],
+            fieldnorms: [0u8; COMPRESSION_BLOCK_SIZE],
             len: 0,
         }
     }
@@ -460,17 +494,11 @@ impl PostingsSerializer {
             }
             let mut blockwand_params = (0u8, 0u32);
             if let Some(bm25_weight) = self.bm25_weight.as_ref() {
-                if let Some(fieldnorm_reader) = self.fieldnorm_reader.as_ref() {
-                    let docs = self.block.doc_ids().iter().cloned();
+                if self.fieldnorm_reader.is_some() {
                     let term_freqs = self.block.term_freqs().iter().cloned();
-                    let fieldnorms = docs.map(|doc| fieldnorm_reader.fieldnorm_id(doc));
+                    let fieldnorms = self.block.fieldnorms[..self.block.len].iter().copied();
                     blockwand_params = fieldnorms
                         .zip(term_freqs)
-                        .inspect(|&(norm, _)| {
-                            if cfg!(feature = "posting-norms") {
-                                self.posting_norms.push(norm);
-                            }
-                        })
                         .max_by(
                             |(left_fieldnorm_id, left_term_freq),
                              (right_fieldnorm_id, right_term_freq)| {
@@ -496,6 +524,20 @@ impl PostingsSerializer {
     /// * doc_id - the document id.
     /// * term_freq - the term frequency within the document.
     pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32) {
+        let norm = self
+            .fieldnorm_reader
+            .as_ref()
+            .map(|reader| reader.fieldnorm_id(doc_id));
+        self.write_doc_with_fieldnorm(doc_id, term_freq, norm);
+    }
+
+    fn write_doc_with_fieldnorm(&mut self, doc_id: DocId, term_freq: u32, norm: Option<u8>) {
+        self.block.fieldnorms[self.block.len] = norm.unwrap_or(0);
+        if cfg!(feature = "posting-norms") {
+            if let Some(norm) = norm {
+                self.posting_norms.push(norm);
+            }
+        }
         self.block.append_doc(doc_id, term_freq);
         if self.block.is_full() {
             self.write_block();
@@ -509,16 +551,6 @@ impl PostingsSerializer {
         output_write: &mut impl std::io::Write,
     ) -> io::Result<()> {
         if !self.block.is_empty() {
-            if cfg!(feature = "posting-norms") && self.term_has_freq {
-                if let Some(norms) = &self.fieldnorm_reader {
-                    self.posting_norms.extend(
-                        self.block
-                            .doc_ids()
-                            .iter()
-                            .map(|&doc| norms.fieldnorm_id(doc)),
-                    );
-                }
-            }
             // we have doc ids waiting to be written
             // this happens when the number of doc ids is
             // not a perfect multiple of our block size.

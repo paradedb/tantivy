@@ -8,6 +8,7 @@ use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
 
 use crate::docset::{DocSet, TERMINATED};
+use crate::fieldnorm::FieldNormReader;
 use crate::postings::{Postings, SegmentPostings};
 use crate::DocId;
 
@@ -27,15 +28,21 @@ pub(crate) fn next_mapped_doc(
 
 /// One segment's postings, positioned on a document that survives the merge mapping.
 struct MappedPostings<'a> {
+    segment_ord: usize,
     postings: SegmentPostings,
     mapping: &'a [Option<DocId>],
     current_doc: DocId,
 }
 
 impl<'a> MappedPostings<'a> {
-    fn new(mut postings: SegmentPostings, mapping: &'a [Option<DocId>]) -> Option<Self> {
+    fn new(
+        segment_ord: usize,
+        mut postings: SegmentPostings,
+        mapping: &'a [Option<DocId>],
+    ) -> Option<Self> {
         let current_doc = next_mapped_doc(&mut postings, mapping)?;
         Some(Self {
+            segment_ord,
             postings,
             mapping,
             current_doc,
@@ -106,7 +113,9 @@ impl<'a> PostingsMerger<'a> {
         let (lower, _) = segments.size_hint();
         let mut heap = BinaryHeap::with_capacity(lower);
         for (segment_ord, postings) in segments {
-            if let Some(cursor) = MappedPostings::new(postings, &doc_id_map[segment_ord]) {
+            if let Some(cursor) =
+                MappedPostings::new(segment_ord, postings, &doc_id_map[segment_ord])
+            {
                 heap.push(Reverse(Box::new(cursor)));
             }
         }
@@ -158,6 +167,13 @@ impl<'a> PostingsMerger<'a> {
             .0
             .postings
             .term_freq()
+    }
+
+    pub(crate) fn fieldnorm_id(&self, fallback_readers: &[FieldNormReader]) -> u8 {
+        let cursor = &self.heap.peek().expect("advance() returned true").0;
+        cursor.postings.fieldnorm_id().unwrap_or_else(|| {
+            fallback_readers[cursor.segment_ord].fieldnorm_id(cursor.postings.doc())
+        })
     }
 
     /// Fill `output` with the current document's positions.

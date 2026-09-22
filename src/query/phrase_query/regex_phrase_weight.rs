@@ -48,9 +48,7 @@ impl RegexPhraseWeight {
 
     fn fieldnorm_reader(&self, reader: &SegmentReader) -> crate::Result<FieldNormReader> {
         if self.similarity_weight_opt.is_some() {
-            if let Some(fieldnorm_reader) = reader.fieldnorms_readers().get_field(self.field)? {
-                return Ok(fieldnorm_reader);
-            }
+            return reader.scoring_fieldnorm_reader(self.field);
         }
         Ok(FieldNormReader::constant(reader.max_doc(), 1))
     }
@@ -303,8 +301,7 @@ impl Weight for RegexPhraseWeight {
         if scorer.seek(doc) != doc {
             return Err(does_not_match(doc));
         }
-        let fieldnorm_reader = self.fieldnorm_reader(reader)?;
-        let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
+        let fieldnorm_id = scorer.fieldnorm_id();
         let phrase_count = scorer.phrase_count();
         let mut explanation = Explanation::new("Phrase Scorer", scorer.score());
         if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
