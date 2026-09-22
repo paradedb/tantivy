@@ -21,6 +21,9 @@ pub mod serializer;
 pub(crate) mod skip;
 mod term_info;
 pub(crate) mod subblock;
+pub(crate) mod term_norms;
+
+pub use term_norms::{posting_norm_reads, set_posting_norms_enabled};
 
 pub use loaded_postings::LoadedPostings;
 pub(crate) use merger::{next_mapped_doc, PostingsMerger};
@@ -767,4 +770,13 @@ mod bench {
             s
         });
     }
+}
+
+thread_local! {
+    static SUBBLOCK_PRUNING_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[doc(hidden)]
+pub fn set_subblock_pruning_enabled(enabled: bool) -> bool {
+    SUBBLOCK_PRUNING_ENABLED.replace(enabled)
 }

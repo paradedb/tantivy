@@ -87,7 +87,9 @@ impl TermScorer {
     }
 
     pub fn fieldnorm_id(&self) -> u8 {
-        self.fieldnorm_reader.fieldnorm_id(self.doc())
+        self.postings
+            .block_cursor
+            .fieldnorm_id_at(self.postings.block_offset(), &self.fieldnorm_reader)
     }
 
     pub fn explain(&self) -> Explanation {
@@ -132,7 +134,9 @@ impl TermScorer {
     }
 
     pub(crate) fn subblock_bound(&self) -> Option<(DocId, Score)> {
-        self.postings.block_cursor.subblock_bound(self.postings.block_offset(), &self.similarity_weight)
+        self.postings
+            .block_cursor
+            .subblock_bound(self.postings.block_offset(), &self.similarity_weight)
     }
 
     /// Returns a mutable reference to the underlying block cursor.
@@ -215,7 +219,14 @@ mod tests {
         crate::assert_nearly_equals!(max_scorer, 1.3990127);
         assert_eq!(term_scorer.doc(), 2);
         assert_eq!(term_scorer.term_freq(), 3);
-        assert_nearly_equals!(term_scorer.block_max_score(), if cfg!(feature = "subblock-pruning") {1.3862944} else {1.3676447});
+        assert_nearly_equals!(
+            term_scorer.block_max_score(),
+            if cfg!(feature = "subblock-pruning") {
+                1.3862944
+            } else {
+                1.3676447
+            }
+        );
         assert_nearly_equals!(term_scorer.score(), 1.0892314);
         assert_eq!(term_scorer.advance(), 3);
         assert_eq!(term_scorer.doc(), 3);
@@ -316,7 +327,14 @@ mod tests {
         assert_nearly_equals!(docs.block_max_score(), 3.4597192);
         docs.seek_block(256);
         // the block is not loaded yet.
-        assert_nearly_equals!(docs.block_max_score(), if cfg!(feature = "subblock-pruning") {3.9539647} else {5.2971773});
+        assert_nearly_equals!(
+            docs.block_max_score(),
+            if cfg!(feature = "subblock-pruning") {
+                3.9539647
+            } else {
+                5.2971773
+            }
+        );
         assert_eq!(256, docs.seek(256));
         assert_nearly_equals!(docs.block_max_score(), 3.9539647);
     }

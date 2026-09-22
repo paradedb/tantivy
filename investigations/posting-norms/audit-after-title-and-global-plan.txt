@@ -1,0 +1,25 @@
+Limit  (cost=10.00..22.41 rows=10 width=31) (actual rows=10.00 loops=1)
+  Output: id, title, by, score, (pdb.score(id))
+  Buffers: shared hit=2045
+  ->  Custom Scan (ParadeDB Base Scan) on public.hn_items  (cost=10.00..22.41 rows=10 width=31) (actual rows=10.00 loops=1)
+        Output: id, title, by, score, pdb.score(id)
+        Table: hn_items
+        Index: hn_items_idx
+        Segment Count: 10
+        Worker Selection: Cost model
+        Heap Fetches: 10
+        Virtual Tuples: 0
+        Invisible Tuples: 0
+        IO Breakdown: {"scope":"this backend; ExecCustomScan calls only","total":{"hits":2045,"reads":0},"components":{"fast":{"hits":53,"reads":0},"fieldnorm":{"hits":1655,"reads":0},"heap":{"hits":10,"reads":0},"idx":{"hits":114,"reads":0},"metadata":{"hits":59,"reads":0},"pos":{"hits":80,"reads":0},"term":{"hits":74,"reads":0}},"file_read_calls":{"fast/read_bytes":80,"fieldnorm/read_byte":2380,"fieldnorm/read_bytes":20,"idx/read_bytes":50,"pos/read_bytes":40,"term/read_bytes":90},"unique_pages_scope":"RelationBufferAccess only; excludes heap pages","tracked":{"hits":2045,"reads":0,"unique_pages":1997},"untracked":{"hits":0,"reads":0},"buckets":{"collect/fieldnorm/block_map":{"hits":20,"reads":0},"collect/fieldnorm/read_byte":{"hits":1625,"reads":0},"collect/fieldnorm/read_bytes":{"hits":10,"reads":0},"collect/idx/read_bytes":{"hits":24,"reads":0},"collect/pos/block_map":{"hits":50,"reads":0},"collect/pos/read_bytes":{"hits":30,"reads":0},"execute/fast/block_map":{"hits":16,"reads":0},"execute/fast/read_bytes":{"hits":37,"reads":0},"execute/heap/visibility_and_fetch":{"hits":10,"reads":0},"reader_setup/metadata/direct":{"hits":59,"reads":0},"weight/idx/block_map":{"hits":70,"reads":0},"weight/idx/read_bytes":{"hits":20,"reads":0},"weight/term/block_map":{"hits":20,"reads":0},"weight/term/read_bytes":{"hits":54,"reads":0}},"unique_pages_by_bucket":{"collect/fieldnorm/block_map":20,"collect/fieldnorm/read_byte":1601,"collect/fieldnorm/read_bytes":10,"collect/idx/read_bytes":24,"collect/pos/block_map":50,"collect/pos/read_bytes":30,"execute/fast/block_map":16,"execute/fast/read_bytes":37,"reader_setup/metadata/direct":55,"weight/idx/block_map":70,"weight/idx/read_bytes":20,"weight/term/block_map":20,"weight/term/read_bytes":54}}
+        Exec Method: TopKScanExecState
+        Scores: true
+           TopK Order By: pdb.score() desc
+           TopK Limit: 10
+           Queries: 1
+        Tantivy Query: {"boolean":{"must":[{"with_index":{"query":{"term":{"field":"title","value":"postgres"}}}},{"with_index":{"query":{"term":{"field":"title","value":"database"}}}}]}}
+        Buffers: shared hit=2045
+Settings: effective_cache_size = '8GB', work_mem = '16MB', max_parallel_workers = '6', random_page_cost = '1.1', jit = 'off', max_parallel_workers_per_gather = '0'
+Planning:
+  Buffers: shared hit=264
+Planning Time: 0.253 ms
+Execution Time: 1.819 ms

@@ -36,6 +36,13 @@ fn path_for_version(version: &str) -> String {
     format!("./tests/compat_tests_data/index_v{version}/")
 }
 
+#[test]
+#[cfg(not(feature = "quickwit"))]
+fn test_format_9() {
+    let index = Index::open_in_dir(path_for_version("9")).expect("Failed to open index");
+    assert_date_time_precision(&index, DateTimePrecision::Nanoseconds);
+}
+
 /// feature flag quickwit uses a different dictionary type
 #[test]
 #[cfg(not(feature = "quickwit"))]

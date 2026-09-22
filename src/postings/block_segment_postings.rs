@@ -32,6 +32,8 @@ pub struct BlockSegmentPostings {
     data: OwnedBytes,
     skip_reader: SkipReader,
     subblock_summaries: OwnedBytes,
+    term_norm_offset: Option<u64>,
+    term_norms: Option<super::term_norms::TermNormReader>,
 }
 
 pub(crate) fn decode_bitpacked_block(
@@ -101,6 +103,7 @@ impl BlockSegmentPostings {
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
+        let (term_norm_offset, bytes) = super::term_norms::read_header(bytes)?;
         let (subblock_summaries, bytes) = super::subblock::read_summaries(doc_freq, bytes)?;
         let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
         let skip_reader = match skip_data_opt {
@@ -136,6 +139,8 @@ impl BlockSegmentPostings {
             data: postings_data,
             skip_reader,
             subblock_summaries,
+            term_norm_offset,
+            term_norms: None,
         };
         block_segment_postings.load_block();
         Ok(block_segment_postings)
@@ -152,18 +157,20 @@ impl BlockSegmentPostings {
         bm25_weight: &Bm25Weight,
     ) -> Score {
         #[cfg(test)]
-        if let Some(bound) = crate::fieldnorm::threshold_trace::block_bound(
-            self.skip_reader.last_doc_in_block(),
-        ) {
+        if let Some(bound) =
+            crate::fieldnorm::threshold_trace::block_bound(self.skip_reader.last_doc_in_block())
+        {
             return bound;
         }
         if let Some(score) = self.block_max_score_cache {
             return score;
         }
         if let Some(summaries) = self.current_subblock_summaries() {
-            let bound = summaries.chunks_exact(2)
+            let bound = summaries
+                .chunks_exact(2)
                 .map(|bytes| super::subblock::SubblockSummary::from_bytes(bytes).bound(bm25_weight))
-                .reduce(Score::max).unwrap_or(0.0);
+                .reduce(Score::max)
+                .unwrap_or(0.0);
             self.block_max_score_cache = Some(bound);
             return bound;
         }
@@ -180,8 +187,8 @@ impl BlockSegmentPostings {
             let _phase = crate::fieldnorm::threshold_trace::bound_phase();
             let docs = self.doc_decoder.output_array().iter().cloned();
             let freqs = self.freq_decoder.output_array().iter().cloned();
-            let bm25_scores = docs.zip(freqs).map(|(doc, term_freq)| {
-                let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
+            let bm25_scores = docs.zip(freqs).enumerate().map(|(offset, (_, term_freq))| {
+                let fieldnorm_id = self.fieldnorm_id_at(offset, fieldnorm_reader);
                 bm25_weight.score(fieldnorm_id, term_freq)
             });
             let block_max_score = max_score(bm25_scores).unwrap_or(0.0);
@@ -199,8 +206,35 @@ impl BlockSegmentPostings {
         self.freq_reading_option
     }
 
+    pub(crate) fn set_term_norm_source(
+        &mut self,
+        source: std::sync::Arc<common::file_slice::DeferredFileSlice>,
+    ) {
+        self.term_norms = self.term_norm_offset.and_then(|offset| {
+            super::term_norms::TermNormReader::new(source, offset, self.doc_freq)
+        });
+    }
+
+    pub(crate) fn disable_term_norms(&mut self) {
+        self.term_norms = None;
+    }
+
+    pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
+        if let Some(norms) = &self.term_norms {
+            let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + offset;
+            norms
+                .read(ordinal)
+                .expect("failed to read posting fieldnorm")
+        } else {
+            fallback.fieldnorm_id(self.doc(offset))
+        }
+    }
+
     fn current_subblock_summaries(&self) -> Option<&[u8]> {
-        if self.subblock_summaries.is_empty() || self.freq_reading_option != FreqReadingOption::ReadFreq {
+        if !super::SUBBLOCK_PRUNING_ENABLED.get()
+            || self.subblock_summaries.is_empty()
+            || self.freq_reading_option != FreqReadingOption::ReadFreq
+        {
             return None;
         }
         let remaining = self.skip_reader.remaining_docs() as usize;
@@ -209,10 +243,15 @@ impl BlockSegmentPostings {
         Some(&self.subblock_summaries[start..start + len])
     }
 
-    pub(crate) fn subblock_bound(&self, offset: usize, weight: &Bm25Weight) -> Option<(DocId, Score)> {
+    pub(crate) fn subblock_bound(
+        &self,
+        offset: usize,
+        weight: &Bm25Weight,
+    ) -> Option<(DocId, Score)> {
         let summaries = self.current_subblock_summaries()?;
         let group = offset / super::subblock::SUBBLOCK_SIZE;
-        let summary = super::subblock::SubblockSummary::from_bytes(&summaries[group * 2..group * 2 + 2]);
+        let summary =
+            super::subblock::SubblockSummary::from_bytes(&summaries[group * 2..group * 2 + 2]);
         let end = ((group + 1) * super::subblock::SUBBLOCK_SIZE).min(self.block_len()) - 1;
         Some((self.doc(end), summary.bound(weight)))
     }
@@ -228,7 +267,11 @@ impl BlockSegmentPostings {
     //
     // This does not reset the positions list.
     pub(crate) fn reset(&mut self, doc_freq: u32, postings_data: OwnedBytes) -> io::Result<()> {
-        let (subblock_summaries, postings_data) = super::subblock::read_summaries(doc_freq, postings_data)?;
+        let (term_norm_offset, postings_data) = super::term_norms::read_header(postings_data)?;
+        self.term_norm_offset = term_norm_offset;
+        self.term_norms = None;
+        let (subblock_summaries, postings_data) =
+            super::subblock::read_summaries(doc_freq, postings_data)?;
         self.subblock_summaries = subblock_summaries;
         let (skip_data_opt, postings_data) =
             split_into_skips_and_postings(doc_freq, postings_data)?;
@@ -474,6 +517,8 @@ impl BlockSegmentPostings {
             data: OwnedBytes::empty(),
             skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic),
             subblock_summaries: OwnedBytes::empty(),
+            term_norm_offset: None,
+            term_norms: None,
         }
     }
 

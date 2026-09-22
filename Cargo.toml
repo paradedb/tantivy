@@ -172,6 +172,7 @@ stopwords = []
 block-min-fieldnorm = []
 tf-class-min-fieldnorm = []
 subblock-pruning = []
+posting-norms = []
 
 lz4-compression = ["lz4_flex"]
 zstd-compression = ["zstd"]

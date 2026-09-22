@@ -1,0 +1,16 @@
+{
+  "saved_pruning_branch": "codex/subblock-pruning-prototype",
+  "saved_pruning_commit": "dc193cf83",
+  "new_branch": "codex/lazy-posting-norms",
+  "binaries_before": {
+    "/Users/mingying/benchmarker/bm25-io-investigation-20260921/runtime/pg18/lib/postgresql/pg_search.dylib": "a6fc735ce77ce943f56927ab5a5a2dc2086e3f73a4c9e7c2e7953f6b4817a508",
+    "/Users/mingying/benchmarker/hn-page-bitmap/native-topk/main-runtime/pg18/lib/postgresql/pg_search.dylib": "ebb686b263efe400a90604ba3d06ebc871ead7e6943a9a0661db3085a594a660"
+  },
+  "prototype_binary_sha256": "4275ed183c5d8744180a8f57c39c42de50403b01d4a5cfe8654f908a2eb04e26",
+  "audited_binary_sha256": "2509be660b0628368212c4403fb9777f976bed4cca788221aa3af9c7f65fac1a",
+  "persistent_index": "public.hn_items_idx on port 29950; rebuilt and committed; leave installed",
+  "audit_changes": [
+    "avoid norm reads when scoring is disabled",
+    "cached byte reads without cloning OwnedBytes"
+  ]
+}

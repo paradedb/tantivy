@@ -1,0 +1,1490 @@
+{
+  "title-single": {
+    "query": "SELECT id, title, by, score FROM hn_items WHERE title === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "global": [
+        [
+          173402,
+          "Database agnostic != database ignorant",
+          "nreece",
+          9,
+          6.2588186
+        ],
+        [
+          3940737,
+          "Stig Database",
+          "jamesbritt",
+          4,
+          5.936894
+        ],
+        [
+          458864,
+          "Database Troubles ",
+          "nickb",
+          11,
+          5.936894
+        ],
+        [
+          22034176,
+          "Nutrition Database",
+          "bookofjoe",
+          2,
+          5.936894
+        ],
+        [
+          1265075,
+          "Database Development",
+          "symtex",
+          1,
+          5.936894
+        ],
+        [
+          5020007,
+          "Database Expert",
+          "philipzhong1980",
+          1,
+          5.936894
+        ],
+        [
+          14862644,
+          "Cinemetrics \u2013 Database",
+          "jonbaer",
+          2,
+          5.936894
+        ],
+        [
+          7964029,
+          "FreeTuxTV Database",
+          "TuxLyn",
+          1,
+          5.936894
+        ],
+        [
+          19186171,
+          "Database Encryption",
+          "baby",
+          2,
+          5.936894
+        ],
+        [
+          22985444,
+          "Database Marketing",
+          "godelmachine",
+          2,
+          5.936894
+        ]
+      ],
+      "local": [
+        [
+          173402,
+          "Database agnostic != database ignorant",
+          "nreece",
+          9,
+          6.2588186
+        ],
+        [
+          3940737,
+          "Stig Database",
+          "jamesbritt",
+          4,
+          5.936894
+        ],
+        [
+          458864,
+          "Database Troubles ",
+          "nickb",
+          11,
+          5.936894
+        ],
+        [
+          22034176,
+          "Nutrition Database",
+          "bookofjoe",
+          2,
+          5.936894
+        ],
+        [
+          1265075,
+          "Database Development",
+          "symtex",
+          1,
+          5.936894
+        ],
+        [
+          5020007,
+          "Database Expert",
+          "philipzhong1980",
+          1,
+          5.936894
+        ],
+        [
+          14862644,
+          "Cinemetrics \u2013 Database",
+          "jonbaer",
+          2,
+          5.936894
+        ],
+        [
+          7964029,
+          "FreeTuxTV Database",
+          "TuxLyn",
+          1,
+          5.936894
+        ],
+        [
+          19186171,
+          "Database Encryption",
+          "baby",
+          2,
+          5.936894
+        ],
+        [
+          22985444,
+          "Database Marketing",
+          "godelmachine",
+          2,
+          5.936894
+        ]
+      ]
+    },
+    "summary": {
+      "global": {
+        "execution_ms": 1.1925,
+        "shared_hits": 1052.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 716.0,
+        "posting_norm_hits": 0.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 2038.0,
+        "local_norm_lookups": 0.0
+      },
+      "local": {
+        "execution_ms": 0.6944999999999999,
+        "shared_hits": 428.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "posting_norm_hits": 62.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 0.0,
+        "local_norm_lookups": 2038.0
+      }
+    },
+    "storage": [
+      {
+        "docs": 2841903,
+        "segment": "eb76c643dffe4ce18003d09dce2f1863",
+        "postings_bytes": 268808425,
+        "fieldnorm_bytes": 5683850,
+        "posting_norm_bytes": 117156283
+      },
+      {
+        "docs": 2838888,
+        "segment": "b186860cda6c4aea8afafba1198c6ab9",
+        "postings_bytes": 269048221,
+        "fieldnorm_bytes": 5677820,
+        "posting_norm_bytes": 117199981
+      },
+      {
+        "docs": 2848277,
+        "segment": "09e6d775f1e3435881bfa65a659da170",
+        "postings_bytes": 269173003,
+        "fieldnorm_bytes": 5696598,
+        "posting_norm_bytes": 117123307
+      },
+      {
+        "docs": 2841222,
+        "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+        "postings_bytes": 269307631,
+        "fieldnorm_bytes": 5682488,
+        "posting_norm_bytes": 117320259
+      },
+      {
+        "docs": 2844031,
+        "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+        "postings_bytes": 269551680,
+        "fieldnorm_bytes": 5688106,
+        "posting_norm_bytes": 117422007
+      },
+      {
+        "docs": 2860468,
+        "segment": "952f1be13273443181ade989398abb9b",
+        "postings_bytes": 272181951,
+        "fieldnorm_bytes": 5720980,
+        "posting_norm_bytes": 119337827
+      },
+      {
+        "docs": 2902246,
+        "segment": "9bfdcce177344e53b0af62abd21ab30a",
+        "postings_bytes": 276012513,
+        "fieldnorm_bytes": 5804536,
+        "posting_norm_bytes": 120821681
+      },
+      {
+        "docs": 2903133,
+        "segment": "f95824e6498d4161a8258e04c2d939c3",
+        "postings_bytes": 276231942,
+        "fieldnorm_bytes": 5806310,
+        "posting_norm_bytes": 121160453
+      },
+      {
+        "docs": 2989299,
+        "segment": "722b2cc326774eab96019ec88ce833a7",
+        "postings_bytes": 283545294,
+        "fieldnorm_bytes": 5978642,
+        "posting_norm_bytes": 124281391
+      },
+      {
+        "docs": 2868090,
+        "segment": "f2cb57ddb7764036a46406913fb0a474",
+        "postings_bytes": 272717621,
+        "fieldnorm_bytes": 5736224,
+        "posting_norm_bytes": 119546168
+      }
+    ],
+    "index_size_bytes": 13220569088,
+    "identical_rows_and_scores": true,
+    "identical_norm_lookup_count": true
+  },
+  "title-and": {
+    "query": "SELECT id, title, by, score FROM hn_items WHERE title === 'postgres' AND title === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "global": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "local": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ]
+    },
+    "summary": {
+      "global": {
+        "execution_ms": 1.9435,
+        "shared_hits": 2045.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 1655.0,
+        "posting_norm_hits": 0.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 2380.0,
+        "local_norm_lookups": 0.0
+      },
+      "local": {
+        "execution_ms": 0.9715,
+        "shared_hits": 492.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "posting_norm_hits": 72.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 0.0,
+        "local_norm_lookups": 2380.0
+      }
+    },
+    "storage": [
+      {
+        "docs": 2841903,
+        "segment": "eb76c643dffe4ce18003d09dce2f1863",
+        "postings_bytes": 268808425,
+        "fieldnorm_bytes": 5683850,
+        "posting_norm_bytes": 117156283
+      },
+      {
+        "docs": 2838888,
+        "segment": "b186860cda6c4aea8afafba1198c6ab9",
+        "postings_bytes": 269048221,
+        "fieldnorm_bytes": 5677820,
+        "posting_norm_bytes": 117199981
+      },
+      {
+        "docs": 2848277,
+        "segment": "09e6d775f1e3435881bfa65a659da170",
+        "postings_bytes": 269173003,
+        "fieldnorm_bytes": 5696598,
+        "posting_norm_bytes": 117123307
+      },
+      {
+        "docs": 2841222,
+        "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+        "postings_bytes": 269307631,
+        "fieldnorm_bytes": 5682488,
+        "posting_norm_bytes": 117320259
+      },
+      {
+        "docs": 2844031,
+        "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+        "postings_bytes": 269551680,
+        "fieldnorm_bytes": 5688106,
+        "posting_norm_bytes": 117422007
+      },
+      {
+        "docs": 2860468,
+        "segment": "952f1be13273443181ade989398abb9b",
+        "postings_bytes": 272181951,
+        "fieldnorm_bytes": 5720980,
+        "posting_norm_bytes": 119337827
+      },
+      {
+        "docs": 2902246,
+        "segment": "9bfdcce177344e53b0af62abd21ab30a",
+        "postings_bytes": 276012513,
+        "fieldnorm_bytes": 5804536,
+        "posting_norm_bytes": 120821681
+      },
+      {
+        "docs": 2903133,
+        "segment": "f95824e6498d4161a8258e04c2d939c3",
+        "postings_bytes": 276231942,
+        "fieldnorm_bytes": 5806310,
+        "posting_norm_bytes": 121160453
+      },
+      {
+        "docs": 2989299,
+        "segment": "722b2cc326774eab96019ec88ce833a7",
+        "postings_bytes": 283545294,
+        "fieldnorm_bytes": 5978642,
+        "posting_norm_bytes": 124281391
+      },
+      {
+        "docs": 2868090,
+        "segment": "f2cb57ddb7764036a46406913fb0a474",
+        "postings_bytes": 272717621,
+        "fieldnorm_bytes": 5736224,
+        "posting_norm_bytes": 119546168
+      }
+    ],
+    "index_size_bytes": 13220569088,
+    "identical_rows_and_scores": true,
+    "identical_norm_lookup_count": true
+  },
+  "title-or": {
+    "query": "SELECT id, title, by, score FROM hn_items WHERE title === 'postgres' OR title === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "global": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ],
+      "local": [
+        [
+          20514962,
+          "Scaling Postgres Database",
+          "eloycoto",
+          14,
+          10.2370205
+        ],
+        [
+          19393882,
+          "Postgres Database Bloat Analysis",
+          "craigkerstiens",
+          3,
+          8.411795
+        ],
+        [
+          26674756,
+          "Securing a Postgres Database",
+          "bryanmikaelian",
+          312,
+          8.411795
+        ],
+        [
+          18257765,
+          "Commenting your Postgres database",
+          "craigkerstiens",
+          2,
+          8.411795
+        ],
+        [
+          15212728,
+          "Better database migrations in Postgres",
+          "craigkerstiens",
+          2,
+          7.138944
+        ],
+        [
+          25884450,
+          "Postgres: The Batteries Included Database",
+          "plaur782",
+          6,
+          7.138944
+        ],
+        [
+          26006719,
+          "Cleaning Up Your Postgres Database",
+          "tapoueh",
+          5,
+          7.138944
+        ],
+        [
+          26040593,
+          "Cleaning Up Your Postgres Database",
+          "fdr",
+          3,
+          7.138944
+        ],
+        [
+          15235221,
+          "Better Database Migrations in Postgres",
+          "jbreihan",
+          316,
+          7.138944
+        ],
+        [
+          26367080,
+          "Cleaning Up Your Postgres Database",
+          "plaur782",
+          120,
+          7.138944
+        ]
+      ]
+    },
+    "summary": {
+      "global": {
+        "execution_ms": 2.848,
+        "shared_hits": 2774.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 2384.0,
+        "posting_norm_hits": 0.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 7297.0,
+        "local_norm_lookups": 0.0
+      },
+      "local": {
+        "execution_ms": 1.0234999999999999,
+        "shared_hits": 492.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "posting_norm_hits": 72.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 0.0,
+        "local_norm_lookups": 7297.0
+      }
+    },
+    "storage": [
+      {
+        "docs": 2841903,
+        "segment": "eb76c643dffe4ce18003d09dce2f1863",
+        "postings_bytes": 268808425,
+        "fieldnorm_bytes": 5683850,
+        "posting_norm_bytes": 117156283
+      },
+      {
+        "docs": 2838888,
+        "segment": "b186860cda6c4aea8afafba1198c6ab9",
+        "postings_bytes": 269048221,
+        "fieldnorm_bytes": 5677820,
+        "posting_norm_bytes": 117199981
+      },
+      {
+        "docs": 2848277,
+        "segment": "09e6d775f1e3435881bfa65a659da170",
+        "postings_bytes": 269173003,
+        "fieldnorm_bytes": 5696598,
+        "posting_norm_bytes": 117123307
+      },
+      {
+        "docs": 2841222,
+        "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+        "postings_bytes": 269307631,
+        "fieldnorm_bytes": 5682488,
+        "posting_norm_bytes": 117320259
+      },
+      {
+        "docs": 2844031,
+        "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+        "postings_bytes": 269551680,
+        "fieldnorm_bytes": 5688106,
+        "posting_norm_bytes": 117422007
+      },
+      {
+        "docs": 2860468,
+        "segment": "952f1be13273443181ade989398abb9b",
+        "postings_bytes": 272181951,
+        "fieldnorm_bytes": 5720980,
+        "posting_norm_bytes": 119337827
+      },
+      {
+        "docs": 2902246,
+        "segment": "9bfdcce177344e53b0af62abd21ab30a",
+        "postings_bytes": 276012513,
+        "fieldnorm_bytes": 5804536,
+        "posting_norm_bytes": 120821681
+      },
+      {
+        "docs": 2903133,
+        "segment": "f95824e6498d4161a8258e04c2d939c3",
+        "postings_bytes": 276231942,
+        "fieldnorm_bytes": 5806310,
+        "posting_norm_bytes": 121160453
+      },
+      {
+        "docs": 2989299,
+        "segment": "722b2cc326774eab96019ec88ce833a7",
+        "postings_bytes": 283545294,
+        "fieldnorm_bytes": 5978642,
+        "posting_norm_bytes": 124281391
+      },
+      {
+        "docs": 2868090,
+        "segment": "f2cb57ddb7764036a46406913fb0a474",
+        "postings_bytes": 272717621,
+        "fieldnorm_bytes": 5736224,
+        "posting_norm_bytes": 119546168
+      }
+    ],
+    "index_size_bytes": 13220569088,
+    "identical_rows_and_scores": true,
+    "identical_norm_lookup_count": true
+  },
+  "text-single": {
+    "query": "SELECT id, title, by, score FROM hn_items WHERE text === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "global": [
+        [
+          767773,
+          "India email database",
+          "feros1990",
+          1,
+          10.538096
+        ],
+        [
+          4145544,
+          "Restaurant Database Software ",
+          "chdexperts",
+          1,
+          10.161247
+        ],
+        [
+          17698365,
+          "",
+          "komali2",
+          0,
+          10.054385
+        ],
+        [
+          10082949,
+          "",
+          "Nadya",
+          0,
+          9.99126
+        ],
+        [
+          17500899,
+          "",
+          "kgwgk",
+          0,
+          9.99126
+        ],
+        [
+          1214732,
+          "",
+          "figgs",
+          0,
+          9.9690485
+        ],
+        [
+          26133525,
+          "",
+          "SV_BubbleTime",
+          0,
+          9.947942
+        ],
+        [
+          6456058,
+          "",
+          "kkowalczyk",
+          0,
+          9.94463
+        ],
+        [
+          16400908,
+          "",
+          "mjburgess",
+          0,
+          9.904998
+        ],
+        [
+          6690051,
+          "",
+          "dkhenry",
+          0,
+          9.904998
+        ]
+      ],
+      "local": [
+        [
+          767773,
+          "India email database",
+          "feros1990",
+          1,
+          10.538096
+        ],
+        [
+          4145544,
+          "Restaurant Database Software ",
+          "chdexperts",
+          1,
+          10.161247
+        ],
+        [
+          17698365,
+          "",
+          "komali2",
+          0,
+          10.054385
+        ],
+        [
+          10082949,
+          "",
+          "Nadya",
+          0,
+          9.99126
+        ],
+        [
+          17500899,
+          "",
+          "kgwgk",
+          0,
+          9.99126
+        ],
+        [
+          1214732,
+          "",
+          "figgs",
+          0,
+          9.9690485
+        ],
+        [
+          26133525,
+          "",
+          "SV_BubbleTime",
+          0,
+          9.947942
+        ],
+        [
+          6456058,
+          "",
+          "kkowalczyk",
+          0,
+          9.94463
+        ],
+        [
+          16400908,
+          "",
+          "mjburgess",
+          0,
+          9.904998
+        ],
+        [
+          6690051,
+          "",
+          "dkhenry",
+          0,
+          9.904998
+        ]
+      ]
+    },
+    "summary": {
+      "global": {
+        "execution_ms": 6.3835,
+        "shared_hits": 3673.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 3238.0,
+        "posting_norm_hits": 0.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 25890.0,
+        "local_norm_lookups": 0.0
+      },
+      "local": {
+        "execution_ms": 1.2005,
+        "shared_hits": 542.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "posting_norm_hits": 77.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 0.0,
+        "local_norm_lookups": 25890.0
+      }
+    },
+    "storage": [
+      {
+        "docs": 2841903,
+        "segment": "eb76c643dffe4ce18003d09dce2f1863",
+        "postings_bytes": 268808425,
+        "fieldnorm_bytes": 5683850,
+        "posting_norm_bytes": 117156283
+      },
+      {
+        "docs": 2838888,
+        "segment": "b186860cda6c4aea8afafba1198c6ab9",
+        "postings_bytes": 269048221,
+        "fieldnorm_bytes": 5677820,
+        "posting_norm_bytes": 117199981
+      },
+      {
+        "docs": 2848277,
+        "segment": "09e6d775f1e3435881bfa65a659da170",
+        "postings_bytes": 269173003,
+        "fieldnorm_bytes": 5696598,
+        "posting_norm_bytes": 117123307
+      },
+      {
+        "docs": 2841222,
+        "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+        "postings_bytes": 269307631,
+        "fieldnorm_bytes": 5682488,
+        "posting_norm_bytes": 117320259
+      },
+      {
+        "docs": 2844031,
+        "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+        "postings_bytes": 269551680,
+        "fieldnorm_bytes": 5688106,
+        "posting_norm_bytes": 117422007
+      },
+      {
+        "docs": 2860468,
+        "segment": "952f1be13273443181ade989398abb9b",
+        "postings_bytes": 272181951,
+        "fieldnorm_bytes": 5720980,
+        "posting_norm_bytes": 119337827
+      },
+      {
+        "docs": 2902246,
+        "segment": "9bfdcce177344e53b0af62abd21ab30a",
+        "postings_bytes": 276012513,
+        "fieldnorm_bytes": 5804536,
+        "posting_norm_bytes": 120821681
+      },
+      {
+        "docs": 2903133,
+        "segment": "f95824e6498d4161a8258e04c2d939c3",
+        "postings_bytes": 276231942,
+        "fieldnorm_bytes": 5806310,
+        "posting_norm_bytes": 121160453
+      },
+      {
+        "docs": 2989299,
+        "segment": "722b2cc326774eab96019ec88ce833a7",
+        "postings_bytes": 283545294,
+        "fieldnorm_bytes": 5978642,
+        "posting_norm_bytes": 124281391
+      },
+      {
+        "docs": 2868090,
+        "segment": "f2cb57ddb7764036a46406913fb0a474",
+        "postings_bytes": 272717621,
+        "fieldnorm_bytes": 5736224,
+        "posting_norm_bytes": 119546168
+      }
+    ],
+    "index_size_bytes": 13220569088,
+    "identical_rows_and_scores": true,
+    "identical_norm_lookup_count": true
+  },
+  "text-and": {
+    "query": "SELECT id, title, by, score FROM hn_items WHERE text === 'postgres' AND text === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "global": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "local": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ]
+    },
+    "summary": {
+      "global": {
+        "execution_ms": 8.1205,
+        "shared_hits": 4037.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 3522.0,
+        "posting_norm_hits": 0.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 34555.0,
+        "local_norm_lookups": 0.0
+      },
+      "local": {
+        "execution_ms": 1.3075,
+        "shared_hits": 635.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "posting_norm_hits": 90.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 0.0,
+        "local_norm_lookups": 34555.0
+      }
+    },
+    "storage": [
+      {
+        "docs": 2841903,
+        "segment": "eb76c643dffe4ce18003d09dce2f1863",
+        "postings_bytes": 268808425,
+        "fieldnorm_bytes": 5683850,
+        "posting_norm_bytes": 117156283
+      },
+      {
+        "docs": 2838888,
+        "segment": "b186860cda6c4aea8afafba1198c6ab9",
+        "postings_bytes": 269048221,
+        "fieldnorm_bytes": 5677820,
+        "posting_norm_bytes": 117199981
+      },
+      {
+        "docs": 2848277,
+        "segment": "09e6d775f1e3435881bfa65a659da170",
+        "postings_bytes": 269173003,
+        "fieldnorm_bytes": 5696598,
+        "posting_norm_bytes": 117123307
+      },
+      {
+        "docs": 2841222,
+        "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+        "postings_bytes": 269307631,
+        "fieldnorm_bytes": 5682488,
+        "posting_norm_bytes": 117320259
+      },
+      {
+        "docs": 2844031,
+        "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+        "postings_bytes": 269551680,
+        "fieldnorm_bytes": 5688106,
+        "posting_norm_bytes": 117422007
+      },
+      {
+        "docs": 2860468,
+        "segment": "952f1be13273443181ade989398abb9b",
+        "postings_bytes": 272181951,
+        "fieldnorm_bytes": 5720980,
+        "posting_norm_bytes": 119337827
+      },
+      {
+        "docs": 2902246,
+        "segment": "9bfdcce177344e53b0af62abd21ab30a",
+        "postings_bytes": 276012513,
+        "fieldnorm_bytes": 5804536,
+        "posting_norm_bytes": 120821681
+      },
+      {
+        "docs": 2903133,
+        "segment": "f95824e6498d4161a8258e04c2d939c3",
+        "postings_bytes": 276231942,
+        "fieldnorm_bytes": 5806310,
+        "posting_norm_bytes": 121160453
+      },
+      {
+        "docs": 2989299,
+        "segment": "722b2cc326774eab96019ec88ce833a7",
+        "postings_bytes": 283545294,
+        "fieldnorm_bytes": 5978642,
+        "posting_norm_bytes": 124281391
+      },
+      {
+        "docs": 2868090,
+        "segment": "f2cb57ddb7764036a46406913fb0a474",
+        "postings_bytes": 272717621,
+        "fieldnorm_bytes": 5736224,
+        "posting_norm_bytes": 119546168
+      }
+    ],
+    "index_size_bytes": 13220569088,
+    "identical_rows_and_scores": true,
+    "identical_norm_lookup_count": true
+  },
+  "text-or": {
+    "query": "SELECT id, title, by, score FROM hn_items WHERE text === 'postgres' OR text === 'database' ORDER BY pdb.score(id) DESC LIMIT 10",
+    "rows": {
+      "global": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ],
+      "local": [
+        [
+          19459938,
+          "",
+          "paulmendoza",
+          0,
+          19.825937
+        ],
+        [
+          26678958,
+          "",
+          "dijit",
+          0,
+          19.569767
+        ],
+        [
+          16211545,
+          "",
+          "iamalchemist",
+          0,
+          19.228153
+        ],
+        [
+          8335968,
+          "",
+          "redidas",
+          0,
+          19.140583
+        ],
+        [
+          26488626,
+          "",
+          "jack90",
+          0,
+          19.131554
+        ],
+        [
+          21413365,
+          "",
+          "fabian2k",
+          0,
+          19.027636
+        ],
+        [
+          17311845,
+          "",
+          "dmoreno",
+          0,
+          18.923498
+        ],
+        [
+          17392670,
+          "",
+          "gaius",
+          0,
+          18.923498
+        ],
+        [
+          23791701,
+          "",
+          "stansler",
+          0,
+          18.86266
+        ],
+        [
+          23976177,
+          "",
+          "lpasselin",
+          0,
+          18.740486
+        ]
+      ]
+    },
+    "summary": {
+      "global": {
+        "execution_ms": 4.7665,
+        "shared_hits": 3160.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 2645.0,
+        "posting_norm_hits": 0.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 14166.0,
+        "local_norm_lookups": 0.0
+      },
+      "local": {
+        "execution_ms": 1.632,
+        "shared_hits": 635.0,
+        "shared_reads": 0.0,
+        "fieldnorm_hits": 30.0,
+        "posting_norm_hits": 90.0,
+        "fieldnorm_reads": 0.0,
+        "posting_norm_reads": 0.0,
+        "global_norm_lookups": 0.0,
+        "local_norm_lookups": 14166.0
+      }
+    },
+    "storage": [
+      {
+        "docs": 2841903,
+        "segment": "eb76c643dffe4ce18003d09dce2f1863",
+        "postings_bytes": 268808425,
+        "fieldnorm_bytes": 5683850,
+        "posting_norm_bytes": 117156283
+      },
+      {
+        "docs": 2838888,
+        "segment": "b186860cda6c4aea8afafba1198c6ab9",
+        "postings_bytes": 269048221,
+        "fieldnorm_bytes": 5677820,
+        "posting_norm_bytes": 117199981
+      },
+      {
+        "docs": 2848277,
+        "segment": "09e6d775f1e3435881bfa65a659da170",
+        "postings_bytes": 269173003,
+        "fieldnorm_bytes": 5696598,
+        "posting_norm_bytes": 117123307
+      },
+      {
+        "docs": 2841222,
+        "segment": "dfcd1e59e0b14c61a6df452c329ab1db",
+        "postings_bytes": 269307631,
+        "fieldnorm_bytes": 5682488,
+        "posting_norm_bytes": 117320259
+      },
+      {
+        "docs": 2844031,
+        "segment": "a53d5b9aebf94536ae4e68ae6fcf7654",
+        "postings_bytes": 269551680,
+        "fieldnorm_bytes": 5688106,
+        "posting_norm_bytes": 117422007
+      },
+      {
+        "docs": 2860468,
+        "segment": "952f1be13273443181ade989398abb9b",
+        "postings_bytes": 272181951,
+        "fieldnorm_bytes": 5720980,
+        "posting_norm_bytes": 119337827
+      },
+      {
+        "docs": 2902246,
+        "segment": "9bfdcce177344e53b0af62abd21ab30a",
+        "postings_bytes": 276012513,
+        "fieldnorm_bytes": 5804536,
+        "posting_norm_bytes": 120821681
+      },
+      {
+        "docs": 2903133,
+        "segment": "f95824e6498d4161a8258e04c2d939c3",
+        "postings_bytes": 276231942,
+        "fieldnorm_bytes": 5806310,
+        "posting_norm_bytes": 121160453
+      },
+      {
+        "docs": 2989299,
+        "segment": "722b2cc326774eab96019ec88ce833a7",
+        "postings_bytes": 283545294,
+        "fieldnorm_bytes": 5978642,
+        "posting_norm_bytes": 124281391
+      },
+      {
+        "docs": 2868090,
+        "segment": "f2cb57ddb7764036a46406913fb0a474",
+        "postings_bytes": 272717621,
+        "fieldnorm_bytes": 5736224,
+        "posting_norm_bytes": 119546168
+      }
+    ],
+    "index_size_bytes": 13220569088,
+    "identical_rows_and_scores": true,
+    "identical_norm_lookup_count": true
+  }
+}

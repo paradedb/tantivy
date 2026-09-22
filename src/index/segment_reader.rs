@@ -308,12 +308,25 @@ impl SegmentReader {
             }
         };
 
-        let inv_idx_reader = Arc::new(InvertedIndexReader::new(
+        let mut inv_idx_reader = InvertedIndexReader::new(
             TermDictionary::open(termdict_file)?,
             postings_file,
             DeferredFileSlice::new(positions_file_opener),
             record_option,
-        )?);
+        )?;
+        let norm_path = self.relative_path(SegmentComponent::Custom("pnorm".into()));
+        let norm_directory = self.index.directory().clone();
+        inv_idx_reader.set_posting_norms_file(DeferredFileSlice::new(move || {
+            let source = norm_directory
+                .open_read(&norm_path)
+                .map_err(io::Error::other)?;
+            CompositeFile::open(&source)?
+                .open_read(field)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing posting norm field")
+                })
+        }));
+        let inv_idx_reader = Arc::new(inv_idx_reader);
 
         // by releasing the lock in between, we may end up opening the inverting index
         // twice, but this is fine.
