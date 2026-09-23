@@ -96,6 +96,7 @@ impl BlockWandIntersectionScorer {
         scorer
     }
 
+    /// Finds the next document matching every term, then scores it, without checking score bounds.
     fn advance_without_pruning(&mut self) -> DocId {
         let mut candidate = self.leader.seek(self.internal_doc);
         'candidate: while candidate != TERMINATED {
