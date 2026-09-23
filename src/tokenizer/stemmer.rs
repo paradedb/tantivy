@@ -1,13 +1,16 @@
 use std::borrow::Cow;
 use std::mem;
 
+use frostem::Algorithm;
 use serde::{Deserialize, Serialize};
 
 use super::{Token, TokenFilter, TokenStream, Tokenizer};
 
-#[derive(Clone)]
+/// The stemming backend for a language: frostem (Snowball) for the languages it
+/// covers, tantivy-stemmers for the rest (currently Polish, which Snowball lacks).
+#[derive(Copy, Clone)]
 enum StemmerAlgorithm {
-    Rust(rust_stemmers::Algorithm),
+    Frostem(Algorithm),
     Tantivy(fn(&str) -> Cow<str>),
 }
 
@@ -41,28 +44,31 @@ impl Language {
     fn algorithm(self) -> StemmerAlgorithm {
         use self::Language::*;
         match self {
-            Arabic => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Arabic),
+            Arabic => StemmerAlgorithm::Frostem(Algorithm::Arabic),
             Czech => {
                 StemmerAlgorithm::Tantivy(tantivy_stemmers::algorithms::czech_dolamic_aggressive)
             }
-            Danish => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Danish),
-            Dutch => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Dutch),
-            English => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::English),
-            Finnish => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Finnish),
-            French => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::French),
-            German => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::German),
-            Greek => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Greek),
-            Hungarian => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Hungarian),
-            Italian => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Italian),
-            Norwegian => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Norwegian),
+            Danish => StemmerAlgorithm::Frostem(Algorithm::Danish),
+            // Snowball 3.0 replaced the Dutch algorithm with one that produces different
+            // stems (e.g. "lokaal" no longer stems to "lokal"). Existing indexes carry
+            // old-algorithm stems, so stay on the legacy variant to keep them matching.
+            Dutch => StemmerAlgorithm::Frostem(Algorithm::DutchPorter),
+            English => StemmerAlgorithm::Frostem(Algorithm::English),
+            Finnish => StemmerAlgorithm::Frostem(Algorithm::Finnish),
+            French => StemmerAlgorithm::Frostem(Algorithm::French),
+            German => StemmerAlgorithm::Frostem(Algorithm::German),
+            Greek => StemmerAlgorithm::Frostem(Algorithm::Greek),
+            Hungarian => StemmerAlgorithm::Frostem(Algorithm::Hungarian),
+            Italian => StemmerAlgorithm::Frostem(Algorithm::Italian),
+            Norwegian => StemmerAlgorithm::Frostem(Algorithm::Norwegian),
             Polish => StemmerAlgorithm::Tantivy(tantivy_stemmers::algorithms::polish_yarovoy),
-            Portuguese => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Portuguese),
-            Romanian => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Romanian),
-            Russian => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Russian),
-            Spanish => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Spanish),
-            Swedish => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Swedish),
-            Tamil => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Tamil),
-            Turkish => StemmerAlgorithm::Rust(rust_stemmers::Algorithm::Turkish),
+            Portuguese => StemmerAlgorithm::Frostem(Algorithm::Portuguese),
+            Romanian => StemmerAlgorithm::Frostem(Algorithm::Romanian),
+            Russian => StemmerAlgorithm::Frostem(Algorithm::Russian),
+            Spanish => StemmerAlgorithm::Frostem(Algorithm::Spanish),
+            Swedish => StemmerAlgorithm::Frostem(Algorithm::Swedish),
+            Tamil => StemmerAlgorithm::Frostem(Algorithm::Tamil),
+            Turkish => StemmerAlgorithm::Frostem(Algorithm::Turkish),
         }
     }
 }
@@ -109,7 +115,7 @@ pub struct StemmerFilter<T> {
 }
 
 enum StemmerImpl {
-    Rust(rust_stemmers::Stemmer),
+    Frostem(frostem::Stemmer),
     Tantivy(fn(&str) -> Cow<str>),
 }
 
@@ -118,7 +124,7 @@ impl<T: Tokenizer> Tokenizer for StemmerFilter<T> {
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
         let stemmer = match self.stemmer_algorithm {
-            StemmerAlgorithm::Rust(alg) => StemmerImpl::Rust(rust_stemmers::Stemmer::create(alg)),
+            StemmerAlgorithm::Frostem(alg) => StemmerImpl::Frostem(frostem::Stemmer::new(alg)),
             StemmerAlgorithm::Tantivy(f) => StemmerImpl::Tantivy(f),
         };
         StemmerTokenStream {
@@ -142,7 +148,7 @@ impl<T: TokenStream> TokenStream for StemmerTokenStream<T> {
         }
         let token = self.tail.token_mut();
         let stemmed_str = match self.stemmer {
-            StemmerImpl::Rust(ref s) => s.stem(&token.text),
+            StemmerImpl::Frostem(ref s) => s.stem(&token.text),
             StemmerImpl::Tantivy(f) => f(&token.text),
         };
         match stemmed_str {

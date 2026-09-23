@@ -95,10 +95,14 @@ fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
     num_docs: u32,
 ) -> Box<dyn Scorer> {
     match scorer {
-        SpecializedScorer::TermUnion(term_scorers) => {
-            let union_scorer =
-                BufferedUnionScorer::build(term_scorers, score_combiner_fn, num_docs);
-            Box::new(union_scorer)
+        SpecializedScorer::TermUnion(mut term_scorers) => {
+            if term_scorers.len() == 1 {
+                Box::new(term_scorers.pop().unwrap())
+            } else {
+                let union_scorer =
+                    BufferedUnionScorer::build(term_scorers, score_combiner_fn, num_docs);
+                Box::new(union_scorer)
+            }
         }
         SpecializedScorer::TermIntersection(term_scorers) => {
             let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
@@ -488,6 +492,17 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
     ) -> crate::Result<Box<dyn crate::query::scorer::PruningScorer>> {
         let scorer = self.complex_scorer(reader, boost, &self.score_combiner_fn)?;
         match scorer {
+            // Block-WAND scores by summing the matching terms, so it may only
+            // drive a combiner that sums. Anything else (dis_max) still needs
+            // every matching term and falls back to the plain union.
+            SpecializedScorer::TermUnion(scorers) if !TScoreCombiner::SUPPORTS_BLOCK_WAND => {
+                let union_scorer =
+                    BufferedUnionScorer::build(scorers, &self.score_combiner_fn, reader.num_docs());
+                Ok(Box::new(BasicPruningScorer::new(
+                    Box::new(union_scorer),
+                    init_threshold,
+                )))
+            }
             SpecializedScorer::TermUnion(mut scorers) => {
                 // Drop already-exhausted scorers so a lone survivor uses the
                 // (~3x faster) single-scorer specialization
@@ -538,10 +553,15 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
         let num_docs = reader.num_docs();
         match scorer {
-            SpecializedScorer::TermUnion(term_scorers) => {
-                let mut union_scorer =
-                    BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
-                for_each_scorer(&mut union_scorer, callback);
+            SpecializedScorer::TermUnion(mut term_scorers) => {
+                if term_scorers.len() == 1 {
+                    let mut term_scorer = term_scorers.pop().unwrap();
+                    for_each_scorer(&mut term_scorer, callback);
+                } else {
+                    let mut union_scorer =
+                        BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
+                    for_each_scorer(&mut union_scorer, callback);
+                }
             }
             SpecializedScorer::TermIntersection(term_scorers) => {
                 let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
@@ -582,6 +602,15 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
     ) -> crate::Result<()> {
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
         match scorer {
+            // Block-WAND scores by summing the matching terms, so it may only
+            // drive a combiner that sums. Anything else (dis_max) still needs
+            // every matching term and falls back to the plain union.
+            SpecializedScorer::TermUnion(scorers) if !TScoreCombiner::SUPPORTS_BLOCK_WAND => {
+                let union_scorer =
+                    BufferedUnionScorer::build(scorers, &self.score_combiner_fn, reader.num_docs());
+                let mut scorer = BasicPruningScorer::new(Box::new(union_scorer), threshold);
+                for_each_pruning_scorer(&mut scorer, callback);
+            }
             SpecializedScorer::TermUnion(mut scorers) => {
                 scorers.retain(|scorer| scorer.doc() < TERMINATED);
                 match scorers.len() {
@@ -619,10 +648,15 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
 
         match scorer {
-            SpecializedScorer::TermUnion(term_scorers) => {
-                let mut union_scorer =
-                    BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
-                for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+            SpecializedScorer::TermUnion(mut term_scorers) => {
+                if term_scorers.len() == 1 {
+                    let mut term_scorer = term_scorers.pop().unwrap();
+                    for_each_docset_buffered(&mut term_scorer, &mut buffer, callback);
+                } else {
+                    let mut union_scorer =
+                        BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
+                    for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+                }
             }
             SpecializedScorer::TermIntersection(term_scorers) => {
                 let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers

@@ -249,12 +249,17 @@ impl HistogramBounds {
     }
 }
 
-/// The per-bucket identifier stored in a [`SegmentHistogramBucketEntry`].
+/// The per-bucket identifier stored alongside a bucket's count (e.g. in a
+/// [`SegmentHistogramBucketEntry`] or a term-agg `Bucket`).
 ///
-/// It is [`BucketId`] when the histogram has sub aggregations (which key their state by it), and
+/// It is [`BucketId`] when the aggregation has sub aggregations (which key their state by it), and
 /// the zero-sized `()` when it does not. Without sub aggregations the id is never read, so storing
-/// `()` drops 8 bytes per bucket (24 -> 16) and turns id assignment into a no-op.
-pub trait BucketIdSlot: Copy + Default + std::fmt::Debug + PartialEq {
+/// `()` drops the id bytes per bucket and turns id assignment into a no-op.
+pub trait BucketIdSlot: Copy + Default + std::fmt::Debug + PartialEq + 'static {
+    /// Whether this slot carries a real id, i.e. `assign` produces a meaningful value. `false` for
+    /// the `()` slot, letting callers gate id-assignment code out at compile time (e.g. skip the
+    /// lazy-assign branch in a hot loop entirely rather than relying on the optimizer).
+    const ASSIGNS_ID: bool;
     /// Assigns the next id from the provider, called once when a bucket is first filled.
     fn assign(provider: &mut BucketIdProvider) -> Self;
     /// Resolves to the `BucketId` for sub-aggregation bookkeeping.
@@ -264,6 +269,7 @@ pub trait BucketIdSlot: Copy + Default + std::fmt::Debug + PartialEq {
     fn to_bucket_id(self) -> BucketId;
 }
 impl BucketIdSlot for BucketId {
+    const ASSIGNS_ID: bool = true;
     #[inline(always)]
     fn assign(provider: &mut BucketIdProvider) -> Self {
         provider.next_bucket_id()
@@ -274,6 +280,7 @@ impl BucketIdSlot for BucketId {
     }
 }
 impl BucketIdSlot for () {
+    const ASSIGNS_ID: bool = false;
     #[inline(always)]
     fn assign(_provider: &mut BucketIdProvider) -> Self {}
     #[inline(always)]
@@ -625,14 +632,15 @@ impl<B: BucketIdSlot> SegmentHistogramCollector<B> {
 
 impl SegmentHistogramCollector<()> {
     /// Builds a histogram collector whose parent `t` is a dense histogram filled from
-    /// `counts[t * num_time_buckets .. (t + 1) * num_time_buckets]` (row-major). Used by the fused
-    /// terms×histogram collector to turn its flat 2D counters into the regular intermediate result,
-    /// so cross-segment merging is shared with the general path.
-    pub(crate) fn from_dense_rows(
+    /// `counts[t * num_time_buckets .. (t + 1) * num_time_buckets]` (row-major), consolidating each
+    /// cell's count lanes. Used by the fused terms×histogram collector to turn its flat 2D counters
+    /// into the regular intermediate result, so cross-segment merging is shared with the general
+    /// path.
+    pub(crate) fn from_dense_rows<const LANES: usize>(
         req_data: HistogramAggReqData,
         base_pos: i64,
         num_time_buckets: usize,
-        counts: &[u32],
+        counts: &[[u32; LANES]],
     ) -> Self {
         let interval = req_data.req.interval;
         let offset = req_data.offset;
@@ -643,13 +651,13 @@ impl SegmentHistogramCollector<()> {
                 let buckets = row
                     .iter()
                     .enumerate()
-                    .map(|(b, &doc_count)| SegmentHistogramBucketEntry {
+                    .map(|(b, count_lanes)| SegmentHistogramBucketEntry {
                         key: get_bucket_key_from_pos(
                             (base_pos + b as i64) as f64,
                             interval,
                             offset,
                         ),
-                        doc_count: doc_count as u64,
+                        doc_count: count_lanes.iter().map(|&count| u64::from(count)).sum(),
                         bucket_id: (),
                     })
                     .collect();

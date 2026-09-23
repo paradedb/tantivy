@@ -2,7 +2,7 @@
 
 mod block_search;
 
-pub(crate) use self::block_search::branchless_binary_search;
+pub(crate) use self::block_search::search_block;
 
 pub(crate) mod block_segment_postings;
 
@@ -10,8 +10,8 @@ pub(crate) mod compression;
 mod indexing_context;
 mod json_postings_writer;
 mod loaded_postings;
+mod merger;
 mod per_field_postings_writer;
-pub(crate) mod plugin;
 mod postings;
 mod postings_writer;
 mod recorder;
@@ -22,12 +22,12 @@ pub(crate) mod skip;
 mod term_info;
 
 pub use loaded_postings::LoadedPostings;
+pub(crate) use merger::{next_mapped_doc, PostingsMerger};
 pub(crate) use stacker::compute_table_memory_size;
 
 pub use self::block_segment_postings::BlockSegmentPostings;
 pub(crate) use self::indexing_context::IndexingContext;
 pub(crate) use self::per_field_postings_writer::PerFieldPostingsWriter;
-pub use self::plugin::{PostingsPlugin, PostingsPluginWriter};
 pub use self::postings::Postings;
 pub(crate) use self::postings_writer::{serialize_postings, IndexingPosition, PostingsWriter};
 pub use self::segment_postings::SegmentPostings;

@@ -1,6 +1,6 @@
 [package]
 name = "tantivy"
-version = "0.26.0"
+version = "0.27.0"
 authors = ["Paul Masurel <paul.masurel@gmail.com>"]
 license = "MIT"
 categories = ["database-implementations", "data-structures"]
@@ -16,7 +16,7 @@ exclude = ["benches/*.json", "benches/*.txt"]
 
 [dependencies]
 oneshot = "0.1.13"
-base64 = "0.22.0"
+base64 = "0.23.0"
 byteorder = "1.4.3"
 crc32fast = "1.3.2"
 fastrand = "2"
@@ -28,7 +28,7 @@ regex = { version = "1.5.5", default-features = false, features = [
 aho-corasick = "1.0"
 tantivy-fst = { git = "https://github.com/paradedb/fst.git" }
 memmap2 = { version = "0.9.0", optional = true }
-lz4_flex = { version = "0.13", default-features = false, optional = true }
+lz4_flex = { version = "0.14", default-features = false, optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
 tempfile = { version = "3.12.0", optional = true }
 log = "0.4.16"
@@ -38,7 +38,26 @@ fs4 = { version = "0.13.1", optional = true }
 levenshtein_automata = "0.2.1"
 uuid = { version = "1.0.0", features = ["v4", "serde"] }
 crossbeam-channel = "0.5.4"
-rust-stemmers = { version = "1.2.0", optional = true }
+frostem = { version = "1.20260804.2", optional = true, default-features = false, features = [
+    "arabic",
+    "danish",
+    "dutch_porter",
+    "english",
+    "finnish",
+    "french",
+    "german",
+    "greek",
+    "hungarian",
+    "italian",
+    "norwegian",
+    "portuguese",
+    "romanian",
+    "russian",
+    "spanish",
+    "swedish",
+    "tamil",
+    "turkish",
+] }
 tantivy-stemmers = { version = "0.4.0", default-features = false, features = ["czech_dolamic_aggressive", "polish_yarovoy"] }
 downcast-rs = "2.0.1"
 bitpacking = { version = "0.9.3", default-features = false, features = [
@@ -56,7 +75,7 @@ time = { version = "0.3.47", features = ["serde-well-known"] }
 deranged = "=0.4.0"
 smallvec = "1.8.0"
 rayon = "1.5.2"
-lru = "0.16.3"
+lru = "0.18.2"
 fastdivide = "0.4.0"
 itertools = "0.14.0"
 measure_time = "0.9.0"
@@ -77,6 +96,7 @@ futures-channel = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
 parking_lot = "0.12.4"
 typetag = "0.2.21"
+unwrap-infallible = "1.0.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -121,7 +141,7 @@ overflow-checks = true
 
 [features]
 default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer"]
-stemmer = ["rust-stemmers"]
+stemmer = ["frostem"]
 mmap = ["fs4", "tempfile", "memmap2"]
 stopwords = []
 

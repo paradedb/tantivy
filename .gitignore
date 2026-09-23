@@ -7,6 +7,7 @@ target/debug
 .vscode
 target/release
 benchmark
+agg_bench
 .DS_Store
 *.bk
 .idea

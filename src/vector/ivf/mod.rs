@@ -21,10 +21,10 @@ pub use graph::{
     Workspace,
 };
 pub use index::{IvfIndex, IvfSearchMetrics};
-pub use params::AdaptiveProbeParams;
+pub use params::{AdaptiveProbeParams, WorkModel};
 pub(crate) use plugin::merge_ivf;
 pub(crate) use training::{decode_row, encode_vector};
 pub use training::{
-    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfVectorBatch,
-    IvfVectors,
+    IvfCentroids, IvfClusterer, IvfMatrix, IvfMatrixView, IvfMergeSettings, IvfTrainingBatch,
+    IvfTrainingVectors, IvfVectorBatch, IvfVectors,
 };

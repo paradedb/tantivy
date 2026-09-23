@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 #[cfg(feature = "mmap")]
 use std::path::Path;
@@ -16,15 +16,15 @@ use crate::directory::MmapDirectory;
 use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
 use crate::error::{DataCorruption, TantivyError};
 use crate::fastfield::FastFieldsPlugin;
-use crate::fieldnorm::FieldNormsPlugin;
-use crate::index::{IndexMeta, SegmentComponent, SegmentId, SegmentMeta, SegmentMetaInventory};
+use crate::index::{
+    IndexMeta, InvertedIndexPlugin, SegmentComponent, SegmentId, SegmentMeta, SegmentMetaInventory,
+};
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
 };
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 use crate::plugin::SegmentPlugin;
-use crate::postings::PostingsPlugin;
 use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
@@ -65,13 +65,20 @@ fn load_metas(
 
 /// The built-in plugins, in write order.
 pub(crate) fn builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
-    vec![
-        Arc::new(FieldNormsPlugin),
-        Arc::new(PostingsPlugin),
+    let mut plugins: Vec<Arc<dyn SegmentPlugin>> = vec![
+        Arc::new(InvertedIndexPlugin),
         Arc::new(FastFieldsPlugin),
         Arc::new(StorePlugin),
-        Arc::new(VectorPlugin),
-    ]
+    ];
+    plugins.extend(erased_builtin_plugins());
+    plugins
+}
+
+/// The built-in plugins whose writers are driven entirely through the type-erased
+/// [`PluginWriter`](crate::plugin::PluginWriter) interface, unlike the first three
+/// built-ins, whose concrete writer types the `SegmentWriter` constructs directly.
+pub(crate) fn erased_builtin_plugins() -> Vec<Arc<dyn SegmentPlugin>> {
+    vec![Arc::new(VectorPlugin)]
 }
 
 /// The files owned by the given segments: one per plugin extension (the built-in
@@ -319,6 +326,14 @@ impl IndexBuilder {
 
     fn validate(&self) -> crate::Result<()> {
         if let Some(schema) = self.schema.as_ref() {
+            if self.index_settings.manual_doc_id_mapping
+                && self.index_settings.sort_by_field.is_some()
+            {
+                return Err(TantivyError::InvalidArgument(
+                    "IndexSettings::manual_doc_id_mapping cannot be combined with sort_by_field"
+                        .to_string(),
+                ));
+            }
             if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref() {
                 let schema_field = schema.get_field(&sort_by_field.field).map_err(|_| {
                     TantivyError::InvalidArgument(format!(
@@ -381,79 +396,6 @@ impl IndexBuilder {
             index.set_ivf_clusterer(clusterer);
         }
         Ok(index)
-    }
-}
-
-/// An [`Index`] whose registered plugin set has been validated against the index's
-/// recorded plugin set: no two plugins claim the same extension, none claim a reserved
-/// one, and the registered custom plugins exactly match the extensions the index was
-/// created with. The plugin set is part of the index's structure, like the schema, and
-/// is fixed at creation.
-pub(crate) struct PluginCheckedIndex(Index);
-
-impl PluginCheckedIndex {
-    pub(crate) fn new(index: Index) -> crate::Result<Self> {
-        // No two plugins may claim the same extension, and none may claim a reserved one.
-        let all_plugins: Vec<_> = index.all_plugins().collect();
-        let mut claimed_extensions: HashSet<&str> =
-            RESERVED_NON_PLUGIN_EXTENSIONS.iter().copied().collect();
-        let mut conflicting: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for plugin in &all_plugins {
-            for &ext in plugin.extensions() {
-                if !claimed_extensions.insert(ext) {
-                    conflicting.insert(ext.to_string());
-                }
-            }
-        }
-        if !conflicting.is_empty() {
-            return Err(crate::TantivyError::ConflictingPlugins(
-                conflicting.into_iter().collect::<Vec<_>>().join(", "),
-            ));
-        }
-
-        // The index persists, at creation, the custom plugin extensions it requires; that
-        // index-wide record is the single source of truth for the plugin set. The currently
-        // registered custom plugins must match it exactly.
-        let metas = index.load_metas()?;
-        let persisted_custom_extensions: HashSet<&str> = metas
-            .persisted_custom_extensions
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let registered_custom_extensions: HashSet<&str> = index
-            .custom_plugins
-            .iter()
-            .flat_map(|plugin| plugin.extensions().iter().copied())
-            .collect();
-
-        // Persisted but not registered: writing or merging would silently drop that plugin's data.
-        let missing: std::collections::BTreeSet<&str> = persisted_custom_extensions
-            .difference(&registered_custom_extensions)
-            .copied()
-            .collect();
-        if !missing.is_empty() {
-            return Err(crate::TantivyError::MissingPlugin(
-                missing.into_iter().collect::<Vec<_>>().join(", "),
-            ));
-        }
-
-        // Registered but not persisted: the plugin set is fixed at creation, so a plugin not
-        // persisted there cannot be added to an existing index.
-        let unexpected: std::collections::BTreeSet<&str> = registered_custom_extensions
-            .difference(&persisted_custom_extensions)
-            .copied()
-            .collect();
-        if !unexpected.is_empty() {
-            return Err(crate::TantivyError::UnexpectedPlugin(
-                unexpected.into_iter().collect::<Vec<_>>().join(", "),
-            ));
-        }
-
-        Ok(Self(index))
-    }
-
-    pub(crate) fn into_inner(self) -> Index {
-        self.0
     }
 }
 
@@ -769,11 +711,7 @@ impl Index {
                 )
             })?;
 
-        IndexWriter::new(
-            PluginCheckedIndex::new(self.clone())?,
-            options,
-            directory_lock,
-        )
+        IndexWriter::new(self.clone(), options, directory_lock)
     }
 
     /// Open a new index writer. Attempts to acquire a lockfile.
@@ -845,6 +783,25 @@ impl Index {
         &self.custom_plugins
     }
 
+    /// The plugins whose writers are driven through the type-erased
+    /// [`PluginWriter`](crate::plugin::PluginWriter) interface, in write order: the
+    /// erased built-ins (currently the vector plugin) followed by the registered
+    /// custom plugins.
+    pub(crate) fn erased_plugins(&self) -> Vec<Arc<dyn SegmentPlugin>> {
+        erased_builtin_plugins()
+            .into_iter()
+            .chain(self.custom_plugins.iter().cloned())
+            .collect()
+    }
+
+    /// The sorted set of extensions claimed by the registered custom (non-built-in) plugins.
+    pub(crate) fn custom_extensions(&self) -> BTreeSet<&str> {
+        self.custom_plugins
+            .iter()
+            .flat_map(|plugin| plugin.extensions().iter().copied())
+            .collect()
+    }
+
     /// All plugins that participate in writing and merging, in write order: the built-ins
     /// (field norms, postings, fast fields, store) followed by the registered custom
     /// plugins. Built-ins are not stored; they are produced fresh here from `builtin_plugins`.
@@ -852,6 +809,63 @@ impl Index {
         builtin_plugins()
             .into_iter()
             .chain(self.custom_plugins.iter().cloned())
+    }
+
+    /// Validates that the registered plugin set matches the index's recorded plugin set:
+    /// no two plugins claim the same extension, none claim a reserved one, and the
+    /// registered custom plugins exactly match the extensions the index was created with.
+    /// The plugin set is part of the index's structure, like the schema, and is fixed at
+    /// creation.
+    pub(crate) fn validate_plugins(&self) -> crate::Result<()> {
+        // No two plugins may claim the same extension, and none may claim a reserved one.
+        let all_plugins: Vec<_> = self.all_plugins().collect();
+        let mut claimed_extensions: HashSet<&str> =
+            RESERVED_NON_PLUGIN_EXTENSIONS.iter().copied().collect();
+        let mut conflicting: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for plugin in &all_plugins {
+            for &ext in plugin.extensions() {
+                if !claimed_extensions.insert(ext) {
+                    conflicting.insert(ext.to_string());
+                }
+            }
+        }
+        if !conflicting.is_empty() {
+            return Err(crate::TantivyError::ConflictingPlugins(
+                conflicting.into_iter().collect::<Vec<_>>().join(", "),
+            ));
+        }
+
+        // The index persists, at creation, the custom plugin extensions it requires; that
+        // index-wide record is the single source of truth for the plugin set. The currently
+        // registered custom plugins must match it exactly.
+        let metas = self.load_metas()?;
+        let persisted_custom_extensions: BTreeSet<&str> = metas
+            .persisted_custom_extensions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let registered_custom_extensions = self.custom_extensions();
+
+        // Persisted but not registered: writing or merging would silently drop that plugin's data.
+        let missing: Vec<&str> = persisted_custom_extensions
+            .difference(&registered_custom_extensions)
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            return Err(crate::TantivyError::MissingPlugin(missing.join(", ")));
+        }
+
+        // Registered but not persisted: the plugin set is fixed at creation, so a plugin not
+        // persisted there cannot be added to an existing index.
+        let unexpected: Vec<&str> = registered_custom_extensions
+            .difference(&persisted_custom_extensions)
+            .copied()
+            .collect();
+        if !unexpected.is_empty() {
+            return Err(crate::TantivyError::UnexpectedPlugin(unexpected.join(", ")));
+        }
+
+        Ok(())
     }
 
     /// Accessor to the index settings

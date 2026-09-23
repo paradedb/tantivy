@@ -110,6 +110,21 @@ impl Default for IntermediateStats {
 }
 
 impl IntermediateStats {
+    /// Stats computed outside of tantivy, for a caller that finalizes through it.
+    /// `min` and `max` are ignored for an empty input, where the defaults stand.
+    pub fn from_parts(count: u64, sum: f64, min: f64, max: f64) -> Self {
+        if count == 0 {
+            return Self::default();
+        }
+        Self {
+            count,
+            sum,
+            delta: 0.0,
+            min,
+            max,
+        }
+    }
+
     /// Returns the number of values collected.
     pub fn count(&self) -> u64 {
         self.count

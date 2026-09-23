@@ -39,7 +39,7 @@ pub(crate) fn save_metas(
     previous_metas: &IndexMeta,
     directory: &dyn Directory,
 ) -> crate::Result<()> {
-    info!("save metas");
+    debug!("save metas");
 
     match directory.save_metas(metas, previous_metas, &mut ()) {
         Ok(_) => Ok(()),
@@ -48,10 +48,7 @@ pub(crate) fn save_metas(
             // Just adding a new line at the end of the buffer.
             writeln!(&mut buffer)?;
             crate::fail_point!("save_metas", |msg| Err(crate::TantivyError::from(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    msg.unwrap_or_else(|| "Undefined".to_string())
-                )
+                std::io::Error::other(msg.unwrap_or_else(|| "Undefined".to_string()))
             )));
             directory.sync_directory()?;
             directory.atomic_write(&META_FILEPATH, &buffer[..])?;
@@ -116,7 +113,7 @@ impl Deref for SegmentUpdater {
 fn garbage_collect_files(
     segment_updater: SegmentUpdater,
 ) -> crate::Result<GarbageCollectionResult> {
-    info!("Running garbage collection");
+    debug!("Running garbage collection");
     let mut index = segment_updater.index.clone();
     index
         .directory_mut()
@@ -186,10 +183,9 @@ fn merge(
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
 ///
-/// It is the caller's responsibility to ensure every custom
-/// [`SegmentPlugin`](crate::SegmentPlugin) is registered on the source indices and that
-/// the indices share the same plugin set. A source segment whose custom extension has no
-/// registered plugin has that component's data silently dropped from the merge.
+/// Every custom [`SegmentPlugin`](crate::SegmentPlugin) must be registered on the source
+/// indices, and all source indices must register the same plugin set; the merge errors
+/// otherwise. The merged output carries that shared plugin set forward.
 #[doc(hidden)]
 pub fn merge_indices<T: Into<Box<dyn Directory>>>(
     indices: &[Index],
@@ -244,10 +240,9 @@ pub fn merge_indices<T: Into<Box<dyn Directory>>>(
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
 ///
-/// It is the caller's responsibility to ensure every custom
-/// [`SegmentPlugin`](crate::SegmentPlugin) is registered on the segments' source indices.
-/// A source segment whose custom extension has no registered plugin has that component's
-/// data silently dropped from the merge.
+/// Every custom [`SegmentPlugin`](crate::SegmentPlugin) must be registered on the segments'
+/// source indices, and all of those indices must register the same plugin set; the merge
+/// errors otherwise. The merged output carries that shared plugin set forward.
 #[doc(hidden)]
 pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     segments: &[Segment],
@@ -656,7 +651,7 @@ impl SegmentUpdater {
             }
         };
 
-        info!("Starting merge  - {:?}", merge_operation.segment_ids());
+        debug!("Starting merge  - {:?}", merge_operation.segment_ids());
 
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
@@ -812,7 +807,7 @@ impl SegmentUpdater {
             .as_ref()
             .map(|after_merge_segment_entry| after_merge_segment_entry.meta().clone());
         self.schedule_task(move || {
-            info!(
+            debug!(
                 "End merge {:?}",
                 after_merge_segment_entry.as_ref().map(|entry| entry.meta())
             );

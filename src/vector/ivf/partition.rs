@@ -53,16 +53,22 @@ pub struct TPTree<'a> {
 }
 
 impl<'a> TPTree<'a> {
-    /// `vectors` is the flat `dim`-strided buffer (its length must be a
-    /// multiple of `dim`).
-    pub fn new(config: TPTreeConfig, dim: usize, vectors: &'a [f32]) -> Self {
+    /// * `config` (`TPTreeConfig`) — split and leaf-size configuration.
+    /// * `dim` (`usize`) — vector dimensionality; must be non-zero.
+    /// * `vectors` (`&[f32]`) — flat `dim`-strided buffer; length must be a multiple of `dim`.
+    /// * `seed` (`u64`) — fixed split-direction RNG seed: builds must be reproducible; the value
+    ///   doesn't matter.
+    ///
+    /// Returns (`TPTree`): the tree; callers that union several trees reuse
+    /// one instance so the RNG advances from tree to tree.
+    pub fn new(config: TPTreeConfig, dim: usize, vectors: &'a [f32], seed: u64) -> Self {
         debug_assert!(dim > 0, "dim must be non-zero");
         debug_assert_eq!(vectors.len() % dim, 0, "arena not a multiple of dim");
         TPTree {
             vectors,
             dim,
             config,
-            rng: fastrand::Rng::new(),
+            rng: fastrand::Rng::with_seed(seed),
         }
     }
 
@@ -233,7 +239,7 @@ mod tests {
             top_dims: 2,
             iterations: 100,
         };
-        let mut tpt = TPTree::new(config, 3, &v);
+        let mut tpt = TPTree::new(config, 3, &v, 42);
         let mut indices: Vec<NodeId> = (0..8).collect();
 
         let leaves = tpt.partition(&mut indices);
@@ -259,7 +265,7 @@ mod tests {
             top_dims: 2,
             iterations: 8,
         };
-        let mut tpt = TPTree::new(config, 3, &v);
+        let mut tpt = TPTree::new(config, 3, &v, 42);
         let mut indices: Vec<NodeId> = (0..8).collect();
 
         let leaves = tpt.partition(&mut indices);

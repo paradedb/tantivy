@@ -175,7 +175,7 @@ impl ManagedDirectory {
         for file_to_delete in files_to_delete {
             match self.delete(&file_to_delete) {
                 Ok(_) => {
-                    info!("Deleted {file_to_delete:?}");
+                    debug!("Deleted {file_to_delete:?}");
                     deleted_files.push(file_to_delete);
                 }
                 Err(file_error) => {

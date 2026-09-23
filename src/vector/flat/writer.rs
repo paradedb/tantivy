@@ -7,7 +7,7 @@ use crate::directory::CompositeWrite;
 use crate::index::{Segment, SegmentComponent};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::plugin::PluginWriter;
-use crate::schema::document::{TantivyDocument, Value};
+use crate::schema::document::{ErasedDocument, ErasedValue, ReferenceValueLeaf};
 use crate::schema::{Field, FieldType, Schema, VectorOptions};
 use crate::vector::distance::{maybe_normalize_bytes, NormalizeOutcome};
 use crate::vector::header::write_header;
@@ -83,29 +83,32 @@ impl PluginWriter for FlatVecWriter {
     fn add_document(
         &mut self,
         doc_id: DocId,
-        doc: &TantivyDocument,
+        doc: &dyn ErasedDocument,
         schema: &Schema,
     ) -> crate::Result<()> {
         if self.fields.is_empty() {
             return Ok(());
         }
         self.num_docs = doc_id + 1;
-        for (field, buf) in self.fields.iter_mut() {
-            let value = match doc.get_first(*field) {
-                Some(value) => value,
-                None => continue,
+        for (field, value) in doc.erased_fields() {
+            let Some(buf) = self.fields.get_mut(&field) else {
+                continue;
             };
-            let bytes = value.as_value().as_bytes().ok_or_else(|| {
-                TantivyError::SchemaError(format!(
+            // Only the first value per field counts, matching `get_first` semantics.
+            if buf.present_doc_ids.last() == Some(&doc_id) {
+                continue;
+            }
+            let ErasedValue::Leaf(ReferenceValueLeaf::Bytes(bytes)) = value else {
+                return Err(TantivyError::SchemaError(format!(
                     "Expected vector bytes for field {:?}",
-                    schema.get_field_entry(*field).name()
-                ))
-            })?;
+                    schema.get_field_entry(field).name()
+                )));
+            };
             let stride = buf.opts.bytes_per_vector();
             if bytes.len() != stride {
                 return Err(TantivyError::SchemaError(format!(
                     "vector byte length mismatch for field {:?}: expected {} bytes, got {}",
-                    schema.get_field_entry(*field).name(),
+                    schema.get_field_entry(field).name(),
                     stride,
                     bytes.len(),
                 )));
@@ -118,14 +121,15 @@ impl PluginWriter for FlatVecWriter {
                 return Err(TantivyError::InvalidArgument(format!(
                     "non-finite element in vector field '{}' (doc {doc_id}): vectors must contain \
                      only finite values",
-                    schema.get_field_entry(*field).name(),
+                    schema.get_field_entry(field).name(),
                 )));
             }
         }
         Ok(())
     }
+
     fn serialize(
-        &mut self,
+        self: Box<Self>,
         segment: &Segment,
         doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
@@ -136,7 +140,7 @@ impl PluginWriter for FlatVecWriter {
         write_header(&mut write)?;
         let mut composite = CompositeWrite::wrap(write);
 
-        for (field, buf) in &self.fields {
+        for (field, buf) in self.fields {
             // Compute (present, row_bytes) in target doc-id order. For
             // the no-remap case the writer already accumulates in
             // ascending insertion (= target) order.
@@ -144,36 +148,31 @@ impl PluginWriter for FlatVecWriter {
             let (present, row_bytes): (Vec<DocId>, Vec<u8>) = if let Some(map) = doc_id_map {
                 let mut p = Vec::new();
                 let mut r = Vec::new();
-                for new_doc_id in 0..map.num_new_doc_ids() as DocId {
-                    let old_doc_id = map.get_old_doc_id(new_doc_id);
+                for (new_doc_id, old_doc_id) in map.iter_old_doc_ids().enumerate() {
                     if let Ok(row_idx) = buf.present_doc_ids.binary_search(&old_doc_id) {
-                        p.push(new_doc_id);
+                        p.push(new_doc_id as DocId);
                         let start = row_idx * stride;
                         r.extend_from_slice(&buf.row_bytes[start..start + stride]);
                     }
                 }
                 (p, r)
             } else {
-                (buf.present_doc_ids.clone(), buf.row_bytes.clone())
+                (buf.present_doc_ids, buf.row_bytes)
             };
 
             // Slice (field, 0): row→doc_id map. Picks Identity if every
             // doc is present (typical for dense embeddings, just one
             // tag byte) or Bitmap otherwise.
-            let id_map_w = composite.for_field_with_idx(*field, 0);
+            let id_map_w = composite.for_field_with_idx(field, 0);
             IdMap::serialize(&present, self.num_docs, id_map_w)?;
             id_map_w.flush()?;
 
             // Slice (field, 1): dense LE byte rows, one per present doc.
-            let rows_w = composite.for_field_with_idx(*field, 1);
+            let rows_w = composite.for_field_with_idx(field, 1);
             rows_w.write_all(&row_bytes)?;
             rows_w.flush()?;
         }
         composite.close()?;
-        Ok(())
-    }
-
-    fn close(self: Box<Self>) -> crate::Result<()> {
         Ok(())
     }
 

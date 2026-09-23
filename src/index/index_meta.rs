@@ -10,6 +10,7 @@ use super::SegmentComponent;
 use crate::index::SegmentId;
 use crate::schema::Schema;
 use crate::store::Compressor;
+use crate::vector::BoundsScope;
 use crate::{Inventory, Opstamp, TrackedObject};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -289,6 +290,11 @@ pub struct IndexSettings {
     /// provided in `IndexSortByField`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_by_field: Option<IndexSortByField>,
+    /// If true, enables caller-provided doc id mappings at segment finalization time.
+    /// Always skip serializing this field since it's only used at segment finalization time.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub manual_doc_id_mapping: bool,
     /// The `Compressor` used to compress the doc store.
     #[serde(default)]
     pub docstore_compression: Compressor,
@@ -315,6 +321,18 @@ pub struct IndexSettings {
     #[serde(default = "default_vector_clustering_threshold")]
     #[serde(skip_serializing_if = "is_default_vector_clustering_threshold")]
     pub vector_clustering_threshold: usize,
+    /// Which rows a cluster's stored centroid bound covers — captured
+    /// from the index's build-time configuration (the `bounds_scope`
+    /// reloption upstream) so segments written later still fold the
+    /// scope the index was created with. `native` is the only variant
+    /// today.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_default_bounds_scope")]
+    pub vector_bounds_scope: BoundsScope,
+}
+
+fn is_default_bounds_scope(scope: &BoundsScope) -> bool {
+    *scope == BoundsScope::default()
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -342,11 +360,13 @@ impl Default for IndexSettings {
     fn default() -> Self {
         Self {
             sort_by_field: None,
+            manual_doc_id_mapping: false,
             docstore_compression: Compressor::default(),
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
             codec_types: default_codec_types(),
             vector_clustering_threshold: default_vector_clustering_threshold(),
+            vector_bounds_scope: BoundsScope::default(),
         }
     }
 }
@@ -509,6 +529,8 @@ mod tests {
     use crate::store::Compressor;
     #[cfg(feature = "zstd-compression")]
     use crate::store::ZstdCompressor;
+    #[cfg(feature = "lz4-compression")]
+    use crate::vector::BoundsScope;
     use crate::{IndexSettings, IndexSortByField, Order};
 
     #[test]
@@ -559,6 +581,7 @@ mod tests {
                     field: "text".to_string(),
                     order: Order::Asc,
                 }),
+                manual_doc_id_mapping: false,
                 docstore_compression: crate::store::Compressor::Zstd(ZstdCompressor {
                     compression_level: Some(4),
                 }),
@@ -630,11 +653,13 @@ mod tests {
             index_settings,
             IndexSettings {
                 sort_by_field: None,
+                manual_doc_id_mapping: false,
                 docstore_compression: Compressor::default(),
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
                 codec_types: columnar::DEFAULT_CODEC_TYPES.to_vec(),
                 vector_clustering_threshold: 10_000,
+                vector_bounds_scope: BoundsScope::Native,
             }
         );
         {
@@ -649,6 +674,19 @@ mod tests {
             let index_settings_deser: IndexSettings =
                 serde_json::from_value(index_settings_json).unwrap();
             assert_eq!(index_settings_deser, index_settings);
+        }
+        {
+            // manual_doc_id_mapping should not be persisted.
+            index_settings.manual_doc_id_mapping = true;
+            let index_settings_json = serde_json::to_value(&index_settings).unwrap();
+            assert_eq!(
+                index_settings_json,
+                serde_json::json!({
+                    "docstore_compression": "lz4",
+                    "docstore_blocksize": 16384
+                })
+            );
+            index_settings.manual_doc_id_mapping = false;
         }
         {
             index_settings.docstore_compress_dedicated_thread = false;
