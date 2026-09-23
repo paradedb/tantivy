@@ -168,6 +168,38 @@ impl<T: PartialOrd + Copy + Debug + Send + Sync + 'static> Column<T> {
     }
 }
 
+impl Column<u64> {
+    /// Load u32 values for each docid in the provided slice.
+    ///
+    /// This method is only supported for single-valued, non-optional columns (`ColumnIndex::Full`).
+    ///
+    /// # Preconditions
+    ///
+    /// `docids` must be sorted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `docids.len() != output.len()`
+    /// - `self.max_value() > u32::MAX as u64`
+    /// - The column is not `ColumnIndex::Full` (i.e. is `Optional`, `Multivalued`, or `Empty`).
+    #[inline]
+    pub fn u32_vals(&self, docids: &[DocId], output: &mut [u32]) {
+        assert_eq!(docids.len(), output.len());
+        assert!(
+            self.max_value() <= u32::MAX as u64,
+            "u32_vals called on column with max_value ({}) > u32::MAX",
+            self.max_value()
+        );
+        match &self.index {
+            ColumnIndex::Full => self.values.get_u32_vals(docids, output),
+            ColumnIndex::Optional(_) | ColumnIndex::Multivalued(_) | ColumnIndex::Empty { .. } => {
+                panic!("u32_vals is only supported on single-valued, non-optional (Full) columns");
+            }
+        }
+    }
+}
+
 impl BinarySerializable for Cardinality {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> std::io::Result<()> {
         self.to_code().serialize(writer)
@@ -209,5 +241,111 @@ impl<T: PartialOrd + Debug + Send + Sync + Copy + 'static> ColumnValues<T>
             ColumnIndex::Optional(optional_idx) => optional_idx.num_docs(),
             ColumnIndex::Multivalued(multivalue_idx) => multivalue_idx.num_docs(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::column_index::{MultiValueIndex, OptionalIndex};
+
+    #[derive(Clone)]
+    struct MockU64Values {
+        vals: Vec<u64>,
+        max_val: u64,
+    }
+
+    impl ColumnValues<u64> for MockU64Values {
+        fn get_val(&self, idx: u32) -> u64 {
+            self.vals[idx as usize]
+        }
+        fn min_value(&self) -> u64 {
+            *self.vals.iter().min().unwrap_or(&0)
+        }
+        fn max_value(&self) -> u64 {
+            self.max_val
+        }
+        fn num_vals(&self) -> u32 {
+            self.vals.len() as u32
+        }
+        fn get_u32_vals(&self, indexes: &[u32], output: &mut [u32]) {
+            for (out, &idx) in output.iter_mut().zip(indexes) {
+                *out = self.vals[idx as usize] as u32;
+            }
+        }
+    }
+
+    #[test]
+    fn test_u32_vals_full() {
+        let col = Column {
+            index: ColumnIndex::Full,
+            values: Arc::new(MockU64Values {
+                vals: vec![10, 20, 30],
+                max_val: 30,
+            }),
+        };
+        let mut out = [0u32; 3];
+        col.u32_vals(&[0, 1, 2], &mut out);
+        assert_eq!(out, [10, 20, 30]);
+
+        let mut out_dup = [0u32; 4];
+        col.u32_vals(&[0, 1, 1, 2], &mut out_dup);
+        assert_eq!(out_dup, [10, 20, 20, 30]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "u32_vals is only supported on single-valued, non-optional (Full) columns"
+    )]
+    fn test_u32_vals_optional_panics() {
+        let col = Column {
+            index: ColumnIndex::Optional(OptionalIndex::for_test(3, &[0, 2])),
+            values: Arc::new(MockU64Values {
+                vals: vec![10, 30],
+                max_val: 30,
+            }),
+        };
+        let mut out = [0u32; 2];
+        col.u32_vals(&[0, 2], &mut out);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "u32_vals is only supported on single-valued, non-optional (Full) columns"
+    )]
+    fn test_u32_vals_multivalued_panics() {
+        let col = Column {
+            index: ColumnIndex::Multivalued(MultiValueIndex::for_test(&[0, 2])),
+            values: Arc::new(MockU64Values {
+                vals: vec![10, 20],
+                max_val: 20,
+            }),
+        };
+        let mut out = [0u32; 1];
+        col.u32_vals(&[0], &mut out);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "u32_vals is only supported on single-valued, non-optional (Full) columns"
+    )]
+    fn test_u32_vals_empty_panics() {
+        let col = Column::<u64>::build_empty_column(5);
+        let mut out = [0u32; 1];
+        col.u32_vals(&[0], &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "u32_vals called on column with max_value")]
+    fn test_u32_vals_max_value_overflow_panics() {
+        let col = Column {
+            index: ColumnIndex::Full,
+            values: Arc::new(MockU64Values {
+                vals: vec![10, (u32::MAX as u64) + 1],
+                max_val: (u32::MAX as u64) + 1,
+            }),
+        };
+        let mut out = [0u32; 2];
+        col.u32_vals(&[0, 1], &mut out);
     }
 }

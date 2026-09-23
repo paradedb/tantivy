@@ -87,6 +87,77 @@ impl ColumnValues for BitpackedReader {
         self.stats.min_value + self.stats.gcd.get() * self.unpack_val(doc)
     }
 
+    fn get_u32_vals(&self, indexes: &[u32], output: &mut [u32]) {
+        assert_eq!(indexes.len(), output.len());
+        if indexes.is_empty() {
+            return;
+        }
+
+        let min_value = self.stats.min_value;
+        let gcd = self.stats.gcd.get();
+        let bit_width = self.bit_unpacker.bit_width();
+
+        if bit_width == 0 {
+            output.fill(min_value as u32);
+            return;
+        }
+
+        debug_assert!(
+            indexes.windows(2).all(|w| w[0] <= w[1]),
+            "indexes must be sorted"
+        );
+
+        let first = indexes[0];
+        let last = indexes[indexes.len() - 1];
+
+        if first > last {
+            for (&idx, out) in indexes.iter().zip(output.iter_mut()) {
+                *out = self.get_val(idx) as u32;
+            }
+            return;
+        }
+
+        let span = last as usize - first as usize + 1;
+        let count = indexes.len();
+
+        if bit_width <= 32 && count >= 32 && span <= count * 2 {
+            let data_range = self
+                .bit_unpacker
+                .block_oblivious_range(first..last.saturating_add(1), self.data.len());
+            let data_offset = data_range.start;
+            let data_subset = self
+                .data
+                .slice(data_range)
+                .read_bytes()
+                .expect("Failed to read column values.");
+
+            // If count == span and elements are strictly increasing, the indexes are contiguous
+            // without duplicates, so we can unpack the entire range directly into output.
+            if count == span && indexes.windows(2).all(|w| w[0] < w[1]) {
+                self.bit_unpacker
+                    .get_batch_u32s(first, data_offset, &data_subset, output);
+                if min_value != 0 || gcd != 1 {
+                    for out in output.iter_mut() {
+                        *out = (min_value + gcd * (*out as u64)) as u32;
+                    }
+                }
+                return;
+            } else {
+                for (&idx, out) in indexes.iter().zip(output.iter_mut()) {
+                    let unpacked =
+                        self.bit_unpacker
+                            .get_from_subset(idx, data_offset, &data_subset);
+                    *out = (min_value + gcd * unpacked) as u32;
+                }
+                return;
+            }
+        }
+
+        for (&idx, out) in indexes.iter().zip(output.iter_mut()) {
+            *out = self.get_val(idx) as u32;
+        }
+    }
+
     #[inline]
     fn min_value(&self) -> u64 {
         self.stats.min_value

@@ -101,6 +101,24 @@ pub trait ColumnValues<T: PartialOrd = u64>: Send + Sync + DowncastSync {
         }
     }
 
+    /// Allows pushing down multiple fetch calls directly into `u32`, to avoid
+    /// dynamic dispatch and 16-byte `Option<u64>` overhead.
+    ///
+    /// `indexes` and `output` should have the same length.
+    ///
+    /// # Preconditions
+    ///
+    /// `indexes` must be sorted.
+    ///
+    /// # Panics
+    ///
+    /// May panic if `idx` is greater than the column length or if the codec does not support u32
+    /// pushdown.
+    fn get_u32_vals(&self, indexes: &[u32], output: &mut [u32]) {
+        let _ = (indexes, output);
+        panic!("get_u32_vals is not supported on this ColumnValues type");
+    }
+
     /// Fills an output buffer with the fast field values
     /// associated with the `DocId` going from
     /// `start` to `start + output.len()`.
@@ -195,6 +213,11 @@ impl<T: PartialOrd + Default> ColumnValues<T> for EmptyColumnValues {
     fn num_vals(&self) -> u32 {
         0
     }
+
+    fn get_u32_vals(&self, indexes: &[u32], output: &mut [u32]) {
+        assert_eq!(indexes.len(), output.len());
+        output.fill(0);
+    }
 }
 
 impl<T: Copy + PartialOrd + Debug + 'static> ColumnValues<T> for Arc<dyn ColumnValues<T>> {
@@ -204,8 +227,18 @@ impl<T: Copy + PartialOrd + Debug + 'static> ColumnValues<T> for Arc<dyn ColumnV
     }
 
     #[inline(always)]
+    fn get_vals(&self, indexes: &[u32], output: &mut [T]) {
+        self.as_ref().get_vals(indexes, output)
+    }
+
+    #[inline(always)]
     fn get_vals_opt(&self, indexes: &[u32], output: &mut [Option<T>]) {
         self.as_ref().get_vals_opt(indexes, output)
+    }
+
+    #[inline(always)]
+    fn get_u32_vals(&self, indexes: &[u32], output: &mut [u32]) {
+        self.as_ref().get_u32_vals(indexes, output)
     }
 
     #[inline(always)]

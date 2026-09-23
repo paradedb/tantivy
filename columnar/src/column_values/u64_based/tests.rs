@@ -98,7 +98,7 @@ pub(crate) fn create_and_validate<TColumnCodec: ColumnCodec>(
 
     let actual_compression = buffer.len() as u64;
 
-    let reader = TColumnCodec::load(FileSlice::from(buffer)).unwrap();
+    let reader = std::sync::Arc::new(TColumnCodec::load(FileSlice::from(buffer)).unwrap());
     assert_eq!(reader.num_vals(), vals.len() as u32);
     let mut buffer = Vec::new();
     for (doc, orig_val) in vals.iter().copied().enumerate() {
@@ -121,6 +121,83 @@ pub(crate) fn create_and_validate<TColumnCodec: ColumnCodec>(
     buffer.resize(all_docs.len(), 0);
     reader.get_vals(&all_docs, &mut buffer);
     assert_eq!(vals, buffer);
+
+    let mut opt_buffer: Vec<Option<u64>> = vec![None; all_docs.len()];
+    reader.get_vals_opt(&all_docs, &mut opt_buffer);
+    let opt_unwrapped: Vec<u64> = opt_buffer.iter().map(|o| o.unwrap()).collect();
+    assert_eq!(
+        vals, opt_unwrapped,
+        "get_vals_opt mismatch in data set {name}"
+    );
+
+    if vals.iter().all(|&v| v <= u32::MAX as u64) {
+        let mut u32_buffer: Vec<u32> = vec![0; all_docs.len()];
+        reader.get_u32_vals(&all_docs, &mut u32_buffer);
+        let u32_expected: Vec<u32> = vals.iter().map(|&v| v as u32).collect();
+        assert_eq!(
+            u32_expected, u32_buffer,
+            "get_u32_vals mismatch in data set {name}"
+        );
+
+        let col = crate::Column {
+            values: reader.clone(),
+            index: crate::ColumnIndex::Full,
+        };
+        let mut col_u32_buffer = vec![0; all_docs.len()];
+        col.u32_vals(&all_docs, &mut col_u32_buffer);
+        assert_eq!(
+            u32_expected, col_u32_buffer,
+            "Column::u32_vals mismatch in data set {name}"
+        );
+
+        if vals.len() >= 2 {
+            let sub_docs: Vec<u32> = (1..all_docs.len() as u32).collect();
+            let mut sub_buffer = vec![0; sub_docs.len()];
+            reader.get_u32_vals(&sub_docs, &mut sub_buffer);
+            let sub_expected: Vec<u32> = vals[1..].iter().map(|&v| v as u32).collect();
+            assert_eq!(sub_expected, sub_buffer, "get_u32_vals sub-slice in {name}");
+        }
+
+        if vals.len() >= 64 {
+            let strided_docs: Vec<u32> = (0..64).step_by(2).collect();
+            let mut strided_buffer = vec![0; strided_docs.len()];
+            reader.get_u32_vals(&strided_docs, &mut strided_buffer);
+            let strided_expected: Vec<u32> = strided_docs
+                .iter()
+                .map(|&d| vals[d as usize] as u32)
+                .collect();
+            assert_eq!(
+                strided_expected, strided_buffer,
+                "get_u32_vals strided in {name}"
+            );
+        }
+
+        if vals.len() >= 200 {
+            let sparse_docs: Vec<u32> = (0..200).step_by(5).collect();
+            let mut sparse_buffer = vec![0; sparse_docs.len()];
+            reader.get_u32_vals(&sparse_docs, &mut sparse_buffer);
+            let sparse_expected: Vec<u32> = sparse_docs
+                .iter()
+                .map(|&d| vals[d as usize] as u32)
+                .collect();
+            assert_eq!(
+                sparse_expected, sparse_buffer,
+                "get_u32_vals sparse in {name}"
+            );
+        }
+
+        if !all_docs.is_empty() {
+            let small_len = all_docs.len().min(5);
+            let small_docs = &all_docs[..small_len];
+            let mut small_buffer = vec![0; small_len];
+            reader.get_u32_vals(small_docs, &mut small_buffer);
+            let small_expected: Vec<u32> = small_docs
+                .iter()
+                .map(|&d| vals[d as usize] as u32)
+                .collect();
+            assert_eq!(small_expected, small_buffer, "get_u32_vals small in {name}");
+        }
+    }
 
     // Validate `get_range` over the full column and a sub-range. The sub-range starts
     // at a non-zero offset to exercise the entrance-ramp alignment of the batch decode.
@@ -238,6 +315,87 @@ proptest! {
     #[test]
     fn test_proptest_large_blockwise_linear_v2(data in proptest::collection::vec(num_strategy(), 1..6000)) {
         create_and_validate::<BlockwiseLinearV2Codec>(&data, "proptest multilinearinterpol v2");
+    }
+}
+
+fn validate_codec_u32_vals<TColumnCodec: ColumnCodec>(vals: &[u32], docids: &[u32]) {
+    let u64_vals: Vec<u64> = vals.iter().map(|&v| v as u64).collect();
+    let mut stats_collector = StatsCollector::default();
+    let mut codec_estimator = TColumnCodec::Estimator::default();
+    for &val in &u64_vals {
+        stats_collector.collect(val);
+        codec_estimator.collect(val);
+    }
+    codec_estimator.finalize();
+    let stats = stats_collector.stats();
+    if codec_estimator.estimate(&stats).is_none() {
+        return;
+    }
+
+    let mut buffer = Vec::new();
+    codec_estimator
+        .serialize(&stats, &mut u64_vals.iter().copied(), &mut buffer)
+        .unwrap();
+
+    let reader = TColumnCodec::load(FileSlice::from(buffer)).unwrap();
+
+    let mut output = vec![0u32; docids.len()];
+    reader.get_u32_vals(docids, &mut output);
+
+    let expected: Vec<u32> = docids.iter().map(|&doc| vals[doc as usize]).collect();
+    assert_eq!(output, expected);
+
+    let col = crate::Column {
+        values: std::sync::Arc::new(reader),
+        index: crate::ColumnIndex::Full,
+    };
+    let mut col_output = vec![0u32; docids.len()];
+    col.u32_vals(docids, &mut col_output);
+    assert_eq!(col_output, expected);
+}
+
+fn u32_vals_and_sorted_docids() -> impl Strategy<Value = (Vec<u32>, Vec<u32>)> {
+    prop::collection::vec(prop::num::u32::ANY, 1..600).prop_flat_map(|vals| {
+        let len = vals.len() as u32;
+        let docids_strategy = prop_oneof![
+            // Contiguous slice:
+            1 => (0..len).prop_flat_map(move |start| {
+                (start..=len).prop_map(move |end| (start..end).collect::<Vec<_>>())
+            }),
+            // Strictly increasing subsequence (unique, with gaps):
+            2 => proptest::sample::subsequence((0..len).collect::<Vec<_>>(), 0..=len as usize),
+            // Sorted with possible duplicates:
+            3 => prop::collection::vec(0..len, 0..=len as usize).prop_map(|mut docids| {
+                docids.sort_unstable();
+                docids
+            }),
+        ];
+        (Just(vals), docids_strategy)
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn test_proptest_u32_vals_bitpacked((vals, docids) in u32_vals_and_sorted_docids()) {
+        validate_codec_u32_vals::<BitpackedCodec>(&vals, &docids);
+    }
+
+    #[test]
+    fn test_proptest_u32_vals_linear((vals, docids) in u32_vals_and_sorted_docids()) {
+        validate_codec_u32_vals::<LinearCodec>(&vals, &docids);
+    }
+
+    #[test]
+    fn test_proptest_u32_vals_blockwise_linear((vals, docids) in u32_vals_and_sorted_docids()) {
+        validate_codec_u32_vals::<BlockwiseLinearCodec>(&vals, &docids);
+    }
+
+    #[cfg(feature = "paradedb")]
+    #[test]
+    fn test_proptest_u32_vals_blockwise_linear_v2((vals, docids) in u32_vals_and_sorted_docids()) {
+        validate_codec_u32_vals::<BlockwiseLinearV2Codec>(&vals, &docids);
     }
 }
 
