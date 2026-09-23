@@ -634,10 +634,9 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 match scorers.len() {
                     0 => {}
                     1 => {
-                        scorers
-                            .pop()
-                            .unwrap()
-                            .for_each_pruning_batch(threshold, callback);
+                        let mut scorer =
+                            BlockWandSingleScorer::new(scorers.pop().unwrap(), threshold);
+                        for_each_pruning_scorer(&mut scorer, callback);
                     }
                     _ if self.should_use_block_maxscore(&scorers, reader.max_doc()) => {
                         super::block_maxscore::block_maxscore(scorers, threshold, 8192, callback);
