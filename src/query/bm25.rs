@@ -6,8 +6,6 @@ use crate::query::Explanation;
 use crate::schema::Field;
 use crate::{Score, Searcher, Term};
 
-mod batch;
-
 /// Provides the corpus-level statistics needed by BM25 scoring.
 ///
 /// The standard implementation is [`Searcher`], but you can implement this
@@ -217,10 +215,6 @@ impl Bm25Weight {
         self.weight * self.tf_factor(fieldnorm_id, term_freq)
     }
 
-    pub(crate) fn score_batch(&self, fieldnorms: &[u8], freqs: &[u32], scores: &mut [Score]) {
-        batch::score_batch(self.weight, &self.cache, fieldnorms, freqs, scores);
-    }
-
     pub fn max_score(&self) -> Score {
         self.score(255u8, 2_013_265_944)
     }
@@ -297,36 +291,6 @@ mod tests {
             "Custom k1/b should produce different scores: default={score_default}, \
              custom={score_custom}"
         );
-    }
-
-    #[test]
-    fn test_batch_matches_scalar_bm25() {
-        use super::Bm25Weight;
-        use crate::index::Bm25Params;
-
-        let fieldnorms: Vec<u8> = (0..=255).collect();
-        let freqs: Vec<u32> = (0u32..=255).map(|i| i.wrapping_mul(2654435761)).collect();
-        for params in [
-            Bm25Params::default(),
-            Bm25Params::new(0.0, 0.0),
-            Bm25Params::new(2.0, 1.0),
-        ] {
-            for avg in [0.5, 50.0, 10000.0] {
-                for boost in [0.0, 0.25, 10.0] {
-                    let weight = Bm25Weight::for_one_term(10, 100, avg, params).boost_by(boost);
-                    let mut scores = [0.0; 256];
-                    weight.score_batch(&fieldnorms, &freqs, &mut scores);
-                    for ((&norm, &freq), score) in fieldnorms.iter().zip(&freqs).zip(scores) {
-                        let expected = weight.score(norm, freq);
-                        if expected.is_nan() {
-                            assert!(score.is_nan());
-                        } else {
-                            assert_eq!(score.to_bits(), expected.to_bits());
-                        }
-                    }
-                }
-            }
-        }
     }
 
     #[test]
