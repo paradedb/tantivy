@@ -231,11 +231,13 @@ impl InvertedIndexReader {
         let postings_data = self
             .postings_file_slice
             .slice(term_info.postings_range.clone());
-        let mut postings = BlockSegmentPostings::open(
+        let buffer_size = 32768;
+        let mut postings = BlockSegmentPostings::open_from_file(
             term_info.doc_freq,
-            postings_data.read_bytes()?,
+            postings_data,
             self.record_option,
             requested_option,
+            buffer_size,
         )?;
         postings.set_term_norm_source(self.posting_norms_file_slice.clone(), self.norm_storage)?;
         Ok(postings)

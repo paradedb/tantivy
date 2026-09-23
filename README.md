@@ -17,6 +17,8 @@ an off-the-shelf search engine server, but rather a crate that can be used to bu
 
 Tantivy is, in fact, strongly inspired by Lucene's design.
 
+[Lazy postings](doc/lazy-postings.md) explains read buffering and its tradeoffs.
+
 ## Benchmark
 
 The following [benchmark](https://tantivy-search.github.io/bench/) breaks down the
