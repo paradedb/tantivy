@@ -182,6 +182,25 @@ where
             if self.current_block_addr.as_ref() != Some(&target_block) {
                 match self.dict.sstable_delta_reader_block(target_block.clone()) {
                     Ok(reader) => {
+                        let next_block = self
+                            .sorted_keys
+                            .as_slice()
+                            .get(self.input_cursor + 1)
+                            .and_then(|key| {
+                                self.dict.sstable_index.get_block_with_key(key.as_ref())
+                            });
+                        if next_block.as_ref() != Some(&target_block) {
+                            let index = self.input_cursor;
+                            self.input_cursor += 1;
+                            match self.dict.do_get(target, reader) {
+                                Ok(Some(value)) => return Some(Ok((index, value))),
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    self.errored = true;
+                                    return Some(Err(error));
+                                }
+                            }
+                        }
                         self.delta_reader = Some(reader);
                         self.current_block_addr = Some(target_block);
                         self.current_entry_key.clear();

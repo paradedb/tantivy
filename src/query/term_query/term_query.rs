@@ -1,10 +1,12 @@
 use std::fmt;
 use std::ops::Bound;
+use std::sync::Arc;
 
 use super::term_weight::TermWeight;
 use crate::index::Bm25Params;
 use crate::query::bm25::Bm25Weight;
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
+use crate::query::resolved_terms::{ResolvedTermInfo, ResolvedTerms};
 use crate::query::{EnableScoring, Explanation, Query, RangeQuery, Weight};
 use crate::schema::{Field, IndexRecordOption};
 use crate::{SegmentReader, Term};
@@ -92,6 +94,27 @@ impl TermQuery {
         &self,
         enable_scoring: EnableScoring<'_>,
     ) -> crate::Result<TermWeight> {
+        let resolved = if let EnableScoring::Enabled {
+            statistics_provider,
+            ..
+        } = enable_scoring
+        {
+            statistics_provider
+                .local_searcher()
+                .map(|searcher| ResolvedTerms::new(searcher, [&self.term]))
+                .transpose()?
+                .and_then(|terms| terms.get(&self.term).cloned())
+        } else {
+            None
+        };
+        self.specialized_weight_with_term_info(enable_scoring, resolved)
+    }
+
+    pub(crate) fn specialized_weight_with_term_info(
+        &self,
+        enable_scoring: EnableScoring<'_>,
+        resolved: Option<Arc<ResolvedTermInfo>>,
+    ) -> crate::Result<TermWeight> {
         let schema = enable_scoring.schema();
         let field_entry = schema.get_field_entry(self.term.field());
         if !field_entry.is_indexed() {
@@ -102,7 +125,21 @@ impl TermQuery {
             EnableScoring::Enabled {
                 statistics_provider,
                 ..
-            } => Bm25Weight::for_terms(statistics_provider, std::slice::from_ref(&self.term))?,
+            } => {
+                if let Some(info) = &resolved {
+                    let total_num_tokens =
+                        statistics_provider.total_num_tokens(self.term.field())?;
+                    let total_num_docs = statistics_provider.total_num_docs()?;
+                    Bm25Weight::for_one_term(
+                        info.doc_freq,
+                        total_num_docs,
+                        total_num_tokens as crate::Score / total_num_docs as crate::Score,
+                        statistics_provider.bm25_params(self.term.field()),
+                    )
+                } else {
+                    Bm25Weight::for_terms(statistics_provider, std::slice::from_ref(&self.term))?
+                }
+            }
             EnableScoring::Disabled { .. } => Bm25Weight::new(
                 Explanation::new("<no score>", 1.0f32),
                 1.0f32,
@@ -116,12 +153,14 @@ impl TermQuery {
             IndexRecordOption::Basic
         };
 
-        Ok(TermWeight::new(
+        let mut weight = TermWeight::new(
             self.term.clone(),
             index_record_option,
             bm25_weight,
             scoring_enabled,
-        ))
+        );
+        weight.resolved_term_info = resolved;
+        Ok(weight)
     }
 }
 
