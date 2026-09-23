@@ -433,6 +433,7 @@ mod tests {
     use crate::{DocId, DocSet, Score, TERMINATED};
 
     include!("block_maxscore_bench.rs");
+    include!("single_term_bench.rs");
 
     struct Float(Score);
 
@@ -461,7 +462,7 @@ mod tests {
     }
 
     fn compute_checkpoints_for_each_pruning(
-        term_scorers: Vec<TermScorer>,
+        mut term_scorers: Vec<TermScorer>,
         n: usize,
         window: Option<u32>,
     ) -> Vec<(DocId, Score)> {
@@ -490,6 +491,9 @@ mod tests {
                 window,
                 callback,
             );
+        } else if term_scorers.len() == 1 {
+            let mut scorer = term_scorers.pop().unwrap();
+            scorer.for_each_pruning_batch(Score::MIN, callback);
         } else {
             super::block_wand(term_scorers, Score::MIN, callback);
         }

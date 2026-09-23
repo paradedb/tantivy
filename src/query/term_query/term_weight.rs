@@ -10,7 +10,7 @@ use crate::query::boolean_query::BlockWandSingleScorer;
 use crate::query::explanation::does_not_match;
 use crate::query::resolved_terms::ResolvedTermInfo;
 use crate::query::scorer::BasicPruningScorer;
-use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
+use crate::query::weight::{for_each_docset_buffered, for_each_scorer};
 use crate::query::{AllScorer, AllWeight, EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::IndexRecordOption;
 use crate::{DocId, Score, TantivyError, Term};
@@ -114,8 +114,8 @@ impl Weight for TermWeight {
         let specialized_scorer = self.specialized_scorer(reader, 1.0)?;
         match specialized_scorer {
             TermOrEmptyOrAllScorer::TermScorer(term_scorer) => {
-                let mut scorer = BlockWandSingleScorer::new(*term_scorer, threshold);
-                for_each_pruning_scorer(&mut scorer, callback);
+                let mut term_scorer = term_scorer;
+                term_scorer.for_each_pruning_batch(threshold, callback);
             }
             TermOrEmptyOrAllScorer::Empty => {}
             TermOrEmptyOrAllScorer::AllMatch(_) => {
