@@ -123,6 +123,7 @@ struct QuantizedLayerLayout {
 
 /// Per-field quantized slot layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
+// TODO(quant-v4): see QuantizedTempSlot.
 struct QuantizedWriteLayout {
     layers: Vec<QuantizedLayerLayout>,
     residual_norms: QuantizedSlotLayout,
@@ -173,6 +174,23 @@ impl QuantizedWriteLayout {
 }
 
 /// Merge-local spill file for one quantized slot.
+///
+/// TODO(quant-v4): remove the temp-file spill by moving to a cluster-major layout.
+/// The V3 layout keeps segment-wide slots per layer (codes, sidecar, constants),
+/// and `CompositeWrite` writes one slot at a time, while the encoder produces
+/// every layer's output for a cluster in one pass (layer N is encoded from layer
+/// N-1's residual). So each cluster's runs are spilled here and spliced back
+/// slot by slot at close, which writes the quantized data twice on every merge.
+/// A slot per layer does not fix this; the layers still wait on each other.
+/// V4 should store one slot per field with one block per cluster, columnar
+/// inside the block: radius², then per layer codes / scales / γ / E / constants.
+/// Block sizes are deterministic from cluster counts and the schedule, so
+/// `QuantizedWriteLayout` can still carry per-cluster offsets up front, and
+/// layer skipping on the read side becomes a range skip inside the block.
+/// IdMap and fp32 rows are already written directly and stay as they are.
+/// Touches `QuantizedWriteLayout`, `VectorFileVersion`, and `read_batch` in the
+/// quantized scan. Do it with the merge perf/mem work.
+/// See [https://github.com/paradedb/tantivy/pull/219#issuecomment-5801264380](https://github.com/paradedb/tantivy/pull/219#issuecomment-5801264380)
 struct QuantizedTempSlot {
     file: TempFilePtr,
     expected_len: usize,
