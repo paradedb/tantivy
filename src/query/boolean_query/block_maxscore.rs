@@ -9,8 +9,8 @@ pub(super) fn should_use_block_maxscore(scorers: &[TermScorer], max_doc: DocId) 
         .iter()
         .map(|scorer| u64::from(scorer.size_hint()))
         .sum();
-    let density = 256;
-    scorers.len() >= 3 && postings >= 256 && postings.saturating_mul(density) >= u64::from(max_doc)
+    let density = if scorers.len() == 2 { 128 } else { 256 };
+    postings >= 256 && postings.saturating_mul(density) >= u64::from(max_doc)
 }
 
 struct Term {
@@ -21,7 +21,7 @@ struct Term {
     remaining: f64,
 }
 
-pub(super) fn block_maxscore(
+pub(super) fn block_maxscore<const BATCH: bool>(
     scorers: Vec<TermScorer>,
     mut threshold: Score,
     min_window: u32,
@@ -86,18 +86,33 @@ pub(super) fn block_maxscore(
             let mut matches_len = 0;
             if strong.len() == 1 {
                 let scorer = &mut strong[0].scorer;
-                while scorer.doc() < window_end {
-                    matches[matches_len] = (scorer.doc(), scorer.score() as f64);
-                    matches_len += 1;
-                    scorer.advance();
+                if BATCH {
+                    scorer.for_each_until(window_end, |doc, score| {
+                        matches[matches_len] = (doc, score as f64);
+                        matches_len += 1;
+                    });
+                } else {
+                    while scorer.doc() < window_end {
+                        matches[matches_len] = (scorer.doc(), scorer.score() as f64);
+                        matches_len += 1;
+                        scorer.advance();
+                    }
                 }
             } else {
                 for term in strong.iter_mut() {
-                    while term.scorer.doc() < window_end {
-                        let offset = (term.scorer.doc() - base) as usize;
-                        candidates[offset / 64] |= 1u64 << (offset % 64);
-                        scores[offset] += term.scorer.score() as f64;
-                        term.scorer.advance();
+                    if BATCH {
+                        term.scorer.for_each_until(window_end, |doc, score| {
+                            let offset = (doc - base) as usize;
+                            candidates[offset / 64] |= 1u64 << (offset % 64);
+                            scores[offset] += score as f64;
+                        });
+                    } else {
+                        while term.scorer.doc() < window_end {
+                            let offset = (term.scorer.doc() - base) as usize;
+                            candidates[offset / 64] |= 1u64 << (offset % 64);
+                            scores[offset] += term.scorer.score() as f64;
+                            term.scorer.advance();
+                        }
                     }
                 }
                 for (word, bits) in candidates.iter_mut().enumerate() {

@@ -82,6 +82,71 @@ impl TermScorer {
         )
     }
 
+    pub(crate) fn for_each_until(&mut self, end: DocId, mut callback: impl FnMut(DocId, Score)) {
+        let mut norms = [0u8; 128];
+        let mut scores = [0.0; 128];
+        while self.doc() < end {
+            let start = self.postings.block_offset();
+            let block = &self.postings.block_cursor;
+            let docs = &block.docs()[start..block.block_len()];
+            let len = docs.partition_point(|&doc| doc < end);
+            block.fieldnorms_range(start, &mut norms[..len], &self.fieldnorm_reader);
+            self.similarity_weight.score_batch(
+                &norms[..len],
+                &block.freqs()[start..start + len],
+                &mut scores[..len],
+            );
+            for (&doc, &score) in docs[..len].iter().zip(&scores[..len]) {
+                callback(doc, score);
+            }
+            self.postings.advance_by(len);
+        }
+    }
+
+    pub(crate) fn for_each_pruning_batch(
+        &mut self,
+        threshold: Score,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) {
+        self.for_each_pruning_batch_size::<8, 128>(threshold, callback);
+    }
+
+    pub(crate) fn for_each_pruning_batch_size<const FIRST: usize, const REST: usize>(
+        &mut self,
+        mut threshold: Score,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) {
+        let mut start = self.doc();
+        while start < crate::TERMINATED {
+            self.seek_block(start);
+            let last = self.last_doc_in_block();
+            let bound = self.block_max_score();
+            if bound > threshold {
+                if self.doc() < start {
+                    self.seek(start);
+                }
+                let mut batch = FIRST;
+                while self.doc() <= last && self.doc() != crate::TERMINATED && bound > threshold {
+                    let block = &self.postings.block_cursor;
+                    let stop = (self.postings.block_offset() + batch).min(block.block_len());
+                    let end = block.docs()[stop - 1]
+                        .saturating_add(1)
+                        .min(crate::TERMINATED);
+                    self.for_each_until(end, |doc, score| {
+                        if score > threshold {
+                            threshold = callback(doc, score);
+                        }
+                    });
+                    batch = REST;
+                }
+            }
+            if last == crate::TERMINATED {
+                break;
+            }
+            start = last + 1;
+        }
+    }
+
     pub fn term_freq(&self) -> u32 {
         self.postings.term_freq()
     }

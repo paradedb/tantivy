@@ -222,6 +222,26 @@ impl BlockSegmentPostings {
             .unwrap_or_else(|| fallback.fieldnorm_id(self.doc(offset)))
     }
 
+    pub(crate) fn fieldnorms_range(
+        &self,
+        start: usize,
+        output: &mut [u8],
+        fallback: &FieldNormReader,
+    ) {
+        if let Some(norms) = &self.term_norms {
+            let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + start;
+            output.copy_from_slice(
+                &norms
+                    .read_range(ordinal..ordinal + output.len())
+                    .expect("failed to read posting fieldnorms"),
+            );
+        } else {
+            for (i, norm) in output.iter_mut().enumerate() {
+                *norm = fallback.fieldnorm_id(self.doc(start + i));
+            }
+        }
+    }
+
     pub(crate) fn posting_fieldnorm_id_at(&self, offset: usize) -> Option<u8> {
         self.term_norms.as_ref().map(|norms| {
             let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + offset;

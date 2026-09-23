@@ -13,7 +13,43 @@ fn benchmark_pruning(scorers: Vec<TermScorer>, k: usize, mode: usize) -> Vec<Sco
     };
     match mode {
         0 => super::block_wand(scorers, Score::MIN, &mut callback),
-        1 => super::super::block_maxscore::block_maxscore(scorers, Score::MIN, 8192, &mut callback),
+        1 => super::super::block_maxscore::block_maxscore::<false>(
+            scorers,
+            Score::MIN,
+            8192,
+            &mut callback,
+        ),
+        2 => super::super::block_maxscore::block_maxscore::<true>(
+            scorers,
+            Score::MIN,
+            8192,
+            &mut callback,
+        ),
+        3 => scorers
+            .into_iter()
+            .next()
+            .unwrap()
+            .for_each_pruning_batch(Score::MIN, &mut callback),
+        4 => scorers
+            .into_iter()
+            .next()
+            .unwrap()
+            .for_each_pruning_batch_size::<8, 8>(Score::MIN, &mut callback),
+        5 => scorers
+            .into_iter()
+            .next()
+            .unwrap()
+            .for_each_pruning_batch_size::<16, 16>(Score::MIN, &mut callback),
+        6 => scorers
+            .into_iter()
+            .next()
+            .unwrap()
+            .for_each_pruning_batch_size::<64, 64>(Score::MIN, &mut callback),
+        7 => scorers
+            .into_iter()
+            .next()
+            .unwrap()
+            .for_each_pruning_batch_size::<128, 128>(Score::MIN, &mut callback),
         _ => unreachable!(),
     }
     let mut scores: Vec<_> = heap.into_iter().map(|v| v.0).collect();
@@ -66,10 +102,10 @@ fn benchmark_scheduler_cutovers() {
                         .collect();
                     for k in [10, 100] {
                         let expected = benchmark_pruning(scorers.clone(), k, 0);
-                        let mut times = [Vec::new(), Vec::new()];
+                        let mut times = [Vec::new(), Vec::new(), Vec::new()];
                         for round in 0..5 {
-                            for turn in 0..2 {
-                                let mode = (round + turn) % 2;
+                            for turn in 0..3 {
+                                let mode = (round + turn) % 3;
                                 let actual = benchmark_pruning(scorers.clone(), k, mode);
                                 assert_eq!(actual.len(), expected.len());
                                 assert!(actual
@@ -98,6 +134,57 @@ fn benchmark_scheduler_cutovers() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "release-mode cutover benchmark; prints CSV"]
+fn benchmark_single_term_cutovers() {
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    println!("SINGLE,postings,k,mode,median_ns");
+    for count in [1u32, 4, 8, 16, 32, 64, 127, 128, 129, 256, 1024, 8192] {
+        let norms: Vec<_> = (0..count).map(|i| 64 + i % 257).collect();
+        let avg = norms.iter().map(|&v| v as u64).sum::<u64>() as f32 / count as f32;
+        let postings: Vec<_> = (0..count).map(|i| (i, 1 + (i * 137) % 16)).collect();
+        let weight =
+            Bm25Weight::for_one_term(count as u64, count as u64, avg, Bm25Params::default());
+        let norm_reader = crate::fieldnorm::FieldNormReader::for_test(&norms);
+        let mut scorer = TermScorer::create_for_test(&postings, &norms, weight);
+        scorer.block_cursor().set_posting_norms_for_test(
+            postings
+                .iter()
+                .map(|&(doc, _)| norm_reader.fieldnorm_id(doc))
+                .collect(),
+        );
+        let scorers = vec![scorer];
+        for k in [1, 10, 100] {
+            let expected = benchmark_pruning(scorers.clone(), k, 0);
+            let modes = [0, 4, 5, 3, 6, 7];
+            let mut times: Vec<Vec<u64>> = modes.iter().map(|_| Vec::new()).collect();
+            for round in 0..7 {
+                for turn in 0..modes.len() {
+                    let mode = (round + turn) % modes.len();
+                    assert_eq!(benchmark_pruning(scorers.clone(), k, modes[mode]), expected);
+                    let start = Instant::now();
+                    let mut n = 0u32;
+                    while start.elapsed() < Duration::from_millis(10) {
+                        black_box(benchmark_pruning(
+                            black_box(scorers.clone()),
+                            k,
+                            modes[mode],
+                        ));
+                        n += 1;
+                    }
+                    times[mode].push(start.elapsed().as_nanos() as u64 / u64::from(n));
+                }
+            }
+            for (mode, samples) in times.iter_mut().enumerate() {
+                samples.sort_unstable();
+                println!("SINGLE,{count},{k},{},{}", modes[mode], samples[3]);
             }
         }
     }
@@ -166,10 +253,10 @@ fn benchmark_scheduler_boundary() {
                         .collect();
                     for k in [10, 100] {
                         let expected = benchmark_pruning(scorers.clone(), k, 0);
-                        let mut times = [Vec::new(), Vec::new()];
+                        let mut times = [Vec::new(), Vec::new(), Vec::new()];
                         for round in 0..5 {
-                            for turn in 0..2 {
-                                let mode = (round + turn) % 2;
+                            for turn in 0..3 {
+                                let mode = (round + turn) % 3;
                                 let actual = benchmark_pruning(scorers.clone(), k, mode);
                                 assert_eq!(actual.len(), expected.len());
                                 assert!(actual

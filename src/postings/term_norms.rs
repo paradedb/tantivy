@@ -58,6 +58,25 @@ impl TermNormReader {
         })
     }
 
+    pub(crate) fn read_range(&self, range: std::ops::Range<usize>) -> io::Result<OwnedBytes> {
+        if range.start > range.end || range.end > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "posting norm range out of bounds",
+            ));
+        }
+        if range.is_empty() {
+            return Ok(OwnedBytes::empty());
+        }
+        self.read(range.start)?;
+        READS.set(READS.get() + (range.len() - 1) as u64);
+        self.buffer
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .get_bytes(range.start as u64..range.end as u64)
+    }
+
     pub(crate) fn read(&self, ordinal: usize) -> io::Result<u8> {
         if ordinal >= self.len {
             return Err(io::Error::new(
@@ -144,6 +163,15 @@ mod tests {
         assert_eq!(reads.lock().unwrap().last().unwrap(), &(28202..29010));
         assert_eq!(opens.load(Ordering::Relaxed), 1);
         assert!(reader.read(29000).is_err());
+        for range in [0..128, 8170..8200, 28000..29000, 29000..29000] {
+            let bytes = reader.read_range(range.clone()).unwrap();
+            assert_eq!(
+                bytes.as_slice(),
+                range.map(|i| ((i + 10) % 251) as u8).collect::<Vec<_>>()
+            );
+        }
+        assert!(reader.read_range(0..29001).is_err());
+        assert!(reader.read_range(2..1).is_err());
         let empty = BufferedFileSlice::empty();
         assert!(empty.read_byte(0).is_err());
         assert!(empty.read_byte(u64::MAX).is_err());
