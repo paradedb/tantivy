@@ -208,6 +208,15 @@ impl BlockSegmentPostings {
         self.term_norms = None;
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_posting_norms_for_test(&mut self, norms: Vec<u8>) {
+        let file = crate::directory::FileSlice::from(norms);
+        let source = std::sync::Arc::new(common::file_slice::DeferredFileSlice::new(move || {
+            Ok(file.clone())
+        }));
+        self.term_norms = super::term_norms::TermNormReader::new(source, 0, self.doc_freq, true);
+    }
+
     pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
         self.posting_fieldnorm_id_at(offset)
             .unwrap_or_else(|| fallback.fieldnorm_id(self.doc(offset)))
@@ -381,6 +390,28 @@ impl BlockSegmentPostings {
 
     pub(crate) fn block_is_loaded(&self) -> bool {
         self.block_loaded
+    }
+
+    pub(crate) fn block_max_score_up_to(
+        &mut self,
+        target: DocId,
+        fieldnorms: &FieldNormReader,
+        weight: &Bm25Weight,
+    ) -> (Score, DocId) {
+        let mut bound = self.block_max_score(fieldnorms, weight);
+        if self.skip_reader.last_doc_in_block() >= target {
+            return (bound, self.skip_reader.last_doc_in_block());
+        }
+        let mut impacts = self.skip_reader.clone();
+        while impacts.last_doc_in_block() < target {
+            impacts.advance();
+            bound = bound.max(
+                impacts
+                    .block_max_score(weight)
+                    .unwrap_or_else(|| weight.max_score()),
+            );
+        }
+        (bound, impacts.last_doc_in_block())
     }
 
     pub(crate) fn load_block(&mut self) {
