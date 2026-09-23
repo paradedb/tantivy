@@ -46,7 +46,7 @@ pub struct BlockWandIntersectionScorer {
     candidate_idx: usize,
 
     threshold: Score,
-    membership_first: bool,
+    no_score_cutoff_yet: bool,
     current: (DocId, Score),
     internal_doc: DocId,
     window_end: DocId,
@@ -87,7 +87,7 @@ impl BlockWandIntersectionScorer {
             num_candidates: 0,
             candidate_idx: 0,
             threshold,
-            membership_first: threshold == Score::MIN,
+            no_score_cutoff_yet: threshold == Score::MIN,
             current: (0, Score::MIN),
             internal_doc,
             window_end: 0,
@@ -178,7 +178,7 @@ impl PruningScorer for BlockWandIntersectionScorer {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
-        self.membership_first &= score == Score::MIN;
+        self.no_score_cutoff_yet &= score == Score::MIN;
     }
 }
 impl DocSet for BlockWandIntersectionScorer {
@@ -189,7 +189,7 @@ impl DocSet for BlockWandIntersectionScorer {
         }
 
         // An unfilled top-k heap has no competitive score to prune against.
-        if self.membership_first {
+        if self.no_score_cutoff_yet {
             return self.advance_without_pruning();
         }
 
