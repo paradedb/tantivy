@@ -432,6 +432,8 @@ mod tests {
     use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
     use crate::{DocId, DocSet, Score, TERMINATED};
 
+    include!("block_maxscore_bench.rs");
+
     struct Float(Score);
 
     impl Eq for Float {}
@@ -459,8 +461,9 @@ mod tests {
     }
 
     fn compute_checkpoints_for_each_pruning(
-        mut term_scorers: Vec<TermScorer>,
+        term_scorers: Vec<TermScorer>,
         n: usize,
+        window: Option<u32>,
     ) -> Vec<(DocId, Score)> {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(n);
         let mut checkpoints: Vec<(DocId, Score)> = Vec::new();
@@ -480,9 +483,13 @@ mod tests {
             limit
         };
 
-        if term_scorers.len() == 1 {
-            let scorer = term_scorers.pop().unwrap();
-            super::block_wand_single_scorer(scorer, Score::MIN, callback);
+        if let Some(window) = window {
+            super::super::block_maxscore::block_maxscore(
+                term_scorers,
+                Score::MIN,
+                window,
+                callback,
+            );
         } else {
             super::block_wand(term_scorers, Score::MIN, callback);
         }
@@ -602,9 +609,12 @@ mod tests {
                 TermScorer::create_for_test(postings, &fieldnorms_expanded[..], bm25_weight)
             })
             .collect();
-        for top_k in 1..4 {
+        for (top_k, window) in [1, 3, 10, 100]
+            .into_iter()
+            .flat_map(|k| [None, Some(0), Some(512), Some(4096)].map(|w| (k, w)))
+        {
             let checkpoints_for_each_pruning =
-                compute_checkpoints_for_each_pruning(term_scorers.clone(), top_k);
+                compute_checkpoints_for_each_pruning(term_scorers.clone(), top_k, window);
             let checkpoints_manual =
                 compute_checkpoints_manual(term_scorers.clone(), top_k, max_doc as u32);
             assert_eq!(checkpoints_for_each_pruning.len(), checkpoints_manual.len());
@@ -631,6 +641,14 @@ mod tests {
         #[test]
         fn test_block_wand_single_term_scorer((posting_lists, fieldnorms) in gen_term_scorers(1)) {
             test_block_wand_aux(&posting_lists[..], &fieldnorms[..]);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn test_block_maxscore_ten_terms((posting_lists, fieldnorms) in gen_term_scorers(10)) {
+            test_block_wand_aux(&posting_lists, &fieldnorms);
         }
     }
 
