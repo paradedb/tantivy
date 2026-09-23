@@ -191,12 +191,15 @@ impl Query for BooleanQuery {
                 Ok((*occur, subquery.weight(enable_scoring)?))
             })
             .collect::<crate::Result<_>>()?;
-        Ok(Box::new(BooleanWeight::with_minimum_number_should_match(
-            sub_weights,
-            self.minimum_number_should_match,
-            enable_scoring.is_scoring_enabled(),
-            Box::new(SumCombiner::default),
-        )))
+        Ok(Box::new(
+            BooleanWeight::with_minimum_number_should_match(
+                sub_weights,
+                self.minimum_number_should_match,
+                enable_scoring.is_scoring_enabled(),
+                Box::new(SumCombiner::default),
+            )
+            .with_disjunction_pruning(enable_scoring.disjunction_pruning()),
+        ))
     }
 
     fn query_terms(
@@ -300,10 +303,13 @@ mod tests {
     use std::collections::HashSet;
 
     use super::BooleanQuery;
-    use crate::collector::{Count, DocSetCollector};
-    use crate::query::{Query, QueryClone, QueryParser, TermQuery};
+    use crate::collector::{Count, DocSetCollector, TopDocs};
+    use crate::query::{
+        DisjunctionMaxQuery, DisjunctionPruning, EnableScoring, Query, QueryClone, QueryParser,
+        TermQuery,
+    };
     use crate::schema::{Field, IndexRecordOption, Schema, TEXT};
-    use crate::{DocAddress, DocId, Index, Term};
+    use crate::{assert_nearly_equals, DocAddress, DocId, Executor, Index, Term};
 
     fn create_test_index() -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
@@ -317,6 +323,81 @@ mod tests {
         writer.add_document(doc!(text=>"a d"))?;
         writer.commit()?;
         Ok(index)
+    }
+
+    #[test]
+    fn test_disjunction_pruning_search() -> crate::Result<()> {
+        let index = create_test_index()?;
+        let searcher = index.reader()?.searcher();
+        let text = index.schema().get_field("text")?;
+        let parser = QueryParser::for_index(&index, vec![text]);
+        let mut queries = [
+            "a OR b",
+            "a OR b OR c",
+            "a OR missing",
+            "missing OR absent",
+            "a",
+            "a AND b",
+        ]
+        .map(|query| parser.parse_query(query))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        let terms = || {
+            ["a", "b", "c"]
+                .map(|term| {
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(text, term),
+                        IndexRecordOption::WithFreqs,
+                    )) as Box<dyn Query>
+                })
+                .into_iter()
+                .collect()
+        };
+        queries.push(Box::new(DisjunctionMaxQuery::with_tie_breaker(
+            terms(),
+            0.1,
+        )));
+        queries.push(Box::new(BooleanQuery::union_with_minimum_required_clauses(
+            terms(),
+            2,
+        )));
+        for query in queries {
+            for limit in [1, 2, 10] {
+                let expected =
+                    searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
+                for pruning in [
+                    DisjunctionPruning::Auto,
+                    DisjunctionPruning::BlockWand,
+                    DisjunctionPruning::BlockMaxScore,
+                ] {
+                    let actual = searcher.search_with_executor(
+                        &query,
+                        &TopDocs::with_limit(limit).order_by_score(),
+                        &Executor::SingleThread,
+                        EnableScoring::enabled_from_searcher(&searcher)
+                            .with_disjunction_pruning(pruning),
+                    )?;
+                    assert_eq!(actual.len(), expected.len(), "{query:?}, {pruning:?}");
+                    for ((score, doc), (expected_score, expected_doc)) in
+                        actual.iter().zip(&expected)
+                    {
+                        assert_eq!(doc, expected_doc, "{query:?}, {pruning:?}");
+                        assert_nearly_equals!(*score, *expected_score);
+                    }
+                    assert_eq!(
+                        searcher.search_with_executor(
+                            &query,
+                            &Count,
+                            &Executor::SingleThread,
+                            EnableScoring::disabled_from_searcher(&searcher)
+                                .with_disjunction_pruning(pruning),
+                        )?,
+                        searcher.search(&query, &Count)?
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
