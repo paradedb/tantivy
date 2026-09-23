@@ -217,11 +217,13 @@ impl BlockSegmentPostings {
         self.term_norms = super::term_norms::TermNormReader::new(source, 0, self.doc_freq, true);
     }
 
+    #[inline]
     pub(crate) fn fieldnorm_id_at(&self, offset: usize, fallback: &FieldNormReader) -> u8 {
         self.posting_fieldnorm_id_at(offset)
             .unwrap_or_else(|| fallback.fieldnorm_id(self.doc(offset)))
     }
 
+    #[inline]
     pub(crate) fn posting_fieldnorm_id_at(&self, offset: usize) -> Option<u8> {
         self.term_norms.as_ref().map(|norms| {
             let ordinal = (self.doc_freq - self.skip_reader.remaining_docs()) as usize + offset;
