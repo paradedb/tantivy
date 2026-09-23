@@ -432,6 +432,8 @@ mod tests {
     use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
     use crate::{DocId, DocSet, Score, TERMINATED};
 
+    include!("single_term_bench.rs");
+
     struct Float(Score);
 
     impl Eq for Float {}
@@ -481,8 +483,8 @@ mod tests {
         };
 
         if term_scorers.len() == 1 {
-            let scorer = term_scorers.pop().unwrap();
-            super::block_wand_single_scorer(scorer, Score::MIN, callback);
+            let mut scorer = term_scorers.pop().unwrap();
+            scorer.for_each_pruning_batch(Score::MIN, callback);
         } else {
             super::block_wand(term_scorers, Score::MIN, callback);
         }

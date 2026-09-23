@@ -1,5 +1,6 @@
 use crate::docset::DocSet;
 use crate::fieldnorm::FieldNormReader;
+use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Explanation, Scorer};
@@ -76,6 +77,55 @@ impl TermScorer {
 
     pub fn term_freq(&self) -> u32 {
         self.postings.term_freq()
+    }
+
+    pub(crate) fn for_each_pruning_batch(
+        &mut self,
+        mut threshold: Score,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) {
+        let mut norms = [0u8; COMPRESSION_BLOCK_SIZE];
+        let mut scores = [0.0; COMPRESSION_BLOCK_SIZE];
+        let mut start = self.doc();
+        while start < crate::TERMINATED {
+            self.seek_block(start);
+            let last = self.last_doc_in_block();
+            let bound = self.block_max_score();
+            if bound > threshold {
+                if self.doc() < start {
+                    self.seek(start);
+                }
+                let mut batch_size = 8;
+                while self.doc() <= last && self.doc() != crate::TERMINATED && bound > threshold {
+                    let offset = self.postings.block_offset();
+                    let block = &self.postings.block_cursor;
+                    let stop = (offset + batch_size).min(block.block_len());
+                    let docs = &block.docs()[offset..stop];
+                    let len = docs.len();
+                    for (norm, &doc) in norms[..len].iter_mut().zip(docs) {
+                        *norm = self.fieldnorm_reader.fieldnorm_id(doc);
+                    }
+                    let freqs = if block.freq_reading_option() == FreqReadingOption::ReadFreq {
+                        &block.freqs()[offset..stop]
+                    } else {
+                        &[1; COMPRESSION_BLOCK_SIZE][..len]
+                    };
+                    self.similarity_weight
+                        .score_batch(&norms[..len], freqs, &mut scores[..len]);
+                    for (&doc, &score) in docs.iter().zip(&scores[..len]) {
+                        if score > threshold {
+                            threshold = callback(doc, score);
+                        }
+                    }
+                    self.postings.advance_by(len);
+                    batch_size = COMPRESSION_BLOCK_SIZE;
+                }
+            }
+            if last == crate::TERMINATED {
+                break;
+            }
+            start = last + 1;
+        }
     }
 
     pub fn fieldnorm_id(&self) -> u8 {
@@ -163,6 +213,37 @@ mod tests {
     use crate::{
         assert_nearly_equals, DocId, DocSet, Index, IndexWriter, Score, Searcher, Term, TERMINATED,
     };
+
+    #[test]
+    fn test_batch_without_stored_frequencies() {
+        for count in [1u32, 8, 127, 128, 129, 256] {
+            let docs: Vec<_> = (0..count).map(|i| i * 3).collect();
+            let norms: Vec<_> = (0..count * 3).map(|i| 1 + i % 53).collect();
+            let weight = Bm25Weight::for_one_term(
+                count as u64,
+                norms.len() as u64,
+                27.0,
+                Bm25Params::default(),
+            );
+            let mut scorer = TermScorer::new(
+                crate::postings::SegmentPostings::create_from_docs(&docs),
+                crate::fieldnorm::FieldNormReader::for_test(&norms),
+                weight,
+            );
+            let mut scalar = scorer.clone();
+            let mut expected = Vec::new();
+            while scalar.doc() != TERMINATED {
+                expected.push((scalar.doc(), scalar.score()));
+                scalar.advance();
+            }
+            let mut actual = Vec::new();
+            scorer.for_each_pruning_batch(Score::MIN, &mut |doc, score| {
+                actual.push((doc, score));
+                Score::MIN
+            });
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn test_term_scorer_max_score() -> crate::Result<()> {
