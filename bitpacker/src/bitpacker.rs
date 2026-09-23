@@ -190,7 +190,13 @@ impl BitUnpacker {
     // #Panics
     //
     // This methods panics if `num_bits` is > 32.
-    fn get_batch_u32s(&self, start_idx: u32, data_offset: usize, data: &[u8], output: &mut [u32]) {
+    pub fn get_batch_u32s(
+        &self,
+        start_idx: u32,
+        data_offset: usize,
+        data: &[u8],
+        output: &mut [u32],
+    ) {
         assert!(
             self.bit_width() <= 32,
             "Bitwidth must be <= 32 to use this method."
@@ -221,7 +227,7 @@ impl BitUnpacker {
         // We want the start of the fast track to start align with bytes.
         // A sufficient condition is to start with an idx that is a multiple of 8,
         // so highway start is the closest multiple of 8 that is >= start_idx.
-        let entrance_ramp_len = 8 - (start_idx % 8) % 8;
+        let entrance_ramp_len = (8 - (start_idx % 8)) % 8;
 
         let highway_start: u32 = start_idx + entrance_ramp_len;
 
