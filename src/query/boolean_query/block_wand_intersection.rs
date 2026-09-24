@@ -46,6 +46,7 @@ pub struct BlockWandIntersectionScorer {
     candidate_idx: usize,
 
     threshold: Score,
+    no_score_cutoff_yet: bool,
     current: (DocId, Score),
     internal_doc: DocId,
     window_end: DocId,
@@ -86,12 +87,45 @@ impl BlockWandIntersectionScorer {
             num_candidates: 0,
             candidate_idx: 0,
             threshold,
+            no_score_cutoff_yet: threshold == Score::MIN,
             current: (0, Score::MIN),
             internal_doc,
             window_end: 0,
         };
         scorer.advance();
         scorer
+    }
+
+    /// Finds the next document matching every term, then scores it, without checking score bounds.
+    fn advance_without_pruning(&mut self) -> DocId {
+        let mut candidate = self.leader.seek(self.internal_doc);
+        'candidate: while candidate != TERMINATED {
+            for secondary in &mut self.secondaries {
+                let secondary_doc = if secondary.doc() < candidate {
+                    secondary.seek(candidate)
+                } else {
+                    secondary.doc()
+                };
+                if secondary_doc > candidate {
+                    candidate = self.leader.seek(secondary_doc);
+                    continue 'candidate;
+                }
+            }
+
+            let mut score = self.leader.score();
+            for secondary in &mut self.secondaries {
+                score += secondary.score();
+            }
+            self.internal_doc = candidate + 1;
+            if score > self.threshold {
+                self.current = (candidate, score);
+                return candidate;
+            }
+            candidate = self.leader.seek(self.internal_doc);
+        }
+        self.internal_doc = TERMINATED;
+        self.current = (TERMINATED, Score::MIN);
+        TERMINATED
     }
 
     fn handle_candidates(&mut self) -> Option<DocId> {
@@ -145,6 +179,7 @@ impl PruningScorer for BlockWandIntersectionScorer {
     #[inline]
     fn set_threshold(&mut self, score: Score) {
         self.threshold = score;
+        self.no_score_cutoff_yet &= score == Score::MIN;
     }
 }
 impl DocSet for BlockWandIntersectionScorer {
@@ -152,6 +187,11 @@ impl DocSet for BlockWandIntersectionScorer {
         if self.maximum_possible_score <= self.threshold {
             self.current = (TERMINATED, Score::MIN);
             return TERMINATED;
+        }
+
+        // An unfilled top-k heap has no competitive score to prune against.
+        if self.no_score_cutoff_yet {
+            return self.advance_without_pruning();
         }
 
         // check for leftover candidates to handle
@@ -321,7 +361,7 @@ mod tests {
     ) -> Vec<(DocId, Score)> {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(top_k);
         let mut checkpoints: Vec<(DocId, Score)> = Vec::new();
-        let mut limit: Score = 0.0;
+        let mut limit: Score = Score::MIN;
 
         let callback = &mut |doc, score| {
             heap.push(Float(score));
@@ -758,5 +798,81 @@ mod tests {
         let checkpoints_naive =
             compute_checkpoints_naive_intersection(vec![make_scorer(), make_scorer()], 5);
         assert_eq!(checkpoints_opt.len(), checkpoints_naive.len());
+    }
+
+    #[test]
+    fn test_membership_first_transition() {
+        use crate::query::scorer::PruningScorer;
+
+        let fieldnorms: Vec<u32> = (0..2048).map(|doc| 10 + doc % 71).collect();
+        let postings: Vec<Vec<(DocId, u32)>> = [3, 5, 7]
+            .into_iter()
+            .map(|divisor| {
+                (0..2048)
+                    .filter(|doc| doc % divisor < 2)
+                    .map(|doc| (doc, 1 + doc % 9))
+                    .collect()
+            })
+            .collect();
+        let make_scorers = || {
+            let mut scorers: Vec<_> = postings
+                .iter()
+                .map(|postings| {
+                    TermScorer::create_for_test(
+                        postings,
+                        &fieldnorms,
+                        Bm25Weight::for_one_term(
+                            postings.len() as u64,
+                            fieldnorms.len() as u64,
+                            45.0,
+                            crate::Bm25Params::default(),
+                        ),
+                    )
+                })
+                .collect();
+            scorers.sort_by_key(TermScorer::size_hint);
+            scorers
+        };
+        let mut scorers = make_scorers();
+        let mut expected = Vec::new();
+        for doc in 0..2048 {
+            if scorers
+                .iter_mut()
+                .all(|scorer| scorer.doc() <= doc && scorer.seek(doc) == doc)
+            {
+                let mut score = scorers[0].score();
+                for scorer in &mut scorers[1..] {
+                    score += scorer.score();
+                }
+                expected.push((doc, score));
+            }
+        }
+        assert!(expected.len() > 128);
+
+        for unpruned_matches in [0, 1, 3, 10, 128, expected.len()] {
+            let mut threshold = if unpruned_matches == 0 {
+                0.0
+            } else {
+                Score::MIN
+            };
+            let mut scorer = super::BlockWandIntersectionScorer::new(make_scorers(), threshold);
+            let mut returned = 0;
+            for &(doc, score) in &expected {
+                if score <= threshold {
+                    continue;
+                }
+                assert_eq!(scorer.doc(), doc);
+                assert_eq!(scorer.score().to_bits(), score.to_bits());
+                returned += 1;
+                if returned >= unpruned_matches {
+                    threshold = threshold.max(score * 0.8);
+                    scorer.set_threshold(threshold);
+                }
+                scorer.advance();
+            }
+            assert_eq!(scorer.doc(), TERMINATED);
+            assert_eq!(scorer.advance(), TERMINATED);
+            assert_eq!(scorer.advance(), TERMINATED);
+        }
     }
 }
