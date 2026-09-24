@@ -1781,6 +1781,20 @@ impl<T: VectorElement> VectorBackend<T> {
                 let QueryBound::Armed { t } = query_bound else {
                     return f32::INFINITY;
                 };
+                #[cfg(debug_assertions)]
+                {
+                    let stride = self.reader.options().bytes_per_vector();
+                    let centroid_bytes = index.centroid_bytes().expect("readable centroid rows");
+                    let exact = metric.similarity_bytes::<f32>(
+                        query.query(),
+                        &centroid_bytes[cluster * stride..(cluster + 1) * stride],
+                    );
+                    debug_assert_eq!(
+                        sim, exact,
+                        "routing stream key must be the exact centroid similarity; the quantized \
+                         L2 base and query-residual norm are derived from it"
+                    );
+                }
                 let r = bounds.ball_r(cluster);
                 match metric {
                     Metric::L2 | Metric::Cosine => {
