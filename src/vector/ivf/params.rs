@@ -76,7 +76,7 @@ pub struct AdaptiveProbeParams {
     /// `(0, 1]`. Below `1.0` the router stops scanning its lists once the
     /// estimated recall of the top clusters reaches it (APS); `1.0` routes
     /// with the fixed nprobe fractions. Ignored by other routers, and
-    /// forced to `1.0` at or above
+    /// forced to `1.0` above
     /// [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM). Default
     /// [`DEFAULT_ROUTER_RECALL`], PROVISIONAL.
     pub router_recall_target: f32,

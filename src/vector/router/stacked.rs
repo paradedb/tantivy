@@ -79,7 +79,7 @@ pub(super) fn open(
 /// [`APS_MAX_DIM`], where the cap-volume estimate is unreliable and the
 /// fixed nprobe path is used instead.
 pub(crate) fn effective_recall(dim: usize, recall: f32) -> f32 {
-    if dim >= APS_MAX_DIM || !(recall < 1.0) {
+    if dim > APS_MAX_DIM || !(recall < 1.0) {
         1.0
     } else {
         recall.max(0.0)

@@ -372,10 +372,10 @@ mod tests {
         }
     }
 
-    /// Below `APS_MAX_DIM` the requested recall target is honoured and the
+    /// Up to `APS_MAX_DIM` the requested recall target is honoured and the
     /// ranking is bounded by `k`; the metrics report the router's work.
     #[test]
-    fn stacked_ranking_uses_requested_recall_below_dim_cap() -> crate::Result<()> {
+    fn stacked_ranking_uses_requested_recall_within_dim_cap() -> crate::Result<()> {
         let opened = open_stacked(2, 64)?;
         let mut workspace = RouterWorkspace::default();
         let query = vec![0.0f32; 2];
@@ -392,12 +392,12 @@ mod tests {
         Ok(())
     }
 
-    /// At or above `APS_MAX_DIM` the recall target is forced to `1.0` (fixed
+    /// Above `APS_MAX_DIM` the recall target is forced to `1.0` (fixed
     /// nprobe list selection), but the returned set is still capped at `k`
     /// so the caller's probe budget limits `candidate_count`.
     #[test]
-    fn stacked_ranking_falls_back_to_nprobe_at_dim_cap() -> crate::Result<()> {
-        let dim = crate::vector::ivf::APS_MAX_DIM;
+    fn stacked_ranking_falls_back_to_nprobe_above_dim_cap() -> crate::Result<()> {
+        let dim = crate::vector::ivf::APS_MAX_DIM + 1;
         let opened = open_stacked(dim, 32)?;
         let mut workspace = RouterWorkspace::default();
         let query = vec![0.0f32; dim];
@@ -422,11 +422,11 @@ mod tests {
         assert_eq!(stacked::effective_recall(2, f32::NAN), 1.0);
         assert_eq!(
             stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM, 0.9),
-            1.0
+            0.9
         );
         assert_eq!(
-            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM - 1, 0.9),
-            0.9
+            stacked::effective_recall(crate::vector::ivf::APS_MAX_DIM + 1, 0.9),
+            1.0
         );
     }
 
