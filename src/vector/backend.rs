@@ -681,6 +681,7 @@ impl QuantizedCandidates {
         residual_norm_squared: f32,
         gamma: f32,
         sign_query_error_term: f32,
+        arithmetic_variance: ArithmeticError,
     ) {
         self.rows.push(row);
         self.docs.push(doc);
@@ -691,7 +692,7 @@ impl QuantizedCandidates {
         self.residual_norm_squared.push(residual_norm_squared);
         self.gammas.push(gamma);
         self.sign_query_error_terms.push(sign_query_error_term);
-        self.arithmetic_variances.push(ArithmeticError::default());
+        self.arithmetic_variances.push(arithmetic_variance);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -793,8 +794,8 @@ impl QuantizedCandidates {
                 survivor.residual_norm_squared,
                 survivor.gamma,
                 survivor.sign_query_error_term,
+                survivor.arithmetic_variance,
             );
-            *self.arithmetic_variances.last_mut().unwrap() = survivor.arithmetic_variance;
         }
     }
 }
@@ -1490,6 +1491,7 @@ impl QuantizedScanCtx {
             residual_norm_squared,
             gamma,
             sign_query_error_term,
+            ArithmeticError::default(),
         );
     }
 
@@ -4055,8 +4057,30 @@ mod tests {
     #[test]
     fn l2_refinement_gamma_corrects_only_raw_prefix_and_keeps_state_local() {
         let mut candidates = QuantizedCandidates::with_capacity(2);
-        candidates.push(0, 10, 10.0, 2.0, 14.0, 0.0, 9.0, 1.0, 0.0);
-        candidates.push(1, 11, 20.0, 1.0, 22.0, 0.0, 4.0, 1.0, 1.0);
+        candidates.push(
+            0,
+            10,
+            10.0,
+            2.0,
+            14.0,
+            0.0,
+            9.0,
+            1.0,
+            0.0,
+            ArithmeticError::default(),
+        );
+        candidates.push(
+            1,
+            11,
+            20.0,
+            1.0,
+            22.0,
+            0.0,
+            4.0,
+            1.0,
+            1.0,
+            ArithmeticError::default(),
+        );
 
         combine_refinement_decoded(
             Metric::L2,
