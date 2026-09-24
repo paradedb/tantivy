@@ -127,14 +127,13 @@ impl IvfIndex {
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
     /// the bounds, and the router topology are materialized; the centroid
     /// rows stay behind a [`FileSlice`] for lazy per-node reads.
-    /// The persisted router kind must match the configured router.
+    /// The router is opened as the kind persisted in `router_slice`.
     pub(crate) fn open(
         version: VectorFileVersion,
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         router_slice: FileSlice,
-        router: RouterKind,
         bounds_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -177,7 +176,7 @@ impl IvfIndex {
             .into());
         }
 
-        let router = router.open(version, router_slice, centroids_slice.clone(), options)?;
+        let router = RouterKind::open(version, router_slice, centroids_slice.clone(), options)?;
 
         let bytes = bounds_slice.read_bytes()?;
         let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
