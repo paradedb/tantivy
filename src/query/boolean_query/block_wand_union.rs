@@ -426,16 +426,11 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use crate::collector::{Count, TopDocs};
     use crate::index::Bm25Params;
     use crate::query::score_combiner::SumCombiner;
     use crate::query::term_query::TermScorer;
-    use crate::query::{
-        Bm25Weight, BooleanQuery, BufferedUnionScorer, DisjunctionMaxQuery, DisjunctionPruning,
-        EnableScoring, Query, QueryParser, Scorer, TermQuery,
-    };
-    use crate::schema::{IndexRecordOption, Schema, TEXT};
-    use crate::{assert_nearly_equals, DocId, DocSet, Executor, Index, Score, Term, TERMINATED};
+    use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
+    use crate::{DocId, DocSet, Score, TERMINATED};
 
     struct Float(Score);
 
@@ -463,10 +458,18 @@ mod tests {
         (left - right).abs() < 0.0001 * (left + right).abs()
     }
 
-    fn compute_checkpoints_for_each_pruning(
+    #[derive(Clone, Copy, Debug)]
+    enum PruningMode {
+        NoPruning,
+        Wand,
+        MaxScore(u32),
+    }
+
+    fn compute_checkpoints(
         term_scorers: Vec<TermScorer>,
         n: usize,
-        window: Option<u32>,
+        max_doc: u32,
+        mode: PruningMode,
     ) -> Vec<(DocId, Score)> {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(n);
         let mut checkpoints: Vec<(DocId, Score)> = Vec::new();
@@ -486,15 +489,17 @@ mod tests {
             limit
         };
 
-        if let Some(window) = window {
-            super::super::block_maxscore::block_maxscore(
+        match mode {
+            PruningMode::NoPruning => {
+                return compute_checkpoints_manual(term_scorers, n, max_doc);
+            }
+            PruningMode::Wand => super::block_wand(term_scorers, Score::MIN, callback),
+            PruningMode::MaxScore(window) => super::super::block_maxscore::block_maxscore(
                 term_scorers,
                 Score::MIN,
                 window,
                 callback,
-            );
-        } else {
-            super::block_wand(term_scorers, Score::MIN, callback);
+            ),
         }
         checkpoints
     }
@@ -564,114 +569,10 @@ mod tests {
             .boxed()
     }
 
-    fn check_disjunction_pruning_search(
+    fn make_term_scorers(
         posting_lists: &[Vec<(DocId, u32)>],
-        max_doc: usize,
-    ) -> crate::Result<()> {
-        let mut schema = Schema::builder();
-        let text = schema.add_text_field("text", TEXT);
-        let index = Index::create_in_ram(schema.build());
-        let mut documents = vec![String::new(); max_doc];
-        let term_names: Vec<_> = (0..posting_lists.len())
-            .map(|i| format!("term{i}"))
-            .collect();
-        for (postings, term) in posting_lists.iter().zip(&term_names) {
-            for &(doc, frequency) in postings {
-                for _ in 0..frequency {
-                    documents[doc as usize].push_str(term);
-                    documents[doc as usize].push(' ');
-                }
-            }
-        }
-        let mut writer = index.writer_for_tests()?;
-        for document in documents {
-            writer.add_document(doc!(text => document))?;
-        }
-        writer.commit()?;
-        let searcher = index.reader()?.searcher();
-        let text = index.schema().get_field("text")?;
-        let parser = QueryParser::for_index(&index, vec![text]);
-        let mut queries = [
-            term_names.join(" OR "),
-            format!("{} OR missing", term_names[0]),
-            "missing OR absent".to_string(),
-            term_names[0].clone(),
-            term_names.join(" AND "),
-        ]
-        .iter()
-        .map(|query| parser.parse_query(query))
-        .collect::<Result<Vec<_>, _>>()?;
-        let terms = || {
-            term_names
-                .iter()
-                .map(|term| {
-                    Box::new(TermQuery::new(
-                        Term::from_field_text(text, term),
-                        IndexRecordOption::WithFreqs,
-                    )) as Box<dyn Query>
-                })
-                .collect()
-        };
-        queries.push(Box::new(DisjunctionMaxQuery::with_tie_breaker(
-            terms(),
-            0.1,
-        )));
-        if term_names.len() >= 2 {
-            queries.push(Box::new(BooleanQuery::union_with_minimum_required_clauses(
-                terms(),
-                2,
-            )));
-        }
-        for query in queries {
-            let all_docs = searcher.search_with_executor(
-                &query,
-                &TopDocs::with_limit(max_doc).order_by_score(),
-                &Executor::SingleThread,
-                EnableScoring::enabled_from_searcher(&searcher)
-                    .with_disjunction_pruning(DisjunctionPruning::BlockWand),
-            )?;
-            for limit in [1, 2, 10] {
-                let expected = &all_docs[..limit.min(all_docs.len())];
-                for pruning in [
-                    DisjunctionPruning::Auto,
-                    DisjunctionPruning::BlockWand,
-                    DisjunctionPruning::BlockMaxScore,
-                ] {
-                    let actual = searcher.search_with_executor(
-                        &query,
-                        &TopDocs::with_limit(limit).order_by_score(),
-                        &Executor::SingleThread,
-                        EnableScoring::enabled_from_searcher(&searcher)
-                            .with_disjunction_pruning(pruning),
-                    )?;
-                    assert_eq!(actual.len(), expected.len(), "{query:?}, {pruning:?}");
-                    // Rounding can reorder tied documents; verify ranks and each document's score.
-                    for ((score, doc), (expected_score, _)) in actual.iter().zip(expected) {
-                        assert_nearly_equals!(*score, *expected_score);
-                        let (doc_score, _) = all_docs
-                            .iter()
-                            .find(|(_, expected_doc)| doc == expected_doc)
-                            .unwrap();
-                        assert_nearly_equals!(*score, *doc_score);
-                    }
-                    assert_eq!(
-                        searcher.search_with_executor(
-                            &query,
-                            &Count,
-                            &Executor::SingleThread,
-                            EnableScoring::disabled_from_searcher(&searcher)
-                                .with_disjunction_pruning(pruning),
-                        )?,
-                        searcher.search(&query, &Count)?
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn test_block_wand_aux(posting_lists: &[Vec<(DocId, u32)>], fieldnorms: &[u32]) {
-        check_disjunction_pruning_search(posting_lists, fieldnorms.len()).unwrap();
+        fieldnorms: &[u32],
+    ) -> (Vec<TermScorer>, u32) {
         // We virtually repeat all docs 64 times in order to emulate blocks of 2 documents
         // and surface blogs more easily.
         const REPEAT: usize = 64;
@@ -719,46 +620,42 @@ mod tests {
                 TermScorer::create_for_test(postings, &fieldnorms_expanded[..], bm25_weight)
             })
             .collect();
-        for (top_k, window) in [1, 3, 10, 100]
-            .into_iter()
-            .flat_map(|k| [None, Some(0), Some(512), Some(4096)].map(|w| (k, w)))
-        {
-            let checkpoints_for_each_pruning =
-                compute_checkpoints_for_each_pruning(term_scorers.clone(), top_k, window);
-            let checkpoints_manual =
-                compute_checkpoints_manual(term_scorers.clone(), top_k, max_doc as u32);
-            assert_eq!(checkpoints_for_each_pruning.len(), checkpoints_manual.len());
-            for (&(left_doc, left_score), &(right_doc, right_score)) in checkpoints_for_each_pruning
-                .iter()
-                .zip(checkpoints_manual.iter())
-            {
-                assert_eq!(left_doc, right_doc);
-                assert!(nearly_equals(left_score, right_score));
+        (term_scorers, max_doc as u32)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1100))]
+        #[test]
+        fn test_disjunction_pruning(
+            (posting_lists, fieldnorms) in prop_oneof![
+                gen_term_scorers(1),
+                gen_term_scorers(2),
+                gen_term_scorers(10),
+            ]
+        ) {
+            let (term_scorers, max_doc) = make_term_scorers(&posting_lists, &fieldnorms);
+            for top_k in [1, 3, 10, 100] {
+                let no_pruning =
+                    compute_checkpoints(term_scorers.clone(), top_k, max_doc, PruningMode::NoPruning);
+                for mode in [
+                    PruningMode::Wand,
+                    PruningMode::MaxScore(0),
+                    PruningMode::MaxScore(512),
+                    PruningMode::MaxScore(4096),
+                ] {
+                    let actual = compute_checkpoints(term_scorers.clone(), top_k, max_doc, mode);
+                    assert_eq!(actual.len(), no_pruning.len(), "{mode:?}, k={top_k}");
+                    for (&(doc, score), &(expected_doc, expected_score)) in
+                        actual.iter().zip(&no_pruning)
+                    {
+                        assert_eq!(doc, expected_doc, "{mode:?}, k={top_k}");
+                        assert!(
+                            nearly_equals(score, expected_score),
+                            "{mode:?}, k={top_k}: {score} != {expected_score}"
+                        );
+                    }
+                }
             }
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(500))]
-        #[test]
-        fn test_block_wand_two_term_scorers((posting_lists, fieldnorms) in gen_term_scorers(2)) {
-            test_block_wand_aux(&posting_lists[..], &fieldnorms[..]);
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(500))]
-        #[test]
-        fn test_block_wand_single_term_scorer((posting_lists, fieldnorms) in gen_term_scorers(1)) {
-            test_block_wand_aux(&posting_lists[..], &fieldnorms[..]);
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
-        #[test]
-        fn test_block_maxscore_ten_terms((posting_lists, fieldnorms) in gen_term_scorers(10)) {
-            test_block_wand_aux(&posting_lists, &fieldnorms);
         }
     }
 
@@ -864,7 +761,29 @@ mod tests {
             489, 734, 814, 724, 700, 304, 128, 779, 311, 877, 774, 15, 866, 368, 894, 371, 982,
             502, 507, 669, 680, 76, 594, 626, 578, 331, 170, 639, 665, 186,
         ][..];
-        test_block_wand_aux(postings_lists, fieldnorms);
+        let (term_scorers, max_doc) = make_term_scorers(postings_lists, fieldnorms);
+        for top_k in [1, 3, 10, 100] {
+            let no_pruning =
+                compute_checkpoints(term_scorers.clone(), top_k, max_doc, PruningMode::NoPruning);
+            for mode in [
+                PruningMode::Wand,
+                PruningMode::MaxScore(0),
+                PruningMode::MaxScore(512),
+                PruningMode::MaxScore(4096),
+            ] {
+                let actual = compute_checkpoints(term_scorers.clone(), top_k, max_doc, mode);
+                assert_eq!(actual.len(), no_pruning.len(), "{mode:?}, k={top_k}");
+                for (&(doc, score), &(expected_doc, expected_score)) in
+                    actual.iter().zip(&no_pruning)
+                {
+                    assert_eq!(doc, expected_doc, "{mode:?}, k={top_k}");
+                    assert!(
+                        nearly_equals(score, expected_score),
+                        "{mode:?}, k={top_k}: {score} != {expected_score}"
+                    );
+                }
+            }
+        }
     }
 
     proptest! {
@@ -873,7 +792,29 @@ mod tests {
         #[test]
         #[ignore]
         fn test_block_wand_three_term_scorers((posting_lists, fieldnorms) in gen_term_scorers(3)) {
-            test_block_wand_aux(&posting_lists[..], &fieldnorms[..]);
+            let (term_scorers, max_doc) = make_term_scorers(&posting_lists, &fieldnorms);
+            for top_k in [1, 3, 10, 100] {
+                let no_pruning =
+                    compute_checkpoints(term_scorers.clone(), top_k, max_doc, PruningMode::NoPruning);
+                for mode in [
+                    PruningMode::Wand,
+                    PruningMode::MaxScore(0),
+                    PruningMode::MaxScore(512),
+                    PruningMode::MaxScore(4096),
+                ] {
+                    let actual = compute_checkpoints(term_scorers.clone(), top_k, max_doc, mode);
+                    assert_eq!(actual.len(), no_pruning.len(), "{mode:?}, k={top_k}");
+                    for (&(doc, score), &(expected_doc, expected_score)) in
+                        actual.iter().zip(&no_pruning)
+                    {
+                        assert_eq!(doc, expected_doc, "{mode:?}, k={top_k}");
+                        assert!(
+                            nearly_equals(score, expected_score),
+                            "{mode:?}, k={top_k}: {score} != {expected_score}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
