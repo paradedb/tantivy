@@ -1321,16 +1321,22 @@ fn score_layer(
             let row = selected_rows[selected_start];
             debug_assert!(row >= read_range.start);
             let scale_offset = (row - read_range.start) * std::mem::size_of::<f32>();
-            let scale_bits = sidecar.scales()[scale_offset] as u32
-                | (sidecar.scales()[scale_offset + 1] as u32) << 8
-                | (sidecar.scales()[scale_offset + 2] as u32) << 16
-                | (sidecar.scales()[scale_offset + 3] as u32) << 24;
-            let gamma_offset = (row - read_range.start) * std::mem::size_of::<u16>();
-            let gamma_bits = sidecar.gammas()[gamma_offset] as u16
-                | (sidecar.gammas()[gamma_offset + 1] as u16) << 8;
-            let error_ratio_bits = sidecar.error_ratios()[gamma_offset] as u16
-                | (sidecar.error_ratios()[gamma_offset + 1] as u16) << 8;
-            decoded_scales[selected_start] = f32::from_bits(scale_bits);
+            decoded_scales[selected_start] = f32::from_le_bytes(
+                sidecar.scales()[scale_offset..scale_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let f16_offset = (row - read_range.start) * std::mem::size_of::<u16>();
+            let gamma_bits = u16::from_le_bytes(
+                sidecar.gammas()[f16_offset..f16_offset + 2]
+                    .try_into()
+                    .unwrap(),
+            );
+            let error_ratio_bits = u16::from_le_bytes(
+                sidecar.error_ratios()[f16_offset..f16_offset + 2]
+                    .try_into()
+                    .unwrap(),
+            );
             decoded_gammas[selected_start] = f16_to_f32(gamma_bits);
             decoded_error_ratios[selected_start] = f16_to_f32(error_ratio_bits);
             selected_start += 1;
@@ -1358,11 +1364,8 @@ fn score_layer(
                 let row = selected_rows[selected_start];
                 debug_assert!(row >= read_range.start);
                 let offset = (row - read_range.start) * std::mem::size_of::<f32>();
-                let bits = constants[offset] as u32
-                    | (constants[offset + 1] as u32) << 8
-                    | (constants[offset + 2] as u32) << 16
-                    | (constants[offset + 3] as u32) << 24;
-                decoded_constants[selected_start] = f32::from_bits(bits);
+                decoded_constants[selected_start] =
+                    f32::from_le_bytes(constants[offset..offset + 4].try_into().unwrap());
                 selected_start += 1;
             }
         }
