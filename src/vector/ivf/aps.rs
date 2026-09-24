@@ -280,6 +280,64 @@ pub(crate) fn is_euclidean(metric: Metric) -> bool {
     matches!(metric, Metric::L2)
 }
 
+/// Relative change in `ρ` that triggers a recall profile recompute.
+pub const APS_RECOMPUTE_THRESHOLD: f32 = 0.10;
+
+/// Running APS recall estimate over a ranked candidate set.
+///
+/// Candidates are covered in rank order, so the covered set is always a
+/// prefix. The recall profile depends on `ρ` (the k-th result's radius)
+/// and is recomputed only when `ρ` moves by more than
+/// [`APS_RECOMPUTE_THRESHOLD`]; otherwise each newly covered candidate adds
+/// its cached probability.
+pub(crate) struct RecallEstimator {
+    boundary: Vec<f32>,
+    dim: usize,
+    metric: Metric,
+    rho: Option<f32>,
+    profile: Vec<f32>,
+    covered: usize,
+    estimate: f32,
+}
+
+impl RecallEstimator {
+    /// `centroids[i]` is candidate `i`'s centroid, nearest first.
+    pub(crate) fn new(query: &[f32], centroids: &[&[f32]], metric: Metric) -> Self {
+        Self {
+            boundary: compute_boundary_distances(query, centroids, is_euclidean(metric)),
+            dim: query.len(),
+            metric,
+            rho: None,
+            profile: Vec::new(),
+            covered: 0,
+            estimate: 0.0,
+        }
+    }
+
+    /// Covers the next candidate and returns the estimated recall of the
+    /// covered prefix. `kth` is the current k-th result, `None` until the
+    /// result heap holds `k`; the estimate is `None` until then too.
+    pub(crate) fn cover_next(&mut self, kth: Option<Similarity>) -> Option<f32> {
+        let i = self.covered;
+        self.covered += 1;
+        let rho = radius_from_kth(kth?, self.metric);
+        let recompute = self.rho.map_or(true, |old| {
+            (old - rho).abs() > APS_RECOMPUTE_THRESHOLD * old
+        });
+        if recompute {
+            self.rho = Some(rho);
+            self.profile =
+                compute_recall_profile(&self.boundary, rho, self.dim, is_euclidean(self.metric));
+            self.estimate = self.profile[..self.covered.min(self.profile.len())]
+                .iter()
+                .sum();
+        } else {
+            self.estimate += self.profile.get(i).copied().unwrap_or(0.0);
+        }
+        Some(self.estimate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +392,57 @@ mod tests {
         let sum: f32 = p.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "{p:?} sum={sum}");
         assert!(p.len() == 3);
+    }
+
+    fn three_cells() -> ([f32; 2], [[f32; 2]; 3]) {
+        ([0.1, 0.0], [[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]])
+    }
+
+    /// L2 similarity of a k-th result at distance `r`.
+    fn kth_at(r: f32) -> Similarity {
+        Similarity::new(-(r * r))
+    }
+
+    #[test]
+    fn estimator_waits_for_a_full_heap() {
+        let (q, c) = three_cells();
+        let rows: Vec<&[f32]> = c.iter().map(|r| &r[..]).collect();
+        let mut est = RecallEstimator::new(&q, &rows, Metric::L2);
+        assert_eq!(est.cover_next(None), None);
+        // The first estimate covers every candidate seen so far.
+        let got = est.cover_next(Some(kth_at(1.5))).unwrap();
+        let profile = compute_recall_profile(&est.boundary, 1.5, 2, true);
+        assert!(
+            (got - (profile[0] + profile[1])).abs() < 1e-6,
+            "{got} {profile:?}"
+        );
+    }
+
+    #[test]
+    fn estimator_reuses_profile_within_threshold() {
+        let (q, c) = three_cells();
+        let rows: Vec<&[f32]> = c.iter().map(|r| &r[..]).collect();
+        let mut est = RecallEstimator::new(&q, &rows, Metric::L2);
+        let first = est.cover_next(Some(kth_at(1.5))).unwrap();
+        let profile = est.profile.clone();
+        // A 5% radius change keeps the cached profile.
+        let second = est.cover_next(Some(kth_at(1.5 * 0.95))).unwrap();
+        assert_eq!(est.profile, profile);
+        assert!((second - (first + profile[1])).abs() < 1e-6);
+        // Covering everything under one profile reaches full recall.
+        let third = est.cover_next(Some(kth_at(1.5 * 0.95))).unwrap();
+        assert!((third - 1.0).abs() < 1e-5, "{third}");
+    }
+
+    #[test]
+    fn estimator_recomputes_past_threshold() {
+        let (q, c) = three_cells();
+        let rows: Vec<&[f32]> = c.iter().map(|r| &r[..]).collect();
+        let mut est = RecallEstimator::new(&q, &rows, Metric::L2);
+        est.cover_next(Some(kth_at(1.5)));
+        let got = est.cover_next(Some(kth_at(0.5))).unwrap();
+        let profile = compute_recall_profile(&est.boundary, 0.5, 2, true);
+        assert_eq!(est.profile, profile);
+        assert!((got - (profile[0] + profile[1])).abs() < 1e-6);
     }
 }
