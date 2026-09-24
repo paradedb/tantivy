@@ -40,6 +40,7 @@ pub struct SegmentReader {
     custom_alive_bitset: Option<AliveBitSet>,
 
     inv_idx_reader_cache: Arc<RwLock<HashMap<Field, Arc<InvertedIndexReader>>>>,
+    term_dictionary_cache: Arc<RwLock<HashMap<Field, Option<Arc<TermDictionary>>>>>,
     vector_reader_cache: Arc<RwLock<HashMap<Field, Arc<VectorIndexReader>>>>,
     delete_opstamp: Option<Opstamp>,
 
@@ -209,6 +210,7 @@ impl SegmentReader {
             custom_alive_bitset: custom_bitset,
 
             inv_idx_reader_cache: Default::default(),
+            term_dictionary_cache: Default::default(),
             vector_reader_cache: Default::default(),
             delete_opstamp: segment.meta().delete_opstamp(),
 
@@ -226,6 +228,33 @@ impl SegmentReader {
             alive_bitset_opt: Default::default(),
             schema: segment.schema(),
         })
+    }
+
+    /// Opens a field's term dictionary without opening postings or positions.
+    /// Returns `None` for unindexed fields or fields absent from this segment.
+    pub fn term_dictionary(&self, field: Field) -> crate::Result<Option<Arc<TermDictionary>>> {
+        if !self.schema.get_field_entry(field).is_indexed() {
+            return Ok(None);
+        }
+        if let Some(dictionary) = self
+            .term_dictionary_cache
+            .read()
+            .expect("Term dictionary cache lock poisoned")
+            .get(&field)
+        {
+            return Ok(dictionary.clone());
+        }
+        let dictionary = self
+            .termdict_composite()
+            .open_read(field)
+            .map(TermDictionary::open)
+            .transpose()?
+            .map(Arc::new);
+        self.term_dictionary_cache
+            .write()
+            .expect("Term dictionary cache lock poisoned")
+            .insert(field, dictionary.clone());
+        Ok(dictionary)
     }
 
     /// Returns a field reader associated with the field given in argument.
@@ -271,14 +300,13 @@ impl SegmentReader {
         let record_option = record_option_opt.unwrap();
         let postings_file = postings_file_opt.unwrap();
 
-        let termdict_file: FileSlice =
-            self.termdict_composite().open_read(field).ok_or_else(|| {
-                DataCorruption::comment_only(format!(
-                    "Failed to open field {:?}'s term dictionary in the composite file. Has the \
-                     schema been modified?",
-                    field_entry.name()
-                ))
-            })?;
+        let termdict = self.term_dictionary(field)?.ok_or_else(|| {
+            DataCorruption::comment_only(format!(
+                "Failed to open field {:?}'s term dictionary in the composite file. Has the \
+                 schema been modified?",
+                field_entry.name()
+            ))
+        })?;
 
         // not all queries require positions.
         // we can defer opening the file until needed
@@ -309,7 +337,7 @@ impl SegmentReader {
         };
 
         let inv_idx_reader = Arc::new(InvertedIndexReader::new(
-            TermDictionary::open(termdict_file)?,
+            termdict,
             postings_file,
             DeferredFileSlice::new(positions_file_opener),
             record_option,
@@ -816,7 +844,10 @@ impl fmt::Debug for SegmentReader {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::collector::Count;
     use crate::index::Index;
+    use crate::merge_policy::NoMergePolicy;
+    use crate::query::TermQuery;
     use crate::schema::{Term, STORED, TEXT};
     use crate::IndexWriter;
 
@@ -981,6 +1012,55 @@ mod test {
         res2.merge(field_metadata1);
         assert_eq!(res1, field_metadata_expected);
         assert_eq!(res2, field_metadata_expected);
+    }
+
+    #[test]
+    fn test_term_count_without_postings() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let absent = schema.add_text_field("absent", TEXT);
+        let stored = schema.add_text_field("stored", STORED);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        writer.add_document(doc!(text => "a a b"))?;
+        writer.add_document(doc!(text => "a c"))?;
+        writer.commit()?;
+
+        let query = TermQuery::new(Term::from_field_text(text, "a"), IndexRecordOption::Basic);
+        let absent_query =
+            TermQuery::new(Term::from_field_text(absent, "a"), IndexRecordOption::Basic);
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment = searcher.segment_reader(0);
+        assert_eq!(searcher.search(&query, &Count)?, 2);
+        assert_eq!(searcher.search(&absent_query, &Count)?, 0);
+        let missing = TermQuery::new(
+            Term::from_field_text(text, "missing"),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(searcher.search(&missing, &Count)?, 0);
+        assert!(segment.term_dictionary(stored)?.is_none());
+        assert!(segment.postings_composite.get().is_none());
+        assert!(segment.positions_composite.get().is_none());
+        assert!(segment.inv_idx_reader_cache.read().unwrap().is_empty());
+
+        let dictionary = segment.term_dictionary(text)?.unwrap();
+        assert!(Arc::ptr_eq(
+            &dictionary,
+            &segment.term_dictionary(text)?.unwrap()
+        ));
+        let inverted = segment.inverted_index(text)?;
+        assert!(std::ptr::eq(dictionary.as_ref(), inverted.terms()));
+
+        writer.delete_term(Term::from_field_text(text, "b"));
+        writer.commit()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert!(searcher.segment_reader(0).has_deletes());
+        assert_eq!(searcher.search(&query, &Count)?, 1);
+        assert_eq!(searcher.search(&absent_query, &Count)?, 0);
+        Ok(())
     }
 
     #[test]

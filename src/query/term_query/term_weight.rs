@@ -78,9 +78,10 @@ impl Weight for TermWeight {
         if let Some(alive_bitset) = reader.alive_bitset() {
             Ok(self.scorer(reader, 1.0)?.count(alive_bitset))
         } else {
-            let field = self.term.field();
-            let inv_index = reader.inverted_index(field)?;
-            let term_info = inv_index.get_term_info(&self.term)?;
+            let Some(dictionary) = reader.term_dictionary(self.term.field())? else {
+                return Ok(0);
+            };
+            let term_info = dictionary.get(self.term.serialized_value_bytes())?;
             Ok(term_info.map(|term_info| term_info.doc_freq).unwrap_or(0))
         }
     }

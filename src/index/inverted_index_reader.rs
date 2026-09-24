@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Arc;
 
 use common::file_slice::DeferredFileSlice;
 use common::json_path_writer::JSON_END_OF_PATH;
@@ -29,7 +30,7 @@ use crate::termdict::TermDictionary;
 /// `InvertedIndexReader` are created by calling
 /// [`SegmentReader::inverted_index()`](crate::SegmentReader::inverted_index).
 pub struct InvertedIndexReader {
-    termdict: TermDictionary,
+    termdict: Arc<TermDictionary>,
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
     record_option: IndexRecordOption,
@@ -65,7 +66,7 @@ impl InvertedIndexFieldSpace {
 
 impl InvertedIndexReader {
     pub(crate) fn new(
-        termdict: TermDictionary,
+        termdict: Arc<TermDictionary>,
         postings_file_slice: FileSlice,
         positions_file_slice: DeferredFileSlice,
         record_option: IndexRecordOption,
@@ -85,7 +86,7 @@ impl InvertedIndexReader {
     /// contains no terms at all.
     pub fn empty(record_option: IndexRecordOption) -> InvertedIndexReader {
         InvertedIndexReader {
-            termdict: TermDictionary::empty(),
+            termdict: Arc::new(TermDictionary::empty()),
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
             record_option,
