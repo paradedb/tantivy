@@ -1734,14 +1734,14 @@ impl<T: VectorElement> VectorBackend<T> {
         let max_doc = segment_reader.max_doc();
         let filter = build_filter_bitset(weight, segment_reader, max_doc)?;
         let alive = segment_reader.alive_bitset();
+        if filter.len() == 0 {
+            return Ok(Vec::new());
+        }
         let eligibility = alive.map(|alive| {
             let mut eligibility = filter.clone();
             eligibility.intersect_update(alive.bitset());
             eligibility
         });
-        if filter.len() == 0 {
-            return Ok(Vec::new());
-        }
         let filter_is_all = filter.len() == max_doc as usize;
         let scan_levels = query.active_layers();
         let quantized = self
