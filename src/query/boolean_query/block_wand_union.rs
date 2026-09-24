@@ -623,9 +623,15 @@ mod tests {
             )));
         }
         for query in queries {
+            let all_docs = searcher.search_with_executor(
+                &query,
+                &TopDocs::with_limit(max_doc).order_by_score(),
+                &Executor::SingleThread,
+                EnableScoring::enabled_from_searcher(&searcher)
+                    .with_disjunction_pruning(DisjunctionPruning::BlockWand),
+            )?;
             for limit in [1, 2, 10] {
-                let expected =
-                    searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
+                let expected = &all_docs[..limit.min(all_docs.len())];
                 for pruning in [
                     DisjunctionPruning::Auto,
                     DisjunctionPruning::BlockWand,
@@ -639,11 +645,14 @@ mod tests {
                             .with_disjunction_pruning(pruning),
                     )?;
                     assert_eq!(actual.len(), expected.len(), "{query:?}, {pruning:?}");
-                    for ((score, doc), (expected_score, expected_doc)) in
-                        actual.iter().zip(&expected)
-                    {
-                        assert_eq!(doc, expected_doc, "{query:?}, {pruning:?}");
+                    // Rounding can reorder tied documents; verify ranks and each document's score.
+                    for ((score, doc), (expected_score, _)) in actual.iter().zip(expected) {
                         assert_nearly_equals!(*score, *expected_score);
+                        let (doc_score, _) = all_docs
+                            .iter()
+                            .find(|(_, expected_doc)| doc == expected_doc)
+                            .unwrap();
+                        assert_nearly_equals!(*score, *doc_score);
                     }
                     assert_eq!(
                         searcher.search_with_executor(
