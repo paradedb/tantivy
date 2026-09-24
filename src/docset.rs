@@ -207,6 +207,12 @@ pub trait DocSet: Send {
         count
     }
 
+    /// Consumes and counts a bounded batch, including deleted documents.
+    /// Returns zero only when exhausted, leaving the cursor on the next document.
+    fn count_including_deleted_chunk(&mut self) -> u32 {
+        self.fill_buffer(&mut [0; COLLECT_BLOCK_BUFFER_LEN]) as u32
+    }
+
     /// Returns the count of documents, deleted or not.
     /// Calling this method consumes the `DocSet`.
     ///
@@ -278,6 +284,10 @@ impl DocSet for &mut dyn DocSet {
     fn count_including_deleted(&mut self) -> u32 {
         (**self).count_including_deleted()
     }
+
+    fn count_including_deleted_chunk(&mut self) -> u32 {
+        (**self).count_including_deleted_chunk()
+    }
 }
 
 impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
@@ -333,5 +343,10 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
     fn count_including_deleted(&mut self) -> u32 {
         let unboxed: &mut TDocSet = self.borrow_mut();
         unboxed.count_including_deleted()
+    }
+
+    fn count_including_deleted_chunk(&mut self) -> u32 {
+        let unboxed: &mut TDocSet = self.borrow_mut();
+        unboxed.count_including_deleted_chunk()
     }
 }
