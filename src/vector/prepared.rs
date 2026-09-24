@@ -330,7 +330,9 @@ impl QuantizedQueryCtx {
         Arc::ptr_eq(&self.index, index) || self.index.config == index.config
     }
 
-    /// Squared query-quantization error accumulated through this layer.
+    /// Squared query-quantization error contributed by this layer alone: the
+    /// sign-plane error for a 1-bit layer, zero for a grid layer. Callers that
+    /// need the cumulative term sum it themselves (see `combine_refinement_decoded`).
     pub(crate) fn query_error_squared(&self, layer: usize) -> f64 {
         self.prepared.query_error_squared(layer)
     }
