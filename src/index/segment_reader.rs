@@ -847,7 +847,7 @@ mod test {
     use crate::collector::Count;
     use crate::index::Index;
     use crate::merge_policy::NoMergePolicy;
-    use crate::query::TermQuery;
+    use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
     use crate::schema::{Term, STORED, TEXT};
     use crate::IndexWriter;
 
@@ -1060,6 +1060,53 @@ mod test {
         assert!(searcher.segment_reader(0).has_deletes());
         assert_eq!(searcher.search(&query, &Count)?, 1);
         assert_eq!(searcher.search(&absent_query, &Count)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_term_scorer_estimate_without_postings() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let absent = schema.add_text_field("absent", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        writer.add_document(doc!(text => "all a a b"))?;
+        writer.add_document(doc!(text => "all a c"))?;
+        writer.add_document(doc!(text => "all d"))?;
+        writer.commit()?;
+
+        for has_deletes in [false, true] {
+            if has_deletes {
+                writer.delete_term(Term::from_field_text(text, "b"));
+                writer.commit()?;
+            }
+            for (field, value, expected) in [
+                (text, "a", 2),
+                (text, "b", 1),
+                (text, "all", 3),
+                (text, "missing", 0),
+                (absent, "a", 0),
+            ] {
+                let reader = index.reader()?;
+                let searcher = reader.searcher();
+                let segment = searcher.segment_reader(0);
+                assert_eq!(segment.has_deletes(), has_deletes);
+                let scoring = EnableScoring::disabled_from_schema(searcher.schema());
+                let query = TermQuery::new(
+                    Term::from_field_text(field, value),
+                    IndexRecordOption::Basic,
+                );
+                let weight = query.weight(scoring)?;
+                let estimate = weight.scorer_estimate(segment)?;
+                assert_eq!(estimate, Some((expected, u64::from(expected))));
+                assert!(segment.postings_composite.get().is_none());
+                assert!(segment.positions_composite.get().is_none());
+                let scorer = weight.scorer(segment, 1.0)?;
+                assert_eq!(estimate, Some((scorer.size_hint(), scorer.cost())));
+                assert_eq!(AllQuery.weight(scoring)?.scorer_estimate(segment)?, None);
+            }
+        }
         Ok(())
     }
 

@@ -74,15 +74,16 @@ impl Weight for TermWeight {
         }
     }
 
+    fn scorer_estimate(&self, reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        let doc_freq = self.doc_freq(reader)?;
+        Ok(Some((doc_freq, u64::from(doc_freq))))
+    }
+
     fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
         if let Some(alive_bitset) = reader.alive_bitset() {
             Ok(self.scorer(reader, 1.0)?.count(alive_bitset))
         } else {
-            let Some(dictionary) = reader.term_dictionary(self.term.field())? else {
-                return Ok(0);
-            };
-            let term_info = dictionary.get(self.term.serialized_value_bytes())?;
-            Ok(term_info.map(|term_info| term_info.doc_freq).unwrap_or(0))
+            self.doc_freq(reader)
         }
     }
 
@@ -183,6 +184,14 @@ impl TermWeight {
 
     pub fn term(&self) -> &Term {
         &self.term
+    }
+
+    fn doc_freq(&self, reader: &SegmentReader) -> crate::Result<u32> {
+        let Some(dictionary) = reader.term_dictionary(self.term.field())? else {
+            return Ok(0);
+        };
+        let term_info = dictionary.get(self.term.serialized_value_bytes())?;
+        Ok(term_info.map(|term_info| term_info.doc_freq).unwrap_or(0))
     }
 
     /// We need a method to access the actual `TermScorer` implementation

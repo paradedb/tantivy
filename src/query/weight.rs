@@ -87,6 +87,12 @@ pub trait Weight: Send + Sync + 'static {
     /// Returns an [`Explanation`] for the given document.
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation>;
 
+    /// Returns a fresh scorer's `(size_hint, cost)` from metadata, including deleted documents.
+    /// `Some((0, _))` means known empty; return `None` when metadata cannot provide an estimate.
+    fn scorer_estimate(&self, _reader: &SegmentReader) -> crate::Result<Option<(u32, u64)>> {
+        Ok(None)
+    }
+
     /// Returns the number documents within the given [`SegmentReader`].
     fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
         let mut scorer = self.scorer(reader, 1.0)?;
