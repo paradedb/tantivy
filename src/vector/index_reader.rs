@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use common::{HasLen, OwnedBytes};
 use quant_model::f16::f16_to_f32;
@@ -779,8 +779,7 @@ impl QuantizedLayerReader {
 
 /// Field-keyed quantized payloads resolved from immutable index metadata.
 pub(crate) struct QuantizedFieldReader {
-    config: VectorQuantizationConfig,
-    index_ctx: OnceLock<Arc<QuantizedIndexCtx>>,
+    index_ctx: Arc<QuantizedIndexCtx>,
     layers: Vec<QuantizedLayerReader>,
     residual_norms: FileSlice,
 }
@@ -853,7 +852,7 @@ impl QuantizedResidualNormBatch {
 
 impl QuantizedFieldReader {
     pub(crate) fn config(&self) -> &VectorQuantizationConfig {
-        &self.config
+        &self.index_ctx.config
     }
 
     pub(crate) fn layers(&self) -> &[QuantizedLayerReader] {
@@ -909,18 +908,8 @@ impl QuantizedFieldReader {
             .read_bytes()?)
     }
 
-    pub(crate) fn index_ctx(&self) -> crate::Result<Arc<QuantizedIndexCtx>> {
-        if let Some(index_ctx) = self.index_ctx.get() {
-            return Ok(Arc::clone(index_ctx));
-        }
-        let resolved = QuantizedIndexCtx::resolve_from_config(self.config.clone())?;
-        let _ = self.index_ctx.set(Arc::clone(&resolved));
-        Ok(self.index_ctx.get().map(Arc::clone).unwrap_or(resolved))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn index_ctx_is_initialized(&self) -> bool {
-        self.index_ctx.get().is_some()
+    pub(crate) fn index_ctx(&self) -> &Arc<QuantizedIndexCtx> {
+        &self.index_ctx
     }
 }
 
@@ -1237,8 +1226,7 @@ impl VectorIndexReader {
                     }
                 };
                 Some(QuantizedFieldReader {
-                    config,
-                    index_ctx: OnceLock::new(),
+                    index_ctx: Arc::new(QuantizedIndexCtx::new(config)?),
                     layers,
                     residual_norms,
                 })

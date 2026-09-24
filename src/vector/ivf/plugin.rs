@@ -1159,7 +1159,7 @@ mod tests {
     use crate::query::{AllQuery, EnableScoring, Query, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, Term, STORED, STRING};
     use crate::vector::ivf::AdaptiveProbeParams;
-    use crate::vector::prepared::{QuantizedIndexCtx, QuantizedQueryCtx};
+    use crate::vector::prepared::QuantizedQueryCtx;
     use crate::vector::tests::ground_truth;
     use crate::vector::{TopDocsByVectorSimilarity, VectorQuantizationLayer};
     use crate::{Index, TantivyDocument};
@@ -1879,10 +1879,7 @@ mod tests {
             .map(|coordinate| ((coordinate as f32 + 0.5) * 0.031).cos())
             .collect();
         let harness = cascade::prepare_split_query(&query, &specs, &grids, 4);
-        let scan = QuantizedQueryCtx::new(
-            QuantizedIndexCtx::resolve_from_config(quantized.config().clone()).unwrap(),
-            query,
-        );
+        let scan = QuantizedQueryCtx::new(Arc::clone(quantized.index_ctx()), query);
 
         for row in 0..ivf.num_rows() {
             let mut scan_sum = 0.0;
@@ -1960,14 +1957,12 @@ mod tests {
             .with_max_scan_levels(0);
         let quantized_reader = quantized.reader()?;
         let quantized_searcher = quantized_reader.searcher();
-        let quantized_storage = quantized_searcher.segment_readers()[0].vector_index(field)?;
-        let quantized_field = quantized_storage
+        assert!(quantized_searcher.segment_readers()[0]
+            .vector_index(field)?
             .quantization()
-            .expect("fixture must carry quantized slots");
-        assert!(!quantized_field.index_ctx_is_initialized());
+            .is_some());
         let level_zero_fruit = quantized_searcher.search(&AllQuery, &level_zero_collector)?;
         assert!(!level_zero_collector.has_quantized_query());
-        assert!(!quantized_field.index_ctx_is_initialized());
 
         assert_eq!(level_zero_fruit.results, unquantized_fruit.results);
         assert_eq!(level_zero_fruit.stats.len(), 1);
@@ -2154,7 +2149,6 @@ mod tests {
             });
         let quantized_fruit = searcher.search(&AllQuery, &collector)?;
         assert!(collector.has_quantized_query());
-        assert!(quantized.index_ctx_is_initialized());
         assert_eq!(quantized_fruit.stats.len(), 1);
         let stats = &quantized_fruit.stats[0];
         let trace = &stats.quantized_trace;

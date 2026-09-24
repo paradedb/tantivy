@@ -89,7 +89,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
 
     fn segment_query(&self, reader: &SegmentReader) -> crate::Result<VectorQuery<T>> {
         let quantized = match reader.vector_index(self.field)?.quantization() {
-            Some(field) if self.max_scan_levels > 0 => Some(self.quantized_query(field)?),
+            Some(field) if self.max_scan_levels > 0 => Some(self.quantized_query(field)),
             _ => None,
         };
         Ok(VectorQuery::new(Arc::clone(&self.query), quantized))
@@ -97,25 +97,22 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
 
     /// A collector reused on another index may meet a different quantization
     /// config; such segments get their own query instead of the shared one.
-    fn quantized_query(
-        &self,
-        field: &QuantizedFieldReader,
-    ) -> crate::Result<Arc<QuantizedQueryCtx>> {
-        let index_ctx = field.index_ctx()?;
+    fn quantized_query(&self, field: &QuantizedFieldReader) -> Arc<QuantizedQueryCtx> {
+        let index_ctx = field.index_ctx();
         let prepare = || {
             let active_layers = self.max_scan_levels.min(index_ctx.specs.len());
             let query = self.query.iter().map(|value| value.to_f32()).collect();
             Arc::new(QuantizedQueryCtx::with_depth(
-                Arc::clone(&index_ctx),
+                Arc::clone(index_ctx),
                 query,
                 active_layers,
             ))
         };
         let shared = self.quantized_query.get_or_init(prepare);
-        if shared.is_prepared_for(&index_ctx) {
-            Ok(Arc::clone(shared))
+        if shared.is_prepared_for(index_ctx) {
+            Arc::clone(shared)
         } else {
-            Ok(prepare())
+            prepare()
         }
     }
 
