@@ -133,6 +133,10 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
         self.docset.fill_buffer(buffer)
     }
 
+    fn count_including_deleted_chunk(&mut self) -> u32 {
+        self.docset.count_including_deleted_chunk()
+    }
+
     fn doc(&self) -> DocId {
         self.docset.doc()
     }

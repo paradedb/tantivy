@@ -39,6 +39,14 @@ pub trait SegmentAggregationCollector: Debug {
         agg_data: &mut AggregationsSegmentCtx,
     ) -> crate::Result<()>;
 
+    fn supports_count(&self) -> bool {
+        false
+    }
+
+    fn collect_count(&mut self, _parent_bucket_id: BucketId, _count: u32) {
+        unreachable!("aggregation requires document IDs")
+    }
+
     /// Collect docs for multiple buckets in one call.
     /// Minimizes dynamic dispatch overhead when collecting many buckets.
     ///
@@ -143,6 +151,16 @@ impl SegmentAggregationCollector for GenericSegmentAggregationResultsCollector {
             collector.collect(parent_bucket_id, docs, agg_data)?;
         }
         Ok(())
+    }
+
+    fn supports_count(&self) -> bool {
+        self.aggs.iter().all(|agg| agg.supports_count())
+    }
+
+    fn collect_count(&mut self, parent_bucket_id: BucketId, count: u32) {
+        for agg in &mut self.aggs {
+            agg.collect_count(parent_bucket_id, count);
+        }
     }
 
     fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {

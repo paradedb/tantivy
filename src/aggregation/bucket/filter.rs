@@ -620,6 +620,16 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentFilterCollector<B> 
         Ok(())
     }
 
+    fn supports_count(&self) -> bool {
+        self.sub_aggregations.is_none()
+            && self.req_data.evaluator.bitset.len()
+                == self.req_data.segment_reader.max_doc() as usize
+    }
+
+    fn collect_count(&mut self, parent_bucket_id: BucketId, count: u32) {
+        self.parent_buckets[parent_bucket_id as usize].doc_count += u64::from(count);
+    }
+
     fn collect(
         &mut self,
         parent_bucket_id: BucketId,
@@ -709,7 +719,8 @@ mod tests {
     use crate::aggregation::agg_req::Aggregations;
     use crate::aggregation::agg_result::AggregationResults;
     use crate::aggregation::{AggContextParams, AggregationCollector};
-    use crate::query::{AllQuery, TermQuery};
+    use crate::collector::{Collector, SegmentCollector};
+    use crate::query::{AllQuery, QueryParser, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, Term, FAST, INDEXED, TEXT};
     use crate::{doc, Index, IndexWriter};
 
@@ -830,6 +841,65 @@ mod tests {
             deserialized,
             AggContextParams::new(Default::default(), index.tokenizers().clone()),
         ))
+    }
+
+    #[test]
+    fn test_filter_count_batches_and_deleted_docs() -> crate::Result<()> {
+        let index = create_standard_test_index()?;
+        let reader = index.reader()?;
+        let collector = create_collector(
+            &index,
+            serde_json::from_value(json!({
+                "matches": {"filter": "*"},
+                "copy": {"filter": "*"}
+            }))?,
+        )?;
+        let query = QueryParser::for_index(&index, vec![])
+            .parse_query("category:electronics OR category:clothing")?;
+        for (ordinal, segment) in reader.searcher().segment_readers().iter().enumerate() {
+            assert!(collector
+                .for_segment(ordinal as u32, segment)?
+                .supports_count());
+        }
+        let result = reader.searcher().search(&query, &collector)?;
+        assert_agg_results!(
+            &result,
+            json!({
+                "matches": {"doc_count": 3}, "copy": {"doc_count": 3}
+            })
+        );
+
+        let mixed = create_collector(
+            &index,
+            serde_json::from_value(json!({
+                "matches": {"filter": "*"},
+                "price": {"sum": {"field": "price"}}
+            }))?,
+        )?;
+        for (ordinal, segment) in reader.searcher().segment_readers().iter().enumerate() {
+            assert!(!mixed.for_segment(ordinal as u32, segment)?.supports_count());
+        }
+
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.delete_term(Term::from_field_text(
+            index.schema().get_field("brand")?,
+            "apple",
+        ));
+        writer.commit()?;
+        reader.reload()?;
+        assert!(reader
+            .searcher()
+            .segment_readers()
+            .iter()
+            .any(|segment| segment.has_deletes()));
+        let result = reader.searcher().search(&query, &collector)?;
+        assert_agg_results!(
+            &result,
+            json!({
+                "matches": {"doc_count": 2}, "copy": {"doc_count": 2}
+            })
+        );
+        Ok(())
     }
 
     #[test]

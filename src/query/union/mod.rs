@@ -95,6 +95,34 @@ mod tests {
         }
         assert_eq!(union_expected.advance(), TERMINATED);
         assert_eq!(count, make_union().count_including_deleted());
+        let mut union = make_union();
+        let mut chunk_count = 0;
+        while union.doc() != TERMINATED {
+            let batch = union.count_including_deleted_chunk();
+            assert!(batch > 0);
+            chunk_count += batch;
+        }
+        assert_eq!(chunk_count, count);
+        assert_eq!(union.count_including_deleted_chunk(), 0);
+    }
+
+    #[test]
+    fn test_count_chunks_after_seek_across_windows() {
+        let docs = [
+            vec![0, 63, 64, 4095, 4096, 8192],
+            vec![64, 4095, 4097, 9000],
+        ];
+        aux_test_union(&docs);
+        let mut union = union_from_docs_list(&docs);
+        assert_eq!(union.seek(64), 64);
+        assert_eq!(union.count_including_deleted_chunk(), 2);
+        assert_eq!(union.doc(), 4096);
+        assert_eq!(union.advance(), 4097);
+        assert_eq!(union.count_including_deleted_chunk(), 1);
+        assert_eq!(union.doc(), 8192);
+        assert_eq!(union.count_including_deleted_chunk(), 2);
+        assert_eq!(union.doc(), TERMINATED);
+        assert_eq!(union.count_including_deleted_chunk(), 0);
     }
 
     use proptest::prelude::*;

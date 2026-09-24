@@ -129,6 +129,10 @@ impl<S: Scorer> DocSet for BoostScorer<S> {
         self.underlying.fill_buffer(buffer)
     }
 
+    fn count_including_deleted_chunk(&mut self) -> u32 {
+        self.underlying.count_including_deleted_chunk()
+    }
+
     fn doc(&self) -> u32 {
         self.underlying.doc()
     }

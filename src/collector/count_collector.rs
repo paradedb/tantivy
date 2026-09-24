@@ -79,6 +79,14 @@ impl SegmentCollector for SegmentCountCollector {
         self.count += 1;
     }
 
+    fn supports_count(&self) -> bool {
+        true
+    }
+
+    fn collect_count(&mut self, count: u32) {
+        self.count += count as usize;
+    }
+
     fn harvest(self) -> usize {
         self.count
     }

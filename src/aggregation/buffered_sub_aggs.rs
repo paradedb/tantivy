@@ -56,6 +56,10 @@ impl<Backend: SubAggBuffer + Debug> BufferedSubAggs<Backend> {
         }
     }
 
+    pub fn supports_count(&self) -> bool {
+        self.sub_agg_collector.supports_count()
+    }
+
     pub fn get_sub_agg_collector(&mut self) -> &mut dyn SegmentAggregationCollector {
         &mut *self.sub_agg_collector
     }

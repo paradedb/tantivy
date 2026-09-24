@@ -201,6 +201,18 @@ impl SegmentCollector for AggregationSegmentCollector {
         }
     }
 
+    fn supports_count(&self) -> bool {
+        self.agg_collector.supports_count()
+    }
+
+    fn collect_count(&mut self, count: u32) {
+        if self.error.is_none() {
+            self.agg_collector
+                .get_sub_agg_collector()
+                .collect_count(0, count);
+        }
+    }
+
     fn harvest(mut self) -> Self::Fruit {
         if let Some(err) = self.error {
             return Err(err);

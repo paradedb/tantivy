@@ -215,6 +215,16 @@ pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
                 segment_collector.collect(doc, score);
             })?;
         }
+        (None, false) if segment_collector.supports_count() => {
+            let mut scorer = weight.scorer(reader, 1.0)?;
+            loop {
+                let count = scorer.count_including_deleted_chunk();
+                if count == 0 {
+                    break;
+                }
+                segment_collector.collect_count(count);
+            }
+        }
         (None, false) => {
             weight.for_each_no_score(reader, &mut |docs| {
                 segment_collector.collect_block(docs);
@@ -236,6 +246,16 @@ impl<TSegmentCollector: SegmentCollector> SegmentCollector for Option<TSegmentCo
     fn collect_block(&mut self, docs: &[DocId]) {
         if let Some(segment_collector) = self {
             segment_collector.collect_block(docs);
+        }
+    }
+
+    fn supports_count(&self) -> bool {
+        self.as_ref().is_none_or(SegmentCollector::supports_count)
+    }
+
+    fn collect_count(&mut self, count: u32) {
+        if let Some(inner) = self {
+            inner.collect_count(count);
         }
     }
 
@@ -316,6 +336,16 @@ pub trait SegmentCollector: 'static {
         }
     }
 
+    /// Whether this collector can consume counts without document IDs or scores.
+    fn supports_count(&self) -> bool {
+        false
+    }
+
+    /// Collect a count batch. Only called when `supports_count()` is true.
+    fn collect_count(&mut self, _count: u32) {
+        unreachable!("collector requires document IDs")
+    }
+
     /// Extract the fruit of the collection from the `SegmentCollector`.
     fn harvest(self) -> Self::Fruit;
 }
@@ -383,6 +413,15 @@ where
     fn collect_block(&mut self, docs: &[DocId]) {
         self.0.collect_block(docs);
         self.1.collect_block(docs);
+    }
+
+    fn supports_count(&self) -> bool {
+        self.0.supports_count() && self.1.supports_count()
+    }
+
+    fn collect_count(&mut self, count: u32) {
+        self.0.collect_count(count);
+        self.1.collect_count(count);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -461,6 +500,16 @@ where
         self.0.collect_block(docs);
         self.1.collect_block(docs);
         self.2.collect_block(docs);
+    }
+
+    fn supports_count(&self) -> bool {
+        self.0.supports_count() && self.1.supports_count() && self.2.supports_count()
+    }
+
+    fn collect_count(&mut self, count: u32) {
+        self.0.collect_count(count);
+        self.1.collect_count(count);
+        self.2.collect_count(count);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -551,6 +600,20 @@ where
         self.1.collect_block(docs);
         self.2.collect_block(docs);
         self.3.collect_block(docs);
+    }
+
+    fn supports_count(&self) -> bool {
+        self.0.supports_count()
+            && self.1.supports_count()
+            && self.2.supports_count()
+            && self.3.supports_count()
+    }
+
+    fn collect_count(&mut self, count: u32) {
+        self.0.collect_count(count);
+        self.1.collect_count(count);
+        self.2.collect_count(count);
+        self.3.collect_count(count);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {

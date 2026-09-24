@@ -327,6 +327,23 @@ where
         self.docsets.iter().map(|docset| docset.cost()).sum()
     }
 
+    fn count_including_deleted_chunk(&mut self) -> u32 {
+        if self.doc == TERMINATED {
+            return 0;
+        }
+        let count = 1 + self.bitsets[self.bucket_idx..]
+            .iter()
+            .map(|bitset| bitset.len())
+            .sum::<u32>();
+        self.bitsets.fill(TinySet::empty());
+        for score in self.scores.iter_mut() {
+            score.clear();
+        }
+        self.bucket_idx = HORIZON_NUM_TINYBITSETS;
+        self.advance();
+        count
+    }
+
     // TODO Also implement `count` with deletes efficiently.
     fn count_including_deleted(&mut self) -> u32 {
         if self.doc == TERMINATED {
