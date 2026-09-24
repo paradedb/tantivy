@@ -426,11 +426,16 @@ mod tests {
 
     use proptest::prelude::*;
 
+    use crate::collector::{Count, TopDocs};
     use crate::index::Bm25Params;
     use crate::query::score_combiner::SumCombiner;
     use crate::query::term_query::TermScorer;
-    use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
-    use crate::{DocId, DocSet, Score, TERMINATED};
+    use crate::query::{
+        Bm25Weight, BooleanQuery, BufferedUnionScorer, DisjunctionMaxQuery, DisjunctionPruning,
+        EnableScoring, Query, QueryParser, Scorer, TermQuery,
+    };
+    use crate::schema::{IndexRecordOption, Schema, TEXT};
+    use crate::{assert_nearly_equals, DocId, DocSet, Executor, Index, Score, Term, TERMINATED};
 
     struct Float(Score);
 
@@ -559,7 +564,105 @@ mod tests {
             .boxed()
     }
 
+    fn check_disjunction_pruning_search(
+        posting_lists: &[Vec<(DocId, u32)>],
+        max_doc: usize,
+    ) -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut documents = vec![String::new(); max_doc];
+        let term_names: Vec<_> = (0..posting_lists.len())
+            .map(|i| format!("term{i}"))
+            .collect();
+        for (postings, term) in posting_lists.iter().zip(&term_names) {
+            for &(doc, frequency) in postings {
+                for _ in 0..frequency {
+                    documents[doc as usize].push_str(term);
+                    documents[doc as usize].push(' ');
+                }
+            }
+        }
+        let mut writer = index.writer_for_tests()?;
+        for document in documents {
+            writer.add_document(doc!(text => document))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let text = index.schema().get_field("text")?;
+        let parser = QueryParser::for_index(&index, vec![text]);
+        let mut queries = [
+            term_names.join(" OR "),
+            format!("{} OR missing", term_names[0]),
+            "missing OR absent".to_string(),
+            term_names[0].clone(),
+            term_names.join(" AND "),
+        ]
+        .iter()
+        .map(|query| parser.parse_query(query))
+        .collect::<Result<Vec<_>, _>>()?;
+        let terms = || {
+            term_names
+                .iter()
+                .map(|term| {
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(text, term),
+                        IndexRecordOption::WithFreqs,
+                    )) as Box<dyn Query>
+                })
+                .collect()
+        };
+        queries.push(Box::new(DisjunctionMaxQuery::with_tie_breaker(
+            terms(),
+            0.1,
+        )));
+        if term_names.len() >= 2 {
+            queries.push(Box::new(BooleanQuery::union_with_minimum_required_clauses(
+                terms(),
+                2,
+            )));
+        }
+        for query in queries {
+            for limit in [1, 2, 10] {
+                let expected =
+                    searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
+                for pruning in [
+                    DisjunctionPruning::Auto,
+                    DisjunctionPruning::BlockWand,
+                    DisjunctionPruning::BlockMaxScore,
+                ] {
+                    let actual = searcher.search_with_executor(
+                        &query,
+                        &TopDocs::with_limit(limit).order_by_score(),
+                        &Executor::SingleThread,
+                        EnableScoring::enabled_from_searcher(&searcher)
+                            .with_disjunction_pruning(pruning),
+                    )?;
+                    assert_eq!(actual.len(), expected.len(), "{query:?}, {pruning:?}");
+                    for ((score, doc), (expected_score, expected_doc)) in
+                        actual.iter().zip(&expected)
+                    {
+                        assert_eq!(doc, expected_doc, "{query:?}, {pruning:?}");
+                        assert_nearly_equals!(*score, *expected_score);
+                    }
+                    assert_eq!(
+                        searcher.search_with_executor(
+                            &query,
+                            &Count,
+                            &Executor::SingleThread,
+                            EnableScoring::disabled_from_searcher(&searcher)
+                                .with_disjunction_pruning(pruning),
+                        )?,
+                        searcher.search(&query, &Count)?
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn test_block_wand_aux(posting_lists: &[Vec<(DocId, u32)>], fieldnorms: &[u32]) {
+        check_disjunction_pruning_search(posting_lists, fieldnorms.len()).unwrap();
         // We virtually repeat all docs 64 times in order to emulate blocks of 2 documents
         // and surface blogs more easily.
         const REPEAT: usize = 64;
