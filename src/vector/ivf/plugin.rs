@@ -1408,13 +1408,12 @@ mod tests {
                     .into_iter()
                     .flat_map(|center| std::iter::repeat_n(center, self.dim))
                     .collect(),
-                Metric::Cosine => {
+                Metric::Cosine | Metric::Dot => {
                     let mut values = vec![0.0; 2 * self.dim];
                     values[0] = 1.0;
                     values[self.dim + 1] = 1.0;
                     values
                 }
-                Metric::Dot => unreachable!("quantized matrix fixture covers L2 and cosine"),
             };
             Ok(IvfCentroids::F32(IvfMatrix {
                 values,
@@ -1436,8 +1435,7 @@ mod tests {
                 .chunks_exact(self.dim)
                 .map(|row| match self.metric {
                     Metric::L2 => u32::from(row[0] >= 0.5),
-                    Metric::Cosine => u32::from(row[1] > row[0]),
-                    Metric::Dot => unreachable!("quantized matrix fixture covers L2 and cosine"),
+                    Metric::Cosine | Metric::Dot => u32::from(row[1] > row[0]),
                 })
                 .collect())
         }
@@ -1478,7 +1476,7 @@ mod tests {
                     })
                     .collect()
             }
-            Metric::Cosine => {
+            Metric::Cosine | Metric::Dot => {
                 let cluster = usize::from(doc >= 4);
                 let mut vector: Vec<f32> = (0..dim)
                     .map(|coordinate| ((doc * dim + coordinate) as f32 * 0.017).sin() * 0.025)
@@ -1486,7 +1484,6 @@ mod tests {
                 vector[cluster] += 1.0;
                 vector
             }
-            Metric::Dot => unreachable!("quantized matrix fixture covers L2 and cosine"),
         }
     }
 
@@ -1606,7 +1603,7 @@ mod tests {
     fn fixture_search_query(metric: Metric, dim: usize) -> Vec<f32> {
         match metric {
             Metric::L2 => vec![0.05; dim],
-            Metric::Cosine => {
+            Metric::Cosine | Metric::Dot => {
                 let mut query: Vec<f32> = (0..dim)
                     .map(|coordinate| ((coordinate as f32 + 0.5) * 0.031).cos() * 0.01)
                     .collect();
@@ -1614,7 +1611,6 @@ mod tests {
                 query[1] += 0.6;
                 query
             }
-            Metric::Dot => unreachable!("quantized matrix fixture covers L2 and cosine"),
         }
     }
 
@@ -2216,10 +2212,124 @@ mod tests {
     }
 
     #[test]
+    fn quantized_bounds_gate_skips_provably_useless_cluster() -> crate::Result<()> {
+        let index = build_quantized_fixture_case(100, Metric::L2, &[1], true)?;
+        let field = index.schema().get_field("embedding")?;
+        let query = fixture_search_query(Metric::L2, 100);
+        let searcher = index.reader()?.searcher();
+        let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 3)
+            .with_adaptive_params(AdaptiveProbeParams {
+                max_probe_fraction: 1.0,
+                min_probe_clusters: 1,
+                ..Default::default()
+            })
+            .with_max_scan_levels(1);
+        let fruit = searcher.search(&AllQuery, &collector)?;
+        assert_eq!(fruit.stats.len(), 1);
+        let stats = &fruit.stats[0];
+        assert_eq!(
+            fruit.results,
+            fixture_exact_hits(&index, Metric::L2, &query, None, 3)?,
+            "{stats:?}"
+        );
+        assert_eq!(stats.bounds_skips, 1, "{stats:?}");
+        assert_eq!(stats.bound_armed_at_probe, Some(0), "{stats:?}");
+        assert_eq!(stats.clusters_probed(), 1, "{stats:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn quantized_probe_terminates_at_ceiling() -> crate::Result<()> {
+        let index = build_quantized_fixture_case(100, Metric::L2, &[1], true)?;
+        let field = index.schema().get_field("embedding")?;
+        let query = fixture_search_query(Metric::L2, 100);
+        let searcher = index.reader()?.searcher();
+        let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 3)
+            .with_adaptive_params(AdaptiveProbeParams {
+                max_probe_fraction: 0.1,
+                min_probe_clusters: 1,
+                ..Default::default()
+            })
+            .with_max_scan_levels(1);
+        let fruit = searcher.search(&AllQuery, &collector)?;
+        assert_eq!(fruit.stats.len(), 1);
+        let stats = &fruit.stats[0];
+        assert_eq!(
+            fruit.results,
+            fixture_exact_hits(&index, Metric::L2, &query, None, 3)?,
+            "{stats:?}"
+        );
+        assert_eq!(
+            stats.termination,
+            crate::vector::ProbeTermination::Ceiling,
+            "{stats:?}"
+        );
+        assert_eq!(stats.clusters_probed(), 1, "{stats:?}");
+        assert_eq!(
+            stats.vectors_visited,
+            stats.pruned_filter + stats.pruned_dead + stats.candidates_scored,
+            "{stats:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quantized_filtered_rows_are_not_charged() -> crate::Result<()> {
+        let index = build_quantized_fixture_case(100, Metric::L2, &[1], true)?;
+        let field = index.schema().get_field("embedding")?;
+        let label = index.schema().get_field("label")?;
+        let query = fixture_search_query(Metric::L2, 100);
+        let searcher = index.reader()?.searcher();
+        let keep = TermQuery::new(
+            Term::from_field_text(label, "keep"),
+            IndexRecordOption::Basic,
+        );
+        let params = AdaptiveProbeParams {
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 2,
+            ..Default::default()
+        };
+        let vector_reader = searcher.segment_readers()[0].vector_index(field)?;
+        let ivf = vector_reader.index().expect("merged fixture must be IVF");
+        let (_, n_avg, open_share) =
+            params.resolved_work_budget(ivf.num_clusters(), ivf.num_docs())?;
+        let row = (1.0 - open_share) / n_avg;
+        // Request all fixture rows so both scans open every cluster.
+        let collector = TopDocsByVectorSimilarity::new(field, query.clone(), 8)
+            .with_adaptive_params(params)
+            .with_max_scan_levels(1);
+        let unfiltered = searcher.search(&AllQuery, &collector)?;
+        let filtered = searcher.search(&keep, &collector)?;
+        assert_eq!(
+            unfiltered.results,
+            fixture_exact_hits(&index, Metric::L2, &query, None, 8)?
+        );
+        assert_eq!(
+            filtered.results,
+            fixture_exact_hits(&index, Metric::L2, &query, Some(&keep), 8)?
+        );
+        assert_eq!(unfiltered.stats.len(), 1);
+        assert_eq!(filtered.stats.len(), 1);
+        let unfiltered = &unfiltered.stats[0];
+        let filtered = &filtered.stats[0];
+        assert_eq!(
+            filtered.candidates_scored,
+            fixture_filter_docs(&index, &keep)?.len(),
+            "{filtered:?}"
+        );
+        let expected = (unfiltered.candidates_scored - filtered.candidates_scored) as f64 * row;
+        assert!(
+            ((unfiltered.work_charged - filtered.work_charged) as f64 - expected).abs() < 1e-5,
+            "unfiltered={unfiltered:?}; filtered={filtered:?}; expected difference={expected}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn quantized_top_n_fixture_matrix_matches_direct_exact_oracle() -> crate::Result<()> {
         const SCHEDULES: &[&[u8]] = &[&[1], &[1, 4], &[1, 1, 4], &[2, 4]];
 
-        for metric in [Metric::Cosine, Metric::L2] {
+        for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
             for &schedule in SCHEDULES {
                 let dim = 100;
 
