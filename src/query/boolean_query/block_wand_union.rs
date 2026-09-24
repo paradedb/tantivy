@@ -432,7 +432,6 @@ mod tests {
     use crate::query::{Bm25Weight, BufferedUnionScorer, Scorer};
     use crate::{DocId, DocSet, Score, TERMINATED};
 
-    include!("block_maxscore_bench.rs");
 
     struct Float(Score);
 
