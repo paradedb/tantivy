@@ -297,6 +297,23 @@ impl LazyStore {
     pub fn len(&self) -> usize {
         self.arena.num_vectors(self.dim)
     }
+
+    /// Appends row `index` to `out`.
+    pub(crate) fn extend_with_row(&self, index: u32, out: &mut Vec<f32>) -> io::Result<()> {
+        match &self.pinned {
+            Some(rows) => out.extend_from_slice(&rows[index as usize * self.dim..][..self.dim]),
+            None => {
+                let bytes = self.arena.row_bytes(self.dim, index)?;
+                out.extend(
+                    bytes
+                        .as_slice()
+                        .chunks_exact(mem::size_of::<f32>())
+                        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4-byte chunk"))),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl VectorArena for LazyStore {
