@@ -11,17 +11,20 @@ pub(crate) const MAGIC: [u8; 10] = [127, 127, 127, 127, 127, 127, 127, 127, 127,
 const BUFFER_SIZE: usize = 8192;
 
 thread_local! {
+    #[cfg(test)]
     static READS: Cell<u64> = const { Cell::new(0) };
     static ENABLED: Cell<bool> = const { Cell::new(true) };
 }
 
 /// Selects term-local norm reads for newly opened scorers in this thread.
 pub fn set_posting_norms_enabled(enabled: bool) -> bool {
+    #[cfg(test)]
     READS.set(0);
     ENABLED.replace(enabled)
 }
 
 /// Returns the number of term-local norm lookups since the last mode change.
+#[cfg(test)]
 pub fn posting_norm_reads() -> u64 {
     READS.get()
 }
@@ -58,6 +61,7 @@ impl TermNormReader {
         })
     }
 
+    #[inline]
     pub(crate) fn read(&self, ordinal: usize) -> io::Result<u8> {
         if ordinal >= self.len {
             return Err(io::Error::new(
@@ -65,6 +69,7 @@ impl TermNormReader {
                 "posting norm ordinal out of bounds",
             ));
         }
+        #[cfg(test)]
         READS.set(READS.get() + 1);
         let mut buffer = self.buffer.borrow_mut();
         if buffer.is_none() {
