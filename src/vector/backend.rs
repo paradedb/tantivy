@@ -23,7 +23,7 @@ use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
     quantized_model_sigma, refine_dot_raw_prefix, refine_l2_raw_prefix, ArithmeticError,
-    PreparedQuery, QuantizedQueryCache, QuantizedQueryCtx,
+    PreparedQuery, QuantizedQueryCtx, VectorQuery,
 };
 use super::quantization::QUANTIZED_BOUNDARY_KAPPA;
 use super::router::{RouterMetrics, RouterWorkspace};
@@ -65,26 +65,16 @@ impl<T: VectorElement> VectorBackend<T> {
         segment_reader: &SegmentReader,
         segment_ord: SegmentOrdinal,
         field: Field,
-        query: Arc<Vec<T>>,
-        quantized_queries: &QuantizedQueryCache,
+        query: VectorQuery<T>,
         adaptive: AdaptiveProbeParams,
-        max_scan_levels: usize,
     ) -> crate::Result<Self> {
         let reader = segment_reader.vector_index(field)?;
-        let quantized_query = if max_scan_levels == 0 {
-            None
-        } else if let Some(quantized) = reader.quantization() {
-            let index_ctx = quantized.index_ctx()?;
-            let active_layers = max_scan_levels.min(index_ctx.specs.len());
-            Some(quantized_queries.resolve(index_ctx, query.as_slice(), active_layers))
-        } else {
-            None
-        };
-        let query = Arc::new(PreparedQuery::<T>::new(reader.options().metric(), query));
+        let VectorQuery { raw, quantized } = query;
+        let query = Arc::new(PreparedQuery::<T>::new(reader.options().metric(), raw));
         Ok(Self {
             reader,
             query,
-            quantized_query,
+            quantized_query: quantized,
             adaptive,
             segment_ord,
         })
@@ -2324,15 +2314,12 @@ mod tests {
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
         let weight = AllQuery.weight(EnableScoring::disabled_from_searcher(&searcher))?;
-        let quantized_queries = QuantizedQueryCache::default();
         let backend = VectorBackend::<f32>::for_segment(
             segment_reader,
             0,
             embed_field,
-            Arc::new(query),
-            &quantized_queries,
+            VectorQuery::new(Arc::new(query), None),
             params,
-            usize::MAX,
         )?;
         assert!(
             segment_reader.vector_index(embed_field)?.index().is_some(),
@@ -3776,15 +3763,12 @@ mod tests {
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
         let searcher = index.reader()?.searcher();
         let segment_reader = &searcher.segment_readers()[0];
-        let quantized_queries = QuantizedQueryCache::default();
         let backend = VectorBackend::<f32>::for_segment(
             segment_reader,
             0,
             embed_field,
-            Arc::new(query),
-            &quantized_queries,
+            VectorQuery::new(Arc::new(query), None),
             params,
-            usize::MAX,
         )?;
         assert!(
             segment_reader.vector_index(embed_field)?.index().is_some(),
@@ -3833,15 +3817,12 @@ mod tests {
         k: usize,
         weight: &dyn Weight,
     ) -> crate::Result<(Vec<(Score, DocAddress)>, ProbeStats)> {
-        let quantized_queries = QuantizedQueryCache::default();
         let backend = VectorBackend::<f32>::for_segment(
             segment_reader,
             0,
             embed_field,
-            Arc::new(query),
-            &quantized_queries,
+            VectorQuery::new(Arc::new(query), None),
             AdaptiveProbeParams::default(),
-            usize::MAX,
         )?;
         assert!(
             segment_reader.vector_index(embed_field)?.index().is_none(),

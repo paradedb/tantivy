@@ -1,10 +1,11 @@
 //! Top-N vector-similarity collection.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::backend::{ProbeStats, VectorBackend};
+use super::index_reader::QuantizedFieldReader;
 use super::ivf::AdaptiveProbeParams;
-use super::prepared::QuantizedQueryCache;
+use super::prepared::{QuantizedQueryCtx, VectorQuery};
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;
@@ -25,7 +26,8 @@ pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     offset: usize,
     adaptive: AdaptiveProbeParams,
     max_scan_levels: usize,
-    quantized_queries: QuantizedQueryCache,
+    /// Prepared on the first quantized segment and shared by the rest.
+    quantized_query: OnceLock<Arc<QuantizedQueryCtx>>,
     tie_break: S,
 }
 
@@ -39,7 +41,7 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             offset: 0,
             adaptive: AdaptiveProbeParams::default(),
             max_scan_levels: usize::MAX,
-            quantized_queries: QuantizedQueryCache::default(),
+            quantized_query: OnceLock::new(),
             tie_break: NoTieBreak,
         }
     }
@@ -76,7 +78,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             offset: self.offset,
             adaptive: self.adaptive,
             max_scan_levels: self.max_scan_levels,
-            quantized_queries: self.quantized_queries,
+            quantized_query: self.quantized_query,
             tie_break,
         }
     }
@@ -85,9 +87,41 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
         self.limit.saturating_add(self.offset)
     }
 
+    fn segment_query(&self, reader: &SegmentReader) -> crate::Result<VectorQuery<T>> {
+        let quantized = match reader.vector_index(self.field)?.quantization() {
+            Some(field) if self.max_scan_levels > 0 => Some(self.quantized_query(field)?),
+            _ => None,
+        };
+        Ok(VectorQuery::new(Arc::clone(&self.query), quantized))
+    }
+
+    /// A collector reused on another index may meet a different quantization
+    /// config; such segments get their own query instead of the shared one.
+    fn quantized_query(
+        &self,
+        field: &QuantizedFieldReader,
+    ) -> crate::Result<Arc<QuantizedQueryCtx>> {
+        let index_ctx = field.index_ctx()?;
+        let prepare = || {
+            let active_layers = self.max_scan_levels.min(index_ctx.specs.len());
+            let query = self.query.iter().map(|value| value.to_f32()).collect();
+            Arc::new(QuantizedQueryCtx::with_depth(
+                Arc::clone(&index_ctx),
+                query,
+                active_layers,
+            ))
+        };
+        let shared = self.quantized_query.get_or_init(prepare);
+        if shared.is_prepared_for(&index_ctx) {
+            Ok(Arc::clone(shared))
+        } else {
+            Ok(prepare())
+        }
+    }
+
     #[cfg(test)]
-    pub(crate) fn cached_quantized_query_count(&self) -> usize {
-        self.quantized_queries.len()
+    pub(crate) fn has_quantized_query(&self) -> bool {
+        self.quantized_query.get().is_some()
     }
 }
 
@@ -174,10 +208,8 @@ where
             reader,
             segment_ord,
             self.field,
-            Arc::clone(&self.query),
-            &self.quantized_queries,
+            self.segment_query(reader)?,
             self.adaptive.clone(),
-            self.max_scan_levels,
         )?;
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
         let (hits, stats) = backend.top_n_by(

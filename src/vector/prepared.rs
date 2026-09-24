@@ -285,42 +285,18 @@ impl QuantizedIndexCtx {
     }
 }
 
-/// Collector-scoped cache of prepared quantized queries.
-#[derive(Default)]
-pub(crate) struct QuantizedQueryCache {
-    queries: Mutex<HashMap<(usize, usize), Arc<QuantizedQueryCtx>>>,
+/// A vector query as seen by one segment.
+pub(crate) struct VectorQuery<T: VectorElement> {
+    /// Full-precision coordinates, always kept for exact scoring and rerank.
+    pub(crate) raw: Arc<Vec<T>>,
+    /// Quantized scan state; `None` when the segment is not quantized or
+    /// quantized scanning is disabled.
+    pub(crate) quantized: Option<Arc<QuantizedQueryCtx>>,
 }
 
-impl QuantizedQueryCache {
-    pub(crate) fn resolve<T: VectorElement>(
-        &self,
-        index: Arc<QuantizedIndexCtx>,
-        query: &[T],
-        active_layers: usize,
-    ) -> Arc<QuantizedQueryCtx> {
-        assert!((1..=index.specs.len()).contains(&active_layers));
-        let index_identity = Arc::as_ptr(&index) as usize;
-        let key = (index_identity, active_layers);
-        let mut queries = self
-            .queries
-            .lock()
-            .expect("quantized query cache lock poisoned");
-        if let Some(prepared) = queries.get(&key) {
-            return Arc::clone(prepared);
-        }
-        let query_f32 = query.iter().map(|value| value.to_f32()).collect();
-        let prepared = Arc::new(QuantizedQueryCtx::with_depth(
-            index,
-            query_f32,
-            active_layers,
-        ));
-        queries.insert(key, Arc::clone(&prepared));
-        prepared
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.queries.lock().unwrap().len()
+impl<T: VectorElement> VectorQuery<T> {
+    pub(crate) fn new(raw: Arc<Vec<T>>, quantized: Option<Arc<QuantizedQueryCtx>>) -> Self {
+        Self { raw, quantized }
     }
 }
 
@@ -374,6 +350,11 @@ impl QuantizedQueryCtx {
 
     pub(crate) fn active_layers(&self) -> usize {
         self.active_layers
+    }
+
+    /// Whether this query can score a segment quantized with `index`.
+    pub(crate) fn is_prepared_for(&self, index: &Arc<QuantizedIndexCtx>) -> bool {
+        Arc::ptr_eq(&self.index, index) || self.index.config == index.config
     }
 
     /// Squared query-quantization error accumulated through this layer.
@@ -514,7 +495,7 @@ impl<T: VectorElement> PreparedQuery<T> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{QuantizedIndexCtx, QuantizedQueryCache, QuantizedQueryCtx};
+    use super::{QuantizedIndexCtx, QuantizedQueryCtx};
     use crate::schema::{Metric, VectorOptions};
     use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
 
@@ -567,41 +548,9 @@ mod tests {
     }
 
     #[test]
-    fn quantized_query_context_is_shared_by_index_and_prefix() {
-        let config = VectorQuantizationConfig::materialize(
-            "shared_query_embedding".to_string(),
-            &VectorOptions::new(100, Metric::Dot),
-            vec![
-                VectorQuantizationLayer {
-                    bits: 1,
-                    seed: 0xfeed_1001,
-                },
-                VectorQuantizationLayer {
-                    bits: 4,
-                    seed: 0xfeed_1002,
-                },
-            ],
-        )
-        .unwrap();
-        let index = QuantizedIndexCtx::resolve(config).unwrap();
-        let cache = QuantizedQueryCache::default();
-        let query = vec![0.25_f32; 100];
-
-        let first_segment = cache.resolve(Arc::clone(&index), &query, 1);
-        let second_segment = cache.resolve(Arc::clone(&index), &query, 1);
-        assert!(Arc::ptr_eq(&first_segment, &second_segment));
-        assert_eq!(first_segment.active_layers(), 1);
-
-        let full_prefix = cache.resolve(index, &query, 2);
-        assert!(!Arc::ptr_eq(&first_segment, &full_prefix));
-        assert_eq!(full_prefix.active_layers(), 2);
-        assert_eq!(cache.queries.lock().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn reused_collector_cache_does_not_cross_index_contexts() {
+    fn quantized_query_is_prepared_only_for_matching_index_configs() {
         let mut config = VectorQuantizationConfig::materialize(
-            "first_query_index".to_string(),
+            "prepared_for_embedding".to_string(),
             &VectorOptions::new(100, Metric::Dot),
             vec![VectorQuantizationLayer {
                 bits: 1,
@@ -610,59 +559,12 @@ mod tests {
         )
         .unwrap();
         let first_index = QuantizedIndexCtx::resolve(config.clone()).unwrap();
-        config.field = "second_query_index".to_string();
-        let second_index = QuantizedIndexCtx::resolve(config).unwrap();
-        assert!(!Arc::ptr_eq(&first_index, &second_index));
+        let query = QuantizedQueryCtx::new(Arc::clone(&first_index), vec![0.5_f32; 100]);
+        assert!(query.is_prepared_for(&first_index));
 
-        let cache = QuantizedQueryCache::default();
-        let query = vec![0.5_f32; 100];
-        let first = cache.resolve(first_index, &query, 1);
-        let second = cache.resolve(second_index, &query, 1);
-        assert!(!Arc::ptr_eq(&first, &second));
-        assert_eq!(cache.queries.lock().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn concurrent_segments_share_one_quantized_query_context() {
-        let config = VectorQuantizationConfig::materialize(
-            "concurrent_query_embedding".to_string(),
-            &VectorOptions::new(100, Metric::Dot),
-            vec![
-                VectorQuantizationLayer {
-                    bits: 1,
-                    seed: 0xfeed_3001,
-                },
-                VectorQuantizationLayer {
-                    bits: 4,
-                    seed: 0xfeed_3002,
-                },
-            ],
-        )
-        .unwrap();
-        let index = QuantizedIndexCtx::resolve(config).unwrap();
-        let cache = QuantizedQueryCache::default();
-        let query = vec![0.75_f32; 100];
-
-        let prepared = std::thread::scope(|scope| {
-            let handles = (0..8)
-                .map(|_| {
-                    let index = Arc::clone(&index);
-                    let cache = &cache;
-                    let query = &query;
-                    scope.spawn(move || cache.resolve(index, query, 2))
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-
-        assert!(prepared
-            .iter()
-            .skip(1)
-            .all(|other| Arc::ptr_eq(&prepared[0], other)));
-        assert_eq!(cache.len(), 1);
+        config.layers[0].seed = 0xfeed_2002;
+        let reseeded_index = QuantizedIndexCtx::resolve(config).unwrap();
+        assert!(!query.is_prepared_for(&reseeded_index));
     }
 
     #[test]
