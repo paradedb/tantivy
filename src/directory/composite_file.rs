@@ -119,23 +119,18 @@ impl CompositeFile {
         let mut footer_buffer = footer_data.as_slice();
         let num_fields = VInt::deserialize(&mut footer_buffer)?.0 as usize;
 
-        let mut file_addrs = vec![];
-        let mut offsets = vec![];
         let mut field_index = HashMap::new();
-
+        let mut previous = None;
         let mut offset = 0;
         for _ in 0..num_fields {
             offset += VInt::deserialize(&mut footer_buffer)?.0 as usize;
             let file_addr = FileAddr::deserialize(&mut footer_buffer)?;
-            offsets.push(offset);
-            file_addrs.push(file_addr);
+            if let Some((address, start)) = previous.replace((file_addr, offset)) {
+                field_index.insert(address, start..offset);
+            }
         }
-        offsets.push(footer_start);
-        for i in 0..num_fields {
-            let file_addr = file_addrs[i];
-            let start_offset = offsets[i];
-            let end_offset = offsets[i + 1];
-            field_index.insert(file_addr, start_offset..end_offset);
+        if let Some((address, start)) = previous {
+            field_index.insert(address, start..footer_start);
         }
 
         Ok(CompositeFile {
