@@ -28,7 +28,9 @@ use super::bounds::{
     QueryBoundTracker, Verdict,
 };
 use super::distance::norm_squared_wide;
-use super::index_reader::{QuantizedFieldReader, QuantizedLayerReader, VectorIndexReader};
+use super::index_reader::{
+    validate_decoded_sidecar, QuantizedFieldReader, QuantizedLayerReader, VectorIndexReader,
+};
 use super::ivf::{AdaptiveProbeParams, Candidate, IvfIndex};
 use super::prepared::{
     corrected_quantized_estimate, initial_dot_raw_prefix, initial_l2_raw_prefix,
@@ -980,6 +982,7 @@ fn combine_initial_decoded(
             bases[index],
         );
     }
+    debug_assert!(estimates.iter().all(|e| e.is_finite()) && sigmas.iter().all(|s| s.is_finite()));
 }
 
 /// Runs the complete layer-0 cluster scoring shape.
@@ -1200,7 +1203,10 @@ fn combine_refinement_decoded(
         dimension,
         metric,
     );
-    for (index, sigma) in candidates.sigmas[candidate_range].iter_mut().enumerate() {
+    for (index, sigma) in candidates.sigmas[candidate_range.clone()]
+        .iter_mut()
+        .enumerate()
+    {
         *sigma = arithmetic_variances[index].sigma(
             metric,
             *sigma,
@@ -1209,6 +1215,8 @@ fn combine_refinement_decoded(
             bases[index],
         );
     }
+    let sigmas = &candidates.sigmas[candidate_range];
+    debug_assert!(estimates.iter().all(|e| e.is_finite()) && sigmas.iter().all(|s| s.is_finite()));
 }
 
 /// Reads and scores one selected layer range.
@@ -1243,6 +1251,7 @@ fn score_layer(
     }
 
     if matches!(selection, Selection::All) {
+        let first_row = rows.start;
         let batch = layer.read_batch(rows)?;
         query.score_layer_batch_unscaled(
             layer_idx,
@@ -1253,6 +1262,11 @@ fn score_layer(
         decode_f32s(batch.scales(), decoded_scales);
         decode_f16s(batch.gammas(), decoded_gammas);
         decode_f16s(batch.error_ratios(), decoded_error_ratios);
+        validate_decoded_sidecar(
+            &decoded_gammas[..selected_count],
+            &decoded_error_ratios[..selected_count],
+            first_row,
+        )?;
         if metric == Metric::L2 {
             let constants = batch.constants().ok_or_else(|| {
                 TantivyError::DataCorruption(DataCorruption::comment_only(
@@ -1322,6 +1336,12 @@ fn score_layer(
         }
     }
     debug_assert_eq!(selected_start, selected_count);
+    // For sparse selections, the reported error row is approximate after the first selected row.
+    validate_decoded_sidecar(
+        &decoded_gammas[..selected_count],
+        &decoded_error_ratios[..selected_count],
+        selected_rows[0],
+    )?;
 
     if metric == Metric::L2 {
         layer.plan_constant_reads(rows, selected_rows, read_ranges, block_scratch)?;

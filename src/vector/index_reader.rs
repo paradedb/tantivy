@@ -261,6 +261,37 @@ impl QuantizedLayerBatch {
     }
 }
 
+/// Rejects a decoded sidecar batch whose gammas leave the serialized clamp or
+/// whose corrected-error ratios are not finite and non-negative. Runs once per
+/// scored batch on the decoded values, over the selected rows only.
+pub(crate) fn validate_decoded_sidecar(
+    gammas: &[f32],
+    error_ratios: &[f32],
+    first_row: usize,
+) -> crate::Result<()> {
+    debug_assert_eq!(gammas.len(), error_ratios.len());
+    for (index, &gamma) in gammas.iter().enumerate() {
+        if !gamma.is_finite() || !(1.0..=4.0).contains(&gamma) {
+            let row = first_row + index;
+            return Err(DataCorruption::comment_only(format!(
+                "quantized row {row} has invalid cumulative gamma {gamma}; expected finite [1,4]"
+            ))
+            .into());
+        }
+    }
+    for (index, &error_ratio) in error_ratios.iter().enumerate() {
+        if !error_ratio.is_finite() || error_ratio < 0.0 {
+            let row = first_row + index;
+            return Err(DataCorruption::comment_only(format!(
+                "quantized row {row} has invalid corrected error ratio {error_ratio}; expected \
+                 finite and non-negative"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Splits strictly increasing `rows` into maximal runs of consecutive rows.
 fn push_consecutive_runs(rows: &[usize], read_ranges: &mut Vec<Range<usize>>) {
     debug_assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
@@ -383,43 +414,6 @@ impl QuantizedLayerReader {
         )
     }
 
-    fn validate_gammas(gammas: &[u8], rows: &Range<usize>) -> crate::Result<()> {
-        debug_assert_eq!(gammas.len(), rows.len() * QUANTIZED_GAMMA_STRIDE);
-        for (local, bytes) in gammas.chunks_exact(QUANTIZED_GAMMA_STRIDE).enumerate() {
-            let gamma = f16_to_f32(u16::from_le_bytes(bytes.try_into().unwrap()));
-            if !gamma.is_finite() || !(1.0..=4.0).contains(&gamma) {
-                return Err(DataCorruption::comment_only(format!(
-                    "quantized row {} has invalid cumulative gamma {gamma}; expected finite [1,4]",
-                    rows.start + local
-                ))
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_error_ratios(error_ratios: &[u8], rows: &Range<usize>) -> crate::Result<()> {
-        debug_assert_eq!(
-            error_ratios.len(),
-            rows.len() * QUANTIZED_ERROR_RATIO_STRIDE
-        );
-        for (local, bytes) in error_ratios
-            .chunks_exact(QUANTIZED_ERROR_RATIO_STRIDE)
-            .enumerate()
-        {
-            let error_ratio = f16_to_f32(u16::from_le_bytes(bytes.try_into().unwrap()));
-            if !error_ratio.is_finite() || error_ratio < 0.0 {
-                return Err(DataCorruption::comment_only(format!(
-                    "quantized row {} has invalid corrected error ratio {error_ratio}; expected \
-                     finite and non-negative",
-                    rows.start + local
-                ))
-                .into());
-            }
-        }
-        Ok(())
-    }
-
     /// Pins the scale, gamma, and corrected-error-ratio runs for an in-cluster row range.
     pub(crate) fn read_sidecar(&self, rows: Range<usize>) -> crate::Result<QuantizedSidecarBatch> {
         if rows.is_empty() {
@@ -476,8 +470,6 @@ impl QuantizedLayerReader {
                 )
             }
         };
-        Self::validate_gammas(gammas.as_slice(), &rows)?;
-        Self::validate_error_ratios(error_ratios.as_slice(), &rows)?;
         Ok(QuantizedSidecarBatch {
             scales,
             gammas,
@@ -1858,40 +1850,23 @@ mod tests {
     #[test]
     fn sidecar_gamma_validation_is_range_scoped() {
         for gamma in [0.5, 5.0, f32::INFINITY, f32::NAN] {
-            let reader = QuantizedLayerReader {
-                codes: FileSlice::empty(),
-                sidecar: FileSlice::from(test_sidecar(&[17.0], &[gamma])),
-                constants: None,
-                cluster_offsets: test_cluster_offsets(&[0, 1]),
-                code_stride: 8,
-                dim: 64,
-                bits: 1,
-            };
-            assert!(reader.read_sidecar(0..1).is_err(), "gamma={gamma}");
+            assert!(
+                validate_decoded_sidecar(&[gamma], &[0.0], 0).is_err(),
+                "gamma={gamma}"
+            );
         }
+        assert!(validate_decoded_sidecar(&[1.0, 4.0], &[0.0, 0.0], 0).is_ok());
     }
 
     #[test]
     fn sidecar_error_ratio_validation_is_range_scoped() {
         for error_ratio in [-0.5, f32::INFINITY, f32::NAN] {
-            let reader = QuantizedLayerReader {
-                codes: FileSlice::empty(),
-                sidecar: FileSlice::from(test_sidecar_with_error_ratios(
-                    &[17.0],
-                    &[1.0],
-                    &[error_ratio],
-                )),
-                constants: None,
-                cluster_offsets: test_cluster_offsets(&[0, 1]),
-                code_stride: 8,
-                dim: 64,
-                bits: 1,
-            };
             assert!(
-                reader.read_sidecar(0..1).is_err(),
+                validate_decoded_sidecar(&[1.0], &[error_ratio], 0).is_err(),
                 "error_ratio={error_ratio}"
             );
         }
+        assert!(validate_decoded_sidecar(&[1.0, 1.0], &[0.0, 0.5], 0).is_ok());
     }
 
     #[test]
