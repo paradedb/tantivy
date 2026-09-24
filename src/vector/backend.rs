@@ -12,8 +12,8 @@
 //! Supports flat scans and routed quantized scans.
 
 #[cfg(test)]
-#[path = "review_reproductions.rs"]
-mod review_regressions;
+#[path = "quantized_boundary_tests.rs"]
+mod quantized_boundary_tests;
 
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
