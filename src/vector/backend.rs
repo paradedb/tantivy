@@ -1782,9 +1782,6 @@ impl<T: VectorElement> VectorBackend<T> {
                 .map_or(QueryBound::Filling, |score| QueryBound::Armed {
                     t: to_bound_space(metric, score.0 .0),
                 });
-            if armed_probe.is_none() && matches!(query_bound, QueryBound::Armed { .. }) {
-                armed_probe = Some((postings_row + postings_skipped).saturating_sub(1) as u32);
-            }
             let verdict = bounds_verdict(query_bound, || {
                 let QueryBound::Armed { t } = query_bound else {
                     return f32::INFINITY;
@@ -1910,6 +1907,13 @@ impl<T: VectorElement> VectorBackend<T> {
             scan.finish_cluster_bound();
             scan.work_spent += pricing.row * selected_count as f64;
             postings_row += 1;
+            if armed_probe.is_none()
+                && scan
+                    .running_pessimistic_kth(top_n, QUANTIZED_BOUNDARY_KAPPA)
+                    .is_some()
+            {
+                armed_probe = Some((postings_row + postings_skipped - 1) as u32);
+            }
         }
         stats.record_routing(ranked.metrics());
         stats.postings_row += postings_row;
