@@ -261,6 +261,22 @@ impl QuantizedLayerBatch {
     }
 }
 
+/// Splits strictly increasing `rows` into maximal runs of consecutive rows.
+fn push_consecutive_runs(rows: &[usize], read_ranges: &mut Vec<Range<usize>>) {
+    debug_assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+    let Some(&first) = rows.first() else { return };
+    let mut start = first;
+    let mut previous = first;
+    for &row in &rows[1..] {
+        if row != previous + 1 {
+            read_ranges.push(start..previous + 1);
+            start = row;
+        }
+        previous = row;
+    }
+    read_ranges.push(start..previous + 1);
+}
+
 fn storage_block_span(slot: &FileSlice, byte_range: Range<usize>) -> Option<(usize, usize)> {
     debug_assert!(byte_range.start < byte_range.end);
     let first = slot.storage_block_ord(byte_range.start)?;
@@ -535,7 +551,7 @@ impl QuantizedLayerReader {
         block_scratch.clear();
         for &row in rows {
             if !append_storage_block_span(slot, row * stride..(row + 1) * stride, block_scratch) {
-                read_ranges.push(available_rows);
+                push_consecutive_runs(rows, read_ranges);
                 return;
             }
         }
@@ -1492,16 +1508,7 @@ impl VectorIndexReader {
         } else {
             read_ranges.clear();
             block_scratch.clear();
-            let mut start = rows[0];
-            let mut previous = rows[0];
-            for &row in &rows[1..] {
-                if row != previous + 1 {
-                    read_ranges.push(start..previous + 1);
-                    start = row;
-                }
-                previous = row;
-            }
-            read_ranges.push(start..previous + 1);
+            push_consecutive_runs(rows, read_ranges);
         }
 
         let mut chunks = Vec::with_capacity(read_ranges.len());
@@ -1741,8 +1748,11 @@ mod tests {
         Ok(())
     }
 
+    /// Without storage geometry, the plan reads only selected runs, so an unselected
+    /// row is neither read nor validated; corruption there is caught by whichever
+    /// query selects it.
     #[test]
-    fn indexed_range_validates_unselected_gap_row_tail() {
+    fn no_geometry_plan_skips_unselected_gap_rows_and_validates_read_rows() {
         let stride = quantized_code_stride(65, 1);
         let mut codes = vec![0_u8; stride * 3];
         codes[8] = 1;
@@ -1760,11 +1770,10 @@ mod tests {
         let mut ranges = Vec::new();
         let mut blocks = Vec::new();
         reader.plan_code_reads(0..3, &[0, 2], &mut ranges, &mut blocks);
-        assert_eq!(ranges, [0..3]);
-        assert!(
-            reader.read_codes(ranges.pop().unwrap()).is_err(),
-            "the unselected corrupt row inside the pinned range must be checked"
-        );
+        assert_eq!(ranges, [0..1, 2..3]);
+        assert!(reader.read_codes(0..1).is_ok());
+        assert!(reader.read_codes(2..3).is_ok());
+        assert!(reader.read_codes(0..3).is_err());
     }
 
     #[test]
@@ -2023,7 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_read_plan_without_storage_geometry_pins_available_range() {
+    fn indexed_read_plan_without_storage_geometry_reads_consecutive_runs() {
         let reader = QuantizedLayerReader {
             codes: FileSlice::from(vec![0_u8; 8 * 8]),
             sidecar: FileSlice::from(test_sidecar(&[0.0; 8], &[1.0; 8])),
@@ -2036,9 +2045,28 @@ mod tests {
         let mut ranges = Vec::new();
         let mut blocks = Vec::new();
         reader.plan_code_reads(0..8, &[0, 7], &mut ranges, &mut blocks);
-        assert_eq!(ranges, [0..8]);
+        assert_eq!(ranges, [0..1, 7..8]);
+        reader.plan_code_reads(0..8, &[2, 3, 4, 7], &mut ranges, &mut blocks);
+        assert_eq!(ranges, [2..5, 7..8]);
         reader.plan_sidecar_reads(0..8, &[0, 7], &mut ranges, &mut blocks);
         assert_eq!(ranges, [0..8]);
+    }
+
+    #[test]
+    fn cosine_refinement_plan_without_geometry_does_not_span_the_segment() {
+        let reader = QuantizedLayerReader {
+            codes: FileSlice::from(vec![0_u8; 12 * 8]),
+            sidecar: FileSlice::from(test_sidecar(&[0.0; 12], &[1.0; 12])),
+            constants: None,
+            cluster_offsets: test_cluster_offsets(&[0, 4, 8, 12]),
+            code_stride: 8,
+            dim: 64,
+            bits: 1,
+        };
+        let mut ranges = Vec::new();
+        let mut blocks = Vec::new();
+        reader.plan_code_reads(0..12, &[1, 10], &mut ranges, &mut blocks);
+        assert_eq!(ranges, [1..2, 10..11]);
     }
 
     #[test]
