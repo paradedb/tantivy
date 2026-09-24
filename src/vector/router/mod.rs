@@ -7,7 +7,7 @@ use super::ivf::graph::{
     Candidate, NeighborhoodGraphSearchMetrics, RelativeNeighborhoodGraph, ResumableSearchIterator,
     Workspace,
 };
-use super::ivf::{InMemoryStore, IvfCentroids, LazyStore, MultiLevelIvf};
+use super::ivf::{InMemoryStore, IvfCentroids, LazyStore, MultiLevelIvf, RecallEstimator};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
@@ -202,6 +202,24 @@ impl OpenedRouter {
                 RouterIter::Stacked(stacked::rank(router, query, metric, params))
             }
             Self::Exact(router) => RouterIter::Exact(router.rank(query)),
+        }
+    }
+
+    /// The APS estimator for the segment's own cluster scan over
+    /// `ranking`, which must not have been pulled yet. Only the stacked
+    /// router supports APS; `None` otherwise, or when APS is off.
+    pub(crate) fn recall_estimator(
+        &self,
+        ranking: &RouterIter<'_, '_>,
+        query: &[f32],
+        metric: Metric,
+        recall: f32,
+    ) -> crate::Result<Option<RecallEstimator>> {
+        match (self, ranking) {
+            (Self::Stacked(router), RouterIter::Stacked(ranking)) => {
+                stacked::recall_estimator(router, ranking, query, metric, recall)
+            }
+            _ => Ok(None),
         }
     }
 }

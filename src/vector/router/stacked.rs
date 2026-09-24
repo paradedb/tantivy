@@ -2,7 +2,8 @@ use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::ivf::{
     Candidate, ClusterId, InMemoryStackedIvf, IvfConfig, IvfIndexBuilder, LazyStackedIvf,
-    StackedSearchStats, SuperKMeansLevelClusterer, APS_MAX_DIM, PARENT_NPROBE_FRACTION,
+    RecallEstimator, StackedSearchStats, SuperKMeansLevelClusterer, APS_MAX_DIM,
+    PARENT_NPROBE_FRACTION,
 };
 use crate::vector::router::{RouterMetrics, RoutingParams};
 use crate::vector::IvfCentroids;
@@ -110,6 +111,31 @@ pub(super) fn rank(
         stats,
         recall_target: recall,
     }
+}
+
+/// The APS estimator for the segment's own cluster scan over `ranking`,
+/// or `None` when APS is off for `recall` at this dimension. Call before
+/// the first pull: the estimator covers the whole candidate set. The
+/// bottom router level's members are the segment centroids, row for row,
+/// so candidate rows come from its member store.
+pub(super) fn recall_estimator(
+    index: &LazyStackedIvf,
+    ranking: &Ranking,
+    query: &[f32],
+    metric: Metric,
+    recall: f32,
+) -> crate::Result<Option<RecallEstimator>> {
+    let candidates = ranking.ranked.as_slice();
+    if effective_recall(query.len(), recall) >= 1.0 || candidates.is_empty() {
+        return Ok(None);
+    }
+    let dim = query.len();
+    let mut rows = Vec::with_capacity(candidates.len() * dim);
+    for candidate in candidates {
+        index.vectors.extend_with_row(candidate.node.0, &mut rows)?;
+    }
+    let rows: Vec<&[f32]> = rows.chunks_exact(dim).collect();
+    Ok(Some(RecallEstimator::new(query, &rows, metric)))
 }
 
 pub(crate) struct Ranking {

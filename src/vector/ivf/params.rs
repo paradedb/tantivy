@@ -80,6 +80,12 @@ pub struct AdaptiveProbeParams {
     /// [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM). Default
     /// [`DEFAULT_ROUTER_RECALL`], PROVISIONAL.
     pub router_recall_target: f32,
+    /// Recall target for the segment's own cluster scan, in `(0, 1]`.
+    /// Below `1.0` the probe loop stops once the estimated recall of the
+    /// clusters covered so far reaches it (APS); `1.0` leaves the work
+    /// budget as the only bound. Stacked-router segments only, and forced
+    /// to `1.0` above [`APS_MAX_DIM`](crate::vector::ivf::APS_MAX_DIM).
+    pub recall_target: f32,
 }
 
 impl Default for AdaptiveProbeParams {
@@ -89,6 +95,7 @@ impl Default for AdaptiveProbeParams {
             min_probe_clusters: MIN_PROBE_CLUSTERS,
             work_model: None,
             router_recall_target: DEFAULT_ROUTER_RECALL,
+            recall_target: 1.0,
         }
     }
 }
