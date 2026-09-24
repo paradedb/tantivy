@@ -676,11 +676,6 @@ where
         }
     }
 
-    /// Compatibility name used by the archive-identical vector scan.
-    pub fn with_comparator(top_n: usize, comparator: C) -> Self {
-        Self::new_with_comparator(top_n, comparator)
-    }
-
     /// Sets the current threshold.
     pub fn set_threshold(&mut self, threshold: (TSortKey, SegmentOrdinal)) {
         self.threshold = Some(threshold);

@@ -204,7 +204,8 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        let mut topn = TopNComputer::with_comparator(top_n, (NaturalComparator, tie_comparator));
+        let mut topn =
+            TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
         let alive = segment_reader.alive_bitset();
         let mut rows_read = 0usize;
         // Row reads are ranged and can fail; the `for_each` closure can't
@@ -2107,7 +2108,8 @@ impl<T: VectorElement> VectorBackend<T> {
             &mut survivor_read_ranges,
             &mut survivor_block_scratch,
         )?;
-        let mut topn = TopNComputer::with_comparator(top_n, (NaturalComparator, tie_comparator));
+        let mut topn =
+            TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
         for ((row, doc), (batch_row, bytes)) in rerank.into_iter().zip(rerank_batch.iter()) {
             debug_assert_eq!(row, batch_row);
             let score = self.query.score_doc_bytes(bytes);
@@ -2258,7 +2260,8 @@ impl<T: VectorElement> VectorBackend<T> {
         K: SegmentSortKeyComputer,
         CTail: Comparator<K::SegmentSortKey>,
     {
-        let mut topn = TopNComputer::with_comparator(top_n, (NaturalComparator, tie_comparator));
+        let mut topn =
+            TopNComputer::new_with_comparator(top_n, (NaturalComparator, tie_comparator));
         // `candidates` is the cumulative scored count that drives the gate; the
         // prune counters accumulate into locals and fold into `ProbeStats` once
         // after the loop, keeping the hot per-doc path free of indirection.
