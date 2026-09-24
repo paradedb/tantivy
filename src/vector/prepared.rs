@@ -1,7 +1,6 @@
 //! Prepared exact and quantized query state.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::Arc;
 
 use cascade::{prepare_split_query_with_plan, LayerSpec, PreparedSplitQuery, QueryRotationPlan};
 use quant_model::Grid;
@@ -28,22 +27,14 @@ enum QueryKind {
     },
 }
 
-/// Immutable field/segment quantization state resolved once before query prep.
+/// Immutable quantization state for one segment's field, built when the
+/// segment's vector reader opens.
 pub(crate) struct QuantizedIndexCtx {
     pub(crate) config: VectorQuantizationConfig,
     pub(crate) specs: Vec<LayerSpec>,
     pub(crate) grids: Vec<Grid>,
     rotation_plan: QueryRotationPlan,
 }
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct QuantizedIndexCacheKey {
-    config_json: String,
-}
-
-static QUANTIZED_INDEX_CACHE: OnceLock<
-    Mutex<HashMap<QuantizedIndexCacheKey, Weak<QuantizedIndexCtx>>>,
-> = OnceLock::new();
 
 /// Applies the metric-specific correction to a cumulative quantized estimate.
 #[inline(always)]
@@ -207,7 +198,7 @@ pub(crate) fn quantized_model_sigma(
 }
 
 impl QuantizedIndexCtx {
-    fn new(config: VectorQuantizationConfig) -> crate::Result<Self> {
+    pub(crate) fn new(config: VectorQuantizationConfig) -> crate::Result<Self> {
         let specs: Vec<LayerSpec> = config
             .layers
             .iter()
@@ -246,42 +237,6 @@ impl QuantizedIndexCtx {
             grids,
             rotation_plan,
         })
-    }
-
-    /// Shares scorer state held by live readers/queries. The registry owns only weak
-    /// references and removes dead keys on each lookup, including distinct rebuild seeds.
-    pub(crate) fn resolve(config: VectorQuantizationConfig) -> crate::Result<Arc<Self>> {
-        let runtime_config = (
-            config.field.as_str(),
-            config.format_version,
-            config.dim,
-            config.metric,
-            config.norm_policy,
-            config.layers.as_slice(),
-            config.grids.as_slice(),
-        );
-        let key = QuantizedIndexCacheKey {
-            config_json: serde_json::to_string(&runtime_config).map_err(|error| {
-                TantivyError::InternalError(format!(
-                    "vector quantization config failed to serialize for context caching: {error}"
-                ))
-            })?,
-        };
-        let cache = QUANTIZED_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut cache = cache.lock().expect("quantized index cache lock poisoned");
-        cache.retain(|_, context| context.strong_count() != 0);
-        if let Some(resolved) = cache.get(&key).and_then(Weak::upgrade) {
-            return Ok(resolved);
-        }
-        let resolved = Arc::new(Self::new(config)?);
-        cache.insert(key, Arc::downgrade(&resolved));
-        Ok(resolved)
-    }
-
-    pub(crate) fn resolve_from_config(
-        config: VectorQuantizationConfig,
-    ) -> crate::Result<Arc<Self>> {
-        Self::resolve(config)
     }
 }
 
@@ -500,54 +455,6 @@ mod tests {
     use crate::vector::{VectorQuantizationConfig, VectorQuantizationLayer};
 
     #[test]
-    fn dropped_readers_do_not_retain_distinct_seed_contexts() {
-        let mut config = VectorQuantizationConfig::materialize(
-            "review_cache_lifetime".to_string(),
-            &VectorOptions::new(64, Metric::L2),
-            vec![VectorQuantizationLayer { bits: 4, seed: 0 }],
-        )
-        .unwrap();
-        for seed in 0..256 {
-            config.layers[0].seed = seed;
-            let context = QuantizedIndexCtx::resolve(config.clone()).unwrap();
-            let weak = Arc::downgrade(&context);
-            drop(context);
-            assert!(
-                weak.upgrade().is_none(),
-                "seed {seed} retained without a reader"
-            );
-            let registry = super::QUANTIZED_INDEX_CACHE.get().unwrap().lock().unwrap();
-            let retained = registry
-                .keys()
-                .filter(|key| key.config_json.contains("review_cache_lifetime"))
-                .count();
-            assert!(retained <= 1, "dead seed keys accumulated: {retained}");
-        }
-    }
-
-    #[test]
-    fn resolved_quantized_index_context_is_reused_across_segment_opens() {
-        let config = VectorQuantizationConfig::materialize(
-            "cache_reuse_embedding".to_string(),
-            &VectorOptions::new(100, Metric::Dot),
-            vec![
-                VectorQuantizationLayer {
-                    bits: 1,
-                    seed: 0xfeed_0001,
-                },
-                VectorQuantizationLayer {
-                    bits: 4,
-                    seed: 0xfeed_0002,
-                },
-            ],
-        )
-        .unwrap();
-        let first = QuantizedIndexCtx::resolve(config.clone()).unwrap();
-        let reopened = QuantizedIndexCtx::resolve(config).unwrap();
-        assert!(Arc::ptr_eq(&first, &reopened));
-    }
-
-    #[test]
     fn quantized_query_is_prepared_only_for_matching_index_configs() {
         let mut config = VectorQuantizationConfig::materialize(
             "prepared_for_embedding".to_string(),
@@ -558,12 +465,15 @@ mod tests {
             }],
         )
         .unwrap();
-        let first_index = QuantizedIndexCtx::resolve(config.clone()).unwrap();
+        let first_index = Arc::new(QuantizedIndexCtx::new(config.clone()).unwrap());
         let query = QuantizedQueryCtx::new(Arc::clone(&first_index), vec![0.5_f32; 100]);
         assert!(query.is_prepared_for(&first_index));
 
+        let other_segment = Arc::new(QuantizedIndexCtx::new(config.clone()).unwrap());
+        assert!(query.is_prepared_for(&other_segment));
+
         config.layers[0].seed = 0xfeed_2002;
-        let reseeded_index = QuantizedIndexCtx::resolve(config).unwrap();
+        let reseeded_index = Arc::new(QuantizedIndexCtx::new(config).unwrap());
         assert!(!query.is_prepared_for(&reseeded_index));
     }
 
@@ -581,7 +491,7 @@ mod tests {
 
         let mut missing_grid = config.clone();
         missing_grid.grids.clear();
-        let error = QuantizedIndexCtx::resolve(missing_grid)
+        let error = QuantizedIndexCtx::new(missing_grid)
             .err()
             .expect("missing grid must be rejected");
         assert!(error.to_string().contains("no persisted grid/model entry"));
@@ -601,7 +511,7 @@ mod tests {
         let query_values = (0..100)
             .map(|coordinate| ((coordinate as f32 + 0.25) * 0.173).sin())
             .collect::<Vec<_>>();
-        let index = QuantizedIndexCtx::resolve(config).unwrap();
+        let index = Arc::new(QuantizedIndexCtx::new(config).unwrap());
         let expected = cascade::audit_split_query_layer_error_squared_with_plan(
             &query_values,
             &index.rotation_plan,
