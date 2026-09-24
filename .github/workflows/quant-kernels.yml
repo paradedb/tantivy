@@ -120,7 +120,7 @@ jobs:
           test -n "$sign_asm"
           grep -Eq '\bcnt\b' "$sign_asm"
 
-  tantivy-quantization-benches:
+  tantivy-scan-benches:
     name: Tantivy quantization benchmarks
     needs: changed-paths
     if: needs.changed-paths.outputs.tantivy_benches == 'true'
@@ -143,5 +143,5 @@ jobs:
             cargo bench -p tantivy --bench vector_quantization_writer -- --noplot
           fi
           if test -f benches/vector_quantization_scan.rs; then
-            cargo bench -p tantivy --bench vector_quantization_scan --features quantization-bench -- --noplot
+            cargo bench -p tantivy --bench vector_quantization_scan --features unstable -- --noplot
           fi
