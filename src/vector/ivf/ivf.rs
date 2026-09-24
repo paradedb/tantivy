@@ -374,9 +374,7 @@ where
         .serialize(&mut topology)?;
 
     fn serialize_level<C, M>(index: &IvfIndex<C, M>, out: &mut Vec<u8>) -> io::Result<()>
-    where
-        C: SerializableStore,
-    {
+    where C: SerializableStore {
         let nlist = index.centroids.len();
         if index.offsets.len() != nlist {
             return Err(io::Error::new(
@@ -962,8 +960,9 @@ where
                 continue;
             };
             let new_rho = aps::radius_from_kth(kth.sim, metric);
-            let recompute =
-                rho.map_or(true, |old| (old - new_rho).abs() > APS_RECOMPUTE_THRESHOLD * old);
+            let recompute = rho.map_or(true, |old| {
+                (old - new_rho).abs() > APS_RECOMPUTE_THRESHOLD * old
+            });
             if recompute {
                 rho = Some(new_rho);
                 profile =
@@ -1294,8 +1293,6 @@ mod tests {
         }
     }
 
-    #[test]
-
     /// Empty lists after `add_level` share start offsets with the next
     /// non-empty list. Cover validation must still accept the partition
     /// (reproduces the centroid_ratio-sensitive open failure).
@@ -1339,6 +1336,7 @@ mod tests {
         .expect("empty lists after add_level must still open");
     }
 
+    #[test]
     fn test_slice_backed_open_rejects_truncation() {
         let dim = 2;
         let n = 32;

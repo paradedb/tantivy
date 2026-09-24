@@ -35,9 +35,15 @@ pub(crate) struct TestVectorIndexBuilder {
     metric: Metric,
     selectivities: Vec<f32>,
     vector_storage_format: VectorStorageFormat,
+    router: RouterKind,
 }
 
 impl TestVectorIndexBuilder {
+    pub(crate) fn router(mut self, router: RouterKind) -> Self {
+        self.router = router;
+        self
+    }
+
     pub(crate) fn vector_storage_format(
         mut self,
         vector_storage_format: VectorStorageFormat,
@@ -108,7 +114,7 @@ impl TestVectorIndexBuilder {
             builder = builder.ivf_clusterer(Arc::new(Grid2DClusterer {
                 centroids: self.centroids.clone(),
             }));
-            builder = builder.ivf_router(RouterKind::Stacked)?;
+            builder = builder.ivf_router(self.router)?;
         }
         builder.create_in_ram()
     }
@@ -122,6 +128,7 @@ impl TestVectorIndex {
             metric: Metric::L2,
             selectivities: Vec::new(),
             vector_storage_format: VectorStorageFormat::Flat,
+            router: RouterKind::Stacked,
         }
     }
 
