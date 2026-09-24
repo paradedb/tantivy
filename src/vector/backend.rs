@@ -4561,19 +4561,18 @@ mod tests {
     /// overshoots by at most one cluster's charge - the boundary rule on
     /// a real fixture rather than a hand-built one. The distance-ratio
     /// gate is parked (floor unreachable), so the stop point under test
-    /// is the budget's alone.
+    /// is the budget's alone. The exact router ranks every cluster; the
+    /// stacked router caps its ranking at `router_k`, which on this
+    /// fixture's empty clusters can run out before the budget binds.
     #[test]
     fn probe_stats_max_probe_fraction_ceiling() -> crate::Result<()> {
         let index = TestVectorIndex::builder(VectorDType::F32)
             .vector_storage_format(VectorStorageFormat::Ivf)
+            .router(RouterKind::Exact)
             .build()?;
         let params = AdaptiveProbeParams {
             max_probe_fraction: 0.2,
             min_probe_clusters: 1,
-            // Route exhaustively: with APS on, the stacked router hands the
-            // loop only the clusters the recall target needs, and on this
-            // tiny fixture the ranking runs out before the budget binds.
-            router_recall_target: 1.0,
             ..Default::default()
         };
         let searcher = index.index.reader()?.searcher();

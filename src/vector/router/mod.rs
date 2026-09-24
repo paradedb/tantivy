@@ -400,7 +400,10 @@ mod tests {
         let ranking = opened.rank(&mut workspace, &query, Metric::L2, params);
         let (candidates, lists, scored, recall) = stacked_metrics(ranking.metrics());
         assert_eq!(recall, 1.0, "dimension cap must force the nprobe path");
-        assert!(candidates <= 2, "returned set must honor params.k, got {candidates}");
+        assert!(
+            candidates <= 2,
+            "returned set must honor params.k, got {candidates}"
+        );
         assert!(lists >= 1, "nprobe path must still open parent lists");
         assert!(
             scored >= candidates,
