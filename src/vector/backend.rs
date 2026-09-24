@@ -1400,6 +1400,7 @@ struct QuantizedScanCtx {
     /// Running top lower endpoints, all evaluated with `bound_kappa`.
     bound_top: Vec<usize>,
     bound_kappa: f32,
+    boundary_passed: bool,
     /// Cluster-local selection scratch.
     cluster_top: Vec<usize>,
     cluster_top_n: usize,
@@ -1419,6 +1420,7 @@ impl QuantizedScanCtx {
             cluster_query_norms: Vec::new(),
             bound_top: Vec::new(),
             bound_kappa: QUANTIZED_BOUNDARY_KAPPA,
+            boundary_passed: false,
             cluster_top: Vec::new(),
             cluster_top_n: 0,
             cluster_start: None,
@@ -1537,6 +1539,7 @@ impl QuantizedScanCtx {
     }
 
     fn running_pessimistic_kth(&self, top_n: usize, kappa: f32) -> Option<Threshold> {
+        debug_assert!(!self.boundary_passed);
         if top_n == 0 || self.bound_top.len() < top_n {
             return None;
         }
@@ -1597,6 +1600,11 @@ impl QuantizedScanCtx {
             .sort_unstable_by_key(|candidate| candidate.row);
         self.candidates
             .replace_with_boundary_survivors(&self.boundary_scratch);
+        // `bound_top` indexes the pre-boundary column layout; nothing may read the
+        // running admission threshold after a boundary.
+        self.bound_top.clear();
+        self.boundary_passed = true;
+        debug_assert!(self.cluster_start.is_none());
     }
 }
 
