@@ -291,3 +291,8 @@ harness = false
 [[bench]]
 name = "vector_quantization_writer"
 harness = false
+
+[[bench]]
+name = "vector_quantization_scan"
+harness = false
+required-features = ["unstable"]

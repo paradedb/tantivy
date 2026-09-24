@@ -32,6 +32,9 @@ pub(crate) mod tests;
 
 pub(crate) const VEC_EXT: &str = "vec";
 
+#[cfg(feature = "unstable")]
+#[doc(hidden)]
+pub use backend::quantization_bench_layer0_cosine_cluster;
 pub use backend::{
     set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, VectorBackend,
     DEFAULT_FIXED_PROBE_COST_ROWS,
@@ -41,6 +44,9 @@ pub use bounds::{
     BoundKind, BoundStore, BoundsBuilder, HeapPeek, QueryBound, Verdict,
 };
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
+#[cfg(feature = "unstable")]
+#[doc(hidden)]
+pub use distance::quantization_bench_dot_bytes_f32;
 pub use distance::{
     cosine, cosine_bytes, dot, dot_bytes, l2_squared, l2_squared_bytes, Similarity,
 };

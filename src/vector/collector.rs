@@ -16,11 +16,14 @@
 //! [`TopNComputer`](crate::collector::TopNComputer) and `compare_for_top_k` are
 //! shared verbatim with the pull-model path. Only the iteration driver differs,
 //! never the ordering rule.
+//! Top-N vector-similarity collection.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::backend::{ProbeStats, VectorBackend};
+use super::index_reader::QuantizedFieldReader;
 use super::ivf::AdaptiveProbeParams;
+use super::prepared::{QuantizedQueryCtx, VectorQuery};
 use super::tie_break::NoTieBreak;
 use super::VectorElement;
 use crate::collector::sort_key::NaturalComparator;
@@ -45,16 +48,21 @@ use crate::{DocAddress, DocId, Score, SegmentOrdinal, TantivyError};
 /// `S` orders documents that tie on similarity; it defaults to
 /// [`NoTieBreak`], which leaves ties to ascending `DocAddress`. See
 /// [`with_tie_break`](Self::with_tie_break).
+/// Collects documents by descending vector similarity.
 pub struct TopDocsByVectorSimilarity<T: VectorElement, S = NoTieBreak> {
     field: Field,
     query: Arc<Vec<T>>,
     limit: usize,
     offset: usize,
     adaptive: AdaptiveProbeParams,
+    max_scan_levels: usize,
+    /// Prepared on the first quantized segment and shared by the rest.
+    quantized_query: OnceLock<Arc<QuantizedQueryCtx>>,
     tie_break: S,
 }
 
 impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
+    /// Creates a top-vector-similarity collector.
     pub fn new(field: Field, query: Vec<T>, limit: usize) -> Self {
         Self {
             field,
@@ -62,6 +70,8 @@ impl<T: VectorElement> TopDocsByVectorSimilarity<T, NoTieBreak> {
             limit,
             offset: 0,
             adaptive: AdaptiveProbeParams::default(),
+            max_scan_levels: usize::MAX,
+            quantized_query: OnceLock::new(),
             tie_break: NoTieBreak,
         }
     }
@@ -71,6 +81,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// Drop the first `offset` results in the global ranking — used to
     /// paginate. Each segment still produces its top `limit + offset`
     /// to ensure the global window has enough candidates.
+    /// Sets the global result offset.
     pub fn and_offset(mut self, offset: usize) -> Self {
         self.offset = offset;
         self
@@ -78,8 +89,15 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
 
     /// Override the adaptive probing parameters (ignored by flat-only
     /// segments).
+    /// Sets adaptive probing parameters.
     pub fn with_adaptive_params(mut self, params: AdaptiveProbeParams) -> Self {
         self.adaptive = params;
+        self
+    }
+
+    /// Limits the quantized residual prefix.
+    pub fn with_max_scan_levels(mut self, max_scan_levels: usize) -> Self {
+        self.max_scan_levels = max_scan_levels;
         self
     }
 
@@ -103,6 +121,7 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     /// that would have placed globally. The bundled computers satisfy this:
     /// term ordinals ascend with their terms, and `FastValue`'s `u64` encoding
     /// is monotonic.
+    /// Sets a secondary ordering for equal similarities.
     pub fn with_tie_break<S2: SortKeyComputer>(
         self,
         tie_break: S2,
@@ -113,6 +132,8 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
             limit: self.limit,
             offset: self.offset,
             adaptive: self.adaptive,
+            max_scan_levels: self.max_scan_levels,
+            quantized_query: self.quantized_query,
             tie_break,
         }
     }
@@ -120,19 +141,56 @@ impl<T: VectorElement, S> TopDocsByVectorSimilarity<T, S> {
     fn segment_top_n(&self) -> usize {
         self.limit.saturating_add(self.offset)
     }
+
+    fn segment_query(&self, reader: &SegmentReader) -> crate::Result<VectorQuery<T>> {
+        let quantized = match reader.vector_index(self.field)?.quantization() {
+            Some(field) if self.max_scan_levels > 0 => Some(self.quantized_query(field)),
+            _ => None,
+        };
+        Ok(VectorQuery::new(Arc::clone(&self.query), quantized))
+    }
+
+    /// A collector reused on another index may meet a different quantization
+    /// config; such segments get their own query instead of the shared one.
+    fn quantized_query(&self, field: &QuantizedFieldReader) -> Arc<QuantizedQueryCtx> {
+        let index_ctx = field.index_ctx();
+        let prepare = || {
+            let active_layers = self.max_scan_levels.min(index_ctx.specs.len());
+            let query = self.query.iter().map(|value| value.to_f32()).collect();
+            Arc::new(QuantizedQueryCtx::with_depth(
+                Arc::clone(index_ctx),
+                query,
+                active_layers,
+            ))
+        };
+        let shared = self.quantized_query.get_or_init(prepare);
+        if shared.is_prepared_for(index_ctx) {
+            Arc::clone(shared)
+        } else {
+            prepare()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_quantized_query(&self) -> bool {
+        self.quantized_query.get().is_some()
+    }
 }
 
 /// What a [`TopDocsByVectorSimilarity`] search returns: the global top-N
 /// plus each searched segment's [`ProbeStats`], so callers can inspect or
 /// aggregate probe metrics without a side channel.
+/// Contains vector results and per-segment probe statistics.
 #[derive(Debug, Default)]
 pub struct VectorSimilarityFruit {
     /// Global top-N `(score, address)` pairs in descending-similarity order.
+    /// Global results in descending-similarity order.
     pub results: Vec<(Score, DocAddress)>,
     /// One [`ProbeStats`] per collected segment, in segment-ordinal order
     /// after [`Collector::merge_fruits`]. The counter fields are summable
     /// across segments; `termination` and `bound_armed_at_probe` only
     /// carry per-segment meaning.
+    /// Probe statistics in segment order.
     pub stats: Vec<ProbeStats>,
 }
 
@@ -143,6 +201,7 @@ pub struct VectorSimilarityFruit {
 /// merge has to order by the same composite key the per-segment heaps used.
 /// The value is dropped at merge time — callers order by similarity and read
 /// their own columns back themselves, so it never reaches [`VectorSimilarityFruit`].
+/// One segment's vector results with secondary sort keys.
 pub struct SegmentVectorFruit<K> {
     results: Vec<((Score, K), DocAddress)>,
     stats: ProbeStats,
@@ -187,6 +246,7 @@ where
             // `requires_scoring` is false below, so the filter's BM25 score is
             // never computed and every doc would tie-break on the same
             // placeholder. Fail loudly rather than silently ordering by nothing.
+            // Relevance scores are unavailable on vector-ordered scans.
             return Err(TantivyError::InvalidArgument(
                 "vector similarity cannot be tie-broken by the relevance score: no score is \
                  computed when ordering by a vector field"
@@ -222,7 +282,7 @@ where
             reader,
             segment_ord,
             self.field,
-            Arc::clone(&self.query),
+            self.segment_query(reader)?,
             self.adaptive.clone(),
         )?;
         let mut tie_break = self.tie_break.segment_sort_key_computer(reader)?;
@@ -285,6 +345,7 @@ where
 /// Trait-bound shim: the collector overrides [`Collector::collect_segment`]
 /// so the per-doc path never fires, but the `Child: SegmentCollector`
 /// bound on `Collector` still has to be satisfied.
+/// Satisfies the collector's segment-child type requirement.
 pub struct NoOpSegmentCollector<K>(std::marker::PhantomData<K>);
 
 impl<K> Default for NoOpSegmentCollector<K> {
@@ -314,7 +375,6 @@ mod ivf_e2e_tests {
     //! fixture so the manual flat/ivf scene construction the
     //! pre-consolidation tests carried is gone — `vector_storage_format`
     //! is the only knob.
-
     use std::sync::Arc;
 
     use super::VectorSimilarityFruit;
@@ -377,7 +437,7 @@ mod ivf_e2e_tests {
         for s in &fruit.stats {
             assert_eq!(
                 s.vectors_visited,
-                s.pruned_filter + s.pruned_dead + s.pruned_seen + s.candidates_scored,
+                s.pruned_filter + s.pruned_dead + s.candidates_scored,
                 "invariant per segment: {s:?}"
             );
             total_visited += s.vectors_visited;
