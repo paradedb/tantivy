@@ -34,9 +34,7 @@ pub(crate) const VEC_EXT: &str = "vec";
 
 #[cfg(feature = "unstable")]
 #[doc(hidden)]
-pub use backend::{
-    quantization_bench_layer0_cosine_cluster, quantization_bench_layer0_cosine_cluster_f16_scales,
-};
+pub use backend::quantization_bench_layer0_cosine_cluster;
 pub use backend::{
     set_fixed_probe_cost_rows, ProbeStats, ProbeTermination, VectorBackend,
     DEFAULT_FIXED_PROBE_COST_ROWS,

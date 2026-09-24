@@ -1096,65 +1096,6 @@ fn finish_quantization_bench_layer0_cosine_cluster(
     kernel_scores[rows - 1] + estimates[rows - 1] + sigmas[rows - 1]
 }
 
-/// Runs layer-0 scoring with binary16 scale decoding.
-#[cfg(feature = "unstable")]
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-pub fn quantization_bench_layer0_cosine_cluster_f16_scales(
-    dimension: usize,
-    prepared: &cascade::PreparedSplitQuery,
-    spec: cascade::LayerSpec,
-    codes: &[u8],
-    code_stride: usize,
-    scales: &[u8],
-    gammas: &[u8],
-    error_ratios: &[u8],
-    residual_norms: &[u8],
-    cluster_score: f32,
-    score_query_norm_squared: f32,
-    sign_query_error_squared: f32,
-    kernel_scores: &mut Vec<f32>,
-    decoded_scales: &mut Vec<f32>,
-    decoded_gammas: &mut Vec<f32>,
-    decoded_error_ratios: &mut Vec<f32>,
-    decoded_residual_norms: &mut Vec<f32>,
-    bases: &mut Vec<f32>,
-    estimates: &mut Vec<f32>,
-    sigmas: &mut Vec<f32>,
-    residual_norms_squared: &mut Vec<f32>,
-    sign_query_error_terms: &mut Vec<f32>,
-) -> f32 {
-    let rows = scales.len() / std::mem::size_of::<u16>();
-    assert_eq!(codes.len(), rows * code_stride);
-    assert_eq!(gammas.len(), rows * std::mem::size_of::<u16>());
-    assert_eq!(error_ratios.len(), rows * std::mem::size_of::<u16>());
-    assert_eq!(residual_norms.len(), rows * std::mem::size_of::<f32>());
-    kernel_scores.resize(rows, 0.0);
-    prepared.score_layer_batch_unscaled(0, codes, code_stride, spec, kernel_scores);
-    decode_f16s(scales, decoded_scales);
-    finish_quantization_bench_layer0_cosine_cluster(
-        dimension,
-        rows,
-        gammas,
-        error_ratios,
-        residual_norms,
-        cluster_score,
-        score_query_norm_squared,
-        sign_query_error_squared,
-        kernel_scores,
-        decoded_scales,
-        decoded_gammas,
-        decoded_error_ratios,
-        decoded_residual_norms,
-        bases,
-        estimates,
-        sigmas,
-        residual_norms_squared,
-        sign_query_error_terms,
-    )
-}
-
 const COSINE_REFINEMENT_BATCH_ROWS: usize = 2_048;
 
 fn cosine_refinement_batches(row_count: usize) -> impl Iterator<Item = Range<usize>> {

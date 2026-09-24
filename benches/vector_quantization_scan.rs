@@ -11,9 +11,7 @@ use cascade::{audit_split_query_layer_error_squared, prepare_split_query, LayerS
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use quant_model::build_grid;
 use quant_model::f16::f32_to_f16;
-use tantivy::vector::{
-    quantization_bench_layer0_cosine_cluster, quantization_bench_layer0_cosine_cluster_f16_scales,
-};
+use tantivy::vector::quantization_bench_layer0_cosine_cluster;
 
 const DIM: usize = 1_024;
 const ROWS_PER_CLUSTER: usize = 100;
@@ -43,7 +41,6 @@ fn layer0_integrated_shape(c: &mut Criterion) {
     let code_stride = DIM.div_ceil(64) * std::mem::size_of::<u64>();
     let cluster_code_bytes = ROWS_PER_CLUSTER * code_stride;
     let cluster_scale_f32_bytes = ROWS_PER_CLUSTER * std::mem::size_of::<f32>();
-    let cluster_scale_f16_bytes = ROWS_PER_CLUSTER * std::mem::size_of::<u16>();
     let cluster_gamma_bytes = ROWS_PER_CLUSTER * std::mem::size_of::<u16>();
 
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -52,14 +49,9 @@ fn layer0_integrated_shape(c: &mut Criterion) {
         chunk.copy_from_slice(&lcg_next(&mut state).to_le_bytes());
     }
     let mut scales_f32 = vec![0_u8; CLUSTERS * cluster_scale_f32_bytes];
-    let mut scales_f16 = vec![0_u8; CLUSTERS * cluster_scale_f16_bytes];
-    for (f32_chunk, f16_chunk) in scales_f32
-        .chunks_exact_mut(4)
-        .zip(scales_f16.chunks_exact_mut(2))
-    {
+    for f32_chunk in scales_f32.chunks_exact_mut(4) {
         let value = 0.01 + ((lcg_next(&mut state) >> 40) as f32 / (1_u32 << 24) as f32) * 0.2;
         f32_chunk.copy_from_slice(&value.to_le_bytes());
-        f16_chunk.copy_from_slice(&f32_to_f16(value).to_le_bytes());
     }
     let mut gammas = vec![0_u8; CLUSTERS * cluster_gamma_bytes];
     for chunk in gammas.chunks_exact_mut(2) {
@@ -117,30 +109,6 @@ fn layer0_integrated_shape(c: &mut Criterion) {
         &mut residual_norms_squared,
         &mut sign_query_error_terms,
     );
-    let _ = quantization_bench_layer0_cosine_cluster_f16_scales(
-        DIM,
-        &prepared,
-        spec,
-        &codes[..cluster_code_bytes],
-        code_stride,
-        &scales_f16[..cluster_scale_f16_bytes],
-        &gammas[..cluster_gamma_bytes],
-        &error_ratios[..cluster_gamma_bytes],
-        &residual_norms[..cluster_scale_f32_bytes],
-        cluster_scores[0],
-        query_norm_squared,
-        query_error_squared,
-        &mut kernel_scores,
-        &mut decoded_scales,
-        &mut decoded_gammas,
-        &mut decoded_error_ratios,
-        &mut decoded_residual_norms,
-        &mut bases,
-        &mut estimates,
-        &mut sigmas,
-        &mut residual_norms_squared,
-        &mut sign_query_error_terms,
-    );
 
     let mut group = c.benchmark_group("vector_quantization_scan");
     group.throughput(Throughput::Elements(ROWS_PER_CLUSTER as u64));
@@ -159,44 +127,6 @@ fn layer0_integrated_shape(c: &mut Criterion) {
                 black_box(&codes[code_start..code_start + cluster_code_bytes]),
                 code_stride,
                 black_box(&scales_f32[scale_start..scale_start + cluster_scale_f32_bytes]),
-                black_box(&gammas[gamma_start..gamma_start + cluster_gamma_bytes]),
-                black_box(&error_ratios[gamma_start..gamma_start + cluster_gamma_bytes]),
-                black_box(
-                    &residual_norms
-                        [residual_norm_start..residual_norm_start + cluster_scale_f32_bytes],
-                ),
-                cluster_scores[cluster],
-                query_norm_squared,
-                query_error_squared,
-                &mut kernel_scores,
-                &mut decoded_scales,
-                &mut decoded_gammas,
-                &mut decoded_error_ratios,
-                &mut decoded_residual_norms,
-                &mut bases,
-                &mut estimates,
-                &mut sigmas,
-                &mut residual_norms_squared,
-                &mut sign_query_error_terms,
-            ))
-        })
-    });
-    let mut next_cluster_f16 = 0_usize;
-    group.bench_function("layer0_cosine_d1024_cluster100_scale_f16", |b| {
-        b.iter(|| {
-            let cluster = next_cluster_f16;
-            next_cluster_f16 = (next_cluster_f16 + 1) % CLUSTERS;
-            let code_start = cluster * cluster_code_bytes;
-            let scale_start = cluster * cluster_scale_f16_bytes;
-            let gamma_start = cluster * cluster_gamma_bytes;
-            let residual_norm_start = cluster * cluster_scale_f32_bytes;
-            black_box(quantization_bench_layer0_cosine_cluster_f16_scales(
-                DIM,
-                black_box(&prepared),
-                spec,
-                black_box(&codes[code_start..code_start + cluster_code_bytes]),
-                code_stride,
-                black_box(&scales_f16[scale_start..scale_start + cluster_scale_f16_bytes]),
                 black_box(&gammas[gamma_start..gamma_start + cluster_gamma_bytes]),
                 black_box(&error_ratios[gamma_start..gamma_start + cluster_gamma_bytes]),
                 black_box(
