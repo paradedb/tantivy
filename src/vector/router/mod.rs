@@ -50,8 +50,10 @@ impl RouterKind {
         }
     }
 
+    /// Opens the router persisted in `slot`, whichever kind it was built
+    /// with. The configured router only decides what new segments build, so
+    /// an index may hold segments routed by different kinds.
     pub(crate) fn open(
-        self,
         file_version: VectorFileVersion,
         slot: FileSlice,
         centroids: FileSlice,
@@ -60,7 +62,7 @@ impl RouterKind {
         if file_version != VectorFileVersion::V3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("router {self} requires vector file version V3, found {file_version:?}"),
+                format!("routers require vector file version V3, found {file_version:?}"),
             )
             .into());
         }
@@ -72,15 +74,8 @@ impl RouterKind {
             .into());
         }
         let persisted = Self::from_code(slot.read_byte(0)?)?;
-        if persisted != self {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("configured router {self} does not match persisted router {persisted}"),
-            )
-            .into());
-        }
         let payload = slot.slice_from(1);
-        match self {
+        match persisted {
             Self::Rng => Ok(Router::Rng(rng::open(payload, centroids, options)?)),
             Self::Stacked => Ok(Router::Stacked(stacked::open(payload, centroids, options)?)),
             Self::Exact => Ok(Router::Exact(exact::open(payload, centroids, options)?)),
@@ -246,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_router_opens_matching_payload() -> crate::Result<()> {
+    fn exact_router_opens_its_payload() -> crate::Result<()> {
         let options = VectorOptions::new(1, Metric::L2);
         let mut centroids = centroids();
         let built = RouterKind::Exact.build(&options, &mut centroids)?;
@@ -259,7 +254,7 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        let opened = RouterKind::Exact.open(
+        let opened = RouterKind::open(
             VectorFileVersion::V3,
             FileSlice::from(bytes),
             FileSlice::from(rows),
@@ -290,7 +285,7 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        let opened = RouterKind::Rng.open(
+        let opened = RouterKind::open(
             VectorFileVersion::V3,
             FileSlice::from(bytes),
             FileSlice::from(rows),
@@ -347,7 +342,7 @@ mod tests {
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>(),
         };
-        RouterKind::Stacked.open(
+        RouterKind::open(
             VectorFileVersion::V3,
             FileSlice::from(bytes),
             FileSlice::from(rows),
@@ -431,51 +426,56 @@ mod tests {
     }
 
     #[test]
-    fn configured_router_rejects_a_different_persisted_router() {
+    fn open_uses_the_persisted_router_kind() -> crate::Result<()> {
         let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterKind::Stacked
-            .open(
+        for kind in [RouterKind::Rng, RouterKind::Stacked, RouterKind::Exact] {
+            let mut centroids = centroids();
+            let built = kind.build(&options, &mut centroids)?;
+            let mut bytes = Vec::new();
+            built.serialize(&mut bytes)?;
+            let rows = match centroids {
+                IvfCentroids::F32(matrix) => matrix
+                    .values
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            };
+            let opened = RouterKind::open(
                 VectorFileVersion::V3,
-                FileSlice::from(vec![RouterKind::Exact as u8]),
-                FileSlice::empty(),
+                FileSlice::from(bytes),
+                FileSlice::from(rows),
                 &options,
-            )
-            .err()
-            .expect("a different persisted router must fail");
-        assert!(error
-            .to_string()
-            .contains("configured router stacked does not match persisted router exact"));
+            )?;
+            assert_eq!(opened.kind(), kind);
+        }
+        Ok(())
     }
 
     #[test]
     fn pre_v3_router_format_is_rejected() {
         let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterKind::Exact
-            .open(
-                VectorFileVersion::V2,
-                FileSlice::empty(),
-                FileSlice::empty(),
-                &options,
-            )
-            .err()
-            .expect("pre-V3 router formats must fail");
-        assert!(error
-            .to_string()
-            .contains("requires vector file version V3"));
+        let error = RouterKind::open(
+            VectorFileVersion::V2,
+            FileSlice::empty(),
+            FileSlice::empty(),
+            &options,
+        )
+        .err()
+        .expect("pre-V3 router formats must fail");
+        assert!(error.to_string().contains("require vector file version V3"));
     }
 
     #[test]
     fn unknown_router_kind_is_rejected() {
         let options = VectorOptions::new(1, Metric::L2);
-        let error = RouterKind::Exact
-            .open(
-                VectorFileVersion::V3,
-                FileSlice::from(vec![u8::MAX]),
-                FileSlice::empty(),
-                &options,
-            )
-            .err()
-            .expect("unknown router kinds must fail");
+        let error = RouterKind::open(
+            VectorFileVersion::V3,
+            FileSlice::from(vec![u8::MAX]),
+            FileSlice::empty(),
+            &options,
+        )
+        .err()
+        .expect("unknown router kinds must fail");
         assert!(error.to_string().contains("unknown router kind: 255"));
     }
 }

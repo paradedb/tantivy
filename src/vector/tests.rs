@@ -1196,34 +1196,65 @@ mod bounds_storage_tests {
         Ok(())
     }
 
+    /// Segments open under the router persisted in their `.centroids` file:
+    /// no configured router is needed to read them, and a different
+    /// configured router only applies to segments merged afterwards.
     #[test]
-    fn opening_ivf_requires_the_configured_router_to_match() -> crate::Result<()> {
+    fn opening_ivf_uses_the_persisted_router() -> crate::Result<()> {
+        let clusterer = || TestClusterer {
+            fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
+            num_centroids: 2,
+        };
         let directory = RamDirectory::create();
         let (index, field) = build_ivf_with_plan(
             Metric::L2,
-            TestClusterer {
-                fixed_centroids: Some(vec![[0.0, 0.0], [10.0, 10.0]]),
-                num_centroids: 2,
-            },
+            clusterer(),
             &[&[[0.0, 0.0], [0.1, 0.0]], &[[10.0, 10.0], [10.1, 10.0]]],
             Some(directory.clone()),
         )?;
         merge_all(&index)?;
         drop(index);
 
-        let mut reopened = Index::open(directory)?;
+        let reopened = Index::open(directory.clone())?;
         let searcher = reopened.reader()?.searcher();
-        let error = searcher.segment_readers()[0]
-            .vector_index(field)
-            .err()
-            .expect("opening IVF without a router must fail");
-        assert!(error
-            .to_string()
-            .contains("requires an explicitly configured Router"));
+        let vec_reader = searcher.segment_readers()[0].vector_index(field)?;
+        assert_eq!(
+            vec_reader.index().expect("IVF segment").router(),
+            RouterKind::Stacked
+        );
+        drop(searcher);
+        drop(reopened);
 
-        reopened.set_ivf_router(RouterKind::Stacked)?;
+        let mut reopened = Index::open(directory)?;
+        reopened.set_ivf_router(RouterKind::Rng)?;
+        reopened.set_ivf_clusterer(Arc::new(clusterer()));
+        let routers = |index: &Index| -> crate::Result<Vec<RouterKind>> {
+            let searcher = index.reader()?.searcher();
+            searcher
+                .segment_readers()
+                .iter()
+                .map(|segment_reader| {
+                    let vec_reader = segment_reader.vector_index(field)?;
+                    Ok(vec_reader.index().expect("IVF segment").router())
+                })
+                .collect()
+        };
+        assert_eq!(routers(&reopened)?, vec![RouterKind::Stacked]);
+
+        let mut writer: IndexWriter = reopened.writer_with_num_threads(1, 15_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for vector in [[0.2, 0.0], [10.2, 10.0]] {
+            let mut doc = TantivyDocument::new();
+            doc.add_vector(field, vector.as_slice());
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        drop(writer);
+        merge_all(&reopened)?;
+
+        assert_eq!(routers(&reopened)?, vec![RouterKind::Rng]);
         let searcher = reopened.reader()?.searcher();
-        searcher.segment_readers()[0].vector_index(field)?;
+        assert_eq!(searcher.num_docs(), 6);
         Ok(())
     }
 
