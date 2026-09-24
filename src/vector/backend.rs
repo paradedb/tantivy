@@ -1521,29 +1521,14 @@ impl QuantizedScanCtx {
         }
 
         self.cluster_top.clear();
-        for index in cluster_start..self.candidates.len() {
-            if self.cluster_top.len() < top_n {
-                self.cluster_top.push(index);
-                if self.cluster_top.len() == top_n {
-                    self.cluster_top.sort_unstable_by(|&a, &b| {
-                        lower_endpoint_order(&self.candidates, a, b, kappa)
-                    });
-                }
-                continue;
-            }
-            let tracked_min = *self.cluster_top.last().unwrap();
-            if !lower_endpoint_order(&self.candidates, index, tracked_min, kappa).is_lt() {
-                continue;
-            }
-            let insert_at = self.cluster_top.partition_point(|&kept| {
-                lower_endpoint_order(&self.candidates, kept, index, kappa).is_lt()
-            });
-            self.cluster_top.insert(insert_at, index);
-            self.cluster_top.pop();
-        }
-        if self.cluster_top.len() < top_n {
+        self.cluster_top
+            .extend(cluster_start..self.candidates.len());
+        if self.cluster_top.len() > top_n {
             self.cluster_top
-                .sort_unstable_by(|&a, &b| lower_endpoint_order(&self.candidates, a, b, kappa));
+                .select_nth_unstable_by(top_n - 1, |&a, &b| {
+                    lower_endpoint_order(&self.candidates, a, b, kappa)
+                });
+            self.cluster_top.truncate(top_n);
         }
 
         self.bound_merge.clear();
@@ -2107,7 +2092,10 @@ impl<T: VectorElement> VectorBackend<T> {
                 .copied()
                 .zip(scan.candidates.docs.iter().copied()),
         );
-        rerank.sort_unstable_by_key(|&(row, _)| row);
+        debug_assert!(
+            rerank.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "boundary survivors are row-sorted"
+        );
         #[cfg(test)]
         {
             stats.quantized_trace.rerank_docs = rerank.iter().map(|&(_, doc)| doc).collect();
