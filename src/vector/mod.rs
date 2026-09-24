@@ -1,5 +1,14 @@
-//! Vector storage, indexing, and scoring.
-//! Includes flat and inverted-file segment layouts.
+//! Distance kernels, the vector element trait, and the per-segment storage plugin.
+//!
+//! The schema-level field configuration ([`VectorOptions`](crate::schema::VectorOptions),
+//! [`Metric`](crate::schema::Metric), [`VectorDType`]) lives in the schema module and is
+//! re-exported here; the element trait [`VectorElement`], the vector storage abstraction
+//! [`VectorArena`], and the distance kernels live here.
+//! The on-disk formats live in submodules: [`flat`] for the dense full-precision layout and
+//! [`ivf`] for the partitioned/clustered accelerator. Both are owned by a single
+//! [`VectorPlugin`] which picks between them per merge based on
+//! [`IndexSettings::vector_clustering_threshold`](crate::index::IndexSettings::vector_clustering_threshold).
+//! Top-N vector queries dispatch over them via [`VectorBackend`].
 
 use std::io;
 
@@ -14,19 +23,16 @@ mod prepared;
 pub(crate) mod quantization;
 mod tie_break;
 
-/// Flat vector storage.
 pub mod flat;
-/// Inverted-file vector storage.
 pub mod ivf;
 pub mod router;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// Vector segment file extension.
 pub(crate) const VEC_EXT: &str = "vec";
 
-#[cfg(feature = "quantization-bench")]
+#[cfg(feature = "unstable")]
 #[doc(hidden)]
 pub use backend::{
     quantization_bench_layer0_cosine_cluster, quantization_bench_layer0_cosine_cluster_f16_scales,
@@ -40,7 +46,7 @@ pub use bounds::{
     BoundKind, BoundStore, BoundsBuilder, HeapPeek, QueryBound, Verdict,
 };
 pub use collector::{SegmentVectorFruit, TopDocsByVectorSimilarity, VectorSimilarityFruit};
-#[cfg(feature = "quantization-bench")]
+#[cfg(feature = "unstable")]
 #[doc(hidden)]
 pub use distance::quantization_bench_dot_bytes_f32;
 pub use distance::{
@@ -70,15 +76,30 @@ pub use quantization::{
 pub use router::{RouterKind, RouterMetrics};
 pub use tie_break::NoTieBreak;
 
+// The schema-level vector types are re-exported here so `crate::vector::{...}`
+// resolves for callers and tests that work entirely within the vector module.
 pub use crate::schema::{Metric, VectorDType, VectorOptions};
 
-/// Accumulator operations used by reduction kernels.
+/// Wide accumulator used by the reduction kernels (norms). Element
+/// types choose their accumulator via [`VectorElement::Acc`]; this
+/// trait is the vocabulary a kernel needs to *use* that choice:
+/// make a zero, add, read out as f64 at the fold.
+///
+/// Deliberately a custom trait rather than std bounds: the natural
+/// accumulator for a future quantized element is an integer (e.g.
+/// `u64` for `u8` elements — exact, matches integer-SIMD hardware),
+/// and `Into<f64>` does not exist for `u64` because std reserves
+/// `From`/`Into` for lossless conversions. `to_f64` is explicitly
+/// the lossy read-out at the end of a reduction.
+///
+/// Kept separate from `VectorElement` because these operations never
+/// mention the element type — how to sum two `f64`s is a fact about
+/// `f64` — and because accumulator impls are shared: `f32` and a
+/// future `f16` would both declare `type Acc = f64` and reuse this
+/// one impl.
 pub trait Accumulator: Copy + Send + Sync + 'static {
-    /// Additive identity.
     const ZERO: Self;
-    /// Adds two accumulator values.
     fn add(self, rhs: Self) -> Self;
-    /// Converts the accumulator to binary64.
     fn to_f64(self) -> f64;
 }
 
@@ -96,35 +117,50 @@ impl Accumulator for f64 {
     }
 }
 
-/// A vector element supported by storage and distance kernels.
+/// A vector element type with the primitives needed by the storage
+/// layer and the distance kernels.
+///
+/// Implemented for the element types supported by [`VectorDType`]. The
+/// `DTYPE` associated constant lets callers reject mismatches between
+/// the declared schema dtype and the type passed at runtime. The
+/// arithmetic methods (`squared_diff`, `product`) return `f32` so that
+/// kernels can use a uniform accumulator type across dtypes; the
+/// reduction kernels (norms) instead accumulate in [`Self::Acc`] via
+/// [`Self::mul_wide`].
 pub trait VectorElement: Copy + Send + Sync + 'static {
-    /// Schema data type.
     const DTYPE: VectorDType;
-    /// Serialized byte width.
     const SIZE_BYTES: usize;
 
-    /// Accumulator for reduction kernels.
+    /// Accumulator for this element's squares in reduction kernels.
+    /// Each element type declares how much headroom it needs: f32 -> f64
+    /// (squaring doubles the exponent, so |v| > ~1.8e19 overflows an f32
+    /// product; f64 makes any sum of finite-f32 squares finite).
     type Acc: Accumulator;
 
-    /// Writes one little-endian element.
     fn encode_le<W: io::Write + ?Sized>(&self, buf: &mut W) -> io::Result<()>;
 
-    /// Decodes one little-endian element.
+    /// Decode one element from its little-endian byte representation.
+    /// `bytes.len()` must be `SIZE_BYTES`.
     fn decode_le(bytes: &[u8]) -> Self;
 
-    /// Returns the squared difference as binary32.
+    /// `(a - b)^2` promoted to `f32` for accumulator-friendly distance
+    /// computation. For `f32` this is the obvious arithmetic; for
+    /// quantized types it may promote through a wider integer first.
     fn squared_diff(a: Self, b: Self) -> f32;
 
-    /// Returns the product as binary32.
+    /// `a * b` promoted to `f32`. Same rationale as `squared_diff`.
     fn product(a: Self, b: Self) -> f32;
 
-    /// Multiplies after widening to the accumulator type.
+    /// Widen-THEN-multiply: the cast happens before the square so the
+    /// product cannot overflow the narrow type. One operation, so the
+    /// ordering invariant is unforgettable per element type.
     fn mul_wide(a: Self, b: Self) -> Self::Acc;
 
     /// Lossless widening to `f32`.
     fn to_f32(self) -> f32;
 
-    /// Narrows a binary32 value.
+    /// Narrowing from `f32`; used at normalization write-back where
+    /// values are already `<= 1`.
     fn from_f32(v: f32) -> Self;
 }
 
@@ -178,10 +214,10 @@ impl VectorElement for f32 {
 /// query against a stored vector with the kernel matching that
 /// representation. The [`Metric`] is a parameter: an arena never holds one.
 pub trait VectorArena {
-    /// Stored vector element type.
+    /// Element type of the vectors; queries are `&[Elem]`.
     type Elem: VectorElement;
 
-    /// Returns the number of stored vectors.
+    /// The number of vectors held, at `dim` elements each.
     fn num_vectors(&self, dim: usize) -> usize;
 
     /// [`Similarity`] of `query` to the vector at dense row `index`.
@@ -194,7 +230,7 @@ pub trait VectorArena {
     ) -> Similarity;
 }
 
-/// Implements vector storage for contiguous typed slices.
+/// Any `[T]`-shaped storage (`&[T]`, `Vec<T>`, …), scored with the typed kernels.
 impl<T: VectorElement, S: std::ops::Deref<Target = [T]>> VectorArena for S {
     type Elem = T;
 
@@ -228,7 +264,7 @@ pub struct FileSliceArena<T> {
 }
 
 impl<T> FileSliceArena<T> {
-    /// Wraps contiguous little-endian vector rows.
+    /// Wraps a slice of contiguous `dim`-strided little-endian `T` rows.
     pub fn new(slice: crate::directory::FileSlice) -> Self {
         FileSliceArena {
             slice,
