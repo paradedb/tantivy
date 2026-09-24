@@ -1984,7 +1984,7 @@ mod tests {
             .expect("fixture must carry quantized slots");
         assert!(!quantized_field.index_ctx_is_initialized());
         let level_zero_fruit = quantized_searcher.search(&AllQuery, &level_zero_collector)?;
-        assert_eq!(level_zero_collector.cached_quantized_query_count(), 0);
+        assert!(!level_zero_collector.has_quantized_query());
         assert!(!quantized_field.index_ctx_is_initialized());
 
         assert_eq!(level_zero_fruit.results, unquantized_fruit.results);
@@ -2013,6 +2013,40 @@ mod tests {
         assert_eq!(
             level_zero.work_charged.to_bits(),
             baseline.work_charged.to_bits()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reused_collector_prepares_query_per_quantization_config() -> crate::Result<()> {
+        const DIM: usize = 64;
+        let field_of = |index: &Index| index.schema().get_field("embedding");
+        let first = build_quantized_fixture_case(DIM, Metric::L2, &[1, 4], true)?;
+        let second = build_quantized_fixture_case(DIM, Metric::L2, &[4], true)?;
+        let params = AdaptiveProbeParams {
+            max_probe_fraction: 1.0,
+            min_probe_clusters: 2,
+            ..Default::default()
+        };
+        let query = vec![0.05_f32; DIM];
+        let collector = |field| {
+            TopDocsByVectorSimilarity::new(field, query.clone(), 3)
+                .with_adaptive_params(params.clone())
+        };
+
+        let reused = collector(field_of(&first)?);
+        first.reader()?.searcher().search(&AllQuery, &reused)?;
+        assert!(reused.has_quantized_query());
+        let reused_fruit = second.reader()?.searcher().search(&AllQuery, &reused)?;
+        let fresh_fruit = second
+            .reader()?
+            .searcher()
+            .search(&AllQuery, &collector(field_of(&second)?))?;
+
+        assert_eq!(reused_fruit.results, fresh_fruit.results);
+        assert_eq!(
+            format!("{:?}", reused_fruit.stats),
+            format!("{:?}", fresh_fruit.stats)
         );
         Ok(())
     }
@@ -2137,7 +2171,7 @@ mod tests {
                 ..Default::default()
             });
         let quantized_fruit = searcher.search(&AllQuery, &collector)?;
-        assert_eq!(collector.cached_quantized_query_count(), 1);
+        assert!(collector.has_quantized_query());
         assert!(quantized.index_ctx_is_initialized());
         assert_eq!(quantized_fruit.stats.len(), 1);
         let stats = &quantized_fruit.stats[0];
