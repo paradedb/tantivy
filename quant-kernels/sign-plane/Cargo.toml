@@ -1,0 +1,17 @@
+[package]
+name = "sign-plane"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quant-model = { path = "../quant-model" }
+
+[dev-dependencies]
+criterion.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+
+[[bench]]
+name = "score"
+harness = false
+
