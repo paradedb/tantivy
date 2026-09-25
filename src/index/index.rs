@@ -256,7 +256,8 @@ impl IndexBuilder {
         self
     }
 
-    /// Select the router used to build and open IVF segments.
+    /// Select the router used to build new IVF segments. Existing segments
+    /// open under the router persisted in their `.centroids` file.
     pub fn ivf_router(mut self, router: RouterKind) -> crate::Result<Self> {
         configure_ivf_router(&mut self.ivf_router, router)?;
         Ok(self)
@@ -918,7 +919,8 @@ impl Index {
         self.ivf_clusterer = Some(clusterer);
     }
 
-    /// Select the router used to build and open IVF segments.
+    /// Select the router used to build new IVF segments. Existing segments
+    /// open under the router persisted in their `.centroids` file.
     pub fn set_ivf_router(&mut self, router: RouterKind) -> crate::Result<()> {
         configure_ivf_router(&mut self.ivf_router, router)
     }

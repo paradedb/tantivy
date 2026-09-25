@@ -31,7 +31,7 @@ use common::{BinarySerializable, HasLen, OwnedBytes};
 use crate::directory::FileSlice;
 use crate::schema::{Metric, VectorOptions};
 use crate::vector::header::VectorFileVersion;
-use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace};
+use crate::vector::router::{OpenedRouter, RouterIter, RouterKind, RouterWorkspace, RoutingParams};
 use crate::vector::{BoundKind, BoundStore};
 
 /// The IVF routing index over one field's clusters: says which clusters —
@@ -127,14 +127,13 @@ impl IvfIndex {
     /// Parse a field's `.centroids` slots. Only the count words, the offsets,
     /// the bounds, and the router topology are materialized; the centroid
     /// rows stay behind a [`FileSlice`] for lazy per-node reads.
-    /// The persisted router kind must match the configured router.
+    /// The router is opened as the kind persisted in `router_slice`.
     pub(crate) fn open(
         version: VectorFileVersion,
         options: &VectorOptions,
         centroids_slice: FileSlice,
         offsets_slice: FileSlice,
         router_slice: FileSlice,
-        router: RouterKind,
         bounds_slice: FileSlice,
     ) -> crate::Result<Self> {
         let count_words = 2 * mem::size_of::<u32>();
@@ -177,7 +176,7 @@ impl IvfIndex {
             .into());
         }
 
-        let router = router.open(version, router_slice, centroids_slice.clone(), options)?;
+        let router = RouterKind::open(version, router_slice, centroids_slice.clone(), options)?;
 
         let bytes = bounds_slice.read_bytes()?;
         let Some((&kind_code, payload)) = bytes.as_slice().split_first() else {
@@ -292,11 +291,15 @@ impl IvfIndex {
         Ok(self.centroids_slice.read_bytes()?)
     }
 
+    /// Rank this segment's clusters for `query`, nearest first. `params`
+    /// steers the stacked router only (how many clusters the caller will
+    /// probe and its recall target); other routers ignore it.
     pub(crate) fn rank_clusters<'router, 'workspace>(
         &'router self,
         workspace: &'workspace mut RouterWorkspace,
         query: &'router [f32],
+        params: RoutingParams,
     ) -> RouterIter<'router, 'workspace> {
-        self.router.rank(workspace, query, self.metric)
+        self.router.rank(workspace, query, self.metric, params)
     }
 }
