@@ -83,7 +83,12 @@ impl RegexPhraseWeight {
                     "Phrase query exceeded max expansions {num_terms}"
                 )));
             }
-            let union = Self::get_union_from_term_infos(&term_infos, reader, &inverted_index)?;
+            let union = Self::get_union_from_term_infos(
+                &term_infos,
+                reader,
+                &inverted_index,
+                similarity_weight_opt.is_some(),
+            )?;
 
             posting_lists.push((offset, union));
         }
@@ -175,6 +180,7 @@ impl RegexPhraseWeight {
         term_infos: &[TermInfo],
         reader: &SegmentReader,
         inverted_index: &InvertedIndexReader,
+        scoring_enabled: bool,
     ) -> crate::Result<UnionType> {
         let max_doc = reader.max_doc();
 
@@ -196,6 +202,9 @@ impl RegexPhraseWeight {
         for term_info in term_infos {
             let mut term_posting = inverted_index
                 .read_postings_from_terminfo(term_info, IndexRecordOption::WithFreqsAndPositions)?;
+            if !scoring_enabled {
+                term_posting.block_cursor.disable_term_norms();
+            }
             let num_docs = term_posting.doc_freq();
 
             if num_docs < SPARSE_TERM_DOC_THRESHOLD {
@@ -320,6 +329,26 @@ mod tests {
     use crate::docset::TERMINATED;
     use crate::query::{wildcard_query_to_regex_str, EnableScoring, RegexPhraseQuery};
     use crate::DocSet;
+
+    #[test]
+    fn test_unscored_regex_phrase_does_not_open_posting_norms() -> crate::Result<()> {
+        use crate::collector::Count;
+        use crate::index::SegmentComponent;
+        use crate::Directory;
+
+        let documents: Vec<String> = (0..1000).map(|i| format!("rare{i:04} common")).collect();
+        let index = create_index(&documents.iter().map(String::as_str).collect::<Vec<_>>())?;
+        for segment in index.searchable_segments()? {
+            index
+                .directory()
+                .delete(&segment.relative_path(SegmentComponent::Custom("pnorm".into())))
+                .unwrap();
+        }
+        let text = index.schema().get_field("text")?;
+        let query = RegexPhraseQuery::new(text, vec!["rare.*".into(), "common".into()]);
+        assert_eq!(index.reader()?.searcher().search(&query, &Count)?, 1000);
+        Ok(())
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(50))]
