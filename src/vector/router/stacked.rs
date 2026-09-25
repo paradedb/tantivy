@@ -94,9 +94,9 @@ pub(super) fn rank(
     params: RoutingParams,
 ) -> Ranking {
     let recall = effective_recall(query.len(), params.recall);
-    // Always return at most `params.k` L0 centroids. That `k` tracks the
-    // caller's probe budget (`router_k` ← `max_probe`), so easy queries
-    // request fewer candidates and harder ones more.
+    // Always return at most `params.k` L0 centroids. That `k` is the
+    // clusters the caller's probe budget buys under its filter
+    // (`router_k` ← `max_probe` and filter selectivity).
     //
     // The search still opens the parent nprobe lists and scores every
     // member into a size-`k` heap: scanning all members of the selected
