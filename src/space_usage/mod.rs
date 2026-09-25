@@ -446,11 +446,7 @@ mod test {
         expect_single_field(segment.postings(), &field_name, 1, 512);
         assert_eq!(segment.positions().total(), 0);
         expect_single_field(segment.fast_fields(), &field_name, 1, 512);
-        if cfg!(feature = "posting-norms") {
-            assert_eq!(segment.fieldnorms().total(), 0);
-        } else {
-            expect_single_field(segment.fieldnorms(), &field_name, 1, 512);
-        }
+        assert_eq!(segment.fieldnorms().total(), 0);
         // TODO: understand why the following fails
         //        assert_eq!(0, segment.store().total());
         assert_eq!(segment.deletes(), 0);
@@ -491,11 +487,7 @@ mod test {
         expect_single_field(segment.postings(), &field_name, 1, 512);
         expect_single_field(segment.positions(), &field_name, 1, 512);
         assert_eq!(segment.fast_fields().total(), 0);
-        if cfg!(feature = "posting-norms") {
-            assert_eq!(segment.fieldnorms().total(), 0);
-        } else {
-            expect_single_field(segment.fieldnorms(), &field_name, 1, 512);
-        }
+        assert_eq!(segment.fieldnorms().total(), 0);
         // TODO: understand why the following fails
         //        assert_eq!(0, segment.store().total());
         assert_eq!(segment.deletes(), 0);
@@ -586,11 +578,7 @@ mod test {
         expect_single_field(segment_space_usage.postings(), &field_name, 1, 512);
         assert_eq!(segment_space_usage.positions().total(), 0u64);
         assert_eq!(segment_space_usage.fast_fields().total(), 0u64);
-        if cfg!(feature = "posting-norms") {
-            assert_eq!(segment_space_usage.fieldnorms().total(), 0);
-        } else {
-            expect_single_field(segment_space_usage.fieldnorms(), &field_name, 1, 512);
-        }
+        assert_eq!(segment_space_usage.fieldnorms().total(), 0);
         assert!(segment_space_usage.deletes() > 0);
         Ok(())
     }

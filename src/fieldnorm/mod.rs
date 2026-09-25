@@ -154,6 +154,3 @@ mod tests {
         Ok(())
     }
 }
-
-#[cfg(all(test, feature = "posting-norms"))]
-mod migration_tests;

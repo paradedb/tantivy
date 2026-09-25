@@ -168,7 +168,6 @@ mod tests {
         assert!(reader.read(0).is_err());
     }
 
-    #[cfg(feature = "posting-norms")]
     #[test]
     fn scores_seeks_deletes_and_merges() -> crate::Result<()> {
         use crate::collector::TopDocs;

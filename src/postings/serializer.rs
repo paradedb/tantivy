@@ -51,7 +51,7 @@ pub struct InvertedIndexSerializer {
     postings_write: CompositeWrite<WritePtr>,
     positions_write: CompositeWrite<WritePtr>,
     schema: Schema,
-    posting_norms_write: Option<CompositeWrite<WritePtr>>,
+    posting_norms_write: CompositeWrite<WritePtr>,
 }
 
 impl InvertedIndexSerializer {
@@ -63,23 +63,11 @@ impl InvertedIndexSerializer {
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
-            posting_norms_write: if cfg!(feature = "posting-norms") {
-                Some(CompositeWrite::wrap(segment.open_write(
-                    crate::index::SegmentComponent::Custom("pnorm".into()),
-                )?))
-            } else {
-                None
-            },
+            posting_norms_write: CompositeWrite::wrap(
+                segment.open_write(crate::index::SegmentComponent::Custom("pnorm".into()))?,
+            ),
         };
         Ok(inv_index_serializer)
-    }
-
-    #[cfg(all(test, feature = "posting-norms"))]
-    pub(crate) fn use_legacy_norms(&mut self) -> io::Result<()> {
-        if let Some(writer) = self.posting_norms_write.take() {
-            writer.close()?;
-        }
-        Ok(())
     }
 
     /// Must be called before starting pushing terms of
@@ -94,15 +82,13 @@ impl InvertedIndexSerializer {
     ) -> io::Result<FieldSerializer<'_>> {
         let field_entry: &FieldEntry = self.schema.get_field_entry(field);
         let term_dictionary_write = self.terms_write.for_field(field);
-        if self.posting_norms_write.is_some() {
-            let storage = if fieldnorm_reader.is_some() {
-                NormStorage::Posting
-            } else {
-                NormStorage::Disabled
-            };
-            self.postings_write
-                .for_field_with_idx(field, storage as usize);
-        }
+        let storage = if fieldnorm_reader.is_some() {
+            NormStorage::Posting
+        } else {
+            NormStorage::Disabled
+        };
+        self.postings_write
+            .for_field_with_idx(field, storage as usize);
         let postings_write = self.postings_write.for_field(field);
         let positions_write = self.positions_write.for_field(field);
         let index_record_option = field_entry
@@ -119,15 +105,9 @@ impl InvertedIndexSerializer {
             fieldnorm_reader,
             bm25_params,
         )?;
-        serializer.posting_norms_write = self
-            .posting_norms_write
-            .as_mut()
-            .map(|writer| writer.for_field(field));
-        serializer.posting_norms_start_offset = serializer
-            .posting_norms_write
-            .as_ref()
-            .map(|writer| writer.written_bytes())
-            .unwrap_or(0);
+        let posting_norms_write = self.posting_norms_write.for_field(field);
+        serializer.posting_norms_start_offset = posting_norms_write.written_bytes();
+        serializer.posting_norms_write = Some(posting_norms_write);
         Ok(serializer)
     }
 
@@ -136,9 +116,7 @@ impl InvertedIndexSerializer {
         self.terms_write.close()?;
         self.postings_write.close()?;
         self.positions_write.close()?;
-        if let Some(writer) = self.posting_norms_write {
-            writer.close()?;
-        }
+        self.posting_norms_write.close()?;
         Ok(())
     }
 }
@@ -533,10 +511,8 @@ impl PostingsSerializer {
 
     fn write_doc_with_fieldnorm(&mut self, doc_id: DocId, term_freq: u32, norm: Option<u8>) {
         self.block.fieldnorms[self.block.len] = norm.unwrap_or(0);
-        if cfg!(feature = "posting-norms") {
-            if let Some(norm) = norm {
-                self.posting_norms.push(norm);
-            }
+        if let Some(norm) = norm {
+            self.posting_norms.push(norm);
         }
         self.block.append_doc(doc_id, term_freq);
         if self.block.is_full() {

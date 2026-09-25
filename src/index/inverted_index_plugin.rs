@@ -2,7 +2,7 @@
 //!
 //! Field norms, the term dictionary, postings, and positions form a single subsystem:
 //! field norms are produced by the same tokenization pass that feeds the postings.
-//! With `posting-norms`, new segments store norms in `.pnorm`; legacy segments retain
+//! New segments store norms in `.pnorm`; legacy segments retain
 //! `.fieldnorm`. This plugin drives indexing and merging for both formats.
 
 use std::any::Any;
@@ -15,10 +15,10 @@ use itertools::Itertools;
 use measure_time::debug_time;
 use tokenizer_api::BoxTokenStream;
 
-use crate::directory::{CompositeFile, Directory};
+use crate::directory::CompositeFile;
 use crate::docset::DocSet;
 use crate::error::DataCorruption;
-use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
+use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsWriter};
 use crate::index::{Segment, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{DocIdMapping, SegmentDocIdMapping};
 use crate::indexer::indexing_term::IndexingTerm;
@@ -69,26 +69,11 @@ impl SegmentPlugin for InvertedIndexPlugin {
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
-        let fieldnorm_readers = if cfg!(feature = "posting-norms") {
-            None
-        } else {
-            merge_fieldnorms(&ctx)?;
-            Some(FieldNormReaders::open(
-                ctx.target_segment.open_read(SegmentComponent::FieldNorms)?,
-            )?)
-        };
-
         debug_time!("write-postings");
         debug!("write-postings");
         let target_segment = ctx.target_segment;
         let mut serializer = InvertedIndexSerializer::open(target_segment)?;
-        write_postings_merge(
-            ctx.readers,
-            ctx.schema,
-            &mut serializer,
-            fieldnorm_readers,
-            ctx.doc_id_mapping,
-        )?;
+        write_postings_merge(ctx.readers, ctx.schema, &mut serializer, ctx.doc_id_mapping)?;
         serializer.close()?;
         Ok(())
     }
@@ -161,7 +146,6 @@ pub struct InvertedIndexPluginWriter {
     json_positions_per_path: IndexingPositionsPerPath,
     ctx: IndexingContext,
     postings_serializer: InvertedIndexSerializer,
-    fieldnorm_serializer: Option<FieldNormsSerializer>,
     max_doc: DocId,
 }
 
@@ -193,14 +177,6 @@ impl InvertedIndexPluginWriter {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let fieldnorm_serializer = if cfg!(feature = "posting-norms") {
-            None
-        } else {
-            Some(FieldNormsSerializer::from_write(
-                segment.open_write(SegmentComponent::FieldNorms)?,
-            )?)
-        };
-
         let table_size = compute_initial_table_size(ctx.memory_budget_in_bytes)?;
         Ok(InvertedIndexPluginWriter {
             per_field_postings_writers: PerFieldPostingsWriter::for_schema(&schema),
@@ -211,21 +187,9 @@ impl InvertedIndexPluginWriter {
             json_positions_per_path: IndexingPositionsPerPath::default(),
             ctx: IndexingContext::new(table_size),
             postings_serializer: InvertedIndexSerializer::open(segment)?,
-            fieldnorm_serializer,
             schema,
             max_doc: 0,
         })
-    }
-
-    #[cfg(all(test, feature = "posting-norms"))]
-    pub(crate) fn use_legacy_norms(&mut self, segment: &Segment) -> crate::Result<()> {
-        self.postings_serializer.use_legacy_norms()?;
-        if self.fieldnorm_serializer.is_none() {
-            self.fieldnorm_serializer = Some(FieldNormsSerializer::from_write(
-                segment.open_write(SegmentComponent::FieldNorms)?,
-            )?);
-        }
-        Ok(())
     }
 
     /// Generic, zero-copy document ingestion. The `SegmentWriter` calls this directly on the
@@ -447,9 +411,6 @@ impl PluginWriter for InvertedIndexPluginWriter {
         doc_id_map: Option<&DocIdMapping>,
     ) -> crate::Result<()> {
         self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
-        if let Some(serializer) = self.fieldnorm_serializer {
-            self.fieldnorms_writer.serialize(serializer, doc_id_map)?;
-        }
         serialize_postings(
             self.ctx,
             self.schema,
@@ -473,42 +434,6 @@ impl PluginWriter for InvertedIndexPluginWriter {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
-}
-
-// --- Field norm merge ---
-
-fn merge_fieldnorms(ctx: &PluginMergeContext) -> crate::Result<()> {
-    let path = ctx
-        .target_segment
-        .relative_path(SegmentComponent::FieldNorms);
-    let write = ctx.target_segment.index().directory().open_write(&path)?;
-    let mut serializer = FieldNormsSerializer::from_write(write)?;
-
-    let schema = ctx.schema;
-    let fields = FieldNormsWriter::fields_with_fieldnorm(schema);
-    let max_doc: usize = ctx
-        .readers
-        .iter()
-        .map(|reader| reader.num_docs() as usize)
-        .sum();
-    let mut fieldnorms_data = Vec::with_capacity(max_doc);
-
-    for field in fields {
-        fieldnorms_data.clear();
-        let fieldnorms_readers: Vec<FieldNormReader> = ctx
-            .readers
-            .iter()
-            .map(|reader| reader.get_fieldnorms_reader(field))
-            .collect::<Result<_, _>>()?;
-        for old_doc_addr in ctx.doc_id_mapping.iter_old_doc_addrs() {
-            let reader = &fieldnorms_readers[old_doc_addr.segment_ord as usize];
-            let fieldnorm_id = reader.fieldnorm_id(old_doc_addr.doc_id);
-            fieldnorms_data.push(fieldnorm_id);
-        }
-        serializer.serialize_field(field, &fieldnorms_data)?;
-    }
-    serializer.close()?;
-    Ok(())
 }
 
 // --- Postings merge helpers (moved from IndexMerger) ---
@@ -746,14 +671,11 @@ fn write_postings_merge(
     readers: &[SegmentReader],
     schema: &Schema,
     serializer: &mut InvertedIndexSerializer,
-    fieldnorm_readers: Option<FieldNormReaders>,
     doc_id_mapping: &SegmentDocIdMapping,
 ) -> crate::Result<()> {
     for (field, field_entry) in schema.fields() {
         if field_entry.is_indexed() {
-            let fieldnorm_reader = if let Some(readers) = &fieldnorm_readers {
-                readers.get_field(field)?
-            } else if field_entry.has_fieldnorms() {
+            let fieldnorm_reader = if field_entry.has_fieldnorms() {
                 Some(FieldNormReader::posting(
                     readers.iter().map(SegmentReader::num_docs).sum(),
                 ))
