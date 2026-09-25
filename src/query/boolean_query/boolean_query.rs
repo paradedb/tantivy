@@ -161,12 +161,15 @@ impl Query for BooleanQuery {
             .iter()
             .map(|(occur, subquery)| Ok((*occur, subquery.weight(enable_scoring)?)))
             .collect::<crate::Result<_>>()?;
-        Ok(Box::new(BooleanWeight::with_minimum_number_should_match(
-            sub_weights,
-            self.minimum_number_should_match,
-            enable_scoring.is_scoring_enabled(),
-            Box::new(SumCombiner::default),
-        )))
+        Ok(Box::new(
+            BooleanWeight::with_minimum_number_should_match(
+                sub_weights,
+                self.minimum_number_should_match,
+                enable_scoring.is_scoring_enabled(),
+                Box::new(SumCombiner::default),
+            )
+            .with_disjunction_pruning(enable_scoring.disjunction_pruning()),
+        ))
     }
 
     fn query_terms(

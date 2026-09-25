@@ -13,8 +13,8 @@ use crate::query::scorer::BasicPruningScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
-    intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
-    RequiredOptionalScorer, Scorer, Weight,
+    intersect_scorers, AllScorer, BufferedUnionScorer, DisjunctionPruning, EmptyScorer, Exclude,
+    Explanation, Occur, RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score, TERMINATED};
 
@@ -188,6 +188,7 @@ pub struct BooleanWeight<TScoreCombiner: ScoreCombiner> {
     weights: Vec<(Occur, Box<dyn Weight>)>,
     minimum_number_should_match: usize,
     scoring_enabled: bool,
+    disjunction_pruning: DisjunctionPruning,
     score_combiner_fn: Box<dyn Fn() -> TScoreCombiner + Sync + Send>,
 }
 
@@ -203,6 +204,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             scoring_enabled,
             score_combiner_fn,
             minimum_number_should_match: 1,
+            disjunction_pruning: DisjunctionPruning::Auto,
         }
     }
 
@@ -218,6 +220,22 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             minimum_number_should_match,
             scoring_enabled,
             score_combiner_fn,
+            disjunction_pruning: DisjunctionPruning::Auto,
+        }
+    }
+
+    pub(crate) fn with_disjunction_pruning(mut self, pruning: DisjunctionPruning) -> Self {
+        self.disjunction_pruning = pruning;
+        self
+    }
+
+    fn should_use_block_maxscore(&self, scorers: &[TermScorer], max_doc: DocId) -> bool {
+        match self.disjunction_pruning {
+            DisjunctionPruning::Auto => {
+                super::block_maxscore::should_use_block_maxscore(scorers, max_doc)
+            }
+            DisjunctionPruning::BlockWand => false,
+            DisjunctionPruning::BlockMaxScore => true,
         }
     }
 
@@ -620,6 +638,14 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                             BlockWandSingleScorer::new(scorers.pop().unwrap(), threshold);
                         for_each_pruning_scorer(&mut scorer, callback);
                     }
+                    _ if self.should_use_block_maxscore(&scorers, reader.max_doc()) => {
+                        super::block_maxscore::block_maxscore(
+                            scorers,
+                            threshold,
+                            super::block_maxscore::MIN_BOUND_WINDOW,
+                            callback,
+                        );
+                    }
                     _ => {
                         let mut scorer = BlockWandUnionScorer::new(scorers, threshold);
                         for_each_pruning_scorer(&mut scorer, callback);
@@ -678,5 +704,56 @@ fn is_include_occur(occur: Occur) -> bool {
     match occur {
         Occur::Must | Occur::Should => true,
         Occur::MustNot => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BooleanWeight;
+    use crate::query::{Bm25Weight, DisjunctionPruning, SumCombiner, TermScorer};
+    use crate::Bm25Params;
+
+    #[test]
+    fn test_disjunction_pruning_overrides_cutoffs() {
+        for (term_count, doc_freq, max_doc, auto_maxscore) in [
+            (2, 1, 1_024, false),
+            (3, 128, 1_024, true),
+            (3, 128, 1_048_576, false),
+        ] {
+            let docs: Vec<_> = (0..doc_freq).map(|doc| (doc, 1)).collect();
+            let norms = vec![1; doc_freq as usize];
+            let scorers: Vec<_> = (0..term_count)
+                .map(|_| {
+                    TermScorer::create_for_test(
+                        &docs,
+                        &norms,
+                        Bm25Weight::for_one_term(
+                            doc_freq as u64,
+                            max_doc as u64,
+                            1.0,
+                            Bm25Params::default(),
+                        ),
+                    )
+                })
+                .collect();
+            for weight in [
+                BooleanWeight::new(Vec::new(), true, Box::new(SumCombiner::default)),
+                BooleanWeight::with_minimum_number_should_match(
+                    Vec::new(),
+                    1,
+                    true,
+                    Box::new(SumCombiner::default),
+                ),
+            ] {
+                assert_eq!(
+                    weight.should_use_block_maxscore(&scorers, max_doc),
+                    auto_maxscore
+                );
+                let weight = weight.with_disjunction_pruning(DisjunctionPruning::BlockWand);
+                assert!(!weight.should_use_block_maxscore(&scorers, max_doc));
+                let weight = weight.with_disjunction_pruning(DisjunctionPruning::BlockMaxScore);
+                assert!(weight.should_use_block_maxscore(&scorers, max_doc));
+            }
+        }
     }
 }
