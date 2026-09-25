@@ -406,7 +406,6 @@ mod tests {
 
     #[test]
     fn test_posting_norm_requirement_survives_upgrade_and_merge() -> crate::Result<()> {
-        use crate::core::META_FILEPATH;
         use crate::directory::{Directory, RamDirectory};
         use crate::index::list_segment_files;
         use crate::indexer::NoMergePolicy;
@@ -414,12 +413,19 @@ mod tests {
         let mut schema = Schema::builder();
         let text = schema.add_text_field("text", TEXT);
         let directory = RamDirectory::create();
-        let index = Index::create(directory.clone(), schema.build(), Default::default())?;
-        assert_eq!(index.load_metas()?.persisted_custom_extensions, ["pnorm"]);
+        let mut index = Index::create(directory.clone(), schema.build(), Default::default())?;
+        assert!(!index.settings().posting_norms);
+        assert!(index.load_metas()?.persisted_custom_extensions.is_empty());
+        {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.add_document(crate::doc!(text => "one"))?;
+            writer.commit()?;
+        }
+        let legacy_segment = index.searchable_segments()?.pop().unwrap();
+        assert!(!directory
+            .exists(&legacy_segment.relative_path(SegmentComponent::Custom("pnorm".into())))?);
 
-        let mut legacy_meta = index.load_metas()?;
-        legacy_meta.persisted_custom_extensions.clear();
-        directory.atomic_write(&META_FILEPATH, &serde_json::to_vec(&legacy_meta)?)?;
+        index.settings_mut().posting_norms = true;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         for value in ["one", "one two"] {
@@ -427,6 +433,11 @@ mod tests {
             writer.commit()?;
             assert_eq!(index.load_metas()?.persisted_custom_extensions, ["pnorm"]);
         }
+        drop(writer);
+        let mut index = Index::open(directory.clone())?;
+        assert!(index.settings().posting_norms);
+        assert_eq!(index.searchable_segment_ids()?.len(), 3);
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.merge(&index.searchable_segment_ids()?).wait()?;
         let metas = index.load_metas()?;
         assert_eq!(metas.persisted_custom_extensions, ["pnorm"]);
@@ -435,6 +446,16 @@ mod tests {
         assert!(live_files.contains(&norm_path));
         writer.garbage_collect_files().wait()?;
         assert!(directory.exists(&norm_path)?);
+        drop(writer);
+        index.settings_mut().posting_norms = false;
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
+        writer.merge(&index.searchable_segment_ids()?).wait()?;
+        let segment = index.searchable_segments()?.pop().unwrap();
+        assert!(
+            !directory.exists(&segment.relative_path(SegmentComponent::Custom("pnorm".into())))?
+        );
+        assert!(directory.exists(&segment.relative_path(SegmentComponent::FieldNorms))?);
+        assert!(!Index::open(directory)?.settings().posting_norms);
         Ok(())
     }
 
@@ -465,7 +486,7 @@ mod tests {
         assert_eq!(segment_metas.len(), 1);
         assert_eq!(
             index.load_metas()?.persisted_custom_extensions,
-            vec!["marker".to_string(), "pnorm".to_string()]
+            vec!["marker".to_string()]
         );
 
         // Reopen without re-registering the plugin: writing must fail closed

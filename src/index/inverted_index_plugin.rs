@@ -737,6 +737,7 @@ mod tests {
             let index = Index::builder()
                 .schema(schema.build())
                 .settings(IndexSettings {
+                    posting_norms: true,
                     sort_by_field: sorted.then(|| IndexSortByField {
                         field: "id".into(),
                         order: Order::Asc,

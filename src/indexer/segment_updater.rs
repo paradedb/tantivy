@@ -42,10 +42,11 @@ pub(crate) fn save_metas(
     debug!("save metas");
 
     // Older writers reject this required extension and their GC keeps its files.
-    if !metas
-        .persisted_custom_extensions
-        .iter()
-        .any(|ext| ext == "pnorm")
+    if metas.index_settings.posting_norms
+        && !metas
+            .persisted_custom_extensions
+            .iter()
+            .any(|ext| ext == "pnorm")
     {
         metas.persisted_custom_extensions.push("pnorm".to_string());
     }

@@ -188,19 +188,22 @@ impl BlockSegmentPostings {
 
     pub(crate) fn set_term_norm_source(
         &mut self,
-        source: std::sync::Arc<common::file_slice::DeferredFileSlice>,
-        storage: crate::fieldnorm::NormStorage,
+        source: Option<std::sync::Arc<common::file_slice::DeferredFileSlice>>,
     ) -> io::Result<()> {
-        let required = storage == crate::fieldnorm::NormStorage::Posting;
-        if required && self.term_norm_offset.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing required posting norm header",
-            ));
-        }
-        self.term_norms = self
-            .term_norm_offset
-            .map(|offset| super::term_norms::TermNormReader::new(source, offset, self.doc_freq));
+        self.term_norms = match (source, self.term_norm_offset) {
+            (Some(source), Some(offset)) => Some(super::term_norms::TermNormReader::new(
+                source,
+                offset,
+                self.doc_freq,
+            )),
+            (Some(_), None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing required posting norm header",
+                ));
+            }
+            (None, _) => None,
+        };
         Ok(())
     }
 

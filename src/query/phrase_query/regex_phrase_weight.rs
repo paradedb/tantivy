@@ -331,20 +331,26 @@ mod tests {
     use crate::DocSet;
 
     #[test]
-    fn test_unscored_regex_phrase_does_not_open_posting_norms() -> crate::Result<()> {
+    fn test_unscored_regex_phrase_does_not_read_posting_norms() -> crate::Result<()> {
         use crate::collector::Count;
+        use crate::directory::CompositeWrite;
         use crate::index::SegmentComponent;
         use crate::Directory;
 
         let documents: Vec<String> = (0..1000).map(|i| format!("rare{i:04} common")).collect();
-        let index = create_index(&documents.iter().map(String::as_str).collect::<Vec<_>>())?;
-        for segment in index.searchable_segments()? {
-            index
-                .directory()
-                .delete(&segment.relative_path(SegmentComponent::Custom("pnorm".into())))
-                .unwrap();
-        }
+        let mut index = create_index(&[] as &[&str])?;
+        index.settings_mut().posting_norms = true;
         let text = index.schema().get_field("text")?;
+        let mut writer = index.writer_for_tests()?;
+        for document in documents {
+            writer.add_document(doc!(text => document))?;
+        }
+        writer.commit()?;
+        for segment in index.searchable_segments()? {
+            let path = segment.relative_path(SegmentComponent::Custom("pnorm".into()));
+            index.directory().delete(&path).unwrap();
+            CompositeWrite::wrap(index.directory().open_write(&path)?).close()?;
+        }
         let query = RegexPhraseQuery::new(text, vec!["rare.*".into(), "common".into()]);
         assert_eq!(index.reader()?.searcher().search(&query, &Count)?, 1000);
         Ok(())

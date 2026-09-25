@@ -19,13 +19,11 @@
 mod code;
 mod reader;
 mod serializer;
-mod storage;
 mod writer;
 
 use self::code::{fieldnorm_to_id, id_to_fieldnorm};
 pub use self::reader::{FieldNormReader, FieldNormReaders};
 pub use self::serializer::FieldNormsSerializer;
-pub use self::storage::NormStorage;
 pub use self::writer::FieldNormsWriter;
 
 #[cfg(test)]

@@ -139,55 +139,80 @@ mod tests {
     }
 
     #[test]
-    fn scoring_does_not_open_document_norms() -> crate::Result<()> {
+    fn scoring_selects_norms_by_file_presence() -> crate::Result<()> {
         use crate::collector::TopDocs;
         use crate::directory::Directory;
         use crate::index::SegmentComponent;
-        use crate::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
+        use crate::query::{
+            BooleanQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, RegexPhraseQuery, TermQuery,
+        };
         use crate::schema::{IndexRecordOption, Schema, TEXT};
         use crate::{Index, Term};
 
-        let mut schema = Schema::builder();
-        let text = schema.add_text_field("text", TEXT);
-        let index = Index::create_in_ram(schema.build());
-        let mut writer = index.writer_for_tests()?;
-        for body in ["red apple", "red apple pie", "green apple pie"] {
-            writer.add_document(doc!(text => body))?;
-        }
-        writer.commit()?;
-        let red = Term::from_field_text(text, "red");
-        let apple = Term::from_field_text(text, "apple");
-        let queries: Vec<Box<dyn Query>> = vec![
-            Box::new(TermQuery::new(red.clone(), IndexRecordOption::WithFreqs)),
-            Box::new(BooleanQuery::new(vec![
-                (
-                    Occur::Should,
-                    Box::new(TermQuery::new(red.clone(), IndexRecordOption::WithFreqs)),
-                ),
-                (
-                    Occur::Should,
-                    Box::new(TermQuery::new(apple.clone(), IndexRecordOption::WithFreqs)),
-                ),
-            ])),
-            Box::new(PhraseQuery::new(vec![red, apple])),
-        ];
-        let searcher = index.reader()?.searcher();
-        let expected = queries
-            .iter()
-            .map(|query| searcher.search(&**query, &TopDocs::with_limit(3).order_by_score()))
-            .collect::<crate::Result<Vec<_>>>()?;
-        for segment in index.searchable_segments()? {
-            index
-                .directory()
-                .delete(&segment.relative_path(SegmentComponent::FieldNorms))
-                .unwrap();
-        }
-        let searcher = index.reader()?.searcher();
-        for (query, expected) in queries.iter().zip(expected) {
-            assert_eq!(
-                searcher.search(&**query, &TopDocs::with_limit(3).order_by_score())?,
-                expected
-            );
+        for missing in [
+            SegmentComponent::Custom("pnorm".into()),
+            SegmentComponent::FieldNorms,
+        ] {
+            let mut schema = Schema::builder();
+            let text = schema.add_text_field("text", TEXT);
+            let mut index = Index::builder()
+                .schema(schema.build())
+                .settings(crate::IndexSettings {
+                    posting_norms: true,
+                    ..Default::default()
+                })
+                .create_in_ram()?;
+            let mut writer = index.writer_for_tests()?;
+            for body in ["red apple", "red apple pie", "green apple pie"]
+                .into_iter()
+                .cycle()
+                .take(300)
+            {
+                writer.add_document(doc!(text => body))?;
+            }
+            writer.commit()?;
+            if missing == SegmentComponent::FieldNorms {
+                index.settings_mut().posting_norms = false;
+            }
+            let red = Term::from_field_text(text, "red");
+            let apple = Term::from_field_text(text, "apple");
+            let queries: Vec<Box<dyn Query>> = vec![
+                Box::new(TermQuery::new(red.clone(), IndexRecordOption::WithFreqs)),
+                Box::new(BooleanQuery::new(vec![
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(red.clone(), IndexRecordOption::WithFreqs)),
+                    ),
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(apple.clone(), IndexRecordOption::WithFreqs)),
+                    ),
+                ])),
+                Box::new(PhraseQuery::new(vec![red.clone(), apple.clone()])),
+                Box::new(PhrasePrefixQuery::new(vec![red, apple])),
+                Box::new(RegexPhraseQuery::new(
+                    text,
+                    vec!["r.*".into(), "apple".into()],
+                )),
+            ];
+            let searcher = index.reader()?.searcher();
+            let expected = queries
+                .iter()
+                .map(|query| searcher.search(&**query, &TopDocs::with_limit(3).order_by_score()))
+                .collect::<crate::Result<Vec<_>>>()?;
+            for segment in index.searchable_segments()? {
+                index
+                    .directory()
+                    .delete(&segment.relative_path(missing.clone()))
+                    .unwrap();
+            }
+            let searcher = index.reader()?.searcher();
+            for (query, expected) in queries.iter().zip(expected) {
+                assert_eq!(
+                    searcher.search(&**query, &TopDocs::with_limit(3).order_by_score())?,
+                    expected
+                );
+            }
         }
         Ok(())
     }
@@ -203,7 +228,13 @@ mod tests {
         let mut schema = Schema::builder();
         let title = schema.add_text_field("title", TEXT);
         let id = schema.add_u64_field("id", INDEXED);
-        let index = Index::create_in_ram(schema.build());
+        let index = Index::builder()
+            .schema(schema.build())
+            .settings(crate::IndexSettings {
+                posting_norms: true,
+                ..Default::default()
+            })
+            .create_in_ram()?;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         for i in 0..26000u64 {

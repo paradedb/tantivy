@@ -12,7 +12,7 @@ use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, Directory, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
-use crate::fieldnorm::{FieldNormReader, FieldNormReaders, NormStorage};
+use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
 use crate::index::merge_optimized_inverted_index_reader::MergeOptimizedInvertedIndexReader;
 use crate::index::{
     Index, IndexSettings, InvertedIndexReader, Segment, SegmentComponent, SegmentId,
@@ -161,15 +161,12 @@ impl SegmentReader {
         })
     }
 
-    /// Returns a scoring fallback without opening document-addressed norms.
-    /// Posting-local scorers must obtain the byte from their current posting.
+    /// Uses posting-local norms when `.pnorm` exists, otherwise defers to `.fieldnorm`.
     pub fn scoring_fieldnorm_reader(&self, field: Field) -> crate::Result<FieldNormReader> {
-        let storage = self.inverted_index(field)?.norm_storage();
-        if storage == NormStorage::Disabled || !self.schema.get_field_entry(field).has_fieldnorms()
-        {
+        if !self.schema.get_field_entry(field).has_fieldnorms() {
             return Ok(FieldNormReader::constant(self.max_doc(), 1));
         }
-        if storage == NormStorage::Posting {
+        if self.inverted_index(field)?.has_posting_norms() {
             return Ok(FieldNormReader::posting(self.max_doc()));
         }
         let reader = self.clone();
@@ -182,7 +179,7 @@ impl SegmentReader {
                     .ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "missing required legacy fieldnorm field",
+                            "missing required fieldnorm field",
                         )
                     })
             }),
@@ -351,19 +348,24 @@ impl SegmentReader {
             DeferredFileSlice::new(positions_file_opener),
             record_option,
         )?;
-        inv_idx_reader.norm_storage = NormStorage::read(self.postings_composite(), field)?;
-        let norm_path = self.relative_path(SegmentComponent::Custom("pnorm".into()));
-        let norm_directory = self.index.directory().clone();
-        inv_idx_reader.set_posting_norms_file(DeferredFileSlice::new(move || {
-            let source = norm_directory
-                .open_read(&norm_path)
-                .map_err(io::Error::other)?;
-            CompositeFile::open(&source)?
-                .open_read(field)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "missing posting norm field")
-                })
-        }));
+        if field_entry.has_fieldnorms() {
+            match self.open_read(SegmentComponent::Custom("pnorm".into())) {
+                Ok(source) => {
+                    inv_idx_reader.set_posting_norms_file(DeferredFileSlice::new(move || {
+                        CompositeFile::open(&source)?
+                            .open_read(field)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "missing posting norm field",
+                                )
+                            })
+                    }));
+                }
+                Err(OpenReadError::FileDoesNotExist(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let inv_idx_reader = Arc::new(inv_idx_reader);
 
         // by releasing the lock in between, we may end up opening the inverting index

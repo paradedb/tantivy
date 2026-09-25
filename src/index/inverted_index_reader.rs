@@ -32,9 +32,8 @@ pub struct InvertedIndexReader {
     termdict: TermDictionary,
     postings_file_slice: FileSlice,
     positions_file_slice: DeferredFileSlice,
-    posting_norms_file_slice: std::sync::Arc<DeferredFileSlice>,
+    posting_norms_file_slice: Option<std::sync::Arc<DeferredFileSlice>>,
     record_option: IndexRecordOption,
-    pub(crate) norm_storage: crate::fieldnorm::NormStorage,
     total_num_tokens: u64,
 }
 
@@ -78,17 +77,14 @@ impl InvertedIndexReader {
             termdict,
             postings_file_slice: postings_body,
             positions_file_slice,
-            posting_norms_file_slice: std::sync::Arc::new(DeferredFileSlice::new(|| {
-                Ok(FileSlice::empty())
-            })),
+            posting_norms_file_slice: None,
             record_option,
-            norm_storage: crate::fieldnorm::NormStorage::Legacy,
             total_num_tokens,
         })
     }
 
     pub(crate) fn set_posting_norms_file(&mut self, source: DeferredFileSlice) {
-        self.posting_norms_file_slice = std::sync::Arc::new(source);
+        self.posting_norms_file_slice = Some(std::sync::Arc::new(source));
     }
 
     /// Creates an empty `InvertedIndexReader` object, which
@@ -98,18 +94,14 @@ impl InvertedIndexReader {
             termdict: TermDictionary::empty(),
             postings_file_slice: FileSlice::empty(),
             positions_file_slice: DeferredFileSlice::new(|| Ok(FileSlice::empty())),
-            posting_norms_file_slice: std::sync::Arc::new(DeferredFileSlice::new(|| {
-                Ok(FileSlice::empty())
-            })),
+            posting_norms_file_slice: None,
             record_option,
-            norm_storage: crate::fieldnorm::NormStorage::Legacy,
             total_num_tokens: 0u64,
         }
     }
 
-    /// Returns the norm storage declared by this field's postings metadata.
-    pub fn norm_storage(&self) -> crate::fieldnorm::NormStorage {
-        self.norm_storage
+    pub(crate) fn has_posting_norms(&self) -> bool {
+        self.posting_norms_file_slice.is_some()
     }
 
     /// Returns the term info associated with the term.
@@ -200,8 +192,7 @@ impl InvertedIndexReader {
             .slice(term_info.postings_range.clone());
         let postings_bytes = postings_slice.read_bytes()?;
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
-        block_postings
-            .set_term_norm_source(self.posting_norms_file_slice.clone(), self.norm_storage)?;
+        block_postings.set_term_norm_source(self.posting_norms_file_slice.clone())?;
         Ok(())
     }
 
@@ -237,7 +228,7 @@ impl InvertedIndexReader {
             self.record_option,
             requested_option,
         )?;
-        postings.set_term_norm_source(self.posting_norms_file_slice.clone(), self.norm_storage)?;
+        postings.set_term_norm_source(self.posting_norms_file_slice.clone())?;
         Ok(postings)
     }
 
