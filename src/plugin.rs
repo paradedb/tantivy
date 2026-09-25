@@ -422,8 +422,7 @@ mod tests {
             writer.commit()?;
         }
         let legacy_segment = index.searchable_segments()?.pop().unwrap();
-        assert!(!directory
-            .exists(&legacy_segment.relative_path(SegmentComponent::Custom("pnorm".into())))?);
+        assert!(!directory.exists(&legacy_segment.relative_path(SegmentComponent::PostingNorms))?);
 
         index.settings_mut().posting_norms = true;
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
@@ -443,7 +442,7 @@ mod tests {
         assert!(metas.persisted_custom_extensions.is_empty());
         assert!(index.custom_plugins().is_empty());
         let live_files = list_segment_files(&metas.segments, &metas.persisted_custom_extensions);
-        let norm_path = metas.segments[0].relative_path(SegmentComponent::Custom("pnorm".into()));
+        let norm_path = metas.segments[0].relative_path(SegmentComponent::PostingNorms);
         assert!(live_files.contains(&norm_path));
         writer.garbage_collect_files().wait()?;
         assert!(directory.exists(&norm_path)?);
@@ -452,9 +451,7 @@ mod tests {
         let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
         writer.merge(&index.searchable_segment_ids()?).wait()?;
         let segment = index.searchable_segments()?.pop().unwrap();
-        assert!(
-            !directory.exists(&segment.relative_path(SegmentComponent::Custom("pnorm".into())))?
-        );
+        assert!(!directory.exists(&segment.relative_path(SegmentComponent::PostingNorms))?);
         assert!(directory.exists(&segment.relative_path(SegmentComponent::FieldNorms))?);
         assert!(!Index::open(directory)?.settings().posting_norms);
         Ok(())

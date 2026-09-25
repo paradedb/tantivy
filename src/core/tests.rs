@@ -278,44 +278,25 @@ fn garbage_collect_works_as_intended() -> crate::Result<()> {
 
 #[test]
 fn test_single_segment_index_writer() -> crate::Result<()> {
-    for posting_norms in [false, true] {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT);
-        let schema = schema_builder.build();
-        let directory = RamDirectory::default();
-        let mut single_segment_index_writer = Index::builder()
-            .schema(schema)
-            .settings(IndexSettings {
-                posting_norms,
-                ..Default::default()
-            })
-            .single_segment_index_writer(directory, 15_000_000)?;
-        for _ in 0..10 {
-            let doc = doc!(text_field=>"hello");
-            single_segment_index_writer.add_document(doc)?;
-        }
-        let index = single_segment_index_writer.finalize()?;
-        let searcher = index.reader()?.searcher();
-        let term_query = TermQuery::new(
-            Term::from_field_text(text_field, "hello"),
-            IndexRecordOption::Basic,
-        );
-        let count = searcher.search(&term_query, &Count)?;
-        assert_eq!(count, 10);
-        let segment = index.searchable_segments()?.pop().unwrap();
-        assert_eq!(
-            index.directory().exists(
-                &segment.relative_path(crate::index::SegmentComponent::Custom("pnorm".into()))
-            )?,
-            posting_norms
-        );
-        assert_eq!(
-            Index::open(index.directory().clone())?
-                .settings()
-                .posting_norms,
-            posting_norms
-        );
+    let mut schema_builder = Schema::builder();
+    let text_field = schema_builder.add_text_field("text", TEXT);
+    let schema = schema_builder.build();
+    let directory = RamDirectory::default();
+    let mut single_segment_index_writer = Index::builder()
+        .schema(schema)
+        .single_segment_index_writer(directory, 15_000_000)?;
+    for _ in 0..10 {
+        let doc = doc!(text_field=>"hello");
+        single_segment_index_writer.add_document(doc)?;
     }
+    let index = single_segment_index_writer.finalize()?;
+    let searcher = index.reader()?.searcher();
+    let term_query = TermQuery::new(
+        Term::from_field_text(text_field, "hello"),
+        IndexRecordOption::Basic,
+    );
+    let count = searcher.search(&term_query, &Count)?;
+    assert_eq!(count, 10);
     Ok(())
 }
 

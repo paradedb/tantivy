@@ -349,7 +349,7 @@ impl SegmentReader {
             record_option,
         )?;
         if field_entry.has_fieldnorms() {
-            match self.open_read(SegmentComponent::Custom("pnorm".into())) {
+            match self.open_read(SegmentComponent::PostingNorms) {
                 Ok(source) => {
                     inv_idx_reader.set_posting_norms_file(DeferredFileSlice::new(move || {
                         CompositeFile::open(&source)?
@@ -656,6 +656,7 @@ impl SegmentReader {
             SegmentComponent::TempStore => ".store.temp".to_string(),
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
+            SegmentComponent::PostingNorms => ".pnorm".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
             SegmentComponent::Custom(ext) => format!(".{ext}"),
         });

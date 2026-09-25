@@ -31,7 +31,9 @@ use crate::postings::{
 };
 use crate::schema::document::{Document, Value};
 use crate::schema::{Field, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
-use crate::space_usage::{ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, TERMDICT};
+use crate::space_usage::{
+    ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, POSTING_NORMS, TERMDICT,
+};
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
 use crate::{DocId, InvertedIndexReader, TantivyError};
@@ -122,9 +124,9 @@ impl SegmentPlugin for InvertedIndexPlugin {
                 ComponentSpaceUsage::PerField(positions),
             ),
         ]);
-        if let Ok(file) = segment_reader.open_read(SegmentComponent::Custom("pnorm".into())) {
+        if let Ok(file) = segment_reader.open_read(SegmentComponent::PostingNorms) {
             usage.insert(
-                "pnorm".into(),
+                POSTING_NORMS.to_string(),
                 ComponentSpaceUsage::PerField(CompositeFile::open(&file)?.space_usage(schema)),
             );
         }
@@ -761,7 +763,7 @@ mod tests {
             for segment in index.searchable_segments()? {
                 index
                     .directory()
-                    .delete(&segment.relative_path(SegmentComponent::Custom("pnorm".into())))
+                    .delete(&segment.relative_path(SegmentComponent::PostingNorms))
                     .unwrap();
             }
             let reader = index.reader()?;

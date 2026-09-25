@@ -133,6 +133,7 @@ impl SegmentMeta {
             SegmentComponent::TempStore => ".store.temp".to_string(),
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
+            SegmentComponent::PostingNorms => ".pnorm".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
             SegmentComponent::Custom(ext) => format!(".{ext}"),
         });
@@ -293,10 +294,8 @@ impl Eq for Bm25Params {}
 pub struct IndexSettings {
     /// Write posting-local field norms for query scoring. Defaults to false.
     ///
-    /// Adds one byte per posting, a term-offset index, and extra indexing and merge work.
-    /// Document-addressed `.fieldnorm` data is retained. Applies to newly written and merged
-    /// segments; readers choose the norm source by file presence, independently of this
-    /// setting.
+    /// Can speed up top-k BM25 queries at the cost of more storage and longer index builds
+    /// and merges.
     #[serde(default, skip_serializing_if = "is_false")]
     pub posting_norms: bool,
     /// Sorts the documents by information

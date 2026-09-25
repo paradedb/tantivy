@@ -26,6 +26,7 @@ pub(crate) const POSTINGS: &str = "postings";
 pub(crate) const POSITIONS: &str = "positions";
 pub(crate) const FAST_FIELDS: &str = "fast_fields";
 pub(crate) const FIELDNORMS: &str = "fieldnorms";
+pub(crate) const POSTING_NORMS: &str = "pnorm";
 pub(crate) const STORE: &str = "store";
 pub(crate) const DELETES: &str = "deletes";
 
@@ -131,6 +132,7 @@ impl SegmentSpaceUsage {
             Positions => POSITIONS,
             FastFields => FAST_FIELDS,
             FieldNorms => FIELDNORMS,
+            PostingNorms => POSTING_NORMS,
             Terms => TERMDICT,
             Store | TempStore => STORE,
             Delete => DELETES,
@@ -518,13 +520,13 @@ mod test {
         let file = reader
             .searcher()
             .segment_reader(0)
-            .open_read(SegmentComponent::Custom("pnorm".into()))?;
+            .open_read(SegmentComponent::PostingNorms)?;
         let field_file = crate::directory::CompositeFile::open(&file)?
             .open_read(text)
             .unwrap();
         let bytes = field_file.len() as u64;
         assert!(bytes > 2);
-        let norms = usage.segments()[0].component(SegmentComponent::Custom("pnorm".into()));
+        let norms = usage.segments()[0].component(SegmentComponent::PostingNorms);
         assert_eq!(norms.total(), bytes);
         let ComponentSpaceUsage::PerField(norms) = norms else {
             panic!("posting norms should report per-field space usage");

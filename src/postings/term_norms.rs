@@ -268,10 +268,7 @@ mod tests {
         use crate::schema::{IndexRecordOption, Schema, TEXT};
         use crate::{Index, Term};
 
-        for missing in [
-            SegmentComponent::Custom("pnorm".into()),
-            SegmentComponent::FieldNorms,
-        ] {
+        for missing in [SegmentComponent::PostingNorms, SegmentComponent::FieldNorms] {
             let mut schema = Schema::builder();
             let text = schema.add_text_field("text", TEXT);
             let mut index = Index::builder()

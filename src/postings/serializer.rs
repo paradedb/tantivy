@@ -64,9 +64,9 @@ impl InvertedIndexSerializer {
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
             posting_norms_write: if segment.index().settings().posting_norms {
-                Some(CompositeWrite::wrap(segment.open_write(
-                    crate::index::SegmentComponent::Custom("pnorm".into()),
-                )?))
+                Some(CompositeWrite::wrap(
+                    segment.open_write(crate::index::SegmentComponent::PostingNorms)?,
+                ))
             } else {
                 None
             },

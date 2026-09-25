@@ -347,7 +347,7 @@ mod tests {
         }
         writer.commit()?;
         for segment in index.searchable_segments()? {
-            let path = segment.relative_path(SegmentComponent::Custom("pnorm".into()));
+            let path = segment.relative_path(SegmentComponent::PostingNorms);
             index.directory().delete(&path).unwrap();
             CompositeWrite::wrap(index.directory().open_write(&path)?).close()?;
         }
