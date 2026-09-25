@@ -2155,7 +2155,12 @@ impl<T: VectorElement> VectorBackend<T> {
         );
 
         let routing = RoutingParams {
-            k: self.adaptive.router_k(work_budget, index.num_clusters()),
+            k: self.adaptive.router_k(
+                work_budget,
+                x,
+                filter.match_fraction(max_doc),
+                index.num_clusters(),
+            ),
             recall: self.adaptive.router_recall_target,
         };
         let routing_start = Instant::now();
@@ -2678,11 +2683,16 @@ impl<T: VectorElement> VectorBackend<T> {
         stats.scan_init_ns = stats.scan_init_ns.saturating_add(
             (init_start.elapsed().as_nanos() as u64).saturating_sub(non_vector_search_ns),
         );
-        // The stacked router is told how many clusters this budget buys and
-        // the recall target; it drops to the fixed nprobe path itself when
-        // the dimension is past `APS_MAX_DIM`.
+        // The stacked router is told how many clusters this budget buys
+        // under the filter and the recall target; it drops to the fixed
+        // nprobe path itself when the dimension is past `APS_MAX_DIM`.
         let routing = RoutingParams {
-            k: self.adaptive.router_k(work_budget, num_centroids),
+            k: self.adaptive.router_k(
+                work_budget,
+                x,
+                filter.match_fraction(max_doc),
+                num_centroids,
+            ),
             recall: self.adaptive.router_recall_target,
         };
         let routing_start = Instant::now();
@@ -3006,6 +3016,14 @@ impl SegmentFilter {
         match self {
             SegmentFilter::All => None,
             SegmentFilter::Docs(filter) => Some(filter),
+        }
+    }
+
+    /// The share of doc ids below `max_doc` that match.
+    fn match_fraction(&self, max_doc: DocId) -> f64 {
+        match self {
+            SegmentFilter::All => 1.0,
+            SegmentFilter::Docs(filter) => filter.len() as f64 / f64::from(max_doc.max(1)),
         }
     }
 }
