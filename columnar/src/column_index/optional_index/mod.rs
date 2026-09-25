@@ -1,11 +1,11 @@
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 mod set;
 mod set_block;
 
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, OwnedBytes, VInt};
+use common::{BinarySerializable, HasLen, OwnedBytes, VInt};
 pub use set::{SelectCursor, Set, SetCodec};
 use set_block::{
     DENSE_BLOCK_NUM_BYTES, DenseBlock, DenseBlockCodec, SparseBlock, SparseBlockCodec,
@@ -79,12 +79,14 @@ impl BlockVariant {
 /// # Opening
 /// When opening the data layout, the data is expanded to `Vec<SparseCodecBlockVariant>`, where the
 /// index is the block index. For each block `byte_start` and `offset` is computed.
+/// Encoded block data is read and cached only on its first rank/select access.
 #[derive(Clone)]
 pub struct OptionalIndex {
     num_docs: RowId,
     num_non_null_docs: RowId,
-    block_data: OwnedBytes,
+    block_data: FileSlice,
     block_metas: Arc<[BlockMeta]>,
+    blocks: Arc<[OnceLock<OwnedBytes>]>,
 }
 
 impl Iterable<u32> for &OptionalIndex {
@@ -158,7 +160,7 @@ impl OptionalIndexSelectCursor<'_> {
         self.block_doc_idx_start = (self.current_block_id as u32) * ELEMENTS_PER_BLOCK;
         let block_meta = self.optional_index.block_metas[self.current_block_id as usize];
         self.num_null_rows_before_block = block_meta.non_null_rows_before_block;
-        let block: Block<'_> = self.optional_index.block(block_meta);
+        let block: Block<'_> = self.optional_index.block(self.current_block_id as usize);
         self.current_block_cursor = match block {
             Block::Dense(dense_block) => BlockSelectCursor::Dense(dense_block.select_cursor()),
             Block::Sparse(sparse_block) => BlockSelectCursor::Sparse(sparse_block.select_cursor()),
@@ -185,8 +187,7 @@ impl Set<RowId> for OptionalIndex {
             block_id,
             in_block_row_id,
         } = row_addr_from_row_id(row_id);
-        let block_meta = self.block_metas[block_id as usize];
-        match self.block(block_meta) {
+        match self.block(block_id as usize) {
             Block::Dense(dense_block) => dense_block.contains(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.contains(in_block_row_id),
         }
@@ -204,7 +205,7 @@ impl Set<RowId> for OptionalIndex {
             in_block_row_id,
         } = row_addr_from_row_id(doc_id);
         let block_meta = self.block_metas[block_id as usize];
-        let block = self.block(block_meta);
+        let block = self.block(block_id as usize);
 
         let block_offset_row_id = match block {
             Block::Dense(dense_block) => dense_block.rank(in_block_row_id),
@@ -222,7 +223,7 @@ impl Set<RowId> for OptionalIndex {
             in_block_row_id,
         } = row_addr_from_row_id(doc_id);
         let block_meta = *self.block_metas.get(block_id as usize)?;
-        let block = self.block(block_meta);
+        let block = self.block(block_id as usize);
         let block_offset_row_id = match block {
             Block::Dense(dense_block) => dense_block.rank_if_exists(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.rank_if_exists(in_block_row_id),
@@ -235,7 +236,7 @@ impl Set<RowId> for OptionalIndex {
         let block_pos = self.find_block(rank, 0);
         let block_doc_idx_start = (block_pos as u32) * ELEMENTS_PER_BLOCK;
         let block_meta = self.block_metas[block_pos as usize];
-        let block: Block<'_> = self.block(block_meta);
+        let block: Block<'_> = self.block(block_pos as usize);
         let index_in_block = (rank - block_meta.non_null_rows_before_block) as u16;
         let in_block_rank = match block {
             Block::Dense(dense_block) => dense_block.select(index_in_block),
@@ -316,7 +317,7 @@ impl OptionalIndex {
             if let Some(&block_meta) = self.block_metas.get(block_id as usize) {
                 let block_doc_id_start = block_id as u32 * ELEMENTS_PER_BLOCK;
                 let row_id_start = block_meta.non_null_rows_before_block;
-                self.block(block_meta).rank_if_exists_batch(
+                self.block(block_id as usize).rank_if_exists_batch(
                     doc_ids[block_doc_start..block_doc_end]
                         .iter()
                         .map(|doc_id| (doc_id - block_doc_id_start) as u16),
@@ -345,23 +346,18 @@ impl OptionalIndex {
     }
 
     #[inline]
-    fn block(&self, block_meta: BlockMeta) -> Block<'_> {
-        let BlockMeta {
-            start_byte_offset,
-            block_variant,
-            ..
-        } = block_meta;
-        let start_byte_offset = start_byte_offset as usize;
-        let bytes = self.block_data.as_slice();
-        match block_variant {
-            BlockVariant::Dense => Block::Dense(DenseBlockCodec::open(
-                &bytes[start_byte_offset..start_byte_offset + DENSE_BLOCK_NUM_BYTES as usize],
-            )),
-            BlockVariant::Sparse { num_vals } => {
-                let end_byte_offset = start_byte_offset + num_vals as usize * 2;
-                let sparse_bytes = &bytes[start_byte_offset..end_byte_offset];
-                Block::Sparse(SparseBlockCodec::open(sparse_bytes))
-            }
+    fn block(&self, block_id: usize) -> Block<'_> {
+        let meta = self.block_metas[block_id];
+        let bytes = self.blocks[block_id].get_or_init(|| {
+            let start = meta.start_byte_offset as usize;
+            self.block_data
+                .slice(start..start + meta.block_variant.num_bytes_in_block() as usize)
+                .read_bytes()
+                .expect("Failed to read nullable index block")
+        });
+        match meta.block_variant {
+            BlockVariant::Dense => Block::Dense(DenseBlockCodec::open(bytes.as_slice())),
+            BlockVariant::Sparse { .. } => Block::Sparse(SparseBlockCodec::open(bytes.as_slice())),
         }
     }
 
@@ -567,18 +563,23 @@ pub fn open_optional_index(file_slice: FileSlice) -> io::Result<OptionalIndex> {
             .unwrap(),
     );
 
-    let mut bytes = bytes.read_bytes()?;
-    let num_docs = VInt::deserialize_u64(&mut bytes)? as u32;
+    let mut header = bytes.slice(..bytes.len().min(10)).read_bytes()?;
+    let (num_docs, header_len) = VInt::deserialize_with_size(&mut header)?;
+    let num_docs = num_docs.0 as u32;
     let block_metas_num_bytes =
         num_non_empty_block_bytes as usize * SERIALIZED_BLOCK_META_NUM_BYTES;
-    let (block_data, block_metas) = bytes.rsplit(block_metas_num_bytes);
+    let (block_data, block_metas) = bytes
+        .slice(header_len..)
+        .split_from_end(block_metas_num_bytes);
     let (block_metas, num_non_null_docs) =
-        deserialize_optional_index_block_metadatas(block_metas.as_slice(), num_docs);
+        deserialize_optional_index_block_metadatas(block_metas.read_bytes()?.as_slice(), num_docs);
+    let blocks = (0..block_metas.len()).map(|_| OnceLock::new()).collect();
     let optional_index = OptionalIndex {
         num_docs,
         num_non_null_docs,
         block_data,
         block_metas: block_metas.into(),
+        blocks,
     };
     Ok(optional_index)
 }

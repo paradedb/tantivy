@@ -1,3 +1,7 @@
+use std::ops::Range;
+use std::sync::Mutex;
+
+use common::file_slice::FileHandle;
 use proptest::prelude::*;
 use proptest::{prop_oneof, proptest};
 
@@ -488,4 +492,72 @@ mod bench {
     fn bench_translate_codec_to_orig_90percent_filled_full_scan(bench: &mut Bencher) {
         bench_translate_codec_to_orig_util(0.9f64, 100.0f32, bench);
     }
+}
+
+#[test]
+fn test_optional_index_reads_and_caches_only_selected_blocks() {
+    #[derive(Debug)]
+    struct RecordingFile {
+        bytes: OwnedBytes,
+        reads: Arc<Mutex<Vec<Range<usize>>>>,
+    }
+    impl HasLen for RecordingFile {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+    impl FileHandle for RecordingFile {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            self.reads.lock().unwrap().push(range.clone());
+            Ok(self.bytes.slice(range))
+        }
+    }
+
+    let mut rows: Vec<_> = (0..ELEMENTS_PER_BLOCK).collect();
+    rows.extend([
+        2 * ELEMENTS_PER_BLOCK,
+        2 * ELEMENTS_PER_BLOCK + 10,
+        5 * ELEMENTS_PER_BLOCK + 31,
+    ]);
+    let mut bytes = Vec::new();
+    serialize_optional_index(&&rows[..], 6 * ELEMENTS_PER_BLOCK, &mut bytes).unwrap();
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let index = open_optional_index(FileSlice::new(Arc::new(RecordingFile {
+        bytes: OwnedBytes::new(bytes),
+        reads: reads.clone(),
+    })))
+    .unwrap();
+    assert!(reads.lock().unwrap().iter().map(|r| r.len()).sum::<usize>() <= 24);
+    reads.lock().unwrap().clear();
+
+    let mut cursor = index.select_cursor();
+    assert_eq!(cursor.select(ELEMENTS_PER_BLOCK), 2 * ELEMENTS_PER_BLOCK);
+    assert_eq!(
+        cursor.select(ELEMENTS_PER_BLOCK + 2),
+        5 * ELEMENTS_PER_BLOCK + 31
+    );
+    assert_eq!(
+        index.rank(5 * ELEMENTS_PER_BLOCK + 32),
+        ELEMENTS_PER_BLOCK + 3
+    );
+    assert_eq!(
+        index.clone().select(ELEMENTS_PER_BLOCK + 1),
+        2 * ELEMENTS_PER_BLOCK + 10
+    );
+    assert_eq!(
+        reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.len())
+            .collect::<Vec<_>>(),
+        [4, 2]
+    );
+
+    assert_eq!(index.rank(123), 123);
+    assert_eq!(
+        reads.lock().unwrap().last().unwrap().len(),
+        DENSE_BLOCK_NUM_BYTES as usize
+    );
+    assert_eq!(reads.lock().unwrap().len(), 3);
 }

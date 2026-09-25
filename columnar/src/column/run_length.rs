@@ -33,7 +33,7 @@ impl<T: PartialOrd + 'static> RunLengthColumn<T> {
         self.starts.get_or_init(|| {
             let starts = open_optional_index(self.index.clone()).expect("read run starts");
             assert!(
-                starts.contains(0) && starts.num_non_nulls() == self.values.num_vals(),
+                starts.num_non_nulls() == self.values.num_vals(),
                 "invalid run-length column"
             );
             starts
