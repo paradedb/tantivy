@@ -13,6 +13,7 @@ use common::json_path_writer::JSON_END_OF_PATH;
 pub(crate) use serializer::ColumnarSerializer;
 use stacker::{Addr, ArenaHashMap, MemoryArena};
 
+use crate::column::serialize_run_length_column;
 use crate::column_index::{SerializableColumnIndex, SerializableOptionalIndex};
 use crate::column_values::{CodecType, MonotonicallyMappableToU64, MonotonicallyMappableToU128};
 use crate::columnar::column_type::ColumnType;
@@ -58,9 +59,15 @@ pub struct ColumnarWriter {
     // Dictionaries used to store dictionary-encoded values.
     dictionaries: Vec<DictionaryBuilder>,
     buffers: SpareBuffers,
+    run_length_columns: Vec<String>,
 }
 
 impl ColumnarWriter {
+    /// Encodes repeated values of these required u64 columns using nullable run starts.
+    pub fn set_run_length_columns(&mut self, columns: &[String]) {
+        self.run_length_columns = columns.to_vec();
+    }
+
     pub fn mem_usage(&self) -> usize {
         self.arena.mem_usage()
             + self.numerical_field_hash_map.mem_usage()
@@ -507,19 +514,41 @@ impl ColumnarWriter {
                     let mut column_serializer =
                         serializer.start_serialize_column(column_name, column_type);
                     let numerical_type = column_type.numerical_type().unwrap();
-                    serialize_numerical_column(
-                        cardinality,
-                        num_docs,
-                        numerical_type,
-                        numerical_column_writer.operation_iterator(
-                            arena,
-                            old_to_new_row_ids,
-                            &mut symbol_byte_buffer,
-                        ),
-                        buffers,
-                        codec_types,
-                        &mut column_serializer,
-                    )?;
+                    let operations = numerical_column_writer.operation_iterator(
+                        arena,
+                        old_to_new_row_ids,
+                        &mut symbol_byte_buffer,
+                    );
+                    if column_type == ColumnType::U64
+                        && cardinality == Cardinality::Full
+                        && self
+                            .run_length_columns
+                            .iter()
+                            .any(|name| name.as_bytes() == column_name)
+                    {
+                        buffers.u64_values.clear();
+                        consume_operation_iterator(
+                            coerce_numerical_symbol::<u64>(operations),
+                            buffers.value_index_builders.borrow_required_index_builder(),
+                            &mut buffers.u64_values,
+                        );
+                        serialize_run_length_column(
+                            num_docs,
+                            &&buffers.u64_values[..],
+                            codec_types,
+                            &mut column_serializer,
+                        )?;
+                    } else {
+                        serialize_numerical_column(
+                            cardinality,
+                            num_docs,
+                            numerical_type,
+                            operations,
+                            buffers,
+                            codec_types,
+                            &mut column_serializer,
+                        )?;
+                    }
                     column_serializer.finalize()?;
                 }
                 ColumnType::DateTime => {

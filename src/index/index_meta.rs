@@ -1,8 +1,8 @@
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
 
@@ -10,8 +10,8 @@ use super::SegmentComponent;
 use crate::index::SegmentId;
 use crate::schema::Schema;
 use crate::store::Compressor;
-use crate::vector::quantization::validate_quantization_configs;
 use crate::vector::VectorQuantizationConfig;
+use crate::vector::quantization::validate_quantization_configs;
 use crate::{Inventory, Opstamp, TrackedObject};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -315,6 +315,9 @@ pub struct IndexSettings {
     #[serde(default = "default_codec_types")]
     #[serde(skip_serializing_if = "is_default_codec_types")]
     pub codec_types: Vec<columnar::CodecType>,
+    /// Required u64 columns whose consecutive repeats use nullable run starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_length_columns: Vec<String>,
     /// Doc-count boundary for choosing the vector-storage format on merge.
     ///
     /// A merge whose target segment has strictly fewer than this many
@@ -363,6 +366,7 @@ impl Default for IndexSettings {
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
             codec_types: default_codec_types(),
+            run_length_columns: Vec::new(),
             vector_clustering_threshold: default_vector_clustering_threshold(),
             vector_quantization: Vec::new(),
         }

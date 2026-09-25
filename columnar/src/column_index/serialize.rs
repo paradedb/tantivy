@@ -77,8 +77,16 @@ pub fn open_column_index(
     }
     let (header, body) = file_slice.split(1);
     let cardinality_code = header.read_bytes()?.as_slice()[0];
-    let cardinality = Cardinality::try_from_code(cardinality_code)?;
+    open_column_index_body(body, cardinality_code, format_version)
+}
 
+/// Decodes an index whose encoding byte has already been read.
+pub(crate) fn open_column_index_body(
+    body: FileSlice,
+    cardinality_code: u8,
+    format_version: Version,
+) -> io::Result<ColumnIndex> {
+    let cardinality = Cardinality::try_from_code(cardinality_code)?;
     match cardinality {
         Cardinality::Full => Ok(ColumnIndex::Full),
         Cardinality::Optional => {

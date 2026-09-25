@@ -12,15 +12,15 @@ use columnar::{
 use common::TerminatingWrite;
 use measure_time::debug_time;
 
+use crate::Segment;
 use crate::directory::{Directory, WritePtr};
 use crate::fastfield::{FastFieldReaders, FastFieldsWriter};
 use crate::index::{SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{DocIdMapping, MappingType, SegmentDocIdMapping};
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::schema::document::Document;
-use crate::schema::{value_type_to_column_type, Schema};
+use crate::schema::{Schema, value_type_to_column_type};
 use crate::space_usage::{ComponentSpaceUsage, FAST_FIELDS};
-use crate::Segment;
 
 pub struct FastFieldsPlugin;
 
@@ -53,11 +53,12 @@ impl SegmentPlugin for FastFieldsPlugin {
         let merge_row_order = convert_to_merge_order(&columnars[..], doc_id_mapping);
 
         let cancel = ctx.cancel;
-        columnar::merge_columnar(
+        columnar::merge_columnar_with_run_length(
             &columnars[..],
             &required_columns,
             merge_row_order,
             ctx.settings.columnar_codec_types(),
+            &ctx.settings.run_length_columns,
             &mut fast_field_wrt,
             || cancel.wants_cancel(),
         )?;
@@ -91,11 +92,12 @@ impl FastFieldsPluginWriter {
     pub(crate) fn new(ctx: &PluginWriterContext) -> crate::Result<Self> {
         let index = ctx.segment.index();
         let tokenizer_manager = index.fast_field_tokenizer().clone();
-        let writer = FastFieldsWriter::from_schema_and_tokenizer_manager(
+        let mut writer = FastFieldsWriter::from_schema_and_tokenizer_manager(
             &ctx.segment.schema(),
             tokenizer_manager,
         )?;
 
+        writer.set_run_length_columns(&index.settings().run_length_columns);
         let path = ctx.segment.relative_path(SegmentComponent::FastFields);
         let fast_field_write = index.directory().open_write(&path)?;
 

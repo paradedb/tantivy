@@ -2,11 +2,15 @@ use std::io;
 use std::io::Write;
 use std::sync::Arc;
 
+use common::HasLen;
 use common::file_slice::FileSlice;
 use sstable::Dictionary;
 
+use super::run_length::{INDEX_CODE, open as open_run_length_column};
 use crate::column::{BytesColumn, Column};
-use crate::column_index::{SerializableColumnIndex, serialize_column_index};
+use crate::column_index::{
+    SerializableColumnIndex, open_column_index_body, serialize_column_index,
+};
 use crate::column_values::{
     CodecType, MonotonicallyMappableToU64, MonotonicallyMappableToU128,
     load_u64_based_column_values, serialize_column_values_u128, serialize_u64_based_column_values,
@@ -50,7 +54,18 @@ pub fn open_column_u64<T: MonotonicallyMappableToU64>(
             .unwrap(),
     );
     let (column_index_data, column_values_data) = body.split(column_index_num_bytes as usize);
-    let column_index = crate::column_index::open_column_index(column_index_data, format_version)?;
+    if column_index_data.len() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "empty column index",
+        ));
+    }
+    let (header, body) = column_index_data.split(1);
+    let index_code = header.read_bytes()?[0];
+    if index_code == INDEX_CODE {
+        return open_run_length_column(body, column_values_data);
+    }
+    let column_index = open_column_index_body(body, index_code, format_version)?;
     let column_values = load_u64_based_column_values(column_values_data)?;
     Ok(Column {
         index: column_index,

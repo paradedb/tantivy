@@ -36,7 +36,7 @@ pub(crate) mod utils;
 mod value;
 
 pub use block_accessor::ColumnBlockAccessor;
-pub use column::{BytesColumn, Column, StrColumn};
+pub use column::{BytesColumn, Column, RunLengthColumn, StrColumn};
 pub use column_index::ColumnIndex;
 pub use column_values::{
     CodecType, ColumnStats, ColumnValues, EmptyColumnValues, MonotonicallyMappableToU64,
@@ -48,7 +48,7 @@ pub const DEFAULT_CODEC_TYPES: [CodecType; 2] = [CodecType::Bitpacked, CodecType
 pub use columnar::{
     CURRENT_VERSION, ColumnType, ColumnarReader, ColumnarWriter, HasAssociatedColumnType,
     MergeRowOrder, ShuffleMergeOrder, SortColumn, StackMergeOrder, Version,
-    compute_merged_term_ord_mapping, merge_columnar,
+    compute_merged_term_ord_mapping, merge_columnar, merge_columnar_with_run_length,
 };
 use sstable::VoidSSTable;
 pub use value::{NumericalType, NumericalValue};

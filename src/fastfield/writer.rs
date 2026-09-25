@@ -6,8 +6,8 @@ use tokenizer_api::Token;
 
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::schema::document::{Document, ReferenceValue, ReferenceValueLeaf, Value};
-use crate::schema::{value_type_to_column_type, Field, FieldType, Schema, Type};
-use crate::tokenizer::{TextAnalyzer, TokenizerManager, RAW_TOKENIZER_NAME};
+use crate::schema::{Field, FieldType, Schema, Type, value_type_to_column_type};
+use crate::tokenizer::{RAW_TOKENIZER_NAME, TextAnalyzer, TokenizerManager};
 use crate::{DocId, TantivyError};
 
 /// Only index JSON down to a depth of 20.
@@ -106,6 +106,10 @@ impl FastFieldsWriter {
             expand_dots,
             json_path_buffer: JsonPathWriter::default(),
         })
+    }
+
+    pub(crate) fn set_run_length_columns(&mut self, columns: &[String]) {
+        self.columnar_writer.set_run_length_columns(columns);
     }
 
     /// The memory used (inclusive childs)
@@ -384,10 +388,10 @@ mod tests {
     use columnar::{Column, ColumnarReader, ColumnarWriter, StrColumn};
     use common::JsonPathWriter;
 
-    use super::{record_json_value_to_columnar_writer, FastFieldsWriter};
-    use crate::fastfield::writer::JSON_DEPTH_LIMIT;
-    use crate::schema::{Schema, FAST};
+    use super::{FastFieldsWriter, record_json_value_to_columnar_writer};
     use crate::DocId;
+    use crate::fastfield::writer::JSON_DEPTH_LIMIT;
+    use crate::schema::{FAST, Schema};
 
     #[test]
     fn test_raw_fast_fields_bypass_tokenizer() {
@@ -445,34 +449,42 @@ mod tests {
         {
             assert_eq!(columns[0].0, "arr");
             let column_arr_opt: Option<StrColumn> = columns[0].1.open().unwrap().into();
-            assert!(column_arr_opt
-                .unwrap()
-                .term_ords(0)
-                .eq([1, 0, 3, 2].into_iter()));
+            assert!(
+                column_arr_opt
+                    .unwrap()
+                    .term_ords(0)
+                    .eq([1, 0, 3, 2].into_iter())
+            );
         }
         {
             assert_eq!(columns[1].0, "float");
             let column_float_opt: Option<Column<f64>> = columns[1].1.open().unwrap().into();
-            assert!(column_float_opt
-                .unwrap()
-                .values_for_doc(0)
-                .eq([1.02f64].into_iter()));
+            assert!(
+                column_float_opt
+                    .unwrap()
+                    .values_for_doc(0)
+                    .eq([1.02f64].into_iter())
+            );
         }
         {
             assert_eq!(columns[2].0, "nested\u{1}child");
             let column_nest_child_opt: Option<Column<i64>> = columns[2].1.open().unwrap().into();
-            assert!(column_nest_child_opt
-                .unwrap()
-                .values_for_doc(0)
-                .eq([3].into_iter()));
+            assert!(
+                column_nest_child_opt
+                    .unwrap()
+                    .values_for_doc(0)
+                    .eq([3].into_iter())
+            );
         }
         {
             assert_eq!(columns[3].0, "nested\u{1}child2");
             let column_nest_child2_opt: Option<Column<i64>> = columns[3].1.open().unwrap().into();
-            assert!(column_nest_child2_opt
-                .unwrap()
-                .values_for_doc(0)
-                .eq([5].into_iter()));
+            assert!(
+                column_nest_child2_opt
+                    .unwrap()
+                    .values_for_doc(0)
+                    .eq([5].into_iter())
+            );
         }
         {
             assert_eq!(columns[4].0, "text");

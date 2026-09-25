@@ -12,15 +12,18 @@ pub use merge_dict_column::compute_merged_term_ord_mapping;
 pub use merge_mapping::{MergeRowOrder, ShuffleMergeOrder, StackMergeOrder};
 
 use super::writer::ColumnarSerializer;
-use crate::column::{serialize_column_mappable_to_u64, serialize_column_mappable_to_u128};
+use crate::column::{
+    serialize_column_mappable_to_u64, serialize_column_mappable_to_u128,
+    serialize_run_length_column,
+};
 use crate::column_values::{CodecType, MergedColumnValues};
 use crate::columnar::ColumnarReader;
 use crate::columnar::merge::merge_dict_column::merge_bytes_or_str_column;
 use crate::columnar::writer::CompatibleNumericalTypes;
 use crate::dynamic_column::DynamicColumn;
 use crate::{
-    BytesColumn, Column, ColumnIndex, ColumnType, ColumnValues, DynamicColumnHandle, NumericalType,
-    NumericalValue,
+    BytesColumn, Cardinality, Column, ColumnIndex, ColumnType, ColumnValues, DynamicColumnHandle,
+    NumericalType, NumericalValue,
 };
 
 /// Column types are grouped into different categories.
@@ -83,6 +86,27 @@ pub fn merge_columnar(
     output: &mut impl io::Write,
     cancel: impl Fn() -> bool,
 ) -> io::Result<()> {
+    merge_columnar_with_run_length(
+        columnar_readers,
+        required_columns,
+        merge_row_order,
+        codec_types,
+        &[],
+        output,
+        cancel,
+    )
+}
+
+/// Merges columns and regenerates run starts after deletions and row reordering.
+pub fn merge_columnar_with_run_length(
+    columnar_readers: &[&ColumnarReader],
+    required_columns: &[(String, ColumnType)],
+    merge_row_order: MergeRowOrder,
+    codec_types: &[CodecType],
+    run_length_columns: &[String],
+    output: &mut impl io::Write,
+    cancel: impl Fn() -> bool,
+) -> io::Result<()> {
     let mut serializer = ColumnarSerializer::new(output);
     let num_docs_per_columnar = columnar_readers
         .iter()
@@ -115,6 +139,7 @@ pub fn merge_columnar(
             columns,
             &merge_row_order,
             codec_types,
+            run_length_columns.iter().any(|name| name == &column_name),
             &mut column_serializer,
         )?;
         column_serializer.finalize()?;
@@ -141,6 +166,7 @@ fn merge_column(
     columns_to_merge: Vec<Option<DynamicColumn>>,
     merge_row_order: &MergeRowOrder,
     codec_types: &[CodecType],
+    run_length: bool,
     wrt: &mut impl io::Write,
 ) -> io::Result<()> {
     match column_type {
@@ -173,12 +199,24 @@ fn merge_column(
                 column_values: &column_values[..],
                 merge_row_order,
             };
-            serialize_column_mappable_to_u64(
-                merged_column_index,
-                &merge_column_values,
-                codec_types,
-                wrt,
-            )?;
+            if run_length
+                && column_type == ColumnType::U64
+                && merged_column_index.get_cardinality() == Cardinality::Full
+            {
+                serialize_run_length_column(
+                    merge_row_order.num_rows(),
+                    &merge_column_values,
+                    codec_types,
+                    wrt,
+                )?;
+            } else {
+                serialize_column_mappable_to_u64(
+                    merged_column_index,
+                    &merge_column_values,
+                    codec_types,
+                    wrt,
+                )?;
+            }
         }
         ColumnType::IpAddr => {
             let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns_to_merge.len());

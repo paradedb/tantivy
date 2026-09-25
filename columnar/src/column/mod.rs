@@ -1,4 +1,7 @@
 mod dictionary_encoded;
+mod run_length;
+pub use run_length::RunLengthColumn;
+pub(crate) use run_length::serialize_run_length_column;
 mod serialize;
 
 use std::fmt::{self, Debug};
@@ -74,6 +77,12 @@ impl<T: PartialOrd + Copy + Debug + Send + Sync + 'static> Column<T> {
                 col_index.num_docs()
             }
         }
+    }
+
+    /// Returns the compact run starts and values when this column repeats missing entries.
+    pub fn run_length(&self) -> Option<&RunLengthColumn<T>>
+    where T: MonotonicallyMappableToU64 {
+        self.values.as_ref().downcast_ref::<RunLengthColumn<T>>()
     }
 
     pub fn min_value(&self) -> T {
