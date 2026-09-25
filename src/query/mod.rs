@@ -70,6 +70,7 @@ pub use self::term_set_query::*;
 pub use self::union::{BufferedUnionScorer, SimpleUnion};
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
+pub(crate) use self::weight::for_each_docset_buffered;
 pub use self::weight::Weight;
 
 #[cfg(test)]
